@@ -275,7 +275,10 @@ pub struct HttpContext {
     /// bracket `[session req cluster backend]` and emitted into
     /// `ProtobufAccessLog.session_id`.
     pub session_id: Ulid,
-    /// the value of the custom header, named "Sozu-Id", that Kawa should write (request and response)
+    /// Request ULID: the value of the correlation header, named "Sozu-Id" by
+    /// default, that Kawa should write (request and response), of a generated
+    /// `X-Request-Id` and of `%REQUEST_ID`. Request-scoped: `reset` replaces
+    /// it for each keep-alive request, unlike [`Self::session_id`].
     pub id: Ulid,
     pub backend_id: Option<Rc<str>>,
     pub cluster_id: Option<sozu_command_lib::state::ClusterId>,
@@ -1279,13 +1282,27 @@ impl HttpContext {
         shared
     }
 
-    pub fn reset(&mut self) {
+    /// Prepare this context for the next request of a keep-alive connection,
+    /// which `request_id` identifies.
+    ///
+    /// The request id is request-scoped like the rest of what this clears:
+    /// `Sozu-Id`, a generated `X-Request-Id`, `%REQUEST_ID` and the access
+    /// log's `request_id` all read `self.id`, so keeping it would give every
+    /// request of the connection the first one's id. The caller mints it —
+    /// `ConnectionH1` from `Context::next_request_id`
+    /// (`lib/src/protocol/mux/mod.rs`), the same source that numbers H2
+    /// streams — because this struct owns neither a clock nor an RNG.
+    pub fn reset(&mut self, request_id: Ulid) {
         // Snapshot the connection-scoped identity + TLS/listener fields that
         // reset() must NOT touch (set once at handshake, reused across every
         // keep-alive request). Cheap to copy — all `Copy`. Read only inside
         // the postcondition `debug_assert!`s below, so dead code in release.
         let session_id_before = self.session_id;
         let id_before = self.id;
+        debug_assert_ne!(
+            request_id, id_before,
+            "the next request of a connection needs an id of its own"
+        );
         let strict_sni_before = self.strict_sni_binding;
         let elide_before = self.elide_x_real_ip;
         let send_before = self.send_x_real_ip;
@@ -1293,6 +1310,7 @@ impl HttpContext {
         let tls_cipher_before = self.tls_cipher;
         let tls_alpn_before = self.tls_alpn;
 
+        self.id = request_id;
         self.keep_alive_backend = true;
         self.keep_alive_frontend = true;
         self.sticky_session_found = None;
@@ -1334,7 +1352,10 @@ impl HttpContext {
             self.session_id, session_id_before,
             "reset() must preserve the connection session id"
         );
-        debug_assert_eq!(self.id, id_before, "reset() must preserve the request id");
+        debug_assert!(
+            self.id == request_id && self.id != id_before,
+            "reset() must give the next request its own id"
+        );
         debug_assert!(
             self.strict_sni_binding == strict_sni_before
                 && self.elide_x_real_ip == elide_before
@@ -1563,7 +1584,7 @@ mod tests {
             mode: HeaderEditMode::Append,
         });
 
-        ctx.reset();
+        ctx.reset(Ulid::generate());
 
         assert!(ctx.keep_alive_backend);
         assert!(ctx.keep_alive_frontend);
@@ -1600,7 +1621,7 @@ mod tests {
         ctx.tls_alpn = Some("h2");
         ctx.strict_sni_binding = false;
 
-        ctx.reset();
+        ctx.reset(Ulid::generate());
 
         assert_eq!(ctx.tls_server_name.as_deref(), Some("example.com"));
         assert_eq!(ctx.tls_version, Some("TLSv1.3"));
@@ -1621,14 +1642,18 @@ mod tests {
         let original_protocol = ctx.protocol;
         let original_public_address = ctx.public_address;
 
-        ctx.reset();
+        let next_id = Ulid::generate();
+        ctx.reset(next_id);
 
         // Connection-level state is preserved
         assert!(ctx.closing);
         assert_eq!(ctx.cluster_id.as_deref(), Some("cluster-1"));
         assert_eq!(ctx.backend_id.as_deref(), Some("backend-1"));
         assert_eq!(ctx.sticky_session.as_deref(), Some("session-abc"));
-        assert_eq!(ctx.id, original_id);
+        // The request id is request-scoped: a keep-alive connection's next
+        // request must not inherit the previous one's.
+        assert_ne!(ctx.id, original_id);
+        assert_eq!(ctx.id, next_id);
         assert_eq!(ctx.protocol, original_protocol);
         assert_eq!(ctx.public_address, original_public_address);
     }
@@ -2100,7 +2125,8 @@ mod tests {
 
     /// Byte-exact output of the header editing, for the synthesised headers
     /// and for the chains a client supplied, on the first request of a
-    /// connection and on the next one after `reset`.
+    /// connection and on the next ones after `reset`: each request carries
+    /// its own id, never the one of the request before it.
     #[test]
     fn header_editing_output_is_byte_exact_across_keep_alive_requests() {
         let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
@@ -2119,9 +2145,15 @@ mod tests {
             false,
             true,
         );
-        let id = ctx.id.to_string();
+        let mut seen = Vec::new();
 
         for request in 0..3 {
+            let id = ctx.id.to_string();
+            assert!(
+                !seen.contains(&id),
+                "request {request} of the connection reuses the id of an earlier one: {id}"
+            );
+            seen.push(id.clone());
             allocations_of_request_parse(&mut ctx, &mut kawa, BARE_REQUEST);
             let traceparent = synthesised_traceparent_line(&ctx);
             assert_eq!(
@@ -2140,9 +2172,14 @@ mod tests {
                 "request {request} of the connection"
             );
             assert_eq!(ctx.x_request_id.as_deref(), Some(id.as_str()));
-            ctx.reset();
+            ctx.reset(Ulid::generate());
         }
 
+        let id = ctx.id.to_string();
+        assert!(
+            !seen.contains(&id),
+            "the request with a client X-Request-Id reuses an earlier id: {id}"
+        );
         allocations_of_request_parse(
             &mut ctx,
             &mut kawa,

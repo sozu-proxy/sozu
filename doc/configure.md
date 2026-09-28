@@ -1292,7 +1292,9 @@ sozu_id_header = "Sozu-Id"  # rename the per-request correlation header (default
 The `sozu_id_header` knob renames the correlation header Sozu injects on every
 request AND response. Each request gets a unique ULID whose value is written to
 both sides — operators can grep the same identifier across client logs, proxy
-access logs, and backend logs. Default is `Sozu-Id`; a common rebrand is
+access logs, and backend logs. "Each request" includes every request of an
+HTTP/1.1 keep-alive connection and every stream of an HTTP/2 connection: two
+requests never share an id, even on one connection. Default is `Sozu-Id`; a common rebrand is
 `X-Request-Trace` or `X-Edge-Id`. The value must be a valid HTTP header name
 (token chars per RFC 9110 §5.1). Applies to both HTTP and HTTPS listeners.
 
@@ -3285,8 +3287,12 @@ request-smuggling probes, HPACK fuzzing, and H2-specific protocol abuse.
 
 Sōzu preserves or generates an `x-request-id` header on every H1 request and
 every H2 stream (both paths share the same H1 editor callback via `pkawa.rs`).
-The value also lands on the access log's `x_request_id` field — same value Sōzu
-forwarded to the backend, end to end.
+A client-supplied `x-request-id` takes priority and is forwarded verbatim;
+otherwise Sōzu generates one from the request ULID, the value it also writes
+in `Sozu-Id` and `%REQUEST_ID`. That ULID is fresh for every request, including
+each request of an HTTP/1.1 keep-alive connection. The value also lands on the
+access log's `x_request_id` field — same value Sōzu forwarded to the backend,
+end to end.
 
 | Metric                         | Type    | Scope | Description                                                                                               |
 | ------------------------------ | ------- | ----- | --------------------------------------------------------------------------------------------------------- |

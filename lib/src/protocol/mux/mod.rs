@@ -1058,9 +1058,13 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
         });
     }
 
-    /// Mint the request ULID for a stream this session is about to open.
+    /// Mint the request ULID for a stream this session is about to open, or
+    /// for the next request of an H1 keep-alive connection.
     ///
-    /// Replaces `Ulid::generate()` at the mux's single production ULID site.
+    /// The mux's two production ULID sites call it: `ConnectionH2::create_stream`
+    /// (`lib/src/protocol/mux/h2.rs`) for each H2 stream, and the keep-alive
+    /// branch of `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`), which
+    /// hands it to `HttpContext::reset`. It replaces `Ulid::generate()` there.
     /// `generate()` composes two ambient reaches — the wall clock and a
     /// thread-local RNG — inside `rusty_ulid`; this composes the same ULID
     /// from [`Self::now_wall_ms`] and [`Self::request_id_rng`], the two

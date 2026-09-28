@@ -2732,6 +2732,118 @@ pub fn try_keep_alive() -> State {
     State::Success
 }
 
+/// Value of the first `name` header of an H1 message, matched without regard
+/// to case.
+fn h1_header_value(message: &str, name: &str) -> Option<String> {
+    message
+        .split("\r\n\r\n")
+        .next()?
+        .split("\r\n")
+        .skip(1)
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_owned())
+        })
+}
+
+/// Every request of one H1 keep-alive connection carries its own id: the
+/// generated `X-Request-Id`, the request's `Sozu-Id` and the response's
+/// `Sozu-Id` agree within a request and differ between requests. A client
+/// `X-Request-Id` is forwarded verbatim, and `Sozu-Id` still carries Sōzu's
+/// own, fresh, id.
+///
+/// Red before the fix: `HttpContext::reset` kept `HttpContext::id` across
+/// keep-alive requests, so all three requests carried the first one's id.
+pub fn try_keep_alive_rotates_request_id() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_sync_test(
+        "KA-REQUEST-ID",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+
+    let mut backend = backends.pop().unwrap();
+    backend
+        .set_response("HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\npong");
+    backend.connect();
+
+    let mut client = Client::new(
+        "client".to_string(),
+        front_address,
+        "GET /api HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    client.connect();
+
+    let requests = [
+        "GET /api HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "GET /api HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "GET /api HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: client-chosen\r\n\r\n",
+    ];
+    let mut sozu_ids: Vec<String> = Vec::new();
+    for (index, request) in requests.iter().enumerate() {
+        client.set_request(*request);
+        client.send();
+        if index == 0 {
+            backend.accept(0);
+        }
+        let Some(forwarded) = backend.receive(0) else {
+            println!("request {index}: the backend received nothing");
+            return State::Fail;
+        };
+        backend.send(0);
+        let Some(response) = client.receive() else {
+            println!("request {index}: the client received nothing");
+            return State::Fail;
+        };
+        let request_sozu_id = h1_header_value(&forwarded, "Sozu-Id");
+        let x_request_id = h1_header_value(&forwarded, "X-Request-Id");
+        let response_sozu_id = h1_header_value(&response, "Sozu-Id");
+        println!(
+            "request {index}: X-Request-Id={x_request_id:?} request Sozu-Id={request_sozu_id:?} \
+             response Sozu-Id={response_sozu_id:?}"
+        );
+        let Some(sozu_id) = request_sozu_id else {
+            println!("request {index}: the forwarded request carries no Sozu-Id");
+            return State::Fail;
+        };
+        if sozu_id.len() != 26 || response_sozu_id.as_deref() != Some(sozu_id.as_str()) {
+            println!("request {index}: the response Sozu-Id is not the request's");
+            return State::Fail;
+        }
+        let expected_x_request_id = if request.contains("X-Request-Id") {
+            "client-chosen"
+        } else {
+            sozu_id.as_str()
+        };
+        if x_request_id.as_deref() != Some(expected_x_request_id) {
+            println!("request {index}: X-Request-Id should be {expected_x_request_id}");
+            return State::Fail;
+        }
+        if sozu_ids.contains(&sozu_id) {
+            println!("request {index}: Sozu-Id {sozu_id} was already used on this connection");
+            return State::Fail;
+        }
+        sozu_ids.push(sozu_id);
+        if !client.is_connected() {
+            println!("request {index}: the client connection was closed");
+            return State::Fail;
+        }
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    State::Success
+}
+
 pub fn try_stick() -> State {
     let front_address = create_local_address();
 
@@ -3508,6 +3620,18 @@ fn test_blue_green() {
 fn test_keep_alive() {
     assert_eq!(
         repeat_until_error_or(10, "Keep alive combinations", try_keep_alive),
+        State::Success
+    );
+}
+
+#[test]
+fn test_keep_alive_rotates_request_id() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "Keep alive: each request carries its own id",
+            try_keep_alive_rotates_request_id
+        ),
         State::Success
     );
 }

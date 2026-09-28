@@ -161,10 +161,10 @@ combined final coding is not `chunked` (RFC 9112 §6.3), returning before
   0.7.1, and forwarding both lines is what the count clause refuses.
 
 The guard therefore folds over every non-elided `Transfer-Encoding` header in
-`request.blocks` (`editor.rs:676-696`), producing `te_count` and
+`request.blocks` (`editor.rs:679-699`), producing `te_count` and
 `te_all_suffix_chunked` — the latter true only when EVERY such value's literal
 trailing bytes are `chunked` (`compare_no_case` over the last seven bytes). The
-rejection predicate is exactly (`editor.rs:697-700`):
+rejection predicate is exactly (`editor.rs:700-703`):
 
 ```rust
 te_count > 1
@@ -300,8 +300,18 @@ a wedged session, or a security regression.
    `HttpContext::reset` (`editor.rs`) clears the per-request fields but
    preserves the per-connection ULID (`session_id`, `editor.rs`), the
    SNI-derived TLS state, and the rendered `sozu_id_header` label
-   (`editor.rs`). The `request_id` (`HttpContext::id`, `editor.rs`) IS
-   rotated per request to keep the access log correlatable.
+   (`editor.rs`). The request id (`HttpContext::id`, `editor.rs`) IS
+   rotated per request: `reset` takes the next request's id as its argument,
+   and the keep-alive branch of `ConnectionH1::writable`
+   (`lib/src/protocol/mux/h1.rs`) mints it with `Context::next_request_id`
+   (`lib/src/protocol/mux/mod.rs`), the per-session source that also numbers
+   H2 streams — no syscall, no allocation. `Sozu-Id` (request and response),
+   a generated `X-Request-Id`, `%REQUEST_ID` and the access log's
+   `request_id` therefore agree within a request and differ between two
+   requests of one connection. A client-supplied `X-Request-Id` is still
+   forwarded verbatim. Pinned by `header_editing_output_is_byte_exact_across_keep_alive_requests`
+   (`editor.rs`) and `test_keep_alive_rotates_request_id`
+   (`e2e/src/tests/tests.rs`).
 
 5. **`impl kawa::AsBuffer for Checkout` is unique to this module.** It lives at
    `mod.rs:30`; the orphan rule permits no second impl **for `Checkout`**, so
