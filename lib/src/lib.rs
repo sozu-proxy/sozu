@@ -1680,19 +1680,112 @@ pub mod testing {
         tcp::TcpProxy,
     };
 
-    use std::sync::atomic::{AtomicU16, Ordering};
+    use std::{
+        collections::VecDeque,
+        net::{SocketAddr, UdpSocket},
+        sync::{Mutex, PoisonError},
+    };
 
-    /// Port counter for sozu listener addresses in lib tests.
-    /// Starts at 10000 to avoid collision with:
-    /// - Privileged ports (<1024)
-    /// - e2e suite (starts at 2000)
-    /// - Ephemeral port range (typically 32768+)
-    static PORT_PROVIDER: AtomicU16 = AtomicU16::new(10000);
+    use socket2::{Domain, Socket, Type};
 
-    /// Get a unique port for a sozu listener address.
-    /// Each call returns a different port, safe for parallel test execution.
+    /// Ports handed to lib tests, below Linux's default ephemeral range
+    /// (32768–60999) so no `127.0.0.1:0` client socket is auto-bound onto one
+    /// between allocation and use, and above the fixed 10000-based sequence
+    /// older revisions of this function used. The e2e suite draws from
+    /// 20000–65000 through its own registry (`e2e/src/port_registry.rs`),
+    /// which reserves through [`reserve_port`] too.
+    const TEST_PORT_FIRST: u16 = 12_000;
+    const TEST_PORT_LAST: u16 = 19_999;
+
+    /// Next candidate for [`provide_port`].
+    static NEXT_TEST_PORT: Mutex<u16> = Mutex::new(TEST_PORT_FIRST);
+
+    /// How many reservations [`reserve_port`] holds at once. Each one is a
+    /// descriptor: the full e2e suite reserves thousands of ports, which would
+    /// exceed a default soft `RLIMIT_NOFILE` of 1024 if every reservation
+    /// lived until the process exits. The oldest reservation is dropped to
+    /// make room, so a test that releases its listener and binds it again
+    /// only after this process has reserved this many further ports has lost
+    /// its reservation in between.
+    const MAX_HELD_RESERVATIONS: usize = 256;
+
+    /// The sockets [`reserve_port`] holds, oldest first.
+    static PORT_RESERVATIONS: Mutex<VecDeque<Socket>> = Mutex::new(VecDeque::new());
+
+    /// Reserve `127.0.0.1:port` against the other processes on this machine
+    /// that also reserve their ports through this function, until this
+    /// process has reserved 256 more ports. Returns `false`, reserving
+    /// nothing, when the port is already in use.
+    ///
+    /// A port counter alone is unique within one test binary only: two
+    /// binaries running concurrently (several worktrees, parallel CI jobs,
+    /// pre-push hooks) walked the same sequence, and since `server_bind` and
+    /// `udp_bind` set `SO_REUSEPORT`, both processes bound the same address
+    /// without error and the kernel split connections and datagrams between
+    /// them. A port a test releases on purpose, for instance by deactivating
+    /// a listener before activating it again, could likewise be taken by
+    /// another process in between.
+    ///
+    /// The port is reserved only when an exclusive TCP bind (no
+    /// `SO_REUSEADDR`, no `SO_REUSEPORT`) and an exclusive UDP bind on it both
+    /// succeed. The TCP socket is then kept, bound and not listening, with
+    /// `SO_REUSEADDR` and `SO_REUSEPORT` set so this process's own
+    /// `server_bind`, `std::net::TcpListener::bind` and their equivalents
+    /// still succeed on the port. Another process's exclusive TCP bind fails
+    /// on it, so a process reserving through this function skips it; the
+    /// reservation never listens, so it accepts no connection and a connect
+    /// to an otherwise unused reserved port is still refused.
+    ///
+    /// Those same socket options mean the reservation does not stop a process
+    /// that binds without reserving first: a `server_bind` (`SO_REUSEPORT`)
+    /// from a test binary built before this function existed, or a
+    /// `std::net::TcpListener::bind` (`SO_REUSEADDR`) while nothing listens on
+    /// the port, still succeeds on it, including between a deactivate and the
+    /// re-activate of a test's listener. The guarantee holds only between
+    /// processes that all reserve their ports through this function, and only
+    /// while the reservation is held (see `MAX_HELD_RESERVATIONS`). The UDP
+    /// side is only probed, never held: a bound UDP socket sharing the port
+    /// through `SO_REUSEPORT` would receive a share of the datagrams.
+    pub fn reserve_port(port: u16) -> bool {
+        let address = SocketAddr::from(([127, 0, 0, 1], port));
+        let reservation = Socket::new(Domain::IPV4, Type::STREAM, None)
+            .expect("could not create a port reservation socket");
+        if reservation.bind(&address.into()).is_err() || UdpSocket::bind(address).is_err() {
+            return false;
+        }
+        reservation
+            .set_reuse_address(true)
+            .and_then(|()| reservation.set_reuse_port(true))
+            .expect("could not share the port reservation with this process");
+        let mut reservations = PORT_RESERVATIONS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if reservations.len() == MAX_HELD_RESERVATIONS {
+            reservations.pop_front();
+        }
+        reservations.push_back(reservation);
+        true
+    }
+
+    /// Get a localhost port for a test listener, held by [`reserve_port`]:
+    /// unique across concurrent processes that all allocate their ports
+    /// through [`reserve_port`], within that function's limits.
     pub fn provide_port() -> u16 {
-        PORT_PROVIDER.fetch_add(1, Ordering::SeqCst)
+        let mut next_port = NEXT_TEST_PORT
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for _ in TEST_PORT_FIRST..=TEST_PORT_LAST {
+            let candidate = *next_port;
+            *next_port = if candidate == TEST_PORT_LAST {
+                TEST_PORT_FIRST
+            } else {
+                candidate + 1
+            };
+            if reserve_port(candidate) {
+                return candidate;
+            }
+        }
+        panic!("no free localhost port left in {TEST_PORT_FIRST}..={TEST_PORT_LAST}");
     }
 
     /// Everything needed to create a Server

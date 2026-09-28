@@ -6,9 +6,15 @@ use std::{
 };
 
 use sozu_command_lib::scm_socket::Listeners;
+use sozu_lib::testing::reserve_port;
 
-// Keep test allocations in a high user-space range. We still probe with bind()
-// before handing a port out, so overlap with the OS ephemeral range is safe.
+// Keep test allocations in a high user-space range. Every port handed out is
+// first held by `sozu_lib::testing::reserve_port` while the process reserves
+// its next 255 ports. That keeps it away from the kernel's automatic TCP port
+// selection and from other test processes that also reserve through
+// `reserve_port`, even while the test has released its own listener (a
+// deactivate before a re-activate). It does not stop a process that binds
+// without reserving; see `reserve_port`.
 const PORT_SEARCH_START: u16 = 20_000;
 const PORT_SEARCH_END: u16 = 65_000;
 
@@ -47,6 +53,9 @@ impl PortRegistry {
                 continue;
             }
 
+            if !reserve_port(candidate) {
+                continue;
+            }
             let address = SocketAddr::from(([127, 0, 0, 1], candidate));
             let listener = match TcpListener::bind(address) {
                 Ok(listener) => listener,
@@ -73,13 +82,9 @@ impl PortRegistry {
                 continue;
             }
 
-            let address = SocketAddr::from(([127, 0, 0, 1], candidate));
-            let listener = match TcpListener::bind(address) {
-                Ok(listener) => listener,
-                Err(_) => continue,
-            };
-
-            drop(listener);
+            if !reserve_port(candidate) {
+                continue;
+            }
             self.issued_ports.insert(candidate);
             return candidate;
         }

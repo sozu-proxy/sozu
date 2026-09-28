@@ -732,7 +732,29 @@ skipping it produced a real flaky-test or papered-over-bug commit.
 - **Never hardcode ports.** Allocate through the port registry
   (`e2e/src/port_registry.rs`). Use `tests::create_local_address()`
   (`e2e/src/tests/tests.rs`), which draws a free localhost port from the
-  registry. Hardcoded ports collide under parallel test execution.
+  registry. Hardcoded ports collide under parallel test execution, and so
+  do counters that restart at the same value in every process. Unit tests in
+  `lib/` use `sozu_lib::testing::provide_port()`, which hands out ports from
+  12000–19999. Both allocators pass every port through
+  `sozu_lib::testing::reserve_port()`, which keeps it reserved while the
+  process reserves its next 255 ports (a bound kept on the descriptors it
+  costs): a non-listening TCP socket, bound exclusively before
+  `SO_REUSEADDR` and `SO_REUSEPORT` are set on it, so the test's own
+  listeners still bind while another test process's exclusive probe fails.
+  The reservation outlives the test's own listener, so a port released by a
+  deactivate stays out of reach of other reserving processes until the
+  re-activate binds it again. Two limits apply. The guarantee holds only
+  between processes that all reserve through `reserve_port()`: because the
+  reservation carries `SO_REUSEADDR` and `SO_REUSEPORT`, a process that binds
+  without reserving (a `server_bind` from an older test binary, a
+  `std::net::TcpListener::bind` while nothing listens) still succeeds on a
+  reserved port, deactivate window included. And the oldest reservation is
+  dropped once 256 are held, so a test that re-activates only after its
+  process has reserved that many further ports has an unprotected window.
+  Without reservations, two test binaries running at the same time
+  (several worktrees, parallel CI jobs) share ports silently: `server_bind`
+  and `udp_bind` set `SO_REUSEPORT`, so both bind the same address without
+  error and the kernel splits connections and datagrams between them.
 - **Always drain with a `loop_read_*` helper when asserting on TCP responses.** A
   single `read()` sees one TCP segment under load — your assertion races the
   network. Use the looping readers (`Client::receive_until_eof`,
