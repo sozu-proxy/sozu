@@ -336,6 +336,7 @@ jobs:
           cargo test -p sozu --locked ${{ matrix.flags }} --test sigterm_soft_stop_e2e -- --ignored
           cargo test -p sozu --locked ${{ matrix.flags }} --test upgrade_fd_inheritance_e2e -- --ignored
           cargo test -p sozu --locked ${{ matrix.flags }} --test upgrade_keeps_draining_worker_e2e -- --ignored
+          cargo test -p sozu --locked ${{ matrix.flags }} --test soft_stop_waits_for_drain_e2e -- --ignored
 
       # `sozu_top_e2e` adds the `tui` feature, so it runs on the `msrv-full`
       # cell only: that cell already resolves `tui` for `cargo doc
