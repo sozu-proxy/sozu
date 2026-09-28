@@ -296,8 +296,8 @@ mod send_test {
     #[test]
     fn it_should_send_a_proxy_protocol_header_to_the_upstream_backend() {
         setup_test_logger!();
-        let addr_client: SocketAddr = "127.0.0.1:6666".parse().expect("parse address error");
-        let addr_backend: SocketAddr = "127.0.0.1:2001".parse().expect("parse address error");
+        let addr_client = SocketAddr::from(([127, 0, 0, 1], crate::testing::provide_port()));
+        let addr_backend = SocketAddr::from(([127, 0, 0, 1], crate::testing::provide_port()));
         let barrier = Arc::new(Barrier::new(3));
         let end_barrier = Arc::new(Barrier::new(2));
 

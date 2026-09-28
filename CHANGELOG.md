@@ -3360,6 +3360,33 @@
 
 ### 🐛 Fixed
 
+- **`fix(test)`: concurrent test processes no longer share listener ports
+  ([#1659](https://github.com/sozu-proxy/sozu/issues/1659)).** `testing::provide_port` counted
+  up from a fixed 10000, so two `sozu-lib` test binaries running at once (several worktrees,
+  parallel CI jobs, a pre-push hook) received the same ports; because `server_bind` and
+  `udp_bind` set `SO_REUSEPORT`, both bound them without error and the kernel split connections
+  and datagrams between the processes, failing tests such as
+  `inherited_listener_sockets_are_adopted_by_the_initial_activation`,
+  `in_flight_udp_flows_survive_a_duplicate_udp_activate` and `round_trip`. The e2e registry
+  probed before issuing a port, but every process started its cursor at 20000 and nothing held
+  a port once the test's own listener was closed, so another e2e process could take a port
+  between a deactivate and the re-activate: `test_tcp_listener_serves_after_reactivation`
+  failed with `cycled=false` on `Address already in use`. The new
+  `sozu_lib::testing::reserve_port` reserves a port only when exclusive TCP and UDP binds on it
+  succeed, then keeps its TCP socket bound, not listening, while the process reserves its next
+  255 ports (bounding the descriptors held), with `SO_REUSEADDR` and `SO_REUSEPORT` set after
+  the bind: the process's own listeners still bind, while another reserving process's exclusive
+  probe fails and moves on. The guarantee holds only between processes that all reserve through
+  `reserve_port`: the reservation's socket options let a process that binds without reserving
+  (a `server_bind` from an older test binary, a `std::net::TcpListener::bind` while nothing
+  listens) still take the port, deactivate window included; and a test that re-activates only
+  after its process has reserved 256 further ports has lost its reservation in between.
+  `provide_port` now draws from 12000–19999, below the Linux ephemeral range, through it; the
+  e2e registry reserves every port it issues through it too; and
+  `it_should_send_a_proxy_protocol_header_to_the_upstream_backend` takes its two ports from
+  `provide_port` instead of the fixed 6666 and 2001. Test support only; no runtime behaviour
+  changes.
+
 - **`fix(mux-h2)`: a soft-stop waits for an incomplete header block and closes with a final
   GOAWAY ([#1647](https://github.com/sozu-proxy/sozu/issues/1647)).** A stream whose
   HEADERS/CONTINUATION block is still being reassembled is `StreamState::Idle`, and
