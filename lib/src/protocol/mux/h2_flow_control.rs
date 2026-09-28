@@ -14,8 +14,9 @@
 //!
 //! - [`H2FlowControl::window`] — our send credit toward the peer, replenished
 //!   by [`H2FlowControl::apply_window_update`] (a `WINDOW_UPDATE(stream=0)`
-//!   we receive) and consumed by [`H2FlowControl::consume_send_window`] (DATA
-//!   bytes we write).
+//!   we receive), consumed by [`H2FlowControl::consume_send_window`] when DATA
+//!   is prepared, and given back by [`H2FlowControl::refund_send_window`] for
+//!   prepared DATA dropped before it reached the wire.
 //! - [`H2FlowControl::received_bytes_since_update`] — bytes we've received
 //!   and not yet credited back; [`H2FlowControl::account_received_bytes`]
 //!   accumulates it and signals when it crosses the configured threshold.
@@ -230,6 +231,45 @@ impl H2FlowControl {
             "consuming send credit must never grow the window"
         );
         self.debug_assert_invariants();
+    }
+
+    /// RFC 9113 §6.9.1: give back `refunded` octets of send credit that
+    /// [`Self::consume_send_window`] took for DATA which was prepared and
+    /// then dropped before any of it reached the wire. The peer never
+    /// receives those octets, so it never returns their credit through a
+    /// WINDOW_UPDATE; without this the window would stay short of them for
+    /// the life of the connection (sozu-proxy/sozu#1641).
+    ///
+    /// Same outcome as [`Self::apply_window_update`], for the same reason:
+    /// the window the peer really granted is the current one PLUS the
+    /// refund, since those octets never reached it. A peer can push that
+    /// sum past 2^31-1 with WINDOW_UPDATEs sent while the DATA sat parked,
+    /// each accepted on its own, and the refund is the first place the
+    /// overflow is visible. That is peer input, not a broken invariant, so
+    /// it answers [`ApplyWindowUpdateOutcome::Overflow`], leaves the window
+    /// untouched, and the caller answers FLOW_CONTROL_ERROR.
+    pub(super) fn refund_send_window(&mut self, refunded: i32) -> ApplyWindowUpdateOutcome {
+        debug_assert!(refunded > 0, "only a positive refund is ever applied");
+        let before = self.window;
+        let Some(window) = self.window.checked_add(refunded) else {
+            debug_assert_eq!(self.window, before, "an overflowing refund changes nothing");
+            return ApplyWindowUpdateOutcome::Overflow;
+        };
+        self.window = window;
+        debug_assert_eq!(
+            i64::from(self.window),
+            i64::from(before) + i64::from(refunded),
+            "a refund grows the send window by exactly what it gives back"
+        );
+        debug_assert!(
+            self.window > before,
+            "a positive refund must strictly grow the send window"
+        );
+        self.debug_assert_invariants();
+        ApplyWindowUpdateOutcome::Applied {
+            new_window: window,
+            should_arm_writable: before <= 0 && window > 0,
+        }
     }
 
     /// RFC 9113 §6.9: apply a peer-sent, already-validated-non-zero
@@ -504,6 +544,57 @@ mod tests {
         assert_eq!(fc.window(), 65_535);
         assert_eq!(fc.pending_window_updates_len(), 0);
         assert!(fc.pending_window_updates_is_empty());
+    }
+
+    /// A refund restores exactly what the prepare consumed, and reports the
+    /// reopening of a window the prepare had closed (sozu-proxy/sozu#1641).
+    #[test]
+    fn refund_gives_back_consumed_credit_and_reports_a_reopened_window() {
+        let mut fc = H2FlowControl::new(65_535);
+        fc.consume_send_window(65_535);
+        assert_eq!(fc.window(), 0);
+        assert!(
+            matches!(
+                fc.refund_send_window(16_384),
+                ApplyWindowUpdateOutcome::Applied {
+                    new_window: 16_384,
+                    should_arm_writable: true
+                }
+            ),
+            "a closed window reopens"
+        );
+        assert!(
+            matches!(
+                fc.refund_send_window(49_151),
+                ApplyWindowUpdateOutcome::Applied {
+                    new_window: 65_535,
+                    should_arm_writable: false
+                }
+            ),
+            "an already open window does not reopen"
+        );
+        assert_eq!(fc.window(), 65_535, "back to the credit before the prepare");
+    }
+
+    /// A refund on top of a window the peer already grew to 2^31-1 is the
+    /// peer's overflow, reported and not applied (sozu-proxy/sozu#1641).
+    #[test]
+    fn a_refund_past_the_window_ceiling_is_an_overflow_and_changes_nothing() {
+        let mut fc = H2FlowControl::new(65_535);
+        fc.consume_send_window(65_535);
+        assert!(matches!(
+            fc.apply_window_update(i32::MAX),
+            ApplyWindowUpdateOutcome::Applied { .. }
+        ));
+        assert!(matches!(
+            fc.refund_send_window(65_535),
+            ApplyWindowUpdateOutcome::Overflow
+        ));
+        assert_eq!(
+            fc.window(),
+            i32::MAX,
+            "the window is left as the peer set it"
+        );
     }
 
     #[test]

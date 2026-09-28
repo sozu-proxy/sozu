@@ -565,6 +565,22 @@ where
     streams.values().any(|gid| probe(*gid))
 }
 
+/// The send credit `kawa.out` still holds in whole, unsent DATA frames
+/// ([`h2_transmit::queued_data_payload`]), as the `i32` both send windows
+/// count in. Every one of those octets was debited from a window that never
+/// exceeds 2^31-1, so the conversion cannot fail; if it ever did, answering
+/// zero gives back too little rather than too much.
+fn parked_data_credit(kawa: &GenericHttpStream) -> i32 {
+    let queued = h2_transmit::queued_data_payload(kawa);
+    let credit = i32::try_from(queued).unwrap_or(0);
+    debug_assert_eq!(
+        usize::try_from(credit).ok(),
+        Some(queued),
+        "queued DATA fits the window it was debited from"
+    );
+    credit
+}
+
 /// True when a stream still has response/upload bytes that could be put on the
 /// wire — headers/body in flight, or a terminated-but-not-fully-flushed buffer.
 /// Deliberately EXCLUDES `is_error()`/`rst_sent`: that disjunct is specific to
@@ -780,6 +796,22 @@ pub struct ConnectionH2 {
     /// write pass parks a stream, cleared by the next pass's
     /// `H2WritePhase::Start`.
     parked_header_block: bool,
+    /// The DATA payload octets the stream parked in `expect_write` still
+    /// holds, whole and unsent, in its `kawa.out`
+    /// ([`h2_transmit::queued_data_payload`]).
+    ///
+    /// `H2WritePhase::Prepare` debits both send windows when it encodes DATA,
+    /// before any of it is written. The same "only the parked stream holds
+    /// unsent frames" argument as [`Self::parked_header_block`] makes this
+    /// the whole of the credit spent on DATA the wire has not taken. When
+    /// those frames are dropped instead of sent — the stream removed, or its
+    /// `kawa.out` cleared — the peer never receives them and never returns
+    /// their credit, so the connection gives it back itself
+    /// ([`Self::refund_parked_data`], sozu-proxy/sozu#1641): eagerly in
+    /// [`Self::remove_dead_stream`], otherwise at the next pass's
+    /// `H2WritePhase::Start`. Set with `parked_header_block`, taken by
+    /// whichever comes first.
+    parked_data: i32,
     /// RFC 9113 §6.8 double-GOAWAY drain bookkeeping, encapsulated so
     /// nothing outside `h2_drain.rs` can reach the raw fields — see
     /// [`h2_drain::H2DrainState`].
@@ -1881,6 +1913,7 @@ impl ConnectionH2 {
             flow_control: h2_flow_control::H2FlowControl::new(DEFAULT_INITIAL_WINDOW_SIZE as i32),
             pending_table_size_update: None,
             parked_header_block: false,
+            parked_data: 0,
             drain: h2_drain::H2DrainState::new(graceful_shutdown_deadline),
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
             output: h2_output::H2Output::default(),
@@ -2908,6 +2941,39 @@ impl ConnectionH2 {
         loop {
             match pass.phase {
                 H2WritePhase::Start => {
+                    // sozu-proxy/sozu#1641: DATA the last pass left parked
+                    // and that is no longer queued was dropped unsent. Its
+                    // stream is still here (a removal refunds eagerly and
+                    // clears the park), so both windows get it back; the
+                    // DATA still queued goes out in the resume below.
+                    let parked_data = std::mem::take(&mut self.parked_data);
+                    if parked_data > 0 {
+                        match self.stream_table.expect_write() {
+                            Some(H2StreamId::Other { gid, .. }) => {
+                                let parts = context.streams[gid].split(&self.position);
+                                let queued = parked_data_credit(parts.wbuffer);
+                                debug_assert!(
+                                    queued <= parked_data,
+                                    "nothing adds DATA to a parked stream before it resumes"
+                                );
+                                let dropped = parked_data - queued;
+                                if dropped > 0 {
+                                    *parts.window = parts.window.saturating_add(dropped);
+                                    if let Some(result) = self.refund_parked_data(dropped) {
+                                        return H2WriteTarget::Done(result);
+                                    }
+                                }
+                            }
+                            // The park was cleared without a removal: the
+                            // frontend hung up while draining.
+                            _ => {
+                                if let Some(result) = self.refund_parked_data(parked_data) {
+                                    return H2WriteTarget::Done(result);
+                                }
+                            }
+                        }
+                    }
+                    debug_assert_eq!(self.parked_data, 0, "the park's DATA is settled here");
                     // sozu-proxy/sozu#1627: a header block the last pass left
                     // parked and unsent is gone if its stream was removed or
                     // its `kawa.out` cleared. Nothing encoded after it is
@@ -3016,6 +3082,7 @@ impl ConnectionH2 {
                         // §9 invariant 16's readiness policy has nothing to
                         // decide and the park must survive untouched.
                         self.parked_header_block = h2_transmit::holds_header_frame(kawa);
+                        self.parked_data = parked_data_credit(kawa);
                         return H2WriteTarget::Done(MuxResult::Continue);
                     }
                     self.stream_table.set_expect_write(None);
@@ -3324,6 +3391,7 @@ impl ConnectionH2 {
                     if pass.stalled {
                         self.stream_table.set_expect_write(Some(write_stream));
                         self.parked_header_block = h2_transmit::holds_header_frame(kawa);
+                        self.parked_data = parked_data_credit(kawa);
                         pass.phase = H2WritePhase::End;
                         continue;
                     }
@@ -3757,6 +3825,19 @@ impl ConnectionH2 {
     /// payload is skipped instead of left unread — see
     /// [`Self::skip_orphaned_data_payload`].
     fn remove_dead_stream(&mut self, stream_id: StreamId, global_stream_id: GlobalStreamId) {
+        // Read before `H2StreamTable::remove` nulls `expect_write`: the
+        // parked DATA dies with its stream (sozu-proxy/sozu#1641).
+        if matches!(
+            self.stream_table.expect_write(),
+            Some(H2StreamId::Other { gid, .. }) if gid == global_stream_id
+        ) {
+            let parked_data = std::mem::take(&mut self.parked_data);
+            if parked_data > 0 {
+                // An overflow sends GOAWAY(FLOW_CONTROL_ERROR); its outcome
+                // lives on in the connection state (see the callee's doc).
+                let _ = self.refund_parked_data(parked_data);
+            }
+        }
         // Read before `H2StreamTable::remove` nulls `expect_read`.
         let orphaned = match (self.stream_table.expect_read(), &self.state) {
             (Some((H2StreamId::Other { gid, .. }, remaining)), H2State::Frame(header))
@@ -3778,6 +3859,60 @@ impl ConnectionH2 {
         self.scheduler.remove_stream(&stream_id);
         if let Some((remaining, payload_len)) = orphaned {
             self.skip_orphaned_data_payload(remaining, payload_len);
+        }
+    }
+
+    /// Give the connection send window back `dropped` octets of DATA credit
+    /// spent on frames that were prepared and then dropped before the wire
+    /// took any of them ([`Self::parked_data`], sozu-proxy/sozu#1641), and
+    /// re-arm WRITABLE when that reopens the window: every stream starved on
+    /// it may have released WRITABLE, and nothing else would wake them. The
+    /// stream's own window is the caller's, since only a live stream has one
+    /// worth restoring.
+    ///
+    /// When the peer's WINDOW_UPDATEs have meanwhile pushed the window so
+    /// high that the refund would pass 2^31-1, the credit the peer granted
+    /// overflows (RFC 9113 §6.9.1) and this answers the GOAWAY
+    /// (FLOW_CONTROL_ERROR) `Self::handle_window_update_frame` sends for an
+    /// overflowing increment. `Self::goaway` records its outcome in the
+    /// connection state, so a caller that cannot return it
+    /// ([`Self::remove_dead_stream`]) may drop the result.
+    fn refund_parked_data(&mut self, dropped: i32) -> Option<MuxResult> {
+        debug_assert!(dropped > 0, "only a positive refund is applied");
+        let window_before = self.flow_control.window();
+        match self.flow_control.refund_send_window(dropped) {
+            h2_flow_control::ApplyWindowUpdateOutcome::Applied {
+                new_window,
+                should_arm_writable,
+            } => {
+                if should_arm_writable {
+                    self.readiness.arm_writable();
+                }
+                debug_assert!(
+                    new_window > window_before,
+                    "an applied refund grew the connection window"
+                );
+                debug!(
+                    "{} H2 prepared DATA dropped unsent: {} octets of send credit given back, connection window {}",
+                    log_context!(self),
+                    dropped,
+                    new_window
+                );
+                None
+            }
+            h2_flow_control::ApplyWindowUpdateOutcome::Overflow => {
+                debug_assert_eq!(
+                    self.flow_control.window(),
+                    window_before,
+                    "an overflowing refund is not applied"
+                );
+                error!(
+                    "{} INVALID WINDOW INCREMENT: refunding {} octets of dropped DATA passes 2^31-1",
+                    log_context!(self),
+                    dropped
+                );
+                Some(self.goaway(H2Error::FlowControlError))
+            }
         }
     }
 
@@ -11982,6 +12117,319 @@ mod tests {
             "the peer must decode stream 3's block with its own table"
         );
         assert_eq!(status, vec![b"200".to_vec()]);
+    }
+
+    /// A response body 1000 octets past the default window, so one prepare
+    /// takes the whole connection window and leaves the rest in the blocks.
+    /// A `Store::Static`, because kawa 0.7.1's `Store::Alloc` arm of
+    /// `Store::consume` subtracts the length before it adds the index back,
+    /// which overflows in a debug build once the converter has split the
+    /// chunk (CleverCloud/kawa#22).
+    static WINDOW_SIZED_BODY: [u8; DEFAULT_INITIAL_WINDOW_SIZE as usize + 1000] =
+        [b'b'; DEFAULT_INITIAL_WINDOW_SIZE as usize + 1000];
+
+    /// Queue on `gid`'s response side a 200 carrying `body`, closed with
+    /// END_STREAM, the way a relayed response with a payload reaches the
+    /// write pass.
+    fn queue_response_with_body(
+        connection: &mut H2Shell<PacedSocket>,
+        context: &mut Context<TestListener>,
+        gid: GlobalStreamId,
+        body: &'static [u8],
+    ) {
+        let stream = &mut context.streams[gid];
+        let kawa = &mut stream.back;
+        kawa.detached.status_line = kawa::StatusLine::Response {
+            version: kawa::Version::V20,
+            code: 200,
+            status: kawa::Store::Static(b"200"),
+            reason: kawa::Store::Empty,
+        };
+        kawa.push_block(kawa::Block::StatusLine);
+        kawa.push_block(kawa::Block::Flags(kawa::Flags {
+            end_body: false,
+            end_chunk: false,
+            end_header: true,
+            end_stream: false,
+        }));
+        kawa.push_block(kawa::Block::Chunk(kawa::Chunk {
+            data: kawa::Store::Static(body),
+        }));
+        kawa.push_block(kawa::Block::Flags(kawa::Flags {
+            end_body: true,
+            end_chunk: false,
+            end_header: false,
+            end_stream: true,
+        }));
+        kawa.parsing_phase = kawa::ParsingPhase::Terminated;
+        stream.state = StreamState::Unlinked;
+        connection.core.readiness.arm_writable();
+    }
+
+    /// The DATA payload octets `wire` carries for `stream_id`.
+    fn data_on_wire(wire: &[u8], stream_id: u32) -> usize {
+        peer_frames(wire)
+            .unwrap()
+            .iter()
+            .filter(|(kind, _, id, _)| *kind == 0 && *id == stream_id)
+            .map(|(_, _, _, payload)| payload.len())
+            .sum()
+    }
+
+    /// Stream 1's response body fills the whole connection send window in
+    /// one prepare, the socket takes `budget` octets, and the stream is
+    /// parked with the rest still queued. Its removal drops what the wire
+    /// has not started.
+    fn park_a_window_sized_body_on_stream_1(
+        budget: usize,
+    ) -> (
+        H2Shell<PacedSocket>,
+        Context<TestListener>,
+        Router,
+        GlobalStreamId,
+        GlobalStreamId,
+    ) {
+        let (_pool, mut connection, mut context, mut router, _peer) = two_requests_read(budget);
+        let gid = |connection: &H2Shell<PacedSocket>, id: u32| {
+            *connection
+                .core
+                .stream_table
+                .streams()
+                .get(&id)
+                .expect("the stream is open")
+        };
+        let (first, third) = (gid(&connection, 1), gid(&connection, 3));
+        queue_response_with_body(&mut connection, &mut context, first, &WINDOW_SIZED_BODY);
+        connection.core.readiness.event.insert(Ready::WRITABLE);
+        connection.writable(&mut context, EndpointClient(&mut router));
+        assert!(
+            connection.socket.wire.len() == budget
+                && connection.core.stream_table.expect_write().is_some(),
+            "premise: stream 1's DATA was prepared and parked, the socket took {budget} octets"
+        );
+        assert_eq!(
+            connection.core.flow_control.window(),
+            0,
+            "premise: preparing stream 1's body took the whole connection window"
+        );
+        (connection, context, router, first, third)
+    }
+
+    /// RFC 9113 §6.9: the connection send window accounts for the DATA that
+    /// was SENT. DATA prepared on stream 1 and dropped unsent when the peer
+    /// resets it never reaches the peer, which will therefore never return
+    /// that credit, so the connection must take it back itself; otherwise
+    /// the window stays at zero for the life of the connection and stream 3's
+    /// body never leaves (sozu-proxy/sozu#1641).
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::remove_dead_stream`, delete the
+    /// `self.refund_parked_data(parked_data)` call. The removal then gives
+    /// nothing back: `the removal itself gives the credit back`, `left: 0,
+    /// right: 65535`. Without the fix at all, stream 3 also sends nothing
+    /// (`left: 0, right: 1000`). Delete the `self.readiness.arm_writable()`
+    /// in `ConnectionH2::refund_parked_data` instead: `and re-arms WRITABLE`
+    /// fails. Verified 2026-09-28 (red on `5db53c60`).
+    #[test]
+    fn data_dropped_with_its_parked_stream_gives_the_connection_window_back() {
+        let (mut connection, mut context, mut router, _first, third) =
+            park_a_window_sized_body_on_stream_1(0);
+        // A zero-progress pass may release WRITABLE; only the refund may
+        // bring it back here.
+        connection.core.readiness.interest.remove(Ready::WRITABLE);
+        connection.socket.inbound.extend(RST_STREAM_1);
+        for _ in 0..4 {
+            connection.core.readiness.event.insert(Ready::READABLE);
+            connection.readable(&mut context, EndpointClient(&mut router));
+        }
+        assert!(
+            !connection.core.stream_table.streams().contains_key(&1),
+            "premise: the RST removed stream 1"
+        );
+        assert_eq!(
+            connection.core.flow_control.window(),
+            DEFAULT_INITIAL_WINDOW_SIZE as i32,
+            "the removal itself gives the credit back, before any write pass"
+        );
+        assert!(
+            connection.core.readiness.interest.is_writable(),
+            "and re-arms WRITABLE for the streams the closed window starved"
+        );
+        connection.socket.budget = usize::MAX;
+        queue_response_with_body(&mut connection, &mut context, third, &[b'c'; 1000]);
+        drive_both_ways(&mut connection, &mut context, &mut router);
+        let wire = &connection.socket.wire;
+        assert_eq!(data_on_wire(wire, 1), 0, "stream 1's DATA never left");
+        assert_eq!(
+            data_on_wire(wire, 3),
+            1000,
+            "stream 3's body must not wait on credit spent on dropped DATA"
+        );
+        assert_eq!(
+            i64::from(connection.core.flow_control.window())
+                + (data_on_wire(wire, 1) + data_on_wire(wire, 3)) as i64,
+            i64::from(DEFAULT_INITIAL_WINDOW_SIZE),
+            "the window is debited for the DATA octets sent, and only those"
+        );
+    }
+
+    /// The same drop without a removal: a forced termination clears the
+    /// parked stream's queue and keeps the stream, which then sends its
+    /// RST_STREAM. Both the connection's and the stream's credit for the
+    /// dropped DATA come back (sozu-proxy/sozu#1641).
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::poll_write_target`'s
+    /// `H2WritePhase::Start` arm, delete the `self.refund_parked_data(dropped)`
+    /// call: `the connection window is back where it was before the
+    /// prepare`, `left: 0, right: 65535`. Delete the `*parts.window` refund
+    /// beside it instead: `the stream's window is back where it was before
+    /// the prepare`, `left: 0, right: 65535`. Verified 2026-09-28 (red on
+    /// `5db53c60`).
+    #[test]
+    fn data_dropped_from_a_live_parked_stream_gives_both_windows_back() {
+        let (mut connection, mut context, mut router, first, _third) =
+            park_a_window_sized_body_on_stream_1(0);
+        crate::protocol::mux::answers::forcefully_terminate_answer(
+            &mut context.streams[first],
+            &mut connection.core.readiness,
+            H2Error::InternalError,
+        );
+        connection.socket.budget = usize::MAX;
+        connection.core.readiness.event.insert(Ready::WRITABLE);
+        connection.writable(&mut context, EndpointClient(&mut router));
+        assert_eq!(
+            context.streams[first].window, DEFAULT_INITIAL_WINDOW_SIZE as i32,
+            "the stream's window is back where it was before the prepare"
+        );
+        drive_both_ways(&mut connection, &mut context, &mut router);
+        assert_eq!(
+            data_on_wire(&connection.socket.wire, 1),
+            0,
+            "premise: stream 1's DATA never left"
+        );
+        assert_eq!(
+            connection.core.flow_control.window(),
+            DEFAULT_INITIAL_WINDOW_SIZE as i32,
+            "the connection window is back where it was before the prepare"
+        );
+    }
+
+    /// The peer grows the connection window to 2^31-1 while stream 1's
+    /// 65535 prepared octets sit parked, then resets the stream. The window
+    /// that really stands is 2^31-1 plus those octets, past the RFC 9113
+    /// §6.9.1 ceiling, and the refund is where that shows: the connection
+    /// answers GOAWAY(FLOW_CONTROL_ERROR), as it does for an overflowing
+    /// WINDOW_UPDATE, instead of asserting on what the peer sent.
+    ///
+    /// TO SEE THIS RED: in `H2FlowControl::refund_send_window`, put back a
+    /// `debug_assert!(false, ..)` on the `checked_add` overflow: the test
+    /// panics on `a refund of consumed credit cannot overflow the send
+    /// window`, which is how `08730c9a` behaved. In
+    /// `ConnectionH2::refund_parked_data`, answer `None` on the overflow
+    /// instead of the GOAWAY: `exactly one GOAWAY`, `left: 0, right: 1`.
+    /// Verified 2026-09-28.
+    #[test]
+    fn a_refund_the_peer_pushed_past_the_window_ceiling_is_a_flow_control_error() {
+        let (mut connection, mut context, mut router, _first, _third) =
+            park_a_window_sized_body_on_stream_1(0);
+        // WINDOW_UPDATE(stream 0, 2^31-1), then RST_STREAM(1, CANCEL).
+        connection
+            .socket
+            .inbound
+            .extend(b"\x00\x00\x04\x08\x00\x00\x00\x00\x00\x7f\xff\xff\xff");
+        connection.socket.inbound.extend(RST_STREAM_1);
+        for _ in 0..4 {
+            connection.core.readiness.event.insert(Ready::READABLE);
+            connection.readable(&mut context, EndpointClient(&mut router));
+        }
+        assert_eq!(
+            connection.core.flow_control.window(),
+            i32::MAX,
+            "premise: the peer's WINDOW_UPDATE was accepted, and the refund not applied"
+        );
+        connection.socket.budget = usize::MAX;
+        drive_both_ways(&mut connection, &mut context, &mut router);
+        let goaways: Vec<Vec<u8>> = peer_frames(&connection.socket.wire)
+            .unwrap()
+            .into_iter()
+            .filter(|(kind, _, _, _)| *kind == 7)
+            .map(|(_, _, _, payload)| payload)
+            .collect();
+        assert_eq!(goaways.len(), 1, "exactly one GOAWAY");
+        assert_eq!(
+            &goaways[0][4..8],
+            &3u32.to_be_bytes(),
+            "the GOAWAY carries FLOW_CONTROL_ERROR"
+        );
+    }
+
+    /// A second write pass that is stalled too resumes the parked stream,
+    /// writes nothing and parks it again: every prepared DATA octet is still
+    /// queued, so nothing is given back and both windows stay at zero
+    /// (sozu-proxy/sozu#1641). Only DATA no longer queued is refunded.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::poll_write_target`'s
+    /// `H2WritePhase::Start` arm, refund `parked_data` instead of
+    /// `parked_data - queued`: `left: 65535, right: 0`. Verified 2026-09-28.
+    #[test]
+    fn data_still_parked_after_a_second_stalled_pass_is_not_given_back() {
+        let (mut connection, mut context, mut router, first, _third) =
+            park_a_window_sized_body_on_stream_1(0);
+        connection.core.readiness.event.insert(Ready::WRITABLE);
+        connection.writable(&mut context, EndpointClient(&mut router));
+        assert!(
+            connection.socket.wire.is_empty()
+                && connection.core.stream_table.expect_write().is_some(),
+            "premise: the second pass resumed nothing and kept the park"
+        );
+        assert_eq!(
+            connection.core.flow_control.window(),
+            0,
+            "the connection window still owes every queued DATA octet"
+        );
+        assert_eq!(context.streams[first].window, 0, "and so does the stream's");
+    }
+
+    /// A write that cuts stream 1's first DATA frame hands the rest of that
+    /// frame to the ordered output queue, which sends it whole even after
+    /// the stream is gone (sozu-proxy/sozu#1625). Only the frames behind it,
+    /// which the wire never started, are given back: the window still
+    /// accounts for exactly the DATA octets sent (sozu-proxy/sozu#1641).
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::remove_dead_stream`, give back the
+    /// whole prepare instead of the parked DATA
+    /// (`self.refund_parked_data(DEFAULT_INITIAL_WINDOW_SIZE as i32)`). The
+    /// window then exceeds the peer's grant by the cut frame's payload:
+    /// `left: 81919, right: 65535`. Without the fix at all it falls short by
+    /// the dropped frames instead: `left: 16384, right: 65535`. Verified
+    /// 2026-09-28 (red on `5db53c60`).
+    #[test]
+    fn data_a_partial_write_started_is_sent_whole_and_not_given_back() {
+        // A 10-octet HEADERS (`:status: 200`), then 109 octets of the first
+        // DATA frame: its header and 100 octets of payload.
+        let budget = 10 + 9 + 100;
+        let (mut connection, mut context, mut router, _first, _third) =
+            park_a_window_sized_body_on_stream_1(budget);
+        connection.socket.inbound.extend(RST_STREAM_1);
+        for _ in 0..4 {
+            connection.core.readiness.event.insert(Ready::READABLE);
+            connection.readable(&mut context, EndpointClient(&mut router));
+        }
+        assert!(
+            !connection.core.stream_table.streams().contains_key(&1),
+            "premise: the RST removed stream 1"
+        );
+        connection.socket.budget = usize::MAX;
+        drive_both_ways(&mut connection, &mut context, &mut router);
+        let sent = data_on_wire(&connection.socket.wire, 1);
+        assert_eq!(
+            sent, 16_384,
+            "the cut frame left whole, and nothing after it"
+        );
+        assert_eq!(
+            i64::from(connection.core.flow_control.window()) + sent as i64,
+            i64::from(DEFAULT_INITIAL_WINDOW_SIZE),
+            "the window is debited for the DATA octets sent, and only those"
+        );
     }
 
     /// An H1 backend answers chunked with `Connection: close`, sends the
