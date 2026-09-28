@@ -376,6 +376,31 @@
 
 ### 🔄 Changed
 
+- **`chore(deps)`: every dependency upgraded to its latest release, with no major bump and no
+  MSRV change ([#1675](https://github.com/sozu-proxy/sozu/pull/1675)).** Checked against the crates.io sparse index on 2026-09-28, 58 of the 66
+  registry requirements across the workspace and `fuzz/` manifests already named their latest
+  release. The other 8 are patch bumps in the root `[workspace.dependencies]`: `hyper-rustls`
+  0.27.9 → 0.27.10 and `hyper-util` 0.1.20 → 0.1.21 (both `sozu-e2e` only), `rand` 0.10.2 →
+  0.10.3, `thiserror` 2.0.20 → 2.0.21, and the `tui` feature widgets `tui-big-text` 0.8.9 →
+  0.8.10, `tui-input` 0.15.4 → 0.15.5, `tui-popup` 0.7.6 → 0.7.7 and `tui-scrollview` 0.6.7 →
+  0.6.8. `cargo update` then moved 75 locked packages in `Cargo.lock` and 22 in
+  `fuzz/Cargo.lock`, notably `aws-lc-rs` 1.18.0 → 1.18.1 with `aws-lc-sys` 0.44.0 → 0.45.0 and
+  `aws-lc-fips-sys` 0.14.1 → 0.14.2 (the `crypto-aws-lc-rs` and `fips` providers) and
+  `tokio-rustls` 0.26.4 → 0.26.6. `rustls` 0.23.45, `ring` 0.17.14, `openssl` 0.10.81,
+  `rustls-openssl` 0.4.1, `tokio` 1.53.1, `mio` 1.2.3 and `kawa` 0.7.2 were already current.
+  No crate enters or leaves either lockfile: the only new entry is a second `synstructure`
+  version, 0.14.0 beside 0.13.2, pulled by `yoke-derive` 0.8.3. `generic-array` stays at
+  0.14.7, which `crypto-common` 0.1.7 pins exactly. No locked package declares a
+  `rust-version` above 1.93.1, so the MSRV stays 1.93.1. `cargo audit` reports no advisory
+  before or after. No code change and no new direct dependency.
+  The `pipeline` job of `ci.yml` now deletes `target/` when rust-cache restores a cache saved
+  for another `Cargo.lock` (`cache-hit != 'true'`). A lockfile change that moves base crates
+  such as `cfg-if`, `cc` or `syn` rebuilds the whole graph beside the stale artifacts: measured
+  for the `msrv-full` cell (`du -sb`, 1.93.1, CARGO_INCREMENTAL=0, line-tables-only), this
+  upgrade peaks at 8.35GB of `target/` on a pruned main cache against 5.38GB from an empty one,
+  and got the cell's pod evicted twice under its 8Gi ephemeral-storage limit. Main on its own
+  cache peaks at 5.50GB; an exact cache hit is untouched.
+
 - **`docs`: the H1 keep-alive TLS allocation gap of `doc/hot_path_zero_copy.md` is attributed per
   request and per connection ([#1669](https://github.com/sozu-proxy/sozu/pull/1669)).** §2.3 now explains that the 20.25–20.30 heap operations per request
   over TLS, against 7.80 in clear, are about 4 per request plus about 168 per connection (8.4 per
