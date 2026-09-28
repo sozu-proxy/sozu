@@ -5583,6 +5583,29 @@
 
 ### 🔐 Security
 
+- **`fix(h1)`: a request without `Content-Length` or `Transfer-Encoding` no longer swallows
+  the requests pipelined behind it ([#1650](https://github.com/sozu-proxy/sozu/issues/1650)).**
+  kawa 0.7.1 parses such a request as close-delimited: `kawa::h1::parse` enters
+  `ParsingPhase::Body` on `BodySize::Empty` for a request as for a response, and takes every
+  byte left in the buffer as its body (CleverCloud/kawa#23). A second request written in the
+  same segment behind a plain `GET` — or a `HEAD`, a `DELETE`, a body-less `POST` — was
+  forwarded raw to the first request's backend: never routed, never checked against the
+  frontend's Basic auth, with no `Sozu-Id` and no `X-Forwarded-*`/`Forwarded` hop (CWE-444).
+  RFC 9112 §6.3 rule 7 gives such a request a zero-length body, whatever its method or
+  version; read-until-close (rule 8) is for responses only. `HttpContext::on_request_headers`
+  now ends the request after its headers when kawa's H1 parser selected close-delimited
+  framing for it (`ParsingPhase::Body` on `BodySize::Empty`), so the pipelined request is
+  parsed, routed, authenticated and edited on its own. H2 requests, whose framing
+  `pkawa::handle_header` resolves after the same callback, and close-delimited responses are
+  unchanged; `CONNECT`, which Sōzu does not tunnel, no longer streams client bytes to the
+  backend as a request body. No allocation is added. Covered by
+  `a_request_without_length_ends_after_its_headers`,
+  `a_framed_request_and_an_unframed_response_keep_their_bodies`,
+  `an_h2_request_is_left_for_pkawa_to_frame` and the six `test_h1_unframed_request_then_*`
+  e2e tests (same cluster, another cluster, a Basic-auth-gated cluster; clear and TLS; `GET`,
+  `HEAD`, `DELETE`, `POST`), all 24 e2e cases red before the fix: the backend of the first
+  request received both request lines and one `Sozu-Id`.
+
 - **`fix(mux-h2)`: a header block HPACK-encoded and then dropped unsent no longer shifts the
   peer's dynamic table, which could make the peer read one field in place of another
   ([#1627](https://github.com/sozu-proxy/sozu/issues/1627)).** The connection's encoder changes

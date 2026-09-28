@@ -946,9 +946,30 @@ impl HttpContext {
                 .map(ToOwned::to_owned);
         }
 
-        // if self.method == Some(Method::Get) && request.body_size == kawa::BodySize::Empty {
-        //     request.parsing_phase = kawa::ParsingPhase::Terminated;
-        // }
+        // A request with neither Content-Length nor Transfer-Encoding has no
+        // body, whatever its method or version (RFC 9112 §6.3 rule 7);
+        // close-delimited framing (rule 8) is for responses only. kawa 0.7.1
+        // does not make that distinction: `kawa::h1::parse` maps
+        // `BodySize::Empty` to `ParsingPhase::Body` for both kinds, and that
+        // arm takes every byte left in the buffer. A request pipelined behind
+        // this one would then be forwarded raw as its "body" to this
+        // request's backend: never routed, never Basic-auth checked, without
+        // `Sozu-Id` or `X-Forwarded-*` (CWE-444). End it here instead, so the
+        // flags block kawa pushes right after this callback carries
+        // `end_stream`, and the next request stays unparsed for its own turn.
+        //
+        // The `ParsingPhase::Body` conjunct is what confines this to kawa's
+        // H1 parser, which sets that phase before calling back.
+        // `pkawa::handle_header` calls this same callback for an H2 request
+        // while its `body_size` is still `Empty` and its phase still the
+        // initial one, then frames a request whose DATA follows as chunked
+        // unless the callback terminated it: `Empty` alone would drop that
+        // body. Pinned by `an_h2_request_is_left_for_pkawa_to_frame`.
+        if request.parsing_phase == kawa::ParsingPhase::Body
+            && request.body_size == kawa::BodySize::Empty
+        {
+            request.parsing_phase = kawa::ParsingPhase::Terminated;
+        }
 
         let public_port = self.public_address.port();
         let proto = match self.protocol {
@@ -2756,5 +2777,174 @@ mod tests {
             ),
             "a new protocol is rendered"
         );
+    }
+
+    // ── request framing: no Content-Length, no Transfer-Encoding ───────
+
+    /// Parse `bytes` as a `kind` message through the real parser and a fresh
+    /// context, as `ConnectionH1::readable` does.
+    fn parse_message(
+        pool: &mut crate::pool::Pool,
+        kind: kawa::Kind,
+        bytes: &[u8],
+    ) -> GenericHttpStream {
+        let mut kawa: GenericHttpStream = kawa::Kawa::new(
+            kind,
+            kawa::Buffer::new(
+                pool.checkout()
+                    .expect("the test pool must hand out a buffer"),
+            ),
+        );
+        kawa.storage.space()[..bytes.len()].copy_from_slice(bytes);
+        kawa.storage.fill(bytes.len());
+        kawa::h1::parse(&mut kawa, &mut make_context());
+        kawa
+    }
+
+    /// The flag block kawa pushes right after the header callback, which
+    /// every converter reads to decide whether the message ended.
+    fn header_end_flags(kawa: &GenericHttpStream) -> kawa::Flags {
+        kawa.blocks
+            .iter()
+            .find_map(|block| match block {
+                kawa::Block::Flags(flags) if flags.end_header => Some(flags.clone()),
+                _ => None,
+            })
+            .expect("a parsed message carries its end-of-headers flags")
+    }
+
+    /// RFC 9112 §6.3 rule 7: a request with neither `Content-Length` nor
+    /// `Transfer-Encoding` has a zero-length body, whatever its method or
+    /// version. kawa reads such a request as close-delimited
+    /// (`ParsingPhase::Body` on `BodySize::Empty`, whose arm takes every
+    /// byte left in the buffer), so without `on_request_headers` ending it,
+    /// the request pipelined behind it becomes a `Block::Chunk` of its body
+    /// and is forwarded raw to the first request's backend (CWE-444).
+    ///
+    /// TO SEE THIS RED, delete the `ParsingPhase::Body` + `BodySize::Empty`
+    /// branch of `on_request_headers`: every case then fails the first
+    /// assertion, still in `Body`.
+    #[test]
+    fn a_request_without_length_ends_after_its_headers() {
+        const NEXT: &[u8] = b"GET /next HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let heads: [&[u8]; 7] = [
+            b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            b"HEAD / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            b"DELETE /item HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            b"POST /form HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            b"POST /form HTTP/1.0\r\nHost: example.com\r\n\r\n",
+            b"PUT /item HTTP/1.1\r\nHost: example.com\r\nExpect: 100-continue\r\n\r\n",
+            b"GET /chat HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        ];
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        for head in heads {
+            let label = String::from_utf8_lossy(head.split(|b| *b == b'\r').next().unwrap());
+            let bytes = [head, NEXT].concat();
+            let kawa = parse_message(&mut pool, kawa::Kind::Request, &bytes);
+            assert!(
+                kawa.is_terminated(),
+                "{label}: must end after its headers, got {:?}",
+                kawa.parsing_phase
+            );
+            let flags = header_end_flags(&kawa);
+            assert!(
+                flags.end_stream,
+                "{label}: the end-of-headers flags must end the stream"
+            );
+            assert!(
+                !kawa
+                    .blocks
+                    .iter()
+                    .any(|block| matches!(block, kawa::Block::Chunk(_))),
+                "{label}: no byte may be read as its body"
+            );
+            assert_eq!(
+                kawa.storage.unparsed_data(),
+                NEXT,
+                "{label}: the pipelined request must stay unparsed for its own turn"
+            );
+        }
+    }
+
+    /// The guard reads a missing length, not a present one: a request that
+    /// declares its body keeps it, and a close-delimited RESPONSE (RFC 9112
+    /// §6.3 rule 8) keeps reading until the close.
+    #[test]
+    fn a_framed_request_and_an_unframed_response_keep_their_bodies() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 3, 4096);
+
+        let length = parse_message(
+            &mut pool,
+            kawa::Kind::Request,
+            b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 10\r\n\r\nHello",
+        );
+        assert_eq!(length.parsing_phase, kawa::ParsingPhase::Body);
+        assert_eq!(length.expects, 5, "half of the declared body is still due");
+
+        let chunked = parse_message(
+            &mut pool,
+            kawa::Kind::Request,
+            b"POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHello\r\n",
+        );
+        assert!(
+            matches!(chunked.parsing_phase, kawa::ParsingPhase::Chunks { .. }),
+            "a chunked request waits for its last chunk, got {:?}",
+            chunked.parsing_phase
+        );
+
+        let response = parse_message(
+            &mut pool,
+            kawa::Kind::Response,
+            b"HTTP/1.1 200 OK\r\n\r\nclose-delimited",
+        );
+        assert_eq!(
+            response.parsing_phase,
+            kawa::ParsingPhase::Body,
+            "a response without length is delimited by the close"
+        );
+        assert!(!header_end_flags(&response).end_stream);
+        assert!(
+            response
+                .blocks
+                .iter()
+                .any(|block| matches!(block, kawa::Block::Chunk(_))),
+            "the close-delimited response body is still read"
+        );
+    }
+
+    /// `pkawa::handle_header` calls the same `on_headers` for an H2 request
+    /// BEFORE it resolves the framing: `body_size` is still `Empty` there
+    /// for a request whose DATA frames follow, and it upgrades that to
+    /// chunked afterwards unless the callback terminated the message. The
+    /// guard keys on the `ParsingPhase::Body` kawa's H1 parser sets for a
+    /// close-delimited message, which the H2 path never sets before the
+    /// callback, so an H2 request is left for pkawa to frame.
+    ///
+    /// TO SEE THIS RED, key the guard on `body_size == BodySize::Empty`
+    /// alone: this request is then terminated.
+    #[test]
+    fn an_h2_request_is_left_for_pkawa_to_frame() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let mut kawa: GenericHttpStream = kawa::Kawa::new(
+            kawa::Kind::Request,
+            kawa::Buffer::new(
+                pool.checkout()
+                    .expect("the test pool must hand out a buffer"),
+            ),
+        );
+        kawa.detached.status_line = kawa::StatusLine::Request {
+            version: kawa::Version::V20,
+            method: kawa::Store::Static(b"POST"),
+            uri: kawa::Store::Static(b"/upload"),
+            authority: kawa::Store::Static(b"example.com"),
+            path: kawa::Store::Static(b"/upload"),
+        };
+        let phase_before = kawa.parsing_phase;
+        assert_eq!(kawa.body_size, kawa::BodySize::Empty, "premise");
+
+        kawa::h1::ParserCallbacks::on_headers(&mut make_context(), &mut kawa);
+
+        assert!(!kawa.is_terminated(), "an H2 request body may still follow");
+        assert_eq!(kawa.parsing_phase, phase_before);
     }
 }

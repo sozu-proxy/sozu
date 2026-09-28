@@ -21,13 +21,14 @@ use base64::Engine;
 use sozu_command_lib::{
     config::ListenerBuilder,
     proto::command::{
-        ActivateListener, Cluster, ListenerType, Request, RequestHttpFrontend, request::RequestType,
+        ActivateListener, AddCertificate, CertificateAndKey, Cluster, ListenerType, PathRule,
+        Request, RequestHttpFrontend, request::RequestType,
     },
 };
 
 use crate::{
     http_utils::http_ok_response,
-    mock::{client::Client, sync_backend::Backend as SyncBackend},
+    mock::{client::Client, https_client::Verifier, sync_backend::Backend as SyncBackend},
     port_registry::attach_reserved_http_listener,
     sozu::worker::Worker,
     tests::{State, repeat_until_error_or, setup_sync_test},
@@ -2238,5 +2239,449 @@ fn the_unselectable_000_guard_reads_the_status_line_not_the_whole_answer() {
     assert!(
         !builtin_404_answer_selected("HTTP/1.1 000 x"),
         "a header-less 000 status line must still be rejected"
+    );
+}
+
+// =========================================================================
+// Test: a request without Content-Length or Transfer-Encoding has no body
+//
+// RFC 9112 §6.3 rule 7: "If this is a request message and none of the above
+// are true, then the message body length is zero (no message body is
+// present)." Close-delimited framing (rule 8) belongs to responses only.
+//
+// kawa frames a message with neither header as `BodySize::Empty` and, for a
+// request exactly as for a response, parses it into `ParsingPhase::Body`,
+// where the `Empty` arm takes every byte left in the buffer. A second request
+// pipelined in the same segment used to become the first request's "body":
+// forwarded raw to the first request's backend — never routed, never
+// Basic-auth checked, without `Sozu-Id` or `X-Forwarded-*` (CWE-444).
+// `HttpContext::on_request_headers` now ends such a request after its
+// headers, so the pipelined one is parsed, routed and edited on its own.
+//
+// The matrix: the first request's method (GET, HEAD, DELETE, POST, none of
+// them framed), the second request's destination (the same cluster, another
+// cluster by path, an auth-gated cluster), and a clear or a TLS frontend.
+// =========================================================================
+
+/// Which listener the unframed-request cases go through.
+#[derive(Clone, Copy, Debug)]
+enum UnframedFront {
+    Clear,
+    Tls,
+}
+
+/// Where the pipelined second request must be routed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnframedTarget {
+    /// `/a/…`: the first request's own cluster.
+    Same,
+    /// `/b/…`: another, open cluster.
+    Other,
+    /// `/c/…`: a cluster whose frontend requires Basic auth the second
+    /// request does not carry.
+    AuthGated,
+}
+
+/// Start a worker with three clusters on one listener, split by path:
+/// `/a` → `cluster_a`, `/b` → `cluster_b`, `/c` → `cluster_c` (Basic auth
+/// required), each with one backend.
+fn spawn_unframed_worker(
+    label: &str,
+    front: UnframedFront,
+    front_address: SocketAddr,
+    back_addresses: [SocketAddr; 3],
+) -> Worker {
+    let (config, mut listeners, state) = Worker::empty_config();
+    let mut worker = match front {
+        UnframedFront::Clear => {
+            attach_reserved_http_listener(&mut listeners, front_address);
+            let mut worker = Worker::start_new_worker_owned(label, config, listeners, state);
+            worker.send_proxy_request_type(RequestType::AddHttpListener(
+                ListenerBuilder::new_http(front_address.into())
+                    .to_http(None)
+                    .expect("default HTTP listener must build"),
+            ));
+            worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+                address: front_address.into(),
+                proxy: ListenerType::Http.into(),
+                from_scm: true,
+            }));
+            worker
+        }
+        UnframedFront::Tls => {
+            let (config, listeners, state) = Worker::empty_https_config(front_address);
+            let mut worker = Worker::start_new_worker_owned(label, config, listeners, state);
+            worker.send_proxy_request_type(RequestType::AddHttpsListener(
+                ListenerBuilder::new_https(front_address.into())
+                    .to_tls(None)
+                    .expect("default HTTPS listener must build"),
+            ));
+            worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+                address: front_address.into(),
+                proxy: ListenerType::Https.into(),
+                from_scm: false,
+            }));
+            worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+                address: front_address.into(),
+                certificate: CertificateAndKey {
+                    certificate: String::from(include_str!(
+                        "../../../lib/assets/local-certificate.pem"
+                    )),
+                    key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+                    certificate_chain: vec![],
+                    versions: vec![],
+                    names: vec![],
+                },
+                expired_at: None,
+            }));
+            worker
+        }
+    };
+
+    for (index, (name, back_address)) in ["a", "b", "c"].into_iter().zip(back_addresses).enumerate()
+    {
+        let cluster_id = format!("cluster_{name}");
+        let gated = index == 2;
+        worker.send_proxy_request_type(RequestType::AddCluster(if gated {
+            Cluster {
+                authorized_hashes: vec![format!("admin:{AUTH_BYPASS_SECRET_SHA256_HEX}")],
+                www_authenticate: Some("Basic realm=\"sozu\"".to_owned()),
+                ..Worker::default_cluster(&cluster_id)
+            }
+        } else {
+            Worker::default_cluster(&cluster_id)
+        }));
+        let frontend = RequestHttpFrontend {
+            path: PathRule::prefix(format!("/{name}")),
+            required_auth: gated.then_some(true),
+            ..Worker::default_http_frontend(&cluster_id, front_address)
+        };
+        worker.send_proxy_request_type(match front {
+            UnframedFront::Clear => RequestType::AddHttpFrontend(frontend),
+            UnframedFront::Tls => RequestType::AddHttpsFrontend(frontend),
+        });
+        worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+            &cluster_id,
+            format!("{cluster_id}-0"),
+            back_address,
+            None,
+        )));
+    }
+    worker.read_to_last();
+    worker
+}
+
+/// Every value of the `Sozu-Id` header in `forwarded`, in order.
+fn sozu_ids(forwarded: &str) -> Vec<&str> {
+    forwarded
+        .split("\r\n")
+        .filter_map(|line| line.strip_prefix("Sozu-Id: "))
+        .collect()
+}
+
+/// Request lines (`METHOD /path HTTP/1.x`) found in `forwarded`.
+fn request_lines(forwarded: &str) -> Vec<&str> {
+    forwarded
+        .split("\r\n")
+        .filter(|line| line.ends_with(" HTTP/1.1") || line.ends_with(" HTTP/1.0"))
+        .collect()
+}
+
+/// Read from `stream` until `count` status lines arrived or `timeout` ran
+/// out, tolerating segmentation and the short read timeouts of both
+/// transports.
+fn read_status_lines<S: Read>(stream: &mut S, count: usize, timeout: Duration) -> String {
+    let start = Instant::now();
+    let mut received = Vec::new();
+    let mut buf = [0u8; 4096];
+    while start.elapsed() < timeout {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                received.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&received);
+                if text.matches("HTTP/1.1 ").count() >= count {
+                    break;
+                }
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&received).into_owned()
+}
+
+/// Wait for `backend` to accept on `client_id` until `deadline`.
+fn backend_accepts_within(backend: &mut SyncBackend, client_id: usize, deadline: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < deadline {
+        if backend.accept(client_id) {
+            return true;
+        }
+    }
+    false
+}
+
+/// One case: send `<method> /a/first` with neither Content-Length nor
+/// Transfer-Encoding and a second request to `target` in ONE write, then
+/// prove each reached its own backend as a distinct, edited request.
+fn unframed_request_case<S: Read + Write>(
+    label: &str,
+    method: &str,
+    target: UnframedTarget,
+    stream: &mut S,
+    backends: &mut [SyncBackend; 3],
+) -> Result<(), String> {
+    let second_path = match target {
+        UnframedTarget::Same => "/a/second",
+        UnframedTarget::Other => "/b/second",
+        UnframedTarget::AuthGated => "/c/second",
+    };
+    // Keep-alive on purpose: a `Connection: close` first request would make
+    // Sōzu legitimately drop the second one after the first response, and
+    // the test would then prove nothing.
+    let payload = format!(
+        "{method} /a/first HTTP/1.1\r\nHost: localhost\r\n\r\nGET {second_path} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    );
+    stream
+        .write_all(payload.as_bytes())
+        .and_then(|()| stream.flush())
+        .map_err(|e| format!("write pipelined requests: {e}"))?;
+
+    let [backend_a, backend_b, backend_c] = backends;
+    if !backend_accepts_within(backend_a, 0, Duration::from_millis(1000)) {
+        return Err("the first request never reached cluster_a".to_owned());
+    }
+    let first = backend_drain(backend_a, 0, Duration::from_millis(300));
+    println!(
+        "{label}: cluster_a received first {} bytes: {first:?}",
+        first.len()
+    );
+    let lines = request_lines(&first);
+    if first.contains(second_path) || lines.len() != 1 {
+        return Err(format!(
+            "the pipelined request was forwarded inside the first one's body \
+             (request lines {lines:?}, Sozu-Id {:?})",
+            sozu_ids(&first)
+        ));
+    }
+    let first_ids = sozu_ids(&first);
+    if first_ids.len() != 1 {
+        return Err(format!("first request carries Sozu-Id {first_ids:?}"));
+    }
+    let first_id = first_ids[0].to_owned();
+
+    backend_a.set_response(if method == "HEAD" {
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n"
+    } else {
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\npongA"
+    });
+    backend_a.send(0);
+
+    let second = match target {
+        UnframedTarget::Same => {
+            // Sōzu reuses the pooled backend connection or opens a fresh one;
+            // which one is not what this case is about.
+            let mut second = backend_drain(backend_a, 0, Duration::from_millis(300));
+            let mut client_id = 0;
+            if second.is_empty() && backend_accepts_within(backend_a, 1, Duration::from_millis(700))
+            {
+                client_id = 1;
+                second = backend_drain(backend_a, 1, Duration::from_millis(300));
+            }
+            backend_a.set_response("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\npongA");
+            backend_a.send(client_id);
+            Some(second)
+        }
+        UnframedTarget::Other => {
+            if !backend_accepts_within(backend_b, 0, Duration::from_millis(1000)) {
+                return Err("the pipelined request never reached cluster_b".to_owned());
+            }
+            let second = backend_drain(backend_b, 0, Duration::from_millis(300));
+            backend_b.send(0);
+            Some(second)
+        }
+        UnframedTarget::AuthGated => {
+            if backend_accepts_within(backend_c, 0, Duration::from_millis(300)) {
+                let leaked = backend_drain(backend_c, 0, Duration::from_millis(300));
+                return Err(format!(
+                    "the unauthenticated request reached cluster_c: {leaked:?}"
+                ));
+            }
+            None
+        }
+    };
+
+    if let Some(second) = &second {
+        println!("{label}: second request forwarded as {second:?}");
+        let lines = request_lines(second);
+        if lines != [format!("GET {second_path} HTTP/1.1").as_str()] {
+            return Err(format!(
+                "the pipelined request was not forwarded on its own: {lines:?}"
+            ));
+        }
+        let ids = sozu_ids(second);
+        if ids.len() != 1 || ids[0] == first_id {
+            return Err(format!(
+                "the pipelined request must carry its own Sozu-Id, got {ids:?} (first {first_id})"
+            ));
+        }
+        if !second.contains("X-Forwarded-For: ") {
+            return Err("the pipelined request carries no X-Forwarded-For".to_owned());
+        }
+    }
+
+    let responses = read_status_lines(stream, 2, Duration::from_millis(2000));
+    println!("{label}: client received {responses:?}");
+    // A body is not followed by a line break: `pongAHTTP/1.1 200 OK` is one
+    // line, so find the status lines by their prefix, not line by line.
+    let statuses: Vec<&str> = responses
+        .match_indices("HTTP/1.1 ")
+        .map(|(at, _)| &responses[at..(at + 12).min(responses.len())])
+        .collect();
+    let second_status = match target {
+        UnframedTarget::AuthGated => "HTTP/1.1 401",
+        _ => "HTTP/1.1 200",
+    };
+    if statuses.len() != 2
+        || !statuses[0].starts_with("HTTP/1.1 200")
+        || !statuses[1].starts_with(second_status)
+    {
+        return Err(format!(
+            "expected a 200 then a {second_status} response, got {statuses:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn try_h1_unframed_request_has_no_body(front: UnframedFront, target: UnframedTarget) -> State {
+    // Every method runs, so one failure does not hide which others fail.
+    let mut state = State::Success;
+    for method in ["GET", "HEAD", "DELETE", "POST"] {
+        let label = format!("UNFRAMED-{front:?}-{target:?}-{method}");
+        let front_address = create_local_address();
+        let back_addresses = [
+            create_local_address(),
+            create_local_address(),
+            create_local_address(),
+        ];
+        let mut worker = spawn_unframed_worker(&label, front, front_address, back_addresses);
+        let mut backends = back_addresses.map(|address| {
+            let mut backend = SyncBackend::new(
+                format!("{label}-{address}"),
+                address,
+                "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\npong_",
+            );
+            backend.connect();
+            backend
+        });
+
+        let tcp = raw_connect(front_address);
+        let outcome = match front {
+            UnframedFront::Clear => {
+                let mut tcp = tcp;
+                unframed_request_case(&label, method, target, &mut tcp, &mut backends)
+            }
+            UnframedFront::Tls => {
+                let mut tls_config = rustls::ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(std::sync::Arc::new(Verifier))
+                    .with_no_client_auth();
+                tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+                let server_name = rustls::pki_types::ServerName::try_from("localhost")
+                    .expect("localhost is a valid server name")
+                    .to_owned();
+                let conn =
+                    rustls::ClientConnection::new(std::sync::Arc::new(tls_config), server_name)
+                        .expect("TLS client connection");
+                let mut tls = rustls::StreamOwned::new(conn, tcp);
+                unframed_request_case(&label, method, target, &mut tls, &mut backends)
+            }
+        };
+
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        match outcome {
+            Ok(()) => println!("{label}: OK"),
+            Err(reason) => {
+                println!("{label}: FAIL — {reason}");
+                state = State::Fail;
+            }
+        }
+    }
+    state
+}
+
+#[test]
+fn test_h1_unframed_request_then_same_cluster() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "H1 security: a pipelined request behind an unframed one reaches its cluster on its own (clear)",
+            || try_h1_unframed_request_has_no_body(UnframedFront::Clear, UnframedTarget::Same),
+        ),
+        State::Success,
+    );
+}
+
+#[test]
+fn test_h1_unframed_request_then_other_cluster() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "H1 security: an unframed request cannot carry a pipelined one past routing (clear)",
+            || try_h1_unframed_request_has_no_body(UnframedFront::Clear, UnframedTarget::Other),
+        ),
+        State::Success,
+    );
+}
+
+#[test]
+fn test_h1_unframed_request_then_auth_gated_cluster() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "H1 security: an unframed request cannot carry a pipelined one past Basic auth (clear)",
+            || try_h1_unframed_request_has_no_body(UnframedFront::Clear, UnframedTarget::AuthGated),
+        ),
+        State::Success,
+    );
+}
+
+#[test]
+fn test_h1_unframed_request_then_same_cluster_tls() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "H1 security: a pipelined request behind an unframed one reaches its cluster on its own (TLS)",
+            || try_h1_unframed_request_has_no_body(UnframedFront::Tls, UnframedTarget::Same),
+        ),
+        State::Success,
+    );
+}
+
+#[test]
+fn test_h1_unframed_request_then_other_cluster_tls() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "H1 security: an unframed request cannot carry a pipelined one past routing (TLS)",
+            || try_h1_unframed_request_has_no_body(UnframedFront::Tls, UnframedTarget::Other),
+        ),
+        State::Success,
+    );
+}
+
+#[test]
+fn test_h1_unframed_request_then_auth_gated_cluster_tls() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "H1 security: an unframed request cannot carry a pipelined one past Basic auth (TLS)",
+            || try_h1_unframed_request_has_no_body(UnframedFront::Tls, UnframedTarget::AuthGated),
+        ),
+        State::Success,
     );
 }
