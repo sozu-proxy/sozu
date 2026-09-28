@@ -1536,9 +1536,8 @@ pub enum H2ControlFlushTarget {
     /// Nothing owed, nothing stalled: `writable()` proceeds into its state
     /// dispatch.
     Proceed,
-    /// The preamble ended the pass by itself — a SETTINGS-ACK timeout GOAWAY,
-    /// an RST_STREAM lifetime-cap GOAWAY, or a deferred initial GOAWAY that
-    /// could not be serialised. This is the pass's result, and no TLS query
+    /// The preamble ended the pass by itself — a SETTINGS-ACK timeout GOAWAY
+    /// or an RST_STREAM lifetime-cap GOAWAY. This is the pass's result, and no TLS query
     /// follows it.
     Done(MuxResult),
     /// The output flush stalled. Read `tls_wants_write`, hand it to
@@ -4212,33 +4211,6 @@ impl ConnectionH2 {
         MuxResult::Continue
     }
 
-    /// True while a HEADERS/CONTINUATION field block is being reassembled
-    /// (spanning one or more `readable()` passes, by protocol design — a
-    /// legitimate large header block routinely splits across frames).
-    ///
-    /// `self.zero` no longer doubles as the reassembly buffer — that role
-    /// moved to `self.header_reassembly` (`h2_header_reassembly.rs`), which
-    /// no write-side code can reach. That closes the #1396/#1397/#1401
-    /// class outright: the ACCUMULATED, multi-frame history of a block is
-    /// no longer representable as bytes a control-frame flush can touch, by
-    /// construction, not by convention.
-    ///
-    /// Since #1604 `zero` is input only, too: control frames are queued in
-    /// `self.output`, so no write-side site can clear or reuse the bytes of
-    /// a CONTINUATION frame still *mid-flight* in `zero.storage` either. The
-    /// one remaining reader is the initial graceful GOAWAY's defer-or-send
-    /// decision ([`Self::graceful_goaway`], and its deferred send in
-    /// [`Self::flush_pending_control_frames`]), which `h2_drain` still
-    /// defers until the block completes. That deferral no longer protects a
-    /// buffer; it only delays an advisory frame, and is kept because
-    /// removing it would be a change to the drain policy, not to the output.
-    fn header_block_reassembly_in_progress(&self) -> bool {
-        matches!(
-            self.state,
-            H2State::ContinuationHeader(_) | H2State::ContinuationFrame(_)
-        )
-    }
-
     /// Queue pending control frames (WINDOW_UPDATEs, RST_STREAMs) behind the
     /// ordered output and flush it, before entering the main writable state
     /// machine.
@@ -4285,25 +4257,6 @@ impl ConnectionH2 {
                 SETTINGS_ACK_TIMEOUT
             );
             return H2ControlFlushTarget::Done(self.goaway(H2Error::SettingsTimeout));
-        }
-
-        // Stage — queue a deferred initial GOAWAY.
-        // `graceful_goaway` defers it while a header block is being
-        // reassembled — see its comment and `send_initial_goaway`. Queue it now
-        // that reassembly has completed, and let the flush below send it this
-        // pass; if reassembly is still in progress, leave the flag set and
-        // retry on a later pass (nothing is lost: `graceful_goaway` already
-        // armed WRITABLE). The reassembly check stays here, computed by this
-        // caller: `H2DrainState` has no `self.state` to compute it itself —
-        // see `h2_drain`'s module doc.
-        if self
-            .drain
-            .take_deferred_initial_goaway(!self.header_block_reassembly_in_progress())
-        {
-            let result = self.send_initial_goaway();
-            if !matches!(result, MuxResult::Continue) {
-                return H2ControlFlushTarget::Done(result);
-            }
         }
 
         // Stage — queue pending WINDOW_UPDATE frames.
@@ -5414,12 +5367,6 @@ fn h2_frame_rx_metric_key(frame_type: FrameType) -> &'static str {
 impl ConnectionH2 {
     pub fn goaway(&mut self, error: H2Error) -> MuxResult {
         self.state = H2State::Error;
-        // A final/error GOAWAY supersedes any advisory initial GOAWAY that
-        // `graceful_goaway` deferred: this frame carries a real
-        // `last_stream_id` and `expect_read` is dropped below, so no further
-        // readable() will ever complete the reassembly that deferred it.
-        // Sending the stale advisory afterward would only be a redundant,
-        // less informative GOAWAY.
         self.drain.enter_final_goaway();
         self.stream_table.set_expect_read(None);
         // Disarm the SETTINGS ACK timer: once we've committed to GOAWAY, the
@@ -5484,39 +5431,20 @@ impl ConnectionH2 {
     /// `ready()` and therefore outside the pass that last refreshed the
     /// mirror. In-module callers pass `self.now`.
     pub fn graceful_goaway(&mut self, now: Instant) -> MuxResult {
-        // While a HEADERS/CONTINUATION field block is being reassembled
-        // (`header_block_reassembly_in_progress`), the advisory GOAWAY is
-        // deferred until the block completes. Since #1604 that defers nothing
-        // a buffer needs: the GOAWAY is queued in the separate `self.output`,
-        // which shares nothing with `zero` or `header_reassembly`, so it
-        // could not clobber the block. The deferral is kept as drain policy
-        // (LIFECYCLE.md invariant 24, as amended) rather than removed here,
-        // since that would change the drain, not the output.
-        // `H2DrainState::begin_graceful_drain` takes this caller-computed
-        // check because the module has no `H2State` of its own to read.
-        let reassembly_in_progress = self.header_block_reassembly_in_progress();
-        match self.drain.begin_graceful_drain(now, reassembly_in_progress) {
+        // The initial GOAWAY goes out even while a peer HEADERS/CONTINUATION
+        // block is still being reassembled: RFC 9113 §4.3/§6.10 constrain the
+        // block's sender, not a GOAWAY travelling the other way, and it is
+        // queued in `self.output`, which shares nothing with `zero` or
+        // `header_reassembly`. Deferring it (#1401, removed in #1637) let a
+        // drain close a session whose only stream was mid-block without any
+        // GOAWAY — see `h2_drain`'s module doc.
+        match self.drain.begin_graceful_drain(now) {
             // Second GOAWAY: send with the real last_stream_id.
             GracefulDrainDecision::AlreadyDraining => self.goaway(H2Error::NoError),
-            // Defer, the same way `flush_pending_control_frames` already
-            // defers its WINDOW_UPDATE and RST_STREAM drains:
-            // `flush_pending_control_frames` sends the deferred GOAWAY via
-            // `send_initial_goaway` as soon as reassembly completes.
-            GracefulDrainDecision::DeferInitial => {
-                debug!(
-                    "{} GOAWAY (graceful, initial) deferred: header block reassembly in progress",
-                    log_context!(self)
-                );
-                // Ensure a writable() pass happens even if nothing else would
-                // arm it, so the deferred GOAWAY is not left waiting on an
-                // unrelated event.
-                self.readiness.arm_writable();
-                MuxResult::Continue
-            }
-            // First GOAWAY, no reassembly in progress: advertise MAX stream
-            // ID so the peer knows we are draining but does not yet know the
-            // cutoff. This gives in-flight requests a chance to arrive
-            // before we commit to a final last_stream_id.
+            // First GOAWAY: advertise MAX stream ID so the peer knows we are
+            // draining but does not yet know the cutoff. This gives in-flight
+            // requests a chance to arrive before we commit to a final
+            // last_stream_id.
             GracefulDrainDecision::SendInitial => self.send_initial_goaway(),
         }
     }
@@ -5525,12 +5453,6 @@ impl ConnectionH2 {
     /// (`NO_ERROR`, `last_stream_id = STREAM_ID_MAX`) of a graceful drain
     /// in the ordered output queue (`self.output`), behind whatever is
     /// already queued there.
-    ///
-    /// Split out of [`Self::graceful_goaway`] so
-    /// [`Self::flush_pending_control_frames`] can call it once an in-flight
-    /// header block finishes reassembling, for the case where
-    /// `graceful_goaway` had to defer it. Callers must already have checked
-    /// `!self.header_block_reassembly_in_progress()`.
     fn send_initial_goaway(&mut self) -> MuxResult {
         // Keep expect_read as-is: existing streams should continue reading
         // data during the drain window opened by the initial GOAWAY. Only
@@ -16185,13 +16107,18 @@ mod tests {
     /// unrelated WINDOW_UPDATE flush — the third instance of the same bug
     /// class (issue #1398).
     ///
-    /// To SEE THIS RED: this is the pre-existing behaviour on `main`, no
-    /// mutation needed. `graceful_goaway` clears `self.zero.storage`
-    /// unconditionally to serialize the advisory GOAWAY, with no check on
-    /// `header_block_reassembly_in_progress()`. Deferring that clear (and
-    /// the serialization) until reassembly completes — mirroring the
-    /// WINDOW_UPDATE/RST_STREAM drains `flush_pending_control_frames`
-    /// already gates — is exactly the fix this test proves.
+    /// Since #1637 the advisory GOAWAY is no longer deferred while the block
+    /// reassembles: it is queued in `self.output` and flushed in the same
+    /// pass, and this test checks both halves on the wire — the peer reads
+    /// the 17-byte `GOAWAY(NO_ERROR, STREAM_ID_MAX)` BEFORE it sends the
+    /// CONTINUATION, and the block that CONTINUATION completes still decodes
+    /// byte-for-byte afterwards.
+    ///
+    /// To SEE THIS RED, either reintroduce the #1401 deferral (hold the
+    /// GOAWAY back while `H2State::ContinuationHeader` holds) — the
+    /// `read_exact` of the advisory GOAWAY before the CONTINUATION finds nothing
+    /// — or serialize the GOAWAY into `self.zero.storage` as the pre-#1604
+    /// code did, which corrupts the block and fails the decode assertions.
     #[test]
     fn a_legitimate_continuation_survives_a_graceful_goaway() {
         use std::io::{Read, Write};
@@ -16279,36 +16206,54 @@ mod tests {
         let result = connection.graceful_goaway(drain_at);
         assert!(
             matches!(result, MuxResult::Continue),
-            "graceful_goaway must not tear the connection down while deferring: {result:?}"
+            "graceful_goaway must not tear the connection down mid-reassembly: {result:?}"
         );
 
         // The forced-close budget must arm from the moment the proxy decided
-        // to drain, not from whenever the deferred GOAWAY eventually goes
-        // out — `Mux::shutting_down` samples exactly this field against
+        // to drain — `Mux::shutting_down` samples exactly this field against
         // `graceful_shutdown_deadline`.
         assert!(
             connection.core.drain.draining(),
-            "graceful_goaway must mark the connection as draining immediately, \
-             even when the GOAWAY itself is deferred"
+            "graceful_goaway must mark the connection as draining immediately"
         );
         assert_eq!(
             connection.core.drain.__test_started_at(),
             Some(drain_at),
-            "the forced-close budget must arm from `graceful_goaway`'s `now` \
-             parameter immediately, not once the deferred GOAWAY is sent"
+            "the forced-close budget must arm from `graceful_goaway`'s `now` parameter"
         );
         assert!(
-            connection.core.drain.__test_initial_goaway_pending(),
-            "the advisory GOAWAY must be deferred while a header block is \
-             reassembling, not sent (and clobber the reassembly) or dropped"
+            matches!(connection.core.state, H2State::ContinuationHeader(_)),
+            "queueing the advisory GOAWAY must leave the reassembly state alone: {:?}",
+            connection.core.state
         );
 
         // Mirror `Mux::shutting_down_inner` exactly: it calls
         // `flush_output_buffer()` immediately after `graceful_goaway()`
         // returns `Continue`, because edge-triggered epoll won't deliver a
-        // fresh WRITABLE event for an already-writable socket. Must be a
-        // no-op while reassembly is still in progress.
+        // fresh WRITABLE event for an already-writable socket. The advisory
+        // GOAWAY leaves in this flush, while the block is still incomplete.
         connection.flush_output_buffer();
+        assert!(
+            connection.core.output.is_empty(),
+            "the advisory GOAWAY must have been fully flushed to the socket"
+        );
+
+        let mut expected = [0u8; 17];
+        let (_, expected_size) =
+            serializer::gen_goaway(&mut expected, STREAM_ID_MAX, H2Error::NoError)
+                .expect("serializing the expected GOAWAY must succeed");
+        assert_eq!(expected_size, 17);
+
+        let mut received = [0u8; 17];
+        peer.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("setting a read timeout must succeed");
+        peer.read_exact(&mut received)
+            .expect("the peer must receive the advisory GOAWAY before it completes the block");
+        assert_eq!(
+            received, expected,
+            "the advisory GOAWAY must reach the peer byte-for-byte while its \
+             header block is still incomplete"
+        );
 
         // Now the CONTINUATION frame completing the block arrives.
         let mut continuation_frame = Vec::with_capacity(9 + second_half.len());
@@ -16369,43 +16314,11 @@ mod tests {
              clobbered by graceful_goaway"
         );
 
-        // The deferred advisory GOAWAY must not be lost: drive writable()
-        // until it is queued and flushed, then verify the peer actually
-        // received it, byte-for-byte identical to an immediate (non-deferred)
-        // serialization.
-        for _ in 0..8 {
-            connection.writable(&mut context, EndpointClient(&mut router));
-            if !connection.core.drain.__test_initial_goaway_pending()
-                && connection.core.output.is_empty()
-            {
-                break;
-            }
-        }
-        assert!(
-            !connection.core.drain.__test_initial_goaway_pending(),
-            "the deferred advisory GOAWAY must be sent once reassembly completes, \
-             not left pending forever"
-        );
+        // Nothing else was owed to the peer: the drain is not a second
+        // GOAWAY, and the completed block leaves nothing queued.
         assert!(
             connection.core.output.is_empty(),
-            "the advisory GOAWAY must have been fully flushed to the socket"
-        );
-
-        let mut expected = [0u8; 17];
-        let (_, expected_size) =
-            serializer::gen_goaway(&mut expected, STREAM_ID_MAX, H2Error::NoError)
-                .expect("serializing the expected GOAWAY must succeed");
-        assert_eq!(expected_size, 17);
-
-        let mut received = [0u8; 17];
-        peer.set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("setting a read timeout must succeed");
-        peer.read_exact(&mut received)
-            .expect("the peer must receive the deferred advisory GOAWAY");
-        assert_eq!(
-            received, expected,
-            "the deferred advisory GOAWAY must reach the peer byte-for-byte \
-             once header-block reassembly completes"
+            "completing the block must not queue a second advisory GOAWAY"
         );
     }
 
@@ -17554,7 +17467,7 @@ mod tests {
             None,
             UnrelatedWindowUpdateFlush,
             HupWhileDraining,
-            GracefulGoawayDefer,
+            GracefulGoaway,
         }
 
         impl Arbitrary for Interleave {
@@ -17563,7 +17476,7 @@ mod tests {
                     Interleave::None,
                     Interleave::UnrelatedWindowUpdateFlush,
                     Interleave::HupWhileDraining,
-                    Interleave::GracefulGoawayDefer,
+                    Interleave::GracefulGoaway,
                 ])
                 .expect("the choice slice above is non-empty")
             }
@@ -17611,7 +17524,7 @@ mod tests {
             }
         }
 
-        /// Apply one interleave. `GracefulGoawayDefer` checks
+        /// Apply one interleave. `GracefulGoaway` checks
         /// `connection.drain.draining()` — the AUTHORITATIVE state, not a
         /// separately tracked bool — before calling `graceful_goaway`:
         /// once the connection is already draining (whether a prior point
@@ -17622,9 +17535,9 @@ mod tests {
         /// (`GracefulDrainDecision::AlreadyDraining`), which drops
         /// `expect_read` and makes the block permanently uncompletable — a
         /// different scenario than this property drives, so a
-        /// `GracefulGoawayDefer` point reached while already draining is
+        /// `GracefulGoaway` point reached while already draining is
         /// treated as `None` instead. A local `bool` tracking only
-        /// "did GracefulGoawayDefer itself fire" would miss the
+        /// "did GracefulGoaway itself fire" would miss the
         /// `HupWhileDraining` case and was exactly the bug `quickcheck`
         /// found while writing this property (review of `e1c3c2fb`, B3).
         fn apply_interleave<L>(
@@ -17647,7 +17560,7 @@ mod tests {
                     connection.writable(context, EndpointClient(router));
                     connection.core.readiness.event.remove(Ready::HUP);
                 }
-                Interleave::GracefulGoawayDefer => {
+                Interleave::GracefulGoaway => {
                     if !connection.core.drain.draining() {
                         let now = connection.core.now;
                         connection.graceful_goaway(now);

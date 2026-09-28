@@ -231,7 +231,9 @@ Declared in `h2.rs` (`pub enum H2State`):
   read then queues re-arms it (sozu-proxy/sozu#1631,
   `a_backend_stream_ended_during_the_handshake_keeps_the_connection`,
   `a_request_linked_during_the_handshake_goes_out_after_the_settings`).
-- `ClientPreface` → `ClientSettings` at `h2.rs:2669`.
+- `ClientPreface` → `ClientSettings` in the `(H2State::ClientPreface,
+  Position::Server)` arm of `ConnectionH2::handle_read` (`h2.rs`), once the
+  client preface parses.
 - `ClientSettings` → `ServerSettings` in the `H2State::ClientSettings` arm of
   `ConnectionH2::handle_read` (`h2.rs`), right after the SETTINGS frame is
   serialized. By symbol, not line: `self.state = H2State::ServerSettings;` is
@@ -291,36 +293,25 @@ Declared in `h2.rs` (`pub enum H2State`):
   too since #1604: control frames are serialised into the separate output
   queue (invariant 28), `zero` is input only, and those stages no longer
   consult `ConnectionH2::header_block_reassembly_in_progress` nor defer.
-- **`graceful_goaway` is subject to the same guard, unconditionally — the
-  third and previously unguarded instance of this bug class.** Its first
-  GOAWAY also clears and reuses `zero.storage` to serialize the advisory
-  `GOAWAY(NO_ERROR, last_stream_id=MAX)`, directly contradicting its own
-  intent that in-flight streams keep reading during the drain window. Unlike
-  the WINDOW_UPDATE/RST_STREAM case, no coincident traffic is required — every
-  drain during an in-flight reassembly hits it. Since the step-5 GOAWAY/drain
-  extraction (`h2_drain.rs`), the decision lives in
-  [`H2DrainState::begin_graceful_drain`](h2_drain.rs): `ConnectionH2::graceful_goaway`
-  passes it `now` and its own `header_block_reassembly_in_progress()` result,
-  and the method returns `GracefulDrainDecision::DeferInitial` — arming
-  `initial_goaway_pending` internally — when a block is in progress, instead
-  of `SendInitial`. Unlike the WINDOW_UPDATE/RST_STREAM stages, which already
-  had a pending queue to fall back on, a deferred advisory GOAWAY has nothing
-  else to carry it, so `flush_pending_control_frames` drains the flag via
-  `H2DrainState::take_deferred_initial_goaway` and the new
-  `ConnectionH2::send_initial_goaway` (split out of `graceful_goaway`) as soon
-  as reassembly completes, guaranteeing it is still sent rather than silently
-  lost. `begin_graceful_drain` marks the connection draining and arms the
-  forced-close budget unconditionally before the reassembly check, so the
-  forced-close budget invariant (§9.3 below) still arms on time.
-  `ConnectionH2::goaway` (the final GOAWAY) calls
-  [`H2DrainState::enter_final_goaway`](h2_drain.rs), which clears
-  `initial_goaway_pending` too: `goaway` drops `expect_read`, so no further
-  reassembly will ever complete. Since #1604 the GOAWAY goes to the separate
-  output queue and can no longer clobber anything, so this deferral protects
-  no buffer: it survives as a drain policy that delays the advisory frame
-  until the block completes, and `H2Shell::flush_output_buffer` — the direct,
-  `writable()`-bypassing flush `Mux::shutting_down` calls right after
-  `graceful_goaway` — flushes whatever is queued, with no reassembly guard.
+- **`graceful_goaway` sends its advisory GOAWAY even mid-block.** Before
+  #1604 its first GOAWAY cleared and reused `zero.storage` to serialize
+  `GOAWAY(NO_ERROR, last_stream_id=MAX)` — the third instance of this bug
+  class (#1401) — so `H2DrainState::begin_graceful_drain` (`h2_drain.rs`)
+  deferred it while a block was in progress, through a `DeferInitial`
+  decision and an `initial_goaway_pending` flag that
+  `flush_pending_control_frames` drained once the block completed. Since
+  #1604 the GOAWAY is queued in the separate output queue and can clobber
+  nothing, and #1637 removed the deferral: it protected no buffer, and a
+  drain landing while the only stream was mid-block let
+  `Mux::shutting_down_inner` (`mod.rs`) close the session with nothing
+  queued — the peer saw no GOAWAY at all, against RFC 9113 §6.8. RFC 9113
+  §4.3/§6.10 constrain the block's sender, not a GOAWAY travelling the other
+  way. `begin_graceful_drain` now takes only `now`, marks the connection
+  draining, arms the forced-close budget (§9.3 below) and answers
+  `SendInitial`; `ConnectionH2::graceful_goaway` queues the frame through
+  `ConnectionH2::send_initial_goaway`, and `H2Shell::flush_output_buffer` —
+  the direct, `writable()`-bypassing flush `Mux::shutting_down` calls right
+  after `graceful_goaway` — sends it in the same pass.
 
 ### 2.3 Entry points
 
@@ -1041,7 +1032,8 @@ deadlines are compared against `ConnectionH2.now` (§7.5):
 1. `readable()` entry runs `cancel_timed_out_streams` first, inside
    `ConnectionH2::poll_read_target` (§7.2).
 2. Then that same call optionally fires `goaway(SettingsTimeout)` if the
-   SETTINGS ACK is overdue (`h2.rs:2433-2443`) — before any read is offered.
+   SETTINGS ACK is overdue (`ConnectionH2::poll_read_target`, `h2.rs`) — before
+   any read is offered.
 3. Then `ConnectionH2::handle_read` consumes the frame / payload.
 4. `writable()` mirrors this check, via `flush_pending_control_frames`
    (`ConnectionH2::flush_pending_control_frames`, `h2.rs`).
@@ -1459,7 +1451,8 @@ kept in lock-step:
 
 The three RST push sites retrofit to `enqueue_rst`:
 
-- DATA-on-closed-stream (`h2.rs:2217` — `H2Error::StreamClosed`).
+- DATA-on-closed-stream (the closed-stream DATA branch of
+  `ConnectionH2::handle_header_state`, `h2.rs` — `H2Error::StreamClosed`).
 - `refuse_stream_and_discard` (`h2.rs` — MCS / pool exhaustion).
 - `reset_stream` (`h2.rs` — per-stream error paths: malformed HEADERS,
   content-length mismatch, WINDOW_UPDATE zero-increment or overflow,
@@ -1517,7 +1510,7 @@ private fields. `begin_graceful_drain` arms `started_at` from the `now` it is
 handed, and the `debug_assert!` guarding that assignment states the invariant
 the budget rests on:
 
-```rust lib/src/protocol/mux/h2_drain.rs:240-243
+```rust lib/src/protocol/mux/h2_drain.rs:206-209
 debug_assert!(
     self.started_at.is_none(),
     "begin_graceful_drain must arm started_at exactly once, on the first call"
@@ -2333,15 +2326,16 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     residual (a single in-flight frame's partial bytes) needed, and now
     has, the ordinary guard.
 
-    **Amended by #1604 (invariant 28): five of the six guards below are
+    **Amended by #1604 (invariant 28) and #1637: all six guards below are
     gone, because what they guarded is gone.** Control frames are now
     serialised into the separate ordered output queue, `zero` is input only,
-    and no write-side site clears or reuses `zero.storage` any more. The one
-    that stays is `graceful_goaway`'s defer-or-send decision (with
-    `take_deferred_initial_goaway`'s `ready_to_flush`), kept as a drain
-    policy rather than a buffer guard. The tests listed below still pin the
-    outcome, a block that survives every interleaved flush. The paragraph
-    that follows is the account the six guards were written against.
+    and no write-side site clears or reuses `zero.storage` any more. #1604
+    removed five; the sixth, `graceful_goaway`'s defer-or-send decision, was
+    kept as a drain policy until #1637 removed it together with
+    `header_block_reassembly_in_progress()` itself (§2.2). The tests listed
+    below still pin the outcome, a block that survives every interleaved
+    flush. The paragraph that follows is the account the six guards were
+    written against.
 
     **All six `header_block_reassembly_in_progress()` call sites were
     load-bearing (before #1604).** `ConnectionH2::header_block_reassembly_in_progress()`
@@ -2365,15 +2359,16 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     that in-flight chunk would still truncate or corrupt an otherwise-
     completable block — and, per the finding above, "the frontend already
     hung up" does not reliably rule this out either.
-    `h2_drain::H2DrainState::initial_goaway_pending` stays: it is the flag
-    `begin_graceful_drain` sets so a `graceful_goaway` landing
-    mid-reassembly defers its advisory GOAWAY, and
-    `flush_pending_control_frames` drains it via `take_deferred_initial_goaway`
-    once reassembly completes. Pinned by
+    `h2_drain::H2DrainState::initial_goaway_pending` was the flag
+    `begin_graceful_drain` set so a `graceful_goaway` landing
+    mid-reassembly deferred its advisory GOAWAY, drained by
+    `flush_pending_control_frames` via `take_deferred_initial_goaway` once
+    reassembly completed. Pinned by
     `a_legitimate_continuation_survives_an_unrelated_window_update_flush`
     (the WINDOW_UPDATE-stage case, #1397),
     `a_legitimate_continuation_survives_a_graceful_goaway` (the GOAWAY case,
-    #1401), `a_legitimate_continuation_survives_a_hup_while_draining` (the
+    #1401; since #1637 it also reads the advisory GOAWAY before the block
+    completes), `a_legitimate_continuation_survives_a_hup_while_draining` (the
     inter-frame HUP case) and
     `a_continuation_frame_split_by_tcp_segmentation_survives_a_hup_while_draining`
     (the mid-frame HUP case, #1423's actual residual); the RST_STREAM drain

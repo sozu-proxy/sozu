@@ -183,7 +183,7 @@ Notes:
   real HPACK field block into 2..=5 CONTINUATION fragments and, before each
   one after the first, independently choosing one of four interleaves —
   nothing, an unrelated WINDOW_UPDATE flush, a HUP-while-draining event, or a
-  deferred `graceful_goaway` — composing all three deterministic triggers
+  `graceful_goaway` — composing all three deterministic triggers
   above (not just two of them, an earlier version of this property claimed to
   but did not) in every order and count `quickcheck` cares to generate. Each
   interleave point also independently chooses to fire at a frame boundary or
@@ -756,26 +756,42 @@ skipping it produced a real flaky-test or papered-over-bug commit.
   required)`, and its pass line reads `stability check PASSED: the single
   required run succeeded`. See issue #1410.
 - **A test for a guarantee that protects a *mid-frame* window has to reach
-  that window — a whole-frame write never does.** Writing a frame in one
+  that window — a whole-frame write never does — and a guard that a later
+  refactor made inert shows up only under mutation.** Writing a frame in one
   `write_all` only ever presents the peer with a frame **boundary**, and a
   guard that exists for the half-read state is inert there, so the test stays
   green with the guard deleted. Check it the only way that settles it: invert
   the production decision and confirm the test turns red. sozu#1453 is the
-  worked example —
+  first half of the worked example —
   `test_h2_continuation_survives_a_graceful_drain_mid_reassembly`
   (`e2e/src/tests/h2_tests.rs`) sent its whole CONTINUATION in one TLS write,
-  so `graceful_goaway`'s `GracefulDrainDecision::DeferInitial` could be forced
-  to `SendInitial` without the test noticing; splitting that frame across two
-  TLS writes with the drain triggered between them is what put the test inside
-  the window. Sequencing the two writes needs an observable that a **partial**
-  read moves: a per-frame counter such as `h2.frames.rx.headers` ticks only on
-  a frame completed and cannot witness one still arriving, whereas `bytes_in`
-  (`ConnectionH2::handle_read`) advances on every socket read, and `read_space`
-  caps each read at exactly the bytes the current frame stage expects, so the
-  total is exact rather than approximate. Gate on that total — and fail the
-  run on an overshoot, which would mean something else feeds the counter and
-  the gate proves nothing. Never sequence the two writes with a `sleep`: a
-  second write that lands "usually after" is the same defect in a new costume.
+  so the drain's then-live `GracefulDrainDecision::DeferInitial` could be
+  forced to `SendInitial` without the test noticing; splitting that frame
+  across two TLS writes with the drain triggered between them is what put the
+  test inside the window. Sequencing the two writes needs an observable that
+  a **partial** read moves: a per-frame counter such as
+  `h2.frames.rx.headers` ticks only on a frame completed and cannot witness
+  one still arriving, whereas `bytes_in` (`ConnectionH2::handle_read`,
+  `lib/src/protocol/mux/h2.rs`) advances on every socket read, and
+  `read_space` caps each read at exactly the bytes the current frame stage
+  expects, so the total is exact rather than approximate. Gate on that total
+  — and fail the run on an overshoot, which would mean something else feeds
+  the counter and the gate proves nothing. Never sequence the two writes with
+  a `sleep`: a second write that lands "usually after" is the same defect in
+  a new costume. The second half is sozu#1637: once #1625 (sozu#1604)
+  queued every control frame in the separate output queue
+  (`ConnectionH2::output`, `lib/src/protocol/mux/h2.rs`), the
+  GOAWAY could no longer clobber the half-read frame, the same mutation left
+  the split test green again, and only unit tests reading the internal flag
+  still failed. The re-run mutation was the evidence that the guard protected
+  nothing any more; asking what else it changed on the wire found that it
+  let a drain close a session whose only stream was mid-block without any
+  GOAWAY (RFC 9113 §6.8). The guard was removed, and
+  `test_h2_graceful_drain_mid_header_block_sends_goaway_before_closing`
+  (`e2e/src/tests/h2_tests.rs`) pins the wire behaviour instead. Re-run a
+  guard's mutation after a refactor that moves the state it protects; a
+  test that asserts an internal flag keeps passing for a guard that no
+  longer guards anything.
 - **Assert a status by decoding it, never by scanning a field block for its
   digits.** An HPACK block is not text. `payload.windows(3).any(|w| w == b"421")`
   matches any three adjacent bytes, and every Sōzu response carries a `Sozu-Id`
