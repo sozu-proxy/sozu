@@ -3,7 +3,9 @@
 //!
 //! [`SplicePipe`] owns a pair of kernel pipes that carry data between a
 //! frontend socket and a backend socket without round-tripping payload
-//! through user space. Its `Drop` impl closes all four pipe fds.
+//! through user space. Its `Drop` impl hands a pair that is proven empty
+//! back to a small per-worker pool, which the next [`SplicePipe::new`]
+//! takes from before creating pipes, and closes all four fds otherwise.
 //!
 //! The pipe capacity matches the default Linux pipe buffer size
 //! (64 KiB). Both ends are created with `O_NONBLOCK` so [`splice_in`] /
@@ -12,6 +14,7 @@
 //! hot-upgrade safety).
 
 use std::{
+    cell::RefCell,
     io::{Error, ErrorKind},
     os::unix::io::AsRawFd,
     ptr,
@@ -58,6 +61,23 @@ fn requested_pipe_capacity() -> usize {
         .unwrap_or(DEFAULT_SPLICE_PIPE_CAPACITY)
 }
 
+/// Upper bound on the idle [`SplicePipe`]s a worker keeps for reuse (four
+/// pipe fds each). [`SplicePipe::new`] takes from the pool before creating,
+/// so the pool never makes a worker hold more pipe fds than it already held
+/// at its peak of concurrent spliced sessions; the bound only caps what it
+/// retains after that peak.
+const SPLICE_PIPE_POOL_CAPACITY: usize = 32;
+
+thread_local! {
+    /// Idle pipe pairs of this worker, each proven empty by
+    /// [`SplicePipe::is_empty`] when it was returned. A worker runs its
+    /// event loop on one thread, so this pool is per worker. Its fds are
+    /// `O_CLOEXEC`, so an upgrade's `exec` does not carry them into the new
+    /// worker, and they close with the worker (or with the thread-local on
+    /// thread exit, through [`SplicePipe`]'s `Drop`).
+    static SPLICE_PIPE_POOL: RefCell<Vec<SplicePipe>> = const { RefCell::new(Vec::new()) };
+}
+
 /// A pair of kernel pipes used to carry zero-copy traffic between a
 /// frontend socket and a backend socket.
 ///
@@ -93,14 +113,24 @@ pub struct SplicePipe {
 }
 
 impl SplicePipe {
-    /// Allocate two `pipe2(O_NONBLOCK | O_CLOEXEC)` pairs and apply the
-    /// operator-requested capacity (or the built-in 64 KiB default) to
+    /// Take an idle pair from this worker's pool, or, when the pool is
+    /// empty, allocate two `pipe2(O_NONBLOCK | O_CLOEXEC)` pairs and apply
+    /// the operator-requested capacity (or the built-in 64 KiB default) to
     /// both via `fcntl(F_SETPIPE_SZ)`. The realised size — possibly
     /// page-rounded or kernel-clamped — is read back via
-    /// `fcntl(F_GETPIPE_SZ)` and stored in `capacity`. Returns `None`
-    /// if either pipe allocation fails (typically RLIMIT_NOFILE
-    /// pressure); the caller falls back to the buffered path.
+    /// `fcntl(F_GETPIPE_SZ)` and stored in `capacity`. A pooled pair keeps
+    /// the capacity it was created with, which is the same: the override is
+    /// set once per worker before any session. Returns `None` if either
+    /// pipe allocation fails (typically RLIMIT_NOFILE pressure); the caller
+    /// falls back to the buffered path.
     pub fn new() -> Option<Self> {
+        let pooled = SPLICE_PIPE_POOL
+            .try_with(|pool| pool.try_borrow_mut().ok().and_then(|mut pool| pool.pop()))
+            .ok()
+            .flatten();
+        if pooled.is_some() {
+            return pooled;
+        }
         let in_pipe = create_pipe()?;
         let out_pipe = match create_pipe() {
             Some(p) => p,
@@ -166,8 +196,57 @@ fn set_and_query_pipe_size(fd: libc::c_int, requested: usize) -> usize {
     }
 }
 
+impl SplicePipe {
+    /// Whether both pipes hold no byte, so that the pair can serve another
+    /// session without handing it a byte of this one. The pending counters
+    /// track every `splice(2)` in and out, and are checked first so that a
+    /// pair still carrying bytes costs no syscall; `FIONREAD` on each read
+    /// end then asks the kernel itself, so a counter that missed bytes can
+    /// never recycle them. Any `ioctl` failure answers "not empty".
+    fn is_empty(&self) -> bool {
+        self.in_pipe_pending == 0
+            && self.out_pipe_pending == 0
+            && pipe_is_empty(self.in_pipe[0])
+            && pipe_is_empty(self.out_pipe[0])
+    }
+}
+
+/// Ask the kernel whether the pipe behind `read_end` holds no byte.
+fn pipe_is_empty(read_end: libc::c_int) -> bool {
+    let mut queued: libc::c_int = 0;
+    // SAFETY: `read_end` is the read end of a pipe owned by the calling
+    // `SplicePipe`; `FIONREAD` writes one `c_int` through the valid,
+    // aligned pointer and retains nothing after `ioctl` returns.
+    let ret = unsafe { libc::ioctl(read_end, libc::FIONREAD, &mut queued) };
+    ret == 0 && queued == 0
+}
+
 impl Drop for SplicePipe {
     fn drop(&mut self) {
+        // Recycle an empty pair into this worker's pool while it has room.
+        // Room is checked first so that a full pool costs no `FIONREAD`. The
+        // pooled value is built inside the closure and takes over the four
+        // fds, so this instance then returns without closing them. When the
+        // thread-local is being destroyed, `try_with` fails without running
+        // the closure and the fds are closed below.
+        let pooled = SPLICE_PIPE_POOL
+            .try_with(|pool| match pool.try_borrow_mut() {
+                Ok(mut pool) if pool.len() < SPLICE_PIPE_POOL_CAPACITY && self.is_empty() => {
+                    pool.push(SplicePipe {
+                        in_pipe: self.in_pipe,
+                        out_pipe: self.out_pipe,
+                        in_pipe_pending: 0,
+                        out_pipe_pending: 0,
+                        capacity: self.capacity,
+                    });
+                    true
+                }
+                _ => false,
+            })
+            .unwrap_or(false);
+        if pooled {
+            return;
+        }
         // SAFETY: All four fds were created by `create_pipe` in
         // `SplicePipe::new`, are exclusively owned by this struct, and
         // are about to go out of scope. The worker event loop is
@@ -306,6 +385,94 @@ mod tests {
     };
 
     use super::*;
+
+    fn pooled_count() -> usize {
+        SPLICE_PIPE_POOL.with(|pool| pool.borrow().len())
+    }
+
+    /// Bytes the kernel holds in the pipe behind `read_end`.
+    fn queued(read_end: libc::c_int) -> usize {
+        let mut queued: libc::c_int = 0;
+        // SAFETY: `read_end` is a live pipe fd owned by the test's
+        // `SplicePipe`; FIONREAD writes one `c_int` through the pointer.
+        let ret = unsafe { libc::ioctl(read_end, libc::FIONREAD, &mut queued) };
+        assert_eq!(ret, 0, "FIONREAD must succeed on a pipe");
+        queued as usize
+    }
+
+    /// A pair returned with both pipes empty is the next pair handed out,
+    /// without creating a pipe. Each test runs on its own thread, so it
+    /// starts with an empty pool.
+    #[test]
+    fn an_empty_splice_pipe_is_reused() {
+        let pipe = SplicePipe::new().expect("create splice pipe");
+        let fds = (pipe.in_pipe, pipe.out_pipe);
+        drop(pipe);
+        assert_eq!(pooled_count(), 1, "an empty pair must return to the pool");
+
+        let reused = SplicePipe::new().expect("take splice pipe");
+        assert_eq!((reused.in_pipe, reused.out_pipe), fds);
+        assert_eq!(pooled_count(), 0);
+    }
+
+    /// A pair returned with bytes still inside either pipe must never serve
+    /// another session: those bytes belong to the session that ends, and
+    /// the next session would forward them to its own peer. Covers both
+    /// directions, with the bytes counted in `*_pipe_pending` (a session
+    /// closing before its pipe drained) and with a counter that missed
+    /// them, which only the kernel's `FIONREAD` can see.
+    #[test]
+    fn a_splice_pipe_returned_with_bytes_in_flight_is_never_reused() {
+        let leaked = b"session A";
+        for backend_to_frontend in [false, true] {
+            for counted in [true, false] {
+                let mut pipe = SplicePipe::new().expect("create splice pipe");
+                let write_end = if backend_to_frontend {
+                    pipe.out_pipe[1]
+                } else {
+                    pipe.in_pipe[1]
+                };
+                // SAFETY: `write_end` is a live pipe fd owned by `pipe`; the
+                // buffer is valid for `leaked.len()` bytes.
+                let written =
+                    unsafe { libc::write(write_end, leaked.as_ptr().cast(), leaked.len()) };
+                assert_eq!(written, leaked.len() as isize);
+                if counted {
+                    if backend_to_frontend {
+                        pipe.out_pipe_pending = leaked.len();
+                    } else {
+                        pipe.in_pipe_pending = leaked.len();
+                    }
+                }
+                drop(pipe);
+                assert_eq!(
+                    pooled_count(),
+                    0,
+                    "a pair holding bytes must not return to the pool \
+                     (backend_to_frontend={backend_to_frontend}, counted={counted})"
+                );
+
+                let next = SplicePipe::new().expect("create splice pipe");
+                assert_eq!(
+                    (queued(next.in_pipe[0]), queued(next.out_pipe[0])),
+                    (0, 0),
+                    "the next session must get empty pipes \
+                     (backend_to_frontend={backend_to_frontend}, counted={counted})"
+                );
+            }
+        }
+    }
+
+    /// The pool keeps at most `SPLICE_PIPE_POOL_CAPACITY` idle pairs; the
+    /// pairs beyond it are closed.
+    #[test]
+    fn the_splice_pipe_pool_is_bounded() {
+        let pipes: Vec<SplicePipe> = (0..=SPLICE_PIPE_POOL_CAPACITY)
+            .map(|_| SplicePipe::new().expect("create splice pipe"))
+            .collect();
+        drop(pipes);
+        assert_eq!(pooled_count(), SPLICE_PIPE_POOL_CAPACITY);
+    }
 
     /// Round-trip a payload through a kernel pipe and assert the byte
     /// count is preserved. Exercises `create_pipe`, `splice_in`, and

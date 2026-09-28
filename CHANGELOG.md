@@ -531,6 +531,20 @@
   `protocol::udp::ClusterConfig::cluster` take or return `ClusterId`. Build one from a `&str` or
   `String` with `.into()` or `ClusterId::from`.
 
+- **`perf(tcp)`: a TCP session reuses the splice pipes of an earlier one
+  ([#1664](https://github.com/sozu-proxy/sozu/pull/1664)).** With the `splice` feature, every raw TCP session created two kernel pipes (`pipe2` ×2, `fcntl` ×4) and closed them
+  (`close` ×4): 10 of its system calls. Each worker now keeps up to 32 idle pipe pairs
+  (`lib/src/splice.rs`); `SplicePipe::new` takes one before creating any, and a session's pair
+  returns to the pool only when both pipes are empty — its pending counters read zero and
+  `ioctl(FIONREAD)` on each read end confirms it — so no byte of one client can reach another
+  (`a_splice_pipe_returned_with_bytes_in_flight_is_never_reused`). A pair holding bytes is closed as
+  before. Measured per connection on top of #1657, release, 20 sequential `curl` through a TCP
+  listener, two passes: 34.10–34.90 → 25.75–26.85 system calls (−10 on a reused pair, +2 `ioctl` on a pair returned while the
+  pool has room). The pipes are `O_CLOEXEC`, so a worker upgrade starts with an
+  empty pool. An idle pair holds four descriptors, but a worker never holds more pipe descriptors
+  than at its earlier peak of spliced sessions. No configuration, protocol or
+  metric change.
+
 - **`perf(h1)`: a request renders its id once, and the default `Sozu-Id` name not at all.** The
   generated `X-Request-Id`, its copy for the access log and the `Sozu-Id` value of the request and of
   the response were four renderings of the same 26-character ULID, each a `String` from `Ulid`'s

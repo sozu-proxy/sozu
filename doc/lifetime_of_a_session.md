@@ -597,9 +597,10 @@ A WebSocket upgrade on an H1 connection ends in the same `Pipe`.
    connect is retried, up to `CONN_RETRIES` times. A connect that completes
    resets the retry policy (`TcpSession::set_back_connected`).
 3. **Relay.** On Linux with the `splice` feature, a `Protocol::TCP` pipe
-   allocates a `SplicePipe` (`lib/src/splice.rs`) when it is created: two
-   `pipe2(2)` and four `fcntl(2)` (`F_SETPIPE_SZ` and `F_GETPIPE_SZ` on each
-   pipe). The payload then moves socket → pipe → socket with `splice(2)` and
+   takes a `SplicePipe` (`lib/src/splice.rs`) when it is created: an idle pair
+   from the worker's pool when there is one, at no system call, otherwise a new
+   one, two `pipe2(2)` and four `fcntl(2)` (`F_SETPIPE_SZ` and `F_GETPIPE_SZ`
+   on each pipe). The payload then moves socket → pipe → socket with `splice(2)` and
    never enters user space; bytes buffered before the pipe existed drain first
    (`tcp_preread/LIFECYCLE.md` §8). Without splice, or on a WebSocket pipe, the
    `Pipe` copies through its two pooled buffers with `recv`/`send`.
@@ -618,8 +619,12 @@ A WebSocket upgrade on an H1 connection ends in the same `Pipe`.
    `ENOTCONN` and the log showed none, now logs the dialed address, as the
    mux does. `TcpSession::close` then shuts both sockets down with
    `Shutdown::Both` — correct on a plaintext relay, which has no TLS send
-   buffer to truncate — and closes them and the four pipe descriptors,
-   without an `EPOLL_CTL_DEL` (§11).
+   buffer to truncate — and closes them, without an `EPOLL_CTL_DEL` (§11).
+   Dropping the `SplicePipe` returns it to the worker's pool when the pool has
+   room and both of its pipes are empty: its pending counters must read zero,
+   then one `ioctl(FIONREAD)` per pipe must confirm it, so a pair still holding
+   a byte of this session never serves another one. A pair holding bytes, or
+   one beyond the pool's 32 idle pairs, closes its four descriptors.
 
 Measured on the same rig as §6.7, `curl` through a TCP listener to the same
 backend, one connection per request. The `c086b456` column is the closing
@@ -636,6 +641,15 @@ measurement; the #1657 columns come from its own pair of release binaries
 | `getpeername` | ×1 | ×1 | 0 |
 | other setup and teardown | `accept4` ×2, `socket`, `connect`, `setsockopt`, `pipe2` ×2, `fcntl` ×4, `shutdown` ×2, `getsockopt` ×2, `close` ×6 | same | same |
 | heap operations | 14.45, 3 778 bytes | — | — |
+
+Reusing the pipes changes the setup and teardown row. Measured with the same
+rig on `34d5e71f` (#1657 merged) and on the change, release, 20 sequential
+`curl`, two interleaved passes each (load1 21.7–22.1): 34.90 / 34.10 →
+**26.85 / 25.75** system calls per connection; `pipe2` 2.00 → 0.10, `fcntl`
+4.00 → 0.20 (the first connection of the worker still creates its pair),
+`close` 6.00 → 2.00, `ioctl` 0 → 2.00, the rest unchanged but for the
+timing-dependent `splice` and `epoll_wait`. After 1 000 further connections the
+worker holds one idle pair, four pipe descriptors.
 
 ## 10. UDP flow lifecycle
 

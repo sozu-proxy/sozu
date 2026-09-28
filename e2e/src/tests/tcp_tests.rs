@@ -13,6 +13,7 @@ use std::{
     collections::HashMap,
     io::{Read, Write},
     net::{Shutdown, SocketAddr, TcpStream},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -1086,6 +1087,328 @@ fn test_tcp_proxy_multiple_requests() {
             5,
             "TCP multiple requests: N round-trips on one persistent connection",
             try_tcp_proxy_multiple_requests,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 7b: Successive TCP sessions each carry only their own bytes
+//
+// With the splice feature, a worker hands a session's kernel pipes back to
+// a pool when the session ends empty, and the next session takes them
+// (`lib/src/splice.rs`). Each session here sends a payload of its own,
+// several pipe capacities long, that the backend checks and echoes back:
+// a byte of an earlier session reaching a later one fails the test.
+// Protocol-level, so it runs identically without the feature.
+// =========================================================================
+
+fn session_payload(session: usize, len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| (i.wrapping_mul(7).wrapping_add(session * 31) % 251) as u8)
+        .collect()
+}
+
+fn try_tcp_proxy_successive_sessions_keep_their_own_bytes() -> State {
+    const SESSIONS: usize = 8;
+    const LEN: usize = 256 * 1024;
+    let (mut worker, backend_addrs, front_address) = setup_tcp_test("TCP-SUCCESSIVE", 1);
+    // Bound before the client connects, so no wait is needed for the
+    // backend to listen.
+    let listener = bind_std_listener(backend_addrs[0], "successive sessions backend");
+    listener
+        .set_nonblocking(false)
+        .expect("could not set blocking");
+
+    let backend_handle = thread::spawn(move || {
+        let mut intact = 0usize;
+        for session in 0..SESSIONS {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set read timeout");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .expect("set write timeout");
+            let mut request = vec![0u8; LEN];
+            if stream.read_exact(&mut request).is_err() {
+                println!("backend: session {session} request truncated");
+                break;
+            }
+            if request != session_payload(session, LEN) {
+                println!("backend: session {session} received bytes it did not send");
+                break;
+            }
+            if stream.write_all(&request).is_err() {
+                break;
+            }
+            intact += 1;
+        }
+        intact
+    });
+
+    let mut intact = 0usize;
+    for session in 0..SESSIONS {
+        let mut stream = raw_connect(front_address);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("set write timeout");
+        let payload = session_payload(session, LEN);
+        if stream.write_all(&payload).is_err() {
+            break;
+        }
+        let mut response = vec![0u8; LEN];
+        if stream.read_exact(&mut response).is_err() {
+            println!("client: session {session} response truncated");
+            break;
+        }
+        if response != payload {
+            println!("client: session {session} received bytes it did not send");
+            break;
+        }
+        intact += 1;
+    }
+
+    let backend_intact = backend_handle.join().expect("backend thread");
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    println!(
+        "successive sessions: client {intact}/{SESSIONS}, backend {backend_intact}/{SESSIONS}"
+    );
+
+    if stopped && intact == SESSIONS && backend_intact == SESSIONS {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_tcp_proxy_successive_sessions_keep_their_own_bytes() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TCP successive sessions: each session carries only its own bytes",
+            try_tcp_proxy_successive_sessions_keep_their_own_bytes,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 7c/7d: A session that ends with bytes in its splice pipe
+//
+// The two tests above and below end their sessions with empty pipes, so
+// they would pass even if a pipe still holding bytes were handed to the
+// next session. These two end session A while one direction is saturated
+// end to end, so that its kernel pipe (on the splice path) still holds A's
+// bytes when the session closes, then check that session B carries only
+// its own bytes. Every wait is on an event: EAGAIN for saturation, a peeked
+// byte for data having crossed the proxy, and the peer's close for the
+// proxy having torn session A down (the worker drops a session in the
+// same event-loop pass as it closes its sockets, so session B, accepted in
+// a later pass, can only take a pair session A returned).
+// =========================================================================
+
+const SESSION_B: &[u8] = b"session-B";
+
+/// Write `byte` on a non-blocking `stream` until the kernel answers EAGAIN:
+/// every buffer between here and a peer that does not read is then full.
+/// Returns false on any other error.
+fn write_until_saturated(stream: &mut TcpStream, byte: u8) -> bool {
+    let chunk = vec![byte; 64 * 1024];
+    stream.set_nonblocking(true).expect("set nonblocking");
+    let saturated = loop {
+        match stream.write(&chunk) {
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break true,
+            Err(e) => {
+                println!("write until saturated: {e}");
+                break false;
+            }
+        }
+    };
+    stream.set_nonblocking(false).expect("set blocking");
+    saturated
+}
+
+/// Block until the proxy closes `stream`: a read that returns end of file or
+/// a reset. A read timeout is not a close.
+fn wait_for_proxy_close(stream: &mut TcpStream) -> bool {
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => return true,
+            Ok(_) => continue,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ConnectionReset
+                    || e.kind() == std::io::ErrorKind::ConnectionAborted =>
+            {
+                return true;
+            }
+            Err(e) => {
+                println!("wait for proxy close: {e}");
+                return false;
+            }
+        }
+    }
+}
+
+fn set_timeouts(stream: &TcpStream) {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .expect("set write timeout");
+}
+
+/// Client → backend: the backend never reads session A, the client fills
+/// every buffer up to the frontend pipe, and the backend closes A with
+/// unread bytes. The backend must then read exactly session B's bytes.
+fn try_tcp_request_bytes_left_in_the_pipe_never_reach_the_next_session() -> State {
+    let (mut worker, backend_addrs, front_address) = setup_tcp_test("TCP-LEFTOVER-IN", 1);
+    let listener = bind_std_listener(backend_addrs[0], "leftover request backend");
+    listener
+        .set_nonblocking(false)
+        .expect("could not set blocking");
+    let (saturated_tx, saturated_rx) = mpsc::channel::<()>();
+
+    let backend_handle = thread::spawn(move || {
+        let (session_a, _) = listener.accept().expect("backend accept A");
+        set_timeouts(&session_a);
+        // Session A's bytes crossed the proxy before we close it.
+        let mut first = [0u8; 1];
+        let crossed = session_a.peek(&mut first).is_ok_and(|n| n == 1);
+        if saturated_rx.recv().is_err() {
+            return None;
+        }
+        // Closing with unread bytes resets the proxy's backend connection.
+        drop(session_a);
+
+        let (mut session_b, _) = listener.accept().expect("backend accept B");
+        set_timeouts(&session_b);
+        let mut received = vec![0u8; SESSION_B.len()];
+        session_b.read_exact(&mut received).ok()?;
+        Some((crossed, received))
+    });
+
+    let mut session_a = raw_connect(front_address);
+    set_timeouts(&session_a);
+    let saturated = write_until_saturated(&mut session_a, b'a');
+    saturated_tx.send(()).expect("signal backend");
+    let a_closed = saturated && wait_for_proxy_close(&mut session_a);
+    drop(session_a);
+
+    let mut session_b = raw_connect(front_address);
+    set_timeouts(&session_b);
+    let sent_b = a_closed && session_b.write_all(SESSION_B).is_ok();
+
+    let backend = backend_handle.join().expect("backend thread");
+    drop(session_b);
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    let (crossed, received) = backend.unwrap_or_default();
+    println!(
+        "leftover request bytes: saturated={saturated} crossed={crossed} a_closed={a_closed} \
+         backend received {:?}",
+        String::from_utf8_lossy(&received)
+    );
+    if stopped && crossed && sent_b && received == SESSION_B {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_tcp_request_bytes_left_in_the_pipe_never_reach_the_next_session() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TCP: request bytes session A left in the proxy never reach session B's backend",
+            try_tcp_request_bytes_left_in_the_pipe_never_reach_the_next_session,
+        ),
+        State::Success,
+    );
+}
+
+/// Backend → client: client A never reads, the backend fills every buffer
+/// up to the backend pipe, and client A closes with unread bytes. Client B
+/// must then read exactly its own bytes.
+fn try_tcp_response_bytes_left_in_the_pipe_never_reach_the_next_session() -> State {
+    let (mut worker, backend_addrs, front_address) = setup_tcp_test("TCP-LEFTOVER-OUT", 1);
+    let listener = bind_std_listener(backend_addrs[0], "leftover response backend");
+    listener
+        .set_nonblocking(false)
+        .expect("could not set blocking");
+    let (saturated_tx, saturated_rx) = mpsc::channel::<bool>();
+    let (a_closed_tx, a_closed_rx) = mpsc::channel::<bool>();
+
+    let backend_handle = thread::spawn(move || {
+        let (mut session_a, _) = listener.accept().expect("backend accept A");
+        set_timeouts(&session_a);
+        let saturated = write_until_saturated(&mut session_a, b'z');
+        saturated_tx.send(saturated).expect("signal client");
+        // The proxy closes its backend connection once session A is torn
+        // down.
+        let closed = saturated && wait_for_proxy_close(&mut session_a);
+        a_closed_tx.send(closed).expect("signal client");
+        if !closed {
+            return false;
+        }
+        let (mut session_b, _) = listener.accept().expect("backend accept B");
+        set_timeouts(&session_b);
+        session_b.write_all(SESSION_B).is_ok()
+    });
+
+    let session_a = raw_connect(front_address);
+    set_timeouts(&session_a);
+    // Session A's bytes crossed the proxy before we close it.
+    let mut first = [0u8; 1];
+    let crossed = session_a.peek(&mut first).is_ok_and(|n| n == 1);
+    let saturated = saturated_rx.recv().unwrap_or(false);
+    // Closing with unread bytes resets the proxy's frontend connection.
+    drop(session_a);
+    let a_closed = a_closed_rx.recv().unwrap_or(false);
+
+    let mut received = vec![0u8; SESSION_B.len()];
+    let mut read_b = false;
+    if a_closed {
+        let mut session_b = raw_connect(front_address);
+        set_timeouts(&session_b);
+        read_b = session_b.read_exact(&mut received).is_ok();
+    }
+
+    let sent_b = backend_handle.join().expect("backend thread");
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    println!(
+        "leftover response bytes: crossed={crossed} saturated={saturated} a_closed={a_closed} \
+         client B received {:?}",
+        String::from_utf8_lossy(&received)
+    );
+    if stopped && crossed && sent_b && read_b && received == SESSION_B {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_tcp_response_bytes_left_in_the_pipe_never_reach_the_next_session() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TCP: response bytes session A left in the proxy never reach client B",
+            try_tcp_response_bytes_left_in_the_pipe_never_reach_the_next_session,
         ),
         State::Success,
     );
