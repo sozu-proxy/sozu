@@ -51,7 +51,7 @@ Each step draws one weighted-random action:
 | weight | action            | what it exercises                                  |
 |--------|-------------------|----------------------------------------------------|
 |   34   | `ClientDatagram`  | admission, reuse, buffer, forward (incl. empty / oversized payloads) |
-|   16   | `BackendResolved` | await→established transition (valid + stale id)     |
+|   16   | `ChangeBackendSet`| the backend set the core selects from, changed between admissions (an empty set included) |
 |   14   | `BackendDatagram` | NAT return path (valid + unknown / closed id)       |
 |   14   | `AdvanceClock`    | idle reaper (small jumps + occasional mass-reap)    |
 |    6   | `ReconfigCluster` | reconfig storms (affinity / caps / PPv2 / timeouts) |
@@ -63,8 +63,11 @@ Each step draws one weighted-random action:
 
 After **every** action the workload fully drains `poll_output()` to `None`,
 folding each `Output` into a shadow model (tracking `FlowCreated` / `FlowEvicted`
-for active-flow accounting) and honouring a subset of `SelectBackend` requests
-with `BackendResolved` so flows progress to `Established`.
+for active-flow accounting, and recording each `OpenUpstream` flow as
+established). Selection happens inside the core, from the harness's
+`SimBackends` set lent with each `ClientDatagram`, so there is no selection
+request to answer: the retired `SelectBackend` / `BackendResolved` round trip is
+replaced by `ChangeBackendSet`, which changes that set between two admissions.
 
 **Swarm configurations** (Groce et al., ISSTA 2012 — see
 `doc/testing.md` §5 "Swarm configurations" for the full doctrine): each seed
@@ -88,8 +91,8 @@ manager — so the long run keeps admitting afterwards.
 
 `buggify_with_prob!(p)` is moonpool's [FoundationDB `buggify`][fdb-buggify]
 primitive: with low per-call probability it injects an *extra* adversarial event
-(stale `BackendResolved`, a reconfig burst, a `max_flows` shrink to a tiny value,
-a giant clock jump). It only ever runs under simulation. Each arm is gated by
+(a backend set emptied then refilled, a reconfig burst, a `max_flows` shrink to
+a tiny value, a giant clock jump). It only ever runs under simulation. Each arm is gated by
 its sibling grammar feature: a swarm configuration that omits a feature omits
 its fault as well (the arm is skipped, never redrawn).
 

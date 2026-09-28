@@ -246,9 +246,9 @@ pub struct Stream {
     /// from an untouched request, so this is what keeps
     /// `end_stream_decision` and `ConnectionH2::handle_goaway_frame` from
     /// linking it to another backend, where the stale frames would decode
-    /// against another table — another client's fields, or a
-    /// COMPRESSION_ERROR that takes the shared connection down
-    /// (sozu-proxy/sozu#1632). An H1 backend never sets it: its output is
+    /// against another table — fields another request of this frontend
+    /// connection inserted (a backend connection belongs to one `Mux`), or a
+    /// COMPRESSION_ERROR that takes that connection down (sozu-proxy/sozu#1632). An H1 backend never sets it: its output is
     /// protocol bytes any fresh H1 connection can send as they are.
     ///
     /// Cleared with the front kawa, wherever the slot takes a new request.

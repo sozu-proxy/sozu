@@ -770,7 +770,7 @@ pub(super) fn tcp_info_reads() -> usize {
 ///
 /// Skipping it changes nothing on the wire. None of these descriptors is
 /// shared (no `dup`, `try_clone` or fork; see `doc/lifetime_of_a_session.md`
-/// §9), so the `close(2)` that follows is the last one, and Linux's
+/// §11), so the `close(2)` that follows is the last one, and Linux's
 /// `tcp_close` then sends the FIN after the queued bytes itself when the
 /// receive queue is empty, or a RST when it is not — whether or not a
 /// `shutdown(SHUT_WR)` came first. Once the peer has closed, the shutdown is

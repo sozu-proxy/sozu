@@ -226,7 +226,7 @@ Declared in `h2.rs` (`pub enum H2State`):
   before them), `ClientSettings` flushes them and turns READABLE on, and
   `ServerSettings` waits for the server's SETTINGS. A write readiness in
   `ServerSettings` is withdrawn, not an error: `ConnectionH2::start_stream`
-  arms one for every stream the router links, and `Router::connect` links onto
+  arms one for every stream the router links, and `Router::plan_connect` links onto
   a `Connected` connection whatever its handshake state; the SETTINGS ACK the
   read then queues re-arms it (sozu-proxy/sozu#1631,
   `a_backend_stream_ended_during_the_handshake_keeps_the_connection`,
@@ -616,7 +616,8 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
 `StreamState::Recycle` marks a slot as **logically free but still allocated**.
 It means:
 
-- The pool buffers have been cleared (`mod.rs:1251-1254`).
+- The pool buffers are cleared when the slot is taken over (the reuse branch
+  of `Context::create_stream`, `mod.rs`).
 - Metrics have been reset — the `SessionMetrics::reset` call in
   `Context::create_stream`'s recycled-slot branch (`mod.rs`).
 - The slot can be handed back to a new request by `Context::create_stream`
@@ -655,7 +656,7 @@ runs — see §6.
 
 ### 4.2 `Context.streams` (per-session buffer array)
 
-- Type: `Vec<Stream>` — `mod.rs:872`.
+- Type: `Vec<Stream>` — the `Context::streams` field (`mod.rs`).
 - Scope: one `Vec` per `Mux` session. **Both** H1 and H2 frontends use it, and
   **every** backend `ConnectionH2` attached to this session indexes into it.
 - Index: `GlobalStreamId = usize` (`mod.rs`).
@@ -687,7 +688,7 @@ with at most one live stream at a time.
 ### 5.1 The fields
 
 Both private fields of [`H2StreamTable`](h2_stream_table.rs)
-(`h2_stream_table.rs:129-131`) since the step-3 extraction, reached from
+(`H2StreamTable::expect_read`, `H2StreamTable::expect_write`) since the step-3 extraction, reached from
 `h2.rs` only through `expect_read()`/`set_expect_read()` and
 `expect_write()`/`set_expect_write()`:
 
@@ -747,7 +748,8 @@ Dereference sites:
 - `read_buffer` — indexes `context.streams[global_stream_id]` on behalf of
   both halves of the read protocol: `ConnectionH2::poll_read_target` and
   `ConnectionH2::handle_read` each hand it `&mut context.streams`, and its
-  `H2StreamId::Other` arm does the dereference at `h2.rs:1439`. `readable`
+  `H2StreamId::Other` arm does the dereference (the free function
+  `read_buffer`, `h2.rs`). `readable`
   itself only sits between the two halves — it reaches this slice through
   `read_space`, which calls `read_buffer` for it.
 
@@ -1061,7 +1063,7 @@ read the same `ConnectionH2.now` — see §7.5.
 
 Every deadline above is evaluated against a snapshot, not against a fresh
 `Instant::now()`. **`Mux` is the only clock sampler in the mux.** It writes
-`Context.now` (`mod.rs:981`) at three points:
+`Context.now` (the `Context::now` field, `mod.rs`) at three points:
 
 - once per **outer** `Mux::ready` pass (the top of `Mux::ready_inner`'s outer
   loop), so that the inner loop
@@ -1383,8 +1385,10 @@ Three directions:
   still pending open; the burnt id is closed implicitly by the next HEADERS on
   a higher id (§5.1.1), and a HEADERS block parked unsent is dropped with the
   stream and resets the HPACK encoder's table on the next pass (§9 invariant
-  28). The connection is shared by the streams of several clients
-  (`Router::connect`), so a RST here used to cost all of them
+  28). The connection is shared by the concurrent streams of the session's
+  one frontend connection (`Router::plan_connect`; a backend connection
+  belongs to one `Mux` session and is never shared with another client
+  connection), so a RST here used to cost all of them
   (sozu-proxy/sozu#1631). Pinned by
   `a_backend_stream_ended_before_its_headers_left_is_not_reset`,
   `a_backend_stream_ended_before_the_preface_leaves_the_preface_first`,
@@ -1647,10 +1651,12 @@ none of them. `front.consumed` is then still false, but the request is no
 longer untouched: its frames carry that connection's stream id and field blocks
 encoded against that connection's encoder table, and the blocks are gone, so it
 can be neither sent on nor encoded for another connection. Re-linked, it used
-to go out first on the new connection — possibly one `Router::connect` shares
-with other clients — where the block decodes against another table: another
-client's indexed fields, or a COMPRESSION_ERROR/PROTOCOL_ERROR that takes the
-whole connection down (sozu-proxy/sozu#1632). `Stream::front_bound_to_backend`
+to go out first on the new connection — possibly one `Router::plan_connect`
+shares with the other streams of the same frontend connection — where the
+block decodes against another table: another request's indexed fields, or a
+COMPRESSION_ERROR/PROTOCOL_ERROR that takes the whole connection down
+(sozu-proxy/sozu#1632). Both stay within one frontend connection, since a
+backend connection belongs to one `Mux` session. `Stream::front_bound_to_backend`
 records it: set by the `Position::Client` prepare of
 `ConnectionH2::poll_write_target` when it leaves output, cleared with the front
 kawa where a slot takes a new request (`Context::create_stream`'s reuse,
@@ -2780,10 +2786,11 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     request has reached the socket, so its HEADERS have not left and the
     stream is idle on the backend. Retiring it (`ConnectionH2::end_stream`,
     `ConnectionH2::cancel_timed_out_streams`) queues nothing, and a request
-    in error is not handed to the converter (`H2WritePhase::Prepare`): a RST_STREAM on
-    an idle stream is a connection error (RFC 9113 §5.1, §6.4) on a
-    connection other clients share. The client preface is the first thing
-    queued on a backend connection (debug-asserted in the `ClientPreface` arm
+    in error is not handed to the converter (`H2WritePhase::Prepare`): a
+    RST_STREAM on an idle stream is a connection error (RFC 9113 §5.1,
+    §6.4) on a connection the other streams of the same frontend connection
+    share. The client preface is the first thing queued on a backend
+    connection (debug-asserted in the `ClientPreface` arm
     of `ConnectionH2::dispatch_writable_state`), and a write readiness while
     the server's SETTINGS are awaited is withdrawn, never answered with a
     disconnect (§2.2, §8.2, sozu-proxy/sozu#1631).
@@ -2851,7 +2858,12 @@ If you are fixing a bug in this module:
   `prune_inactive_streams_while_closing` (`h2.rs`) and make sure every
   removal increments nothing and decrements what it should.
 
-Last revision date of the surviving line anchors: 2026-09-25, against
+Last revision date of the surviving line anchors: 2026-09-28, when the last
+five `file.rs:NNN` anchors outside a pinned code block (§3.3, §4.2, §5.1,
+§5.2, §7.5) were converted to the symbols their prose names; the only line
+numbers left in this file are the ranges of pinned code blocks, which
+`check_doc_citations.py` compares line by line. The sweep before that was
+2026-09-25, against
 `refactor/h2-writable-flush-lift` (issue #1339 Q10, lifting the
 `(H2State::Error, Position::Server)` and `H2State::GoAway` flush triples out of
 `ConnectionH2::writable` into `ConnectionH2::dispatch_writable_state` and
@@ -2911,3 +2923,51 @@ Regression coverage:
 - `lib/tests/log_layout.rs` — static check that this site uses
   `log_context!(self)` and that no protocol/runtime log call drifts away from
   the canonical envelope.
+
+---
+
+## 12. What a request costs on the nominal path
+
+The hot-path work of 2026-09-26 to 2026-09-28 (`doc/hot_path_zero_copy.md`)
+left the mux with the costs below. Measured figures per protocol are in
+`doc/lifetime_of_a_session.md` §6.7 (H1) and §7.6 (H2); this section says where
+in the mux each remaining cost sits, so a change that adds one is visible in
+review.
+
+**Once per session.** The session object (`Rc<RefCell<HttpSession>>` or
+`HttpsSession`) holds the `Mux` inline, including the first backend connection
+(`BackendConnections`), the frontend's timer handle (`MuxTimeouts`), the first
+entry of `Context::backend_streams` (`InlineTokenMap` of `LinkedStreams`) and an
+empty `DebugHistory`. A connection's first stream slot, its first
+`BackendRegistry` entry, `Context::pending_links` and its write-descriptor
+vectors (`io_slices`) are each allocated once, sized for one. The H2 output
+queue (`H2Output`) holds 128 bytes inline and allocates only under
+backpressure.
+
+**Once per connection.** The access log's RTT cells cost one
+`getsockopt(TCP_INFO)` per connection and side, at its first logged request
+(`memoized_rtt`, `Connection::rtt`). The H1 forwarding values are rendered once
+per frontend connection (`ForwardingHop`, `kawa_h1/LIFECYCLE.md` §2). A backend
+connection costs `socket`, `connect`, `setsockopt(TCP_NODELAY)` and
+`epoll_ctl(EPOLL_CTL_ADD)` when it is dialled (`Mux::dial_backend`), and its
+`close(2)` with no `EPOLL_CTL_DEL`; a `shutdown(SHUT_WR)` only while its peer has
+not closed (`shutdown_write`).
+
+**Once per request or stream.** The stream's request id is minted without a
+system call (`Context::next_request_id`) and rendered once into an `Rc<str>`
+that its headers and its log line share. Routing, the per-(cluster,
+source-IP) gate and a reused backend copy no identifier: the cluster id is a
+`ClusterId = Arc<str>` and the backend id an `Rc<str>` interned per session
+(`BackendRegistry::id_for`), both cloned by reference count. One read per
+direction and flight (a short read stops it, `update_readiness_after_read`),
+one `writev(2)` per direction and write pass (`h2_transmit::gather`, and
+`h2_transmit::gather_after` behind the H2 output queue), and one access-log
+record rendered into the logger's reused buffer. `Instant::now()` is sampled
+once per `Mux` pass through the vDSO (§7.5).
+
+**What is held by tests.** The allocation budgets use `crate::test_allocations`
+(`doc/testing.md` §2) and the system-call counts use counters compiled under
+`cfg(test)` (`protocol::mux::sample_rtt`'s read count, `shutdown_write`'s
+shutdown count, `crate::socket::tls_writes`); the list of tests, one per
+property, is `doc/hot_path_zero_copy.md` §5.
+

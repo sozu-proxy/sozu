@@ -376,6 +376,33 @@
 
 ### 🔄 Changed
 
+- **`docs`: the hot-path zero-copy and system-call work of 2026-09-26 to 2026-09-28 is written up,
+  and the request lifecycles describe the code as it now stands
+  ([#1656](https://github.com/sozu-proxy/sozu/pull/1656)).** The new
+  `doc/hot_path_zero_copy.md` records the goal (no per-request system call or allocation the
+  request does not need, and access logs rendered without allocating), the measurement method
+  (intentrace, an `LD_PRELOAD` descriptor tracer and allocation counter, `crate::test_allocations`),
+  one section per change with its before/after figures and pull requests, the correctness fixes
+  found along the way, and a table of the tests that hold each invariant. It adds a closing
+  measurement taken on 2026-09-28 with one release binary at `b5169d44` and one at `c086b456`,
+  interleaved, per request: H1 26.25–26.70 → 18.45–18.85 system calls and 83.65–83.85 → 39.95–40.35
+  heap operations; H1 keep-alive 14.75 → 9.65 and 50.80 → 7.80; H2 over TLS 61.25–61.60 →
+  40.15–40.75 and 412.15–413.90 → 240.60–241.75; H2 multiplexed 25.05 → 13.55. `doc/lifetime_of_a_session.md`
+  is rewritten: accept, TLS, PROXY pre-flight, the H1, H2, TCP and UDP lifecycles, close, soft stop
+  and GOAWAY, with the system calls and allocations each step still pays on the nominal path. It
+  also corrects two statements the code contradicted: a TCP session is closed on the first soft-stop
+  pass (`TcpSession::shutting_down` answers `true`), and a UDP listener session is drained by
+  `UdpProxy::notify`'s `SoftStop` arm, not by `shutting_down`. `lib/src/protocol/udp/LIFECYCLE.md`
+  no longer describes a `SelectBackend` / `BackendResolved` round trip that was removed when
+  selection moved into the core, and gains a per-datagram cost table. The `file.rs:NNN` citations
+  of `doc/lifetime_of_a_session.md` and of the UDP, kawa-H1 and mux `LIFECYCLE.md` files are now
+  symbol citations, which a line shift above them cannot move; the pinned code blocks keep their
+  line ranges. The Security and Fixed entries for #1627, #1631 and #1632 no longer describe an H2
+  backend connection as shared by several clients: it belongs to one `Mux` session and carries the
+  streams of one frontend connection only, so another user is reachable only behind an
+  intermediary that multiplexes users on one frontend connection. Documentation only: no
+  production code, no test and no dependency changes.
+
 - **`chore(deps)`: bump `kawa` to [0.7.2](https://github.com/CleverCloud/kawa/releases/tag/v0.7.2);
   Sōzu's two H1 framing guards stay as defense in depth.** kawa 0.7.2 brings three parser fixes
   upstream. [CleverCloud/kawa#26](https://github.com/CleverCloud/kawa/pull/26) accepts only
@@ -1099,7 +1126,7 @@
   protocol. mio 1.x keeps no per-source state on epoll or kqueue for a deregister to release.
   `L7Proxy::deregister_socket` was left without a caller and is removed by
   [#1615](https://github.com/sozu-proxy/sozu/issues/1615). Regression tests read the
-  kernel's epoll table from `/proc/self/fdinfo`; `doc/lifetime_of_a_session.md` §9 carries the
+  kernel's epoll table from `/proc/self/fdinfo`; `doc/lifetime_of_a_session.md` §11 carries the
   argument.
 
 - **`perf(backends)`: a backend selection allocates nothing and clones one `Rc`
@@ -3464,16 +3491,18 @@
   is written after the response).
 
 - **`fix(mux-h2)`: a backend stream ended before its HEADERS left sozu is forgotten instead of
-  reset, so one client cancelling a request no longer takes down the shared backend connection
-  ([#1631](https://github.com/sozu-proxy/sozu/issues/1631)).** `ConnectionH2::start_stream`
+  reset, so cancelling one request no longer takes down the backend connection its sibling
+  streams share ([#1631](https://github.com/sozu-proxy/sozu/issues/1631)).** `ConnectionH2::start_stream`
   allocates a stream id when the router links a request, but its HEADERS leave with a later
   write pass. When the frontend gave up in between (client RST_STREAM or disconnect, stream or
   backend timeout), `ConnectionH2::end_stream` and `ConnectionH2::cancel_timed_out_streams`
   queued `RST_STREAM(CANCEL)` for a stream the backend had never seen: a connection error on an
   idle stream (RFC 9113 §5.1, §6.4), sent ahead of the connection preface when the TCP connect
-  was still in progress (§3.4). `Router::connect` multiplexes the streams of several clients on
-  one H2 backend connection, including one still connecting, so every other request on it was
-  lost. A stream whose request never reached the socket (`front.consumed` false on
+  was still in progress (§3.4). `Router::plan_connect` multiplexes the concurrent streams of one
+  frontend connection on one H2 backend connection of the session, including one still
+  connecting, so every other request of that frontend connection on it was lost. The backend
+  connection belongs to that one `Mux` session (`Mux::router`) and is never shared with another
+  client connection. A stream whose request never reached the socket (`front.consumed` false on
   `Position::Client`, the HEADERS block possibly still parked in `front.out`) is now retired with
   no frame at all, as hyperium/h2 drops a stream still pending open; its id is burnt, and the
   next HEADERS on a higher id closes it implicitly (RFC 9113 §5.1.1). A block parked unsent goes
@@ -5603,7 +5632,7 @@
   ([#1615](https://github.com/sozu-proxy/sozu/issues/1615)).** It has had no caller since
   [#1567](https://github.com/sozu-proxy/sozu/issues/1567) stopped closing sessions with
   `EPOLL_CTL_DEL`: the last close of a session socket removes it from the epoll set
-  (`doc/lifetime_of_a_session.md` §9). The trait declaration goes with its `HttpProxy` and
+  (`doc/lifetime_of_a_session.md` §11). The trait declaration goes with its `HttpProxy` and
   `HttpsProxy` implementations and two `unreachable!` test doubles. An embedder implementing
   `L7Proxy` drops the method; one that called it through the trait calls `Registry::deregister`
   on its own `mio::Registry` instead, as the health checker and the listener paths already do.
@@ -5742,8 +5771,8 @@
   request received both request lines and one `Sozu-Id`.
 
 - **`fix(mux-h2)`: a request HPACK-encoded for one H2 backend connection and not yet sent is
-  never re-linked to another backend, where its stale frames could deliver other clients'
-  fields or take a shared connection down
+  never re-linked to another backend, where its stale frames could deliver fields of another
+  request of the same frontend connection or take that backend connection down
   ([#1632](https://github.com/sozu-proxy/sozu/issues/1632)).** An H2 backend's write pass
   encodes a request in `kawa.prepare`: it pops the request's header blocks and leaves
   HEADERS/CONTINUATION frames in `front.out`, carrying that connection's stream id and a field
@@ -5752,11 +5781,15 @@
   answered `Reconnect`) or refused the stream with a GOAWAY below it
   (`ConnectionH2::handle_goaway_frame` re-linked every unconsumed stream above
   `last_stream_id`), the request was linked to another backend with those frames. They went out
-  first there. `Router::connect` prefers an existing connection of the cluster, usually shared
-  by other clients: with a stream id above that connection's highest, the backend decoded the
-  stale block against the shared table and rebuilt a request carrying fields other clients had
-  inserted (for example an indexed `authorization`-like header); otherwise it answered
-  PROTOCOL_ERROR or COMPRESSION_ERROR and closed every stream on it. Proven at connection level:
+  first there. `Router::plan_connect` prefers an existing connection of the cluster, usually
+  shared by the other streams of the same frontend connection: with a stream id above that
+  connection's highest, the backend decoded the stale block against that connection's table and
+  rebuilt a request carrying fields those other requests had inserted (for example an indexed
+  `authorization`-like header); otherwise it answered PROTOCOL_ERROR or COMPRESSION_ERROR and
+  closed every stream on it. The scope is one frontend connection: a backend connection belongs
+  to one `Mux` session (`Mux::router`) and is never shared across client connections, so
+  another user's fields are reachable only behind an intermediary that multiplexes several
+  users on one frontend connection. Proven at connection level:
   a request encoded on backend A and offered to backend B went out on B unchanged, stream id 1
   and A's field block. `Stream::front_bound_to_backend` now marks a request an H2 backend has
   encoded; `end_stream_decision` answers it `502` instead of `Reconnect`,
@@ -5792,8 +5825,10 @@
   an older entry was decoded by the peer as a different field, with no error (measured:
   `x-c: 3` encoded, `x-a: 1` decoded, and a literal naming `x-c` read under the name `x-a`),
   and naming a newer one failed with `COMPRESSION_ERROR`. On a backend connection, where the
-  streams of several clients share one encoder, the substituted field can belong to another
-  client's request. The fix uses the reset RFC 7541 §4.2 provides ("setting a maximum size of
+  concurrent streams of one frontend connection share one encoder, the substituted field can
+  belong to another request of that frontend connection; a backend connection belongs to one
+  `Mux` session (`Mux::router`), so it reaches another user's request only behind an
+  intermediary that multiplexes several users on one frontend connection. The fix uses the reset RFC 7541 §4.2 provides ("setting a maximum size of
   0, which can subsequently be restored"): `Encoder::reset_table` empties the encoder's table
   and the next header block opens with the size updates `0`, then the maximum size, which
   empty the peer's table too. `ConnectionH2::parked_header_block` records, where a write pass
@@ -8145,7 +8180,7 @@
   `impl kawa::AsBuffer for Checkout` are all live and consumed by `mux`. `answers.rs` was assessed
   item by item and **nothing** in it became dead. `lib/src/protocol/kawa_h1/LIFECYCLE.md` has been
   rewritten from "H1 session lifecycle" to "the H1 vocabulary the mux builds on", with its
-  citations refreshed; `doc/lifetime_of_a_session.md` §6.1, `doc/testing.md`, `doc/observability.md`
+  citations refreshed; `doc/lifetime_of_a_session.md` §6, `doc/testing.md`, `doc/observability.md`
   (the `KAWA-H1` log tag no longer exists), `doc/configure.md`, `doc/benchmark.md` (a pre-mux
   profiler capture, kept verbatim with a note), `e2e/COVERAGE.md`, `lib/README.md`,
   `lib/src/protocol/proxy_protocol/LIFECYCLE.md` and `CLAUDE.md` are updated in the same changeset.
@@ -8635,10 +8670,11 @@
 
   No prose claim was rewritten to match the code. Four have gone stale and are recorded here rather
   than silently corrected, because a citation repair that also edits claims cannot be reviewed as
-  either one. `doc/lifetime_of_a_session.md` §2.2 names `mux::connection` as the home of the
+  either one. `doc/lifetime_of_a_session.md` §2.2 (§2.3 since 2026-09-28) named `mux::connection` as the home of the
   `signal_pending_write` / `arm_writable` invariant, where that module's own doc comment delegates
   to `mux::h2`; the same section attributes the "invariant-15 pair" to module documentation in
-  `mux::answers`, where the phrase appears only on a test. Its §9 lists `mux::router` among the
+  `mux::answers`, where the phrase appears only on a test. Its §9 (§11 since 2026-09-28; the
+  passage no longer exists) lists `mux::router` among the
   per-stream `backend.pool.size` decrements: `Router::connect` does carry a `-1`, but only as a
   rollback when mio registration fails, and the comment beside its `+1` names the two real partners,
   in `mux::connection` and `mux::mod`. `doc/configure_admin_ops.md` §5.5 points at a

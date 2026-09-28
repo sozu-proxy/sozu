@@ -1755,9 +1755,9 @@ timed out — is idle for the backend. RFC 9113 §5.1 and §6.4 make any frame b
 HEADERS or PRIORITY on an idle stream, RST_STREAM included, a connection error
 (hyperium/h2 answers GOAWAY(PROTOCOL_ERROR) from `Recv::ensure_not_idle`,
 HAProxy from `h2_frame_check_vs_state`), and a frame queued before the preface
-breaks it (§3.4). `Router::connect` multiplexes the streams of several clients
-on one backend connection, still connecting included, so one cancelled request
-used to cost all of them
+breaks it (§3.4). `Router::plan_connect` multiplexes the concurrent streams of
+one frontend connection on one backend connection of its `Mux` session, still
+connecting included, so one cancelled request used to cost all of them
 ([#1631](https://github.com/sozu-proxy/sozu/issues/1631)). The
 `Position::Client` arm of `ConnectionH2::end_stream` and
 `ConnectionH2::cancel_timed_out_streams` now queue nothing for such a stream,
@@ -1971,8 +1971,12 @@ entry one index down in the encoder's table only, and a later block naming an
 older entry makes the peer read a different field with no error at all:
 `hpack::tests::a_dropped_block_substitutes_fields_until_the_table_is_reset`
 encodes `x-c: 3` and the peer reads `x-a: 1`. On a backend connection, where
-the streams of several clients share one encoder, that is one client's field
-delivered in another client's request.
+the concurrent streams of one frontend connection share one encoder, that is
+one request's field delivered in another request of the same frontend
+connection. A backend connection belongs to one `Mux` session (`Mux::router`)
+and is never shared across client connections, so the field of a different
+user is reachable only behind an intermediary that multiplexes several users on
+one frontend connection.
 
 The repair is the one RFC 7541 §4.2 provides: "This mechanism can be used to
 completely clear entries from the dynamic table by setting a maximum size of 0,
@@ -2039,11 +2043,12 @@ If the socket takes none of it and the connection is then lost, or refuses the
 stream with a GOAWAY below it, the request still reads `front.consumed ==
 false`, which used to mean "untouched, retry it elsewhere"
 ([#1632](https://github.com/sozu-proxy/sozu/issues/1632)). Re-linked, its
-stale frames went out first on the new connection. `Router::connect` prefers an
-existing connection of the cluster, usually shared: a stream id above that
-connection's highest opens a stream whose field block resolves its dynamic
-indexes against another table, so the backend rebuilds a request carrying
-fields other clients inserted there; any other id, or an index out of range, is
+stale frames went out first on the new connection. `Router::plan_connect`
+prefers an existing connection of the cluster, usually shared by the other
+streams of the same frontend connection: a stream id above that connection's
+highest opens a stream whose field block resolves its dynamic indexes against
+another table, so the backend rebuilds a request carrying fields those other
+requests inserted there; any other id, or an index out of range, is
 a PROTOCOL_ERROR or COMPRESSION_ERROR that ends every stream on it.
 
 `Stream::front_bound_to_backend` marks the request once an H2 backend has

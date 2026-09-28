@@ -762,7 +762,7 @@ impl UdpProxy {
         self.cluster_for_listener.insert(token, cluster_id);
 
         // Commit the cluster routing into the manager so admitted flows know
-        // which cluster to `SelectBackend` against.
+        // which cluster to select a backend from (`BackendSource::select`).
         if let Some(mgr) = self.managers.get(&token) {
             let listener = self.listeners.get(&token).unwrap();
             let cfg = {
@@ -2210,7 +2210,7 @@ mod tests {
         } = prebuild_server(16, 16384, false).expect("could not prebuild a test server");
 
         // A reachable backend so the flow is admitted and established rather
-        // than aborted by `on_select_backend`'s no-backend path.
+        // than dropped by the core's no-backend path (`DropReason::NoBackend`).
         backends.borrow_mut().add_backend(
             CLUSTER,
             Backend::new(

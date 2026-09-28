@@ -2,775 +2,831 @@
 
 ## 1. Audience and purpose
 
-Operator-and-new-contributor entry point for "how a request flows
-through Sōzu". It explains the single-threaded mio worker, where the
-per-protocol state machines sit, where the HTTP/1.1 vs HTTP/2
-boundary is drawn, and which files to read next.
+Operator-and-new-contributor entry point for "how a request flows through
+Sōzu". It follows a connection from `accept(2)` to `close(2)` for every
+protocol the worker serves — HTTP/1.1, HTTP/2, raw TCP and UDP — and says, at
+each step, which system calls and heap allocations the nominal path still
+pays. The figures come from the measurement described in
+[`hot_path_zero_copy.md`](./hot_path_zero_copy.md) §2, taken on 2026-09-28 at
+`c086b456`; that document also explains why each cost that used to be here is
+gone.
 
 For deep per-protocol detail, follow the `LIFECYCLE.md` siblings:
 
 - HTTP/1.1 and HTTP/2 mux: [`lib/src/protocol/mux/LIFECYCLE.md`](../lib/src/protocol/mux/LIFECYCLE.md)
-- H1 vocabulary shared with the mux (`DefaultAnswer`, answer templates, `HttpContext`, `Method`): [`lib/src/protocol/kawa_h1/LIFECYCLE.md`](../lib/src/protocol/kawa_h1/LIFECYCLE.md)
+- H1 vocabulary shared with the mux (`HttpContext`, header editing, default answers): [`lib/src/protocol/kawa_h1/LIFECYCLE.md`](../lib/src/protocol/kawa_h1/LIFECYCLE.md)
 - PROXY-protocol pre-flight: [`lib/src/protocol/proxy_protocol/LIFECYCLE.md`](../lib/src/protocol/proxy_protocol/LIFECYCLE.md)
-- UDP datagram flows (connectionless; sits outside the per-session model): [`lib/src/protocol/udp/LIFECYCLE.md`](../lib/src/protocol/udp/LIFECYCLE.md)
+- TCP SNI/ALPN preread: [`lib/src/protocol/tcp_preread/LIFECYCLE.md`](../lib/src/protocol/tcp_preread/LIFECYCLE.md)
+- UDP datagram flows: [`lib/src/protocol/udp/LIFECYCLE.md`](../lib/src/protocol/udp/LIFECYCLE.md)
 - Master/worker supervisor: [`bin/src/command/LIFECYCLE.md`](../bin/src/command/LIFECYCLE.md)
 
-This file stays narrative. Cited paths are repo-relative; SHA-pinned
-permalinks have been removed because they rot. Where the prose names an
-item — a function, a method, a struct, an enum, a field — the anchor is that
-item plus its file, with no line number, because a line number does not
-survive an edit above it. A `file.rs:LINE` or `file.rs:LINE-LINE` anchor is
-kept only where the claim is about a specific statement or branch inside an
-item; those were refreshed against `main` at `ba7fa5f9` on 2026-09-20.
+This file stays narrative. Paths are repo-relative. Every anchor is a symbol —
+a function, a method, a type or a field, plus its file — never a line number,
+because a line number does not survive an edit above it; where the prose means
+one branch inside a function, it names the branch in words.
 
 ## 2. Conceptual primitives
 
 ### 2.1 The mio event loop
 
-A Sōzu worker is a single OS thread that owns one `mio::Poll`
-(`Server::poll` in `lib/src/server.rs`). On Linux this is a thin wrapper
-around `epoll(7)`; on the BSDs and macOS it is `kqueue(2)`. The worker
-registers every socket — listen sockets, frontend, backend, metrics,
-unix command-channel pair — with that single poller, then loops
-reading events out of `Events` and dispatching them to the correct
-session. Loop time is observable via the `epoll_time` time! metric
-(`names::event_loop::EPOLL_TIME` in `Server::run`, `lib/src/server.rs`).
+A Sōzu worker is a single OS thread that owns one `mio::Poll` (`Server::poll`
+in `lib/src/server.rs`). On Linux this is `epoll(7)`; on the BSDs and macOS it
+is `kqueue(2)`. The worker registers every socket — listeners, frontend and
+backend sockets, the metrics socket, the command channel — with that one
+poller, then loops in `Server::run`:
 
-### 2.2 Edge-triggered readiness and the writable invariant
+1. one `epoll_wait(2)`, whose timeout is the next timer date capped by
+   `poll_timeout` (1 s);
+2. the command channel (token 0), the timer wheel (token 1), the metrics socket
+   (token 2), the TCP and UDP health checkers, then every other token through
+   `Server::ready` to the session that owns it;
+3. `handle_remaining_readiness`, `create_sessions` (the accept queue, §3.2),
+   `zombie_check`, the health checkers' `poll` and `UdpProxy::health_poll`;
+4. the gauges, the metrics flush, and — during a soft stop — one
+   `shut_down_sessions` pass (§10).
 
-mio runs in edge-triggered mode: the kernel notifies the worker only
-once when a socket transitions to readable or writable. If Sōzu does
-not drain the kernel buffer fully on that wake-up, it gets no other
-event until the *next* edge.
+Nothing in steps 2 to 4 issues a system call per turn unless a socket has work:
+`UdpProxy::health_poll` borrows the worker's `Registry` instead of cloning it,
+which used to cost an `fcntl(F_DUPFD_CLOEXEC)` and a `close(2)` on every turn
+whether or not a UDP cluster existed
+([#1553](https://github.com/sozu-proxy/sozu/pull/1553)). Loop time is observable
+through the `epoll_time` and `event_loop_time` metrics
+(`names::event_loop`, `lib/src/metrics/names.rs`). Clocks are read through the
+vDSO and cost no system call: the mux samples `Instant::now()` once per pass
+(`lib/src/protocol/mux/LIFECYCLE.md` §7.5).
 
-On the read side, "drained" is detected without a wasted `recv(2)`
-([#1602](https://github.com/sozu-proxy/sozu/issues/1602)). A read that
-returns fewer bytes than it was offered has emptied the stream socket's
-receive queue (`man 7 epoll`), so `plain_socket_read` and
-`rustls_socket_read` (`lib/src/socket.rs`) stop there and answer
-`WouldBlock` with the bytes instead of reading on to an EAGAIN; any byte
-that arrives later raises a new edge. A read that fills its buffer is not
-a short read and answers `Continue`. The one exception is a FIN that
-arrived with the data: its edge is the HUP already folded into the
-readiness, and nothing will announce the EOF again, so
-`update_readiness_after_read` (`lib/src/protocol/mux/mod.rs`) keeps
-READABLE after a short read once HUP was seen and the next pass reads the
-EOF. The pipe and the pre-mux states act on HUP directly
-(`Pipe::frontend_hup`, `Pipe::backend_hup`) and need no EOF read.
+### 2.2 Edge-triggered readiness and short reads
 
-A TLS frontend also carries that proof from one read call to the next
-([#1609](https://github.com/sozu-proxy/sozu/issues/1609)). The H2 read
-path asks for one frame header, then one payload, so the frames of one
-record are served by several calls from rustls's plaintext buffer, and
-the call that emptied it used to `recv` once more for an EAGAIN.
-`FrontRustls::recv_memory` (`RecvMemory`, `lib/src/socket.rs`) remembers
-that a `recv` answered short or EAGAIN, and `HttpsSession::update_readiness`
-(`lib/src/https.rs`) clears it on every event delivered for the frontend
-token, in every session state: a byte that arrived after the proof raised
-an edge that is either pending in epoll, and re-arms READABLE when the next
-`epoll_wait` delivers it, or already delivered, which cleared the memory.
-HUP or ERROR turns the memory off for good, so a FIN that arrived with the
-data is read by the next call as above.
+mio registers every socket edge-triggered (`EPOLLET`): the kernel notifies the
+worker once per change, and a socket that is not drained on that wake-up gets
+no further event until the next edge. Each session keeps the edge it received
+in a `Readiness` (`lib/src/lib.rs`: `event` is what the kernel said, `interest`
+is what the state machine wants).
+
+"Drained" is detected without a wasted `recv(2)`
+([#1602](https://github.com/sozu-proxy/sozu/issues/1602)). A read that returns
+fewer bytes than it was offered has emptied a stream socket's receive queue
+(`man 7 epoll`), so `plain_socket_read` and `rustls_socket_read`
+(`lib/src/socket.rs`) stop there and answer `WouldBlock` with the bytes instead
+of reading on to an `EAGAIN`; any byte that arrives later raises a new edge. A
+read that fills its buffer is not a short read and answers `Continue`. The one
+exception is a FIN that arrived with the data: its edge is the HUP already
+folded into the readiness, and nothing will announce the EOF again, so
+`update_readiness_after_read` (`lib/src/protocol/mux/mod.rs`) keeps READABLE
+after a short read once HUP was seen, and the next pass reads the EOF. The pipe
+and the pre-mux states act on HUP directly (`Pipe::frontend_hup`,
+`Pipe::backend_hup`) and need no EOF read.
+
+A TLS frontend carries that proof from one read call to the next
+([#1609](https://github.com/sozu-proxy/sozu/issues/1609)). The H2 read path asks
+for a 9-byte frame header, then its payload, so the frames of one record are
+served by several calls from rustls's plaintext buffer; `rustls_socket_read`
+serves that plaintext before it calls `read_tls` at all
+([#1588](https://github.com/sozu-proxy/sozu/issues/1588)), and
+`FrontRustls::recv_memory` (`RecvMemory`, `lib/src/socket.rs`) remembers that a
+`recv` answered short or `EAGAIN`, so the call that empties the plaintext does
+not `recv` again for an `EAGAIN`. `HttpsSession::update_readiness`
+(`lib/src/https.rs`) clears the memory on every event delivered for the
+frontend token, in every session state: a byte that arrived after the proof
+raised an edge that is either pending in epoll, and re-arms READABLE when the
+next `epoll_wait` delivers it, or already delivered, which cleared the memory.
+HUP or ERROR turns the memory off for good.
 
 The stop has a price, and it is HAProxy's (`src/raw_sock.c`: stop when
-`ret < try`, let the poller report the EOF). When a backend's FIN lands
-after the `epoll_wait` that woke the pass, the event carries READABLE
-without HUP; the short read returns the last bytes and does not issue the
-`recv` that would have found the EOF, so the backend is closed one
-`epoll_wait` round later, on the `EPOLLRDHUP` edge the FIN queued, and no
-later (`a_fin_after_epoll_wait_closes_the_backend_on_the_next_round_at_the_latest`).
-When the FIN reached the kernel before `epoll_wait` returned, the edge
-carries HUP and the backend is closed in the same pass. The `recv` saved
-answers EAGAIN on every short read not followed by a FIN, which is the
-common case.
+`ret < try`, let the poller report the EOF). When a backend's FIN lands after
+the `epoll_wait` that woke the pass, the event carries READABLE without HUP; the
+short read returns the last bytes and does not issue the `recv` that would have
+found the EOF, so the backend is closed one `epoll_wait` round later, on the
+`EPOLLRDHUP` edge the FIN queued, and no later
+(`a_fin_after_epoll_wait_closes_the_backend_on_the_next_round_at_the_latest`).
+When the FIN reached the kernel before `epoll_wait` returned, the edge carries
+HUP and the backend is closed in the same pass.
 
-The guarantee has one known hole: TCP urgent data. `recv` stops before
-an urgent (out-of-band) mark even with bytes queued behind it, so a
-short read while such a mark is pending leaves those bytes in the kernel
-with no further edge. A stream that carries OOB data (telnet, rlogin,
-FTP `ABOR`) can stall until the peer's next send. HAProxy and tokio
-behave the same, and Sōzu never read out-of-band data before this
-change either.
+The guarantee has one known hole: TCP urgent data. `recv` stops before an
+urgent (out-of-band) mark even with bytes queued behind it, so a short read
+while such a mark is pending leaves those bytes in the kernel with no further
+edge. A stream that carries OOB data (telnet, rlogin, FTP `ABOR`) can stall
+until the peer's next send. HAProxy and tokio behave the same, and Sōzu never
+read out-of-band data before this change either.
 
-To survive that contract, every protocol module routes its readiness
-through a `Readiness` tracker (`Readiness` in `lib/src/lib.rs`, reached in
-the mux through `Connection::readiness_mut` in
-`lib/src/protocol/mux/connection.rs`) and uses two helpers:
+### 2.3 The writable invariant
 
-- `signal_pending_write` — set by code that has produced bytes that
-  must eventually go out, even though the writable epoll edge may have
-  been consumed already.
-- `arm_writable` — set when bytes are queued from a *readable* code
-  path so the next pump iteration writes them out without waiting for
-  another kernel wake-up.
+Output produced from a read path has no epoll edge of its own: the writable
+edge may have been consumed long ago. Every protocol module therefore routes
+its readiness through the `Readiness` tracker (reached in the mux through
+`Connection::readiness_mut`, `lib/src/protocol/mux/connection.rs`) and uses two
+helpers:
 
-If new code queues output bytes from a readable path and forgets to
-call `arm_writable` (mux) or `signal_pending_write` (pipe),
-the session "stalls" — bytes sit in the buffer and the next epoll
-event never arrives. Past truncation bugs on this branch all
-originated here. The `mux::answers` module documents this as the
-"invariant-15 pair" (`set_default_answer_arms_writable_and_signals`,
-`lib/src/protocol/mux/answers.rs`); the
-home for the invariant is `mux::connection`
-(`lib/src/protocol/mux/connection.rs:13-16`).
+- `signal_pending_write` — set by code that has produced bytes that must go
+  out, even though the writable edge may have been consumed already;
+- `arm_writable` — set when bytes are queued from a *readable* code path so the
+  next pump iteration writes them without waiting for another kernel wake-up.
 
-### 2.3 Tokens, the SessionManager, and the slab
+Forgetting either stalls the session: the bytes sit in a buffer and no event
+ever arrives. The `mux::answers` module documents this as the "invariant-15
+pair" (`set_default_answer_arms_writable_and_signals`,
+`lib/src/protocol/mux/answers.rs`). The module doc of
+`lib/src/protocol/mux/connection.rs` names the canonical home of the invariant:
+the edge-trigger discipline of `H2Shell::writable` (`lib/src/protocol/mux/h2.rs`),
+to which the `Connection` abstractions delegate through the protocol-specific
+writers.
 
-Every mio registration carries a `Token` (a `usize`). The
-`SessionManager` (`lib/src/server.rs`) owns a
-`Slab<Rc<RefCell<dyn ProxySession>>>` (`SessionManager::slab`,
-`lib/src/server.rs`) that
-maps each token back to the session that owns the registration. This
-slab is also the unit of bookkeeping that enforces `max_connections`
-(`SessionManager::check_limits` / `SessionManager::at_capacity`,
-`lib/src/server.rs`) and gauges
-`client.connections`, `client.connections_max`,
-`client.connections_percent`, `slab.{entries,capacity,usage_percent,
-accept_threshold_percent}` and `buffer.{in_use,capacity,usage_percent}`,
-all sampled once per run-loop iteration in
-`Server::run` (`lib/src/server.rs`).
+### 2.4 Tokens, the SessionManager, and the slab
 
-Listeners live in that same slab, but on a different clock. A listener
-is given one slab slot by `add-listener`, and it keeps that exact slot —
-and therefore that exact token — until `remove-listener`. `deactivate-listener`
-does *not* give the slot back: it puts the inert `ListenSession` placeholder
-back in it, because the proxies keep the token inside the listener and hand
-the very same one back out of a later `activate-listener`. A slot released on
-deactivation would leave the reactivated socket registered under a token the
-slab no longer knows, and `Server::ready` silently drops an event whose token
-has no slab entry — the listener would report a successful activation and then
-never see traffic again. It would also let the slab hand that key to an
-ordinary session, which the UDP activation path would then overwrite.
-`Server::reserve_listen_token` (`lib/src/server.rs`) holds this invariant.
+Every mio registration carries a `Token` (a `usize`). The `SessionManager`
+(`lib/src/server.rs`) owns a `Slab<Rc<RefCell<dyn ProxySession>>>`
+(`SessionManager::slab`) that maps each token back to the session that owns
+the registration. This slab is also the unit of bookkeeping that enforces
+`max_connections` (`SessionManager::check_limits` /
+`SessionManager::at_capacity`) and feeds `client.connections`,
+`client.connections_max`, `client.connections_percent`,
+`slab.{entries,capacity,usage_percent,accept_threshold_percent}` and
+`buffer.{in_use,capacity,usage_percent}`, all sampled once per loop turn in
+`Server::run`.
 
-Reserving the slot settles where the key may be *handed*, not what the
-UDP activation path may *write* into it. UDP is the one protocol that
-replaces the placeholder with a real session (`UdpListenerSession`), and
-`activate-listener` is not a once-per-listener request: `UdpListener::activate`
-short-circuits on its own `active` flag and answers with the same token for a
-listener that is already up, `ConfigState::activate_listener` accepts the
-repeat, and `load_state` re-emits one `activate-listener` per *active* listener
-on every replay. The activation arm therefore installs its session only when
-one is not installed already — the proxy's `listener_sessions` map is the
-record — and answers `ok` for a repeat without touching anything. Rebuilding on
-a repeat would drop the live session while the proxy kept the shared
-`UdpManager` and its flow table, so every in-flight flow would stop forwarding
-and its upstream slab slot could never be released. `close()` is a
-`ProxySession` method, not `Drop`, so a displaced session runs no teardown.
+Listeners live in the same slab, on a different clock. A listener is given
+one slab slot by `add-listener` and keeps that exact slot — and therefore that
+exact token — until `remove-listener`. `deactivate-listener` does *not* give the
+slot back: it puts the inert `ListenSession` placeholder back in it, because
+the proxies keep the token inside the listener and hand the very same one back
+out of a later `activate-listener`. A slot released on deactivation would leave
+the reactivated socket registered under a token the slab no longer knows, and
+`Server::ready` silently drops an event whose token has no slab entry.
+`Server::reserve_listen_token` (`lib/src/server.rs`) holds this invariant. UDP
+is the one protocol that replaces the placeholder with a real session
+(`UdpListenerSession`), and its activation arm installs that session only when
+none is installed already (the proxy's `listener_sessions` map is the record),
+because `load_state` re-emits one `activate-listener` per active listener on
+every replay.
 
-A single session typically occupies *two* slab entries while it is
-forwarding traffic: one for the frontend token (registered when the
-client connection was accepted) and one for the backend token
-(registered after `connect_to_backend` succeeded). This is the
-single biggest mental-model adjustment for new contributors: the same
-session is reachable through two different keys.
+A forwarding session occupies one slab entry per socket: the frontend token,
+plus one token per backend connection. The same session is reachable through
+several keys.
 
-Listen sockets themselves are stored as `ListenSession` entries in the
-same slab (`ListenSession`, `lib/src/server.rs`), which is what allows
-the same event loop to multiplex accept events alongside data events.
+### 2.5 The four proxies
 
-### 2.4 The three proxies
+A worker hosts one proxy per listener protocol:
 
-A worker hosts three proxy types, one per supported listener protocol:
+- `HttpProxy` (`lib/src/http.rs`) and `HttpsProxy` (`lib/src/https.rs`), whose
+  sessions run the mux (§6, §7, §8);
+- `TcpProxy` (`lib/src/tcp.rs`), whose sessions run a byte pipe (§9);
+- `UdpProxy` (`lib/src/udp.rs`), connectionless, one session per listener (§10).
 
-- `HttpProxy` (`lib/src/http.rs`)
-- `HttpsProxy` (`lib/src/https.rs`)
-- `TcpProxy` (`lib/src/tcp.rs`)
-
-Each proxy owns its listeners, its known frontends and clusters, the
-per-protocol configuration (TLS material, ALPN list, H2 knobs, etc.),
-and the upgrade paths that promote a session from one protocol layer
-to the next.
+Each proxy owns its listeners, its frontends and clusters, the per-protocol
+configuration (TLS material, ALPN list, H2 knobs, …) and the upgrade paths that
+promote a session from one protocol layer to the next.
 
 ## 3. Accepting a connection
 
-### 3.1 Listeners and SO_REUSEPORT
+### 3.1 Listeners, `SO_REUSEPORT` and `TCP_NODELAY`
 
-Listen sockets are created via `lib/src/socket.rs` with
-`SO_REUSEPORT` enabled (`server_bind`, `lib/src/socket.rs`); multiple
-workers in the same Sōzu process share each listener address and the kernel
-distributes accept events across them. Each listener is registered
-with mio and tracked through a `ListenSession` slab entry. Hot
-reconfig adds and removes listeners at runtime via the master-to-
-worker channel (`Server::notify_proxys`, `lib/src/server.rs`).
+Listen sockets are created with `SO_REUSEPORT` (`server_bind`,
+`lib/src/socket.rs`); several workers share each listener address and the
+kernel spreads accepts across them. Hot reconfiguration adds and removes
+listeners at runtime through the command channel (`Server::notify_proxys`).
 
 `TCP_NODELAY` is set once per listener, in each listener's `activate`
-(`HttpListener::activate`, `HttpsListener::activate`,
-`TcpListener::activate`), on whichever socket it activates: freshly bound,
-inherited over SCM_RIGHTS at an upgrade, or parked by a failed registration.
-The kernel copies the flag to every socket whose handshake completes
-afterwards, so an accepted socket needs no `setsockopt(2)` of its own. A
-connection that completed its handshake before the listener had the flag —
-the backlog of a socket inherited from a worker that never set it — does not
-inherit it, so each listener's `accept` sets it per connection until its first
-`WouldBlock` after an activation (`nodelay_backlog`), which is exactly that
-backlog. See sozu-proxy/sozu#1586.
+(`HttpListener::activate`, `HttpsListener::activate`, `TcpListener::activate`),
+on whichever socket it activates: freshly bound, inherited over SCM_RIGHTS at
+an upgrade, or parked by a failed registration. Linux and the BSDs copy the
+flag to every socket whose handshake completes afterwards, so an accepted
+socket needs no `setsockopt(2)` of its own. A connection that completed its
+handshake before the listener had the flag — the backlog of a socket inherited
+from a worker that never set it — does not inherit it, so each listener's
+`accept` sets it per connection until its first `WouldBlock` after an
+activation (`nodelay_backlog`), which is exactly that backlog
+([#1586](https://github.com/sozu-proxy/sozu/issues/1586)).
 
 ### 3.2 The accept queue
 
-When a listener becomes readable, the proxy accepts every pending
-connection in a single batch and parks each `TcpStream` on an internal
-`accept_queue: VecDeque<…>` (`Server::accept_queue`,
-`lib/src/server.rs`), together with the peer address `accept(2)` returned
-for it. That address feeds the `client.connect.per_source.*` counter and is
-handed to `create_session`, which seeds the session with it: nothing on the
-accept path calls `getpeername(2)`. On an expect-proxy listener it stays the
-network peer (the load balancer); the client address comes from the PROXY
-header when the session upgrades. Sessions are
-*not* created synchronously inside the accept loop. The queue is
-drained later, newest-first, so connections that have been waiting
-too long are dropped before they are turned into a session. The
-cut-off is `accept_queue_timeout` (`Server::accept_queue_timeout`,
-`lib/src/server.rs`).
+When a listener becomes readable, the proxy accepts every pending connection in
+one batch — one `accept4(2)` per connection plus the one that answers `EAGAIN`
+and ends the batch — and parks each `TcpStream` on
+`Server::accept_queue`, together with the peer address `accept(2)` returned.
+That address feeds the `client.connect.per_source.*` counter and is handed to
+`create_session`, which seeds the session with it: nothing on the accept path
+calls `getpeername(2)` ([#1586](https://github.com/sozu-proxy/sozu/issues/1586)).
+On an expect-proxy listener it stays the network peer (the load balancer); the
+client address comes from the PROXY header when the session upgrades.
+
+Sessions are *not* created inside the accept loop. `Server::create_sessions`
+drains the queue later in the same turn, newest first, and drops connections
+that waited longer than `accept_queue_timeout`. Creating a session registers
+its frontend socket (`epoll_ctl(EPOLL_CTL_ADD)`) and allocates the session
+object once: `Rc<RefCell<HttpSession>>` carries the mux inline, including the
+first backend connection slot and the frontend's timer handle (§8.1).
 
 ### 3.3 Backpressure and `max_connections`
 
-If the slab is at capacity (`SessionManager::can_accept` is `false`,
-`lib/src/server.rs`) the proxy stops draining the accept queue and
-the kernel's listen backlog absorbs the surplus. The
-`accept_queue.backpressure` gauge flips to 1 in that state
-(`SessionManager::check_limits`, `lib/src/server.rs`); a 1 Hz ticker also bumps
-`accept_queue.saturated_seconds` so dashboards can plot how long the
-worker spent backpressured (`lib/src/server.rs:110-114`, and the
-`ACCEPT_SATURATION_TICK` block of `Server::run` in `lib/src/server.rs`). The
-system unwinds at 90% of `max_connections` to avoid flapping
-(`lib/src/server.rs:1056-1064`).
+If the slab is at capacity (`SessionManager::can_accept` is `false`) the proxy
+stops draining the accept queue and the kernel's listen backlog absorbs the
+surplus. The `accept_queue.backpressure` gauge flips to 1 in that state
+(`SessionManager::check_limits`); a 1 Hz ticker also bumps
+`accept_queue.saturated_seconds` so dashboards can plot how long the worker
+spent backpressured (the `ACCEPT_SATURATION_TICK` block of `Server::run`). The
+gate reopens only below 90 % of `max_connections`, to avoid flapping (the
+`can_accept` branch of `SessionManager::decr`).
 
 ### 3.4 Zombie detection
 
-A periodic "zombie checker" pass walks the slab and forcibly closes
-sessions that look stuck — typically because of a logic bug elsewhere.
-This is a safety net, not a primary lifecycle mechanism.
+A periodic "zombie checker" pass (`Server::zombie_check`) walks the slab and
+closes sessions that look stuck — typically because of a logic bug elsewhere.
+It is a safety net, not a lifecycle mechanism.
 
 ## 4. TLS handshake (HTTPS only)
 
-For `HttpsProxy` sessions, the first protocol layer above raw TCP is
-TLS. Sōzu uses [rustls](https://docs.rs/rustls) and instantiates one
-`rustls::ServerConnection` per session
-(`TlsHandshake::session`, `lib/src/protocol/rustls.rs`). The handshake
-itself is driven from `lib/src/protocol/rustls.rs`; the listener-level config
-(certificate stores, ALPN list, SNI binding policy) lives in
-`lib/src/https.rs` and `lib/src/tls.rs`.
+For `HttpsProxy` sessions the first layer above TCP is TLS. Sōzu uses
+[rustls](https://docs.rs/rustls) and instantiates one
+`rustls::ServerConnection` per session (`TlsHandshake::session`,
+`lib/src/protocol/rustls.rs`); the listener-level configuration (certificate
+stores, ALPN list, SNI binding policy) lives in `lib/src/https.rs` and
+`lib/src/tls.rs`.
 
-The handshake reads the way the established session does (§2.2,
-[#1609](https://github.com/sozu-proxy/sozu/issues/1609)): `handshake_read`
-(`lib/src/protocol/rustls.rs`) stops on a `recv` that answers fewer bytes
-than the 4096 rustls offered, as on EAGAIN, and drops READABLE; the next
-segment of a ClientHello split across several raises the next edge. A TLS 1.3
-server wants to read again as soon as its own flight is queued, so without that
-stop the ClientHello and the client `Finished` were each followed by a `recv`
-that answered EAGAIN. The handshake closes on HUP before reading, so it needs
-no EOF exception. When the handshake completes, `upgraded_frontend_events`
-(`lib/src/https.rs`) arms the mux frontend for WRITABLE, and for READABLE only
-when the handshake still held a READABLE edge or rustls already holds
-plaintext (the HTTP/2 preface sharing a segment with the `Finished`) or a
-`close_notify`; a socket the handshake proved empty gets no read until its
-next edge. The TCP urgent data reserve of §2.2 applies to the handshake too.
+The handshake reads the way the established session does (§2.2):
+`handshake_read` (`lib/src/protocol/rustls.rs`) stops on a `recv` that answers
+fewer bytes than rustls offered, as on `EAGAIN`, and drops READABLE; the next
+segment of a ClientHello split across several raises the next edge. When the
+handshake completes, `upgraded_frontend_events` (`lib/src/https.rs`) arms the
+mux frontend for WRITABLE, and for READABLE only when the handshake still held
+a READABLE edge or rustls already holds plaintext (an HTTP/2 preface sharing a
+segment with the client `Finished`) or a `close_notify`
+([#1609](https://github.com/sozu-proxy/sozu/issues/1609)).
+
+On the wire a TLS 1.3 handshake costs the server one `writev(2)` for its flight
+(ServerHello, ChangeCipherSpec, encrypted handshake messages) and one for the
+session tickets (`send_tls13_tickets`, four by default; `0` removes that
+write). With `crypto-ring`, the provider of the default build (`bin/Cargo.toml`,
+`lib/Cargo.toml`, the Dockerfile, the RPM and Arch packages), each handshake also
+costs 15 `getrandom(2)`, one per random draw, because ring reads the kernel
+directly; a build with `crypto-aws-lc-rs` draws from a thread-local DRBG and
+issues none on this path ([`hot_path_zero_copy.md`](./hot_path_zero_copy.md)
+§3.13).
 
 ### 4.1 SNI / `:authority` binding
 
 If `strict_sni_binding` is enabled on a listener
-(`ListenerBuilder::strict_sni_binding`, `command/src/config.rs`), Sōzu
-rejects any HTTP request whose
-`:authority` (H2) or `Host` (H1) is not covered by a SAN of the
-certificate served on this TLS session, with RFC 6125 §6.4.3 wildcard
-handling. This matches Firefox / Chrome connection-coalescing
-semantics (RFC 7540 §9.1.1 / RFC 9113 §9.1.1) — browsers reuse a
-single H2 connection for any origin covered by the served
-certificate's SubjectAlternativeName dNSName entries (RFC 6125
-§6.4.4: when SAN dNSName is present, the CN is ignored).
-Misses are answered with 421 Misdirected Request (RFC 9110 §15.5.20),
-which both browsers handle by opening a fresh connection on the right
-SNI. The SAN dNSName snapshot is captured once at handshake (mirroring
-browser cache semantics) and stored on the mux `Context` as
-`tls_cert_names`; it is frozen for the connection lifetime even if the
-operator swaps the underlying certificate mid-flight. Plaintext
-listeners have no SNI / cert to compare against and bypass the check.
-This protects multi-tenant HTTPS deployments from an attacker reaching
-tenant B via a TLS session keyed for tenant A while staying compatible
-with browser-driven coalescing on legitimate wildcard certs.
+(`ListenerBuilder::strict_sni_binding`, `command/src/config.rs`), Sōzu rejects
+any HTTP request whose `:authority` (H2) or `Host` (H1) is not covered by a SAN
+of the certificate served on this TLS session, with RFC 6125 §6.4.3 wildcard
+handling. This matches browser connection coalescing (RFC 9113 §9.1.1): a
+browser reuses one H2 connection for any origin covered by the served
+certificate's dNSName entries (RFC 6125 §6.4.4: when SAN dNSName is present, the
+CN is ignored). Misses are answered with 421 Misdirected Request
+(RFC 9110 §15.5.20), which browsers handle by opening a fresh connection on the
+right SNI. The SAN snapshot is captured once at handshake and stored on the mux
+`Context` as `tls_cert_names`, shared by every stream through an `Arc`; it is
+frozen for the connection's lifetime even if the operator swaps the certificate
+mid-flight. Plaintext listeners have no certificate to compare against and
+bypass the check.
 
 ### 4.2 ALPN and `disable_http11`
 
-After the handshake completes, Sōzu inspects the negotiated ALPN
-protocol (`lib/src/https.rs:477-536`) and decides which mux
-flavour to instantiate:
+After the handshake, `HttpsSession::upgrade_handshake` (`lib/src/https.rs`)
+reads the negotiated ALPN protocol and picks the mux flavour:
 
-- ALPN `h2` → HTTP/2 mux.
-- ALPN `http/1.1` → HTTP/1.1 path.
-- No ALPN selected → HTTP/1.1 by default.
+- ALPN `h2` → HTTP/2 frontend;
+- ALPN `http/1.1`, or no ALPN → HTTP/1.1 frontend.
 
 Listener-level `disable_http11` (`ListenerBuilder::disable_http11`,
-`command/src/config.rs`) lets an
-operator force H2-only on a per-listener basis. ALPN rejections are
-counted with two distinct keys so dashboards can split refusals by
-cause:
-
-- `https.alpn.rejected.unsupported` — peer offered an ALPN that Sōzu
-  does not implement (e.g. `h3`) (`lib/src/https.rs:514`).
-- `https.alpn.rejected.http11_disabled` — peer wanted `http/1.1` but
-  the listener has `disable_http11 = true`
-  (`lib/src/https.rs:497, 527`).
-
-The startup-time validator at `command/src/config.rs:1279-1283, 1301-1307`
-catches the obvious operator mistake of pairing `disable_http11 = true` with
-`alpn_protocols` that still contains `"http/1.1"`.
+`command/src/config.rs`) forces H2-only per listener. ALPN refusals are counted
+under two keys so dashboards can split them by cause: `https.alpn.rejected.unsupported`
+(the peer offered an ALPN Sōzu does not implement, e.g. `h3`) and
+`https.alpn.rejected.http11_disabled` (the peer wanted `http/1.1` on a
+`disable_http11` listener), both emitted by `HttpsSession::upgrade_handshake`.
+The configuration validator refuses `disable_http11 = true` beside an
+`alpn_protocols` list that still contains `"http/1.1"`
+(`ConfigError::DisableHttp11WithHttp11Alpn`, returned by `ListenerBuilder::to_tls`,
+`command/src/config.rs`).
 
 ### 4.3 Handshake telemetry
 
 Successful handshakes report `tls.handshake_ms` as a histogram
-(`TlsHandshake::record_handshake_duration_ms`,
-`lib/src/protocol/rustls.rs`). Failures are
-tagged with a constant key per rustls error variant
-(`tls.handshake.failed.alert_received`,
-`tls.handshake.failed.no_alpn`, …) so statsd cardinality stays bounded
-even when a misbehaving client is hammering the handshake
-(`handshake_failure_reason`, `lib/src/protocol/rustls.rs`).
+(`TlsHandshake::record_handshake_duration_ms`). Failures are tagged with one
+constant key per rustls error variant (`tls.handshake.failed.alert_received`,
+`tls.handshake.failed.no_alpn`, …) so the metric cardinality stays bounded
+under a misbehaving client (`handshake_failure_reason`,
+`lib/src/protocol/rustls.rs`).
 
 ## 5. PROXY-protocol pre-flight
 
-When a frontend is configured to expect a HAProxy PROXY-protocol
-header (typically because Sōzu sits behind a Layer-4 load balancer)
-the session starts in a small `ExpectProxyProtocol` state
-(`HttpSession::new` in `lib/src/http.rs`, `ExpectProxyProtocol::readable`
-in `lib/src/protocol/proxy_protocol/expect.rs`). That state reads the
-v1 / v2 header off the front socket, extracts the real client address,
-and then transitions the session into the downstream protocol
-(HTTP/1.1, HTTP/2, or raw TCP relay). A v2 header carrying the `LOCAL`
-command (ver/cmd `0x20`) is the exception: it describes a connection the
-upstream proxy originated itself, so its address block is discarded per the
-HAProxy PROXY protocol specification §2.2 and no client address is
-extracted at all.
+When a frontend expects a HAProxy PROXY-protocol header (Sōzu behind a layer-4
+load balancer), the session starts in `ExpectProxyProtocol`
+(`HttpSession::new`, `lib/src/http.rs`; `ExpectProxyProtocol::readable`,
+`lib/src/protocol/proxy_protocol/expect.rs`). That state reads the v1 / v2
+header off the front socket, extracts the real client address, and transitions
+the session into the downstream protocol (HTTP/1.1, HTTP/2 or raw TCP). A v2
+header carrying the `LOCAL` command describes a connection the upstream proxy
+originated itself: its address block is discarded (PROXY protocol
+specification §2.2). A TCP listener then keeps the front socket's own
+`peer_addr` (`ExpectProxyProtocol::into_pipe`, `RelayProxyProtocol::into_pipe`,
+`TcpSession::build_pipe_from_preread`, `TcpSession::effective_session_address`);
+an HTTP or HTTPS listener refuses the upgrade (`HttpSession::upgrade_expect` /
+`HttpsSession::upgrade_expect` need both a source and a destination), so the
+session closes before any request is read. The full lifecycle of the three
+sub-state machines is in
+[`lib/src/protocol/proxy_protocol/LIFECYCLE.md`](../lib/src/protocol/proxy_protocol/LIFECYCLE.md).
 
-What happens next depends on the listener, because the two families
-resolve the resulting `ProxyAddr::AfUnspec` differently. A **TCP**
-listener keeps the front socket's own `peer_addr`:
-`ExpectProxyProtocol::into_pipe`
-(`lib/src/protocol/proxy_protocol/expect.rs`) /
-`RelayProxyProtocol::into_pipe`
-(`lib/src/protocol/proxy_protocol/relay.rs`), the SNI preread
-(`TcpSession::build_pipe_from_preread`, `lib/src/tcp.rs`) and
-`TcpSession::effective_session_address`
-(`lib/src/tcp.rs`, which feeds the raw-TCP `max_connections_per_ip`
-gate) all fall back to it. An **HTTP or HTTPS**
-listener instead refuses the upgrade: `HttpSession::upgrade_expect`
-(`lib/src/http.rs`) / `HttpsSession::upgrade_expect` (`lib/src/https.rs`)
-needs both a source and a destination to build the session, `AfUnspec` supplies neither, so it
-returns `None` and `HttpSession::upgrade` reports `SessionIsToBeClosed`
-(`lib/src/http.rs`) — the session is closed at the expect stage,
-before any request is read.
+## 6. HTTP/1.1 request lifecycle
 
-That close is not a regression for legitimate traffic. HAProxy pairs
-`LOCAL` with `AF_UNSPEC`, which already parsed to `AfUnspec`, so an
-HTTP or HTTPS session from a health-checking upstream already closed
-here. The only behaviour the discard changes is the forged case — a
-`LOCAL` header carrying a populated address block — which used to
-upgrade with attacker-chosen addresses and now closes instead.
+H1 runs on the mux: `HttpStateMachine` and `HttpsStateMachine` carry a `Mux`
+variant, whose frontend is a `ConnectionH1` (`lib/src/protocol/mux/h1.rs`)
+driving a [kawa](https://github.com/CleverCloud/kawa) parser over a pooled
+buffer. The per-request state is an `HttpContext`
+(`lib/src/protocol/kawa_h1/editor.rs`) inside a `Stream`
+(`lib/src/protocol/mux/stream.rs`). The standalone `kawa_h1::Http` session that
+used to own this path was removed on 2026-09-20 (sozu#1346).
 
-The full lifecycle of the three sub-state-machines (`expect`, `relay`,
-`send`) is documented in
-[`lib/src/protocol/proxy_protocol/LIFECYCLE.md`](../lib/src/protocol/proxy_protocol/LIFECYCLE.md);
-read it before changing anything in
-`lib/src/protocol/proxy_protocol/`.
+### 6.1 Read and parse
 
-## 6. Per-protocol session lifecycle
+`Mux::ready` (`lib/src/protocol/mux/mod.rs`) hands a frontend READABLE edge to
+`ConnectionH1::readable`, which reads into the stream's front buffer with one
+`recv(2)` (a short read ends the read, §2.2) and runs `kawa::h1::parse` with
+the `HttpContext` callbacks. kawa (0.7.2 and later) refuses a `Content-Length`
+that is not `1*DIGIT` and ends a request that declares no body after its
+headers (RFC 9112 §6.3 rule 7); `HttpContext::on_request_headers` rejects
+ambiguous `Transfer-Encoding` framing (the CL.TE guard), keeps the two kawa
+checks as defense in depth, then edits the request in place
+(`kawa_h1/LIFECYCLE.md` §2):
 
-Once the session has gone through any TLS and PROXY-protocol
-pre-flight, control transfers to one of three protocol state machines
-that own the rest of the session.
+- the forwarding headers (`X-Forwarded-For`, `Forwarded`, `X-Forwarded-Port`,
+  `X-Real-IP` with `send_x_real_ip`) come from a `ForwardingHop` rendered once
+  per connection and shared through `kawa::Store::Shared`, a reference-count
+  bump per header; a client-supplied chain is extended into one exact-size copy
+  ([#1643](https://github.com/sozu-proxy/sozu/pull/1643));
+- the request id is rendered once on the stack and copied once into an
+  `Rc<str>` that the generated `X-Request-Id`, the access log and both
+  `Sozu-Id` headers share ([#1628](https://github.com/sozu-proxy/sozu/pull/1628)).
 
-### 6.1 HTTP/1.1 (mux in H1 mode)
+A parse error answers a default 400 (`set_default_answer`) before routing, so a
+malformed request never reaches a backend.
 
-The HTTP/1.1 path is the historical core of Sōzu and is backed by the
-[Kawa](https://github.com/CleverCloud/kawa) HTTP parser. Since the mux
-migration it does **not** run through a protocol module of its own:
-`HttpStateMachine` and `HttpsStateMachine` carry a `Mux` variant only, so
-H1 and H2 share `lib/src/protocol/mux/` and differ in their connection
-type (`ConnectionH1` in `mux/h1.rs`, `ConnectionH2` in `mux/h2.rs`). The
-standalone `kawa_h1::Http` session that used to own this path was removed
-on 2026-09-20 (sozu#1346) after a planted `panic!` proved no binary
-constructed it. Conceptually the lifecycle is:
+### 6.2 Route and gate
 
-1. **Parse the request** out of the front buffer using Kawa, in
-   `ConnectionH1::readable` (`lib/src/protocol/mux/h1.rs`), driven by the
-   `HttpContext` callbacks in `lib/src/protocol/kawa_h1/editor.rs`.
-2. **Route the request** to a cluster via `Router::route_from_request`
-   (`lib/src/protocol/mux/router.rs`).
-3. **Pick a backend and connect to it** via `Router::backend_from_request`
-   (same file), which `Mux::dial_backend` (`lib/src/protocol/mux/mod.rs`) calls
-   once `Router::plan_connect` has decided to dial. A previously-opened
-   keep-alive socket may be reused after a liveness probe.
-4. **Forward bytes** in both directions through the per-`Stream`
-   front/back Kawa buffer pair (`lib/src/protocol/mux/stream.rs`),
-   registering writable interest with `arm_writable` as needed.
-5. **Close or reset** when the response completes, emitting the access log
-   and the status metrics from `Stream::generate_access_log`.
+`Router::plan_connect` (`lib/src/protocol/mux/router.rs`) routes the request
+through `Router::route_from_request`: the frontend lookup walks the pattern trie
+without allocating (`InlineTrieMatches` keeps up to 16 matched segments on the
+stack, `lib/src/router/pattern_trie.rs`), the authority is not copied unless a
+host rewrite needs it, and the matched cluster id is a `ClusterId = Arc<str>`
+shared with the route table
+([#1594](https://github.com/sozu-proxy/sozu/pull/1594),
+[#1629](https://github.com/sozu-proxy/sozu/pull/1629)). The per-frontend
+Basic-auth check (`check_basic`, `lib/src/protocol/mux/auth.rs`) runs here. The
+per-(cluster, source-IP) admission gate, `consult_ip_gate`
+(`lib/src/protocol/mux/mod.rs`), tracks the session under that same shared id.
+Then `Router::decide_after_gate` either reuses a backend connection the session
+already holds or asks for a dial.
 
-The full state diagram, including the parser back-pressure rules, the
-H1 → WebSocket upgrade path, the H1 → H2 transition, and the keep-alive vs
-close attribution, lives in
-[`lib/src/protocol/mux/LIFECYCLE.md`](../lib/src/protocol/mux/LIFECYCLE.md).
-[`lib/src/protocol/kawa_h1/LIFECYCLE.md`](../lib/src/protocol/kawa_h1/LIFECYCLE.md)
-now documents only the H1 vocabulary that module still provides
-(`DefaultAnswer`, `HttpAnswers`, `HttpContext`, `Method`).
+### 6.3 Connect, or reuse, a backend
 
-### 6.2 HTTP/2 (mux)
+A session's backend connections live in its own `Router::backends`
+(`BackendConnections`: the first connection inline, the others in a
+`BTreeMap`). A keep-alive H1 backend whose previous response completed is
+reused with no system call and no liveness probe; a request that finds the
+reused connection already closed by the backend is replayed on a fresh one,
+from a copy of the bytes it sent (`ReplayOnFreshBackend`, `mux/LIFECYCLE.md`
+§8.5). Keeping that copy costs one allocation per request on a reused
+connection (the replay capture of `ConnectionH1::writable`).
 
-The H2 multiplexer is the largest single piece of Sōzu and lives under
-`lib/src/protocol/mux/`. The high-level data model:
+Otherwise `Mux::dial_backend` lends the router a `BackendDialer` for one call;
+`BackendDialer::select_and_dial` picks a backend through the cluster's
+load-balancing policy over a borrowed `Candidates` view (no candidate `Vec`, no
+`Rc` clone but the chosen one,
+[#1557](https://github.com/sozu-proxy/sozu/pull/1557)), then connects it:
+`socket(2)`, a non-blocking `connect(2)`, `setsockopt(TCP_NODELAY)` and
+`epoll_ctl(EPOLL_CTL_ADD)` on a new slab token. The backend's identity is
+interned once per session in the `BackendRegistry`, so a redial or a reuse
+stamps the stream with a reference count, not a copy
+([#1565](https://github.com/sozu-proxy/sozu/pull/1565),
+[#1581](https://github.com/sozu-proxy/sozu/pull/1581)).
 
-- A single `ConnectionH2` per TCP connection, wrapped in an
-  `H2Shell<Front>` that holds the socket
-  (`lib/src/protocol/mux/h2.rs`) owns the wire state: HPACK encoder
-  and decoder, connection-level flow window, GOAWAY state, and the
-  per-connection `H2FloodDetector`.
-- A `Context<L>` (`lib/src/protocol/mux/mod.rs`) owns the
-  `Vec<Stream>` that backs every individual H2 stream's request /
-  response buffers. Streams are referenced across the two through a
-  `GlobalStreamId = usize`.
-- Each `Stream` carries a `StreamState`
-  (`lib/src/protocol/mux/stream.rs`) that walks through the
-  lifecycle `Idle` → `Link` → `Linked(Token)` → `Unlinked` →
-  `Recycle`. Only `Idle` and `Recycle` are "free" slots; the
-  intermediate states pin the stream to a backend connection.
+### 6.4 Forward the request, read the response
 
-The H2 mux owns a few invariants that are easy to break by accident:
+`ConnectionH1::writable` on the backend position gathers the request's kawa
+blocks into one `writev(2)` through `h2_transmit::gather` and `confirm`, over a
+descriptor vector the connection keeps for its lifetime (`io_slices`,
+[#1582](https://github.com/sozu-proxy/sozu/pull/1582)). The response is read the
+way the request was, and `HttpContext::on_response_headers` captures the status
+and — for a standard phrase — a `'static` reason, with no copy
+([#1644](https://github.com/sozu-proxy/sozu/pull/1644)). The response goes to
+the client in one `writev(2)` per pass, over the frontend connection's own
+`io_slices`. A backend that ends a response early is handled per framing:
+close-delimited bodies end cleanly at the EOF, anything else is truncated and
+the client connection is closed (`ConnectionH1::terminate_close_delimited`,
+`mux/LIFECYCLE.md` §8.4).
 
-- **Flow control.** Per-stream and per-connection windows must be
-  topped up with `WINDOW_UPDATE` frames or the peer stalls.
-- **HPACK stateful coding.** Decoder and encoder state must stay in
-  lock-step with the wire — silently dropping a size update or
-  skipping a dynamic-table eviction de-syncs the peer for the rest of
-  the connection.
-- **RFC 9218 priorities.** Priorities are extracted from the
-  `priority` request header and from `PRIORITY_UPDATE` frames
-  (`parse_rfc9218_priority`, `lib/src/protocol/mux/pkawa.rs`) and feed the
-  writable scheduler so a slow priority-7 download cannot starve a priority-0
-  interactive request.
-- **GOAWAY and graceful drain.** After GOAWAY(NO_ERROR) the connection
-  enters draining mode (`H2DrainState::draining`,
-  `lib/src/protocol/mux/h2_drain.rs`); new
-  peer streams must be refused (RFC 9113 §6.8) and existing streams
-  must complete. The graceful-shutdown deadline is driven from the
-  listener config (`HttpsListener::get_h2_graceful_shutdown_deadline`,
-  `lib/src/https.rs`).
-- **Flood mitigation.** The `H2FloodDetector` sits inline in the read
-  path and backs the published mitigations for CVE-2023-44487 (Rapid
-  Reset), CVE-2024-27316 (CONTINUATION flood), and CVE-2025-8671
-  (MadeYouReset), plus PING / SETTINGS / WINDOW_UPDATE / glitch flood
-  thresholds. Every trip emits a distinct
-  `h2.flood.violation.<kind>` counter (kinds include
-  `rst_stream_{lifetime,pre_response_lifetime,emitted_lifetime,window}`,
-  `ping_{window,lifetime}`, `settings_{window,lifetime}`,
-  `empty_data_window`, `continuation_per_block`,
-  `window_update_stream0_window`, `header_size_per_block`,
-  `glitch_window`; see `H2FloodViolation` in
-  `lib/src/protocol/mux/h2_flood_detector.rs` and
-  `ConnectionH2::handle_flood_violation`).
-  GOAWAY and RST_STREAM sends/receives are attributed by error code
-  via `h2.{goaway,rst_stream}.{sent,received}.<code>`
-  (`metric_for_goaway_sent` / `metric_for_goaway_received` /
-  `metric_for_rst_stream_sent` / `metric_for_rst_stream_received` in
-  `lib/src/protocol/mux/h2.rs`).
-- **Edge-triggered writes.** The mux is the most common offender for
-  the "queued bytes, no writable wake-up" stall described in §2.2;
-  `arm_writable` calls are scattered across `mux::answers`, `mux::h1`,
-  and `mux::h2` and must not be removed without an equivalent kick.
+### 6.5 Access log
 
-The full per-stream state diagram and the connection-level handler
-catalogue are in
-[`lib/src/protocol/mux/LIFECYCLE.md`](../lib/src/protocol/mux/LIFECYCLE.md).
+When the response completes, `Stream::generate_access_log`
+(`lib/src/protocol/mux/stream.rs`) records the metrics and emits one access-log
+record. The line is rendered into the logger's reused buffer with no
+allocation (`LogAddress` in `command/src/logging/access_logs.rs`; `write_ulid`,
+`EscapedUserAgent` and `write_status` in `command/src/logging/display.rs`;
+[#1592](https://github.com/sozu-proxy/sozu/pull/1592)), and leaves in one system
+call per record on `tcp://`, `udp://`, `unix://` and `stdout` targets, or batched
+in whole records by a `MultiLineWriter` on `file://` (one `write(2)` per 4 KiB,
+about 0.1 per request; [#1552](https://github.com/sozu-proxy/sozu/pull/1552)).
+Its `client_rtt` and `server_rtt` cells are read with
+`getsockopt(TCP_INFO)` once per connection, at that connection's first logged
+request, and repeated on every later line of the connection (`memoized_rtt`,
+`lib/src/protocol/mux/mod.rs`,
+[#1634](https://github.com/sozu-proxy/sozu/pull/1634)).
 
-### 6.3 WebSocket and TCP pass-through (pipe)
+### 6.6 Keep-alive or close
 
-Once an HTTP/1.1 session has successfully negotiated a WebSocket
-upgrade (or once a `TcpProxy` accepts a connection that is pure
-byte-stream pass-through), the session promotes to a `Pipe` state
-(`Pipe`, `lib/src/protocol/pipe.rs`). The pipe holds no protocol
-parser; it shuttles bytes between the front and back sockets and
-relies on the standard readiness-pumping discipline. WebSocket
-metadata (`WebSocketContext`, `lib/src/protocol/pipe.rs`) is
-inherited from the H1 mux at upgrade time so logging and metrics
-keep their context.
+`ConnectionH1::writable` keeps the client connection only while both
+`keep_alive_frontend` and `keep_alive_backend` hold, so a backend's
+`Connection: close` also closes the client connection once the response is
+flushed ([#1648](https://github.com/sozu-proxy/sozu/pull/1648)). On keep-alive,
+`HttpContext::reset` clears the request-scoped fields and installs the next
+request's id, minted by `Context::next_request_id` from the pass's wall-clock
+snapshot and the session's seeded RNG — no system call, no allocation
+([#1635](https://github.com/sozu-proxy/sozu/pull/1635)) — while the session id,
+the TLS state, the forwarding hop and the backend connection stay. A request
+already pipelined behind the first is parsed, routed and edited on its own.
 
-## 7. Connect to the backend cluster
+### 6.7 What a request still costs
 
-Routing happens after the request headers are parsed. The router asks
-"which cluster does this `(host, path, method)` match?" and returns a
-`cluster_id`. From there the load-balancer picks a backend.
+Measured on `c086b456` (release, `crypto-ring`, one worker, `file://` access
+log, a `python3 -m http.server` backend on loopback, `curl`, 20 requests;
+intentrace and an `LD_PRELOAD` descriptor tracer, method in
+[`hot_path_zero_copy.md`](./hot_path_zero_copy.md) §2):
 
-The available algorithms all live in `lib/src/load_balancing.rs`:
+| Per request | One request per connection | Keep-alive (20 requests, one connection) |
+|---|---|---|
+| system calls (intentrace) | 18.45–18.85 | 9.65 plaintext, 10.70 over TLS |
+| of which per connection | `accept4` ×2, `socket`, `connect`, `setsockopt` (backend `TCP_NODELAY`), `epoll_ctl` ADD ×2, `close` ×2, `getsockopt(TCP_INFO)` ×1 (the test backend closes before the second is read) | the same, once per connection (0.05 per request each); over TLS also the handshake (§4) |
+| of which per request | `recvfrom` ×2, `writev` ×2, `epoll_wait` ×4–5, `write` ×0.1 (log) | `recvfrom` ×3, `writev` ×3, `epoll_wait` ×3, `write` ×0.1 (the third read/write pair is the test backend sending headers and body separately) |
+| heap operations (malloc + calloc + realloc + memalign) | 39.95–40.35, 15 793–16 069 bytes | 7.80 plaintext (1 322 bytes), 20.25–20.30 over TLS (3 638–3 640 bytes) |
 
-- `RoundRobin` — the next backend in declaration order. Reads no load.
-- `Random` — one backend drawn at random, weighted by its configured
-  `weight`. Reads no load.
-- `LeastLoaded` — reads the load of every backend and takes the minimum.
-  The best balance available, at `O(n)` load reads per request.
-- `PowerOfTwo` — power-of-two-choices: draws two backends at random and
-  keeps the less loaded of the two, breaking an exact tie with a coin flip.
-  It reads two backend loads whatever the cluster size, against
-  `LeastLoaded`'s `n`, and stays close to `LeastLoaded`'s balance. Because
-  no worker ever computes a global minimum, independently seeded workers
-  cannot herd onto the same backend.
-- `Rendezvous` (`HRW`) and `Maglev` — flow-affine hashing for UDP clusters;
-  the backend is a function of the flow key, so they read no load either.
-  Both DO read `weight` on that keyed path — `Rendezvous::score` scales the
-  rendezvous score by it, `Maglev::rebuild` hands out table slots in
-  proportion to it — and both fall back to `RoundRobin`, which ignores it,
-  when they are called with no key.
+There is no `shutdown(2)` when the peer has already closed (§11), no
+`EPOLL_CTL_DEL`, no `getpeername(2)`, no per-connection `setsockopt` on the
+frontend and no read that ends in `EAGAIN`.
 
-`LeastLoaded` and `PowerOfTwo` are the two policies that read load, through
-the cluster's `load_metric`.
+## 7. HTTP/2 request lifecycle
 
-Those load-read counts are not the per-request cost of a policy. Whatever the
-policy, `BackendList::next_available_backend_with_key` first builds the
-candidate set: it walks the cluster's backend list and records the position of
-every healthy backend in a buffer the list reuses across selections, then lends
-the policy a borrowed `Candidates` view of those positions. The walk allocates
-nothing and clones no `Rc` but the chosen backend's, yet every policy is still
-`O(n)` per request because of it; power-of-two-choices only removes the `n`
-load reads layered on top of it.
+An `h2` ALPN makes the mux frontend a `ConnectionH2`, wrapped in an `H2Shell`
+that owns the socket (`lib/src/protocol/mux/h2.rs`). The shell holds the only
+OS handles; the connection core holds the wire state: HPACK encoder and decoder
+(the in-tree sans-io codec, `lib/src/protocol/mux/hpack/`), flow-control
+windows, the GOAWAY/drain state and the flood detector. A `Context`
+(`lib/src/protocol/mux/mod.rs`) owns the `Vec<Stream>` whose buffers carry each
+request and response; the two are linked by `GlobalStreamId = usize`.
 
-Sticky sessions are implemented as an opt-in cookie-based override:
-when a request carries a sticky cookie that names a still-healthy
-backend, the load balancer skips its normal selection and pins the
-request to that backend.
+### 7.1 Preface and settings
 
-Backend health is tracked in `lib/src/backends.rs`. A request that
-fails to reach its first chosen backend retries up to three attempts
-(within the same cluster) before Sōzu serves a default 503; if no
-cluster matches the request at all, Sōzu serves a default 404.
+The server preface — SETTINGS, the stream-0 WINDOW_UPDATE that enlarges the
+connection window, and the ACK of the client's SETTINGS — leaves in one
+`writev(2)` ([#1558](https://github.com/sozu-proxy/sozu/pull/1558)). Every
+control frame goes through the connection's ordered output queue, `H2Output`
+(`lib/src/protocol/mux/h2_output.rs`), which holds 128 bytes inline and spills
+to the heap only under backpressure
+([#1625](https://github.com/sozu-proxy/sozu/pull/1625)).
 
-## 8. Forwarding bytes both ways
+### 7.2 Frames, HPACK and streams
 
-After the backend connection is established the session enters its
-steady-state. The H1 path holds a `front`/`back` pair of Kawa buffers;
-the H2 path holds a per-stream pair driven by the mux scheduler; the
-pipe path passes bytes through verbatim. In all three cases the loop
-shape is the same:
+Reads are exact-sized (a 9-byte header, then the payload) and served from
+rustls's plaintext before any `recv` (§2.2). HEADERS are decoded by the in-tree
+HPACK decoder, which calls back per field with slices borrowed from the block,
+a table or one scratch buffer, and decodes Huffman strings through a
+compile-time state machine with no allocation
+([#1620](https://github.com/sozu-proxy/sozu/pull/1620)); `pkawa` turns the
+fields into a kawa request and validates the pseudo-headers. Each stream gets
+its own request id from `Context::next_request_id`. Routing, the gate and the
+backend connection are the H1 ones (§6.2, §6.3).
 
-1. mio reports a readable edge on either socket.
-2. The session reads as much as the kernel buffer holds.
-3. The bytes are processed (parsed, scheduled, or copied) and queued
-   for the opposite socket.
-4. The session arms writable interest if it just produced new output
-   from a readable code path (§2.2).
-5. mio reports a writable edge on the destination socket.
-6. The session drains as much as the kernel will accept and loops.
+### 7.3 Backends and the write pass
 
-The two pitfalls that bite repeatedly:
+The H2 frontend's streams share the session's backend connections: H1
+backends carry one request at a time, an H2 backend multiplexes the
+concurrent streams of this one frontend connection. A backend connection
+belongs to one `Mux` session (`Mux::router`) and is never shared with another
+client connection.
 
-- **Forgetting `arm_writable` / `signal_pending_write` after queueing
-  bytes from a readable handler.** The session looks alive but never
-  flushes the last frame.
-- **Asymmetric scalar vs vectored write paths.** `socket_write` and
-  `socket_write_vectored` must retry under partial writes the same
-  way; past divergence here caused the multi-megabyte response
-  truncation bug on `feat/h2-mux`.
+`H2Shell::write_streams` prepares each stream's frames, then writes the output
+queue followed by the stream's `kawa.out` blocks as `IoSlice`s into one
+`writev(2)` (`h2_transmit::gather_after`), over the shell's reused `io_slices`
+([#1578](https://github.com/sozu-proxy/sozu/pull/1578)): a response's HEADERS
+and DATA leave together. Stream frames stay zero-copy; only the rest of a frame
+a partial write cut is copied into the output queue, bounded to one frame or
+one header block, so a removed stream never leaves half a frame on the wire.
+Flow control debits the windows when DATA is prepared and gives the credit
+back when that DATA is dropped unsent (`H2FlowControl::refund_send_window`,
+[#1646](https://github.com/sozu-proxy/sozu/pull/1646)); a header block dropped
+after encoding resets both HPACK tables (`Encoder::reset_table`,
+[#1630](https://github.com/sozu-proxy/sozu/pull/1630)).
 
-Per-cluster traffic is observed via `requests`, `bytes_in`,
-`bytes_out`, and `backend_response_time`
-(`names::backend`, `lib/src/metrics/names.rs`).
+### 7.4 Access log and stream recycle
 
-## 9. Closing the session
+Each finished stream logs one record as in §6.5; the frontend's `client_rtt`
+is sampled at the connection's first logged stream and reused by every later
+one (`ShellEndpoint::local_rtt`,
+[#1598](https://github.com/sozu-proxy/sozu/pull/1598),
+[#1634](https://github.com/sozu-proxy/sozu/pull/1634)). A finished slot becomes
+`StreamState::Recycle` and is reused by the next stream; its buffers go back to
+the pool (`mux/LIFECYCLE.md` §3.3).
+
+### 7.5 Closing an H2 connection
+
+A GOAWAY from the client, an idle timeout or a soft stop ends the connection
+with Sōzu's final GOAWAY. On a TLS frontend that GOAWAY and the `close_notify`
+behind it leave in one `writev(2)` (`H2Shell::flush_output_to_socket`,
+`ConnectionH2::output_flush_closes_connection`, `SocketHandler::socket_write_then_close`,
+[#1608](https://github.com/sozu-proxy/sozu/pull/1608)); the rest of the close is
+§11.
+
+### 7.6 What a request still costs
+
+Same rig as §6.7, TLS listener with ALPN `h2`:
+
+| Per request | One request per TLS connection | 20 streams on one connection |
+|---|---|---|
+| system calls (intentrace) | 40.15–40.75 | 13.55 |
+| per-connection share | `accept4` ×2, `getrandom` ×15 (`crypto-ring` only), `writev` ×4 (handshake flight, tickets, preface, GOAWAY with `close_notify`), `getsockopt(TCP_INFO)` ×1, `epoll_ctl` ADD and `close` of the frontend socket | spread over the 20 streams (`getrandom` 0.75, `accept4` 0.10 per request) |
+| per request | `recvfrom` ×4 (client flights and the backend response), `writev` ×2 (request to the backend, HEADERS+DATA to the client), `epoll_wait` ×5–6, and the backend's `socket`, `connect`, `setsockopt`, `epoll_ctl` ADD and `close` | `recvfrom` ×2.10, `writev` ×2.20, `epoll_wait` ×3.15, and one backend connection per stream, since `python3 -m http.server` answers one request per connection |
+| heap operations | 240.60–241.75, 47 559–47 963 bytes | 41.15–42.00, 4 792–4 825 bytes |
+
+## 8. The mux session
+
+### 8.1 What a session allocates once
+
+A mux session is one heap object. Its setup no longer allocates per request on
+a one-request connection: the first backend connection is inline in
+`BackendConnections` rather than in an 18 KiB `BTreeMap` leaf
+([#1612](https://github.com/sozu-proxy/sozu/pull/1612)); the frontend's timer
+handle is a named field of `MuxTimeouts` and the backends' live in an
+`InlineTokenMap`, as does the reverse index `Context::backend_streams`
+(`LinkedStreams` holds the first stream inline,
+[#1614](https://github.com/sozu-proxy/sozu/pull/1614)); the 48 KiB debug-event
+ring (`DebugHistory`, `lib/src/protocol/mux/debug.rs`) is reserved on the first
+push, which only a `debug_assertions` build makes
+([#1591](https://github.com/sozu-proxy/sozu/pull/1591)). What remains per
+connection is the session object itself, the stream slot, the registry entry
+and the write descriptors, each sized for one.
+
+### 8.2 One pass
+
+`Mux::ready_inner` takes one clock snapshot per iteration of its outer loop
+(`mux/LIFECYCLE.md` §7.5), services the frontend and every
+backend whose readiness has work, sweeps the backends found dead (their tokens
+collect in `Router::dead_backends`, reused across passes) and settles the
+per-backend accounting through `BackendRegistry::apply_all`, whose ledger keeps
+its capacity. The loop repeats while any connection still has interest and an
+event, bounded by `MAX_LOOP_ITERATIONS`.
+
+## 9. TCP (pipe) session lifecycle
+
+`TcpProxy` sessions run `TcpSession` (`lib/src/tcp.rs`), a small state machine:
+an optional `SniPreread` on an SNI-routed listener
+([`tcp_preread/LIFECYCLE.md`](../lib/src/protocol/tcp_preread/LIFECYCLE.md)),
+an optional PROXY-protocol stage (expect, send or relay), then a `Pipe`
+(`lib/src/protocol/pipe.rs`) that copies bytes both ways without parsing them.
+A WebSocket upgrade on an H1 connection ends in the same `Pipe`.
+
+1. **Accept** as in §3; the listener's `TCP_NODELAY` and the accepted address
+   apply unchanged.
+2. **Connect.** `TcpSession::connect_to_backend` resolves the cluster (the
+   SNI-routed one, else the listener's), passes the per-(cluster, source-IP)
+   gate, picks a backend through the same `Candidates` view as the mux, and
+   dials it: `socket(2)`, `connect(2)`, `setsockopt(TCP_NODELAY)`,
+   `epoll_ctl(EPOLL_CTL_ADD)`. A failed connect is retried up to
+   `CONN_RETRIES` times.
+3. **Relay.** On Linux with the `splice` feature, a `Protocol::TCP` pipe
+   allocates a `SplicePipe` (`lib/src/splice.rs`) when it is created: two
+   `pipe2(2)` and four `fcntl(2)` (`F_SETPIPE_SZ` and `F_GETPIPE_SZ` on each
+   pipe). The payload then moves socket → pipe → socket with `splice(2)` and
+   never enters user space; bytes buffered before the pipe existed drain first
+   (`tcp_preread/LIFECYCLE.md` §8). Without splice, or on a WebSocket pipe, the
+   `Pipe` copies through its two pooled buffers with `recv`/`send`.
+4. **Close.** A HUP on either side drains what is in flight
+   (`Pipe::frontend_hup`, `Pipe::backend_hup`). The `Pipe` logs the session
+   once, from whichever of its handlers ends it (`Pipe::log_request_success`
+   or `Pipe::log_request_error`, both through `Pipe::log_request`:
+   `getsockopt(TCP_INFO)` on each side, and `getpeername(2)` on the backend
+   socket through `Pipe::get_backend_address`). `TcpSession::close` then
+   shuts both sockets down with
+   `Shutdown::Both` — correct on a plaintext relay, which has no TLS send
+   buffer to truncate — deregisters them (`EPOLL_CTL_DEL`) and closes them and
+   the four pipe descriptors.
+
+The TCP path kept its deregistering close: the campaign that removed
+`EPOLL_CTL_DEL` and the redundant `shutdown(2)` from HTTP and HTTPS sessions
+(§11) did not touch `lib/src/tcp.rs`. Measured on the same rig as §6.7,
+`curl` through a TCP listener to the same backend, one connection per request:
+
+| Per connection | `c086b456` |
+|---|---|
+| system calls (intentrace) | 36.05–36.15 |
+| `splice` | 6.05–6.15 (6.70–6.85 under the descriptor tracer) |
+| `epoll_wait` | 3.95 |
+| setup and teardown | `accept4` ×2, `socket`, `connect`, `setsockopt`, `pipe2` ×2, `fcntl` ×4, `epoll_ctl` ×4 (2 ADD, 2 DEL), `shutdown` ×2, `getsockopt` ×2, `getpeername` ×1, `close` ×6 |
+| heap operations | 14.45, 3 778 bytes |
+
+## 10. UDP flow lifecycle
+
+UDP has no connection and no accept. One `UdpListenerSession` per listener
+(`lib/src/udp.rs`) serves every client; the pure core `UdpManager`
+(`lib/src/protocol/udp/manager.rs`) keeps a flow table keyed on the client's
+source address. The full workflow — admission, selection inside the core,
+symmetric NAT return through one connected upstream socket per flow, teardown
+on idle or request/response caps — is in
+[`udp/LIFECYCLE.md`](../lib/src/protocol/udp/LIFECYCLE.md). Its costs, read from
+the code (no UDP scenario was traced):
+
+- **per client datagram:** one `recvfrom(2)`, one owned copy of the payload
+  into the forwarded `Transmit`, one `send(2)` on the flow's connected socket;
+  each readiness burst ends with one `recvfrom` that answers `EAGAIN`, since a
+  datagram socket offers no short-read proof;
+- **per backend reply:** one `recv(2)`, one copy, one `sendto(2)` on the
+  listener socket;
+- **per new flow:** `udp_connect` (`lib/src/socket.rs`) issues `socket(2)`,
+  `bind(2)`, two `fcntl(2)` to set `O_NONBLOCK` and `connect(2)`, then — in
+  release builds too, since only the assertions they feed are compiled out —
+  a third `fcntl` (`nonblocking()`), a `getsockname(2)` (`local_addr()`) and a
+  `getpeername(2)` (`peer_addr()`) for its post-condition checks; the shell
+  then registers the socket (`epoll_ctl(EPOLL_CTL_ADD)`) and takes the flow's
+  slab slot. **Per closed flow:** `EPOLL_CTL_DEL` and `close(2)`.
+
+## 11. Closing a session
 
 A session ends when:
 
-- The H1 response completes and either side closed the connection, or
-- The H2 stream pool drains after GOAWAY and the connection is
-  destroyed, or
-- A protocol error or flood violation forces a hard close, or
-- The zombie checker decides the session is wedged.
+- an H1 response completes and either side closes the connection;
+- an H2 connection ends on GOAWAY, after its streams drain;
+- a protocol error, a flood violation or a timeout forces the close;
+- the zombie checker decides it is wedged.
 
-For TLS frontends specifically, the close path uses **write-only
-shutdown** on the front socket
-(the `Shutdown::Write` block of `HttpsSession::close` in
-`lib/src/https.rs`, mirrored in `HttpSession::close` in
-`lib/src/http.rs`):
+On a TLS frontend the close path shuts down the **write side only**
+(`mux::shutdown_write` in `HttpsSession::close`, `lib/src/https.rs`, mirrored in
+`HttpSession::close`, `lib/src/http.rs`). `Shutdown::Both` is forbidden there: it
+includes `SHUT_RD`, which discards unread data in the receive buffer (the
+client's GOAWAY, ACKs, trailing TLS records), and on Linux the `close()` that
+follows then sends a TCP RST instead of a FIN, destroying the TLS records the
+drain loop just flushed. The plaintext TCP relay keeps `Shutdown::Both`
+(`TcpSession::close`, `TcpSession::close_backend`, §9).
 
-```rust
-mux::shutdown_write(front_socket, peer_closed)
-```
+`shutdown_write` (`lib/src/protocol/mux/mod.rs`) also skips the `shutdown(2)`
+once the peer has closed its side, on the front socket and on every backend
+socket of `Mux::close` and of the dead-backend sweep
+([#1603](https://github.com/sozu-proxy/sozu/issues/1603)). The peer has closed
+when its connection's readiness carries HUP — `EPOLLRDHUP`/`EPOLLHUP` from the
+event loop, or an H1 backend read that met the EOF — or, on a TLS frontend,
+when a read met the client's EOF or `close_notify`
+(`FrontRustls::peer_disconnected`); a backend Sōzu drops on its own
+(`BackendStatus::Disconnecting`) keeps its shutdown. Nothing changes on the
+wire: the `close()` that follows is the descriptor's last, and Linux's
+`tcp_close` sends the FIN after the queued bytes itself (or a RST when unread
+data remains), with or without a prior `shutdown(SHUT_WR)`. HAProxy skips the
+socket shutdown on the same condition (`conn_sock_shutw`,
+`include/haproxy/connection.h`). The TLS `close_notify` is kept: RFC 8446 §6.1
+requires it before the write side closes, whether or not the peer sent its own.
 
-`Shutdown::Both` is forbidden on a TLS frontend. It includes
-`SHUT_RD`, which discards any unread data in the kernel receive
-buffer (the client's GOAWAY, ACKs, or trailing TLS records). On
-Linux the subsequent `close()` then sends a TCP RST instead of a FIN,
-destroying any data still in the send buffer — including the TLS
-records the drain loop just flushed. `Shutdown::Write` sends FIN only
-after the send buffer drains, preserving the response. The plaintext
-TCP path (`lib/src/tcp.rs:1568-1572, 1843-1848`) keeps `Shutdown::Both`
-because it has no encrypted send-buffer to truncate; the comment
-flags that a future TLS upgrade on TCP would need to switch modes.
+An H1 backend read that meets the EOF records HUP (`ConnectionH1::readable`,
+[#1603](https://github.com/sozu-proxy/sozu/issues/1603)), so the dead-backend
+check closes the backend without waiting for the `EPOLLRDHUP` edge. Since
+[#1606](https://github.com/sozu-proxy/sozu/issues/1606) a short read stops the
+read, so the last bytes and the EOF no longer come back from one `recv`: the
+EOF is read by a later `readable`, in the same pass when the event already
+carried HUP, one `epoll_wait` round later when the FIN landed after that
+`epoll_wait` returned (§2.2). A frontend read does not record HUP: over TLS its
+`Closed` can be a `close_notify` on a TCP stream that is still open, and a
+frontend HUP closes the whole session.
 
-`shutdown_write` (`lib/src/protocol/mux/mod.rs`) skips the
-`shutdown(SHUT_WR)` once the peer has closed its side, on the front
-socket and on the backend sockets of `Mux::close` and of the
-`dead_backends` block alike
-([#1603](https://github.com/sozu-proxy/sozu/issues/1603)). The peer
-has closed when its connection's readiness carries HUP —
-`EPOLLRDHUP`/`EPOLLHUP` from the event loop, or an H1 backend read that
-met the EOF — or, on a TLS frontend, when a read met the client's EOF
-or `close_notify` (`FrontRustls::peer_disconnected`); a backend that
-sozu itself drops (`BackendStatus::Disconnecting`) keeps its shutdown.
-Nothing changes on the wire, for the reason the next paragraphs give:
-the `close()` that follows is the descriptor's last, and Linux's
-`tcp_close` then sends the FIN after the queued bytes itself when the
-receive queue is empty, or a RST when it is not, with or without a
-prior `shutdown(SHUT_WR)`. A peer that half-closed and is still
-reading therefore still gets its FIN; what goes away is one syscall
-per closed side, which on an H2 client that had already reset used to
-fail with `ENOTCONN`. HAProxy skips the socket shutdown on the same
-condition (`conn_sock_shutw`, `include/haproxy/connection.h`). The TLS
-`close_notify` is written before and is kept: RFC 8446 §6.1 requires
-it before the write side closes, whether or not the peer sent its own.
-On an H2 frontend closed by its final GOAWAY, rustls sends that GOAWAY
-and the `close_notify` behind it in one `writev(2)`
-(`H2Shell::flush_zero_to_socket`,
-[#1607](https://github.com/sozu-proxy/sozu/issues/1607)).
+The sockets of an HTTP or HTTPS session are **not** deregistered from epoll
+([#1567](https://github.com/sozu-proxy/sozu/issues/1567)). Each one closes when
+its owner drops: a dead backend connection at the end of the dead-backend
+sweep of `Mux::ready_inner`, and the front socket plus every remaining backend
+when the session itself drops, which `shut_down_sessions_by_frontend_tokens`
+(`lib/src/server.rs`) does before the loop's next `epoll_wait`. Linux removes a
+file from every epoll set on its last close, so an `EPOLL_CTL_DEL` just before
+that close costs a system call and removes nothing. The argument needs the
+close to be the *last* one: a duplicated descriptor would keep the file, and
+its registration, alive under a slab token that may already belong to a new
+session. Nothing duplicates a session socket: there is no `dup` or `try_clone`
+of one, a worker never forks, and SCM_RIGHTS (`command/src/scm_socket.rs`)
+carries only listeners. mio keeps no per-source state on epoll or kqueue that a
+deregister would release, and BSD also drops a descriptor's kevents on close.
+`closed_sessions_leave_their_sockets_to_close` (`lib/src/http.rs`) and
+`close_leaves_backend_sockets_to_their_last_close`
+(`lib/src/protocol/mux/mod.rs`) pin it by reading the kernel's epoll table from
+`/proc/self/fdinfo`.
 
-A backend whose H1 read returns its last bytes together with the EOF
-records HUP on that read (`ConnectionH1::readable`,
-`lib/src/protocol/mux/h1.rs`), so the dead-backend check closes it on
-the same `ready` pass, after those bytes are parsed, instead of on the
-`EPOLLRDHUP` edge the kernel queued for the same FIN, which cost one
-more `epoll_wait`. A frontend read does not: over TLS its `Closed` can
-be a `close_notify` on a TCP stream that is still open, and a frontend
-HUP closes the whole session.
+## 12. Soft stop, hard stop and GOAWAY
 
-After shutdown, `state.close(...)` closes the backend, flushes any
-close-notify, and releases buffers; the proxy removes the session
-from the slab under both front and back tokens, and the slab entries
-return to the free list.
+A soft stop (`sozu shutdown`, a worker upgrade, or `SIGTERM` to the main
+process, [#1555](https://github.com/sozu-proxy/sozu/issues/1555)) stops the
+listeners from accepting — each proxy's `soft_stop` (`HttpProxy::soft_stop`
+and its siblings) deregisters and drops its listener sockets — then calls
+`Server::shut_down_sessions` once per event-loop turn: each session's
+`shutting_down` says whether it may close now.
 
-The sockets are **not** deregistered from epoll. Each one closes when
-its owner drops: a dead backend connection at the end of the
-`dead_backends` block in `Mux::ready` (the tokens are collected in
-`Router::dead_backends`, emptied at each sweep and kept for its capacity,
-sozu-proxy/sozu#1610), and the front socket plus every
-remaining backend when the session itself drops, which
-`shut_down_sessions_by_frontend_tokens` (`lib/src/server.rs`) does
-before the event loop's next `epoll_wait`. Linux removes a file from
-every epoll set on its last close, so an `EPOLL_CTL_DEL` just before
-that close costs a syscall and removes nothing the close would not.
-The argument needs the close to be the *last* one: a duplicated
-descriptor would keep the file, and its registration, alive, and
-would report events under a slab token that may already belong to a
-new session. Nothing duplicates a session socket: there is no `dup` or
-`try_clone` of one, a worker never forks, and the SCM_RIGHTS channel
-(`command/src/scm_socket.rs`) only carries listeners. mio keeps no
-per-source state on epoll or kqueue that a deregister would release,
-and BSD also drops a descriptor's kevents on close. The regression
-tests are `closed_sessions_leave_their_sockets_to_close` in
-`lib/src/http.rs` (front socket) and
-`close_leaves_backend_sockets_to_their_last_close` in
-`lib/src/protocol/mux/mod.rs` (backend sockets); each reads the
-kernel's epoll table from `/proc/self/fdinfo`. Half-closed
-H2 streams unwind the same way — per-stream cleanup in `mux::mod` and
-`mux::router` decrements `backend.pool.size`
-(`Mux::close` in `lib/src/protocol/mux/mod.rs`, `Router::plan_connect` in
-`lib/src/protocol/mux/router.rs`).
+- **H2.** The first call sends the advisory `GOAWAY(NO_ERROR, 2^31-1)` at once
+  and flushes it (`ConnectionH2::graceful_goaway`), even while a peer header
+  block is still being reassembled
+  ([#1637](https://github.com/sozu-proxy/sozu/issues/1637)). The session then
+  stays open while streams are in flight — including a request whose header
+  block is still arriving (`ConnectionH2::peer_header_block_in_progress`) or
+  that awaits its backend link (`StreamState::Link`,
+  [#1647](https://github.com/sozu-proxy/sozu/issues/1647)); when they have
+  drained, the final GOAWAY carries the real `last_stream_id` (RFC 9113 §6.8).
+  The `h2_graceful_shutdown_deadline_seconds` budget (5 s by default, `0` for
+  no bound of its own) bounds the wait. When it elapses, the session is not
+  closed silently: `ConnectionH2::goaway_before_forced_close` queues a final
+  `GOAWAY(NO_ERROR)` first, whose `last_stream_id` excludes a stream whose
+  opening block never completed, so the client knows it may retry it
+  ([#1654](https://github.com/sozu-proxy/sozu/pull/1654);
+  `mux/LIFECYCLE.md` invariant 31).
+  `Mux::drive_frontend_shutdown_io` forces one write pass per call and stops as
+  soon as nothing is queued or the socket blocks, where it used to spin
+  `MAX_LOOP_ITERATIONS` empty writes per draining session and per call
+  ([#1645](https://github.com/sozu-proxy/sozu/pull/1645)).
+- **H1.** There is no GOAWAY: a session whose stream is still linked to a
+  backend is kept until its response is done, and an idle keep-alive
+  connection, whose stream the keep-alive branch of `ConnectionH1::writable`
+  returned to `StreamState::Idle`, closes on the next call
+  (`Mux::shutting_down_inner` waits only for `Linked` and non-quiesced
+  `Unlinked` streams).
+- **TCP.** `TcpSession::shutting_down` answers `true`, as it has since
+  `be5dd44b` (2020-01-10): a TCP session is closed on the first
+  `shut_down_sessions` pass after the soft stop, whatever it still has in
+  flight, with no drain of its own.
+- **UDP.** The listener session is not a connection and answers `false`; the
+  soft stop is `UdpProxy::notify`'s `SoftStop` arm, and it is active. It puts
+  every flow manager in `Drain` (no new flow is admitted), then closes every
+  existing flow at once through `UdpListenerSession::close_all_flows`, so
+  `udp.active_flows` returns to zero and a reply still in flight may be lost,
+  then clears the listener sessions and deregisters the listener sockets.
 
-## 10. Hot reconfig and upgrades
+When the last session is gone the worker answers the main process and leaves
+its event loop, flushing the log backends first so a `file://` access log keeps
+its buffered records ([#1554](https://github.com/sozu-proxy/sozu/pull/1554)). A
+hard stop (`sozu shutdown --hard`, or a second `SIGTERM` during a soft stop)
+closes every session at once.
 
-Everything above describes a worker forwarding live traffic. That
-data path is decoupled from the **control plane**: master and workers
-communicate through a unix command channel, the master validates
-incoming requests, and changes fan out to workers through
-SCM_RIGHTS-passing pairs. Hot reconfiguration (add a frontend, remove
-a backend, swap a certificate) flows through this channel without
-touching live sessions. The hot **upgrade** path additionally re-execs
-the master with the listener file descriptors handed off across
-`execve` (`bin/src/upgrade.rs`), so a new binary takes over the same
-listening sockets without dropping accepted connections.
+## 13. Hot reconfiguration and upgrades
 
-Detailed master/worker lifecycle, the `HardStop` / `SoftStop` arms of
-`Server::read_channel_messages_and_notify` (`lib/src/server.rs`), and
-the audit-log envelope live in
-[`bin/src/command/LIFECYCLE.md`](../bin/src/command/LIFECYCLE.md).
+Everything above describes a worker forwarding live traffic. The control plane
+is separate: the main process and the workers talk over unix channels, the main
+process validates each request, and changes fan out to the workers. Hot
+reconfiguration (add a frontend, remove a backend, swap a certificate) flows
+through this channel without touching live sessions. The hot
+**upgrade** re-execs the main process with the listener descriptors handed over
+across `execve` (`bin/src/upgrade.rs`), so a new binary takes over the same
+listening sockets without dropping accepted connections. The master/worker
+lifecycle, the `HardStop` / `SoftStop` arms of
+`Server::read_channel_messages_and_notify` and the audit log are in
+[`bin/src/command/LIFECYCLE.md`](../bin/src/command/LIFECYCLE.md). Data-plane
+sessions never emit audit-log lines; to answer "where did this 502 come from",
+read the per-cluster metrics and the protocol logs.
 
-**Scope clarification.** Data-plane sessions never emit audit-log
-lines. The audit log is bound to control-plane mutations (frontends,
-backends, certificates, listener config) over the unix command
-socket. To answer "where did this 502 come from", read the per-cluster
-metrics and the protocol log macros — not the audit log.
-
-## 11. Where to look in the code
-
-Use this map as the entry point when you want to read source.
+## 14. Where to look in the code
 
 | Concern | Files |
 |---|---|
-| mio loop, slab, accept queue, max_connections, soft/hard stop | `lib/src/server.rs` |
-| `SO_REUSEPORT`, socket helpers | `lib/src/socket.rs` |
+| mio loop, slab, accept queue, `max_connections`, soft/hard stop | `lib/src/server.rs` |
+| `SO_REUSEPORT`, socket reads (short-read stop, TLS plaintext first), `udp_connect` | `lib/src/socket.rs` |
 | `HttpProxy`, H1 listener, upgrade transitions | `lib/src/http.rs` |
 | `HttpsProxy`, TLS listener, ALPN dispatch, write-only shutdown | `lib/src/https.rs`, `lib/src/tls.rs` |
-| `TcpProxy` (plaintext byte relay) | `lib/src/tcp.rs` |
 | TLS handshake (rustls glue), handshake metrics | `lib/src/protocol/rustls.rs` |
-| H1 vocabulary (`DefaultAnswer`, answer templates, `HttpContext` editor, `Method`) | `lib/src/protocol/kawa_h1/` |
-| HTTP/1.1 and HTTP/2 mux (connection, frames, HPACK, priorities, scheduler, flood detector, router, backend connect, keep-alive) | `lib/src/protocol/mux/` |
-| WebSocket / TCP pass-through after upgrade | `lib/src/protocol/pipe.rs` |
+| H1 vocabulary (`HttpContext` editor, answer templates, `Method`) | `lib/src/protocol/kawa_h1/` |
+| HTTP/1.1 and HTTP/2 mux (connections, frames, HPACK, output queue, scheduler, flood detector, router, backend dial, keep-alive) | `lib/src/protocol/mux/` |
+| TCP sessions and the pipe (splice, WebSocket) | `lib/src/tcp.rs`, `lib/src/protocol/pipe.rs`, `lib/src/splice.rs` |
+| TCP SNI/ALPN preread | `lib/src/protocol/tcp_preread/` |
 | PROXY-protocol pre-flight (expect / relay / send) | `lib/src/protocol/proxy_protocol/` |
+| UDP shell and sans-io core | `lib/src/udp.rs`, `lib/src/protocol/udp/` |
 | Routing and load balancing | `lib/src/router/`, `lib/src/load_balancing.rs`, `lib/src/backends.rs` |
-| Metrics emission | `lib/src/metrics/mod.rs` |
+| Access-log rendering and log backends | `command/src/logging/` |
+| Metrics emission and the local drain | `lib/src/metrics/` |
 | Master/worker supervisor, command socket, hot upgrade | `bin/src/command/`, `bin/src/upgrade.rs` |
-| Config knobs (buffer_size, ALPN, H2 timeouts, flood thresholds, sticky sessions) | `command/src/config.rs` |
-| Per-protocol log macros (`MUX-H1`, `MUX-H2`, `RUSTLS`, `PIPE`, `TCP`, `HTTPS`, …) | each module's `log_context!` family |
+| Configuration knobs | `command/src/config.rs`, [`configure.md`](./configure.md) |
 
-## 11.5 Where metrics fire along the path
+### 14.1 Where metrics fire along the path
 
-Full taxonomy: `doc/configure.md` + `lib/src/metrics/`. The minimum
-set to read a session's life from a dashboard:
+Full taxonomy: [`configure.md`](./configure.md) and `lib/src/metrics/`. The
+minimum set to read a session's life from a dashboard:
 
-- `tls.handshake_ms`, `tls.handshake.failed.<reason>` — handshake
-  latency + per-rustls-variant failure attribution
-  (`TlsHandshake::record_handshake_duration_ms` /
-  `handshake_failure_reason`, `lib/src/protocol/rustls.rs`).
-- `https.alpn.rejected.{unsupported,http11_disabled}` — ALPN refusal
-  causes (`lib/src/https.rs:497, 514, 527`).
-- `client.connections`, `client.connections_max`,
-  `client.connections_percent` — slab-backed lifecycle gauges
-  (`client.connections` is sampled per increment/decrement in
-  `SessionManager::incr/decr`; `_max` and `_percent` are sampled in the
-  run loop alongside `slab.*` and `buffer.*`).
-- `accept_queue.backpressure`, `accept_queue.saturated_seconds` —
-  binary backpressure + time-integrated saturation
-  (`SessionManager::check_limits` and `SessionManager::decr` in
-  `lib/src/server.rs`, plus the `ACCEPT_SATURATION_TICK` block of
-  `Server::run` in the same file).
-- `backend.pool.size` — long-lived gauge mirroring open backend
-  connections (`Router::plan_connect` in `lib/src/protocol/mux/router.rs`,
-  `Mux::close` in `lib/src/protocol/mux/mod.rs`,
-  `Connection::pre_close_client_bookkeeping` in
-  `lib/src/protocol/mux/connection.rs`).
-- `requests`, `bytes_in`, `bytes_out`, `backend_response_time` —
-  per-cluster + per-backend counters and timing
+- `tls.handshake_ms`, `tls.handshake.failed.<reason>` — handshake latency and
+  per-rustls-variant failures (`TlsHandshake::record_handshake_duration_ms`,
+  `handshake_failure_reason`).
+- `https.alpn.rejected.{unsupported,http11_disabled}` — ALPN refusals
+  (`HttpsSession::upgrade_handshake`).
+- `client.connections`, `client.connections_max`, `client.connections_percent`
+  — slab-backed gauges (`SessionManager::incr` / `SessionManager::decr`, and
+  the run loop for `_max` and `_percent`).
+- `accept_queue.backpressure`, `accept_queue.saturated_seconds` — binary
+  backpressure and time-integrated saturation (`SessionManager::check_limits`,
+  `SessionManager::decr`, the `ACCEPT_SATURATION_TICK` block of `Server::run`).
+- `backend.pool.size` — open backend connections (`+1` in
+  `Mux::dial_backend`; `-1` in `Mux::close` for the backends still open at
+  session teardown, in `Connection::pre_close_client_bookkeeping` for a backend
+  closed through `Connection::close` — the dead-backend sweep of
+  `Mux::ready_inner` included — and in `Mux::dial_backend`'s rollback when the
+  mio registration of a new backend socket fails).
+- `requests`, `bytes_in`, `bytes_out`, `backend_response_time`,
+  `backend_header_time` — per-cluster and per-backend counters and timings
   (`names::backend`, `lib/src/metrics/names.rs`).
-- `h2.flood.violation.<kind>` — H2 flood-detector trips
-  (`ConnectionH2::handle_flood_violation`,
-  `lib/src/protocol/mux/h2.rs`).
-- `h2.{goaway,rst_stream}.{sent,received}.<code>` — H2 error
-  attribution (the `metric_for_goaway_sent` family in
-  `lib/src/protocol/mux/h2.rs`).
-- `epoll_time` — `Poll::poll` wall-clock, useful for worker saturation
-  (`names::event_loop::EPOLL_TIME` in `Server::run`, `lib/src/server.rs`).
-
-## 12. Removed and migrated APIs
-
-Earlier revisions of this document (and the `e4e7488…` permalinks they
-embedded) cited two modules that no longer exist on `feat/h2-mux`:
-
-- `lib/src/https_openssl.rs` — the OpenSSL-backed HTTPS path. Sōzu
-  has been rustls-only for several releases; the canonical
-  replacements are `lib/src/https.rs` (proxy + listener) and
-  `lib/src/protocol/rustls.rs` (per-session handshake state machine).
-- `lib/src/protocol/http/mod.rs` — the pre-Kawa HTTP/1.1 state
-  machine. Its Kawa-backed successor, `kawa_h1::Http`, was itself
-  removed on 2026-09-20 (sozu#1346) once it became unreachable; the
-  canonical replacement for the H1 datapath is now
-  `lib/src/protocol/mux/` (with its sibling
-  [`LIFECYCLE.md`](../lib/src/protocol/mux/LIFECYCLE.md)).
-
-A stale reference to either path elsewhere in `doc/` is a defect —
-update it against current sources rather than copying the obsolete
-name into new docs.
+- `h2.flood.violation.<kind>` — flood-detector trips
+  (`ConnectionH2::handle_flood_violation`).
+- `h2.{goaway,rst_stream}.{sent,received}.<code>` — H2 error attribution (the
+  `metric_for_goaway_sent` family, `lib/src/protocol/mux/h2.rs`).
+- `epoll_time`, `event_loop_time` — the loop's wall-clock split
+  (`names::event_loop`).

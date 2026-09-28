@@ -542,8 +542,8 @@ of its seed). After **every** action the workload fully drains `poll_output()` t
 
 **Buggify.** `buggify_with_prob!(p)` is moonpool's FoundationDB-`buggify`
 primitive: with low per-call probability it injects an *extra* adversarial event
-(a stale `BackendResolved`, a reconfig burst, a `max_flows` shrink to a tiny
-value, a giant clock jump). It runs only under simulation, never in production.
+(a backend set emptied then refilled, a reconfig burst, a `max_flows` shrink to
+a tiny value, a giant clock jump). It runs only under simulation, never in production.
 
 **Replay ergonomics.** A failing seed is surfaced in moonpool's `SimulationReport`
 (and the panicking invariant prints the seed + step). Reproduce a run verbosely
@@ -572,9 +572,9 @@ paper's active-suppression and passive-competition mechanisms).
 **What a feature is here.**
 
 - `udp_simulation.rs`: an entry of the weighted `Action` grammar
-  (`ACTION_TABLE`). Each buggify arm is tied to its sibling feature (a
-  stale-resolution fault makes no sense in a configuration without
-  `BackendResolved`) and is skipped — never redrawn — when that feature is off.
+  (`ACTION_TABLE`). Each buggify arm is tied to its sibling feature (backend-set
+  churn makes no sense in a configuration without `ChangeBackendSet`) and is
+  skipped — never redrawn — when that feature is off.
 - `tcp_preread_sim.rs`: a scenario generator (`GENERATOR_TABLE`), plus the one
   genuinely orthogonal **fragmentation** axis (off → every delivery is
   one-shot, and the forced drip generator leaves the pool). The other
