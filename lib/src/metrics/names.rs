@@ -300,6 +300,12 @@ pub mod http {
     /// Requests rejected because a Transfer-Encoding header survived parsing without
     /// kawa adopting chunked framing (CL.TE request-smuggling defense, CWE-444).
     pub const FRONTEND_TE_SMUGGLING: &str = "http.frontend.transfer_encoding_smuggling";
+    /// Requests rejected (400) because a forwarded Content-Length value was not
+    /// `1*DIGIT`, e.g. `+5` (RFC 9110 §8.6; request-smuggling defense, CWE-444).
+    pub const FRONTEND_CONTENT_LENGTH_INVALID: &str = "http.frontend.content_length_invalid";
+    /// Backend responses rejected (502) because their Content-Length value was
+    /// not `1*DIGIT` (RFC 9110 §8.6, RFC 9112 §6.3).
+    pub const BACKEND_CONTENT_LENGTH_INVALID: &str = "http.backend.content_length_invalid";
     pub const FRONTEND_PARSE_ERRORS: &str = "http.frontend_parse_errors";
     pub const HSTS_FRONTEND_ADDED: &str = "http.hsts.frontend_added";
     pub const HSTS_FRONTEND_REFRESHED: &str = "http.hsts.frontend_refreshed";

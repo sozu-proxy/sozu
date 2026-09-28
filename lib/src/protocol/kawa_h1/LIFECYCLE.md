@@ -231,6 +231,57 @@ If the predicate holds, the guard increments
 short-circuit anything else in kawa — the very next line back in
 `kawa::h1::parse`'s loop re-checks `parsing_phase`, sees `Error`, and returns.
 
+#### Content-Length value clause
+
+Right after the Transfer-Encoding predicate, `on_request_headers` rejects a
+request whose non-elided `Content-Length` value is not exclusively ASCII
+digits (`has_non_digit_content_length`, `editor.rs`). RFC 9110 §8.6 defines
+`Content-Length = 1*DIGIT` and forbids a sender to forward a message whose
+value does not match it; RFC 9112 §6.3 rule 5 makes it an unrecoverable
+framing error (400 for a request, 502 for a response received by a proxy).
+
+kawa 0.7.1's `process_headers` reads the value with `nom::ParseTo`, i.e.
+`usize::from_str`, which accepts one leading `+`, and leaves the field line
+in place with its original spelling (CleverCloud/kawa#25). Without the
+clause, `Content-Length: +5` framed a 5-byte body and reached the backend as
+`+5`: a backend that refuses or re-reads that spelling takes the body for the
+start of the next request, never routed nor Basic-auth checked (CWE-444,
+sozu-proxy/sozu#1652). Measured against `usize::from_str`, the clause is the
+one that fires on traffic kawa accepted, and only for these spellings:
+
+| Value | Outcome |
+|---|---|
+| `+5`, `+0` | rejected by this clause (400) — the live case |
+| `-0`, `+`, `5 5`, `0x5`, `5.0`, overflow, non-ASCII digits, empty | kawa already refuses (400); the clause is defense in depth |
+| `5, 5` | kawa already refuses (400); RFC 9110 §8.6 lets a recipient reject or collapse a list of equal values, and Sōzu rejects |
+| `005` | `1*DIGIT`: accepted and forwarded as sent, as the H2 path forwards it |
+
+Only non-elided lines are judged, because they are the lines the H1
+serializer forwards: kawa elides a second line equal to the first (so
+`5` then `+5` forwards `5`, while `+5` then `5` is rejected) and every
+`Content-Length` beside a `Transfer-Encoding` (RFC 9110 §6.3). The guard
+increments `names::http::FRONTEND_CONTENT_LENGTH_INVALID`, logs a `warn!`
+and errors the parse, like the predicate above. The clause cannot fire for an
+H2 request: `pkawa::write_regular_header` already refuses a non-digit
+`content-length` with `RejectReason::DuplicateCl` before this callback runs.
+
+`on_response_headers` applies the same check first, before the 204/304/1xx
+override of `body_size`, and increments
+`names::http::BACKEND_CONTENT_LENGTH_INVALID`. The failed response parse makes
+`ConnectionH1::readable` end the backend stream, and
+`shared::end_stream_decision` answers the client 502 because no byte of the
+response was consumed.
+
+Covered by `a_request_content_length_that_is_not_only_digits_is_rejected`,
+`a_forwarded_content_length_is_only_digits`,
+`a_response_content_length_that_is_not_only_digits_is_rejected` and
+`the_content_length_helper_judges_every_non_digit_value` (unit, in
+`editor.rs`; the last one calls the helper directly, since kawa refuses
+most non-digit spellings before the callback runs) and by `test_h1_signed_content_length_request_rejected`,
+`test_h1_signed_content_length_response_rejected` and
+`test_h1_leading_zero_content_length_forwarded` in
+`e2e/src/tests/h1_security_tests.rs`.
+
 The resulting `ParsingPhase::Error` is observed by the mux H1 connection in
 `ConnectionH1::readable` (`lib/src/protocol/mux/h1.rs`), which checks
 `kawa.is_error()` immediately after `kawa::h1::parse` and, on the server side,

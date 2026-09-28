@@ -1645,6 +1645,225 @@ fn test_h1_te_ows_forwarded_canonically() {
 }
 
 // =========================================================================
+// Test 13b: a Content-Length that is not 1*DIGIT is never forwarded
+//
+// RFC 9110 §8.6: `Content-Length = 1*DIGIT`, and a sender MUST NOT forward
+// a message whose Content-Length does not match that grammar. kawa 0.7.1
+// reads the value with `usize::from_str`, which accepts one leading `+`:
+// `Content-Length: +5` framed a 5-byte body and reached the backend
+// verbatim. A backend that refuses, ignores or re-reads that spelling
+// takes the body for the start of the next request — one sozu never
+// routed nor checked against the frontend's Basic auth (CWE-444).
+// `HttpContext::on_request_headers` now answers 400 before routing, and
+// `HttpContext::on_response_headers` fails a backend response carrying one,
+// which the mux answers with a 502.
+// =========================================================================
+
+fn try_h1_signed_content_length_request_rejected() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_sync_test(
+        "SIGNED-CL-REQUEST",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+    let mut backend = backends.pop().unwrap();
+    backend.connect();
+
+    // The 5 body bytes are a request of their own to any backend that does
+    // not read `+5` as a length.
+    const REQUEST: &[u8] =
+        b"POST /api HTTP/1.1\r\nHost: localhost\r\nContent-Length: +5\r\n\r\nGET /";
+
+    let mut stream = raw_connect(front_address);
+    stream
+        .write_all(REQUEST)
+        .expect("write signed Content-Length request");
+
+    let not_forwarded = {
+        let start = Instant::now();
+        let mut forwarded = None;
+        while start.elapsed() < Duration::from_millis(500) {
+            if backend.accept(0) {
+                forwarded = Some(backend_drain(&mut backend, 0, Duration::from_millis(300)));
+                backend.send(0);
+                break;
+            }
+        }
+        if let Some(bytes) = &forwarded {
+            println!("SIGNED-CL-REQUEST: FAIL — backend received {bytes:?}");
+        }
+        forwarded.is_none()
+    };
+    let response = raw_read(&mut stream);
+    println!("SIGNED-CL-REQUEST: client received {response:?}");
+    drop(stream);
+
+    let rejected = matches!(&response, Some(r) if r.starts_with("HTTP/1.1 400"));
+    let healthy = verify_sozu_healthy(front_address, &mut backend, !not_forwarded);
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    if not_forwarded && rejected && healthy {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h1_signed_content_length_request_rejected() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H1 security: a signed Content-Length request is answered 400 and never reaches the backend",
+            try_h1_signed_content_length_request_rejected,
+        ),
+        State::Success,
+    );
+}
+
+fn try_h1_signed_content_length_response_rejected() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_sync_test(
+        "SIGNED-CL-RESPONSE",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+    let mut backend = backends.pop().unwrap();
+    backend.set_response("HTTP/1.1 200 OK\r\nContent-Length: +5\r\n\r\nhello");
+    backend.connect();
+
+    // POST, so the failed response is never replayed on a fresh backend.
+    const REQUEST: &[u8] =
+        b"POST /api HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nConnection: close\r\n\r\nHello";
+
+    let mut stream = raw_connect(front_address);
+    stream.write_all(REQUEST).expect("write request");
+
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut accepted = false;
+    while Instant::now() < deadline {
+        if backend.accept(0) {
+            accepted = true;
+            break;
+        }
+    }
+    if !accepted {
+        println!("SIGNED-CL-RESPONSE: FAIL — a canonical request never reached the backend");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+    backend_drain(&mut backend, 0, Duration::from_millis(200));
+    backend.send(0);
+
+    let response = raw_read_all(&mut stream);
+    println!("SIGNED-CL-RESPONSE: client received {response:?}");
+    drop(stream);
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    // The backend's framing never reaches the client: neither its signed
+    // Content-Length nor the body it framed.
+    if response.starts_with("HTTP/1.1 502")
+        && !response.contains("+5")
+        && !response.contains("hello")
+    {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h1_signed_content_length_response_rejected() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H1 security: a backend response with a signed Content-Length is answered 502",
+            try_h1_signed_content_length_response_rejected,
+        ),
+        State::Success,
+    );
+}
+
+/// Non-regression: `005` matches `1*DIGIT`, so it is legal, framed as 5 and
+/// forwarded as sent — the same as the H2 path does.
+fn try_h1_leading_zero_content_length_forwarded() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) =
+        setup_sync_test("ZERO-CL", config, listeners, state, front_address, 1, false);
+    let mut backend = backends.pop().unwrap();
+    backend.set_response("HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\npong");
+    backend.connect();
+
+    const REQUEST: &[u8] =
+        b"POST /api HTTP/1.1\r\nHost: localhost\r\nContent-Length: 005\r\nConnection: close\r\n\r\nHello";
+
+    let mut stream = raw_connect(front_address);
+    stream.write_all(REQUEST).expect("write request");
+
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut accepted = false;
+    while Instant::now() < deadline {
+        if backend.accept(0) {
+            accepted = true;
+            break;
+        }
+    }
+    if !accepted {
+        println!("ZERO-CL: FAIL — a legal request never reached the backend");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+    let forwarded = backend_drain(&mut backend, 0, Duration::from_millis(300));
+    backend.send(0);
+    let response = raw_read(&mut stream);
+    println!("ZERO-CL: backend received {forwarded:?}, client received {response:?}");
+    drop(stream);
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    if forwarded.contains("Content-Length: 005\r\n")
+        && forwarded.ends_with("\r\n\r\nHello")
+        && matches!(&response, Some(r) if r.starts_with("HTTP/1.1 200") && r.contains("pong"))
+    {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h1_leading_zero_content_length_forwarded() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H1 security: a leading-zero Content-Length is legal and forwarded",
+            try_h1_leading_zero_content_length_forwarded,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
 // Test 14: Non-regression — legitimately framed requests are still forwarded
 //
 // The CL.TE guard added to `editor.rs::on_request_headers` must reject
