@@ -799,6 +799,29 @@
   they pinned the field this change removes, and their contracts — one value per pass, a fresh
   value on the next pass — are kept.
 
+- **`perf(mux)`: the access log's RTT is sampled once per connection, not once per request.**
+  `client_rtt` and `server_rtt` were each a `getsockopt(TCP_INFO)` per request — on an H1
+  keep-alive connection two of the worker's 11.55 syscalls per request. Each connection now reads
+  its own socket once, at its first access log, through `memoized_rtt`
+  (`lib/src/protocol/mux/mod.rs`), and every later request of that connection reuses the value;
+  a backend connection keeps its sample across keep-alive pool reuse. `Mux::expire_client_rtt`
+  and `H2Shell::expire_local_rtt` are removed. Pipe and TCP already logged once per session.
+  **Operator-visible:** on HTTP/1.x and HTTP/2, `client_rtt` is the frontend SRTT when the
+  connection's first request was logged, and `server_rtt` the backend connection's SRTT when the
+  first response through it was logged — no longer the SRTT when this request finished. Every line
+  of one connection repeats the same values (`doc/configure.md`, "When each cell is measured").
+  The sample is not taken at `accept`: Linux has a handshake RTT there already (27–34 µs on
+  loopback), but the lazy read is free on a connection that never logs.
+  Measured with `intentrace -p`, release build, 20 requests on one client connection: H1
+  keep-alive 11.55 → 9.65 syscalls per request (`getsockopt` 2.00 → 0.10), H1 over TLS
+  11.85 → 9.95 (2.00 → 0.10), 20 multiplexed H2 streams 12.35 → 11.35 (2.00 → 1.05: sozu dials one
+  backend connection per concurrent stream). Pinned by
+  `keep_alive_requests_read_tcp_info_once_per_connection` (`h1.rs`) and
+  `a_mux_pass_keeps_the_connection_sample_and_reads_none_without_a_log` (`mod.rs`), both seen red
+  on `58550dd4`; `snapshot_rtts_samples_the_frontend_once_per_pass` and
+  `a_mux_pass_forgets_the_previous_sample_and_reads_none_without_a_log` are rewritten into
+  `snapshot_rtts_samples_the_frontend_once_per_connection` and the second of those.
+
 - **`perf(mux)`: a request on a reused backend connection allocates nothing past routing
   ([#1583](https://github.com/sozu-proxy/sozu/issues/1583)).** Four per-request or per-dial
   allocations left after #1579 are gone. The backend reverse index keeps the emptied `Vec` in its

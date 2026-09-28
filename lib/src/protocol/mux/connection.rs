@@ -16,6 +16,7 @@
 //! protocol-specific writers.
 
 use std::{
+    cell::Cell,
     fmt::Debug,
     net::SocketAddr,
     time::{Duration, Instant},
@@ -29,7 +30,7 @@ use super::{
     BackendChange, BackendId, BackendStatus, ConnectionH1, Context, Endpoint, GlobalStreamId,
     MuxResult, Position, Router,
     h2::{self, H2Shell, H2StreamId},
-    h2_flood_detector, sample_rtt,
+    h2_flood_detector, memoized_rtt,
 };
 use crate::metrics::names;
 use crate::{L7ListenerHandler, ListenerHandler, Readiness, socket::SocketHandler};
@@ -110,6 +111,7 @@ impl<Front: SocketHandler> Connection<Front> {
             session_ulid,
             reused_from_pool: false,
             io_slices: Vec::new(),
+            rtt: Cell::new(None),
         })
     }
     pub fn new_h1_client(
@@ -145,6 +147,7 @@ impl<Front: SocketHandler> Connection<Front> {
             session_ulid,
             reused_from_pool: false,
             io_slices: Vec::new(),
+            rtt: Cell::new(None),
         })
     }
 
@@ -249,6 +252,16 @@ impl<Front: SocketHandler> Connection<Front> {
         match self {
             Connection::H1(c) => c.socket.socket_ref(),
             Connection::H2(c) => c.socket.socket_ref(),
+        }
+    }
+    /// Smoothed RTT of this connection's own socket, sampled once for the
+    /// connection's whole life by [`memoized_rtt`] and reused by every
+    /// access log that reports it: `client_rtt` for a frontend, `server_rtt`
+    /// for a backend.
+    pub(super) fn rtt(&self) -> Option<Duration> {
+        match self {
+            Connection::H1(c) => memoized_rtt(&c.rtt, c.socket.socket_ref()),
+            Connection::H2(c) => memoized_rtt(&c.local_rtt, c.socket.socket_ref()),
         }
     }
     pub fn socket_mut(&mut self) -> &mut TcpStream {
@@ -633,7 +646,7 @@ impl<Front: SocketHandler + Debug> Endpoint for EndpointServer<'_, Front> {
         self.0.readiness_mut()
     }
     fn peer_rtt(&self, _token: Token) -> Option<Duration> {
-        sample_rtt(self.0.socket())
+        self.0.rtt()
     }
     fn local_rtt(&self) -> Option<Duration> {
         None
@@ -691,10 +704,7 @@ impl Endpoint for EndpointClient<'_> {
         }
     }
     fn peer_rtt(&self, token: Token) -> Option<Duration> {
-        self.0
-            .backends
-            .get(&token)
-            .and_then(|c| sample_rtt(c.socket()))
+        self.0.backends.get(&token).and_then(Connection::rtt)
     }
     fn local_rtt(&self) -> Option<Duration> {
         None

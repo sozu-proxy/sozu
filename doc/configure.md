@@ -3345,45 +3345,45 @@ to `None`.
 
 ##### When each cell is measured
 
-On every path except HTTP/2, both cells are read at access-log emission time
-and cost one `getsockopt(TCP_INFO)` syscall per side, so each one is the
-kernel's SRTT estimate for that socket at the moment that request finished.
+**On HTTP/1.x and HTTP/2, each cell is sampled once per connection, at the
+first access log of that connection, and reused for every later request of the
+same connection.** `client_rtt` is the frontend connection's SRTT when its first
+request was logged; `server_rtt` is the backend connection's SRTT when the
+first response that went through it was logged — a backend connection taken
+back out of the keep-alive pool keeps the value it was first sampled at. A
+keep-alive connection carrying twenty requests therefore costs one
+`getsockopt(TCP_INFO)` per side, not twenty, and a connection that logs nothing
+costs none.
 
-**On HTTP/2, `client_rtt` is measured once per readiness sweep, at the first
-access log of the sweep.** A `Mux::ready`, `Mux::timeout` or
-`Mux::shutting_down` pass reads the frontend's `TCP_INFO` when it emits its
-first access log, and every other stream that finishes during that pass reports
-the same value. A pass that emits no access log reads nothing. `server_rtt` is
-read per request, through `Endpoint::peer_rtt`, because the backend socket is
-the other side of the connection.
+The sample is not taken at `accept` or `connect`, although Linux already has a
+handshake RTT on an accepted socket (27–34 µs on loopback straight out of
+`accept`): the first access log costs nothing on a connection that never logs,
+and a backend dial is still in flight when its non-blocking `connect(2)`
+returns.
 
-Two consequences for anyone trending the field:
+Consequences for anyone trending the field:
 
-- **`client_rtt` means "the frontend SRTT when the first stream of this sweep
-  was logged".** Several H2 access logs emitted from one sweep carry an
-  identical `client_rtt`, so repeated values across concurrent streams are
-  expected and are not a sign of a stuck measurement. A percentile computed
-  over H2 access logs is weighted by how many streams happened to complete
-  together. For a stream that finishes alone in its sweep — every stream of a
-  connection carrying one request at a time — the value is the SRTT at the
-  moment its response was logged, exactly as on H1.
-- **The two cells on one H2 log line share a sampling instant only for the
-  first stream of a sweep.** For a later stream of the same sweep, `client_rtt`
-  may predate `server_rtt` by the time between the two logs. Do not subtract
-  one from the other on an H2 line and read the difference as a network
-  asymmetry.
+- **`client_rtt` and `server_rtt` mean "the SRTT at the first request of the
+  connection", not "the SRTT when this request finished".** Every access line
+  of one connection carries the same value in each cell, so repeated values are
+  expected and are not a stuck measurement. The kernel's SRTT keeps moving over
+  the life of a connection; the log does not follow it. A percentile computed
+  over access logs is weighted by requests per connection.
+- **The two cells of one line come from two different instants**, each the
+  first access log of its own connection. Do not subtract one from the other
+  and read the difference as a network asymmetry.
+- **Pipe (TCP and WebSocket) and the TCP frontend** log once per session, at
+  its end, and read both cells then: one sample per connection there too.
 
 `Mux::close`, which logs the streams still in flight when a session is torn
-down, reads the frontend once if it finds such a stream and not at all
-otherwise.
+down, asks for the connection's sample if it finds such a stream — a read only
+when the connection had logged nothing before — and not at all otherwise.
 
-The per-sweep value comes from issue #1339 (question 11): the frontend RTT was
-the last thing the H2 core read from an operating-system socket handle, and the
-core now asks its connection's owner for it instead. Issue #1590 made that ask
-lazy — before it, the sample was taken at the top of every sweep whether or not
-the sweep logged anything, which cost 7.85 `getsockopt(TCP_INFO)` per H2
-request for the two cells its access log prints. See
-`doc/h2_mux_internals.md` for the measurements.
+The history: issue #1339 (question 11) made the HTTP/2 frontend value one per
+readiness sweep, issue #1590 made that sample lazy (it had been taken at the
+top of every sweep, 7.85 `getsockopt(TCP_INFO)` per H2 request), and the
+per-connection sample removed the last per-request reads (about 2 per H1
+keep-alive request). See `doc/h2_mux_internals.md` for the measurements.
 
 #### HTTP/2 flood mitigations
 
