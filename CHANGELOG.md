@@ -442,6 +442,25 @@
   an `Option<Rc<str>>`. A bare request's header editing costs 7 heap operations instead of 10, and
   the response's 1 instead of 3 (`a_response_shares_the_request_id_rendering`).
 
+- **`perf(h1)`: a standard reason phrase is captured without a copy.** `on_response_headers` copied
+  the backend's reason phrase into a `String` for the access log on every response. It now keeps a
+  `'static` reference to the phrase RFC 9110 §15 (and RFC 6585 §4 for 429) registers for the status
+  code when the backend sent exactly that phrase, and copies only a phrase that differs from it — a
+  custom one, another case, or an older name such as `Payload Too Large`, which is logged verbatim,
+  never normalised. The forwarded status line is kawa's own and never reads the captured value, so
+  the bytes sent to the client are unchanged, and so is the access log's `reason`.
+  `HttpContext::reason` is now an `Option<Cow<'static, str>>`. The header editing of a response
+  that carries a standard phrase costs 0 heap operations instead of 1
+  (`a_response_shares_the_request_id_rendering`,
+  `a_response_reason_is_borrowed_when_standard_and_copied_otherwise`).
+
+  **Measured** on a release build without jemalloc (`crypto-aws-lc-rs`), one curl keep-alive
+  connection of 20 `GET`s behind a Python `http.server`, which answers `200 OK`, heap operations
+  per request counted by an `LD_PRELOAD` malloc counter, two runs each: plaintext H1 11.45 → 10.45,
+  H1 over TLS 27.55 → 26.55. The syscalls, traced with intentrace on the jemalloc build, are the
+  same classes in the same counts outside the event-loop wake-ups timing decides (identical 231 and
+  192 on a plaintext and a TLS pair).
+
 - **`perf(h1)`: the forwarding headers of a request share one scratch buffer.** `on_request_headers`
   handed its scratch `Vec` to the first synthesised header and let the next one regrow an empty
   buffer, and `into_boxed_slice` reallocated each to shrink its spare capacity: seven heap operations

@@ -94,7 +94,11 @@ mutable companion to the Kawa parser. Its `kawa::h1::ParserCallbacks` impl
   the configured `Forwarded`/`X-Forwarded-*` hop; injects the `Sozu-Id`
   correlation header named by `sozu_id_header`;
 - `on_response_headers` (`editor.rs`) — captures `:status`, `:reason`,
-  optionally rewrites `Set-Cookie` for sticky sessions.
+  optionally rewrites `Set-Cookie` for sticky sessions. The reason is kept
+  for the access log as the `'static` phrase RFC 9110 §15 registers for the
+  code (`standard_reason`, `editor.rs`) when the backend sent exactly that
+  phrase, and copied otherwise; the forwarded status line is kawa's own and
+  never reads it.
 
 `HttpContext::extract_route` (`editor.rs`) hands the mux router the
 authority, path and method it needs, and `HttpContext::log_context`
@@ -161,10 +165,10 @@ combined final coding is not `chunked` (RFC 9112 §6.3), returning before
   0.7.1, and forwarding both lines is what the count clause refuses.
 
 The guard therefore folds over every non-elided `Transfer-Encoding` header in
-`request.blocks` (`editor.rs:679-699`), producing `te_count` and
+`request.blocks` (`editor.rs:747-767`), producing `te_count` and
 `te_all_suffix_chunked` — the latter true only when EVERY such value's literal
 trailing bytes are `chunked` (`compare_no_case` over the last seven bytes). The
-rejection predicate is exactly (`editor.rs:700-703`):
+rejection predicate is exactly (`editor.rs:768-771`):
 
 ```rust
 te_count > 1

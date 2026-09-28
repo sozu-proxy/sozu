@@ -7,6 +7,7 @@
 //! Kawa `ParserCallbacks` implementation for the H1 mux path.
 
 use std::{
+    borrow::Cow,
     io::Write as _,
     net::{IpAddr, SocketAddr},
     rc::Rc,
@@ -245,8 +246,10 @@ pub struct HttpContext {
     pub path: Option<String>,
     /// the value of the status code in the response line
     pub status: Option<u16>,
-    /// the value of the reason in the response line
-    pub reason: Option<String>,
+    /// the value of the reason in the response line: the `'static` phrase
+    /// RFC 9110 §15 registers for the status code when the backend sent
+    /// exactly that phrase, a copy otherwise (`standard_reason`)
+    pub reason: Option<Cow<'static, str>>,
     // ---------- Additional optional data
     pub user_agent: Option<String>,
     /// Value of the `x-request-id` header observed (if propagated from the
@@ -519,6 +522,71 @@ fn render_ulid(id: Ulid) -> [u8; 26] {
         "a rendered ULID must only carry Crockford base-32 digits"
     );
     rendered
+}
+
+/// The reason phrase RFC 9110 §15 registers for `code`, plus 429 from
+/// RFC 6585 §4, or `None` for a code it registers none for.
+///
+/// `on_response_headers` captures a backend's reason for the access log by
+/// reference to this phrase when the two are byte-identical, and copies it
+/// otherwise: an older name (`Payload Too Large`), a different case or a
+/// custom phrase is recorded verbatim, never normalised.
+fn standard_reason(code: u16) -> Option<&'static str> {
+    let phrase = match code {
+        100 => "Continue",
+        101 => "Switching Protocols",
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        203 => "Non-Authoritative Information",
+        204 => "No Content",
+        205 => "Reset Content",
+        206 => "Partial Content",
+        300 => "Multiple Choices",
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        304 => "Not Modified",
+        305 => "Use Proxy",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        402 => "Payment Required",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        406 => "Not Acceptable",
+        407 => "Proxy Authentication Required",
+        408 => "Request Timeout",
+        409 => "Conflict",
+        410 => "Gone",
+        411 => "Length Required",
+        412 => "Precondition Failed",
+        413 => "Content Too Large",
+        414 => "URI Too Long",
+        415 => "Unsupported Media Type",
+        416 => "Range Not Satisfiable",
+        417 => "Expectation Failed",
+        421 => "Misdirected Request",
+        422 => "Unprocessable Content",
+        426 => "Upgrade Required",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        501 => "Not Implemented",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        505 => "HTTP Version Not Supported",
+        _ => return None,
+    };
+    // Post: a registered phrase is non-empty and CR/LF-free; it is only ever
+    // compared with, and logged in place of, identical wire bytes.
+    debug_assert!(
+        !phrase.is_empty() && is_crlf_free(phrase.as_bytes()),
+        "a registered reason phrase is a non-empty single-line token"
+    );
+    Some(phrase)
 }
 
 /// The store of a correlation-header name: the default `Sozu-Id` — what
@@ -1168,10 +1236,27 @@ impl HttpContext {
         // Captures the response line
         if let kawa::StatusLine::Response { code, reason, .. } = &response.detached.status_line {
             self.status = Some(*code);
+            // The standard phrase for the code is borrowed, anything else
+            // copied: the access log records the wire bytes either way.
             self.reason = reason
                 .data_opt(buf)
                 .and_then(|data| from_utf8(data).ok())
-                .map(ToOwned::to_owned);
+                .map(|data| match standard_reason(*code) {
+                    Some(phrase) if phrase == data => Cow::Borrowed(phrase),
+                    _ => Cow::Owned(data.to_owned()),
+                });
+            // Post: the captured reason is the wire reason, byte for byte,
+            // whichever representation carries it.
+            debug_assert_eq!(
+                self.reason.as_deref().map(str::as_bytes),
+                reason.data_opt(buf).filter(|data| from_utf8(data).is_ok()),
+                "the captured reason must be the backend's own bytes"
+            );
+            debug_assert!(
+                !matches!(&self.reason, Some(Cow::Owned(owned))
+                    if standard_reason(*code) == Some(owned.as_str())),
+                "a standard reason must be borrowed, never copied"
+            );
         }
 
         if self.method == Some(Method::Head) {
@@ -1405,7 +1490,7 @@ impl HttpContext {
             method: self.method.clone(),
             authority: self.authority.clone(),
             path: self.path.clone(),
-            reason: self.reason.clone(),
+            reason: self.reason.as_deref().map(ToOwned::to_owned),
             status: self.status,
         }
     }
@@ -1571,7 +1656,7 @@ mod tests {
         ctx.authority = Some("example.com".to_owned());
         ctx.path = Some("/upload".to_owned());
         ctx.status = Some(200);
-        ctx.reason = Some("OK".to_owned());
+        ctx.reason = Some(Cow::Owned("Fine".to_owned()));
         ctx.user_agent = Some("curl/7.81".to_owned());
         ctx.x_request_id = Some(Rc::from("client-xrid-123"));
         ctx.xff_chain = Some("203.0.113.5, 198.51.100.10".to_owned());
@@ -2059,13 +2144,17 @@ mod tests {
     /// for `X-Request-Id`, and still carries Sōzu's own id when the client
     /// chose its `X-Request-Id`.
     ///
-    /// The one allocation left on the generated path is the `reason`
-    /// captured for the access log.
+    /// Nothing is left to allocate on the generated path: the standard `OK`
+    /// reason is captured for the access log as a `'static` phrase
+    /// (`standard_reason`).
     ///
-    /// TO SEE THIS RED: in `on_response_headers`, push the correlation
-    /// header as `key: kawa::Store::from_string(self.sozu_id_header
-    /// .clone())` and `val: kawa::Store::from_string(self.id.to_string())`.
-    /// Measured: `left: 3, right: 1`.
+    /// TO SEE THIS RED, either of:
+    /// - in `on_response_headers`, push the correlation header as `key:
+    ///   kawa::Store::from_string(self.sozu_id_header.clone())` and `val:
+    ///   kawa::Store::from_string(self.id.to_string())`. Measured: `left: 2,
+    ///   right: 0`.
+    /// - capture every reason as a copy again, `.map(|reason|
+    ///   Cow::Owned(reason.to_owned()))`. Measured: `left: 1, right: 0`.
     #[test]
     fn a_response_shares_the_request_id_rendering() {
         const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
@@ -2081,8 +2170,9 @@ mod tests {
             format!("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nSozu-Id: {id}\r\n\r\n")
         );
         assert_eq!(
-            allocations, 1,
-            "the response must share the id rendering the request generated"
+            allocations, 0,
+            "the response must share the id rendering the request generated \
+             and borrow its standard reason"
         );
 
         let mut client_chosen = make_context();
@@ -2100,6 +2190,75 @@ mod tests {
             ),
             "the correlation header carries Sōzu's id, not the client's"
         );
+    }
+
+    /// The reason of a response is captured for the access log as the
+    /// `'static` phrase RFC 9110 §15 registers for its code when the backend
+    /// sent exactly that phrase, and as a verbatim copy otherwise — a
+    /// different phrase, a different case, an older name or an unregistered
+    /// code. The forwarded bytes come from kawa's status line either way and
+    /// stay byte-exact across the keep-alive requests of a connection.
+    ///
+    /// TO SEE THIS RED: capture every reason as a copy again, `.map(|reason|
+    /// Cow::Owned(reason.to_owned()))` in `on_response_headers`. Measured:
+    /// `left: 1, right: 0` on the first, standard, response.
+    #[test]
+    fn a_response_reason_is_borrowed_when_standard_and_copied_otherwise() {
+        let cases: [(&[u8], &str, usize); 8] = [
+            (b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", "OK", 0),
+            (b"HTTP/1.1 200 Fine\r\nContent-Length: 0\r\n\r\n", "Fine", 1),
+            (b"HTTP/1.1 200 ok\r\nContent-Length: 0\r\n\r\n", "ok", 1),
+            (
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+                "Not Found",
+                0,
+            ),
+            (
+                b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n",
+                "Payload Too Large",
+                1,
+            ),
+            (
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+                "Service Unavailable",
+                0,
+            ),
+            (
+                b"HTTP/1.1 599 Network Connect Timeout Error\r\nContent-Length: 0\r\n\r\n",
+                "Network Connect Timeout Error",
+                1,
+            ),
+            (
+                b"HTTP/1.1 302 Found\r\nContent-Length: 0\r\n\r\n",
+                "Found",
+                0,
+            ),
+        ];
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let mut kawa = warm_request_kawa(&mut pool);
+        let mut ctx = make_context();
+
+        for (response, reason, cost) in cases {
+            allocations_of_request_parse(&mut ctx, &mut kawa, BARE_REQUEST);
+            let (allocations, serialized) = response_parse(&mut ctx, response);
+            let raw = from_utf8(response).expect("the response literal is ASCII");
+            let headers_end = raw.len() - "\r\n".len();
+            assert_eq!(
+                serialized,
+                format!("{}Sozu-Id: {}\r\n\r\n", &raw[..headers_end], ctx.id),
+                "the forwarded response of {raw:?} is byte-exact"
+            );
+            assert_eq!(
+                ctx.reason.as_deref(),
+                Some(reason),
+                "the access log records the reason of {raw:?} verbatim"
+            );
+            assert_eq!(
+                allocations, cost,
+                "capturing the reason of {raw:?} costs {cost} allocation(s)"
+            );
+            ctx.reset(Ulid::generate());
+        }
     }
 
     /// `render_ulid` agrees with `Ulid`'s own `Display` at both ends of the
