@@ -48,6 +48,8 @@ pub(super) enum EndStreamAction {
     ForwardUnterminated,
     /// No response is available and the request was already partially consumed,
     /// so retrying is unsafe — send the given default status (502 Bad Gateway).
+    /// Also chosen for a request an H2 backend encoded and did not send
+    /// ([`Stream::front_bound_to_backend`]): it cannot be sent elsewhere.
     SendDefault(u16),
     /// No response is available and the request is untouched, so the caller may
     /// link the stream to a fresh backend and retry.
@@ -96,6 +98,19 @@ pub(super) fn end_stream_decision(stream: &Stream) -> EndStreamAction {
         } else {
             EndStreamAction::SendDefault(502)
         }
+    } else if stream.front_bound_to_backend {
+        // Nothing reached the backend, but an H2 backend encoded the request:
+        // `front.out` holds frames bound to that connection's stream id and
+        // HPACK encoder, and the blocks they came from are gone. Linking it
+        // to another backend would send those frames there, where they decode
+        // against another table (sozu-proxy/sozu#1632); it cannot be encoded
+        // again either. An H1 backend's output never sets the flag, so its
+        // untouched requests keep `Reconnect`.
+        debug_assert!(
+            !stream.front.out.is_empty(),
+            "a request bound to a backend holds that backend's unsent frames"
+        );
+        EndStreamAction::SendDefault(502)
     } else {
         EndStreamAction::Reconnect
     }

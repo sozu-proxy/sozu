@@ -1252,6 +1252,9 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             stream.back.storage.clear();
             stream.front.clear();
             stream.front.storage.clear();
+            // The request that released the slot may have been encoded for
+            // an H2 backend; the one taking it over was not.
+            stream.front_bound_to_backend = false;
             stream.forget_upstream_replay();
             stream.metrics.reset();
             stream.metrics.mark_request_start();

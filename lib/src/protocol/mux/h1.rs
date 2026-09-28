@@ -1016,6 +1016,9 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         stream.back.storage.clear();
                         stream.front.clear();
                         // do not stream.front.storage.clear() because of H1 pipelining
+                        // The next request has not been encoded for any
+                        // backend yet (sozu-proxy/sozu#1632).
+                        stream.front_bound_to_backend = false;
                         stream.attempts = 0;
                         // The next pipelined request gets its own replay
                         // decision: `start_stream` re-arms capture only if it

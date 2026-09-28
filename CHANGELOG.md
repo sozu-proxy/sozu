@@ -5688,6 +5688,40 @@
   `HEAD`, `DELETE`, `POST`), all 24 e2e cases red before the fix: the backend of the first
   request received both request lines and one `Sozu-Id`.
 
+- **`fix(mux-h2)`: a request HPACK-encoded for one H2 backend connection and not yet sent is
+  never re-linked to another backend, where its stale frames could deliver other clients'
+  fields or take a shared connection down
+  ([#1632](https://github.com/sozu-proxy/sozu/issues/1632)).** An H2 backend's write pass
+  encodes a request in `kawa.prepare`: it pops the request's header blocks and leaves
+  HEADERS/CONTINUATION frames in `front.out`, carrying that connection's stream id and a field
+  block encoded against that connection's HPACK table. When the socket took none of it,
+  `front.consumed` stayed false, and when the connection was then lost (`end_stream_decision`
+  answered `Reconnect`) or refused the stream with a GOAWAY below it
+  (`ConnectionH2::handle_goaway_frame` re-linked every unconsumed stream above
+  `last_stream_id`), the request was linked to another backend with those frames. They went out
+  first there. `Router::connect` prefers an existing connection of the cluster, usually shared
+  by other clients: with a stream id above that connection's highest, the backend decoded the
+  stale block against the shared table and rebuilt a request carrying fields other clients had
+  inserted (for example an indexed `authorization`-like header); otherwise it answered
+  PROTOCOL_ERROR or COMPRESSION_ERROR and closed every stream on it. Proven at connection level:
+  a request encoded on backend A and offered to backend B went out on B unchanged, stream id 1
+  and A's field block. `Stream::front_bound_to_backend` now marks a request an H2 backend has
+  encoded; `end_stream_decision` answers it `502` instead of `Reconnect`,
+  `handle_goaway_frame` answers it a whole `503` response (the backend refused it unprocessed,
+  RFC 9110 §15.6.4) instead of re-linking it — not REFUSED_STREAM, whose empty `Error` response
+  an H1 frontend cannot write, leaving its client waiting for a timeout — and `ConnectionH2::start_stream` refuses any request whose
+  `front.out` already holds output. Re-encoding was not retained: the popped blocks are gone,
+  and keeping a copy of every request's blocks would cost the nominal path. H1 backends are
+  unaffected: their prepared output is plain HTTP/1.1 bytes any fresh connection sends as they
+  are, and they keep `Reconnect`. The nominal path gains one store, no allocation. Covered by
+  `a_request_encoded_for_a_backend_is_refused_on_goaway_not_relinked`,
+  `a_request_encoded_for_a_lost_backend_is_answered_not_relinked` and
+  `a_request_encoded_for_one_backend_never_reaches_another` (red on `d5161919`),
+  `a_request_encoded_for_an_h2_backend_is_not_reconnected` and the H1 non-regression
+  `an_untouched_request_prepared_for_an_h1_backend_is_still_reconnected`, and
+  `an_h1_client_behind_a_goaway_refusing_its_encoded_request_gets_a_response` (red with a
+  REFUSED_STREAM answer: the H1 client reads nothing).
+
 - **`fix(mux-h2)`: a header block HPACK-encoded and then dropped unsent no longer shifts the
   peer's dynamic table, which could make the peer read one field in place of another
   ([#1627](https://github.com/sozu-proxy/sozu/issues/1627)).** The connection's encoder changes
