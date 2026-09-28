@@ -227,6 +227,145 @@ fn write_forwarded_suffix(
     );
 }
 
+/// The separator a hop is appended to a client-supplied chain with. A
+/// rendered hop starts with it, and a synthesised header shares the same
+/// rendering from just past it (`kawa::Store::Shared`'s start offset).
+const HOP_SEPARATOR: &[u8] = b", ";
+
+/// The forwarding values of one connection, rendered once from the inputs
+/// they depend on and shared by every request that reuses those inputs.
+///
+/// Neither value depends on the request: the peer and public addresses and
+/// the protocol are connection-scoped, so the second and later requests of
+/// a keep-alive connection forward them without a heap operation
+/// (`kawa::Store::Shared` bumps a reference count). A client-supplied
+/// `X-Forwarded-For` or `Forwarded` chain is request-scoped and is never
+/// kept here: the rendered hop is appended to a copy of it.
+/// `HttpContext::forwarding_hop` renders the values again whenever an input
+/// differs from the ones they were rendered from.
+#[derive(Debug)]
+pub(crate) struct ForwardingHop {
+    protocol: Protocol,
+    public_address: SocketAddr,
+    session_address: Option<SocketAddr>,
+    /// The `X-Forwarded-Port` value: the public port.
+    port: Rc<[u8]>,
+    /// `, <peer ip>`: the hop appended to a client `X-Forwarded-For`; past
+    /// `HOP_SEPARATOR`, the value of a synthesised `X-Forwarded-For` and
+    /// of `X-Real-IP`. `None` without a peer address.
+    x_forwarded_for: Option<Rc<[u8]>>,
+    /// `, proto=<proto>;for="<peer>";by=<public>`: the element appended to a
+    /// client `Forwarded`; past `HOP_SEPARATOR`, the value of a
+    /// synthesised `Forwarded`. `None` without a peer address.
+    forwarded: Option<Rc<[u8]>>,
+}
+
+impl ForwardingHop {
+    /// Render the forwarding values of `protocol`, labelled `proto`, for
+    /// the given public and peer addresses.
+    fn render(
+        protocol: Protocol,
+        proto: &str,
+        public_address: SocketAddr,
+        session_address: Option<SocketAddr>,
+    ) -> Self {
+        let mut port_buf = itoa::Buffer::new();
+        let port = Rc::from(port_buf.format(public_address.port()).as_bytes());
+        let (x_forwarded_for, forwarded) = match session_address {
+            Some(peer) => {
+                // One scratch renders both values, each copied out once at
+                // its exact size.
+                let mut scratch = Vec::with_capacity(128);
+                scratch.extend_from_slice(HOP_SEPARATOR);
+                let _ = write!(scratch, "{}", peer.ip());
+                let x_forwarded_for = Rc::<[u8]>::from(&scratch[..]);
+                scratch.clear();
+                write_forwarded_suffix(
+                    &mut scratch,
+                    proto,
+                    peer.ip(),
+                    peer.port(),
+                    public_address.ip(),
+                );
+                (Some(x_forwarded_for), Some(Rc::<[u8]>::from(&scratch[..])))
+            }
+            None => (None, None),
+        };
+        let hop = Self {
+            protocol,
+            public_address,
+            session_address,
+            port,
+            x_forwarded_for,
+            forwarded,
+        };
+        // Post: both peer values exist exactly when there is a peer, each
+        // starts with the separator and carries a value past it, and every
+        // rendered byte is CR/LF-free — they are spliced verbatim into
+        // header values (anti-injection, CWE-93).
+        debug_assert!(
+            hop.x_forwarded_for.is_some() == session_address.is_some()
+                && hop.forwarded.is_some() == session_address.is_some(),
+            "the peer values are rendered exactly when there is a peer"
+        );
+        debug_assert!(
+            [&hop.x_forwarded_for, &hop.forwarded]
+                .into_iter()
+                .flatten()
+                .all(|value| value.len() > HOP_SEPARATOR.len()
+                    && value.starts_with(HOP_SEPARATOR)
+                    && is_crlf_free(value)),
+            "a rendered hop is the separator followed by a CR/LF-free value"
+        );
+        debug_assert!(
+            !hop.port.is_empty() && hop.port.iter().all(u8::is_ascii_digit),
+            "the X-Forwarded-Port value is the rendered public port"
+        );
+        hop
+    }
+
+    /// Whether these values were rendered from exactly these inputs.
+    fn renders(
+        &self,
+        protocol: Protocol,
+        public_address: SocketAddr,
+        session_address: Option<SocketAddr>,
+    ) -> bool {
+        self.protocol == protocol
+            && self.public_address == public_address
+            && self.session_address == session_address
+    }
+}
+
+/// A synthesised header value: `hop` past its `HOP_SEPARATOR`, shared.
+fn synthesised_from_hop(hop: &Rc<[u8]>) -> kawa::Store {
+    debug_assert!(
+        hop.starts_with(HOP_SEPARATOR),
+        "a rendered hop starts with the separator"
+    );
+    kawa::Store::Shared(hop.clone(), HOP_SEPARATOR.len() as u32)
+}
+
+/// A client-supplied chain `client` extended with `hop`, in one allocation
+/// of the exact size of the result.
+fn extended_chain(client: &[u8], hop: &[u8]) -> kawa::Store {
+    let mut value = Vec::with_capacity(client.len() + hop.len());
+    value.extend_from_slice(client);
+    value.extend_from_slice(hop);
+    // Post: the client chain is kept as a prefix, our CR/LF-free hop is
+    // appended after it (anti-injection), and the buffer is full, so
+    // `kawa::Store::from_vec` keeps it without reallocating.
+    debug_assert!(
+        value.starts_with(client) && value.len() > client.len(),
+        "a client chain is only ever extended"
+    );
+    debug_assert!(
+        is_crlf_free(&value[client.len()..]) && value.len() == value.capacity(),
+        "the appended hop is CR/LF-free and the value exactly sized"
+    );
+    kawa::Store::from_vec(value)
+}
+
 /// This is the container used to store and use information about the session from within a Kawa parser callback
 #[derive(Debug)]
 pub struct HttpContext {
@@ -441,6 +580,11 @@ pub struct HttpContext {
     /// `None` until the request is routed, and for a request that matched
     /// no frontend at all.
     pub tags: Option<Rc<CachedTags>>,
+    /// The forwarding values rendered for this connection, reused by every
+    /// request whose inputs match (`HttpContext::forwarding_hop`).
+    /// Connection-scoped: `reset` keeps it. `None` until the first request
+    /// is edited.
+    pub(crate) forwarding_hop: Option<ForwardingHop>,
     /// Stable, structured discriminator surfaced as the access-log
     /// `message` field when the session terminates on a timeout. Set by
     /// the `MuxState::timeout` handler
@@ -672,6 +816,7 @@ impl HttpContext {
             frontend_redirect_template: None,
             redirect_status: None,
             tags: None,
+            forwarding_hop: None,
             access_log_message: None,
         }
     }
@@ -805,7 +950,6 @@ impl HttpContext {
         //     request.parsing_phase = kawa::ParsingPhase::Terminated;
         // }
 
-        let public_ip = self.public_address.ip();
         let public_port = self.public_address.port();
         let proto = match self.protocol {
             Protocol::HTTP => "http",
@@ -992,77 +1136,41 @@ impl HttpContext {
             (otel, traceparent.is_some())
         };
 
+        // The connection's forwarding values, rendered by its first request
+        // and shared by the next ones: a reference-count bump each, never a
+        // copy (`HttpContext::forwarding_hop`).
+        let (port_hop, x_forwarded_for_hop, forwarded_hop) = {
+            let hop = self.forwarding_hop(proto);
+            (
+                hop.port.clone(),
+                hop.x_forwarded_for.clone(),
+                hop.forwarded.clone(),
+            )
+        };
+
         // If session_address is set:
         // - append its ip address to the list of "X-Forwarded-For" if it was found, creates it if not
         // - append "proto=[PROTO];for=[PEER];by=[PUBLIC]" to the list of "Forwarded" if it was found, creates it if not
-        if let Some(peer_addr) = self.session_address {
-            let peer_ip = peer_addr.ip();
-            let peer_port = peer_addr.port();
+        if let (Some(x_forwarded_for_hop), Some(forwarded_hop)) =
+            (x_forwarded_for_hop, forwarded_hop)
+        {
             let has_x_for = x_for.is_some();
             let has_forwarded = forwarded.is_some();
 
-            // One scratch buffer renders every value below, and each header
-            // takes an exact-size copy of it (`Store::from_slice`) before the
-            // scratch is cleared for the next. Handing the scratch itself over
-            // (`Store::from_vec` of a `take`n buffer) cost two more heap
-            // operations per header: `into_boxed_slice` reallocates to shrink
-            // the spare capacity away, and the next header regrows an empty
-            // buffer from zero — 8, 16, 32, 64 bytes for a synthesised
-            // `Forwarded`. The pinned count is
-            // `a_bare_request_costs_one_scratch_and_one_copy_per_forwarding_header`.
-            let mut hdr_buf = Vec::with_capacity(128);
-
+            // A client-supplied chain is request-scoped: it is extended into
+            // one exact-size copy (`extended_chain`), never kept.
             if let Some(header) = x_for {
-                let prior_len = header.val.data(buf).len();
-                hdr_buf.extend_from_slice(header.val.data(buf));
-                let _ = write!(hdr_buf, ", {peer_ip}");
-                // Pre: we only ever extend the client-attested chain — the
-                // existing value stays a prefix and we appended the `, ip`
-                // separator, so the rewritten value is strictly longer and
-                // CR/LF-free (else the appended peer would split the header).
-                debug_assert!(
-                    hdr_buf.len() > prior_len,
-                    "X-Forwarded-For append must grow the value"
-                );
-                debug_assert!(
-                    is_crlf_free(&hdr_buf[prior_len..]),
-                    "the X-Forwarded-For hop we append must be CR/LF-free (anti-injection)"
-                );
-                header.val = kawa::Store::from_slice(&hdr_buf);
-                hdr_buf.clear();
+                header.val = extended_chain(header.val.data(buf), &x_forwarded_for_hop);
             }
             if let Some(header) = &mut forwarded {
-                let prior_len = header.val.data(buf).len();
-                hdr_buf.extend_from_slice(header.val.data(buf));
-                write_forwarded_suffix(&mut hdr_buf, proto, peer_ip, peer_port, public_ip);
-                // Pre: same contract for the structured `Forwarded` chain —
-                // the existing value is preserved as a prefix and our suffix
-                // is CR/LF-free (`write_forwarded_suffix` asserts the suffix
-                // span too; this pins it relative to the prior value).
-                debug_assert!(
-                    hdr_buf.len() > prior_len,
-                    "Forwarded append must grow the value"
-                );
-                debug_assert!(
-                    is_crlf_free(&hdr_buf[prior_len..]),
-                    "the Forwarded element we append must be CR/LF-free (anti-injection)"
-                );
-                header.val = kawa::Store::from_slice(&hdr_buf);
-                hdr_buf.clear();
+                header.val = extended_chain(header.val.data(buf), &forwarded_hop);
             }
 
             if !has_x_for {
                 let blocks_before = request.blocks.len();
-                let _ = write!(hdr_buf, "{peer_ip}");
-                debug_assert!(
-                    is_crlf_free(&hdr_buf),
-                    "a synthesised X-Forwarded-For value must be CR/LF-free"
-                );
-                let val = kawa::Store::from_slice(&hdr_buf);
-                hdr_buf.clear();
                 request.push_block(kawa::Block::Header(kawa::Pair {
                     key: kawa::Store::Static(b"X-Forwarded-For"),
-                    val,
+                    val: synthesised_from_hop(&x_forwarded_for_hop),
                 }));
                 debug_assert_eq!(
                     request.blocks.len(),
@@ -1072,18 +1180,9 @@ impl HttpContext {
             }
             if !has_forwarded {
                 let blocks_before = request.blocks.len();
-                hdr_buf.extend_from_slice(b"proto=");
-                hdr_buf.extend_from_slice(proto.as_bytes());
-                write_forwarded_for_by(&mut hdr_buf, peer_ip, peer_port, public_ip);
-                debug_assert!(
-                    is_crlf_free(&hdr_buf),
-                    "a synthesised Forwarded value must be CR/LF-free"
-                );
-                let val = kawa::Store::from_slice(&hdr_buf);
-                hdr_buf.clear();
                 request.push_block(kawa::Block::Header(kawa::Pair {
                     key: kawa::Store::Static(b"Forwarded"),
-                    val,
+                    val: synthesised_from_hop(&forwarded_hop),
                 }));
                 debug_assert_eq!(
                     request.blocks.len(),
@@ -1095,31 +1194,19 @@ impl HttpContext {
             // Inject a proxy-generated `X-Real-IP` header carrying the
             // peer IP (post-PROXY-v2 unwrap, so the original client IP
             // even when the upstream presented PROXY-v2). Folded into the
-            // `if let Some(peer_addr)` arm so missing peers (raw socket,
-            // no PROXY-v2) skip the injection silently — identical to the
-            // X-Forwarded-For / Forwarded synthesis behaviour above. Any
-            // client-supplied `X-Real-IP` was either elided in the block
-            // walk (if `elide_x_real_ip` is on) or passes through; this
-            // header is appended last so order in the resulting block
-            // list is deterministic for tests.
+            // peer arm so missing peers (raw socket, no PROXY-v2) skip the
+            // injection silently — identical to the X-Forwarded-For /
+            // Forwarded synthesis behaviour above. It shares the
+            // X-Forwarded-For rendering of the peer. Any client-supplied
+            // `X-Real-IP` was either elided in the block walk (if
+            // `elide_x_real_ip` is on) or passes through; this header is
+            // appended last so order in the resulting block list is
+            // deterministic for tests.
             if self.send_x_real_ip {
                 let blocks_before = request.blocks.len();
-                debug_assert!(
-                    hdr_buf.is_empty(),
-                    "the header scratch buffer was cleared before reuse"
-                );
-                let _ = write!(hdr_buf, "{peer_ip}");
-                // The proxy-generated value is a rendered IpAddr — non-empty
-                // and CR/LF-free, so it cannot inject a second header.
-                debug_assert!(
-                    !hdr_buf.is_empty() && is_crlf_free(&hdr_buf),
-                    "the injected X-Real-IP value must be a CR/LF-free IP"
-                );
-                let val = kawa::Store::from_slice(&hdr_buf);
-                hdr_buf.clear();
                 request.push_block(kawa::Block::Header(kawa::Pair {
                     key: kawa::Store::Static(b"X-Real-IP"),
-                    val,
+                    val: synthesised_from_hop(&x_forwarded_for_hop),
                 }));
                 debug_assert_eq!(
                     request.blocks.len(),
@@ -1142,11 +1229,9 @@ impl HttpContext {
         }
 
         if !has_x_port {
-            let mut port_buf = itoa::Buffer::new();
-            let port_str = port_buf.format(public_port);
             request.push_block(kawa::Block::Header(kawa::Pair {
                 key: kawa::Store::Static(b"X-Forwarded-Port"),
-                val: kawa::Store::from_slice(port_str.as_bytes()),
+                val: kawa::Store::Shared(port_hop, 0),
             }));
         }
         if !has_x_proto {
@@ -1344,6 +1429,36 @@ impl HttpContext {
         );
     }
 
+    /// The connection's forwarding values for the current inputs, rendered
+    /// only when the cached ones were rendered from different inputs — the
+    /// first request of a connection, or an input changed since.
+    fn forwarding_hop(&mut self, proto: &str) -> &ForwardingHop {
+        let (protocol, public_address, session_address) =
+            (self.protocol, self.public_address, self.session_address);
+        let cached = self
+            .forwarding_hop
+            .as_ref()
+            .is_some_and(|hop| hop.renders(protocol, public_address, session_address));
+        if !cached {
+            self.forwarding_hop = Some(ForwardingHop::render(
+                protocol,
+                proto,
+                public_address,
+                session_address,
+            ));
+        }
+        let hop = self
+            .forwarding_hop
+            .as_ref()
+            .expect("the forwarding values were just rendered or reused");
+        // Post: the values handed out were rendered from the current inputs.
+        debug_assert!(
+            hop.renders(protocol, public_address, session_address),
+            "the forwarding values must match the current inputs"
+        );
+        hop
+    }
+
     /// `self.id` rendered, as a shared value for the correlation header.
     ///
     /// When the request carried no `X-Request-Id`, `on_request_headers`
@@ -1394,6 +1509,10 @@ impl HttpContext {
         let tls_version_before = self.tls_version;
         let tls_cipher_before = self.tls_cipher;
         let tls_alpn_before = self.tls_alpn;
+        let forwarding_hop_before = self
+            .forwarding_hop
+            .as_ref()
+            .map(|hop| Rc::as_ptr(&hop.port));
 
         self.id = request_id;
         self.keep_alive_backend = true;
@@ -1415,7 +1534,8 @@ impl HttpContext {
         // strict_sni_binding, elide_x_real_ip, send_x_real_ip are
         // connection-scoped — set once at handshake completion and reused
         // across every keep-alive request, so reset() intentionally leaves
-        // them in place.
+        // them in place. So is forwarding_hop, rendered from connection-
+        // scoped inputs only.
 
         // Post: request-scoped state is fully cleared (a stale value here
         // would leak across pipelined requests on the same connection).
@@ -1449,6 +1569,13 @@ impl HttpContext {
                 && self.tls_cipher == tls_cipher_before
                 && self.tls_alpn == tls_alpn_before,
             "reset() must preserve connection-scoped TLS/listener knobs"
+        );
+        debug_assert_eq!(
+            self.forwarding_hop
+                .as_ref()
+                .map(|hop| Rc::as_ptr(&hop.port)),
+            forwarding_hop_before,
+            "reset() must keep the connection's forwarding values"
         );
     }
 
@@ -2059,24 +2186,25 @@ mod tests {
         0
     };
 
-    /// A bare request: every forwarding header is synthesised, and each
-    /// costs one exact-size copy of one shared scratch; the request id is
-    /// rendered once.
+    /// The first request of a connection: every forwarding header is
+    /// synthesised from the connection's forwarding values, which one
+    /// scratch renders and each copies out once; the request id is rendered
+    /// once. The next requests reuse the values
+    /// (`keep_alive_requests_reuse_the_connection_forwarding_hop`).
     ///
     /// The seven: `authority` and `path` captured for routing and the access
-    /// log (2), the scratch (1), `X-Forwarded-For` and `Forwarded` (2),
-    /// `X-Forwarded-Port` (1), and the one rendering of the request id that
-    /// `X-Request-Id`, the access log and the `Sozu-Id` value share (1). The
-    /// default `Sozu-Id` name is a `'static` literal (0). Under the
-    /// `opentelemetry` feature, the synthesised `traceparent` adds its one
-    /// copy ([`SYNTHESISED_TRACEPARENT`]).
+    /// log (2), the scratch (1), the `X-Forwarded-For` hop, the `Forwarded`
+    /// element and the `X-Forwarded-Port` value (3), and the one rendering of
+    /// the request id that `X-Request-Id`, the access log and the `Sozu-Id`
+    /// value share (1). The default `Sozu-Id` name is a `'static` literal
+    /// (0). Under the `opentelemetry` feature, the synthesised `traceparent`
+    /// adds its one copy ([`SYNTHESISED_TRACEPARENT`]).
     ///
     /// TO SEE THIS RED, either of:
-    /// - in `on_request_headers`, hand the scratch itself to each header
-    ///   again — `kawa::Store::from_vec(std::mem::take(&mut hdr_buf))` in
-    ///   place of the `from_slice` + `clear` pairs. Measured: `left: 11,
-    ///   right: 7`, the shrink of `X-Forwarded-For` and the 8 → 16 → 32 → 64
-    ///   regrowth and shrink of `Forwarded`.
+    /// - in `on_request_headers`, allocate a scratch for every request again
+    ///   to extend the client chains in, as the recipe of
+    ///   `a_client_chain_costs_one_exact_copy_per_extended_header` does.
+    ///   Measured: `left: 8, right: 7`.
     /// - render the id per header again: `kawa::Store::from_string(
     ///   self.id.to_string())` for the `Sozu-Id` value, `from_string(
     ///   self.sozu_id_header.clone())` for its name, and a `self.id
@@ -2364,5 +2492,269 @@ mod tests {
             "client chains are extended, a client X-Request-Id is kept verbatim"
         );
         assert_eq!(ctx.x_request_id.as_deref(), Some("client-chosen"));
+    }
+
+    // ── connection-scoped forwarding hop ───────────────────────────────
+
+    /// A context whose forwarding inputs the caller chooses, with the
+    /// default correlation header name.
+    fn forwarding_context(
+        protocol: Protocol,
+        public_address: SocketAddr,
+        session_address: SocketAddr,
+        send_x_real_ip: bool,
+    ) -> HttpContext {
+        HttpContext::new(
+            Ulid::generate(),
+            Ulid::generate(),
+            protocol,
+            public_address,
+            Some(session_address),
+            "SERVERID".to_owned(),
+            "Sozu-Id".to_owned(),
+            false,
+            send_x_real_ip,
+        )
+    }
+
+    /// The second and later requests of a keep-alive connection reuse the
+    /// forwarding values the first one rendered: `X-Forwarded-For`,
+    /// `Forwarded`, `X-Real-IP` and `X-Forwarded-Port` then cost no heap
+    /// operation at all.
+    ///
+    /// The three left: `authority` and `path` captured for routing and the
+    /// access log (2), and the one rendering of the request id (1). Under
+    /// the `opentelemetry` feature, the synthesised `traceparent` adds its
+    /// one copy ([`SYNTHESISED_TRACEPARENT`]).
+    ///
+    /// TO SEE THIS RED: in `HttpContext::forwarding_hop`, rebuild the hop on
+    /// every call instead of returning the cached one whose inputs match.
+    /// Measured: `left: 7, right: 3` (the scratch and the three values).
+    #[test]
+    fn keep_alive_requests_reuse_the_connection_forwarding_hop() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let mut kawa = warm_request_kawa(&mut pool);
+        let mut ctx = forwarding_context(
+            Protocol::HTTP,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 54321),
+            true,
+        );
+
+        let first = allocations_of_request_parse(&mut ctx, &mut kawa, BARE_REQUEST);
+        assert_eq!(
+            first,
+            7 + SYNTHESISED_TRACEPARENT,
+            "the first request renders the connection's forwarding values once, \
+             X-Real-IP sharing the X-Forwarded-For rendering"
+        );
+        for request in 1..4 {
+            ctx.reset(Ulid::generate());
+            let later = allocations_of_request_parse(&mut ctx, &mut kawa, BARE_REQUEST);
+            assert_eq!(
+                later,
+                3 + SYNTHESISED_TRACEPARENT,
+                "request {request} of the connection must reuse the forwarding values"
+            );
+        }
+    }
+
+    /// A client-supplied chain is extended with one exact-size copy per
+    /// header, the appended hop coming from the connection's rendering.
+    ///
+    /// The six on a later request: `authority` and `path` (2), the
+    /// `xff_chain` snapshot for the access log (1), the extended
+    /// `X-Forwarded-For` and `Forwarded` (2), and the request id (1).
+    ///
+    /// TO SEE THIS RED: in `on_request_headers`, extend the client chains in
+    /// a `Vec::with_capacity(128)` scratch shared by both again, each copied
+    /// out with `kawa::Store::from_slice`. Measured: `left: 7, right: 6`, the
+    /// scratch.
+    #[test]
+    fn a_client_chain_costs_one_exact_copy_per_extended_header() {
+        const CLIENT_CHAINS: &[u8] = b"GET / HTTP/1.1\r\nHost: example.com\r\n\
+              X-Forwarded-For: 192.0.2.7\r\n\
+              Forwarded: for=192.0.2.7\r\n\r\n";
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let mut kawa = warm_request_kawa(&mut pool);
+        let mut ctx = make_context();
+
+        allocations_of_request_parse(&mut ctx, &mut kawa, BARE_REQUEST);
+        ctx.reset(Ulid::generate());
+        let later = allocations_of_request_parse(&mut ctx, &mut kawa, CLIENT_CHAINS);
+        assert_eq!(
+            later,
+            6 + SYNTHESISED_TRACEPARENT,
+            "a client chain costs one exact copy per extended header"
+        );
+    }
+
+    /// The bytes forwarded on a keep-alive connection that alternates bare
+    /// requests with requests carrying their own chains: a client chain is
+    /// extended, never kept for the next request, and the IPv6 literals
+    /// keep their RFC 7239 §6 brackets and quotes.
+    #[test]
+    fn a_client_chain_never_leaks_into_the_next_request() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let mut kawa = warm_request_kawa(&mut pool);
+        let mut ctx = forwarding_context(
+            Protocol::HTTPS,
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+                443,
+            ),
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 1, 2)),
+                50000,
+            ),
+            true,
+        );
+        let bare = |id: &str, traceparent: &str| {
+            format!(
+                "GET / HTTP/1.1\r\nHost: example.com\r\n\
+                 X-Forwarded-For: 2001:db8::1:2\r\n\
+                 Forwarded: proto=https;for=\"[2001:db8::1:2]:50000\";by=\"[2001:db8::1]\"\r\n\
+                 X-Real-IP: 2001:db8::1:2\r\n\
+                 {traceparent}\
+                 X-Forwarded-Port: 443\r\n\
+                 X-Forwarded-Proto: https\r\n\
+                 X-Request-Id: {id}\r\n\
+                 Sozu-Id: {id}\r\n\r\n"
+            )
+        };
+
+        for round in 0..2 {
+            let id = ctx.id.to_string();
+            allocations_of_request_parse(&mut ctx, &mut kawa, BARE_REQUEST);
+            let traceparent = synthesised_traceparent_line(&ctx);
+            assert_eq!(
+                serialized_request(&mut kawa),
+                bare(&id, &traceparent),
+                "bare request of round {round}"
+            );
+            assert_eq!(ctx.xff_chain, None);
+            ctx.reset(Ulid::generate());
+
+            let id = ctx.id.to_string();
+            allocations_of_request_parse(
+                &mut ctx,
+                &mut kawa,
+                b"GET / HTTP/1.1\r\nHost: example.com\r\n\
+                  X-Forwarded-For: 192.0.2.7, 198.51.100.3\r\n\
+                  Forwarded: for=192.0.2.7;proto=http\r\n\r\n",
+            );
+            let traceparent = synthesised_traceparent_line(&ctx);
+            assert_eq!(
+                serialized_request(&mut kawa),
+                format!(
+                    "GET / HTTP/1.1\r\nHost: example.com\r\n\
+                     X-Forwarded-For: 192.0.2.7, 198.51.100.3, 2001:db8::1:2\r\n\
+                     Forwarded: for=192.0.2.7;proto=http, \
+                     proto=https;for=\"[2001:db8::1:2]:50000\";by=\"[2001:db8::1]\"\r\n\
+                     X-Real-IP: 2001:db8::1:2\r\n\
+                     {traceparent}\
+                     X-Forwarded-Port: 443\r\n\
+                     X-Forwarded-Proto: https\r\n\
+                     X-Request-Id: {id}\r\n\
+                     Sozu-Id: {id}\r\n\r\n"
+                ),
+                "request with client chains of round {round}"
+            );
+            assert_eq!(ctx.xff_chain.as_deref(), Some("192.0.2.7, 198.51.100.3"));
+            ctx.reset(Ulid::generate());
+        }
+    }
+
+    /// Changing an input of the forwarding values between two requests —
+    /// the peer, the public address or the protocol — renders them again:
+    /// a value is reused only for the inputs it was rendered from.
+    #[test]
+    fn a_changed_forwarding_input_renders_the_hop_again() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let mut kawa = warm_request_kawa(&mut pool);
+        let mut ctx = forwarding_context(
+            Protocol::HTTP,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 54321),
+            true,
+        );
+        let expected = |ctx: &HttpContext, peer: &str, forwarded: &str, port: u16, proto: &str| {
+            let id = ctx.id.to_string();
+            let traceparent = synthesised_traceparent_line(ctx);
+            format!(
+                "GET / HTTP/1.1\r\nHost: example.com\r\n\
+                 X-Forwarded-For: {peer}\r\n\
+                 Forwarded: {forwarded}\r\n\
+                 X-Real-IP: {peer}\r\n\
+                 {traceparent}\
+                 X-Forwarded-Port: {port}\r\n\
+                 X-Forwarded-Proto: {proto}\r\n\
+                 X-Request-Id: {id}\r\n\
+                 Sozu-Id: {id}\r\n\r\n"
+            )
+        };
+
+        allocations_of_request_parse(&mut ctx, &mut kawa, BARE_REQUEST);
+        assert_eq!(
+            serialized_request(&mut kawa),
+            expected(
+                &ctx,
+                "10.0.0.1",
+                "proto=http;for=\"10.0.0.1:54321\";by=127.0.0.1",
+                8080,
+                "http"
+            )
+        );
+
+        ctx.reset(Ulid::generate());
+        ctx.session_address = Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            40000,
+        ));
+        allocations_of_request_parse(&mut ctx, &mut kawa, BARE_REQUEST);
+        assert_eq!(
+            serialized_request(&mut kawa),
+            expected(
+                &ctx,
+                "10.0.0.2",
+                "proto=http;for=\"10.0.0.2:40000\";by=127.0.0.1",
+                8080,
+                "http"
+            ),
+            "a new peer is rendered"
+        );
+
+        ctx.reset(Ulid::generate());
+        ctx.public_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 8443);
+        allocations_of_request_parse(&mut ctx, &mut kawa, BARE_REQUEST);
+        assert_eq!(
+            serialized_request(&mut kawa),
+            expected(
+                &ctx,
+                "10.0.0.2",
+                "proto=http;for=\"10.0.0.2:40000\";by=192.0.2.1",
+                8443,
+                "http"
+            ),
+            "a new public address is rendered"
+        );
+
+        // The protocol alone changes: the addresses are the ones the cached
+        // values were rendered from, so only the protocol can invalidate
+        // them — a stale `Forwarded` would still say `proto=http`.
+        ctx.reset(Ulid::generate());
+        ctx.protocol = Protocol::HTTPS;
+        allocations_of_request_parse(&mut ctx, &mut kawa, BARE_REQUEST);
+        assert_eq!(
+            serialized_request(&mut kawa),
+            expected(
+                &ctx,
+                "10.0.0.2",
+                "proto=https;for=\"10.0.0.2:40000\";by=192.0.2.1",
+                8443,
+                "https"
+            ),
+            "a new protocol is rendered"
+        );
     }
 }
