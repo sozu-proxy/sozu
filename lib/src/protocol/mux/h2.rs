@@ -6929,8 +6929,8 @@ impl ConnectionH2 {
             // again. Once this connection encoded it, `front.out` holds
             // frames bound to this connection's stream id and HPACK encoder
             // and its header blocks are gone: re-linked, those frames would
-            // reach another backend, possibly one other clients share
-            // (sozu-proxy/sozu#1632).
+            // reach another backend connection of this session, possibly one
+            // this frontend connection's other streams share (sozu#1632).
             if stream.front.consumed {
                 // Request was already sent to this backend — we can't
                 // replay it. Use the linked token's readiness (via

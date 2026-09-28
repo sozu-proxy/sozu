@@ -1048,7 +1048,7 @@ mod tests {
             .unwrap();
         drain(&mut mgr);
 
-        // Second datagram from same source: no new SelectBackend, direct send.
+        // Second datagram from same source: no new selection, direct send.
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src,

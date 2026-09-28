@@ -50,9 +50,9 @@ pub struct UdpFlow {
     /// Real (pre-NAT) client source address — the symmetric NAT return target
     /// and the PPv2 source address.
     pub client: SocketAddr,
-    /// Resolved backend id, set on `BackendResolved`.
+    /// Backend id, set when the core selects the flow's backend at admission.
     pub backend_id: Option<String>,
-    /// Resolved backend address, set on `BackendResolved`.
+    /// Backend address, set when the core selects the flow's backend at admission.
     pub backend_addr: Option<SocketAddr>,
     /// Lifecycle phase.
     pub phase: FlowPhase,

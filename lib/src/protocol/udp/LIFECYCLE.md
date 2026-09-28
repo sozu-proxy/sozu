@@ -5,13 +5,13 @@ core) and `lib/src/udp.rs` (the I/O shell). Companion to
 `lib/src/protocol/mux/LIFECYCLE.md` (H2), `lib/src/protocol/kawa_h1/LIFECYCLE.md`
 (H1) and `lib/src/protocol/proxy_protocol/LIFECYCLE.md` (PROXY ingress).
 
-Every claim is anchored to code. Where the prose names an item — a function, a
-method, a struct, an enum — the anchor is that item plus its file, with no line
-number, because a line number does not survive an edit above it. A `file.rs:LINE`
-or `file.rs:LINE-LINE` anchor is kept only where the claim is about a specific
-statement or branch inside an item; those were refreshed against `main` at
-`0cb1e2a7` on 2026-09-20. Implements issue #1273; the design rationale lives in
-the `tasks/udp-lb/MASTER-PLAN.md` referenced by the PR.
+Every claim is anchored to code by symbol: the item the prose names — a
+function, a method, a struct, an enum, a field — plus its file, never a line
+number, because a line number does not survive an edit above it. Where the
+claim is about one branch inside a function, the anchor names the function and
+the branch in words. Converted on 2026-09-28. Implements issue #1273; the
+design rationale lives in the `tasks/udp-lb/MASTER-PLAN.md` referenced by the
+PR.
 
 ---
 
@@ -25,10 +25,10 @@ lifetime.
 UDP is **connectionless** and therefore **one-listener-many-flows**. A single
 bound `mio::net::UdpSocket` (`UdpListener`, `udp.rs`) serves every client.
 A readable event means "datagrams are waiting", **not** "a new connection"
-(`udp.rs:11-13`). There is no accept loop and no `create_session()` call: a
-`Protocol::UDP` listener falls through `Server::ready`'s generic arm into
-`ProxySession::ready` (`udp.rs:25-27`, `Server::ready`'s generic session arm,
-`lib/src/server.rs`). Because there is no
+(the module doc of `udp.rs`). There is no accept loop and no `create_session()`
+call: a `Protocol::UDP` listener falls through `Server::ready`'s generic arm
+into `ProxySession::ready` (`UdpListenerSession`'s impl, `udp.rs`;
+`Server::ready`'s generic session arm, `lib/src/server.rs`). Because there is no
 kernel-level connection, Sōzu reconstructs the notion of a "connection" itself —
 a **virtual flow** keyed on the client source address. That flow table is, in
 effect, a **userland UDP conntrack** living inside the single-threaded worker
@@ -51,7 +51,7 @@ holds protocol state and an impure shell that holds the syscalls.
 | **I/O shell** | `lib/src/udp.rs` (+ `lib/src/udp/health.rs`) | every syscall, buffer pool, per-flow connected upstream sockets, the actual `TIMER` wheel, the `BackendMap`, health checks, metrics, slab/token bookkeeping |
 
 The core performs **no I/O**: no socket, no `Instant::now()`/`SystemTime`, no
-`rand`, no `Arc<Mutex>` (`mod.rs:6-7`). Time is injected as `now: Instant` on
+`rand`, no `Arc<Mutex>` (the module doc of `mod.rs`). Time is injected as `now: Instant` on
 every time-dependent entry point; the hash seed is injected once at construction
 (`UdpManager::new` / `UdpManager::with_extractor`, `manager.rs`). This purity is
 exactly what the deterministic-simulation test in `sim/tests/udp_simulation.rs`
@@ -60,15 +60,17 @@ exactly what the deterministic-simulation test in `sim/tests/udp_simulation.rs`
 The two halves talk over a narrow message contract in `mod.rs`:
 
 - **`ManagerInput<'a>`** (`mod.rs`) — what the shell feeds in:
-  `ClientDatagram { src, payload }` (`mod.rs`), `BackendDatagram { flow, payload }`
-  (`mod.rs`, already tagged with the owning flow), `Config(ConfigEvent)`
-  (`mod.rs`), `BackendResolved { flow, backend, addr }` (`mod.rs`).
-  Inputs **borrow** the recv buffer.
+  `ClientDatagram { src, payload, backends }` (`mod.rs`; `backends` is the
+  `BackendSource` view the core selects from, lent for this datagram only),
+  `BackendDatagram { flow, payload }` (`mod.rs`, already tagged with the owning
+  flow) and `Config(ConfigEvent)` (`mod.rs`). Inputs **borrow** the recv buffer.
 - **`Output`** (`mod.rs`) — what the core emits, drained by the shell via
   `poll_output()` until `None` (`manager.rs`, `udp.rs` `drain_outputs`):
-  `SelectBackend` (`mod.rs`), `OpenUpstream` (`mod.rs`), `SendToBackend`
-  (`mod.rs`), `SendToClient` (`mod.rs`), `ArmTimer` (`mod.rs`),
-  `Metric` (`mod.rs`), `CloseFlow` (`mod.rs`), `Drop` (`mod.rs`).
+  `OpenUpstream` (`mod.rs`), `SendToBackend` (`mod.rs`), `SendToClient`
+  (`mod.rs`), `ArmTimer` (`mod.rs`), `Metric` (`mod.rs`), `CloseFlow`
+  (`mod.rs`), `Drop` (`mod.rs`). There is no selection round trip: the
+  `SelectBackend` output and the `BackendResolved` input were removed when
+  selection moved into the core (#1340, Question 6).
 
 The **single owned copy** the design permits is the admission copy: the borrowed
 recv buffer is materialised into an owned `Transmit::payload: Vec<u8>`
@@ -98,17 +100,19 @@ pub struct FlowKey { pub src: SocketAddr }
 `0`) otherwise — a per-cluster knob (`ClusterConfig::affinity_with_port`,
 `mod.rs`). The extractor is the only seam (`FlowKeyExtractor` trait,
 `manager.rs`); the in-scope impl is `SourceTupleExtractor` (`manager.rs`),
-which also enforces "an empty datagram is not a valid flow trigger" (`manager.rs:50-53`).
+which also enforces "an empty datagram is not a valid flow trigger" (`SourceTupleExtractor::flow_key`).
 
 **Two-tier selection** on a client datagram (`UdpManager::on_client_datagram`, `manager.rs`):
 
-1. Oversize → `Drop(Truncated)` before any allocation (`manager.rs:251-255`).
-2. No cluster configured → `Drop(NoBackend)` (`manager.rs:256-260`).
-3. Extract the key; rejection → `Drop(Invalid)`, allocates nothing (`manager.rs:261-268`).
-4. **Key already in the table** → reuse its flow & backend (`manager.rs:270-274`,
-   `forward_on_existing_flow`). This is what makes affinity sticky: the same
-   client always reaches the same backend for the life of the flow.
-5. **New key**, draining or at cap → shed (`manager.rs:276-302`), allocate nothing.
+1. Oversize → `Drop(Truncated)` before any allocation (the first check of
+   `on_client_datagram`).
+2. No cluster configured → `Drop(NoBackend)`.
+3. Extract the key; rejection → `Drop(Invalid)`, allocates nothing.
+4. **Key already in the table** → reuse its flow & backend
+   (`UdpManager::forward_on_existing_flow`). This is what makes affinity
+   sticky: the same client always reaches the same backend for the life of the
+   flow.
+5. **New key**, draining or at cap → shed, allocate nothing.
 6. Otherwise **select and admit**, in that order. `UdpManager` picks the
    backend itself, from the `BackendSource` view the embedder handed in with
    this datagram (`mod.rs`). No backend available → `Drop(NoBackend)`,
@@ -178,12 +182,11 @@ by `every_datagram_of_an_opening_burst_is_forwarded_and_counted_once`
 client ──dgram──▶ front UDP socket ──▶ ingest_client (udp.rs)
                                          │  recv_from into recv_buf
                                          ▼
-                       UdpManager::handle_input(ClientDatagram)  (manager.rs)
-                                         │  admit / reuse / drop
-                                         ▼   Output::SelectBackend (new flow)
-                       drain_outputs (udp.rs) → on_select_backend (udp.rs)
-                                         │  BackendMap::next_available_backend_with_key
-                                         ▼   ManagerInput::BackendResolved (on_backend_resolved, manager.rs)
+                       UdpManager::handle_input(ClientDatagram { backends })  (manager.rs)
+                                         │  admit / reuse / drop; a new flow selects
+                                         │  here, through BackendSource::select
+                                         │  (BackendMap's impl, backends.rs)
+                                         ▼   drain_outputs (udp.rs)
                        Output::OpenUpstream  → on_open_upstream (udp.rs)
                                          │  udp_connect(backend)  (socket.rs)
                                          │  register upstream_token → flow
@@ -238,7 +241,7 @@ A flow is reaped on the **first** of these (`CloseReason`, `flow.rs`):
 
 | Knob | Config | Semantics | Check |
 |------|--------|-----------|-------|
-| **idle** | `front_timeout` / `back_timeout` (default 30 s, `mod.rs:279-280`) | no datagram in that direction within the window | `UdpManager::handle_timeout` (`manager.rs`) |
+| **idle** | `front_timeout` / `back_timeout` (default 30 s, `ClusterConfig`'s `Default`, `mod.rs`) | no datagram in that direction within the window | `UdpManager::handle_timeout` (`manager.rs`) |
 | **responses** | `responses` (`0` = unlimited) | close after N backend replies — **DNS uses 1** | `UdpFlow::responses_exhausted` (`flow.rs`) |
 | **requests** | `requests` (`0` = unlimited) | close after N client forwards | `UdpFlow::requests_exhausted` (`flow.rs`) |
 | drain / admin | — | listener drain, remove, soft/hard-stop, abort | `UdpManager::close_all` (`manager.rs`), `UdpManager::abort_flow` (`manager.rs`) |
@@ -276,7 +279,7 @@ millisecond. Either figure is enough for what follows; the hazard is any
 earliness at all. `Timer::poll` then *removes* that entry from its slab. So on every expiry, whether or not a flow
 was due:
 
-- the manager clears `armed_deadline` (`manager.rs:531`) **before** any
+- the manager clears `armed_deadline` (`UdpManager::handle_timeout`) **before** any
   `reschedule`, so a recomputed deadline equal to the old one is still emitted
   as a fresh `ArmTimer` instead of being memoized away — this is the
   load-bearing half;
@@ -324,18 +327,18 @@ a missing or already-`Closing` flow is a no-op — no double-evict, no underflow
 ## 8. PROXY Protocol v2 (DGRAM)
 
 Sōzu defines PPv2-over-UDP — **no reference proxy ships it**
-(`proxy_protocol.rs:3`). The v2 spec carries a DGRAM encoding: the
+(the module doc of `proxy_protocol.rs`). The v2 spec carries a DGRAM encoding: the
 version+command byte (offset 12) is `0x21` and the family+transport byte
 (offset 13) is `0x12` for UDP-over-IPv4 / `0x22` for UDP-over-IPv6 (low nibble
 `0x2` = DGRAM, vs `0x1` = STREAM used by the TCP serializer)
-(`proxy_protocol.rs:4-7`, `26-37`).
+(the module doc and the `PP2_SIGNATURE` and byte constants of `proxy_protocol.rs`).
 
 `dgram_header(client, backend)` (`proxy_protocol.rs`) builds the header with
 the **real (pre-NAT) client** as the PPv2 source and the backend as the
 destination. `prepend_dgram_header` (`proxy_protocol.rs`) splices it in front
 of the owned payload. Mixed-family (a v4/v6 mismatch the datapath never produces,
 since the connected socket matches the backend family) falls back to an
-`AF_UNSPEC` zero-length block per the spec (`proxy_protocol.rs:73-82`).
+`AF_UNSPEC` zero-length block per the spec (the mixed-family arm of `dgram_header`).
 
 Policy is per-cluster: `send_proxy_protocol` gates it; `proxy_protocol_every_datagram`
 chooses **first-datagram-only** (default) vs **every-datagram**. `UdpFlow::take_proxy_protocol`
@@ -343,18 +346,22 @@ chooses **first-datagram-only** (default) vs **every-datagram**. `UdpFlow::take_
 `flow.rs`) so the prefix is applied exactly once when first-only. The prefix
 is applied in the **core**, so the shell writes `Transmit::payload` verbatim
 (`mod.rs`); metric byte counts exclude the prefix (`MetricEvent::DatagramIn`
-carries the payload length, `mod.rs`). Byte-exact tests:
-`proxy_protocol.rs:108-174`.
+carries the payload length, `mod.rs`). Byte-exact tests: the `tests` module of
+`proxy_protocol.rs`.
 
 ---
 
 ## 9. Load Balancing
 
-Selection is **requested** by the core and **performed** by the shell. On a new
-flow the core emits `SelectBackend { flow, cluster, key }` (`mod.rs`), where
-`key` is an affinity hash computed from the flow key (`affinity_hash`,
-`manager.rs`). The shell's `on_select_backend` (`udp.rs`) consults
-`BackendMap::next_available_backend_with_key`, then replies with `BackendResolved`.
+Selection is **performed by the core**, from a view the shell lends it. On a
+new flow `UdpManager::on_client_datagram` computes an affinity `key` from the
+flow key (`affinity_hash`, `manager.rs`) and calls `BackendSource::select`
+(`mod.rs`) on the `backends` view that arrived with the datagram; the shell's
+view is `BackendMap`, whose impl (`backends.rs`) calls
+`BackendMap::backend_from_cluster_id_with_key`. No backend available →
+`Drop(NoBackend)` before any slot is allocated. The view is borrowed for that
+one admission and never retained (#1340, Question 6), which is what lets the
+simulator substitute its own backend set.
 
 A single `key: Option<u64>` threaded through the LB trait selects the algorithm
 per cluster:
@@ -368,14 +375,14 @@ per cluster:
 
 Health-aware selection skips unhealthy backends but **fails open**: if every
 backend reads unhealthy, selection routes over the full set rather than
-black-holing (`lib/src/udp/health.rs:19-22`).
+black-holing (the module doc of `lib/src/udp/health.rs`).
 
 ---
 
 ## 10. Health Checks
 
 UDP has no reliable liveness signal, so health is bound to the **endpoint**, not
-the listener (`lib/src/udp/health.rs:1-26`, MASTER-PLAN §7):
+the listener (the module doc of `lib/src/udp/health.rs`, MASTER-PLAN §7):
 
 - **Primary — companion TCP probe**: non-blocking mio TCP `connect` to a
   configurable `tcp_port` (default = the data port). Established ⇒ healthy;
@@ -388,7 +395,7 @@ Results feed `Backend::health` through rise/fall hysteresis
 (`HealthState`), steering only **new** selections — a flow already pinned to a
 now-unhealthy backend stays until idle-timeout (the flow table pins it). Probes
 run **non-blocking in the event loop** (`UdpProxy::health_poll` `udp.rs`,
-driven from `Server::run`'s health tick, `lib/src/server.rs`; `health_owns_token`/`health_ready` route readiness,
+called once per event-loop turn by `Server::run`, `lib/src/server.rs`; `health_owns_token`/`health_ready` route readiness,
 `udp.rs`, `Server::ready`'s UDP health arm, `lib/src/server.rs`). No background threads — consistent with the
 single-threaded worker model. The per-turn call borrows the proxy's `Registry`
 and allocates no descriptor: cloning it there cost an `fcntl(F_DUPFD_CLOEXEC)`
@@ -469,14 +476,15 @@ model.
 1. **Silence is a virtue — drop before you allocate.** Unknown / empty /
    oversized / no-cluster / over-cap datagrams are dropped + metered **before**
    any flow, buffer, or socket is allocated (`UdpManager::on_client_datagram`,
-   `manager.rs:251-302`). Each early return pair-asserts `flows.len()` is
-   unchanged (`manager.rs:282-301`). `DropReason` (`mod.rs`) carries the
+   `manager.rs`). Each early return pair-asserts `flows.len()` is
+   unchanged (the `flows_before_admit` snapshot in the same function). `DropReason` (`mod.rs`) carries the
    reason into `udp.datagrams.dropped`.
 2. **Bounded flow table = bounded fds.** `max_flows` (`UdpManager::max_flows`, `manager.rs`;
    `effective_max_flows` `udp.rs`) defaults to ~70 % of the soft
    `RLIMIT_NOFILE`, **clamped against shared-slab headroom** so a UDP listener
-   cannot starve HTTP/TCP. Beyond the cap, new flows are **shed** (`FlowShed`,
-   `manager.rs:293-294`); existing flows are protected. This is the bounded
+   cannot starve HTTP/TCP. Beyond the cap, new flows are **shed**
+   (`MetricEvent::FlowShed`, emitted by `UdpManager::on_client_datagram`);
+   existing flows are protected. This is the bounded
    analog of kernel conntrack-table exhaustion.
 3. **Bounded rx.** `max_rx_datagram_size` is clamped to `buffer_size`
    (`clamp_max_rx`, `udp.rs`); the `recv_buf` is sized `max_rx + 1`
@@ -484,8 +492,8 @@ model.
    `max_rx`) and dropped as `Truncated` rather than silently cut.
 4. **Bounded egress write queue.** A stalled backend cannot balloon memory: the
    per-flow upstream write queue (`WriteQueue`, `udp.rs`) has a small cap;
-   past it the datagram is dropped (`udp.datagrams.dropped.wq_full`,
-   `udp.rs:121-123`) — UDP is best-effort, the client retries. Writable re-arm
+   past it the datagram is dropped (`udp.datagrams.dropped.wq_full`, the
+   `WriteQueue` doc in `udp.rs`) — UDP is best-effort, the client retries. Writable re-arm
    (`arm_upstream_writable` / `drain_upstream_queue`; client side
    `arm_client_writable` / `drain_client_queue`; all `udp.rs`) is the UDP analog
    of `signal_pending_write` on the edge-triggered loop.
@@ -504,15 +512,42 @@ model.
    (`on_open_upstream` failure path, `udp.rs`) rather than panicking,
    freeing the slab slot it would otherwise pin for the idle timeout.
 8. **Debug invariants everywhere.** `UdpManager::check_invariants` (`manager.rs`) runs
-   as a post-condition after every public mutating method
-   (`handle_input`, `manager.rs:187`); the deterministic simulator
+   as a post-condition after every public mutating method (the
+   `debug_assert_invariants` call that ends `UdpManager::handle_input`); the
+   deterministic simulator
    (`sim/tests/udp_simulation.rs`, the moonpool-driven `sozu-sim` crate) and the
    property tests (`prop_flow_invariants`, `manager.rs`) drive the core hard
    enough to trip any regression.
 
 ---
 
-## 13. Cross-References
+## 13. What a Datagram Costs
+
+Read from the code on 2026-09-28; no UDP scenario was traced, so these are
+counts of calls in the source, not measurements. The one UDP change the
+hot-path work measured is §10's: `UdpProxy::health_poll` no longer clones the
+registry on every event-loop turn, which removed an `fcntl` and a `close` per
+turn from every worker, UDP cluster or not (`doc/hot_path_zero_copy.md` §3.10).
+
+| Event | System calls | Allocations |
+|---|---|---|
+| client datagram, known flow | one `recvfrom(2)` (`ingest_client`), one `send(2)` on the flow's connected socket (`on_send_to_backend`) | one owned copy of the payload into `Transmit::payload` (`UdpManager::forward_on_existing_flow`), plus the PPv2 prefix on the datagrams that carry one |
+| backend reply | one `recv(2)` (`ingest_upstream`), one `sendto(2)` on the listener socket (`on_send_to_client`) | one owned copy into `Transmit::payload` (`UdpManager::on_backend_datagram`) |
+| end of a readiness burst | one more `recvfrom` / `recv` that answers `EAGAIN` | none |
+| new flow | `udp_connect` (`lib/src/socket.rs`): `socket(2)`, `bind(2)`, two `fcntl(2)` for `O_NONBLOCK`, `connect(2)`, then a third `fcntl`, a `getsockname(2)` and a `getpeername(2)` for its post-condition checks, which run in release builds too (only the assertions they feed are compiled out); then `epoll_ctl(EPOLL_CTL_ADD)` (`on_open_upstream`) | the flow's slab slot and its shell-side map entries |
+| closed flow | `epoll_ctl(EPOLL_CTL_DEL)` and `close(2)` (`on_close_flow`) | none |
+| send buffer full | the datagram joins a bounded `WriteQueue` and the socket is re-registered for WRITABLE (`epoll_ctl(EPOLL_CTL_MOD)`) | the queued copy |
+
+Two of these differ from the TCP-based paths on purpose. The `EAGAIN` read
+stays: the short-read stop that removed it on stream sockets
+(`doc/lifetime_of_a_session.md` §2.2) has no datagram equivalent, since a
+datagram smaller than the buffer says nothing about the next one. And a closing
+flow keeps its `EPOLL_CTL_DEL`: that argument was made for HTTP and HTTPS
+session sockets only, and it was not re-examined for the upstream sockets here.
+
+---
+
+## 14. Cross-References
 
 - `lib/src/protocol/udp/mod.rs` — the `ManagerInput`/`Output` contract, `FlowKey`,
   `ClusterConfig`, `MetricEvent`, `DropReason`.

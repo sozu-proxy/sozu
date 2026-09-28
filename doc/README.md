@@ -60,6 +60,8 @@ Sōzu is a reverse proxy for load balancing, written in Rust. Its main job is to
 
 * [Lifetime of a session][li]
 
+* [Hot-path zero-copy and syscall reduction][hp] — what a request costs in system calls and allocations, what was cut from 2026-09-26 to 2026-09-28, how it was measured, and the invariants that keep it
+
 ## Testing
 
 * [Testing guide][tst] — the testing doctrine: assertion-first + deterministic simulation, categories, and what every change must land with
@@ -630,6 +632,7 @@ every rule here, unchanged.
 [udplc]: ../lib/src/protocol/udp/LIFECYCLE.md
 [hc]: ./health_checks.md
 [li]: ./lifetime_of_a_session.md
+[hp]: ./hot_path_zero_copy.md
 [tst]: ./testing.md
 [ue]: ./upgrade_e2e_tests.md
 [uds]: ./udp_simulation.md

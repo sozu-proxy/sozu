@@ -657,7 +657,7 @@ impl ProxySession for HttpSession {
         // That holds because nothing duplicates a session socket: no `dup` or
         // `try_clone`, no fork from a worker, and SCM_RIGHTS only carries
         // listeners. The explicit deregister was one syscall per connection
-        // that bought nothing; see §9 of `doc/lifetime_of_a_session.md`.
+        // that bought nothing; see §11 of `doc/lifetime_of_a_session.md`.
         let proxy = self.proxy.borrow();
         proxy.remove_session(self.frontend_token);
 

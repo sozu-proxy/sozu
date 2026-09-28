@@ -45,7 +45,7 @@ Each proxy implementation (HTTP, HTTPS and TCP) will use in each client session 
 
 Each protocol will work with the `Readiness` structure to indicate if it wants to read or write on each socket. As an example, the [rustls based handshake](https://github.com/sozu-proxy/sozu/blob/main/lib/src/protocol/rustls.rs) is only interested in the frontend socket.
 
-A fourth proxy implementation, **UDP**, load-balances datagram traffic (DNS, syslog, NTP, generic UDP). It is connectionless, so it deliberately sits outside the per-session `accept()`/state-machine model above: a single listener socket serves many virtual 4-tuple *flows*, each with its own connected upstream socket for symmetric NAT return. The flow lifecycle, the userland-conntrack flow table, teardown, and the hardening rules are walked end-to-end (with `file.rs:LINE` citations) in [`lib/src/protocol/udp/LIFECYCLE.md`](https://github.com/sozu-proxy/sozu/tree/main/lib/src/protocol/udp/LIFECYCLE.md). See also [`lib/src/protocol/udp`](https://github.com/sozu-proxy/sozu/tree/main/lib/src/protocol/udp) and the UDP sections of [`doc/configure.md`](configure.md).
+A fourth proxy implementation, **UDP**, load-balances datagram traffic (DNS, syslog, NTP, generic UDP). It is connectionless, so it deliberately sits outside the per-session `accept()`/state-machine model above: a single listener socket serves many virtual 4-tuple *flows*, each with its own connected upstream socket for symmetric NAT return. The flow lifecycle, the userland-conntrack flow table, teardown, and the hardening rules are walked end-to-end (with symbol citations) in [`lib/src/protocol/udp/LIFECYCLE.md`](https://github.com/sozu-proxy/sozu/tree/main/lib/src/protocol/udp/LIFECYCLE.md). See also [`lib/src/protocol/udp`](https://github.com/sozu-proxy/sozu/tree/main/lib/src/protocol/udp) and the UDP sections of [`doc/configure.md`](configure.md).
 
 They are all defined in [`lib/src/protocol`](https://github.com/sozu-proxy/sozu/tree/main/lib/src/protocol).
 
@@ -368,7 +368,9 @@ means adding its row here — an obligation no gate enforces either.
 
 The actively maintained on-branch reference for the mux is
 `lib/src/protocol/mux/LIFECYCLE.md`, which walks every state transition
-with `file.rs:LINE` citations against current HEAD.
+with symbol citations (`Type::method` plus its file). What each step of a request still costs in
+system calls and allocations is in `doc/lifetime_of_a_session.md`, and how those costs were cut in
+`doc/hot_path_zero_copy.md`.
 
 - **Bidirectional end-of-stream tracking**: Separate `front_received_end_of_stream` and
   `back_received_end_of_stream` fields on each `Stream` prevent the frontend and backend
