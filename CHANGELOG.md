@@ -376,6 +376,34 @@
 
 ### 🔄 Changed
 
+- **`perf(tcp)`: a raw TCP session no longer asks its backend socket for its address and no
+  longer deregisters its sockets from epoll, 36.10–36.25 → 33.05–33.10 system calls per
+  session.** `Pipe::get_backend_address` fed the access log's backend address with a
+  `getpeername(2)` on the backend socket, once per session, although Sōzu chose that address
+  itself: it now returns the address recorded when the backend was chosen, taken from the
+  `Backend` handed to `Pipe::new` on a WebSocket upgrade and passed by
+  `TcpSession::connect_to_backend` through `Pipe::set_backend_address` on every dial, so a
+  retry onto another backend reports the new one. The logged address is the same as before for
+  a connected backend; a backend still connecting or already reset, where `getpeername(2)`
+  failed with `ENOTCONN` and the log showed none, now logs the address that was dialed, as the
+  HTTP mux already does. `TcpSession::close` and `TcpSession::close_backend` drop their
+  `EPOLL_CTL_DEL`, as #1567 did for HTTP and HTTPS: the last `close(2)` removes the socket from
+  the epoll set before the next `epoll_wait`, including on a connect retry, where the old socket
+  is replaced in the same pass or the session closes. Both `shutdown(Shutdown::Both)` calls and
+  the close order are unchanged, so the peer sees the same FIN, RST and bytes. Measured on a
+  release worker (`crypto-ring,opentelemetry,splice,simd`) behind `python3 -m http.server`,
+  20 sequential `curl` sessions through a TCP listener, two passes each: `getpeername` 1 → 0,
+  `epoll_ctl` 4 → 2 (40 ADD + 40 DEL → 40 ADD), every other count unchanged (`intentrace -p`;
+  an `LD_PRELOAD` descriptor tracer agrees, 37.30–38.30 → 33.85–34.35); the worker holds 14
+  descriptors before and after 1000 further sessions. Tests:
+  `backend_address_is_reported_without_asking_the_socket` (`lib/src/protocol/pipe.rs`),
+  `a_dialed_pipe_reports_the_backend_address_it_was_given`,
+  `a_send_proxy_protocol_pipe_reports_the_dialed_backend_address`,
+  `a_relay_proxy_protocol_pipe_reports_the_dialed_backend_address` and
+  `an_sni_preread_pipe_reports_the_dialed_backend_address` (one per path that hands the
+  address to the `Pipe`), and `closed_tcp_sessions_leave_their_sockets_to_close`
+  (`lib/src/tcp.rs`, reading the kernel's epoll table from `/proc/self/fdinfo`).
+
 - **`perf(udp)`: a new UDP flow opens its upstream socket in three system calls, not eight.**
   `udp_connect` (`lib/src/socket.rs`) created the per-flow connected socket blocking, set
   `O_NONBLOCK` with an `fcntl(F_GETFL)`/`fcntl(F_SETFL)` pair, then ran an `fcntl(F_GETFL)`, a
