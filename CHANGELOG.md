@@ -3304,6 +3304,30 @@
 
 ### 🐛 Fixed
 
+- **`fix(mux-h2)`: a soft-stop waits for an incomplete header block and closes with a final
+  GOAWAY ([#1647](https://github.com/sozu-proxy/sozu/issues/1647)).** A stream whose
+  HEADERS/CONTINUATION block is still being reassembled is `StreamState::Idle`, and
+  `Mux::shutting_down_inner` kept a draining session open only for `Linked` and non-quiesced
+  `Unlinked` streams. A soft-stop landing while a connection's only stream was mid-block therefore
+  closed the session as soon as the advisory `GOAWAY(NO_ERROR, 2^31-1)` was flushed: the request
+  was lost, and the client never received the final GOAWAY telling it whether the stream had been
+  processed (RFC 9113 §6.8). The session now stays open while a peer header block is in progress
+  (`ConnectionH2::peer_header_block_in_progress`) and while a complete H2 request awaits its
+  backend link (`StreamState::Link`, the state a CONTINUATION read by `drive_frontend_shutdown_io`
+  leaves), bounded by `h2_graceful_shutdown_deadline_seconds`. The request is then served and the
+  final GOAWAY carries its stream id. **Visible change:** when that budget elapses, the forced
+  close is now preceded by a final `GOAWAY(NO_ERROR)` for every draining H2 session
+  (`ConnectionH2::goaway_before_forced_close`), where it used to close after the advisory one
+  only; its `last_stream_id` excludes a stream whose opening block never completed, so the client
+  knows it may retry it. A client that never finishes its block now holds the drain until the
+  budget instead of being closed at once (with the knob at `0`, until the connection's own
+  timeouts). Pinned by
+  `test_h2_graceful_drain_waits_for_an_incomplete_header_block`,
+  `test_h2_graceful_drain_deadline_mid_header_block_sends_final_goaway`,
+  `test_h2_graceful_drain_deadline_with_a_linked_stream_sends_final_goaway`
+  (`e2e/src/tests/h2_tests.rs`), all red before the change, and
+  `a_draining_h2_session_waits_for_a_stream_awaiting_its_link` (`lib/src/protocol/mux/mod.rs`).
+
 - **`fix(mux-h2)`: a graceful drain sends its advisory GOAWAY immediately, even while a peer
   header block is incomplete ([#1637](https://github.com/sozu-proxy/sozu/issues/1637)).**
   `H2DrainState::begin_graceful_drain` deferred the initial `GOAWAY(NO_ERROR, 2^31-1)` until an

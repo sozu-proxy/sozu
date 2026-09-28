@@ -3685,11 +3685,18 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         // lost in exchange for honoring the operator-configured SLA.
         // Listeners that disable the knob (`= 0` → `None`) short-circuit
         // the check inside `graceful_shutdown_deadline_elapsed`.
+        //
+        // RFC 9113 §6.8: the close is still preceded by the final GOAWAY, so
+        // the peer learns which streams were processed; the advisory one at
+        // `2^31-1` says nothing about it (sozu-proxy/sozu#1647). It is flushed
+        // once, best effort, like the advisory GOAWAY above.
         if self.frontend.graceful_shutdown_deadline_elapsed() {
             debug!(
                 "{} Mux shutting_down: graceful-shutdown deadline elapsed, forcing close",
                 log_context!(self)
             );
+            let _ = self.frontend.goaway_before_forced_close(&self.context);
+            self.frontend.flush_output_buffer();
             return true;
         }
         if matches!(self.frontend, Connection::H2(_)) && self.frontend.is_draining() {
@@ -3713,10 +3720,22 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 }
             }
         }
-        let mut can_stop = true;
+        // An H2 request that has not reached a backend yet still holds the
+        // session, bounded by the forced-close deadline above: a field block
+        // still being reassembled (its stream is `StreamState::Idle`), and a
+        // complete one awaiting `Mux::ready`'s link pass (`StreamState::Link`),
+        // which is where a CONTINUATION read by `drive_frontend_shutdown_io`
+        // leaves it. Closing on either loses a request the advisory GOAWAY
+        // invited, and skips the final GOAWAY `ConnectionH2::finalize_write`
+        // sends once the stream is done (sozu-proxy/sozu#1647).
+        let front_is_h2 = matches!(self.frontend, Connection::H2(_));
+        let mut can_stop = !self.frontend.peer_header_block_in_progress();
         for stream in &mut self.context.streams {
             match stream.state {
                 StreamState::Linked(_) => {
+                    can_stop = false;
+                }
+                StreamState::Link if front_is_h2 => {
                     can_stop = false;
                 }
                 StreamState::Unlinked => {
@@ -4185,6 +4204,74 @@ mod tests {
             mux.shutting_down(),
             "shutting_down must refresh the clock snapshot itself, so a silent \
              draining session's forced-close budget still expires"
+        );
+    }
+
+    /// sozu-proxy/sozu#1647: a CONTINUATION that `drive_frontend_shutdown_io`
+    /// reads completes the block outside `Mux::ready`, so its stream is left
+    /// `StreamState::Link` until the next `ready` pass links it. A draining
+    /// H2 session must stay open for it, within budget, rather than drop a
+    /// request the advisory GOAWAY invited.
+    #[test]
+    fn a_draining_h2_session_waits_for_a_stream_awaiting_its_link() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (socket, _peer) = connected_socket();
+
+        let mut h2 = h2::H2Shell::new(
+            Ulid::generate(),
+            socket,
+            Position::Server,
+            &mut PoolBufferSource::new(Rc::downgrade(&pool)),
+            H2FloodConfig::default(),
+            H2ConnectionConfig::default(),
+            Duration::from_secs(30),
+            Some(Duration::from_secs(60)),
+            Duration::from_secs(30),
+            None,
+            Ready::READABLE | Ready::HUP | Ready::ERROR,
+        )
+        .expect("a pool with free buffers must yield an H2 connection");
+        // Already draining, budget armed now: nothing but the stream below
+        // can keep the session open.
+        h2.core.state = H2State::Header;
+        h2.core.drain.__test_arm_draining(Instant::now());
+        let mut frontend = Connection::H2(h2);
+
+        let mut context = test_context(&pool);
+        let stream_id = context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("test context must create a stream");
+        context.streams[stream_id].state = StreamState::Link;
+        // A live wire stream, so `finalize_write` does not send the final
+        // GOAWAY and close through `drive_frontend_shutdown_io`.
+        let Connection::H2(h2) = &mut frontend else {
+            unreachable!("frontend was built as H2")
+        };
+        h2.core.__test_insert_wire_mapping_only(1, stream_id);
+
+        let mut mux = Mux {
+            configured_frontend_timeout: Duration::from_secs(30),
+            frontend_token: Token(0),
+            frontend,
+            router: Router::new(Duration::from_secs(30), Duration::from_secs(30)),
+            context,
+            session_ulid: Ulid::generate(),
+            timeouts: MuxTimeouts::new(TimeoutContainer::new_empty(Duration::from_secs(30))),
+            backend_registry: BackendRegistry::default(),
+        };
+        assert!(
+            !mux.frontend.graceful_shutdown_deadline_elapsed(),
+            "precondition: the forced-close budget has not elapsed"
+        );
+
+        assert!(
+            !mux.shutting_down(),
+            "a draining H2 session must stay open for a stream awaiting its link"
+        );
+        assert_eq!(
+            mux.context.streams[stream_id].state,
+            StreamState::Link,
+            "the shutdown pass must leave the stream for `Mux::ready` to link"
         );
     }
 

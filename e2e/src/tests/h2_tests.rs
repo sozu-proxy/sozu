@@ -1276,15 +1276,13 @@ fn try_h2_continuation_survives_a_graceful_drain_mid_reassembly() -> State {
 ///
 /// The shape: one connection whose only stream is a HEADERS frame without
 /// END_HEADERS — a request whose field block has not finished arriving — when
-/// the worker receives `soft_stop()`. Such a stream is still
-/// `StreamState::Idle`, which `Mux::shutting_down_inner`
-/// (`lib/src/protocol/mux/mod.rs`) does not wait for, so the session is torn
-/// down in the same drain pass. What reaches the client before that close is
-/// exactly what `ConnectionH2::graceful_goaway`
-/// (`lib/src/protocol/mux/h2.rs`) queued in that pass. Until #1637 it queued
-/// nothing: the advisory GOAWAY was deferred until the block completed, the
-/// block never completed, and the client saw a bare close. It must see at
-/// least one `GOAWAY(NO_ERROR)` first.
+/// the worker receives `soft_stop()`. Until #1637 the advisory GOAWAY was
+/// deferred until the block completed, the block never completed, and the
+/// client saw a bare close. It must see at least one `GOAWAY(NO_ERROR)` first.
+/// Since #1647 the session waits for the block until the listener's default
+/// forced-close budget, and closes after a final GOAWAY;
+/// `test_h2_graceful_drain_deadline_mid_header_block_sends_final_goaway`
+/// pins what that final GOAWAY carries.
 ///
 /// No timer orders anything. `h2.frames.rx.headers` ticking proves sozu is in
 /// reassembly before the drain is requested; `wait_for_server_stop` returns
@@ -1345,6 +1343,296 @@ fn try_h2_graceful_drain_mid_header_block_sends_goaway_before_closing() -> State
     }
 
     if stopped && announced {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+// ============================================================================
+// Test 3d: a drain landing mid-header-block waits for the block (#1647)
+// ============================================================================
+
+/// Every GOAWAY in `frames`, in wire order, as `(last_stream_id, error_code)`.
+/// `goaway_last_stream_id` answers only the first one, which on a graceful
+/// drain is always the advisory `2^31-1`; these tests are about the last one.
+fn goaways(frames: &[(u8, u8, u32, Vec<u8>)]) -> Vec<(u32, u32)> {
+    frames
+        .iter()
+        .filter(|(t, _, _, payload)| *t == H2_FRAME_GOAWAY && payload.len() >= 8)
+        .map(|(_, _, _, payload)| {
+            (
+                u32::from_be_bytes([payload[0] & 0x7F, payload[1], payload[2], payload[3]]),
+                u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]),
+            )
+        })
+        .collect()
+}
+
+/// Opens a raw H2 connection and sends the first half of a real request's
+/// field block on stream 1, HEADERS with END_STREAM but without END_HEADERS,
+/// then waits until sozu has decoded it — i.e. until the connection is in
+/// `H2State::ContinuationHeader` — through the same `h2.frames.rx.headers`
+/// gate `try_h2_graceful_drain_mid_header_block_sends_goaway_before_closing`
+/// uses. Returns the connection and the second half of the block, or `None`
+/// when a step failed (already reported).
+fn open_stream_one_mid_header_block(
+    worker: &mut Worker,
+    front_port: u16,
+    test_name: &str,
+    path: &str,
+) -> Option<(
+    rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>,
+    Vec<u8>,
+)> {
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    let headers_rx_before = query_proxy_count(worker, H2_FRAMES_RX_HEADERS);
+
+    let block = super::h2_utils::build_chrome146_get_headers("localhost", path, None);
+    let (first_half, second_half) = block.split_at(block.len() / 2);
+    let headers_frame = H2Frame::headers(1, first_half.to_vec(), false, true);
+    if tls.write_all(&headers_frame.encode()).is_err() || tls.flush().is_err() {
+        println!("{test_name} - HEADERS write failed");
+        return None;
+    }
+
+    let reassembly_start = Instant::now();
+    while query_proxy_count(worker, H2_FRAMES_RX_HEADERS) <= headers_rx_before {
+        if reassembly_start.elapsed() > Duration::from_secs(5) {
+            println!("{test_name} - sozu never read the partial HEADERS");
+            return None;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Some((tls, second_half.to_vec()))
+}
+
+/// RFC 9113 §6.8: a graceful shutdown sends an advisory GOAWAY at `2^31-1`
+/// and then, "after allowing time for any in-flight stream creation", a final
+/// GOAWAY carrying the real last stream identifier. A stream whose field block
+/// is still arriving when the drain lands is exactly such an in-flight
+/// creation.
+///
+/// The shape of sozu-proxy/sozu#1647: the connection's only stream is a
+/// HEADERS without END_HEADERS when the worker receives `soft_stop()`. That
+/// stream is still `StreamState::Idle`, and `Mux::shutting_down_inner`
+/// (`lib/src/protocol/mux/mod.rs`) used to wait only for `Linked` and
+/// non-quiesced `Unlinked` streams, so it closed the session in the drain pass
+/// itself: the CONTINUATION landed on a closed connection, the request was
+/// lost, and no final GOAWAY ever said so. The block must instead be allowed
+/// to complete, the request served, and the final GOAWAY sent with
+/// `last_stream_id = 1` once the stream is done.
+///
+/// The listener's forced-close budget is 60 s, far above anything this test
+/// waits for, so a stop well inside it proves the session ended through the
+/// drained-connection path (`ConnectionH2::finalize_write`), not through the
+/// deadline. Ordering is causal: `h2.frames.rx.headers` proves reassembly is
+/// live before the drain, `server.live == 0` proves the drain reached the
+/// connection before the CONTINUATION is written, and `wait_for_server_stop`
+/// returns only once the session is closed, so every byte sozu wrote is in
+/// the client's socket buffer when the single read below starts.
+fn try_h2_graceful_drain_waits_for_an_incomplete_header_block() -> State {
+    let test_name = "H2 drain waits for header block";
+    let deadline = Duration::from_secs(60);
+    let (mut worker, front_port, _request_seen, release_response, mut backend) =
+        start_h2_graceful_deadline_fixture("H2-DRAIN-WAITS-BLOCK", deadline.as_secs() as u32);
+    // The backend answers as soon as the request reaches it: nothing but the
+    // header block holds the stream here.
+    release_response.store(true, Ordering::Relaxed);
+
+    let Some((mut tls, second_half)) =
+        open_stream_one_mid_header_block(&mut worker, front_port, test_name, "/api/mid-block")
+    else {
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        let _ = backend.stop_and_get_aggregator();
+        return State::Fail;
+    };
+
+    let soft_stop_started = Instant::now();
+    worker.soft_stop();
+
+    // `Server::run` writes `server.live = 0` and then, in the same loop
+    // iteration, calls `shut_down_sessions`, which reaches
+    // `Mux::shutting_down` on this connection. A command answer observing 0
+    // was produced in a later iteration, so the drain pass has run. A worker
+    // that has already exited closed every session first, which is the drain
+    // having landed too: it is how the defect shows, the session torn down in
+    // the drain pass with nothing left to keep the worker running.
+    let drain_start = Instant::now();
+    while !worker.server_job.is_finished()
+        && query_proxy_gauge(&mut worker, sozu_lib::metrics::names::server::LIVE) != Some(0)
+    {
+        if drain_start.elapsed() > Duration::from_secs(5) {
+            println!("{test_name} - the soft-stop drain never landed");
+            let _ = worker.wait_for_server_stop();
+            let _ = backend.stop_and_get_aggregator();
+            return State::Fail;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let continuation = H2Frame::continuation(1, second_half, true);
+    let sent = tls.write_all(&continuation.encode()).is_ok() && tls.flush().is_ok();
+
+    let stopped = worker.wait_for_server_stop();
+    let elapsed = soft_stop_started.elapsed();
+    let data = read_all_available(&mut tls, Duration::from_secs(2));
+    let frames = parse_h2_frames(&data);
+    log_frames(test_name, &frames);
+    let _ = backend.stop_and_get_aggregator();
+
+    let stream_one: Vec<_> = frames
+        .iter()
+        .filter(|(_, _, sid, _)| *sid == 1)
+        .cloned()
+        .collect();
+    let served = headers_status_matches(&stream_one, b"200")
+        && stream_one.iter().any(|(ft, flags, _, _)| {
+            *ft == super::h2_utils::H2_FRAME_DATA && flags & H2_FLAG_END_STREAM != 0
+        });
+    let goaways = goaways(&frames);
+    // The final GOAWAY is the last frame on the wire: nothing may follow it.
+    let final_goaway_last = frames
+        .last()
+        .is_some_and(|(ft, _, _, _)| *ft == H2_FRAME_GOAWAY);
+    let announced = goaways.first() == Some(&(0x7FFF_FFFF, H2_ERROR_NO_ERROR))
+        && goaways.last() == Some(&(1, H2_ERROR_NO_ERROR))
+        && goaways.len() == 2
+        && final_goaway_last;
+    let within_budget = elapsed < deadline;
+
+    println!(
+        "{test_name} - sent={sent} served={served} goaways={goaways:?} \
+         final_goaway_last={final_goaway_last} stopped={stopped} elapsed={elapsed:?}"
+    );
+    if sent && served && announced && stopped && within_budget {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+/// The other half of sozu-proxy/sozu#1647: the client never sends the
+/// CONTINUATION. Waiting for the block is bounded by the listener's
+/// `h2_graceful_shutdown_deadline_seconds`, and the forced close at that
+/// deadline must be preceded by a final GOAWAY whose `last_stream_id`
+/// excludes the stream whose field block never completed — sozu took no
+/// action on it, so the client may retry it (RFC 9113 §6.8). Stream 1 is the
+/// only stream, so that id is 0.
+///
+/// A 1 s budget keeps the run short. `wait_for_server_stop` returns only
+/// once the forced close has happened, so the read below sees every byte.
+fn try_h2_graceful_drain_deadline_mid_header_block_sends_final_goaway() -> State {
+    let test_name = "H2 drain deadline mid header block";
+    let (mut worker, front_port, _request_seen, _release_response, mut backend) =
+        start_h2_graceful_deadline_fixture("H2-DRAIN-DEADLINE-BLOCK", 1);
+
+    let Some((mut tls, _second_half)) =
+        open_stream_one_mid_header_block(&mut worker, front_port, test_name, "/api/never")
+    else {
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        let _ = backend.stop_and_get_aggregator();
+        return State::Fail;
+    };
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    let data = read_all_available(&mut tls, Duration::from_secs(2));
+    let frames = parse_h2_frames(&data);
+    log_frames(test_name, &frames);
+    let aggregator = backend.stop_and_get_aggregator();
+
+    let goaways = goaways(&frames);
+    let final_goaway_last = frames
+        .last()
+        .is_some_and(|(ft, _, _, _)| *ft == H2_FRAME_GOAWAY);
+    let announced = goaways == vec![(0x7FFF_FFFF, H2_ERROR_NO_ERROR), (0, H2_ERROR_NO_ERROR)]
+        && final_goaway_last;
+    // The request was never complete, so it must never have been forwarded.
+    let never_forwarded = aggregator.is_some_and(|a| a.requests_received == 0);
+
+    println!(
+        "{test_name} - goaways={goaways:?} final_goaway_last={final_goaway_last} \
+         never_forwarded={never_forwarded} stopped={stopped}"
+    );
+    if announced && never_forwarded && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+/// The general half of the forced-close change in sozu-proxy/sozu#1647: when
+/// the `h2_graceful_shutdown_deadline_seconds` budget elapses while a stream
+/// is `StreamState::Linked` to a backend that has not answered, the forced
+/// close must still be preceded by a final `GOAWAY(NO_ERROR)`, and its
+/// `last_stream_id` must cover that stream: sozu forwarded it, so the client
+/// must not assume it was left untouched (RFC 9113 §6.8). Before the change
+/// the client saw only the advisory `2^31-1` GOAWAY and then the close.
+///
+/// The backend holds its response until released, which happens only after
+/// the worker has stopped, so the stream is `Linked` for the whole drain. The
+/// 1 s budget is the only thing that ends it. `request_seen` proves the
+/// request reached the backend before `soft_stop()`, and
+/// `wait_for_server_stop` returns only once the forced close has happened, so
+/// the single read below sees every byte sozu wrote.
+fn try_h2_graceful_drain_deadline_with_a_linked_stream_sends_final_goaway() -> State {
+    let test_name = "H2 drain deadline linked stream";
+    let (mut worker, front_port, request_seen, release_response, mut backend) =
+        start_h2_graceful_deadline_fixture("H2-DRAIN-DEADLINE-LINKED", 1);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    let block = super::h2_utils::build_chrome146_get_headers("localhost", "/api/linked", None);
+    let headers_frame = H2Frame::headers(1, block, true, true);
+    if tls.write_all(&headers_frame.encode()).is_err() || tls.flush().is_err() {
+        println!("{test_name} - HEADERS write failed");
+        release_response.store(true, Ordering::Relaxed);
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        let _ = backend.stop_and_get_aggregator();
+        return State::Fail;
+    }
+
+    let wait_start = Instant::now();
+    while !request_seen.load(Ordering::Relaxed) {
+        if wait_start.elapsed() > Duration::from_secs(5) {
+            println!("{test_name} - the request never reached the backend");
+            release_response.store(true, Ordering::Relaxed);
+            worker.soft_stop();
+            let _ = worker.wait_for_server_stop();
+            let _ = backend.stop_and_get_aggregator();
+            return State::Fail;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    let data = read_all_available(&mut tls, Duration::from_secs(2));
+    let frames = parse_h2_frames(&data);
+    log_frames(test_name, &frames);
+    release_response.store(true, Ordering::Relaxed);
+    let _ = backend.stop_and_get_aggregator();
+
+    let goaways = goaways(&frames);
+    let final_goaway_last = frames
+        .last()
+        .is_some_and(|(ft, _, _, _)| *ft == H2_FRAME_GOAWAY);
+    let announced = goaways == vec![(0x7FFF_FFFF, H2_ERROR_NO_ERROR), (1, H2_ERROR_NO_ERROR)]
+        && final_goaway_last;
+
+    println!(
+        "{test_name} - goaways={goaways:?} final_goaway_last={final_goaway_last} stopped={stopped}"
+    );
+    if announced && stopped {
         State::Success
     } else {
         State::Fail
@@ -1782,6 +2070,49 @@ fn test_h2_graceful_drain_mid_header_block_sends_goaway_before_closing() {
             "H2 edge: a graceful drain landing while a peer header block is \
              incomplete must send a GOAWAY before closing the session",
             try_h2_graceful_drain_mid_header_block_sends_goaway_before_closing
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_h2_graceful_drain_waits_for_an_incomplete_header_block() {
+    // One run settles it: every ordering is established by observation.
+    assert_eq!(
+        repeat_until_error_or(
+            1,
+            "H2 edge: a graceful drain landing while the only stream's header \
+             block is incomplete must serve that request, then send the final \
+             GOAWAY with its stream id",
+            try_h2_graceful_drain_waits_for_an_incomplete_header_block
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_h2_graceful_drain_deadline_mid_header_block_sends_final_goaway() {
+    // One run settles it: the forced close is ordered by the deadline itself.
+    assert_eq!(
+        repeat_until_error_or(
+            1,
+            "H2 edge: a forced close at the drain deadline while a header block \
+             never completed must send a final GOAWAY excluding that stream",
+            try_h2_graceful_drain_deadline_mid_header_block_sends_final_goaway
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_h2_graceful_drain_deadline_with_a_linked_stream_sends_final_goaway() {
+    // One run settles it: the forced close is ordered by the deadline itself.
+    assert_eq!(
+        repeat_until_error_or(
+            1,
+            "H2 edge: a forced close at the drain deadline while a stream is \
+             linked to a silent backend must send a final GOAWAY covering it",
+            try_h2_graceful_drain_deadline_with_a_linked_stream_sends_final_goaway
         ),
         State::Success
     );

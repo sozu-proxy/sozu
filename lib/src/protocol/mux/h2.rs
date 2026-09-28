@@ -5371,7 +5371,78 @@ fn h2_frame_rx_metric_key(frame_type: FrameType) -> &'static str {
 }
 
 impl ConnectionH2 {
+    /// Queue the final GOAWAY with `last_stream_id` set to the highest
+    /// peer-initiated stream observed (`H2StreamTable::highest_peer_stream_id`).
     pub fn goaway(&mut self, error: H2Error) -> MuxResult {
+        let last_stream_id = self.stream_table.highest_peer_stream_id();
+        self.goaway_with_last_stream_id(error, last_stream_id)
+    }
+
+    /// True while a peer HEADERS block is still being reassembled
+    /// (`H2State::ContinuationHeader` / `H2State::ContinuationFrame`).
+    pub fn peer_header_block_in_progress(&self) -> bool {
+        matches!(
+            self.state,
+            H2State::ContinuationHeader(_) | H2State::ContinuationFrame(_)
+        )
+    }
+
+    /// RFC 9113 §6.8: the final GOAWAY a draining connection sends when its
+    /// graceful-shutdown budget elapses, just before `Mux::shutting_down_inner`
+    /// (`lib/src/protocol/mux/mod.rs`) closes it. Without it a forced close
+    /// leaves the peer holding only the advisory `2^31-1` GOAWAY, which says
+    /// nothing about which streams were processed (sozu-proxy/sozu#1647).
+    ///
+    /// A stream whose opening field block is still being reassembled is
+    /// excluded: it is `StreamState::Idle`, it never reached a backend, and
+    /// the peer may retry it. `create_stream` already counted it in
+    /// `H2StreamTable::highest_peer_stream_id` when its HEADERS frame header
+    /// arrived. Every stream `create_stream` accepted before it has a lower
+    /// id (RFC 9113 §5.1.1, enforced by `handle_header_state` against
+    /// `Self::last_stream_id`), and none can be accepted after it while the
+    /// block is open (§6.10), so every stream sozu may have acted on is below
+    /// it: the reported id is the one two below it (the previous odd id, or
+    /// 0). A higher id counted in `highest_peer_stream_id` can only be a
+    /// refused stream, which sozu did not act on either.
+    ///
+    /// A connection already in `H2State::GoAway` or `H2State::Error` has
+    /// sent (or failed to send) its final GOAWAY and gets no second one.
+    pub fn goaway_before_forced_close<L>(&mut self, context: &Context<L>) -> MuxResult
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        debug_assert!(
+            self.drain.draining(),
+            "a forced close follows a graceful drain, which marks the connection draining"
+        );
+        if matches!(self.state, H2State::GoAway | H2State::Error) {
+            return MuxResult::Continue;
+        }
+        let highest = self.stream_table.highest_peer_stream_id();
+        let last_stream_id = match &self.state {
+            H2State::ContinuationHeader(headers) | H2State::ContinuationFrame(headers)
+                if self
+                    .stream_table
+                    .get(headers.stream_id)
+                    .and_then(|global_stream_id| context.streams.get(global_stream_id))
+                    .is_some_and(|stream| stream.state == StreamState::Idle) =>
+            {
+                headers.stream_id.saturating_sub(2)
+            }
+            _ => highest,
+        };
+        debug_assert!(
+            last_stream_id <= highest && (last_stream_id == 0 || last_stream_id & 1 == 1),
+            "the final GOAWAY reports 0 or a peer-initiated id no higher than any observed"
+        );
+        self.goaway_with_last_stream_id(H2Error::NoError, last_stream_id)
+    }
+
+    fn goaway_with_last_stream_id(
+        &mut self,
+        error: H2Error,
+        last_stream_id: StreamId,
+    ) -> MuxResult {
         self.state = H2State::Error;
         self.drain.enter_final_goaway();
         self.stream_table.set_expect_read(None);
@@ -5399,7 +5470,6 @@ impl ConnectionH2 {
         // RFC 9113 §6.8: last_stream_id is the highest peer-initiated stream
         // we processed. Queued behind whatever output is already waiting (an
         // ACK, the rest of a stream frame), never in place of it.
-        let last_stream_id = self.stream_table.highest_peer_stream_id();
         match self.output.push_frames(GOAWAY_FRAME_SIZE, |buf| {
             serializer::gen_goaway(buf, last_stream_id, error).map(|(_, size)| size)
         }) {
@@ -8341,6 +8411,18 @@ impl<Front: SocketHandler> H2Shell<Front> {
     /// `ConnectionH2::send_initial_goaway`'s serialisation-failure arm.
     pub fn graceful_goaway(&mut self, now: Instant) -> MuxResult {
         let result = self.core.graceful_goaway(now);
+        self.settled(result)
+    }
+
+    /// [`ConnectionH2::goaway_before_forced_close`], settled.
+    ///
+    /// Reaches `ConnectionH2::force_disconnect` through the
+    /// serialisation-failure arm of the final GOAWAY.
+    pub fn goaway_before_forced_close<L>(&mut self, context: &Context<L>) -> MuxResult
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        let result = self.core.goaway_before_forced_close(context);
         self.settled(result)
     }
 

@@ -312,6 +312,14 @@ Declared in `h2.rs` (`pub enum H2State`):
   `ConnectionH2::send_initial_goaway`, and `H2Shell::flush_output_buffer` —
   the direct, `writable()`-bypassing flush `Mux::shutting_down` calls right
   after `graceful_goaway` — sends it in the same pass.
+- **A drain waits for a block in progress (#1647).** Sending the advisory
+  GOAWAY mid-block was not enough: the block's stream is still
+  `StreamState::Idle`, and `Mux::shutting_down_inner` then waited only for
+  `Linked` and non-quiesced `Unlinked` streams, so it closed the session as
+  soon as the advisory GOAWAY was flushed — the request was lost and no final
+  GOAWAY followed. `ConnectionH2::peer_header_block_in_progress` now holds the
+  session in either reassembly state, within the forced-close budget
+  (invariant 31).
 
 ### 2.3 Entry points
 
@@ -1335,7 +1343,11 @@ Two GOAWAY frames in `ConnectionH2::graceful_goaway` (`h2.rs`):
 2. **Final GOAWAY** — on the second invocation (draining already true), call
    `goaway(NoError)` (`ConnectionH2::goaway`, `h2.rs`) with the actual `highest_peer_stream_id`,
    remove `READABLE` interest (same function), transition to `H2State::GoAway`.
-   Caller is `finalize_write` when all streams drain (`h2.rs`).
+   Caller is `finalize_write` when all streams drain (`h2.rs`). When the
+   forced-close budget elapses first (§8.3), `Mux::shutting_down_inner` sends
+   it through `ConnectionH2::goaway_before_forced_close` instead, which
+   reports a stream whose opening block never completed as unprocessed
+   (invariant 31).
 
 `peer_gone_after_final_goaway` (`h2.rs`) guards against deadlock on a
 peer-side HUP after the final GOAWAY.
@@ -1494,8 +1506,10 @@ shutdown or listener reload. It:
 3. Checks the graceful-shutdown forced-close deadline: when
    `ConnectionH2::graceful_shutdown_deadline_elapsed` (`h2.rs`) returns
    `true` (i.e. `drain.started_at + drain.graceful_shutdown_deadline <=
-   ConnectionH2.now`) the session returns `true` immediately so the server loop
-   can tear the connection down even with Linked streams still in flight. The
+   ConnectionH2.now`) the session queues the final GOAWAY
+   (`ConnectionH2::goaway_before_forced_close`), flushes it once, best effort,
+   and returns `true` so the server loop can tear the connection down even
+   with Linked streams still in flight. The
    comparison is against the connection's snapshot, which `shutting_down`
    refreshes unconditionally at its top (§7.5) — including on the
    already-draining path, which never reaches `graceful_goaway`. Without that
@@ -1503,7 +1517,9 @@ shutdown or listener reload. It:
    last `ready()` pass and the budget would never expire.
 4. Marks `front_received_end_of_stream` on streams whose request is already
    complete and consumed.
-5. Returns `true` when no `Linked` or non-quiesced `Unlinked` streams remain.
+5. Returns `true` when no `Linked` or non-quiesced `Unlinked` streams remain,
+   and, on an H2 frontend, no peer header block is in progress and no stream
+   awaits its link (`StreamState::Link`) — invariant 31.
 
 The forced-close deadline is armed inside
 [`H2DrainState::begin_graceful_drain`](h2_drain.rs), which
@@ -1855,7 +1871,10 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     `Mux::shutting_down_inner` (`lib/src/protocol/mux/mod.rs`) only calls it if
     `!self.frontend.is_draining()`; a second unconditional call would
     collapse the initial GOAWAY into the final one and disconnect
-    in-flight streams.
+    in-flight streams. The one final GOAWAY `Mux::shutting_down_inner` sends
+    itself goes through `ConnectionH2::goaway_before_forced_close`, and only
+    once the forced-close deadline has elapsed and the session is closing
+    anyway (invariant 31).
 11. **Frontend HUP defers close when output is pending.**
     `delay_close_for_frontend_flush` (`mod.rs`) must be consulted before
     returning `SessionResult::Close` so that unflushed TLS/GOAWAY records are
@@ -2777,6 +2796,33 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     than re-link it (debug-asserted: a re-linked stream holds no frame), and
     `ConnectionH2::start_stream` refuses any request whose `front.out` is not
     empty (§8.5, sozu-proxy/sozu#1632).
+
+31. **A draining H2 session waits for a request still on its way to a
+    backend, and a forced close is announced.** `Mux::shutting_down_inner`
+    (`lib/src/protocol/mux/mod.rs`) keeps an H2 frontend open while
+    `ConnectionH2::peer_header_block_in_progress` holds (the block's stream is
+    still `StreamState::Idle`) and while any stream is `StreamState::Link` —
+    the state a CONTINUATION read by `Mux::drive_frontend_shutdown_io` leaves,
+    since only `Mux::ready` links it. The request is then served and
+    `ConnectionH2::finalize_write` sends the final GOAWAY with its id, as for
+    any drained stream. Both waits are bounded by
+    `h2_graceful_shutdown_deadline_seconds` (§8.3); when it elapses,
+    `ConnectionH2::goaway_before_forced_close` queues the final
+    `GOAWAY(NO_ERROR)` before the close, for every draining H2 session. Its
+    `last_stream_id` is `H2StreamTable::highest_peer_stream_id`, except that a
+    stream whose opening block never completed is excluded: every stream
+    `ConnectionH2::create_stream` accepted has a lower id (RFC 9113 §5.1.1,
+    §6.10), and a higher observed id can only be a refused stream, so the id
+    two below it is reported and the client may retry it. With the knob at
+    `0` the drain has no bound of its own and the wait ends with the
+    connection's own timeouts. Before sozu-proxy/sozu#1647 the
+    session closed as soon as the advisory GOAWAY was flushed, and a forced
+    close sent no final GOAWAY at all. Pinned by
+    `test_h2_graceful_drain_waits_for_an_incomplete_header_block`,
+    `test_h2_graceful_drain_deadline_mid_header_block_sends_final_goaway`,
+    `test_h2_graceful_drain_deadline_with_a_linked_stream_sends_final_goaway`
+    (`e2e/src/tests/h2_tests.rs`, all red before the change) and
+    `a_draining_h2_session_waits_for_a_stream_awaiting_its_link`.
 
 
 ---
