@@ -320,6 +320,11 @@ fn wait_for_client_connections(
     snapshot
 }
 
+/// Failure bound for one keep-alive response in [`try_async`]. A response is
+/// read until it is complete, so this only decides how long a lost one takes
+/// to fail the run.
+const ASYNC_RESPONSE_DEADLINE: Duration = Duration::from_secs(5);
+
 pub fn try_async(nb_backends: usize, nb_clients: usize, nb_requests: usize) -> State {
     let front_address = create_local_address();
 
@@ -350,10 +355,12 @@ pub fn try_async(nb_backends: usize, nb_clients: usize, nb_requests: usize) -> S
         for client in clients.iter_mut() {
             client.send();
         }
+        // One whole response per request, however many reads it takes: a
+        // single `receive()` counts a response per `read()`, so under load a
+        // late one went uncounted and a split one counted twice.
         for client in clients.iter_mut() {
-            match client.receive() {
-                Some(response) => println!("{response}"),
-                _ => {}
+            if let Some(response) = client.receive_response(ASYNC_RESPONSE_DEADLINE) {
+                println!("{response}");
             }
         }
     }

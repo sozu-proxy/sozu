@@ -161,7 +161,150 @@ impl Client {
         Some(from_utf8(&acc).ok()?.to_string())
     }
 
+    /// Read exactly ONE `Content-Length`-framed HTTP/1 response, however many
+    /// socket reads it takes, and count it only once it is whole.
+    ///
+    /// `receive` counts one response per `read()`, which holds only when the
+    /// whole response lands in a single segment within the 100 ms socket
+    /// timeout `connect` installs. Under load neither is guaranteed: a
+    /// response later than 100 ms is not counted at all, and one split across
+    /// two segments is counted twice. Returns `None`, and counts nothing, when
+    /// `deadline` elapses, the peer closes, or the bytes read are not exactly
+    /// one response.
+    pub fn receive_response(&mut self, deadline: Duration) -> Option<String> {
+        let stream = self.stream.as_mut()?;
+        let response = read_one_http_response(stream, deadline)?;
+        self.responses_received += 1;
+        Some(response)
+    }
+
     pub fn set_request<S1: Into<String>>(&mut self, request: S1) {
         self.request = request.into();
+    }
+}
+
+/// Total length of the first response in `bytes`, once its head is complete:
+/// the head, the blank line and `Content-Length` body bytes. `None` while the
+/// head is still arriving or when it carries no parsable `Content-Length`.
+fn http_response_len(bytes: &[u8]) -> Option<usize> {
+    let head_end = bytes.windows(4).position(|window| window == b"\r\n\r\n")? + 4;
+    let head = from_utf8(&bytes[..head_end]).ok()?;
+    let body_len = head.split("\r\n").find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    })?;
+    Some(head_end + body_len)
+}
+
+/// Read from `reader` until it holds one complete `Content-Length`-framed
+/// response, the peer closes, or `deadline` elapses. The caller has exactly
+/// one request outstanding, so any byte past that response is a framing error
+/// and fails the read rather than being folded into it.
+fn read_one_http_response(reader: &mut impl Read, deadline: Duration) -> Option<String> {
+    let started = Instant::now();
+    let mut acc: Vec<u8> = Vec::with_capacity(BUFFER_SIZE);
+    let mut buf = [0u8; BUFFER_SIZE];
+    loop {
+        if let Some(total) = http_response_len(&acc) {
+            if acc.len() == total {
+                return from_utf8(&acc).ok().map(str::to_owned);
+            }
+            if acc.len() > total {
+                println!(
+                    "read {} bytes, past the {total}-byte response: not exactly one response",
+                    acc.len()
+                );
+                return None;
+            }
+        }
+        if started.elapsed() >= deadline {
+            println!(
+                "no complete response within {deadline:?} ({} bytes read)",
+                acc.len()
+            );
+            return None;
+        }
+        match reader.read(&mut buf) {
+            Ok(0) => {
+                println!(
+                    "peer closed after {} bytes, before a complete response",
+                    acc.len()
+                );
+                return None;
+            }
+            Ok(n) => acc.extend_from_slice(&buf[..n]),
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(error) => {
+                println!("could not receive: {error}");
+                return None;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::VecDeque, io};
+
+    use super::*;
+
+    /// A reader that replays a fixed script of read outcomes, one per call,
+    /// then reports `WouldBlock` forever: the shape of a socket under a read
+    /// timeout, without a socket or a clock to race.
+    struct ScriptedReader(VecDeque<io::Result<Vec<u8>>>);
+
+    impl Read for ScriptedReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.0.pop_front() {
+                Some(Ok(bytes)) => {
+                    buf[..bytes.len()].copy_from_slice(&bytes);
+                    Ok(bytes.len())
+                }
+                Some(Err(error)) => Err(error),
+                None => Err(io::ErrorKind::WouldBlock.into()),
+            }
+        }
+    }
+
+    const RESPONSE: &str = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\npong0";
+
+    #[test]
+    fn a_response_split_across_reads_and_a_timeout_is_read_whole_once() {
+        let (head, body) = RESPONSE.split_at(RESPONSE.len() - 3);
+        let mut reader = ScriptedReader(VecDeque::from([
+            Err(io::ErrorKind::WouldBlock.into()),
+            Ok(head.as_bytes().to_vec()),
+            Err(io::ErrorKind::TimedOut.into()),
+            Ok(body.as_bytes().to_vec()),
+        ]));
+        assert_eq!(
+            read_one_http_response(&mut reader, Duration::from_secs(5)).as_deref(),
+            Some(RESPONSE)
+        );
+    }
+
+    #[test]
+    fn bytes_past_one_response_are_not_counted_as_it() {
+        let two = format!("{RESPONSE}{RESPONSE}");
+        let mut reader = ScriptedReader(VecDeque::from([Ok(two.into_bytes())]));
+        assert_eq!(
+            read_one_http_response(&mut reader, Duration::from_secs(5)),
+            None
+        );
+    }
+
+    #[test]
+    fn an_incomplete_response_is_not_counted() {
+        let mut reader = ScriptedReader(VecDeque::from([
+            Ok(RESPONSE.as_bytes()[..RESPONSE.len() - 1].to_vec()),
+            Ok(Vec::new()),
+        ]));
+        assert_eq!(
+            read_one_http_response(&mut reader, Duration::from_secs(5)),
+            None
+        );
     }
 }
