@@ -411,6 +411,26 @@ impl ScmSocket {
             socket::MsgFlags::MSG_DONTWAIT
         };
 
+        // Received descriptors are close-on-exec. The main process forks and
+        // execs a new worker while it holds the listeners it just received
+        // from the retiring one; without the flag the new worker inherits a
+        // second, untracked copy of every listener, which keeps the socket
+        // listening after the worker deactivates it. The paths that do hand a
+        // descriptor across `exec` clear the flag explicitly on that
+        // descriptor (`util::disable_close_on_exec` in `bin/`), and none of
+        // them hands over a received listener. `MSG_CMSG_CLOEXEC` sets the
+        // flag atomically with the receipt; where it does not exist, the flag
+        // is set right after, which leaves a window for a concurrent `fork`.
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ))]
+        let flags = flags | socket::MsgFlags::MSG_CMSG_CLOEXEC;
+
         let msg = socket::recvmsg::<()>(self.fd, &mut iov[..], Some(&mut cmsg), flags)
             .map_err(|error| ScmSocketError::Receive(error.to_string()))?;
 
@@ -436,6 +456,20 @@ impl ScmSocket {
         for (fd, place) in received_fds.zip(fds.iter_mut()) {
             fd_count += 1;
             *place = fd;
+            #[cfg(not(any(
+                target_os = "linux",
+                target_os = "android",
+                target_os = "freebsd",
+                target_os = "dragonfly",
+                target_os = "netbsd",
+                target_os = "openbsd"
+            )))]
+            // SAFETY: `fd` was just installed in this process by `recvmsg`
+            // and is owned by the caller's table; `F_SETFD` only changes its
+            // descriptor flags.
+            unsafe {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
             // The zip is bounded by `fds.iter_mut()`, so each wrap stays within
             // the destination array — never write past `fds_capacity`.
             debug_assert!(
@@ -618,6 +652,68 @@ mod tests {
     fn socket_addr_from_str(str: &str) -> SocketAddr {
         SocketAddr::from_str(str)
             .unwrap_or_else(|_| panic!("failed to create socket address from string slice {str}"))
+    }
+
+    /// A descriptor received over the SCM socket must be close-on-exec.
+    ///
+    /// Without `MSG_CMSG_CLOEXEC` the kernel installs it without
+    /// `FD_CLOEXEC`, so every process the receiver later spawns with `exec`
+    /// inherits the listening socket: the main process forks and execs a new
+    /// worker while it holds the listeners it just received from the retiring
+    /// one, and that worker ends up holding each listener twice, once through
+    /// an fd it never tracks. When the worker later deactivates the listener,
+    /// the untracked copy keeps it listening.
+    #[test]
+    fn received_listener_descriptors_are_close_on_exec() {
+        let (stream_1, stream_2) =
+            MioUnixStream::pair().expect("Could not create a pair of mio unix streams");
+        let sending_scm_socket =
+            ScmSocket::new(stream_1.into_raw_fd()).expect("Could not create scm socket");
+        let receiving_scm_socket =
+            ScmSocket::new(stream_2.into_raw_fd()).expect("Could not create scm socket");
+
+        let tcp_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("Could not bind a TCP listener");
+        let udp_socket =
+            std::net::UdpSocket::bind("127.0.0.1:0").expect("Could not bind a UDP socket");
+        let listeners = Listeners {
+            http: vec![],
+            tls: vec![],
+            tcp: vec![(
+                tcp_listener.local_addr().expect("TCP local address"),
+                tcp_listener.as_raw_fd(),
+            )],
+            udp: vec![(
+                udp_socket.local_addr().expect("UDP local address"),
+                udp_socket.as_raw_fd(),
+            )],
+        };
+        sending_scm_socket
+            .send_listeners(&listeners)
+            .expect("Could not send listeners");
+
+        let received = receiving_scm_socket
+            .receive_listeners()
+            .expect("Could not receive listeners");
+        let received_fds: Vec<RawFd> = received
+            .tcp
+            .iter()
+            .chain(received.udp.iter())
+            .map(|(_, fd)| *fd)
+            .collect();
+        assert_eq!(received_fds.len(), 2, "both descriptors must arrive");
+        for fd in received_fds {
+            // SAFETY: `fd` is a descriptor this test just received and still
+            // owns; `F_GETFD` only reads its descriptor flags.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(flags >= 0, "F_GETFD failed on received fd {fd}");
+            assert_ne!(
+                flags & libc::FD_CLOEXEC,
+                0,
+                "received fd {fd} must be close-on-exec so no exec'd child inherits it"
+            );
+        }
+        received.close();
     }
 
     #[test]

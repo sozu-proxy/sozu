@@ -3405,6 +3405,24 @@
 
 ### 🐛 Fixed
 
+- **`fix(command)`: listener descriptors received over SCM are close-on-exec
+  ([#1665](https://github.com/sozu-proxy/sozu/issues/1665)).** `ScmSocket::receive_listeners`
+  called `recvmsg` without `MSG_CMSG_CLOEXEC`, so every received listener lacked `FD_CLOEXEC`.
+  During a worker upgrade the main process forks and execs the new worker while it still holds
+  the listeners it just received from the retiring one, so the new worker inherited a second,
+  untracked copy of each listener beside the one it then received over SCM (observed in
+  `/proc/<pid>/fd`: every listener held twice, `cloexec=NO`). After that worker deactivated and
+  re-activated a listener, the untracked copy kept the old socket listening; with `SO_REUSEPORT`
+  the kernel spread new connections over both sockets, and 14 of 40 connections hung in the
+  orphaned backlog. In the e2e suite the same leak let `cargo fuzz`, spawned by
+  `fuzz_tcp_clienthello`, hold the in-process workers' listeners, and
+  `test_tcp_listener_serves_after_reactivation` failed on `Address already in use` in 4 of 5 runs
+  of `cargo test -p sozu-e2e --features splice -- tcp_`. Descriptors are now received with
+  `MSG_CMSG_CLOEXEC` (or given `FD_CLOEXEC` right after receipt where the flag does not exist).
+  No path relies on a received listener surviving `exec`: the descriptors that must cross it
+  already clear the flag explicitly. Pinned by
+  `received_listener_descriptors_are_close_on_exec`.
+
 - **`fix(test)`: concurrent test processes no longer share listener ports
   ([#1659](https://github.com/sozu-proxy/sozu/issues/1659)).** `testing::provide_port` counted
   up from a fixed 10000, so two `sozu-lib` test binaries running at once (several worktrees,
