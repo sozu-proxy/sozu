@@ -73,7 +73,8 @@ pub enum CtlError {
 
 pub struct CommandManager {
     channel: Channel<Request, Response>,
-    timeout: Duration,
+    /// read timeout of a command's answer, `None` waits without a limit
+    timeout: Option<Duration>,
     config: Config,
     /// wether to display the response in JSON
     json: bool,
@@ -98,7 +99,7 @@ pub fn ctl(args: cli::Args) -> Result<(), CtlError> {
         std::process::exit(0);
     }
 
-    let timeout = Duration::from_millis(args.timeout.unwrap_or(config.ctl_command_timeout));
+    let timeout = read_timeout(args.timeout.unwrap_or(config.ctl_command_timeout));
     if !args.json {
         debug!("applying timeout {:?}", timeout);
     }
@@ -108,8 +109,14 @@ pub fn ctl(args: cli::Args) -> Result<(), CtlError> {
     command_manager.handle_command(args.cmd)
 }
 
+/// The read timeout of a command, from `--timeout` or `ctl_command_timeout`
+/// in milliseconds, where `0` disables the timeout.
+fn read_timeout(millis: u64) -> Option<Duration> {
+    (millis != 0).then(|| Duration::from_millis(millis))
+}
+
 impl CommandManager {
-    pub fn new(config: Config, timeout: Duration, json: bool) -> Result<Self, CtlError> {
+    pub fn new(config: Config, timeout: Option<Duration>, json: bool) -> Result<Self, CtlError> {
         Ok(Self {
             channel: create_channel(&config)?,
             timeout,
@@ -268,4 +275,19 @@ pub fn create_channel(config: &Config) -> Result<Channel<Request, Response>, Ctl
 
     channel.blocking().map_err(CtlError::BlockChannel)?;
     Ok(channel)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_timeout_disables_the_read_timeout() {
+        assert_eq!(read_timeout(0), None);
+    }
+
+    #[test]
+    fn non_zero_timeout_bounds_the_read() {
+        assert_eq!(read_timeout(1_000), Some(Duration::from_secs(1)));
+    }
 }

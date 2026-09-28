@@ -3429,6 +3429,14 @@
 
 ### 🐛 Fixed
 
+- **`fix(ctl)`: `--timeout 0` and `ctl_command_timeout = 0` disable the command timeout
+  ([#1671](https://github.com/sozu-proxy/sozu/issues/1671)).** The `--timeout` help says `0`
+  disables the timeout, but the CLI turned `0` into a zero deadline, so `sozu -t 0 status`
+  failed at once with `Error: Cli(ReadBlocking(TimeoutReached(0ns)))`. The key
+  `ctl_command_timeout = 0` failed the same way, since both reach the same conversion. `0` now
+  reads the answer without a deadline, as the soft `shutdown` does; every non-zero value and the
+  1 s default keep their deadline. Pinned by unit tests in `bin/src/ctl/mod.rs`.
+
 - **`fix(bin)`: `sozu status` reports a draining worker as `STOPPING` instead of `RUNNING`
   ([#1672](https://github.com/sozu-proxy/sozu/issues/1672)).** `status` snapshots each worker
   with `querying_info`, which keeps `Stopping` and `Stopped` and gives a running worker the
