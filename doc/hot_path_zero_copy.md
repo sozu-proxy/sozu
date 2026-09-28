@@ -493,8 +493,9 @@ keep `crypto-ring` so that they compare with each other.
   ([`lifetime_of_a_session.md`](./lifetime_of_a_session.md) §9). No change
   targeted the TCP data path; its figures in §2.3 moved only through code it
   shares with the HTTP path.
-- **UDP** was not traced beyond the event-loop fix of §3.10. Its per-datagram
-  costs are read from the code in
+- **UDP** was traced only for the event-loop fix of §3.10 and for a new flow's
+  upstream socket, which `udp_connect` now opens in three system calls instead
+  of eight (release, Linux). Its per-datagram costs are read from the code in
   [`udp/LIFECYCLE.md`](../lib/src/protocol/udp/LIFECYCLE.md) §13.
 
 ## 4. Correctness and safety fixes found along the way
