@@ -3429,6 +3429,19 @@
 
 ### 🐛 Fixed
 
+- **`fix(ctl)`: a soft `sozu shutdown` waits for the drain and reports its outcome
+  ([#1671](https://github.com/sozu-proxy/sozu/issues/1671)).** The main answers a `SoftStop`
+  with a `Processing` at once and sends the final `Ok` only when the last worker has drained
+  its sessions, with no deadline of its own. The CLI read that answer with the
+  `--timeout` / `ctl_command_timeout` deadline (1 s by default), so a shutdown issued while a
+  request was still in flight printed `Error: Cli(ReadBlocking(TimeoutReached(1s)))` and exited
+  1, although the request completed and every process stopped. The soft shutdown now reads
+  without a deadline, as `sozu events` does, and prints the main's final message
+  (`Successfully closed N workers, …`); it still fails with `NoByteToRead` if the main dies
+  first. `shutdown --hard`, which the main bounds with `worker_timeout`, and every other
+  command keep the timeout. Pinned by the process-level
+  `bin/tests/soft_stop_waits_for_drain_e2e.rs`.
+
 - **`fix(bin)`: workers no longer inherit other workers' SCM sockets, stopped workers'
   channels, or the upgrade file ([#1668](https://github.com/sozu-proxy/sozu/issues/1668)).**
   `fork_main_into_worker` cleared `FD_CLOEXEC` on the main end of each new worker's SCM socket

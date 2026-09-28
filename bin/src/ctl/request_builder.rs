@@ -62,7 +62,7 @@ impl CommandManager {
     pub fn soft_stop(&mut self) -> Result<(), CtlError> {
         debug!("shutting down proxy softly");
 
-        self.send_request(RequestType::SoftStop(SoftStop {}).into())
+        self.send_request_no_timeout(RequestType::SoftStop(SoftStop {}).into())
     }
 
     pub fn hard_stop(&mut self) -> Result<(), CtlError> {
