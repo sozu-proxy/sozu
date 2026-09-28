@@ -4386,11 +4386,11 @@ impl ConnectionH2 {
             // The preface and SETTINGS are out and the server's SETTINGS are
             // not read yet: there is nothing to write until they are. A write
             // readiness here is not an error — `start_stream` arms one for a
-            // stream linked to this connection, which `Router::connect` does
-            // for a `Connected` connection whatever its handshake state — so
-            // it is withdrawn, and the SETTINGS ACK the read queues re-arms it
-            // (sozu-proxy/sozu#1631). Only the control-frame preamble, which
-            // already ran, may have written: stream frames wait for `Header`.
+            // stream linked to this connection, which `Router::plan_connect`'s
+            // pool scan does for a `Connected` connection whatever its handshake
+            // state — so it is withdrawn, and the SETTINGS ACK the read queues
+            // re-arms it (sozu-proxy/sozu#1631). Only the control-frame preamble,
+            // which already ran, may have written: stream frames wait for `Header`.
             (H2State::ServerSettings, Position::Client(..)) => {
                 trace!(
                     "{} waiting for the server SETTINGS before writing streams",
@@ -15676,8 +15676,8 @@ mod tests {
     /// sozu-proxy/sozu#1631, `ServerSettings` row: the preface is out and the
     /// server's SETTINGS are not read yet. Neither ending a stream nor
     /// linking one may kill the connection; `start_stream` arms a write, as
-    /// it must for `Router::connect`, which links onto a `Connected`
-    /// connection whatever its handshake state.
+    /// it must for `Router::plan_connect`, whose pool scan links onto a
+    /// `Connected` connection whatever its handshake state.
     ///
     /// TO SEE THIS RED: in [`ConnectionH2::dispatch_writable_state`], move
     /// `(H2State::ServerSettings, Position::Client(..))` back into the
