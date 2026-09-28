@@ -234,6 +234,25 @@ pub struct Stream {
     /// The capture is charged against [`MAX_ARMED_REPLAY_CAPTURES`] for as
     /// long as it is `Some`; see [`ReplayCapture`].
     pub retry_buffer: Option<ReplayCapture>,
+    /// True once an H2 backend connection has HPACK-encoded this request
+    /// into `front.out` (`ConnectionH2::poll_write_target`'s
+    /// `H2WritePhase::Prepare` arm, `Position::Client` only).
+    ///
+    /// Those frames carry that connection's stream id and field blocks
+    /// encoded against that connection's HPACK encoder, and the request's
+    /// header blocks are gone from `front.blocks`: the request can no longer
+    /// be sent on any other connection, nor encoded again. Until a request
+    /// byte reaches the socket (`front.consumed`), nothing distinguishes it
+    /// from an untouched request, so this is what keeps
+    /// `end_stream_decision` and `ConnectionH2::handle_goaway_frame` from
+    /// linking it to another backend, where the stale frames would decode
+    /// against another table — another client's fields, or a
+    /// COMPRESSION_ERROR that takes the shared connection down
+    /// (sozu-proxy/sozu#1632). An H1 backend never sets it: its output is
+    /// protocol bytes any fresh H1 connection can send as they are.
+    ///
+    /// Cleared with the front kawa, wherever the slot takes a new request.
+    pub front_bound_to_backend: bool,
     pub context: HttpContext,
     pub metrics: SessionMetrics,
     /// The listener answer registry this stream renders its default answers
@@ -295,6 +314,7 @@ impl Debug for Stream {
                 "retry_buffer",
                 &self.retry_buffer.as_ref().map(|bytes| bytes.len()),
             )
+            .field("front_bound_to_backend", &self.front_bound_to_backend)
             .field("context", &self.context)
             .field("metrics", &self.metrics)
             .finish()
@@ -317,6 +337,9 @@ pub struct StreamParts<'a> {
     /// client can record the exact bytes it hands the upstream socket before
     /// `kawa::Kawa::consume` drops them from the front buffer.
     pub retry_buffer: &'a mut Option<ReplayCapture>,
+    /// [`Stream::front_bound_to_backend`], set by the H2 write path when a
+    /// backend connection encodes the request.
+    pub front_bound_to_backend: &'a mut bool,
 }
 
 impl Stream {
@@ -347,6 +370,7 @@ impl Stream {
             front: GenericHttpStream::new(kawa::Kind::Request, kawa::Buffer::new(front_buffer)),
             back: GenericHttpStream::new(kawa::Kind::Response, kawa::Buffer::new(back_buffer)),
             retry_buffer: None,
+            front_bound_to_backend: false,
             context,
             metrics: SessionMetrics::new(None),
             answers,
@@ -368,6 +392,10 @@ impl Stream {
             (stream.front_data_received, stream.back_data_received),
             (0, 0),
             "new stream DATA counters must start at 0"
+        );
+        debug_assert!(
+            !stream.front_bound_to_backend,
+            "a new stream's request is bound to no backend connection"
         );
         #[cfg(debug_assertions)]
         stream.check_invariants();
@@ -460,6 +488,7 @@ impl Stream {
                 context: &mut self.context,
                 metrics: &mut self.metrics,
                 retry_buffer: &mut self.retry_buffer,
+                front_bound_to_backend: &mut self.front_bound_to_backend,
             },
             Position::Server => StreamParts {
                 window: &mut self.window,
@@ -470,6 +499,7 @@ impl Stream {
                 context: &mut self.context,
                 metrics: &mut self.metrics,
                 retry_buffer: &mut self.retry_buffer,
+                front_bound_to_backend: &mut self.front_bound_to_backend,
             },
         }
     }
@@ -1271,6 +1301,93 @@ mod tests {
             EndStreamAction::SendDefault(502),
             "a request the budget declined to capture must still be answered, \
              un-replayable, exactly as it was before the replay existed"
+        );
+    }
+
+    /// Queue a GET request on `stream`'s request side, closed with
+    /// END_STREAM, the way a parsed request waits for its backend.
+    fn queue_get(stream: &mut Stream) {
+        let kawa = &mut stream.front;
+        kawa.detached.status_line = kawa::StatusLine::Request {
+            version: kawa::Version::V11,
+            method: kawa::Store::Static(b"GET"),
+            uri: kawa::Store::Static(b"/"),
+            authority: kawa::Store::Static(b"example.com"),
+            path: kawa::Store::Static(b"/"),
+        };
+        kawa.push_block(kawa::Block::StatusLine);
+        kawa.push_block(kawa::Block::Header(kawa::Pair {
+            key: kawa::Store::Static(b"Host"),
+            val: kawa::Store::Static(b"example.com"),
+        }));
+        kawa.push_block(kawa::Block::Flags(kawa::Flags {
+            end_body: false,
+            end_chunk: false,
+            end_header: true,
+            end_stream: true,
+        }));
+        kawa.parsing_phase = kawa::ParsingPhase::Terminated;
+    }
+
+    /// H1 non-regression for sozu-proxy/sozu#1632: an H1 backend's write pass
+    /// prepared the request (its blocks are converted to H1 bytes in
+    /// `front.out`) and the socket took none of it before the backend went
+    /// away. Those bytes are protocol-level and any fresh H1 connection can
+    /// send them as they are, so the untouched request is still reconnected.
+    ///
+    /// TO SEE THIS RED: in `shared::end_stream_decision`, test
+    /// `!stream.front.out.is_empty()` instead of
+    /// `stream.front_bound_to_backend`. The request is then refused:
+    /// `left: SendDefault(502), right: Reconnect`.
+    #[test]
+    fn an_untouched_request_prepared_for_an_h1_backend_is_still_reconnected() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 2, 16384)));
+        let mut stream = test_stream(&pool);
+        queue_get(&mut stream);
+        stream.front.prepare(&mut kawa::h1::BlockConverter);
+        assert!(
+            !stream.front.out.is_empty() && !stream.front.consumed,
+            "premise: the H1 bytes are prepared and unsent"
+        );
+        assert!(
+            !stream.front_bound_to_backend,
+            "premise: only an H2 backend binds a request"
+        );
+        assert_eq!(
+            shared::end_stream_decision(&stream),
+            EndStreamAction::Reconnect,
+            "an untouched request prepared for H1 must still be retried"
+        );
+    }
+
+    /// sozu-proxy/sozu#1632: a request an H2 backend encoded and did not
+    /// send is refused a reconnect, since its frames belong to that
+    /// connection and its blocks are gone. It is answered like a request that
+    /// reached the backend; a response already started still wins, and a
+    /// request that reached the backend keeps its replay decision.
+    ///
+    /// TO SEE THIS RED: in `shared::end_stream_decision`, delete the
+    /// `stream.front_bound_to_backend` branch: `left: Reconnect, right:
+    /// SendDefault(502)`.
+    #[test]
+    fn a_request_encoded_for_an_h2_backend_is_not_reconnected() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 2, 16384)));
+        let mut stream = test_stream(&pool);
+        queue_get(&mut stream);
+        // What an H2 backend's write pass leaves: frames in `front.out`, the
+        // blocks gone, nothing written.
+        stream.front.prepare(&mut kawa::h1::BlockConverter);
+        stream.front_bound_to_backend = true;
+        assert_eq!(
+            shared::end_stream_decision(&stream),
+            EndStreamAction::SendDefault(502),
+            "a request encoded for one H2 backend must not be linked to another"
+        );
+        stream.front.consumed = true;
+        assert_eq!(
+            shared::end_stream_decision(&stream),
+            EndStreamAction::SendDefault(502),
+            "a request that reached the backend keeps its own decision"
         );
     }
 

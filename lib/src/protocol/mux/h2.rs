@@ -3260,6 +3260,12 @@ impl ConnectionH2 {
                             incremental_peer_count,
                         );
                         kawa.prepare(&mut converter);
+                        // sozu-proxy/sozu#1632: what a backend connection
+                        // encoded belongs to it (its stream id, its HPACK
+                        // table) and cannot be sent on another one.
+                        if matches!(self.position, Position::Client(..)) && !kawa.out.is_empty() {
+                            *parts.front_bound_to_backend = true;
+                        }
                         let remaining = pass
                             .converter_mut()
                             .reclaim(converter, &mut self.metric_events);
@@ -6848,10 +6854,17 @@ impl ConnectionH2 {
                 remove_backend_stream(&mut context.backend_streams, token, *global_stream_id);
             }
             let stream = &mut context.streams[*global_stream_id];
+            // A stream above `last_stream_id` was not processed (RFC 9113
+            // §6.8), but it is only replayable if its request can be sent
+            // again. Once this connection encoded it, `front.out` holds
+            // frames bound to this connection's stream id and HPACK encoder
+            // and its header blocks are gone: re-linked, those frames would
+            // reach another backend, possibly one other clients share
+            // (sozu-proxy/sozu#1632).
             if stream.front.consumed {
                 // Request was already sent to this backend — we can't
-                // replay it. Use the linked token's readiness (via endpoint)
-                // so the RST_STREAM reaches the client.
+                // replay it. Use the linked token's readiness (via
+                // endpoint) so the RST_STREAM reaches the client.
                 debug!(
                     "{} GOAWAY: stream {} already consumed, cannot retry",
                     log_context!(self),
@@ -6867,7 +6880,44 @@ impl ConnectionH2 {
                         stream_id
                     );
                 }
+            } else if stream.front_bound_to_backend {
+                // Encoded for this backend, not sent, not processed: answered
+                // with a whole 503 response rather than an error-terminated
+                // one. `forcefully_terminate_answer` leaves an empty response
+                // kawa in `Error`, which an H2 frontend turns into a
+                // RST_STREAM but an H1 frontend cannot write at all, so its
+                // client would wait for its timeout; this core cannot tell
+                // which frontend it serves. 503, not 502: the backend refused
+                // the request explicitly and did not process it (RFC 9110
+                // §15.6.4), which is what a draining GOAWAY means.
+                debug!(
+                    "{} GOAWAY: stream {} encoded for this backend and unsent, answering 503",
+                    log_context!(self),
+                    stream_id
+                );
+                if let StreamState::Linked(token) = stream.state {
+                    let answers_rc = stream.answers.clone();
+                    let answers = answers_rc.borrow();
+                    let front_readiness = endpoint.readiness_mut(token);
+                    set_default_answer(stream, front_readiness, 503, &answers);
+                    debug_assert!(
+                        stream.state == StreamState::Unlinked && !stream.back.is_error(),
+                        "a refused, unsent request gets a whole answer, never a silent error"
+                    );
+                } else {
+                    warn!(
+                        "{} GOAWAY: stream {} encoded but not Linked, cannot notify frontend",
+                        log_context!(self),
+                        stream_id
+                    );
+                }
             } else {
+                // Pre: a stream re-linked here carries no frame of this
+                // connection (sozu-proxy/sozu#1632).
+                debug_assert!(
+                    stream.front.out.is_empty(),
+                    "a stream re-linked after GOAWAY holds no frame encoded for this connection"
+                );
                 stream.state = StreamState::Link;
                 context.pending_links.push_back(*global_stream_id);
             }
@@ -7611,6 +7661,21 @@ impl ConnectionH2 {
             stream,
             self.readiness
         );
+        // sozu-proxy/sozu#1632, defense in depth: a request whose front
+        // already holds output was prepared for another connection — frames
+        // with its stream id and HPACK state, or H1 bytes — and its blocks
+        // are gone, so this connection could neither send nor re-encode it.
+        // `end_stream_decision` and `handle_goaway_frame` never link such a
+        // request; this refuses one that a future path would, before an id is
+        // allocated. The caller answers the client with an error.
+        if !context.streams[stream].front.out.is_empty() {
+            error!(
+                "{} Cannot open stream {}: its request was already encoded for another connection",
+                log_context!(self),
+                stream
+            );
+            return false;
+        }
         let Some(stream_id) = self.new_stream_id() else {
             // Pass 4 Medium #5: the client-initiated stream-ID space
             // (31 bits, odd only) is exhausted. The backend is now useless
@@ -12043,6 +12108,291 @@ mod tests {
             "the peer must decode stream 3's block with its own table"
         );
         assert_eq!(status, vec![b"404".to_vec()], "and read what was encoded");
+    }
+
+    /// An H2 backend connection (`Position::Client`, `Connected`, handshake
+    /// done) over a [`PacedSocket`] taking `budget` bytes.
+    fn paced_backend(pool: &Rc<RefCell<Pool>>, budget: usize) -> H2Shell<PacedSocket> {
+        let (socket, _peer) = connected_socket();
+        let backend = Rc::new(RefCell::new(crate::backends::Backend::new(
+            "relink-backend",
+            "127.0.0.1:2".parse().expect("backend address must parse"),
+            None,
+            None,
+            None,
+        )));
+        let mut registry = crate::protocol::mux::BackendRegistry::default();
+        let mut connection = H2Shell::new(
+            Ulid::generate(),
+            PacedSocket {
+                stream: socket,
+                budget,
+                wire: Vec::new(),
+                inbound: std::collections::VecDeque::new(),
+            },
+            Position::Client(
+                "relink-cluster".into(),
+                registry.id_for(&backend),
+                BackendStatus::Connected,
+            ),
+            &mut PoolBufferSource::new(Rc::downgrade(pool)),
+            H2FloodConfig::default(),
+            H2ConnectionConfig::default(),
+            Duration::from_secs(30),
+            None,
+            Duration::from_secs(30),
+            Some((H2StreamId::Zero, 9)),
+            Ready::READABLE | Ready::WRITABLE | Ready::HUP | Ready::ERROR,
+        )
+        .expect("a pool with free buffers must yield an H2 connection");
+        connection.core.state = H2State::Header;
+        connection
+    }
+
+    /// Queue a GET request carrying `x-api-key: <key>` on `gid`'s request
+    /// side, closed with END_STREAM, the way a relayed request reaches a
+    /// backend's write pass. The custom field is indexed into the encoder's
+    /// dynamic table, as a credential-like header would be.
+    fn queue_backend_request(
+        context: &mut Context<TestListener>,
+        gid: GlobalStreamId,
+        key: &'static [u8],
+    ) {
+        let kawa = &mut context.streams[gid].front;
+        kawa.detached.status_line = kawa::StatusLine::Request {
+            version: kawa::Version::V20,
+            method: kawa::Store::Static(b"GET"),
+            uri: kawa::Store::Static(b"/"),
+            authority: kawa::Store::Static(b"example.com"),
+            path: kawa::Store::Static(b"/"),
+        };
+        kawa.push_block(kawa::Block::StatusLine);
+        kawa.push_block(kawa::Block::Header(kawa::Pair {
+            key: kawa::Store::Static(b"x-api-key"),
+            val: kawa::Store::Static(key),
+        }));
+        kawa.push_block(kawa::Block::Flags(kawa::Flags {
+            end_body: false,
+            end_chunk: false,
+            end_header: true,
+            end_stream: true,
+        }));
+        kawa.parsing_phase = kawa::ParsingPhase::Terminated;
+    }
+
+    /// The #1632 starting point: a request linked to backend `backend`,
+    /// whose write pass HPACK-encoded its HEADERS while the socket took
+    /// nothing. Answers the request's global id and the exact bytes that
+    /// connection encoded for it.
+    fn park_an_encoded_request(
+        backend: &mut H2Shell<PacedSocket>,
+        context: &mut Context<TestListener>,
+        router: &mut Router,
+    ) -> (GlobalStreamId, Vec<u8>) {
+        let gid = context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("test context must create a stream");
+        queue_backend_request(context, gid, b"alice-secret");
+        context.streams[gid].state = StreamState::Linked(mio::Token(1));
+        assert!(backend.start_stream(gid, context), "premise: stream 1");
+        backend.core.readiness.event.insert(Ready::WRITABLE);
+        backend.writable(context, EndpointClient(router));
+        let front = &context.streams[gid].front;
+        assert!(
+            backend.socket.wire.is_empty() && !front.out.is_empty() && !front.consumed,
+            "premise: the request was encoded and parked unsent"
+        );
+        let encoded: Vec<u8> = front
+            .as_io_slice()
+            .iter()
+            .flat_map(|slice| slice.iter().copied())
+            .collect();
+        (gid, encoded)
+    }
+
+    /// sozu-proxy/sozu#1632, GOAWAY form: the backend refuses the stream
+    /// (`last_stream_id` below it) after its HEADERS were encoded but not
+    /// sent. It was not processed, but its request cannot be sent anywhere
+    /// else: `front.out` holds this connection's frames and the blocks are
+    /// gone. It must be refused (REFUSED_STREAM toward the client, RFC 9113
+    /// §8.7), never queued for a re-link.
+    ///
+    /// TO SEE THIS RED: in [`ConnectionH2::handle_goaway_frame`], test
+    /// `stream.front.consumed` alone. The stream is then re-linked with its
+    /// stale frames: `a request encoded for this backend must not be re-linked
+    /// after its GOAWAY`. Red on `d5161919`, verified 2026-09-28.
+    #[test]
+    fn a_request_encoded_for_a_backend_is_refused_on_goaway_not_relinked() {
+        let pool = make_pool_for_invariant_16();
+        let mut backend = paced_backend(&pool, 0);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        let (gid, _) = park_an_encoded_request(&mut backend, &mut context, &mut router);
+
+        // GOAWAY(last_stream_id = 0, NO_ERROR): stream 1 was not processed.
+        backend
+            .socket
+            .inbound
+            .extend(orphan_frame(7, 0, 0, 8, &[0; 8]));
+        for _ in 0..4 {
+            backend.core.readiness.event.insert(Ready::READABLE);
+            if backend.core.readiness.filter_interest().is_readable() {
+                backend.readable(&mut context, EndpointClient(&mut router));
+            }
+        }
+
+        assert!(
+            !context.pending_links.contains(&gid),
+            "a request encoded for this backend must not be re-linked after its GOAWAY"
+        );
+        let stream = &context.streams[gid];
+        assert!(
+            stream.context.status == Some(503) && stream.state == StreamState::Unlinked,
+            "the client must be answered 503, got {:?} / {:?}",
+            stream.context.status,
+            stream.state
+        );
+    }
+
+    /// sozu-proxy/sozu#1632, H1 frontend form (found by the adversarial
+    /// review of the first fix): behind a GOAWAY that refuses a request its
+    /// H2 backend encoded but did not send, an H1 client must receive an
+    /// error response, not silence. The first fix answered with
+    /// `forcefully_terminate_answer(REFUSED_STREAM)`, an empty response kawa
+    /// in `Error`, which `ConnectionH1::writable` cannot write: it withdraws
+    /// WRITABLE and the client waits for its timeout.
+    ///
+    /// TO SEE THIS RED: in [`ConnectionH2::handle_goaway_frame`], answer the
+    /// `front_bound_to_backend` branch with `forcefully_terminate_answer(..,
+    /// H2Error::RefusedStream)` as the consumed branch does. The H1 client
+    /// then reads nothing: `the H1 client must read an error response, got
+    /// ""`. Verified 2026-09-28.
+    #[test]
+    fn an_h1_client_behind_a_goaway_refusing_its_encoded_request_gets_a_response() {
+        use std::io::Read;
+
+        let pool = make_pool_for_invariant_16();
+        let mut backend = paced_backend(&pool, 0);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        let (gid, _) = park_an_encoded_request(&mut backend, &mut context, &mut router);
+        let (socket, mut client) = connected_socket();
+        let mut frontend =
+            Connection::new_h1_server(Ulid::generate(), socket, Duration::from_secs(30));
+        assert_eq!(gid, 0, "premise: the H1 frontend serves slot 0");
+
+        backend
+            .socket
+            .inbound
+            .extend(orphan_frame(7, 0, 0, 8, &[0; 8]));
+        for _ in 0..4 {
+            backend.core.readiness.event.insert(Ready::READABLE);
+            if backend.core.readiness.filter_interest().is_readable() {
+                backend.readable(
+                    &mut context,
+                    crate::protocol::mux::connection::EndpointServer(&mut frontend),
+                );
+            }
+        }
+        assert!(
+            !context.pending_links.contains(&gid),
+            "premise: the stream was refused, not re-linked"
+        );
+
+        let mut received = Vec::new();
+        for _ in 0..16 {
+            frontend.readiness_mut().event.insert(Ready::WRITABLE);
+            if frontend.readiness().filter_interest().is_writable() {
+                frontend.writable(&mut context, EndpointClient(&mut router));
+            }
+            let mut buf = [0u8; 4096];
+            if let Ok(n) = client.read(&mut buf) {
+                received.extend_from_slice(&buf[..n]);
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            received.starts_with(b"HTTP/1.1 503"),
+            "the H1 client must read an error response, got {:?}",
+            String::from_utf8_lossy(&received)
+        );
+    }
+
+    /// sozu-proxy/sozu#1632, connection-loss form: the backend connection
+    /// goes away with the request encoded and parked, and
+    /// `H2Shell::close` hands the stream to its frontend, whose
+    /// `end_stream_decision` used to answer `Reconnect` on
+    /// `!front.consumed`. The request must be answered with an error instead.
+    ///
+    /// TO SEE THIS RED: in `shared::end_stream_decision`, delete the
+    /// `stream.front_bound_to_backend` branch. The stream is then re-linked:
+    /// `a request encoded for a lost backend must not be re-linked`. Red on
+    /// `d5161919`, verified 2026-09-28.
+    #[test]
+    fn a_request_encoded_for_a_lost_backend_is_answered_not_relinked() {
+        let pool = make_pool_for_invariant_16();
+        let mut backend = paced_backend(&pool, 0);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        let (gid, _) = park_an_encoded_request(&mut backend, &mut context, &mut router);
+
+        // What `H2Shell::close` does through `EndpointServer`: the frontend
+        // ends the stream the lost backend carried.
+        let (mut frontend, _peer) = test_h2_connection(&pool, None);
+        frontend.core.end_stream(gid, &mut context);
+
+        assert!(
+            !context.pending_links.contains(&gid),
+            "a request encoded for a lost backend must not be re-linked"
+        );
+        assert_eq!(
+            context.streams[gid].context.status,
+            Some(502),
+            "the client gets the answer a request that reached the backend gets"
+        );
+    }
+
+    /// sozu-proxy/sozu#1632, the property itself: no byte one backend
+    /// connection's encoder produced may leave on another connection. Here
+    /// the request encoded on backend A is offered to backend B, as a
+    /// re-link would; B must refuse it and write nothing of A's.
+    ///
+    /// TO SEE THIS RED: in [`ConnectionH2::start_stream`], delete the
+    /// `front.out` guard. B then sends A's frames — stream id 1 of A, a field
+    /// block encoded against A's table: `backend B must not send what
+    /// backend A encoded`. Red on `d5161919`, verified 2026-09-28.
+    #[test]
+    fn a_request_encoded_for_one_backend_never_reaches_another() {
+        let pool = make_pool_for_invariant_16();
+        let mut first = paced_backend(&pool, 0);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        let (gid, encoded) = park_an_encoded_request(&mut first, &mut context, &mut router);
+        assert!(
+            peer_frames(&encoded)
+                .expect("whole frames")
+                .iter()
+                .any(|(kind, _, id, _)| *kind == 1 && *id == 1),
+            "premise: backend A encoded a HEADERS frame for its stream 1"
+        );
+
+        let mut second = paced_backend(&pool, usize::MAX);
+        let started = second.start_stream(gid, &mut context);
+        drive_both_ways(&mut second, &mut context, &mut router);
+
+        assert!(
+            !second
+                .socket
+                .wire
+                .windows(encoded.len())
+                .any(|window| window == encoded.as_slice()),
+            "backend B must not send what backend A encoded: {:?}",
+            peer_frames(&second.socket.wire)
+        );
+        assert!(
+            !started,
+            "backend B must refuse a request encoded for another connection"
+        );
     }
 
     /// Queue on `gid`'s response side a 200 whose field block is `fields`,

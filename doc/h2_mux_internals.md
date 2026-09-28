@@ -658,7 +658,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:4656-4669
+```rust lib/src/protocol/mux/h2.rs:4662-4675
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -684,7 +684,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:4704-4710
+```rust lib/src/protocol/mux/h2.rs:4710-4716
 let events = stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -716,7 +716,7 @@ taken at the top of `H2WritePhase::Flush`'s post-flush tail
 (`ConnectionH2::poll_write_target`, `lib/src/protocol/mux/h2.rs`) and passes `stream.linked_token()` straight
 out of it:
 
-```rust lib/src/protocol/mux/h2.rs:3425-3426
+```rust lib/src/protocol/mux/h2.rs:3431-3432
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 ```
@@ -1069,7 +1069,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8431-8435
+```rust lib/src/protocol/mux/h2.rs:8496-8500
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1202,7 +1202,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8508-8512
+```rust lib/src/protocol/mux/h2.rs:8573-8577
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1676,7 +1676,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:7946
+```rust lib/src/protocol/mux/h2.rs:8011
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -1815,7 +1815,7 @@ and `tracestate` headers are extracted from inbound requests:
 At access log emission time (`Stream::generate_access_log`, in
 `lib/src/protocol/mux/stream.rs`):
 
-```rust lib/src/protocol/mux/stream.rs:852-855
+```rust lib/src/protocol/mux/stream.rs:882-885
 #[cfg(feature = "opentelemetry")]
 otel: context.otel.as_ref(),
 #[cfg(not(feature = "opentelemetry"))]
@@ -1887,7 +1887,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:6645-6647
+```rust lib/src/protocol/mux/h2.rs:6651-6653
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1895,7 +1895,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:6659-6665
+```rust lib/src/protocol/mux/h2.rs:6665-6671
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.
@@ -2018,6 +2018,39 @@ uses. Encoding at send time would move the
 encoding out of `kawa.prepare`, which the converter and the zero-copy output
 queue are built around; the reset keeps both and sends nothing for a dead
 stream.
+
+### An encoded request belongs to its backend connection
+
+The encoding changes the connection twice when a backend's write pass prepares
+a request: the HPACK encoder's table (see above), and the request itself.
+`kawa.prepare` pops the request's `StatusLine`/`Header`/`Flags` blocks and
+leaves HEADERS/CONTINUATION frames in `front.out`, carrying the stream id this
+connection allocated and a field block only this connection's peer can decode.
+If the socket takes none of it and the connection is then lost, or refuses the
+stream with a GOAWAY below it, the request still reads `front.consumed ==
+false`, which used to mean "untouched, retry it elsewhere"
+([#1632](https://github.com/sozu-proxy/sozu/issues/1632)). Re-linked, its
+stale frames went out first on the new connection. `Router::connect` prefers an
+existing connection of the cluster, usually shared: a stream id above that
+connection's highest opens a stream whose field block resolves its dynamic
+indexes against another table, so the backend rebuilds a request carrying
+fields other clients inserted there; any other id, or an index out of range, is
+a PROTOCOL_ERROR or COMPRESSION_ERROR that ends every stream on it.
+
+`Stream::front_bound_to_backend` marks the request once an H2 backend has
+encoded it (one store in the `Position::Client` prepare, no allocation), and
+the three places that could send it elsewhere check it:
+`end_stream_decision` answers `SendDefault(502)` instead of `Reconnect`;
+`ConnectionH2::handle_goaway_frame` answers a whole `503` (refused and not
+processed, RFC 9110 §15.6.4) instead of re-linking — not REFUSED_STREAM, whose
+empty error answer an H1 frontend cannot write;
+and `ConnectionH2::start_stream` refuses any request whose `front.out` already
+holds output, before it allocates an id. Encoding it again for the new
+connection would need the blocks `kawa.prepare` popped, so every request would
+keep a copy on the nominal path; hyperium/h2 has no such state because it
+encodes at send time. An H1 backend's prepared output is plain HTTP/1.1 bytes,
+valid on any fresh H1 connection, so it never sets the flag and keeps its
+reconnect.
 
 ### Buffer shrinking after large headers
 

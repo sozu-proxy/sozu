@@ -652,7 +652,8 @@ runs — see §6.
   **every** backend `ConnectionH2` attached to this session indexes into it.
 - Index: `GlobalStreamId = usize` (`mod.rs`).
 - Mutated by:
-  - push — `create_stream` when no `Recycle` slot is available (`mod.rs:1268`).
+  - push — `create_stream` when no `Recycle` slot is available (`Context::create_stream`,
+  `mod.rs`).
   - pop — `shrink_trailing_recycle` (`mod.rs`).
   - in-place state edits — everywhere.
 
@@ -759,7 +760,8 @@ become out-of-bounds later on if:
 
 Step 1 happens in every `remove_dead_stream` caller and in every reset / cancel
 path (see §8). Step 2 happens on every `create_stream` call that finds a
-recycled slot to reuse and then crosses the shrink ratio (`mod.rs:1262-1263`).
+recycled slot to reuse and then crosses the shrink ratio (the `h2_stream_shrink_ratio` test at the end of
+`Context::create_stream`, `mod.rs`).
 Step 3 follows automatically.
 
 ### 5.4 Who invalidates these fields
@@ -862,7 +864,8 @@ pub fn shrink_trailing_recycle(&mut self) {
 ### 6.1 When it runs
 
 Called from `Context::create_stream` after a `Recycle` slot is reused, guarded
-by a ratio threshold so we don't thrash on every request (`mod.rs:1262-1263`):
+by a ratio threshold so we don't thrash on every request (the `h2_stream_shrink_ratio` test at the
+end of `Context::create_stream`, `mod.rs`):
 
 ```rust
 if total > 1 && active > 0 && total > active * self.h2_stream_shrink_ratio {
@@ -911,7 +914,7 @@ re-validates every delivery and puts an early one back — §7.6.
   embedder to call back at. The wheel handle is `Mux.timeouts.frontend` — see
   §7.7.
 - Fired when: no traffic observed for `configured_frontend_timeout`
-  (`mod.rs:1515`) while any stream is live, or the shorter `request_timeout`
+  (the `Mux::configured_frontend_timeout` field, `mod.rs`) while any stream is live, or the shorter `request_timeout`
   until the first `Link` transition (`Mux::ready_inner` switches the frontend
   to `configured_frontend_timeout` there).
 - Reset: on meaningful activity — HEADERS for an existing stream, DATA bytes
@@ -1611,14 +1614,50 @@ Pinned by the e2e `test_h1_close_delimited_body_closes_client`,
 
 ### 8.5 Stale-upstream replay (`ReplayOnFreshBackend`)
 
-`end_stream_decision` splits "the backend closed without answering" in three,
-on two questions: did the request reach the upstream, and is it replayable?
+`end_stream_decision` splits "the backend closed without answering" in four,
+on three questions: did the request reach the upstream, is it replayable, and
+was it encoded for an H2 upstream?
 
 | Request state | Upstream answered | Action |
 |---|---|---|
-| untouched (`!front.consumed`) | no | `Reconnect` — re-link and route from the intact front kawa |
+| untouched (`!front.consumed`, `!front_bound_to_backend`) | no | `Reconnect` — re-link and route from the intact front kawa |
+| encoded for an H2 backend, unsent (`!front.consumed`, `front_bound_to_backend`) | no | `SendDefault(502)` — its frames belong to that connection |
 | written, replayable | no | `ReplayOnFreshBackend` — re-link and re-serialize the captured bytes |
 | written, not replayable | no | `SendDefault(502)` |
+
+An H2 backend's write pass HPACK-encodes the request into `front.out` and pops
+its blocks (`kawa.prepare`) before any byte is written, and the socket may take
+none of them. `front.consumed` is then still false, but the request is no
+longer untouched: its frames carry that connection's stream id and field blocks
+encoded against that connection's encoder table, and the blocks are gone, so it
+can be neither sent on nor encoded for another connection. Re-linked, it used
+to go out first on the new connection — possibly one `Router::connect` shares
+with other clients — where the block decodes against another table: another
+client's indexed fields, or a COMPRESSION_ERROR/PROTOCOL_ERROR that takes the
+whole connection down (sozu-proxy/sozu#1632). `Stream::front_bound_to_backend`
+records it: set by the `Position::Client` prepare of
+`ConnectionH2::poll_write_target` when it leaves output, cleared with the front
+kawa where a slot takes a new request (`Context::create_stream`'s reuse,
+`ConnectionH1`'s keep-alive reset). `ConnectionH2::handle_goaway_frame` reads
+it too: a stream above `last_stream_id` was not processed (RFC 9113 §6.8), but
+a bound one is answered a whole `503` (the backend refused it unprocessed,
+RFC 9110 §15.6.4) instead of re-linked. Not REFUSED_STREAM: its answer,
+`forcefully_terminate_answer`, is an empty response kawa in `Error`, which an H2
+frontend turns into a RST_STREAM but an H1 frontend cannot write at all, and
+the backend core cannot tell which frontend it serves
+(`an_h1_client_behind_a_goaway_refusing_its_encoded_request_gets_a_response`). As defense in depth,
+`ConnectionH2::start_stream` refuses a request whose `front.out` already holds
+output, before allocating an id. An H1 backend never sets the flag: its output
+is protocol bytes a fresh H1 connection sends as they are, so its untouched
+requests keep `Reconnect`. Re-encoding from the kawa is not possible without
+keeping a copy of every request's blocks on the nominal path; hyperium/h2
+avoids the question by encoding at send time (`FramedWrite::buffer`). Pinned by
+`a_request_encoded_for_a_backend_is_refused_on_goaway_not_relinked`,
+`a_request_encoded_for_a_lost_backend_is_answered_not_relinked`,
+`a_request_encoded_for_one_backend_never_reaches_another` (`h2.rs`, red on
+`d5161919`), `a_request_encoded_for_an_h2_backend_is_not_reconnected` and
+`an_untouched_request_prepared_for_an_h1_backend_is_still_reconnected`
+(`stream.rs`).
 
 `ReplayOnFreshBackend` exists because a *pooled* H1 keep-alive upstream can be
 closed by its peer while idle, with no event sozu has processed yet. The next
@@ -1751,7 +1790,7 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
 4. **`expect_read` validity.** Same as (3) for `expect_read`.
 5. **Recycled slot cleanliness.** A `StreamState::Recycle` slot has cleared
    `front`, `back`, `front.storage`, `back.storage`, reset metrics
-   (`mod.rs:1251-1256`).
+   (the slot-reuse branch of `Context::create_stream`, `mod.rs`).
 6. **No stale `Linked` after backend close.** Before transitioning a stream away
    from `Linked(token)`, call `unlink_stream` (`mod.rs`) or
    `remove_backend_stream` (`mod.rs`) to keep the reverse index honest.
@@ -2729,6 +2768,15 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     of `ConnectionH2::dispatch_writable_state`), and a write readiness while
     the server's SETTINGS are awaited is withdrawn, never answered with a
     disconnect (§2.2, §8.2, sozu-proxy/sozu#1631).
+
+30. **Frames a backend connection encoded never leave on another one.**
+    Once an H2 backend's write pass leaves a request's frames in `front.out`
+    (`Stream::front_bound_to_backend`), that request is bound to the
+    connection: `end_stream_decision` answers it `SendDefault(502)` rather
+    than `Reconnect`, `ConnectionH2::handle_goaway_frame` answers it `503` rather
+    than re-link it (debug-asserted: a re-linked stream holds no frame), and
+    `ConnectionH2::start_stream` refuses any request whose `front.out` is not
+    empty (§8.5, sozu-proxy/sozu#1632).
 
 
 ---
