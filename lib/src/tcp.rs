@@ -1739,6 +1739,12 @@ impl TcpSession {
                 e
             );
         }
+        // Keep the selected backend's handle, as the mux keeps its own in
+        // its `BackendRegistry`: `fail_backend_connection` and
+        // `set_back_connected` charge it (failure counter, retry policy,
+        // UP/DOWN transitions), and `remove_backend` releases the connection
+        // `Backend::try_connect` counted on it.
+        self.backend = Some(Rc::clone(&backend));
         self.backend_connected = BackendConnectionStatus::Connecting(Instant::now());
 
         let back_token = {
