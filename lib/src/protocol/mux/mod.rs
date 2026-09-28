@@ -1866,6 +1866,15 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     /// This is required for H2 graceful shutdown because a stream may still
     /// need one last readable pass to observe the peer's END_STREAM or one last
     /// writable pass to retire the stream, emit GOAWAY, or flush TLS records.
+    ///
+    /// An H2 frontend always gets that one writable pass. Further passes run
+    /// only while the connection still has output queued AND the socket took
+    /// the last write: the loop stops as soon as either is false. It must not
+    /// wait for the WRITABLE *event* to clear, because the forced pass sets
+    /// that bit itself (`signal_pending_write`) and `writable()` clears it only
+    /// on `WouldBlock`. An idle draining session therefore never cleared it,
+    /// and every `shut_down_sessions()` tick spun `MAX_LOOP_ITERATIONS` empty
+    /// `writable()` calls per draining H2 session.
     fn drive_frontend_shutdown_io(&mut self) -> SessionIsToBeClosed {
         let force_h2_read = matches!(self.frontend, Connection::H2(_));
         let force_h2_write = matches!(self.frontend, Connection::H2(_));
@@ -1908,6 +1917,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             if force_h2_write {
                 self.frontend.readiness_mut().signal_pending_write();
             }
+            #[cfg(test)]
+            SHUTDOWN_WRITABLE_PASSES.with(|passes| passes.set(passes.get() + 1));
             match self
                 .frontend
                 .writable(&mut self.context, EndpointClient(&mut self.router))
@@ -1918,8 +1929,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
 
             iterations += 1;
             if iterations >= MAX_LOOP_ITERATIONS
-                || (!self.frontend.has_pending_write()
-                    && !self.frontend.readiness().event.is_writable())
+                || !self.frontend.has_pending_write()
+                || !self.frontend.readiness().event.is_writable()
             {
                 break;
             }
@@ -3969,6 +3980,14 @@ pub(crate) mod test_support {
     }
 }
 
+// Counts `writable()` calls made by `Mux::drive_frontend_shutdown_io`, so a
+// test can pin how much work one shutdown pass does. Thread-local: each test
+// runs on its own thread.
+#[cfg(test)]
+thread_local! {
+    static SHUTDOWN_WRITABLE_PASSES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::test_support::{TEST_STICKY_NAME, connected_socket, test_context};
@@ -4005,6 +4024,93 @@ mod tests {
     /// compiles). `readable()` then mirrors the frozen snapshot, the budget
     /// reads as 0s elapsed against a 5s deadline, and the final assertion fails
     /// with `assertion failed: mux.shutting_down()`.
+    /// One `shutting_down()` pass on an idle draining H2 session makes exactly
+    /// one `writable()` call: the forced pass, with nothing queued after it.
+    ///
+    /// `shut_down_sessions()` calls `shutting_down()` on every draining session
+    /// at each 100 ms shutdown tick, so the work in one pass is multiplied by
+    /// both. The loop in `Mux::drive_frontend_shutdown_io` used to wait for the
+    /// WRITABLE event bit to clear, a bit that its own `signal_pending_write`
+    /// had just set and that `writable()` clears only on `WouldBlock`, so an
+    /// idle session with a writable socket ran all `MAX_LOOP_ITERATIONS`.
+    /// Measured on the e2e drain test in a debug build: 10 000 calls and about
+    /// 29 ms of CPU per pass, uncontended.
+    ///
+    /// To SEE THIS RED: restore the old exit condition,
+    /// `!has_pending_write() && !readiness().event.is_writable()`; the count
+    /// becomes `MAX_LOOP_ITERATIONS`.
+    #[test]
+    fn an_idle_draining_h2_session_makes_one_writable_pass_per_shutdown_tick() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (socket, _peer) = connected_socket();
+
+        let mut h2 = h2::H2Shell::new(
+            Ulid::generate(),
+            socket,
+            Position::Server,
+            &mut PoolBufferSource::new(Rc::downgrade(&pool)),
+            H2FloodConfig::default(),
+            H2ConnectionConfig::default(),
+            Duration::from_secs(30),
+            Some(Duration::from_secs(3600)),
+            Duration::from_secs(30),
+            None,
+            Ready::READABLE | Ready::HUP | Ready::ERROR,
+        )
+        .expect("a pool with free buffers must yield an H2 connection");
+
+        // Already draining, budget far from elapsed: the pass must neither
+        // send a GOAWAY nor force-close, only drive the frontend I/O.
+        let armed_at = Instant::now();
+        h2.core.state = H2State::Header;
+        h2.core.drain.__test_arm_draining(armed_at);
+        let mut frontend = Connection::H2(h2);
+
+        let mut context = test_context(&pool);
+        context.now = armed_at;
+        // One live stream, so the session keeps draining instead of closing.
+        let stream_id = context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("test context must create a stream");
+        context.streams[stream_id].state = StreamState::Linked(Token(1));
+        let Connection::H2(h2) = &mut frontend else {
+            unreachable!("frontend was built as H2")
+        };
+        h2.core.__test_insert_wire_mapping_only(1, stream_id);
+
+        let mut mux = Mux {
+            configured_frontend_timeout: Duration::from_secs(30),
+            frontend_token: Token(0),
+            frontend,
+            router: Router::new(Duration::from_secs(30), Duration::from_secs(30)),
+            context,
+            session_ulid: Ulid::generate(),
+            timeouts: MuxTimeouts::new(TimeoutContainer::new_empty(Duration::from_secs(30))),
+            backend_registry: BackendRegistry::default(),
+        };
+        assert!(
+            !mux.frontend.has_pending_write(),
+            "precondition: the idle draining session has nothing queued"
+        );
+
+        SHUTDOWN_WRITABLE_PASSES.with(|passes| passes.set(0));
+        assert!(
+            !mux.shutting_down(),
+            "a draining session with a live stream and budget left must stay open"
+        );
+        let passes = SHUTDOWN_WRITABLE_PASSES.with(|passes| passes.get());
+        assert_eq!(
+            passes, 1,
+            "one shutdown pass on an idle draining H2 session must make exactly the \
+             one forced writable() call, not spin until MAX_LOOP_ITERATIONS \
+             ({MAX_LOOP_ITERATIONS}); got {passes}"
+        );
+        assert!(
+            !mux.frontend.has_pending_write(),
+            "the pass must leave nothing queued behind"
+        );
+    }
+
     #[test]
     fn shutting_down_refreshes_the_snapshot_so_the_drain_budget_expires() {
         let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));

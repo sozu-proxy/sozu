@@ -3304,6 +3304,19 @@
 
 ### 🐛 Fixed
 
+- **`perf(mux)`: a draining H2 session no longer spins 10 000 empty writes at every shutdown
+  tick.** During a soft stop, `shut_down_sessions()` visits every draining session every
+  100 ms, and `Mux::drive_frontend_shutdown_io` forces one `writable()` pass on each H2
+  frontend. Its loop then waited for the WRITABLE event bit to clear, but the forced pass sets
+  that bit itself and `writable()` clears it only on `WouldBlock`. An idle draining session
+  with a writable socket therefore ran all `MAX_LOOP_ITERATIONS` (10 000) calls on every tick.
+  The loop now stops once nothing is queued or the socket blocks. On the e2e drain test (one
+  session), the median CPU cost of one shutdown pass fell from 3.94 ms to 7 µs in a release
+  build and from 79.5 ms to 116 µs in a debug build. The cost scaled with the number of
+  draining sessions and delayed every other event of the worker during a soft stop or hot
+  upgrade. Covered by
+  `mux::tests::an_idle_draining_h2_session_makes_one_writable_pass_per_shutdown_tick`.
+
 - **`fix(mux)`: a `Content-Length` response truncated by a backend close is no longer
   forwarded as complete ([#1633](https://github.com/sozu-proxy/sozu/issues/1633)).** A
   `Connection: close` H1 backend that closed before its announced `Content-Length` had its body
