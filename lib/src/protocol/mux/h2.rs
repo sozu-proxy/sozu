@@ -9313,6 +9313,7 @@ mod tests {
             frontend_redirect_template: None,
             redirect_status: None,
             tags: None,
+            forwarding_hop: None,
             access_log_message: None,
         };
         Stream::new(

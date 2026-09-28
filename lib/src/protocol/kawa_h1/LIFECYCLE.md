@@ -92,7 +92,13 @@ mutable companion to the Kawa parser. Its `kawa::h1::ParserCallbacks` impl
 - `on_request_headers` (`editor.rs`) — captures the `:method`, authority,
   path; copies `X-Forwarded-For` into `xff_chain` for the access log; appends
   the configured `Forwarded`/`X-Forwarded-*` hop; injects the `Sozu-Id`
-  correlation header named by `sozu_id_header`;
+  correlation header named by `sozu_id_header`. The hop is rendered once per
+  connection (`ForwardingHop`, `HttpContext::forwarding_hop`, `editor.rs`)
+  from its only inputs — the protocol, the public address and the peer
+  address — and rendered again only when one of them changes: a synthesised
+  `X-Forwarded-For`, `Forwarded`, `X-Real-IP` or `X-Forwarded-Port` shares
+  that rendering (`kawa::Store::Shared`), while a client-supplied chain,
+  which is request-scoped, is extended into an exact-size copy of its own;
 - `on_response_headers` (`editor.rs`) — captures `:status`, `:reason`,
   optionally rewrites `Set-Cookie` for sticky sessions. The reason is kept
   for the access log as the `'static` phrase RFC 9110 §15 registers for the
@@ -165,10 +171,11 @@ combined final coding is not `chunked` (RFC 9112 §6.3), returning before
   0.7.1, and forwarding both lines is what the count clause refuses.
 
 The guard therefore folds over every non-elided `Transfer-Encoding` header in
-`request.blocks` (`editor.rs:747-767`), producing `te_count` and
-`te_all_suffix_chunked` — the latter true only when EVERY such value's literal
+`request.blocks` (the `te_count` fold at the top of
+`HttpContext::on_request_headers`, `lib/src/protocol/kawa_h1/editor.rs`),
+producing `te_count` and `te_all_suffix_chunked` — the latter true only when EVERY such value's literal
 trailing bytes are `chunked` (`compare_no_case` over the last seven bytes). The
-rejection predicate is exactly (`editor.rs:768-771`):
+rejection predicate is exactly (the `if` that follows the fold):
 
 ```rust
 te_count > 1
@@ -303,7 +310,8 @@ a wedged session, or a security regression.
 4. **`HttpContext` outlives a single request when keep-alive is in play.**
    `HttpContext::reset` (`editor.rs`) clears the per-request fields but
    preserves the per-connection ULID (`session_id`, `editor.rs`), the
-   SNI-derived TLS state, and the rendered `sozu_id_header` label
+   SNI-derived TLS state, the connection's rendered forwarding values
+   (`forwarding_hop`, `editor.rs`), and the rendered `sozu_id_header` label
    (`editor.rs`). The request id (`HttpContext::id`, `editor.rs`) IS
    rotated per request: `reset` takes the next request's id as its argument,
    and the keep-alive branch of `ConnectionH1::writable`

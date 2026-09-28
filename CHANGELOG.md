@@ -471,6 +471,30 @@
   (`header_editing_output_is_byte_exact_across_keep_alive_requests`). The editor is shared by the
   H1 and H2 frontends, so every HTTP/2 stream gains the same.
 
+- **`perf(h1)`: a keep-alive connection renders its forwarding values once.** Every request
+  rendered the `X-Forwarded-For`, `Forwarded`, `X-Real-IP` and `X-Forwarded-Port` values again,
+  although they depend only on the protocol, the public address and the peer address, all
+  connection-scoped. `HttpContext` now keeps them (`ForwardingHop`), rendered by the first request
+  and shared by the next ones through `kawa::Store::Shared`, and renders them again only when one of
+  those inputs changes. `X-Real-IP` shares the `X-Forwarded-For` rendering. A client-supplied
+  `X-Forwarded-For` or `Forwarded` chain is request-scoped and never kept: it is extended with the
+  rendered hop into one exact-size copy, without the shared scratch buffer. The bytes forwarded are
+  unchanged, IPv6 brackets included (`header_editing_output_is_byte_exact_across_keep_alive_requests`,
+  `a_client_chain_never_leaks_into_the_next_request`,
+  `a_changed_forwarding_input_renders_the_hop_again`). The header editing of a bare request costs 3
+  heap operations instead of 7 from the second request of a connection on (8 with `send_x_real_ip`,
+  `keep_alive_requests_reuse_the_connection_forwarding_hop`), a request carrying both chains 6
+  instead of 8 (`a_client_chain_costs_one_exact_copy_per_extended_header`), and the first request of
+  a connection is unchanged at 7. Each HTTP/2 stream has its own `HttpContext`, so it pays the first
+  request's cost, as before.
+
+  **Measured** on a release build without jemalloc (`crypto-aws-lc-rs`), one curl keep-alive
+  connection of 20 `GET`s behind a Python `http.server`, heap operations per request counted by an
+  `LD_PRELOAD` malloc counter, two runs each, against `6eef0ba1`: plaintext H1 11.45 → 7.65, H1 over
+  TLS 27.55 → 23.75.
+  The syscalls, traced with intentrace on the jemalloc build, are the same classes in the same
+  counts outside the event-loop wake-ups timing decides (identical 210 on one plaintext pair).
+
 - **`perf(mux-h2)`: HPACK is a sans-io module of `sozu-lib`, and `loona-hpack` is gone
   ([#1616](https://github.com/sozu-proxy/sozu/issues/1616)).** `loona-hpack` 0.4.3, unchanged since
   2024-11-03, built a 257-entry `HashMap` for every Huffman-coded string it decoded and kept every

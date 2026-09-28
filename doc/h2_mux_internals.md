@@ -1701,9 +1701,9 @@ When disabled, the `otel` field in access log records is `None`.
 ### How it works in the Mux layer
 
 OpenTelemetry context propagation is handled by `HttpContext` (defined in
-`lib/src/protocol/kawa_h1/editor.rs`), which contains:
+`lib/src/protocol/kawa_h1/editor.rs`), whose `HttpContext::otel` field is:
 
-```rust lib/src/protocol/kawa_h1/editor.rs:270-271
+```rust
 #[cfg(feature = "opentelemetry")]
 pub otel: Option<sozu_command::logging::OpenTelemetry>,
 ```
