@@ -523,18 +523,19 @@ model.
 
 ## 13. What a Datagram Costs
 
-Read from the code on 2026-09-28; no UDP scenario was traced, so these are
-counts of calls in the source, not measurements. The one UDP change the
-hot-path work measured is §10's: `UdpProxy::health_poll` no longer clones the
-registry on every event-loop turn, which removed an `fcntl` and a `close` per
-turn from every worker, UDP cluster or not (`doc/hot_path_zero_copy.md` §3.10).
+Read from the code on 2026-09-28, so these are counts of calls in the source,
+except the new-flow row, which was also traced with `intentrace -p` on a release
+worker. The other UDP change the hot-path work measured is §10's:
+`UdpProxy::health_poll` no longer clones the registry on every event-loop turn,
+which removed an `fcntl` and a `close` per turn from every worker, UDP cluster
+or not (`doc/hot_path_zero_copy.md` §3.10).
 
 | Event | System calls | Allocations |
 |---|---|---|
 | client datagram, known flow | one `recvfrom(2)` (`ingest_client`), one `send(2)` on the flow's connected socket (`on_send_to_backend`) | one owned copy of the payload into `Transmit::payload` (`UdpManager::forward_on_existing_flow`), plus the PPv2 prefix on the datagrams that carry one |
 | backend reply | one `recv(2)` (`ingest_upstream`), one `sendto(2)` on the listener socket (`on_send_to_client`) | one owned copy into `Transmit::payload` (`UdpManager::on_backend_datagram`) |
 | end of a readiness burst | one more `recvfrom` / `recv` that answers `EAGAIN` | none |
-| new flow | `udp_connect` (`lib/src/socket.rs`): `socket(2)`, `bind(2)`, two `fcntl(2)` for `O_NONBLOCK`, `connect(2)`, then a third `fcntl`, a `getsockname(2)` and a `getpeername(2)` for its post-condition checks, which run in release builds too (only the assertions they feed are compiled out); then `epoll_ctl(EPOLL_CTL_ADD)` (`on_open_upstream`) | the flow's slab slot and its shell-side map entries |
+| new flow | `udp_connect` (`lib/src/socket.rs`): `socket(2)` with `SOCK_NONBLOCK \| SOCK_CLOEXEC`, `bind(2)`, `connect(2)`; then `epoll_ctl(EPOLL_CTL_ADD)` (`on_open_upstream`). Four calls on a Linux release build, measured (nine before: two `fcntl(2)` set `O_NONBLOCK`, and an `fcntl`, a `getsockname(2)` and a `getpeername(2)` fed post-condition checks). Those three queries now run only with `debug_assertions`; other platforms keep the `set_nonblocking` pair. UDP health probes pay the same `udp_connect` | the flow's slab slot and its shell-side map entries |
 | closed flow | `epoll_ctl(EPOLL_CTL_DEL)` and `close(2)` (`on_close_flow`) | none |
 | send buffer full | the datagram joins a bounded `WriteQueue` and the socket is re-registered for WRITABLE (`epoll_ctl(EPOLL_CTL_MOD)`) | the queued copy |
 

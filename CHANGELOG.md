@@ -376,6 +376,23 @@
 
 ### 🔄 Changed
 
+- **`perf(udp)`: a new UDP flow opens its upstream socket in three system calls, not eight.**
+  `udp_connect` (`lib/src/socket.rs`) created the per-flow connected socket blocking, set
+  `O_NONBLOCK` with an `fcntl(F_GETFL)`/`fcntl(F_SETFL)` pair, then ran an `fcntl(F_GETFL)`, a
+  `getsockname(2)` and a `getpeername(2)` whose only consumers were `debug_assert!`s, so release
+  builds paid for them too. On Linux the socket is now created with `SOCK_NONBLOCK` (and, as
+  before, `SOCK_CLOEXEC`) through socket2's `Type::nonblocking`, and the post-condition queries run
+  only under `debug_assertions`, unchanged in debug builds. Other platforms keep
+  `set_nonblocking`. UDP health probes, which also go through `udp_connect`, save the same five.
+  **Operator-visible:** none.
+  Measured with `intentrace -p` on the worker, release build, one worker, Python echo backend,
+  five client flows: `socket bind fcntl fcntl connect fcntl getsockname getpeername epoll_ctl(ADD)`
+  (9 per new flow) → `socket bind connect epoll_ctl(ADD)` (4). Pinned by
+  `udp_connect_is_born_nonblocking_and_skips_release_queries` (`socket.rs`), which counts the
+  `fcntl`/`getsockname`/`getpeername` calls of one `udp_connect` with a seccomp user-notification
+  filter (`[0, 0, 0]` in release, `[1, 1, 1]` in debug) and checks `O_NONBLOCK` and `FD_CLOEXEC`
+  on the returned socket; seen red without the fix in both profiles (`[3, 1, 1]`).
+
 - **`docs`: the hot-path zero-copy and system-call work of 2026-09-26 to 2026-09-28 is written up,
   and the request lifecycles describe the code as it now stands
   ([#1656](https://github.com/sozu-proxy/sozu/pull/1656)).** The new

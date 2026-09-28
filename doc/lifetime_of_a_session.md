@@ -630,7 +630,7 @@ source address. The full workflow — admission, selection inside the core,
 symmetric NAT return through one connected upstream socket per flow, teardown
 on idle or request/response caps — is in
 [`udp/LIFECYCLE.md`](../lib/src/protocol/udp/LIFECYCLE.md). Its costs, read from
-the code (no UDP scenario was traced):
+the code (only the new-flow cost was traced):
 
 - **per client datagram:** one `recvfrom(2)`, one owned copy of the payload
   into the forwarded `Transmit`, one `send(2)` on the flow's connected socket;
@@ -639,12 +639,14 @@ the code (no UDP scenario was traced):
 - **per backend reply:** one `recv(2)`, one copy, one `sendto(2)` on the
   listener socket;
 - **per new flow:** `udp_connect` (`lib/src/socket.rs`) issues `socket(2)`,
-  `bind(2)`, two `fcntl(2)` to set `O_NONBLOCK` and `connect(2)`, then — in
-  release builds too, since only the assertions they feed are compiled out —
-  a third `fcntl` (`nonblocking()`), a `getsockname(2)` (`local_addr()`) and a
-  `getpeername(2)` (`peer_addr()`) for its post-condition checks; the shell
-  then registers the socket (`epoll_ctl(EPOLL_CTL_ADD)`) and takes the flow's
-  slab slot. **Per closed flow:** `EPOLL_CTL_DEL` and `close(2)`.
+  born non-blocking and close-on-exec (`SOCK_NONBLOCK | SOCK_CLOEXEC`),
+  `bind(2)` and `connect(2)`; the shell then registers the socket
+  (`epoll_ctl(EPOLL_CTL_ADD)`) and takes the flow's slab slot. That is four
+  calls on a Linux release build, traced with `intentrace -p` (nine before:
+  two `fcntl(2)` set `O_NONBLOCK`, and an `fcntl`, a `getsockname(2)` and a
+  `getpeername(2)` fed post-condition checks that now run only with
+  `debug_assertions`). Other platforms keep the `set_nonblocking` pair.
+  **Per closed flow:** `EPOLL_CTL_DEL` and `close(2)`.
 
 ## 11. Closing a session
 

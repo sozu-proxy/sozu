@@ -1713,6 +1713,13 @@ pub fn udp_bind(addr: SocketAddr) -> Result<UdpSocket, ServerBindError> {
 /// the manager as a `BackendDatagram`. `send` (not `send_to`) is then used for
 /// the forward path. Errors (`EMFILE`/`ENFILE`/connect refusal) bubble up so
 /// the caller can shed the flow rather than panic.
+///
+/// On Linux the socket is created non-blocking and close-on-exec in the one
+/// `socket(2)` call (`SOCK_NONBLOCK | SOCK_CLOEXEC`; `Socket::new` adds the
+/// latter), so a new flow costs `socket`, `bind`, `connect` and no `fcntl(2)`.
+/// Other platforms keep the `set_nonblocking` round trip. The post-condition
+/// queries (`fcntl(F_GETFL)`, `getsockname(2)`, `getpeername(2)`) only feed
+/// `debug_assert!`s, so they are compiled out of release builds.
 pub fn udp_connect(backend: SocketAddr) -> Result<UdpSocket, ServerBindError> {
     let unspecified: SocketAddr = match backend {
         SocketAddr::V4(_) => (std::net::Ipv4Addr::UNSPECIFIED, 0).into(),
@@ -1730,15 +1737,18 @@ pub fn udp_connect(backend: SocketAddr) -> Result<UdpSocket, ServerBindError> {
         0,
         "ephemeral bind must use port 0 so the kernel picks the source port"
     );
-    let sock = Socket::new(
-        Domain::for_address(backend),
-        Type::DGRAM,
-        Some(Protocol::UDP),
-    )
-    .map_err(ServerBindError::SocketCreationError)?;
+    // Linux takes `O_NONBLOCK` at creation, which saves the `F_GETFL`/`F_SETFL`
+    // pair of `set_nonblocking` on every new flow.
+    #[cfg(target_os = "linux")]
+    let ty = Type::DGRAM.nonblocking();
+    #[cfg(not(target_os = "linux"))]
+    let ty = Type::DGRAM;
+    let sock = Socket::new(Domain::for_address(backend), ty, Some(Protocol::UDP))
+        .map_err(ServerBindError::SocketCreationError)?;
 
     sock.bind(&unspecified.into())
         .map_err(ServerBindError::BindError)?;
+    #[cfg(not(target_os = "linux"))]
     sock.set_nonblocking(true)
         .map_err(ServerBindError::SetNonBlocking)?;
     // `connect` on a DGRAM socket pins the return 4-tuple; a non-blocking
@@ -1748,37 +1758,41 @@ pub fn udp_connect(backend: SocketAddr) -> Result<UdpSocket, ServerBindError> {
 
     // Post-conditions — assert the flag/connect state stuck (logic bug if not),
     // degrading to a no-op when the kernel refuses the query so a dying fd never
-    // panics on this network-facing path.
-    if let Ok(nonblocking) = sock.nonblocking() {
-        debug_assert!(
-            nonblocking,
-            "udp_connect must return a non-blocking socket (the worker event loop is edge-triggered)"
-        );
-    }
-    // The connected return socket's local addr family must match the backend,
-    // and the kernel must have assigned a concrete source port (no longer 0).
-    if let Ok(local) = sock.local_addr() {
-        debug_assert_eq!(
-            local.is_ipv4(),
-            backend.is_ipv4(),
-            "connected UDP socket family must match the backend family"
-        );
-        if let Some(local) = local.as_socket() {
-            debug_assert_ne!(
-                local.port(),
-                0,
-                "connect must bind a concrete ephemeral source port (the return-demux key)"
+    // panics on this network-facing path. Each query is a syscall that only
+    // feeds a `debug_assert!`, so release builds skip them on this per-flow path.
+    #[cfg(debug_assertions)]
+    {
+        if let Ok(nonblocking) = sock.nonblocking() {
+            debug_assert!(
+                nonblocking,
+                "udp_connect must return a non-blocking socket (the worker event loop is edge-triggered)"
             );
         }
-    }
-    // `connect` pinned the peer 4-tuple — `getpeername(2)` must echo the backend.
-    if let Ok(peer) = sock.peer_addr()
-        && let Some(peer) = peer.as_socket()
-    {
-        debug_assert_eq!(
-            peer, backend,
-            "connect must pin the peer to the requested backend (symmetric-NAT return-demux key)"
-        );
+        // The connected return socket's local addr family must match the backend,
+        // and the kernel must have assigned a concrete source port (no longer 0).
+        if let Ok(local) = sock.local_addr() {
+            debug_assert_eq!(
+                local.is_ipv4(),
+                backend.is_ipv4(),
+                "connected UDP socket family must match the backend family"
+            );
+            if let Some(local) = local.as_socket() {
+                debug_assert_ne!(
+                    local.port(),
+                    0,
+                    "connect must bind a concrete ephemeral source port (the return-demux key)"
+                );
+            }
+        }
+        // `connect` pinned the peer 4-tuple — `getpeername(2)` must echo the backend.
+        if let Ok(peer) = sock.peer_addr()
+            && let Some(peer) = peer.as_socket()
+        {
+            debug_assert_eq!(
+                peer, backend,
+                "connect must pin the peer to the requested backend (symmetric-NAT return-demux key)"
+            );
+        }
     }
 
     Ok(UdpSocket::from_std(sock.into()))
@@ -2275,6 +2289,201 @@ mod tests {
             !rendered.contains("peer=None"),
             "the SOCKET peer= slot must not collapse to None while a cache exists; \
              rendered: {rendered}"
+        );
+    }
+
+    /// Counts, with a seccomp user-notification filter, the `fcntl(2)`,
+    /// `getsockname(2)` and `getpeername(2)` calls one `udp_connect` makes,
+    /// then checks the returned socket's flags and addresses.
+    ///
+    /// The filter is installed on a dedicated thread only (no `TSYNC`), so the
+    /// rest of the test binary is untouched. Every matching call is reported to
+    /// this thread, counted, and let through unchanged
+    /// (`SECCOMP_USER_NOTIF_FLAG_CONTINUE`), so `udp_connect` sees the real
+    /// kernel answers. Release builds must make none of the three calls: the
+    /// socket is born non-blocking and the post-condition queries only feed
+    /// `debug_assert!`s. Debug builds keep exactly those queries: one
+    /// `F_GETFL`, one `getsockname`, one `getpeername`.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn udp_connect_is_born_nonblocking_and_skips_release_queries() {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+
+        const WATCHED: [libc::c_long; 3] = [
+            libc::SYS_fcntl,
+            libc::SYS_getsockname,
+            libc::SYS_getpeername,
+        ];
+
+        let backend_sock =
+            std::net::UdpSocket::bind("127.0.0.1:0").expect("the test backend must bind");
+        let backend = backend_sock
+            .local_addr()
+            .expect("the test backend must report its address");
+
+        let (listener_tx, listener_rx) = std::sync::mpsc::channel::<OwnedFd>();
+        let worker = std::thread::spawn(move || {
+            let stmt = |code: u32, k: u32| libc::sock_filter {
+                code: code as u16,
+                jt: 0,
+                jf: 0,
+                k,
+            };
+            let jeq = |k: libc::c_long, jt: u8| libc::sock_filter {
+                code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                jt,
+                jf: 0,
+                k: k as u32,
+            };
+            // `seccomp_data.nr` is the first field; any watched number jumps
+            // to the USER_NOTIF return, everything else is allowed.
+            let mut program = [
+                stmt(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, 0),
+                jeq(WATCHED[0], 3),
+                jeq(WATCHED[1], 2),
+                jeq(WATCHED[2], 1),
+                stmt(libc::BPF_RET | libc::BPF_K, libc::SECCOMP_RET_ALLOW),
+                stmt(libc::BPF_RET | libc::BPF_K, libc::SECCOMP_RET_USER_NOTIF),
+            ];
+            let fprog = libc::sock_fprog {
+                len: program.len() as u16,
+                filter: program.as_mut_ptr(),
+            };
+            // SAFETY: plain syscalls on this thread; `fprog` outlives them.
+            let listener = unsafe {
+                assert_eq!(
+                    libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0),
+                    0,
+                    "PR_SET_NO_NEW_PRIVS: {}",
+                    std::io::Error::last_os_error()
+                );
+                libc::syscall(
+                    libc::SYS_seccomp,
+                    libc::SECCOMP_SET_MODE_FILTER,
+                    libc::SECCOMP_FILTER_FLAG_NEW_LISTENER,
+                    &fprog as *const libc::sock_fprog,
+                )
+            };
+            assert!(
+                listener >= 0,
+                "installing the seccomp filter failed: {}",
+                std::io::Error::last_os_error()
+            );
+            // SAFETY: the kernel just returned this descriptor to us.
+            let listener = unsafe { OwnedFd::from_raw_fd(listener as libc::c_int) };
+            listener_tx
+                .send(listener)
+                .expect("the counting thread must receive the listener");
+            udp_connect(backend)
+        });
+
+        let listener = listener_rx
+            .recv()
+            .expect("the worker must hand over the seccomp listener");
+        let mut counts = [0usize; 3];
+        loop {
+            let mut pollfd = libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd. The 10 s bound only turns a wedged
+            // worker into a failure instead of a hung test run.
+            let ready = unsafe { libc::poll(&mut pollfd, 1, 10_000) };
+            assert!(ready > 0, "no seccomp notification or hang-up within 10 s");
+            if pollfd.revents & libc::POLLIN == 0 {
+                // POLLHUP: the filtered thread has exited.
+                break;
+            }
+            // SAFETY: both structs are plain data; RECV requires a zeroed one.
+            let mut notif: libc::seccomp_notif = unsafe { std::mem::zeroed() };
+            if unsafe {
+                libc::ioctl(
+                    listener.as_raw_fd(),
+                    libc::SECCOMP_IOCTL_NOTIF_RECV,
+                    &mut notif,
+                )
+            } != 0
+            {
+                let error = std::io::Error::last_os_error();
+                // ENOENT: the notifying call was interrupted before we read it.
+                assert_eq!(
+                    error.raw_os_error(),
+                    Some(libc::ENOENT),
+                    "SECCOMP_IOCTL_NOTIF_RECV: {error}"
+                );
+                continue;
+            }
+            let nr = libc::c_long::from(notif.data.nr);
+            let slot = WATCHED
+                .iter()
+                .position(|watched| *watched == nr)
+                .expect("the filter only reports watched syscalls");
+            counts[slot] += 1;
+            let mut resp: libc::seccomp_notif_resp = unsafe { std::mem::zeroed() };
+            resp.id = notif.id;
+            resp.flags = libc::SECCOMP_USER_NOTIF_FLAG_CONTINUE as u32;
+            // SAFETY: `resp` is a valid response for the id just received.
+            let sent = unsafe {
+                libc::ioctl(
+                    listener.as_raw_fd(),
+                    libc::SECCOMP_IOCTL_NOTIF_SEND,
+                    &mut resp,
+                )
+            };
+            assert_eq!(
+                sent,
+                0,
+                "SECCOMP_IOCTL_NOTIF_SEND: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        let sock = worker
+            .join()
+            .expect("the filtered thread must not panic")
+            .expect("udp_connect must succeed toward a bound loopback backend");
+
+        let expected = if cfg!(debug_assertions) {
+            [1, 1, 1]
+        } else {
+            [0, 0, 0]
+        };
+        assert_eq!(
+            counts,
+            expected,
+            "udp_connect (fcntl, getsockname, getpeername) calls, debug_assertions = {}",
+            cfg!(debug_assertions)
+        );
+
+        let fd = sock.as_raw_fd();
+        // SAFETY: fcntl queries on a descriptor we own.
+        let (status, fd_flags) = unsafe {
+            (
+                libc::fcntl(fd, libc::F_GETFL),
+                libc::fcntl(fd, libc::F_GETFD),
+            )
+        };
+        assert!(status >= 0 && fd_flags >= 0, "fcntl on the returned socket");
+        assert_ne!(
+            status & libc::O_NONBLOCK,
+            0,
+            "the socket must be non-blocking"
+        );
+        assert_ne!(
+            fd_flags & libc::FD_CLOEXEC,
+            0,
+            "the socket must be close-on-exec"
+        );
+        let local = sock
+            .local_addr()
+            .expect("the socket must report its local address");
+        assert!(local.is_ipv4(), "the local family must match the backend's");
+        assert_ne!(local.port(), 0, "connect must pick a concrete source port");
+        assert_eq!(
+            sock.peer_addr().expect("the socket must be connected"),
+            backend,
+            "connect must pin the peer to the backend"
         );
     }
 }
