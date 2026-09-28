@@ -3151,9 +3151,25 @@ impl ConnectionH2 {
                     // what keeps one stream's stall from terminating the next
                     // stream's flush before its first transmit.
                     pass.stalled = false;
+                    // A request in error on a backend stream whose HEADERS
+                    // never left (the H1 frontend rejected the body and
+                    // answered 400 itself, say) must not reach the converter,
+                    // whose `initialize` would queue a RST_STREAM for a stream
+                    // the backend has never seen: a connection error on the
+                    // shared connection (RFC 9113 §5.1, §6.4,
+                    // sozu-proxy/sozu#1631). There is nothing to cancel; the
+                    // stream is left for `end_stream` or the idle reaper, which
+                    // retire it without a frame.
+                    let never_opened_error = kawa.is_error()
+                        && !kawa.consumed
+                        && matches!(self.position, Position::Client(..));
+                    #[cfg(debug_assertions)]
+                    let out_before = kawa.out.len();
                     if kawa.is_main_phase()
                         || (kawa.is_terminated() && !kawa.is_completed())
-                        || (kawa.is_error() && !self.stream_table.rst_sent_contains(stream_id))
+                        || (kawa.is_error()
+                            && !never_opened_error
+                            && !self.stream_table.rst_sent_contains(stream_id))
                     {
                         let window = min(*parts.window, self.flow_control.window());
                         // Same-urgency-bucket ready-peer count (Tier 3a, LIFECYCLE §9
@@ -3286,6 +3302,11 @@ impl ConnectionH2 {
                         pass.census_mut()
                             .note_fired(urgency, stream_id, is_incremental, consumed);
                     }
+                    #[cfg(debug_assertions)]
+                    debug_assert!(
+                        !never_opened_error || kawa.out.len() == out_before,
+                        "nothing is encoded for a backend stream in error that never opened"
+                    );
                     context.debug.push(DebugEvent::S(
                         stream_id,
                         global_stream_id,
@@ -4403,9 +4424,31 @@ impl ConnectionH2 {
                     }
                 }
             }
-            (H2State::Error, _)
-            | (H2State::ClientSettings, Position::Server)
-            | (H2State::ServerSettings, Position::Client(..)) => {
+            // The preface and SETTINGS are out and the server's SETTINGS are
+            // not read yet: there is nothing to write until they are. A write
+            // readiness here is not an error — `start_stream` arms one for a
+            // stream linked to this connection, which `Router::connect` does
+            // for a `Connected` connection whatever its handshake state — so
+            // it is withdrawn, and the SETTINGS ACK the read queues re-arms it
+            // (sozu-proxy/sozu#1631). Only the control-frame preamble, which
+            // already ran, may have written: stream frames wait for `Header`.
+            (H2State::ServerSettings, Position::Client(..)) => {
+                trace!(
+                    "{} waiting for the server SETTINGS before writing streams",
+                    log_context!(self)
+                );
+                self.readiness.interest.remove(Ready::WRITABLE);
+                debug_assert!(
+                    !self.readiness.interest.is_writable(),
+                    "a backend awaiting the server SETTINGS must stop asking to write"
+                );
+                debug_assert!(
+                    self.readiness.interest.is_readable(),
+                    "a backend awaiting the server SETTINGS must keep reading them"
+                );
+                H2WritableStateTarget::Done(MuxResult::Continue)
+            }
+            (H2State::Error, _) | (H2State::ClientSettings, Position::Server) => {
                 error!(
                     "{} Unexpected combination: (Writable, {:?}, {:?})",
                     log_context!(self),
@@ -4464,6 +4507,13 @@ impl ConnectionH2 {
             }
             (H2State::ClientPreface, Position::Client(..)) => {
                 trace!("{} Preparing preface and settings", log_context!(self));
+                // RFC 9113 §3.4: the preface is the first byte on the wire.
+                // No stream frame can be queued before it, because no stream
+                // opens before `Header` (sozu-proxy/sozu#1631).
+                debug_assert!(
+                    self.output.is_empty(),
+                    "nothing may be queued ahead of the client connection preface"
+                );
                 self.output.push(serializer::H2_PRI.as_bytes());
                 let local_settings = &self.local_settings;
                 match self.output.push_frames(SETTINGS_FRAME_SIZE, |buf| {
@@ -4968,7 +5018,25 @@ impl ConnectionH2 {
             // flood violation that becomes visible mid-iteration will be
             // re-detected on the next `record_rst_emitted` call (the
             // counter is sticky), so dropping the early-return is safe.
-            let _ = self.enqueue_rst(sid, H2Error::Cancel);
+            //
+            // A backend stream whose HEADERS never left is forgotten, not
+            // reset: a RST_STREAM on a stream the backend has never seen is a
+            // connection error that takes down every stream of the shared
+            // connection (sozu-proxy/sozu#1631, see the `Position::Client` arm
+            // of `ConnectionH2::end_stream`).
+            let never_opened = matches!(self.position, Position::Client(..))
+                && self
+                    .stream_table
+                    .get(sid)
+                    .is_some_and(|gid| !context.streams[gid].front.consumed);
+            let queued_before = self.control_tx.lifetime_queued();
+            if !never_opened {
+                let _ = self.enqueue_rst(sid, H2Error::Cancel);
+            }
+            debug_assert!(
+                !never_opened || self.control_tx.lifetime_queued() == queued_before,
+                "a backend stream reaped before its HEADERS left must not be reset"
+            );
 
             // Remove from streams map and recycle the context stream so the slot
             // no longer counts against MAX_CONCURRENT_STREAMS.
@@ -7359,10 +7427,35 @@ impl ConnectionH2 {
                     // already in "closed" state (RFC 9113 §5.1) — sending RST_STREAM
                     // on a closed stream would be a protocol error that could cause
                     // the H2 peer to close the entire connection.
+                    //
+                    // Nor for a stream the backend has never seen: its id is
+                    // allocated by `start_stream` when the request is linked,
+                    // but its HEADERS leave with a later write pass, and they
+                    // may never have (the preface is not out yet, the pass has
+                    // not run, or the socket took nothing and the block sits
+                    // parked in `front.out`). On `Position::Client`,
+                    // `front.consumed` is exactly "a request byte reached this
+                    // socket", and a stream's first frame is its HEADERS. A
+                    // RST_STREAM on an idle stream is a connection error
+                    // (RFC 9113 §5.1, §6.4), and one queued ahead of the
+                    // preface breaks it (§3.4): either takes down every stream
+                    // this shared connection carries (sozu-proxy/sozu#1631).
+                    // The stream is forgotten instead, as hyperium/h2 drops a
+                    // stream still pending open: its id is burnt, which the
+                    // next HEADERS on a higher id closes implicitly
+                    // (RFC 9113 §5.1.1). A block parked unsent is dropped with
+                    // it and resets the encoder's table on the next pass
+                    // (`ConnectionH2::parked_header_block`).
                     let stream = &context.streams[stream_gid];
                     let fully_completed =
                         stream.back_received_end_of_stream && stream.front.is_terminated();
-                    if !fully_completed && !self.stream_table.rst_sent_contains(id) {
+                    let opened_on_the_wire = stream.front.consumed;
+                    #[cfg(debug_assertions)]
+                    let queued_before = self.output.len();
+                    if opened_on_the_wire
+                        && !fully_completed
+                        && !self.stream_table.rst_sent_contains(id)
+                    {
                         // Same path as a PING or SETTINGS ACK: queued whole
                         // behind any output already waiting, including the
                         // rest of a stream frame a partial write cut, and
@@ -7385,6 +7478,17 @@ impl ConnectionH2 {
                     // if they still reference this gid — the slot may be popped
                     // by `shrink_trailing_recycle` on the next create_stream.
                     self.remove_dead_stream(id, stream_gid);
+                    // Post: a stream that never opened on the wire leaves no
+                    // frame of its own behind (sozu-proxy/sozu#1631).
+                    #[cfg(debug_assertions)]
+                    debug_assert!(
+                        opened_on_the_wire || self.output.len() == queued_before,
+                        "no frame is queued for a backend stream whose HEADERS never left"
+                    );
+                    debug_assert!(
+                        !self.stream_table.streams().contains_key(&id),
+                        "end_stream must retire the backend stream's wire id"
+                    );
                     if context.streams[stream_gid].state != StreamState::Recycle {
                         context.streams[stream_gid].state = StreamState::Unlinked;
                     }
@@ -14918,6 +15022,9 @@ mod tests {
             .create_stream(Ulid::generate(), 1 << 16)
             .expect("test context must create a stream");
         context.streams[gid].state = StreamState::Linked(mio::Token(1));
+        // The backend is answering, so the request's HEADERS reached it: only
+        // a stream opened on the wire is reset (sozu-proxy/sozu#1631).
+        context.streams[gid].front.consumed = true;
         connection
             .core
             .stream_table
@@ -14988,6 +15095,514 @@ mod tests {
              PING ACK; state={:?} expect_read={:?}",
             connection.core.state,
             connection.core.stream_table.expect_read()
+        );
+    }
+
+    /// What [`backend_with_a_linked_stream`] builds. Callers bind `_pool`
+    /// first so it is dropped last, after everything holding its buffers.
+    struct LinkedBackend {
+        connection: H2Shell<mio::net::TcpStream>,
+        /// The backend's end of the socket.
+        peer: std::net::TcpStream,
+        context: Context<TestListener>,
+        router: Router,
+        /// The linked stream's global id.
+        gid: GlobalStreamId,
+        _pool: Rc<RefCell<Pool>>,
+    }
+
+    /// A backend (`Position::Client`) connection in `state` over a loopback
+    /// socket, with `interest`, and one stream linked to it by
+    /// [`H2Shell::start_stream`]: stream 1, whose HEADERS no write pass has
+    /// sent.
+    fn backend_with_a_linked_stream(
+        state: H2State,
+        status: BackendStatus,
+        interest: Ready,
+    ) -> LinkedBackend {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+        let (socket, peer) = connected_socket();
+        let backend = Rc::new(RefCell::new(crate::backends::Backend::new(
+            "idle-backend",
+            "127.0.0.1:2".parse().expect("backend address must parse"),
+            None,
+            None,
+            None,
+        )));
+        let mut registry = crate::protocol::mux::BackendRegistry::default();
+        let expect_read = match state {
+            H2State::ClientPreface | H2State::ClientSettings => None,
+            _ => Some((H2StreamId::Zero, 9)),
+        };
+        let mut connection = H2Shell::new(
+            Ulid::generate(),
+            socket,
+            Position::Client("idle-cluster".into(), registry.id_for(&backend), status),
+            &mut PoolBufferSource::new(Rc::downgrade(&pool)),
+            H2FloodConfig::default(),
+            H2ConnectionConfig::default(),
+            Duration::from_secs(30),
+            None,
+            Duration::from_secs(30),
+            expect_read,
+            interest,
+        )
+        .expect("a pool with free buffers must yield an H2 connection");
+        connection.core.state = state;
+        let mut context = test_context(&pool);
+        let router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        let gid = context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("test context must create a stream");
+        assert!(
+            connection.start_stream(gid, &mut context),
+            "premise: the backend connection accepts the stream"
+        );
+        assert_eq!(
+            connection.core.stream_table.get(1),
+            Some(gid),
+            "premise: the stream got wire id 1"
+        );
+        LinkedBackend {
+            connection,
+            peer,
+            context,
+            router,
+            gid,
+            _pool: pool,
+        }
+    }
+
+    /// Drive a backend connection the way `Mux` does — `writable()` and
+    /// `readable()` only when the filtered readiness allows them — and answer
+    /// every byte its peer end received.
+    fn drive_and_read_backend(
+        connection: &mut H2Shell<mio::net::TcpStream>,
+        peer: &mut std::net::TcpStream,
+        context: &mut Context<TestListener>,
+        router: &mut Router,
+    ) -> Vec<u8> {
+        use std::io::Read;
+
+        let mut received = Vec::new();
+        for _ in 0..64 {
+            connection
+                .core
+                .readiness
+                .event
+                .insert(Ready::READABLE | Ready::WRITABLE);
+            if connection.core.readiness.filter_interest().is_writable() {
+                connection.writable(context, EndpointClient(router));
+            }
+            if connection.core.readiness.filter_interest().is_readable() {
+                connection.readable(context, EndpointClient(router));
+            }
+            let mut buf = [0u8; 256];
+            if let Ok(n) = peer.read(&mut buf) {
+                received.extend_from_slice(&buf[..n]);
+            }
+            std::thread::yield_now();
+        }
+        received
+    }
+
+    /// Queue a GET request on `gid`'s request side, closed with END_STREAM,
+    /// the way a relayed request reaches a backend's write pass.
+    fn queue_request(context: &mut Context<TestListener>, gid: GlobalStreamId) {
+        let kawa = &mut context.streams[gid].front;
+        kawa.detached.status_line = kawa::StatusLine::Request {
+            version: kawa::Version::V20,
+            method: kawa::Store::Static(b"GET"),
+            uri: kawa::Store::Static(b"/"),
+            authority: kawa::Store::Static(b"example.com"),
+            path: kawa::Store::Static(b"/"),
+        };
+        kawa.push_block(kawa::Block::StatusLine);
+        kawa.push_block(kawa::Block::Header(kawa::Pair {
+            key: kawa::Store::Static(b"x-client"),
+            val: kawa::Store::Static(b"alice"),
+        }));
+        kawa.push_block(kawa::Block::Flags(kawa::Flags {
+            end_body: false,
+            end_chunk: false,
+            end_header: true,
+            end_stream: true,
+        }));
+        kawa.parsing_phase = kawa::ParsingPhase::Terminated;
+    }
+
+    /// sozu-proxy/sozu#1631, `Header` row: a backend stream ended before any
+    /// write pass sent its HEADERS is idle on the backend, and a RST_STREAM
+    /// for it is a connection error there (RFC 9113 §5.1, §6.4) that takes
+    /// down every stream of the shared connection. It must be forgotten: no
+    /// frame at all.
+    ///
+    /// TO SEE THIS RED: in the `Position::Client` arm of
+    /// [`ConnectionH2::end_stream`], replace `opened_on_the_wire` in the RST
+    /// condition with `true`. The backend then reads `RST_STREAM(1, CANCEL)`:
+    /// `left: [0, 0, 4, 3, 0, 0, 0, 0, 1, 0, 0, 0, 8], right: []`. Red on
+    /// `d5161919`, verified 2026-09-28.
+    #[test]
+    fn a_backend_stream_ended_before_its_headers_left_is_not_reset() {
+        let LinkedBackend {
+            _pool,
+            mut connection,
+            mut peer,
+            mut context,
+            mut router,
+            gid,
+        } = backend_with_a_linked_stream(
+            H2State::Header,
+            BackendStatus::Connected,
+            Ready::READABLE | Ready::HUP | Ready::ERROR,
+        );
+
+        connection.end_stream(gid, &mut context);
+        let received =
+            drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+
+        assert_eq!(
+            received,
+            Vec::<u8>::new(),
+            "the backend must receive nothing for a stream it never saw"
+        );
+        assert!(
+            connection.core.stream_table.is_empty()
+                && !connection.core.stream_table.rst_sent_contains(1),
+            "the stream is retired without a reset"
+        );
+        assert!(
+            matches!(connection.core.state, H2State::Header),
+            "the shared connection stays up, got {:?}",
+            connection.core.state
+        );
+    }
+
+    /// sozu-proxy/sozu#1631, `ClientPreface` row: the backend connection's
+    /// TCP connect is still in progress when the stream ends. The preface
+    /// must be the first bytes the backend reads (RFC 9113 §3.4), with no
+    /// frame for the stream anywhere.
+    ///
+    /// TO SEE THIS RED: same edit as
+    /// `a_backend_stream_ended_before_its_headers_left_is_not_reset`. The
+    /// backend then reads the RST before `PRI * HTTP/2.0`: `the connection
+    /// preface must come first`. Red on `d5161919`, verified 2026-09-28.
+    #[test]
+    fn a_backend_stream_ended_before_the_preface_leaves_the_preface_first() {
+        let LinkedBackend {
+            _pool,
+            mut connection,
+            mut peer,
+            mut context,
+            mut router,
+            gid,
+        } = backend_with_a_linked_stream(
+            H2State::ClientPreface,
+            BackendStatus::Connecting(Instant::now()),
+            Ready::WRITABLE | Ready::HUP | Ready::ERROR,
+        );
+
+        connection.end_stream(gid, &mut context);
+        let received =
+            drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+
+        let preface = serializer::H2_PRI.as_bytes();
+        assert!(
+            received.starts_with(preface),
+            "the connection preface must come first, got {received:?}"
+        );
+        let frames =
+            peer_frames(&received[preface.len()..]).expect("whole frames after the preface");
+        assert!(
+            frames.iter().all(|(kind, _, id, _)| *id == 0 && *kind != 3),
+            "only connection-level frames may follow, got {frames:?}"
+        );
+    }
+
+    /// sozu-proxy/sozu#1631, `ServerSettings` row: the preface is out and the
+    /// server's SETTINGS are not read yet. Neither ending a stream nor
+    /// linking one may kill the connection; `start_stream` arms a write, as
+    /// it must for `Router::connect`, which links onto a `Connected`
+    /// connection whatever its handshake state.
+    ///
+    /// TO SEE THIS RED: in [`ConnectionH2::dispatch_writable_state`], move
+    /// `(H2State::ServerSettings, Position::Client(..))` back into the
+    /// `Unexpected combination` arm. The connection then force-disconnects:
+    /// `the shared connection must survive the handshake, got Error`. Red on
+    /// `d5161919`, verified 2026-09-28.
+    #[test]
+    fn a_backend_stream_ended_during_the_handshake_keeps_the_connection() {
+        let LinkedBackend {
+            _pool,
+            mut connection,
+            mut peer,
+            mut context,
+            mut router,
+            gid,
+        } = backend_with_a_linked_stream(
+            H2State::ServerSettings,
+            BackendStatus::Connected,
+            Ready::READABLE | Ready::HUP | Ready::ERROR,
+        );
+
+        connection.end_stream(gid, &mut context);
+        let received =
+            drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+
+        assert!(
+            matches!(connection.core.state, H2State::ServerSettings),
+            "the shared connection must survive the handshake, got {:?}",
+            connection.core.state
+        );
+        assert_eq!(
+            received,
+            Vec::<u8>::new(),
+            "the backend must receive nothing for a stream it never saw"
+        );
+    }
+
+    /// The liveness half of the `ServerSettings` fix: the write readiness
+    /// withdrawn while the server's SETTINGS are awaited comes back with
+    /// them, and a request linked during the handshake goes out after the
+    /// SETTINGS ACK.
+    ///
+    /// TO SEE THIS RED: in [`ConnectionH2::dispatch_writable_state`], move
+    /// `(H2State::ServerSettings, Position::Client(..))` back into the
+    /// `Unexpected combination` arm: the connection force-disconnects before
+    /// the SETTINGS arrive, `premise: nothing is written before the server
+    /// SETTINGS, got [] in Error`. Red on `d5161919`, verified 2026-09-28.
+    #[test]
+    fn a_request_linked_during_the_handshake_goes_out_after_the_settings() {
+        use std::io::Write;
+
+        let LinkedBackend {
+            _pool,
+            mut connection,
+            mut peer,
+            mut context,
+            mut router,
+            gid,
+        } = backend_with_a_linked_stream(
+            H2State::ServerSettings,
+            BackendStatus::Connected,
+            Ready::READABLE | Ready::HUP | Ready::ERROR,
+        );
+        queue_request(&mut context, gid);
+        let before = drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+        assert!(
+            before.is_empty() && matches!(connection.core.state, H2State::ServerSettings),
+            "premise: nothing is written before the server SETTINGS, got {before:?} in {:?}",
+            connection.core.state
+        );
+
+        peer.write_all(&orphan_frame(4, 0, 0, 0, b""))
+            .expect("loopback write must complete");
+        let after = drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+
+        let frames = peer_frames(&after).expect("whole frames");
+        assert!(
+            frames
+                .iter()
+                .any(|(kind, flags, id, _)| *kind == 4 && *flags == parser::FLAG_ACK && *id == 0),
+            "the server SETTINGS are acknowledged, got {frames:?}"
+        );
+        assert!(
+            frames.iter().any(|(kind, _, id, _)| *kind == 1 && *id == 1),
+            "the request linked during the handshake must go out, got {frames:?}"
+        );
+    }
+
+    /// sozu-proxy/sozu#1631, reaper form: `cancel_timed_out_streams` has the
+    /// same shape as `end_stream` for a backend stream reaped before its
+    /// HEADERS left, and must forget it the same way.
+    ///
+    /// TO SEE THIS RED: in [`ConnectionH2::cancel_timed_out_streams`], make
+    /// `never_opened` `false`. The stream is then reset: `a stream reaped
+    /// before its HEADERS left must not be reset`. Red on `d5161919`,
+    /// verified 2026-09-28.
+    #[test]
+    fn a_backend_stream_reaped_before_its_headers_left_is_not_reset() {
+        let LinkedBackend {
+            _pool,
+            mut connection,
+            mut peer,
+            mut context,
+            mut router,
+            gid: _,
+        } = backend_with_a_linked_stream(
+            H2State::Header,
+            BackendStatus::Connected,
+            Ready::READABLE | Ready::HUP | Ready::ERROR,
+        );
+        connection.core.readiness.interest.remove(Ready::WRITABLE);
+
+        context.now += Duration::from_secs(31);
+        connection.cancel_timed_out_streams(&mut context, &mut EndpointClient(&mut router));
+        assert!(
+            connection.core.stream_table.is_empty(),
+            "premise: the idle guard reaped stream 1"
+        );
+        assert!(
+            connection.core.control_tx.pending().is_empty()
+                && !connection.core.readiness.interest.is_writable()
+                && connection.core.output.is_empty(),
+            "a stream reaped before its HEADERS left must not be reset"
+        );
+        let received =
+            drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+        assert_eq!(
+            received,
+            Vec::<u8>::new(),
+            "and nothing reaches the backend"
+        );
+    }
+
+    /// sozu-proxy/sozu#1631, frontend-error form (found by the adversarial
+    /// review of the first fix): the H1 frontend rejects a malformed request
+    /// body and answers 400 itself, which leaves the request kawa in `Error`
+    /// while its backend stream is still registered and its HEADERS never
+    /// left. The next write pass used to hand it to the converter, whose
+    /// `initialize` queues a RST_STREAM for that idle stream.
+    ///
+    /// TO SEE THIS RED: in [`ConnectionH2::poll_write_target`]'s
+    /// `H2WritePhase::Prepare` arm, make `never_opened_error` `false`. The
+    /// backend then reads `RST_STREAM(1)`: `no frame may name stream 1`.
+    /// Red on `6eef0ba1`, verified 2026-09-28.
+    #[test]
+    fn a_backend_stream_whose_request_failed_before_its_headers_left_is_not_reset() {
+        let LinkedBackend {
+            _pool,
+            mut connection,
+            mut peer,
+            mut context,
+            mut router,
+            gid,
+        } = backend_with_a_linked_stream(
+            H2State::Header,
+            BackendStatus::Connected,
+            Ready::READABLE | Ready::HUP | Ready::ERROR,
+        );
+        queue_request(&mut context, gid);
+        // What `kawa::h1::parse` leaves on a malformed chunked body.
+        context.streams[gid]
+            .front
+            .parsing_phase
+            .error(kawa::ParsingErrorKind::Processing {
+                message: "malformed chunk",
+            });
+        assert!(
+            context.streams[gid].front.is_error() && !context.streams[gid].front.consumed,
+            "premise: the request failed before any byte left"
+        );
+
+        let received =
+            drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+
+        let frames = peer_frames(&received).expect("whole frames");
+        assert!(
+            frames.iter().all(|(_, _, id, _)| *id != 1),
+            "no frame may name stream 1, which the backend never saw: {frames:?}"
+        );
+        assert!(
+            matches!(connection.core.state, H2State::Header),
+            "the shared connection stays up, got {:?}",
+            connection.core.state
+        );
+    }
+
+    /// sozu-proxy/sozu#1631, parked form: the stream's HEADERS were encoded
+    /// by a write pass, but the socket took none of it, so the block is
+    /// parked in `front.out` (the #1627 situation on `Position::Client`).
+    /// The backend has still not seen the stream: no RST for it, and since
+    /// #1630 the dropped block resets the encoder's table, so the next
+    /// stream's block still decodes on the backend.
+    ///
+    /// TO SEE THIS RED: same edit as
+    /// `a_backend_stream_ended_before_its_headers_left_is_not_reset`. The
+    /// backend then reads a RST_STREAM for stream 1, which it never opened:
+    /// `no frame may name stream 1`. Red on `d5161919`, verified 2026-09-28.
+    #[test]
+    fn a_backend_stream_ended_with_its_headers_parked_is_not_reset() {
+        let pool = make_pool_for_invariant_16();
+        let (socket, _peer) = connected_socket();
+        let backend = Rc::new(RefCell::new(crate::backends::Backend::new(
+            "parked-backend",
+            "127.0.0.1:2".parse().expect("backend address must parse"),
+            None,
+            None,
+            None,
+        )));
+        let mut registry = crate::protocol::mux::BackendRegistry::default();
+        let mut connection = H2Shell::new(
+            Ulid::generate(),
+            PacedSocket {
+                stream: socket,
+                budget: 0,
+                wire: Vec::new(),
+                inbound: std::collections::VecDeque::new(),
+            },
+            Position::Client(
+                "parked-cluster".into(),
+                registry.id_for(&backend),
+                BackendStatus::Connected,
+            ),
+            &mut PoolBufferSource::new(Rc::downgrade(&pool)),
+            H2FloodConfig::default(),
+            H2ConnectionConfig::default(),
+            Duration::from_secs(30),
+            None,
+            Duration::from_secs(30),
+            Some((H2StreamId::Zero, 9)),
+            Ready::READABLE | Ready::WRITABLE | Ready::HUP | Ready::ERROR,
+        )
+        .expect("a pool with free buffers must yield an H2 connection");
+        connection.core.state = H2State::Header;
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        let first = context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("test context must create a stream");
+        queue_request(&mut context, first);
+        assert!(
+            connection.start_stream(first, &mut context),
+            "premise: stream 1"
+        );
+        connection.core.readiness.event.insert(Ready::WRITABLE);
+        connection.writable(&mut context, EndpointClient(&mut router));
+        assert!(
+            connection.socket.wire.is_empty()
+                && !context.streams[first].front.out.is_empty()
+                && !context.streams[first].front.consumed,
+            "premise: stream 1's HEADERS were encoded and parked unsent"
+        );
+
+        connection.end_stream(first, &mut context);
+        let third = context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("test context must create a stream");
+        queue_request(&mut context, third);
+        assert!(
+            connection.start_stream(third, &mut context),
+            "premise: stream 3"
+        );
+        connection.socket.budget = usize::MAX;
+        drive_both_ways(&mut connection, &mut context, &mut router);
+
+        let frames = peer_frames(&connection.socket.wire).expect("whole frames");
+        assert!(
+            frames.iter().all(|(_, _, id, _)| *id != 1),
+            "no frame may name stream 1, which the backend never saw: {frames:?}"
+        );
+        let mut decoder = crate::protocol::mux::hpack::Decoder::new();
+        let decoded: Vec<(u32, bool)> = frames
+            .iter()
+            .filter(|(kind, ..)| *kind == 1)
+            .map(|(_, _, id, payload)| (*id, decoder.decode_with_cb(payload, |_, _| {}).is_ok()))
+            .collect();
+        assert_eq!(
+            decoded,
+            vec![(3, true)],
+            "stream 3's block must decode with the backend's own table"
         );
     }
 

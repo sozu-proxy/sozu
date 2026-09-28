@@ -220,6 +220,17 @@ Declared in `h2.rs` (`pub enum H2State`):
                     Error         ← terminal (force_disconnect queued)
 ```
 
+- On a backend (`Position::Client`) the same names run the other way: the
+  `ClientPreface` writable arm queues the preface and SETTINGS, which must be
+  the first bytes on the wire (RFC 9113 §3.4, debug-asserted: nothing is queued
+  before them), `ClientSettings` flushes them and turns READABLE on, and
+  `ServerSettings` waits for the server's SETTINGS. A write readiness in
+  `ServerSettings` is withdrawn, not an error: `ConnectionH2::start_stream`
+  arms one for every stream the router links, and `Router::connect` links onto
+  a `Connected` connection whatever its handshake state; the SETTINGS ACK the
+  read then queues re-arms it (sozu-proxy/sozu#1631,
+  `a_backend_stream_ended_during_the_handshake_keeps_the_connection`,
+  `a_request_linked_during_the_handshake_goes_out_after_the_settings`).
 - `ClientPreface` → `ClientSettings` at `h2.rs:2669`.
 - `ClientSettings` → `ServerSettings` in the `H2State::ClientSettings` arm of
   `ConnectionH2::handle_read` (`h2.rs`), right after the SETTINGS frame is
@@ -238,8 +249,8 @@ Declared in `h2.rs` (`pub enum H2State`):
   `ClientPreface` bullet above used at an earlier revision — a collision the
   drift rule cannot tell from staleness, because it keys on the citation text
   rather than on where it sits (sozu-proxy/sozu#1447). Do not convert it back.
-- `Continuation*` states handle multi-frame HEADERS per RFC 9113 §4.3 — enter at
-  `h2.rs:6350`.
+- `Continuation*` states handle multi-frame HEADERS per RFC 9113 §4.3 — enter in
+  `ConnectionH2::handle_headers_frame` (`h2.rs`).
 - **Discard does not skip HPACK.** HPACK field-compression state is scoped to
   the *connection* (RFC 9113 §4.3), not the stream, so the bytes `Discard`
   drops on a refused stream are still a field block the peer's encoder has
@@ -790,10 +801,10 @@ method that calls it more than once, or — for the `close` exception below —
 one block inside a method that does several unrelated things:
 
 - `poll_write_target` after end-of-stream — the `H2WritePhase::Resume` retirement
-  at `h2.rs:3178` and `H2WritePhase::End`'s deferred `completed_streams` loop at
-  `h2.rs:3585`.
+  and `H2WritePhase::End`'s deferred `completed_streams` loop, both in
+  `ConnectionH2::poll_write_target` (`h2.rs`).
 - `ConnectionH2::prune_inactive_streams_while_closing` (`h2.rs`).
-- `handle_window_update_frame` zero-increment path — `h2.rs:7074`.
+- `ConnectionH2::handle_window_update_frame` zero-increment path (`h2.rs`).
 - `ConnectionH2::cancel_timed_out_streams` slow-multiplex guard (`h2.rs`).
 - `ConnectionH2::handle_continuation_header_state` CONTINUATION oversize
   (`h2.rs`).
@@ -808,7 +819,7 @@ reintroduced inline `self.streams.remove(...)` inside `ConnectionH2` fails
 with `E0609: no field 'streams'`). The one exception below does not remove at
 all:
 
-- `close` backend-stream teardown — `h2.rs:8230-8232` (does not remove, only
+- `close` backend-stream teardown — the final loop of `H2Shell::close` (`h2.rs`) (does not remove, only
   notifies the endpoint — the surrounding `close` path drops the whole
   connection, and every entry in the wire map (`self.stream_table`) with it,
   shortly after).
@@ -1033,7 +1044,7 @@ deadlines are compared against `ConnectionH2.now` (§7.5):
    SETTINGS ACK is overdue (`h2.rs:2433-2443`) — before any read is offered.
 3. Then `ConnectionH2::handle_read` consumes the frame / payload.
 4. `writable()` mirrors this check, via `flush_pending_control_frames`
-   (`h2.rs:4389-4399`).
+   (`ConnectionH2::flush_pending_control_frames`, `h2.rs`).
 5. If the frontend timer fires while streams are linked, the timeout logic in
    `Mux::timeout` (`mod.rs`) decides per-stream; backend timer fires independently.
 6. Loop budget (`MAX_LOOP_ITERATIONS = 10_000`, `mod.rs`) is a hard backstop
@@ -1087,18 +1098,18 @@ asymmetry that produces it is architectural:
 - An **arm** site runs at an arbitrary depth into its pass — the liveness
   refreshes in the DATA-payload arm of `ConnectionH2::poll_read_target` (`h2.rs`, by
   symbol for the collision the liveness `Reset:` bullet above records — do not
-  convert it back) and at `h2.rs:6371` (HEADERS), the
+  convert it back) and in `ConnectionH2::handle_headers_frame` (`h2.rs`, HEADERS), the
   outbound-byte refreshes in the `H2WritePhase::Resume` branch of
   `ConnectionH2::poll_write_target` (`h2.rs`, by symbol because the `writable`
   lift moved another citation onto the number this one used to carry — do not
   convert it back) and at
-  `h2.rs:3420-3422` (`H2WritePhase::Flush`), the `FcStallAction::Arm` branch of
+  the `H2WritePhase::Flush` arm of `ConnectionH2::poll_write_target` (`h2.rs`), the `FcStallAction::Arm` branch of
   `ConnectionH2::poll_write_target` (`h2.rs`) — and stamps the
   snapshot taken at the START of that pass. The
   stored instant is therefore OLDER than the event it records.
 - An **eval** site runs near the top of a pass: `cancel_timed_out_streams` is
   the first thing `readable` does (§7.4 step 1), and the SETTINGS-ACK check
-  (`h2.rs:2433` in `poll_read_target`, `h2.rs:4389` in `flush_pending_control_frames`)
+  (in `ConnectionH2::poll_read_target` and in `ConnectionH2::flush_pending_control_frames`, `h2.rs`)
   is step 2.
 - The measured age is therefore inflated by the arm site's depth, so a deadline
   can fire up to one pass **early** as well as one pass late. Worked against the
@@ -1327,8 +1338,8 @@ Two GOAWAY frames in `ConnectionH2::graceful_goaway` (`h2.rs`):
    can still arrive. Called first time from `Mux::shutting_down_inner`
    (`lib/src/protocol/mux/mod.rs`). Draining flag set.
 2. **Final GOAWAY** — on the second invocation (draining already true), call
-   `goaway(NoError)` (`h2.rs:5564`) with the actual `highest_peer_stream_id`,
-   remove `READABLE` interest (`h2.rs:5520`), transition to `H2State::GoAway`.
+   `goaway(NoError)` (`ConnectionH2::goaway`, `h2.rs`) with the actual `highest_peer_stream_id`,
+   remove `READABLE` interest (same function), transition to `H2State::GoAway`.
    Caller is `finalize_write` when all streams drain (`h2.rs`).
 
 `peer_gone_after_final_goaway` (`h2.rs`) guards against deadlock on a
@@ -1347,6 +1358,34 @@ Three directions:
   cleanup, queues the outgoing RST via
   [`enqueue_rst`](#proxy-rst-emission-path), and counts against
   `record_rst_emitted` (CVE-2025-8671 MadeYouReset) unless `NoError`.
+- **Never for a backend stream still idle** — on `Position::Client` a stream id
+  is allocated by `ConnectionH2::start_stream` when the router links the
+  request, but its HEADERS leave with a later write pass, possibly never (the
+  preface is not out, the pass has not run, or the socket took nothing and the
+  block is parked in `front.out`). `front.consumed` is exactly "a request byte
+  reached this socket", and a stream's first frame is its HEADERS, so until it
+  is set the backend has not seen the stream: a RST_STREAM for it is a
+  connection error there (RFC 9113 §5.1, §6.4), and one queued before the
+  preface breaks the connection preface (§3.4). The `Position::Client` arm of
+  `ConnectionH2::end_stream` and `ConnectionH2::cancel_timed_out_streams`
+  therefore retire such a stream with no frame, and the `H2WritePhase::Prepare`
+  arm of `ConnectionH2::poll_write_target` does not hand a request in error
+  whose HEADERS never left to the converter, whose `initialize` would queue
+  the RST (an H1 frontend that rejects a malformed body answers 400 itself and
+  leaves the backend stream registered), as hyperium/h2 drops a stream
+  still pending open; the burnt id is closed implicitly by the next HEADERS on
+  a higher id (§5.1.1), and a HEADERS block parked unsent is dropped with the
+  stream and resets the HPACK encoder's table on the next pass (§9 invariant
+  28). The connection is shared by the streams of several clients
+  (`Router::connect`), so a RST here used to cost all of them
+  (sozu-proxy/sozu#1631). Pinned by
+  `a_backend_stream_ended_before_its_headers_left_is_not_reset`,
+  `a_backend_stream_ended_before_the_preface_leaves_the_preface_first`,
+  `a_backend_stream_reaped_before_its_headers_left_is_not_reset`,
+  `a_backend_stream_ended_with_its_headers_parked_is_not_reset` (`h2.rs`, red
+  on `d5161919`) and
+  `a_backend_stream_whose_request_failed_before_its_headers_left_is_not_reset`
+  (red on `6eef0ba1`).
 - **Proxy-initiated, idle cancel** — `cancel_timed_out_streams` (§7.2); the
   per-stream `forcefully_terminate_answer` call in the `Mux::timeout_inner` timeout
   path now arms `Ready::WRITABLE` via `arm_writable()` so the pair with
@@ -1502,12 +1541,15 @@ soft-stop.
 `ConnectionH2::end_stream` (`h2.rs`) is the server-side wiper for a single
 stream that has completed on the backend. Behavior depends on `Position`:
 
-- **Client** position (i.e. the backend's view) — `h2.rs:7479-7530`. Sends
-  RST_STREAM(CANCEL) unless both request and response have terminated, removes
-  the wire mapping, marks the stream `Unlinked` if not already `Recycle`.
+- **Client** position (i.e. the backend's view) — the `Position::Client` arm
+  of `ConnectionH2::end_stream` (`h2.rs`). Sends
+  RST_STREAM(CANCEL) unless both request and response have terminated, or the
+  request's HEADERS never left (`front.consumed` false), removes the wire
+  mapping, marks the stream `Unlinked` if not already `Recycle`. A stream the
+  backend has never seen gets no frame at all (sozu-proxy/sozu#1631): see §8.2.
 - **Server** position — the `Position::Server` arm of `ConnectionH2::end_stream`
-  (`h2.rs:7531-7682`; the range start is one of eight identical
-  `Position::Server => {` lines, hence the symbol). Dispatches on
+  (`h2.rs`; by symbol because `Position::Server => {` is one of eight
+  identical lines). Dispatches on
   `end_stream_decision` (`shared.rs`): either `ForwardTerminated`,
   `CloseDelimited`, `ForwardUnterminated`, `SendDefault(status)`, `Reconnect`,
   or `ReplayOnFreshBackend` — each path sets the appropriate `StreamState` and
@@ -2652,6 +2694,19 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     `frame_tail_cases`, `h2_output`'s unit tests and
     `a_full_output_queue_stops_reading_until_it_drains`.
 
+29. **A backend stream the backend has never seen gets no frame.** On
+    `Position::Client`, until `front.consumed` is set no byte of the
+    request has reached the socket, so its HEADERS have not left and the
+    stream is idle on the backend. Retiring it (`ConnectionH2::end_stream`,
+    `ConnectionH2::cancel_timed_out_streams`) queues nothing, and a request
+    in error is not handed to the converter (`H2WritePhase::Prepare`): a RST_STREAM on
+    an idle stream is a connection error (RFC 9113 §5.1, §6.4) on a
+    connection other clients share. The client preface is the first thing
+    queued on a backend connection (debug-asserted in the `ClientPreface` arm
+    of `ConnectionH2::dispatch_writable_state`), and a write readiness while
+    the server's SETTINGS are awaited is withdrawn, never answered with a
+    disconnect (§2.2, §8.2, sozu-proxy/sozu#1631).
+
 
 ---
 
@@ -2714,7 +2769,7 @@ arm) fires when `socket_wants_write()` is still true after `MAX_DRAIN_ROUNDS`
 empty `socket_write_vectored(&[])` calls. The severity is tiered along
 **stream-count + close-state**, not peer-vs-operator. The tier is intentionally
 orthogonal to — and composes with — the send-side `H2Error`-variant tier in
-`goaway()` (`h2.rs:5503-5507`); both rules demote benign paths and keep
+`ConnectionH2::goaway` (`h2.rs`); both rules demote benign paths and keep
 loss-bearing paths loud.
 
 | Stream count   | `H2State`           | Severity | Rationale                                                                                                                                                                                                                                                                         |

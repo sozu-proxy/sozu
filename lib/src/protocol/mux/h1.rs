@@ -496,6 +496,31 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     self.end_stream(global_stream_id, context);
                     endpoint.end_stream(token, global_stream_id, context);
                 }
+                Position::Server if stream.back.consumed => {
+                    // The response already started on the wire — a backend
+                    // may answer early and stream its body while the client
+                    // is still uploading. A 400 now would land inside that
+                    // body as a second, complete response, which the client
+                    // reads as part of the first. The response is cut
+                    // instead: nothing more is written, and the connection
+                    // closes for writing, so the client sees a truncated
+                    // message (RFC 9112 §8), never a spliced one.
+                    incr!(names::http::FRONTEND_PARSE_ERRORS);
+                    warn!(
+                        "{} H1 request rejected after its response started: closing",
+                        log_context!(self)
+                    );
+                    forcefully_terminate_answer(
+                        stream,
+                        &mut self.readiness,
+                        H2Error::InternalError,
+                    );
+                    debug_assert!(
+                        stream.back.is_error() && stream.back.out.is_empty(),
+                        "a response already started is cut, not replaced"
+                    );
+                    return self.defer_close_for_tls_flush("request-error-mid-response");
+                }
                 Position::Server => {
                     incr!(names::http::FRONTEND_PARSE_ERRORS);
                     let answers = answers_rc.borrow();
@@ -2184,6 +2209,85 @@ mod tests {
                 }
             }
         })
+    }
+
+    /// A request that fails to parse after its response started on the wire
+    /// (a backend answering early and streaming its body while the client
+    /// still uploads a chunked body, then a malformed chunk) must cut that
+    /// response, never splice a complete `HTTP/1.1 400` into its body, which
+    /// the client would read as part of the first response.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH1::readable`, delete the
+    /// `Position::Server if stream.back.consumed` arm. The 400 is then
+    /// written: `no 400 may follow a response already on the wire`.
+    #[test]
+    fn a_request_error_after_the_response_started_cuts_it_instead_of_splicing_a_400() {
+        use std::io::Read;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let mut context = test_context(&pool);
+        context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("the test pool must hand out stream buffers");
+        let (front_socket, mut front_peer) = connected_socket();
+        front_peer
+            .set_nonblocking(true)
+            .expect("the loopback peer must switch to non-blocking");
+        let mut server = h1_of(Connection::new_h1_server(
+            Ulid::generate(),
+            front_socket,
+            Duration::from_secs(60),
+        ));
+        server.stream = Some(0);
+        let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+        // The early response already put bytes on the client's wire.
+        context.streams[0].back.consumed = true;
+
+        front_peer
+            .write_all(
+                b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\n",
+            )
+            .expect("the loopback peer must accept the staged request bytes");
+        let mut result = MuxResult::Continue;
+        for _ in 0..64 {
+            server.readiness.event.insert(Ready::READABLE);
+            result = server.readable(&mut context, EndpointClient(&mut router));
+            if context.streams[0].front.is_error() {
+                break;
+            }
+        }
+        assert!(
+            context.streams[0].front.is_error(),
+            "premise: the malformed chunk must be rejected by the parse"
+        );
+
+        let mut received = Vec::new();
+        for _ in 0..16 {
+            server.readiness.event.insert(Ready::WRITABLE);
+            if server.readiness.filter_interest().is_writable() {
+                server.writable(&mut context, EndpointClient(&mut router));
+            }
+            let mut buf = [0u8; 4096];
+            if let Ok(n) = front_peer.read(&mut buf) {
+                received.extend_from_slice(&buf[..n]);
+            }
+        }
+        assert!(
+            !received.windows(12).any(|w| w == b"HTTP/1.1 400"),
+            "no 400 may follow a response already on the wire, got {:?}",
+            String::from_utf8_lossy(&received)
+        );
+        assert_ne!(
+            context.streams[0].context.status,
+            Some(400),
+            "the started response must not be replaced by a 400"
+        );
+        assert!(
+            context.streams[0].back.is_error() && matches!(result, MuxResult::CloseSession),
+            "the response is cut and the session closes, got {:?} / {:?}",
+            context.streams[0].back.parsing_phase,
+            result
+        );
     }
 
     /// The access log of an H1 request carries the frontend round-trip time,
