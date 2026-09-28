@@ -30,6 +30,12 @@ It addresses [#1155](https://github.com/sozu-proxy/sozu/issues/1155).
 - **File-descriptor passing**: a separate side-band channel uses
   `SCM_RIGHTS` (see `command/src/scm_socket.rs`) to hand off listener
   fds during hot upgrades. Regular CLI traffic does not use SCM.
+  Received descriptors are close-on-exec (`MSG_CMSG_CLOEXEC`): the main
+  process forks and execs the new worker while it holds the listeners it
+  received from the retiring one, and they reach that worker over SCM only.
+  A descriptor that must cross `exec` (channels, state and upgrade files, the
+  command socket) has `FD_CLOEXEC` cleared explicitly by
+  `util::disable_close_on_exec` in `bin/`.
 
 ## Wire frame
 
