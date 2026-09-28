@@ -63,8 +63,9 @@
 //! or reuses `zero.storage` any more, and the six guards this paragraph used
 //! to list (the hung-up, WINDOW_UPDATE and RST_STREAM stages, the
 //! deferred-initial-GOAWAY check, `graceful_goaway`'s decision and the
-//! shutdown flush) are gone but for `graceful_goaway`'s defer-or-send drain
-//! policy. The paragraph below is the account they were written against.
+//! shutdown flush) are all gone — the last, `graceful_goaway`'s defer-or-send
+//! drain policy, together with `header_block_reassembly_in_progress()` itself
+//! in #1637. The paragraph below is the account they were written against.
 //!
 //! **What was *not* eliminated by this module, and needed guarding until
 //! #1604** — checked via `header_block_reassembly_in_progress()`: a single

@@ -3304,6 +3304,23 @@
 
 ### 🐛 Fixed
 
+- **`fix(mux-h2)`: a graceful drain sends its advisory GOAWAY immediately, even while a peer
+  header block is incomplete ([#1637](https://github.com/sozu-proxy/sozu/issues/1637)).**
+  `H2DrainState::begin_graceful_drain` deferred the initial `GOAWAY(NO_ERROR, 2^31-1)` until an
+  in-progress HEADERS/CONTINUATION block completed, a guard added for #1401 when the GOAWAY was
+  serialised into the buffer that also held the block. Since #1625 it goes to the separate
+  output queue, so the deferral protected nothing, and it had one effect of its own: a soft-stop
+  landing while a connection's only stream was mid-block closed the session with nothing
+  queued, so the client saw no GOAWAY at all, against RFC 9113 §6.8. RFC 9113 §4.3/§6.10
+  constrain the block's sender, not a GOAWAY travelling the other way; hyperium/h2 and HAProxy
+  send it the same way. **Visible change:** the advisory GOAWAY now leaves in the drain pass
+  itself, possibly before the rest of a peer's header block, and such a session no longer closes
+  without one. Removed with it: `initial_goaway_pending`, `GracefulDrainDecision::DeferInitial`,
+  `H2DrainState::take_deferred_initial_goaway`, the deferred-GOAWAY stage of
+  `ConnectionH2::flush_pending_control_frames` and `ConnectionH2::header_block_reassembly_in_progress`.
+  Pinned by `test_h2_graceful_drain_mid_header_block_sends_goaway_before_closing`
+  (`e2e/src/tests/h2_tests.rs`), red before the change.
+
 - **`fix(mux)`: an H1 client connection closes after a response carrying the backend's
   `Connection: close` ([#1642](https://github.com/sozu-proxy/sozu/issues/1642)).** sozu forwards
   that header to the client, but `ConnectionH1::writable` kept a keep-alive client connection

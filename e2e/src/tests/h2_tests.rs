@@ -874,25 +874,23 @@ fn try_h2_goaway_graceful_drain() -> State {
 /// reached the backend; stream 3's CONTINUATION is then split across TWO TLS
 /// writes, and `soft_stop()` fires BETWEEN them.
 ///
-/// **The drain must land mid-FRAME, not merely mid-BLOCK** (sozu#1453). An
+/// **The drain lands mid-FRAME, not merely mid-BLOCK** (sozu#1453). An
 /// earlier revision of this test sent the whole CONTINUATION in one write, so
-/// the drain always landed on a frame boundary: reassembly in progress, but
-/// `zero.storage` empty, the accumulated block safe in
-/// `ConnectionH2::header_reassembly` where no write-side site can reach it.
-/// `graceful_goaway`'s `GracefulDrainDecision::DeferInitial` therefore
-/// protected nothing this test could observe — forcing its
-/// `reassembly_in_progress` argument to `false` left the test GREEN, which
-/// means the production guarantee could have been deleted outright without
-/// this test noticing. The window that decision still guards is the one
-/// `h2_header_reassembly.rs` names: a single CONTINUATION frame whose payload
-/// is *mid-`socket_read()`*, its already-read bytes sitting in `zero.storage`
-/// with more still to come. `send_initial_goaway` clears `zero.storage` to
-/// serialize the GOAWAY into it, so landing the drain in that window destroys
-/// those bytes unless the decision defers. Splitting the CONTINUATION is what
-/// puts this test inside it — the same shape
+/// the drain always landed on a frame boundary, where the then-live
+/// `GracefulDrainDecision::DeferInitial` guard protected nothing the test
+/// could observe. The split put the test inside the window that guard was
+/// written for: a single CONTINUATION frame whose payload is
+/// *mid-`socket_read()`*, its already-read bytes sitting in `zero.storage`
+/// with more still to come — the same shape
 /// `reassembly_property::qc_h2_header_reassembly_survives_interleaved_control_frame_flushes`
-/// covers at the unit level, driven here through a real worker and a real TLS
-/// socket.
+/// (`lib/src/protocol/mux/h2.rs`) covers at the unit level. Since #1604 the
+/// GOAWAY is queued in the separate output queue and `zero` is input only, so
+/// that window holds by construction; #1637 then removed the deferral itself.
+/// What this test still pins is the absence of corruption: a drain landing on
+/// a half-read CONTINUATION must leave the block to complete and be served.
+/// The advisory GOAWAY now leaves in the drain pass itself, before the rest
+/// of the frame; `test_h2_graceful_drain_mid_header_block_sends_goaway_before_closing`
+/// pins that it is sent at all.
 ///
 /// All three orderings are established by waiting on an observable state
 /// change, not by sleeping: `h2.frames.rx.headers` proves sozu decoded the
@@ -900,10 +898,9 @@ fn try_h2_goaway_graceful_drain() -> State {
 /// first chunk's length proves sozu read those bytes and no others, so the
 /// half-read frame really is parked in `zero.storage`; and `server.live`
 /// dropping to 0 proves the soft-stop drain has already reached this
-/// connection. All three are read over the worker's command channel, because
-/// the connection itself can witness none of them — no frame may legally be
-/// interleaved into an open header block, and the initial GOAWAY is
-/// deliberately deferred for the duration of the reassembly this test creates.
+/// connection. The first two are read over the worker's command channel,
+/// because no frame may legally be interleaved into an open header block, so
+/// the connection itself cannot witness them.
 ///
 /// `drain_witnessed` (a GOAWAY frame observed in the response) remains a
 /// required part of success, not just `anchor_ok`/`stream3_ok`: without it, a
@@ -1052,12 +1049,11 @@ fn try_h2_continuation_survives_a_graceful_drain_mid_reassembly() -> State {
 
     // Stream 3's CONTINUATION, split across two TLS writes so the drain
     // below lands while this ONE FRAME is half-read: its first bytes already
-    // in `zero.storage`, `expect_read` still owing the rest. That is the
-    // window `graceful_goaway`'s defer decision actually guards (sozu#1453).
-    // A CONTINUATION written whole only ever presents a frame BOUNDARY —
+    // in `zero.storage`, `expect_read` still owing the rest (sozu#1453). A
+    // CONTINUATION written whole only ever presents a frame BOUNDARY —
     // `zero.storage` empty, the accumulated block already copied into
-    // `ConnectionH2::header_reassembly` — where `send_initial_goaway`'s
-    // `clear()` has nothing left to destroy and the defer decision is inert.
+    // `ConnectionH2::header_reassembly` — which is not the window this test
+    // exists to reach.
     assert!(
         second_half.len() >= 2,
         "stream 3's CONTINUATION payload must be at least 2 bytes to split \
@@ -1139,9 +1135,8 @@ fn try_h2_continuation_survives_a_graceful_drain_mid_reassembly() -> State {
 
     // Trigger a graceful shutdown WHILE stream 3's CONTINUATION is still
     // half-read — the mid-`socket_read()` window `h2_header_reassembly.rs`
-    // names as the one `graceful_goaway`'s defer decision still guards, and
-    // the wire-level twin of the mid-frame interleave `reassembly_property`
-    // generates — while stream 1 is still unresolved on the backend holding
+    // names, and the wire-level twin of the mid-frame interleave
+    // `reassembly_property` generates — while stream 1 is still unresolved on the backend holding
     // its response, so the worker actually drains instead of exiting with
     // nothing to wait for. `soft_stop()` only signals the worker; the drain
     // itself runs asynchronously on the worker's own event loop.
@@ -1157,14 +1152,11 @@ fn try_h2_continuation_survives_a_graceful_drain_mid_reassembly() -> State {
     // iteration — by which time the iteration that wrote it, and therefore
     // the `graceful_goaway` call that followed it, has completed.
     //
-    // The wire cannot witness this either, and here the absence is by design:
-    // `graceful_goaway` DEFERS the initial GOAWAY while reassembly is in
-    // progress (`GracefulDrainDecision::DeferInitial`) precisely so it does
-    // not clobber the block being reassembled. In the interleaving this test
-    // exists to exercise, no GOAWAY is emitted until the CONTINUATION below
-    // completes the block — so gating on one would wait for a frame that
-    // correct behaviour guarantees will not come, and would only ever proceed
-    // in the runs where the premise had already been missed.
+    // Since #1637 the advisory GOAWAY leaves in that same drain pass, so it
+    // is already on its way when the gate below opens. The gate stays on
+    // `server.live` rather than on reading that GOAWAY from `tls`, so the
+    // sequencing does not depend on when the drain policy emits it, and every
+    // frame stays unread for the single collection below.
     let drain_start = Instant::now();
     while query_proxy_gauge(&mut worker, sozu_lib::metrics::names::server::LIVE) != Some(0) {
         if drain_start.elapsed() > Duration::from_secs(5) {
@@ -1245,10 +1237,9 @@ fn try_h2_continuation_survives_a_graceful_drain_mid_reassembly() -> State {
     // NOTHING about the race this test exists to exercise. The `server.live`
     // gate has already established that the drain reached this connection
     // while the CONTINUATION was half-read — before its remaining bytes went
-    // out, and after the ones that put it mid-frame — so the deferred GOAWAY is
-    // owed — but it is emitted by a later `flush_pending_control_frames`
-    // pass, and this assertion is what holds the run to actually observing
-    // it rather than assuming it. Treat a missing witness as a failed
+    // out, and after the ones that put it mid-frame — so the advisory GOAWAY
+    // is owed, and this assertion is what holds the run to actually
+    // observing it rather than assuming it. Treat a missing witness as a failed
     // (inconclusive) run rather than a silent pass, so
     // `repeat_until_error_or`'s retries have a chance to land one that
     // actually raced the drain.
@@ -1266,6 +1257,94 @@ fn try_h2_continuation_survives_a_graceful_drain_mid_reassembly() -> State {
     delayed_backend.stop();
 
     if success && anchor_ok && stream3_ok && drain_witnessed {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+// ============================================================================
+// Test 3c: a drain landing mid-header-block still announces itself (#1637)
+// ============================================================================
+
+/// RFC 9113 §6.8: "Endpoints SHOULD always send a GOAWAY frame before closing
+/// a connection", and a server shutting down gracefully "SHOULD send an
+/// initial GOAWAY frame with the last stream identifier set to 2^31-1".
+/// Neither sentence is conditioned on what the peer is in the middle of
+/// sending: RFC 9113 §4.3 and §6.10 forbid interleaving frames into a field
+/// block the peer is *transmitting*, not a GOAWAY travelling the other way.
+///
+/// The shape: one connection whose only stream is a HEADERS frame without
+/// END_HEADERS — a request whose field block has not finished arriving — when
+/// the worker receives `soft_stop()`. Such a stream is still
+/// `StreamState::Idle`, which `Mux::shutting_down_inner`
+/// (`lib/src/protocol/mux/mod.rs`) does not wait for, so the session is torn
+/// down in the same drain pass. What reaches the client before that close is
+/// exactly what `ConnectionH2::graceful_goaway`
+/// (`lib/src/protocol/mux/h2.rs`) queued in that pass. Until #1637 it queued
+/// nothing: the advisory GOAWAY was deferred until the block completed, the
+/// block never completed, and the client saw a bare close. It must see at
+/// least one `GOAWAY(NO_ERROR)` first.
+///
+/// No timer orders anything. `h2.frames.rx.headers` ticking proves sozu is in
+/// reassembly before the drain is requested; `wait_for_server_stop` returns
+/// only after the worker closed every session, so every byte it wrote is
+/// already in the client's socket buffer when the read starts, and the read
+/// ends at the close.
+fn try_h2_graceful_drain_mid_header_block_sends_goaway_before_closing() -> State {
+    let (mut worker, front_port, _front_address) = setup_h2_listener_only("H2-DRAIN-MID-BLOCK");
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    let headers_rx_before = query_proxy_count(&mut worker, H2_FRAMES_RX_HEADERS);
+
+    // Stream 1: HEADERS carrying half of a real request's field block, with
+    // END_HEADERS clear, so sozu enters CONTINUATION reassembly and the
+    // block never completes — the rest is never sent.
+    let block = super::h2_utils::build_chrome146_get_headers("localhost", "/api/mid-block", None);
+    let (first_half, _) = block.split_at(block.len() / 2);
+    let headers_frame = H2Frame::headers(1, first_half.to_vec(), false, true);
+    if tls.write_all(&headers_frame.encode()).is_err() || tls.flush().is_err() {
+        println!("H2 drain mid-block - HEADERS write failed");
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    // `ConnectionH2::handle_frame` counts the frame immediately before
+    // `ConnectionH2::handle_headers_frame` assigns
+    // `H2State::ContinuationHeader`, in one event-loop pass, so a later
+    // command-channel answer observing the increment implies reassembly is live.
+    let reassembly_start = Instant::now();
+    while query_proxy_count(&mut worker, H2_FRAMES_RX_HEADERS) <= headers_rx_before {
+        if reassembly_start.elapsed() > Duration::from_secs(5) {
+            println!("H2 drain mid-block - sozu never read the partial HEADERS");
+            worker.soft_stop();
+            let _ = worker.wait_for_server_stop();
+            return State::Fail;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    let data = read_all_available(&mut tls, Duration::from_secs(2));
+    let frames = parse_h2_frames(&data);
+    log_frames("H2 drain mid-block", &frames);
+
+    let announced = goaway_error_code(&frames) == Some(H2_ERROR_NO_ERROR);
+    if !announced {
+        println!(
+            "H2 drain mid-block - the session closed without a GOAWAY(NO_ERROR) \
+             ({} bytes received, stopped={stopped})",
+            data.len()
+        );
+    }
+
+    if stopped && announced {
         State::Success
     } else {
         State::Fail
@@ -1688,6 +1767,21 @@ fn test_h2_continuation_survives_a_graceful_drain_mid_reassembly() {
             "H2 edge: a HEADERS+CONTINUATION block still in progress when a \
              graceful drain lands must complete and be served, not corrupted",
             try_h2_continuation_survives_a_graceful_drain_mid_reassembly
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_h2_graceful_drain_mid_header_block_sends_goaway_before_closing() {
+    // One run settles it: the order is established causally, not by timing,
+    // so repeating it adds no assurance (see `repeat_until_error_or`).
+    assert_eq!(
+        repeat_until_error_or(
+            1,
+            "H2 edge: a graceful drain landing while a peer header block is \
+             incomplete must send a GOAWAY before closing the session",
+            try_h2_graceful_drain_mid_header_block_sends_goaway_before_closing
         ),
         State::Success
     );

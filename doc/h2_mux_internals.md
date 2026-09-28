@@ -61,7 +61,7 @@ ConnectionH2
  |
  |-- drain: H2DrainState                    // Closed API (h2_drain.rs, private fields):
  |                                         // draining, peer_last_stream_id, started_at,
- |                                         // graceful_shutdown_deadline, initial_goaway_pending
+ |                                         // graceful_shutdown_deadline
  |
  |-- flood_detector: H2FloodDetector        // Closed API (h2_flood_detector.rs, private fields):
  |                                         // config: H2FloodConfig (13 configurable thresholds),
@@ -658,7 +658,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:4703-4716
+```rust lib/src/protocol/mux/h2.rs:4656-4669
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -684,7 +684,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:4751-4757
+```rust lib/src/protocol/mux/h2.rs:4704-4710
 let events = stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -716,7 +716,7 @@ taken at the top of `H2WritePhase::Flush`'s post-flush tail
 (`ConnectionH2::poll_write_target`, `lib/src/protocol/mux/h2.rs`) and passes `stream.linked_token()` straight
 out of it:
 
-```rust lib/src/protocol/mux/h2.rs:3426-3427
+```rust lib/src/protocol/mux/h2.rs:3425-3426
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 ```
@@ -1069,7 +1069,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8509-8513
+```rust lib/src/protocol/mux/h2.rs:8431-8435
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1202,7 +1202,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8586-8590
+```rust lib/src/protocol/mux/h2.rs:8508-8512
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1289,16 +1289,13 @@ application frames, in order:
    guard its clear on `!header_block_reassembly_in_progress()` instead
 2. **SETTINGS ACK timeout check**: If peer hasn't ACK'd within 5 seconds,
    sends GOAWAY(SETTINGS_TIMEOUT)
-3. **Deferred initial GOAWAY**: `H2DrainState::take_deferred_initial_goaway`
-   check-and-clears the deferred advisory (`graceful_goaway` deferred it — see
-   below), and it is queued via `ConnectionH2::send_initial_goaway`
-4. **WINDOW_UPDATE frames**: `H2FlowControl::drain_window_updates_into`
+3. **WINDOW_UPDATE frames**: `H2FlowControl::drain_window_updates_into`
    (`h2_flow_control.rs`) serializes every queued entry into room reserved at
    the end of the output queue and removes what it wrote — coalescing already
    happened at queue time (`queue_window_update`, keyed by stream ID; `0` is
    the connection-level entry). Drain order is the map's ascending stream-id
    order, deterministic across processes — see that module's doc comment
-5. **Pending RST_STREAM frames**: Asks `H2ControlTx::drain_rst_streams_into`
+4. **Pending RST_STREAM frames**: Asks `H2ControlTx::drain_rst_streams_into`
    (`h2_control_tx.rs`) to serialize every queued frame into room reserved at
    the end of the output queue, with flood detection (`MAX_PENDING_RST_STREAMS`
    cap). Proxy-emitted RSTs (DATA-on-closed, `refuse_stream_and_discard`,
@@ -1327,7 +1324,7 @@ application frames, in order:
    `reset_stream` returns). `finalize_write` retains `Ready::WRITABLE`
    whenever the queue is non-empty, so a pass that ends before this stage
    re-runs on the next tick rather than stranding the queued RST.
-6. **One output flush**: when the output queue holds anything — what the
+5. **One output flush**: when the output queue holds anything — what the
    stages above queued, behind whatever was already waiting (an ACK, the rest
    of a stream frame a partial write cut) — the walk answers `FlushOutput`.
 
@@ -1335,10 +1332,12 @@ Before #1604 each stage serialised into `zero`, which was also the read
 landing zone, so the WINDOW_UPDATE, RST_STREAM and GOAWAY stages had to defer
 while `header_block_reassembly_in_progress()` was true and could not
 serialise while an earlier flush still owned the buffer. The output queue
-shares nothing with the read side, so only the deferred initial GOAWAY still
-waits for a block to complete, as a drain policy: the
-`initial_goaway_pending` flag is what guarantees that advisory GOAWAY is
-still sent once reassembly completes rather than silently dropped.
+shares nothing with the read side, so no stage waits for a block to complete.
+The last one that did — a deferred initial GOAWAY, kept as a drain policy after
+#1604 — was removed in #1637: `ConnectionH2::graceful_goaway` queues the
+advisory GOAWAY in the drain pass itself, because deferring it let a drain
+close a session whose only stream was mid-block without any GOAWAY (see the
+module doc of `lib/src/protocol/mux/h2_drain.rs`).
 
 Answers `H2ControlFlushTarget`: `Done(MuxResult)` when a GOAWAY already ended
 the pass, `Proceed` when `writable()` should carry on into its state dispatch,
@@ -1677,7 +1676,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:8024
+```rust lib/src/protocol/mux/h2.rs:7946
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -1888,7 +1887,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:6723-6725
+```rust lib/src/protocol/mux/h2.rs:6645-6647
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1896,7 +1895,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:6737-6743
+```rust lib/src/protocol/mux/h2.rs:6659-6665
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.
