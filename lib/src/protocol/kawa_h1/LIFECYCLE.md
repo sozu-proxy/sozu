@@ -98,7 +98,8 @@ mutable companion to the Kawa parser. Its `kawa::h1::ParserCallbacks` impl
   address — and rendered again only when one of them changes: a synthesised
   `X-Forwarded-For`, `Forwarded`, `X-Real-IP` or `X-Forwarded-Port` shares
   that rendering (`kawa::Store::Shared`), while a client-supplied chain,
-  which is request-scoped, is extended into an exact-size copy of its own;
+  which is request-scoped, is extended into an exact-size copy of its own.
+  It also ends a request that declares no body after its headers (§2.2);
 - `on_response_headers` (`editor.rs`) — captures `:status`, `:reason`,
   optionally rewrites `Set-Cookie` for sticky sessions. The reason is kept
   for the access log as the `'static` phrase RFC 9110 §15 registers for the
@@ -244,6 +245,57 @@ consumers must search both spellings.
 
 Mirrors the equivalent HTTP/2 → H1 defense, `RejectReason::ClTeConflict`
 (`lib/src/protocol/mux/pkawa.rs:289`).
+
+### 2.2 A request without Content-Length or Transfer-Encoding has no body
+
+RFC 9112 §6.3 rule 7: a request with neither header has a zero-length body,
+whatever its method or version. Read-until-close (rule 8) belongs to
+responses only. kawa 0.7.1 does not make that distinction: after
+`process_headers`, `kawa::h1::parse` maps `BodySize::Empty` to
+`ParsingPhase::Body` with `expects = 1` for both kinds, and its `Body` arm
+takes every byte left in the buffer when `body_size` is `Empty`
+(CleverCloud/kawa#23). Left alone, a request pipelined behind a plain `GET`
+became that `GET`'s body and was forwarded raw to its backend — never routed,
+never checked by `check_basic`, without `Sozu-Id` or `X-Forwarded-*`
+(CWE-444, sozu-proxy/sozu#1650).
+
+`HttpContext::on_request_headers` (`editor.rs`) therefore sets
+`ParsingPhase::Terminated` when it finds `parsing_phase == ParsingPhase::Body`
+and `body_size == BodySize::Empty`. kawa pushes the end-of-headers `Flags`
+block right after the callback with `end_stream: kawa.is_terminated()`, so the
+request is forwarded complete, `ConnectionH1::readable` stops reading the
+frontend, and the pipelined request stays unparsed until the keep-alive branch
+of `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`) parses, routes and
+edits it on its own. `body_size` stays `Empty`: nothing is injected on the
+wire, the phase alone ends the message.
+
+- **The `ParsingPhase::Body` conjunct confines the rule to the H1 parser.**
+  `pkawa::handle_header` (`lib/src/protocol/mux/pkawa.rs`) calls the same
+  `on_headers` for an H2 request while `body_size` is still `Empty` and the
+  phase still the initial one, then frames a request whose DATA follows as
+  chunked — unless the callback terminated it. `Empty` alone would drop those
+  bodies (`an_h2_request_is_left_for_pkawa_to_frame`).
+- **Responses are untouched.** `on_response_headers` never runs this rule, so
+  a response without length stays close-delimited, ended by
+  `ConnectionH1::terminate_close_delimited`.
+- **Interactions.** `Expect: 100-continue` with no length has no body to wait
+  for. A WebSocket `GET` with `Upgrade` has no body either; the 101 still
+  switches to the pipe. Bytes a client sends behind the upgrade request
+  before the 101 (which RFC 6455 §4.1 forbids) are held and reach the
+  backend after the 101, through the pipe, whether they share the request's
+  segment or not; they used to be forwarded before the 101 as the request's
+  body. Measured on 2026-09-28 with a temporary e2e probe on a clear
+  listener. `CONNECT` is not tunnelled by Sōzu: its request ends
+  after its headers like any other, where it used to stream client bytes to
+  the backend as a close-delimited "body". HTTP/1.0 follows the same rule.
+
+Covered by `a_request_without_length_ends_after_its_headers`,
+`a_framed_request_and_an_unframed_response_keep_their_bodies` (unit, in
+`editor.rs`) and the `test_h1_unframed_request_then_*` rows of
+`e2e/src/tests/h1_security_tests.rs`, which pipeline a second request behind
+an unframed `GET`, `HEAD`, `DELETE` or `POST` in one write, to the same
+cluster, another cluster and a Basic-auth-gated cluster, over clear and TLS
+listeners.
 
 ---
 
