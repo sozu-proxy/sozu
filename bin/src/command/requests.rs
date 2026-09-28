@@ -4156,9 +4156,17 @@ impl GatheringTask for StatusTask {
                 }
             };
 
+            // The probe only resolves the `NotAnswering` placeholder that
+            // `querying_info` gives a running worker. A `Stopping` worker still
+            // answers while it drains, and its answer must not report it as
+            // running (sozu#1672); a `Stopped` one is never probed.
             self.worker_infos
                 .entry(worker_id)
-                .and_modify(|worker_info| worker_info.run_state = new_run_state as i32);
+                .and_modify(|worker_info| {
+                    if worker_info.run_state == RunState::NotAnswering as i32 {
+                        worker_info.run_state = new_run_state as i32;
+                    }
+                });
         }
 
         let worker_info_vec = WorkerInfos {
@@ -5652,7 +5660,7 @@ mod load_state_rollback_tests {
     use std::collections::BTreeMap;
     use std::{fs::File, io::Write as _};
 
-    fn create_test_hub() -> (CommandHub, tempfile::TempDir) {
+    pub(super) fn create_test_hub() -> (CommandHub, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("Could not create temp dir");
         let socket_path = dir.path().join("test.sock");
         let unix_listener = UnixListener::bind(&socket_path).expect("Could not bind socket");
@@ -5732,9 +5740,9 @@ mod load_state_rollback_tests {
         gatherer
     }
 
-    type ClientPair = (ClientSession, Channel<Request, Response>);
+    pub(super) type ClientPair = (ClientSession, Channel<Request, Response>);
 
-    fn test_client() -> ClientPair {
+    pub(super) fn test_client() -> ClientPair {
         let (client_channel, peer) =
             Channel::<Response, Request>::generate_nonblocking(4096, 40960)
                 .expect("could not create a channel pair");
@@ -5757,7 +5765,7 @@ mod load_state_rollback_tests {
     /// Decode every framed `Response` queued on a client's back buffer: a
     /// nonblocking `write_message` only fills that buffer (the event loop is
     /// what flushes it), so this is where `finish_ok` / `finish_failure` land.
-    fn queued_responses(client: &ClientSession) -> Vec<Response> {
+    pub(super) fn queued_responses(client: &ClientSession) -> Vec<Response> {
         let data = client.channel.back_buf.data();
         let delimiter = delimiter_size();
         let mut responses = vec![];
@@ -6330,6 +6338,121 @@ mod load_state_rollback_tests {
         assert!(
             matches!(bulk_replay_timeout(0, 0), Timeout::Custom(d) if d >= std::time::Duration::from_secs(1)),
             "a zero worker_timeout must not produce a zero deadline"
+        );
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    //! sozu#1672: `sozu status` must report the lifecycle state the main
+    //! process knows, not RUNNING for a worker that is draining.
+    //!
+    //! `status` snapshots every worker with `querying_info`, which keeps
+    //! `Stopping` and `Stopped` and turns `Running` into the `NotAnswering`
+    //! placeholder the probe then resolves. A `Stopping` worker is still
+    //! probed — it is draining its in-flight sessions and answers — and
+    //! `StatusTask::on_finish` used to overwrite every answered entry, so a
+    //! worker left draining by `upgrade --worker` showed RUNNING while
+    //! `worker list` showed STOPPING.
+    //!
+    //! To SEE THIS RED (regression proof), drop the `NotAnswering` guard in
+    //! `StatusTask::on_finish` so every answer overwrites the snapshot again:
+    //! the draining worker comes back `Running`.
+    use std::collections::HashMap;
+
+    use sozu_command_lib::proto::command::{
+        ResponseStatus, RunState, WorkerInfo, WorkerResponse, response_content::ContentType,
+    };
+
+    use super::{
+        StatusTask,
+        load_state_rollback_tests::{create_test_hub, queued_responses, test_client},
+    };
+    use crate::command::server::{DefaultGatherer, GatheringTask};
+
+    fn info(id: u32, run_state: RunState) -> (u32, WorkerInfo) {
+        (
+            id,
+            WorkerInfo {
+                id,
+                pid: 1000 + id as i32,
+                run_state: run_state as i32,
+            },
+        )
+    }
+
+    fn answer(id: u32, status: ResponseStatus) -> (u32, WorkerResponse) {
+        (
+            id,
+            WorkerResponse {
+                id: format!("{id}-0-0"),
+                status: status as i32,
+                message: String::new(),
+                content: None,
+            },
+        )
+    }
+
+    #[test]
+    fn status_keeps_the_lifecycle_state_of_a_draining_or_stopped_worker() {
+        let (mut hub, _dir) = create_test_hub();
+        let (mut client, _peer) = test_client();
+
+        // The snapshot `status` takes: worker 0 drains after `upgrade --worker`,
+        // worker 1 runs (placeholder `NotAnswering`), worker 2 runs but its
+        // probe fails, worker 3 has exited and is never probed.
+        let task = StatusTask {
+            client_token: client.token,
+            gatherer: DefaultGatherer {
+                responses: vec![
+                    answer(0, ResponseStatus::Ok),
+                    answer(1, ResponseStatus::Ok),
+                    answer(2, ResponseStatus::Failure),
+                ],
+                ..Default::default()
+            },
+            worker_infos: HashMap::from([
+                info(0, RunState::Stopping),
+                info(1, RunState::NotAnswering),
+                info(2, RunState::NotAnswering),
+                info(3, RunState::Stopped),
+            ]),
+        };
+        Box::new(task).on_finish(&mut hub.server, &mut Some(&mut client), false);
+
+        let responses = queued_responses(&client);
+        let last = responses
+            .last()
+            .expect("the client must be answered exactly once");
+        assert_eq!(last.status, ResponseStatus::Ok as i32, "{last:?}");
+        let Some(ContentType::Workers(workers)) = last
+            .content
+            .as_ref()
+            .and_then(|content| content.content_type.clone())
+        else {
+            panic!("status must answer with the worker list: {last:?}");
+        };
+        let mut states: Vec<(u32, RunState)> = workers
+            .vec
+            .iter()
+            .map(|worker| {
+                (
+                    worker.id,
+                    RunState::try_from(worker.run_state).expect("a known run state"),
+                )
+            })
+            .collect();
+        states.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            states,
+            vec![
+                (0, RunState::Stopping),
+                (1, RunState::Running),
+                (2, RunState::NotAnswering),
+                (3, RunState::Stopped),
+            ],
+            "a draining worker must stay Stopping and an exited one Stopped; \
+             only the probed running workers resolve to Running or NotAnswering"
         );
     }
 }
