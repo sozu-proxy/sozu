@@ -163,6 +163,8 @@ sozu --config /etc/sozu/config.toml shutdown
 A soft shutdown returns once every worker has finished its in-flight requests and prints the
 final result, however long the drain lasts: it does not apply `--timeout` or
 `ctl_command_timeout`. `shutdown --hard` does not wait for the requests and keeps the timeout.
+The commands that apply the timeout wait `--timeout` milliseconds, or `ctl_command_timeout` when
+the flag is absent, and `0` disables that timeout.
 
 Restart sozu and restore its state:
 

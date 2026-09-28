@@ -19,7 +19,7 @@ impl CommandManager {
 
     fn read_channel_message_with_timeout(&mut self) -> Result<Response, CtlError> {
         self.channel
-            .read_message_blocking_timeout(Some(self.timeout))
+            .read_message_blocking_timeout(self.timeout)
             .map_err(CtlError::ReadBlocking)
     }
 
@@ -189,7 +189,7 @@ impl CommandManager {
 
                 let mut command_manager = CommandManager {
                     channel,
-                    timeout: Duration::from_secs(60), // overriden by upgrade_timeout anyway
+                    timeout: Some(Duration::from_secs(60)), // overriden by upgrade_timeout anyway
                     config,
                     json: false,
                 };
