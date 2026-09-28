@@ -88,6 +88,12 @@ pub enum WebSocketContext {
 pub struct Pipe<Front: SocketHandler, L: ListenerHandler> {
     backend_buffer: Checkout,
     backend_id: Option<String>,
+    /// Address of the backend this pipe forwards to, recorded when Sōzu
+    /// picked it: from `backend` in `Pipe::new` (WebSocket upgrades), or
+    /// through `set_backend_address` by the TCP proxy when it dials. The
+    /// access log reads it from here instead of asking the socket with
+    /// `getpeername(2)` once per session.
+    backend_address: Option<SocketAddr>,
     pub backend_readiness: Readiness,
     backend_socket: Option<TcpStream>,
     backend_status: ConnectionStatus,
@@ -168,9 +174,11 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             ConnectionStatus::Normal
         };
 
+        let backend_address = backend.as_ref().map(|backend| backend.borrow().address);
         let mut session = Pipe {
             backend_buffer,
             backend_id,
+            backend_address,
             backend_readiness: Readiness {
                 interest: Ready::READABLE | Ready::WRITABLE | Ready::HUP | Ready::ERROR,
                 event: Ready::EMPTY,
@@ -327,15 +335,24 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         self.backend_token = Some(token);
     }
 
+    /// Record the address of the backend Sōzu dialed for this pipe (see the
+    /// `backend_address` field doc). The TCP proxy calls it on every dial,
+    /// so a retry onto another backend overwrites the previous address.
+    pub fn set_backend_address(&mut self, backend_address: Option<SocketAddr>) {
+        self.backend_address = backend_address;
+    }
+
     pub fn get_session_address(&self) -> Option<SocketAddr> {
         self.session_address
             .or_else(|| self.frontend.socket_ref().peer_addr().ok())
     }
 
+    /// The address recorded when the backend was chosen, without a
+    /// `getpeername(2)`: it stays reported whatever the socket's state, where
+    /// `peer_addr` failed with `ENOTCONN` on a backend still connecting or
+    /// already reset.
     pub fn get_backend_address(&self) -> Option<SocketAddr> {
-        self.backend_socket
-            .as_ref()
-            .and_then(|backend| backend.peer_addr().ok())
+        self.backend_address
     }
 
     fn protocol_string(&self) -> &'static str {
@@ -3263,5 +3280,76 @@ mod tests {
     #[test]
     fn splice_readable_recovers_when_pipe_growth_is_refused() {
         assert!(!exercise_splice_readable_pipe_full_recovery(true));
+    }
+    /// The access log's backend address is the one recorded when the backend
+    /// was chosen, never a `getpeername(2)` on the backend socket: that call
+    /// cost one syscall per session, and failed with `ENOTCONN` (logging no
+    /// address) on a backend still connecting or already reset.
+    ///
+    /// The backend socket here is refused: nothing listens on its port, so
+    /// on loopback it is reset before the first assertion and `peer_addr`
+    /// can only fail. The address must still be reported, first from the
+    /// `Backend` handed to `Pipe::new` (the WebSocket upgrade path), then from
+    /// `set_backend_address` (the TCP proxy's dial, overwritten on a retry).
+    ///
+    /// To SEE THIS RED: make `Pipe::get_backend_address` return
+    /// `self.backend_socket.as_ref().and_then(|backend| backend.peer_addr().ok())`
+    /// again. The first assertion then fails with `None`.
+    #[test]
+    fn backend_address_is_reported_without_asking_the_socket() {
+        let refused = {
+            let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind a throwaway listener");
+            listener
+                .local_addr()
+                .expect("throwaway listener local addr")
+        };
+        let backend_socket = TcpStream::connect(refused).expect("a nonblocking connect starts");
+        let (_frontend_peer, frontend_socket) = connected_pair();
+
+        let mut pool = Pool::with_capacity(2, 2, 4096);
+        let backend_buffer = pool.checkout().expect("backend buffer");
+        let frontend_buffer = pool.checkout().expect("frontend buffer");
+        let address = "127.0.0.1:0".parse().expect("test address");
+        let listener = Rc::new(RefCell::new(TestListener { address }));
+        let backend = Rc::new(RefCell::new(Backend::new(
+            "backend-refused",
+            refused,
+            None,
+            None,
+            None,
+        )));
+
+        let mut pipe = Pipe::new(
+            backend_buffer,
+            Some("backend-refused".to_owned()),
+            Some(backend_socket),
+            Some(backend),
+            None,
+            None,
+            None,
+            frontend_buffer,
+            Token(0),
+            TcpStream::from_std(frontend_socket),
+            listener,
+            Protocol::HTTP,
+            Ulid::generate(),
+            Ulid::generate(),
+            None,
+            WebSocketContext::Tcp,
+        );
+        assert_eq!(
+            pipe.get_backend_address(),
+            Some(refused),
+            "the address of the backend handed to Pipe::new must be reported \
+             even though its socket was refused"
+        );
+
+        let retried: SocketAddr = "192.0.2.7:4242".parse().expect("retry address");
+        pipe.set_backend_address(Some(retried));
+        assert_eq!(
+            pipe.get_backend_address(),
+            Some(retried),
+            "a later dial must replace the reported backend address"
+        );
     }
 }

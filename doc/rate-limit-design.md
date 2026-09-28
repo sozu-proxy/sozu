@@ -292,10 +292,10 @@ against the socket peer:
   function that resolves step 1 above for raw TCP**. It reads
   `ExpectProxyProtocol::addresses` / `RelayProxyProtocol::addresses` and the
   preread outcome directly, folds the raw socket peer over them with
-  `.or(self.frontend_address)` (`lib/src/tcp.rs:390`; `frontend_address =
-  Some(peer)`, the address `accept(2)` returned, `lib/src/tcp.rs:186` and
-  `lib/src/tcp.rs:310`), and is called from
-  the per-(cluster, source-IP) gate at `lib/src/tcp.rs:1677`.
+  `.or(self.frontend_address)` (`frontend_address = Some(peer)`, the address
+  `accept(2)` returned, set in `TcpSession::new` and
+  `TcpSession::new_sni_preread`), and is called from the per-(cluster,
+  source-IP) gate in `TcpSession::connect_to_backend`.
 - `ExpectProxyProtocol::into_pipe`
   (`lib/src/protocol/proxy_protocol/expect.rs`) and
   `RelayProxyProtocol::into_pipe`
@@ -303,7 +303,7 @@ against the socket peer:
   `Pipe::session_address`, which `effective_session_address` then returns for
   the post-upgrade `Pipe` state.
 - the SNI preread's `proxy_source` (`lib/src/protocol/tcp_preread/mod.rs:284`,
-  resolved against the socket at `lib/src/tcp.rs:913`).
+  resolved against the socket in `TcpSession::build_pipe_from_preread`).
 
 The two HTTP consumers do not:
 `HttpSession::upgrade_expect` (`lib/src/http.rs`) and

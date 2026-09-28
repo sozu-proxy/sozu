@@ -601,25 +601,35 @@ A WebSocket upgrade on an H1 connection ends in the same `Pipe`.
    (`Pipe::frontend_hup`, `Pipe::backend_hup`). The `Pipe` logs the session
    once, from whichever of its handlers ends it (`Pipe::log_request_success`
    or `Pipe::log_request_error`, both through `Pipe::log_request`:
-   `getsockopt(TCP_INFO)` on each side, and `getpeername(2)` on the backend
-   socket through `Pipe::get_backend_address`). `TcpSession::close` then
-   shuts both sockets down with
+   `getsockopt(TCP_INFO)` on each side). The backend address it logs is the
+   one recorded when the backend was chosen, not a `getpeername(2)`:
+   `Pipe::new` takes it from the `Backend` a WebSocket upgrade hands over, and
+   `TcpSession::connect_to_backend` passes the address it dials through
+   `Pipe::set_backend_address`, overwritten when a failed connect is retried
+   on another backend ([#1657](https://github.com/sozu-proxy/sozu/pull/1657)).
+   For a connected backend it is the address `getpeername(2)` returned; a
+   backend still connecting or already reset, where that call failed with
+   `ENOTCONN` and the log showed none, now logs the dialed address, as the
+   mux does. `TcpSession::close` then shuts both sockets down with
    `Shutdown::Both` — correct on a plaintext relay, which has no TLS send
-   buffer to truncate — deregisters them (`EPOLL_CTL_DEL`) and closes them and
-   the four pipe descriptors.
+   buffer to truncate — and closes them and the four pipe descriptors,
+   without an `EPOLL_CTL_DEL` (§11).
 
-The TCP path kept its deregistering close: the campaign that removed
-`EPOLL_CTL_DEL` and the redundant `shutdown(2)` from HTTP and HTTPS sessions
-(§11) did not touch `lib/src/tcp.rs`. Measured on the same rig as §6.7,
-`curl` through a TCP listener to the same backend, one connection per request:
+Measured on the same rig as §6.7, `curl` through a TCP listener to the same
+backend, one connection per request. The `c086b456` column is the closing
+measurement; the #1657 columns come from its own pair of release binaries
+(`f5136d67` and the branch), 20 sessions, two passes per instrument:
 
-| Per connection | `c086b456` |
-|---|---|
-| system calls (intentrace) | 36.05–36.15 |
-| `splice` | 6.05–6.15 (6.70–6.85 under the descriptor tracer) |
-| `epoll_wait` | 3.95 |
-| setup and teardown | `accept4` ×2, `socket`, `connect`, `setsockopt`, `pipe2` ×2, `fcntl` ×4, `epoll_ctl` ×4 (2 ADD, 2 DEL), `shutdown` ×2, `getsockopt` ×2, `getpeername` ×1, `close` ×6 |
-| heap operations | 14.45, 3 778 bytes |
+| Per connection | `c086b456` | #1657 before (`f5136d67`) | #1657 after |
+|---|---|---|---|
+| system calls (intentrace) | 36.05–36.15 | 36.10–36.25 | 33.05–33.10 |
+| system calls (descriptor tracer) | — | 37.30–38.30 | 33.85–34.35 |
+| `splice` | 6.05–6.15 (6.70–6.85 under the descriptor tracer) | 6.10–6.25 | 6.05–6.10 |
+| `epoll_wait` | 3.95 | 3.95 | 3.95 |
+| `epoll_ctl` | ×4 (2 ADD, 2 DEL) | ×4 (2 ADD, 2 DEL) | ×2 (ADD only) |
+| `getpeername` | ×1 | ×1 | 0 |
+| other setup and teardown | `accept4` ×2, `socket`, `connect`, `setsockopt`, `pipe2` ×2, `fcntl` ×4, `shutdown` ×2, `getsockopt` ×2, `close` ×6 | same | same |
+| heap operations | 14.45, 3 778 bytes | — | — |
 
 ## 10. UDP flow lifecycle
 
@@ -711,6 +721,20 @@ deregister would release, and BSD also drops a descriptor's kevents on close.
 `close_leaves_backend_sockets_to_their_last_close`
 (`lib/src/protocol/mux/mod.rs`) pin it by reading the kernel's epoll table from
 `/proc/self/fdinfo`.
+
+The raw TCP proxy closes the same way since
+[#1657](https://github.com/sozu-proxy/sozu/pull/1657): `TcpSession::close` and
+`TcpSession::close_backend` free the slab slots and shut both sockets down with
+`Shutdown::Both` as before, without an `EPOLL_CTL_DEL`. Nothing changes for the
+peer: the deregister is local to the epoll instance, and the `shutdown(2)` and
+`close(2)` calls, their order and the socket options are the same, so the FIN,
+a RST on unread data and the bytes in flight are unchanged. `close_backend` also
+runs when a backend connect fails and is retried (`TcpSession::ready_inner`):
+`TcpSession::connect_to_backend` either installs the new socket, which drops
+the old one in the same pass, or fails, and every failure closes the session
+(`handle_connection_result`), so the old socket's last close still comes before
+the next `epoll_wait`. `closed_tcp_sessions_leave_their_sockets_to_close`
+(`lib/src/tcp.rs`) pins it the same way.
 
 ## 12. Soft stop, hard stop and GOAWAY
 

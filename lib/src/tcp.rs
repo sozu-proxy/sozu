@@ -3,7 +3,6 @@ use std::{
     collections::{BTreeMap, HashMap, hash_map::Entry},
     io::ErrorKind,
     net::{Shutdown, SocketAddr},
-    os::unix::io::AsRawFd,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -11,7 +10,6 @@ use std::{
 use mio::{
     Interest, Registry, Token,
     net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream},
-    unix::SourceFd,
 };
 use rusty_ulid::Ulid;
 use socket2::SockRef;
@@ -112,6 +110,10 @@ pub struct TcpSession {
     backend_buffer: Option<Checkout>,
     backend_connected: BackendConnectionStatus,
     backend_id: Option<String>,
+    /// Address of the backend `connect_to_backend` last dialed, handed to the
+    /// `Pipe` for its access log (`Pipe::set_backend_address`), so the log
+    /// never asks the socket with `getpeername(2)`.
+    backend_address: Option<SocketAddr>,
     backend_token: Option<Token>,
     backend: Option<Rc<RefCell<Backend>>>,
     cluster_id: Option<ClusterId>,
@@ -259,6 +261,7 @@ impl TcpSession {
             backend_buffer: backend_buffer_session,
             backend_connected: BackendConnectionStatus::NotConnected,
             backend_id,
+            backend_address: None,
             backend_token: None,
             backend: None,
             cluster_id,
@@ -344,6 +347,7 @@ impl TcpSession {
             backend_buffer: Some(backend_buffer),
             backend_connected: BackendConnectionStatus::NotConnected,
             backend_id: None,
+            backend_address: None,
             backend_token: None,
             backend: None,
             cluster_id: None,
@@ -641,6 +645,7 @@ impl TcpSession {
             pipe.restore_readiness_events(frontend_event, backend_event);
 
             pipe.set_cluster_id(self.cluster_id.clone());
+            pipe.set_backend_address(self.backend_address);
             // Only `Some` when this `SendProxyProtocol` was itself reached
             // via `upgrade_sni_preread`'s `SendHeader` branch (sozu-proxy/sozu#1279)
             // -- a legacy, non-SNI-routed `SendHeader` cluster never
@@ -668,6 +673,7 @@ impl TcpSession {
             let mut pipe =
                 rpp.into_pipe(self.backend_buffer.take().unwrap(), self.listener.clone());
             pipe.set_cluster_id(self.cluster_id.clone());
+            pipe.set_backend_address(self.backend_address);
             gauge_add!(names::protocol::PROXY_RELAY, -1);
             gauge_add!(names::protocol::TCP, 1);
             return Some(TcpStateMachine::Pipe(pipe));
@@ -694,6 +700,7 @@ impl TcpSession {
             );
 
             pipe.set_cluster_id(self.cluster_id.clone());
+            pipe.set_backend_address(self.backend_address);
             gauge_add!(names::protocol::PROXY_EXPECT, -1);
             gauge_add!(names::protocol::TCP, 1);
             return Some(TcpStateMachine::Pipe(pipe));
@@ -942,6 +949,7 @@ impl TcpSession {
         // guaranteed by `Pipe::readable`'s half-close drain (sozu-proxy/sozu#1279).
         pipe.restore_readiness_events(frontend_event, backend_event);
         pipe.set_back_token(backend_token);
+        pipe.set_backend_address(self.backend_address);
         // Access-log tagging: reaching `Pipe` straight from
         // `SniPreread` (Expect/Relay/None) -- unlike `SendHeader`, which
         // detours through `SendProxyProtocol` first (see `upgrade_send`).
@@ -1030,6 +1038,15 @@ impl TcpSession {
         self.backend_id = Some(id.clone());
         if let TcpStateMachine::Pipe(pipe) = &mut self.state {
             pipe.set_backend_id(Some(id));
+        }
+    }
+
+    /// Record the dialed backend's address; a session that is not a `Pipe`
+    /// yet hands it over at upgrade time instead.
+    fn set_backend_address(&mut self, address: SocketAddr) {
+        self.backend_address = Some(address);
+        if let TcpStateMachine::Pipe(pipe) = &mut self.state {
+            pipe.set_backend_address(Some(address));
         }
     }
 
@@ -1539,21 +1556,23 @@ impl TcpSession {
 
     /// TCP session closes its backend on its own, without defering this task to the state
     fn close_backend(&mut self) {
-        if let (Some(token), Some(fd)) = (
-            self.backend_token,
-            self.back_socket_mut().map(|s| s.as_raw_fd()),
-        ) {
-            let proxy = self.proxy.borrow();
-            if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
-                error!(
-                    "{} Error deregistering socket({:?}): {:?}",
-                    log_context!(self),
-                    fd,
-                    e
-                );
-            }
-
-            proxy.sessions.borrow_mut().slab.try_remove(token.0);
+        // No `EPOLL_CTL_DEL` for the backend socket: its last `close(2)`
+        // takes it out of the epoll set, and it comes before the next
+        // `epoll_wait`, so the freed slab token cannot receive a stale event.
+        // From `close()`, the server drops the session right after. From
+        // `ready_inner`'s retry, `connect_to_backend` either replaces the
+        // socket (`set_back_socket` drops the old one) or fails, and every
+        // failure closes the session (`handle_connection_result`). No session
+        // socket is ever duplicated (no `dup`, `try_clone` or worker fork).
+        if let Some(token) = self.backend_token
+            && self.back_socket_mut().is_some()
+        {
+            self.proxy
+                .borrow()
+                .sessions
+                .borrow_mut()
+                .slab
+                .try_remove(token.0);
         }
         self.remove_backend();
 
@@ -1752,6 +1771,7 @@ impl TcpSession {
         self.metrics.backend_id = Some(Rc::from(backend.borrow().backend_id.as_str()));
         self.metrics.backend_start();
         self.set_backend_id(backend.borrow().backend_id.clone());
+        self.set_backend_address(backend.borrow().address);
 
         // Postcondition of a successful New connect: the session is wired to
         // its freshly-registered backend token and the status reflects an
@@ -1857,24 +1877,15 @@ impl ProxySession for TcpSession {
             }
         }
 
-        // deregister the frontend and remove it, in a separate scope to drop proxy when done
-        {
-            let proxy = self.proxy.borrow();
-            let fd = front_socket.as_raw_fd();
-            if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
-                error!(
-                    "{} Error deregistering front socket({:?}) while closing TCP session: {:?}",
-                    log_context!(self),
-                    fd,
-                    e
-                );
-            }
-            proxy
-                .sessions
-                .borrow_mut()
-                .slab
-                .try_remove(self.frontend_token.0);
-        }
+        // Free the frontend slot. No `EPOLL_CTL_DEL`: the server drops the
+        // session right after `close()`, and that last `close(2)` of the
+        // front socket takes it out of the epoll set (see `close_backend`).
+        self.proxy
+            .borrow()
+            .sessions
+            .borrow_mut()
+            .slab
+            .try_remove(self.frontend_token.0);
 
         self.close_backend();
         self.has_been_closed = true;
@@ -5225,6 +5236,426 @@ mod sni_routing_tests {
             closed,
             "a connecting backend with no readiness slot must close the session"
         );
+    }
+
+    /// Drive an `ExpectHeader` fixture through its PROXY header, which
+    /// upgrades it to `Pipe` and dials the backend in that same `ready()`.
+    fn expect_proxy_fixture_dialed() -> ExpectProxyFixture {
+        use std::io::Write as _;
+
+        let mut fixture = expect_proxy_fixture();
+        fixture
+            .client
+            .write_all(&proxy_protocol_v2_ipv4_header())
+            .expect("write the PROXY-v2 header");
+        fixture
+            .session
+            .borrow_mut()
+            .update_readiness(fixture.frontend_token, Ready::READABLE);
+        let proxy_session = fixture.proxy_session.clone();
+        let _ = fixture.session.borrow_mut().ready(proxy_session);
+        {
+            let session = fixture.session.borrow();
+            assert!(
+                matches!(session.state, TcpStateMachine::Pipe(_)),
+                "precondition: the parsed header upgrades the session to Pipe"
+            );
+            assert!(
+                session.backend_token.is_some(),
+                "precondition: the Pipe dialed its backend"
+            );
+        }
+        fixture
+    }
+
+    /// The `Pipe`'s access log reports the address `connect_to_backend`
+    /// dialed, handed over by `TcpSession::set_backend_address`, rather than
+    /// a `getpeername(2)` on the backend socket.
+    ///
+    /// To SEE THIS RED: remove the `self.set_backend_address(...)` call from
+    /// `connect_to_backend`. The pipe then reports `None`.
+    #[test]
+    fn a_dialed_pipe_reports_the_backend_address_it_was_given() {
+        let fixture = expect_proxy_fixture_dialed();
+        let backend_address = fixture
+            ._backend_listener
+            .local_addr()
+            .expect("test backend local addr");
+        let session = fixture.session.borrow();
+        let TcpStateMachine::Pipe(pipe) = &session.state else {
+            unreachable!("expect_proxy_fixture_dialed checked the Pipe state");
+        };
+        assert_eq!(
+            pipe.get_backend_address(),
+            Some(backend_address),
+            "the pipe must report the backend address the session dialed"
+        );
+    }
+
+    /// Closing a TCP session issues no `EPOLL_CTL_DEL` for its front or
+    /// back socket: the last `close(2)` of each, when the server drops the
+    /// session right after `close()`, takes it out of the epoll set.
+    ///
+    /// The test reads the kernel's own epoll table (`/proc/self/fdinfo`), so
+    /// it tells "never deregistered" from "removed by the close".
+    ///
+    /// To SEE THIS RED: put back
+    /// `let _ = self.proxy.borrow().registry.deregister(&mut mio::unix::SourceFd(&front_socket.as_raw_fd()));`
+    /// in `TcpSession::close` (or the matching backend call in
+    /// `close_backend`). The first assertion after `close()` then fails.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn closed_tcp_sessions_leave_their_sockets_to_close() {
+        use std::os::fd::AsRawFd as _;
+
+        use crate::protocol::mux::test_support::epoll_watches;
+
+        let fixture = expect_proxy_fixture_dialed();
+        let session = fixture.session.clone();
+        let frontend_token = fixture.frontend_token;
+        let registry = session
+            .borrow()
+            .proxy
+            .borrow()
+            .registry
+            .try_clone()
+            .expect("the test registry must clone");
+
+        // `create_session` registers the front socket; the fixture builds the
+        // session directly, so register it the same way here.
+        let (front_fd, back_fd) = {
+            let mut session = session.borrow_mut();
+            let front_fd = session.state.front_socket().as_raw_fd();
+            registry
+                .register(
+                    &mut mio::unix::SourceFd(&front_fd),
+                    frontend_token,
+                    Interest::READABLE | Interest::WRITABLE,
+                )
+                .expect("register the front socket");
+            let back_fd = session
+                .back_socket_mut()
+                .expect("the dialed Pipe owns a backend socket")
+                .as_raw_fd();
+            (front_fd, back_fd)
+        };
+        assert!(
+            epoll_watches(&registry, front_fd) && epoll_watches(&registry, back_fd),
+            "precondition: both sockets are in the epoll set"
+        );
+
+        // What `Server::shut_down_sessions_by_frontend_tokens` does.
+        let removed = session
+            .borrow()
+            .proxy
+            .borrow()
+            .sessions
+            .borrow_mut()
+            .slab
+            .remove(frontend_token.0);
+        session.borrow_mut().close();
+        assert!(
+            epoll_watches(&registry, front_fd),
+            "TcpSession::close must not deregister a front socket it is about \
+             to close: the close removes it, the EPOLL_CTL_DEL is a wasted syscall"
+        );
+        assert!(
+            epoll_watches(&registry, back_fd),
+            "TcpSession::close_backend must not deregister a backend socket it \
+             is about to close: the close removes it"
+        );
+
+        drop(removed);
+        drop(session);
+        drop(fixture);
+        assert!(
+            !epoll_watches(&registry, front_fd),
+            "dropping the session closes the front socket's only descriptor, \
+             which must take it out of the epoll set"
+        );
+        assert!(
+            !epoll_watches(&registry, back_fd),
+            "dropping the session closes the backend socket's only descriptor, \
+             which must take it out of the epoll set"
+        );
+    }
+
+    /// A session dialed from a state that is not `Pipe` yet, plus everything
+    /// that must outlive it.
+    struct DialFixture {
+        session: Rc<RefCell<TcpSession>>,
+        proxy_session: Rc<RefCell<dyn ProxySession>>,
+        frontend_token: Token,
+        backend_address: SocketAddr,
+        client: std::net::TcpStream,
+        _frontend_listener: std::net::TcpListener,
+        _backend_listener: std::net::TcpListener,
+    }
+
+    /// Build a session for cluster `cluster-dial`, wired to a real bound
+    /// backend and a real accepted frontend socket, registered in the slab the
+    /// way `expect_proxy_fixture` does. `build` picks the constructor, hence
+    /// the starting state; `sni_route` routes `example.com` to the cluster.
+    fn dial_fixture(
+        sni_route: bool,
+        build: impl FnOnce(
+            Checkout,
+            Checkout,
+            Token,
+            Rc<RefCell<TcpListener>>,
+            Rc<RefCell<TcpProxy>>,
+            MioTcpStream,
+            SocketAddr,
+        ) -> TcpSession,
+    ) -> DialFixture {
+        let ServerParts {
+            registry,
+            sessions,
+            pool,
+            backends,
+            ..
+        } = prebuild_server(16, 16384, false).expect("could not prebuild a test server");
+
+        let backend_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind test backend");
+        let backend_address = backend_listener
+            .local_addr()
+            .expect("test backend local addr");
+        backends.borrow_mut().add_backend(
+            "cluster-dial",
+            Backend::new("cluster-dial-1", backend_address, None, None, None),
+        );
+
+        let proxy = Rc::new(RefCell::new(TcpProxy::new(
+            registry,
+            sessions.clone(),
+            pool.clone(),
+            backends,
+        )));
+        let mut bare_listener = test_listener();
+        if sni_route {
+            bare_listener
+                .insert_sni_route("example.com".to_owned(), vec![], "cluster-dial".into())
+                .expect("insert_sni_route must succeed for a valid test SNI");
+        }
+        let listener = Rc::new(RefCell::new(bare_listener));
+
+        let frontend_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind test frontend listener");
+        let client = std::net::TcpStream::connect(
+            frontend_listener
+                .local_addr()
+                .expect("test frontend local addr"),
+        )
+        .expect("connect test client");
+        let (frontend, frontend_peer) = frontend_listener
+            .accept()
+            .expect("accept the client connection");
+        frontend
+            .set_nonblocking(true)
+            .expect("frontend socket nonblocking");
+
+        let (frontend_buffer, backend_buffer) = {
+            let mut pool = pool.borrow_mut();
+            (
+                pool.checkout().expect("front buffer checkout must succeed"),
+                pool.checkout().expect("back buffer checkout must succeed"),
+            )
+        };
+
+        let frontend_token = {
+            let mut session_manager = sessions.borrow_mut();
+            let entry = session_manager.slab.vacant_entry();
+            let token = Token(entry.key());
+            entry.insert(Rc::new(RefCell::new(crate::server::ListenSession {
+                protocol: Protocol::TCPListen,
+            })));
+            token
+        };
+
+        let session = Rc::new(RefCell::new(build(
+            backend_buffer,
+            frontend_buffer,
+            frontend_token,
+            listener,
+            proxy,
+            MioTcpStream::from_std(frontend),
+            frontend_peer,
+        )));
+        let proxy_session: Rc<RefCell<dyn ProxySession>> = session.clone();
+        sessions.borrow_mut().slab[frontend_token.0] = proxy_session.clone();
+
+        DialFixture {
+            session,
+            proxy_session,
+            frontend_token,
+            backend_address,
+            client,
+            _frontend_listener: frontend_listener,
+            _backend_listener: backend_listener,
+        }
+    }
+
+    /// A legacy (non-SNI) session whose cluster uses `proxy_protocol`; its
+    /// first `ready()` dials the backend while it is still in its
+    /// PROXY-protocol state.
+    fn proxy_protocol_session_dialed(proxy_protocol: ProxyProtocolConfig) -> DialFixture {
+        let fixture = dial_fixture(
+            false,
+            |back_buffer, front_buffer, token, listener, proxy, socket, peer| {
+                TcpSession::new(
+                    back_buffer,
+                    None,
+                    Some("cluster-dial".into()),
+                    Duration::from_secs(30),
+                    Duration::from_secs(30),
+                    Duration::from_secs(30),
+                    front_buffer,
+                    token,
+                    listener,
+                    Some(proxy_protocol),
+                    proxy,
+                    socket,
+                    peer,
+                    Duration::from_millis(0),
+                )
+            },
+        );
+        fixture
+            .session
+            .borrow_mut()
+            .update_readiness(fixture.frontend_token, Ready::WRITABLE);
+        let closed = fixture
+            .session
+            .borrow_mut()
+            .ready(fixture.proxy_session.clone());
+        assert!(!closed, "precondition: the dial keeps the session open");
+        fixture
+    }
+
+    /// Upgrade a dialed, not-yet-`Pipe` session and assert the `Pipe` reports
+    /// the backend address the session dialed: the address its access log
+    /// carries.
+    fn assert_upgraded_pipe_reports_the_dialed_address(fixture: &DialFixture) {
+        {
+            let session = fixture.session.borrow();
+            assert!(
+                !matches!(session.state, TcpStateMachine::Pipe(_)),
+                "precondition: the backend was dialed before the Pipe existed"
+            );
+            assert!(
+                session.backend_token.is_some(),
+                "precondition: the session dialed its backend"
+            );
+        }
+        let closed = fixture.session.borrow_mut().upgrade();
+        assert!(!closed, "the upgrade to Pipe must succeed");
+        let session = fixture.session.borrow();
+        let TcpStateMachine::Pipe(pipe) = &session.state else {
+            panic!("the upgrade must install a Pipe");
+        };
+        assert_eq!(
+            pipe.get_backend_address(),
+            Some(fixture.backend_address),
+            "the Pipe must report the backend address dialed before the upgrade"
+        );
+    }
+
+    /// `SendProxyProtocol` dials before it becomes a `Pipe`: `upgrade_send`
+    /// must hand the dialed address over.
+    ///
+    /// To SEE THIS RED: make `TcpSession::set_backend_address` record nothing,
+    /// or pass `None` to `pipe.set_backend_address` in `upgrade_send`.
+    #[test]
+    fn a_send_proxy_protocol_pipe_reports_the_dialed_backend_address() {
+        let fixture = proxy_protocol_session_dialed(ProxyProtocolConfig::SendHeader);
+        assert!(
+            matches!(
+                fixture.session.borrow().state,
+                TcpStateMachine::SendProxyProtocol(_)
+            ),
+            "precondition: a SendHeader cluster starts in the send state"
+        );
+        assert_upgraded_pipe_reports_the_dialed_address(&fixture);
+    }
+
+    /// `RelayProxyProtocol` dials before it becomes a `Pipe`: `upgrade_relay`
+    /// must hand the dialed address over.
+    ///
+    /// To SEE THIS RED: make `TcpSession::set_backend_address` record nothing,
+    /// or pass `None` to `pipe.set_backend_address` in `upgrade_relay`.
+    #[test]
+    fn a_relay_proxy_protocol_pipe_reports_the_dialed_backend_address() {
+        let fixture = proxy_protocol_session_dialed(ProxyProtocolConfig::RelayHeader);
+        assert!(
+            matches!(
+                fixture.session.borrow().state,
+                TcpStateMachine::RelayProxyProtocol(_)
+            ),
+            "precondition: a RelayHeader cluster starts in the relay state"
+        );
+        assert_upgraded_pipe_reports_the_dialed_address(&fixture);
+    }
+
+    /// An SNI-routed session dials from `SniPreread`: `upgrade_sni_preread`
+    /// builds the `Pipe` through `build_pipe_from_preread`, which must hand
+    /// the dialed address over.
+    ///
+    /// To SEE THIS RED: make `TcpSession::set_backend_address` record nothing,
+    /// or pass `None` to `pipe.set_backend_address` in
+    /// `build_pipe_from_preread`.
+    #[test]
+    fn an_sni_preread_pipe_reports_the_dialed_backend_address() {
+        use std::io::Write as _;
+
+        let mut fixture = dial_fixture(
+            true,
+            |back_buffer, front_buffer, token, listener, proxy, socket, peer| {
+                TcpSession::new_sni_preread(
+                    back_buffer,
+                    Duration::from_secs(30),
+                    Duration::from_secs(30),
+                    front_buffer,
+                    token,
+                    listener,
+                    proxy,
+                    socket,
+                    peer,
+                    Duration::from_millis(0),
+                    Duration::from_secs(3),
+                    16384,
+                )
+            },
+        );
+        fixture
+            .client
+            .write_all(&minimal_client_hello_wire("example.com"))
+            .expect("write ClientHello");
+        fixture.client.flush().ok();
+        for _ in 0..10 {
+            if fixture.session.borrow().cluster_id.is_some() {
+                break;
+            }
+            let _ = fixture.session.borrow_mut().readable();
+        }
+        assert_eq!(
+            fixture.session.borrow().cluster_id.as_deref(),
+            Some("cluster-dial"),
+            "precondition: the ClientHello routes the session"
+        );
+        let closed = fixture
+            .session
+            .borrow_mut()
+            .ready(fixture.proxy_session.clone());
+        assert!(!closed, "precondition: the dial keeps the session open");
+        assert!(
+            matches!(
+                fixture.session.borrow().state,
+                TcpStateMachine::SniPreread(_)
+            ),
+            "precondition: the routed session dials while still in SniPreread"
+        );
+        assert_upgraded_pipe_reports_the_dialed_address(&fixture);
     }
 }
 

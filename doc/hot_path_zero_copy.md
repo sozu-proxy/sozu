@@ -97,6 +97,11 @@ requests share the connection): that is the `crypto-ring` provider, the one
 the default build uses; `crypto-aws-lc-rs` issues none (§3.13). The TCP row moved only through code it
 shares with the HTTP path — the accept path of §3.10 and the access-log
 renderer of §3.1 among it; its allocations were not attributed further.
+[#1657](https://github.com/sozu-proxy/sozu/pull/1657) later took the TCP relay
+from 36.10–36.25 to **33.05–33.10** system calls per connection under
+intentrace (37.30–38.30 → 33.85–34.35 under the descriptor tracer), measured on
+its own pair of release binaries, `f5136d67` and its branch, not on this
+table's two (§3.10).
 
 Two earlier figures frame this table. The first map of the campaign, taken on
 2026-09-26 with the `LD_PRELOAD` interposer alone on a debug build, with a
@@ -405,6 +410,20 @@ response). Both write paths built that vector per pass.
   socket: `epoll_ctl` **4.00 → 2.00** per request, H1 and H2; descriptors stable
   over 1 000 requests. `L7Proxy::deregister_socket`, left without a caller, was
   then removed ([#1618](https://github.com/sozu-proxy/sozu/pull/1618)).
+- **The TCP relay: no `getpeername(2)` for the log line, no `EPOLL_CTL_DEL`
+  before `close`
+  ([#1657](https://github.com/sozu-proxy/sozu/pull/1657)).** `Pipe::log_request`
+  read the backend address back from the socket once per session; the `Pipe`
+  now keeps the address `TcpSession::connect_to_backend` dialed (or the
+  upgraded WebSocket's `Backend` address). `TcpSession::close` and
+  `TcpSession::close_backend` drop their deregister on the #1568 argument, the
+  connect-retry path included; both `shutdown(Shutdown::Both)` calls stay, so
+  the peer sees the same close. Measured with the rig of §2, one release binary
+  at `f5136d67` and one on the branch, a TCP listener, 20 sequential `curl`
+  sessions, two passes per instrument: `getpeername` **1 → 0**, `epoll_ctl`
+  **4 → 2** (ADD only) per connection, every other family unchanged; total
+  36.10–36.25 → **33.05–33.10** (intentrace), 37.30–38.30 → 33.85–34.35
+  (descriptor tracer); descriptors stable over 1 000 sessions.
 - **No `shutdown(2)` on a closed peer, no `epoll_wait` for a known EOF
   ([#1605](https://github.com/sozu-proxy/sozu/pull/1605)).** `shutdown_write`
   skips the call once the peer's HUP, EOF or `close_notify` has been seen (the
@@ -487,12 +506,13 @@ keep `crypto-ring` so that they compare with each other.
   buffer per request (`ConnectionH1::writable`), and rustls allocates about five
   buffers per TLS request for its own records; both were measured and left
   ([#1628](https://github.com/sozu-proxy/sozu/pull/1628)).
-- **The TCP relay** (`lib/src/tcp.rs`) still deregisters and shuts down both
-  sockets before closing them, reads the backend address back with
-  `getpeername(2)` for its log line, and allocates its splice pipes per session
-  ([`lifetime_of_a_session.md`](./lifetime_of_a_session.md) §9). No change
-  targeted the TCP data path; its figures in §2.3 moved only through code it
-  shares with the HTTP path.
+- **The TCP relay** (`lib/src/tcp.rs`) still shuts down both sockets with
+  `Shutdown::Both` before closing them and allocates its splice pipes per
+  session: `pipe2` ×2, `fcntl` ×4 and `close` ×4, ten system calls per
+  connection ([`lifetime_of_a_session.md`](./lifetime_of_a_session.md) §9).
+  Its deregister and its `getpeername(2)` went in #1657 (§3.10), after the
+  measurement of §2.3; no earlier change targeted the TCP data path, and its
+  figures in §2.3 moved only through code it shares with the HTTP path.
 - **UDP** was traced only for the event-loop fix of §3.10 and for a new flow's
   upstream socket, which `udp_connect` now opens in three system calls instead
   of eight (release, Linux). Its per-datagram costs are read from the code in
