@@ -471,6 +471,29 @@ impl<Front: SocketHandler> Connection<Front> {
         }
     }
 
+    /// RFC 9113 §6.8 final GOAWAY ahead of a drain's forced close. H1 has
+    /// no GOAWAY and ignores it. See
+    /// [`h2::ConnectionH2::goaway_before_forced_close`].
+    pub(super) fn goaway_before_forced_close<L>(&mut self, context: &Context<L>) -> MuxResult
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        match self {
+            Connection::H1(_) => MuxResult::Continue,
+            Connection::H2(c) => c.goaway_before_forced_close(context),
+        }
+    }
+
+    /// True while an H2 peer's HEADERS block is still being reassembled.
+    /// H1 has no such state. See
+    /// [`h2::ConnectionH2::peer_header_block_in_progress`].
+    pub(super) fn peer_header_block_in_progress(&self) -> bool {
+        match self {
+            Connection::H1(_) => false,
+            Connection::H2(c) => c.core.peer_header_block_in_progress(),
+        }
+    }
+
     pub(super) fn is_draining(&self) -> bool {
         match self {
             Connection::H1(_) => false,
