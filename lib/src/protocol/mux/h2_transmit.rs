@@ -375,6 +375,62 @@ pub fn holds_header_frame<T: AsBuffer>(kawa: &Kawa<T>) -> bool {
     const HEADERS: u8 = 0x1;
     const PUSH_PROMISE: u8 = 0x5;
     const CONTINUATION: u8 = 0x9;
+
+    let mut found = false;
+    let tiled = walk_whole_frames(kawa, |frame_type, _| {
+        found = matches!(frame_type, HEADERS | PUSH_PROMISE | CONTINUATION);
+        !found
+    });
+    // A frame cut short (a partial header, or a payload the queue does not
+    // hold) is not a whole frame: answer the safe side.
+    found || !tiled
+}
+
+/// The DATA payload octets `kawa.out` still holds whole: flow-controlled
+/// credit the prepare already consumed for frames the wire has not started
+/// (sozu-proxy/sozu#1641). The rest of a frame a partial write cut is not in
+/// `kawa.out` any more but in `super::h2_output::H2Output`, which sends it,
+/// so it is not counted.
+///
+/// Same walk and same callers as [`holds_header_frame`]. Its safe side is the
+/// opposite one: a DATA frame the queue does not hold whole is not counted,
+/// because giving back credit for octets that could still reach the peer
+/// would let the connection overrun the peer's window, while giving back too
+/// little only leaves the window short.
+pub fn queued_data_payload<T: AsBuffer>(kawa: &Kawa<T>) -> usize {
+    const DATA: u8 = 0x0;
+
+    let mut payload = 0usize;
+    let tiled = walk_whole_frames(kawa, |frame_type, payload_len| {
+        if frame_type == DATA {
+            payload += payload_len;
+        }
+        true
+    });
+    debug_assert!(tiled, "an H2 stream queues whole frames only");
+    debug_assert!(
+        payload <= kawa.out.iter().map(|block| block_len(kawa, block)).sum(),
+        "the counted DATA payload is part of the queued octets"
+    );
+    payload
+}
+
+/// The octets one queued block describes.
+fn block_len<T: AsBuffer>(kawa: &Kawa<T>, block: &kawa::OutBlock) -> usize {
+    match block {
+        kawa::OutBlock::Delimiter => 0,
+        kawa::OutBlock::Store(store) => store.data(kawa.storage.buffer()).len(),
+    }
+}
+
+/// Hand `visit` the type and payload length of every whole frame `kawa.out`
+/// holds, in order, up to the first delimiter, until `visit` answers
+/// `false`. Answers `false` when the queue ends inside a frame, `true`
+/// otherwise, including when `visit` stopped the walk.
+fn walk_whole_frames<T: AsBuffer>(
+    kawa: &Kawa<T>,
+    mut visit: impl FnMut(u8, usize) -> bool,
+) -> bool {
     const FRAME_HEADER: usize = 9;
 
     let buffer = kawa.storage.buffer();
@@ -391,6 +447,9 @@ pub fn holds_header_frame<T: AsBuffer>(kawa: &Kawa<T>) -> bool {
                 let skipped = payload_left.min(data.len());
                 payload_left -= skipped;
                 data = &data[skipped..];
+                if payload_left == 0 && !visit(head[3], frame_payload_len(&head)) {
+                    return true;
+                }
                 continue;
             }
             let copied = (FRAME_HEADER - filled).min(data.len());
@@ -398,13 +457,11 @@ pub fn holds_header_frame<T: AsBuffer>(kawa: &Kawa<T>) -> bool {
             filled += copied;
             data = &data[copied..];
             if filled == FRAME_HEADER {
-                if matches!(head[3], HEADERS | PUSH_PROMISE | CONTINUATION) {
+                filled = 0;
+                payload_left = frame_payload_len(&head);
+                if payload_left == 0 && !visit(head[3], 0) {
                     return true;
                 }
-                payload_left = (usize::from(head[0]) << 16)
-                    | (usize::from(head[1]) << 8)
-                    | usize::from(head[2]);
-                filled = 0;
             }
         }
     }
@@ -412,9 +469,12 @@ pub fn holds_header_frame<T: AsBuffer>(kawa: &Kawa<T>) -> bool {
         filled < FRAME_HEADER,
         "a whole frame header is consumed as soon as it is read"
     );
-    // A frame cut short (a partial header, or a payload the queue does not
-    // hold) is not a whole frame: answer the safe side.
-    filled != 0 || payload_left != 0
+    filled == 0 && payload_left == 0
+}
+
+/// The 24-bit payload length a frame header announces.
+fn frame_payload_len(head: &[u8; 9]) -> usize {
+    (usize::from(head[0]) << 16) | (usize::from(head[1]) << 8) | usize::from(head[2])
 }
 
 /// Apply the byte count the shell accepted, and discharge [`gather`]'s safety
@@ -973,5 +1033,36 @@ mod tests {
             holds_header_frame(&kawa),
             "a cut frame answers the safe side"
         );
+    }
+
+    /// `queued_data_payload` sums the payload of every DATA frame the queue
+    /// holds, however the blocks split the frames, counts no other frame
+    /// type and no frame header, and allocates nothing
+    /// (sozu-proxy/sozu#1641).
+    #[test]
+    fn queued_data_payload_counts_only_data_payload_octets() {
+        let data = [0, 0, 3, 0, 0, 0, 0, 0, 1, b'a', b'b', b'c'];
+        let rst = [0, 0, 4, 3, 0, 0, 0, 0, 1, 0, 0, 0, 8];
+        let trailers = [0, 0, 1, 1, 5, 0, 0, 0, 1, 0x88];
+        let more = [0, 0, 5, 0, 0, 0, 0, 0, 1, b'd', b'e', b'f', b'g', b'h'];
+        let end = [0, 0, 0, 0, 1, 0, 0, 0, 1];
+        let mut frames = Vec::new();
+        for frame in [&data[..], &rst, &trailers, &more, &end] {
+            frames.extend_from_slice(frame);
+        }
+        for cut in 1..frames.len() {
+            let mut buf = vec![0u8; 64];
+            let kawa = kawa_with_out(&mut buf, &frames, &[cut]);
+            let before = crate::test_allocations::allocations();
+            assert_eq!(queued_data_payload(&kawa), 3 + 5, "cut at {cut}");
+            assert_eq!(
+                crate::test_allocations::allocations() - before,
+                0,
+                "the walk allocates nothing"
+            );
+        }
+        let mut buf = vec![0u8; 64];
+        let kawa = kawa_with_out(&mut buf, &rst, &[]);
+        assert_eq!(queued_data_payload(&kawa), 0, "no DATA, no credit");
     }
 }

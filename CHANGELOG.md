@@ -3334,6 +3334,21 @@
   `test_h1_chunked_truncated_by_backend_close_closes_client`, with complete and
   close-delimited bodies pinned unchanged on both frontends.
 
+- **`fix(mux-h2)`: DATA prepared and dropped unsent gives its send-window credit back
+  ([#1641](https://github.com/sozu-proxy/sozu/issues/1641)).** The write pass debits the
+  stream's and the connection's send windows when it prepares DATA, before the socket takes
+  any of it. When a parked stream holding such DATA was removed (a peer RST_STREAM, a client
+  cancel, a timeout) or had its queue cleared, the frames were dropped but the credit was not
+  given back, and the peer never returns credit for DATA it never received: each drop shrank
+  the connection window for the rest of the connection's life, until every stream's DATA
+  stalled and the flow-control-stall reaper cancelled streams that had done nothing wrong.
+  The connection now gives back the DATA payload the parked stream still held whole, to the
+  connection window when the stream is removed (re-arming WRITABLE if that reopens the
+  window) and to both windows when a live stream's queue was cleared. The rest of a frame a
+  partial write cut is still sent whole and is not given back. A refund the peer's
+  WINDOW_UPDATEs pushed past 2^31-1 is a FLOW_CONTROL_ERROR and closes the connection with
+  GOAWAY, as an overflowing WINDOW_UPDATE does.
+
 - **`fix(mux-h2)`: an HPACK size update carried by a header block dropped for exceeding
   `MAX_HEADER_LIST_SIZE` is signalled again on the next block
   ([#1627](https://github.com/sozu-proxy/sozu/issues/1627)).** The pass had already marked the

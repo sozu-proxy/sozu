@@ -512,6 +512,60 @@ simulator deliberately carries no such property.
 `lib/src/protocol/mux/h2_flow_control.rs`'s module doc carries the same
 statement beside the code.
 
+### Prepared DATA dropped unsent gives its send credit back
+
+The send windows are debited when DATA is **prepared**, not when it is
+written: `ConnectionH2::poll_write_target`'s `H2WritePhase::Prepare` arm
+encodes up to `min(stream window, connection window)` octets of DATA into the
+stream's `kawa.out`, then debits both windows by what it encoded
+(`H2FlowControl::consume_send_window`). The converter needs the window as a
+budget at that moment, so the debit cannot simply move to the write. RFC 9113
+§6.9 counts only the DATA that was sent, though, and the peer returns credit
+through WINDOW_UPDATE only for what it received. DATA prepared and then
+dropped unsent therefore used to shrink the connection window for the life of
+the connection, one drop at a time, until every stream waited on credit that
+would never come
+([#1641](https://github.com/sozu-proxy/sozu/issues/1641)). A backend
+connection belongs to one `Mux` session, so the damage stayed within that
+session, but a long-lived one could still starve.
+
+The repair gives back what will never be sent. Only the stream parked in
+`expect_write` holds unsent frames (the argument of the section on dropped
+header blocks), so where a pass parks a stream it records
+`ConnectionH2::parked_data`, the DATA payload `kawa.out` still holds whole
+(`h2_transmit::queued_data_payload`, the same frame walk as
+`h2_transmit::holds_header_frame`, on the same park, with no allocation). The
+rest of a frame a partial write cut is not in `kawa.out` any more: the ordered
+output queue adopted it and sends it whole, so it is not counted. Then:
+
+- `ConnectionH2::remove_dead_stream`, reached by every removal (peer
+  RST_STREAM, `end_stream`, expiry, `prune_inactive_streams_while_closing`),
+  gives the parked credit back to the connection window when it removes the
+  parked stream, before `H2StreamTable::remove` clears the park, and re-arms
+  WRITABLE when that reopens a closed window;
+- the next pass's `H2WritePhase::Start` gives back, to the stream's window and
+  the connection's, the part of a live park's DATA that is no longer queued
+  (`forcefully_terminate_answer` or a default answer cleared it).
+
+Both go through `ConnectionH2::refund_parked_data` and
+`H2FlowControl::refund_send_window`, which asserts that the window grows by
+exactly the refund. Giving back too little is the safe side: a queue that
+ends inside a DATA frame does not count that frame. The refund can still
+overflow, and that is the peer's doing: WINDOW_UPDATEs sent while the DATA
+sat parked are each accepted on their own, yet the window they really grant
+is the current one plus the unsent octets. When that sum passes 2^31-1,
+`refund_send_window` answers `ApplyWindowUpdateOutcome::Overflow` without
+touching the window, and the connection sends GOAWAY(FLOW_CONTROL_ERROR),
+exactly as `ConnectionH2::handle_window_update_frame` does for an
+overflowing increment (RFC 9113 §6.9.1). Nothing asserts on it.
+
+This is the shape of hyperium/h2, whose `Prioritize` reserves capacity when it
+assigns it, debits the windows when a frame leaves the stream's queue for the
+codec buffer, and reclaims reserved but unsent capacity on a reset
+(`Prioritize::reclaim_reserved_capacity`). HAProxy debits `h2s->sws` and
+`h2c->mws` when it writes a DATA frame into the connection's `mbuf`, which a
+stream never drops, so it has nothing to give back.
+
 ---
 
 ## Overhead Distribution
@@ -604,7 +658,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:4518-4531
+```rust lib/src/protocol/mux/h2.rs:4653-4666
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -630,7 +684,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:4566-4572
+```rust lib/src/protocol/mux/h2.rs:4701-4707
 let events = stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -647,9 +701,9 @@ The other three sites take the `&mut self` wrapper
   `reason` variable, one of `H2::WindowStall` or `H2::IdleTimeout`, and counts
   the reap under a different metric for each so a DoS-mitigation reap stays
   distinguishable from an ordinary idle one.
-- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:6473`) uses
+- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:6743`) uses
   `H2::ResetFrame`.
-- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:7168`) uses
+- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:7438`) uses
   `H2::Reset`.
 
 Only the last two are reset paths; the first is the idle/stall sweep.
@@ -659,10 +713,10 @@ for one `kawa.prepare` call rather than held across the per-stream write loop,
 so no borrow of `self.hpack` is outstanding at this call site. The call below
 sits inside the `let stream = &mut context.streams[global_stream_id];` borrow
 taken at the top of `H2WritePhase::Flush`'s post-flush tail
-(`lib/src/protocol/mux/h2.rs:3277`) and passes `stream.linked_token()` straight
+(`lib/src/protocol/mux/h2.rs:3412`) and passes `stream.linked_token()` straight
 out of it:
 
-```rust lib/src/protocol/mux/h2.rs:3337-3338
+```rust lib/src/protocol/mux/h2.rs:3405-3406
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 ```
@@ -1015,7 +1069,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8270-8274
+```rust lib/src/protocol/mux/h2.rs:8405-8409
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1148,7 +1202,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8347-8351
+```rust lib/src/protocol/mux/h2.rs:8482-8486
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1623,7 +1677,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:7785
+```rust lib/src/protocol/mux/h2.rs:7920
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -1794,7 +1848,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:6520-6522
+```rust lib/src/protocol/mux/h2.rs:6655-6657
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1802,7 +1856,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:6534-6540
+```rust lib/src/protocol/mux/h2.rs:6669-6675
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.
