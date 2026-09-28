@@ -329,6 +329,9 @@ pub fn begin_new_main_process(
     let _ = upgrade_file
         .read_to_string(&mut content)
         .map_err(UpgradeError::ReadFile)?;
+    // An unlinked temporary file inherited without `FD_CLOEXEC`: close it once
+    // read, or every worker this main forks inherits it.
+    drop(upgrade_file);
 
     // This is the read side of the write->read round-trip started in
     // `fork_main_into_new_main`: the old master wrote a non-empty serialized
@@ -376,6 +379,9 @@ pub fn begin_new_main_process(
             result: "success".to_string(),
             channel_err,
         })?;
+    // The confirmation channel is used once and was inherited without
+    // `FD_CLOEXEC`: close it, or every worker this main forks inherits it.
+    drop(fork_confirmation_channel);
 
     info!("starting new main loop");
 

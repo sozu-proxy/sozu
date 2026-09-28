@@ -3429,6 +3429,29 @@
 
 ### 🐛 Fixed
 
+- **`fix(bin)`: workers no longer inherit other workers' SCM sockets, stopped workers'
+  channels, or the upgrade file ([#1668](https://github.com/sozu-proxy/sozu/issues/1668)).**
+  `fork_main_into_worker` cleared `FD_CLOEXEC` on the main end of each new worker's SCM socket
+  and nothing set it back, so every worker forked later inherited the main end of every earlier
+  worker's SCM socket, stopped ones included, and the main never saw EOF from those peers. A main
+  upgrade also cleared the flag on the channel of every worker, while the new main adopted only
+  those that were neither `Stopped` nor `Stopping`, leaving the others open and inheritable;
+  `enable_cloexec_after_upgrade` restored it on `Running` channels only. That leaked channel was
+  also the only thing keeping a draining worker's command channel open across a main upgrade. The new main kept its
+  unlinked upgrade file and its confirmation channel open, and each worker its state file. On a
+  real main with two workers, `upgrade --worker 0`, `upgrade --worker 1` and `upgrade` left 8
+  sockets shared between the main and both workers, plus deleted files in every worker. The flag
+  now stays set except in `SerializedWorkerSession::try_from`, for the SCM socket and channel of
+  the workers the next main adopts; the new main now adopts the `Stopping` workers too, so a
+  worker still draining after `upgrade --worker` keeps its command channel, and its in-flight
+  requests, across a main upgrade, and `sozu upgrade` no longer asks it for a second upgrade;
+  `enable_cloexec_after_upgrade` restores the flag on every adopted worker's channel and SCM
+  socket, and the old main calls it when the upgrade fails; the used upgrade file, confirmation
+  channel and worker state file are closed. A stopped worker's channel
+  and SCM socket still stay open in the main, close-on-exec, until the next main upgrade. Pinned
+  by the process-level `bin/tests/upgrade_fd_inheritance_e2e.rs` and
+  `bin/tests/upgrade_keeps_draining_worker_e2e.rs`.
+
 - **`chore(clippy)`: `cargo clippy --all-targets --release -- -D warnings` passes again, and CI now
   runs it.** CI linted only the dev profile, where `debug_assertions` is on, so items used only by
   `#[cfg(debug_assertions)]` code or by a `debug!` call (compiled out of release builds) failed the

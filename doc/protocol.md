@@ -35,7 +35,16 @@ It addresses [#1155](https://github.com/sozu-proxy/sozu/issues/1155).
   received from the retiring one, and they reach that worker over SCM only.
   A descriptor that must cross `exec` (channels, state and upgrade files, the
   command socket) has `FD_CLOEXEC` cleared explicitly by
-  `util::disable_close_on_exec` in `bin/`.
+  `util::disable_close_on_exec` in `bin/`, for that one hand-off only: the
+  main end of a worker's SCM socket and channel lose the flag in
+  `SerializedWorkerSession::try_from`, for the workers the next main adopts
+  (every worker not yet `Stopped`: a `Stopping` one is still draining and
+  needs its command channel),
+  and `Server::enable_cloexec_after_upgrade` sets it back once they are
+  adopted or the upgrade failed. The new main closes its upgrade file and
+  confirmation channel once used, and a worker its state file once read.
+  `bin/tests/upgrade_fd_inheritance_e2e.rs` fails when two sozu processes
+  share a socket after worker and main upgrades.
 
 ## Wire frame
 
