@@ -468,6 +468,21 @@ allocations count as per-request ones.
   same map with `LinkedStreams`, which holds the first linked stream inline:
   **−3 allocations per request** on a one-request connection.
 
+- **A TCP session reuses the splice pipes of an earlier one
+  ([#1664](https://github.com/sozu-proxy/sozu/pull/1664)).** With the
+  `splice` feature, each `Protocol::TCP` pipe created its two kernel pipes
+  (`pipe2(2)` ×2, `fcntl(2)` ×4) and closed them at the end (`close(2)` ×4).
+  `SplicePipe::new` now takes an idle pair from a pool of the worker, bounded to
+  32 pairs, and dropping a `SplicePipe` returns its pair there only if both
+  pipes are empty: the pending counters must read zero and `ioctl(FIONREAD)` on
+  each read end must confirm it, so the bytes of one client can never reach
+  another. Measured per TCP connection on top of #1657, release, 20
+  connections, two passes: **34.10–34.90 → 25.75–26.85** system calls: −10 on a reused pair, +2 `ioctl` on a
+  pair returned while the pool has room. A burst that ends more sessions than
+  the pool holds pays for the pairs beyond 32 exactly as before.
+  Since `SplicePipe::new` takes from the pool before creating, a worker never
+  holds more pipe descriptors than at its earlier peak of spliced sessions.
+
 ### 3.12 Soft stop without a busy loop
 
 During a soft stop, `Mux::drive_frontend_shutdown_io` forced one write pass on
@@ -507,12 +522,13 @@ keep `crypto-ring` so that they compare with each other.
   buffers per TLS request for its own records; both were measured and left
   ([#1628](https://github.com/sozu-proxy/sozu/pull/1628)).
 - **The TCP relay** (`lib/src/tcp.rs`) still shuts down both sockets with
-  `Shutdown::Both` before closing them and allocates its splice pipes per
-  session: `pipe2` ×2, `fcntl` ×4 and `close` ×4, ten system calls per
-  connection ([`lifetime_of_a_session.md`](./lifetime_of_a_session.md) §9).
-  Its deregister and its `getpeername(2)` went in #1657 (§3.10), after the
-  measurement of §2.3; no earlier change targeted the TCP data path, and its
-  figures in §2.3 moved only through code it shares with the HTTP path.
+  `Shutdown::Both` before closing them
+  ([`lifetime_of_a_session.md`](./lifetime_of_a_session.md) §9). Its deregister
+  and its `getpeername(2)` went in #1657 (§3.10), and the splice pipes it
+  allocated per session (`pipe2` ×2, `fcntl` ×4 and `close` ×4) are reused
+  since (§3.11), both after the measurement of §2.3; no earlier change targeted
+  the TCP data path, and its figures in §2.3 moved only through code it shares
+  with the HTTP path.
 - **UDP** was traced only for the event-loop fix of §3.10 and for a new flow's
   upstream socket, which `udp_connect` now opens in three system calls instead
   of eight (release, Linux). Its per-datagram costs are read from the code in
@@ -684,6 +700,7 @@ compiled into that binary) and `cargo test -p sozu-command-lib`.
 | No `EPOLL_CTL_DEL` before a session socket's last close | `closed_sessions_leave_their_sockets_to_close`, `close_leaves_backend_sockets_to_their_last_close` |
 | No `shutdown(2)` once the peer has closed | `mux_close_skips_the_backend_shutdown_once_the_backend_closed`, `https_close_skips_the_frontend_shutdown_once_the_client_closed` |
 | No per-connection `getpeername` or `TCP_NODELAY` | `a_steady_state_accepted_socket_inherits_nodelay_and_its_peer_address` |
+| A splice pipe pair returns to the pool only when both pipes are empty | `a_splice_pipe_returned_with_bytes_in_flight_is_never_reused`, `an_empty_splice_pipe_is_reused`, `the_splice_pipe_pool_is_bounded` (compiled with `--features splice`), `test_tcp_request_bytes_left_in_the_pipe_never_reach_the_next_session`, `test_tcp_response_bytes_left_in_the_pipe_never_reach_the_next_session`, `test_tcp_proxy_successive_sessions_keep_their_own_bytes` (`e2e`) |
 | A draining session makes one write pass per soft-stop call | `an_idle_draining_h2_session_makes_one_writable_pass_per_shutdown_tick` |
 | A draining H2 session waits for a request still arriving or awaiting its link, and a forced close sends a final GOAWAY | `a_draining_h2_session_waits_for_a_stream_awaiting_its_link`, `test_h2_graceful_drain_deadline_mid_header_block_sends_final_goaway` |
 | A fresh request id per keep-alive request and per stream | `header_editing_output_is_byte_exact_across_keep_alive_requests`, `test_keep_alive_rotates_request_id`, `test_h2_streams_carry_distinct_request_ids` |
