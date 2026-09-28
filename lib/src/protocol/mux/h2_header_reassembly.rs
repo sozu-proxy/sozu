@@ -158,6 +158,7 @@ impl HeaderBlockAccumulator {
         self.bytes.len()
     }
 
+    #[cfg(any(debug_assertions, test))]
     pub(super) fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }

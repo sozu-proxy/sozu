@@ -235,6 +235,33 @@ jobs:
         if: matrix.toolchain == '1.93.1'
         run: cargo clippy --all-targets --locked ${{ matrix.flags }} -- -D warnings
 
+      # The step above lints the dev profile only, where `debug_assertions` is
+      # on. An item used solely by `#[cfg(debug_assertions)]` code or by a
+      # `debug!`/`trace!` call, which release builds compile out, is dead or
+      # redundant in release and nothing reported it: on 2026-09-28
+      # `cargo clippy --all-targets --release -- -D warnings` failed on five
+      # such items in `lib/src/protocol/mux/` and one `if_same_then_else` in
+      # `bin/src/command/server.rs`. `debug_assertions` is orthogonal to the
+      # crypto provider, so one cell is enough.
+      #
+      # The step deletes `target/release` as soon as the lint passes. Its
+      # check artifacts weigh 0.90GB (`du -sb`, 1.93.1, these flags,
+      # CARGO_INCREMENTAL=0, line-tables-only), and kept they would add to the
+      # 5.46GB `target/` this cell reaches once the sozu-e2e tests are built,
+      # under the pod's 8Gi ephemeral-storage limit described at the top of
+      # this file. Kept, they got this cell's pod evicted during `Test
+      # sozu-e2e` ("Pod ephemeral local storage usage exceeds the total limit
+      # of containers 8Gi", 2026-09-28). Deleted here, the step peaks at
+      # 3.71GB, below the later test steps, and adds nothing to the cell's
+      # peak. Nothing else in this cell uses `target/release` (it runs no
+      # bench), and rust-cache therefore never stores it: every run re-checks
+      # the dependencies in release, about 55s, measured in CI and locally.
+      - name: Lint (clippy, release profile)
+        if: matrix.cell == 'msrv-full'
+        run: |
+          cargo clippy --all-targets --release --locked ${{ matrix.flags }} -- -D warnings
+          rm -rf target/release
+
       # `sozu-command-lib` was named in no workflow at all until this step:
       # CI tested `sozu-lib`, `sozu`, `sozu-e2e` and `sozu-sim`, and there is
       # no `cargo test --workspace` anywhere, so `command/`'s 170 `#[test]`

@@ -1007,11 +1007,11 @@ impl CommandHub {
     }
 
     fn handle_finishing_task(&mut self, task_id: TaskId, task: TaskContainer, timed_out: bool) {
-        if timed_out {
-            debug!("Task timeout: {:?}", task);
-        } else {
-            debug!("Task finish: {:?}", task);
-        }
+        debug!(
+            "Task {}: {:?}",
+            if timed_out { "timeout" } else { "finish" },
+            task
+        );
         let client = &mut task
             .job
             .client_token()
