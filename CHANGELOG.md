@@ -3429,6 +3429,16 @@
 
 ### 🐛 Fixed
 
+- **`test(pipe)`: the splice EOF-drain test names the host pipe limit instead of reporting a
+  false regression.** `splice_readable_eof_drains_kernel_pipe_bytes_before_closing` in
+  `lib/src/protocol/pipe.rs` needs the whole 32 KiB payload to sit in the kernel in_pipe. Once a
+  user's pipe buffers exceed `fs.pipe-user-pages-soft`, Linux creates every new pipe with 2 pages
+  (8 KiB) and refuses `F_SETPIPE_SZ` with `EPERM`, so `splice_readable` stops at its capacity
+  guard and the test failed on `left: 8192 right: 32768`, which read as a Sōzu regression. The
+  test now asserts the realised splice capacity first and fails with a message naming the limit
+  and its current value. The drain assertion is unchanged, and the test still fails, rather than
+  skips, when the host cannot meet the precondition. Test only.
+
 - **`fix(ctl)`: `--timeout 0` and `ctl_command_timeout = 0` disable the command timeout
   ([#1671](https://github.com/sozu-proxy/sozu/issues/1671)).** The `--timeout` help says `0`
   disables the timeout, but the CLI turned `0` into a zero deadline, so `sozu -t 0 status`
