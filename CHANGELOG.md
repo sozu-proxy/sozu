@@ -3429,6 +3429,17 @@
 
 ### 🐛 Fixed
 
+- **`fix(bin)`: `sozu status` reports a draining worker as `STOPPING` instead of `RUNNING`
+  ([#1672](https://github.com/sozu-proxy/sozu/issues/1672)).** `status` snapshots each worker
+  with `querying_info`, which keeps `Stopping` and `Stopped` and gives a running worker the
+  `NotAnswering` placeholder its probe resolves. A `Stopping` worker is still probed, since it
+  answers while it drains, and `StatusTask::on_finish` wrote `Running` over every answered entry,
+  so the old worker of an `upgrade --worker` showed `RUNNING` until it exited. An answer now only
+  resolves the `NotAnswering` placeholder; a `Stopped` worker is still never probed and still
+  shows `STOPPED`. Pinned by
+  `status_keeps_the_lifecycle_state_of_a_draining_or_stopped_worker` in
+  `bin/src/command/requests.rs`.
+
 - **`fix(ctl)`: a soft `sozu shutdown` waits for the drain and reports its outcome
   ([#1671](https://github.com/sozu-proxy/sozu/issues/1671)).** The main answers a `SoftStop`
   with a `Processing` at once and sends the final `Ok` only when the last worker has drained
