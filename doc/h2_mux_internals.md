@@ -658,7 +658,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:4653-4666
+```rust lib/src/protocol/mux/h2.rs:4703-4716
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -684,7 +684,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:4701-4707
+```rust lib/src/protocol/mux/h2.rs:4751-4757
 let events = stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -701,9 +701,9 @@ The other three sites take the `&mut self` wrapper
   `reason` variable, one of `H2::WindowStall` or `H2::IdleTimeout`, and counts
   the reap under a different metric for each so a DoS-mitigation reap stays
   distinguishable from an ordinary idle one.
-- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:6743`) uses
+- `ConnectionH2::handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs`) uses
   `H2::ResetFrame`.
-- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:7438`) uses
+- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs`) uses
   `H2::Reset`.
 
 Only the last two are reset paths; the first is the idle/stall sweep.
@@ -713,10 +713,10 @@ for one `kawa.prepare` call rather than held across the per-stream write loop,
 so no borrow of `self.hpack` is outstanding at this call site. The call below
 sits inside the `let stream = &mut context.streams[global_stream_id];` borrow
 taken at the top of `H2WritePhase::Flush`'s post-flush tail
-(`lib/src/protocol/mux/h2.rs:3412`) and passes `stream.linked_token()` straight
+(`ConnectionH2::poll_write_target`, `lib/src/protocol/mux/h2.rs`) and passes `stream.linked_token()` straight
 out of it:
 
-```rust lib/src/protocol/mux/h2.rs:3405-3406
+```rust lib/src/protocol/mux/h2.rs:3426-3427
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 ```
@@ -1069,7 +1069,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8405-8409
+```rust lib/src/protocol/mux/h2.rs:8509-8513
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1202,7 +1202,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8482-8486
+```rust lib/src/protocol/mux/h2.rs:8586-8590
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1677,7 +1677,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:7920
+```rust lib/src/protocol/mux/h2.rs:8024
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -1731,6 +1731,46 @@ H2 stream state, GOAWAY sequencing, and rustls buffering interact:
   `close_notify` the call only failed with `ENOTCONN`
   ([#1603](https://github.com/sozu-proxy/sozu/issues/1603)). The
   `close_notify` itself is still sent.
+
+### A backend stream the backend never saw
+
+On a backend connection (`Position::Client`) a stream exists in sozu before it
+exists on the wire. `ConnectionH2::start_stream` allocates the id and registers
+it as soon as the router links the request; the HEADERS leave with a later
+write pass, once the preface is out and the handshake reached `H2State::Header`,
+and the socket may take none of them, leaving the block parked in `front.out`.
+`front.consumed` is the discriminator: on this position it is exactly "a request
+byte reached this socket", and the first frame of a stream is its HEADERS.
+
+A stream retired before that — the client reset or left, the stream or backend
+timed out — is idle for the backend. RFC 9113 §5.1 and §6.4 make any frame but
+HEADERS or PRIORITY on an idle stream, RST_STREAM included, a connection error
+(hyperium/h2 answers GOAWAY(PROTOCOL_ERROR) from `Recv::ensure_not_idle`,
+HAProxy from `h2_frame_check_vs_state`), and a frame queued before the preface
+breaks it (§3.4). `Router::connect` multiplexes the streams of several clients
+on one backend connection, still connecting included, so one cancelled request
+used to cost all of them
+([#1631](https://github.com/sozu-proxy/sozu/issues/1631)). The
+`Position::Client` arm of `ConnectionH2::end_stream` and
+`ConnectionH2::cancel_timed_out_streams` now queue nothing for such a stream,
+as hyperium/h2 drops a stream still pending open. The same holds for a request
+that fails while its backend stream is registered and its HEADERS have not
+left — an H1 frontend rejecting a malformed body answers 400 itself: the
+`H2WritePhase::Prepare` arm no longer hands it to the converter, whose
+`initialize` would have queued the RST. Its id stays burnt: the next
+HEADERS on a higher id closes it implicitly (§5.1.1), which is harmless because
+the backend never processed it. A block parked unsent goes with the stream,
+and the next write pass resets the HPACK encoder's table for it (see "A dropped
+header block resets both tables" below).
+
+The handshake is covered the same way. A backend connection is `Connected` from
+its first writable, before its preface is written, and the router links streams
+onto it from then on; `start_stream` arms a write for each. In
+`H2State::ServerSettings` (preface out, server SETTINGS not read) that write used
+to hit `Unexpected combination` and force-disconnect. It is now withdrawn, and
+the SETTINGS ACK the read queues re-arms it, so a request linked during the
+handshake goes out right after it. The `ClientPreface` arm debug-asserts that
+nothing was queued ahead of the preface.
 
 ### complete_server_stream()
 
@@ -1848,7 +1888,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:6655-6657
+```rust lib/src/protocol/mux/h2.rs:6723-6725
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1856,7 +1896,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:6669-6675
+```rust lib/src/protocol/mux/h2.rs:6737-6743
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.

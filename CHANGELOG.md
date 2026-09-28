@@ -3349,6 +3349,51 @@
   WINDOW_UPDATEs pushed past 2^31-1 is a FLOW_CONTROL_ERROR and closes the connection with
   GOAWAY, as an overflowing WINDOW_UPDATE does.
 
+- **`fix(mux-h1)`: an H1 request that fails to parse after its response started no longer gets
+  a `400` spliced into that response's body.** A backend may answer early and stream its body
+  while the client is still uploading; a malformed chunk then made `ConnectionH1::readable`
+  replace the response with a complete `HTTP/1.1 400`, written after the bytes already sent, so
+  the client read it as part of the first response. When `back.consumed` is set, the response
+  is now cut (`forcefully_terminate_answer`) and the connection closes for writing
+  (`defer_close_for_tls_flush`), so the client sees a truncated message; a request rejected
+  before any response byte keeps its `400`. Covered by
+  `a_request_error_after_the_response_started_cuts_it_instead_of_splicing_a_400` (red: the 400
+  is written after the response).
+
+- **`fix(mux-h2)`: a backend stream ended before its HEADERS left sozu is forgotten instead of
+  reset, so one client cancelling a request no longer takes down the shared backend connection
+  ([#1631](https://github.com/sozu-proxy/sozu/issues/1631)).** `ConnectionH2::start_stream`
+  allocates a stream id when the router links a request, but its HEADERS leave with a later
+  write pass. When the frontend gave up in between (client RST_STREAM or disconnect, stream or
+  backend timeout), `ConnectionH2::end_stream` and `ConnectionH2::cancel_timed_out_streams`
+  queued `RST_STREAM(CANCEL)` for a stream the backend had never seen: a connection error on an
+  idle stream (RFC 9113 §5.1, §6.4), sent ahead of the connection preface when the TCP connect
+  was still in progress (§3.4). `Router::connect` multiplexes the streams of several clients on
+  one H2 backend connection, including one still connecting, so every other request on it was
+  lost. A stream whose request never reached the socket (`front.consumed` false on
+  `Position::Client`, the HEADERS block possibly still parked in `front.out`) is now retired with
+  no frame at all, as hyperium/h2 drops a stream still pending open; its id is burnt, and the
+  next HEADERS on a higher id closes it implicitly (RFC 9113 §5.1.1). A block parked unsent goes
+  with it and resets the HPACK encoder's table, as for any dropped block since #1627. Separately,
+  a write readiness on a backend connection waiting for the server's SETTINGS
+  (`H2State::ServerSettings`) no longer force-disconnects it as an `Unexpected combination`:
+  `start_stream` arms one for every stream linked there, and the router links onto a `Connected`
+  connection whatever its handshake state. The readiness is withdrawn, and the SETTINGS ACK
+  re-arms it, so a request linked during the handshake goes out after it. Covered by
+  `a_backend_stream_ended_before_its_headers_left_is_not_reset`,
+  `a_backend_stream_ended_before_the_preface_leaves_the_preface_first`,
+  `a_backend_stream_ended_during_the_handshake_keeps_the_connection`,
+  `a_request_linked_during_the_handshake_goes_out_after_the_settings`,
+  `a_backend_stream_reaped_before_its_headers_left_is_not_reset` and
+  `a_backend_stream_ended_with_its_headers_parked_is_not_reset`, all red on `d5161919`. A third
+  producer had the same shape: when the H1 frontend rejects a malformed request body and
+  answers 400 itself, the request kawa turns `Error` while its backend stream stays registered,
+  and the next backend write pass handed it to `H2BlockConverter::initialize`, which queued the
+  RST_STREAM. The `H2WritePhase::Prepare` arm of `ConnectionH2::poll_write_target` now skips a
+  request in error whose HEADERS never left; the stream is retired later without a frame
+  (`a_backend_stream_whose_request_failed_before_its_headers_left_is_not_reset`, red on
+  `6eef0ba1` with `RST_STREAM(1, INTERNAL_ERROR)` on the wire).
+
 - **`fix(mux-h2)`: an HPACK size update carried by a header block dropped for exceeding
   `MAX_HEADER_LIST_SIZE` is signalled again on the next block
   ([#1627](https://github.com/sozu-proxy/sozu/issues/1627)).** The pass had already marked the
