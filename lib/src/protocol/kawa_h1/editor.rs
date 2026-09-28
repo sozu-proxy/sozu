@@ -736,12 +736,15 @@ fn standard_reason(code: u16) -> Option<&'static str> {
 /// Whether `kawa` carries a non-elided `Content-Length` whose value is not
 /// `1*DIGIT` (RFC 9110 §8.6).
 ///
-/// kawa 0.7.1 reads the value with `usize::from_str`, which also accepts one
-/// leading `+`, and leaves the field line in place with its original
-/// spelling (CleverCloud/kawa#25); kawa refuses every spelling `from_str`
-/// refuses. Only non-elided lines are judged, because they are the
-/// ones the H1 serializer forwards: kawa elides a second line equal to the
-/// first, and every Content-Length beside a Transfer-Encoding.
+/// kawa 0.7.1 read the value with `usize::from_str`, which also accepts one
+/// leading `+`, and left the field line in place with its original
+/// spelling (CleverCloud/kawa#25). kawa >= 0.7.2 checks `1*DIGIT` itself
+/// before the header callback (CleverCloud/kawa#26), so under the locked
+/// kawa this helper never finds a non-digit value on a parsed message: it
+/// is defense in depth against a kawa regression. Only non-elided lines are
+/// judged, because they are the ones the H1 serializer forwards: kawa elides
+/// a second line equal to the first, and every Content-Length beside a
+/// Transfer-Encoding.
 fn has_non_digit_content_length(kawa: &GenericHttpStream) -> bool {
     let buf = kawa.storage.buffer();
     kawa.blocks.iter().any(|block| match block {
@@ -872,9 +875,9 @@ impl HttpContext {
         //   * a TE header whose field value does not end in `chunked`, or
         //   * a TE header present while kawa did not adopt chunked framing.
         //
-        // WHICH CLAUSE ACTUALLY FIRES, against the kawa this workspace pins (`^0.7.1`,
-        // locked at 0.7.1). Read from kawa 0.7.1's `process_headers`
-        // (its `src/protocol/h1/parser/mod.rs`), not measured here: kawa resolves the
+        // WHICH CLAUSE ACTUALLY FIRES, against the kawa this workspace pins (`^0.7.2`,
+        // locked at 0.7.2; its Transfer-Encoding handling is 0.7.1's). Read from kawa's
+        // `process_headers` (its `src/protocol/h1/parser/mod.rs`), not measured here: kawa resolves the
         // combined Transfer-Encoding BEFORE this callback and, for a REQUEST whose
         // combined final coding is not chunked, errors the parse and returns without
         // calling `callbacks.on_headers` at all (RFC 9112 §6.3). It judges the LAST TE
@@ -953,7 +956,11 @@ impl HttpContext {
         // forwarded as sent: a backend that refuses or re-reads `+5` takes the
         // body for the start of the next request — never routed, never
         // Basic-auth checked (CWE-444, sozu#1652). RFC 9112 §6.3 rule 5 makes
-        // it an unrecoverable framing error: 400. A list of equal values
+        // it an unrecoverable framing error: 400. kawa >= 0.7.2 refuses every
+        // non-digit value before calling back (CleverCloud/kawa#26), so this
+        // clause no longer fires on a request kawa accepted: it is defense in
+        // depth against a kawa regression — keep it, and do not describe it
+        // as closing a live hole. A list of equal values
         // (`5, 5`), which RFC 9110 §8.6 lets a recipient either collapse or
         // reject, is rejected — kawa already refuses it. `005` is `1*DIGIT`
         // and is forwarded as sent, as the H2 path forwards it. Mirrors
@@ -996,17 +1003,23 @@ impl HttpContext {
         // A request with neither Content-Length nor Transfer-Encoding has no
         // body, whatever its method or version (RFC 9112 §6.3 rule 7);
         // close-delimited framing (rule 8) is for responses only. kawa 0.7.1
-        // does not make that distinction: `kawa::h1::parse` maps
+        // did not make that distinction: `kawa::h1::parse` mapped
         // `BodySize::Empty` to `ParsingPhase::Body` for both kinds, and that
         // arm takes every byte left in the buffer. A request pipelined behind
         // this one would then be forwarded raw as its "body" to this
         // request's backend: never routed, never Basic-auth checked, without
-        // `Sozu-Id` or `X-Forwarded-*` (CWE-444). End it here instead, so the
-        // flags block kawa pushes right after this callback carries
-        // `end_stream`, and the next request stays unparsed for its own turn.
+        // `Sozu-Id` or `X-Forwarded-*` (CWE-444, sozu#1650). End it here
+        // instead, so the flags block kawa pushes right after this callback
+        // carries `end_stream`, and the next request stays unparsed for its
+        // own turn.
+        //
+        // kawa >= 0.7.2 applies rule 7 itself (CleverCloud/kawa#27): it maps
+        // `BodySize::Empty` to `ParsingPhase::Terminated` for a request before
+        // calling back, so this branch no longer fires on the H1 path. It is
+        // defense in depth against a kawa regression — keep it.
         //
         // The `ParsingPhase::Body` conjunct is what confines this to kawa's
-        // H1 parser, which sets that phase before calling back.
+        // H1 parser, which set that phase before calling back (kawa 0.7.1).
         // `pkawa::handle_header` calls this same callback for an H2 request
         // while its `body_size` is still `Empty` and its phase still the
         // initial one, then frames a request whose DATA follows as chunked
@@ -1391,6 +1404,9 @@ impl HttpContext {
         // and `shared::end_stream_decision` answers the client 502 since no
         // byte of the response was consumed. Checked before the 204/304/1xx
         // override of `body_size`, which leaves the field line in place.
+        // kawa >= 0.7.2 already fails such a response before calling back
+        // (CleverCloud/kawa#26) — the same 502 through the same path — so
+        // this clause is defense in depth against a kawa regression.
         if has_non_digit_content_length(response) {
             incr!(names::http::BACKEND_CONTENT_LENGTH_INVALID);
             warn!(
@@ -2203,18 +2219,27 @@ mod tests {
 
     /// RFC 9110 §8.6: `Content-Length = 1*DIGIT`, and a sender MUST NOT
     /// forward a message whose Content-Length does not match that grammar.
-    /// kawa 0.7.1 reads the value with `usize::from_str`, which also accepts
+    /// kawa 0.7.1 read the value with `usize::from_str`, which also accepts
     /// one leading `+`: `Content-Length: +5` framed a 5-byte body and was
     /// forwarded verbatim, handing any backend that refuses or re-reads
     /// that spelling a body it would take for the next request (CWE-444).
     ///
-    /// Only the `+` rows reach `on_request_headers`; every other row is
-    /// already refused by kawa (`Invalid Content-Length field value`) and
-    /// pins that the guard neither relaxes nor depends on that refusal.
+    /// kawa >= 0.7.2 refuses every row here itself (`Invalid Content-Length
+    /// field value`, CleverCloud/kawa#26) before `on_request_headers` runs;
+    /// under kawa 0.7.1 the `+` rows reached it. The test pins the outcome —
+    /// the request is refused — whichever layer refuses it, and that the
+    /// Sōzu clause neither relaxes nor depends on kawa's refusal.
     ///
-    /// TO SEE THIS RED, delete the Content-Length clause of
-    /// `on_request_headers`: the `plus`, `plus-zero` and
-    /// `plus-then-canonical` rows then parse clean.
+    /// TO SEE THIS RED: deleting the Content-Length clause of
+    /// `on_request_headers` alone no longer turns it red, since kawa >= 0.7.2
+    /// refuses every row first. Either see the clause's own predicate fail in
+    /// `the_content_length_helper_judges_every_non_digit_value`, or pin
+    /// kawa 0.7.1 (`kawa = { version = "=0.7.1", default-features = false }`
+    /// in the root `Cargo.toml`, then `cargo update -p kawa --precise 0.7.1`)
+    /// and delete the clause: the `plus`, `plus-zero` and
+    /// `plus-then-canonical` rows then parse clean. Under that pin the
+    /// `canonical-then-plus` assertion fails even with the clause present:
+    /// that refusal is kawa's alone, since kawa 0.7.1 elided the `+5` line.
     #[test]
     fn a_request_content_length_that_is_not_only_digits_is_rejected() {
         let cases: [(&str, &[u8]); 13] = [
@@ -2259,14 +2284,31 @@ mod tests {
             "plus-then-canonical: the surviving `+5` must be refused, got {:?}",
             kawa.parsing_phase
         );
+        // Hand the pool's only buffer back for the next parse.
+        drop(kawa);
+
+        // The mirror order. kawa 0.7.1 parsed the second line as 5, elided
+        // it as equal to the first and forwarded only `5`. kawa >= 0.7.2
+        // judges every line against `1*DIGIT` before comparing it, so the
+        // message carries an invalid Content-Length field line and is
+        // refused (RFC 9112 §6.3 rule 5) — the same verdict as the order
+        // above, no longer one that depends on which line comes first.
+        let request = b"POST /api HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\nContent-Length: +5\r\n\r\nHello";
+        let kawa = parse_framed(&mut pool, kawa::Kind::Request, request);
+        assert!(
+            kawa.is_error(),
+            "canonical-then-plus: a `+5` field line must be refused, got {:?}",
+            kawa.parsing_phase
+        );
     }
 
     /// `has_non_digit_content_length` on its own, over hand-built header
-    /// blocks. kawa 0.7.1 refuses `-0`, `0x5`, `5 5` and the empty value
-    /// before `on_request_headers` runs, so the parse-driven test above
-    /// proves kawa's refusal for those rows, not the helper's: a helper
-    /// narrowed to a leading `+` would still pass it. This test pins the
-    /// helper's own `1*DIGIT` contract, and that an elided line is not judged.
+    /// blocks. kawa refuses `-0`, `0x5`, `5 5` and the empty value before
+    /// `on_request_headers` runs — and, since 0.7.2, `+5` too — so the
+    /// parse-driven tests above prove kawa's refusal, not the helper's: a
+    /// helper narrowed to a leading `+`, or not called at all, would still
+    /// pass them. This test is the one that pins the helper's own `1*DIGIT`
+    /// contract, and that an elided line is not judged.
     ///
     /// TO SEE THIS RED, narrow the helper's predicate to
     /// `val.first() == Some(&b'+')`: the `-0`, `0x5`, `5 5` and empty rows
@@ -2315,14 +2357,17 @@ mod tests {
     ///
     /// - `005` matches `1*DIGIT`: it is legal and forwarded as sent, exactly
     ///   as the H2 path (`pkawa::write_regular_header`) forwards it.
-    /// - `5` then `+5`: kawa elided the second, equal, line; only the
-    ///   canonical first line is forwarded.
     /// - `+5` beside `Transfer-Encoding: chunked`: kawa elided the
-    ///   Content-Length (RFC 9110 §6.3 — Transfer-Encoding overrides it), so
-    ///   nothing non-canonical is forwarded.
+    ///   Content-Length (RFC 9110 §6.3 — Transfer-Encoding overrides it)
+    ///   without reading its value, so nothing non-canonical is forwarded.
+    ///
+    /// `5` then `+5` is no longer a row here: kawa 0.7.1 elided the second
+    /// line as equal to the first and forwarded `5`, while kawa >= 0.7.2
+    /// refuses the `+5` line itself, so that request is now pinned as
+    /// refused in `a_request_content_length_that_is_not_only_digits_is_rejected`.
     #[test]
     fn a_forwarded_content_length_is_only_digits() {
-        let cases: [(&str, &[u8], &str); 4] = [
+        let cases: [(&str, &[u8], &str); 3] = [
             (
                 "canonical",
                 b"POST /api HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nHello",
@@ -2332,11 +2377,6 @@ mod tests {
                 "leading-zeros",
                 b"POST /api HTTP/1.1\r\nHost: example.com\r\nContent-Length: 005\r\n\r\nHello",
                 "Content-Length: 005\r\n",
-            ),
-            (
-                "canonical-then-plus",
-                b"POST /api HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\nContent-Length: +5\r\n\r\nHello",
-                "Content-Length: 5\r\n",
             ),
             (
                 "plus-beside-chunked",
@@ -2373,8 +2413,15 @@ mod tests {
     /// response parse, which the mux answers with a 502 before any byte of
     /// it reaches the client (`shared::end_stream_decision`).
     ///
-    /// TO SEE THIS RED, delete the Content-Length clause of
-    /// `on_response_headers`.
+    /// kawa >= 0.7.2 already fails such a response itself
+    /// (CleverCloud/kawa#26), before `on_response_headers` runs.
+    ///
+    /// TO SEE THIS RED: deleting the Content-Length clause of
+    /// `on_response_headers` alone no longer turns it red. Pin
+    /// kawa 0.7.1 (`kawa = { version = "=0.7.1", default-features = false }`
+    /// in the root `Cargo.toml`, then `cargo update -p kawa --precise 0.7.1`)
+    /// and delete the clause; the helper's own predicate is pinned by
+    /// `the_content_length_helper_judges_every_non_digit_value`.
     #[test]
     fn a_response_content_length_that_is_not_only_digits_is_rejected() {
         let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
@@ -3102,15 +3149,22 @@ mod tests {
 
     /// RFC 9112 §6.3 rule 7: a request with neither `Content-Length` nor
     /// `Transfer-Encoding` has a zero-length body, whatever its method or
-    /// version. kawa reads such a request as close-delimited
+    /// version. kawa 0.7.1 read such a request as close-delimited
     /// (`ParsingPhase::Body` on `BodySize::Empty`, whose arm takes every
     /// byte left in the buffer), so without `on_request_headers` ending it,
-    /// the request pipelined behind it becomes a `Block::Chunk` of its body
-    /// and is forwarded raw to the first request's backend (CWE-444).
+    /// the request pipelined behind it became a `Block::Chunk` of its body
+    /// and was forwarded raw to the first request's backend (CWE-444).
+    /// kawa >= 0.7.2 ends it itself (CleverCloud/kawa#27); the test pins the
+    /// outcome, whichever layer ends it.
     ///
-    /// TO SEE THIS RED, delete the `ParsingPhase::Body` + `BodySize::Empty`
-    /// branch of `on_request_headers`: every case then fails the first
-    /// assertion, still in `Body`.
+    /// TO SEE THIS RED: deleting the `ParsingPhase::Body` +
+    /// `BodySize::Empty` branch of `on_request_headers` alone no longer
+    /// turns it red, since kawa >= 0.7.2 terminates the request before that
+    /// branch is reached. Pin
+    /// kawa 0.7.1 (`kawa = { version = "=0.7.1", default-features = false }`
+    /// in the root `Cargo.toml`, then `cargo update -p kawa --precise 0.7.1`)
+    /// and delete the branch: every case then fails the first assertion,
+    /// still in `Body`.
     #[test]
     fn a_request_without_length_ends_after_its_headers() {
         const NEXT: &[u8] = b"GET /next HTTP/1.1\r\nHost: example.com\r\n\r\n";
@@ -3203,9 +3257,11 @@ mod tests {
     /// BEFORE it resolves the framing: `body_size` is still `Empty` there
     /// for a request whose DATA frames follow, and it upgrades that to
     /// chunked afterwards unless the callback terminated the message. The
-    /// guard keys on the `ParsingPhase::Body` kawa's H1 parser sets for a
-    /// close-delimited message, which the H2 path never sets before the
-    /// callback, so an H2 request is left for pkawa to frame.
+    /// guard keys on the `ParsingPhase::Body` kawa's H1 parser set for a
+    /// close-delimited request up to kawa 0.7.1, which the H2 path never
+    /// sets before the callback, so an H2 request is left for pkawa to frame.
+    /// This test calls the callback directly, so it is unaffected by
+    /// kawa >= 0.7.2 ending an H1 request itself.
     ///
     /// TO SEE THIS RED, key the guard on `body_size == BodySize::Empty`
     /// alone: this request is then terminated.

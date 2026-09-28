@@ -99,7 +99,8 @@ mutable companion to the Kawa parser. Its `kawa::h1::ParserCallbacks` impl
   `X-Forwarded-For`, `Forwarded`, `X-Real-IP` or `X-Forwarded-Port` shares
   that rendering (`kawa::Store::Shared`), while a client-supplied chain,
   which is request-scoped, is extended into an exact-size copy of its own.
-  It also ends a request that declares no body after its headers (§2.2);
+  It also ends a request that declares no body after its headers should
+  kawa not have done so already — defense in depth since kawa 0.7.2 (§2.2);
 - `on_response_headers` (`editor.rs`) — captures `:status`, `:reason`,
   optionally rewrites `Set-Cookie` for sticky sessions. The reason is kept
   for the access log as the `'static` phrase RFC 9110 §15 registers for the
@@ -173,8 +174,9 @@ aggregate.
 kawa **>= 0.7.1** resolves the combined Transfer-Encoding from the LAST TE field
 line, per RFC 9110 §5.3 combining, and errors the parse for a REQUEST whose
 combined final coding is not `chunked` (RFC 9112 §6.3), returning before
-`callbacks.on_headers` is called at all. Two consequences, read from kawa 0.7.1's
-`src/protocol/h1/parser/mod.rs` rather than measured here:
+`callbacks.on_headers` is called at all. Two consequences, read from kawa's
+`src/protocol/h1/parser/mod.rs` rather than measured here (0.7.1 and 0.7.2, the
+version this workspace locks, resolve Transfer-Encoding identically):
 
 - a leading `Transfer-Encoding: chunked` line can no longer latch chunked framing
   while a later `identity` line rides along. That latch was a kawa **0.7.0**
@@ -182,7 +184,7 @@ combined final coding is not `chunked` (RFC 9112 §6.3), returning before
   against;
 - the residual gap is the mirror of it: a chunked-final LAST line with a
   differently-framed EARLIER one — `identity` then `chunked` — parses clean under
-  0.7.1, and forwarding both lines is what the count clause refuses.
+  kawa >= 0.7.1, and forwarding both lines is what the count clause refuses.
 
 The guard therefore folds over every non-elided `Transfer-Encoding` header in
 `request.blocks` (the `te_count` fold at the top of
@@ -203,14 +205,14 @@ which rejects three distinct shapes:
   `chunked` be applied once and be the final coding; multiple TE field lines
   cannot be safely reconciled here, and forwarding them all hands the backend the
   combining problem sōzu just declined to solve. **This is the only clause that
-  can fire on a request kawa 0.7.1 accepted**, in the `identity`-then-`chunked`
+  can fire on a request kawa >= 0.7.1 accepted**, in the `identity`-then-`chunked`
   shape above;
 - one surviving TE header whose final coding is not `chunked`
   (`!te_all_suffix_chunked`), e.g. `Transfer-Encoding: chunked, gzip`;
 - one surviving TE header while kawa did not adopt chunked framing
   (`body_size != BodySize::Chunked`).
 
-The last two cannot fire under kawa 0.7.1: a TE line that survives to this point
+The last two cannot fire under kawa >= 0.7.1: a TE line that survives to this point
 is chunked-final, or kawa already refused the request, and `body_size` is then
 `Chunked`. They stay as defense in depth against a kawa regression — do not read
 either as closing a live hole, and do not delete them on that basis. The
@@ -247,26 +249,38 @@ digits (`has_non_digit_content_length`, `editor.rs`). RFC 9110 §8.6 defines
 value does not match it; RFC 9112 §6.3 rule 5 makes it an unrecoverable
 framing error (400 for a request, 502 for a response received by a proxy).
 
-kawa 0.7.1's `process_headers` reads the value with `nom::ParseTo`, i.e.
-`usize::from_str`, which accepts one leading `+`, and leaves the field line
+kawa 0.7.1's `process_headers` read the value with `nom::ParseTo`, i.e.
+`usize::from_str`, which accepts one leading `+`, and left the field line
 in place with its original spelling (CleverCloud/kawa#25). Without the
 clause, `Content-Length: +5` framed a 5-byte body and reached the backend as
 `+5`: a backend that refuses or re-reads that spelling takes the body for the
 start of the next request, never routed nor Basic-auth checked (CWE-444,
-sozu-proxy/sozu#1652). Measured against `usize::from_str`, the clause is the
-one that fires on traffic kawa accepted, and only for these spellings:
+sozu-proxy/sozu#1652).
 
-| Value | Outcome |
-|---|---|
-| `+5`, `+0` | rejected by this clause (400) — the live case |
-| `-0`, `+`, `5 5`, `0x5`, `5.0`, overflow, non-ASCII digits, empty | kawa already refuses (400); the clause is defense in depth |
-| `5, 5` | kawa already refuses (400); RFC 9110 §8.6 lets a recipient reject or collapse a list of equal values, and Sōzu rejects |
-| `005` | `1*DIGIT`: accepted and forwarded as sent, as the H2 path forwards it |
+kawa **>= 0.7.2** checks the value against `1*DIGIT` itself, before parsing it
+and before `callbacks.on_headers` is called
+([CleverCloud/kawa#26](https://github.com/CleverCloud/kawa/pull/26)), so every
+non-digit spelling is refused by kawa with `Invalid Content-Length field
+value`, and the parse error is still answered 400 (502 for a response). The
+clause no longer fires on any traffic kawa accepts: it stays as defense in
+depth against a kawa regression, and the `FRONTEND_CONTENT_LENGTH_INVALID` /
+`BACKEND_CONTENT_LENGTH_INVALID` counters stay at zero while kawa holds —
+such a message is counted in `http.frontend_parse_errors` /
+`http.backend_parse_errors` instead. Do not delete the clause on that basis.
+
+| Value | kawa 0.7.1 | kawa >= 0.7.2 (locked) |
+|---|---|---|
+| `+5`, `+0` | accepted by kawa; rejected by this clause (400) | refused by kawa (400); the clause is defense in depth |
+| `-0`, `+`, `5 5`, `0x5`, `5.0`, overflow, non-ASCII digits, empty | refused by kawa (400) | refused by kawa (400) |
+| `5, 5` | refused by kawa (400) | refused by kawa (400); RFC 9110 §8.6 lets a recipient reject or collapse a list of equal values, and Sōzu rejects |
+| `005` | `1*DIGIT`: accepted and forwarded as sent, as the H2 path forwards it | same |
 
 Only non-elided lines are judged, because they are the lines the H1
-serializer forwards: kawa elides a second line equal to the first (so
-`5` then `+5` forwards `5`, while `+5` then `5` is rejected) and every
-`Content-Length` beside a `Transfer-Encoding` (RFC 9110 §6.3). The guard
+serializer forwards: kawa elides a second line equal to the first and
+every `Content-Length` beside a `Transfer-Encoding` (RFC 9110 §6.3). Under
+kawa 0.7.1, `5` then `+5` forwarded `5` (the second line parsed equal and was
+elided) while `+5` then `5` was rejected by this clause; kawa >= 0.7.2 judges
+every line against `1*DIGIT` first, so both orders are refused by kawa. The guard
 increments `names::http::FRONTEND_CONTENT_LENGTH_INVALID`, logs a `warn!`
 and errors the parse, like the predicate above. The clause cannot fire for an
 H2 request: `pkawa::write_regular_header` already refuses a non-digit
@@ -283,11 +297,18 @@ Covered by `a_request_content_length_that_is_not_only_digits_is_rejected`,
 `a_forwarded_content_length_is_only_digits`,
 `a_response_content_length_that_is_not_only_digits_is_rejected` and
 `the_content_length_helper_judges_every_non_digit_value` (unit, in
-`editor.rs`; the last one calls the helper directly, since kawa refuses
-most non-digit spellings before the callback runs) and by `test_h1_signed_content_length_request_rejected`,
+`editor.rs`) and by `test_h1_signed_content_length_request_rejected`,
 `test_h1_signed_content_length_response_rejected` and
 `test_h1_leading_zero_content_length_forwarded` in
-`e2e/src/tests/h1_security_tests.rs`.
+`e2e/src/tests/h1_security_tests.rs`. Under kawa >= 0.7.2 the parse-driven
+tests and the e2e tests pin the end-to-end outcome — kawa's refusal and the
+clause together — so deleting the clause alone leaves them green. The only
+test that still goes red on the clause by itself is
+`the_content_length_helper_judges_every_non_digit_value`, which calls the
+helper directly. To see the parse-driven tests red on the clause, pin
+kawa 0.7.1 (`kawa = { version = "=0.7.1", … }` in the root `Cargo.toml`, then
+`cargo update -p kawa --precise 0.7.1`) and delete the clause: the `+5`
+rows then parse clean.
 
 The resulting `ParsingPhase::Error` is observed by the mux H1 connection in
 `ConnectionH1::readable` (`lib/src/protocol/mux/h1.rs`), which checks
@@ -308,8 +329,8 @@ Mirrors the equivalent HTTP/2 → H1 defense, `RejectReason::ClTeConflict`
 
 RFC 9112 §6.3 rule 7: a request with neither header has a zero-length body,
 whatever its method or version. Read-until-close (rule 8) belongs to
-responses only. kawa 0.7.1 does not make that distinction: after
-`process_headers`, `kawa::h1::parse` maps `BodySize::Empty` to
+responses only. kawa 0.7.1 did not make that distinction: after
+`process_headers`, `kawa::h1::parse` mapped `BodySize::Empty` to
 `ParsingPhase::Body` with `expects = 1` for both kinds, and its `Body` arm
 takes every byte left in the buffer when `body_size` is `Empty`
 (CleverCloud/kawa#23). Left alone, a request pipelined behind a plain `GET`
@@ -317,15 +338,26 @@ became that `GET`'s body and was forwarded raw to its backend — never routed,
 never checked by `check_basic`, without `Sozu-Id` or `X-Forwarded-*`
 (CWE-444, sozu-proxy/sozu#1650).
 
-`HttpContext::on_request_headers` (`editor.rs`) therefore sets
+kawa **>= 0.7.2** applies rule 7 itself
+([CleverCloud/kawa#27](https://github.com/CleverCloud/kawa/pull/27)): for a
+request, `kawa::h1::parse` maps `BodySize::Empty` to
+`ParsingPhase::Terminated` before calling `callbacks.on_headers`, pushes the
+end-of-headers `Flags` block with `end_stream: true`, and leaves the bytes
+that follow in `unparsed_data()`. Responses keep the close-delimited mapping.
+The request is therefore forwarded complete, `ConnectionH1::readable` stops
+reading the frontend, and the pipelined request stays unparsed until the
+keep-alive branch of `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`)
+parses, routes and edits it on its own. `body_size` stays `Empty`: nothing is
+injected on the wire, the phase alone ends the message.
+
+`HttpContext::on_request_headers` (`editor.rs`) still sets
 `ParsingPhase::Terminated` when it finds `parsing_phase == ParsingPhase::Body`
-and `body_size == BodySize::Empty`. kawa pushes the end-of-headers `Flags`
-block right after the callback with `end_stream: kawa.is_terminated()`, so the
-request is forwarded complete, `ConnectionH1::readable` stops reading the
-frontend, and the pipelined request stays unparsed until the keep-alive branch
-of `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`) parses, routes and
-edits it on its own. `body_size` stays `Empty`: nothing is injected on the
-wire, the phase alone ends the message.
+and `body_size == BodySize::Empty`. Under kawa >= 0.7.2 that branch never
+fires — the H1 parser no longer calls back in that state — and it stays as
+defense in depth against a kawa regression; do not delete it on that basis.
+kawa pushes the end-of-headers `Flags` block right after the callback with
+`end_stream: kawa.is_terminated()`, which is why a phase set there would
+still end the stream.
 
 - **The `ParsingPhase::Body` conjunct confines the rule to the H1 parser.**
   `pkawa::handle_header` (`lib/src/protocol/mux/pkawa.rs`) calls the same
@@ -353,7 +385,11 @@ Covered by `a_request_without_length_ends_after_its_headers`,
 `e2e/src/tests/h1_security_tests.rs`, which pipeline a second request behind
 an unframed `GET`, `HEAD`, `DELETE` or `POST` in one write, to the same
 cluster, another cluster and a Basic-auth-gated cluster, over clear and TLS
-listeners.
+listeners. Under kawa >= 0.7.2 these tests pin kawa's rule 7 and the Sōzu
+branch together, so deleting the branch alone leaves them green; to see
+them red on the branch, pin kawa 0.7.1 (`kawa = { version = "=0.7.1", … }` in
+the root `Cargo.toml`, then `cargo update -p kawa --precise 0.7.1`) and
+delete it.
 
 ---
 

@@ -1649,14 +1649,19 @@ fn test_h1_te_ows_forwarded_canonically() {
 //
 // RFC 9110 §8.6: `Content-Length = 1*DIGIT`, and a sender MUST NOT forward
 // a message whose Content-Length does not match that grammar. kawa 0.7.1
-// reads the value with `usize::from_str`, which accepts one leading `+`:
+// read the value with `usize::from_str`, which accepts one leading `+`:
 // `Content-Length: +5` framed a 5-byte body and reached the backend
 // verbatim. A backend that refuses, ignores or re-reads that spelling
 // takes the body for the start of the next request — one sozu never
 // routed nor checked against the frontend's Basic auth (CWE-444).
-// `HttpContext::on_request_headers` now answers 400 before routing, and
-// `HttpContext::on_response_headers` fails a backend response carrying one,
-// which the mux answers with a 502.
+// kawa >= 0.7.2 refuses such a value itself before the header callback
+// (CleverCloud/kawa#26); `HttpContext::on_request_headers` and
+// `HttpContext::on_response_headers` keep the same check as defense in
+// depth. Either way the request is answered 400 before routing, and a
+// backend response carrying one fails its parse, which the mux answers
+// with a 502. These tests pin that outcome, so they stay green if only
+// the Sōzu clauses are deleted; see `kawa_h1/LIFECYCLE.md` for how to
+// reproduce the regression against kawa 0.7.1.
 // =========================================================================
 
 fn try_h1_signed_content_length_request_rejected() -> State {
@@ -2468,14 +2473,18 @@ fn the_unselectable_000_guard_reads_the_status_line_not_the_whole_answer() {
 // are true, then the message body length is zero (no message body is
 // present)." Close-delimited framing (rule 8) belongs to responses only.
 //
-// kawa frames a message with neither header as `BodySize::Empty` and, for a
-// request exactly as for a response, parses it into `ParsingPhase::Body`,
+// kawa frames a message with neither header as `BodySize::Empty`. kawa 0.7.1,
+// for a request exactly as for a response, parsed it into `ParsingPhase::Body`,
 // where the `Empty` arm takes every byte left in the buffer. A second request
 // pipelined in the same segment used to become the first request's "body":
 // forwarded raw to the first request's backend — never routed, never
 // Basic-auth checked, without `Sozu-Id` or `X-Forwarded-*` (CWE-444).
-// `HttpContext::on_request_headers` now ends such a request after its
-// headers, so the pipelined one is parsed, routed and edited on its own.
+// kawa >= 0.7.2 ends such a request after its headers itself
+// (CleverCloud/kawa#27), and `HttpContext::on_request_headers` keeps doing
+// so as defense in depth, so the pipelined one is parsed, routed and edited
+// on its own. These tests pin that outcome, so they stay green if only the
+// Sōzu branch is deleted; see `kawa_h1/LIFECYCLE.md` §2.2 for how to
+// reproduce the regression against kawa 0.7.1.
 //
 // The matrix: the first request's method (GET, HEAD, DELETE, POST, none of
 // them framed), the second request's destination (the same cluster, another
