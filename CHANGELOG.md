@@ -376,6 +376,35 @@
 
 ### 🔄 Changed
 
+- **`chore(deps)`: bump `kawa` to [0.7.2](https://github.com/CleverCloud/kawa/releases/tag/v0.7.2);
+  Sōzu's two H1 framing guards stay as defense in depth.** kawa 0.7.2 brings three parser fixes
+  upstream. [CleverCloud/kawa#26](https://github.com/CleverCloud/kawa/pull/26) accepts only
+  `1*DIGIT` as a `Content-Length` value, checked by kawa before the header callback, so `+5` is
+  refused by the parser (RFC 9110 §8.6). [CleverCloud/kawa#27](https://github.com/CleverCloud/kawa/pull/27)
+  ends a request with neither `Content-Length` nor `Transfer-Encoding` after its headers
+  (`ParsingPhase::Terminated`, `end_stream: true` on the end-of-headers flags, the following bytes
+  left in `unparsed_data()`), per RFC 9112 §6.3 rule 7; responses stay close-delimited.
+  [CleverCloud/kawa#24](https://github.com/CleverCloud/kawa/pull/24) fixes an arithmetic underflow
+  in `Store::consume`. The first two are the upstream fixes for what Sōzu already worked around:
+  the `ParsingPhase::Body` + `BodySize::Empty` branch of `HttpContext::on_request_headers`
+  ([#1650](https://github.com/sozu-proxy/sozu/issues/1650), [#1651](https://github.com/sozu-proxy/sozu/pull/1651)) and the
+  `has_non_digit_content_length` clauses of `on_request_headers` / `on_response_headers`
+  ([#1652](https://github.com/sozu-proxy/sozu/issues/1652), [#1653](https://github.com/sozu-proxy/sozu/pull/1653)). Both are kept, unchanged, as
+  defense in depth against a kawa regression: under 0.7.2 neither fires on traffic kawa accepts,
+  so deleting one alone turns no parse-driven test red. Their comments, the `TO SEE THIS RED`
+  recipes and `lib/src/protocol/kawa_h1/LIFECYCLE.md` §2.1–§2.2 now say so, and name how to
+  reproduce the regression instead — the direct helper test
+  `the_content_length_helper_judges_every_non_digit_value`, or pinning kawa 0.7.1. Observable
+  change: a non-`1*DIGIT` `Content-Length` is still answered 400 (request) or 502 (response), but
+  it is now counted only in `http.frontend_parse_errors` / `http.backend_parse_errors`;
+  `http.frontend.content_length_invalid` and `http.backend.content_length_invalid` stay at zero
+  unless kawa regresses. One unit-test row encoded kawa 0.7.1's leniency and moves: `Content-Length: 5`
+  followed by `Content-Length: +5` was accepted (kawa parsed the second line as 5 and elided it as
+  equal), and is now refused by kawa like the reverse order already was by Sōzu, so it leaves
+  `a_forwarded_content_length_is_only_digits` for
+  `a_request_content_length_that_is_not_only_digits_is_rejected` (RFC 9112 §6.3 rule 5). No code
+  or test is removed.
+
 - **`refactor(command)`: `ClusterId` is a reference-counted `Arc<str>`, and no step of a request
   copies its cluster id anymore.** `sozu_command_lib::state::ClusterId` was `String`, so routing
   cloned the id out of the route table on every request, and the per-(cluster, source-IP) gate

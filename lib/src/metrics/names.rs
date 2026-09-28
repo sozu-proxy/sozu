@@ -302,9 +302,13 @@ pub mod http {
     pub const FRONTEND_TE_SMUGGLING: &str = "http.frontend.transfer_encoding_smuggling";
     /// Requests rejected (400) because a forwarded Content-Length value was not
     /// `1*DIGIT`, e.g. `+5` (RFC 9110 §8.6; request-smuggling defense, CWE-444).
+    /// Defense in depth: kawa >= 0.7.2 refuses such a value first, counted in
+    /// `FRONTEND_PARSE_ERRORS`, so this stays at zero unless kawa regresses.
     pub const FRONTEND_CONTENT_LENGTH_INVALID: &str = "http.frontend.content_length_invalid";
     /// Backend responses rejected (502) because their Content-Length value was
-    /// not `1*DIGIT` (RFC 9110 §8.6, RFC 9112 §6.3).
+    /// not `1*DIGIT` (RFC 9110 §8.6, RFC 9112 §6.3). Defense in depth:
+    /// kawa >= 0.7.2 refuses such a response first, counted in
+    /// `BACKEND_PARSE_ERRORS`, so this stays at zero unless kawa regresses.
     pub const BACKEND_CONTENT_LENGTH_INVALID: &str = "http.backend.content_length_invalid";
     pub const FRONTEND_PARSE_ERRORS: &str = "http.frontend_parse_errors";
     pub const HSTS_FRONTEND_ADDED: &str = "http.hsts.frontend_added";
