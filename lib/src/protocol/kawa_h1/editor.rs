@@ -733,6 +733,28 @@ fn standard_reason(code: u16) -> Option<&'static str> {
     Some(phrase)
 }
 
+/// Whether `kawa` carries a non-elided `Content-Length` whose value is not
+/// `1*DIGIT` (RFC 9110 §8.6).
+///
+/// kawa 0.7.1 reads the value with `usize::from_str`, which also accepts one
+/// leading `+`, and leaves the field line in place with its original
+/// spelling (CleverCloud/kawa#25); kawa refuses every spelling `from_str`
+/// refuses. Only non-elided lines are judged, because they are the
+/// ones the H1 serializer forwards: kawa elides a second line equal to the
+/// first, and every Content-Length beside a Transfer-Encoding.
+fn has_non_digit_content_length(kawa: &GenericHttpStream) -> bool {
+    let buf = kawa.storage.buffer();
+    kawa.blocks.iter().any(|block| match block {
+        kawa::Block::Header(header)
+            if !header.is_elided() && compare_no_case(header.key.data(buf), b"content-length") =>
+        {
+            let val = header.val.data(buf);
+            val.is_empty() || !val.iter().all(u8::is_ascii_digit)
+        }
+        _ => false,
+    })
+}
+
 /// The store of a correlation-header name: the default `Sozu-Id` — what
 /// `L7ListenerHandler::get_sozu_id_header` (`lib/src/lib.rs`) and its
 /// `HttpListener` and `HttpsListener` implementations answer when the
@@ -922,6 +944,31 @@ impl HttpContext {
             request
                 .parsing_phase
                 .error("Transfer-Encoding conflicts with message framing".into());
+            return;
+        }
+
+        // RFC 9110 §8.6: `Content-Length = 1*DIGIT`, and a sender MUST NOT
+        // forward a message whose Content-Length does not match it. kawa
+        // 0.7.1 framed `Content-Length: +5` as 5 bytes and left the line to be
+        // forwarded as sent: a backend that refuses or re-reads `+5` takes the
+        // body for the start of the next request — never routed, never
+        // Basic-auth checked (CWE-444, sozu#1652). RFC 9112 §6.3 rule 5 makes
+        // it an unrecoverable framing error: 400. A list of equal values
+        // (`5, 5`), which RFC 9110 §8.6 lets a recipient either collapse or
+        // reject, is rejected — kawa already refuses it. `005` is `1*DIGIT`
+        // and is forwarded as sent, as the H2 path forwards it. Mirrors
+        // `RejectReason::DuplicateCl` on the H2 side
+        // (`pkawa::write_regular_header`), which is why this cannot fire for
+        // an H2 request.
+        if has_non_digit_content_length(request) {
+            incr!(names::http::FRONTEND_CONTENT_LENGTH_INVALID);
+            warn!(
+                "{} rejecting request: Content-Length is not 1*DIGIT (possible request smuggling)",
+                self.log_context()
+            );
+            request
+                .parsing_phase
+                .error("Content-Length is not 1*DIGIT".into());
             return;
         }
 
@@ -1336,6 +1383,25 @@ impl HttpContext {
         // Like the request path, response editing only adds or elides — pin
         // the entry count so the postcondition can assert "blocks only grow".
         let blocks_at_entry = response.blocks.len();
+
+        // The response mirror of the request's Content-Length clause: a
+        // proxy that receives an invalid Content-Length MUST discard the
+        // response and answer 502 (RFC 9112 §6.3 rule 5). Failing the parse
+        // here does that: `ConnectionH1::readable` ends the backend stream,
+        // and `shared::end_stream_decision` answers the client 502 since no
+        // byte of the response was consumed. Checked before the 204/304/1xx
+        // override of `body_size`, which leaves the field line in place.
+        if has_non_digit_content_length(response) {
+            incr!(names::http::BACKEND_CONTENT_LENGTH_INVALID);
+            warn!(
+                "{} rejecting response: Content-Length is not 1*DIGIT",
+                self.log_context()
+            );
+            response
+                .parsing_phase
+                .error("Content-Length is not 1*DIGIT".into());
+            return;
+        }
 
         let buf = &mut response.storage.mut_buffer();
 
@@ -2110,6 +2176,227 @@ mod tests {
             assert_eq!(parsed_trace_id, trace_id);
             assert_eq!(parsed_parent_id, parent_id);
         }
+    }
+
+    // ── Content-Length field value: 1*DIGIT ────────────────────────────
+
+    /// Parse `bytes` as a `kind` message through the real parser, and so
+    /// through `on_request_headers` / `on_response_headers`, on a fresh
+    /// context — the way `ConnectionH1::readable` drives it.
+    fn parse_framed(
+        pool: &mut crate::pool::Pool,
+        kind: kawa::Kind,
+        bytes: &[u8],
+    ) -> GenericHttpStream {
+        let mut kawa: GenericHttpStream = kawa::Kawa::new(
+            kind,
+            kawa::Buffer::new(
+                pool.checkout()
+                    .expect("the test pool must hand out a buffer"),
+            ),
+        );
+        kawa.storage.space()[..bytes.len()].copy_from_slice(bytes);
+        kawa.storage.fill(bytes.len());
+        kawa::h1::parse(&mut kawa, &mut make_context());
+        kawa
+    }
+
+    /// RFC 9110 §8.6: `Content-Length = 1*DIGIT`, and a sender MUST NOT
+    /// forward a message whose Content-Length does not match that grammar.
+    /// kawa 0.7.1 reads the value with `usize::from_str`, which also accepts
+    /// one leading `+`: `Content-Length: +5` framed a 5-byte body and was
+    /// forwarded verbatim, handing any backend that refuses or re-reads
+    /// that spelling a body it would take for the next request (CWE-444).
+    ///
+    /// Only the `+` rows reach `on_request_headers`; every other row is
+    /// already refused by kawa (`Invalid Content-Length field value`) and
+    /// pins that the guard neither relaxes nor depends on that refusal.
+    ///
+    /// TO SEE THIS RED, delete the Content-Length clause of
+    /// `on_request_headers`: the `plus`, `plus-zero` and
+    /// `plus-then-canonical` rows then parse clean.
+    #[test]
+    fn a_request_content_length_that_is_not_only_digits_is_rejected() {
+        let cases: [(&str, &[u8]); 13] = [
+            ("plus", b"+5"),
+            ("plus-zero", b"+0"),
+            ("minus-zero", b"-0"),
+            ("plus-alone", b"+"),
+            ("list-of-equal-values", b"5, 5"),
+            ("list-without-space", b"5,5"),
+            ("inner-space", b"5 5"),
+            ("hexadecimal", b"0x5"),
+            ("decimal-point", b"5.0"),
+            ("overflow", b"99999999999999999999999"),
+            ("arabic-indic-digit", "\u{0665}".as_bytes()),
+            ("fullwidth-digit", "\u{FF15}".as_bytes()),
+            ("empty", b""),
+        ];
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        for (label, value) in cases {
+            let request = [
+                &b"POST /api HTTP/1.1\r\nHost: example.com\r\nContent-Length: "[..],
+                value,
+                b"\r\n\r\nHello",
+            ]
+            .concat();
+            let kawa = parse_framed(&mut pool, kawa::Kind::Request, &request);
+            assert!(
+                kawa.is_error(),
+                "{label}: a Content-Length that is not 1*DIGIT must be refused, got {:?} with {:?}",
+                kawa.parsing_phase,
+                kawa.body_size
+            );
+        }
+
+        // kawa elides a second Content-Length equal to the first, so the
+        // FIRST line is the one that survives to be forwarded — and so the
+        // one the guard judges.
+        let request = b"POST /api HTTP/1.1\r\nHost: example.com\r\nContent-Length: +5\r\nContent-Length: 5\r\n\r\nHello";
+        let kawa = parse_framed(&mut pool, kawa::Kind::Request, request);
+        assert!(
+            kawa.is_error(),
+            "plus-then-canonical: the surviving `+5` must be refused, got {:?}",
+            kawa.parsing_phase
+        );
+    }
+
+    /// `has_non_digit_content_length` on its own, over hand-built header
+    /// blocks. kawa 0.7.1 refuses `-0`, `0x5`, `5 5` and the empty value
+    /// before `on_request_headers` runs, so the parse-driven test above
+    /// proves kawa's refusal for those rows, not the helper's: a helper
+    /// narrowed to a leading `+` would still pass it. This test pins the
+    /// helper's own `1*DIGIT` contract, and that an elided line is not judged.
+    ///
+    /// TO SEE THIS RED, narrow the helper's predicate to
+    /// `val.first() == Some(&b'+')`: the `-0`, `0x5`, `5 5` and empty rows
+    /// then read `false`.
+    #[test]
+    fn the_content_length_helper_judges_every_non_digit_value() {
+        fn content_length(val: &'static [u8], elided: bool) -> GenericHttpStream {
+            let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+            let mut kawa: GenericHttpStream = kawa::Kawa::new(
+                kawa::Kind::Request,
+                kawa::Buffer::new(
+                    pool.checkout()
+                        .expect("the test pool must hand out a buffer"),
+                ),
+            );
+            let mut pair = kawa::Pair {
+                key: kawa::Store::Static(b"Content-Length"),
+                val: kawa::Store::Static(val),
+            };
+            if elided {
+                pair.elide();
+            }
+            kawa.push_block(kawa::Block::Header(pair));
+            kawa
+        }
+        let cases: [(&str, &'static [u8], bool, bool); 7] = [
+            ("minus-zero", b"-0", false, true),
+            ("hexadecimal", b"0x5", false, true),
+            ("inner-space", b"5 5", false, true),
+            ("empty", b"", false, true),
+            ("leading-zeros", b"005", false, false),
+            ("zero", b"0", false, false),
+            ("elided-plus", b"+5", true, false),
+        ];
+        for (label, val, elided, expected) in cases {
+            assert_eq!(
+                has_non_digit_content_length(&content_length(val, elided)),
+                expected,
+                "{label}"
+            );
+        }
+    }
+
+    /// Non-regression for the Content-Length clause of `on_request_headers`:
+    /// it judges only the Content-Length that is forwarded.
+    ///
+    /// - `005` matches `1*DIGIT`: it is legal and forwarded as sent, exactly
+    ///   as the H2 path (`pkawa::write_regular_header`) forwards it.
+    /// - `5` then `+5`: kawa elided the second, equal, line; only the
+    ///   canonical first line is forwarded.
+    /// - `+5` beside `Transfer-Encoding: chunked`: kawa elided the
+    ///   Content-Length (RFC 9110 §6.3 — Transfer-Encoding overrides it), so
+    ///   nothing non-canonical is forwarded.
+    #[test]
+    fn a_forwarded_content_length_is_only_digits() {
+        let cases: [(&str, &[u8], &str); 4] = [
+            (
+                "canonical",
+                b"POST /api HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nHello",
+                "Content-Length: 5\r\n",
+            ),
+            (
+                "leading-zeros",
+                b"POST /api HTTP/1.1\r\nHost: example.com\r\nContent-Length: 005\r\n\r\nHello",
+                "Content-Length: 005\r\n",
+            ),
+            (
+                "canonical-then-plus",
+                b"POST /api HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\nContent-Length: +5\r\n\r\nHello",
+                "Content-Length: 5\r\n",
+            ),
+            (
+                "plus-beside-chunked",
+                b"POST /api HTTP/1.1\r\nHost: example.com\r\nContent-Length: +5\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHello\r\n0\r\n\r\n",
+                "Transfer-Encoding: chunked\r\n",
+            ),
+        ];
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        for (label, request, expected) in cases {
+            let mut kawa = parse_framed(&mut pool, kawa::Kind::Request, request);
+            assert!(
+                !kawa.is_error(),
+                "{label}: must be accepted, got {:?}",
+                kawa.parsing_phase
+            );
+            let forwarded = serialized_request(&mut kawa);
+            assert!(
+                forwarded.contains(expected),
+                "{label}: expected {expected:?} in {forwarded:?}"
+            );
+            assert!(
+                !forwarded.contains('+'),
+                "{label}: a signed Content-Length must never be forwarded: {forwarded:?}"
+            );
+            assert_eq!(
+                forwarded.matches("Content-Length").count(),
+                usize::from(label != "plus-beside-chunked"),
+                "{label}: exactly the framing Content-Length is forwarded: {forwarded:?}"
+            );
+        }
+    }
+
+    /// The response mirror: a backend's `Content-Length: +5` fails the
+    /// response parse, which the mux answers with a 502 before any byte of
+    /// it reaches the client (`shared::end_stream_decision`).
+    ///
+    /// TO SEE THIS RED, delete the Content-Length clause of
+    /// `on_response_headers`.
+    #[test]
+    fn a_response_content_length_that_is_not_only_digits_is_rejected() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        for status in ["200 OK", "204 No Content", "304 Not Modified"] {
+            let response = format!("HTTP/1.1 {status}\r\nContent-Length: +5\r\n\r\nHello");
+            let kawa = parse_framed(&mut pool, kawa::Kind::Response, response.as_bytes());
+            assert!(
+                kawa.is_error(),
+                "{status}: a signed Content-Length must fail the response, got {:?}",
+                kawa.parsing_phase
+            );
+        }
+        let kawa = parse_framed(
+            &mut pool,
+            kawa::Kind::Response,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 005\r\n\r\nHello",
+        );
+        assert!(
+            !kawa.is_error(),
+            "a 1*DIGIT Content-Length must still be accepted, got {:?}",
+            kawa.parsing_phase
+        );
     }
 
     // ── header-editing allocations ─────────────────────────────────────

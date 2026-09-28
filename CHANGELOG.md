@@ -5771,6 +5771,25 @@
   `holds_header_frame_finds_a_block_behind_other_frames`, and a drop-and-reset operation added
   to the `fuzz_hpack_roundtrip` script.
 
+- **`fix(h1)`: a `Content-Length` that is not `1*DIGIT` is no longer accepted and forwarded
+  verbatim ([#1652](https://github.com/sozu-proxy/sozu/issues/1652)).** kawa 0.7.1 reads the
+  value with `usize::from_str`, which accepts one leading `+` (CleverCloud/kawa#25):
+  `Content-Length: +5` framed a 5-byte body and reached the backend as `+5`. A backend that
+  refuses, ignores or re-reads that spelling takes the body for the start of the next request —
+  one Sōzu never routed nor checked against the frontend's Basic auth, without `Sozu-Id` or
+  `X-Forwarded-*` (CWE-444, the class of #1650). RFC 9110 §8.6 forbids forwarding such a value
+  and RFC 9112 §6.3 rule 5 makes it an unrecoverable framing error. `HttpContext::on_request_headers`
+  now answers 400 before routing when a forwarded `Content-Length` is not exclusively ASCII
+  digits, and `HttpContext::on_response_headers` fails a backend response carrying one, which
+  the mux answers with 502. Every other spelling `usize::from_str` refuses (`-0`, `5 5`, `0x5`,
+  overflow, non-ASCII digits, empty) and the list `5, 5` were already refused by kawa; `005` is
+  `1*DIGIT` and is still forwarded as sent. The H2 path already had this check
+  (`RejectReason::DuplicateCl`). New counters `http.frontend.content_length_invalid` and
+  `http.backend.content_length_invalid`. No allocation is added. Covered by four unit tests in
+  `editor.rs` (one calls the helper directly, since kawa refuses most non-digit spellings first) and three e2e tests, `test_h1_signed_content_length_request_rejected` and
+  `test_h1_signed_content_length_response_rejected` red before the fix: the backend received
+  `Content-Length: +5` and the client a backend's `Content-Length: +5`.
+
 - **`fix(mux-h2)`: bound `pending_rst_streams` at the insert, so one mass idle-timeout reap cannot
   grow the queue past the cap `check_invariants` asserts.** `enqueue_rst_into` had no per-insert
   cap. The only bound was `flush_pending_control_frames`'s
