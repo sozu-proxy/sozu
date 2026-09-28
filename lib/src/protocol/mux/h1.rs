@@ -977,7 +977,30 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     if let StreamState::Linked(token) = old_state {
                         remove_backend_stream(&mut context.backend_streams, token, stream_id);
                     }
-                    if stream.context.keep_alive_frontend {
+                    // The connection outlives the response only when neither
+                    // side asked to close it. `keep_alive_backend` is false
+                    // once the backend's response carried `Connection: close`
+                    // (`HttpContext::on_response_headers`,
+                    // `lib/src/protocol/kawa_h1/editor.rs`): sozu forwards that
+                    // header, so RFC 9112 §9.6 requires it to close after this
+                    // response and to process no further request on it. It
+                    // is also the only way a close-delimited body ends here:
+                    // `ConnectionH1::terminate_close_delimited` runs only for
+                    // such a backend, and that body ends, for the client too,
+                    // only with the close (§6.3 rule 8). Keeping the
+                    // connection left the client waiting for more body until
+                    // the frontend timeout, and appended the next pipelined
+                    // response to the body (sozu-proxy/sozu#1642).
+                    //
+                    // Pre: the decision is taken once, when the whole response
+                    // has left, never while part of it is still queued.
+                    debug_assert!(
+                        stream.back.is_terminated() && stream.back.is_completed(),
+                        "the keep-alive decision must follow a completely written response"
+                    );
+                    let keep_alive =
+                        stream.context.keep_alive_frontend && stream.context.keep_alive_backend;
+                    if keep_alive {
                         self.timeout_deadline = now.checked_add(self.timeout_duration);
                         if let StreamState::Linked(token) = old_state {
                             endpoint.end_stream(token, stream_id, context);
@@ -1048,6 +1071,22 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                             // else: incomplete parse, wait for more data via READABLE
                         }
                     } else {
+                        // Pair: at least one side asked for the close. A
+                        // pipelined request already buffered is dropped with
+                        // the connection, never answered on it; the client
+                        // retries it on a new connection (RFC 9112 §9.3.2).
+                        debug_assert!(
+                            !stream.context.keep_alive_frontend
+                                || !stream.context.keep_alive_backend,
+                            "the frontend closes only when one side asked to"
+                        );
+                        if !stream.context.keep_alive_backend {
+                            debug!(
+                                "{} H1 closing the frontend after a response carrying the backend's Connection: close on stream {}",
+                                log_context!(self),
+                                stream_id
+                            );
+                        }
                         return self.defer_close_for_tls_flush("response-complete");
                     }
                 }

@@ -4490,3 +4490,101 @@ fn test_h2_close_delimited_body_ends_stream_at_backend_close() {
         State::Success
     );
 }
+
+/// Non-regression for sozu-proxy/sozu#1642: an H1 frontend closes after a
+/// response carrying the backend's `Connection: close`, an H2 frontend does
+/// not. `Connection` is hop-by-hop (RFC 9110 §7.6.1) and never reaches an H2
+/// client (RFC 9113 §8.2.2), and the close-delimited body ends with
+/// END_STREAM, so the H2 connection keeps serving streams: no GOAWAY after
+/// stream 1, and stream 3 is answered by a fresh backend connection.
+fn try_h2_backend_connection_close_keeps_the_connection(name: &str, response: &str) -> State {
+    let (worker, front_port, back_address) = setup_single_h1_backend_listener(name, None);
+    let mut backend = SyncBackend::new(format!("{name}-BACKEND"), back_address, "");
+    backend.connect();
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 1_000_000);
+    let headers = H2Frame::headers(1, build_get_headers_no_priority(), true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    let started = Instant::now();
+    while !backend.accept(0) && started.elapsed() < Duration::from_secs(5) {}
+    backend.receive(0);
+    backend.set_response(response);
+    backend.send(0);
+    backend.close(0);
+    let (_, first_ended, first_rst, _) =
+        drain_h2_stream_until_end_stream(&mut tls, 1, Duration::from_secs(5));
+
+    let headers = H2Frame::headers(3, build_get_headers_no_priority(), true, true);
+    let sent = tls.write_all(&headers.encode()).is_ok() && tls.flush().is_ok();
+    let started = Instant::now();
+    let mut accepted = false;
+    while sent && !accepted && started.elapsed() < Duration::from_secs(5) {
+        accepted = backend.accept(1);
+    }
+    if accepted {
+        backend.receive(1);
+        backend.set_response("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\npong1");
+        backend.send(1);
+    }
+    let (second_bytes, second_ended, second_rst, _) =
+        drain_h2_stream_until_end_stream(&mut tls, 3, Duration::from_secs(5));
+    let infra_ok = teardown(
+        tls,
+        front_port,
+        worker,
+        Vec::<AsyncBackend<SimpleAggregator>>::new(),
+    );
+    drop(backend);
+    if first_ended
+        && !first_rst
+        && accepted
+        && second_ended
+        && !second_rst
+        && second_bytes == 5
+        && infra_ok
+    {
+        State::Success
+    } else {
+        println!(
+            "FAIL {name}: first_ended={first_ended} first_rst={first_rst} accepted={accepted} \
+             second_ended={second_ended} second_rst={second_rst} second_bytes={second_bytes} \
+             infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_close_delimited_body_keeps_the_h2_connection() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: a close-delimited H1 response keeps the H2 client connection",
+            || try_h2_backend_connection_close_keeps_the_connection(
+                "H2-CLOSE-DELIM-REUSE",
+                "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nabcd",
+            ),
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_h2_content_length_with_connection_close_keeps_the_h2_connection() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: a Content-Length H1 response carrying Connection: close keeps \
+             the H2 client connection",
+            || try_h2_backend_connection_close_keeps_the_connection(
+                "H2-CL-CLOSE-REUSE",
+                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 10\r\n\r\n0123456789",
+            ),
+        ),
+        State::Success
+    );
+}

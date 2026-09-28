@@ -2707,13 +2707,17 @@ pub fn try_keep_alive() -> State {
     let request = backend.receive(0);
     println!("request: {request:?}");
     backend.send(0);
-    let response = client.receive();
+    // sozu forwards the backend's `Connection: close`, so it closes the client
+    // connection after that response too (RFC 9112 §9.6, sozu-proxy/sozu#1642).
+    let response = client.receive_until_eof(Duration::from_secs(5));
     println!("response: {response:?}");
-    assert!(client.is_connected()); // front connected
+    assert!(response.is_some_and(|r| r.ends_with("pong")));
+    assert!(!client.is_connected()); // front disconnected
     assert!(!backend.is_connected(0)); // back disconnected
 
     info!("front: close / back: close");
     client.set_request("GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    client.connect();
     client.send();
     backend.accept(0);
     let request = backend.receive(0);
