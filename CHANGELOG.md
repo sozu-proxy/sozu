@@ -376,6 +376,16 @@
 
 ### 🔄 Changed
 
+- **`docs`: the H1 keep-alive TLS allocation gap of `doc/hot_path_zero_copy.md` is attributed per
+  request and per connection ([#1669](https://github.com/sozu-proxy/sozu/pull/1669)).** §2.3 now explains that the 20.25–20.30 heap operations per request
+  over TLS, against 7.80 in clear, are about 4 per request plus about 168 per connection (8.4 per
+  request amortised over 20), measured on 2026-09-28 as the marginal cost between 20 and 40
+  requests per connection (8.22 measured at 40 for 8.2 predicted). §3.14 replaces "about five
+  buffers per TLS request" with the measured 4, none of them in Sōzu's code: one `Vec<&[u8]>`
+  built by rustls 0.23.45's `Writer::write_vectored` for Sōzu's header block, and three internal
+  to rustls (`PrefixedPayload` ×2, `to_vec` ×1). Its TLS 1.3 ticket entry adds their cost, about
+  44 of the 161 handshake heap operations per connection. Documentation only.
+
 - **`perf(tcp)`: a raw TCP session no longer asks its backend socket for its address and no
   longer deregisters its sockets from epoll, 36.10–36.25 → 33.05–33.10 system calls per
   session.** `Pipe::get_backend_address` fed the access log's backend address with a

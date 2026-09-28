@@ -103,6 +103,17 @@ intentrace (37.30–38.30 → 33.85–34.35 under the descriptor tracer), measur
 its own pair of release binaries, `f5136d67` and its branch, not on this
 table's two (§3.10).
 
+The gap between the two H1 keep-alive rows, 20.25–20.30 heap operations per
+request over TLS against 7.80 in clear, is not a per-request cost alone. It is
+about 4 allocations per request plus about 168 per connection, and the 168
+amortised over the 20 requests of the scenario make 8.4 of it. The split was
+measured on 2026-09-28 as a marginal cost: the same scenario at 20 and at 40
+requests per connection, the difference between the two runs giving the
+per-request cost and the remainder the per-connection one, with the allocation
+counter of §2.2 (`mcount.so`) and a backtrace-recording variant of it
+(`mbt.so`). At 40 requests per connection the gap was measured at 8.22 per
+request, for 4 + 168 / 40 = 8.2 predicted. §3.14 attributes both parts.
+
 Two earlier figures frame this table. The first map of the campaign, taken on
 2026-09-26 with the `LD_PRELOAD` interposer alone on a debug build, with a
 `stdout` access log, counted about 25.1 system calls per H1 request and 34.8
@@ -516,11 +527,25 @@ keep `crypto-ring` so that they compare with each other.
 
 - **`file://`, `stdout` and `unix://` access logs** (§3.1).
 - **TLS 1.3 session tickets:** one `writev` per connection with the default
-  `send_tls13_tickets = 4`; `0` removes it. A configuration trade, not a defect.
+  `send_tls13_tickets = 4`, and about 44 of the 161 heap operations the rustls
+  and ring handshake costs per connection (§2.3); `0` removes both, at the cost
+  of session resumption. A configuration trade, not a defect.
 - **The HTTP/1.1 replay capture** of a pooled upstream connection reserves one
-  buffer per request (`ConnectionH1::writable`), and rustls allocates about five
-  buffers per TLS request for its own records; both were measured and left
+  buffer per request (`ConnectionH1::writable`); it was measured and left
   ([#1628](https://github.com/sozu-proxy/sozu/pull/1628)).
+- **TLS allocations of an H1 keep-alive request:** 4 per request beyond the
+  clear-text path, measured on 2026-09-28 with rustls 0.23.45 (§2.3). None is
+  in Sōzu's code. One is made by rustls on Sōzu's behalf: `Writer::write_vectored`
+  (rustls 0.23.45, `src/conn.rs`) collects the slices it is given into a
+  `Vec<&[u8]>`, about 496 bytes for the header block; only an extra copy of the
+  headers would avoid it, which the zero-copy rule of §1 excludes. The other
+  three are internal to rustls: one `PrefixedPayload` per outgoing record (two
+  per request) and one `to_vec` per incoming application-data record, with the
+  `crypto-ring` and the `crypto-aws-lc-rs` provider alike. Per connection, the
+  rustls and ring handshake accounts for about 161 heap operations and Sōzu's
+  SAN snapshot for about 5 to 8 (`CertificateResolver::names_for_sni` and
+  the `tls_cert_names` snapshot in `HttpsSession::upgrade_handshake`); both
+  were left.
 - **The TCP relay** (`lib/src/tcp.rs`) still shuts down both sockets with
   `Shutdown::Both` before closing them
   ([`lifetime_of_a_session.md`](./lifetime_of_a_session.md) §9). Its deregister
