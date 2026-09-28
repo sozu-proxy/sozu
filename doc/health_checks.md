@@ -184,7 +184,8 @@ because those signals are not driven exclusively by health checks — they also
 fold in retry-policy state observed on the data path. As a consequence the
 `cluster.*` surface and the per-backend `backend.available` gauge work
 **without** a configured health check: each TCP connect failure on the data path
-arms `Backend::retry_policy`, and once every backend reaches
+arms `Backend::retry_policy` — on the HTTP/HTTPS mux and on the raw TCP proxy
+alike, including a connect refused after `EINPROGRESS` — and once every backend reaches
 `retry_policy.is_down()` the next routing call flips the cluster to `AllDown`
 and emits the matching event + log line. Adding an active health check on top is
 useful when a cluster is idle (no requests means no passive observations) but is

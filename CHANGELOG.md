@@ -3432,6 +3432,30 @@
   `provide_port` instead of the fixed 6666 and 2001. Test support only; no runtime behaviour
   changes.
 
+- **`fix(tcp)`: a raw TCP session keeps the backend it dials, so a refused connect is charged to
+  that backend ([#1658](https://github.com/sozu-proxy/sozu/issues/1658)).**
+  `TcpSession::connect_to_backend` dropped the `Backend` handle `BackendMap::backend_from_cluster_id`
+  returned, and `TcpSession::backend` stayed `None` for the whole session. The accounting that
+  reads it did nothing on the TCP proxy: `TcpSession::fail_backend_connection`, which handles a
+  non-blocking connect refused after `EINPROGRESS` (a HUP on the connecting socket), neither
+  bumped `Backend::failures` nor armed `Backend::retry_policy`, so a refusing backend stayed in
+  round-robin selection and every session that landed on it paid a failed connect and a retry;
+  `TcpSession::set_back_connected` never reset the retry policy or fed the PeakEWMA connection
+  time; and `TcpSession::remove_backend` never released the connection `Backend::try_connect`
+  counted, so `Backend::active_connections` only grew and skewed connection-based balancing. The
+  session now keeps the handle, as the mux keeps its own in its `BackendRegistry`. **Visible
+  change:** `backend.connections.error`, `backend.down`, `backend.up` and `backend.available`
+  and the `BackendDown`/`BackendUp` events are now emitted for TCP backends, and a removed TCP
+  backend's `RemovedBackendHasNoConnections` event waits for its last session to close. Per-backend
+  byte counters and `connections_per_backend` are unchanged: they are keyed by the backend id the
+  session already recorded. Pinned by `test_tcp_refused_backend_is_accounted_and_avoided`
+  (`e2e/src/tests/tcp_tests.rs`): two backends, the first refusing, sixteen sequential sessions; on
+  `main` the refused backend was dialed in all sixteen and no error was counted, now it is dialed
+  once and `backend.connections.error` reads 1. The test bounds that count by what the retry policy
+  allows in the measured duration (at least one second between two dials of a backend in
+  back-off), and requires that bound to sit below the `SESSIONS - 1` dials round-robin makes
+  without it, so a loaded runner cannot turn it red.
+
 - **`fix(mux-h2)`: a soft-stop waits for an incomplete header block and closes with a final
   GOAWAY ([#1647](https://github.com/sozu-proxy/sozu/issues/1647)).** A stream whose
   HEADERS/CONTINUATION block is still being reassembled is `StreamState::Idle`, and

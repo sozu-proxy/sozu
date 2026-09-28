@@ -588,8 +588,14 @@ A WebSocket upgrade on an H1 connection ends in the same `Pipe`.
    SNI-routed one, else the listener's), passes the per-(cluster, source-IP)
    gate, picks a backend through the same `Candidates` view as the mux, and
    dials it: `socket(2)`, `connect(2)`, `setsockopt(TCP_NODELAY)`,
-   `epoll_ctl(EPOLL_CTL_ADD)`. A failed connect is retried up to
-   `CONN_RETRIES` times.
+   `epoll_ctl(EPOLL_CTL_ADD)`. The session keeps the chosen `Backend`
+   (`TcpSession::backend`) until `TcpSession::remove_backend` releases it. A
+   connect refused after `EINPROGRESS` shows up as a HUP on the connecting
+   socket: `TcpSession::fail_backend_connection` bumps `Backend::failures`,
+   arms `Backend::retry_policy` (which keeps the backend out of selection for
+   its back-off window) and counts `backend.connections.error`, then the
+   connect is retried, up to `CONN_RETRIES` times. A connect that completes
+   resets the retry policy (`TcpSession::set_back_connected`).
 3. **Relay.** On Linux with the `splice` feature, a `Protocol::TCP` pipe
    allocates a `SplicePipe` (`lib/src/splice.rs`) when it is created: two
    `pipe2(2)` and four `fcntl(2)` (`F_SETPIPE_SZ` and `F_GETPIPE_SZ` on each

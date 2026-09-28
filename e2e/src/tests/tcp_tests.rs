@@ -7,17 +7,22 @@
 /// - Large payload handling (1 MB)
 /// - TCP half-close semantics
 /// - Backend connection failure resilience
+/// - Refused-backend failure accounting and avoidance
 /// - Proxy protocol V2 with TCP listeners
 use std::{
+    collections::HashMap,
     io::{Read, Write},
     net::{Shutdown, SocketAddr, TcpStream},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use sozu_command_lib::{
     config::ListenerBuilder,
-    proto::command::{ActivateListener, ListenerType, request::RequestType},
+    proto::command::{
+        ActivateListener, ListenerType, QueryMetricsOptions, ResponseStatus, filtered_metrics,
+        request::RequestType, response_content::ContentType,
+    },
 };
 
 use crate::{
@@ -561,6 +566,209 @@ fn test_tcp_backend_connection_failure() {
             10,
             "TCP backend failure: unreachable backend handled without crash",
             try_tcp_backend_connection_failure,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 4b: a refused backend is accounted for and avoided
+//
+// A cluster with two backends, the first one refusing connections. Each
+// session that lands on it fails over to the live backend inside its
+// retry budget, so the client never sees the difference. What must see it
+// is the backend's own failure accounting: `TcpSession::fail_backend_connection`
+// feeds the retry policy, which takes the refused backend out of selection
+// for its back-off window, and emits `backend.connections.error` for it —
+// exactly what the mux does for HTTP. Without the session holding the
+// selected `Backend` handle, that accounting is a no-op: the counter never
+// appears and round-robin keeps dialing the dead backend in every session.
+//
+// The avoidance bound is derived from the retry policy, not from a guess
+// about how fast the sessions run. `ExponentialBackoffPolicy::fail` arms a
+// wait of at least one second on every failure it records, and a backend
+// inside its wait fails `Backend::can_open`, so it is not a selection
+// candidate while the live backend is (no fail-open). Two consecutive dials
+// of the refused backend are therefore at least one second apart, and over
+// an interval of `elapsed` it can be dialed at most `1 + floor(elapsed)`
+// times. Without that accounting, round-robin over the constant pair
+// alternates on every selection: a session that starts on the refused
+// backend uses two selections (refused, then live) and the next one starts
+// on it again, a session that starts on the live one uses one, so every
+// session but possibly the first dials the refused backend, at least
+// `SESSIONS - 1` times. The test requires the policy bound to sit strictly
+// below that count, so it can tell the two apart however loaded the runner.
+// =========================================================================
+
+/// Cluster-level metrics of `cluster_id`. At the default `Cluster` metric
+/// detail, a metric emitted with a `(cluster, backend)` label pair lands in
+/// its cluster's row with the backend label dropped.
+fn query_cluster_metrics(
+    worker: &mut Worker,
+    cluster_id: &str,
+) -> Option<HashMap<String, filtered_metrics::Inner>> {
+    worker.send_proxy_request_type(RequestType::QueryMetrics(QueryMetricsOptions {
+        list: false,
+        cluster_ids: vec![cluster_id.to_owned()],
+        backend_ids: vec![],
+        metric_names: vec![],
+        no_clusters: false,
+        workers: false,
+    }));
+    let response = worker.read_proxy_response()?;
+    if response.status != ResponseStatus::Ok as i32 {
+        return None;
+    }
+    let ContentType::WorkerMetrics(metrics) = response.content?.content_type? else {
+        return None;
+    };
+    let cluster = metrics.clusters.get(cluster_id)?;
+    Some(
+        cluster
+            .cluster
+            .iter()
+            .filter_map(|(name, metric)| Some((name.to_owned(), metric.inner.clone()?)))
+            .collect(),
+    )
+}
+
+fn try_tcp_refused_backend_is_accounted_and_avoided() -> State {
+    const SESSIONS: usize = 16;
+    let front_address = create_local_address();
+    let dead_backend_address = create_unbound_local_address();
+    let live_backend_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_tcp_config(front_address);
+    let mut worker = Worker::start_new_worker_owned("TCP-REFUSED", config, listeners, state);
+    worker.send_proxy_request_type(RequestType::AddTcpListener(
+        ListenerBuilder::new_tcp(front_address.into())
+            .to_tcp(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.into(),
+        proxy: ListenerType::Tcp.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddTcpFrontend(Worker::default_tcp_frontend(
+        "cluster_0",
+        front_address,
+    )));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-dead",
+        dead_backend_address,
+        None,
+    )));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-live",
+        live_backend_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    // Live backend: echo one message per accepted connection.
+    let listener = bind_std_listener(live_backend_address, "refused-test live backend");
+    let backend_handle = thread::spawn(move || {
+        let mut echoed = 0usize;
+        for _ in 0..SESSIONS {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("set read timeout");
+            let mut buf = [0u8; 64];
+            match stream.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    if stream.write_all(&buf[..n]).is_ok() {
+                        echoed += 1;
+                    }
+                }
+                _ => break,
+            }
+        }
+        echoed
+    });
+
+    // Sessions run one after the other: each one must reach the live
+    // backend, whichever backend the balancer tried first.
+    let mut served = 0usize;
+    let started = Instant::now();
+    for i in 0..SESSIONS {
+        let mut stream = raw_connect(front_address);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("set read timeout");
+        let request = format!("session-{i}");
+        stream.write_all(request.as_bytes()).expect("client write");
+        let mut buf = [0u8; 64];
+        if let Ok(n) = stream.read(&mut buf)
+            && buf[..n] == *request.as_bytes()
+        {
+            served += 1;
+        }
+    }
+    // Every dial and every refusal of the refused backend happened inside
+    // this interval: each session was answered before the next one started.
+    let elapsed = started.elapsed();
+    let echoed = backend_handle.join().expect("backend thread");
+
+    let metrics = query_cluster_metrics(&mut worker, "cluster_0");
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    println!("refused-backend test: served {served}/{SESSIONS}, echoed {echoed}");
+    println!("cluster_0 metrics: {metrics:#?}");
+
+    // Only the refused backend can fail a connect: the live one is
+    // listening for the whole test, so the cluster's count is its count.
+    let dead_errors = metrics
+        .as_ref()
+        .and_then(|values| values.get("backend.connections.error"))
+        .and_then(|inner| match inner {
+            filtered_metrics::Inner::Count(value) => Some(*value),
+            _ => None,
+        });
+
+    // Dials the back-off allows in `elapsed` (at least one second between
+    // two of them), and dials round-robin makes without it: see the test
+    // header for both derivations.
+    let readmission_bound = 1 + elapsed.as_secs() as usize;
+    let unaccounted_dials = SESSIONS - 1;
+    let discriminates = readmission_bound < unaccounted_dials;
+    let accounted = matches!(dead_errors, Some(errors) if errors >= 1);
+    let avoided = matches!(dead_errors, Some(errors) if errors as usize <= readmission_bound);
+    println!(
+        "dead backend backend.connections.error = {dead_errors:?}, sessions took {elapsed:?}, \
+         back-off allows at most {readmission_bound}, round-robin without it makes at least \
+         {unaccounted_dials}"
+    );
+    if !discriminates {
+        println!(
+            "the sessions took too long for the back-off bound to sit below the round-robin count"
+        );
+    }
+
+    if stopped && served == SESSIONS && echoed == SESSIONS && accounted && avoided && discriminates
+    {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_tcp_refused_backend_is_accounted_and_avoided() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TCP refused backend: failure accounted and backend avoided",
+            try_tcp_refused_backend_is_accounted_and_avoided,
         ),
         State::Success,
     );
