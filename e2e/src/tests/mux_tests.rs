@@ -2786,3 +2786,312 @@ fn test_h1_active_requests_balances_over_one_request() {
         State::Success,
     );
 }
+
+// =========================================================================
+// A `Connection: close` backend that closes before its `Content-Length`
+// (sozu-proxy/sozu#1633)
+//
+// RFC 9112 §6.3 rule 5: a sender that closes the connection before the
+// indicated number of octets leaves an incomplete message, and the recipient
+// MUST close the connection. Only a body with neither `Content-Length` nor
+// `Transfer-Encoding` is delimited by the close (rule 8). The truncation
+// reaches an H1 client as what it is only if sozu closes the client
+// connection too: completing the response and keeping the connection alive
+// leaves the client waiting for bytes that never come, and a pipelined
+// response would land where the client still expects the missing body.
+// =========================================================================
+
+/// Answer one keep-alive request with `response`, split into `parts` sent
+/// one after the other, then close the backend connection. Returns the
+/// client connection, already past the backend close.
+fn h1_backend_close_scenario(
+    name: &str,
+    parts: &[&str],
+    pause_before_close: bool,
+) -> (Worker, SyncBackend, TcpStream) {
+    let front_address = create_local_address();
+    let (config, listeners, state) = Worker::empty_config();
+    let (worker, mut backends) =
+        setup_sync_test(name, config, listeners, state, front_address, 1, false);
+    let mut backend = backends.pop().unwrap();
+    backend.connect();
+
+    let mut stream = raw_connect(front_address);
+    stream
+        .write_all(b"GET /api HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .expect("write the keep-alive request");
+
+    let started = Instant::now();
+    while !backend.accept(0) && started.elapsed() < Duration::from_secs(5) {}
+    backend.receive(0);
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            thread::sleep(Duration::from_millis(50));
+        }
+        backend.set_response(*part);
+        backend.send(0);
+    }
+    if pause_before_close {
+        thread::sleep(Duration::from_millis(100));
+    }
+    backend.close(0);
+    (worker, backend, stream)
+}
+
+/// Split one H1 response into its head and its body.
+fn split_h1_response(response: &str) -> Option<(&str, &str)> {
+    response.split_once("\r\n\r\n")
+}
+
+fn try_h1_content_length_truncated_by_backend_close(
+    name: &str,
+    parts: &[&str],
+    pause_before_close: bool,
+) -> State {
+    let (mut worker, _backend, mut stream) =
+        h1_backend_close_scenario(name, parts, pause_before_close);
+
+    // The barrier: the client connection must be closed. Before the fix sozu
+    // took the truncated body for a complete one and kept the keep-alive
+    // client connection open, so this read ran into its deadline.
+    let result = raw_read_until_eof(&mut stream, Duration::from_secs(5));
+    // The close logs the stream: its `http.active_requests` charge is
+    // released, not leaked with the connection.
+    let released = await_active_requests_h1(&mut worker, 0, Duration::from_secs(10));
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    if let Err(diag) = released {
+        println!("{name}: the truncated request kept its charge - {diag}");
+        return State::Fail;
+    }
+
+    let response = match result {
+        Ok(response) => response,
+        Err(diag) => {
+            println!("{name}: the client connection was not closed: {diag}");
+            return State::Fail;
+        }
+    };
+    // The client sees the truncation: either the backend's head with a body
+    // short of its `Content-Length` and then the close, or a 502 when nothing
+    // was forwarded yet. Never a complete 200, never a 502 written into the
+    // body of the 200.
+    let verdict = match split_h1_response(&response) {
+        Some((head, body)) if head.starts_with("HTTP/1.1 200") => {
+            head.contains("Content-Length: 10") && body.len() < 10 && !body.contains("HTTP/1.1")
+        }
+        Some((head, _)) => head.starts_with("HTTP/1.1 502"),
+        None => false,
+    };
+    if !verdict {
+        println!("{name}: unexpected response {response:?}");
+        return State::Fail;
+    }
+    if stopped { State::Success } else { State::Fail }
+}
+
+#[test]
+fn test_h1_content_length_truncated_by_backend_close_closes_client() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H1: a Content-Length response truncated by a backend close closes \
+             the client connection instead of completing it",
+            || try_h1_content_length_truncated_by_backend_close(
+                "H1-CL-TRUNC",
+                &["HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 10\r\n\r\nabcd"],
+                false,
+            ),
+        ),
+        State::Success,
+    );
+}
+
+#[test]
+fn test_h1_content_length_truncated_after_forwarded_head_closes_client() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H1: a Content-Length response whose head was already forwarded, \
+             then truncated by a backend close, closes the client connection",
+            || try_h1_content_length_truncated_by_backend_close(
+                "H1-CL-TRUNC-SPLIT",
+                &[
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 10\r\n\r\n",
+                    "abcd",
+                ],
+                true,
+            ),
+        ),
+        State::Success,
+    );
+}
+
+/// Non-regression: a `Content-Length` body delivered whole before the backend
+/// close is complete, and the client connection stays reusable.
+fn try_h1_content_length_complete_then_backend_close() -> State {
+    let (mut worker, mut backend, mut stream) = h1_backend_close_scenario(
+        "H1-CL-COMPLETE",
+        &["HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 10\r\n\r\n0123456789"],
+        true,
+    );
+
+    let mut response = String::new();
+    let started = Instant::now();
+    while !response.ends_with("0123456789") && started.elapsed() < Duration::from_secs(5) {
+        if let Some(chunk) = raw_read(&mut stream) {
+            response.push_str(&chunk);
+        }
+    }
+    let first_ok = response.starts_with("HTTP/1.1 200") && response.ends_with("0123456789");
+
+    // Keep-alive reuse proves the first response ended cleanly.
+    let second = stream
+        .write_all(b"GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .ok()
+        .and_then(|()| {
+            let started = Instant::now();
+            while !backend.accept(1) && started.elapsed() < Duration::from_secs(5) {}
+            backend.receive(1);
+            backend.set_response(http_ok_response("pong1"));
+            backend.send(1);
+            raw_read_until_eof(&mut stream, Duration::from_secs(5)).ok()
+        });
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    let second_ok = second
+        .as_deref()
+        .is_some_and(|r| r.starts_with("HTTP/1.1 200") && r.ends_with("pong1"));
+    if first_ok && second_ok && stopped {
+        State::Success
+    } else {
+        println!("H1-CL-COMPLETE: first={response:?} second={second:?} stopped={stopped}");
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h1_content_length_complete_then_backend_close_stays_alive() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H1: a complete Content-Length response followed by a backend close \
+             ends cleanly and keeps the client connection alive",
+            try_h1_content_length_complete_then_backend_close,
+        ),
+        State::Success,
+    );
+}
+
+/// Non-regression: a body with neither `Content-Length` nor chunked coding is
+/// delimited by the backend close and reaches the client whole, with no error
+/// answer behind it.
+///
+/// Reads until the body arrives rather than until EOF: sozu forwards the
+/// backend's `Connection: close` but keeps a keep-alive H1 client connection
+/// open after a close-delimited body, a separate defect this test does not
+/// pin.
+fn try_h1_close_delimited_body_ends_at_backend_close() -> State {
+    let (mut worker, _backend, mut stream) = h1_backend_close_scenario(
+        "H1-CLOSE-DELIM",
+        &["HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nabcd"],
+        true,
+    );
+    let mut response = String::new();
+    let started = Instant::now();
+    while !response.ends_with("abcd") && started.elapsed() < Duration::from_secs(5) {
+        if let Some(chunk) = raw_read(&mut stream) {
+            response.push_str(&chunk);
+        }
+    }
+    // Anything sozu queued behind the body (a 502 once was) lands now.
+    if let Some(chunk) = raw_read(&mut stream) {
+        response.push_str(&chunk);
+    }
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    let ok = split_h1_response(&response)
+        .is_some_and(|(head, body)| head.starts_with("HTTP/1.1 200") && body == "abcd");
+    if ok && stopped {
+        State::Success
+    } else {
+        println!("H1-CLOSE-DELIM: response={response:?} stopped={stopped}");
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h1_close_delimited_body_ends_at_backend_close() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H1: a close-delimited body ends cleanly at the backend close",
+            try_h1_close_delimited_body_ends_at_backend_close,
+        ),
+        State::Success,
+    );
+}
+
+#[test]
+fn test_h1_chunked_truncated_by_backend_close_closes_client() {
+    fn try_chunked() -> State {
+        let (mut worker, _backend, mut stream) = h1_backend_close_scenario(
+            "H1-CHUNKED-TRUNC",
+            &[
+                "HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n",
+                "4\r\nabcd\r\n",
+            ],
+            true,
+        );
+        let result = raw_read_until_eof(&mut stream, Duration::from_secs(5));
+        worker.soft_stop();
+        let stopped = worker.wait_for_server_stop();
+        // Closed, without the terminating zero chunk and without a 502 in the
+        // body of the 200.
+        let ok = result
+            .as_deref()
+            .is_ok_and(|response| match split_h1_response(response) {
+                Some((head, body)) if head.starts_with("HTTP/1.1 200") => {
+                    !body.contains("0\r\n\r\n") && !body.contains("HTTP/1.1")
+                }
+                Some((head, _)) => head.starts_with("HTTP/1.1 502"),
+                None => false,
+            });
+        if ok && stopped {
+            State::Success
+        } else {
+            println!("H1-CHUNKED-TRUNC: result={result:?} stopped={stopped}");
+            State::Fail
+        }
+    }
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H1: a chunked response truncated by a backend close closes the \
+             client connection",
+            try_chunked,
+        ),
+        State::Success,
+    );
+}
+
+/// A keep-alive backend (no `Connection: close`) that dies mid-body reaches
+/// `EndStreamAction::ForwardUnterminated`. The H1 client connection closes
+/// once the errored response is flushed, instead of waiting for the frontend
+/// timeout.
+#[test]
+fn test_h1_keep_alive_backend_dying_mid_body_closes_client() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H1: a keep-alive backend dying mid-body closes the client connection",
+            || try_h1_content_length_truncated_by_backend_close(
+                "H1-CL-KA-DEATH",
+                &["HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n", "abcd"],
+                true,
+            ),
+        ),
+        State::Success,
+    );
+}

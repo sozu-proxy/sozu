@@ -280,14 +280,18 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         }
     }
 
-    /// Terminate a close-delimited kawa body by pushing END_STREAM flags.
-    /// Called when the backend closes the connection to signal end-of-body
-    /// (no Content-Length, no chunked encoding).
+    /// End a response body at the backend's EOF.
     ///
-    /// Chunked responses that TCP-close before the terminating `0\r\n\r\n`
-    /// are demoted to `ParsingPhase::Error` so the H2 converter emits
-    /// RST_STREAM(InternalError) rather than a silent END_STREAM with a
-    /// truncated body — RFC 9112 §7.1 requires the zero-chunk terminator.
+    /// Only a body with neither `Content-Length` nor chunked coding
+    /// (`BodySize::Empty`) is delimited by the close (RFC 9112 §6.3 rule 8):
+    /// it is terminated by pushing END_STREAM flags.
+    ///
+    /// A `Content-Length` body still expecting bytes, or a chunked body the
+    /// backend closed before its terminating `0\r\n\r\n` (RFC 9112 §7.1), is
+    /// truncated: RFC 9112 §6.3 rule 5 makes it incomplete. It is demoted to
+    /// `ParsingPhase::Error`, so the H2 converter emits
+    /// RST_STREAM(InternalError) and the H1 frontend closes the connection,
+    /// rather than a silent end of message over a truncated body.
     fn terminate_close_delimited(kawa: &mut super::GenericHttpStream, stream_id: GlobalStreamId) {
         // Pre: we only synthesize an end-of-body for a response still in its
         // body phase. A kawa already Terminated/Error must not be re-terminated
@@ -296,10 +300,22 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             !kawa.is_terminated(),
             "terminate_close_delimited must not run on an already-terminated kawa"
         );
-        if kawa.body_size == kawa::BodySize::Chunked {
+        debug_assert!(
+            kawa.is_main_phase(),
+            "terminate_close_delimited must only end a response in its body phase"
+        );
+        if kawa.body_size != kawa::BodySize::Empty {
+            // kawa moves a `Content-Length` body to Terminated once its last
+            // byte is parsed, so a `Length` body still in its body phase is
+            // missing bytes: `expects` counts them.
+            debug_assert!(
+                !matches!(kawa.body_size, kawa::BodySize::Length(_)) || kawa.expects > 0,
+                "a Content-Length body still in its body phase must be missing bytes"
+            );
             warn!(
-                "{} H1 backend EOF mid-chunked response on stream {}: emitting RST_STREAM",
+                "{} H1 backend EOF before the end of a {:?} response on stream {}: emitting RST_STREAM",
                 log_module_context!(),
+                kawa.body_size,
                 stream_id
             );
             incr!(names::h1::BACKEND_EOF_BEFORE_MESSAGE_COMPLETE);
@@ -307,11 +323,11 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 .error(kawa::ParsingErrorKind::Processing {
                     message: "INTERNAL_ERROR",
                 });
-            // Post: a truncated chunked body is demoted to Error so the
-            // converter emits RST_STREAM, never a silent END_STREAM.
+            // Post: a truncated body is demoted to Error so the converter
+            // emits RST_STREAM, never a silent END_STREAM.
             debug_assert!(
                 kawa.is_error(),
-                "truncated chunked response must end in the Error phase"
+                "truncated response must end in the Error phase"
             );
             return;
         }
@@ -715,8 +731,11 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         // onto `context.debug`. Its one `return` in that window is taken only
         // when the vector is empty, so no descriptor outlives the pass.
         let queued = unsafe { super::h2_transmit::gather(kawa, &mut self.io_slices) };
+        // A response in the Error phase ends here too: the backend truncated
+        // it or it was forcefully terminated, so once what was queued before
+        // the failure is flushed the connection closes (see below).
         let can_finalize_server_close = matches!(self.position, Position::Server)
-            && kawa.is_terminated()
+            && (kawa.is_terminated() || kawa.is_error())
             && kawa.is_completed();
         if self.io_slices.is_empty()
             && !self.socket.socket_wants_write()
@@ -806,6 +825,26 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             return MuxResult::Continue;
         }
 
+        if matches!(self.position, Position::Server) && kawa.is_error() && kawa.is_completed() {
+            // The response failed after part of it may have left: a body the
+            // backend truncated (`ConnectionH1::terminate_close_delimited`) or
+            // a response `forcefully_terminate_answer` ended. H1 has no
+            // RST_STREAM, and neither a default answer nor the next pipelined
+            // response may follow those bytes on this connection, so close
+            // it: the client sees a close before the end of the message, which
+            // RFC 9112 §6.3 rule 5 makes the incomplete-message signal. Never
+            // kept alive; `Mux::close` logs the stream as an error.
+            debug_assert!(
+                !kawa.is_terminated(),
+                "an errored response must not also be terminated"
+            );
+            debug!(
+                "{} H1 closing the frontend after an incomplete response on stream {}",
+                log_context!(self),
+                stream_id
+            );
+            return self.defer_close_for_tls_flush("incomplete-response");
+        }
         if kawa.is_terminated() && kawa.is_completed() {
             match self.position {
                 Position::Client(..) => self.readiness.interest.insert(Ready::READABLE),
@@ -2661,5 +2700,57 @@ mod tests {
             1,
             "a fresh H1 backend must size its descriptor vector in one allocation"
         );
+    }
+
+    /// `ConnectionH1::terminate_close_delimited` at a backend EOF: only a body
+    /// with neither `Content-Length` nor chunked coding is delimited by the
+    /// close (RFC 9112 §6.3 rule 8). A `Content-Length` body still missing
+    /// bytes (rule 5) and a chunked body without its terminating zero chunk
+    /// (§7.1) are truncated and end in the Error phase, which the H2
+    /// converter turns into RST_STREAM and the H1 frontend into a close.
+    ///
+    /// Red on `d5161919`: the `Content-Length` case ended `Terminated`
+    /// (sozu-proxy/sozu#1633).
+    #[test]
+    fn only_a_close_delimited_body_ends_cleanly_at_the_backend_eof() {
+        let cases: [(&[u8], bool); 3] = [
+            (b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabcd", true),
+            (
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n",
+                true,
+            ),
+            (b"HTTP/1.1 200 OK\r\n\r\nabcd", false),
+        ];
+        for (bytes, truncated) in cases {
+            let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+            let mut context = test_context(&pool);
+            let id = context
+                .create_stream(Ulid::generate(), 1 << 16)
+                .expect("the test pool must hand out stream buffers");
+            let kawa = &mut context.streams[id].back;
+            kawa.storage.space()[..bytes.len()].copy_from_slice(bytes);
+            kawa.storage.fill(bytes.len());
+            kawa::h1::parse(kawa, &mut kawa::h1::NoCallbacks);
+            assert!(
+                kawa.is_main_phase() && !kawa.is_terminated(),
+                "premise: {:?} is in its body phase",
+                kawa.body_size
+            );
+            ConnectionH1::<mio::net::TcpStream>::terminate_close_delimited(kawa, id);
+            if truncated {
+                assert!(
+                    kawa.is_error(),
+                    "a truncated {:?} body must end in Error, got {:?}",
+                    kawa.body_size,
+                    kawa.parsing_phase
+                );
+            } else {
+                assert!(
+                    kawa.is_terminated(),
+                    "a close-delimited body ends cleanly, got {:?}",
+                    kawa.parsing_phase
+                );
+            }
+        }
     }
 }

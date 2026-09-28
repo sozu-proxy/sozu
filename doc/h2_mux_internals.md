@@ -1899,9 +1899,12 @@ is resumed or gone:
   wakes the writer again, so the trailers go out whole. Waiting must always
   end: a block the next queued flags do not close was cut short and is dropped
   unencoded, and `ConnectionH2::end_stream`'s close-delimited arm ends a
-  chunked response its H1 backend closed mid-body, trailers included, with
-  RST_STREAM (the truncation `ConnectionH1::terminate_close_delimited` already
-  reports the same way, RFC 9112 §7.1) and drops its unencoded blocks.
+  chunked response its H1 backend closed mid-body, trailers included, or a
+  `Content-Length` response short of its length, with RST_STREAM (the
+  truncation `ConnectionH1::terminate_close_delimited` already reports the same
+  way, RFC 9112 §6.3 and §7.1) and drops its unencoded blocks. Only a body with
+  neither `Content-Length` nor chunked coding ends cleanly at the backend close
+  (sozu-proxy/sozu#1633).
 - Every converter path that still throws encoded bytes away
   (`check_header_capacity`, the `StatusLine::Unknown` abort, `finalize`) goes
   through `H2BlockConverter::discard_encoded_block`, which calls

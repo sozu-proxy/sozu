@@ -45,7 +45,7 @@ use sozu_command_lib::{
 use crate::{
     mock::{
         aggregator::SimpleAggregator, async_backend::BackendHandle as AsyncBackend,
-        raw_h2_stall_backend::RawH2StallBackend,
+        raw_h2_stall_backend::RawH2StallBackend, sync_backend::Backend as SyncBackend,
     },
     sozu::worker::Worker,
     tests::{State, h2_utils::*, provide_port, repeat_until_error_or, tests::create_local_address},
@@ -4311,6 +4311,181 @@ fn test_h2_peer_goaway_during_response_body() {
             3,
             "H2 peer GOAWAY mid-response \u{2014} stream torn down, worker stays healthy",
             try_h2_peer_goaway_during_response_body
+        ),
+        State::Success
+    );
+}
+
+// ----------------------------------------------------------------------------
+// A `Connection: close` H1 backend that closes before its `Content-Length`
+// (sozu-proxy/sozu#1633)
+// ----------------------------------------------------------------------------
+
+/// Serve one H2 GET from an H1 backend that answers with `parts`, sent one
+/// after the other, then closes its connection after a pause, so the H2
+/// frontend has encoded the response head before the close arrives. Returns `(body_bytes,
+/// end_stream_seen, got_rst, infra_ok)` as seen by the H2 client.
+///
+/// RFC 9113 §8.1.1: a response whose DATA lengths do not sum to its
+/// `content-length` is malformed, so a body the backend truncated must end
+/// with RST_STREAM, never a clean END_STREAM. Only a body with neither
+/// `Content-Length` nor chunked coding is delimited by the close (RFC 9112
+/// §6.3 rule 8).
+fn h2_backend_close_scenario(name: &str, parts: &[&str]) -> (usize, bool, bool, bool) {
+    let (worker, front_port, back_address) = setup_single_h1_backend_listener(name, None);
+    let mut backend = SyncBackend::new(format!("{name}-BACKEND"), back_address, "");
+    backend.connect();
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 1_000_000);
+    let sid: u32 = 1;
+    let headers = H2Frame::headers(sid, build_get_headers_no_priority(), true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    let started = Instant::now();
+    while !backend.accept(0) && started.elapsed() < Duration::from_secs(5) {}
+    backend.receive(0);
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            thread::sleep(Duration::from_millis(50));
+        }
+        backend.set_response(*part);
+        backend.send(0);
+    }
+    thread::sleep(Duration::from_millis(100));
+    backend.close(0);
+
+    let (body_bytes, end_stream_seen, got_rst, elapsed) =
+        drain_h2_stream_until_end_stream(&mut tls, sid, Duration::from_secs(5));
+    println!(
+        "{name}: body_bytes={body_bytes} end_stream={end_stream_seen} rst={got_rst} \
+         elapsed={elapsed:?}"
+    );
+    let infra_ok = teardown(
+        tls,
+        front_port,
+        worker,
+        Vec::<AsyncBackend<SimpleAggregator>>::new(),
+    );
+    drop(backend);
+    (body_bytes, end_stream_seen, got_rst, infra_ok)
+}
+
+fn try_h2_content_length_truncated_by_backend_close_rsts(name: &str, parts: &[&str]) -> State {
+    let (body_bytes, end_stream_seen, got_rst, infra_ok) = h2_backend_close_scenario(name, parts);
+    // Before the fix the 4 bytes left with a clean END_STREAM under
+    // `content-length: 10`.
+    if infra_ok && got_rst && !end_stream_seen && body_bytes < 10 {
+        State::Success
+    } else {
+        println!(
+            "FAIL {name}: body_bytes={body_bytes}, end_stream={end_stream_seen}, \
+             rst={got_rst}, infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_content_length_truncated_by_backend_close_rsts() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: a Content-Length response truncated by a backend close ends \
+             with RST_STREAM, not END_STREAM",
+            || try_h2_content_length_truncated_by_backend_close_rsts(
+                "H2-CL-TRUNC",
+                &["HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 10\r\n\r\nabcd"],
+            ),
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_h2_content_length_truncated_after_forwarded_head_rsts() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: a Content-Length response whose head was already forwarded, \
+             then truncated by a backend close, ends with RST_STREAM",
+            || try_h2_content_length_truncated_by_backend_close_rsts(
+                "H2-CL-TRUNC-SPLIT",
+                &[
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 10\r\n\r\n",
+                    "abcd",
+                ],
+            ),
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_h2_chunked_truncated_by_closing_backend_rsts() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: a chunked `Connection: close` response truncated by the backend \
+             close ends with RST_STREAM",
+            || try_h2_content_length_truncated_by_backend_close_rsts(
+                "H2-CHUNKED-TRUNC",
+                &[
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n",
+                    "4\r\nabcd\r\n",
+                ],
+            ),
+        ),
+        State::Success
+    );
+}
+
+/// Non-regression: a whole `Content-Length` body, and a close-delimited body,
+/// end with a clean END_STREAM at the backend close.
+fn try_h2_body_complete_at_backend_close(name: &str, response: &str, want: usize) -> State {
+    let (body_bytes, end_stream_seen, got_rst, infra_ok) =
+        h2_backend_close_scenario(name, &[response]);
+    if infra_ok && end_stream_seen && !got_rst && body_bytes == want {
+        State::Success
+    } else {
+        println!(
+            "FAIL {name}: body_bytes={body_bytes} (want {want}), \
+             end_stream={end_stream_seen}, rst={got_rst}, infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_content_length_complete_then_backend_close_ends_stream() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: a complete Content-Length response followed by a backend close \
+             ends with END_STREAM",
+            || try_h2_body_complete_at_backend_close(
+                "H2-CL-COMPLETE",
+                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 10\r\n\r\n0123456789",
+                10,
+            ),
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_h2_close_delimited_body_ends_stream_at_backend_close() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: a close-delimited body ends with END_STREAM at the backend close",
+            || try_h2_body_complete_at_backend_close(
+                "H2-CLOSE-DELIM",
+                "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nabcd",
+                4,
+            ),
         ),
         State::Success
     );

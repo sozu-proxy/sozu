@@ -104,7 +104,13 @@ mutable companion to the Kawa parser. Its `kawa::h1::ParserCallbacks` impl
   for the access log as the `'static` phrase RFC 9110 §15 registers for the
   code (`standard_reason`, `editor.rs`) when the backend sent exactly that
   phrase, and copied otherwise; the forwarded status line is kawa's own and
-  never reads it.
+  never reads it. It also clears `keep_alive_backend` on a backend
+  `Connection: close`. That flag is what sends a backend EOF into
+  `ConnectionH1::terminate_close_delimited` (`lib/src/protocol/mux/h1.rs`),
+  where only a body with neither `Content-Length` nor chunked coding ends
+  cleanly: a body the close cut short ends in `ParsingPhase::Error`,
+  RST_STREAM to an H2 client and a closed connection to an H1 one
+  (`lib/src/protocol/mux/LIFECYCLE.md` §8.4).
 
 `HttpContext::extract_route` (`editor.rs`) hands the mux router the
 authority, path and method it needs, and `HttpContext::log_context`
@@ -225,7 +231,7 @@ short-circuit anything else in kawa — the very next line back in
 `kawa::h1::parse`'s loop re-checks `parsing_phase`, sees `Error`, and returns.
 
 The resulting `ParsingPhase::Error` is observed by the mux H1 connection in
-`ConnectionH1::readable` (`lib/src/protocol/mux/h1.rs:468`), which checks
+`ConnectionH1::readable` (`lib/src/protocol/mux/h1.rs`), which checks
 `kawa.is_error()` immediately after `kawa::h1::parse` and, on the server side,
 calls
 `set_default_answer(..., 400, ...)` and returns — before routing or the
@@ -263,7 +269,11 @@ template-rendered Kawa streams. The relevant pieces:
   unrecognised name is compiled but never chosen.
 - `mux::answers::set_default_answer` (`lib/src/protocol/mux/answers.rs:195`)
   is the one chokepoint that queues a rendered answer onto a `Stream` and arms
-  the readiness flags so the writable pass flushes it. The mux fills the
+  the readiness flags so the writable pass flushes it. It replaces a response
+  only while none of it has left: `end_stream_decision`
+  (`lib/src/protocol/mux/shared.rs`) no longer picks it for a failed response
+  whose kawa is `consumed`, which would put the answer behind bytes the client
+  already has. The mux fills the
   parse-detail fields (`message`, `phase`, `successfully_parsed`, …) with
   neutral placeholders (`default_answer_for_code`, `mux/answers.rs:134`): it
   has no H1 parse state to report, which is why the `kawa_h1::diagnostics`
