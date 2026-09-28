@@ -15,6 +15,7 @@ use super::{BackendConnectionError, MuxResult, Readiness, StreamState};
 
 /// Maximum number of debug events retained in the ring buffer.
 /// Oldest entries are dropped when this limit is reached.
+#[cfg(debug_assertions)]
 pub(super) const DEBUG_HISTORY_CAPACITY: usize = 512;
 
 #[derive(Default)]

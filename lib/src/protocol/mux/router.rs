@@ -3397,7 +3397,7 @@ mod backend_selection_order_tests {
     fn a_routed_request_on_a_reused_backend_connection_copies_no_cluster_id() {
         use std::hint::black_box;
 
-        use crate::{protocol::mux::DebugEvent, test_allocations::allocations};
+        use crate::test_allocations::allocations;
 
         const REQUESTS: usize = 64;
         let backend_token = Token(LOWEST_TOKEN);
@@ -3496,6 +3496,8 @@ mod backend_selection_order_tests {
                 let before = allocations();
                 #[cfg(debug_assertions)]
                 {
+                    use crate::protocol::mux::DebugEvent;
+
                     let route = context.streams[stream_id].context.get_route();
                     context.debug.push(DebugEvent::Str(route));
                 }

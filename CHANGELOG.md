@@ -3429,6 +3429,23 @@
 
 ### 🐛 Fixed
 
+- **`chore(clippy)`: `cargo clippy --all-targets --release -- -D warnings` passes again, and CI now
+  runs it.** CI linted only the dev profile, where `debug_assertions` is on, so items used only by
+  `#[cfg(debug_assertions)]` code or by a `debug!` call (compiled out of release builds) failed the
+  release lint unnoticed. The fixes follow each item's real users: `HashMap` in
+  `lib/src/protocol/mux/mod.rs` is now imported by the `#[cfg(debug_assertions)]` index check and
+  by the test module that use it; the router allocation test imports `DebugEvent` inside its
+  `#[cfg(debug_assertions)]` block; `DEBUG_HISTORY_CAPACITY` is `#[cfg(debug_assertions)]`, like
+  the ring push that reads it; `HeaderBlockAccumulator::is_empty` and
+  `H2StreamTable::stream_last_activity_at` are `#[cfg(any(debug_assertions, test))]`, because only
+  the debug invariant checks and the unit tests call them; and the two `debug!` branches of
+  `CommandHub::handle_finishing_task`, identical once the macro compiles out
+  (`clippy::if_same_then_else` on 1.93.1), are one `debug!` with the same text. No behaviour
+  changes and every debug assertion stays active. The `msrv-full` CI cell gains a
+  `Lint (clippy, release profile)` step so the regression cannot return silently. The step deletes
+  its 0.90GB of release check artifacts as soon as the lint passes, so the cell's peak disk use
+  does not grow and its runner pod stays under the 8Gi ephemeral-storage limit.
+
 - **`fix(command)`: listener descriptors received over SCM are close-on-exec
   ([#1665](https://github.com/sozu-proxy/sozu/issues/1665)).** `ScmSocket::receive_listeners`
   called `recvmsg` without `MSG_CMSG_CLOEXEC`, so every received listener lacked `FD_CLOEXEC`.

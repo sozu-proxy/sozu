@@ -17,7 +17,7 @@
 
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, VecDeque},
     fmt::Debug,
     io::ErrorKind,
     net::{Shutdown, SocketAddr},
@@ -3213,6 +3213,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
 
         #[cfg(debug_assertions)]
         {
+            use std::collections::HashMap;
+
             // Verify backend_streams index matches actual stream states.
             let mut expected: HashMap<Token, Vec<GlobalStreamId>> = HashMap::new();
             for (id, stream) in self.context.streams.iter().enumerate() {
@@ -4012,6 +4014,8 @@ thread_local! {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::test_support::{TEST_STICKY_NAME, connected_socket, test_context};
     use super::*;
     use crate::{

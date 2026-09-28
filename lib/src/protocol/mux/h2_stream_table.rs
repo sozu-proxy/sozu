@@ -374,6 +374,7 @@ impl H2StreamTable {
 
     // ---- per-stream activity / flow-control-stall caches --------------------
 
+    #[cfg(any(debug_assertions, test))]
     pub(super) fn stream_last_activity_at(&self) -> &BTreeMap<StreamId, Instant> {
         &self.stream_last_activity_at
     }
