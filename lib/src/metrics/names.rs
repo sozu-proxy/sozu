@@ -331,6 +331,12 @@ pub mod http {
     pub const STATUS_4XX: &str = "http.status.4xx";
     pub const STATUS_5XX: &str = "http.status.5xx";
     pub const STATUS_OTHER: &str = "http.status.other";
+    /// Trailer fields elided from an H1 chunked request because their name is
+    /// one of `editor::TRAILER_SPOOF_VECTOR_HEADERS` (client attribution a
+    /// trailer must not carry, RFC 9110 §6.5.1; sozu-proxy/sozu#1689). One
+    /// increment per field. The H2 frontend counts the same drop in
+    /// `h2::TRAILER_SPOOF_VECTOR_ELIDED`.
+    pub const TRAILER_SPOOF_VECTOR_ELIDED: &str = "http.trailer.spoof_vector_elided";
     pub const TRUSTING_X_PORT: &str = "http.trusting.x_port";
     pub const TRUSTING_X_PORT_DIFF: &str = "http.trusting.x_port.diff";
     pub const TRUSTING_X_PROTO: &str = "http.trusting.x_proto";

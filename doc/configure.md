@@ -1395,10 +1395,17 @@ populated address block: it used to be injected verbatim as `X-Real-IP`, and now
 closes the session.
 
 Both flags apply uniformly to HTTP/1 and HTTP/2 because the elision and
-injection live on the shared `HttpContext::on_request_headers` callback. The H2
-trailer-block code path additionally honours `elide_x_real_ip` for trailer
-HEADERS frames, so an H2 client cannot spoof `x-real-ip` as a trailer to bypass
-the anti-spoof.
+injection live on the shared `HttpContext::on_request_headers` callback. That
+callback only sees the header block, so both frontends also drop client
+attribution from a request's trailer section, unconditionally and whatever these
+flags say (RFC 9110 §6.5.1): `X-Real-IP`, `X-Forwarded-For`, `Forwarded`,
+`X-Request-Id`, `X-Forwarded-Proto`, `X-Forwarded-Port` and `X-Forwarded-Host`,
+the single list `TRAILER_SPOOF_VECTOR_HEADERS`
+(`lib/src/protocol/kawa_h1/editor.rs`). H2 trailer HEADERS frames are filtered by
+`pkawa::handle_trailer` (`lib/src/protocol/mux/pkawa.rs`) and H1 chunked trailer
+sections by `elide_request_trailer_spoof_vectors` (`editor.rs`), so a client
+cannot spoof its address as a trailer to bypass the anti-spoof (#1689). Every
+other trailer field, such as `grpc-status`, is forwarded.
 
 Both knobs are runtime-patchable via `UpdateHttpListenerConfig` /
 `UpdateHttpsListenerConfig`. Patches apply immediately to all H1 sessions and to
@@ -1444,8 +1451,10 @@ converted elements would be exactly as untrusted. RFC 7239 §4 allows a proxy to
 remove forwarding fields, so the backend is left with one family whose last
 element is Sōzu's. Other `X-Forwarded-*` names (for example
 `X-Forwarded-Prefix`) are not forwarding attestations Sōzu manages and pass
-through in every mode. An H2 trailer block cannot smuggle a forwarding header
-past the mode: `pkawa::handle_trailer` (`lib/src/protocol/mux/pkawa.rs`) drops
+through in every mode. A trailer cannot smuggle a forwarding header past the
+mode: `pkawa::handle_trailer` (`lib/src/protocol/mux/pkawa.rs`) for an H2
+trailer block, and `elide_request_trailer_spoof_vectors`
+(`lib/src/protocol/kawa_h1/editor.rs`) for an H1 chunked trailer section, drop
 `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Port` and
 `X-Forwarded-Host` from trailers in every mode.
 
@@ -3050,6 +3059,7 @@ Incremented when Sōzu generates a default error response instead of proxying:
 | `http.frontend.transfer_encoding_smuggling`  | counter | proxy | H1 request rejected (400) for ambiguous `Transfer-Encoding` framing: more than one non-elided `Transfer-Encoding` header, or one whose final coding is not `chunked` (e.g. `chunked, gzip`), or one present without kawa adopting chunked framing (RFC 9110 §7.6 / RFC 9112 §6.1; #726). Whitespace around a coding is not ambiguity — kawa >= 0.7.1 excludes it from the field value (RFC 9112 §5), so `chunked\t` frames as chunked and is forwarded canonically rather than counted here |
 | `http.frontend.content_length_invalid`      | counter | proxy | H1 request rejected (400) by Sōzu's own check because its forwarded `Content-Length` value is not `1*DIGIT` — e.g. `+5`, which kawa 0.7.1 framed as 5 and forwarded verbatim (RFC 9110 §8.6 / RFC 9112 §6.3; #1652). Since kawa 0.7.2 the parser refuses such a value first, so the request is still answered 400 but this counter stays at zero unless kawa regresses (defense in depth). A leading-zero value such as `005` is `1*DIGIT` and is not counted. Also counted in `http.frontend_parse_errors` |
 | `http.backend_parse_errors`                  | counter | proxy | Backend response parsing failures                                                                                                                                                              |
+| `http.trailer.spoof_vector_elided`          | counter | proxy | Trailer fields elided from an H1 chunked request because their name is a forwarding header a trailer must not carry — `X-Real-IP`, `X-Forwarded-For`, `Forwarded`, `X-Request-Id`, `X-Forwarded-Proto`, `X-Forwarded-Port` or `X-Forwarded-Host`, in any case (RFC 9110 §6.5.1; #1689). One increment per field; the request is still forwarded. The H2 frontend counts the same drop in `h2.trailer.spoof_vector_elided` |
 | `http.backend.content_length_invalid`       | counter | proxy | H1 backend response discarded and answered 502 by Sōzu's own check because its `Content-Length` value is not `1*DIGIT` (RFC 9112 §6.3; #1652). Since kawa 0.7.2 the parser refuses such a response first — still 502 — so this counter stays at zero unless kawa regresses (defense in depth). Also counted in `http.backend_parse_errors` |
 
 #### Backend health

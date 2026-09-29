@@ -17,6 +17,7 @@ use sozu_command::{logging::ansi_palette, ready::Ready};
 use crate::metrics::names;
 use crate::{
     L7ListenerHandler, ListenerHandler, Readiness,
+    protocol::kawa_h1::editor,
     protocol::mux::{
         BackendStatus, Context, DebugEvent, Endpoint, GlobalStreamId, MuxResult, Position,
         StreamState, forcefully_terminate_answer, memoized_rtt,
@@ -480,7 +481,12 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         }
 
         let was_main_phase = kawa.is_main_phase();
+        let blocks_before_parse = kawa.blocks.len();
         kawa::h1::parse(kawa, parts.context);
+        // kawa has no trailer callback: drop spoofed forwarding fields from a
+        // chunked request's trailer section here (sozu-proxy/sozu#1689). A
+        // backend response is a `Kind::Response` and is left untouched.
+        editor::elide_request_trailer_spoof_vectors(kawa, blocks_before_parse);
         if kawa.is_error() {
             match self.position {
                 Position::Client(..) => {
@@ -1053,7 +1059,12 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         // the socket buffer may be empty — all requests were already
                         // read into kawa storage in the first socket_read.
                         if !stream.front.storage.is_empty() {
+                            let blocks_before_parse = stream.front.blocks.len();
                             kawa::h1::parse(&mut stream.front, &mut stream.context);
+                            editor::elide_request_trailer_spoof_vectors(
+                                &mut stream.front,
+                                blocks_before_parse,
+                            );
                             let is_error = stream.front.is_error();
                             let is_main = stream.front.is_main_phase();
                             let malformed = is_main

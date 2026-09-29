@@ -484,6 +484,64 @@ them red on the branch, pin kawa 0.7.1 (`kawa = { version = "=0.7.1", … }` in
 the root `Cargo.toml`, then `cargo update -p kawa --precise 0.7.1`) and
 delete it.
 
+### 2.3 Request trailers never carry client attribution
+
+`HttpContext::on_request_headers` edits the header block only. kawa's H1
+parser calls no callback for a chunked request's trailer section: its
+`ParsingPhase::Trailers` arm pushes each trailer field as a `Block::Header`
+after the `Flags` block carrying `end_body` (the last chunk), then closes the
+section with a `Flags` block carrying `end_header` and `end_stream`. Until
+sozu-proxy/sozu#1689 those fields reached the backend verbatim, so a client
+could append `X-Forwarded-For`, `Forwarded` or `X-Real-IP` to its body and
+hand a forged address to a backend that merges trailers into its header view.
+
+`elide_request_trailer_spoof_vectors` (`editor.rs`) closes that path. Both
+frontend parse sites of `ConnectionH1` (`lib/src/protocol/mux/h1.rs`) call it
+right after `kawa::h1::parse`: `ConnectionH1::readable`, and the keep-alive
+branch of `ConnectionH1::writable` that parses a pipelined request. It elides
+every field named in `TRAILER_SPOOF_VECTOR_HEADERS` (`editor.rs`), compared
+without case: `X-Real-IP`, `X-Forwarded-For`, `Forwarded`, `X-Request-Id`,
+`X-Forwarded-Proto`, `X-Forwarded-Port` and `X-Forwarded-Host`. The H2 filter
+`pkawa::handle_trailer` (`lib/src/protocol/mux/pkawa.rs`) reads the same list,
+so the two frontends drop the same names. Each elided H1 field increments
+`http.trailer.spoof_vector_elided`.
+
+- **Where the walk stops.** Each call site reads `kawa.blocks.len()` just
+  before `kawa::h1::parse` and passes it as `first_new_block`. The walk goes
+  back from the end of the block queue over the closing `Flags` block and the
+  trailer fields, and stops at the first other block (the `end_body` marker)
+  or at `first_new_block`. The header block ends with its own `end_header`
+  marker before the chunks, so it is never reached.
+- **Linear cost.** A parse only appends blocks and `prepare` only drains them
+  from the front between parses, so the fields past `first_new_block` are
+  exactly the ones that parse added, and every older field was examined by
+  the call after the parse that queued it. A client trickling one trailer line
+  per segment while the backend is not writable therefore costs one block per
+  line, not a re-walk of the whole section. A trailer section split across
+  reads, its first part already forwarded, is filtered part by part.
+- **Framing.** An elided field has an empty key, which kawa's H1 converter and
+  the H2 converter skip; the last chunk (`0\r\n`) and the closing empty line
+  are still written, so the chunk framing stays valid when every trailer field
+  is dropped. The advisory `Trailer` header is left as sent.
+- **Cost.** A request that is not chunked, or has not reached its trailer
+  section, returns on the kind, `body_size` and `parsing_phase` checks before
+  any block is read.
+- **Responses are not filtered.** A response trailer travels towards the
+  client, which takes no client attribution from it; `on_response_headers`
+  keeps its own rules.
+
+Covered by `a_chunked_request_trailer_section_loses_its_spoof_vector_fields`,
+`a_trailer_section_parsed_after_the_last_chunk_was_forwarded_is_filtered`,
+`a_trailer_section_split_across_reads_is_filtered_in_each_part`,
+`a_trailer_walk_stops_at_the_blocks_queued_before_the_parse` and
+`trailer_elision_leaves_headers_and_responses_alone` (unit, in `editor.rs`),
+and by `test_h1_trailer_spoof_headers_dropped`,
+`test_h1_trailer_spoof_headers_dropped_split`,
+`test_h1_trailer_spoof_headers_dropped_split_inside_trailers` and
+`test_h1_pipelined_trailer_spoof_headers_dropped`
+(`e2e/src/tests/h1_security_tests.rs`), which read the bytes the backend
+receives.
+
 ---
 
 ## 3. Default Answers
