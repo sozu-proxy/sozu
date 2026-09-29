@@ -22,7 +22,7 @@ use crate::{
         command::{
             ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
             ClusterInformation, CustomHttpAnswers, DeactivateListener, ForwardedHeaders,
-            FrontendFilters, HealthChecksList, HttpListenerConfig, HttpsListenerConfig,
+            FrontendFilters, HealthChecksList, HstsConfig, HttpListenerConfig, HttpsListenerConfig,
             InitialState, ListedFrontends, ListenerType, ListenersList, PathRule,
             QueryCertificatesFilters, RemoveBackend, RemoveCertificate, RemoveListener,
             ReplaceCertificate, Request, RequestCounts, RequestHttpFrontend, RequestTcpFrontend,
@@ -828,7 +828,12 @@ impl ConfigState {
     /// Only `Some` fields in the patch are written; `None` fields preserve the
     /// current value. Returns `StateError::NotFound` if the address is unknown,
     /// `StateError::InvalidValue` if a flood-knob value is below the required
-    /// minimum.
+    /// minimum or another field is invalid.
+    ///
+    /// All-or-nothing (sozu-proxy/sozu#1703): every fallible check runs before
+    /// the first write, so a refused patch leaves the stored listener exactly
+    /// as it was. Every write below is infallible; keep it that way, or move
+    /// a new check up with the others.
     fn update_http_listener(&mut self, patch: &UpdateHttpListenerConfig) -> Result<(), StateError> {
         validate_h2_flood_knobs_http(patch)?;
 
@@ -837,6 +842,13 @@ impl ConfigState {
             patch.address.into(),
             ObjectKind::HttpListener,
         )?;
+        if let Some(ref v) = patch.sozu_id_header {
+            validate_sozu_id_header(v)?;
+        }
+        if let Some(v) = patch.forwarded_headers {
+            validate_forwarded_headers(v)?;
+        }
+
         let listener = self
             .http_listeners
             .get_mut(&key)
@@ -930,11 +942,9 @@ impl ConfigState {
             listener.h2_max_window_update_stream0_per_window = Some(v);
         }
         if let Some(ref v) = patch.sozu_id_header {
-            validate_sozu_id_header(v)?;
             listener.sozu_id_header = Some(v.to_owned());
         }
         if let Some(v) = patch.forwarded_headers {
-            validate_forwarded_headers(v)?;
             listener.forwarded_headers = Some(v);
         }
         Ok(())
@@ -945,7 +955,18 @@ impl ConfigState {
     /// Only `Some` fields in the patch are written; `None` fields preserve the
     /// current value. Returns `StateError::NotFound` if the address is unknown,
     /// `StateError::InvalidValue` if a flood-knob value is below the required
-    /// minimum or an ALPN value is unknown.
+    /// minimum, an ALPN value is unknown, an `hsts` block lacks `enabled`, or
+    /// another field is invalid.
+    ///
+    /// All-or-nothing (sozu-proxy/sozu#1703), as
+    /// [`Self::update_http_listener`]: every fallible check runs before the
+    /// first write.
+    ///
+    /// `hsts` is checked but not stored here: the worker owns the listener
+    /// HSTS default. The check exists so the main process refuses the same
+    /// patch every worker refuses (`ListenerError::HstsEnabledRequired` in
+    /// `HttpsListener::update_config`, `lib/src/https.rs`) instead of
+    /// recording its other fields while no worker applies them.
     fn update_https_listener(
         &mut self,
         patch: &UpdateHttpsListenerConfig,
@@ -957,6 +978,19 @@ impl ConfigState {
             patch.address.into(),
             ObjectKind::HttpsListener,
         )?;
+        if let Some(ref alpn_wrapper) = patch.alpn_protocols {
+            validate_alpn_protocols(&alpn_wrapper.values)?;
+        }
+        if let Some(ref v) = patch.sozu_id_header {
+            validate_sozu_id_header(v)?;
+        }
+        if let Some(v) = patch.forwarded_headers {
+            validate_forwarded_headers(v)?;
+        }
+        if let Some(ref hsts) = patch.hsts {
+            validate_hsts_patch(hsts)?;
+        }
+
         let listener = self
             .https_listeners
             .get_mut(&key)
@@ -995,7 +1029,6 @@ impl ConfigState {
         }
         // HTTPS-only knobs
         if let Some(ref alpn_wrapper) = patch.alpn_protocols {
-            validate_alpn_protocols(&alpn_wrapper.values)?;
             // Empty values vec = reset to default (runtime treats empty as default)
             listener.alpn_protocols = alpn_wrapper.values.clone();
         }
@@ -1062,11 +1095,9 @@ impl ConfigState {
             listener.h2_max_window_update_stream0_per_window = Some(v);
         }
         if let Some(ref v) = patch.sozu_id_header {
-            validate_sozu_id_header(v)?;
             listener.sozu_id_header = Some(v.to_owned());
         }
         if let Some(v) = patch.forwarded_headers {
-            validate_forwarded_headers(v)?;
             listener.forwarded_headers = Some(v);
         }
         Ok(())
@@ -3320,6 +3351,20 @@ pub fn validate_sozu_id_header(value: &str) -> Result<(), StateError> {
                 reason: "must be a valid HTTP header name (RFC 9110 §5.1 token: alphanumeric or one of !#$%&'*+-.^_`|~)",
             });
         }
+    }
+    Ok(())
+}
+
+/// Validate the `hsts` block of an `UpdateHttpsListenerConfig` patch: it
+/// replaces the listener default whole, and `enabled` is what tells "disable"
+/// from "enable", so a block without it is refused — on the main process
+/// here, on the worker with `ListenerError::HstsEnabledRequired`.
+pub fn validate_hsts_patch(hsts: &HstsConfig) -> Result<(), StateError> {
+    if hsts.enabled.is_none() {
+        return Err(StateError::InvalidValue {
+            field: "hsts",
+            reason: "`enabled` is required whenever the hsts block is present",
+        });
     }
     Ok(())
 }
@@ -6917,6 +6962,209 @@ mod tests {
                 }
             ),
             "expected NotFound, got: {err}"
+        );
+    }
+
+    // ── rejected listener patches are all-or-nothing (sozu#1703) ───────────────
+
+    /// The state a rejected request must leave intact: everything but
+    /// `request_counts`, which `ConfigState::dispatch` bumps before it runs
+    /// the verb, accepted or not.
+    fn without_request_counts(state: &ConfigState) -> ConfigState {
+        ConfigState {
+            request_counts: BTreeMap::new(),
+            ..state.clone()
+        }
+    }
+
+    /// A rejected `UpdateHttpListener` leaves the main state exactly as it was.
+    /// Each patch carries fields that validate and are applied early, then one
+    /// invalid field: the old code wrote the early fields, validated the late
+    /// one, and returned the error with the early writes kept, so
+    /// `listener list`, `SaveState` and upgrade replay showed a patch that was
+    /// refused.
+    ///
+    /// To SEE THIS RED: in `ConfigState::update_http_listener`, move the
+    /// `validate_sozu_id_header` / `validate_forwarded_headers` calls back
+    /// into the field writes they guard.
+    #[test]
+    fn update_http_listener_rejected_patch_leaves_the_state_unchanged() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8080);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpListener(make_http_listener(addr)).into())
+            .unwrap();
+
+        let valid_prefix = UpdateHttpListenerConfig {
+            address: addr,
+            front_timeout: Some(99),
+            sticky_name: Some("PATCHED".to_owned()),
+            elide_x_real_ip: Some(true),
+            http_answers: Some(CustomHttpAnswers {
+                answer_404: Some("HTTP/1.1 404 Not Found\r\n\r\n".to_owned()),
+                ..Default::default()
+            }),
+            h2_max_rst_stream_per_window: Some(7),
+            ..Default::default()
+        };
+        let rejected = [
+            (
+                "sozu_id_header",
+                UpdateHttpListenerConfig {
+                    sozu_id_header: Some("bad header".to_owned()),
+                    ..valid_prefix.clone()
+                },
+            ),
+            (
+                "forwarded_headers",
+                UpdateHttpListenerConfig {
+                    forwarded_headers: Some(i32::MAX),
+                    ..valid_prefix.clone()
+                },
+            ),
+        ];
+        for (field, patch) in rejected {
+            let before = without_request_counts(&state);
+            let err = state
+                .dispatch(&RequestType::UpdateHttpListener(patch).into())
+                .unwrap_err();
+            assert!(
+                matches!(err, StateError::InvalidValue { field: f, .. } if f == field),
+                "expected InvalidValue on {field}, got: {err}"
+            );
+            assert!(
+                without_request_counts(&state) == before,
+                "a patch rejected on {field} must leave the main state unchanged"
+            );
+        }
+
+        // The same prefix alone is accepted: the rejections above come from
+        // the invalid field, not from the prefix.
+        state
+            .dispatch(&RequestType::UpdateHttpListener(valid_prefix).into())
+            .expect("the valid prefix alone must apply");
+        let listener = state.http_listeners.get(&ListenerKey::from(addr)).unwrap();
+        assert_eq!(listener.front_timeout, 99);
+        assert_eq!(listener.sticky_name, "PATCHED");
+    }
+
+    /// The HTTPS counterpart, with the two HTTPS-only late failures: an unknown
+    /// ALPN value (validated mid-way through the old write sequence) and an
+    /// `hsts` block without `enabled`, which every worker refuses
+    /// (`ListenerError::HstsEnabledRequired`) but the main state used to
+    /// accept, so the main process and its workers disagreed on the verdict.
+    ///
+    /// To SEE THIS RED: in `ConfigState::update_https_listener`, move the
+    /// field validators back into the field writes they guard, or drop the
+    /// `hsts` check.
+    #[test]
+    fn update_https_listener_rejected_patch_leaves_the_state_unchanged() {
+        use crate::proto::command::AlpnProtocols;
+
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpsListener(make_https_listener(addr)).into())
+            .unwrap();
+
+        let valid_prefix = UpdateHttpsListenerConfig {
+            address: addr,
+            front_timeout: Some(99),
+            sticky_name: Some("PATCHED".to_owned()),
+            send_x_real_ip: Some(true),
+            http_answers: Some(CustomHttpAnswers {
+                answer_404: Some("HTTP/1.1 404 Not Found\r\n\r\n".to_owned()),
+                ..Default::default()
+            }),
+            strict_sni_binding: Some(false),
+            h2_max_rst_stream_per_window: Some(7),
+            ..Default::default()
+        };
+        let rejected = [
+            (
+                "alpn_protocols",
+                UpdateHttpsListenerConfig {
+                    alpn_protocols: Some(AlpnProtocols {
+                        values: vec!["h3".to_owned()],
+                    }),
+                    ..valid_prefix.clone()
+                },
+            ),
+            (
+                "sozu_id_header",
+                UpdateHttpsListenerConfig {
+                    sozu_id_header: Some(String::new()),
+                    ..valid_prefix.clone()
+                },
+            ),
+            (
+                "forwarded_headers",
+                UpdateHttpsListenerConfig {
+                    forwarded_headers: Some(-1),
+                    ..valid_prefix.clone()
+                },
+            ),
+            (
+                "hsts",
+                UpdateHttpsListenerConfig {
+                    hsts: Some(HstsConfig {
+                        enabled: None,
+                        max_age: Some(60),
+                        ..Default::default()
+                    }),
+                    ..valid_prefix.clone()
+                },
+            ),
+        ];
+        for (field, patch) in rejected {
+            let before = without_request_counts(&state);
+            let err = state
+                .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+                .unwrap_err();
+            assert!(
+                matches!(err, StateError::InvalidValue { field: f, .. } if f == field),
+                "expected InvalidValue on {field}, got: {err}"
+            );
+            assert!(
+                without_request_counts(&state) == before,
+                "a patch rejected on {field} must leave the main state unchanged"
+            );
+        }
+
+        state
+            .dispatch(&RequestType::UpdateHttpsListener(valid_prefix).into())
+            .expect("the valid prefix alone must apply");
+        let listener = state.https_listeners.get(&ListenerKey::from(addr)).unwrap();
+        assert_eq!(listener.front_timeout, 99);
+        assert_eq!(listener.strict_sni_binding, Some(false));
+    }
+
+    /// `update_tcp_listener` validates nothing past the listener lookup, so a
+    /// TCP patch can only be refused before its first write. This pins that:
+    /// a refused TCP patch leaves the main state unchanged.
+    #[test]
+    fn update_tcp_listener_rejected_patch_leaves_the_state_unchanged() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 9000);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddTcpListener(make_tcp_listener(addr)).into())
+            .unwrap();
+
+        let before = without_request_counts(&state);
+        let err = state
+            .dispatch(
+                &RequestType::UpdateTcpListener(UpdateTcpListenerConfig {
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 9001),
+                    front_timeout: Some(5),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StateError::NotFound { .. }), "got: {err}");
+        assert!(
+            without_request_counts(&state) == before,
+            "a refused TCP patch must change nothing"
         );
     }
 

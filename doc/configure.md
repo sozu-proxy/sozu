@@ -302,7 +302,7 @@ The only **conditional** required-field rule is inside the block itself: when th
 | Block omitted                               | Inherit listener default (or no HSTS if the listener has none).                        |
 | `[hsts]` with `enabled = true`              | Explicitly enable HSTS at this scope. `max_age` defaults to `31_536_000` if omitted.   |
 | `[hsts]` with `enabled = false`             | Explicitly disable HSTS at this scope, suppressing any inherited listener default.     |
-| `[hsts]` without `enabled`                  | **Error** — `ConfigError::HstsEnabledRequired` (TOML) or `ListenerError::HstsEnabledRequired` (partial update). |
+| `[hsts]` without `enabled`                  | **Error** — `ConfigError::HstsEnabledRequired` (TOML); on a partial update, `StateError::InvalidValue` in the main process and `ListenerError::HstsEnabledRequired` on a worker. |
 
 A minimal HTTPS deployment with no HSTS is therefore just:
 
@@ -407,7 +407,7 @@ Both surfaces share the same flag set: `--hsts-max-age`, `--hsts-include-subdoma
 
 ##### Hot-reconfig partial-update
 
-`UpdateHttpsListenerConfig.hsts` follows full-object replacement semantics: when present in the patch, the entire HSTS block replaces the listener's current value. `enabled` is REQUIRED whenever `hsts` is present (`ListenerError::HstsEnabledRequired` rejects an `enabled = None` block). Absent `hsts` field on the patch preserves the current value. The CLI surface above (`sozu listener https update --hsts-*`) feeds this same partial-update message; supplying any `--hsts-*` flag on the command line replaces the listener's HSTS policy and supplying `--hsts-disabled` substitutes the explicit-disable block (`enabled = Some(false)`).
+`UpdateHttpsListenerConfig.hsts` follows full-object replacement semantics: when present in the patch, the entire HSTS block replaces the listener's current value. `enabled` is REQUIRED whenever `hsts` is present: the main process refuses an `enabled = None` block with `StateError::InvalidValue` before it reaches the workers, which refuse it with `ListenerError::HstsEnabledRequired`, and the whole patch is refused, its other fields included. Absent `hsts` field on the patch preserves the current value. The CLI surface above (`sozu listener https update --hsts-*`) feeds this same partial-update message; supplying any `--hsts-*` flag on the command line replaces the listener's HSTS policy and supplying `--hsts-disabled` substitutes the explicit-disable block (`enabled = Some(false)`).
 
 **Inheriting frontends are refreshed automatically.** Patching the listener-default HSTS reflows the new policy onto every existing frontend that inherited from the listener (i.e. has no per-frontend `[hsts]` block at add time). `Router::refresh_inheriting_hsts` walks the routing trie via two paths:
 
@@ -2500,6 +2500,17 @@ others are preserved exactly as they are. Existing sessions continue with their
 configuration snapshot; only new sessions, connections, or TLS handshakes —
 depending on the field — pick up the new values. Use `sozu listener list` to
 inspect current values before patching.
+
+A patch is **all-or-nothing**. When any field is refused — an invalid
+`sozu_id_header`, an unknown `forwarded_headers` mode or ALPN value, a flood
+knob below its floor, an answer template that does not parse, an `hsts` block
+without `enabled` — the whole patch is refused and none of its fields is
+applied, neither in the main process (what `sozu listener list` and `SaveState`
+report) nor on the workers. The main process and the workers run the same
+checks, so a patch the workers would refuse is refused by the main process
+before it reaches them. One refusal stays worker-only: a worker that fails to
+rebuild its TLS context for a new `alpn_protocols` list keeps its listener
+unchanged, but the main process has already recorded the patch.
 
 > **Bind-only fields are not patchable.** The address, TLS crypto parameters,
 > and the `active` flag can only be changed by removing and re-adding the

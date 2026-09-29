@@ -1164,6 +1164,43 @@ impl HttpAnswers {
             .collect::<Result<_, _>>()
     }
 
+    /// Parse every template an `Update{Http,Https}ListenerConfig` patch
+    /// brings, without building a registry (sozu-proxy/sozu#1703).
+    ///
+    /// The worker's `update_config` runs it before its first write, and the
+    /// main process runs it before `ConfigState::dispatch`
+    /// (`validate_listener_request`, `bin/src/command/requests.rs`), so both
+    /// refuse the same patches. It reads the patch alone: the templates a
+    /// listener already holds parsed when they were added, and the built-in
+    /// defaults are static.
+    ///
+    /// It follows the merge `update_config` applies: an empty `answers` body is
+    /// skipped (the worker ignores it), and a legacy `http_answers` field is
+    /// skipped when the same patch's `answers` map covers its status (the map
+    /// wins in `merge_legacy_into_map`). A legacy field shadowed only by an
+    /// entry the listener already holds is still parsed: the worker stores
+    /// it in its configuration, so an unparseable one is refused rather than
+    /// kept.
+    pub fn validate_patch_templates(
+        legacy: Option<&CustomHttpAnswers>,
+        answers: &BTreeMap<String, String>,
+    ) -> Result<(), (String, TemplateError)> {
+        for (name, body) in answers {
+            if !body.is_empty() {
+                Self::template(name, body)?;
+            }
+        }
+        if let Some(legacy) = legacy {
+            for (name, body) in legacy_to_map(legacy) {
+                if answers.get(&name).is_some_and(|body| !body.is_empty()) {
+                    continue;
+                }
+                Self::template(&name, &body)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Build the listener-level template registry. The map can be empty —
     /// every status code referenced in [`DefaultAnswer`] gets a built-in
     /// fallback template.

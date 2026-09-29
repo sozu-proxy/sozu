@@ -1746,6 +1746,14 @@ impl HttpsListener {
     /// in-flight handshakes keep the old Arc; new ones see the new one.
     /// If `http_answers` is present only the listener-default templates are
     /// replaced; per-cluster overrides in `cluster_custom_answers` are kept.
+    ///
+    /// All-or-nothing (sozu-proxy/sozu#1703): the patch is validated, then
+    /// applied to a copy of the configuration, and every fallible artifact
+    /// (the rustls context, the answer registry) is built from that copy.
+    /// Only once all of it succeeded are the copy and the artifacts
+    /// committed and the inheriting frontends' HSTS refreshed, so a refused
+    /// patch leaves the listener exactly as it was. The copy is one
+    /// `HttpsListenerConfig` clone per patch, on the command path only.
     pub fn update_config(
         &mut self,
         patch: &UpdateHttpsListenerConfig,
@@ -1753,7 +1761,10 @@ impl HttpsListener {
         // Defense-in-depth validation: main-process ConfigState::dispatch
         // validates before scatter, but a raw protobuf client or state replay
         // may reach the worker without that check. `StateError` lifts into
-        // `ListenerError` via `From` so `?` suffices.
+        // `ListenerError` via `From` so `?` suffices. The main process runs
+        // the same checks (`ConfigState::update_https_listener` and, for the
+        // templates, `validate_listener_request` in
+        // `bin/src/command/requests.rs`), so both refuse the same patches.
         validate_h2_flood_knobs_https(patch)?;
         if let Some(ref alpn) = patch.alpn_protocols {
             validate_alpn_protocols(&alpn.values)?;
@@ -1764,155 +1775,188 @@ impl HttpsListener {
         if let Some(v) = patch.forwarded_headers {
             validate_forwarded_headers(v)?;
         }
+        // HSTS is a full-object replacement, and `enabled` is the explicit
+        // disambiguator between "disable" and "enable" semantics: the
+        // operator must signal one or the other on every update, so a block
+        // without it is refused. The main process refuses it too, with
+        // `StateError::InvalidValue` (`validate_hsts_patch`,
+        // `command/src/state.rs`).
+        if patch.hsts.is_some_and(|hsts| hsts.enabled.is_none()) {
+            return Err(ListenerError::HstsEnabledRequired);
+        }
+        HttpAnswers::validate_patch_templates(patch.http_answers.as_ref(), &patch.answers)
+            .map_err(|(name, error)| ListenerError::TemplateParse(name, error))?;
+
+        let mut config = self.config.clone();
 
         // --- simple field patches ---
         if let Some(v) = patch.public_address {
-            self.config.public_address = Some(v);
+            config.public_address = Some(v);
         }
         if let Some(v) = patch.expect_proxy {
-            self.config.expect_proxy = v;
+            config.expect_proxy = v;
         }
         if let Some(ref v) = patch.sticky_name {
-            self.config.sticky_name = v.to_owned();
+            config.sticky_name = v.to_owned();
         }
         if let Some(v) = patch.front_timeout {
-            self.config.front_timeout = v;
+            config.front_timeout = v;
         }
         if let Some(v) = patch.back_timeout {
-            self.config.back_timeout = v;
+            config.back_timeout = v;
         }
         if let Some(v) = patch.connect_timeout {
-            self.config.connect_timeout = v;
+            config.connect_timeout = v;
         }
         if let Some(v) = patch.request_timeout {
-            self.config.request_timeout = v;
+            config.request_timeout = v;
         }
         if let Some(v) = patch.strict_sni_binding {
-            self.config.strict_sni_binding = Some(v);
+            config.strict_sni_binding = Some(v);
         }
         if let Some(v) = patch.disable_http11 {
-            self.config.disable_http11 = Some(v);
+            config.disable_http11 = Some(v);
         }
         if let Some(ref v) = patch.sozu_id_header {
-            self.config.sozu_id_header = Some(v.to_owned());
+            config.sozu_id_header = Some(v.to_owned());
         }
         if let Some(v) = patch.elide_x_real_ip {
-            self.config.elide_x_real_ip = Some(v);
+            config.elide_x_real_ip = Some(v);
         }
         if let Some(v) = patch.send_x_real_ip {
-            self.config.send_x_real_ip = Some(v);
+            config.send_x_real_ip = Some(v);
         }
         if let Some(v) = patch.forwarded_headers {
-            self.config.forwarded_headers = Some(v);
+            config.forwarded_headers = Some(v);
         }
 
         // --- H2 flood knobs ---
         if let Some(v) = patch.h2_max_rst_stream_per_window {
-            self.config.h2_max_rst_stream_per_window = Some(v);
+            config.h2_max_rst_stream_per_window = Some(v);
         }
         if let Some(v) = patch.h2_max_ping_per_window {
-            self.config.h2_max_ping_per_window = Some(v);
+            config.h2_max_ping_per_window = Some(v);
         }
         if let Some(v) = patch.h2_max_settings_per_window {
-            self.config.h2_max_settings_per_window = Some(v);
+            config.h2_max_settings_per_window = Some(v);
         }
         if let Some(v) = patch.h2_max_empty_data_per_window {
-            self.config.h2_max_empty_data_per_window = Some(v);
+            config.h2_max_empty_data_per_window = Some(v);
         }
         if let Some(v) = patch.h2_max_continuation_frames {
-            self.config.h2_max_continuation_frames = Some(v);
+            config.h2_max_continuation_frames = Some(v);
         }
         if let Some(v) = patch.h2_max_glitch_count {
-            self.config.h2_max_glitch_count = Some(v);
+            config.h2_max_glitch_count = Some(v);
         }
         if let Some(v) = patch.h2_initial_connection_window {
-            self.config.h2_initial_connection_window = Some(v);
+            config.h2_initial_connection_window = Some(v);
         }
         if let Some(v) = patch.h2_max_concurrent_streams {
-            self.config.h2_max_concurrent_streams = Some(v);
+            config.h2_max_concurrent_streams = Some(v);
         }
         if let Some(v) = patch.h2_stream_shrink_ratio {
-            self.config.h2_stream_shrink_ratio = Some(v);
+            config.h2_stream_shrink_ratio = Some(v);
         }
         if let Some(v) = patch.h2_max_rst_stream_lifetime {
-            self.config.h2_max_rst_stream_lifetime = Some(v);
+            config.h2_max_rst_stream_lifetime = Some(v);
         }
         if let Some(v) = patch.h2_max_rst_stream_abusive_lifetime {
-            self.config.h2_max_rst_stream_abusive_lifetime = Some(v);
+            config.h2_max_rst_stream_abusive_lifetime = Some(v);
         }
         if let Some(v) = patch.h2_max_rst_stream_emitted_lifetime {
-            self.config.h2_max_rst_stream_emitted_lifetime = Some(v);
+            config.h2_max_rst_stream_emitted_lifetime = Some(v);
         }
         if let Some(v) = patch.h2_max_header_list_size {
-            self.config.h2_max_header_list_size = Some(v);
+            config.h2_max_header_list_size = Some(v);
         }
         if let Some(v) = patch.h2_max_header_table_size {
-            self.config.h2_max_header_table_size = Some(v);
+            config.h2_max_header_table_size = Some(v);
         }
         if let Some(v) = patch.h2_max_header_fields {
-            self.config.h2_max_header_fields = Some(v);
+            config.h2_max_header_fields = Some(v);
         }
         if let Some(v) = patch.h2_stream_idle_timeout_seconds {
-            self.config.h2_stream_idle_timeout_seconds = Some(v);
+            config.h2_stream_idle_timeout_seconds = Some(v);
         }
         if let Some(v) = patch.h2_graceful_shutdown_deadline_seconds {
-            self.config.h2_graceful_shutdown_deadline_seconds = Some(v);
+            config.h2_graceful_shutdown_deadline_seconds = Some(v);
         }
         if let Some(v) = patch.h2_max_window_update_stream0_per_window {
-            self.config.h2_max_window_update_stream0_per_window = Some(v);
+            config.h2_max_window_update_stream0_per_window = Some(v);
+        }
+
+        if let Some(new_hsts) = patch.hsts {
+            config.hsts = Some(new_hsts);
+        }
+        if let Some(ref alpn_wrapper) = patch.alpn_protocols {
+            // Empty values vec = reset to default (runtime treats empty as default)
+            config.alpn_protocols = alpn_wrapper.values.clone();
         }
 
         // --- ALPN rebuild (may force a rustls ServerConfig rebuild) ---
         //
-        // Transactional: build the candidate rustls context first using a
-        // **cloned** config that carries the new ALPN. Only if the build
-        // succeeds do we commit `self.config.alpn_protocols` and swap the
-        // Arc. This ensures a rustls failure (crypto provider transient,
-        // resolver error, etc.) leaves the listener observably unchanged —
-        // the master-side state would still diverge from the worker-side
-        // refusal, but the worker itself stays consistent.
-        if let Some(ref alpn_wrapper) = patch.alpn_protocols {
-            let mut candidate = self.config.clone();
-            candidate.alpn_protocols = alpn_wrapper.values.clone();
-            let new_rustls = Arc::new(Self::create_rustls_context(
-                &candidate,
+        // Built from the candidate config, which carries the new ALPN, and
+        // published below only once every other fallible step succeeded, so
+        // a rustls failure (crypto provider transient, resolver error, etc.)
+        // leaves the listener observably unchanged. The main-process state
+        // would still diverge from that worker-side refusal: the main process
+        // cannot build this worker's rustls context before it commits.
+        let new_rustls = if patch.alpn_protocols.is_some() {
+            Some(Arc::new(Self::create_rustls_context(
+                &config,
                 self.resolver.clone(),
-            )?);
-            // Build succeeded — commit.
-            self.config.alpn_protocols = alpn_wrapper.values.clone();
+            )?))
+        } else {
+            None
+        };
+
+        // HTTP answers: merge legacy `http_answers` and the new `answers`
+        // map on top of the candidate config, then build the listener-level
+        // template registry from it. It is fallible, so it is built here and
+        // published below with the config, never before.
+        let answers_changed = patch.http_answers.is_some() || !patch.answers.is_empty();
+        let rebuilt = if answers_changed {
+            if let Some(ref new_answers) = patch.http_answers {
+                crate::sozu_command::state::merge_custom_http_answers(
+                    &mut config.http_answers,
+                    new_answers,
+                );
+            }
+            for (code, body) in &patch.answers {
+                if !body.is_empty() {
+                    config.answers.insert(code.clone(), body.clone());
+                }
+            }
+
+            let mut answers_map = config.answers.clone();
+            if let Some(ref legacy) = config.http_answers {
+                crate::protocol::http::answers::merge_legacy_into_map(&mut answers_map, legacy);
+            }
+            Some(
+                HttpAnswers::new(&answers_map)
+                    .map_err(|(name, error)| ListenerError::TemplateParse(name, error))?,
+            )
+        } else {
+            None
+        };
+
+        // Commit: nothing below can fail.
+        self.config = config;
+        if let Some(new_rustls) = new_rustls {
             self.rustls_details = new_rustls;
-            // Post: the commit is atomic — the live config must now name exactly
-            // the patched ALPN set. New handshakes negotiate against this set, so
-            // the `upgrade_handshake` "protocol ∈ configured ALPN" property is
+        }
+        if let Some(alpn_wrapper) = &patch.alpn_protocols {
+            // Post: the live config must now name exactly the patched ALPN
+            // set. New handshakes negotiate against this set, so the
+            // `upgrade_handshake` "protocol ∈ configured ALPN" property is
             // anchored to what we just stored.
             debug_assert_eq!(
                 self.config.alpn_protocols, alpn_wrapper.values,
                 "committed ALPN config must match the patch values exactly"
             );
         }
-
-        // HTTP answers: merge legacy `http_answers` and the new `answers`
-        // map on top of the existing config, then rebuild the listener-level
-        // template registry. Per-cluster overrides in
-        // `HttpAnswers::cluster_answers` are preserved across the rebuild.
-        let answers_changed = patch.http_answers.is_some() || !patch.answers.is_empty();
-        if answers_changed {
-            if let Some(ref new_answers) = patch.http_answers {
-                crate::sozu_command::state::merge_custom_http_answers(
-                    &mut self.config.http_answers,
-                    new_answers,
-                );
-            }
-            for (code, body) in &patch.answers {
-                if !body.is_empty() {
-                    self.config.answers.insert(code.clone(), body.clone());
-                }
-            }
-
-            let mut answers_map = self.config.answers.clone();
-            if let Some(ref legacy) = self.config.http_answers {
-                crate::protocol::http::answers::merge_legacy_into_map(&mut answers_map, legacy);
-            }
+        if let Some(mut rebuilt) = rebuilt {
             // The rebuilt registry is PUBLISHED under a new `Rc`, not written
             // through the old one. Every request already in flight captured
             // the old handle when it arrived (`mux::Context::create_stream`)
@@ -1927,18 +1971,14 @@ impl HttpsListener {
             // in-flight requests still hold and strip their cluster templates
             // mid-response. The copy is a map clone over `Rc<Template>`, so
             // both registries share the compiled templates themselves.
-            let mut rebuilt = HttpAnswers::new(&answers_map)
-                .map_err(|(name, error)| ListenerError::TemplateParse(name, error))?;
             rebuilt.cluster_answers = self.answers.borrow().cluster_answers.clone();
             self.answers = Rc::new(RefCell::new(rebuilt));
         }
 
-        // HSTS: full-object replacement when present in the patch. Absent
-        // patch field preserves current value (matches the rest of this
-        // partial-update handler). When `enabled` is missing on a present
-        // HSTS block, refuse the patch — `enabled` is the explicit
-        // disambiguator between "disable" and "enable" semantics, and the
-        // operator must signal one or the other on every update.
+        // HSTS: full-object replacement when present in the patch (stored
+        // into the candidate config above; a block without `enabled` was
+        // refused before the first write). Absent patch field preserves
+        // current value (matches the rest of this partial-update handler).
         //
         // Inheriting frontends are refreshed in place via
         // `Router::refresh_inheriting_hsts`: every frontend that declared no
@@ -1951,11 +1991,7 @@ impl HttpsListener {
         // dashboards can correlate patches with the new
         // `http.hsts.frontend_refreshed` counter (sum of refreshed
         // frontends from this patch).
-        if let Some(new_hsts) = patch.hsts {
-            if new_hsts.enabled.is_none() {
-                return Err(ListenerError::HstsEnabledRequired);
-            }
-            self.config.hsts = Some(new_hsts);
+        if patch.hsts.is_some() {
             let refreshed = self
                 .fronts
                 .refresh_inheriting_hsts(self.config.hsts.as_ref());
@@ -4287,6 +4323,99 @@ mod listener_sibling_tests {
                 ..Default::default()
             })
             .expect("patch the listener HSTS default");
+    }
+
+    /// A patch the worker refuses leaves the HTTPS listener exactly as it was
+    /// (sozu-proxy/sozu#1703): its configuration, its rustls context, its
+    /// answer registry and the HSTS its frontends serve. Each patch carries
+    /// fields that validate — an ALPN change among them, which rebuilds the
+    /// rustls context — then one refused field: an `hsts` block without
+    /// `enabled`, which the old code checked after committing every other
+    /// field, the new ALPN context and the new templates, or an answer
+    /// template that does not parse.
+    ///
+    /// To SEE THIS RED: in `HttpsListener::update_config`, move the
+    /// `HstsEnabledRequired` check back to the HSTS block at the end, and
+    /// write the fields into `self.config` instead of the candidate copy.
+    #[test]
+    fn a_rejected_patch_leaves_the_listener_unchanged() {
+        use sozu_command::proto::command::{AlpnProtocols, UpdateHttpsListenerConfig};
+
+        let mut proxy = proxy();
+        let address = SocketAddress::new_v4(0, 0, 0, 0, provide_port());
+        add_with_hsts(&mut proxy, address, None, 0, Some(hsts(100)));
+        proxy
+            .add_https_frontend(tagged_front(address))
+            .expect("add the frontend");
+
+        let valid_prefix = UpdateHttpsListenerConfig {
+            address,
+            front_timeout: Some(99),
+            sozu_id_header: Some("X-Edge-Id".to_owned()),
+            alpn_protocols: Some(AlpnProtocols {
+                values: vec!["http/1.1".to_owned()],
+            }),
+            answers: BTreeMap::from([(
+                "404".to_owned(),
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_owned(),
+            )]),
+            ..Default::default()
+        };
+        let rejected = [
+            UpdateHttpsListenerConfig {
+                hsts: Some(HstsConfig {
+                    enabled: None,
+                    max_age: Some(200),
+                    ..Default::default()
+                }),
+                ..valid_prefix.clone()
+            },
+            UpdateHttpsListenerConfig {
+                answers: BTreeMap::from([(
+                    "503".to_owned(),
+                    "not a valid http response".to_owned(),
+                )]),
+                hsts: Some(hsts(200)),
+                ..valid_prefix.clone()
+            },
+        ];
+        for patch in rejected {
+            let listener = &proxy.listeners[&Token(0)];
+            let config_before = listener.borrow().config.clone();
+            let rustls_before = listener.borrow().rustls_details.clone();
+            let answers_before = listener.borrow().get_answers().clone();
+            listener
+                .borrow_mut()
+                .update_config(&patch)
+                .expect_err("the patch must be refused");
+            let listener = listener.borrow();
+            assert_eq!(
+                listener.config, config_before,
+                "a refused patch must leave the listener configuration unchanged"
+            );
+            assert!(
+                Arc::ptr_eq(&rustls_before, &listener.rustls_details),
+                "a refused patch must not publish a new rustls context"
+            );
+            assert!(
+                Rc::ptr_eq(&answers_before, listener.get_answers()),
+                "a refused patch must not publish a new answer registry"
+            );
+            drop(listener);
+            assert_eq!(
+                served_hsts(&proxy, 0).as_deref(),
+                Some("max-age=100"),
+                "a refused patch must not refresh the frontends' HSTS"
+            );
+        }
+
+        proxy.listeners[&Token(0)]
+            .borrow_mut()
+            .update_config(&valid_prefix)
+            .expect("the valid prefix alone must apply");
+        let listener = proxy.listeners[&Token(0)].borrow();
+        assert_eq!(listener.config.front_timeout, 99);
+        assert_eq!(listener.config.alpn_protocols, vec!["http/1.1".to_owned()]);
     }
 
     /// A policy-carrying frontend with no `hsts` of its own, added while the

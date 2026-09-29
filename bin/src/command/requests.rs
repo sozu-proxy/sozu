@@ -41,7 +41,9 @@ use sozu_command_lib::{
     state::ConfigState,
 };
 use sozu_lib::{
+    ListenerError,
     metrics::METRICS,
+    protocol::kawa_h1::answers::HttpAnswers,
     router::{MAX_HOSTNAME_LENGTH, pattern_trie::TrieNode},
 };
 
@@ -2263,12 +2265,24 @@ impl MetricDetailAuditFields {
 /// existing `SetMetricDetail` pre-validation in [`worker_request`]: fail fast
 /// before fan-out rather than amplifying a bad input across every worker.
 ///
-/// Only listener-add requests are validated; every other request returns `Ok`.
+/// Listener-add requests are validated, and so are the answer templates an
+/// `UpdateHttpListener` / `UpdateHttpsListener` patch carries
+/// (sozu-proxy/sozu#1703): `ConfigState` cannot parse a template (`command`
+/// does not depend on `lib`), so without this arm the main process recorded a
+/// patch every worker refused. The worker runs the very same
+/// `HttpAnswers::validate_patch_templates` before its first write; every other
+/// patch check lives in `ConfigState::update_http_listener` /
+/// `update_https_listener`, which the worker mirrors, so the main process and
+/// the workers refuse the same patches. Every other request returns `Ok`.
 /// TCP/UDP construction has no fallible config today (see their
 /// `validate_config`), so those arms currently always succeed. This is one half
 /// of the shared pre-dispatch gate — call [`validate_request`], not this
 /// function, from an apply path.
 fn validate_listener_request(request: &RequestType) -> Result<(), String> {
+    let patch_templates = |legacy, answers| {
+        HttpAnswers::validate_patch_templates(legacy, answers)
+            .map_err(|(name, error)| ListenerError::TemplateParse(name, error))
+    };
     match request {
         RequestType::AddHttpListener(config) => {
             sozu_lib::http::HttpListener::validate_config(config)
@@ -2278,6 +2292,12 @@ fn validate_listener_request(request: &RequestType) -> Result<(), String> {
         }
         RequestType::AddTcpListener(config) => sozu_lib::tcp::TcpListener::validate_config(config),
         RequestType::AddUdpListener(config) => sozu_lib::udp::UdpListener::validate_config(config),
+        RequestType::UpdateHttpListener(patch) => {
+            patch_templates(patch.http_answers.as_ref(), &patch.answers)
+        }
+        RequestType::UpdateHttpsListener(patch) => {
+            patch_templates(patch.http_answers.as_ref(), &patch.answers)
+        }
         _ => return Ok(()),
     }
     .map_err(|listener_error| listener_error.to_string())
@@ -5136,6 +5156,203 @@ mod listener_validation_tests {
         state
             .dispatch(&good.into())
             .expect("corrected reload applies when the bad listener never reserved the address");
+    }
+
+    /// sozu-proxy/sozu#1703: the main process — the pre-dispatch gate, then
+    /// `ConfigState::dispatch` — refuses an `Update{Http,Https}Listener` patch
+    /// exactly when a worker's `update_config` refuses it, and a refused
+    /// patch leaves what `sozu listener list` reports
+    /// (`ConfigState::list_listeners`) unchanged. Every patch carries fields
+    /// that validate, so a partial apply shows up in the listing.
+    ///
+    /// To SEE THIS RED: drop the `UpdateHttpListener` / `UpdateHttpsListener`
+    /// arms of `validate_listener_request` (the main process then records a
+    /// patch whose template every worker refuses), or the `hsts` check of
+    /// `ConfigState::update_https_listener`.
+    #[test]
+    fn listener_patches_are_refused_by_the_main_process_exactly_when_a_worker_refuses_them() {
+        use mio::Token;
+        use sozu_command_lib::proto::command::{
+            AlpnProtocols, CustomHttpAnswers, HstsConfig, UpdateHttpListenerConfig,
+            UpdateHttpsListenerConfig,
+        };
+
+        const BAD: &str = "not a valid http response";
+        const GOOD: &str = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+
+        /// Run `request` through the main process's apply path; true if refused.
+        fn main_refuses(state: &mut ConfigState, request: RequestType) -> bool {
+            let listed_before = state.list_listeners();
+            let refused = validate_request(&request, RequestOrigin::Authored).is_err()
+                || state.dispatch(&request.into()).is_err();
+            if refused {
+                assert_eq!(
+                    state.list_listeners(),
+                    listed_before,
+                    "a refused patch must leave the listed listeners unchanged"
+                );
+            }
+            refused
+        }
+
+        let http_address = SocketAddress::new_v4(127, 0, 0, 1, 8090);
+        let http_config = ListenerBuilder::new_http(http_address)
+            .to_http(None)
+            .expect("default HTTP listener config");
+        let http_prefix = UpdateHttpListenerConfig {
+            address: http_address,
+            front_timeout: Some(99),
+            sticky_name: Some("PATCHED".to_owned()),
+            ..Default::default()
+        };
+        let legacy_404 = |body: &str| {
+            Some(CustomHttpAnswers {
+                answer_404: Some(body.to_owned()),
+                ..Default::default()
+            })
+        };
+        let http_cases = [
+            ("valid", false, http_prefix.clone()),
+            (
+                "sozu_id_header",
+                true,
+                UpdateHttpListenerConfig {
+                    sozu_id_header: Some("bad: name".to_owned()),
+                    ..http_prefix.clone()
+                },
+            ),
+            (
+                "forwarded_headers",
+                true,
+                UpdateHttpListenerConfig {
+                    forwarded_headers: Some(42),
+                    ..http_prefix.clone()
+                },
+            ),
+            (
+                "flood knob",
+                true,
+                UpdateHttpListenerConfig {
+                    h2_max_ping_per_window: Some(0),
+                    ..http_prefix.clone()
+                },
+            ),
+            (
+                "answers template",
+                true,
+                UpdateHttpListenerConfig {
+                    answers: BTreeMap::from([("503".to_owned(), BAD.to_owned())]),
+                    ..http_prefix.clone()
+                },
+            ),
+            (
+                "legacy template",
+                true,
+                UpdateHttpListenerConfig {
+                    http_answers: legacy_404(BAD),
+                    ..http_prefix.clone()
+                },
+            ),
+            (
+                "empty answers body (ignored)",
+                false,
+                UpdateHttpListenerConfig {
+                    answers: BTreeMap::from([("503".to_owned(), String::new())]),
+                    ..http_prefix.clone()
+                },
+            ),
+            (
+                "legacy template shadowed by the same patch's map",
+                false,
+                UpdateHttpListenerConfig {
+                    answers: BTreeMap::from([("404".to_owned(), GOOD.to_owned())]),
+                    http_answers: legacy_404(BAD),
+                    ..http_prefix.clone()
+                },
+            ),
+        ];
+        for (label, expected, patch) in http_cases {
+            let mut state = ConfigState::new();
+            state
+                .dispatch(&RequestType::AddHttpListener(http_config.clone()).into())
+                .expect("add the HTTP listener");
+            let mut worker = sozu_lib::http::HttpListener::new(http_config.clone(), Token(0))
+                .expect("build the HTTP listener");
+            let worker_refused = worker.update_config(&patch).is_err();
+            let main_refused = main_refuses(&mut state, RequestType::UpdateHttpListener(patch));
+            assert_eq!(worker_refused, expected, "HTTP {label}: worker verdict");
+            assert_eq!(main_refused, expected, "HTTP {label}: main-process verdict");
+        }
+
+        let https_address = SocketAddress::new_v4(127, 0, 0, 1, 8091);
+        let https_config = https_config(https_address, true);
+        let https_prefix = UpdateHttpsListenerConfig {
+            address: https_address,
+            front_timeout: Some(99),
+            alpn_protocols: Some(AlpnProtocols {
+                values: vec!["http/1.1".to_owned()],
+            }),
+            ..Default::default()
+        };
+        let https_cases = [
+            ("valid", false, https_prefix.clone()),
+            (
+                "alpn_protocols",
+                true,
+                UpdateHttpsListenerConfig {
+                    alpn_protocols: Some(AlpnProtocols {
+                        values: vec!["h3".to_owned()],
+                    }),
+                    ..https_prefix.clone()
+                },
+            ),
+            (
+                "hsts without enabled",
+                true,
+                UpdateHttpsListenerConfig {
+                    hsts: Some(HstsConfig {
+                        max_age: Some(60),
+                        ..Default::default()
+                    }),
+                    ..https_prefix.clone()
+                },
+            ),
+            (
+                "hsts disabled",
+                false,
+                UpdateHttpsListenerConfig {
+                    hsts: Some(HstsConfig {
+                        enabled: Some(false),
+                        ..Default::default()
+                    }),
+                    ..https_prefix.clone()
+                },
+            ),
+            (
+                "answers template",
+                true,
+                UpdateHttpsListenerConfig {
+                    answers: BTreeMap::from([("404".to_owned(), BAD.to_owned())]),
+                    ..https_prefix.clone()
+                },
+            ),
+        ];
+        for (label, expected, patch) in https_cases {
+            let mut state = ConfigState::new();
+            state
+                .dispatch(&RequestType::AddHttpsListener(https_config.clone()).into())
+                .expect("add the HTTPS listener");
+            let mut worker =
+                sozu_lib::https::HttpsListener::try_new(https_config.clone(), Token(0))
+                    .expect("build the HTTPS listener");
+            let worker_refused = worker.update_config(&patch).is_err();
+            let main_refused = main_refuses(&mut state, RequestType::UpdateHttpsListener(patch));
+            assert_eq!(worker_refused, expected, "HTTPS {label}: worker verdict");
+            assert_eq!(
+                main_refused, expected,
+                "HTTPS {label}: main-process verdict"
+            );
+        }
     }
 
     #[test]

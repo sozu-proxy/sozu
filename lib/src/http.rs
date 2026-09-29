@@ -1511,11 +1511,21 @@ impl HttpListener {
     /// Fields absent in the patch (i.e. `None`) are preserved unchanged.
     /// If `http_answers` is present only the listener-default templates are
     /// replaced; per-cluster overrides in `cluster_custom_answers` are kept.
+    ///
+    /// All-or-nothing (sozu-proxy/sozu#1703): the patch is validated, then
+    /// applied to a copy of the configuration, and every fallible artifact
+    /// (the rebuilt answer registry) is built from that copy. Only once all
+    /// of it succeeded are the copy and the artifacts committed, so a refused
+    /// patch leaves the listener exactly as it was. The copy is one
+    /// `HttpListenerConfig` clone per patch, on the command path only.
     pub fn update_config(&mut self, patch: &UpdateHttpListenerConfig) -> Result<(), ListenerError> {
         // Defense-in-depth validation: main-process ConfigState::dispatch
         // validates before scatter, but a raw protobuf client or state replay
         // may reach the worker without that check. `StateError` lifts into
-        // `ListenerError` via `From` so `?` suffices.
+        // `ListenerError` via `From` so `?` suffices. The main process runs
+        // the same checks (`ConfigState::update_http_listener` and, for the
+        // templates, `validate_listener_request` in
+        // `bin/src/command/requests.rs`), so both refuse the same patches.
         validate_h2_flood_knobs_http(patch)?;
         if let Some(ref hdr) = patch.sozu_id_header {
             validate_sozu_id_header(hdr)?;
@@ -1523,121 +1533,136 @@ impl HttpListener {
         if let Some(v) = patch.forwarded_headers {
             validate_forwarded_headers(v)?;
         }
+        HttpAnswers::validate_patch_templates(patch.http_answers.as_ref(), &patch.answers)
+            .map_err(|(name, error)| ListenerError::TemplateParse(name, error))?;
+
+        let mut config = self.config.clone();
 
         if let Some(v) = patch.public_address {
-            self.config.public_address = Some(v);
+            config.public_address = Some(v);
         }
         if let Some(v) = patch.expect_proxy {
-            self.config.expect_proxy = v;
+            config.expect_proxy = v;
         }
         if let Some(ref v) = patch.sticky_name {
-            self.config.sticky_name = v.to_owned();
+            config.sticky_name = v.to_owned();
         }
         if let Some(v) = patch.front_timeout {
-            self.config.front_timeout = v;
+            config.front_timeout = v;
         }
         if let Some(v) = patch.back_timeout {
-            self.config.back_timeout = v;
+            config.back_timeout = v;
         }
         if let Some(v) = patch.connect_timeout {
-            self.config.connect_timeout = v;
+            config.connect_timeout = v;
         }
         if let Some(v) = patch.request_timeout {
-            self.config.request_timeout = v;
+            config.request_timeout = v;
         }
         if let Some(ref v) = patch.sozu_id_header {
-            self.config.sozu_id_header = Some(v.to_owned());
+            config.sozu_id_header = Some(v.to_owned());
         }
         if let Some(v) = patch.elide_x_real_ip {
-            self.config.elide_x_real_ip = Some(v);
+            config.elide_x_real_ip = Some(v);
         }
         if let Some(v) = patch.send_x_real_ip {
-            self.config.send_x_real_ip = Some(v);
+            config.send_x_real_ip = Some(v);
         }
         if let Some(v) = patch.forwarded_headers {
-            self.config.forwarded_headers = Some(v);
+            config.forwarded_headers = Some(v);
         }
 
         // H2 flood knobs
         if let Some(v) = patch.h2_max_rst_stream_per_window {
-            self.config.h2_max_rst_stream_per_window = Some(v);
+            config.h2_max_rst_stream_per_window = Some(v);
         }
         if let Some(v) = patch.h2_max_ping_per_window {
-            self.config.h2_max_ping_per_window = Some(v);
+            config.h2_max_ping_per_window = Some(v);
         }
         if let Some(v) = patch.h2_max_settings_per_window {
-            self.config.h2_max_settings_per_window = Some(v);
+            config.h2_max_settings_per_window = Some(v);
         }
         if let Some(v) = patch.h2_max_empty_data_per_window {
-            self.config.h2_max_empty_data_per_window = Some(v);
+            config.h2_max_empty_data_per_window = Some(v);
         }
         if let Some(v) = patch.h2_max_continuation_frames {
-            self.config.h2_max_continuation_frames = Some(v);
+            config.h2_max_continuation_frames = Some(v);
         }
         if let Some(v) = patch.h2_max_glitch_count {
-            self.config.h2_max_glitch_count = Some(v);
+            config.h2_max_glitch_count = Some(v);
         }
         if let Some(v) = patch.h2_initial_connection_window {
-            self.config.h2_initial_connection_window = Some(v);
+            config.h2_initial_connection_window = Some(v);
         }
         if let Some(v) = patch.h2_max_concurrent_streams {
-            self.config.h2_max_concurrent_streams = Some(v);
+            config.h2_max_concurrent_streams = Some(v);
         }
         if let Some(v) = patch.h2_stream_shrink_ratio {
-            self.config.h2_stream_shrink_ratio = Some(v);
+            config.h2_stream_shrink_ratio = Some(v);
         }
         if let Some(v) = patch.h2_max_rst_stream_lifetime {
-            self.config.h2_max_rst_stream_lifetime = Some(v);
+            config.h2_max_rst_stream_lifetime = Some(v);
         }
         if let Some(v) = patch.h2_max_rst_stream_abusive_lifetime {
-            self.config.h2_max_rst_stream_abusive_lifetime = Some(v);
+            config.h2_max_rst_stream_abusive_lifetime = Some(v);
         }
         if let Some(v) = patch.h2_max_rst_stream_emitted_lifetime {
-            self.config.h2_max_rst_stream_emitted_lifetime = Some(v);
+            config.h2_max_rst_stream_emitted_lifetime = Some(v);
         }
         if let Some(v) = patch.h2_max_header_list_size {
-            self.config.h2_max_header_list_size = Some(v);
+            config.h2_max_header_list_size = Some(v);
         }
         if let Some(v) = patch.h2_max_header_table_size {
-            self.config.h2_max_header_table_size = Some(v);
+            config.h2_max_header_table_size = Some(v);
         }
         if let Some(v) = patch.h2_max_header_fields {
-            self.config.h2_max_header_fields = Some(v);
+            config.h2_max_header_fields = Some(v);
         }
         if let Some(v) = patch.h2_stream_idle_timeout_seconds {
-            self.config.h2_stream_idle_timeout_seconds = Some(v);
+            config.h2_stream_idle_timeout_seconds = Some(v);
         }
         if let Some(v) = patch.h2_graceful_shutdown_deadline_seconds {
-            self.config.h2_graceful_shutdown_deadline_seconds = Some(v);
+            config.h2_graceful_shutdown_deadline_seconds = Some(v);
         }
         if let Some(v) = patch.h2_max_window_update_stream0_per_window {
-            self.config.h2_max_window_update_stream0_per_window = Some(v);
+            config.h2_max_window_update_stream0_per_window = Some(v);
         }
 
         // HTTP answers: merge legacy `http_answers` and the new `answers`
-        // map on top of the existing config, then rebuild the listener-level
-        // template registry. Per-cluster overrides in
-        // `HttpAnswers::cluster_answers` are preserved across the rebuild.
+        // map on top of the candidate config, then build the listener-level
+        // template registry from it. It is fallible, so it is built here and
+        // published below with the config, never before.
         let answers_changed = patch.http_answers.is_some() || !patch.answers.is_empty();
-        if answers_changed {
+        let new_answers = if answers_changed {
             if let Some(ref new_answers) = patch.http_answers {
                 crate::sozu_command::state::merge_custom_http_answers(
-                    &mut self.config.http_answers,
+                    &mut config.http_answers,
                     new_answers,
                 );
             }
             for (code, body) in &patch.answers {
                 if !body.is_empty() {
-                    self.config.answers.insert(code.clone(), body.clone());
+                    config.answers.insert(code.clone(), body.clone());
                 }
             }
 
-            let mut answers_map = self.config.answers.clone();
-            if let Some(ref legacy) = self.config.http_answers {
+            let mut answers_map = config.answers.clone();
+            if let Some(ref legacy) = config.http_answers {
                 crate::protocol::http::answers::merge_legacy_into_map(&mut answers_map, legacy);
             }
-            // Rebuild the listener-level templates and migrate the existing
-            // per-cluster overrides over to the new `HttpAnswers`.
+            Some(
+                HttpAnswers::new(&answers_map)
+                    .map_err(|(name, error)| ListenerError::TemplateParse(name, error))?,
+            )
+        } else {
+            None
+        };
+
+        // Commit: nothing below can fail.
+        self.config = config;
+        if let Some(mut new_answers) = new_answers {
+            // Per-cluster overrides in `HttpAnswers::cluster_answers` are
+            // preserved across the rebuild.
             //
             // The rebuilt registry is PUBLISHED under a new `Rc`, not written
             // through the old one. Every request already in flight captured
@@ -1653,8 +1678,6 @@ impl HttpListener {
             // in-flight requests still hold and strip their cluster templates
             // mid-response. The copy is a map clone over `Rc<Template>`, so
             // both registries share the compiled templates themselves.
-            let mut new_answers = HttpAnswers::new(&answers_map)
-                .map_err(|(name, error)| ListenerError::TemplateParse(name, error))?;
             new_answers.cluster_answers = self.answers.borrow().cluster_answers.clone();
             self.answers = Rc::new(RefCell::new(new_answers));
         }
@@ -2090,8 +2113,8 @@ mod tests {
         channel::Channel,
         config::ListenerBuilder,
         proto::command::{
-            LoadBalancingParams, PathRule, RulePosition, SoftStop, WorkerRequest,
-            request::RequestType,
+            CustomHttpAnswers, LoadBalancingParams, PathRule, RulePosition, SoftStop,
+            WorkerRequest, request::RequestType,
         },
         response::{Backend, HttpFrontend},
     };
@@ -2763,6 +2786,76 @@ mod tests {
                 .contains_key("cluster_1"),
             "the published registry must carry the cluster overrides forward"
         );
+    }
+
+    /// A patch the worker refuses leaves the listener exactly as it was
+    /// (sozu-proxy/sozu#1703): its configuration and its published answer
+    /// registry. Each patch carries fields that validate, then an answer
+    /// template that does not parse — the failure the old code only hit
+    /// after writing every other field into `self.config`, so the listener
+    /// kept a patch it had refused, and a config its templates no longer
+    /// matched.
+    ///
+    /// To SEE THIS RED: in `HttpListener::update_config`, drop the
+    /// `validate_patch_templates` call from the up-front checks and write the
+    /// fields into `self.config` instead of the candidate copy.
+    #[test]
+    fn a_rejected_patch_leaves_the_listener_unchanged() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 1042);
+        let config = ListenerBuilder::new_http(address)
+            .to_http(None)
+            .expect("default HTTP listener config");
+        let mut listener = HttpListener::new(config, Token(0)).expect("build listener");
+
+        let valid_prefix = UpdateHttpListenerConfig {
+            address,
+            front_timeout: Some(99),
+            sozu_id_header: Some("X-Edge-Id".to_owned()),
+            forwarded_headers: Some(ForwardedHeaders::Rfc7239 as i32),
+            h2_max_rst_stream_per_window: Some(7),
+            ..Default::default()
+        };
+        let rejected = [
+            UpdateHttpListenerConfig {
+                answers: BTreeMap::from([(
+                    "404".to_owned(),
+                    "not a valid http response".to_owned(),
+                )]),
+                ..valid_prefix.clone()
+            },
+            UpdateHttpListenerConfig {
+                http_answers: Some(CustomHttpAnswers {
+                    answer_503: Some("not a valid http response".to_owned()),
+                    ..Default::default()
+                }),
+                ..valid_prefix.clone()
+            },
+        ];
+        for patch in rejected {
+            let config_before = listener.config.clone();
+            let answers_before = listener.get_answers().clone();
+            let error = listener
+                .update_config(&patch)
+                .expect_err("an unparseable template must be refused");
+            assert!(
+                matches!(error, ListenerError::TemplateParse(..)),
+                "expected TemplateParse, got {error:?}"
+            );
+            assert_eq!(
+                listener.config, config_before,
+                "a refused patch must leave the listener configuration unchanged"
+            );
+            assert!(
+                Rc::ptr_eq(&answers_before, listener.get_answers()),
+                "a refused patch must not publish a new answer registry"
+            );
+        }
+
+        listener
+            .update_config(&valid_prefix)
+            .expect("the valid prefix alone must apply");
+        assert_eq!(listener.config.front_timeout, 99);
+        assert_eq!(listener.config.sozu_id_header.as_deref(), Some("X-Edge-Id"));
     }
 
     /// A closed session issues no `EPOLL_CTL_DEL` for its front socket: the

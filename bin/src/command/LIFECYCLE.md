@@ -231,6 +231,25 @@ carries the tags the identity needs.
 Upsert verbs (`AddCluster`, `AddBackend`) and non-add verbs stay deliberately
 uncovered: they keep the best-effort behaviour rather than risk a wrong revert.
 
+A listener patch (`Update*Listener`) has no inverse either, so it relies on two
+properties instead (sozu#1703). First, it is all-or-nothing on both sides:
+`ConfigState::update_http_listener` and `ConfigState::update_https_listener`
+(`command/src/state.rs`) run every check before their first write, and
+`HttpListener::update_config` (`lib/src/http.rs`) and
+`HttpsListener::update_config` (`lib/src/https.rs`) apply the patch to a copy of
+the listener configuration, build the fallible artifacts (answer registry,
+rustls context) from it, and commit only once all of them succeeded — a refused
+patch leaves the listener exactly as it was, where it used to keep every field
+written before the failing one. Second, the main process refuses the patches the
+workers refuse: the answer templates, which `ConfigState` cannot parse, are
+checked before dispatch by `validate_listener_request` (`requests.rs`) with the
+same `HttpAnswers::validate_patch_templates`
+(`lib/src/protocol/kawa_h1/answers.rs`) the worker runs, and an `hsts` block
+without `enabled` is refused by `ConfigState::update_https_listener` as by the
+worker. The one refusal the main process cannot predict is a worker failing to
+build its rustls context for a new ALPN list; the main state then records a
+patch that worker refused.
+
 Both also arm a bounded deadline (`bulk_replay_timeout`: one
 `worker_timeout` plus 10 ms per scattered entry, capped at ten
 `worker_timeout`s) instead of the former `Timeout::None`, and report a
