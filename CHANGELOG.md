@@ -3571,6 +3571,22 @@
 
 ### 🐛 Fixed
 
+- **`fix(h1)`: keep the `Connection` options while shutting down
+  ([#1690](https://github.com/sozu-proxy/sozu/issues/1690)).** While Sōzu shut down
+  (`HttpContext::closing`), `HttpContext::on_request_headers` and
+  `HttpContext::on_response_headers` (`lib/src/protocol/kawa_h1/editor.rs`) overwrote every
+  `Connection` value with `close`, so a field the peer nominated as hop-by-hop, such as
+  `Connection: x-custom`, was forwarded as end-to-end (RFC 9110 §7.6.1), and the backend's own
+  `close` was no longer recorded in `keep_alive_backend`. Both sides now record the close
+  options first, then merge every `Connection` line into one that keeps the other options and
+  ends in a single `close`, dropping only `keep-alive`, the approach non-persistent HTTP/1.0
+  responses already used. A final response now announces the close in HTTP/1.1 too, with or
+  without a `Connection` of its own; a 1xx is left alone. A request that asks for a protocol
+  upgrade during shutdown loses its `upgrade` option and `Upgrade` field: Sōzu closes the
+  client connection after the response, before it would handle a 101, so the backend answers
+  in HTTP/1.1 (RFC 9110 §7.8) and the client retries the upgrade on a new connection. Before,
+  the `Upgrade` field reached the backend without the `upgrade` option that must accompany it.
+
 - **`fix(listener)`: a frontend without its own HSTS follows the default of every listener it
   reaches ([#1691](https://github.com/sozu-proxy/sozu/issues/1691)).** A frontend carrying
   policy (tags, headers, redirect, rewrite or auth) and no `hsts` block of its own, added while
