@@ -129,7 +129,12 @@ impl SimBackends {
 }
 
 impl BackendSource for SimBackends {
-    fn select(&mut self, _cluster: &str, key: Option<u64>) -> Option<(String, SocketAddr)> {
+    fn select(
+        &mut self,
+        _cluster: &str,
+        key: Option<u64>,
+        _now: Instant,
+    ) -> Option<(String, SocketAddr)> {
         if self.backends.is_empty() {
             return None;
         }

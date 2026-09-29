@@ -1,6 +1,19 @@
-use std::{cmp, fmt::Debug, time};
+//! Backoff after a failed backend connection.
+//!
+//! Nothing here reads a clock or draws from an ambient RNG: every method that
+//! depends on time takes `now`, and [`RetryPolicy::fail`] draws its jitter from
+//! the RNG it is lent. The worker passes the pass's clock sample and the
+//! backend map's RNG; a simulator passes its own, so the backoff windows a
+//! seed produces are a pure function of that seed and of the instants it
+//! supplies (#1684).
 
-use rand::RngExt;
+use std::{
+    cmp,
+    fmt::Debug,
+    time::{Duration, Instant},
+};
+
+use rand::{Rng, RngExt};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RetryAction {
@@ -12,10 +25,13 @@ pub trait RetryPolicy: Debug + PartialEq + Eq {
     fn max_tries(&self) -> usize;
     fn current_tries(&self) -> usize;
 
-    fn fail(&mut self);
-    fn succeed(&mut self);
+    /// Record a failed attempt at `now`, drawing the backoff jitter from `rng`.
+    fn fail<R: Rng + ?Sized>(&mut self, now: Instant, rng: &mut R);
+    /// Record a successful attempt at `now`.
+    fn succeed(&mut self, now: Instant);
 
-    fn can_try(&self) -> Option<RetryAction> {
+    /// Whether an attempt may be made at `now`.
+    fn can_try(&self, _now: Instant) -> Option<RetryAction> {
         if self.current_tries() >= self.max_tries() {
             None
         } else {
@@ -35,8 +51,12 @@ pub enum RetryPolicyWrapper {
 pub struct ExponentialBackoffPolicy {
     max_tries: usize,
     current_tries: usize,
-    last_try: time::Instant,
-    wait: time::Duration,
+    /// When the last attempt was recorded; `None` until the first one.
+    ///
+    /// `wait` is zero whenever this is `None`, so no instant is needed at
+    /// construction: a policy that has never failed can always be tried.
+    last_try: Option<Instant>,
+    wait: Duration,
 }
 
 impl ExponentialBackoffPolicy {
@@ -44,9 +64,20 @@ impl ExponentialBackoffPolicy {
         ExponentialBackoffPolicy {
             max_tries,
             current_tries: 0,
-            last_try: time::Instant::now(),
-            wait: time::Duration::from_secs(0),
+            last_try: None,
+            wait: Duration::ZERO,
         }
+    }
+
+    /// Time since the last recorded attempt, as seen at `now`.
+    ///
+    /// Saturates at zero, so an injected `now` earlier than the last attempt
+    /// reads as "no time has passed" rather than panicking. With no attempt
+    /// recorded, `wait` is zero and any value compares the same way.
+    fn since_last_try(&self, now: Instant) -> Duration {
+        self.last_try.map_or(Duration::ZERO, |last_try| {
+            now.saturating_duration_since(last_try)
+        })
     }
 }
 
@@ -59,8 +90,8 @@ impl RetryPolicy for ExponentialBackoffPolicy {
         self.current_tries
     }
 
-    fn fail(&mut self) {
-        if self.last_try.elapsed().lt(&self.wait) {
+    fn fail<R: Rng + ?Sized>(&mut self, now: Instant, rng: &mut R) {
+        if self.since_last_try(now).lt(&self.wait) {
             //we're already in back off
             return;
         }
@@ -73,23 +104,22 @@ impl RetryPolicy for ExponentialBackoffPolicy {
         let wait = if max_secs == 1 {
             1
         } else {
-            let mut rng = rand::rng();
             rng.random_range(1..max_secs)
         };
 
-        self.wait = time::Duration::from_secs(wait);
-        self.last_try = time::Instant::now();
+        self.wait = Duration::from_secs(wait);
+        self.last_try = Some(now);
         self.current_tries = cmp::min(self.current_tries + 1, self.max_tries);
     }
 
-    fn succeed(&mut self) {
-        self.wait = time::Duration::default();
-        self.last_try = time::Instant::now();
+    fn succeed(&mut self, now: Instant) {
+        self.wait = Duration::default();
+        self.last_try = Some(now);
         self.current_tries = 0;
     }
 
-    fn can_try(&self) -> Option<RetryAction> {
-        let action = if self.last_try.elapsed().ge(&self.wait) {
+    fn can_try(&self, now: Instant) -> Option<RetryAction> {
+        let action = if self.since_last_try(now).ge(&self.wait) {
             RetryAction::OKAY
         } else {
             RetryAction::WAIT
@@ -148,25 +178,25 @@ impl RetryPolicy for RetryPolicyWrapper {
         .current_tries()
     }
 
-    fn fail(&mut self) {
+    fn fail<R: Rng + ?Sized>(&mut self, now: Instant, rng: &mut R) {
         match *self {
             RetryPolicyWrapper::ExponentialBackoff(ref mut policy) => policy,
         }
-        .fail()
+        .fail(now, rng)
     }
 
-    fn succeed(&mut self) {
+    fn succeed(&mut self, now: Instant) {
         match *self {
             RetryPolicyWrapper::ExponentialBackoff(ref mut policy) => policy,
         }
-        .succeed()
+        .succeed(now)
     }
 
-    fn can_try(&self) -> Option<RetryAction> {
+    fn can_try(&self, now: Instant) -> Option<RetryAction> {
         match *self {
             RetryPolicyWrapper::ExponentialBackoff(ref policy) => policy,
         }
-        .can_try()
+        .can_try(now)
     }
 
     fn is_down(&self) -> bool {
@@ -179,63 +209,130 @@ impl RetryPolicy for RetryPolicyWrapper {
 
 #[cfg(test)]
 mod tests {
-    use serial_test::serial;
+    use std::time::{Duration, Instant};
+
+    use rand::{SeedableRng, rngs::StdRng};
 
     use super::{ExponentialBackoffPolicy, RetryAction, RetryPolicy};
 
     const MAX_FAILS: usize = 10;
 
-    #[serial]
+    fn rng() -> StdRng {
+        StdRng::seed_from_u64(0x5eed)
+    }
+
     #[test]
     fn no_fail() {
         let policy = ExponentialBackoffPolicy::new(MAX_FAILS);
-        let can_try = policy.can_try();
+        let can_try = policy.can_try(Instant::now());
 
         assert_eq!(Some(RetryAction::OKAY), can_try)
     }
 
-    #[serial]
     #[test]
     fn single_fail() {
+        let t0 = Instant::now();
         let mut policy = ExponentialBackoffPolicy::new(MAX_FAILS);
-        policy.fail();
-        let can_try = policy.can_try();
+        policy.fail(t0, &mut rng());
+        let can_try = policy.can_try(t0);
 
-        // The wait will be >= 1s, so we'll be WAIT by the time we do the assert
+        // The wait is >= 1s, and no time has passed on the injected clock.
         assert_eq!(Some(RetryAction::WAIT), can_try)
     }
 
-    #[serial]
     #[test]
     fn max_fails() {
+        let t0 = Instant::now();
+        let mut rng = rng();
         let mut policy = ExponentialBackoffPolicy::new(MAX_FAILS);
 
         for _ in 0..MAX_FAILS {
-            policy.fail();
+            policy.fail(t0, &mut rng);
         }
 
-        let can_try = policy.can_try();
+        let can_try = policy.can_try(t0);
 
         assert_eq!(Some(RetryAction::WAIT), can_try)
     }
 
-    #[serial]
     #[test]
     fn recover_from_fail() {
+        let t0 = Instant::now();
+        let mut rng = rng();
         let mut policy = ExponentialBackoffPolicy::new(MAX_FAILS);
 
         // Stop just before total failure
         for _ in 0..(MAX_FAILS - 1) {
-            policy.fail();
+            policy.fail(t0, &mut rng);
         }
 
-        policy.succeed();
-        policy.fail();
-        policy.fail();
-        policy.fail();
+        policy.succeed(t0);
+        policy.fail(t0, &mut rng);
+        policy.fail(t0, &mut rng);
+        policy.fail(t0, &mut rng);
 
-        let can_try = policy.can_try();
+        let can_try = policy.can_try(t0);
 
         assert_eq!(Some(RetryAction::WAIT), can_try)
+    }
+
+    /// #1684: the backoff window is measured on the clock the caller passes,
+    /// not on the wall clock.
+    ///
+    /// The first failure always waits exactly one second (`max_secs == 1`,
+    /// no jitter), so the window closes at `t0 + 1s` on the injected clock
+    /// while almost no real time has passed.
+    ///
+    /// TO SEE THIS RED: measure `since_last_try` from `Instant::now()`
+    /// instead of `now`; `can_try(t0 + 1s)` then still answers `WAIT`.
+    #[test]
+    fn the_backoff_window_follows_the_injected_clock() {
+        let t0 = Instant::now();
+        let mut policy = ExponentialBackoffPolicy::new(MAX_FAILS);
+        policy.fail(t0, &mut rng());
+
+        let one_second = Duration::from_secs(1);
+        assert_eq!(
+            policy.can_try(t0 + one_second - Duration::from_nanos(1)),
+            Some(RetryAction::WAIT),
+            "one nanosecond before the window closes, the policy must wait"
+        );
+        assert_eq!(
+            policy.can_try(t0 + one_second),
+            Some(RetryAction::OKAY),
+            "the window closes at t0 + 1s on the injected clock"
+        );
+    }
+
+    /// Every backoff window a policy chooses, failing again the instant the
+    /// previous window closes, until the budget is spent.
+    fn windows(seed: u64) -> Vec<Duration> {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut policy = ExponentialBackoffPolicy::new(MAX_FAILS);
+        let mut now = Instant::now();
+        let mut windows = Vec::with_capacity(MAX_FAILS);
+        while !policy.is_down() {
+            policy.fail(now, &mut rng);
+            windows.push(policy.wait);
+            now += policy.wait;
+        }
+        windows
+    }
+
+    /// #1684: the jitter of every backoff window is drawn from the RNG the
+    /// caller lends, so one seed always yields one sequence of windows.
+    ///
+    /// TO SEE THIS RED: draw the jitter in `fail` from `rand::rng()` and
+    /// ignore the argument; two runs of one seed then disagree.
+    #[test]
+    fn one_seed_yields_one_sequence_of_backoff_windows() {
+        let first = windows(7);
+        assert_eq!(first.len(), MAX_FAILS);
+        assert_eq!(first, windows(7), "one seed must yield one sequence");
+        assert_ne!(
+            first,
+            windows(8),
+            "the jitter must come from the lent RNG, so another seed differs"
+        );
     }
 }

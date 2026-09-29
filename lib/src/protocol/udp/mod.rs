@@ -28,7 +28,10 @@ pub mod flow;
 pub mod manager;
 pub mod proxy_protocol;
 
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 
 use sozu_command::state::ClusterId;
 
@@ -111,7 +114,15 @@ pub trait BackendSource {
     /// client flow stays on one backend under HRW / Maglev. `None` means the
     /// cluster has no backend that can serve, which is the caller's cue to
     /// abort the flow rather than park it.
-    fn select(&mut self, cluster: &str, key: Option<u64>) -> Option<(BackendId, SocketAddr)>;
+    ///
+    /// `now` is the instant of the admission, which the embedder's selection
+    /// judges backoff windows and connection-time decay against (#1684).
+    fn select(
+        &mut self,
+        cluster: &str,
+        key: Option<u64>,
+        now: Instant,
+    ) -> Option<(BackendId, SocketAddr)>;
 }
 
 /// Inputs the shell feeds into the manager. Borrows the recv buffer; the core

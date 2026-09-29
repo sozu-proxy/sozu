@@ -47,7 +47,14 @@ struct FuzzBackends {
 }
 
 impl BackendSource for FuzzBackends {
-    fn select(&mut self, _cluster: &str, key: Option<u64>) -> Option<(String, SocketAddr)> {
+    /// `now` is the core's virtual clock, advanced only by the input's
+    /// deltas; this set has no backoff or decay to judge against it.
+    fn select(
+        &mut self,
+        _cluster: &str,
+        key: Option<u64>,
+        _now: Instant,
+    ) -> Option<(String, SocketAddr)> {
         if self.backends.is_empty() {
             return None;
         }

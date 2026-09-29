@@ -20,7 +20,10 @@ use std::{
     alloc::{GlobalAlloc, Layout, System},
     cell::Cell,
     net::SocketAddr,
+    time::Instant,
 };
+
+use rand::{SeedableRng, rngs::StdRng};
 
 use sozu_command_lib::proto::command::{LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric};
 use sozu_lib::{
@@ -99,8 +102,14 @@ fn is_candidate(tier: Tier, index: usize) -> bool {
 /// Ten backends with distinct weights. The unavailable ones sit between
 /// available ones, never only at the tail, so a policy that indexed the full
 /// list instead of the candidate list would pick differently.
-fn fixture(tier: Tier) -> BackendList {
-    let mut list = BackendList::new();
+///
+/// Every backend is created at `now` and every selection runs at `now`, so no
+/// connection-time average decays and no back-off window closes while a
+/// sequence is drawn: the picks depend on the fixture alone, not on how fast
+/// the test runs.
+fn fixture(tier: Tier, now: Instant) -> BackendList {
+    let mut jitter = StdRng::seed_from_u64(SEED);
+    let mut list = BackendList::with_seed(SEED);
     for index in 0..10 {
         let backup = match tier {
             // Backends 2 and 7 are backups: not primary candidates.
@@ -108,7 +117,7 @@ fn fixture(tier: Tier) -> BackendList {
             // Only the odd backends are backups; every primary is closed.
             Tier::Backup => index % 2 == 1,
         };
-        let mut backend = Backend::new(
+        let mut backend = Backend::new_at(
             &format!("backend-{index}"),
             address(index),
             None,
@@ -116,6 +125,7 @@ fn fixture(tier: Tier) -> BackendList {
                 weight: 10 + 7 * index as i32,
             }),
             Some(backup),
+            now,
         );
         // Every candidate carries a load of at least 1 and every excluded
         // backend a load of 0, so a least-loaded pick that leaked outside the
@@ -131,7 +141,7 @@ fn fixture(tier: Tier) -> BackendList {
                     backend.status = BackendStatus::Closing;
                 }
                 if index == 5 {
-                    backend.retry_policy().fail();
+                    backend.retry_policy().fail(now, &mut jitter);
                 }
             }
             Tier::Backup => {
@@ -152,7 +162,7 @@ fn fixture(tier: Tier) -> BackendList {
                     backend.status = BackendStatus::Closing;
                 }
                 if index == 6 {
-                    backend.retry_policy().fail();
+                    backend.retry_policy().fail(now, &mut jitter);
                 }
             }
         }
@@ -191,17 +201,19 @@ const SEED: u64 = 0x5eed_1549;
 fn apply(list: &mut BackendList, policy: Policy) {
     match policy {
         Policy::RoundRobin => {
-            list.set_load_balancing_policy(LoadBalancingAlgorithms::RoundRobin, None)
+            list.set_load_balancing_policy(LoadBalancingAlgorithms::RoundRobin, None, SEED)
         }
         Policy::Random => list.load_balancing = Box::new(Random::with_seed(SEED)),
         Policy::LeastLoaded(metric) => {
-            list.set_load_balancing_policy(LoadBalancingAlgorithms::LeastLoaded, Some(metric))
+            list.set_load_balancing_policy(LoadBalancingAlgorithms::LeastLoaded, Some(metric), SEED)
         }
         Policy::PowerOfTwo(metric) => {
             list.load_balancing = Box::new(PowerOfTwo::with_seed(SEED, metric))
         }
-        Policy::Hrw => list.set_load_balancing_policy(LoadBalancingAlgorithms::Hrw, None),
-        Policy::Maglev => list.set_load_balancing_policy(LoadBalancingAlgorithms::Maglev, None),
+        Policy::Hrw => list.set_load_balancing_policy(LoadBalancingAlgorithms::Hrw, None, SEED),
+        Policy::Maglev => {
+            list.set_load_balancing_policy(LoadBalancingAlgorithms::Maglev, None, SEED)
+        }
     }
 }
 
@@ -214,12 +226,13 @@ fn key(step: usize) -> Option<u64> {
 /// Index (`0..10`, see [`address`]) of every backend picked over `steps`
 /// selections.
 fn picks(tier: Tier, policy: Policy, steps: usize) -> Vec<usize> {
-    let mut list = fixture(tier);
+    let now = Instant::now();
+    let mut list = fixture(tier, now);
     apply(&mut list, policy);
     (0..steps)
         .map(|step| {
             let picked = list
-                .next_available_backend_with_key(key(step))
+                .next_available_backend_with_key(key(step), now)
                 .expect("every fixture tier has candidates");
             let port = picked.borrow().address.port();
             usize::from(port - 9000)
@@ -234,17 +247,21 @@ fn backend_selection_allocates_nothing_in_steady_state() {
     let mut failures = Vec::new();
     for tier in [Tier::Primary, Tier::Backup, Tier::FailOpen] {
         for policy in POLICIES {
-            let mut list = fixture(tier);
+            let now = Instant::now();
+            let mut list = fixture(tier, now);
             apply(&mut list, policy);
             // Warm-up: the fail-open latch, the metrics aggregator's first
             // insert for a key, and any lazily built policy state settle
             // here, off the measured window.
             for step in 0..WARMUP {
-                assert!(list.next_available_backend_with_key(key(step)).is_some());
+                assert!(
+                    list.next_available_backend_with_key(key(step), now)
+                        .is_some()
+                );
             }
             let before = allocations();
             for step in 0..MEASURED {
-                let picked = list.next_available_backend_with_key(key(step));
+                let picked = list.next_available_backend_with_key(key(step), now);
                 assert!(picked.is_some(), "{tier:?}/{policy:?}: no backend selected");
             }
             let allocated = allocations() - before;

@@ -328,7 +328,7 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
             now,
         ));
         let Some((backend_id, backend_addr)) =
-            backends.select(&self.cluster.cluster, Some(key_hash))
+            backends.select(&self.cluster.cluster, Some(key_hash), now)
         else {
             // The cluster has nothing that can serve. Drop without allocating
             // a slab slot: there is no flow to park and nothing to abort.
@@ -877,7 +877,12 @@ mod tests {
     }
 
     impl BackendSource for TestBackends {
-        fn select(&mut self, _cluster: &str, _key: Option<u64>) -> Option<(String, SocketAddr)> {
+        fn select(
+            &mut self,
+            _cluster: &str,
+            _key: Option<u64>,
+            _now: Instant,
+        ) -> Option<(String, SocketAddr)> {
             if self.backends.is_empty() {
                 return None;
             }

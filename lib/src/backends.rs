@@ -3,10 +3,14 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     rc::Rc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use mio::net::TcpStream;
+use rand::{
+    Rng, SeedableRng,
+    rngs::{StdRng, SysRng},
+};
 use sozu_command::{
     proto::command::{
         Event, EventKind, HealthCheckConfig, LoadBalancingAlgorithms, LoadBalancingParams,
@@ -171,12 +175,37 @@ pub struct Backend {
 }
 
 impl Backend {
+    /// A backend created now, on the wall clock.
+    ///
+    /// The production default: the one place backend construction reads the
+    /// clock, because the connection-time average decays from the instant the
+    /// backend was created. A simulator that must not read the wall clock
+    /// uses [`Self::new_at`].
     pub fn new(
         backend_id: &str,
         address: SocketAddr,
         sticky_id: Option<String>,
         load_balancing_parameters: Option<LoadBalancingParams>,
         backup: Option<bool>,
+    ) -> Backend {
+        Self::new_at(
+            backend_id,
+            address,
+            sticky_id,
+            load_balancing_parameters,
+            backup,
+            Instant::now(),
+        )
+    }
+
+    /// A backend created at `now` (#1684).
+    pub fn new_at(
+        backend_id: &str,
+        address: SocketAddr,
+        sticky_id: Option<String>,
+        load_balancing_parameters: Option<LoadBalancingParams>,
+        backup: Option<bool>,
+        now: Instant,
     ) -> Backend {
         let desired_policy = retry::ExponentialBackoffPolicy::new(6);
         Backend {
@@ -190,7 +219,7 @@ impl Backend {
             failures: 0,
             load_balancing_parameters,
             backup: backup.unwrap_or(false),
-            connection_time: PeakEWMA::new(),
+            connection_time: PeakEWMA::new(now),
             health: HealthState::default(),
         }
     }
@@ -203,11 +232,12 @@ impl Backend {
         &mut self.retry_policy
     }
 
-    pub fn can_open(&self) -> bool {
+    /// Whether this backend can take a new connection at `now`.
+    pub fn can_open(&self, now: Instant) -> bool {
         if !self.health.is_healthy() {
             return false;
         }
-        if let Some(action) = self.retry_policy.can_try() {
+        if let Some(action) = self.retry_policy.can_try(now) {
             self.status == BackendStatus::Normal && action == retry::RetryAction::OKAY
         } else {
             false
@@ -308,15 +338,23 @@ impl Backend {
         }
     }
 
-    pub fn set_connection_time(&mut self, dur: Duration) {
-        self.connection_time.observe(dur.as_nanos() as f64);
+    /// Record that a connection took `dur` to establish, observed at `now`.
+    pub fn set_connection_time(&mut self, dur: Duration, now: Instant) {
+        self.connection_time.observe(dur.as_nanos() as f64, now);
     }
 
-    pub fn peak_ewma_connection(&mut self) -> f64 {
-        self.connection_time.get(self.active_connections)
+    /// The connection-time cost of this backend, as seen at `now`.
+    pub fn peak_ewma_connection(&mut self, now: Instant) -> f64 {
+        self.connection_time.get(self.active_connections, now)
     }
 
-    pub fn try_connect(&mut self) -> Result<mio::net::TcpStream, BackendError> {
+    /// Open a connection to this backend. A failure at `now` arms the retry
+    /// policy, whose backoff jitter is drawn from `rng`.
+    pub fn try_connect<R: Rng + ?Sized>(
+        &mut self,
+        now: Instant,
+        rng: &mut R,
+    ) -> Result<mio::net::TcpStream, BackendError> {
         if self.status != BackendStatus::Normal {
             return Err(BackendError::Status(self.status.to_owned()));
         }
@@ -348,7 +386,7 @@ impl Backend {
                 Ok(tcp_stream)
             }
             Err(io_error) => {
-                self.retry_policy.fail();
+                self.retry_policy.fail(now, rng);
                 self.failures += 1;
                 // A failed connect arms the retry policy and advances the
                 // failure counter by exactly one, leaving the connection gauge
@@ -399,6 +437,21 @@ pub struct BackendMap {
     /// h2c-only backend is not probed with an HTTP/1.1 preface that
     /// would always fail.
     pub cluster_http2: HashMap<ClusterId, bool>,
+    /// The one source of randomness selection and backoff draw from: it seeds
+    /// every cluster's load-balancing policy and supplies the jitter of every
+    /// backoff window a failed connection arms.
+    ///
+    /// [`Self::new`] seeds it from the OS once, so each worker draws an
+    /// independent keystream, as the thread-local RNG it replaces did;
+    /// [`Self::with_seed`] makes the whole map reproducible for a simulator
+    /// (#1684). Taken at construction, never on the datapath.
+    rng: StdRng,
+}
+
+/// A generator seeded from the OS, for the production defaults of
+/// [`BackendMap::new`] and [`BackendList::new`].
+fn os_rng() -> StdRng {
+    StdRng::try_from_rng(&mut SysRng).expect("failed to seed random number generator from system")
 }
 
 impl Default for BackendMap {
@@ -408,13 +461,31 @@ impl Default for BackendMap {
 }
 
 impl BackendMap {
+    /// A backend map whose randomness is seeded from the OS.
     pub fn new() -> BackendMap {
+        Self::with_rng(os_rng())
+    }
+
+    /// A backend map whose every policy seed and backoff jitter derives from
+    /// `seed`, for a deterministic simulator (#1684).
+    pub fn with_seed(seed: u64) -> BackendMap {
+        Self::with_rng(StdRng::seed_from_u64(seed))
+    }
+
+    fn with_rng(rng: StdRng) -> BackendMap {
         BackendMap {
             backends: HashMap::new(),
             max_failures: 3,
             health_check_configs: HashMap::new(),
             cluster_http2: HashMap::new(),
+            rng,
         }
+    }
+
+    /// The map's generator, for a caller that arms a backend's retry policy
+    /// outside [`Self::backend_from_cluster_id`] and needs its jitter.
+    pub fn rng(&mut self) -> &mut StdRng {
+        &mut self.rng
     }
 
     /// Re-evaluate the availability of `cluster_id`, publish the
@@ -564,13 +635,18 @@ impl BackendMap {
         &mut self,
         backends: &HashMap<ClusterId, Vec<sozu_command::response::Backend>>,
     ) {
-        self.backends
-            .extend(backends.iter().map(|(cluster_id, backend_vec)| {
-                (
-                    cluster_id.clone(),
-                    BackendList::import_configuration_state(backend_vec),
-                )
-            }));
+        // Seed the clusters in id order, not in the `HashMap`'s: its
+        // `RandomState` iterates differently in every process, so drawing in
+        // that order would hand a seeded map's seeds to different clusters on
+        // every run (#1684). Sorting the ids allocates once, on this
+        // control-plane replay path only.
+        let mut cluster_ids: Vec<&ClusterId> = backends.keys().collect();
+        cluster_ids.sort_unstable();
+        for cluster_id in cluster_ids {
+            let list =
+                BackendList::import_configuration_state(&backends[cluster_id], self.rng.next_u64());
+            self.backends.insert(cluster_id.clone(), list);
+        }
         // Replay path inserts every cluster's backend list without
         // touching the gauge emission sites used by add/remove/health.
         // Latch `cluster.available_backends` and `.total_backends` here
@@ -584,9 +660,7 @@ impl BackendMap {
 
     pub fn add_backend(&mut self, cluster_id: &str, backend: Backend) {
         let address = backend.address;
-        self.backends
-            .entry(cluster_id.into())
-            .or_default()
+        self.get_or_create_backend_list_for_cluster(cluster_id)
             .add_backend(backend);
         // Adding a backend must leave the cluster present and containing the
         // just-added address (whether it created the entry or updated in place).
@@ -655,9 +729,11 @@ impl BackendMap {
             .unwrap_or(false)
     }
 
+    /// Select a backend of `cluster_id` at `now` and connect to it.
     pub fn backend_from_cluster_id(
         &mut self,
         cluster_id: &str,
+        now: Instant,
     ) -> Result<(Rc<RefCell<Backend>>, TcpStream), BackendError> {
         let cluster_backends = self
             .backends
@@ -679,7 +755,7 @@ impl BackendMap {
             "selection runs only on a non-empty backend list"
         );
 
-        let next_backend = match cluster_backends.next_available_backend() {
+        let next_backend = match cluster_backends.next_available_backend(now) {
             Some(nb) => nb,
             None => {
                 // Drop the &mut BackendList before the &self helper call.
@@ -706,14 +782,14 @@ impl BackendMap {
                 )
             );
 
-            borrowed_backend.try_connect().map_err(|backend_error| {
-                BackendError::ConnectionFailures {
+            borrowed_backend
+                .try_connect(now, &mut self.rng)
+                .map_err(|backend_error| BackendError::ConnectionFailures {
                     cluster_id: cluster_id.to_owned(),
                     backend_address: borrowed_backend.address,
                     failures: borrowed_backend.failures,
                     error: backend_error.to_string(),
-                }
-            })?
+                })?
         };
 
         // Connection succeeded: re-evaluate so we capture an
@@ -755,6 +831,7 @@ impl BackendMap {
         &mut self,
         cluster_id: &str,
         key: Option<u64>,
+        now: Instant,
     ) -> Result<(String, SocketAddr), BackendError> {
         let cluster_backends = self
             .backends
@@ -771,7 +848,7 @@ impl BackendMap {
             "keyed selection runs only on a non-empty backend list"
         );
 
-        let next_backend = match cluster_backends.next_available_backend_with_key(key) {
+        let next_backend = match cluster_backends.next_available_backend_with_key(key, now) {
             Some(nb) => nb,
             None => {
                 let _ = cluster_backends;
@@ -793,18 +870,22 @@ impl BackendMap {
         Ok((backend_id, address))
     }
 
+    /// Connect to the backend of `cluster_id` that `sticky_session` names, at
+    /// `now`, falling back to [`Self::backend_from_cluster_id`].
     pub fn backend_from_sticky_session(
         &mut self,
         cluster_id: &str,
         sticky_session: &str,
+        now: Instant,
     ) -> Result<(Rc<RefCell<Backend>>, TcpStream), BackendError> {
+        let rng = &mut self.rng;
         let sticky_conn = self
             .backends
             .get_mut(cluster_id)
-            .and_then(|cluster_backends| cluster_backends.find_sticky(sticky_session))
+            .and_then(|cluster_backends| cluster_backends.find_sticky(sticky_session, now))
             .map(|backend| {
                 let mut borrowed = backend.borrow_mut();
-                let conn = borrowed.try_connect();
+                let conn = borrowed.try_connect(now, rng);
 
                 conn.map(|tcp_stream| (backend.clone(), tcp_stream))
                     .inspect_err(|_| {
@@ -822,7 +903,7 @@ impl BackendMap {
                     "Couldn't find a backend corresponding to sticky_session {} for cluster {}",
                     sticky_session, cluster_id
                 );
-                self.backend_from_cluster_id(cluster_id)
+                self.backend_from_cluster_id(cluster_id, now)
             }
         }
     }
@@ -835,12 +916,16 @@ impl BackendMap {
     ) {
         // The cluster can be created before the backends were registered because of the async config messages.
         // So when we set the load balancing policy, we have to create the backend list if if it doesn't exist yet.
+        let seed = self.rng.next_u64();
         let cluster_backends = self.get_or_create_backend_list_for_cluster(cluster_id);
-        cluster_backends.set_load_balancing_policy(lb_algo, metric);
+        cluster_backends.set_load_balancing_policy(lb_algo, metric, seed);
     }
 
     pub fn get_or_create_backend_list_for_cluster(&mut self, cluster_id: &str) -> &mut BackendList {
-        self.backends.entry(cluster_id.into()).or_default()
+        let rng = &mut self.rng;
+        self.backends
+            .entry(cluster_id.into())
+            .or_insert_with(|| BackendList::with_seed(rng.next_u64()))
     }
 }
 
@@ -857,8 +942,10 @@ impl crate::protocol::udp::BackendSource for BackendMap {
         &mut self,
         cluster: &str,
         key: Option<u64>,
+        now: Instant,
     ) -> Option<(crate::protocol::udp::BackendId, SocketAddr)> {
-        self.backend_from_cluster_id_with_key(cluster, key).ok()
+        self.backend_from_cluster_id_with_key(cluster, key, now)
+            .ok()
     }
 }
 
@@ -895,11 +982,20 @@ impl Default for BackendList {
 }
 
 impl BackendList {
+    /// An empty list whose default `Random` policy is seeded from the OS.
     pub fn new() -> BackendList {
+        Self::with_seed(os_rng().next_u64())
+    }
+
+    /// An empty list whose default `Random` policy is seeded with `seed`.
+    ///
+    /// [`BackendMap`] builds every list it holds this way, from its own
+    /// generator, so a seeded map seeds every cluster (#1684).
+    pub fn with_seed(seed: u64) -> BackendList {
         BackendList {
             backends: Vec::new(),
             next_id: 0,
-            load_balancing: Box::new(Random::new()),
+            load_balancing: Box::new(Random::with_seed(seed)),
             fail_open_warned: false,
             availability: Cell::new(ClusterAvailability::Available),
             candidates: Vec::new(),
@@ -959,10 +1055,12 @@ impl BackendList {
         }
     }
 
+    /// A list holding `backend_vec`, its default policy seeded with `seed`.
     pub fn import_configuration_state(
         backend_vec: &[sozu_command_lib::response::Backend],
+        seed: u64,
     ) -> BackendList {
-        let mut list = BackendList::new();
+        let mut list = BackendList::with_seed(seed);
         for backend in backend_vec {
             let backend = Backend::new(
                 &backend.backend_id,
@@ -1087,20 +1185,26 @@ impl BackendList {
             .find(|backend| backend.borrow().address == *backend_address)
     }
 
-    pub fn find_sticky(&mut self, sticky_session: &str) -> Option<&mut Rc<RefCell<Backend>>> {
+    /// The backend `sticky_session` names, if it can take a connection at
+    /// `now`.
+    pub fn find_sticky(
+        &mut self,
+        sticky_session: &str,
+        now: Instant,
+    ) -> Option<&mut Rc<RefCell<Backend>>> {
         self.backends
             .iter_mut()
             .find(|b| b.borrow().sticky_id.as_deref() == Some(sticky_session))
-            .filter(|b| b.borrow().can_open())
+            .filter(|b| b.borrow().can_open(now))
     }
 
     /// The backends of one tier that can take a connection now, cloned into
     /// a fresh `Vec`. Selection does not call this: it walks the same
     /// predicate, `is_tier_candidate`, into a reused buffer instead.
-    pub fn available_backends(&mut self, backup: bool) -> Vec<Rc<RefCell<Backend>>> {
+    pub fn available_backends(&mut self, backup: bool, now: Instant) -> Vec<Rc<RefCell<Backend>>> {
         self.backends
             .iter()
-            .filter(|backend| is_tier_candidate(&backend.borrow(), backup))
+            .filter(|backend| is_tier_candidate(&backend.borrow(), backup, now))
             .map(Clone::clone)
             .collect()
     }
@@ -1126,8 +1230,9 @@ impl BackendList {
         self.candidates.len()
     }
 
-    pub fn next_available_backend(&mut self) -> Option<Rc<RefCell<Backend>>> {
-        self.next_available_backend_with_key(None)
+    /// Pick the next available backend at `now`.
+    pub fn next_available_backend(&mut self, now: Instant) -> Option<Rc<RefCell<Backend>>> {
+        self.next_available_backend_with_key(None, now)
     }
 
     /// Pick the next available backend, optionally pinned by an affinity `key`.
@@ -1136,14 +1241,21 @@ impl BackendList {
     /// every other policy ignores it, so `next_available_backend_with_key(None)`
     /// is byte-for-byte the legacy behavior. The UDP datapath calls this with
     /// `Some(flow_hash)` to keep a client flow pinned to one backend.
+    ///
+    /// `now` is the instant the selection happens at: it decides which
+    /// backends are out of their backoff window and how far each
+    /// connection-time average has decayed, so the same `now` over the same
+    /// state picks the same backend.
     pub fn next_available_backend_with_key(
         &mut self,
         key: Option<u64>,
+        now: Instant,
     ) -> Option<Rc<RefCell<Backend>>> {
-        let mut available = self.collect_candidates(|backend| is_tier_candidate(backend, false));
+        let mut available =
+            self.collect_candidates(|backend| is_tier_candidate(backend, false, now));
 
         if available == 0 {
-            available = self.collect_candidates(|backend| is_tier_candidate(backend, true));
+            available = self.collect_candidates(|backend| is_tier_candidate(backend, true, now));
         }
 
         if available != 0 {
@@ -1155,9 +1267,10 @@ impl BackendList {
                 );
                 self.fail_open_warned = false;
             }
-            let picked = self
-                .load_balancing
-                .next_available_backend(key, Candidates::new(&self.backends, &self.candidates));
+            let picked = self.load_balancing.next_available_backend(
+                key,
+                Candidates::new(&self.backends, &self.candidates, now),
+            );
             debug_assert!(
                 picked.as_ref().is_none_or(|b| {
                     let addr = b.borrow().address;
@@ -1179,7 +1292,7 @@ impl BackendList {
         let available = self.collect_candidates(|backend| {
             backend.status == BackendStatus::Normal
                 && matches!(
-                    backend.retry_policy.can_try(),
+                    backend.retry_policy.can_try(now),
                     Some(retry::RetryAction::OKAY)
                 )
         });
@@ -1201,27 +1314,34 @@ impl BackendList {
         count!(names::backend::FAIL_OPEN, 1);
 
         self.load_balancing
-            .next_available_backend(key, Candidates::new(&self.backends, &self.candidates))
+            .next_available_backend(key, Candidates::new(&self.backends, &self.candidates, now))
     }
 
+    /// Replace the cluster's policy. `seed` seeds the policies that draw at
+    /// random, `Random` and `PowerOfTwo`; the others ignore it.
     pub fn set_load_balancing_policy(
         &mut self,
         load_balancing_policy: LoadBalancingAlgorithms,
         metric: Option<LoadMetric>,
+        seed: u64,
     ) {
         match load_balancing_policy {
             LoadBalancingAlgorithms::RoundRobin => {
                 self.load_balancing = Box::new(RoundRobin::new())
             }
-            LoadBalancingAlgorithms::Random => self.load_balancing = Box::new(Random::new()),
+            LoadBalancingAlgorithms::Random => {
+                self.load_balancing = Box::new(Random::with_seed(seed))
+            }
             LoadBalancingAlgorithms::LeastLoaded => {
                 self.load_balancing = Box::new(LeastLoaded {
                     metric: metric.unwrap_or(LoadMetric::Connections),
                 })
             }
             LoadBalancingAlgorithms::PowerOfTwo => {
-                self.load_balancing =
-                    Box::new(PowerOfTwo::new(metric.unwrap_or(LoadMetric::Connections)))
+                self.load_balancing = Box::new(PowerOfTwo::with_seed(
+                    seed,
+                    metric.unwrap_or(LoadMetric::Connections),
+                ))
             }
             // Affinity policies (used by the UDP datapath). They consult the
             // optional hash key; with `None` they fall back to round-robin.
@@ -1238,9 +1358,9 @@ impl BackendList {
 }
 
 /// Whether `backend` is a candidate of the primary (`backup == false`) or the
-/// backup tier: it belongs to that tier and can take a connection now.
-fn is_tier_candidate(backend: &Backend, backup: bool) -> bool {
-    backend.backup == backup && backend.can_open()
+/// backup tier: it belongs to that tier and can take a connection at `now`.
+fn is_tier_candidate(backend: &Backend, backup: bool, now: Instant) -> bool {
+    backend.backup == backup && backend.can_open(now)
 }
 
 #[cfg(test)]
@@ -1286,7 +1406,11 @@ mod backends_test {
             Backend::new(&format!("{cluster_id}-1"), backend_addr, None, None, None),
         );
 
-        assert!(backend_map.backend_from_cluster_id(cluster_id).is_ok());
+        assert!(
+            backend_map
+                .backend_from_cluster_id(cluster_id, Instant::now())
+                .is_ok()
+        );
         sender.send(()).unwrap();
     }
 
@@ -1301,7 +1425,7 @@ mod backends_test {
 
         assert!(
             backend_map
-                .backend_from_cluster_id(cluster_not_recorded)
+                .backend_from_cluster_id(cluster_not_recorded, Instant::now())
                 .is_err()
         );
     }
@@ -1310,7 +1434,11 @@ mod backends_test {
     fn it_should_not_retrieve_a_backend_from_cluster_id_when_backend_list_is_empty() {
         let mut backend_map = BackendMap::new();
 
-        assert!(backend_map.backend_from_cluster_id("dumb").is_err());
+        assert!(
+            backend_map
+                .backend_from_cluster_id("dumb", Instant::now())
+                .is_err()
+        );
     }
 
     #[test]
@@ -1356,7 +1484,7 @@ mod backends_test {
 
         assert!(
             backend_map
-                .backend_from_sticky_session(cluster_id, sticky_session)
+                .backend_from_sticky_session(cluster_id, sticky_session, Instant::now())
                 .is_ok()
         );
         sender.send(()).unwrap();
@@ -1371,7 +1499,7 @@ mod backends_test {
 
         assert!(
             backend_map
-                .backend_from_sticky_session(cluster_id, sticky_session)
+                .backend_from_sticky_session(cluster_id, sticky_session, Instant::now())
                 .is_err()
         );
     }
@@ -1384,7 +1512,7 @@ mod backends_test {
 
         assert!(
             backend_map
-                .backend_from_sticky_session(mycluster_not_recorded, sticky_session)
+                .backend_from_sticky_session(mycluster_not_recorded, sticky_session, Instant::now())
                 .is_err()
         );
     }
@@ -1455,10 +1583,10 @@ mod backends_test {
         list.add_backend(unhealthy_backend("b2", 9002));
 
         // Sanity: `available_backends` returns nothing (the regular path).
-        assert!(list.available_backends(false).is_empty());
-        assert!(list.available_backends(true).is_empty());
+        assert!(list.available_backends(false, Instant::now()).is_empty());
+        assert!(list.available_backends(true, Instant::now()).is_empty());
 
-        let picked = list.next_available_backend();
+        let picked = list.next_available_backend(Instant::now());
         assert!(
             picked.is_some(),
             "fail-open must pick a Normal+OKAY backend"
@@ -1477,15 +1605,18 @@ mod backends_test {
         list.add_backend(unhealthy_backend("b1", 9011));
         list.add_backend(unhealthy_backend("b2", 9012));
         for backend_rc in &list.backends {
-            backend_rc.borrow_mut().retry_policy().fail();
+            backend_rc
+                .borrow_mut()
+                .retry_policy()
+                .fail(Instant::now(), &mut rand::rng());
             assert_eq!(
                 Some(retry::RetryAction::WAIT),
-                backend_rc.borrow().retry_policy.can_try(),
+                backend_rc.borrow().retry_policy.can_try(Instant::now()),
                 "test fixture must place retry policy in WAIT"
             );
         }
 
-        let picked = list.next_available_backend();
+        let picked = list.next_available_backend(Instant::now());
         assert!(
             picked.is_none(),
             "fail-open must skip backends whose retry policy is in WAIT"
@@ -1505,10 +1636,10 @@ mod backends_test {
         list.add_backend(unhealthy_backend("b1", 9021));
         list.add_backend(unhealthy_backend("b2", 9022));
 
-        assert!(list.next_available_backend().is_some());
+        assert!(list.next_available_backend(Instant::now()).is_some());
         assert!(list.fail_open_warned, "first fail-open must latch");
 
-        assert!(list.next_available_backend().is_some());
+        assert!(list.next_available_backend(Instant::now()).is_some());
         assert!(
             list.fail_open_warned,
             "subsequent fail-open routing keeps the latch"
@@ -1517,7 +1648,7 @@ mod backends_test {
         // Heal one backend — the next routing call takes the healthy path
         // and must clear the latch (regime exit logged once).
         list.backends[0].borrow_mut().health.status = HealthStatus::Healthy;
-        let picked = list.next_available_backend();
+        let picked = list.next_available_backend(Instant::now());
         assert!(
             picked.is_some(),
             "regular path must select the healed backend"
@@ -1573,7 +1704,7 @@ mod backends_test {
         );
 
         // Reset retry, switch lifecycle to Closing.
-        backend.retry_policy.succeed();
+        backend.retry_policy.succeed(Instant::now());
         backend.set_closing();
         assert!(
             !backend.is_available(),
@@ -1773,6 +1904,282 @@ mod backends_test {
             map.backends.get(cluster_id).unwrap().availability.get(),
             "set_health_check_config(None) must re-emit the rollup after \
              resetting backend health, otherwise dashboards stay stuck at AllDown"
+        );
+    }
+
+    // ----- #1684: selection reads neither the wall clock nor an ambient RNG -----
+
+    /// Four backends of `cluster_id` under `policy`, created at `now` in a map
+    /// that seeded the policy, and the addresses of `draws` selections at `now`.
+    fn draws(
+        map: &mut BackendMap,
+        cluster_id: &str,
+        policy: LoadBalancingAlgorithms,
+        now: Instant,
+        draws: usize,
+    ) -> Vec<SocketAddr> {
+        map.set_load_balancing_policy_for_cluster(
+            cluster_id,
+            policy,
+            Some(LoadMetric::Connections),
+        );
+        for index in 0..4u16 {
+            map.add_backend(
+                cluster_id,
+                Backend::new_at(
+                    &format!("{cluster_id}-{index}"),
+                    SocketAddr::from(([127, 0, 0, 1], 9100 + index)),
+                    None,
+                    None,
+                    None,
+                    now,
+                ),
+            );
+        }
+        let list = map
+            .backends
+            .get_mut(cluster_id)
+            .expect("the policy call created the list");
+        (0..draws)
+            .map(|_| {
+                list.next_available_backend(now)
+                    .expect("four fresh backends can all open")
+                    .borrow()
+                    .address
+            })
+            .collect()
+    }
+
+    /// #1684: a map built from a seed seeds every policy it creates from it,
+    /// so one seed yields one sequence of picks.
+    ///
+    /// TO SEE THIS RED: build `BackendMap::with_seed` from `os_rng()` and
+    /// ignore the seed; two maps of one seed then disagree.
+    #[test]
+    fn one_map_seed_yields_one_selection_sequence() {
+        let now = Instant::now();
+        for policy in [
+            LoadBalancingAlgorithms::Random,
+            LoadBalancingAlgorithms::PowerOfTwo,
+        ] {
+            let first = draws(&mut BackendMap::with_seed(7), "c", policy, now, 48);
+            assert_eq!(
+                first,
+                draws(&mut BackendMap::with_seed(7), "c", policy, now, 48),
+                "{policy:?}: one seed must yield one sequence of picks"
+            );
+            assert_ne!(
+                first,
+                draws(&mut BackendMap::with_seed(8), "c", policy, now, 48),
+                "{policy:?}: the picks must come from the map's seed, so another seed differs"
+            );
+        }
+    }
+
+    /// The addresses of `draws` selections at `now` from `cluster_id`.
+    fn picks_of(
+        map: &mut BackendMap,
+        cluster_id: &str,
+        now: Instant,
+        draws: usize,
+    ) -> Vec<SocketAddr> {
+        let list = map
+            .backends
+            .get_mut(cluster_id)
+            .expect("the cluster was created");
+        (0..draws)
+            .map(|_| {
+                list.next_available_backend(now)
+                    .expect("fresh backends can all open")
+                    .borrow()
+                    .address
+            })
+            .collect()
+    }
+
+    /// #1684: a cluster the map creates while adding a backend, before any
+    /// policy is set, is seeded from the map too, not from the OS.
+    ///
+    /// TO SEE THIS RED: create the list in `BackendMap::add_backend` with
+    /// `or_default()`, which seeds its `Random` policy from the OS.
+    #[test]
+    fn a_cluster_created_by_adding_a_backend_is_seeded_by_the_map() {
+        let now = Instant::now();
+        let sequence = || {
+            let mut map = BackendMap::with_seed(7);
+            for index in 0..4u16 {
+                map.add_backend(
+                    "c",
+                    Backend::new_at(
+                        &format!("c-{index}"),
+                        SocketAddr::from(([127, 0, 0, 1], 9300 + index)),
+                        None,
+                        None,
+                        None,
+                        now,
+                    ),
+                );
+            }
+            picks_of(&mut map, "c", now, 48)
+        };
+        assert_eq!(
+            sequence(),
+            sequence(),
+            "a list created by add_backend must draw its seed from the map"
+        );
+    }
+
+    /// #1684: importing a configuration state seeds each cluster from the
+    /// map in cluster-id order, so one map seed gives every cluster the same
+    /// seed whatever order the state's `HashMap` iterates in.
+    ///
+    /// TO SEE THIS RED: draw the seeds while iterating `backends` directly in
+    /// `BackendMap::import_configuration_state`; each `HashMap` has its own
+    /// `RandomState`, so two imports hand the seeds out in different orders.
+    #[test]
+    fn importing_a_state_seeds_its_clusters_in_a_fixed_order() {
+        const CLUSTERS: u16 = 16;
+        let now = Instant::now();
+        let state = |ids: &mut dyn Iterator<Item = u16>| {
+            let mut state: HashMap<ClusterId, Vec<sozu_command_lib::response::Backend>> =
+                HashMap::new();
+            for id in ids {
+                let cluster_id: ClusterId = format!("import-{id:02}").into();
+                let backends = (0..4u16)
+                    .map(|index| sozu_command_lib::response::Backend {
+                        cluster_id: cluster_id.clone(),
+                        backend_id: format!("{cluster_id}-{index}"),
+                        address: SocketAddr::from(([127, 0, 0, 1], 9400 + 4 * id + index)),
+                        sticky_id: None,
+                        load_balancing_parameters: None,
+                        backup: None,
+                    })
+                    .collect();
+                state.insert(cluster_id, backends);
+            }
+            state
+        };
+        let forward = state(&mut (0..CLUSTERS));
+        let backward = state(&mut (0..CLUSTERS).rev());
+
+        let mut first = BackendMap::with_seed(7);
+        first.import_configuration_state(&forward);
+        let mut second = BackendMap::with_seed(7);
+        second.import_configuration_state(&backward);
+        for id in 0..CLUSTERS {
+            let cluster_id = format!("import-{id:02}");
+            assert_eq!(
+                picks_of(&mut first, &cluster_id, now, 32),
+                picks_of(&mut second, &cluster_id, now, 32),
+                "{cluster_id}: one map seed must give each imported cluster one seed"
+            );
+        }
+    }
+
+    /// Regression guard moved from `load_balancing.rs`, where it held
+    /// `Random::new()`: the production seed must never be a shared constant.
+    /// If it were, every worker, on every cold start, would draw from a
+    /// bit-for-bit identical keystream and pick the same backend at every
+    /// step — the correlated-load event uniform selection exists to prevent,
+    /// arriving at a synchronised redeploy. The OS seed now enters through
+    /// `BackendMap::new`, which seeds every cluster's policy, so two maps (two
+    /// workers) and two clusters of one map must each diverge.
+    ///
+    /// 48 draws over four backends collide with probability ~4^-48 if the
+    /// keystreams are independent, so this cannot flake.
+    #[test]
+    fn random_policies_seeded_by_the_os_are_not_correlated() {
+        let now = Instant::now();
+        let policy = LoadBalancingAlgorithms::Random;
+        let mut map = BackendMap::new();
+        let first = draws(&mut map, "a", policy, now, 48);
+        assert_ne!(
+            first,
+            draws(&mut BackendMap::new(), "a", policy, now, 48),
+            "two BackendMap::new() must NOT seed Random from a shared/correlated keystream"
+        );
+        assert_ne!(
+            first,
+            draws(&mut map, "b", policy, now, 48),
+            "two clusters of one map must NOT draw from a shared keystream"
+        );
+    }
+
+    /// The same guard for `PowerOfTwo`'s tie-break, moved from
+    /// `load_balancing.rs`. Every backend starts at zero load, so a tie (and
+    /// its coin flip) is the common case: a shared seed would resolve every
+    /// worker's first ties identically after a synchronised redeploy,
+    /// reintroducing the herding P2C exists to prevent.
+    #[test]
+    fn power_of_two_policies_seeded_by_the_os_are_not_correlated() {
+        let now = Instant::now();
+        let policy = LoadBalancingAlgorithms::PowerOfTwo;
+        let mut map = BackendMap::new();
+        let first = draws(&mut map, "a", policy, now, 48);
+        assert_ne!(
+            first,
+            draws(&mut BackendMap::new(), "a", policy, now, 48),
+            "two BackendMap::new() must NOT seed PowerOfTwo from a shared/correlated keystream"
+        );
+        assert_ne!(
+            first,
+            draws(&mut map, "b", policy, now, 48),
+            "two clusters of one map must NOT draw from a shared keystream"
+        );
+    }
+
+    /// #1684: the connection-time average decays on the instants it is
+    /// given. A backend created at `t0` and read at `t0 + 1s` has aged by
+    /// exactly one decay constant, `e^-1`, whatever the wall clock did.
+    ///
+    /// TO SEE THIS RED: take `now` from `Instant::now()` inside
+    /// `PeakEWMA::observe`; almost no real time passes, so the average does
+    /// not decay and the cost stays at its 50 ms default.
+    #[test]
+    fn the_connection_time_average_decays_on_the_injected_clock() {
+        let t0 = Instant::now();
+        let mut backend = Backend::new_at(
+            "ewma",
+            SocketAddr::from(([127, 0, 0, 1], 9200)),
+            None,
+            None,
+            None,
+            t0,
+        );
+        let default_rtt = backend.connection_time.rtt;
+        let cost = backend.peak_ewma_connection(t0 + Duration::from_secs(1));
+        assert_eq!(
+            cost,
+            default_rtt * (-1f64).exp(),
+            "one second after creation, the average must have decayed by e^-1"
+        );
+
+        // One sequence of instants, one average, bit for bit.
+        let replay = |backend: &mut Backend| {
+            backend.set_connection_time(Duration::from_millis(80), t0 + Duration::from_millis(10));
+            backend.set_connection_time(Duration::from_millis(20), t0 + Duration::from_millis(900));
+            backend.peak_ewma_connection(t0 + Duration::from_millis(2_500))
+        };
+        let mut twin = Backend::new_at(
+            "ewma",
+            SocketAddr::from(([127, 0, 0, 1], 9200)),
+            None,
+            None,
+            None,
+            t0,
+        );
+        let mut again = Backend::new_at(
+            "ewma",
+            SocketAddr::from(([127, 0, 0, 1], 9200)),
+            None,
+            None,
+            None,
+            t0,
+        );
+        assert_eq!(
+            replay(&mut twin).to_bits(),
+            replay(&mut again).to_bits(),
+            "one sequence of instants must yield one average, bit for bit"
         );
     }
 }

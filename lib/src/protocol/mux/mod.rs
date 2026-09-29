@@ -2335,6 +2335,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             let mut dialer = RegistryDialer {
                 backends: &mut backends,
                 registry: backend_registry,
+                now: context.now,
             };
             router.backend_from_request(
                 &cluster_id,
@@ -2650,8 +2651,9 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
 
                                 //successful connection, reset failure counter
                                 backend_borrow.failures = 0;
-                                backend_borrow.set_connection_time(start.elapsed());
-                                backend_borrow.retry_policy.succeed();
+                                backend_borrow
+                                    .set_connection_time(start.elapsed(), self.context.now);
+                                backend_borrow.retry_policy.succeed(self.context.now);
                                 drop(backend_borrow);
 
                                 // These streams linked while the connection
@@ -2777,7 +2779,12 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 backend_borrow.failures += 1;
 
                                 let already_unavailable = backend_borrow.retry_policy.is_down();
-                                backend_borrow.retry_policy.fail();
+                                // The jitter comes from the worker's backend
+                                // map, the one generator selection draws
+                                // from; nothing else borrows the map here.
+                                backend_borrow
+                                    .retry_policy
+                                    .fail(self.context.now, self.backends.borrow_mut().rng());
                                 incr!(
                                     names::backend::CONNECTIONS_ERROR,
                                     Some(cluster_id),
@@ -3818,6 +3825,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
 struct RegistryDialer<'a> {
     backends: &'a mut BackendMap,
     registry: &'a mut BackendRegistry,
+    /// The pass's clock sample, [`Context::now`]: selection judges backoff
+    /// windows and connection-time decay against it rather than reading a
+    /// clock (#1684).
+    now: Instant,
 }
 
 impl router::BackendDialer for RegistryDialer<'_> {
@@ -3829,10 +3840,10 @@ impl router::BackendDialer for RegistryDialer<'_> {
         let (handle, socket) = match affinity {
             router::Affinity::Sticky(Some(cookie)) => self
                 .backends
-                .backend_from_sticky_session(cluster_id, cookie)?,
-            router::Affinity::Sticky(None) | router::Affinity::Unpinned => {
-                self.backends.backend_from_cluster_id(cluster_id)?
-            }
+                .backend_from_sticky_session(cluster_id, cookie, self.now)?,
+            router::Affinity::Sticky(None) | router::Affinity::Unpinned => self
+                .backends
+                .backend_from_cluster_id(cluster_id, self.now)?,
         };
         let sticky_session = match affinity {
             router::Affinity::Sticky(_) => {

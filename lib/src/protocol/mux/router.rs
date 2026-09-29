@@ -3850,7 +3850,10 @@ mod backend_selection_order_tests {
 /// session.
 #[cfg(test)]
 mod backend_dialer_tests {
-    use std::{net::TcpListener, time::Duration};
+    use std::{
+        net::TcpListener,
+        time::{Duration, Instant},
+    };
 
     use sozu_command::proto::command::{LoadBalancingAlgorithms, LoadMetric};
 
@@ -3937,6 +3940,7 @@ mod backend_dialer_tests {
             let mut dialer = RegistryDialer {
                 backends: &mut self.backends,
                 registry: &mut self.registry,
+                now: Instant::now(),
             };
             let (_socket, backend) = self
                 .router

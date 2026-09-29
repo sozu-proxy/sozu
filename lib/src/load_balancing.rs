@@ -1,10 +1,12 @@
-use std::{cell::RefCell, fmt::Debug, hash::Hasher, net::SocketAddr, ops::Index, rc::Rc};
+use std::{
+    cell::RefCell, fmt::Debug, hash::Hasher, net::SocketAddr, ops::Index, rc::Rc, time::Instant,
+};
 
 use rand::{
     RngExt, SeedableRng,
     distr::uniform::{UniformInt, UniformSampler},
     prelude::IndexedRandom,
-    rngs::{StdRng, SysRng},
+    rngs::StdRng,
 };
 
 use crate::{backends::Backend, sozu_command::proto::command::LoadMetric};
@@ -161,16 +163,22 @@ impl Hasher for FnvHasher {
 /// `Vec` of cloned candidates this view replaces. Building the view borrows
 /// and copies nothing: the caller owns `indices`, and only the backend a
 /// policy returns has its `Rc` cloned.
+///
+/// The view also carries the instant the selection happens at, which a
+/// policy reading `LoadMetric::ConnectionTime` decays each average to: no
+/// policy reads a clock of its own (#1684).
 #[derive(Clone, Copy, Debug)]
 pub struct Candidates<'a> {
     backends: &'a [Rc<RefCell<Backend>>],
     indices: &'a [usize],
+    now: Instant,
 }
 
 impl<'a> Candidates<'a> {
-    /// View `backends` through `indices`. Every index must address a slot of
-    /// `backends`, and the indices must be strictly increasing.
-    pub fn new(backends: &'a [Rc<RefCell<Backend>>], indices: &'a [usize]) -> Self {
+    /// View `backends` through `indices` for a selection at `now`. Every
+    /// index must address a slot of `backends`, and the indices must be
+    /// strictly increasing.
+    pub fn new(backends: &'a [Rc<RefCell<Backend>>], indices: &'a [usize], now: Instant) -> Self {
         debug_assert!(
             indices.iter().all(|&index| index < backends.len()),
             "a candidate index must address a slot of the backend list"
@@ -182,7 +190,16 @@ impl<'a> Candidates<'a> {
             indices.windows(2).all(|pair| pair[0] < pair[1]),
             "candidate indices must be strictly increasing"
         );
-        Self { backends, indices }
+        Self {
+            backends,
+            indices,
+            now,
+        }
+    }
+
+    /// The instant this selection happens at.
+    pub fn now(&self) -> Instant {
+        self.now
     }
 
     pub fn len(&self) -> usize {
@@ -300,9 +317,8 @@ impl RoundRobin {
 
 /// Uniform (optionally weight-biased) random backend selection.
 ///
-/// The RNG is read off the datapath, at construction, instead of reaching for
-/// the ambient thread-local `rand::rng()` on the selection hot path — but,
-/// unlike [`Rendezvous`]/[`Maglev`], it is NOT seeded from the shared
+/// The RNG is seeded once, at construction, and never from an ambient source
+/// on the selection hot path — but, unlike [`Rendezvous`]/[`Maglev`], it is NOT seeded from the shared
 /// [`DEFAULT_HASH_SEED`] constant. `Rendezvous`/`Maglev` feed their seed into
 /// a *pure, stateless* hash function (`hash_backend`): same `(seed, key,
 /// addr)` in, same score out, independent of call history, so sharing the
@@ -317,13 +333,14 @@ impl RoundRobin {
 /// exactly the correlated-load event uniform selection exists to prevent,
 /// arriving at the worst possible moment (a synchronised redeploy, when every
 /// worker's call counter resets together and initial load is otherwise
-/// indistinguishable). So `new()` reads a fresh seed from the OS
-/// (`SysRng`) once, at construction — off the datapath, satisfying the
-/// no-ambient-entropy-on-the-hot-path rule without recreating the old
-/// thread-local `rng()`'s cross-process correlation. `with_seed(seed)` stays
-/// available for tests and any future deterministic simulator that needs a
-/// fixed, reproducible sequence (mirrors `quinn-proto`'s
-/// `rng_seed`/`SysRng` construction shape).
+/// indistinguishable). So the seed is the caller's, and the production caller
+/// draws it from an OS-seeded generator: `BackendMap::new` seeds its own
+/// generator from the OS once, at construction, and hands every cluster's
+/// policy a seed drawn from it (`crate::backends::BackendMap`, #1684). Each
+/// worker's keystream is therefore independent, as with the thread-local
+/// `rng()` this replaced, while a simulator that builds the map with
+/// `BackendMap::with_seed` gets a fixed, reproducible sequence (mirrors
+/// `quinn-proto`'s `rng_seed` construction shape).
 ///
 /// This does NOT make `Random` return a fixed backend: `next_available_backend`
 /// *advances* the internal RNG on every call, so a sequence of calls still
@@ -333,34 +350,17 @@ impl RoundRobin {
 /// `with_seed` on the same seed and driven through the same sequence of
 /// backend sets reproduce the same sequence of picks (what makes this
 /// testable); a single instance called repeatedly keeps drawing fresh values
-/// from its advancing RNG state, exactly like a real RNG would; two `new()`
-/// instances draw from independent OS-seeded keystreams, exactly like the old
-/// ambient `rng()` did.
+/// from its advancing RNG state, exactly like a real RNG would; two lists of
+/// one map, or two maps, draw from independent keystreams.
 #[derive(Debug)]
 pub struct Random {
     rng: StdRng,
 }
 
-impl Default for Random {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Random {
-    /// Seed from the OS, once, off the datapath. Deliberately NOT
-    /// `DEFAULT_HASH_SEED` — see the struct docs for why sharing a
-    /// compile-time constant here would correlate every worker's pick
-    /// sequence instead of merely making each one internally reproducible.
-    pub fn new() -> Self {
-        Self {
-            rng: StdRng::try_from_rng(&mut SysRng)
-                .expect("failed to seed random number generator from system"),
-        }
-    }
-
-    /// Deterministic construction for tests / simulation. NOT used for the
-    /// production default — see [`Random::new`].
+    /// A policy whose draws are the keystream of `seed`. Never
+    /// `DEFAULT_HASH_SEED` in production — see the struct docs for why a
+    /// shared compile-time constant would correlate every worker's picks.
     pub fn with_seed(seed: u64) -> Self {
         Self {
             rng: StdRng::seed_from_u64(seed),
@@ -478,8 +478,9 @@ impl LoadBalancingAlgorithm for LeastLoaded {
                 .min_by_key(|backend| backend.borrow().active_requests),
             LoadMetric::ConnectionTime => {
                 let mut b = None;
+                let now = backends.now();
                 for backend in backends.iter() {
-                    let cost2 = backend.borrow_mut().peak_ewma_connection();
+                    let cost2 = backend.borrow_mut().peak_ewma_connection(now);
 
                     match b.take() {
                         None => b = Some((cost2, backend)),
@@ -530,7 +531,7 @@ impl LoadBalancingAlgorithm for LeastLoaded {
 ///
 /// What the two-read bound does buy is real but narrower: under
 /// [`LoadMetric::ConnectionTime`] a load read is a `PeakEWMA::observe` call
-/// that takes an `Instant::now()` stamp and decays the backend's average, so
+/// that decays the backend's average to the selection's instant, so
 /// two of them per selection instead of `n` is measurable work removed —
 /// under `Connections`/`Requests` a load read is a field read and the saving
 /// is small.
@@ -556,7 +557,7 @@ impl LoadBalancingAlgorithm for LeastLoaded {
 /// requirement to *preserve* here. But answering "must we preserve
 /// agreement?" is not the same question as "does this mechanism *create*
 /// agreement?" — see the next section for why that distinction is the whole
-/// reason `new()` does not use [`DEFAULT_HASH_SEED`].
+/// reason its seed is never [`DEFAULT_HASH_SEED`].
 ///
 /// A deterministic tie-break (e.g. "lowest backend id wins") was considered
 /// and rejected: ties are common, not rare — every backend starts at zero
@@ -571,7 +572,7 @@ impl LoadBalancingAlgorithm for LeastLoaded {
 /// candidate set over the process lifetime while still satisfying the
 /// no-ambient-entropy-on-the-hot-path rule.
 ///
-/// # Seed source: OS entropy at construction, NOT `DEFAULT_HASH_SEED`
+/// # Seed source: the backend map's OS-seeded generator, NOT `DEFAULT_HASH_SEED`
 ///
 /// `Rendezvous`/`Maglev` feed their seed into a *pure, stateless* hash
 /// function: sharing [`DEFAULT_HASH_SEED`] fleet-wide is exactly what gives
@@ -583,11 +584,11 @@ impl LoadBalancingAlgorithm for LeastLoaded {
 /// hit after a synchronised redeploy (and ties are the common case here, see
 /// above) would resolve identically, fleet-wide, on every restart. That is
 /// the deterministic-tie-break herding problem above, reintroduced by the
-/// "fix" instead of prevented by it. `new()` therefore reads a fresh seed
-/// from the OS (`SysRng`) once, at construction — off the datapath — so each
-/// worker's keystream is independent, the same property the old thread-local
-/// `rng()` had. `with_seed(seed, metric)` stays available for tests and any
-/// future deterministic simulator that needs a fixed, reproducible sequence.
+/// "fix" instead of prevented by it. The production seed therefore comes from
+/// `BackendMap`'s generator, which reads the OS once, at construction — off
+/// the datapath — so each worker's keystream is independent, the same
+/// property the old thread-local `rng()` had, while `BackendMap::with_seed`
+/// gives a simulator a fixed, reproducible sequence (#1684).
 #[derive(Debug)]
 pub struct PowerOfTwo {
     pub metric: LoadMetric,
@@ -595,18 +596,8 @@ pub struct PowerOfTwo {
 }
 
 impl PowerOfTwo {
-    /// Seed from the OS, once, off the datapath. Deliberately NOT
-    /// `DEFAULT_HASH_SEED` — see the struct docs.
-    pub fn new(metric: LoadMetric) -> Self {
-        Self {
-            metric,
-            rng: StdRng::try_from_rng(&mut SysRng)
-                .expect("failed to seed random number generator from system"),
-        }
-    }
-
-    /// Deterministic construction for tests / simulation. NOT used for the
-    /// production default — see [`PowerOfTwo::new`].
+    /// A policy whose tie-breaks are the keystream of `seed`. Never
+    /// `DEFAULT_HASH_SEED` in production — see the struct docs.
     pub fn with_seed(seed: u64, metric: LoadMetric) -> Self {
         Self {
             metric,
@@ -619,12 +610,12 @@ impl PowerOfTwo {
     /// Called exactly twice per selection, whatever the cluster size — that
     /// call count is the algorithm, not an implementation detail of it. The
     /// `ConnectionTime` arm needs `borrow_mut` because `peak_ewma_connection`
-    /// decays the EWMA as it reads it.
-    fn measure(&self, backend: &Rc<RefCell<Backend>>) -> f64 {
+    /// decays the EWMA, to the selection's instant `now`, as it reads it.
+    fn measure(&self, backend: &Rc<RefCell<Backend>>, now: Instant) -> f64 {
         match self.metric {
             LoadMetric::Connections => backend.borrow().active_connections as f64,
             LoadMetric::Requests => backend.borrow().active_requests as f64,
-            LoadMetric::ConnectionTime => backend.borrow_mut().peak_ewma_connection(),
+            LoadMetric::ConnectionTime => backend.borrow_mut().peak_ewma_connection(now),
         }
     }
 }
@@ -664,8 +655,8 @@ impl LoadBalancingAlgorithm for PowerOfTwo {
             "the shifted second index must stay inside the candidate set"
         );
 
-        let first_measure = self.measure(&backends[first]);
-        let second_measure = self.measure(&backends[second]);
+        let first_measure = self.measure(&backends[first], backends.now());
+        let second_measure = self.measure(&backends[second], backends.now());
 
         // Keep the lighter of the two samples. An exact tie is broken by a
         // coin flip rather than by index order: ties are the common case
@@ -1144,7 +1135,7 @@ impl LoadBalancingAlgorithm for Maglev {
 mod test {
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
-        time::Instant,
+        time::Duration,
     };
 
     use super::*;
@@ -1162,8 +1153,18 @@ mod test {
         key: Option<u64>,
         backends: &[Rc<RefCell<Backend>>],
     ) -> Option<Rc<RefCell<Backend>>> {
+        pick_at(policy, key, backends, Instant::now())
+    }
+
+    /// [`pick`] for a selection at `now`.
+    fn pick_at(
+        policy: &mut (impl LoadBalancingAlgorithm + ?Sized),
+        key: Option<u64>,
+        backends: &[Rc<RefCell<Backend>>],
+        now: Instant,
+    ) -> Option<Rc<RefCell<Backend>>> {
         let indices: Vec<usize> = (0..backends.len()).collect();
-        policy.next_available_backend(key, Candidates::new(backends, &indices))
+        policy.next_available_backend(key, Candidates::new(backends, &indices, now))
     }
 
     fn create_backend(id: String, connections: Option<usize>) -> Backend {
@@ -1178,7 +1179,7 @@ mod test {
             failures: 0,
             load_balancing_parameters: None,
             backup: false,
-            connection_time: PeakEWMA::new(),
+            connection_time: PeakEWMA::new(Instant::now()),
             health: HealthState::default(),
         }
     }
@@ -1678,46 +1679,6 @@ mod test {
     }
 
     #[test]
-    fn random_new_instances_are_not_correlated() {
-        // Regression guard for a real defect a review caught in an earlier
-        // revision of this change: `Random::new()` must NOT seed from
-        // `DEFAULT_HASH_SEED` (or any other shared constant). If it did,
-        // every freshly constructed `Random` — i.e. every worker process, on
-        // every cold start — would draw from a bit-for-bit identical
-        // keystream, so two independently constructed instances would pick
-        // the exact same backend at every step. That is precisely the
-        // correlated-load event uniform selection exists to prevent, and it
-        // would arrive at the worst possible moment: a synchronised
-        // redeploy, when every worker's call counter resets together and
-        // initial load is otherwise indistinguishable. `Random::new()` reads
-        // a fresh seed from the OS per instance, so two instances must
-        // diverge — this asserts that property directly, not just that
-        // `new()` compiles.
-        let backends = make_backends(4);
-        let mut r1 = Random::new();
-        let mut r2 = Random::new();
-
-        let sel1 = backends.clone();
-        let sel2 = backends.clone();
-
-        let seq1: Vec<u8> = (0..32)
-            .map(|_| addr_index(chosen_addr(&pick(&mut r1, None, &sel1).unwrap())))
-            .collect();
-        let seq2: Vec<u8> = (0..32)
-            .map(|_| addr_index(chosen_addr(&pick(&mut r2, None, &sel2).unwrap())))
-            .collect();
-
-        // Collision probability over 32 draws across 4 backends is
-        // astronomically small (~4^-32) if the two instances are genuinely
-        // independently seeded, so this is not a flaky assertion in
-        // practice.
-        assert_ne!(
-            seq1, seq2,
-            "two Random::new() instances must NOT draw from a shared/correlated keystream"
-        );
-    }
-
-    #[test]
     fn random_distribution_does_not_collapse() {
         // A seeded RNG must still spread draws across every backend rather
         // than pinning one — determinism is per-(seed, sequence), not
@@ -1771,7 +1732,8 @@ mod test {
 
         // Reproducibility: `with_seed` is deterministic given the same seed
         // and call sequence — the property tests/simulation need. This is
-        // NOT a claim about production: `PowerOfTwo::new()` seeds from OS
+        // NOT a claim about production: there the seed comes from the
+        // backend map's generator, which `BackendMap::new` seeds from OS
         // entropy specifically so two independent worker processes do NOT
         // draw from the same keystream (see the struct docs' "Seed source"
         // section for why sharing a seed here would be a regression, not a
@@ -1802,13 +1764,12 @@ mod test {
         // HOW TO TELL A LEGITIMATE RECAPTURE FROM PAPERING OVER A
         // REGRESSION. Every other `power_of_two_*` test in this module
         // asserts a SEMANTIC property that no RNG stream can shift. There
-        // are EIGHT of them — `grep -cE '^\s+fn power_of_two_'` in this file
-        // gives nine, this test included — and the rule below covers all
-        // eight, not a convenient subset. The pattern is anchored on
+        // are SEVEN of them — `grep -cE '^\s+fn power_of_two_'` in this file
+        // gives eight, this test included — and the rule below covers all
+        // seven, not a convenient subset. The pattern is anchored on
         // purpose: unanchored it also counts this very comment, reports
-        // ten, and sends the reader after a test that does not exist. The
-        // eight are:
-        // `power_of_two_new_instances_are_not_correlated`,
+        // nine, and sends the reader after a test that does not exist. The
+        // seven are:
         // `power_of_two_tie_break_distribution_does_not_collapse`,
         // `power_of_two_tie_break_is_decided_by_the_coin_flip_not_by_sample_position`,
         // `power_of_two_touches_exactly_two_backends`,
@@ -1816,6 +1777,10 @@ mod test {
         // `power_of_two_handles_empty_and_singleton_sets_without_panic`,
         // `power_of_two_never_returns_the_strictly_heaviest_backend` and
         // `power_of_two_sample_size_is_two_not_the_whole_set`.
+        // The eighth this rule used to name, the seed-correlation guard, is
+        // `power_of_two_policies_seeded_by_the_os_are_not_correlated` in
+        // `backends.rs` now that the production seed comes from `BackendMap`
+        // (#1684); it belongs in the rule too.
         // Recapture only when THIS assertion is the only failing one and all
         // eight are green with their bodies untouched. If any of them is
         // red, or one had to be edited to get green, the algorithm regressed
@@ -1826,38 +1791,6 @@ mod test {
         assert_eq!(
             seq1, expected,
             "PowerOfTwo selection sequence for DEFAULT_HASH_SEED regressed"
-        );
-    }
-
-    #[test]
-    fn power_of_two_new_instances_are_not_correlated() {
-        // Same regression guard as `random_new_instances_are_not_correlated`,
-        // for the tie-break: `PowerOfTwo::new()` must NOT seed from
-        // `DEFAULT_HASH_SEED`. Every backend starts at zero load, so a tie
-        // (and therefore a coin flip) is the COMMON case, not the rare one —
-        // if `new()` shared a seed, every worker's first tie-break after a
-        // synchronised redeploy would resolve identically, fleet-wide,
-        // reintroducing exactly the herding effect P2C exists to prevent.
-        let backends = make_backends(4);
-        let mut p1 = PowerOfTwo::new(LoadMetric::Connections);
-        let mut p2 = PowerOfTwo::new(LoadMetric::Connections);
-
-        let sel1 = backends.clone();
-        let sel2 = backends.clone();
-
-        let seq1: Vec<u8> = (0..48)
-            .map(|_| addr_index(chosen_addr(&pick(&mut p1, None, &sel1).unwrap())))
-            .collect();
-        let seq2: Vec<u8> = (0..48)
-            .map(|_| addr_index(chosen_addr(&pick(&mut p2, None, &sel2).unwrap())))
-            .collect();
-
-        // Each draw picks one of four backends, so 48 draws give a collision
-        // probability well under 2^-48 if the two instances are genuinely
-        // independently seeded — not a flaky assertion.
-        assert_ne!(
-            seq1, seq2,
-            "two PowerOfTwo::new() instances must NOT draw from a shared/correlated keystream"
         );
     }
 
@@ -1917,72 +1850,66 @@ mod test {
         // fails it, and whose own comment invites a recapture. A dropped
         // coin flip could ride in behind such a recapture unnoticed.
         //
-        // This test makes the tie-break directly observable instead. Under
-        // `LoadMetric::ConnectionTime` each measurement runs
-        // `PeakEWMA::observe`, which stamps `last_event = Instant::now()`,
-        // and `next_available_backend` measures its samples in order: the
-        // backend it drew as `first` carries the EARLIER stamp. So the pair's
-        // order is readable from outside, and "which member of a tie won" is
-        // decidable.
+        // This test makes the tie-break directly observable instead. Each
+        // trial is the first selection of a policy seeded with the trial's
+        // own seed, so the pair is the first two draws of that seed's
+        // keystream, and a generator seeded alike replays which backend was
+        // drawn as `first` and which as `second`. The replay stops before the
+        // coin flip, so it agrees with the policy whether the flip is there
+        // or not. (It used to read the order off `PeakEWMA` stamps taken on
+        // the wall clock; a selection now measures both samples at one
+        // injected instant, #1684.)
         //
-        // The decay has to be frozen for the tie to exist at all. `observe`
-        // ages `rtt` by `exp(-elapsed / decay)`, so at the default 1s decay
-        // the backend measured second has aged longer, comes back strictly
-        // lighter, and the coin-flip branch is never reached. With a decay
-        // this large the weight rounds to exactly 1.0 and `rtt` survives
-        // bit-for-bit, so both measures tie exactly while `observe` still
-        // stamps `last_event`.
+        // The replay mirrors the sampler's exact draws, so it is checked, not
+        // trusted: with THREE equally loaded backends the pair leaves one out,
+        // and every pick must be one of the two the replay predicts. A change
+        // to the sampling desynchronises the replay, and a pick then lands on
+        // the backend it left out, failing this test loudly instead of
+        // quietly counting noise.
+        //
+        // Every backend carries the same load, so every selection is an exact
+        // tie and every one of them reaches the tie-break.
         const TOTAL: usize = 2_000;
-        let backends = make_backends(2);
-        for backend in &backends {
-            backend.borrow_mut().connection_time.decay = 1e300;
-        }
+        const BACKENDS: u8 = 3;
+        let backends = make_backends(BACKENDS);
 
-        let mut p = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::ConnectionTime);
         let sel = backends.clone();
-        let mut decided = 0usize;
         let mut second_measured_won = 0usize;
-        for _ in 0..TOTAL {
-            let picked = addr_index(chosen_addr(&pick(&mut p, None, &sel).unwrap()));
-            let stamp_0 = backends[0].borrow().connection_time.last_event;
-            let stamp_1 = backends[1].borrow().connection_time.last_event;
-            // Two reads that the monotonic clock could not separate leave the
-            // pair's order unknowable, so the sample is dropped rather than
-            // guessed. `decided` is asserted below so dropping them all can
-            // never be mistaken for a pass.
-            if stamp_0 == stamp_1 {
-                continue;
+        for trial in 0..TOTAL as u64 {
+            let seed = DEFAULT_HASH_SEED ^ trial;
+            let mut p = PowerOfTwo::with_seed(seed, LoadMetric::Connections);
+            let mut replay = StdRng::seed_from_u64(seed);
+            let len = usize::from(BACKENDS);
+            let first = replay.random_range(0..len);
+            let mut second = replay.random_range(0..len - 1);
+            if second >= first {
+                second += 1;
             }
-            decided += 1;
-            let measured_second = u8::from(stamp_0 < stamp_1);
-            if picked == measured_second {
+            let picked = usize::from(addr_index(chosen_addr(&pick(&mut p, None, &sel).unwrap())));
+            assert!(
+                picked == first || picked == second,
+                "trial {trial}: picked backend {picked}, outside the pair ({first}, {second}) \
+                 the replay predicts; the sampler no longer draws the pair this test replays"
+            );
+            if picked == second {
                 second_measured_won += 1;
             }
         }
 
-        assert!(
-            decided >= TOTAL / 2,
-            "only {decided} of {TOTAL} selections had distinguishable measurement stamps; the \
-             clock is too coarse to decide this test rather than the tie-break being wrong"
-        );
-
         // A fair coin gives the second-measured backend half the ties. The
         // band is +/-20 percentage points around 50%, so its half-width is
-        // `0.2 * decided` against a standard deviation of
-        // `sqrt(decided * 0.25)`. Quote it at the FLOOR the guard above
-        // permits, which is the only bound that has to hold: at
-        // decided = 1000 that is 200 against sigma 15.8, ~12.6 sigma (~17.9
-        // sigma at the full 2000). It cannot flake, and it is two-sided:
-        // pinning the tie-break to `first` drives this to 0, pinning it to
-        // `second` drives it to `decided`.
-        let low = decided * 30 / 100;
-        let high = decided * 70 / 100;
+        // `0.2 * TOTAL` against a standard deviation of `sqrt(TOTAL * 0.25)`:
+        // 400 against sigma 22.4, ~17.9 sigma. It cannot flake, and it is
+        // two-sided: pinning the tie-break to `first` drives this to 0,
+        // pinning it to `second` drives it to `TOTAL`.
+        let low = TOTAL * 30 / 100;
+        let high = TOTAL * 70 / 100;
         assert!(
             second_measured_won > low && second_measured_won < high,
-            "power-of-two resolved {second_measured_won} of {decided} exact ties in favour of \
+            "power-of-two resolved {second_measured_won} of {TOTAL} exact ties in favour of \
              the second-measured sample; a coin flip must land near {}, and a count at either \
              end means the tie is being awarded by sample position instead",
-            decided / 2
+            TOTAL / 2
         );
     }
 
@@ -1997,8 +1924,8 @@ mod test {
         // to build the candidate set handed in here, so a selection is `O(n)` whatever
         // this policy does. `LoadMetric::ConnectionTime` reads a backend's load
         // through `Backend::peak_ewma_connection` -> `PeakEWMA::get` ->
-        // `PeakEWMA::observe`, and `observe` stamps `last_event =
-        // Instant::now()`. That stamp is an exact per-backend receipt saying
+        // `PeakEWMA::observe`, and `observe` stamps `last_event` with the
+        // selection's instant. That stamp is an exact per-backend receipt saying
         // "this backend's load was measured", so the number of fresh stamps
         // after one selection IS the number of backends the algorithm
         // consulted: a full scan leaves `n` of them, power-of-two-choices
@@ -2010,20 +1937,16 @@ mod test {
         const N: u8 = 64;
         let backends = make_backends(N);
 
-        // Stamp every backend with one instant, then spin until the
-        // monotonic clock is strictly past it. After that point every
-        // `Instant::now()` is `> before`, so "was this backend measured?"
-        // is decidable without depending on the clock's resolution.
+        // Stamp every backend with one instant and select one nanosecond
+        // later on the injected clock, so "was this backend measured?" is
+        // decidable without depending on the wall clock's resolution.
         let before = Instant::now();
         for backend in &backends {
             backend.borrow_mut().connection_time.last_event = before;
         }
-        while Instant::now() <= before {
-            std::hint::spin_loop();
-        }
 
         let mut p = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::ConnectionTime);
-        assert!(pick(&mut p, None, &backends).is_some());
+        assert!(pick_at(&mut p, None, &backends, before + Duration::from_nanos(1)).is_some());
 
         let touched = backends
             .iter()

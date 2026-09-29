@@ -674,6 +674,21 @@ and every assertion stayed exactly as written** — only the driver was rewritte
 That is the "swap the driver, keep the scenarios" promise each sub-machine
 extraction makes, and this is the first time it has been collected in full.
 
+**Backend selection and backoff** take their time and randomness from the
+caller too (#1684), so a simulator that reaches them drives them from its own
+clock and seed. Every selection entry point takes `now`:
+`BackendMap::backend_from_cluster_id`, `backend_from_sticky_session` and
+`backend_from_cluster_id_with_key`, `BackendList::next_available_backend`,
+`Backend::can_open`, and the `RetryPolicy` and `PeakEWMA` methods beneath
+them. Randomness comes from one generator per `BackendMap`:
+`BackendMap::with_seed(seed)` seeds every cluster's `Random` and `PowerOfTwo`
+policy and every backoff jitter from `seed`, where `BackendMap::new` seeds it
+from the OS once. Build backends with `Backend::new_at(.., now)`: `Backend::new`
+is the production default and stamps the wall clock, which the connection-time
+average decays from. Two production defaults remain outside these files and
+are not simulated: `Backend::new`'s stamp, and the TCP proxy (`tcp.rs`), which
+selects at `Instant::now()` and draws its backoff jitter from `rand::rng()`.
+
 ---
 
 ## 6. Fuzzing

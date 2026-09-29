@@ -1126,12 +1126,13 @@ impl TcpSession {
                 }
 
                 if let BackendConnectionStatus::Connecting(start) = last {
-                    backend.set_connection_time(Instant::now() - start);
+                    let now = Instant::now();
+                    backend.set_connection_time(now - start, now);
                 }
 
                 //successful connection, rest failure counter
                 backend.failures = 0;
-                backend.retry_policy.succeed();
+                backend.retry_policy.succeed(Instant::now());
             }
         }
     }
@@ -1163,7 +1164,9 @@ impl TcpSession {
             backend.failures += 1;
 
             let already_unavailable = backend.retry_policy.is_down();
-            backend.retry_policy.fail();
+            // The TCP proxy is not simulated: it keeps the wall clock and the
+            // thread-local generator at its own edge (#1684).
+            backend.retry_policy.fail(Instant::now(), &mut rand::rng());
             incr!(
                 names::backend::CONNECTIONS_ERROR,
                 self.cluster_id.as_deref(),
@@ -1729,7 +1732,7 @@ impl TcpSession {
             .borrow()
             .backends
             .borrow_mut()
-            .backend_from_cluster_id(&cluster_id)
+            .backend_from_cluster_id(&cluster_id, Instant::now())
             .map_err(BackendConnectionError::Backend)?;
 
         if let Err(e) = stream.set_nodelay(true) {
