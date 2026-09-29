@@ -396,6 +396,17 @@
 
 ### 🔄 Changed
 
+- **`docs`: rule order within a frontend `position`, and what a reload does not change, are
+  documented ([#952](https://github.com/sozu-proxy/sozu/issues/952)).** `doc/configure.md` gains a
+  "Rule order within `PRE` and `POST`" section: `PRE` rules, then the routing trie, then `POST`
+  rules; inside `PRE` or `POST` the first matching rule wins, in the order the worker received the
+  rules, while the trie follows hostname and path specificity. It also states two limits of the
+  current behaviour: `sozu reload` refuses every frontend whose address, hostname, path and method
+  already exist, so reordering the file, or changing only the `position` or cluster of an existing
+  frontend, has no effect and a frontend deleted from the file is not removed; and a new or
+  upgraded worker receives frontends sorted by that key rather than in insertion order.
+  `bin/config.toml` summarises the same under `position`. No behaviour change.
+
 - **`docs`: the catch-all hostname, `hostname = "*"` with `position = "POST"`, is documented
   ([#633](https://github.com/sozu-proxy/sozu/issues/633)).** A `POST` frontend on a bare `*` is
   `DomainRule::Any`: it is consulted after the routing trie and answers every request no other
