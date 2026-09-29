@@ -20,7 +20,7 @@ use std::{
     ptr,
 };
 
-use crate::socket::SocketResult;
+use crate::{metrics::names, socket::SocketResult};
 
 /// Default kernel-pipe capacity (64 KiB), matching the Linux default
 /// for an unprivileged pipe and the historical `splice(2)` chunk size.
@@ -308,6 +308,15 @@ pub fn splice_in(
             match err.kind() {
                 ErrorKind::WouldBlock => (0, SocketResult::WouldBlock),
                 _ => {
+                    // A peer reset still answers `Error`, as before, but is
+                    // counted beside the plain socket paths' resets
+                    // (sozu-proxy/sozu#434).
+                    if matches!(
+                        err.kind(),
+                        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+                    ) {
+                        incr!(names::tcp::READ_RESET);
+                    }
                     error!(
                         "SPLICE\terr splicing from fd({}) to pipe({}): {:?}",
                         fd.as_raw_fd(),
@@ -360,6 +369,15 @@ pub fn splice_out(
             match err.kind() {
                 ErrorKind::WouldBlock => (0, SocketResult::WouldBlock),
                 _ => {
+                    // A peer reset still answers `Error`, as before, but is
+                    // counted beside the plain socket paths' resets
+                    // (sozu-proxy/sozu#434).
+                    if matches!(
+                        err.kind(),
+                        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+                    ) {
+                        incr!(names::tcp::WRITE_RESET);
+                    }
                     error!(
                         "SPLICE\terr splicing from pipe({}) to fd({}): {:?}",
                         pipe_read_end,
@@ -398,6 +416,41 @@ mod tests {
         let ret = unsafe { libc::ioctl(read_end, libc::FIONREAD, &mut queued) };
         assert_eq!(ret, 0, "FIONREAD must succeed on a pipe");
         queued as usize
+    }
+
+    /// A `splice(2)` that meets the peer's RST answers `Error`, as it always
+    /// did, and counts the reset beside the plain socket paths' resets
+    /// (sozu-proxy/sozu#434): `tcp.read.reset` from the socket,
+    /// `tcp.write.reset` towards it.
+    ///
+    /// To SEE THIS RED: drop either `incr!(names::tcp::…_RESET)` from
+    /// `splice_in` / `splice_out`.
+    #[test]
+    fn a_splice_through_a_reset_socket_counts_the_reset() {
+        use crate::socket::tests::{proxy_count, reset_stream};
+
+        let pipe = SplicePipe::new().expect("create splice pipe");
+        let from = reset_stream();
+        let before = proxy_count(names::tcp::READ_RESET);
+        assert_eq!(
+            splice_in(&from, pipe.in_pipe[1], 4096),
+            (0, SocketResult::Error)
+        );
+        assert_eq!(proxy_count(names::tcp::READ_RESET) - before, 1);
+
+        let payload = b"after the reset";
+        // SAFETY: `pipe.in_pipe[1]` is a live pipe fd owned by `pipe`; the
+        // buffer is valid for `payload.len()` bytes.
+        let written =
+            unsafe { libc::write(pipe.in_pipe[1], payload.as_ptr().cast(), payload.len()) };
+        assert_eq!(written, payload.len() as isize);
+        let to = reset_stream();
+        let before = proxy_count(names::tcp::WRITE_RESET);
+        assert_eq!(
+            splice_out(pipe.in_pipe[0], &to, payload.len()),
+            (0, SocketResult::Error)
+        );
+        assert_eq!(proxy_count(names::tcp::WRITE_RESET) - before, 1);
     }
 
     /// A pair returned with both pipes empty is the next pair handed out,

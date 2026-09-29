@@ -3480,16 +3480,30 @@ behind each reject reason.
 
 #### Socket and I/O errors
 
-| Metric                             | Type    | Scope | Description                                     |
-| ---------------------------------- | ------- | ----- | ----------------------------------------------- |
-| `socket.write.infinite_loop.error` | counter | proxy | TCP socket write loop safety breaker triggered  |
-| `tcp.read.error`                   | counter | proxy | TCP socket read error                           |
-| `tcp.write.error`                  | counter | proxy | TCP socket write error                          |
-| `tcp.infinite_loop.error`          | counter | proxy | TCP session event loop safety breaker triggered |
-| `rustls.read.error`                | counter | proxy | TLS read error                                  |
-| `rustls.write.error`               | counter | proxy | TLS write error                                 |
-| `rustls.read.infinite_loop.error`  | counter | proxy | TLS read loop safety breaker triggered          |
-| `rustls.write.infinite_loop.error` | counter | proxy | TLS write loop safety breaker triggered         |
+| Metric                             | Type    | Scope | Description                                                                             |
+| ---------------------------------- | ------- | ----- | --------------------------------------------------------------------------------------- |
+| `socket.write.infinite_loop.error` | counter | proxy | TCP socket write loop safety breaker triggered                                          |
+| `tcp.read.error`                   | counter | proxy | TCP socket read error                                                                   |
+| `tcp.read.reset`                   | counter | proxy | Peer reset seen by a plain TCP read or splice from the socket                           |
+| `tcp.write.error`                  | counter | proxy | TCP socket write error, a peer reset met by a `send` included                           |
+| `tcp.write.reset`                  | counter | proxy | Peer reset seen by a plain TCP write or splice to the socket                            |
+| `tcp.infinite_loop.error`          | counter | proxy | TCP session event loop safety breaker triggered                                         |
+| `rustls.read.error`                | counter | proxy | TLS read error                                                                          |
+| `rustls.read.reset`                | counter | proxy | Peer reset seen by a TLS frontend read, during the handshake or after it                |
+| `rustls.write.error`               | counter | proxy | TLS write error, a peer reset included                                                  |
+| `rustls.write.reset`               | counter | proxy | Peer reset seen by a TLS frontend write, during the handshake or after it               |
+| `rustls.read.infinite_loop.error`  | counter | proxy | TLS read loop safety breaker triggered                                                  |
+| `rustls.write.infinite_loop.error` | counter | proxy | TLS write loop safety breaker triggered                                                 |
+
+A peer reset is a client or backend that aborts its connection with a TCP RST
+instead of closing it cleanly: `ECONNRESET` (or `ECONNABORTED`) from the
+`recv`, `send` or `splice` that meets it. It is not necessarily an error, so
+the four `*.reset` counters report it on its own; the session still closes
+exactly as before. The kernel reports the reset to one syscall only, so each
+reset is counted once, on the read or the write side, whichever met it first.
+A reset that reaches Sōzu only as a hang-up event, on a session that then
+closes without reading or writing, is not counted: learning that it was a
+reset would take an extra `getsockopt(SO_ERROR)` per closing session.
 
 #### UDP
 

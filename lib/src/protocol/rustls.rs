@@ -139,7 +139,17 @@ fn handshake_read<R: Read>(
                 event.remove(Ready::READABLE);
                 can_read = false;
             }
-            Err(e) => return Err(HandshakeReadFault::ReadTls(e)),
+            Err(e) => {
+                // A reset during the handshake is counted with the ones after
+                // it (sozu-proxy/sozu#434); the session closes either way.
+                if matches!(
+                    e.kind(),
+                    ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+                ) {
+                    incr!(names::rustls::READ_RESET);
+                }
+                return Err(HandshakeReadFault::ReadTls(e));
+            }
         }
         session
             .process_new_packets()
@@ -351,6 +361,12 @@ impl TlsHandshake {
                             can_write = false
                         }
                         _ => {
+                            if matches!(
+                                e.kind(),
+                                ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+                            ) {
+                                incr!(names::rustls::WRITE_RESET);
+                            }
                             error!(
                                 "{} Could not perform handshake: {:?}",
                                 log_context!(self),
@@ -621,8 +637,10 @@ mod tests {
     use mio::{Token, net::TcpStream};
     use rusty_ulid::Ulid;
 
-    use super::{TlsHandshake, handshake_failure_reason, handshake_read};
-    use crate::{Ready, SessionResult, protocol::SessionState, timer::TimeoutContainer};
+    use super::{HandshakeReadFault, TlsHandshake, handshake_failure_reason, handshake_read};
+    use crate::{
+        Ready, SessionResult, metrics::names, protocol::SessionState, timer::TimeoutContainer,
+    };
     use std::io::ErrorKind;
 
     /// Every rustls error variant the proxy can observe must map to a distinct,
@@ -777,6 +795,30 @@ mod tests {
         );
         assert!(!event.is_readable());
         assert!(!server.is_handshaking(), "the handshake is complete");
+    }
+
+    /// A peer that resets the connection during the handshake closes the
+    /// session, as it always did, and counts `rustls.read.reset` once, like
+    /// a reset after the handshake (sozu-proxy/sozu#434).
+    ///
+    /// To SEE THIS RED: drop `incr!(names::rustls::READ_RESET)` from
+    /// `handshake_read`.
+    #[test]
+    fn a_reset_during_the_handshake_counts_a_read_reset() {
+        use crate::socket::{rustls_read_tests::fresh_pair, tests};
+
+        let (mut server, _client) = fresh_pair(Vec::new());
+        let mut stream = tests::reset_stream();
+        let before = tests::proxy_count(names::rustls::READ_RESET);
+
+        let mut event = Ready::READABLE;
+        let fault = handshake_read(&mut server, &mut stream, &mut event)
+            .expect_err("a reset socket cannot carry a handshake");
+        assert!(
+            matches!(&fault, HandshakeReadFault::ReadTls(e) if e.kind() == ErrorKind::ConnectionReset),
+            "the reset surfaces as a read fault, got {fault:?}"
+        );
+        assert_eq!(tests::proxy_count(names::rustls::READ_RESET) - before, 1);
     }
 
     /// A read that fills the 4096 bytes rustls offered is not a short read:
