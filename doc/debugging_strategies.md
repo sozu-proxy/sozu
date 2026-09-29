@@ -304,6 +304,30 @@ heavy load (in a healthy load, this queue is almost always empty). `sozu.accept_
 as well. If `sozu.accept_queue.timeout` is higher than zero, sozu cannot accept sessions fast enough and
 is rejecting traffic.
 
+### Slow kernel clocksource
+
+Sozu reads the monotonic clock (`Instant::now()`) throughout the request path, for timeouts,
+response times and metrics. On Linux that read stays in user space, through the vDSO, only when the
+kernel clocksource supports it: `tsc`, `kvm-clock`, `xen`, `hyperv_clocksource_tsc_page`,
+`arch_sys_counter` or `riscv_clocksource` (the two paravirtual ones only when the host reports a
+stable TSC). With any other one, such as `hpet` or `acpi_pm`, every read is a `clock_gettime`
+syscall, and a profile of a loaded proxy then shows a large share of its CPU time in `read_hpet` or
+its equivalent ([#500](https://github.com/sozu-proxy/sozu/issues/500)).
+
+The main process checks the clocksource once at startup (`warn_on_slow_clocksource` in
+`bin/src/util.rs`) and logs a warning when it is not one of those. To check and change it:
+
+```bash
+cat /sys/devices/system/clocksource/clocksource0/current_clocksource
+cat /sys/devices/system/clocksource/clocksource0/available_clocksource
+# x86 shown; pick a fast source from available_clocksource (arch_sys_counter on arm64)
+echo tsc | sudo tee /sys/devices/system/clocksource/clocksource0/current_clocksource
+```
+
+Make the choice persistent with the `clocksource=` kernel parameter. The kernel may have
+switched away from `tsc` because it found it unstable: check `dmesg | grep -i clocksource` before
+forcing it back.
+
 ## During development
 
 In the config.toml file:

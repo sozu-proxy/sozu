@@ -27,7 +27,10 @@ use self::server::{HubError, ServerError};
 use crate::{
     cli::Args,
     command::{requests::load_static_config, server::CommandHub},
-    util::{UtilError, get_config_file_path, get_executable_path, setup_metrics, write_pid_file},
+    util::{
+        UtilError, get_config_file_path, get_executable_path, setup_metrics,
+        warn_on_slow_clocksource, write_pid_file,
+    },
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -73,6 +76,7 @@ pub fn begin_main_process(args: &Args) -> Result<(), StartError> {
 
     setup_logging_with_config(&config, "MAIN").map_err(StartError::SetupLogging)?;
     info!("Starting up");
+    warn_on_slow_clocksource();
     setup_metrics(&config).map_err(StartError::SetupMetrics)?;
     write_pid_file(&config).map_err(StartError::WritePidFile)?;
 
