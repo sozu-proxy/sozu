@@ -4,6 +4,26 @@
 
 ### ✨ Added
 
+- **`feat(metrics)`: count peer resets on TCP and TLS sockets
+  ([#434](https://github.com/sozu-proxy/sozu/issues/434)).** A client that aborts its
+  connection with a TCP RST instead of closing it cleanly is not necessarily an error, yet it
+  was invisible: a read that met `ECONNRESET` answered `Closed` with no counter at all, and a
+  write folded it into `tcp.write.error` / `rustls.write.error` with every other failure. Four
+  new proxy-level counters report it on its own: `tcp.read.reset` and `tcp.write.reset` for
+  plain TCP sockets (frontends and backends, the `splice` paths included), and
+  `rustls.read.reset` and `rustls.write.reset` for TLS frontends, during the handshake or
+  after it. `ECONNABORTED` counts as a reset too: it is the same arm today, and the spelling
+  a locally aborted connection takes. `BrokenPipe` does not: it is what a write meets after a
+  reset the kernel already reported. The kernel reports a reset to one syscall only, and a
+  TLS frontend stops writing once it has seen one, so each reset is counted once.
+  Nothing else changes: every `SocketResult` is the one it was, and `tcp.write.error` /
+  `rustls.write.error` still count the resets their `send` paths meet, so existing dashboards
+  keep their values. Each increment is the same thread-local counter bump as its neighbours,
+  on an error arm only, with no allocation and no syscall. A reset that reaches Sōzu only as a
+  hang-up event, on a session that then closes without reading or writing, is not counted.
+  The `crypto-openssl` feature only swaps the rustls crypto provider, so its TLS frontends go
+  through the same counted paths. Documented in `doc/configure.md`.
+
 - **`feat(server)`: per-(cluster, source-subnet) connection limit, a second cap beside the
   per-IP one ([#1270](https://github.com/sozu-proxy/sozu/issues/1270)).** The existing
   `max_connections_per_ip` has no concept of a subnet, so anyone on an IPv6 `/64` — the

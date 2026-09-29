@@ -278,10 +278,17 @@ fn plain_socket_read<R: Read>(
             // operationally identical to any other benign peer-initiated
             // close and does not warrant a log line on every backend
             // that happens to be down.
-            ErrorKind::ConnectionReset
-            | ErrorKind::ConnectionAborted
-            | ErrorKind::BrokenPipe
-            | ErrorKind::ConnectionRefused => (0, SocketResult::Closed, None),
+            //
+            // A reset is still a close, but it is counted: clients that abort
+            // instead of finishing cleanly are an operational signal, not an
+            // error (sozu-proxy/sozu#434). The kernel reports `ECONNRESET` to
+            // the first syscall after the RST only; later reads see EOF and
+            // later writes `EPIPE`, so each reset is counted once.
+            ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => {
+                incr!(names::tcp::READ_RESET);
+                (0, SocketResult::Closed, None)
+            }
+            ErrorKind::BrokenPipe | ErrorKind::ConnectionRefused => (0, SocketResult::Closed, None),
             _ => (0, SocketResult::Error, Some(e)),
         },
     }
@@ -370,10 +377,14 @@ fn tcp_socket_write(
             }
             Err(e) => match e.kind() {
                 ErrorKind::WouldBlock => return (size, SocketResult::WouldBlock),
-                ErrorKind::ConnectionReset
-                | ErrorKind::ConnectionAborted
-                | ErrorKind::BrokenPipe
-                | ErrorKind::ConnectionRefused => {
+                // A peer reset (see `plain_socket_read`) keeps counting under
+                // `tcp.write.error` as well, as it did before `tcp.write.reset`.
+                ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => {
+                    incr!(names::tcp::WRITE_RESET);
+                    incr!(names::tcp::WRITE_ERROR);
+                    return (size, SocketResult::Closed);
+                }
+                ErrorKind::BrokenPipe | ErrorKind::ConnectionRefused => {
                     incr!(names::tcp::WRITE_ERROR);
                     return (size, SocketResult::Closed);
                 }
@@ -426,10 +437,13 @@ fn tcp_socket_write_vectored(
         }
         Err(e) => match e.kind() {
             ErrorKind::WouldBlock => (0, SocketResult::WouldBlock),
-            ErrorKind::ConnectionReset
-            | ErrorKind::ConnectionAborted
-            | ErrorKind::BrokenPipe
-            | ErrorKind::ConnectionRefused => {
+            // Same split as the scalar write path.
+            ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => {
+                incr!(names::tcp::WRITE_RESET);
+                incr!(names::tcp::WRITE_ERROR);
+                (0, SocketResult::Closed)
+            }
+            ErrorKind::BrokenPipe | ErrorKind::ConnectionRefused => {
                 incr!(names::tcp::WRITE_ERROR);
                 (0, SocketResult::Closed)
             }
@@ -709,12 +723,27 @@ impl RecvMemory {
 ///
 /// Every `FrontRustls` write goes through here so tests can count the writes
 /// that reach the socket ([`tls_writes`]).
+///
+/// It is also the one place a TLS frontend's write can observe a peer reset,
+/// so `rustls.write.reset` is counted here rather than at each caller's
+/// error arm (sozu-proxy/sozu#434); the callers' `peer_reset` then stops
+/// every later write before it reaches the socket, so a reset counts once.
+/// The callers still count it under `rustls.write.error` as well.
 fn flush_tls(session: &mut ServerConnection, stream: &mut TcpStream) -> std::io::Result<usize> {
     #[cfg(test)]
     if session.wants_write() {
         TLS_WRITES.with(|writes| writes.set(writes.get() + 1));
     }
-    session.write_tls(stream)
+    let written = session.write_tls(stream);
+    if let Err(e) = &written
+        && matches!(
+            e.kind(),
+            ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+        )
+    {
+        incr!(names::rustls::WRITE_RESET);
+    }
+    written
 }
 
 #[cfg(test)]
@@ -980,6 +1009,14 @@ fn rustls_socket_read<R: Read>(
                     // reach the peer anymore) but still set
                     // `peer_disconnected` for back-compatible read-side
                     // logic.
+                    //
+                    // The reset is counted here, the only arm that reads the
+                    // socket, and once: `peer_reset` stops every later write
+                    // before it reaches the socket (sozu-proxy/sozu#434).
+                    // `EPIPE` is not a reset this `recv` observed.
+                    if e.kind() != ErrorKind::BrokenPipe {
+                        incr!(names::rustls::READ_RESET);
+                    }
                     is_closed = true;
                     *peer_disconnected = true;
                     *peer_reset = true;
@@ -2043,7 +2080,7 @@ pub mod stats {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Address a handler caches. Deliberately non-loopback so it can never
@@ -2485,6 +2522,137 @@ mod tests {
             backend,
             "connect must pin the peer to the backend"
         );
+    }
+
+    // ---- peer resets (sozu-proxy/sozu#434) ------------------------------
+
+    /// The current value of one proxy-level counter on this test thread,
+    /// absent counting as 0. `METRICS` is a `thread_local!` shared with every
+    /// test libtest runs on the same thread, so callers assert a DELTA
+    /// against a baseline, never an absolute value. Mirrors `proxy_metric`
+    /// in `lib/src/protocol/mux/stream.rs`.
+    pub(crate) fn proxy_count(name: &str) -> i64 {
+        use sozu_command::proto::command::filtered_metrics::Inner;
+        crate::metrics::METRICS.with(|metrics| {
+            metrics
+                .borrow_mut()
+                .dump_local_proxy_metrics()
+                .get(name)
+                .and_then(|metric| match metric.inner {
+                    Some(Inner::Count(value)) => Some(value),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        })
+    }
+
+    /// A nonblocking loopback stream whose peer reset it: the accepted side
+    /// sets `SO_LINGER` to zero and closes, which makes the kernel send a
+    /// RST instead of a FIN.
+    ///
+    /// Returns once `poll(2)` reports `POLLERR` on the stream, so the RST has
+    /// been processed and the next syscall is the one that answers
+    /// `ECONNRESET`. `poll` does not consume the pending socket error, a
+    /// blocking read would. Bounded: a RST that never arrives fails the test
+    /// instead of hanging it.
+    pub(crate) fn reset_stream() -> TcpStream {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("test listener must bind to a loopback port");
+        let stream = std::net::TcpStream::connect(
+            listener
+                .local_addr()
+                .expect("test listener must report its local address"),
+        )
+        .expect("loopback connect must complete");
+        let (peer, _) = listener.accept().expect("loopback accept must complete");
+        socket2::SockRef::from(&peer)
+            .set_linger(Some(std::time::Duration::ZERO))
+            .expect("SO_LINGER must accept a zero timeout");
+        drop(peer);
+
+        let mut pollfd = libc::pollfd {
+            fd: std::os::unix::io::AsRawFd::as_raw_fd(&stream),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid `pollfd` borrowed for the duration of the call.
+        let ready = unsafe { libc::poll(&mut pollfd, 1, 5_000) };
+        assert_eq!(ready, 1, "the peer's RST must arrive within 5 s");
+        assert_ne!(
+            pollfd.revents & libc::POLLERR,
+            0,
+            "premise: the peer must have reset the connection, not closed it"
+        );
+        stream
+            .set_nonblocking(true)
+            .expect("mio requires a nonblocking stream");
+        TcpStream::from_std(stream)
+    }
+
+    /// A read that meets the peer's RST answers `Closed`, as it always did,
+    /// and counts `tcp.read.reset` once: the kernel reports `ECONNRESET` to
+    /// that read only, and the next one is an EOF.
+    ///
+    /// To SEE THIS RED: drop `incr!(names::tcp::READ_RESET)` from
+    /// `plain_socket_read`.
+    #[test]
+    fn a_plain_read_counts_a_peer_reset_once() {
+        let mut stream = reset_stream();
+        let before = proxy_count(names::tcp::READ_RESET);
+        let mut buf = [0u8; 64];
+
+        let (size, result) = stream.socket_read(&mut buf);
+        assert_eq!((size, result), (0, SocketResult::Closed));
+        assert_eq!(proxy_count(names::tcp::READ_RESET) - before, 1);
+
+        let (size, result) = stream.socket_read(&mut buf);
+        assert_eq!((size, result), (0, SocketResult::Closed));
+        assert_eq!(
+            proxy_count(names::tcp::READ_RESET) - before,
+            1,
+            "the EOF after the reset is not another reset"
+        );
+    }
+
+    /// A write that meets the peer's RST answers `Closed`, as it always did,
+    /// still counts `tcp.write.error`, and counts `tcp.write.reset` once: the
+    /// next write answers `EPIPE`, which is not a reset.
+    ///
+    /// To SEE THIS RED: drop `incr!(names::tcp::WRITE_RESET)` from
+    /// `tcp_socket_write`.
+    #[test]
+    fn a_plain_write_counts_a_peer_reset_once() {
+        let mut stream = reset_stream();
+        let resets = proxy_count(names::tcp::WRITE_RESET);
+        let errors = proxy_count(names::tcp::WRITE_ERROR);
+
+        let (size, result) = stream.socket_write(b"after the reset");
+        assert_eq!((size, result), (0, SocketResult::Closed));
+        assert_eq!(proxy_count(names::tcp::WRITE_RESET) - resets, 1);
+        assert_eq!(proxy_count(names::tcp::WRITE_ERROR) - errors, 1);
+
+        let (size, result) = stream.socket_write(b"after the reset");
+        assert_eq!((size, result), (0, SocketResult::Closed));
+        assert_eq!(
+            proxy_count(names::tcp::WRITE_RESET) - resets,
+            1,
+            "the EPIPE after the reset is not another reset"
+        );
+    }
+
+    /// The vectored write path counts a reset exactly as the scalar one.
+    ///
+    /// To SEE THIS RED: drop `incr!(names::tcp::WRITE_RESET)` from
+    /// `tcp_socket_write_vectored`.
+    #[test]
+    fn a_plain_vectored_write_counts_a_peer_reset() {
+        let mut stream = reset_stream();
+        let before = proxy_count(names::tcp::WRITE_RESET);
+
+        let (size, result) =
+            stream.socket_write_vectored(&[std::io::IoSlice::new(b"after the reset")]);
+        assert_eq!((size, result), (0, SocketResult::Closed));
+        assert_eq!(proxy_count(names::tcp::WRITE_RESET) - before, 1);
     }
 }
 
@@ -3192,6 +3360,88 @@ pub(crate) mod rustls_read_tests {
         assert_eq!(result, SocketResult::Closed);
         assert!(front.peer_disconnected && front.peer_reset);
         assert_eq!(transport.reads, 1);
+    }
+
+    /// A settled TLS frontend over a real socket its peer reset
+    /// (`SO_LINGER` zero, then close).
+    fn reset_front() -> FrontRustls {
+        let (session, _client) = handshaken_pair();
+        FrontRustls {
+            stream: super::tests::reset_stream(),
+            session,
+            peer_disconnected: false,
+            peer_reset: false,
+            tls_fatal: false,
+            session_ulid: Ulid::generate(),
+            configured_peer: None,
+            recv_memory: RecvMemory::default(),
+        }
+    }
+
+    /// A TLS read that meets the peer's RST answers `Closed` and counts
+    /// `rustls.read.reset` once. The write that follows short-circuits on
+    /// `peer_reset` without reaching the socket, so it counts nothing, and
+    /// the reset does not leak into the plain-TCP counter either.
+    ///
+    /// To SEE THIS RED: drop `incr!(names::rustls::READ_RESET)` from
+    /// `rustls_socket_read`.
+    #[test]
+    fn a_tls_read_counts_a_peer_reset_once() {
+        let mut front = reset_front();
+        let reads = super::tests::proxy_count(names::rustls::READ_RESET);
+        let writes = super::tests::proxy_count(names::rustls::WRITE_RESET);
+        let plain = super::tests::proxy_count(names::tcp::READ_RESET);
+
+        let mut buf = [0u8; 64];
+        let (size, result) = front.socket_read(&mut buf);
+        assert_eq!((size, result), (0, SocketResult::Closed));
+        assert!(front.peer_reset);
+        assert_eq!(
+            super::tests::proxy_count(names::rustls::READ_RESET) - reads,
+            1
+        );
+
+        let (_, result) = front.socket_write(b"after the reset");
+        assert_eq!(result, SocketResult::Closed);
+        assert_eq!(
+            super::tests::proxy_count(names::rustls::WRITE_RESET) - writes,
+            0,
+            "a write after a reset read never reaches the socket"
+        );
+        assert_eq!(super::tests::proxy_count(names::tcp::READ_RESET) - plain, 0);
+    }
+
+    /// A TLS write that meets the peer's RST answers `Closed`, still counts
+    /// `rustls.write.error`, and counts `rustls.write.reset` once: the next
+    /// write short-circuits on `peer_reset`.
+    ///
+    /// To SEE THIS RED: drop `incr!(names::rustls::WRITE_RESET)` from
+    /// `flush_tls`.
+    #[test]
+    fn a_tls_write_counts_a_peer_reset_once() {
+        let mut front = reset_front();
+        let resets = super::tests::proxy_count(names::rustls::WRITE_RESET);
+        let errors = super::tests::proxy_count(names::rustls::WRITE_ERROR);
+
+        let (_, result) = front.socket_write(b"after the reset");
+        assert_eq!(result, SocketResult::Closed);
+        assert!(front.peer_reset);
+        assert_eq!(
+            super::tests::proxy_count(names::rustls::WRITE_RESET) - resets,
+            1
+        );
+        assert_eq!(
+            super::tests::proxy_count(names::rustls::WRITE_ERROR) - errors,
+            1
+        );
+
+        let (_, result) = front.socket_write_vectored(&[std::io::IoSlice::new(b"after the reset")]);
+        assert_eq!(result, SocketResult::Closed);
+        assert_eq!(
+            super::tests::proxy_count(names::rustls::WRITE_RESET) - resets,
+            1,
+            "the reset is counted once"
+        );
     }
 
     /// Read everything `transport` holds through [`plain_socket_read`] with a

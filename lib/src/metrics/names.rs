@@ -410,7 +410,15 @@ pub mod proxy_protocol {
 pub mod rustls {
     pub const READ_ERROR: &str = "rustls.read.error";
     pub const READ_INFINITE_LOOP_ERROR: &str = "rustls.read.infinite_loop.error";
+    /// A TLS frontend's `recv(2)` answered `ECONNRESET`/`ECONNABORTED`: the
+    /// peer reset the connection (sozu-proxy/sozu#434). Counted once per
+    /// reset, during the handshake or after it.
+    pub const READ_RESET: &str = "rustls.read.reset";
     pub const WRITE_ERROR: &str = "rustls.write.error";
+    /// A TLS frontend's `writev(2)` answered `ECONNRESET`/`ECONNABORTED`.
+    /// Still counted under [`WRITE_ERROR`] as well, as it was before this
+    /// counter existed.
+    pub const WRITE_RESET: &str = "rustls.write.reset";
     pub const WRITE_INFINITE_LOOP_ERROR: &str = "rustls.write.infinite_loop.error";
 }
 
@@ -441,6 +449,10 @@ pub mod socket {
 pub mod tcp {
     pub const INFINITE_LOOP_ERROR: &str = "tcp.infinite_loop.error";
     pub const READ_ERROR: &str = "tcp.read.error";
+    /// A plain TCP socket's `recv(2)` or `splice(2)` answered
+    /// `ECONNRESET`/`ECONNABORTED`: the peer reset the connection
+    /// (sozu-proxy/sozu#434). Frontend and backend sockets alike.
+    pub const READ_RESET: &str = "tcp.read.reset";
     pub const REQUESTS: &str = "tcp.requests";
     pub const UPGRADE_EXPECT_FAILED: &str = "tcp.upgrade.expect.failed";
     pub const UPGRADE_PIPE_FAILED: &str = "tcp.upgrade.pipe.failed";
@@ -448,6 +460,10 @@ pub mod tcp {
     pub const UPGRADE_SEND_FAILED: &str = "tcp.upgrade.send.failed";
     pub const UPGRADE_SNI_PREREAD_FAILED: &str = "tcp.upgrade.sni_preread.failed";
     pub const WRITE_ERROR: &str = "tcp.write.error";
+    /// A plain TCP socket's `send(2)`/`writev(2)` or `splice(2)` answered
+    /// `ECONNRESET`/`ECONNABORTED`. The `send` paths still count it under
+    /// [`WRITE_ERROR`] as well, as they did before this counter existed.
+    pub const WRITE_RESET: &str = "tcp.write.reset";
 
     /// SNI-preread counters (TCP passthrough routing, sozu-proxy/sozu#1279),
     /// fed by the shell in `lib/src/protocol/tcp_preread/shell.rs` (decision
