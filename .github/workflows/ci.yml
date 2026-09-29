@@ -173,10 +173,32 @@ jobs:
           rustup component add rustfmt --toolchain nightly
 
       - name: Cache cargo target
+        id: rust-cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
         with:
           cache-all-crates: true
           prefix-key: ci-${{ matrix.cell }}
+
+      # A partial restore brings back a `target/` built for a different
+      # `Cargo.lock`. The cache key hashes the lockfile and every manifest, so
+      # this happens only on a run that changes a dependency, and there the
+      # restored artifacts are dead weight: a bump of a base crate (`cfg-if`,
+      # `cc`, `syn`) changes the hash of every unit above it, so Cargo builds
+      # the whole graph again beside the old one. rust-cache's own pre-clean
+      # on a mismatch removes only entries older than a week, which a cache
+      # saved by main never holds. Measured for the `msrv-full` cell (`du -sb`,
+      # 1.93.1, these flags, CARGO_INCREMENTAL=0, line-tables-only), sozu#1675
+      # on a pruned main cache peaks at 8.35GB of `target/` against 5.38GB
+      # from an empty one, and its pod was evicted twice during `Test sozu top
+      # (unit and snapshot tests)` ("Pod ephemeral local storage usage exceeds
+      # the total limit of containers 8Gi", 2026-09-28). Main on its own cache
+      # peaks at 5.50GB, the same as from empty. Deleting `target/` here makes
+      # such a run build its dependencies from scratch, as a first run does;
+      # the registry and git caches under `~/.cargo` stay restored, and an
+      # exact hit is untouched.
+      - name: Drop a target restored for another lockfile
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        run: rm -rf target
 
       - name: Build
         run: cargo build --locked ${{ matrix.flags }}
