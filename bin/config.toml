@@ -571,6 +571,11 @@ load_balancing = "ROUND_ROBIN"
 # - position = TREE | PRE | POST # defaults to TREE, upper case only. PRE rules are tried before the
 #   routing tree, POST rules after it. `hostname = "*"` with `position = "POST"` is a catch-all
 #   that answers every request no other frontend matched (IP literals and single-label hosts included)
+#   Within PRE or POST the first matching rule wins, in the order the worker received the rules;
+#   a reload never re-applies an existing frontend, and a new worker receives them sorted by
+#   address, hostname and path, so keep overlapping PRE (or POST) rules mutually exclusive.
+#   TREE rules follow hostname and path specificity instead. See "Rule order within `PRE` and
+#   `POST`" in doc/configure.md
 # - sticky_session = false # activates sticky sessions for this cluster
 # - https_redirect = false #  activates automatic redirection to HTTPS for this cluster
 # - custom_tag: a tag to retrieve a frontend with the CLI or in the logs

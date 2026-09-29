@@ -1601,7 +1601,8 @@ covers — those matched through the routing trie, which is the default. The two
 other rule positions sit outside it entirely: a `Pre` frontend is consulted
 *before* the trie and answers first whatever the rules here say, and a `Post`
 frontend is consulted *after* it, answering only requests the trie matched
-nothing for.
+nothing for. How rules are ordered inside those two lists is covered in
+"Rule order within `PRE` and `POST`" below.
 
 The `path` rules of one hostname are not resolved by trie structure. They are a
 flat list held at the trie leaf, in the order they were added, and scanned once.
@@ -1752,6 +1753,37 @@ pin this behaviour.
 The `sozu frontend http add` and `sozu frontend https add` commands always
 create a `TREE` rule and take no position argument, so a catch-all frontend can
 only be declared in the configuration file.
+
+### Rule order within `PRE` and `POST`
+
+The three positions are consulted in a fixed order: every `PRE` rule, then the
+routing trie, then every `POST` rule. Inside the trie, precedence comes from
+hostname specificity and the path rules described above, not from the order of
+the frontends. `PRE` and `POST` are different: each is a plain list, scanned
+from the start, and the **first** rule whose hostname, path and method all match
+answers the request (`Router::lookup`). A worker appends each new rule to the
+end of its list and ignores a second rule on the same hostname, path and method
+(`Router::add_pre_rule`, `Router::add_post_rule`).
+
+What decides a list's order is when each rule reached the worker, and that is
+not always the order of the configuration file:
+
+- **A reload does not re-apply existing frontends.** `sozu reload` re-sends
+  every frontend of the file, and the main process refuses each one whose
+  address, hostname, path and method it already holds, with `Skipping a config
+  entry the state refused` at `warn`. The key includes neither `position` nor
+  `cluster_id`, so reordering frontends in the file, or changing only the
+  position or cluster of an existing one, changes nothing on a reload. A
+  frontend deleted from the file is not removed either.
+- **A new worker gets the rules sorted by key.** A worker that starts, restarts
+  or is upgraded receives the saved state, which lists frontends sorted by
+  address, hostname, path and method (`ConfigState::generate_requests`), not in
+  the order they were added. Removing a frontend and adding it again moves it to
+  the end of its list on the running workers only, and the next worker starts
+  from the sorted order.
+
+Keep overlapping `PRE` rules, and overlapping `POST` rules, mutually exclusive
+rather than relying on their order.
 
 ### Hostname case
 
