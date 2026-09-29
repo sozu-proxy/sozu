@@ -3547,6 +3547,23 @@
 
 ### 🐛 Fixed
 
+- **`fix(listener)`: a frontend without its own HSTS follows the default of every listener it
+  reaches ([#1691](https://github.com/sozu-proxy/sozu/issues/1691)).** A frontend carrying
+  policy (tags, headers, redirect, rewrite or auth) and no `hsts` block of its own, added while
+  its HTTPS listener had no HSTS default, was recorded as an explicit override. A listener later
+  added on the same address copied it without its own HSTS default, and a later
+  `sozu listener https update --hsts-*` on its listener did not reach it either, although the
+  documented contract is that every frontend without a per-frontend `[hsts]` block at add time
+  inherits the listener default (`doc/configure.md`, HSTS hot-reconfig). `add_https_frontend`
+  (`lib/src/https.rs`) now records the frontend's own intent — it declared no `hsts` — instead
+  of whether a default existed, so `Router::refresh_inheriting_hsts` (`lib/src/router/mod.rs`)
+  resolves it against each listener's own default, at copy time and on every later patch.
+  **Behaviour change on a single listener:** such a frontend added before the listener had an
+  HSTS default now receives the header once the default is enabled by a patch, as frontends
+  without any policy already did. A frontend with its own `hsts`, including
+  `enabled = false`, is never overridden, and a frontend added while the listener already had a
+  default behaves as before.
+
 - **`fix(h1)`: honour a `close` option in a request `Connection` list.** A client that sent
   `Connection: keep-alive, close` or `Connection: close, TE` kept its connection open after the
   response: `HttpContext::on_request_headers` (`lib/src/protocol/kawa_h1/editor.rs`) compared
