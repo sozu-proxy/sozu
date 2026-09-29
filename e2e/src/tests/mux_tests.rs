@@ -3287,6 +3287,95 @@ fn test_h1_framed_keep_alive_responses_keep_the_client() {
     );
 }
 
+/// A client `Connection` list that carries `close` closes the client
+/// connection after the response (RFC 9110 §7.6.1, RFC 9112 §9.6), even
+/// behind a keep-alive backend whose framed response would otherwise keep it.
+///
+/// `close` is one token of a comma-separated list: before the fix
+/// `HttpContext::on_request_headers` (`lib/src/protocol/kawa_h1/editor.rs`)
+/// compared the whole field value with `close`, so `keep-alive, close` or
+/// `close, TE` kept the connection open and `raw_read_until_eof` ran into
+/// its deadline. The close is paired with the stream's access log, so the
+/// request's `http.active_requests` charge is released too.
+fn try_h1_client_connection_close_option_in_a_list_closes_client(
+    name: &str,
+    request: &[u8],
+) -> State {
+    let front_address = create_local_address();
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) =
+        setup_sync_test(name, config, listeners, state, front_address, 1, false);
+    let mut backend = backends.pop().unwrap();
+    backend.connect();
+
+    let mut stream = raw_connect(front_address);
+    let written = stream.write_all(request).is_ok();
+    let started = Instant::now();
+    while !backend.accept(0) && started.elapsed() < Duration::from_secs(5) {}
+    let forwarded = backend.receive(0);
+    // The backend keeps its connection: only the client asked to close.
+    backend.set_response(http_ok_response("pong"));
+    backend.send(0);
+
+    let result = raw_read_until_eof(&mut stream, Duration::from_secs(5));
+    let released = await_active_requests_h1(&mut worker, 0, Duration::from_secs(10));
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    if let Err(diag) = released {
+        println!("{name}: the request kept its charge - {diag}");
+        return State::Fail;
+    }
+    let response = match result {
+        Ok(response) => response,
+        Err(diag) => {
+            println!("{name}: the client connection was not closed: {diag}");
+            return State::Fail;
+        }
+    };
+    let forwarded_close = forwarded
+        .as_deref()
+        .is_some_and(|request| request.to_ascii_lowercase().contains("close"));
+    let ok = written
+        && forwarded_close
+        && response.starts_with("HTTP/1.1 200")
+        && response.ends_with("pong");
+    if ok && stopped {
+        State::Success
+    } else {
+        println!(
+            "{name}: written={written} forwarded={forwarded:?} response={response:?} \
+             stopped={stopped}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h1_client_connection_close_option_in_a_list_closes_client() {
+    let cases: [(&str, &[u8]); 2] = [
+        (
+            "H1-CLIENT-CLOSE-LIST",
+            b"GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive, close\r\n\r\n",
+        ),
+        (
+            "H1-CLIENT-CLOSE-TE",
+            b"GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close, TE\r\nTE: trailers\r\n\r\n",
+        ),
+    ];
+    for (name, request) in cases {
+        assert_eq!(
+            repeat_until_error_or(
+                3,
+                "H1: a close option in a client Connection list closes the client \
+                 connection after the response",
+                || try_h1_client_connection_close_option_in_a_list_closes_client(name, request),
+            ),
+            State::Success,
+            "{name}"
+        );
+    }
+}
+
 #[test]
 fn test_h1_chunked_truncated_by_backend_close_closes_client() {
     fn try_chunked() -> State {
