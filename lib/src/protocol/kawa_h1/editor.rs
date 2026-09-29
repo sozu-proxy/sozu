@@ -110,6 +110,58 @@ fn has_connection_option(value: &[u8], option: &[u8]) -> bool {
         .any(|listed| compare_no_case(listed.trim_ascii(), option))
 }
 
+/// Announce that the connection closes after `message` (RFC 9112 §9.6)
+/// without dropping the options it already lists: removing one would turn
+/// the field it nominates as hop-by-hop into an end-to-end one (RFC 9110
+/// §7.6.1). Every `Connection` line is elided and their options merged into
+/// one pushed line ending in a single `close`; only the `keep-alive` the
+/// close contradicts, and a `close` already listed, are dropped. With
+/// `refuse_upgrade`, the `upgrade` option goes too, with every `Upgrade`
+/// field it nominates, so the message requests no protocol switch.
+fn merge_connection_options_into_close(message: &mut GenericHttpStream, refuse_upgrade: bool) {
+    let buf = message.storage.buffer();
+    let mut options = Vec::new();
+    for block in &mut message.blocks {
+        if let kawa::Block::Header(header) = block
+            && !header.is_elided()
+        {
+            let key = header.key.data(buf);
+            if compare_no_case(key, b"connection") {
+                for option in header.val.data(buf).split(|byte| *byte == b',') {
+                    let option = option.trim_ascii();
+                    let dropped = option.is_empty()
+                        || compare_no_case(option, b"keep-alive")
+                        || compare_no_case(option, b"close")
+                        || (refuse_upgrade && compare_no_case(option, b"upgrade"));
+                    if !dropped {
+                        options.extend_from_slice(option);
+                        options.extend_from_slice(b", ");
+                    }
+                }
+                header.elide();
+            } else if refuse_upgrade && compare_no_case(key, b"upgrade") {
+                header.elide();
+            }
+        }
+    }
+    // A lone `close` needs no allocation: the common shutdown case of a
+    // message that listed no other option.
+    let val = if options.is_empty() {
+        kawa::Store::Static(b"close")
+    } else {
+        options.extend_from_slice(b"close");
+        debug_assert!(
+            is_crlf_free(&options),
+            "the merged Connection options must be CR/LF-free (anti-injection)"
+        );
+        kawa::Store::from_vec(options)
+    };
+    message.push_block(kawa::Block::Header(kawa::Pair {
+        key: kawa::Store::Static(b"Connection"),
+        val,
+    }));
+}
+
 /// `true` when `bytes` contains no CR or LF — the anti-injection
 /// invariant for any header value Sōzu serialises onto the wire. A value
 /// carrying a raw CR/LF could split one header into two (request/response
@@ -1231,9 +1283,9 @@ impl HttpContext {
         }
 
         // If found:
-        // - set Connection to "close" if closing is set
         // - set keep_alive_frontend to false if Connection lists "close"
-        //   (RFC 9110 §7.6.1, RFC 9112 §9.6), as on the response side
+        //   (RFC 9110 §7.6.1, RFC 9112 §9.6), as on the response side,
+        //   shutting down or not
         // - update value of X-Forwarded-Proto
         // - update value of X-Forwarded-Port
         // - store X-Forwarded-For
@@ -1253,7 +1305,6 @@ impl HttpContext {
         let mut has_x_port = false;
         let mut has_x_proto = false;
         let mut has_x_request_id = false;
-        let mut has_connection = false;
         #[cfg(feature = "opentelemetry")]
         let mut traceparent: Option<&mut kawa::Pair> = None;
         #[cfg(feature = "opentelemetry")]
@@ -1263,13 +1314,8 @@ impl HttpContext {
                 kawa::Block::Header(header) if !header.is_elided() => {
                     let key = header.key.data(buf);
                     if compare_no_case(key, b"connection") {
-                        has_connection = true;
-                        if self.closing {
-                            header.val = kawa::Store::Static(b"close");
-                        } else {
-                            let val = header.val.data(buf);
-                            self.keep_alive_frontend &= !has_connection_option(val, b"close");
-                        }
+                        let val = header.val.data(buf);
+                        self.keep_alive_frontend &= !has_connection_option(val, b"close");
                     } else if strips_x_forwarded && is_managed_x_forwarded(key) {
                         // `rfc7239`: a client X-Forwarded-For, -Proto,
                         // -Port or -Host is removed, not trusted. The
@@ -1551,12 +1597,17 @@ impl HttpContext {
                 val: kawa::Store::Static(proto.as_bytes()),
             }));
         }
-        // Create a "Connection" header in case it was not found and closing it set
-        if !has_connection && self.closing {
-            request.push_block(kawa::Block::Header(kawa::Pair {
-                key: kawa::Store::Static(b"Connection"),
-                val: kawa::Store::Static(b"close"),
-            }));
+        // A shutting-down Sōzu closes the client connection after this
+        // response (`ConnectionH1::writable`, `lib/src/protocol/mux/h1.rs`),
+        // so the request announces the close too, keeping the other options
+        // the client listed. It refuses a protocol upgrade: `writable` tests
+        // `closing` before it handles a 101, so an upgrade would switch the
+        // client to a connection that closes at once. Dropping the `upgrade`
+        // option with its `Upgrade` field lets the backend answer in
+        // HTTP/1.1, which it always may (RFC 9110 §7.8), and the client
+        // retry the upgrade on a new connection.
+        if self.closing {
+            merge_connection_options_into_close(request, true);
         }
         // Inject "X-Request-Id" derived from the request ULID when the client
         // (or upstream LB) did not already supply one. When already present,
@@ -1702,8 +1753,8 @@ impl HttpContext {
         };
 
         // If found:
-        // - set Connection to "close" if closing is set
-        // - set keep_alive_backend to false if Connection lists "close"
+        // - set keep_alive_backend to false if Connection lists "close",
+        //   shutting down or not
         // - note a "close" and a "keep-alive" option, and Transfer-Encoding
         //   (HTTP/1.0)
         let mut announces_close = false;
@@ -1714,16 +1765,11 @@ impl HttpContext {
                 kawa::Block::Header(header) if !header.is_elided() => {
                     let key = header.key.data(buf);
                     if compare_no_case(key, b"connection") {
-                        if self.closing {
-                            header.val = kawa::Store::Static(b"close");
-                            announces_close = true;
-                        } else {
-                            let val = header.val.data(buf);
-                            let is_close = has_connection_option(val, b"close");
-                            announces_close |= is_close;
-                            self.keep_alive_backend &= !is_close;
-                            asks_keep_alive |= has_connection_option(val, b"keep-alive");
-                        }
+                        let val = header.val.data(buf);
+                        let is_close = has_connection_option(val, b"close");
+                        announces_close |= is_close;
+                        self.keep_alive_backend &= !is_close;
+                        asks_keep_alive |= has_connection_option(val, b"keep-alive");
                     } else if compare_no_case(key, b"transfer-encoding") {
                         has_transfer_encoding = true;
                     }
@@ -1748,54 +1794,32 @@ impl HttpContext {
         // (`ConnectionH1::terminate_close_delimited`,
         // `lib/src/protocol/mux/h1.rs`) and closes an H1 client connection
         // after the response (`ConnectionH1::writable`), and announces that
-        // close (RFC 9112 §9.6): its `Connection` options are merged into one
-        // line ending in `close`, keeping every field they nominate
-        // hop-by-hop (RFC 9110 §7.6.1) and dropping only the `keep-alive`
-        // the close contradicts. The H2 converter drops that line with every
+        // close (RFC 9112 §9.6).
+        //
+        // A shutting-down Sōzu closes the client connection after the
+        // response too (`ConnectionH1::writable` tests `closing` first), in
+        // HTTP/1.1 as in HTTP/1.0, and announces it the same way. Either
+        // close merges the response's `Connection` options into one line
+        // ending in `close`, keeping every field they nominate hop-by-hop
+        // (RFC 9110 §7.6.1) and dropping only the `keep-alive` the close
+        // contradicts. The H2 converter drops that line with every
         // connection-specific header.
         //
         // An interim 1xx says nothing about the connection: its persistence
         // belongs to the final response, which runs this callback again, and
         // a 101 must keep its `Connection: Upgrade` (RFC 9110 §7.8).
-        if is_http10 {
-            if !is_interim {
-                let close_delimited = response.parsing_phase == kawa::ParsingPhase::Body
-                    && response.body_size == kawa::BodySize::Empty;
-                if !asks_keep_alive || close_delimited || has_transfer_encoding {
-                    self.keep_alive_backend = false;
-                }
-                if !self.keep_alive_backend || self.closing {
-                    let mut options = Vec::with_capacity(32);
-                    for block in &mut response.blocks {
-                        if let kawa::Block::Header(header) = block
-                            && !header.is_elided()
-                            && compare_no_case(header.key.data(buf), b"connection")
-                        {
-                            for option in header.val.data(buf).split(|byte| *byte == b',') {
-                                let option = option.trim_ascii();
-                                if !option.is_empty()
-                                    && !compare_no_case(option, b"keep-alive")
-                                    && !compare_no_case(option, b"close")
-                                {
-                                    options.extend_from_slice(option);
-                                    options.extend_from_slice(b", ");
-                                }
-                            }
-                            header.elide();
-                        }
-                    }
-                    options.extend_from_slice(b"close");
-                    debug_assert!(
-                        is_crlf_free(&options),
-                        "the merged Connection options must be CR/LF-free (anti-injection)"
-                    );
-                    response.push_block(kawa::Block::Header(kawa::Pair {
-                        key: kawa::Store::Static(b"Connection"),
-                        val: kawa::Store::from_vec(options),
-                    }));
-                    announces_close = true;
-                }
+        if is_http10 && !is_interim {
+            let close_delimited = response.parsing_phase == kawa::ParsingPhase::Body
+                && response.body_size == kawa::BodySize::Empty;
+            if !asks_keep_alive || close_delimited || has_transfer_encoding {
+                self.keep_alive_backend = false;
             }
+        }
+        if !is_interim && (self.closing || (is_http10 && !self.keep_alive_backend)) {
+            merge_connection_options_into_close(response, false);
+            announces_close = true;
+        }
+        if is_http10 {
             if let kawa::StatusLine::Response { version, .. } = &mut response.detached.status_line {
                 *version = kawa::Version::V11;
             }
@@ -4367,6 +4391,248 @@ mod tests {
                     .iter()
                     .all(|line| !line.to_ascii_lowercase().contains("close")),
                 "{label}: no close is announced, got {wire:?}"
+            );
+        }
+    }
+
+    /// A message parsed by kawa's H1 parser on a context that is shutting
+    /// down (`HttpContext::closing`, set by `Mux::shutting_down_inner`,
+    /// `lib/src/protocol/mux/mod.rs`), which the test keeps.
+    fn parse_closing(
+        pool: &mut crate::pool::Pool,
+        kind: kawa::Kind,
+        bytes: &[u8],
+    ) -> (GenericHttpStream, HttpContext) {
+        let mut ctx = make_context();
+        ctx.closing = true;
+        let mut kawa: GenericHttpStream = kawa::Kawa::new(
+            kind,
+            kawa::Buffer::new(
+                pool.checkout()
+                    .expect("the test pool must hand out a buffer"),
+            ),
+        );
+        kawa.storage.space()[..bytes.len()].copy_from_slice(bytes);
+        kawa.storage.fill(bytes.len());
+        kawa::h1::parse(&mut kawa, &mut ctx);
+        assert!(!kawa.is_error(), "premise: the message must parse");
+        (kawa, ctx)
+    }
+
+    /// The head of a serialised message, lower-cased, one entry per line.
+    fn head_lines(wire: &str) -> Vec<String> {
+        let (head, _) = wire
+            .split_once("\r\n\r\n")
+            .expect("the head ends with an empty line");
+        head.split("\r\n")
+            .map(|line| line.to_ascii_lowercase())
+            .collect()
+    }
+
+    /// While Sōzu shuts down, the request it forwards announces the close
+    /// (RFC 9112 §9.6) without dropping the other options the client listed:
+    /// removing one would turn the field it nominates as hop-by-hop into an
+    /// end-to-end one (RFC 9110 §7.6.1). The options are merged into one
+    /// line ending in a single `close`, `keep-alive` is dropped as the close
+    /// contradicts it, and a client `close` still clears
+    /// `keep_alive_frontend`.
+    ///
+    /// TO SEE THIS RED, restore the whole-value overwrite of the `Connection`
+    /// field under `self.closing` in `HttpContext::on_request_headers`.
+    #[test]
+    fn a_shutting_down_request_keeps_its_connection_options() {
+        let cases: [(&str, &[u8], &str, bool); 6] = [
+            (
+                "no Connection",
+                b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                "Connection: close",
+                true,
+            ),
+            (
+                "nominated field",
+                b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: x-custom\r\nX-Custom: 1\r\n\r\n",
+                "Connection: x-custom, close",
+                true,
+            ),
+            (
+                "keep-alive dropped",
+                b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive, x-custom\r\n\r\n",
+                "Connection: x-custom, close",
+                true,
+            ),
+            (
+                "single close not duplicated",
+                b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+                "Connection: close",
+                false,
+            ),
+            (
+                "two lines merged",
+                b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: x-one\r\nConnection: TE, Close \r\nTE: trailers\r\n\r\n",
+                "Connection: x-one, TE, close",
+                false,
+            ),
+            (
+                "HTTP/1.0",
+                b"GET / HTTP/1.0\r\nHost: example.com\r\nConnection: keep-alive, x-custom\r\n\r\n",
+                "Connection: x-custom, close",
+                true,
+            ),
+        ];
+        for (label, bytes, want, keeps) in cases {
+            let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+            let (mut kawa, ctx) = parse_closing(&mut pool, kawa::Kind::Request, bytes);
+            assert_eq!(
+                ctx.keep_alive_frontend, keeps,
+                "{label}: a client close is still recorded"
+            );
+            let wire = serialized_request(&mut kawa);
+            assert_eq!(
+                connection_lines(&wire),
+                [want],
+                "{label}: the options survive beside one close, got {wire:?}"
+            );
+        }
+    }
+
+    /// A shutting-down Sōzu refuses a protocol upgrade: it closes the client
+    /// connection as soon as the response is written
+    /// (`ConnectionH1::writable`, `lib/src/protocol/mux/h1.rs`, tests
+    /// `closing` before it handles a 101), so a 101 would hand the client a
+    /// switched protocol on a connection that is already closing. The
+    /// `upgrade` option is dropped with the `Upgrade` field it nominates
+    /// (RFC 9110 §7.6.1), so the backend answers in HTTP/1.1, which it may
+    /// always do (RFC 9110 §7.8), and the client retries the upgrade on a
+    /// new connection. The other options are kept.
+    ///
+    /// TO SEE THIS RED, keep the `upgrade` option or the `Upgrade` field in
+    /// the shutdown merge of `HttpContext::on_request_headers`.
+    #[test]
+    fn a_shutting_down_request_does_not_upgrade() {
+        let cases: [(&str, &[u8], &str); 2] = [
+            (
+                "websocket",
+                b"GET /chat HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+                "Connection: close",
+            ),
+            (
+                "upgrade among other options",
+                b"GET /chat HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive, Upgrade, x-custom\r\nUpgrade: websocket\r\nX-Custom: 1\r\n\r\n",
+                "Connection: x-custom, close",
+            ),
+        ];
+        for (label, bytes, want) in cases {
+            let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+            let (mut kawa, _ctx) = parse_closing(&mut pool, kawa::Kind::Request, bytes);
+            let wire = serialized_request(&mut kawa);
+            assert_eq!(
+                connection_lines(&wire),
+                [want],
+                "{label}: the upgrade is not requested, got {wire:?}"
+            );
+            assert!(
+                !head_lines(&wire)
+                    .iter()
+                    .any(|line| line.starts_with("upgrade:")),
+                "{label}: the Upgrade field is not forwarded, got {wire:?}"
+            );
+        }
+    }
+
+    /// While Sōzu shuts down, the final response it forwards announces the
+    /// close (RFC 9112 §9.6), in HTTP/1.1 as in HTTP/1.0, and keeps the
+    /// options the backend listed (RFC 9110 §7.6.1) apart from the
+    /// `keep-alive` the close contradicts. The backend's own `close` is
+    /// still recorded in `keep_alive_backend`, so that connection is not
+    /// pooled.
+    ///
+    /// TO SEE THIS RED, restore the whole-value overwrite of the `Connection`
+    /// field under `self.closing` in `HttpContext::on_response_headers`.
+    #[test]
+    fn a_shutting_down_response_keeps_its_connection_options() {
+        let cases: [(&str, &[u8], &str, bool); 6] = [
+            (
+                "no Connection",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabcd",
+                "Connection: close",
+                true,
+            ),
+            (
+                "nominated field",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: x-custom\r\nX-Custom: 1\r\n\r\nabcd",
+                "Connection: x-custom, close",
+                true,
+            ),
+            (
+                "keep-alive dropped",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: keep-alive, x-custom\r\n\r\nabcd",
+                "Connection: x-custom, close",
+                true,
+            ),
+            (
+                "single close not duplicated",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nabcd",
+                "Connection: close",
+                false,
+            ),
+            (
+                "two lines merged",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: x-one\r\nConnection: x-two, Close \r\n\r\nabcd",
+                "Connection: x-one, x-two, close",
+                false,
+            ),
+            (
+                "persistent HTTP/1.0",
+                b"HTTP/1.0 200 OK\r\nContent-Length: 4\r\nConnection: keep-alive, x-custom\r\n\r\nabcd",
+                "Connection: x-custom, close",
+                true,
+            ),
+        ];
+        for (label, bytes, want, keeps) in cases {
+            let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+            let (mut kawa, ctx) = parse_closing(&mut pool, kawa::Kind::Response, bytes);
+            assert_eq!(
+                ctx.keep_alive_backend, keeps,
+                "{label}: the backend's close is still recorded"
+            );
+            let wire = serialized_request(&mut kawa);
+            assert!(wire.starts_with("HTTP/1.1 200 OK\r\n"), "got {wire:?}");
+            assert_eq!(
+                connection_lines(&wire),
+                [want],
+                "{label}: the options survive beside one close, got {wire:?}"
+            );
+        }
+    }
+
+    /// An interim response says nothing about the connection, shutdown or
+    /// not: the final response carries the close, and a 101 keeps its
+    /// `Connection: Upgrade` (RFC 9110 §7.8).
+    ///
+    /// TO SEE THIS RED, apply the shutdown merge of
+    /// `HttpContext::on_response_headers` to 1xx responses too.
+    #[test]
+    fn a_shutting_down_interim_response_is_left_alone() {
+        let cases: [(&str, &[u8], &[&str]); 2] = [
+            (
+                "101",
+                b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+                &["Connection: Upgrade"],
+            ),
+            ("100", b"HTTP/1.1 100 Continue\r\n\r\n", &[]),
+        ];
+        for (label, bytes, want) in cases {
+            let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+            let (mut kawa, ctx) = parse_closing(&mut pool, kawa::Kind::Response, bytes);
+            assert!(
+                ctx.keep_alive_backend,
+                "{label}: an interim response leaves keep_alive_backend alone"
+            );
+            let wire = serialized_request(&mut kawa);
+            assert_eq!(
+                connection_lines(&wire),
+                want,
+                "{label}: the interim Connection lines are forwarded as sent, got {wire:?}"
             );
         }
     }

@@ -121,7 +121,34 @@ mutable companion to the Kawa parser. Its `kawa::h1::ParserCallbacks` impl
   `a_close_option_in_a_request_connection_list_closes_the_client` (unit, in
   `editor.rs`) and
   `test_h1_client_connection_close_option_in_a_list_closes_client`
-  (`e2e/src/tests/mux_tests.rs`);
+  (`e2e/src/tests/mux_tests.rs`).
+  While Sōzu shuts down (`HttpContext::closing`, set by
+  `Mux::shutting_down_inner`, `lib/src/protocol/mux/mod.rs`),
+  `ConnectionH1::writable` closes the client connection after the response
+  whatever the flags say, and the request announces it (sozu-proxy/sozu#1690):
+  `merge_connection_options_into_close` (`editor.rs`) elides every
+  `Connection` line and pushes one that lists the client's other options
+  followed by a single `close`, dropping only the `keep-alive` the close
+  contradicts, so a field the client nominated as hop-by-hop stays
+  hop-by-hop (RFC 9110 §7.6.1). A request without `Connection` gets
+  `Connection: close`. A client `close` still clears `keep_alive_frontend`.
+  The shutdown refuses a protocol upgrade: the `upgrade` option is dropped
+  with every `Upgrade` field it nominates, so the backend answers in
+  HTTP/1.1, which it always may (RFC 9110 §7.8), and the client retries
+  the upgrade on a new connection. Keeping it would not upgrade either:
+  `ConnectionH1::writable` tests `closing` before it handles a 101, so the
+  client would be switched to a connection that closes at once. Covered by
+  `a_shutting_down_request_keeps_its_connection_options` and
+  `a_shutting_down_request_does_not_upgrade` (unit, in `editor.rs`). The
+  request-side shutdown branch is unreachable today, and the response-side
+  one is not reached by any known sequence: `Mux::shutting_down_inner`
+  (`lib/src/protocol/mux/mod.rs`) sets `closing` only on an `Unlinked`,
+  non-quiesced stream, whose request and response heads were both already
+  edited, and it closes an idle keep-alive session instead of marking it.
+  Both branches are defensive, for a future caller that sets `closing`
+  before a head is parsed, and only unit tests cover them: measured on
+  2026-09-29 with a probe in both branches, the whole `sozu-e2e` suite
+  never reached them;
 - `on_response_headers` (`editor.rs`) — captures `:status`, `:reason`,
   optionally rewrites `Set-Cookie` for sticky sessions. The reason is kept
   for the access log as the `'static` phrase RFC 9110 §15 registers for the
@@ -165,7 +192,14 @@ mutable companion to the Kawa parser. Its `kawa::h1::ParserCallbacks` impl
   `Connection: Upgrade`. A persistent HTTP/1.0 response
   (`Connection: keep-alive` with a length) keeps both connections and its
   header. The `close` option is matched as a list token, for every version,
-  so `Connection: keep-alive, close` closes the backend too. Covered by
+  so `Connection: keep-alive, close` closes the backend too. While Sōzu
+  shuts down, every final response gets the same merged line ending in
+  `close`, in HTTP/1.1 as in HTTP/1.0 and with or without a `Connection` of
+  its own, since `ConnectionH1::writable` closes the client connection after
+  it; the backend's own `close` still clears `keep_alive_backend`, and a 1xx
+  is left alone as above (sozu-proxy/sozu#1690, covered by
+  `a_shutting_down_response_keeps_its_connection_options` and
+  `a_shutting_down_interim_response_is_left_alone`). Covered by
   `an_http10_keep_alive_response_is_forwarded_as_http11`,
   `an_http10_response_without_keep_alive_is_forwarded_as_http11_with_close`,
   `a_close_option_in_a_connection_list_closes_the_backend`,
