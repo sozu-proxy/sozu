@@ -979,7 +979,9 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     }
                     // The connection outlives the response only when neither
                     // side asked to close it. `keep_alive_backend` is false
-                    // once the backend's response carried `Connection: close`
+                    // once the backend's response carried `Connection: close`,
+                    // or was a non-persistent HTTP/1.0 one that sozu forwards
+                    // as HTTP/1.1 with `Connection: close` added
                     // (`HttpContext::on_response_headers`,
                     // `lib/src/protocol/kawa_h1/editor.rs`): sozu forwards that
                     // header, so RFC 9112 §9.6 requires it to close after this

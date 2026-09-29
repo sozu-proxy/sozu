@@ -4491,6 +4491,26 @@ fn test_h2_close_delimited_body_ends_stream_at_backend_close() {
     );
 }
 
+/// An HTTP/1.0 response without `Connection: keep-alive` is not persistent
+/// (RFC 9112 §9.3), so its close-delimited body ends at the backend close
+/// with END_STREAM (sozu-proxy/sozu#16). Before the fix the backend
+/// connection was taken for persistent and its EOF did not end the body.
+#[test]
+fn test_h2_http10_close_delimited_body_ends_stream_at_backend_close() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: an HTTP/1.0 close-delimited body ends with END_STREAM at the backend close",
+            || try_h2_body_complete_at_backend_close(
+                "H2-HTTP10-CLOSE-DELIM",
+                "HTTP/1.0 200 OK\r\n\r\nabcd",
+                4,
+            ),
+        ),
+        State::Success
+    );
+}
+
 /// Non-regression for sozu-proxy/sozu#1642: an H1 frontend closes after a
 /// response carrying the backend's `Connection: close`, an H2 frontend does
 /// not. `Connection` is hop-by-hop (RFC 9110 §7.6.1) and never reaches an H2
@@ -4567,6 +4587,24 @@ fn test_h2_close_delimited_body_keeps_the_h2_connection() {
             || try_h2_backend_connection_close_keeps_the_connection(
                 "H2-CLOSE-DELIM-REUSE",
                 "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nabcd",
+            ),
+        ),
+        State::Success
+    );
+}
+
+/// The `Connection: close` Sōzu adds to a non-persistent HTTP/1.0 response
+/// (sozu-proxy/sozu#16) is hop-by-hop: it never reaches an H2 client and
+/// never closes the H2 connection.
+#[test]
+fn test_h2_http10_close_delimited_body_keeps_the_h2_connection() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: a close-delimited HTTP/1.0 response keeps the H2 client connection",
+            || try_h2_backend_connection_close_keeps_the_connection(
+                "H2-HTTP10-CLOSE-DELIM-REUSE",
+                "HTTP/1.0 200 OK\r\n\r\nabcd",
             ),
         ),
         State::Success

@@ -3503,6 +3503,27 @@
 
 ### 🐛 Fixed
 
+- **`fix(h1)`: forward HTTP/1.0 backend responses as HTTP/1.1
+  ([#16](https://github.com/sozu-proxy/sozu/issues/16)).** A backend's `HTTP/1.0` status line
+  reached the client verbatim; Sōzu now answers in its own version (RFC 9110 §6.2).
+  `HttpContext::on_response_headers` (`lib/src/protocol/kawa_h1/editor.rs`) rewrites the
+  version, and because HTTP/1.0 is not persistent without `Connection: keep-alive` (RFC 9112
+  §9.3), a response lacking that option, with a close-delimited body, or with
+  `Transfer-Encoding` (faulty framing in HTTP/1.0, RFC 9112 §6.1) now closes the backend
+  connection and reaches an H1 client with its `Connection` options merged into one line
+  ending in `close`, after which the client connection closes. Options that nominate
+  hop-by-hop fields are kept; only the contradicting `keep-alive` is dropped. A 1xx keeps
+  its headers, so a 101's `Connection: Upgrade` survives. `close` is now matched as a list
+  token for every version, so `Connection: keep-alive, close` closes the backend
+  connection. This also fixes such a close-delimited HTTP/1.0 body: the backend connection
+  was taken for persistent, so its EOF did not end the body cleanly: an H2 client received
+  the body followed by RST_STREAM instead of END_STREAM. An H2 client never sees the added
+  option, and its connection stays open. A persistent HTTP/1.0 response with a length keeps
+  both connections. **Performance-visible:** a backend that answers HTTP/1.0 without
+  `Connection: keep-alive` now makes Sōzu close the H1 client connection after every
+  response, so those clients open a new connection (and, over TLS, a new handshake) per
+  request; enable keep-alive on such backends to avoid it.
+
 - **`test(lib)`: `cargo test -p sozu-lib --release` no longer fails on six tests that cannot run
   in release.** The three `should_panic` tests of `h2_header_reassembly` rely on a
   `debug_assert!` and are now `#[cfg(debug_assertions)]`. The two `certificate_resolver_logs_redact_*`
