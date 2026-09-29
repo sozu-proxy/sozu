@@ -129,6 +129,59 @@ address = "0.0.0.0:8080"
 # expect_proxy = false
 ```
 
+#### Binding a listener to a network interface
+
+`interface` binds the listening socket to one network interface
+(`SO_BINDTODEVICE`), for an interface whose address is not known ahead or not
+stable, such as a WireGuard `wg0`: listen on the wildcard address and let the
+interface select the traffic.
+
+```toml
+[[listeners]]
+protocol = "https"
+address = "0.0.0.0:443"
+interface = "wg0"
+```
+
+- Available on `http`, `https`, `tcp` and `udp` listeners. **Linux only**: on
+  any other platform the key is refused when the configuration is loaded, never
+  ignored. The name must be a valid interface name (at most 15 bytes, no `/`,
+  `:`, `%` or whitespace).
+- The interface must exist when the listener is activated. Binding a socket to
+  an interface needs the `CAP_NET_RAW` capability on Linux kernels before 5.7;
+  from 5.7 on, an unprivileged process may do it. Activation fails with an error
+  naming the listener address and the interface otherwise. The systemd units in
+  `os-build/systemd/` run Sōzu as root without a capability bounding set, so
+  they need nothing more; a unit that drops privileges (`User=`,
+  `CapabilityBoundingSet=`, `AmbientCapabilities=`) on a kernel before 5.7 must
+  keep `CAP_NET_RAW` in both sets.
+- The interface is part of the listener identity: two listeners may share an
+  `address` when their interfaces differ (`0.0.0.0:443` on `wg0` and on
+  `eth1`), and a listener without `interface` is the one it always was. On the
+  command line, `sozu listener <protocol> add|remove|activate|deactivate` take
+  `--interface`, and `sozu listener list` shows it; state files and the
+  `ListListeners` answer key such a listener `<address>%<interface>`.
+- Frontends and certificates name their listener by `address` alone, so they
+  apply to every listener of their protocol sharing that address, including one
+  added later: a listener added next to one already on its address (with
+  `sozu listener <protocol> add --interface` or a configuration reload) takes
+  over that listener's frontends and certificates when it is created. In the
+  configuration file, listeners sharing an address must use the same protocol,
+  because a file frontend finds its listener's protocol from its address.
+  Per-interface routing is not supported.
+- `interface` cannot be patched with `sozu listener <protocol> update`: moving a
+  listener to another interface means removing it and adding it again. An update
+  names its listener by address, and is refused when several listeners share
+  that address.
+- The binding survives a worker or main-process upgrade: the socket is handed
+  over with its interface.
+- **Upgrade the main process and every worker before adding a listener with
+  `interface`.** A Sōzu that predates the key ignores it: an older worker would
+  bind such a listener on every interface, and would activate, deactivate or
+  remove listeners by address alone. Downgrading is not supported while a
+  listener names an interface: an older Sōzu cannot read the
+  `<address>%<interface>` key in a saved state or an upgrade hand-off.
+
 #### Options specific to HTTP and HTTPS listeners
 
 Since version 1.0.0, Sōzu allows custom HTTP answers defined for HTTP and HTTPS

@@ -423,6 +423,7 @@ fn setup_h2_listener_only_with_zombie_interval(
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -759,6 +760,7 @@ fn try_h2_goaway_graceful_drain() -> State {
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -921,6 +923,7 @@ fn try_h2_continuation_survives_a_graceful_drain_mid_reassembly() -> State {
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -3147,6 +3150,7 @@ fn try_h1_frontend_h2_backend() -> State {
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -3240,6 +3244,7 @@ fn try_h2_goaway_retry_succeeds() -> State {
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -3352,6 +3357,7 @@ fn try_h2_large_response_completes() -> State {
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -3442,6 +3448,7 @@ fn try_h2_slow_stream_does_not_block_fast_stream() -> State {
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -3776,6 +3783,7 @@ fn try_h2_rst_stream_per_stream_independence() -> State {
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -4024,6 +4032,7 @@ fn try_h2_settings_ack_timeout() -> State {
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -6019,6 +6028,7 @@ fn try_h2_stream_priority_basic() -> State {
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -6557,6 +6567,7 @@ fn try_h2_graceful_shutdown_completes_large_transfer() -> State {
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -6849,6 +6860,7 @@ fn start_h2_graceful_deadline_fixture(
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -7293,6 +7305,7 @@ fn try_h2_with_proxy_protocol_v2() -> State {
         listener_builder.to_tls(None).unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -7460,6 +7473,7 @@ fn try_h2_custom_error_page_rendering() -> State {
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -8639,6 +8653,7 @@ fn try_h2_upstream_ping_flood_detection() -> State {
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -8740,6 +8755,7 @@ fn try_h2_upstream_settings_flood_detection() -> State {
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -8840,6 +8856,7 @@ fn try_h2_upstream_window_update_flood() -> State {
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -9128,6 +9145,7 @@ fn try_h2_large_h1_response_content_length() -> State {
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -9243,6 +9261,7 @@ fn try_h2_large_h1_response_chunked() -> State {
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -9391,6 +9410,7 @@ fn try_h2_large_h1_response_close_delimited() -> State {
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -9535,6 +9555,7 @@ fn try_h2_large_response_flow_control_pressure() -> State {
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -9671,6 +9692,7 @@ fn try_h2_large_response_8mb_window_update_race() -> State {
         listener_builder.to_tls(None).unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -9843,6 +9865,7 @@ fn try_h2_large_response_1gb_stress() -> State {
         listener_builder.to_tls(None).unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -10225,6 +10248,7 @@ fn try_h2_active_requests_balances_over_one_request() -> State {
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,

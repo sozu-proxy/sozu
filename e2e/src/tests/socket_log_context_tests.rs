@@ -189,6 +189,7 @@ fn try_tls_socket_log_peer_is_the_advertised_client() -> State {
             .expect("could not build the https listener config"),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,

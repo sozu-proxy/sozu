@@ -1394,6 +1394,24 @@ pub(crate) fn rfc3339_utc(t: std::time::SystemTime) -> String {
     format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{micros:06}Z")
 }
 
+/// The listener an `Update*Listener` patch resolves to: the only one on
+/// `address`, whatever its interface, or `None` when several share it.
+fn sole_listener_at<V>(
+    listeners: &std::collections::BTreeMap<sozu_command_lib::listener_key::ListenerKey, V>,
+    address: sozu_command_lib::proto::command::SocketAddress,
+) -> Option<&V> {
+    let address = std::net::SocketAddr::from(address);
+    let mut matching = listeners
+        .iter()
+        .filter(|(key, _)| key.address == address)
+        .map(|(_, listener)| listener);
+    let first = matching.next();
+    if matching.next().is_some() {
+        return None;
+    }
+    first
+}
+
 /// Build the [AuditEntry] for a control-plane request, or `None` for
 /// non-mutating verbs (the caller skips them — they have no audit footprint).
 ///
@@ -1405,7 +1423,6 @@ fn audit_entry_for(
     request: &RequestType,
     state: &sozu_command_lib::state::ConfigState,
 ) -> Option<AuditEntry> {
-    use std::net::SocketAddr;
     match request {
         RequestType::AddCluster(cluster) => {
             let (verb, counter) = audit_verb!("cluster_added");
@@ -1594,7 +1611,11 @@ fn audit_entry_for(
                 kind: EventKind::ListenerActivated,
                 verb,
                 counter,
-                target: format!("listener:{:?}:{}", listener.proxy(), listener.address),
+                target: format!(
+                    "listener:{:?}:{}",
+                    listener.proxy(),
+                    listener.listener_key()
+                ),
                 cluster_id: None,
                 backend_id: None,
                 address: Some(listener.address),
@@ -1607,7 +1628,11 @@ fn audit_entry_for(
                 kind: EventKind::ListenerDeactivated,
                 verb,
                 counter,
-                target: format!("listener:{:?}:{}", listener.proxy(), listener.address),
+                target: format!(
+                    "listener:{:?}:{}",
+                    listener.proxy(),
+                    listener.listener_key()
+                ),
                 cluster_id: None,
                 backend_id: None,
                 address: Some(listener.address),
@@ -1616,7 +1641,9 @@ fn audit_entry_for(
         }
         RequestType::UpdateHttpListener(patch) => {
             let (verb, counter) = audit_verb!("http_listener_updated");
-            let current = state.http_listeners.get(&SocketAddr::from(patch.address));
+            // The listener the patch resolves to: the one on its address, or
+            // none when several share it (the state refuses that patch).
+            let current = sole_listener_at(&state.http_listeners, patch.address);
             Some(AuditEntry {
                 kind: EventKind::ListenerUpdated,
                 verb,
@@ -1634,7 +1661,9 @@ fn audit_entry_for(
         }
         RequestType::UpdateHttpsListener(patch) => {
             let (verb, counter) = audit_verb!("https_listener_updated");
-            let current = state.https_listeners.get(&SocketAddr::from(patch.address));
+            // The listener the patch resolves to: the one on its address, or
+            // none when several share it (the state refuses that patch).
+            let current = sole_listener_at(&state.https_listeners, patch.address);
             Some(AuditEntry {
                 kind: EventKind::ListenerUpdated,
                 verb,
@@ -1652,7 +1681,9 @@ fn audit_entry_for(
         }
         RequestType::UpdateTcpListener(patch) => {
             let (verb, counter) = audit_verb!("tcp_listener_updated");
-            let current = state.tcp_listeners.get(&SocketAddr::from(patch.address));
+            // The listener the patch resolves to: the one on its address, or
+            // none when several share it (the state refuses that patch).
+            let current = sole_listener_at(&state.tcp_listeners, patch.address);
             Some(AuditEntry {
                 kind: EventKind::ListenerUpdated,
                 verb,
@@ -1670,7 +1701,9 @@ fn audit_entry_for(
         }
         RequestType::UpdateUdpListener(patch) => {
             let (verb, counter) = audit_verb!("udp_listener_updated");
-            let current = state.udp_listeners.get(&SocketAddr::from(patch.address));
+            // The listener the patch resolves to: the one on its address, or
+            // none when several share it (the state refuses that patch).
+            let current = sole_listener_at(&state.udp_listeners, patch.address);
             Some(AuditEntry {
                 kind: EventKind::ListenerUpdated,
                 verb,
@@ -1692,7 +1725,7 @@ fn audit_entry_for(
                 kind: EventKind::ListenerAdded,
                 verb,
                 counter,
-                target: format!("listener:http:{}", listener.address),
+                target: format!("listener:http:{}", listener.listener_key()),
                 cluster_id: None,
                 backend_id: None,
                 address: Some(listener.address),
@@ -1705,7 +1738,7 @@ fn audit_entry_for(
                 kind: EventKind::ListenerAdded,
                 verb,
                 counter,
-                target: format!("listener:https:{}", listener.address),
+                target: format!("listener:https:{}", listener.listener_key()),
                 cluster_id: None,
                 backend_id: None,
                 address: Some(listener.address),
@@ -1718,7 +1751,7 @@ fn audit_entry_for(
                 kind: EventKind::ListenerAdded,
                 verb,
                 counter,
-                target: format!("listener:tcp:{}", listener.address),
+                target: format!("listener:tcp:{}", listener.listener_key()),
                 cluster_id: None,
                 backend_id: None,
                 address: Some(listener.address),
@@ -1731,7 +1764,7 @@ fn audit_entry_for(
                 kind: EventKind::ListenerAdded,
                 verb,
                 counter,
-                target: format!("listener:udp:{}", listener.address),
+                target: format!("listener:udp:{}", listener.listener_key()),
                 cluster_id: None,
                 backend_id: None,
                 address: Some(listener.address),
@@ -1744,7 +1777,7 @@ fn audit_entry_for(
                 kind: EventKind::ListenerRemoved,
                 verb,
                 counter,
-                target: format!("listener:{:?}:{}", remove.proxy(), remove.address),
+                target: format!("listener:{:?}:{}", remove.proxy(), remove.listener_key()),
                 cluster_id: None,
                 backend_id: None,
                 address: Some(remove.address),
@@ -2415,18 +2448,22 @@ fn validate_request(request: &RequestType, origin: RequestOrigin) -> Result<(), 
 fn compute_rollback(request: &RequestType) -> Option<Request> {
     let inverse = match request {
         RequestType::AddHttpListener(config) => RequestType::RemoveListener(RemoveListener {
+            interface: config.interface.clone(),
             address: config.address,
             proxy: ListenerType::Http.into(),
         }),
         RequestType::AddHttpsListener(config) => RequestType::RemoveListener(RemoveListener {
+            interface: config.interface.clone(),
             address: config.address,
             proxy: ListenerType::Https.into(),
         }),
         RequestType::AddTcpListener(config) => RequestType::RemoveListener(RemoveListener {
+            interface: config.interface.clone(),
             address: config.address,
             proxy: ListenerType::Tcp.into(),
         }),
         RequestType::AddUdpListener(config) => RequestType::RemoveListener(RemoveListener {
+            interface: config.interface.clone(),
             address: config.address,
             proxy: ListenerType::Udp.into(),
         }),
@@ -5248,6 +5285,50 @@ mod listener_validation_tests {
             validate_request(&RequestType::AddHttpListener(http), RequestOrigin::Authored).is_ok(),
             "H2 knobs at their documented minimum must be accepted"
         );
+    }
+
+    /// The rollback of a listener add removes that very listener: with an
+    /// `interface`, the inverse names it too, or it would remove the listener
+    /// on the same address without an interface instead (sozu-proxy/sozu#719).
+    #[test]
+    fn rollback_inverse_of_a_listener_add_carries_its_interface() {
+        use sozu_command_lib::proto::command::{
+            HttpListenerConfig, TcpListenerConfig, UdpListenerConfig,
+        };
+
+        let address = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let interface = Some("wg0".to_owned());
+        let adds = [
+            RequestType::AddHttpListener(HttpListenerConfig {
+                address,
+                interface: interface.clone(),
+                ..Default::default()
+            }),
+            RequestType::AddHttpsListener(HttpsListenerConfig {
+                address,
+                interface: interface.clone(),
+                ..Default::default()
+            }),
+            RequestType::AddTcpListener(TcpListenerConfig {
+                address,
+                interface: interface.clone(),
+                ..Default::default()
+            }),
+            RequestType::AddUdpListener(UdpListenerConfig {
+                address,
+                interface: interface.clone(),
+                ..Default::default()
+            }),
+        ];
+        for add in adds {
+            match super::compute_rollback(&add).map(|inverse| inverse.request_type) {
+                Some(Some(RequestType::RemoveListener(remove))) => {
+                    assert_eq!(remove.address, address);
+                    assert_eq!(remove.interface, interface, "inverse of {add:?}");
+                }
+                other => panic!("expected a RemoveListener inverse, got {other:?}"),
+            }
+        }
     }
 
     #[test]

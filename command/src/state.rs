@@ -17,6 +17,7 @@ use crate::{
     ObjectKind,
     certificate::{CertificateError, Fingerprint, calculate_fingerprint},
     config::validate_sni_pattern,
+    listener_key::{InterfaceError, ListenerKey, validate_listener_interface},
     proto::{
         command::{
             ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
@@ -125,6 +126,51 @@ pub enum StateError {
         current_cluster_id: ClusterId,
         current_tags: BTreeMap<String, String>,
     },
+    /// The `interface` of an added listener is not a valid interface name, or
+    /// the platform cannot bind a socket to an interface.
+    #[error("invalid listener interface: {0}")]
+    ListenerInterface(InterfaceError),
+    /// An `Update*Listener` patch names its listener by address only, and
+    /// several listeners share that address on different interfaces.
+    #[error(
+        "{count} listeners share the address {address} on different interfaces; an update \
+         patch cannot tell them apart: remove and re-add the one to change"
+    )]
+    AmbiguousListenerAddress { address: SocketAddr, count: usize },
+}
+
+/// Refuse a listener whose interface is not a valid name on this platform, so
+/// its key always round-trips through its text form (`ListenerKey`).
+fn validated_listener_key(key: ListenerKey) -> Result<ListenerKey, StateError> {
+    if let Some(interface) = &key.interface {
+        validate_listener_interface(interface).map_err(StateError::ListenerInterface)?;
+    }
+    Ok(key)
+}
+
+/// The one listener an update patch names by `address`: the patch carries no
+/// interface, so it applies when exactly one listener sits on that address,
+/// whatever its interface, and is refused when several do.
+fn listener_key_for_update<V>(
+    listeners: &BTreeMap<ListenerKey, V>,
+    address: SocketAddr,
+    kind: ObjectKind,
+) -> Result<ListenerKey, StateError> {
+    let mut matching = listeners.keys().filter(|key| key.address == address);
+    let Some(first) = matching.next() else {
+        return Err(StateError::NotFound {
+            kind,
+            id: address.to_string(),
+        });
+    };
+    let others = matching.count();
+    if others > 0 {
+        return Err(StateError::AmbiguousListenerAddress {
+            address,
+            count: others + 1,
+        });
+    }
+    Ok(first.clone())
 }
 
 impl fmt::Debug for StateError {
@@ -156,14 +202,14 @@ fn certificate_error_kind(error: &CertificateError) -> &'static str {
 pub struct ConfigState {
     pub clusters: BTreeMap<ClusterId, Cluster>,
     pub backends: BTreeMap<ClusterId, Vec<Backend>>,
-    /// socket address -> HTTP listener
-    pub http_listeners: BTreeMap<SocketAddr, HttpListenerConfig>,
-    /// socket address -> HTTPS listener
-    pub https_listeners: BTreeMap<SocketAddr, HttpsListenerConfig>,
-    /// socket address -> TCP listener
-    pub tcp_listeners: BTreeMap<SocketAddr, TcpListenerConfig>,
-    /// socket address -> UDP listener
-    pub udp_listeners: BTreeMap<SocketAddr, UdpListenerConfig>,
+    /// listener key (address, plus interface when bound) -> HTTP listener
+    pub http_listeners: BTreeMap<ListenerKey, HttpListenerConfig>,
+    /// listener key -> HTTPS listener
+    pub https_listeners: BTreeMap<ListenerKey, HttpsListenerConfig>,
+    /// listener key -> TCP listener
+    pub tcp_listeners: BTreeMap<ListenerKey, TcpListenerConfig>,
+    /// listener key -> UDP listener
+    pub udp_listeners: BTreeMap<ListenerKey, UdpListenerConfig>,
     /// HTTP frontends, indexed by a summary of each front's address;hostname;path, for uniqueness.
     /// For example: `"0.0.0.0:8080;lolcatho.st;P/api"`
     pub http_fronts: BTreeMap<String, HttpFrontend>,
@@ -313,26 +359,26 @@ impl ConfigState {
     /// Compiled out entirely in release builds (no body, no callers).
     #[cfg(debug_assertions)]
     fn check_invariants(&self) {
-        // Listener maps: the value's `address` field must match the SocketAddr
-        // key it is filed under, or a hot-upgrade replay (which re-derives the
+        // Listener maps: the value's `address` and `interface` fields must
+        // match the `ListenerKey` it is filed under, or a hot-upgrade replay (which re-derives the
         // key from the value) would land the entry under a different key.
         for (addr, listener) in &self.http_listeners {
             debug_assert_eq!(
-                SocketAddr::from(listener.address),
+                listener.listener_key(),
                 *addr,
                 "http_listener value address must match its map key"
             );
         }
         for (addr, listener) in &self.https_listeners {
             debug_assert_eq!(
-                SocketAddr::from(listener.address),
+                listener.listener_key(),
                 *addr,
                 "https_listener value address must match its map key"
             );
         }
         for (addr, listener) in &self.tcp_listeners {
             debug_assert_eq!(
-                SocketAddr::from(listener.address),
+                listener.listener_key(),
                 *addr,
                 "tcp_listener value address must match its map key"
             );
@@ -585,9 +631,9 @@ impl ConfigState {
     }
 
     fn add_http_listener(&mut self, listener: &HttpListenerConfig) -> Result<(), StateError> {
-        let address: SocketAddr = listener.address.into();
+        let address = validated_listener_key(listener.listener_key())?;
         let before = self.http_listeners.len();
-        match self.http_listeners.entry(address) {
+        match self.http_listeners.entry(address.clone()) {
             BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()),
             BTreeMapEntry::Occupied(_) => {
                 debug_assert_eq!(
@@ -614,9 +660,9 @@ impl ConfigState {
     }
 
     fn add_https_listener(&mut self, listener: &HttpsListenerConfig) -> Result<(), StateError> {
-        let address: SocketAddr = listener.address.into();
+        let address = validated_listener_key(listener.listener_key())?;
         let before = self.https_listeners.len();
-        match self.https_listeners.entry(address) {
+        match self.https_listeners.entry(address.clone()) {
             BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()),
             BTreeMapEntry::Occupied(_) => {
                 debug_assert_eq!(
@@ -643,10 +689,10 @@ impl ConfigState {
     }
 
     fn add_tcp_listener(&mut self, listener: &TcpListenerConfig) -> Result<(), StateError> {
-        let address: SocketAddr = listener.address.into();
+        let address = validated_listener_key(listener.listener_key())?;
         let before = self.tcp_listeners.len();
-        match self.tcp_listeners.entry(address) {
-            BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(*listener),
+        match self.tcp_listeners.entry(address.clone()) {
+            BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()),
             BTreeMapEntry::Occupied(_) => {
                 debug_assert_eq!(
                     self.tcp_listeners.len(),
@@ -672,9 +718,9 @@ impl ConfigState {
     }
 
     fn add_udp_listener(&mut self, listener: &UdpListenerConfig) -> Result<(), StateError> {
-        let address: SocketAddr = listener.address.into();
-        match self.udp_listeners.entry(address) {
-            BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(*listener),
+        let address = validated_listener_key(listener.listener_key())?;
+        match self.udp_listeners.entry(address.clone()) {
+            BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()),
             BTreeMapEntry::Occupied(_) => {
                 return Err(StateError::Exists {
                     kind: ObjectKind::UdpListener,
@@ -687,14 +733,14 @@ impl ConfigState {
 
     fn remove_listener(&mut self, remove: &RemoveListener) -> Result<(), StateError> {
         match ListenerType::try_from(remove.proxy).map_err(StateError::WrongFieldValue)? {
-            ListenerType::Http => self.remove_http_listener(&remove.address.into()),
-            ListenerType::Https => self.remove_https_listener(&remove.address.into()),
-            ListenerType::Tcp => self.remove_tcp_listener(&remove.address.into()),
-            ListenerType::Udp => self.remove_udp_listener(&remove.address.into()),
+            ListenerType::Http => self.remove_http_listener(&remove.listener_key()),
+            ListenerType::Https => self.remove_https_listener(&remove.listener_key()),
+            ListenerType::Tcp => self.remove_tcp_listener(&remove.listener_key()),
+            ListenerType::Udp => self.remove_udp_listener(&remove.listener_key()),
         }
     }
 
-    fn remove_http_listener(&mut self, address: &SocketAddr) -> Result<(), StateError> {
+    fn remove_http_listener(&mut self, address: &ListenerKey) -> Result<(), StateError> {
         let before = self.http_listeners.len();
         if self.http_listeners.remove(address).is_none() {
             debug_assert_eq!(
@@ -716,7 +762,7 @@ impl ConfigState {
         Ok(())
     }
 
-    fn remove_https_listener(&mut self, address: &SocketAddr) -> Result<(), StateError> {
+    fn remove_https_listener(&mut self, address: &ListenerKey) -> Result<(), StateError> {
         let before = self.https_listeners.len();
         if self.https_listeners.remove(address).is_none() {
             debug_assert_eq!(
@@ -738,7 +784,7 @@ impl ConfigState {
         Ok(())
     }
 
-    fn remove_tcp_listener(&mut self, address: &SocketAddr) -> Result<(), StateError> {
+    fn remove_tcp_listener(&mut self, address: &ListenerKey) -> Result<(), StateError> {
         let before = self.tcp_listeners.len();
         if self.tcp_listeners.remove(address).is_none() {
             debug_assert_eq!(
@@ -760,7 +806,7 @@ impl ConfigState {
         Ok(())
     }
 
-    fn remove_udp_listener(&mut self, address: &SocketAddr) -> Result<(), StateError> {
+    fn remove_udp_listener(&mut self, address: &ListenerKey) -> Result<(), StateError> {
         if self.udp_listeners.remove(address).is_none() {
             return Err(StateError::NoChange);
         }
@@ -776,14 +822,15 @@ impl ConfigState {
     fn update_http_listener(&mut self, patch: &UpdateHttpListenerConfig) -> Result<(), StateError> {
         validate_h2_flood_knobs_http(patch)?;
 
-        let address: SocketAddr = patch.address.into();
-        let listener =
-            self.http_listeners
-                .get_mut(&address)
-                .ok_or_else(|| StateError::NotFound {
-                    kind: ObjectKind::HttpListener,
-                    id: address.to_string(),
-                })?;
+        let key = listener_key_for_update(
+            &self.http_listeners,
+            patch.address.into(),
+            ObjectKind::HttpListener,
+        )?;
+        let listener = self
+            .http_listeners
+            .get_mut(&key)
+            .expect("listener_key_for_update returns a key present in the map");
 
         // Shared session-at-accept / per-connection knobs
         if let Some(v) = patch.public_address {
@@ -885,14 +932,15 @@ impl ConfigState {
     ) -> Result<(), StateError> {
         validate_h2_flood_knobs_https(patch)?;
 
-        let address: SocketAddr = patch.address.into();
-        let listener =
-            self.https_listeners
-                .get_mut(&address)
-                .ok_or_else(|| StateError::NotFound {
-                    kind: ObjectKind::HttpsListener,
-                    id: address.to_string(),
-                })?;
+        let key = listener_key_for_update(
+            &self.https_listeners,
+            patch.address.into(),
+            ObjectKind::HttpsListener,
+        )?;
+        let listener = self
+            .https_listeners
+            .get_mut(&key)
+            .expect("listener_key_for_update returns a key present in the map");
 
         // Shared session-at-accept / per-connection knobs
         if let Some(v) = patch.public_address {
@@ -999,14 +1047,15 @@ impl ConfigState {
     /// Only `Some` fields in the patch are written; `None` fields preserve the
     /// current value. Returns `StateError::NotFound` if the address is unknown.
     fn update_tcp_listener(&mut self, patch: &UpdateTcpListenerConfig) -> Result<(), StateError> {
-        let address: SocketAddr = patch.address.into();
-        let listener =
-            self.tcp_listeners
-                .get_mut(&address)
-                .ok_or_else(|| StateError::NotFound {
-                    kind: ObjectKind::TcpListener,
-                    id: address.to_string(),
-                })?;
+        let key = listener_key_for_update(
+            &self.tcp_listeners,
+            patch.address.into(),
+            ObjectKind::TcpListener,
+        )?;
+        let listener = self
+            .tcp_listeners
+            .get_mut(&key)
+            .expect("listener_key_for_update returns a key present in the map");
 
         if let Some(v) = patch.public_address {
             listener.public_address = Some(v);
@@ -1031,14 +1080,15 @@ impl ConfigState {
     /// Only `Some` fields in the patch are written; `None` fields preserve the
     /// current value. Returns `StateError::NotFound` if the address is unknown.
     fn update_udp_listener(&mut self, patch: &UpdateUdpListenerConfig) -> Result<(), StateError> {
-        let address: SocketAddr = patch.address.into();
-        let listener =
-            self.udp_listeners
-                .get_mut(&address)
-                .ok_or_else(|| StateError::NotFound {
-                    kind: ObjectKind::UdpListener,
-                    id: address.to_string(),
-                })?;
+        let key = listener_key_for_update(
+            &self.udp_listeners,
+            patch.address.into(),
+            ObjectKind::UdpListener,
+        )?;
+        let listener = self
+            .udp_listeners
+            .get_mut(&key)
+            .expect("listener_key_for_update returns a key present in the map");
 
         if let Some(v) = patch.public_address {
             listener.public_address = Some(v);
@@ -1062,35 +1112,35 @@ impl ConfigState {
         match ListenerType::try_from(activate.proxy).map_err(StateError::WrongFieldValue)? {
             ListenerType::Http => self
                 .http_listeners
-                .get_mut(&activate.address.into())
+                .get_mut(&activate.listener_key())
                 .map(|listener| listener.active = true)
                 .ok_or(StateError::NotFound {
                     kind: ObjectKind::HttpListener,
-                    id: activate.address.to_string(),
+                    id: activate.listener_key().to_string(),
                 }),
             ListenerType::Https => self
                 .https_listeners
-                .get_mut(&activate.address.into())
+                .get_mut(&activate.listener_key())
                 .map(|listener| listener.active = true)
                 .ok_or(StateError::NotFound {
                     kind: ObjectKind::HttpsListener,
-                    id: activate.address.to_string(),
+                    id: activate.listener_key().to_string(),
                 }),
             ListenerType::Tcp => self
                 .tcp_listeners
-                .get_mut(&activate.address.into())
+                .get_mut(&activate.listener_key())
                 .map(|listener| listener.active = true)
                 .ok_or(StateError::NotFound {
                     kind: ObjectKind::TcpListener,
-                    id: activate.address.to_string(),
+                    id: activate.listener_key().to_string(),
                 }),
             ListenerType::Udp => self
                 .udp_listeners
-                .get_mut(&activate.address.into())
+                .get_mut(&activate.listener_key())
                 .map(|listener| listener.active = true)
                 .ok_or(StateError::NotFound {
                     kind: ObjectKind::UdpListener,
-                    id: activate.address.to_string(),
+                    id: activate.listener_key().to_string(),
                 }),
         }
     }
@@ -1099,35 +1149,35 @@ impl ConfigState {
         match ListenerType::try_from(deactivate.proxy).map_err(StateError::WrongFieldValue)? {
             ListenerType::Http => self
                 .http_listeners
-                .get_mut(&deactivate.address.into())
+                .get_mut(&deactivate.listener_key())
                 .map(|listener| listener.active = false)
                 .ok_or(StateError::NotFound {
                     kind: ObjectKind::HttpListener,
-                    id: deactivate.address.to_string(),
+                    id: deactivate.listener_key().to_string(),
                 }),
             ListenerType::Https => self
                 .https_listeners
-                .get_mut(&deactivate.address.into())
+                .get_mut(&deactivate.listener_key())
                 .map(|listener| listener.active = false)
                 .ok_or(StateError::NotFound {
                     kind: ObjectKind::HttpsListener,
-                    id: deactivate.address.to_string(),
+                    id: deactivate.listener_key().to_string(),
                 }),
             ListenerType::Tcp => self
                 .tcp_listeners
-                .get_mut(&deactivate.address.into())
+                .get_mut(&deactivate.listener_key())
                 .map(|listener| listener.active = false)
                 .ok_or(StateError::NotFound {
                     kind: ObjectKind::TcpListener,
-                    id: deactivate.address.to_string(),
+                    id: deactivate.listener_key().to_string(),
                 }),
             ListenerType::Udp => self
                 .udp_listeners
-                .get_mut(&deactivate.address.into())
+                .get_mut(&deactivate.listener_key())
                 .map(|listener| listener.active = false)
                 .ok_or(StateError::NotFound {
                     kind: ObjectKind::UdpListener,
-                    id: deactivate.address.to_string(),
+                    id: deactivate.listener_key().to_string(),
                 }),
         }
     }
@@ -1861,6 +1911,7 @@ impl ConfigState {
             if listener.active {
                 v.push(
                     RequestType::ActivateListener(ActivateListener {
+                        interface: listener.interface.clone(),
                         address: listener.address,
                         proxy: ListenerType::Http.into(),
                         from_scm: false,
@@ -1875,6 +1926,7 @@ impl ConfigState {
             if listener.active {
                 v.push(
                     RequestType::ActivateListener(ActivateListener {
+                        interface: listener.interface.clone(),
                         address: listener.address,
                         proxy: ListenerType::Https.into(),
                         from_scm: false,
@@ -1885,10 +1937,11 @@ impl ConfigState {
         }
 
         for listener in self.tcp_listeners.values() {
-            v.push(RequestType::AddTcpListener(*listener).into());
+            v.push(RequestType::AddTcpListener(listener.clone()).into());
             if listener.active {
                 v.push(
                     RequestType::ActivateListener(ActivateListener {
+                        interface: listener.interface.clone(),
                         address: listener.address,
                         proxy: ListenerType::Tcp.into(),
                         from_scm: false,
@@ -1899,10 +1952,11 @@ impl ConfigState {
         }
 
         for listener in self.udp_listeners.values() {
-            v.push(RequestType::AddUdpListener(*listener).into());
+            v.push(RequestType::AddUdpListener(listener.clone()).into());
             if listener.active {
                 v.push(
                     RequestType::ActivateListener(ActivateListener {
+                        interface: listener.interface.clone(),
                         address: listener.address,
                         proxy: ListenerType::Udp.into(),
                         from_scm: false,
@@ -1996,7 +2050,8 @@ impl ConfigState {
         {
             v.push(
                 RequestType::ActivateListener(ActivateListener {
-                    address: SocketAddress::from(*front),
+                    interface: front.interface.clone(),
+                    address: SocketAddress::from(front.address),
                     proxy: ListenerType::Http.into(),
                     from_scm: false,
                 })
@@ -2012,7 +2067,8 @@ impl ConfigState {
         {
             v.push(
                 RequestType::ActivateListener(ActivateListener {
-                    address: SocketAddress::from(*front),
+                    interface: front.interface.clone(),
+                    address: SocketAddress::from(front.address),
                     proxy: ListenerType::Https.into(),
                     from_scm: false,
                 })
@@ -2027,7 +2083,8 @@ impl ConfigState {
         {
             v.push(
                 RequestType::ActivateListener(ActivateListener {
-                    address: SocketAddress::from(*front),
+                    interface: front.interface.clone(),
+                    address: SocketAddress::from(front.address),
                     proxy: ListenerType::Tcp.into(),
                     from_scm: false,
                 })
@@ -2042,7 +2099,8 @@ impl ConfigState {
         {
             v.push(
                 RequestType::ActivateListener(ActivateListener {
-                    address: SocketAddress::from(*front),
+                    interface: front.interface.clone(),
+                    address: SocketAddress::from(front.address),
                     proxy: ListenerType::Udp.into(),
                     from_scm: false,
                 })
@@ -2074,24 +2132,23 @@ impl ConfigState {
     }
 
     pub fn diff(&self, other: &ConfigState) -> Vec<Request> {
-        //pub tcp_listeners:   HashMap<SocketAddr, (TcpListener, bool)>,
-        let my_tcp_listeners: HashSet<&SocketAddr> = self.tcp_listeners.keys().collect();
-        let their_tcp_listeners: HashSet<&SocketAddr> = other.tcp_listeners.keys().collect();
+        let my_tcp_listeners: HashSet<&ListenerKey> = self.tcp_listeners.keys().collect();
+        let their_tcp_listeners: HashSet<&ListenerKey> = other.tcp_listeners.keys().collect();
         let removed_tcp_listeners = my_tcp_listeners.difference(&their_tcp_listeners);
         let added_tcp_listeners = their_tcp_listeners.difference(&my_tcp_listeners);
 
-        let my_udp_listeners: HashSet<&SocketAddr> = self.udp_listeners.keys().collect();
-        let their_udp_listeners: HashSet<&SocketAddr> = other.udp_listeners.keys().collect();
+        let my_udp_listeners: HashSet<&ListenerKey> = self.udp_listeners.keys().collect();
+        let their_udp_listeners: HashSet<&ListenerKey> = other.udp_listeners.keys().collect();
         let removed_udp_listeners = my_udp_listeners.difference(&their_udp_listeners);
         let added_udp_listeners = their_udp_listeners.difference(&my_udp_listeners);
 
-        let my_http_listeners: HashSet<&SocketAddr> = self.http_listeners.keys().collect();
-        let their_http_listeners: HashSet<&SocketAddr> = other.http_listeners.keys().collect();
+        let my_http_listeners: HashSet<&ListenerKey> = self.http_listeners.keys().collect();
+        let their_http_listeners: HashSet<&ListenerKey> = other.http_listeners.keys().collect();
         let removed_http_listeners = my_http_listeners.difference(&their_http_listeners);
         let added_http_listeners = their_http_listeners.difference(&my_http_listeners);
 
-        let my_https_listeners: HashSet<&SocketAddr> = self.https_listeners.keys().collect();
-        let their_https_listeners: HashSet<&SocketAddr> = other.https_listeners.keys().collect();
+        let my_https_listeners: HashSet<&ListenerKey> = self.https_listeners.keys().collect();
+        let their_https_listeners: HashSet<&ListenerKey> = other.https_listeners.keys().collect();
         let removed_https_listeners = my_https_listeners.difference(&their_https_listeners);
         let added_https_listeners = their_https_listeners.difference(&my_https_listeners);
 
@@ -2101,7 +2158,8 @@ impl ConfigState {
             if self.tcp_listeners[*address].active {
                 v.push(
                     RequestType::DeactivateListener(DeactivateListener {
-                        address: SocketAddress::from(**address),
+                        interface: address.interface.clone(),
+                        address: SocketAddress::from(address.address),
                         proxy: ListenerType::Tcp.into(),
                         to_scm: false,
                     })
@@ -2111,7 +2169,8 @@ impl ConfigState {
 
             v.push(
                 RequestType::RemoveListener(RemoveListener {
-                    address: SocketAddress::from(**address),
+                    interface: address.interface.clone(),
+                    address: SocketAddress::from(address.address),
                     proxy: ListenerType::Tcp.into(),
                 })
                 .into(),
@@ -2119,12 +2178,13 @@ impl ConfigState {
         }
 
         for address in added_tcp_listeners.clone() {
-            v.push(RequestType::AddTcpListener(other.tcp_listeners[*address]).into());
+            v.push(RequestType::AddTcpListener(other.tcp_listeners[*address].clone()).into());
 
             if other.tcp_listeners[*address].active {
                 v.push(
                     RequestType::ActivateListener(ActivateListener {
-                        address: SocketAddress::from(**address),
+                        interface: address.interface.clone(),
+                        address: SocketAddress::from(address.address),
                         proxy: ListenerType::Tcp.into(),
                         from_scm: false,
                     })
@@ -2137,7 +2197,8 @@ impl ConfigState {
             if self.udp_listeners[*address].active {
                 v.push(
                     RequestType::DeactivateListener(DeactivateListener {
-                        address: SocketAddress::from(**address),
+                        interface: address.interface.clone(),
+                        address: SocketAddress::from(address.address),
                         proxy: ListenerType::Udp.into(),
                         to_scm: false,
                     })
@@ -2147,7 +2208,8 @@ impl ConfigState {
 
             v.push(
                 RequestType::RemoveListener(RemoveListener {
-                    address: SocketAddress::from(**address),
+                    interface: address.interface.clone(),
+                    address: SocketAddress::from(address.address),
                     proxy: ListenerType::Udp.into(),
                 })
                 .into(),
@@ -2155,12 +2217,13 @@ impl ConfigState {
         }
 
         for address in added_udp_listeners.clone() {
-            v.push(RequestType::AddUdpListener(other.udp_listeners[*address]).into());
+            v.push(RequestType::AddUdpListener(other.udp_listeners[*address].clone()).into());
 
             if other.udp_listeners[*address].active {
                 v.push(
                     RequestType::ActivateListener(ActivateListener {
-                        address: SocketAddress::from(**address),
+                        interface: address.interface.clone(),
+                        address: SocketAddress::from(address.address),
                         proxy: ListenerType::Udp.into(),
                         from_scm: false,
                     })
@@ -2173,7 +2236,8 @@ impl ConfigState {
             if self.http_listeners[*address].active {
                 v.push(
                     RequestType::DeactivateListener(DeactivateListener {
-                        address: SocketAddress::from(**address),
+                        interface: address.interface.clone(),
+                        address: SocketAddress::from(address.address),
                         proxy: ListenerType::Http.into(),
                         to_scm: false,
                     })
@@ -2183,7 +2247,8 @@ impl ConfigState {
 
             v.push(
                 RequestType::RemoveListener(RemoveListener {
-                    address: SocketAddress::from(**address),
+                    interface: address.interface.clone(),
+                    address: SocketAddress::from(address.address),
                     proxy: ListenerType::Http.into(),
                 })
                 .into(),
@@ -2196,7 +2261,8 @@ impl ConfigState {
             if other.http_listeners[*address].active {
                 v.push(
                     RequestType::ActivateListener(ActivateListener {
-                        address: SocketAddress::from(**address),
+                        interface: address.interface.clone(),
+                        address: SocketAddress::from(address.address),
                         proxy: ListenerType::Http.into(),
                         from_scm: false,
                     })
@@ -2209,7 +2275,8 @@ impl ConfigState {
             if self.https_listeners[*address].active {
                 v.push(
                     RequestType::DeactivateListener(DeactivateListener {
-                        address: SocketAddress::from(**address),
+                        interface: address.interface.clone(),
+                        address: SocketAddress::from(address.address),
                         proxy: ListenerType::Https.into(),
                         to_scm: false,
                     })
@@ -2219,7 +2286,8 @@ impl ConfigState {
 
             v.push(
                 RequestType::RemoveListener(RemoveListener {
-                    address: SocketAddress::from(**address),
+                    interface: address.interface.clone(),
+                    address: SocketAddress::from(address.address),
                     proxy: ListenerType::Https.into(),
                 })
                 .into(),
@@ -2232,7 +2300,8 @@ impl ConfigState {
             if other.https_listeners[*address].active {
                 v.push(
                     RequestType::ActivateListener(ActivateListener {
-                        address: SocketAddress::from(**address),
+                        interface: address.interface.clone(),
+                        address: SocketAddress::from(address.address),
                         proxy: ListenerType::Https.into(),
                         from_scm: false,
                     })
@@ -2248,13 +2317,14 @@ impl ConfigState {
             if my_listener != their_listener {
                 v.push(
                     RequestType::RemoveListener(RemoveListener {
-                        address: SocketAddress::from(**addr),
+                        interface: addr.interface.clone(),
+                        address: SocketAddress::from(addr.address),
                         proxy: ListenerType::Tcp.into(),
                     })
                     .into(),
                 );
                 // any added listener should be unactive
-                let mut listener_to_add = *their_listener;
+                let mut listener_to_add = their_listener.clone();
                 listener_to_add.active = false;
                 v.push(RequestType::AddTcpListener(listener_to_add).into());
 
@@ -2267,7 +2337,8 @@ impl ConfigState {
                 if their_listener.active {
                     v.push(
                         RequestType::ActivateListener(ActivateListener {
-                            address: SocketAddress::from(**addr),
+                            interface: addr.interface.clone(),
+                            address: SocketAddress::from(addr.address),
                             proxy: ListenerType::Tcp.into(),
                             from_scm: false,
                         })
@@ -2279,7 +2350,8 @@ impl ConfigState {
             if my_listener.active && !their_listener.active {
                 v.push(
                     RequestType::DeactivateListener(DeactivateListener {
-                        address: SocketAddress::from(**addr),
+                        interface: addr.interface.clone(),
+                        address: SocketAddress::from(addr.address),
                         proxy: ListenerType::Tcp.into(),
                         to_scm: false,
                     })
@@ -2295,13 +2367,14 @@ impl ConfigState {
             if my_listener != their_listener {
                 v.push(
                     RequestType::RemoveListener(RemoveListener {
-                        address: SocketAddress::from(**addr),
+                        interface: addr.interface.clone(),
+                        address: SocketAddress::from(addr.address),
                         proxy: ListenerType::Udp.into(),
                     })
                     .into(),
                 );
                 // any added listener should be unactive
-                let mut listener_to_add = *their_listener;
+                let mut listener_to_add = their_listener.clone();
                 listener_to_add.active = false;
                 v.push(RequestType::AddUdpListener(listener_to_add).into());
 
@@ -2314,7 +2387,8 @@ impl ConfigState {
                 if their_listener.active {
                     v.push(
                         RequestType::ActivateListener(ActivateListener {
-                            address: SocketAddress::from(**addr),
+                            interface: addr.interface.clone(),
+                            address: SocketAddress::from(addr.address),
                             proxy: ListenerType::Udp.into(),
                             from_scm: false,
                         })
@@ -2326,7 +2400,8 @@ impl ConfigState {
             if my_listener.active && !their_listener.active {
                 v.push(
                     RequestType::DeactivateListener(DeactivateListener {
-                        address: SocketAddress::from(**addr),
+                        interface: addr.interface.clone(),
+                        address: SocketAddress::from(addr.address),
                         proxy: ListenerType::Udp.into(),
                         to_scm: false,
                     })
@@ -2342,7 +2417,8 @@ impl ConfigState {
             if my_listener != their_listener {
                 v.push(
                     RequestType::RemoveListener(RemoveListener {
-                        address: SocketAddress::from(**addr),
+                        interface: addr.interface.clone(),
+                        address: SocketAddress::from(addr.address),
                         proxy: ListenerType::Http.into(),
                     })
                     .into(),
@@ -2361,7 +2437,8 @@ impl ConfigState {
                 if their_listener.active {
                     v.push(
                         RequestType::ActivateListener(ActivateListener {
-                            address: SocketAddress::from(**addr),
+                            interface: addr.interface.clone(),
+                            address: SocketAddress::from(addr.address),
                             proxy: ListenerType::Http.into(),
                             from_scm: false,
                         })
@@ -2373,7 +2450,8 @@ impl ConfigState {
             if my_listener.active && !their_listener.active {
                 v.push(
                     RequestType::DeactivateListener(DeactivateListener {
-                        address: SocketAddress::from(**addr),
+                        interface: addr.interface.clone(),
+                        address: SocketAddress::from(addr.address),
                         proxy: ListenerType::Http.into(),
                         to_scm: false,
                     })
@@ -2389,7 +2467,8 @@ impl ConfigState {
             if my_listener != their_listener {
                 v.push(
                     RequestType::RemoveListener(RemoveListener {
-                        address: SocketAddress::from(**addr),
+                        interface: addr.interface.clone(),
+                        address: SocketAddress::from(addr.address),
                         proxy: ListenerType::Https.into(),
                     })
                     .into(),
@@ -2408,7 +2487,8 @@ impl ConfigState {
                 if their_listener.active {
                     v.push(
                         RequestType::ActivateListener(ActivateListener {
-                            address: SocketAddress::from(**addr),
+                            interface: addr.interface.clone(),
+                            address: SocketAddress::from(addr.address),
                             proxy: ListenerType::Https.into(),
                             from_scm: false,
                         })
@@ -2420,7 +2500,8 @@ impl ConfigState {
             if my_listener.active && !their_listener.active {
                 v.push(
                     RequestType::DeactivateListener(DeactivateListener {
-                        address: SocketAddress::from(**addr),
+                        interface: addr.interface.clone(),
+                        address: SocketAddress::from(addr.address),
                         proxy: ListenerType::Https.into(),
                         to_scm: false,
                     })
@@ -2636,6 +2717,7 @@ impl ConfigState {
             if listener.active {
                 v.push(
                     RequestType::ActivateListener(ActivateListener {
+                        interface: listener.interface.clone(),
                         address: listener.address,
                         proxy: ListenerType::Tcp.into(),
                         from_scm: false,
@@ -2650,6 +2732,7 @@ impl ConfigState {
             if listener.active {
                 v.push(
                     RequestType::ActivateListener(ActivateListener {
+                        interface: listener.interface.clone(),
                         address: listener.address,
                         proxy: ListenerType::Udp.into(),
                         from_scm: false,
@@ -2957,12 +3040,12 @@ impl ConfigState {
             tcp_listeners: self
                 .tcp_listeners
                 .iter()
-                .map(|(addr, listener)| (addr.to_string(), *listener))
+                .map(|(addr, listener)| (addr.to_string(), listener.clone()))
                 .collect(),
             udp_listeners: self
                 .udp_listeners
                 .iter()
-                .map(|(addr, listener)| (addr.to_string(), *listener))
+                .map(|(addr, listener)| (addr.to_string(), listener.clone()))
                 .collect(),
         }
     }
@@ -4548,6 +4631,7 @@ mod tests {
         state
             .dispatch(
                 &RequestType::ActivateListener(ActivateListener {
+                    interface: None,
                     address: SocketAddress::new_v4(0, 0, 0, 0, 1234),
                     proxy: ListenerType::Tcp.into(),
                     from_scm: false,
@@ -4576,6 +4660,7 @@ mod tests {
         state
             .dispatch(
                 &RequestType::ActivateListener(ActivateListener {
+                    interface: None,
                     address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
                     proxy: ListenerType::Https.into(),
                     from_scm: false,
@@ -4608,6 +4693,7 @@ mod tests {
         state2
             .dispatch(
                 &RequestType::ActivateListener(ActivateListener {
+                    interface: None,
                     address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
                     proxy: ListenerType::Http.into(),
                     from_scm: false,
@@ -4628,6 +4714,7 @@ mod tests {
         state2
             .dispatch(
                 &RequestType::ActivateListener(ActivateListener {
+                    interface: None,
                     address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
                     proxy: ListenerType::Https.into(),
                     from_scm: false,
@@ -4638,6 +4725,7 @@ mod tests {
 
         let e: Vec<Request> = vec![
             RequestType::RemoveListener(RemoveListener {
+                interface: None,
                 address: SocketAddress::new_v4(0, 0, 0, 0, 1234),
                 proxy: ListenerType::Tcp.into(),
             })
@@ -4649,12 +4737,14 @@ mod tests {
             })
             .into(),
             RequestType::DeactivateListener(DeactivateListener {
+                interface: None,
                 address: SocketAddress::new_v4(0, 0, 0, 0, 1234),
                 proxy: ListenerType::Tcp.into(),
                 to_scm: false,
             })
             .into(),
             RequestType::RemoveListener(RemoveListener {
+                interface: None,
                 address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
                 proxy: ListenerType::Http.into(),
             })
@@ -4666,12 +4756,14 @@ mod tests {
             })
             .into(),
             RequestType::ActivateListener(ActivateListener {
+                interface: None,
                 address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
                 proxy: ListenerType::Http.into(),
                 from_scm: false,
             })
             .into(),
             RequestType::RemoveListener(RemoveListener {
+                interface: None,
                 address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
                 proxy: ListenerType::Https.into(),
             })
@@ -4688,6 +4780,7 @@ mod tests {
             // keep the listener live across the hot reconfig. Without it the
             // worker would silently deactivate the listener on replay.
             RequestType::ActivateListener(ActivateListener {
+                interface: None,
                 address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
                 proxy: ListenerType::Https.into(),
                 from_scm: false,
@@ -4733,7 +4826,7 @@ mod tests {
         // config change (the core of the fixed bug).
         let replayed_8443 = replayed
             .https_listeners
-            .get(&SocketAddr::from(SocketAddress::new_v4(0, 0, 0, 0, 8443)))
+            .get(&ListenerKey::from(SocketAddress::new_v4(0, 0, 0, 0, 8443)))
             .expect("8443 HTTPS listener must exist after replay");
         assert!(
             replayed_8443.active,
@@ -5039,6 +5132,7 @@ mod tests {
 
     fn make_udp_listener(address: SocketAddress, active: bool) -> UdpListenerConfig {
         UdpListenerConfig {
+            interface: None,
             address,
             public_address: None,
             front_timeout: 30,
@@ -5069,6 +5163,7 @@ mod tests {
         state
             .dispatch(
                 &RequestType::ActivateListener(ActivateListener {
+                    interface: None,
                     address,
                     proxy: ListenerType::Udp.into(),
                     from_scm: false,
@@ -5209,6 +5304,7 @@ mod tests {
         state
             .dispatch(
                 &RequestType::ActivateListener(ActivateListener {
+                    interface: None,
                     address,
                     proxy: ListenerType::Tcp.into(),
                     from_scm: false,
@@ -5998,7 +6094,7 @@ mod tests {
 
         let listener = state
             .https_listeners
-            .get(&SocketAddr::from(addr))
+            .get(&ListenerKey::from(addr))
             .expect("listener must be present");
         assert_eq!(listener.h2_max_rst_stream_per_window, Some(50));
         assert_eq!(listener.h2_max_ping_per_window, Some(20));
@@ -6051,7 +6147,7 @@ mod tests {
             .dispatch(&RequestType::UpdateHttpsListener(patch).into())
             .expect("no-op patch must succeed");
 
-        let listener = state.https_listeners.get(&SocketAddr::from(addr)).unwrap();
+        let listener = state.https_listeners.get(&ListenerKey::from(addr)).unwrap();
         assert_eq!(listener.front_timeout, original.front_timeout);
         assert_eq!(
             listener.h2_max_rst_stream_per_window,
@@ -6187,7 +6283,7 @@ mod tests {
             .dispatch(&RequestType::UpdateHttpsListener(patch).into())
             .expect("empty ALPN reset must succeed");
 
-        let listener = state.https_listeners.get(&SocketAddr::from(addr)).unwrap();
+        let listener = state.https_listeners.get(&ListenerKey::from(addr)).unwrap();
         assert!(
             listener.alpn_protocols.is_empty(),
             "ALPN must have been reset to empty"
@@ -6216,7 +6312,7 @@ mod tests {
             .dispatch(&RequestType::UpdateHttpsListener(patch).into())
             .expect("valid ALPN must be accepted");
 
-        let listener = state.https_listeners.get(&SocketAddr::from(addr)).unwrap();
+        let listener = state.https_listeners.get(&ListenerKey::from(addr)).unwrap();
         assert_eq!(listener.alpn_protocols, vec!["h2", "http/1.1"]);
     }
 
@@ -6242,7 +6338,7 @@ mod tests {
             .dispatch(&RequestType::UpdateHttpsListener(patch).into())
             .unwrap();
 
-        let listener = state.https_listeners.get(&SocketAddr::from(addr)).unwrap();
+        let listener = state.https_listeners.get(&ListenerKey::from(addr)).unwrap();
         assert_eq!(
             listener.alpn_protocols,
             vec!["h2"],
@@ -6326,7 +6422,7 @@ mod tests {
             .dispatch(&RequestType::UpdateHttpsListener(patch).into())
             .expect("valid header name must be accepted");
 
-        let listener = state.https_listeners.get(&SocketAddr::from(addr)).unwrap();
+        let listener = state.https_listeners.get(&ListenerKey::from(addr)).unwrap();
         assert_eq!(listener.sozu_id_header.as_deref(), Some("X-Edge-Id"));
     }
 
@@ -6348,7 +6444,7 @@ mod tests {
             .dispatch(&RequestType::UpdateHttpsListener(patch).into())
             .expect("graceful_shutdown_deadline=0 must be allowed");
 
-        let listener = state.https_listeners.get(&SocketAddr::from(addr)).unwrap();
+        let listener = state.https_listeners.get(&ListenerKey::from(addr)).unwrap();
         assert_eq!(listener.h2_graceful_shutdown_deadline_seconds, Some(0));
     }
 
@@ -6373,7 +6469,7 @@ mod tests {
             .dispatch(&RequestType::UpdateHttpListener(patch).into())
             .expect("HTTP update must succeed");
 
-        let listener = state.http_listeners.get(&SocketAddr::from(addr)).unwrap();
+        let listener = state.http_listeners.get(&ListenerKey::from(addr)).unwrap();
         assert_eq!(listener.front_timeout, 15);
         assert_eq!(listener.h2_max_rst_stream_per_window, Some(25));
         // untouched
@@ -6429,7 +6525,7 @@ mod tests {
             .dispatch(&RequestType::UpdateTcpListener(patch).into())
             .expect("TCP update must succeed");
 
-        let listener = state.tcp_listeners.get(&SocketAddr::from(addr)).unwrap();
+        let listener = state.tcp_listeners.get(&ListenerKey::from(addr)).unwrap();
         assert_eq!(listener.front_timeout, 5);
         assert_eq!(listener.back_timeout, 30); // untouched
     }
@@ -6807,6 +6903,7 @@ mod tests {
             state
                 .dispatch(
                     &RequestType::ActivateListener(ActivateListener {
+                        interface: None,
                         address,
                         proxy: ListenerType::Udp.into(),
                         from_scm: false,
@@ -6864,6 +6961,295 @@ mod tests {
             logical(&state),
             logical(&replayed),
             "a SaveState -> LoadState round trip must reconstruct the UDP configuration"
+        );
+    }
+
+    // ── listener identity: (address, interface) ─────────────────────────────
+
+    fn with_interface<T>(mut listener: T, set: impl FnOnce(&mut T)) -> T {
+        set(&mut listener);
+        listener
+    }
+
+    /// Two listeners on the same address bound to different interfaces are two
+    /// distinct listeners: both are recorded, keyed `address%interface`, next
+    /// to the one on the same address with no interface, for every protocol.
+    #[test]
+    fn listeners_on_one_address_with_different_interfaces_coexist() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        for interface in [None, Some("lo"), Some("wg0")] {
+            let iface = interface.map(str::to_owned);
+            state
+                .dispatch(
+                    &RequestType::AddHttpListener(with_interface(make_http_listener(addr), |l| {
+                        l.interface = iface.clone()
+                    }))
+                    .into(),
+                )
+                .expect("an HTTP listener on another interface must not collide");
+            state
+                .dispatch(
+                    &RequestType::AddHttpsListener(with_interface(
+                        make_https_listener(addr),
+                        |l| l.interface = iface.clone(),
+                    ))
+                    .into(),
+                )
+                .expect("an HTTPS listener on another interface must not collide");
+            state
+                .dispatch(
+                    &RequestType::AddTcpListener(with_interface(make_tcp_listener(addr), |l| {
+                        l.interface = iface.clone()
+                    }))
+                    .into(),
+                )
+                .expect("a TCP listener on another interface must not collide");
+            state
+                .dispatch(
+                    &RequestType::AddUdpListener(with_interface(
+                        make_udp_listener(addr, false),
+                        |l| l.interface = iface.clone(),
+                    ))
+                    .into(),
+                )
+                .expect("a UDP listener on another interface must not collide");
+        }
+
+        let expected = vec![
+            "0.0.0.0:8443".to_owned(),
+            "0.0.0.0:8443%lo".to_owned(),
+            "0.0.0.0:8443%wg0".to_owned(),
+        ];
+        let list = state.list_listeners();
+        assert_eq!(
+            list.http_listeners.keys().cloned().collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            list.https_listeners.keys().cloned().collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            list.tcp_listeners.keys().cloned().collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            list.udp_listeners.keys().cloned().collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            list.http_listeners["0.0.0.0:8443%wg0"].interface.as_deref(),
+            Some("wg0")
+        );
+
+        // The same (address, interface) twice is still a duplicate.
+        assert!(
+            state
+                .dispatch(
+                    &RequestType::AddHttpListener(with_interface(make_http_listener(addr), |l| {
+                        l.interface = Some("lo".to_owned())
+                    }))
+                    .into(),
+                )
+                .is_err(),
+            "the same (address, interface) must still be refused as a duplicate"
+        );
+
+        // Activate, deactivate and remove target exactly one listener.
+        state
+            .dispatch(
+                &RequestType::ActivateListener(ActivateListener {
+                    address: addr,
+                    proxy: ListenerType::Http.into(),
+                    from_scm: false,
+                    interface: Some("wg0".to_owned()),
+                })
+                .into(),
+            )
+            .expect("activating the wg0 listener");
+        let list = state.list_listeners();
+        assert!(list.http_listeners["0.0.0.0:8443%wg0"].active);
+        assert!(!list.http_listeners["0.0.0.0:8443%lo"].active);
+        assert!(!list.http_listeners["0.0.0.0:8443"].active);
+
+        state
+            .dispatch(
+                &RequestType::RemoveListener(RemoveListener {
+                    address: addr,
+                    proxy: ListenerType::Tcp.into(),
+                    interface: Some("lo".to_owned()),
+                })
+                .into(),
+            )
+            .expect("removing the lo TCP listener");
+        let list = state.list_listeners();
+        assert_eq!(
+            list.tcp_listeners.keys().cloned().collect::<Vec<_>>(),
+            vec!["0.0.0.0:8443".to_owned(), "0.0.0.0:8443%wg0".to_owned()]
+        );
+
+        // Removing an interface that was never added is an error, and does not
+        // fall back to the listener without an interface.
+        assert!(
+            state
+                .dispatch(
+                    &RequestType::RemoveListener(RemoveListener {
+                        address: addr,
+                        proxy: ListenerType::Tcp.into(),
+                        interface: Some("eth9".to_owned()),
+                    })
+                    .into(),
+                )
+                .is_err()
+        );
+
+        // A SaveState -> LoadState round trip rebuilds every listener with its
+        // interface, and the diff between the two states is empty.
+        let mut replayed = ConfigState::new();
+        for request in state.generate_requests() {
+            replayed
+                .dispatch(&request)
+                .expect("replaying generated requests");
+        }
+        assert_eq!(replayed.list_listeners(), state.list_listeners());
+        assert!(state.diff(&replayed).is_empty());
+    }
+
+    /// The diff between two states tells listeners apart by interface: moving a
+    /// listener from one interface to another removes one and adds the other,
+    /// and the remove request names the interface it removes.
+    #[test]
+    fn listener_diff_distinguishes_interfaces() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8080);
+        let mut before = ConfigState::new();
+        before
+            .dispatch(
+                &RequestType::AddHttpListener(with_interface(make_http_listener(addr), |l| {
+                    l.interface = Some("eth0".to_owned())
+                }))
+                .into(),
+            )
+            .unwrap();
+        let mut after = ConfigState::new();
+        after
+            .dispatch(
+                &RequestType::AddHttpListener(with_interface(make_http_listener(addr), |l| {
+                    l.interface = Some("wg0".to_owned())
+                }))
+                .into(),
+            )
+            .unwrap();
+
+        let diff = before.diff(&after);
+        let mut removed = Vec::new();
+        let mut added = Vec::new();
+        for request in &diff {
+            match &request.request_type {
+                Some(RequestType::RemoveListener(remove)) => removed.push(remove.interface.clone()),
+                Some(RequestType::AddHttpListener(add)) => added.push(add.interface.clone()),
+                _ => {}
+            }
+        }
+        assert_eq!(removed, vec![Some("eth0".to_owned())]);
+        assert_eq!(added, vec![Some("wg0".to_owned())]);
+    }
+
+    /// The reload path: adding a listener on an interface next to one that
+    /// already routes frontends yields only that listener's add and
+    /// activation. The frontends are not sent again — they already sit on the
+    /// address — so the worker must give the new listener its sibling's routes
+    /// (`HttpProxy::add_listener`, `lib/src/http.rs`).
+    #[test]
+    fn reload_adding_an_interface_listener_sends_only_that_listener() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8080);
+        let front = RequestHttpFrontend {
+            cluster_id: Some("cluster_1".to_owned()),
+            hostname: "example.com".to_owned(),
+            path: PathRule::prefix("/".to_owned()),
+            address: addr,
+            ..Default::default()
+        };
+        let mut before = ConfigState::new();
+        for request in [
+            RequestType::AddHttpListener(make_http_listener(addr)),
+            RequestType::AddHttpFrontend(front),
+        ] {
+            before.dispatch(&request.into()).unwrap();
+        }
+        let mut after = before.clone();
+        after
+            .dispatch(
+                &RequestType::AddHttpListener(with_interface(make_http_listener(addr), |l| {
+                    l.interface = Some("wg0".to_owned())
+                }))
+                .into(),
+            )
+            .unwrap();
+
+        let diff = before.diff(&after);
+        assert_eq!(diff.len(), 1, "{diff:?}");
+        assert!(matches!(
+            &diff[0].request_type,
+            Some(RequestType::AddHttpListener(listener))
+                if listener.interface.as_deref() == Some("wg0")
+        ));
+    }
+
+    /// An update patch names its listener by address only (the interface is
+    /// not patchable). With two listeners on that address it cannot tell them
+    /// apart, so it is refused rather than applied to an arbitrary one.
+    #[test]
+    fn update_listener_is_refused_when_the_address_is_ambiguous() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8080);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(
+                &RequestType::AddHttpListener(with_interface(make_http_listener(addr), |l| {
+                    l.interface = Some("wg0".to_owned())
+                }))
+                .into(),
+            )
+            .unwrap();
+
+        // One listener on the address: the patch applies to it, interface or not.
+        state
+            .dispatch(
+                &RequestType::UpdateHttpListener(UpdateHttpListenerConfig {
+                    address: addr,
+                    front_timeout: Some(15),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("an unambiguous patch applies to the interface-bound listener");
+        assert_eq!(
+            state.list_listeners().http_listeners["0.0.0.0:8080%wg0"].front_timeout,
+            15
+        );
+
+        state
+            .dispatch(&RequestType::AddHttpListener(make_http_listener(addr)).into())
+            .unwrap();
+        let before = state.list_listeners();
+        let error = state
+            .dispatch(
+                &RequestType::UpdateHttpListener(UpdateHttpListenerConfig {
+                    address: addr,
+                    front_timeout: Some(20),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect_err("a patch matching two listeners must be refused");
+        assert!(
+            matches!(error, StateError::AmbiguousListenerAddress { count: 2, .. }),
+            "{error}"
+        );
+        assert_eq!(
+            before,
+            state.list_listeners(),
+            "a refused patch must leave the listeners untouched"
         );
     }
 }

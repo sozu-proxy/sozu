@@ -201,8 +201,11 @@ message AlpnProtocols {
 // Partial-update patch for a running HTTP listener.
 // Only fields that are `Some` in the patch will be applied;
 // absent fields preserve their current value on the listener.
-// Bind-only fields (address, active) are intentionally absent — use
+// Bind-only fields (address, interface, active) are intentionally absent — use
 // RemoveListener + AddHttpListener to change them.
+// `interface` is bind-only too, and not even a selector here: `address`
+// names the listener, and the main process refuses the patch when several
+// listeners share that address on different interfaces.
 message UpdateHttpListenerConfig {
     // identifies the listener to patch (required — used as key)
     required SocketAddress address = 1;
@@ -282,8 +285,11 @@ message UpdateHttpListenerConfig {
 // absent fields preserve their current value on the listener.
 // Bind-only fields (tls_versions, cipher_list, cipher_suites,
 // signature_algorithms, groups_list, certificate, certificate_chain, key,
-// send_tls13_tickets, active) are intentionally absent — use
+// send_tls13_tickets, interface, active) are intentionally absent — use
 // RemoveListener + AddHttpsListener to change them.
+// `interface` is bind-only too, and not even a selector here: `address`
+// names the listener, and the main process refuses the patch when several
+// listeners share that address on different interfaces.
 message UpdateHttpsListenerConfig {
     // identifies the listener to patch (required — used as key)
     required SocketAddress address = 1;
@@ -379,7 +385,10 @@ message UpdateHttpsListenerConfig {
 // Partial-update patch for a running TCP listener.
 // Only fields that are `Some` in the patch will be applied;
 // absent fields preserve their current value on the listener.
-// Bind-only fields (address, active) are intentionally absent.
+// Bind-only fields (address, interface, active) are intentionally absent.
+// `interface` is bind-only too, and not even a selector here: `address`
+// names the listener, and the main process refuses the patch when several
+// listeners share that address on different interfaces.
 message UpdateTcpListenerConfig {
     // identifies the listener to patch (required — used as key)
     required SocketAddress address = 1;
@@ -397,8 +406,11 @@ message UpdateTcpListenerConfig {
 // Partial-update patch for a running UDP listener.
 // Only fields that are `Some` in the patch will be applied;
 // absent fields preserve their current value on the listener.
-// Bind-only fields (address, active) are intentionally absent — use
+// Bind-only fields (address, interface, active) are intentionally absent — use
 // RemoveListener + AddUdpListener to change them.
+// `interface` is bind-only too, and not even a selector here: `address`
+// names the listener, and the main process refuses the patch when several
+// listeners share that address on different interfaces.
 message UpdateUdpListenerConfig {
     // identifies the listener to patch (required — used as key)
     required SocketAddress address = 1;
@@ -520,6 +532,14 @@ message HttpListenerConfig {
     // indexed-reference header bomb, where 1-byte indexed references are
     // amplified into per-entry bookkeeping. Default: 128.
     optional uint32 h2_max_header_fields = 34;
+    // Name of the network interface (e.g. "wg0") the listening socket is
+    // bound to with SO_BINDTODEVICE, set before bind(). Linux only: the
+    // configuration loader refuses the key on any other platform. Part of the
+    // listener identity together with `address`, so two listeners may share an
+    // address on different interfaces. Absent = not bound to an interface (the
+    // historical behaviour). Not patchable: changing it needs a rebind, so it
+    // is absent from the Update*ListenerConfig patches.
+    optional string interface = 35;
 }
 
 // details of an HTTPS listener
@@ -663,6 +683,14 @@ message HttpsListenerConfig {
     // indexed-reference header bomb, where 1-byte indexed references are
     // amplified into per-entry bookkeeping. Default: 128.
     optional uint32 h2_max_header_fields = 47;
+    // Name of the network interface (e.g. "wg0") the listening socket is
+    // bound to with SO_BINDTODEVICE, set before bind(). Linux only: the
+    // configuration loader refuses the key on any other platform. Part of the
+    // listener identity together with `address`, so two listeners may share an
+    // address on different interfaces. Absent = not bound to an interface (the
+    // historical behaviour). Not patchable: changing it needs a rebind, so it
+    // is absent from the Update*ListenerConfig patches.
+    optional string interface = 48;
 }
 
 // details of an TCP listener
@@ -689,6 +717,14 @@ message TcpListenerConfig {
     // global `buffer_size`: a value greater than `buffer_size` is a
     // configuration error at load time (raise `buffer_size` instead).
     optional uint32 sni_preread_max_bytes = 9 [default = 16384];
+    // Name of the network interface (e.g. "wg0") the listening socket is
+    // bound to with SO_BINDTODEVICE, set before bind(). Linux only: the
+    // configuration loader refuses the key on any other platform. Part of the
+    // listener identity together with `address`, so two listeners may share an
+    // address on different interfaces. Absent = not bound to an interface (the
+    // historical behaviour). Not patchable: changing it needs a rebind, so it
+    // is absent from the Update*ListenerConfig patches.
+    optional string interface = 10;
 }
 
 // details of a UDP listener
@@ -705,6 +741,14 @@ message UdpListenerConfig {
     required uint32 max_flows = 6 [default = 0];
     // wether the listener is actively listening on its socket
     required bool active = 7 [default = false];
+    // Name of the network interface (e.g. "wg0") the listening socket is
+    // bound to with SO_BINDTODEVICE, set before bind(). Linux only: the
+    // configuration loader refuses the key on any other platform. Part of the
+    // listener identity together with `address`, so two listeners may share an
+    // address on different interfaces. Absent = not bound to an interface (the
+    // historical behaviour). Not patchable: changing it needs a rebind, so it
+    // is absent from the Update*ListenerConfig patches.
+    optional string interface = 8;
 }
 
 // HSTS (HTTP Strict Transport Security, RFC 6797) policy attached to
@@ -791,17 +835,29 @@ message ActivateListener {
     required SocketAddress address = 1;
     required ListenerType proxy = 2;
     required bool from_scm = 3;
+    // Interface of the targeted listener, when it was added with one: the
+    // listener identity is (address, interface). Absent targets the listener
+    // added without an interface.
+    optional string interface = 4;
 }
 
 message DeactivateListener {
     required SocketAddress address = 1;
     required ListenerType proxy = 2;
     required bool to_scm = 3;
+    // Interface of the targeted listener, when it was added with one: the
+    // listener identity is (address, interface). Absent targets the listener
+    // added without an interface.
+    optional string interface = 4;
 }
 
 message RemoveListener {
     required SocketAddress address = 1;
     required ListenerType proxy = 2;
+    // Interface of the targeted listener, when it was added with one: the
+    // listener identity is (address, interface). Absent targets the listener
+    // added without an interface.
+    optional string interface = 3;
 }
 
 enum ListenerType {
@@ -813,13 +869,13 @@ enum ListenerType {
 
 // All listeners, listed
 message ListenersList {
-    // address -> http listener config
+    // listener key (address, plus `%<interface>` when bound) -> http listener config
     map<string, HttpListenerConfig> http_listeners = 1;
-    // address -> https listener config
+    // listener key -> https listener config
     map<string, HttpsListenerConfig> https_listeners = 2;
-    // address -> tcp listener config
+    // listener key -> tcp listener config
     map<string, TcpListenerConfig> tcp_listeners = 3;
-    // address -> udp listener config
+    // listener key -> udp listener config
     map<string, UdpListenerConfig> udp_listeners = 4;
 }
 
@@ -1964,7 +2020,10 @@ enum ProtobufAccessLogFormat {
     Protobuf = 2;
 }
 
-// Addresses of listeners, passed to new workers
+// Addresses of listeners, passed to new workers. Each entry is a listener
+// key: the socket address, followed by `%<interface>` when the listener is
+// bound to a network interface (see `ListenerKey` in
+// `command/src/listener_key.rs`).
 message ListenersCount {
     // socket addresses of HTTP listeners
     repeated string http = 1;

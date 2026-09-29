@@ -33,6 +33,7 @@ use socket2::SockRef;
 use sozu_command::{
     certificate::Fingerprint,
     config::{DEFAULT_ALPN_PROTOCOLS, DEFAULT_CIPHER_LIST},
+    listener_key::ListenerKey,
     proto::command::{
         AddCertificate, CertificateSummary, CertificatesByAddress, Cluster, HttpsListenerConfig,
         ListOfCertificatesByAddress, ListenerType, RemoveCertificate, RemoveListener,
@@ -1444,6 +1445,17 @@ impl L7ListenerHandler for HttpsListener {
 }
 
 impl HttpsListener {
+    /// This listener's identity: its address, plus the network interface its
+    /// socket is bound to when it has one.
+    pub fn key(&self) -> ListenerKey {
+        ListenerKey::new(self.address, self.config.interface.as_deref())
+    }
+
+    /// Whether this listener is the one `key` names.
+    pub fn is(&self, key: &ListenerKey) -> bool {
+        key.matches(&self.address, self.config.interface.as_deref())
+    }
+
     /// Whether this listener rejects clients that do not negotiate `h2`
     /// via TLS ALPN (including those that omit ALPN). Reads the
     /// `disable_http11` knob; defaults to `false` to preserve the
@@ -1565,12 +1577,12 @@ impl HttpsListener {
             }
             (Some(inherited), None) => inherited,
             (None, Some(parked)) => parked,
-            (None, None) => {
-                server_bind(address).map_err(|server_bind_error| ListenerError::Activation {
+            (None, None) => server_bind(address, self.config.interface.as_deref()).map_err(
+                |server_bind_error| ListenerError::Activation {
                     address,
                     error: server_bind_error.to_string(),
-                })?
-            }
+                },
+            )?,
         };
 
         // Once per listener, on whichever socket won above — freshly bound,
@@ -2039,10 +2051,45 @@ impl HttpsProxy {
         config: HttpsListenerConfig,
         token: Token,
     ) -> Result<Token, ProxyError> {
+        if self.listeners.contains_key(&token) {
+            return Err(ProxyError::ListenerAlreadyPresent);
+        }
+        let mut https_listener =
+            HttpsListener::try_new(config, token).map_err(ProxyError::AddListener)?;
+        // Frontends and certificates name their listener by address alone, so
+        // a listener added next to one already on its address (on another
+        // interface) takes over the routes and certificates that one serves:
+        // every listener on an address holds the same ones, whenever it was
+        // added (sozu-proxy/sozu#719). The certificates are copied into this
+        // listener's own resolver, the one its rustls configuration already
+        // points at, so later changes keep reaching it through the fan-out.
+        if let Some(sibling) = self
+            .listeners_at(https_listener.address)
+            .ok()
+            .and_then(|listeners| listeners.into_iter().next())
+        {
+            let sibling = sibling.borrow();
+            https_listener.fronts = sibling.fronts.clone();
+            // Frontends that inherited the sibling's listener-default HSTS
+            // inherit this listener's default instead.
+            https_listener
+                .fronts
+                .refresh_inheriting_hsts(https_listener.config.hsts.as_ref());
+            https_listener.tags = sibling.tags.clone();
+            let certificates = sibling
+                .resolver
+                .0
+                .lock()
+                .map_err(|e| ProxyError::Lock(e.to_string()))?
+                .clone();
+            *https_listener
+                .resolver
+                .0
+                .lock()
+                .map_err(|e| ProxyError::Lock(e.to_string()))? = certificates;
+        }
         match self.listeners.entry(token) {
             Entry::Vacant(entry) => {
-                let https_listener =
-                    HttpsListener::try_new(config, token).map_err(ProxyError::AddListener)?;
                 entry.insert(Rc::new(RefCell::new(https_listener)));
                 Ok(token)
             }
@@ -2056,9 +2103,9 @@ impl HttpsProxy {
     ) -> Result<Option<ResponseContent>, ProxyError> {
         let len = self.listeners.len();
 
-        let remove_address = remove.address.into();
+        let remove_address = remove.listener_key();
         self.listeners
-            .retain(|_, listener| listener.borrow().address != remove_address);
+            .retain(|_, listener| !listener.borrow().is(&remove_address));
 
         if !self.listeners.len() < len {
             info!(
@@ -2231,12 +2278,12 @@ impl HttpsProxy {
     /// The event loop is single-threaded, so nothing can change the listener's
     /// `active` flag between this answer and the `activate_listener` call that
     /// acts on it.
-    pub fn inherited_socket_fate(&self, addr: &StdSocketAddr) -> crate::InheritedSocketFate {
+    pub fn inherited_socket_fate(&self, addr: &ListenerKey) -> crate::InheritedSocketFate {
         use crate::InheritedSocketFate;
         match self
             .listeners
             .values()
-            .find(|listener| listener.borrow().address == *addr)
+            .find(|listener| listener.borrow().is(addr))
         {
             None => InheritedSocketFate::Unclaimed,
             Some(listener) if listener.borrow().active => InheritedSocketFate::Refused,
@@ -2246,20 +2293,20 @@ impl HttpsProxy {
 
     pub fn activate_listener(
         &mut self,
-        addr: &StdSocketAddr,
+        addr: &ListenerKey,
         tcp_listener: Option<MioTcpListener>,
     ) -> Result<Token, ProxyError> {
         let listener = self
             .listeners
             .values()
-            .find(|listener| listener.borrow().address == *addr)
-            .ok_or(ProxyError::NoListenerFound(addr.to_owned()))?;
+            .find(|listener| listener.borrow().is(addr))
+            .ok_or(ProxyError::NoListenerFound(addr.clone()))?;
 
         listener
             .borrow_mut()
             .activate(&self.registry, tcp_listener)
             .map_err(|listener_error| ProxyError::ListenerActivation {
-                address: *addr,
+                address: addr.address,
                 listener_error,
             })
     }
@@ -2272,14 +2319,14 @@ impl HttpsProxy {
     /// touches the session slab. `Server` therefore reads the token here
     /// BEFORE dropping the listener, so that reserved slot is released exactly
     /// once, at the end of the lifetime.
-    pub fn listener_token(&self, address: StdSocketAddr) -> Option<Token> {
+    pub fn listener_token(&self, address: &ListenerKey) -> Option<Token> {
         self.listeners
             .iter()
-            .find(|(_, listener)| listener.borrow().address == address)
+            .find(|(_, listener)| listener.borrow().is(address))
             .map(|(token, _)| *token)
     }
 
-    pub fn give_back_listeners(&mut self) -> Vec<(StdSocketAddr, MioTcpListener)> {
+    pub fn give_back_listeners(&mut self) -> Vec<(ListenerKey, MioTcpListener)> {
         self.listeners
             .values()
             .filter_map(|listener| {
@@ -2288,7 +2335,7 @@ impl HttpsProxy {
                     // Reset `active` so a subsequent `activate()` re-binds
                     // instead of short-circuiting on the stale flag.
                     owned.active = false;
-                    return Some((owned.address, listener));
+                    return Some((owned.key(), listener));
                 }
 
                 None
@@ -2298,13 +2345,13 @@ impl HttpsProxy {
 
     pub fn give_back_listener(
         &mut self,
-        address: StdSocketAddr,
+        address: &ListenerKey,
     ) -> Result<(Token, MioTcpListener), ProxyError> {
         let listener = self
             .listeners
             .values()
-            .find(|listener| listener.borrow().address == address)
-            .ok_or(ProxyError::NoListenerFound(address))?;
+            .find(|listener| listener.borrow().is(address))
+            .ok_or(ProxyError::NoListenerFound(address.clone()))?;
 
         let mut owned = listener.borrow_mut();
 
@@ -2320,6 +2367,31 @@ impl HttpsProxy {
         Ok((owned.token, taken_listener))
     }
 
+    /// Every listener on `address`, whatever its interface. Frontends and
+    /// certificates name their listener by address alone, so they apply to
+    /// all the listeners sharing that address on different interfaces.
+    fn listeners_at(
+        &self,
+        address: StdSocketAddr,
+    ) -> Result<Vec<Rc<RefCell<HttpsListener>>>, ProxyError> {
+        let mut listeners: Vec<_> = self
+            .listeners
+            .iter()
+            .filter(|(_, listener)| listener.borrow().address == address)
+            .map(|(token, listener)| (*token, listener.clone()))
+            .collect();
+        // Token order, so a failure is reported the same way on every run.
+        listeners.sort_by_key(|(token, _)| *token);
+        let listeners: Vec<_> = listeners
+            .into_iter()
+            .map(|(_, listener)| listener)
+            .collect();
+        if listeners.is_empty() {
+            return Err(ProxyError::NoListenerFound(address.into()));
+        }
+        Ok(listeners)
+    }
+
     /// Apply a partial-update patch to the identified HTTPS listener.
     pub fn update_listener(&mut self, patch: UpdateHttpsListenerConfig) -> Result<(), ProxyError> {
         let address: std::net::SocketAddr = patch.address.into();
@@ -2327,7 +2399,7 @@ impl HttpsProxy {
             .listeners
             .values()
             .find(|l| l.borrow().address == address)
-            .ok_or(ProxyError::NoListenerFound(address))?;
+            .ok_or(ProxyError::NoListenerFound(address.into()))?;
         listener
             .borrow_mut()
             .update_config(&patch)
@@ -2384,43 +2456,43 @@ impl HttpsProxy {
         &mut self,
         front: RequestHttpFrontend,
     ) -> Result<Option<ResponseContent>, ProxyError> {
-        let mut front = front.clone().to_frontend().map_err(|request_error| {
+        let front = front.clone().to_frontend().map_err(|request_error| {
             ProxyError::WrongInputFrontend {
                 front: Box::new(front),
                 error: request_error.to_string(),
             }
         })?;
 
-        let mut listener = self
-            .listeners
-            .values()
-            .find(|l| l.borrow().address == front.address)
-            .ok_or(ProxyError::NoListenerFound(front.address))?
-            .borrow_mut();
+        for listener in self.listeners_at(front.address)? {
+            let mut listener = listener.borrow_mut();
+            let mut front = front.clone();
 
-        // ── HSTS listener-default → frontend inheritance ─────────────────
-        // When the frontend declares no `hsts` block, fall back to the
-        // listener default so the operator can opt into HSTS once at the
-        // listener and have every HTTPS frontend inherit it.
-        // `enabled = Some(false)` on the frontend is the explicit-disable
-        // signal: it stays as-is and suppresses the inherited default.
-        //
-        // The `hsts_origin` flag is passed through to the router so the
-        // resulting `Frontend` carries the inheritance bit; a later
-        // `UpdateHttpsListenerConfig.hsts` patch will then refresh this
-        // entry via `Router::refresh_inheriting_hsts` without disturbing
-        // explicit per-frontend overrides.
-        let hsts_origin = if front.hsts.is_none() && listener.config.hsts.is_some() {
-            front.hsts = listener.config.hsts;
-            crate::router::HstsOrigin::InheritedFromListenerDefault
-        } else {
-            crate::router::HstsOrigin::Explicit
-        };
+            // ── HSTS listener-default → frontend inheritance ─────────────────
+            // When the frontend declares no `hsts` block, fall back to the
+            // listener default so the operator can opt into HSTS once at the
+            // listener and have every HTTPS frontend inherit it.
+            // `enabled = Some(false)` on the frontend is the explicit-disable
+            // signal: it stays as-is and suppresses the inherited default.
+            //
+            // The `hsts_origin` flag is passed through to the router so the
+            // resulting `Frontend` carries the inheritance bit; a later
+            // `UpdateHttpsListenerConfig.hsts` patch will then refresh this
+            // entry via `Router::refresh_inheriting_hsts` without disturbing
+            // explicit per-frontend overrides.
+            // Each listener on the address resolves the inheritance against its
+            // own default, on its own copy of the frontend.
+            let hsts_origin = if front.hsts.is_none() && listener.config.hsts.is_some() {
+                front.hsts = listener.config.hsts;
+                crate::router::HstsOrigin::InheritedFromListenerDefault
+            } else {
+                crate::router::HstsOrigin::Explicit
+            };
 
-        listener.set_tags(front.hostname.to_owned(), front.tags.to_owned());
-        listener
-            .add_https_front_with_hsts_origin(front, hsts_origin)
-            .map_err(ProxyError::AddFrontend)?;
+            listener.set_tags(front.hostname.to_owned(), front.tags.to_owned());
+            listener
+                .add_https_front_with_hsts_origin(front, hsts_origin)
+                .map_err(ProxyError::AddFrontend)?;
+        }
         Ok(None)
     }
 
@@ -2435,23 +2507,25 @@ impl HttpsProxy {
             }
         })?;
 
-        let mut listener = self
-            .listeners
-            .values()
-            .find(|l| l.borrow().address == front.address)
-            .ok_or(ProxyError::NoListenerFound(front.address))?
-            .borrow_mut();
+        // Every listener on the address drops the route, even when another
+        // one fails: a sibling must never keep a route the others removed.
+        // The first failure, in token order, is the one reported.
+        let mut result = Ok(None);
+        for listener in self.listeners_at(front.address)? {
+            let mut listener = listener.borrow_mut();
+            let hostname = front.hostname.to_owned();
 
-        let hostname = front.hostname.to_owned();
+            if let Err(error) = listener.remove_https_front(front.clone())
+                && result.is_ok()
+            {
+                result = Err(ProxyError::RemoveFrontend(error));
+            }
 
-        listener
-            .remove_https_front(front)
-            .map_err(ProxyError::RemoveFrontend)?;
-
-        if !listener.fronts.has_hostname(&hostname) {
-            listener.set_tags(hostname, None);
+            if !listener.fronts.has_hostname(&hostname) {
+                listener.set_tags(hostname, None);
+            }
         }
-        Ok(None)
+        result
     }
 
     pub fn add_certificate(
@@ -2460,22 +2534,18 @@ impl HttpsProxy {
     ) -> Result<Option<ResponseContent>, ProxyError> {
         let address = add_certificate.address.into();
 
-        let listener = self
-            .listeners
-            .values()
-            .find(|l| l.borrow().address == address)
-            .ok_or(ProxyError::NoListenerFound(address))?
-            .borrow_mut();
+        for listener in self.listeners_at(address)? {
+            let listener = listener.borrow();
+            let mut resolver = listener
+                .resolver
+                .0
+                .lock()
+                .map_err(|e| ProxyError::Lock(e.to_string()))?;
 
-        let mut resolver = listener
-            .resolver
-            .0
-            .lock()
-            .map_err(|e| ProxyError::Lock(e.to_string()))?;
-
-        resolver
-            .add_certificate(&add_certificate)
-            .map_err(ProxyError::AddCertificate)?;
+            resolver
+                .add_certificate(&add_certificate)
+                .map_err(ProxyError::AddCertificate)?;
+        }
 
         Ok(None)
     }
@@ -2492,24 +2562,29 @@ impl HttpsProxy {
                 .map_err(ProxyError::WrongCertificateFingerprint)?,
         );
 
-        let listener = self
-            .listeners
-            .values()
-            .find(|l| l.borrow().address == address)
-            .ok_or(ProxyError::NoListenerFound(address))?
-            .borrow_mut();
-
-        let mut resolver = listener
-            .resolver
-            .0
-            .lock()
-            .map_err(|e| ProxyError::Lock(e.to_string()))?;
-
-        resolver
-            .remove_certificate(&fingerprint)
-            .map_err(ProxyError::RemoveCertificate)?;
-
-        Ok(None)
+        // Every listener on the address applies the change, even when another
+        // one fails, so none keeps a certificate its siblings dropped; the
+        // first failure, in token order, is the one reported.
+        let mut result = Ok(None);
+        for listener in self.listeners_at(address)? {
+            let listener = listener.borrow();
+            let applied = listener
+                .resolver
+                .0
+                .lock()
+                .map_err(|e| ProxyError::Lock(e.to_string()))
+                .and_then(|mut resolver| {
+                    resolver
+                        .remove_certificate(&fingerprint)
+                        .map_err(ProxyError::RemoveCertificate)
+                });
+            if let Err(error) = applied
+                && result.is_ok()
+            {
+                result = Err(error);
+            }
+        }
+        result
     }
 
     //FIXME: should return an error if certificate still has fronts referencing it
@@ -2519,24 +2594,29 @@ impl HttpsProxy {
     ) -> Result<Option<ResponseContent>, ProxyError> {
         let address = replace_certificate.address.into();
 
-        let listener = self
-            .listeners
-            .values()
-            .find(|l| l.borrow().address == address)
-            .ok_or(ProxyError::NoListenerFound(address))?
-            .borrow_mut();
-
-        let mut resolver = listener
-            .resolver
-            .0
-            .lock()
-            .map_err(|e| ProxyError::Lock(e.to_string()))?;
-
-        resolver
-            .replace_certificate(&replace_certificate)
-            .map_err(ProxyError::ReplaceCertificate)?;
-
-        Ok(None)
+        // Every listener on the address applies the change, even when another
+        // one fails, so none keeps a certificate its siblings dropped; the
+        // first failure, in token order, is the one reported.
+        let mut result = Ok(None);
+        for listener in self.listeners_at(address)? {
+            let listener = listener.borrow();
+            let applied = listener
+                .resolver
+                .0
+                .lock()
+                .map_err(|e| ProxyError::Lock(e.to_string()))
+                .and_then(|mut resolver| {
+                    resolver
+                        .replace_certificate(&replace_certificate)
+                        .map_err(ProxyError::ReplaceCertificate)
+                });
+            if let Err(error) = applied
+                && result.is_ok()
+            {
+                result = Err(error);
+            }
+        }
+        result
     }
 }
 
@@ -3998,5 +4078,116 @@ mod tests {
             "a frontend whose client is still there must keep its shutdown(SHUT_WR)"
         );
         assert!(saw_fin, "the client must observe the FIN");
+    }
+}
+
+#[cfg(test)]
+mod listener_sibling_tests {
+    use sozu_command::{
+        config::ListenerBuilder,
+        proto::command::{CertificateAndKey, PathRule, RequestHttpFrontend, SocketAddress},
+    };
+
+    use super::*;
+    use crate::testing::{ServerParts, prebuild_server, provide_port};
+
+    fn proxy() -> HttpsProxy {
+        let ServerParts {
+            registry,
+            sessions,
+            pool,
+            backends,
+            ..
+        } = prebuild_server(16, 16384, false).expect("could not prebuild a test server");
+        HttpsProxy::new(registry, sessions, pool, backends)
+    }
+
+    fn add(proxy: &mut HttpsProxy, address: SocketAddress, interface: Option<&str>, token: usize) {
+        let config = ListenerBuilder::new_https(address)
+            .with_interface(interface)
+            .to_tls(None)
+            .expect("could not build the listener config");
+        proxy
+            .add_listener(config, Token(token))
+            .expect("could not add the listener");
+    }
+
+    fn certificate(address: SocketAddress) -> AddCertificate {
+        AddCertificate {
+            address,
+            certificate: CertificateAndKey {
+                certificate: include_str!("../assets/certificate.pem").to_owned(),
+                key: include_str!("../assets/key.pem").to_owned(),
+                certificate_chain: Vec::new(),
+                versions: Vec::new(),
+                names: vec!["example.com".to_owned()],
+            },
+            expired_at: None,
+        }
+    }
+
+    fn front(address: SocketAddress) -> RequestHttpFrontend {
+        RequestHttpFrontend {
+            cluster_id: Some("cluster-a".to_owned()),
+            address,
+            hostname: "example.com".to_owned(),
+            path: PathRule::prefix("/".to_owned()),
+            ..Default::default()
+        }
+    }
+
+    fn serves_certificate(proxy: &HttpsProxy, token: usize) -> bool {
+        proxy.listeners[&Token(token)]
+            .borrow()
+            .resolver
+            .0
+            .lock()
+            .expect("resolver lock")
+            .domains
+            .domain_lookup(b"example.com", true)
+            .is_some()
+    }
+
+    fn routes(proxy: &HttpsProxy, token: usize) -> bool {
+        proxy.listeners[&Token(token)]
+            .borrow()
+            .fronts
+            .lookup("example.com", "/", &Method::Get)
+            .is_ok()
+    }
+
+    /// An HTTPS listener added on an address that already serves a certificate
+    /// and a frontend takes both over from the listener already there, so it
+    /// completes TLS handshakes and routes from its first connection
+    /// (sozu-proxy/sozu#719). It gets its own copy of the certificates: a
+    /// later change reaches it through the fan-out, like its sibling.
+    #[test]
+    fn a_listener_added_next_to_a_sibling_takes_over_its_certificates_and_frontends() {
+        let mut proxy = proxy();
+        let address = SocketAddress::new_v4(0, 0, 0, 0, provide_port());
+        add(&mut proxy, address, None, 0);
+        proxy
+            .add_certificate(certificate(address))
+            .expect("add the certificate");
+        proxy
+            .add_https_frontend(front(address))
+            .expect("add the frontend");
+        add(&mut proxy, address, Some("lo"), 1);
+
+        assert!(serves_certificate(&proxy, 0));
+        assert!(
+            serves_certificate(&proxy, 1),
+            "the listener added after the certificate must serve it too"
+        );
+        assert!(
+            routes(&proxy, 1),
+            "the listener added after the frontend must route it too"
+        );
+
+        proxy
+            .remove_https_frontend(front(address))
+            .expect("remove the frontend");
+        assert!(!routes(&proxy, 0));
+        assert!(!routes(&proxy, 1));
     }
 }

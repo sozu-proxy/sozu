@@ -9,7 +9,6 @@
 
 use std::{
     io::{IoSlice, IoSliceMut},
-    net::{AddrParseError, SocketAddr},
     os::unix::{
         io::{FromRawFd, IntoRawFd, RawFd},
         net::UnixStream as StdUnixStream,
@@ -20,7 +19,10 @@ use mio::net::{TcpListener, UdpSocket};
 use nix::{cmsg_space, sys::socket};
 use prost::{DecodeError, Message};
 
-use crate::proto::command::ListenersCount;
+use crate::{
+    listener_key::{ListenerKey, ListenerKeyError},
+    proto::command::ListenersCount,
+};
 
 pub const MAX_FDS_OUT: usize = 200;
 pub const MAX_BYTES_OUT: usize = 4096;
@@ -40,10 +42,10 @@ pub enum ScmSocketError {
     InvalidCharSet(String),
     #[error("Could not deserialize utf8 string into listeners: {0}")]
     ListenerParse(String),
-    #[error("Wrong socket address {address}: {error}")]
+    #[error("Wrong listener key {address}: {error}")]
     WrongSocketAddress {
         address: String,
-        error: AddrParseError,
+        error: ListenerKeyError,
     },
     #[error("error decoding the protobuf format of the listeners: {0}")]
     DecodeError(DecodeError),
@@ -491,20 +493,21 @@ impl ScmSocket {
     }
 }
 
-/// Socket addresses and file descriptors of listening sockets, needed by a
+/// Listener keys (socket address, plus interface when bound) and file
+/// descriptors of listening sockets, needed by a
 /// Proxy to start listening. The transport is fd-type-agnostic: `udp` carries
 /// `UdpSocket` fds, the others carry `TcpListener` fds.
 #[derive(Clone, Default, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Listeners {
-    pub http: Vec<(SocketAddr, RawFd)>,
-    pub tls: Vec<(SocketAddr, RawFd)>,
-    pub tcp: Vec<(SocketAddr, RawFd)>,
+    pub http: Vec<(ListenerKey, RawFd)>,
+    pub tls: Vec<(ListenerKey, RawFd)>,
+    pub tcp: Vec<(ListenerKey, RawFd)>,
     #[serde(default)]
-    pub udp: Vec<(SocketAddr, RawFd)>,
+    pub udp: Vec<(ListenerKey, RawFd)>,
 }
 
 impl Listeners {
-    pub fn get_http(&mut self, addr: &SocketAddr) -> Option<RawFd> {
+    pub fn get_http(&mut self, addr: &ListenerKey) -> Option<RawFd> {
         let before = self.http.len();
         let pos = self.http.iter().position(|(front, _)| front == addr);
         let result = pos.map(|pos| self.http.remove(pos).1);
@@ -522,7 +525,7 @@ impl Listeners {
         result
     }
 
-    pub fn get_https(&mut self, addr: &SocketAddr) -> Option<RawFd> {
+    pub fn get_https(&mut self, addr: &ListenerKey) -> Option<RawFd> {
         let before = self.tls.len();
         let pos = self.tls.iter().position(|(front, _)| front == addr);
         let result = pos.map(|pos| self.tls.remove(pos).1);
@@ -538,7 +541,7 @@ impl Listeners {
         result
     }
 
-    pub fn get_tcp(&mut self, addr: &SocketAddr) -> Option<RawFd> {
+    pub fn get_tcp(&mut self, addr: &ListenerKey) -> Option<RawFd> {
         let before = self.tcp.len();
         let pos = self.tcp.iter().position(|(front, _)| front == addr);
         let result = pos.map(|pos| self.tcp.remove(pos).1);
@@ -554,7 +557,7 @@ impl Listeners {
         result
     }
 
-    pub fn get_udp(&mut self, addr: &SocketAddr) -> Option<RawFd> {
+    pub fn get_udp(&mut self, addr: &ListenerKey) -> Option<RawFd> {
         let before = self.udp.len();
         let pos = self.udp.iter().position(|(front, _)| front == addr);
         let result = pos.map(|pos| self.udp.remove(pos).1);
@@ -612,10 +615,14 @@ impl Listeners {
     }
 }
 
-fn parse_addresses(addresses: &[String]) -> Result<Vec<SocketAddr>, ScmSocketError> {
+/// Parse the manifest's listener keys: the socket address, followed by
+/// `%<interface>` for a listener bound to a network interface. A manifest from
+/// a Sōzu that predates interfaces carries bare addresses, which parse as keys
+/// without an interface.
+fn parse_addresses(addresses: &[String]) -> Result<Vec<ListenerKey>, ScmSocketError> {
     let mut parsed_addresses = Vec::new();
     for address in addresses {
-        parsed_addresses.push(address.parse::<SocketAddr>().map_err(|error| {
+        parsed_addresses.push(address.parse::<ListenerKey>().map_err(|error| {
             ScmSocketError::WrongSocketAddress {
                 address: address.to_owned(),
                 error,
@@ -680,11 +687,11 @@ mod tests {
             http: vec![],
             tls: vec![],
             tcp: vec![(
-                tcp_listener.local_addr().expect("TCP local address"),
+                tcp_listener.local_addr().expect("TCP local address").into(),
                 tcp_listener.as_raw_fd(),
             )],
             udp: vec![(
-                udp_socket.local_addr().expect("UDP local address"),
+                udp_socket.local_addr().expect("UDP local address").into(),
                 udp_socket.as_raw_fd(),
             )],
         };
@@ -740,6 +747,64 @@ mod tests {
         assert_eq!(listeners, received_listeners);
     }
 
+    /// The SCM hand-off (worker upgrade, main upgrade) tells listeners apart by
+    /// interface: two sockets on one address, bound to different interfaces,
+    /// cross the wire under their own keys and each is handed back only to the
+    /// listener with that exact (address, interface).
+    #[test]
+    fn send_and_receive_listeners_keyed_by_interface() {
+        let (stream_1, stream_2) =
+            MioUnixStream::pair().expect("Could not create a pair of mio unix streams");
+        let sending_scm_socket =
+            ScmSocket::new(stream_1.into_raw_fd()).expect("Could not create scm socket");
+        let receiving_scm_socket =
+            ScmSocket::new(stream_2.into_raw_fd()).expect("Could not create scm socket");
+
+        let (bare, wg0) =
+            MioUnixStream::pair().expect("Could not create a pair of mio unix streams");
+        let (lo, udp) = MioUnixStream::pair().expect("Could not create a pair of mio unix streams");
+
+        let address = socket_addr_from_str("0.0.0.0:8443");
+        let bare_key = ListenerKey::from(address);
+        let wg0_key = ListenerKey::new(address, Some("wg0"));
+        let lo_key = ListenerKey::new(address, Some("lo"));
+        let listeners = Listeners {
+            http: vec![
+                (bare_key.clone(), bare.as_raw_fd()),
+                (wg0_key.clone(), wg0.as_raw_fd()),
+                (lo_key.clone(), lo.as_raw_fd()),
+            ],
+            udp: vec![(
+                ListenerKey::new(socket_addr_from_str("[::]:5353"), Some("wg0")),
+                udp.as_raw_fd(),
+            )],
+            ..Default::default()
+        };
+
+        sending_scm_socket
+            .send_listeners(&listeners)
+            .expect("Could not send listeners");
+        let mut received = receiving_scm_socket
+            .receive_listeners()
+            .expect("Could not receive listeners");
+
+        let keys: Vec<&ListenerKey> = received.http.iter().map(|(key, _)| key).collect();
+        assert_eq!(keys, vec![&bare_key, &wg0_key, &lo_key]);
+        assert_eq!(received.udp[0].0, listeners.udp[0].0);
+
+        let wg0_fd = received.get_http(&wg0_key).expect("the wg0 socket");
+        assert_eq!(received.http[1].0, lo_key, "only the wg0 entry is taken");
+        assert!(received.get_http(&wg0_key).is_none());
+        assert!(
+            received
+                .get_http(&ListenerKey::new(address, Some("eth0")))
+                .is_none(),
+            "an unknown interface on a known address matches nothing"
+        );
+        let bare_fd = received.get_http(&bare_key).expect("the bare socket");
+        assert_ne!(wg0_fd, bare_fd);
+    }
+
     #[test]
     fn send_and_receive_socket_addresses() {
         let (stream_1, stream_2) =
@@ -769,41 +834,41 @@ mod tests {
         let listeners = Listeners {
             http: vec![
                 (
-                    socket_addr_from_str("127.0.1.1:8080"),
+                    socket_addr_from_str("127.0.1.1:8080").into(),
                     http_socket1.as_raw_fd(),
                 ),
                 (
-                    socket_addr_from_str("127.0.1.2:8080"),
+                    socket_addr_from_str("127.0.1.2:8080").into(),
                     http_socket2.as_raw_fd(),
                 ),
             ],
             tcp: vec![
                 (
-                    socket_addr_from_str("127.0.2.1:8080"),
+                    socket_addr_from_str("127.0.2.1:8080").into(),
                     tcp_socket1.as_raw_fd(),
                 ),
                 (
-                    socket_addr_from_str("127.0.2.2:8080"),
+                    socket_addr_from_str("127.0.2.2:8080").into(),
                     tcp_socket2.as_raw_fd(),
                 ),
             ],
             tls: vec![
                 (
-                    socket_addr_from_str("127.0.3.1:8443"),
+                    socket_addr_from_str("127.0.3.1:8443").into(),
                     tls_socket1.as_raw_fd(),
                 ),
                 (
-                    socket_addr_from_str("127.0.3.2:8443"),
+                    socket_addr_from_str("127.0.3.2:8443").into(),
                     tls_socket2.as_raw_fd(),
                 ),
             ],
             udp: vec![
                 (
-                    socket_addr_from_str("127.0.4.1:5353"),
+                    socket_addr_from_str("127.0.4.1:5353").into(),
                     udp_socket1.as_raw_fd(),
                 ),
                 (
-                    socket_addr_from_str("127.0.4.2:5353"),
+                    socket_addr_from_str("127.0.4.2:5353").into(),
                     udp_socket2.as_raw_fd(),
                 ),
             ],

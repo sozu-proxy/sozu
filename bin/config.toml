@@ -279,6 +279,13 @@ protocol = "http"
 # listening address
 address = "0.0.0.0:8080"
 
+# bind the listening socket to one network interface (SO_BINDTODEVICE, Linux
+# only), e.g. a WireGuard interface whose address is not known ahead. The
+# interface must exist, and kernels before 5.7 require CAP_NET_RAW. Part of the
+# listener identity: listeners may share an address on different interfaces.
+# See `doc/configure.md`.
+# interface = "wg0"
+
 # specify a different IP than the one the socket sees, for logs and forwarded headers
 # this option is incompatible with expect_proxy
 # public_address = "1.2.3.4:80"

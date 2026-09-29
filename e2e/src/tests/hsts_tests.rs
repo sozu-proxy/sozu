@@ -66,6 +66,7 @@ fn spawn_worker_with_http_listener(name: &str, front_address: std::net::SocketAd
     });
     worker.send_proxy_request(Request {
         request_type: Some(RequestType::ActivateListener(ActivateListener {
+            interface: None,
             address: front_address.into(),
             proxy: ListenerType::Http.into(),
             from_scm: true,
@@ -244,6 +245,7 @@ fn spawn_https_worker(name: &str, front_address: SocketAddress) -> Worker {
             .expect("default HTTPS listener must build"),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,

@@ -204,7 +204,7 @@ single-request path uses: an entry NO worker acknowledged is reverted from
 the master's `ConfigState` with the inverse `compute_rollback` captured at
 scatter time, so `SaveState` cannot re-persist it and the next replay
 cannot re-inject it (sozu#1313). `compute_rollback` covers the four listener
-adds (inverted to `RemoveListener` on the same address and proxy type) and all
+adds (inverted to `RemoveListener` on the same address, interface and proxy type) and all
 four frontend adds — HTTP, HTTPS, TCP and UDP — each inverted to its
 `Remove*Frontend` counterpart carrying the very request message the add
 carried. Each of those removals matches on the very key its add admitted, so

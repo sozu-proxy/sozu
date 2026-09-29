@@ -97,6 +97,7 @@ fn setup_udp_test(
             .expect("could not build udp listener config"),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.into(),
         proxy: ListenerType::Udp.into(),
         from_scm: false,
@@ -588,6 +589,7 @@ fn try_udp_oversized_datagram_dropped() -> State {
         builder.to_udp(None).expect("udp listener config"),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.into(),
         proxy: ListenerType::Udp.into(),
         from_scm: false,
@@ -743,6 +745,7 @@ fn try_udp_hot_add_remove_listener() -> State {
             .expect("udp listener config"),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.into(),
         proxy: ListenerType::Udp.into(),
         from_scm: false,
@@ -773,11 +776,13 @@ fn try_udp_hot_add_remove_listener() -> State {
     // sequence the master emits: deactivate gives the socket back + drops the
     // listener slot, remove drops the config). ---
     worker.send_proxy_request_type(RequestType::DeactivateListener(DeactivateListener {
+        interface: None,
         address: front_address.into(),
         proxy: ListenerType::Udp.into(),
         to_scm: false,
     }));
     worker.send_proxy_request_type(RequestType::RemoveListener(RemoveListener {
+        interface: None,
         address: front_address.into(),
         proxy: ListenerType::Udp.into(),
     }));

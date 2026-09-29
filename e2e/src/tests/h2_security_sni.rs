@@ -134,6 +134,7 @@ fn setup_sni_two_tenant_listener(
     https_listener.strict_sni_binding = strict;
     worker.send_proxy_request_type(RequestType::AddHttpsListener(https_listener));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -426,6 +427,7 @@ fn try_h2_sni_plaintext_no_check() -> State {
             .expect("build http listener"),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.into(),
         proxy: ListenerType::Http.into(),
         from_scm: false,
@@ -692,6 +694,7 @@ fn try_h2_cn_not_coalesced_with_san() -> State {
     https_listener.strict_sni_binding = None;
     worker.send_proxy_request_type(RequestType::AddHttpsListener(https_listener));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,

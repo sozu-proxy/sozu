@@ -54,6 +54,7 @@ fn setup_tcp_test(name: &str, nb_backends: usize) -> (Worker, Vec<SocketAddr>, S
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.into(),
         proxy: ListenerType::Tcp.into(),
         from_scm: false,
@@ -98,6 +99,7 @@ fn setup_tcp_proxy_protocol_test(
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.into(),
         proxy: ListenerType::Tcp.into(),
         from_scm: false,
@@ -504,6 +506,7 @@ fn try_tcp_backend_connection_failure() -> State {
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.into(),
         proxy: ListenerType::Tcp.into(),
         from_scm: false,
@@ -647,6 +650,7 @@ fn try_tcp_refused_backend_is_accounted_and_avoided() -> State {
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.into(),
         proxy: ListenerType::Tcp.into(),
         from_scm: false,
@@ -1529,6 +1533,7 @@ fn setup_tcp_expect_header_cluster_test(name: &str) -> (Worker, SocketAddr, Sock
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.into(),
         proxy: ListenerType::Tcp.into(),
         from_scm: false,

@@ -23,7 +23,8 @@
 
 use sozu_command_lib::{
     parser::parse_several_requests,
-    proto::command::{WorkerRequest, request::RequestType},
+    proto::command::{HttpListenerConfig, SocketAddress, WorkerRequest, request::RequestType},
+    state::ConfigState,
 };
 
 /// `127.0.0.1` as the `IpAddress.Inner.V4` `fixed32` (`u32::from(Ipv4Addr)`
@@ -173,5 +174,92 @@ fn missing_required_scalar_still_fails() {
     assert!(
         !rest.is_empty(),
         "the unparsed bytes must remain — load_state would surface them as the error",
+    );
+}
+
+/// Listeners gained an optional `interface` (sozu-proxy/sozu#719), which is
+/// part of their identity. A pre-#719 writer emits listener records with no
+/// `interface` key at all; they must still load, as listeners without an
+/// interface keyed by their bare address — exactly as before.
+#[test]
+fn legacy_listener_records_without_interface_load_as_bare_address_listeners() {
+    let add_tcp_listener = format!(
+        r#"{{"id":"LEGACY-LISTENER-1","content":{{"request_type":{{"ADD_TCP_LISTENER":{{"address":{{"ip":{{"inner":{{"V4":{LOCALHOST_V4}}}}},"port":9000}},"public_address":null,"expect_proxy":false,"front_timeout":60,"back_timeout":30,"connect_timeout":3,"active":false}}}}}}}}"#,
+    );
+    let activate_listener = format!(
+        r#"{{"id":"LEGACY-LISTENER-2","content":{{"request_type":{{"ACTIVATE_LISTENER":{{"address":{{"ip":{{"inner":{{"V4":{LOCALHOST_V4}}}}},"port":9000}},"proxy":2,"from_scm":false}}}}}}}}"#,
+    );
+    let mut payload = Vec::new();
+    for record in [&add_tcp_listener, &activate_listener] {
+        payload.extend_from_slice(record.as_bytes());
+        payload.extend_from_slice(b"\n\0");
+    }
+
+    let (rest, requests) = parse_several_requests::<WorkerRequest>(&payload)
+        .expect("pre-#719 listener records must parse against the current schema");
+    assert!(rest.is_empty(), "{} leftover bytes", rest.len());
+    assert_eq!(requests.len(), 2);
+
+    let mut state = ConfigState::new();
+    for request in &requests {
+        state
+            .dispatch(&request.content)
+            .expect("a pre-#719 listener record must dispatch");
+    }
+    let listeners = state.list_listeners();
+    let listener = listeners
+        .tcp_listeners
+        .get("127.0.0.1:9000")
+        .expect("the listener keeps its bare-address key");
+    assert_eq!(listener.interface, None);
+    assert!(listener.active, "the legacy ACTIVATE_LISTENER found it");
+}
+
+/// `ConfigState` crosses a main-process upgrade serialized as JSON
+/// (`UpgradeData` in `bin/src/command/upgrade.rs`). The state an older main
+/// writes keys its listener maps by bare address and carries no `interface`
+/// field; the new main must rebuild the identical state from it.
+#[test]
+fn legacy_config_state_json_without_interface_deserializes() {
+    let mut state = ConfigState::new();
+    let address = SocketAddress::new_v4(127, 0, 0, 1, 8080);
+    state
+        .dispatch(
+            &RequestType::AddHttpListener(HttpListenerConfig {
+                address,
+                sticky_name: "SOZUBALANCEID".to_owned(),
+                front_timeout: 60,
+                back_timeout: 30,
+                connect_timeout: 3,
+                request_timeout: 10,
+                ..Default::default()
+            })
+            .into(),
+        )
+        .expect("add the listener");
+
+    let mut json = serde_json::to_value(&state).expect("serialize the state");
+    let listeners = json["http_listeners"]
+        .as_object_mut()
+        .expect("http_listeners is a JSON object");
+    assert_eq!(
+        listeners.keys().collect::<Vec<_>>(),
+        vec!["127.0.0.1:8080"],
+        "a listener without interface keeps the bare-address key an older main reads"
+    );
+    // What an older main writes: no `interface` field at all.
+    for listener in listeners.values_mut() {
+        listener
+            .as_object_mut()
+            .expect("a listener is a JSON object")
+            .remove("interface")
+            .expect("the current schema writes the interface field");
+    }
+
+    let legacy: ConfigState =
+        serde_json::from_value(json).expect("a pre-#719 ConfigState must deserialize");
+    assert!(
+        legacy == state,
+        "the legacy state must rebuild the same state"
     );
 }

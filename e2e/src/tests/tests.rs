@@ -874,6 +874,7 @@ pub fn try_issue_810_panic(part2: bool) -> State {
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.into(),
         proxy: ListenerType::Tcp.into(),
         from_scm: false,
@@ -947,6 +948,7 @@ fn try_tls_with_cert(
     ));
 
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -1052,6 +1054,7 @@ fn try_tls_cardinality_cell(
         listener_builder.to_tls(None).unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -1357,6 +1360,191 @@ pub fn try_upgrade() -> State {
         backend.name, backend.responses_sent, backend.requests_received
     );
 
+    State::Success
+}
+
+/// An HTTP listener bound to a network interface (`SO_BINDTODEVICE`,
+/// sozu-proxy/sozu#719) serves what arrives through that interface — `lo` for
+/// 127.0.0.1 — and keeps serving it across a worker upgrade: the SCM hand-off
+/// carries the socket under its (address, interface) key, so the new worker
+/// adopts that very socket. Were the key to lose the interface, the inherited
+/// socket would stay unclaimed yet still bound with `SO_REUSEPORT`, and take a
+/// share of the new connections that nothing accepts.
+#[cfg(target_os = "linux")]
+pub fn try_upgrade_interface_bound_listener() -> State {
+    let front_address = create_unbound_local_address();
+    let (config, listeners, state) = Worker::empty_config();
+    let mut worker = Worker::start_new_worker_owned("IFACE", config, listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpListener(
+        ListenerBuilder::new_http(front_address.into())
+            .with_interface(Some("lo"))
+            .to_http(None)
+            .expect("build the lo-bound HTTP listener"),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.into(),
+        proxy: ListenerType::Http.into(),
+        from_scm: false,
+        interface: Some("lo".to_owned()),
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpFrontend(Worker::default_http_frontend(
+        "cluster_0",
+        front_address,
+    )));
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let mut backend = SyncBackend::new("BACKEND", back_address, http_ok_response("pong"));
+    backend.connect();
+
+    let round_trip = |worker_name: &str, backend: &mut SyncBackend, index: usize| -> bool {
+        let mut client = Client::new(
+            format!("client-{worker_name}-{index}"),
+            front_address,
+            http_request("GET", "/api", "ping", "localhost"),
+        );
+        client.connect();
+        client.send();
+        backend.accept(index);
+        backend.receive(index);
+        backend.send(index);
+        match receive_with_deadline(&mut client, Duration::from_secs(1)) {
+            Some(response) => response.contains("pong"),
+            None => false,
+        }
+    };
+
+    if !round_trip("old", &mut backend, 0) {
+        println!("the lo-bound listener did not serve a request");
+        return State::Fail;
+    }
+
+    let mut new_worker = worker.upgrade("IFACE_UPGRADED");
+    // Every fresh connection after the upgrade must be served: one landing on
+    // an orphaned inherited socket would never be accepted.
+    for index in 1..=8 {
+        if !round_trip("new", &mut backend, index) {
+            println!("connection {index} after the upgrade was not served");
+            return State::Fail;
+        }
+    }
+
+    new_worker.soft_stop();
+    if !worker.wait_for_server_stop() || !new_worker.wait_for_server_stop() {
+        return State::Fail;
+    }
+    State::Success
+}
+
+/// The runtime add the reload path and `sozu listener http add --interface`
+/// perform: an HTTP listener on `0.0.0.0:P` already routes a frontend, then a
+/// listener on the same address bound to `lo` is added and activated. Linux
+/// hands loopback connections to the `lo`-bound socket from then on, so that
+/// listener must route the frontend it never received a request for —
+/// otherwise every request through `lo` answers 404 (sozu-proxy/sozu#719).
+#[cfg(target_os = "linux")]
+pub fn try_listener_added_on_an_interface_serves_existing_frontends() -> State {
+    let port = create_unbound_local_address().port();
+    let listen_address = SocketAddr::from(([0, 0, 0, 0], port));
+    let client_address = SocketAddr::from(([127, 0, 0, 1], port));
+    let (config, listeners, state) = Worker::empty_config();
+    let mut worker = Worker::start_new_worker_owned("IFACE_ADD", config, listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpListener(
+        ListenerBuilder::new_http(listen_address.into())
+            .to_http(None)
+            .expect("build the HTTP listener"),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: listen_address.into(),
+        proxy: ListenerType::Http.into(),
+        from_scm: false,
+        interface: None,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpFrontend(Worker::default_http_frontend(
+        "cluster_0",
+        listen_address,
+    )));
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let mut backend = SyncBackend::new("BACKEND", back_address, http_ok_response("pong"));
+    backend.connect();
+    let mut accepted = 0;
+    let mut round_trip = |backend: &mut SyncBackend| -> Option<String> {
+        let mut client = Client::new(
+            format!("client-{accepted}"),
+            client_address,
+            http_request("GET", "/api", "ping", "localhost"),
+        );
+        client.connect();
+        client.send();
+        let response = receive_with_deadline(&mut client, Duration::from_millis(300));
+        if response.is_none() {
+            backend.accept(accepted);
+            backend.receive(accepted);
+            backend.send(accepted);
+            accepted += 1;
+            return receive_with_deadline(&mut client, Duration::from_secs(1));
+        }
+        response
+    };
+
+    match round_trip(&mut backend) {
+        Some(response) if response.contains("pong") => {}
+        other => {
+            println!("the listener without interface did not serve the frontend: {other:?}");
+            return State::Fail;
+        }
+    }
+
+    worker.send_proxy_request_type(RequestType::AddHttpListener(
+        ListenerBuilder::new_http(listen_address.into())
+            .with_interface(Some("lo"))
+            .to_http(None)
+            .expect("build the lo-bound HTTP listener"),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: listen_address.into(),
+        proxy: ListenerType::Http.into(),
+        from_scm: false,
+        interface: Some("lo".to_owned()),
+    }));
+    worker.read_to_last();
+
+    for index in 0..4 {
+        match round_trip(&mut backend) {
+            Some(response) if response.contains("pong") => {}
+            other => {
+                println!("request {index} through lo was not routed: {other:?}");
+                return State::Fail;
+            }
+        }
+    }
+
+    worker.soft_stop();
+    if !worker.wait_for_server_stop() {
+        return State::Fail;
+    }
     State::Success
 }
 
@@ -1962,6 +2150,7 @@ fn try_http_behaviors() -> State {
 
     worker.send_proxy_request_type(RequestType::AddHttpListener(http_config));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.into(),
         proxy: ListenerType::Http.into(),
         from_scm: false,
@@ -2267,6 +2456,7 @@ fn try_builtin_404_default_answer_closes_connection() -> State {
 
     worker.send_proxy_request_type(RequestType::AddHttpListener(http_config));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.into(),
         proxy: ListenerType::Http.into(),
         from_scm: false,
@@ -2313,6 +2503,7 @@ fn try_https_redirect() -> State {
 
     worker.send_proxy_request_type(RequestType::AddHttpListener(http_config));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.into(),
         proxy: ListenerType::Http.into(),
         from_scm: false,
@@ -3169,6 +3360,7 @@ fn try_wildcard() -> State {
     );
     worker.send_proxy_request(
         RequestType::ActivateListener(ActivateListener {
+            interface: None,
             address: front_address.into(),
             proxy: ListenerType::Http.into(),
             from_scm: false,
@@ -3691,6 +3883,32 @@ fn test_status_header_split() {
 // Upgrade tests
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "linux")]
+#[test]
+fn test_listener_added_on_an_interface_serves_existing_frontends() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "a listener added on an interface next to a routed listener serves its frontends",
+            try_listener_added_on_an_interface_serves_existing_frontends
+        ),
+        State::Success
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_upgrade_interface_bound_listener() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "Upgrade: a listener bound to an interface keeps serving after a worker upgrade",
+            try_upgrade_interface_bound_listener
+        ),
+        State::Success
+    );
+}
+
 #[test]
 fn test_upgrade() {
     assert_eq!(
@@ -3785,6 +4003,7 @@ fn setup_h2_test(
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -4178,6 +4397,7 @@ fn setup_h2_test_with_alpn(
         listener_builder.to_tls(None).unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -4466,6 +4686,7 @@ fn setup_h2_backend_test(
                 .unwrap(),
         ));
         worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+            interface: None,
             address: front_address.clone(),
             proxy: ListenerType::Https.into(),
             from_scm: false,
@@ -4478,6 +4699,7 @@ fn setup_h2_backend_test(
                 .unwrap(),
         ));
         worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+            interface: None,
             address: front_address.clone(),
             proxy: ListenerType::Http.into(),
             from_scm: false,
@@ -4826,6 +5048,7 @@ fn setup_x_real_ip_test(
 
     worker.send_proxy_request_type(RequestType::AddHttpListener(http_listener));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.into(),
         proxy: ListenerType::Http.into(),
         from_scm: false,
@@ -5294,6 +5517,7 @@ fn try_x_real_ip_elide_h2_trailer() -> State {
         .expect("could not build HTTPS listener");
     worker.send_proxy_request_type(RequestType::AddHttpsListener(listener));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,

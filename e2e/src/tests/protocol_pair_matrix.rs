@@ -221,6 +221,7 @@ fn bring_up_https_listener(
             .expect("default HTTPS listener must build"),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: SocketAddress::from(front_address),
         proxy: ListenerType::Https.into(),
         from_scm: false,

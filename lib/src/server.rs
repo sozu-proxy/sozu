@@ -20,6 +20,7 @@ use slab::Slab;
 use sozu_command::{
     channel::Channel,
     config::MetricDetailLevel,
+    listener_key::ListenerKey,
     logging,
     proto::command::{
         ActivateListener, AddBackend, CertificatesWithFingerprints, Cluster, ClusterHashes,
@@ -2702,12 +2703,12 @@ impl Server {
                 // cycle — and `base_sessions_count`, decremented just above,
                 // drifts below the number of reserved slots. Read the token
                 // BEFORE the proxy drops the listener that holds it.
-                let address: std::net::SocketAddr = remove.address.into();
+                let address = remove.listener_key();
                 let listen_token = match listener_type {
-                    Ok(ListenerType::Http) => self.http.borrow().listener_token(address),
-                    Ok(ListenerType::Https) => self.https.borrow().listener_token(address),
-                    Ok(ListenerType::Tcp) => self.tcp.borrow().listener_token(address),
-                    Ok(ListenerType::Udp) => self.udp.borrow().listener_token(address),
+                    Ok(ListenerType::Http) => self.http.borrow().listener_token(&address),
+                    Ok(ListenerType::Https) => self.https.borrow().listener_token(&address),
+                    Ok(ListenerType::Tcp) => self.tcp.borrow().listener_token(&address),
+                    Ok(ListenerType::Udp) => self.udp.borrow().listener_token(&address),
                     Err(_) => None,
                 };
                 let response = match listener_type {
@@ -3092,7 +3093,7 @@ impl Server {
         let Some(scm_listeners) = self.scm_listeners.as_ref() else {
             return;
         };
-        let leftovers: [(&str, &Vec<(SocketAddr, RawFd)>); 4] = [
+        let leftovers: [(&str, &Vec<(ListenerKey, RawFd)>); 4] = [
             ("HTTP", &scm_listeners.http),
             ("HTTPS", &scm_listeners.tls),
             ("TCP", &scm_listeners.tcp),
@@ -3101,10 +3102,10 @@ impl Server {
         for (label, table) in leftovers {
             for (address, fd) in table {
                 let has_listener = match label {
-                    "HTTP" => self.http.borrow().listener_token(*address).is_some(),
-                    "HTTPS" => self.https.borrow().listener_token(*address).is_some(),
-                    "TCP" => self.tcp.borrow().listener_token(*address).is_some(),
-                    _ => self.udp.borrow().listener_token(*address).is_some(),
+                    "HTTP" => self.http.borrow().listener_token(address).is_some(),
+                    "HTTPS" => self.https.borrow().listener_token(address).is_some(),
+                    "TCP" => self.tcp.borrow().listener_token(address).is_some(),
+                    _ => self.udp.borrow().listener_token(address).is_some(),
                 };
                 if has_listener {
                     info!(
@@ -3138,7 +3139,7 @@ impl Server {
             req_id, activate.proxy, activate
         );
 
-        let address: std::net::SocketAddr = activate.address.into();
+        let address = activate.listener_key();
 
         match ListenerType::try_from(activate.proxy) {
             Ok(ListenerType::Http) => {
@@ -3394,22 +3395,20 @@ impl Server {
             req_id, deactivate.proxy, deactivate
         );
 
-        let address: std::net::SocketAddr = deactivate.address.into();
+        let address = deactivate.listener_key();
 
         match ListenerType::try_from(deactivate.proxy) {
             Ok(ListenerType::Http) => {
-                let (token, mut listener) = match self.http.borrow_mut().give_back_listener(address)
-                {
-                    Ok((token, listener)) => (token, listener),
-                    Err(e) => {
-                        return worker_response_error(
-                            req_id,
-                            format!(
-                                "Couldn't deactivate HTTP listener at address {address:?}: {e}"
-                            ),
-                        );
-                    }
-                };
+                let (token, mut listener) =
+                    match self.http.borrow_mut().give_back_listener(&address) {
+                        Ok((token, listener)) => (token, listener),
+                        Err(e) => {
+                            return worker_response_error(
+                                req_id,
+                                format!("Couldn't deactivate HTTP listener at {address}: {e}"),
+                            );
+                        }
+                    };
 
                 if let Err(e) = self.poll.registry().deregister(&mut listener) {
                     error!(
@@ -3433,7 +3432,7 @@ impl Server {
                 if deactivate.to_scm {
                     self.unblock_scm_socket();
                     let listeners = Listeners {
-                        http: vec![(address, listener.as_raw_fd())],
+                        http: vec![(address.clone(), listener.as_raw_fd())],
                         tls: vec![],
                         tcp: vec![],
                         udp: vec![],
@@ -3448,21 +3447,16 @@ impl Server {
                 WorkerResponse::ok(req_id)
             }
             Ok(ListenerType::Https) => {
-                let (token, mut listener) = match self
-                    .https
-                    .borrow_mut()
-                    .give_back_listener(address)
-                {
-                    Ok((token, listener)) => (token, listener),
-                    Err(e) => {
-                        return worker_response_error(
-                            req_id,
-                            format!(
-                                "Couldn't deactivate HTTPS listener at address {address:?}: {e}",
-                            ),
-                        );
-                    }
-                };
+                let (token, mut listener) =
+                    match self.https.borrow_mut().give_back_listener(&address) {
+                        Ok((token, listener)) => (token, listener),
+                        Err(e) => {
+                            return worker_response_error(
+                                req_id,
+                                format!("Couldn't deactivate HTTPS listener at {address}: {e}",),
+                            );
+                        }
+                    };
                 if let Err(e) = self.poll.registry().deregister(&mut listener) {
                     error!(
                         "error deregistering HTTPS listen socket({:?}): {:?}",
@@ -3478,7 +3472,7 @@ impl Server {
                     self.unblock_scm_socket();
                     let listeners = Listeners {
                         http: vec![],
-                        tls: vec![(address, listener.as_raw_fd())],
+                        tls: vec![(address.clone(), listener.as_raw_fd())],
                         tcp: vec![],
                         udp: vec![],
                     };
@@ -3492,15 +3486,13 @@ impl Server {
                 WorkerResponse::ok(req_id)
             }
             Ok(ListenerType::Tcp) => {
-                let (token, mut listener) = match self.tcp.borrow_mut().give_back_listener(address)
+                let (token, mut listener) = match self.tcp.borrow_mut().give_back_listener(&address)
                 {
                     Ok((token, listener)) => (token, listener),
                     Err(e) => {
                         return worker_response_error(
                             req_id,
-                            format!(
-                                "Could not deactivate TCP listener at address {address:?}: {e}"
-                            ),
+                            format!("Could not deactivate TCP listener at {address}: {e}"),
                         );
                     }
                 };
@@ -3521,7 +3513,7 @@ impl Server {
                     let listeners = Listeners {
                         http: vec![],
                         tls: vec![],
-                        tcp: vec![(address, listener.as_raw_fd())],
+                        tcp: vec![(address.clone(), listener.as_raw_fd())],
                         udp: vec![],
                     };
                     info!("sending TCP listener: {:?}", listeners);
@@ -3534,15 +3526,13 @@ impl Server {
                 WorkerResponse::ok(req_id)
             }
             Ok(ListenerType::Udp) => {
-                let (token, mut listener) = match self.udp.borrow_mut().give_back_listener(address)
+                let (token, mut listener) = match self.udp.borrow_mut().give_back_listener(&address)
                 {
                     Ok((token, listener)) => (token, listener),
                     Err(e) => {
                         return worker_response_error(
                             req_id,
-                            format!(
-                                "Could not deactivate UDP listener at address {address:?}: {e}"
-                            ),
+                            format!("Could not deactivate UDP listener at {address}: {e}"),
                         );
                     }
                 };
@@ -3569,7 +3559,7 @@ impl Server {
                         http: vec![],
                         tls: vec![],
                         tcp: vec![],
-                        udp: vec![(address, listener.as_raw_fd())],
+                        udp: vec![(address.clone(), listener.as_raw_fd())],
                     };
                     info!("sending UDP listener: {:?}", listeners);
                     let res = self.scm.send_listeners(&listeners);
@@ -3626,19 +3616,19 @@ impl Server {
         let listeners = Listeners {
             http: http_listeners
                 .iter()
-                .map(|(addr, listener)| (*addr, listener.as_raw_fd()))
+                .map(|(key, listener)| (key.clone(), listener.as_raw_fd()))
                 .collect(),
             tls: https_listeners
                 .iter()
-                .map(|(addr, listener)| (*addr, listener.as_raw_fd()))
+                .map(|(key, listener)| (key.clone(), listener.as_raw_fd()))
                 .collect(),
             tcp: tcp_listeners
                 .iter()
-                .map(|(addr, listener)| (*addr, listener.as_raw_fd()))
+                .map(|(key, listener)| (key.clone(), listener.as_raw_fd()))
                 .collect(),
             udp: udp_listeners
                 .iter()
-                .map(|(addr, listener)| (*addr, listener.as_raw_fd()))
+                .map(|(key, listener)| (key.clone(), listener.as_raw_fd()))
                 .collect(),
         };
         // Each handed-back listener is collected exactly once: the assembled
@@ -4110,7 +4100,11 @@ impl Server {
 /// The close is explicit rather than a dropped wrapper falling out of scope: it
 /// is the same syscall either way, but this one is deliberate, attributable and
 /// logged, which is precisely what sozu#1342 was missing.
-fn discard_inherited_socket<T: FromRawFd>(fd: Option<RawFd>, address: &SocketAddr, protocol: &str) {
+fn discard_inherited_socket<T: FromRawFd>(
+    fd: Option<RawFd>,
+    address: &ListenerKey,
+    protocol: &str,
+) {
     let Some(fd) = fd else {
         return;
     };
@@ -4436,6 +4430,7 @@ mod accept_ready_tests {
         let response = server.notify_deactivate_listener(
             "test-deactivate",
             &DeactivateListener {
+                interface: None,
                 address,
                 proxy: ListenerType::Tcp as i32,
                 to_scm: false,
@@ -4556,7 +4551,7 @@ mod listener_lifecycle_tests {
         server
             .udp
             .borrow()
-            .listener_token(address.into())
+            .listener_token(&address.into())
             .expect("the added UDP listener must own a token")
     }
 
@@ -4564,6 +4559,7 @@ mod listener_lifecycle_tests {
         let response = server.notify_activate_listener(
             "test-activate",
             &ActivateListener {
+                interface: None,
                 address,
                 proxy: proxy as i32,
                 from_scm: false,
@@ -4580,6 +4576,7 @@ mod listener_lifecycle_tests {
         let response = server.notify_deactivate_listener(
             "test-deactivate",
             &DeactivateListener {
+                interface: None,
                 address,
                 proxy: proxy as i32,
                 to_scm: false,
@@ -4869,6 +4866,7 @@ mod listener_lifecycle_tests {
         let response = server.notify_activate_listener(
             "test-activate-twice",
             &ActivateListener {
+                interface: None,
                 address,
                 proxy: ListenerType::Udp as i32,
                 from_scm: false,
@@ -5047,6 +5045,7 @@ mod listener_lifecycle_tests {
         server.notify_proxys(WorkerRequest {
             id: "test-activate".to_owned(),
             content: RequestType::ActivateListener(ActivateListener {
+                interface: None,
                 address,
                 proxy: ListenerType::Udp as i32,
                 from_scm: false,
@@ -5056,7 +5055,7 @@ mod listener_lifecycle_tests {
         let listen_token = server
             .udp
             .borrow()
-            .listener_token(address.into())
+            .listener_token(&address.into())
             .expect("the added UDP listener must own a token");
         let installed = slab_session(&server, listen_token);
 
@@ -5130,6 +5129,7 @@ mod listener_lifecycle_tests {
             server.notify_proxys(WorkerRequest {
                 id: "test-remove".to_owned(),
                 content: RequestType::RemoveListener(RemoveListener {
+                    interface: None,
                     address,
                     proxy: ListenerType::Udp as i32,
                 })
@@ -5228,6 +5228,7 @@ mod scm_listener_handoff_tests {
             state
                 .dispatch(
                     &RequestType::ActivateListener(ActivateListener {
+                        interface: None,
                         address,
                         proxy: proxy.into(),
                         from_scm: false,
@@ -5240,7 +5241,7 @@ mod scm_listener_handoff_tests {
     }
 
     /// The SCM table for `label`, so a test can assert on retention per protocol.
-    fn inherited_table<'a>(server: &'a Server, label: &str) -> &'a Vec<(SocketAddr, RawFd)> {
+    fn inherited_table<'a>(server: &'a Server, label: &str) -> &'a Vec<(ListenerKey, RawFd)> {
         let scm_listeners = server
             .scm_listeners
             .as_ref()
@@ -5339,14 +5340,14 @@ mod scm_listener_handoff_tests {
 
         // The retiring worker's sockets, bound exactly the way a live worker
         // binds them.
-        let http_listener =
-            server_bind(http_address.into()).expect("could not bind the inherited HTTP socket");
-        let https_listener =
-            server_bind(https_address.into()).expect("could not bind the inherited HTTPS socket");
+        let http_listener = server_bind(http_address.into(), None)
+            .expect("could not bind the inherited HTTP socket");
+        let https_listener = server_bind(https_address.into(), None)
+            .expect("could not bind the inherited HTTPS socket");
         let tcp_listener =
-            server_bind(tcp_address.into()).expect("could not bind the inherited TCP socket");
+            server_bind(tcp_address.into(), None).expect("could not bind the inherited TCP socket");
         let udp_socket =
-            udp_bind(udp_address.into()).expect("could not bind the inherited UDP socket");
+            udp_bind(udp_address.into(), None).expect("could not bind the inherited UDP socket");
 
         // Queue on each inherited socket exactly what the hand-off exists to
         // preserve: a completed connection in the accept backlog, and a
@@ -5538,16 +5539,16 @@ mod scm_listener_handoff_tests {
         .expect("could not build the test server");
 
         // Now hand that already-active worker a descriptor per address.
-        let http_fd = server_bind(http_address.into())
+        let http_fd = server_bind(http_address.into(), None)
             .expect("could not bind the spare HTTP socket")
             .into_raw_fd();
-        let https_fd = server_bind(https_address.into())
+        let https_fd = server_bind(https_address.into(), None)
             .expect("could not bind the spare HTTPS socket")
             .into_raw_fd();
-        let tcp_fd = server_bind(tcp_address.into())
+        let tcp_fd = server_bind(tcp_address.into(), None)
             .expect("could not bind the spare TCP socket")
             .into_raw_fd();
-        let udp_fd = udp_bind(udp_address.into())
+        let udp_fd = udp_bind(udp_address.into(), None)
             .expect("could not bind the spare UDP socket")
             .into_raw_fd();
         {
@@ -5570,6 +5571,7 @@ mod scm_listener_handoff_tests {
             let response = server.notify_activate_listener(
                 "test-repeat",
                 &ActivateListener {
+                    interface: None,
                     address,
                     proxy: proxy.into(),
                     from_scm: false,
@@ -5669,14 +5671,14 @@ mod scm_listener_handoff_tests {
         // Four inherited descriptors and no listener anywhere. The TCP-family
         // ones each carry a completed connection so the adoption can be shown to
         // preserve the backlog, not merely the descriptor.
-        let http_listener =
-            server_bind(http_address.into()).expect("could not bind the inherited HTTP socket");
-        let https_listener =
-            server_bind(https_address.into()).expect("could not bind the inherited HTTPS socket");
+        let http_listener = server_bind(http_address.into(), None)
+            .expect("could not bind the inherited HTTP socket");
+        let https_listener = server_bind(https_address.into(), None)
+            .expect("could not bind the inherited HTTPS socket");
         let tcp_listener =
-            server_bind(tcp_address.into()).expect("could not bind the inherited TCP socket");
+            server_bind(tcp_address.into(), None).expect("could not bind the inherited TCP socket");
         let udp_socket =
-            udp_bind(udp_address.into()).expect("could not bind the inherited UDP socket");
+            udp_bind(udp_address.into(), None).expect("could not bind the inherited UDP socket");
         let _http_client = StdTcpStream::connect::<SocketAddr>(http_address.into())
             .expect("could not queue a connection on the inherited HTTP socket");
         let _https_client = StdTcpStream::connect::<SocketAddr>(https_address.into())
@@ -5715,6 +5717,7 @@ mod scm_listener_handoff_tests {
             let response = server.notify_activate_listener(
                 "test-early",
                 &ActivateListener {
+                    interface: None,
                     address,
                     proxy: proxy.into(),
                     from_scm: false,
@@ -5813,8 +5816,8 @@ mod scm_listener_handoff_tests {
         // A socket whose descriptor is already registered on the same epoll
         // instance, so `activate()`'s own `register` answers EEXIST and parks.
         let pre_registered = |address: SocketAddress| {
-            let mut socket =
-                server_bind(address.into()).expect("could not bind the test listening socket");
+            let mut socket = server_bind(address.into(), None)
+                .expect("could not bind the test listening socket");
             registry
                 .register(&mut socket, Token(usize::MAX - 2), Interest::READABLE)
                 .expect("could not pre-register the test socket");
@@ -5844,7 +5847,7 @@ mod scm_listener_handoff_tests {
         );
         assert!(
             matches!(
-                http_proxy.give_back_listener(http_address.into()),
+                http_proxy.give_back_listener(&http_address.into()),
                 Err(ProxyError::UnactivatedListener)
             ),
             "an HTTP listener holding only a parked socket must not answer as activated"
@@ -5877,7 +5880,7 @@ mod scm_listener_handoff_tests {
         );
         assert!(
             matches!(
-                https_proxy.give_back_listener(https_address.into()),
+                https_proxy.give_back_listener(&https_address.into()),
                 Err(ProxyError::UnactivatedListener)
             ),
             "an HTTPS listener holding only a parked socket must not answer as activated"
@@ -5910,7 +5913,7 @@ mod scm_listener_handoff_tests {
         );
         assert!(
             matches!(
-                tcp_proxy.give_back_listener(tcp_address.into()),
+                tcp_proxy.give_back_listener(&tcp_address.into()),
                 Err(ProxyError::UnactivatedListener)
             ),
             "a TCP listener holding only a parked socket must not answer as activated"
@@ -5934,7 +5937,7 @@ mod scm_listener_handoff_tests {
             )
             .expect("could not add the test UDP listener");
         let mut udp_socket =
-            udp_bind(udp_address.into()).expect("could not bind the test UDP socket");
+            udp_bind(udp_address.into(), None).expect("could not bind the test UDP socket");
         registry
             .register(&mut udp_socket, Token(usize::MAX - 2), Interest::READABLE)
             .expect("could not pre-register the test UDP socket");
@@ -5946,7 +5949,7 @@ mod scm_listener_handoff_tests {
         );
         assert!(
             matches!(
-                udp_proxy.give_back_listener(udp_address.into()),
+                udp_proxy.give_back_listener(&udp_address.into()),
                 Err(ProxyError::UnactivatedListener)
             ),
             "a UDP listener holding only a parked socket must not answer as activated"
@@ -5987,8 +5990,8 @@ mod scm_listener_handoff_tests {
         // Hand each proxy a socket whose descriptor is ALREADY registered on the
         // same epoll instance, so `activate()`'s own `register` answers EEXIST.
         let handed_out = |address: SocketAddress| {
-            let mut socket =
-                server_bind(address.into()).expect("could not bind the test listening socket");
+            let mut socket = server_bind(address.into(), None)
+                .expect("could not bind the test listening socket");
             registry
                 .register(&mut socket, Token(usize::MAX - 1), Interest::READABLE)
                 .expect("could not pre-register the test socket");
@@ -6095,7 +6098,8 @@ mod scm_listener_handoff_tests {
                 token,
             )
             .expect("could not add the test UDP listener");
-        let mut socket = udp_bind(udp_address.into()).expect("could not bind the test UDP socket");
+        let mut socket =
+            udp_bind(udp_address.into(), None).expect("could not bind the test UDP socket");
         registry
             .register(&mut socket, Token(usize::MAX - 1), Interest::READABLE)
             .expect("could not pre-register the test UDP socket");

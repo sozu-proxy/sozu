@@ -138,6 +138,7 @@ fn setup_h2_backend_cluster(name: &str) -> (Worker, H2Backend, u16) {
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -402,6 +403,7 @@ fn try_e2e_session_upgrade_backend_disconnect_no_panic() -> State {
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.into(),
         proxy: ListenerType::Http.into(),
         from_scm: false,

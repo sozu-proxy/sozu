@@ -891,8 +891,10 @@ pub enum ProxyError {
         proxy_protocol: String,
         error: String,
     },
-    #[error("found no listener with address {0:?}")]
-    NoListenerFound(SocketAddr),
+    /// Names the listener key: the address, plus `%<interface>` for a
+    /// listener bound to one.
+    #[error("found no listener at {0}")]
+    NoListenerFound(sozu_command::listener_key::ListenerKey),
     #[error("a listener is already present for this token")]
     ListenerAlreadyPresent,
     #[error("could not add listener: {0}")]
