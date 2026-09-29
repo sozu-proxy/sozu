@@ -4,6 +4,16 @@
 
 ### ✨ Added
 
+- **`feat(main)`: warn at startup when the kernel clocksource is slow
+  ([#500](https://github.com/sozu-proxy/sozu/issues/500)).** Sōzu calls `Instant::now()` on
+  every request for timeouts and metrics; with a clocksource the vDSO cannot read, such as
+  `hpet` or `acpi_pm`, each call is a `clock_gettime` syscall that can dominate CPU time
+  under load. The main process now reads
+  `/sys/devices/system/clocksource/clocksource0/current_clocksource` once at startup and logs a
+  warning, with the commands to check and change it, unless the source is `tsc`, `kvm-clock`, `xen`,
+  `hyperv_clocksource_tsc_page`, `arch_sys_counter` or `riscv_clocksource`. An unreadable file,
+  or a non-Linux system, is skipped. Documented in `doc/debugging_strategies.md`.
+
 - **`feat(metrics)`: count peer resets on TCP and TLS sockets
   ([#434](https://github.com/sozu-proxy/sozu/issues/434)).** A client that aborts its
   connection with a TCP RST instead of closing it cleanly is not necessarily an error, yet it

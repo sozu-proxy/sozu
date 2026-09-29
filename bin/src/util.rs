@@ -340,6 +340,61 @@ pub fn set_process_affinity(pid: pid_t, cpu: usize) {
     };
 }
 
+/// Kernel clocksources that can set a `vdso_clock_mode` other than
+/// `VDSO_CLOCKMODE_NONE`, so that the vDSO reads them in user space: `tsc`
+/// (x86), `kvm-clock` and `xen` (KVM and Xen guests, when the host reports a
+/// stable TSC), `hyperv_clocksource_tsc_page` (Hyper-V guests),
+/// `arch_sys_counter` (arm64) and `riscv_clocksource` (RISC-V). Any other
+/// source, `hpet`, `acpi_pm` or `jiffies` among them, turns every
+/// `clock_gettime` behind `Instant::now()` into a real syscall. The name is a
+/// heuristic: a listed source can still lose its vDSO mode at runtime.
+const FAST_CLOCKSOURCES: &[&str] = &[
+    "tsc",
+    "kvm-clock",
+    "xen",
+    "hyperv_clocksource_tsc_page",
+    "arch_sys_counter",
+    "riscv_clocksource",
+];
+
+const CURRENT_CLOCKSOURCE: &str =
+    "/sys/devices/system/clocksource/clocksource0/current_clocksource";
+
+/// Warning to log when `clocksource`, the content of the sysfs
+/// `current_clocksource` file, makes `clock_gettime` a syscall.
+/// An empty value is not a verdict and yields no warning.
+pub fn slow_clocksource_warning(clocksource: &str) -> Option<String> {
+    let clocksource = clocksource.trim();
+    if clocksource.is_empty() || FAST_CLOCKSOURCES.contains(&clocksource) {
+        return None;
+    }
+    Some(format!(
+        "the kernel clocksource is '{clocksource}', which the vDSO cannot read: every \
+         Instant::now() Sōzu takes for timeouts and metrics becomes a clock_gettime syscall, \
+         which can dominate CPU time under load (see issue #500). Compare \
+         {CURRENT_CLOCKSOURCE} with its sibling available_clocksource and, if one of {} is \
+         listed, switch to it (echo <source> > {CURRENT_CLOCKSOURCE}, or the clocksource= \
+         kernel parameter)",
+        FAST_CLOCKSOURCES.join(", ")
+    ))
+}
+
+/// Log a warning once, at main-process startup, when the kernel clocksource
+/// is slow to read. An unreadable sysfs file is skipped silently.
+#[cfg(target_os = "linux")]
+pub fn warn_on_slow_clocksource() {
+    match std::fs::read_to_string(CURRENT_CLOCKSOURCE) {
+        Ok(clocksource) => match slow_clocksource_warning(&clocksource) {
+            Some(warning) => warn!("{}", warning),
+            None => debug!("kernel clocksource: {}", clocksource.trim()),
+        },
+        Err(e) => debug!("could not read {}: {}", CURRENT_CLOCKSOURCE, e),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn warn_on_slow_clocksource() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,5 +442,40 @@ mod tests {
             p1, p2,
             "expected distinct fd paths from two opens, got {p1} and {p2}"
         );
+    }
+
+    #[test]
+    fn slow_clocksource_warning_accepts_vdso_capable_sources() {
+        for source in FAST_CLOCKSOURCES {
+            assert_eq!(slow_clocksource_warning(source), None, "{source}");
+        }
+        for source in [
+            "tsc",
+            "kvm-clock",
+            "arch_sys_counter",
+            "hyperv_clocksource_tsc_page",
+        ] {
+            assert!(FAST_CLOCKSOURCES.contains(&source), "{source}");
+            assert_eq!(slow_clocksource_warning(source), None, "{source}");
+        }
+    }
+
+    #[test]
+    fn slow_clocksource_warning_flags_syscall_only_sources() {
+        for source in ["hpet", "acpi_pm", "jiffies"] {
+            let warning = slow_clocksource_warning(source).expect(source);
+            assert!(warning.contains(&format!("'{source}'")), "{warning}");
+            assert!(warning.contains("current_clocksource"), "{warning}");
+        }
+    }
+
+    #[test]
+    fn slow_clocksource_warning_trims_the_sysfs_newline() {
+        assert_eq!(slow_clocksource_warning("tsc\n"), None);
+        assert_eq!(slow_clocksource_warning("  kvm-clock \n"), None);
+        let warning = slow_clocksource_warning("hpet\n").expect("hpet is slow");
+        assert!(warning.contains("'hpet'"), "{warning}");
+        assert!(!warning.contains("hpet\n"), "{warning}");
+        assert_eq!(slow_clocksource_warning(" \n"), None);
     }
 }
