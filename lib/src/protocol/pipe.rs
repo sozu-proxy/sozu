@@ -2535,6 +2535,24 @@ mod tests {
         // 32 KiB: below the 64 KiB default pipe capacity so the whole
         // payload fits the kernel in_pipe without backpressure pauses.
         let payload = vec![0x5a_u8; 32 * 1024];
+        // Environment precondition: once this user's pipe buffers exceed
+        // `fs.pipe-user-pages-soft`, Linux creates every new pipe with 2 pages
+        // (8 KiB) and refuses `F_SETPIPE_SZ` with EPERM, so `splice_readable`
+        // parks at its capacity guard and the payload can never sit whole in
+        // the in_pipe. Fail loudly and name the host limit rather than report
+        // a false regression.
+        let capacity = pipe.splice_capacity();
+        assert!(
+            capacity >= payload.len(),
+            "environment precondition not met: splice pipe capacity is {capacity} bytes, \
+             below the {}-byte payload; this user's pipe buffers likely exceed \
+             fs.pipe-user-pages-soft ({}). Close pipe-heavy processes or raise the limit, \
+             then rerun: this is a host limit, not a Sozu regression",
+            payload.len(),
+            std::fs::read_to_string("/proc/sys/fs/pipe-user-pages-soft")
+                .map(|limit| limit.trim().to_owned())
+                .unwrap_or_else(|error| format!("unreadable: {error}")),
+        );
         frontend_peer
             .write_all(&payload)
             .expect("write frontend payload");
