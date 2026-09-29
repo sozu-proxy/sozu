@@ -82,6 +82,50 @@ fn splitmix64_finalize(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// Domain tag of an affinity key derived from a client IP address. Keeps an
+/// address and a header value spelling the same bytes on distinct keys.
+const AFFINITY_DOMAIN_IP: u8 = 0x49; // 'I'
+/// Domain tag of an affinity key derived from a request header or cookie value.
+const AFFINITY_DOMAIN_VALUE: u8 = 0x56; // 'V'
+
+/// The affinity key [`Rendezvous`] and [`Maglev`] pin a client with, derived
+/// from its source address.
+///
+/// The address is canonicalised first, so a dual-stack listener that reports
+/// an IPv4 client as `::ffff:a.b.c.d` keys it exactly as an IPv4 listener
+/// would. The hash is [`DEFAULT_HASH_SEED`]-seeded FNV-1a with the splitmix64
+/// finalizer: a pure function of the address, so every worker and every
+/// restart derives the same key for the same client, and it reads no clock,
+/// draws no randomness and allocates nothing.
+pub fn affinity_key_from_ip(ip: std::net::IpAddr) -> u64 {
+    let mut h = FnvHasher::with_seed(DEFAULT_HASH_SEED);
+    h.write_u8(AFFINITY_DOMAIN_IP);
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(v4) => {
+            h.write_u8(4);
+            h.write(&v4.octets());
+        }
+        std::net::IpAddr::V6(v6) => {
+            h.write_u8(6);
+            h.write(&v6.octets());
+        }
+    }
+    splitmix64_finalize(h.finish())
+}
+
+/// The affinity key derived from the bytes of a request header or cookie
+/// value, for a cluster that keys its clients on one.
+///
+/// Same construction as [`affinity_key_from_ip`] under another domain tag, so
+/// a value never collides with an address by spelling its bytes. The bytes
+/// are hashed where they lie in the request buffer: nothing is copied.
+pub fn affinity_key_from_value(value: &[u8]) -> u64 {
+    let mut h = FnvHasher::with_seed(DEFAULT_HASH_SEED);
+    h.write_u8(AFFINITY_DOMAIN_VALUE);
+    h.write(value);
+    splitmix64_finalize(h.finish())
+}
+
 /// Smallest prime `>= n`. Maglev requires a prime table size `M`: it keeps the
 /// permutation stride coprime with `M` so the population loop visits every
 /// slot, and `M >= 2` so `skip = h2 % (M - 1) + 1` never divides by zero.
@@ -239,7 +283,9 @@ impl Index<usize> for Candidates<'_> {
 pub trait LoadBalancingAlgorithm: Debug {
     /// Select the next backend among `candidates`.
     ///
-    /// `key` carries an optional affinity hash (e.g. a UDP flow key). The
+    /// `key` carries an optional affinity hash: the UDP flow key, or the
+    /// client key of an HTTP, HTTPS or TCP request ([`affinity_key_from_ip`],
+    /// [`affinity_key_from_value`]). The
     /// stateless/round-robin policies ignore it; the consistent-hashing
     /// policies ([`Rendezvous`], [`Maglev`]) use it to pin a key to a backend.
     /// Passing `None` preserves the historical, key-agnostic behavior.
@@ -689,7 +735,10 @@ impl LoadBalancingAlgorithm for PowerOfTwo {
 /// Weighted Rendezvous (Highest Random Weight) hashing.
 ///
 /// For an affinity `key`, the chosen backend is the one maximizing a stable,
-/// per-(key, backend) score. With no key it degrades to plain round-robin.
+/// per-(key, backend) score. With no key it degrades to plain round-robin;
+/// every datapath supplies one for a client it can identify (the UDP flow key,
+/// and the client key of HTTP, HTTPS and TCP, sozu-proxy/sozu#524), so the
+/// fallback is reached only for a request with no source address.
 ///
 /// # Weighting
 ///
@@ -825,7 +874,8 @@ impl LoadBalancingAlgorithm for Rendezvous {
 /// built from; membership is checked against the subset, so an unhealthy
 /// backend is simply skipped — no rebuild, and healthy keys stay pinned. If no
 /// table entry resolves to a healthy backend, fall back to round-robin over the
-/// subset. With no key it falls back to round-robin.
+/// subset. With no key it falls back to round-robin, which, as for
+/// [`Rendezvous`], only a request with no source address reaches.
 #[derive(Debug)]
 pub struct Maglev {
     seed: u64,
@@ -2147,5 +2197,68 @@ mod test {
                 }
             }
         }
+    }
+
+    // ----- #524: the client affinity key of HTTP, HTTPS and TCP -----
+
+    /// #524: the affinity key is a pure function of the client, pinned to a
+    /// value.
+    ///
+    /// Every worker of every instance must derive the same key for the same
+    /// client, or `HRW`/`MAGLEV` send one client to different backends
+    /// depending on which worker accepted it, and an upgrade to a build whose
+    /// hash moved would remap every client at once. The pinned values make a
+    /// change to the construction a deliberate, visible edit.
+    ///
+    /// TO SEE THIS RED: seed [`affinity_key_from_ip`] with anything other than
+    /// [`DEFAULT_HASH_SEED`], or drop its domain tag.
+    #[test]
+    fn affinity_keys_are_pinned_across_workers_and_releases() {
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7));
+        assert_eq!(affinity_key_from_ip(ip), affinity_key_from_ip(ip));
+        assert_eq!(affinity_key_from_ip(ip), PINNED_IP_KEY);
+        assert_eq!(affinity_key_from_value(b"tenant-42"), PINNED_VALUE_KEY);
+    }
+    /// [`affinity_key_from_ip`] of `192.0.2.7`, measured when the construction
+    /// was introduced.
+    const PINNED_IP_KEY: u64 = 12_659_869_658_761_991_936;
+    /// [`affinity_key_from_value`] of `tenant-42`, measured likewise.
+    const PINNED_VALUE_KEY: u64 = 4_927_821_811_038_511_670;
+
+    /// #524: a dual-stack listener reports an IPv4 client as the mapped
+    /// `::ffff:a.b.c.d`; it must key exactly as the same client seen on an
+    /// IPv4 listener, or one client lands on two backends depending on which
+    /// listener it reached.
+    #[test]
+    fn an_ipv4_mapped_client_keys_as_its_ipv4_address() {
+        let v4 = Ipv4Addr::new(198, 51, 100, 9);
+        assert_eq!(
+            affinity_key_from_ip(IpAddr::V6(v4.to_ipv6_mapped())),
+            affinity_key_from_ip(IpAddr::V4(v4)),
+            "a mapped IPv4 client must key as its IPv4 address"
+        );
+        assert_ne!(
+            affinity_key_from_ip(IpAddr::V6(v4.to_ipv6_compatible())),
+            affinity_key_from_ip(IpAddr::V4(v4)),
+            "only the mapped form is the same client; a compatible address is a distinct IPv6 one"
+        );
+    }
+
+    /// #524: a header value spelling an address's bytes is not that address.
+    /// The two constructions carry distinct domain tags, so a client cannot
+    /// collide with another client's source IP by choosing its header value.
+    #[test]
+    fn a_value_never_keys_as_the_address_it_spells() {
+        let v4 = Ipv4Addr::new(10, 1, 2, 3);
+        let mut spelled = vec![4u8];
+        spelled.extend_from_slice(&v4.octets());
+        assert_ne!(
+            affinity_key_from_value(&spelled),
+            affinity_key_from_ip(IpAddr::V4(v4))
+        );
+        assert_ne!(
+            affinity_key_from_value(b"tenant-a"),
+            affinity_key_from_value(b"tenant-b")
+        );
     }
 }

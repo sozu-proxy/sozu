@@ -18,6 +18,15 @@ First you need to create a new cluster with an id and a load balancing policy (`
 sozu --config /etc/sozu/config.toml cluster add --id <my_cluster_id> --load-balancing-policy round_robin
 ```
 
+`hrw` and `maglev` pin each client to one backend, keyed on its source IP. On an
+HTTP/HTTPS cluster, `--affinity-header <name>` or `--affinity-cookie <name>` keys
+it on that request header or cookie instead, falling back to the source IP when a
+request does not carry it:
+
+```bash
+sozu --config /etc/sozu/config.toml cluster add --id <my_cluster_id> --load-balancing-policy hrw --affinity-header X-Tenant
+```
+
 To create a cluster with HTTP/2 backend connections enabled:
 
 ```bash

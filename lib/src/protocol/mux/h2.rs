@@ -9598,6 +9598,7 @@ mod tests {
             id: Ulid::generate(),
             backend_id: None,
             cluster_id: None,
+            affinity_key: None,
             protocol: Protocol::HTTPS,
             public_address: "127.0.0.1:0".parse().unwrap(),
             session_address: None,

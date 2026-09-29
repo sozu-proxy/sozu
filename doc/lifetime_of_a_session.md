@@ -396,7 +396,12 @@ load-balancing policy over a borrowed `Candidates` view (no candidate `Vec`, no
 `Rc` clone but the chosen one,
 [#1557](https://github.com/sozu-proxy/sozu/pull/1557)) and reserves a
 connection on it, and `Mux::dial_backend` then connects it
-([#1684](https://github.com/sozu-proxy/sozu/issues/1684)):
+([#1684](https://github.com/sozu-proxy/sozu/issues/1684)). Under `HRW` or
+`MAGLEV` the policy is handed the client affinity key `Router::plan_connect`
+derived when it routed the request: the hash of the cluster's `affinity_header`
+or `affinity_cookie` value, else of the client source IP, read and hashed in
+place in the request buffer with no allocation
+([#524](https://github.com/sozu-proxy/sozu/issues/524)). The connect itself is:
 `socket(2)`, a non-blocking `connect(2)`, `setsockopt(TCP_NODELAY)` and
 `epoll_ctl(EPOLL_CTL_ADD)` on a new slab token. The backend's identity is
 interned once per session in the `BackendRegistry`, so a redial or a reuse
@@ -591,8 +596,10 @@ A WebSocket upgrade on an H1 connection ends in the same `Pipe`.
    apply unchanged.
 2. **Connect.** `TcpSession::connect_to_backend` resolves the cluster (the
    SNI-routed one, else the listener's), passes the per-(cluster, source-IP)
-   gate, picks a backend through the same `Candidates` view as the mux, and
-   dials it: `socket(2)`, `connect(2)`, `setsockopt(TCP_NODELAY)`,
+   gate, picks a backend through the same `Candidates` view as the mux — under
+   `HRW` or `MAGLEV`, keyed on the client's source IP, the PROXY-v2 source when
+   the cluster expects one ([#524](https://github.com/sozu-proxy/sozu/issues/524)) —
+   and dials it: `socket(2)`, `connect(2)`, `setsockopt(TCP_NODELAY)`,
    `epoll_ctl(EPOLL_CTL_ADD)`. The session keeps the chosen `Backend`
    (`TcpSession::backend`) until `TcpSession::remove_backend` releases it. A
    connect refused after `EINPROGRESS` shows up as a HUP on the connecting

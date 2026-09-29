@@ -3903,13 +3903,14 @@ impl router::BackendSelector for RegistrySelector<'_> {
         &mut self,
         cluster_id: &str,
         affinity: router::Affinity<'_>,
+        key: Option<u64>,
     ) -> Result<router::SelectedBackend, BackendError> {
         let handle = match affinity {
             router::Affinity::Sticky(Some(cookie)) => self
                 .backends
-                .reserve_sticky_backend(cluster_id, cookie, self.now)?,
+                .reserve_sticky_backend(cluster_id, cookie, key, self.now)?,
             router::Affinity::Sticky(None) | router::Affinity::Unpinned => {
-                self.backends.reserve_backend(cluster_id, self.now)?
+                self.backends.reserve_backend(cluster_id, key, self.now)?
             }
         };
         let sticky_session = match affinity {

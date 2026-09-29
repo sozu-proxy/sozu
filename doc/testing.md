@@ -128,6 +128,8 @@ Notes:
   `a_request_on_a_reused_backend_connection_allocates_nothing` and
   `stamping_a_dialled_backend_allocates_nothing` (`lib/src/protocol/mux/router.rs`,
   [#1579](https://github.com/sozu-proxy/sozu/issues/1579)),
+  `deriving_an_affinity_key_allocates_nothing` (`lib/src/protocol/mux/router.rs`,
+  [#524](https://github.com/sozu-proxy/sozu/issues/524)),
   `creating_a_debug_history_allocates_nothing` (`lib/src/protocol/mux/debug.rs`,
   [#1585](https://github.com/sozu-proxy/sozu/issues/1585)), and
   `steady_state_emission_does_not_allocate` (`lib/src/metrics/local_drain.rs`),
@@ -907,7 +909,7 @@ skipping it produced a real flaky-test or papered-over-bug commit.
   symptom is reachable at all. #1353's 421 has exactly one emission site
   (`Mux::ready_inner`, `lib/src/protocol/mux/mod.rs`), reachable only through
   `RetrieveClusterError::SniAuthorityMismatch`, which is constructed at exactly
-  one site (`lib/src/protocol/mux/router.rs:1074`) immediately after
+  one site (`lib/src/protocol/mux/router.rs:1091`) immediately after
   `incr!(names::http::SNI_AUTHORITY_MISMATCH)` — and the failing run reported
   that counter unmoved, alongside a correct backend request count. The proxy was
   innocent by construction, and sixteen serial local reproductions were never

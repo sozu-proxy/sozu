@@ -427,7 +427,9 @@ The logger can be invoked through a thread local storage variable accessible fro
 For a given cluster, Sōzu keeps a list of backends to which the connection is redirected.
 Sōzu detects broken servers and redirects traffic only to healthy ones, with several available loadbalancing algorithms:
 round robin (default), random, least_loaded, power of two, HRW and Maglev.
-The last two are flow-affine hashing policies used by the UDP datapath. See
+The last two are consistent-hashing policies that pin each client to one
+backend: on the flow key for UDP, on the client source IP (or a configured
+header or cookie) for HTTP, HTTPS and TCP. See
 `doc/configure.md` for what each one selects and how much backend load it
 reads.
 

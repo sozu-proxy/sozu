@@ -85,6 +85,136 @@ pub fn build_https_client() -> HttpsClient {
     Client::builder(TokioExecutor::new()).build(https)
 }
 
+/// Build an HTTP/1.1 client, plaintext or TLS, whose every connection leaves
+/// from the loopback address `local` and is used for one request only.
+///
+/// For tests that need Sōzu to see distinct client source addresses without
+/// a PROXY-protocol header: on Linux the whole of `127.0.0.0/8` is local, so
+/// binding `127.0.0.N` before connecting needs no configuration. Pooling is
+/// off (`pool_max_idle_per_host(0)`) so each request opens a frontend
+/// connection of its own and reaches backend selection, instead of riding a
+/// keep-alive connection whose backend was chosen by an earlier request.
+pub fn build_https_client_from(local: std::net::IpAddr) -> HttpsClient {
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+    http.set_local_address(Some(local));
+
+    let https = HttpsConnectorBuilder::new()
+        .with_tls_config(insecure_tls_config())
+        .https_or_http()
+        .enable_http1()
+        .wrap_connector(http);
+
+    Client::builder(TokioExecutor::new())
+        .pool_max_idle_per_host(0)
+        .build(https)
+}
+
+/// [`build_https_client_from`] speaking HTTP/2 only, negotiated over TLS by
+/// ALPN. Each request needs a client of its own to open a connection of its
+/// own: an H2 client multiplexes every request onto one connection, which Sōzu
+/// serves as one session.
+pub fn build_h2_client_from(local: std::net::IpAddr) -> HttpsClient {
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+    http.set_local_address(Some(local));
+
+    let https = HttpsConnectorBuilder::new()
+        .with_tls_config(insecure_tls_config())
+        .https_or_http()
+        .enable_http2()
+        .wrap_connector(http);
+
+    Client::builder(TokioExecutor::new())
+        .http2_only(true)
+        .pool_max_idle_per_host(0)
+        .build(https)
+}
+
+/// Send `request` and return its status and body, under the same 10 s
+/// timeout as [`resolve_request`]. For a request that needs more than a URI:
+/// a header, a cookie.
+pub fn resolve_prepared_request(
+    client: &HttpsClient,
+    request: hyper::Request<String>,
+) -> Option<(StatusCode, String)> {
+    let rt = tokio::runtime::Runtime::new().expect("Could not create Runtime");
+    rt.block_on(async {
+        let fut = async {
+            let response = match client.request(request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    println!("Could not get response: {}", format_error_chain(&error));
+                    return None;
+                }
+            };
+            let status = response.status();
+            let body = match response.into_body().collect().await {
+                Ok(collected) => {
+                    String::from_utf8(collected.to_bytes().to_vec()).unwrap_or_default()
+                }
+                Err(error) => {
+                    println!("Could not get body: {}", format_error_chain(&error));
+                    String::new()
+                }
+            };
+            Some((status, body))
+        };
+        match tokio::time::timeout(Duration::from_secs(10), fut).await {
+            Ok(result) => result,
+            Err(_) => {
+                println!("resolve_prepared_request timed out after 10s");
+                None
+            }
+        }
+    })
+}
+
+/// Send `requests` one after the other through `client` inside ONE runtime,
+/// so a pooling client keeps using the connection the first one opened (an
+/// H2 client multiplexes them all onto it), and return each status and body.
+/// Each request gets the same 10 s timeout as [`resolve_request`].
+pub fn resolve_prepared_requests_in_sequence(
+    client: &HttpsClient,
+    requests: Vec<hyper::Request<String>>,
+) -> Vec<Option<(StatusCode, String)>> {
+    let rt = tokio::runtime::Runtime::new().expect("Could not create Runtime");
+    rt.block_on(async {
+        let mut answers = Vec::with_capacity(requests.len());
+        for request in requests {
+            let fut = async {
+                let response = match client.request(request).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        println!("Could not get response: {}", format_error_chain(&error));
+                        return None;
+                    }
+                };
+                let status = response.status();
+                let body = match response.into_body().collect().await {
+                    Ok(collected) => {
+                        String::from_utf8(collected.to_bytes().to_vec()).unwrap_or_default()
+                    }
+                    Err(error) => {
+                        println!("Could not get body: {}", format_error_chain(&error));
+                        String::new()
+                    }
+                };
+                Some((status, body))
+            };
+            answers.push(
+                tokio::time::timeout(Duration::from_secs(10), fut)
+                    .await
+                    .unwrap_or_else(|_| {
+                        println!("resolve_prepared_requests_in_sequence timed out after 10s");
+                        None
+                    }),
+            );
+        }
+        answers
+    })
+}
+
 /// Build a Hyper HTTP Client that negotiates H2 via ALPN over TLS.
 /// The connector advertises only "h2" in ALPN and the client is forced to HTTP/2.
 pub fn build_h2_client() -> HttpsClient {

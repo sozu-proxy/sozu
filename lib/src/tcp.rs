@@ -21,7 +21,7 @@ use sozu_command::{
     },
     listener_key::ListenerKey,
     logging::{EndpointRecord, LogContext, ansi_palette},
-    proto::command::request::RequestType,
+    proto::command::{LoadBalancingAlgorithms, request::RequestType},
 };
 
 use crate::metrics::names;
@@ -31,6 +31,7 @@ use crate::{
     ListenerError, ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession,
     Readiness, SessionIsToBeClosed, SessionMetrics, SessionResult, StateMachineBuilder,
     backends::{Backend, BackendMap},
+    load_balancing::affinity_key_from_ip,
     pool::{Checkout, Pool},
     protocol::{
         Pipe,
@@ -1690,13 +1691,22 @@ impl TcpSession {
         // `BackendConnectionError::TooManyConnectionsPerIp` →
         // `handle_connection_result` → `SessionResult::Close` — TCP has
         // no HTTP envelope to carry a 429 / `Retry-After`.
-        let (cluster_max_connections_per_ip, cluster_max_connections_per_subnet) = self
+        let (cluster_max_connections_per_ip, cluster_max_connections_per_subnet, keyed) = self
             .proxy
             .borrow()
             .configs
             .get(&cluster_id)
-            .map(|c| (c.max_connections_per_ip, c.max_connections_per_subnet))
-            .unwrap_or((None, None));
+            .map(|c| {
+                (
+                    c.max_connections_per_ip,
+                    c.max_connections_per_subnet,
+                    matches!(
+                        c.load_balancing,
+                        LoadBalancingAlgorithms::Hrw | LoadBalancingAlgorithms::Maglev
+                    ),
+                )
+            })
+            .unwrap_or((None, None, false));
         if let Some(ip) = self.effective_session_address().map(|sa| sa.ip()) {
             let sessions_rc = self.proxy.borrow().sessions.clone();
             // Both caps, through the one combined gate the mux uses too,
@@ -1727,12 +1737,23 @@ impl TcpSession {
             self.cluster_ip_tracked = true;
         }
 
+        // `HRW` and `MAGLEV` pin a TCP client on its source IP — the
+        // PROXY-v2 source when the listener expects one, as for the gate
+        // above. A TCP session has no request to read a header or cookie
+        // from, so the source IP is the only key. Every other policy ignores
+        // a key, so none is derived for it.
+        let affinity_key = if keyed {
+            self.effective_session_address()
+                .map(|address| affinity_key_from_ip(address.ip()))
+        } else {
+            None
+        };
         let (backend, mut stream) = self
             .proxy
             .borrow()
             .backends
             .borrow_mut()
-            .backend_from_cluster_id(&cluster_id, Instant::now())
+            .backend_from_cluster_id(&cluster_id, affinity_key, Instant::now())
             .map_err(BackendConnectionError::Backend)?;
 
         if let Err(e) = stream.set_nodelay(true) {
@@ -2728,8 +2749,10 @@ fn route_key_and_matcher(sni: &str, alpn: Vec<String>) -> (Vec<u8>, AlpnMatcher)
 #[derive(Debug)]
 pub struct ClusterConfiguration {
     proxy_protocol: Option<ProxyProtocolConfig>,
-    // Uncomment this when implementing new load balancing algorithms
-    // load_balancing: LoadBalancingAlgorithms,
+    /// The cluster's policy, read at selection time for one reason: `HRW`
+    /// and `MAGLEV` need the client's affinity key, which
+    /// `TcpSession::connect_to_backend` derives only for them.
+    load_balancing: LoadBalancingAlgorithms,
     /// Per-cluster override of the global per-(cluster, source-IP)
     /// connection limit. `None` inherits the global default,
     /// `Some(0)` is explicit "unlimited", `Some(n > 0)` overrides.
@@ -3086,7 +3109,7 @@ impl ProxyConfiguration for TcpProxy {
                     proxy_protocol: cluster
                         .proxy_protocol
                         .and_then(|n| ProxyProtocolConfig::try_from(n).ok()),
-                    //load_balancing: cluster.load_balancing,
+                    load_balancing: cluster.load_balancing(),
                     max_connections_per_ip: cluster.max_connections_per_ip,
                     max_connections_per_subnet: cluster.max_connections_per_subnet,
                 };

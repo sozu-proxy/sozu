@@ -522,7 +522,7 @@ pub enum ClusterCmd {
         expect_proxy: bool,
         #[clap(
             long = "load-balancing-policy",
-            help = "Configures the load balancing policy. Possible values: 'round_robin', 'random', 'power_of_two', 'least_loaded', 'hrw', 'maglev' (case-insensitive). 'hrw' and 'maglev' are flow-affine policies designed for UDP clusters."
+            help = "Configures the load balancing policy. Possible values: 'round_robin', 'random', 'power_of_two', 'least_loaded', 'hrw', 'maglev' (case-insensitive). 'hrw' and 'maglev' pin each client to one backend: on the UDP flow key, and on HTTP, HTTPS and TCP clusters on the client source IP (or --affinity-header / --affinity-cookie)."
         )]
         load_balancing_policy: LoadBalancingAlgorithms,
         #[clap(
@@ -550,6 +550,17 @@ pub enum ClusterCmd {
             help = "Per-status HTTP answer template for this cluster. Format: <code>=<body> for an inline literal (the value is taken verbatim, no disk I/O), or <code>=file://<path> to load the body off disk. Repeatable. Examples: --answer 503='HTTP/1.1 503 Service Unavailable\\r\\n\\r\\nbusy' , --answer 503=file:///etc/sozu/503.http ."
         )]
         answer: Vec<String>,
+        #[clap(
+            long = "affinity-header",
+            conflicts_with = "affinity_cookie",
+            help = "With the 'hrw' or 'maglev' policy on an HTTP/HTTPS cluster, pin each client on the value of this request header instead of its source IP. A request without the header is pinned on its source IP."
+        )]
+        affinity_header: Option<String>,
+        #[clap(
+            long = "affinity-cookie",
+            help = "With the 'hrw' or 'maglev' policy on an HTTP/HTTPS cluster, pin each client on the value of this request cookie instead of its source IP. A request without the cookie is pinned on its source IP."
+        )]
+        affinity_cookie: Option<String>,
     },
     #[clap(
         name = "h2",

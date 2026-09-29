@@ -183,6 +183,8 @@ impl CommandManager {
                 www_authenticate,
                 authorized_hash,
                 answer,
+                affinity_header,
+                affinity_cookie,
             } => {
                 let proxy_protocol = match (send_proxy, expect_proxy) {
                     (true, true) => Some(ProxyProtocolConfig::RelayHeader),
@@ -220,6 +222,19 @@ impl CommandManager {
                         format!("got https_redirect_port={port}"),
                     ));
                 }
+
+                // The worker's `AddCluster` gate refuses the same thing; checking
+                // here names the flag instead of a proto field.
+                sozu_command_lib::config::validate_affinity_key(
+                    affinity_header.as_deref(),
+                    affinity_cookie.as_deref(),
+                )
+                .map_err(|reason| {
+                    CtlError::ArgsNeeded(
+                        "a valid --affinity-header or --affinity-cookie name".to_string(),
+                        reason.to_owned(),
+                    )
+                })?;
 
                 // Resolve each `--answer code=value` entry. The
                 // right-hand side is the literal template body by
@@ -265,6 +280,8 @@ impl CommandManager {
                         https_redirect_port,
                         authorized_hashes: authorized_hash,
                         www_authenticate,
+                        affinity_header,
+                        affinity_cookie,
                         ..Default::default()
                     })
                     .into(),

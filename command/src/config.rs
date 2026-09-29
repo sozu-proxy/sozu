@@ -359,6 +359,13 @@ pub enum ConfigError {
     },
     #[error("Invalid ALPN protocol '{0}'. Valid values: \"h2\", \"http/1.1\"")]
     InvalidAlpnProtocol(String),
+    /// A cluster's `affinity_header` / `affinity_cookie` breaks
+    /// [`validate_affinity_key`], or is set on a TCP cluster.
+    #[error("cluster {cluster_id}: {reason}")]
+    InvalidAffinityKey {
+        cluster_id: String,
+        reason: &'static str,
+    },
     /// `subnet_ipv4_prefix` / `subnet_ipv6_prefix` is outside the bit
     /// width of its address family. Rejected rather than clamped: a
     /// silently narrowed mask would enforce a different policy than the
@@ -2509,6 +2516,48 @@ impl FileHealthCheckConfig {
     }
 }
 
+/// Validate a cluster's client affinity key source, `affinity_header` or
+/// `affinity_cookie`.
+///
+/// At most one of the two may be set, and the one that is must be an RFC 9110
+/// `token` (a cookie name is a `token` too, RFC 6265 §4.1.1): a name no
+/// request can carry would silently key every request on its source IP.
+///
+/// Two header names are refused although they are tokens, because the key
+/// lookup can never find them among the request's headers: `Host`, which the
+/// H1 parser folds into the request authority and elides (H2 carries it as
+/// `:authority`), and `Cookie`, whose crumbs both parsers move into the cookie
+/// jar — key on one cookie with `affinity_cookie` instead. Names compare
+/// case-insensitively, as header names do.
+///
+/// Called on every `AddCluster`, so a TOML load, a reload, a saved state and
+/// a direct API request are held to the same rule as `sozu cluster add`.
+pub fn validate_affinity_key(
+    affinity_header: Option<&str>,
+    affinity_cookie: Option<&str>,
+) -> Result<(), &'static str> {
+    match (affinity_header, affinity_cookie) {
+        (Some(_), Some(_)) => {
+            Err("affinity_header and affinity_cookie are mutually exclusive: set at most one")
+        }
+        (Some(name), None) if !header_name_is_valid_token(name.as_bytes()) => {
+            Err("affinity_header must be a non-empty RFC 9110 token (a header field name)")
+        }
+        (Some(name), None) if name.eq_ignore_ascii_case("host") => Err(
+            "affinity_header cannot be Host: the request authority is not a header Sōzu keeps \
+             (H1 folds Host into it, H2 sends :authority)",
+        ),
+        (Some(name), None) if name.eq_ignore_ascii_case("cookie") => Err(
+            "affinity_header cannot be Cookie: cookies are parsed into a jar; key on one with \
+             affinity_cookie instead",
+        ),
+        (None, Some(name)) if !header_name_is_valid_token(name.as_bytes()) => {
+            Err("affinity_cookie must be a non-empty RFC 6265 cookie name (an RFC 9110 token)")
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Validate a [`HealthCheckConfig`] for the rules every layer relies on:
 /// strict positive thresholds and a URI that cannot smuggle a second
 /// HTTP message on the wire (RFC 9110 §5.1 — request-target). Used by
@@ -2635,6 +2684,16 @@ pub struct FileClusterConfig {
     /// block produce `udp: None` on the resulting [`Cluster`].
     #[serde(default)]
     pub udp: Option<FileUdpClusterConfig>,
+    /// Key an HTTP/HTTPS cluster's `HRW`/`MAGLEV` selection on the value of
+    /// this request header instead of the client's source IP. A request
+    /// without the header falls back to its source IP. Mutually exclusive
+    /// with `affinity_cookie`; refused on a TCP cluster, which has no request
+    /// headers and always keys on the source IP.
+    #[serde(default)]
+    pub affinity_header: Option<String>,
+    /// Same as `affinity_header`, on the value of this request cookie.
+    #[serde(default)]
+    pub affinity_cookie: Option<String>,
 }
 
 /// UDP backend health-check configuration, parsed from
@@ -2725,8 +2784,26 @@ impl FileClusterConfig {
         // PRE: every frontend that converts cleanly must survive into the built
         // cluster — no frontend is silently dropped during conversion.
         let requested_frontend_count = self.frontends.len();
+        validate_affinity_key(
+            self.affinity_header.as_deref(),
+            self.affinity_cookie.as_deref(),
+        )
+        .map_err(|reason| ConfigError::InvalidAffinityKey {
+            cluster_id: cluster_id.to_owned(),
+            reason,
+        })?;
         match self.protocol {
             FileClusterProtocolConfig::Tcp => {
+                // A TCP cluster has no request to read a header or a cookie
+                // from: it always keys on the source IP. Refused rather than
+                // ignored, so the file never claims a key the proxy does not use.
+                if self.affinity_header.is_some() || self.affinity_cookie.is_some() {
+                    return Err(ConfigError::InvalidAffinityKey {
+                        cluster_id: cluster_id.to_owned(),
+                        reason: "a TCP cluster always keys on the client source IP: \
+                                 affinity_header and affinity_cookie apply to HTTP clusters only",
+                    });
+                }
                 let mut has_expect_proxy = None;
                 let mut frontends = Vec::new();
                 for f in self.frontends {
@@ -2862,6 +2939,8 @@ impl FileClusterConfig {
                     retry_after: self.retry_after,
                     health_check: self.health_check.as_ref().map(|hc| hc.to_proto()),
                     udp,
+                    affinity_header: self.affinity_header,
+                    affinity_cookie: self.affinity_cookie,
                 }))
             }
         }
@@ -3081,6 +3160,14 @@ pub struct HttpClusterConfig {
     /// clusters; carried for shape uniformity with the proto [`Cluster`].
     #[serde(default)]
     pub udp: Option<UdpClusterConfig>,
+    /// Request header keying `HRW`/`MAGLEV` selection. See
+    /// [`FileClusterConfig::affinity_header`].
+    #[serde(default)]
+    pub affinity_header: Option<String>,
+    /// Request cookie keying `HRW`/`MAGLEV` selection. See
+    /// [`FileClusterConfig::affinity_cookie`].
+    #[serde(default)]
+    pub affinity_cookie: Option<String>,
 }
 
 impl HttpClusterConfig {
@@ -3104,6 +3191,8 @@ impl HttpClusterConfig {
                 retry_after: self.retry_after,
                 health_check: self.health_check.clone(),
                 udp: self.udp.clone(),
+                affinity_header: self.affinity_header.clone(),
+                affinity_cookie: self.affinity_cookie.clone(),
             })
             .into(),
         ];
@@ -3245,6 +3334,9 @@ impl TcpClusterConfig {
                 retry_after: self.retry_after,
                 health_check: self.health_check.clone(),
                 udp: self.udp.clone(),
+                // A TCP cluster always keys on the source IP.
+                affinity_header: None,
+                affinity_cookie: None,
             })
             .into(),
         ];
@@ -5237,6 +5329,85 @@ mod tests {
 
         assert!(https_proxy.expect_proxy);
         assert!(!https_direct.expect_proxy);
+    }
+
+    /// #524: `affinity_header` travels from the TOML file to the
+    /// `AddCluster` order the workers receive.
+    #[test]
+    fn an_affinity_header_reaches_the_add_cluster_order() {
+        let file: FileClusterConfig = toml::from_str(
+            r#"
+            protocol = "http"
+            load_balancing = "HRW"
+            affinity_header = "X-Tenant"
+            frontends = []
+            backends = []
+            "#,
+        )
+        .expect("the cluster must parse");
+        let ClusterConfig::Http(http) = file
+            .to_cluster_config("keyed", &HashSet::new())
+            .expect("the cluster must build")
+        else {
+            panic!("an http cluster must build as one");
+        };
+        let orders = http.generate_requests().expect("the orders must build");
+        let Some(RequestType::AddCluster(cluster)) =
+            orders.first().and_then(|order| order.request_type.as_ref())
+        else {
+            panic!("the orders must lead with an AddCluster");
+        };
+        assert_eq!(cluster.affinity_header.as_deref(), Some("X-Tenant"));
+        assert_eq!(cluster.affinity_cookie, None);
+    }
+
+    /// #524: a TCP cluster has no request to read a header or a cookie
+    /// from, so declaring one is refused rather than silently ignored.
+    #[test]
+    fn a_tcp_cluster_refuses_an_affinity_header_or_cookie() {
+        for key in [
+            "affinity_header = \"X-Tenant\"",
+            "affinity_cookie = \"tenant\"",
+        ] {
+            let file: FileClusterConfig = toml::from_str(&format!(
+                "protocol = \"tcp\"\nload_balancing = \"MAGLEV\"\n{key}\nfrontends = []\nbackends = []\n"
+            ))
+            .expect("the cluster must parse");
+            assert!(
+                matches!(
+                    file.to_cluster_config("keyed", &HashSet::new()),
+                    Err(ConfigError::InvalidAffinityKey { .. })
+                ),
+                "a TCP cluster must refuse `{key}`"
+            );
+        }
+    }
+
+    /// #524: at most one key source, and a name a request can carry.
+    #[test]
+    fn validate_affinity_key_accepts_one_token_and_refuses_the_rest() {
+        assert!(validate_affinity_key(None, None).is_ok());
+        assert!(validate_affinity_key(Some("X-Tenant"), None).is_ok());
+        assert!(validate_affinity_key(None, Some("tenant_id")).is_ok());
+        assert!(validate_affinity_key(Some("X-Tenant"), Some("tenant")).is_err());
+        for unreachable in ["Host", "host", "HOST", "Cookie", "cookie"] {
+            assert!(
+                validate_affinity_key(Some(unreachable), None).is_err(),
+                "header {unreachable:?} can never be found and must be refused"
+            );
+        }
+        // A cookie merely NAMED like those headers is an ordinary cookie.
+        assert!(validate_affinity_key(None, Some("host")).is_ok());
+        for bad in ["", "X Tenant", "X-Tenant:", "tenant\r\n", "t=1"] {
+            assert!(
+                validate_affinity_key(Some(bad), None).is_err(),
+                "header {bad:?} must be refused"
+            );
+            assert!(
+                validate_affinity_key(None, Some(bad)).is_err(),
+                "cookie {bad:?} must be refused"
+            );
+        }
     }
 
     #[test]

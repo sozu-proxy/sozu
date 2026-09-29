@@ -608,6 +608,20 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   field at the expect-proxy and TLS-handshake upgrades); `L7Proxy` has no
   `backends` method any more, so a dial borrows neither the proxy nor a
   fresh handle to reach it ([#1684](https://github.com/sozu-proxy/sozu/issues/1684)).
+  `BackendSelector::select` also takes the request's client affinity
+  key, which `HRW` and `MAGLEV` pin the client with
+  ([#524](https://github.com/sozu-proxy/sozu/issues/524)).
+  `Router::plan_connect` derives it (`affinity_key`, `router.rs`) right after
+  `route_from_request`, where both the routed cluster and the request's header
+  blocks are in hand, and stores it in `HttpContext::affinity_key` beside
+  `cluster_id`. The storage is for the same reason as the cluster's: a replay
+  skips routing against a drained front kawa, so it reuses the key the first
+  attempt derived rather than recomputing it from blocks that are gone. The key
+  is `None` under every other policy, and a sticky cookie naming a live backend
+  still wins over it. Connection reuse runs before any dial and does not read
+  the key: an H1 keep-alive or H2 connection the session already holds serves
+  the next request whatever key it carries, as it serves it whatever sticky
+  cookie it carries.
 - **Backend detach.** `Context::unlink_stream` (`mod.rs`) — called from the four
   timeout arms of `Mux::timeout_inner` (`mod.rs`), from H1 EOF
   (`ConnectionH1::end_stream`, `h1.rs`),
