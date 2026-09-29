@@ -6211,6 +6211,32 @@
 
 ### 🔐 Security
 
+- **`fix(h1)`: chunked request trailers can no longer carry spoofed forwarding headers
+  ([#1689](https://github.com/sozu-proxy/sozu/issues/1689)).** kawa's H1 parser pushes the
+  trailer fields of a chunked request after its last chunk with no callback, so
+  `HttpContext::on_request_headers` never saw them and they reached the backend verbatim: an
+  HTTP/1.1 client could append `X-Forwarded-For: 6.6.6.6`, `Forwarded: for=6.6.6.6` or
+  `X-Real-IP: 6.6.6.6` to its body and hand a forged client address to any backend that merges
+  trailers into its header view (CWE-348). RFC 9110 §6.5.1 forbids trailers from carrying such
+  fields. The new `elide_request_trailer_spoof_vectors` (`lib/src/protocol/kawa_h1/editor.rs`)
+  runs after each frontend `kawa::h1::parse` in `ConnectionH1` and elides, in any case,
+  `X-Real-IP`, `X-Forwarded-For`, `Forwarded`, `X-Request-Id`, `X-Forwarded-Proto`,
+  `X-Forwarded-Port` and `X-Forwarded-Host` from the trailer section, whether it arrives with the
+  body, after the last chunk was forwarded, or split across reads, and for a request pipelined
+  behind a keep-alive one. Each call walks only the blocks the last parse appended, so a client
+  trickling one trailer line per segment costs a linear walk in total. The names live in one list, `TRAILER_SPOOF_VECTOR_HEADERS`, which the H2 trailer filter
+  `pkawa::handle_trailer` now reads instead of its own name-by-name match, so the two
+  frontends cannot drift; H2 behaviour is unchanged, the list carrying the seven names #1685
+  already dropped there. Other
+  trailer fields, such as `grpc-status`, are forwarded, and the last chunk and the closing
+  empty line are still written. Backend response trailers are unchanged. A request that is not
+  chunked, or has not reached its trailer section, returns before any block is read. Each
+  elided H1 field increments the new `http.trailer.spoof_vector_elided` counter. Covered by
+  five `editor.rs` unit tests, `handle_trailer_drops_each_spoof_header_individually`, and the
+  `test_h1_trailer_spoof_headers_dropped*` and `test_h1_pipelined_trailer_spoof_headers_dropped`
+  rows of `e2e/src/tests/h1_security_tests.rs`. Documented in `doc/configure.md` and
+  `lib/src/protocol/kawa_h1/LIFECYCLE.md`.
+
 - **`fix(h1)`: a request without `Content-Length` or `Transfer-Encoding` no longer swallows
   the requests pipelined behind it ([#1650](https://github.com/sozu-proxy/sozu/issues/1650)).**
   kawa 0.7.1 parses such a request as close-delimited: `kawa::h1::parse` enters

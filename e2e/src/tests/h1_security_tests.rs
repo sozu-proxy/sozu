@@ -1645,6 +1645,255 @@ fn test_h1_te_ows_forwarded_canonically() {
 }
 
 // =========================================================================
+// Test 13a: chunked request trailers cannot carry spoofed forwarding headers
+//
+// RFC 9110 §6.5.1: a trailer field must not carry routing or
+// client-attribution semantics. Sōzu rewrites `X-Forwarded-For`,
+// `Forwarded`, `X-Real-IP` and the other headers of
+// `editor::TRAILER_SPOOF_VECTOR_HEADERS` on the header block only, so a
+// client that appends them to a chunked body as trailer fields would hand a
+// forged client address to any backend that merges trailers into its
+// header view (sozu-proxy/sozu#1689). The H2 frontend already drops them in
+// `pkawa::handle_trailer`; the H1 frontend must drop the same list. The
+// split variants send the trailer section after the last-chunk marker in a
+// separate write, so the marker is already forwarded when the trailers are
+// parsed, or split the trailer section itself, `X-Forwarded-For` in one
+// write and the other fields in the next. A legitimate trailer
+// (`Grpc-Status`) must still reach the backend.
+// =========================================================================
+
+/// Trailer section shared by both variants: every spoof-vector name carries
+/// the forged address `6.6.6.6`, and one legitimate field must survive.
+const SPOOF_TRAILERS: &str = concat!(
+    "X-Forwarded-For: 6.6.6.6\r\n",
+    "Forwarded: for=6.6.6.6\r\n",
+    "X-Real-IP: 6.6.6.6\r\n",
+    "X-Request-Id: 6.6.6.6\r\n",
+    "X-Forwarded-Proto: 6.6.6.6\r\n",
+    "X-Forwarded-Port: 6.6.6.6\r\n",
+    "X-Forwarded-Host: 6.6.6.6\r\n",
+    "Grpc-Status: 0\r\n",
+    "\r\n",
+);
+
+/// Where the chunked request of `try_h1_trailer_spoof_headers_dropped` is
+/// cut into separate writes.
+#[derive(Clone, Copy)]
+enum TrailerSplit {
+    /// The whole request in one write.
+    None,
+    /// The trailer section in a second write, after the last-chunk line.
+    AfterLastChunk,
+    /// The trailer section itself cut after its first field.
+    InsideTrailers,
+}
+
+fn try_h1_trailer_spoof_headers_dropped(split: TrailerSplit) -> State {
+    let label = match split {
+        TrailerSplit::None => "TRAILER-SPOOF",
+        TrailerSplit::AfterLastChunk => "TRAILER-SPOOF-SPLIT",
+        TrailerSplit::InsideTrailers => "TRAILER-SPOOF-SPLIT-INSIDE",
+    };
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) =
+        setup_sync_test(label, config, listeners, state, front_address, 1, false);
+    let mut backend = backends.pop().unwrap();
+    backend.set_response("HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\npong");
+    backend.connect();
+
+    let head = concat!(
+        "POST /api HTTP/1.1\r\n",
+        "Host: localhost\r\n",
+        "Transfer-Encoding: chunked\r\n",
+        "Trailer: X-Forwarded-For, Forwarded, X-Real-IP, Grpc-Status\r\n",
+        "Connection: close\r\n",
+        "\r\n",
+        "5\r\n",
+        "Hello\r\n",
+        "0\r\n",
+    );
+    let request = format!("{head}{SPOOF_TRAILERS}");
+    let first_field = SPOOF_TRAILERS
+        .find("\r\n")
+        .expect("the trailer section has a first field")
+        + 2;
+    let cut = match split {
+        TrailerSplit::None => request.len(),
+        TrailerSplit::AfterLastChunk => head.len(),
+        TrailerSplit::InsideTrailers => head.len() + first_field,
+    };
+    let mut stream = raw_connect(front_address);
+    stream
+        .write_all(&request.as_bytes()[..cut])
+        .expect("write first segment");
+    if cut < request.len() {
+        thread::sleep(Duration::from_millis(100));
+        stream
+            .write_all(&request.as_bytes()[cut..])
+            .expect("write second segment");
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut accepted = false;
+    while Instant::now() < deadline {
+        if backend.accept(0) {
+            accepted = true;
+            break;
+        }
+    }
+    if !accepted {
+        println!("{label}: FAIL — the chunked request never reached the backend");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    let forwarded = backend_drain(&mut backend, 0, Duration::from_millis(300));
+    backend.send(0);
+    println!("{label}: backend received {forwarded:?}");
+    drop(stream);
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    if forwarded.contains("6.6.6.6") {
+        println!("{label}: FAIL — a spoofed forwarding trailer reached the backend");
+        return State::Fail;
+    }
+    // The legitimate trailer survives, and the chunked framing stays valid:
+    // last-chunk, the surviving trailer field, then the empty line.
+    if !forwarded.ends_with("0\r\nGrpc-Status: 0\r\n\r\n") {
+        println!("{label}: FAIL — the legitimate trailer or the chunk framing was lost");
+        return State::Fail;
+    }
+    State::Success
+}
+
+/// A chunked request pipelined behind a keep-alive `GET` in the same write
+/// is parsed by the keep-alive branch of `ConnectionH1::writable`
+/// (`lib/src/protocol/mux/h1.rs`), not by `ConnectionH1::readable`, once the
+/// first response is written: its trailer section must be filtered there
+/// too.
+fn try_h1_pipelined_trailer_spoof_headers_dropped() -> State {
+    let label = "TRAILER-SPOOF-PIPELINED";
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) =
+        setup_sync_test(label, config, listeners, state, front_address, 1, false);
+    let mut backend = backends.pop().unwrap();
+    backend.set_response("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\npong");
+    backend.connect();
+
+    let request = format!(
+        "{}{}{SPOOF_TRAILERS}",
+        "GET /first HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        concat!(
+            "POST /api HTTP/1.1\r\n",
+            "Host: localhost\r\n",
+            "Transfer-Encoding: chunked\r\n",
+            "Connection: close\r\n",
+            "\r\n",
+            "5\r\n",
+            "Hello\r\n",
+            "0\r\n",
+        ),
+    );
+    let mut stream = raw_connect(front_address);
+    stream
+        .write_all(request.as_bytes())
+        .expect("write pipelined requests");
+
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut accepted = false;
+    while Instant::now() < deadline {
+        if backend.accept(0) {
+            accepted = true;
+            break;
+        }
+    }
+    if !accepted {
+        println!("{label}: FAIL — the first request never reached the backend");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+    let first = backend_drain(&mut backend, 0, Duration::from_millis(300));
+    backend.send(0);
+    // The pipelined request is parsed once the first response is written,
+    // on the same keep-alive backend connection.
+    let second = backend_drain(&mut backend, 0, Duration::from_millis(500));
+    backend.send(0);
+    println!("{label}: backend received {first:?} then {second:?}");
+    drop(stream);
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    if !second.starts_with("POST /api ") {
+        println!("{label}: FAIL — the pipelined request never reached the backend");
+        return State::Fail;
+    }
+    if first.contains("6.6.6.6") || second.contains("6.6.6.6") {
+        println!("{label}: FAIL — a spoofed forwarding trailer reached the backend");
+        return State::Fail;
+    }
+    if !second.ends_with("0\r\nGrpc-Status: 0\r\n\r\n") {
+        println!("{label}: FAIL — the legitimate trailer or the chunk framing was lost");
+        return State::Fail;
+    }
+    State::Success
+}
+
+#[test]
+fn test_h1_pipelined_trailer_spoof_headers_dropped() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H1 security: spoofed forwarding trailers of a pipelined chunked request never reach the backend",
+            try_h1_pipelined_trailer_spoof_headers_dropped,
+        ),
+        State::Success,
+    );
+}
+
+#[test]
+fn test_h1_trailer_spoof_headers_dropped() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H1 security: spoofed forwarding headers in a chunked trailer section never reach the backend",
+            || try_h1_trailer_spoof_headers_dropped(TrailerSplit::None),
+        ),
+        State::Success,
+    );
+}
+
+#[test]
+fn test_h1_trailer_spoof_headers_dropped_split_inside_trailers() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H1 security: spoofed forwarding trailers split across two writes never reach the backend",
+            || try_h1_trailer_spoof_headers_dropped(TrailerSplit::InsideTrailers),
+        ),
+        State::Success,
+    );
+}
+
+#[test]
+fn test_h1_trailer_spoof_headers_dropped_split() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H1 security: spoofed forwarding trailers sent after the last chunk never reach the backend",
+            || try_h1_trailer_spoof_headers_dropped(TrailerSplit::AfterLastChunk),
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
 // Test 13b: a Content-Length that is not 1*DIGIT is never forwarded
 //
 // RFC 9110 §8.6: `Content-Length = 1*DIGIT`, and a sender MUST NOT forward

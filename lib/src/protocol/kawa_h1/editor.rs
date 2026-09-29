@@ -989,6 +989,125 @@ fn correlation_header_name(name: &str) -> kawa::Store {
     }
 }
 
+/// Header names a request trailer section may never carry past Sōzu, in
+/// lower case. This is the single list shared by both frontends:
+/// `pkawa::handle_trailer` (`lib/src/protocol/mux/pkawa.rs`) drops them from
+/// an H2 trailer HEADERS frame, and [`elide_request_trailer_spoof_vectors`]
+/// from an H1 chunked trailer section.
+///
+/// RFC 9110 §6.5.1 forbids trailers from carrying fields that affect message
+/// routing or request semantics. Each name here is client attribution that
+/// Sōzu handles on the header block only: `HttpContext::on_request_headers`
+/// replaces, elides or preserves `X-Real-IP` and `X-Request-Id`, and
+/// synthesises, extends, removes or passes through `X-Forwarded-For`,
+/// `Forwarded`, `X-Forwarded-Proto`, `X-Forwarded-Port` and
+/// `X-Forwarded-Host` according to the listener's `forwarded_headers` mode
+/// (`apply_request_rewrites_and_headers` in
+/// `lib/src/protocol/mux/router.rs` also injects `X-Forwarded-Host` on a
+/// host rewrite). A trailer copy would bypass that handling
+/// and hand a forged value to any backend that merges trailers into its
+/// header view (sozu-proxy/sozu#1689), so they are dropped unconditionally.
+pub const TRAILER_SPOOF_VECTOR_HEADERS: [&[u8]; 7] = [
+    b"x-real-ip",
+    b"x-forwarded-for",
+    b"forwarded",
+    b"x-request-id",
+    b"x-forwarded-proto",
+    b"x-forwarded-port",
+    b"x-forwarded-host",
+];
+
+/// Returns true if `name`, in any case, is one of
+/// [`TRAILER_SPOOF_VECTOR_HEADERS`].
+pub fn is_trailer_spoof_vector(name: &[u8]) -> bool {
+    TRAILER_SPOOF_VECTOR_HEADERS
+        .iter()
+        .any(|spoofed| compare_no_case(name, spoofed))
+}
+
+/// Elide every [`TRAILER_SPOOF_VECTOR_HEADERS`] field that the last
+/// `kawa::h1::parse` appended to the trailer section of a chunked H1
+/// request, and return how many were elided.
+///
+/// kawa's H1 parser has no trailer callback: its `ParsingPhase::Trailers`
+/// arm pushes each trailer field as a `Block::Header` after the `Flags`
+/// block that carries `end_body` (the last chunk), then closes the section
+/// with a `Flags` block carrying `end_header` and `end_stream`. Call this
+/// after each `kawa::h1::parse` of a frontend request, with
+/// `first_new_block` set to `kawa.blocks.len()` read just before that
+/// parse. It walks back from the end of the queue over the closing block
+/// and the trailer fields, and stops at the first other block (the
+/// `end_body` marker) or at `first_new_block`. It never reaches the header
+/// block, which ends with its own `end_header` marker before the chunks.
+///
+/// Stopping at `first_new_block` keeps the total walk linear in the number
+/// of trailer fields: every field queued before that parse was already
+/// examined by the call that followed the parse which queued it, so a
+/// client that trickles one trailer line per segment while the backend is
+/// not writable does not make each call re-walk the whole section. Parsing
+/// only appends blocks, and `prepare` only drains them from the front
+/// between parses, so the fields past `first_new_block` are exactly the new
+/// ones even when earlier trailer fields were already forwarded.
+///
+/// An elided field is skipped by kawa's H1 converter and by the H2 one, so
+/// the last chunk and the closing empty line are still written: the chunk
+/// framing stays valid even when every trailer field is dropped. A request
+/// that is not chunked, or has not reached its trailer section, returns
+/// before touching a block, so the walk costs nothing on the common path.
+///
+/// Only requests are filtered: a response trailer travels towards the
+/// client, which does not take client attribution from it.
+pub fn elide_request_trailer_spoof_vectors(
+    kawa: &mut GenericHttpStream,
+    first_new_block: usize,
+) -> usize {
+    if !matches!(kawa.kind, kawa::Kind::Request)
+        || kawa.body_size != kawa::BodySize::Chunked
+        || !matches!(
+            kawa.parsing_phase,
+            kawa::ParsingPhase::Trailers | kawa::ParsingPhase::Terminated
+        )
+    {
+        return 0;
+    }
+    // Pre: the caller read the length before a parse, which only appends.
+    debug_assert!(
+        first_new_block <= kawa.blocks.len(),
+        "first_new_block must be a block count read before the parse"
+    );
+    let first_new_block = first_new_block.min(kawa.blocks.len());
+    let buf = kawa.storage.buffer();
+    let mut elided = 0;
+    for block in kawa.blocks.range_mut(first_new_block..).rev() {
+        match block {
+            kawa::Block::Flags(kawa::Flags {
+                end_body: false,
+                end_chunk: false,
+                end_header: true,
+                end_stream: true,
+            }) => {}
+            kawa::Block::Header(pair) => {
+                if !pair.is_elided() && is_trailer_spoof_vector(pair.key.data(buf)) {
+                    pair.elide();
+                    elided += 1;
+                    incr!(names::http::TRAILER_SPOOF_VECTOR_ELIDED);
+                }
+                // Post: no spoof-vector trailer field survives the walk.
+                debug_assert!(
+                    pair.is_elided() || !is_trailer_spoof_vector(pair.key.data(buf)),
+                    "a spoof-vector trailer field must be elided"
+                );
+            }
+            _ => break,
+        }
+    }
+    debug_assert!(
+        elided <= kawa.blocks.len() - first_new_block,
+        "only blocks appended by the last parse are elided"
+    );
+    elided
+}
+
 impl kawa::h1::ParserCallbacks<Checkout> for HttpContext {
     fn on_headers(&mut self, stream: &mut GenericHttpStream) {
         match stream.kind {
@@ -1392,10 +1511,12 @@ impl HttpContext {
                         // Anti-spoofing: a client cannot supply its own
                         // `X-Real-IP` and have it reach the backend. The
                         // proxy-injected value (when `send_x_real_ip` is
-                        // also set) is appended after this loop. H2 trailer
-                        // HEADERS frames bypass this callback; they are
-                        // covered by the matching elision in
-                        // `pkawa::handle_trailer`.
+                        // also set) is appended after this loop. Trailer
+                        // fields bypass this callback; they are covered by
+                        // `TRAILER_SPOOF_VECTOR_HEADERS`, dropped from H2
+                        // trailer HEADERS frames by `pkawa::handle_trailer`
+                        // and from H1 chunked trailers by
+                        // `elide_request_trailer_spoof_vectors`.
                         debug_assert!(
                             self.elide_x_real_ip,
                             "X-Real-IP is only elided when anti-spoofing is enabled"
@@ -4704,5 +4825,228 @@ mod tests {
                 "{label}: the interim Connection lines are forwarded as sent, got {wire:?}"
             );
         }
+    }
+
+    // ── chunked request trailers: spoof-vector elision ─────────────────
+
+    /// Head and body of a chunked request, up to and including the
+    /// last-chunk line, so a test can send its trailer section separately.
+    const CHUNKED_HEAD: &[u8] = b"POST /upload HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHello\r\n0\r\n";
+
+    /// A trailer section carrying every spoof-vector name, in mixed case,
+    /// with the forged value `6.6.6.6`, plus one legitimate field.
+    const SPOOF_TRAILERS: &[u8] = b"X-Forwarded-For: 6.6.6.6\r\nforwarded: for=6.6.6.6\r\nX-REAL-IP: 6.6.6.6\r\nX-Request-Id: 6.6.6.6\r\nX-Forwarded-Proto: 6.6.6.6\r\nx-forwarded-port: 6.6.6.6\r\nX-Forwarded-Host: 6.6.6.6\r\nGrpc-Status: 0\r\n\r\n";
+
+    /// RFC 9110 §6.5.1, sozu-proxy/sozu#1689: an H1 chunked request cannot
+    /// carry `X-Forwarded-For`, `Forwarded`, `X-Real-IP` or the rest of
+    /// `TRAILER_SPOOF_VECTOR_HEADERS` in its trailer section, whatever the
+    /// case of the name, while a legitimate trailer and the chunk framing
+    /// survive: last-chunk, the surviving field, then the empty line.
+    ///
+    /// TO SEE THIS RED: make `elide_request_trailer_spoof_vectors` return
+    /// `0` before its walk.
+    #[test]
+    fn a_chunked_request_trailer_section_loses_its_spoof_vector_fields() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let bytes = [CHUNKED_HEAD, SPOOF_TRAILERS].concat();
+        let mut kawa = parse_message(&mut pool, kawa::Kind::Request, &bytes);
+        assert!(kawa.is_terminated(), "the trailer section ends the request");
+
+        assert_eq!(
+            elide_request_trailer_spoof_vectors(&mut kawa, 0),
+            TRAILER_SPOOF_VECTOR_HEADERS.len(),
+            "every spoof-vector trailer field is elided once"
+        );
+        assert_eq!(
+            elide_request_trailer_spoof_vectors(&mut kawa, 0),
+            0,
+            "a second walk finds nothing left to elide"
+        );
+        let wire = serialized_request(&mut kawa);
+        assert!(
+            !wire.contains("6.6.6.6"),
+            "no spoofed trailer may reach the backend, got {wire:?}"
+        );
+        assert!(
+            wire.ends_with("\r\n\r\n5\r\nHello\r\n0\r\nGrpc-Status: 0\r\n\r\n"),
+            "the legitimate trailer and the chunk framing survive, got {wire:?}"
+        );
+    }
+
+    /// The trailer section may arrive after the last-chunk line was already
+    /// forwarded, so the `end_body` marker is no longer in the block queue
+    /// when the trailer fields are parsed. They must still be elided, and a
+    /// request whose every trailer field is dropped still ends with the
+    /// empty line that closes its (now empty) trailer section.
+    #[test]
+    fn a_trailer_section_parsed_after_the_last_chunk_was_forwarded_is_filtered() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let mut kawa = parse_message(&mut pool, kawa::Kind::Request, CHUNKED_HEAD);
+        assert_eq!(kawa.parsing_phase, kawa::ParsingPhase::Trailers);
+        assert_eq!(elide_request_trailer_spoof_vectors(&mut kawa, 0), 0);
+        let head = serialized_request(&mut kawa);
+        assert!(
+            kawa.blocks.is_empty(),
+            "the last-chunk marker was forwarded"
+        );
+
+        const ONLY_SPOOF: &[u8] = b"X-Forwarded-For: 6.6.6.6\r\nForwarded: for=6.6.6.6\r\n\r\n";
+        kawa.storage.space()[..ONLY_SPOOF.len()].copy_from_slice(ONLY_SPOOF);
+        kawa.storage.fill(ONLY_SPOOF.len());
+        let before = kawa.blocks.len();
+        kawa::h1::parse(&mut kawa, &mut make_context());
+        assert!(kawa.is_terminated(), "the trailer section ends the request");
+        assert_eq!(elide_request_trailer_spoof_vectors(&mut kawa, before), 2);
+        let wire = serialized_request(&mut kawa);
+        assert!(
+            wire.starts_with(&head) && !wire.contains("6.6.6.6"),
+            "no spoofed trailer may reach the backend, got {wire:?}"
+        );
+        assert!(
+            wire.ends_with("0\r\n\r\n"),
+            "the empty trailer section is still closed, got {wire:?}"
+        );
+    }
+
+    /// The elision is confined to a chunked request's trailer section: the
+    /// header block of a request, chunked or not, and a response trailer
+    /// are left to their own paths, and the walk returns before touching a
+    /// block.
+    #[test]
+    fn trailer_elision_leaves_headers_and_responses_alone() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let cases: [(kawa::Kind, &[u8]); 3] = [
+            (
+                kawa::Kind::Request,
+                b"POST / HTTP/1.1\r\nHost: example.com\r\nX-Request-Id: keep\r\nContent-Length: 2\r\n\r\nok",
+            ),
+            (
+                kawa::Kind::Request,
+                b"POST / HTTP/1.1\r\nHost: example.com\r\nX-Request-Id: keep\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n",
+            ),
+            (
+                kawa::Kind::Response,
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-Request-Id: keep\r\n\r\n",
+            ),
+        ];
+        for (kind, bytes) in cases {
+            let mut kawa = parse_message(&mut pool, kind, bytes);
+            assert_eq!(
+                elide_request_trailer_spoof_vectors(&mut kawa, 0),
+                0,
+                "{kind:?} {:?}: nothing to elide",
+                kawa.parsing_phase
+            );
+            let wire = serialized_request(&mut kawa);
+            assert!(
+                wire.contains("X-Request-Id: keep\r\n"),
+                "{kind:?}: the field survives, got {wire:?}"
+            );
+        }
+    }
+
+    /// Append `bytes` to `kawa`, parse them, and elide the trailer fields
+    /// that parse appended, as `ConnectionH1::readable` does. Returns the
+    /// number of fields elided.
+    fn feed_and_elide(kawa: &mut GenericHttpStream, bytes: &[u8]) -> usize {
+        kawa.storage.space()[..bytes.len()].copy_from_slice(bytes);
+        kawa.storage.fill(bytes.len());
+        let before = kawa.blocks.len();
+        kawa::h1::parse(kawa, &mut make_context());
+        elide_request_trailer_spoof_vectors(kawa, before)
+    }
+
+    /// The trailer section itself may be split across reads, and the first
+    /// part forwarded before the second arrives: `X-Forwarded-For` comes in
+    /// one segment and is drained towards the backend, `Forwarded` in the
+    /// next. Both must be elided, and the legitimate field and the closing
+    /// empty line of the section survive.
+    ///
+    /// TO SEE THIS RED: make `elide_request_trailer_spoof_vectors` return
+    /// `0` before its walk.
+    #[test]
+    fn a_trailer_section_split_across_reads_is_filtered_in_each_part() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let mut kawa = parse_message(&mut pool, kawa::Kind::Request, CHUNKED_HEAD);
+        assert_eq!(kawa.parsing_phase, kawa::ParsingPhase::Trailers);
+
+        assert_eq!(
+            feed_and_elide(&mut kawa, b"X-Forwarded-For: 6.6.6.6\r\n"),
+            1,
+            "the first trailer part is filtered on its own"
+        );
+        assert_eq!(kawa.parsing_phase, kawa::ParsingPhase::Trailers);
+        let first = serialized_request(&mut kawa);
+        assert!(kawa.blocks.is_empty(), "the first part was forwarded");
+
+        assert_eq!(
+            feed_and_elide(
+                &mut kawa,
+                b"Forwarded: for=6.6.6.6\r\nGrpc-Status: 0\r\n\r\n"
+            ),
+            1,
+            "the second trailer part is filtered on its own"
+        );
+        assert!(kawa.is_terminated(), "the trailer section ends the request");
+        let wire = serialized_request(&mut kawa);
+        assert!(
+            wire.starts_with(&first) && !wire.contains("6.6.6.6"),
+            "no spoofed trailer may reach the backend, got {wire:?}"
+        );
+        assert!(
+            wire.ends_with("0\r\nGrpc-Status: 0\r\n\r\n"),
+            "the legitimate trailer and the closing empty line survive, got {wire:?}"
+        );
+    }
+
+    /// Each call walks only the blocks the last parse appended, so a client
+    /// trickling one trailer line per segment while the backend is not
+    /// writable costs a linear walk in total, not a quadratic one. A field
+    /// queued before the parse is left for the call that followed the parse
+    /// which queued it: here it was deliberately never filtered, and the
+    /// bounded walk must not reach it.
+    ///
+    /// TO SEE THIS RED: ignore `first_new_block` and walk the whole queue
+    /// (`range_mut(0..)`); the call then also elides the older field.
+    #[test]
+    fn a_trailer_walk_stops_at_the_blocks_queued_before_the_parse() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let head = [CHUNKED_HEAD, b"X-Forwarded-For: 6.6.6.6\r\n"].concat();
+        let mut kawa = parse_message(&mut pool, kawa::Kind::Request, &head);
+        assert_eq!(kawa.parsing_phase, kawa::ParsingPhase::Trailers);
+        let queued = kawa.blocks.len();
+
+        // Trickle the rest of the section one line per read, never
+        // draining: each call must see exactly the one new field.
+        for line in [
+            &b"Forwarded: for=6.6.6.6\r\n"[..],
+            b"X-Real-IP: 6.6.6.6\r\n",
+            b"Grpc-Status: 0\r\n",
+        ] {
+            let spoofed = usize::from(!line.starts_with(b"Grpc"));
+            assert_eq!(
+                feed_and_elide(&mut kawa, line),
+                spoofed,
+                "only the field this read appended is examined"
+            );
+        }
+        assert_eq!(feed_and_elide(&mut kawa, b"\r\n"), 0);
+        assert!(kawa.is_terminated(), "the trailer section ends the request");
+
+        let buf = kawa.storage.buffer();
+        let older = kawa
+            .blocks
+            .range(..queued)
+            .filter_map(|block| match block {
+                kawa::Block::Header(pair) if !pair.is_elided() => Some(pair.key.data(buf)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            older
+                .iter()
+                .any(|key| key.eq_ignore_ascii_case(b"X-Forwarded-For")),
+            "a block queued before the parse is outside the walk, got {older:?}"
+        );
     }
 }

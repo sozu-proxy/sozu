@@ -17,7 +17,7 @@ use sozu_command::logging::ansi_palette;
 use crate::{
     pool::Checkout,
     protocol::{
-        http::parser::compare_no_case,
+        http::{editor::TRAILER_SPOOF_VECTOR_HEADERS, parser::compare_no_case},
         mux::{
             GenericHttpStream, StreamId,
             h2::MetricEvent,
@@ -1391,9 +1391,12 @@ where
 ///
 /// RFC 9110 §6.5 forbids trailers from carrying fields that affect
 /// "message framing, message routing, or response semantics." sōzu
-/// rewrites seven client-attribution headers on the initial HEADERS pass
+/// handles seven client-attribution headers on the initial HEADERS pass
 /// (`HttpContext::on_request_headers` in
-/// `lib/src/protocol/kawa_h1/editor.rs`):
+/// `lib/src/protocol/kawa_h1/editor.rs`; the router also injects
+/// `X-Forwarded-Host` on a host rewrite), listed once in
+/// `TRAILER_SPOOF_VECTOR_HEADERS` (same file) so the H1 trailer path
+/// (`elide_request_trailer_spoof_vectors`) drops exactly the same names:
 ///   * `X-Real-IP` is replaced by the post-PROXY-v2 peer IP when
 ///     `send_x_real_ip = true` and stripped client-side when
 ///     `elide_x_real_ip = true`.
@@ -1507,29 +1510,22 @@ pub fn handle_trailer(
         // ── Spoof-vector elision per RFC 9110 §6.5 ──
         //
         // RFC 9110 §6.5 forbids trailers from carrying message-routing
-        // semantics. The client-attribution headers below are the ones
-        // sōzu manages on the initial-HEADERS pass; depending on the
-        // listener's `forwarded_headers` mode it synthesises, extends,
-        // removes or passes each one through as sent (`none` touches no
-        // forwarding header, and `x_forwarded` leaves `Forwarded` alone).
-        // Whatever the mode, a trailer copy never went through that pass,
-        // so admitting them as trailers would let a naive H2 client smuggle
-        // a spoofed value to a backend that merges trailers into its header
-        // view. Drop them unconditionally — keys are already lower-case here
+        // semantics. The client-attribution headers of
+        // `TRAILER_SPOOF_VECTOR_HEADERS` (`lib/src/protocol/kawa_h1/editor.rs`,
+        // shared with the H1 trailer path) are the ones sōzu manages on the
+        // initial-HEADERS pass; depending on the listener's
+        // `forwarded_headers` mode it synthesises, extends, removes or passes
+        // each one through as sent (`none` touches no forwarding header, and
+        // `x_forwarded` leaves `Forwarded` alone). Whatever the mode, a
+        // trailer copy never went through that pass, so admitting them as
+        // trailers would let a naive H2 client smuggle a spoofed value to a
+        // backend that merges trailers into its header view. Drop them
+        // unconditionally — keys are already lower-case here
         // (`classify_invalid_h2_header` rejects any uppercase byte per
         // RFC 9113 §8.2.2), so a byte-equality check is sufficient.
         // `incr!` records the rejection so dashboards observe the
         // attempted smuggle without spamming logs.
-        if matches!(
-            k.as_ref(),
-            b"x-real-ip"
-                | b"x-forwarded-for"
-                | b"forwarded"
-                | b"x-request-id"
-                | b"x-forwarded-proto"
-                | b"x-forwarded-port"
-                | b"x-forwarded-host"
-        ) {
+        if TRAILER_SPOOF_VECTOR_HEADERS.contains(&k.as_ref()) {
             events.push(MetricEvent::TrailerSpoofVectorElided);
             return;
         }
@@ -3028,27 +3024,23 @@ mod tests {
         );
     }
 
-    /// Each of the spoof-vector headers must be dropped on its own,
-    /// so a single-trailer attempt cannot bypass the filter just because
-    /// the others are absent. `x-forwarded-proto`, `-port` and `-host`
-    /// are the rest of the `X-Forwarded-*` family the initial-HEADERS
-    /// pass manages: `forwarded_headers = "rfc7239"` removes them there,
-    /// and `both` / `x_forwarded` synthesise them, so a trailer copy is the
-    /// same spoof vector in every mode (sozu#322).
+    /// Each spoof-vector header must be dropped on its own, so a
+    /// single-trailer attempt cannot bypass the filter just because the
+    /// others are absent. The names come from the list shared with the H1
+    /// trailer path (`TRAILER_SPOOF_VECTOR_HEADERS`,
+    /// `lib/src/protocol/kawa_h1/editor.rs`, sozu-proxy/sozu#1689).
+    /// `x-forwarded-proto`, `-port` and `-host` are the rest of the
+    /// `X-Forwarded-*` family the initial-HEADERS pass manages:
+    /// `forwarded_headers = "rfc7239"` removes them there, and `both` /
+    /// `x_forwarded` synthesise them, so a trailer copy is the same spoof
+    /// vector in every mode (sozu#322).
     ///
-    /// TO SEE THIS RED: drop `x-forwarded-proto` from the spoof-vector
-    /// match in `handle_trailer`.
+    /// TO SEE THIS RED: drop `x-forwarded-proto` from
+    /// `TRAILER_SPOOF_VECTOR_HEADERS`, or restore a name-by-name `matches!`
+    /// in `handle_trailer` that omits it.
     #[test]
     fn handle_trailer_drops_each_spoof_header_individually() {
-        for &name in &[
-            b"x-real-ip" as &[u8],
-            b"x-forwarded-for",
-            b"forwarded",
-            b"x-request-id",
-            b"x-forwarded-proto",
-            b"x-forwarded-port",
-            b"x-forwarded-host",
-        ] {
+        for name in TRAILER_SPOOF_VECTOR_HEADERS {
             let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
             let kawa = decode_trailer(&mut pool, &[(name, b"v")]);
             let surviving = surviving_trailer_keys(&kawa);
