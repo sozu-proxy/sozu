@@ -3485,9 +3485,9 @@
   `BackendList::add_backend` rewrites `Backend::sticky_id` in place on a live entry.
 
   No behaviour change, and no allocation added or removed: the per-selection candidate `Vec` in
-  `BackendList::available_backends` is untouched and out of scope. `L7Proxy::backends` keeps one
-  caller, `Mux::dial_backend` (see the correction under 🔄 Changed); removing it from the trait is
-  left for separate work. `backend_from_request` had no test.
+  `BackendList::available_backends` is untouched and out of scope. `L7Proxy::backends` kept one
+  caller, `Mux::dial_backend` (see the correction under 🔄 Changed), and is removed under
+  ➖ Removed. `backend_from_request` had no test.
   `a_second_selection_observes_the_first_dials_connection` dials twice under `LeastLoaded`
   on connections and requires two different backends — red, both on `backend-a`, when the
   dial's increment is removed. `a_cookie_pins_only_a_frontend_that_sticks` pins that a frontend
@@ -6006,6 +6006,20 @@
 
 
 ### ➖ Removed
+
+- **BREAKING (library API) — `refactor(mux)`: `L7Proxy::backends` is removed
+  ([#1684](https://github.com/sozu-proxy/sozu/issues/1684)).** Its one production caller was
+  `Mux::dial_backend`, which borrowed the proxy and cloned the `Rc<RefCell<BackendMap>>` on every
+  dial to lend the map to `Router::backend_from_request`. `Mux` now holds that handle from
+  construction in a `backends` field: `HttpSession::new` receives it from
+  `HttpProxy::create_session`, and the expect-proxy and TLS-handshake upgrades read the proxy's
+  field once. `HttpProxy` and `HttpsProxy` never reassign that field, so it is the same map. The
+  trait declaration goes with its `HttpProxy` and `HttpsProxy` implementations and two
+  `unreachable!` test doubles. An embedder implementing `L7Proxy` drops the method; one that called
+  it reaches its `BackendMap` directly. `HttpSession::new` gains a `backends` parameter.
+  `size_of::<MuxClear>()` goes 4976 → 4984 bytes and `size_of::<MuxTls>()` 6152 → 6160; a dial saves
+  one `RefCell` borrow of the proxy and one `Rc` clone and drop, and still makes 6 heap allocations
+  from selection to a linked stream, as before. No runtime behaviour changes.
 
 - **BREAKING (library API) — `refactor(lib)`: `L7Proxy::deregister_socket` is removed
   ([#1615](https://github.com/sozu-proxy/sozu/issues/1615)).** It has had no caller since

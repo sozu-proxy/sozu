@@ -599,12 +599,11 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   ledger (see "Drain before any read" under invariant 14 in §9): splitting them
   would open a window between reading the counters and dialling that the code
   has never had. `a_second_selection_observes_the_first_dials_connection`
-  (`router.rs`) holds that property. `L7Proxy::backends` keeps one
-  production caller: `Mux::dial_backend` (`mod.rs`) calls it to reach the
-  `BackendMap` its `RegistryDialer` lends to the router. Moving the backend
-  set out of the router moved that call into the embedder; it did not remove
-  it. Whether to drop the method from the trait is an open question on
-  [#1684](https://github.com/sozu-proxy/sozu/issues/1684).
+  (`router.rs`) holds that property. The map itself is `Mux::backends`,
+  handed over when the session is built (`HttpSession::new`, or the proxy's
+  field at the expect-proxy and TLS-handshake upgrades); `L7Proxy` has no
+  `backends` method any more, so a dial borrows neither the proxy nor a
+  fresh handle to reach it ([#1684](https://github.com/sozu-proxy/sozu/issues/1684)).
 - **Backend detach.** `Context::unlink_stream` (`mod.rs`) — called from the four
   timeout arms of `Mux::timeout_inner` (`mod.rs`), from H1 EOF
   (`ConnectionH1::end_stream`, `h1.rs`),

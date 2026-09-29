@@ -127,6 +127,7 @@ impl HttpSession {
         listener: Rc<RefCell<HttpListener>>,
         pool: Weak<RefCell<Pool>>,
         proxy: Rc<RefCell<HttpProxy>>,
+        backends: Rc<RefCell<BackendMap>>,
         public_address: SocketAddr,
         sock: TcpStream,
         peer: SocketAddr,
@@ -183,6 +184,7 @@ impl HttpSession {
                 // request timeout started when the socket was accepted.
                 timeouts: mux::MuxTimeouts::new(container_frontend_timeout),
                 backend_registry: mux::BackendRegistry::default(),
+                backends,
             })
         };
 
@@ -373,6 +375,11 @@ impl HttpSession {
                     session_ulid,
                     timeouts: mux::MuxTimeouts::new(expect.container_frontend_timeout),
                     backend_registry: mux::BackendRegistry::default(),
+                    // Read once, at the upgrade: the proxy is not borrowed
+                    // while a session runs, and `HttpProxy::backends` is never
+                    // reassigned, so this is the map the session would have
+                    // reached on every dial.
+                    backends: Rc::clone(&self.proxy.borrow().backends),
                 };
                 mux.frontend.readiness_mut().event = expect.frontend_readiness.event;
 
@@ -1872,6 +1879,9 @@ impl ProxyConfiguration for HttpProxy {
             listener.clone(),
             Rc::downgrade(&self.pool),
             proxy,
+            // `create_session` runs under the proxy's `borrow_mut`, so the
+            // session cannot read the map through `proxy`; hand it over here.
+            Rc::clone(&self.backends),
             public_address,
             frontend_sock,
             peer,
@@ -1964,10 +1974,6 @@ impl L7Proxy for HttpProxy {
             "the slot must be free after remove_session"
         );
         removed
-    }
-
-    fn backends(&self) -> Rc<RefCell<BackendMap>> {
-        self.backends.clone()
     }
 
     fn clusters(&self) -> &HashMap<ClusterId, Cluster> {
