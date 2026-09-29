@@ -41,6 +41,7 @@ use std::{
 
 use mio::{Interest, Registry, Token, net::UdpSocket, unix::SourceFd};
 use sozu_command::{
+    listener_key::ListenerKey,
     logging::ansi_palette,
     proto::command::{
         Cluster, LoadBalancingAlgorithms, LoadMetric, RequestUdpFrontend, UdpAffinityKey,
@@ -266,6 +267,17 @@ impl ListenerHandler for UdpListener {
 }
 
 impl UdpListener {
+    /// This listener's identity: its address, plus the network interface its
+    /// socket is bound to when it has one.
+    pub fn key(&self) -> ListenerKey {
+        ListenerKey::new(self.address, self.config.interface.as_deref())
+    }
+
+    /// Whether this listener is the one `key` names.
+    pub fn is(&self, key: &ListenerKey) -> bool {
+        key.matches(&self.address, self.config.interface.as_deref())
+    }
+
     fn new(config: UdpListenerConfig, token: Token) -> Result<UdpListener, ListenerError> {
         Ok(UdpListener {
             cluster_id: None,
@@ -331,7 +343,8 @@ impl UdpListener {
             }
             (Some(inherited), None) => inherited,
             (None, Some(parked)) => parked,
-            (None, None) => udp_bind(address).map_err(|e| ProxyError::BindToSocket(address, e))?,
+            (None, None) => udp_bind(address, self.config.interface.as_deref())
+                .map_err(|e| ProxyError::BindToSocket(address, e))?,
         };
 
         let registration = registry
@@ -517,17 +530,59 @@ impl UdpProxy {
                         self.hash_seed,
                     ))),
                 );
+                self.adopt_sibling_route(token);
                 Ok(token)
             }
             _ => Err(ProxyError::ListenerAlreadyPresent),
         }
     }
 
-    pub fn remove_listener(&mut self, address: SocketAddr) -> SessionIsToBeClosed {
+    /// A UDP frontend names its listener by address alone, so a listener
+    /// added next to one already on its address (on another interface) takes
+    /// over the cluster that one routes to, in its own state and in its flow
+    /// manager: every listener on an address routes the same way, whenever it
+    /// was added (sozu-proxy/sozu#719).
+    fn adopt_sibling_route(&mut self, token: Token) {
+        let address = self.listeners[&token].borrow().address;
+        let Some((cluster_id, tags)) = self
+            .listeners
+            .iter()
+            .filter(|(sibling, listener)| {
+                **sibling != token && listener.borrow().address == address
+            })
+            .min_by_key(|(sibling, _)| **sibling)
+            .map(|(_, listener)| {
+                let listener = listener.borrow();
+                (listener.cluster_id.clone(), listener.tags.clone())
+            })
+        else {
+            return;
+        };
+        {
+            let mut listener = self.listeners[&token].borrow_mut();
+            listener.tags = tags;
+            listener.cluster_id.clone_from(&cluster_id);
+        }
+        if let Some(cluster_id) = cluster_id {
+            self.cluster_for_listener.insert(token, cluster_id);
+            if let Some(mgr) = self.managers.get(&token) {
+                let cfg = {
+                    let l = self.listeners[&token].borrow();
+                    self.cluster_config_for(&l, token)
+                };
+                mgr.borrow_mut().handle_input(
+                    ManagerInput::Config(ConfigEvent::SetCluster(cfg)),
+                    Instant::now(),
+                );
+            }
+        }
+    }
+
+    pub fn remove_listener(&mut self, address: &ListenerKey) -> SessionIsToBeClosed {
         let len = self.listeners.len();
         let mut removed_tokens = Vec::new();
         self.listeners.retain(|token, l| {
-            if l.borrow().address == address {
+            if l.borrow().is(address) {
                 removed_tokens.push(*token);
                 false
             } else {
@@ -557,12 +612,12 @@ impl UdpProxy {
     /// The event loop is single-threaded, so nothing can change the listener's
     /// `active` flag between this answer and the `activate_listener` call that
     /// acts on it.
-    pub fn inherited_socket_fate(&self, addr: &SocketAddr) -> crate::InheritedSocketFate {
+    pub fn inherited_socket_fate(&self, addr: &ListenerKey) -> crate::InheritedSocketFate {
         use crate::InheritedSocketFate;
         match self
             .listeners
             .values()
-            .find(|listener| listener.borrow().address == *addr)
+            .find(|listener| listener.borrow().is(addr))
         {
             None => InheritedSocketFate::Unclaimed,
             Some(listener) if listener.borrow().active => InheritedSocketFate::Refused,
@@ -572,14 +627,14 @@ impl UdpProxy {
 
     pub fn activate_listener(
         &self,
-        addr: &SocketAddr,
+        addr: &ListenerKey,
         udp_socket: Option<UdpSocket>,
     ) -> Result<Token, ProxyError> {
         let listener = self
             .listeners
             .values()
-            .find(|listener| listener.borrow().address == *addr)
-            .ok_or(ProxyError::NoListenerFound(*addr))?;
+            .find(|listener| listener.borrow().is(addr))
+            .ok_or(ProxyError::NoListenerFound(addr.clone()))?;
 
         listener.borrow_mut().activate(&self.registry, udp_socket)
     }
@@ -606,10 +661,10 @@ impl UdpProxy {
     /// touches the session slab. `Server` therefore reads the token here
     /// BEFORE dropping the listener, so that reserved slot is released exactly
     /// once, at the end of the lifetime.
-    pub fn listener_token(&self, address: SocketAddr) -> Option<Token> {
+    pub fn listener_token(&self, address: &ListenerKey) -> Option<Token> {
         self.listeners
             .iter()
-            .find(|(_, listener)| listener.borrow().address == address)
+            .find(|(_, listener)| listener.borrow().is(address))
             .map(|(token, _)| *token)
     }
 
@@ -635,14 +690,14 @@ impl UdpProxy {
         Some(session)
     }
 
-    pub fn give_back_listeners(&mut self) -> Vec<(SocketAddr, UdpSocket)> {
+    pub fn give_back_listeners(&mut self) -> Vec<(ListenerKey, UdpSocket)> {
         self.listeners
             .values()
             .filter_map(|listener| {
                 let mut owned = listener.borrow_mut();
                 if let Some(socket) = owned.socket.take() {
                     owned.active = false;
-                    return Some((owned.address, socket));
+                    return Some((owned.key(), socket));
                 }
                 None
             })
@@ -651,13 +706,13 @@ impl UdpProxy {
 
     pub fn give_back_listener(
         &mut self,
-        address: SocketAddr,
+        address: &ListenerKey,
     ) -> Result<(Token, UdpSocket), ProxyError> {
         let listener = self
             .listeners
             .values()
-            .find(|listener| listener.borrow().address == address)
-            .ok_or(ProxyError::NoListenerFound(address))?;
+            .find(|listener| listener.borrow().is(address))
+            .ok_or(ProxyError::NoListenerFound(address.clone()))?;
 
         let (token, taken) = {
             let mut owned = listener.borrow_mut();
@@ -683,7 +738,7 @@ impl UdpProxy {
             .listeners
             .values()
             .find(|l| l.borrow().address == address)
-            .ok_or(ProxyError::NoListenerFound(address))?;
+            .ok_or(ProxyError::NoListenerFound(address.into()))?;
         {
             let mut l = listener.borrow_mut();
             l.update_config(&patch);
@@ -744,63 +799,69 @@ impl UdpProxy {
         Ok(())
     }
 
+    /// The tokens of every listener on `address`, whatever its interface. A
+    /// UDP frontend names its listener by address alone, so it applies to all
+    /// the listeners sharing that address on different interfaces.
+    fn listener_tokens_at(&self, address: SocketAddr) -> Result<Vec<Token>, ProxyError> {
+        let mut tokens: Vec<Token> = self
+            .listeners
+            .iter()
+            .filter(|(_, listener)| listener.borrow().address == address)
+            .map(|(token, _)| *token)
+            .collect();
+        tokens.sort();
+        if tokens.is_empty() {
+            return Err(ProxyError::NoListenerFound(address.into()));
+        }
+        Ok(tokens)
+    }
+
     pub fn add_udp_front(&mut self, front: RequestUdpFrontend) -> Result<(), ProxyError> {
         let address = front.address.into();
         let cluster_id = ClusterId::from(front.cluster_id);
-        let token = {
-            let mut listener = self
-                .listeners
-                .values()
-                .find(|l| l.borrow().address == address)
-                .ok_or(ProxyError::NoListenerFound(address))?
-                .borrow_mut();
-            self.fronts.insert(cluster_id.clone(), listener.token);
-            listener.set_tags(address.to_string(), Some(front.tags));
-            listener.cluster_id = Some(cluster_id.clone());
-            listener.token
-        };
-        self.cluster_for_listener.insert(token, cluster_id);
+        for token in self.listener_tokens_at(address)? {
+            {
+                let mut listener = self.listeners[&token].borrow_mut();
+                self.fronts.insert(cluster_id.clone(), listener.token);
+                listener.set_tags(address.to_string(), Some(front.tags.clone()));
+                listener.cluster_id = Some(cluster_id.clone());
+            }
+            self.cluster_for_listener.insert(token, cluster_id.clone());
 
-        // Commit the cluster routing into the manager so admitted flows know
-        // which cluster to select a backend from (`BackendSource::select`).
-        if let Some(mgr) = self.managers.get(&token) {
-            let listener = self.listeners.get(&token).unwrap();
-            let cfg = {
-                let l = listener.borrow();
-                self.cluster_config_for(&l, token)
-            };
-            mgr.borrow_mut().handle_input(
-                ManagerInput::Config(ConfigEvent::SetCluster(cfg)),
-                Instant::now(),
-            );
+            // Commit the cluster routing into the manager so admitted flows know
+            // which cluster to select a backend from (`BackendSource::select`).
+            if let Some(mgr) = self.managers.get(&token) {
+                let cfg = {
+                    let l = self.listeners[&token].borrow();
+                    self.cluster_config_for(&l, token)
+                };
+                mgr.borrow_mut().handle_input(
+                    ManagerInput::Config(ConfigEvent::SetCluster(cfg)),
+                    Instant::now(),
+                );
+            }
         }
         Ok(())
     }
 
     pub fn remove_udp_front(&mut self, front: RequestUdpFrontend) -> Result<(), ProxyError> {
         let address = front.address.into();
-        let token = {
-            let mut listener = match self
-                .listeners
-                .values()
-                .find(|l| l.borrow().address == address)
+        for token in self.listener_tokens_at(address)? {
             {
-                Some(l) => l.borrow_mut(),
-                None => return Err(ProxyError::NoListenerFound(address)),
-            };
-            listener.set_tags(address.to_string(), None);
-            if let Some(cluster_id) = listener.cluster_id.take() {
-                self.fronts.remove(&cluster_id);
+                let mut listener = self.listeners[&token].borrow_mut();
+                listener.set_tags(address.to_string(), None);
+                if let Some(cluster_id) = listener.cluster_id.take() {
+                    self.fronts.remove(&cluster_id);
+                }
             }
-            listener.token
-        };
-        self.cluster_for_listener.remove(&token);
-        // Drop the routing in the manager — new datagrams now have no backend.
-        if let Some(mgr) = self.managers.get(&token) {
-            mgr.borrow_mut().handle_input(
-                ManagerInput::Config(ConfigEvent::SetCluster(ClusterConfig::default())),
-                Instant::now(),
-            );
+            self.cluster_for_listener.remove(&token);
+            // Drop the routing in the manager — new datagrams now have no backend.
+            if let Some(mgr) = self.managers.get(&token) {
+                mgr.borrow_mut().handle_input(
+                    ManagerInput::Config(ConfigEvent::SetCluster(ClusterConfig::default())),
+                    Instant::now(),
+                );
+            }
         }
         Ok(())
     }
@@ -999,7 +1060,7 @@ impl UdpProxy {
                 WorkerResponse::ok(message.id)
             }
             RequestType::RemoveListener(remove) => {
-                if !self.remove_listener(remove.address.into()) {
+                if !self.remove_listener(&remove.listener_key()) {
                     WorkerResponse::error(
                         message.id,
                         format!("no UDP listener to remove at address {:?}", remove.address),
@@ -2434,6 +2495,64 @@ mod tests {
             sessions.borrow().slab.len(),
             slab_len,
             "a shed flow must not leave an upstream slab slot behind"
+        );
+    }
+}
+
+#[cfg(test)]
+mod listener_sibling_tests {
+    use sozu_command::{config::ListenerBuilder, proto::command::SocketAddress};
+
+    use super::*;
+    use crate::testing::{ServerParts, prebuild_server, provide_port};
+
+    fn add(proxy: &mut UdpProxy, address: SocketAddress, interface: Option<&str>, token: usize) {
+        let config = ListenerBuilder::new_udp(address)
+            .with_interface(interface)
+            .to_udp(None)
+            .expect("could not build the listener config");
+        proxy
+            .add_listener(config, Token(token))
+            .expect("could not add the listener");
+    }
+
+    /// A UDP listener added on an address that already routes to a cluster
+    /// takes that route over from the listener already there, in its own
+    /// state and in its flow manager, so it forwards from its first datagram
+    /// (sozu-proxy/sozu#719).
+    #[test]
+    fn a_listener_added_next_to_a_sibling_takes_over_its_cluster() {
+        let ServerParts {
+            registry,
+            sessions,
+            pool,
+            backends,
+            ..
+        } = prebuild_server(16, 16384, false).expect("could not prebuild a test server");
+        let mut proxy = UdpProxy::new(registry, sessions, pool, backends, 16, 16384);
+        let address = SocketAddress::new_v4(0, 0, 0, 0, provide_port());
+        add(&mut proxy, address, None, 0);
+        proxy
+            .add_udp_front(RequestUdpFrontend {
+                cluster_id: "cluster-a".to_owned(),
+                address,
+                ..Default::default()
+            })
+            .expect("add the frontend");
+        add(&mut proxy, address, Some("lo"), 1);
+
+        assert_eq!(
+            proxy.listeners[&Token(1)].borrow().cluster_id.as_deref(),
+            Some("cluster-a"),
+            "the listener added after the frontend must route to its cluster"
+        );
+        assert_eq!(
+            proxy
+                .cluster_for_listener
+                .get(&Token(1))
+                .map(|c| c.as_ref()),
+            Some("cluster-a"),
+            "the flow manager side must know the cluster too"
         );
     }
 }

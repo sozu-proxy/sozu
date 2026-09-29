@@ -19,6 +19,7 @@ use sozu_command::{
         DEFAULT_SNI_PREREAD_MAX_BYTES, DEFAULT_SNI_PREREAD_TIMEOUT, MAX_LOOP_ITERATIONS,
         MIN_SNI_PREREAD_MAX_BYTES, validate_sni_pattern,
     },
+    listener_key::ListenerKey,
     logging::{EndpointRecord, LogContext, ansi_palette},
     proto::command::request::RequestType,
 };
@@ -2135,6 +2136,17 @@ impl ListenerHandler for TcpListener {
 }
 
 impl TcpListener {
+    /// This listener's identity: its address, plus the network interface its
+    /// socket is bound to when it has one.
+    pub fn key(&self) -> ListenerKey {
+        ListenerKey::new(self.address, self.config.interface.as_deref())
+    }
+
+    /// Whether this listener is the one `key` names.
+    pub fn is(&self, key: &ListenerKey) -> bool {
+        key.matches(&self.address, self.config.interface.as_deref())
+    }
+
     fn new(config: TcpListenerConfig, token: Token) -> Result<TcpListener, ListenerError> {
         Ok(TcpListener {
             cluster_id: None,
@@ -2463,9 +2475,8 @@ impl TcpListener {
             }
             (Some(inherited), None) => inherited,
             (None, Some(parked)) => parked,
-            (None, None) => {
-                server_bind(address).map_err(|e| ProxyError::BindToSocket(address, e))?
-            }
+            (None, None) => server_bind(address, self.config.interface.as_deref())
+                .map_err(|e| ProxyError::BindToSocket(address, e))?,
         };
 
         // Once per listener, on whichever socket won above — freshly bound,
@@ -2763,10 +2774,26 @@ impl TcpProxy {
         config: TcpListenerConfig,
         token: Token,
     ) -> Result<Token, ProxyError> {
+        if self.listeners.contains_key(&token) {
+            return Err(ProxyError::ListenerAlreadyPresent);
+        }
+        let mut tcp_listener = TcpListener::new(config, token).map_err(ProxyError::AddListener)?;
+        // TCP frontends name their listener by address alone, so a listener
+        // added next to one already on its address (on another interface)
+        // takes over the routes that one serves: every listener on an address
+        // holds the same ones, whenever it was added (sozu-proxy/sozu#719).
+        if let Some(sibling) = self
+            .listeners_at(tcp_listener.address)
+            .ok()
+            .and_then(|listeners| listeners.into_iter().next())
+        {
+            let sibling = sibling.borrow();
+            tcp_listener.cluster_id.clone_from(&sibling.cluster_id);
+            tcp_listener.sni_routes = sibling.sni_routes.clone();
+            tcp_listener.tags = sibling.tags.clone();
+        }
         match self.listeners.entry(token) {
             Entry::Vacant(entry) => {
-                let tcp_listener =
-                    TcpListener::new(config, token).map_err(ProxyError::AddListener)?;
                 entry.insert(Rc::new(RefCell::new(tcp_listener)));
                 Ok(token)
             }
@@ -2774,10 +2801,10 @@ impl TcpProxy {
         }
     }
 
-    pub fn remove_listener(&mut self, address: SocketAddr) -> SessionIsToBeClosed {
+    pub fn remove_listener(&mut self, address: &ListenerKey) -> SessionIsToBeClosed {
         let len = self.listeners.len();
 
-        self.listeners.retain(|_, l| l.borrow().address != address);
+        self.listeners.retain(|_, l| !l.borrow().is(address));
         self.listeners.len() < len
     }
 
@@ -2788,12 +2815,12 @@ impl TcpProxy {
     /// The event loop is single-threaded, so nothing can change the listener's
     /// `active` flag between this answer and the `activate_listener` call that
     /// acts on it.
-    pub fn inherited_socket_fate(&self, addr: &SocketAddr) -> crate::InheritedSocketFate {
+    pub fn inherited_socket_fate(&self, addr: &ListenerKey) -> crate::InheritedSocketFate {
         use crate::InheritedSocketFate;
         match self
             .listeners
             .values()
-            .find(|listener| listener.borrow().address == *addr)
+            .find(|listener| listener.borrow().is(addr))
         {
             None => InheritedSocketFate::Unclaimed,
             Some(listener) if listener.borrow().active => InheritedSocketFate::Refused,
@@ -2803,14 +2830,14 @@ impl TcpProxy {
 
     pub fn activate_listener(
         &self,
-        addr: &SocketAddr,
+        addr: &ListenerKey,
         tcp_listener: Option<MioTcpListener>,
     ) -> Result<Token, ProxyError> {
         let listener = self
             .listeners
             .values()
-            .find(|listener| listener.borrow().address == *addr)
-            .ok_or(ProxyError::NoListenerFound(*addr))?;
+            .find(|listener| listener.borrow().is(addr))
+            .ok_or(ProxyError::NoListenerFound(addr.clone()))?;
 
         listener.borrow_mut().activate(&self.registry, tcp_listener)
     }
@@ -2823,14 +2850,14 @@ impl TcpProxy {
     /// touches the session slab. `Server` therefore reads the token here
     /// BEFORE dropping the listener, so that reserved slot is released exactly
     /// once, at the end of the lifetime.
-    pub fn listener_token(&self, address: SocketAddr) -> Option<Token> {
+    pub fn listener_token(&self, address: &ListenerKey) -> Option<Token> {
         self.listeners
             .iter()
-            .find(|(_, listener)| listener.borrow().address == address)
+            .find(|(_, listener)| listener.borrow().is(address))
             .map(|(token, _)| *token)
     }
 
-    pub fn give_back_listeners(&mut self) -> Vec<(SocketAddr, MioTcpListener)> {
+    pub fn give_back_listeners(&mut self) -> Vec<(ListenerKey, MioTcpListener)> {
         self.listeners
             .values()
             .filter_map(|listener| {
@@ -2839,7 +2866,7 @@ impl TcpProxy {
                     // Reset `active` so a subsequent `activate()` re-binds
                     // instead of short-circuiting on the stale flag.
                     owned.active = false;
-                    return Some((owned.address, listener));
+                    return Some((owned.key(), listener));
                 }
 
                 None
@@ -2849,13 +2876,13 @@ impl TcpProxy {
 
     pub fn give_back_listener(
         &mut self,
-        address: SocketAddr,
+        address: &ListenerKey,
     ) -> Result<(Token, MioTcpListener), ProxyError> {
         let listener = self
             .listeners
             .values()
-            .find(|listener| listener.borrow().address == address)
-            .ok_or(ProxyError::NoListenerFound(address))?;
+            .find(|listener| listener.borrow().is(address))
+            .ok_or(ProxyError::NoListenerFound(address.clone()))?;
 
         let mut owned = listener.borrow_mut();
 
@@ -2878,7 +2905,7 @@ impl TcpProxy {
             .listeners
             .values()
             .find(|l| l.borrow().address == address)
-            .ok_or(ProxyError::NoListenerFound(address))?;
+            .ok_or(ProxyError::NoListenerFound(address.into()))?;
         listener
             .borrow_mut()
             .update_config(&patch)
@@ -2888,15 +2915,34 @@ impl TcpProxy {
             })
     }
 
+    /// Every listener on `address`, whatever its interface. A TCP frontend
+    /// names its listener by address alone, so it applies to all the
+    /// listeners sharing that address on different interfaces.
+    fn listeners_at(
+        &self,
+        address: SocketAddr,
+    ) -> Result<Vec<Rc<RefCell<TcpListener>>>, ProxyError> {
+        let mut listeners: Vec<_> = self
+            .listeners
+            .iter()
+            .filter(|(_, listener)| listener.borrow().address == address)
+            .map(|(token, listener)| (*token, listener.clone()))
+            .collect();
+        // Token order, so a failure is reported the same way on every run.
+        listeners.sort_by_key(|(token, _)| *token);
+        let listeners: Vec<_> = listeners
+            .into_iter()
+            .map(|(_, listener)| listener)
+            .collect();
+        if listeners.is_empty() {
+            return Err(ProxyError::NoListenerFound(address.into()));
+        }
+        Ok(listeners)
+    }
+
     pub fn add_tcp_front(&mut self, front: RequestTcpFrontend) -> Result<(), ProxyError> {
         let address = front.address.into();
-
-        let mut listener = self
-            .listeners
-            .values()
-            .find(|l| l.borrow().address == address)
-            .ok_or(ProxyError::NoListenerFound(address))?
-            .borrow_mut();
+        let listeners = self.listeners_at(address)?;
 
         // Hard-reject a request that would corrupt this listener's SNI/ALPN
         // routing invariants BEFORE any mutation below. Config-load
@@ -2904,36 +2950,49 @@ impl TcpProxy {
         // the same shapes for TOML-sourced requests, but `AddTcpFrontend`
         // can also arrive directly over the command socket, or via
         // `LoadState` replay of a hand-edited/stale state file, bypassing
-        // config.rs entirely.
-        listener.validate_new_tcp_front(&front)?;
-
-        let cluster_id = ClusterId::from(front.cluster_id);
-        self.fronts.insert(cluster_id.clone(), listener.token);
-
-        match front.sni {
-            Some(sni) => {
-                // Per-frontend tags key: many SNI/ALPN fronts share one
-                // listener, so the bare-address key (kept for no-SNI fronts
-                // below) would clobber siblings — see `sni_tags_key`.
-                listener.set_tags(sni_tags_key(&address, &sni, &front.alpn), Some(front.tags));
-                listener.insert_sni_route(sni, front.alpn, cluster_id)?;
-            }
-            None => {
-                listener.set_tags(
-                    TcpFrontendTagsKey::Address(address).to_string(),
-                    Some(front.tags),
-                );
-                listener.cluster_id = Some(cluster_id);
-            }
+        // config.rs entirely. Every listener on the address is checked before
+        // any of them is touched.
+        for listener in &listeners {
+            listener.borrow().validate_new_tcp_front(&front)?;
         }
 
-        // POST: the mixing invariant must hold after every successful add —
-        // `validate_new_tcp_front` is the enforcement point above, this is
-        // the cheap live re-check that it actually held.
-        debug_assert!(
-            listener.cluster_id.is_none() || listener.sni_routes.is_empty(),
-            "a TCP listener must never mix a no-SNI catch-all cluster with SNI-scoped routes"
-        );
+        let cluster_id = ClusterId::from(front.cluster_id);
+        for listener in listeners {
+            let mut listener = listener.borrow_mut();
+            self.fronts.insert(cluster_id.clone(), listener.token);
+
+            match &front.sni {
+                Some(sni) => {
+                    // Per-frontend tags key: many SNI/ALPN fronts share one
+                    // listener, so the bare-address key (kept for no-SNI fronts
+                    // below) would clobber siblings — see `sni_tags_key`.
+                    listener.set_tags(
+                        sni_tags_key(&address, sni, &front.alpn),
+                        Some(front.tags.clone()),
+                    );
+                    listener.insert_sni_route(
+                        sni.to_owned(),
+                        front.alpn.clone(),
+                        cluster_id.clone(),
+                    )?;
+                }
+                None => {
+                    listener.set_tags(
+                        TcpFrontendTagsKey::Address(address).to_string(),
+                        Some(front.tags.clone()),
+                    );
+                    listener.cluster_id = Some(cluster_id.clone());
+                }
+            }
+
+            // POST: the mixing invariant must hold after every successful add —
+            // `validate_new_tcp_front` is the enforcement point above, this is
+            // the cheap live re-check that it actually held.
+            debug_assert!(
+                listener.cluster_id.is_none() || listener.sni_routes.is_empty(),
+                "a TCP listener must never mix a no-SNI catch-all cluster with SNI-scoped routes"
+            );
+        }
 
         Ok(())
     }
@@ -2941,28 +3000,26 @@ impl TcpProxy {
     pub fn remove_tcp_front(&mut self, front: RequestTcpFrontend) -> Result<(), ProxyError> {
         let address = front.address.into();
 
-        let mut listener = match self
-            .listeners
-            .values()
-            .find(|l| l.borrow().address == address)
-        {
-            Some(l) => l.borrow_mut(),
-            None => return Err(ProxyError::NoListenerFound(address)),
-        };
-
-        match front.sni {
-            Some(sni) => {
-                // Clear ONLY this front's own tags entry (`sni_tags_key`) —
-                // the pre-SNI bare-address removal here used to strip tags
-                // for every sibling front on the listener.
-                listener.set_tags(sni_tags_key(&address, &sni, &front.alpn), None);
-                listener.remove_sni_route(sni, front.alpn, &front.cluster_id);
-                self.fronts.remove(front.cluster_id.as_str());
-            }
-            None => {
-                listener.set_tags(TcpFrontendTagsKey::Address(address).to_string(), None);
-                if let Some(cluster_id) = listener.cluster_id.take() {
-                    self.fronts.remove(&cluster_id);
+        for listener in self.listeners_at(address)? {
+            let mut listener = listener.borrow_mut();
+            match &front.sni {
+                Some(sni) => {
+                    // Clear ONLY this front's own tags entry (`sni_tags_key`) —
+                    // the pre-SNI bare-address removal here used to strip tags
+                    // for every sibling front on the listener.
+                    listener.set_tags(sni_tags_key(&address, sni, &front.alpn), None);
+                    listener.remove_sni_route(
+                        sni.to_owned(),
+                        front.alpn.clone(),
+                        &front.cluster_id,
+                    );
+                    self.fronts.remove(front.cluster_id.as_str());
+                }
+                None => {
+                    listener.set_tags(TcpFrontendTagsKey::Address(address).to_string(), None);
+                    if let Some(cluster_id) = listener.cluster_id.take() {
+                        self.fronts.remove(&cluster_id);
+                    }
                 }
             }
         }
@@ -3038,7 +3095,7 @@ impl ProxyConfiguration for TcpProxy {
                 WorkerResponse::ok(message.id)
             }
             RequestType::RemoveListener(remove) => {
-                if !self.remove_listener(remove.address.into()) {
+                if !self.remove_listener(&remove.listener_key()) {
                     WorkerResponse::error(
                         message.id,
                         format!("no TCP listener to remove at address {:?}", remove.address),
@@ -4370,6 +4427,201 @@ mod sni_routing_tests {
             ..
         } = prebuild_server(16, 16384, false).expect("could not prebuild a test server");
         TcpProxy::new(registry, sessions, pool, backends)
+    }
+
+    /// Two listeners on one address, one bound to `lo` and one to no
+    /// interface, coexist in a worker: each is activated, handed back and
+    /// removed under its own (address, interface) key, each socket carries its
+    /// own `SO_BINDTODEVICE`, and a frontend — which names its listener by
+    /// address alone — reaches both.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn listeners_sharing_an_address_on_different_interfaces_coexist() {
+        use socket2::SockRef;
+
+        let mut proxy = test_proxy();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let bare = ListenerKey::from(address);
+        let on_lo = ListenerKey::new(address, Some("lo"));
+        for (token, interface) in [(Token(0), None), (Token(1), Some("lo"))] {
+            let config = ListenerBuilder::new_tcp(address)
+                .with_interface(interface)
+                .to_tcp(None)
+                .expect("could not build listener config");
+            proxy
+                .add_listener(config, token)
+                .expect("a listener on another interface must not collide");
+        }
+        assert_eq!(proxy.listener_token(&bare), Some(Token(0)));
+        assert_eq!(proxy.listener_token(&on_lo), Some(Token(1)));
+        assert_eq!(
+            proxy.listener_token(&ListenerKey::new(address, Some("wg0"))),
+            None,
+            "an interface nobody added names no listener"
+        );
+
+        proxy
+            .add_tcp_front(RequestTcpFrontend {
+                cluster_id: "cluster-a".to_owned(),
+                address,
+                ..Default::default()
+            })
+            .expect("add_tcp_front must succeed");
+        for token in [Token(0), Token(1)] {
+            assert_eq!(
+                proxy.listeners[&token].borrow().cluster_id.as_deref(),
+                Some("cluster-a"),
+                "the frontend must reach the listener at {token:?}"
+            );
+        }
+
+        for key in [&bare, &on_lo] {
+            if let Err(error) = proxy.activate_listener(key, None) {
+                let message = error.to_string();
+                if message.contains("Operation not permitted") {
+                    eprintln!(
+                        "SKIPPED listeners_sharing_an_address_on_different_interfaces_coexist: \
+                         this environment may not bind a socket to an interface: {message}"
+                    );
+                    return;
+                }
+                panic!("activating {key}: {message}");
+            }
+        }
+        let mut handed_back = proxy.give_back_listeners();
+        handed_back.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let keys: Vec<&ListenerKey> = handed_back.iter().map(|(key, _)| key).collect();
+        assert_eq!(keys, vec![&bare, &on_lo]);
+        for (key, socket) in &handed_back {
+            assert_eq!(
+                SockRef::from(socket)
+                    .device()
+                    .expect("getsockopt(SO_BINDTODEVICE)"),
+                key.interface
+                    .as_ref()
+                    .map(|interface| interface.as_bytes().to_vec()),
+                "the socket handed back for {key} must be bound to its interface"
+            );
+        }
+
+        proxy.remove_listener(&on_lo);
+        assert_eq!(proxy.listener_token(&on_lo), None);
+        assert_eq!(
+            proxy.listener_token(&bare),
+            Some(Token(0)),
+            "removing the lo listener must keep the one without interface"
+        );
+    }
+
+    /// A TCP listener added on an address that already routes to a cluster
+    /// takes that route over from the listener already there — the no-SNI
+    /// cluster and the SNI routes alike — so it forwards from its first
+    /// connection (sozu-proxy/sozu#719).
+    #[test]
+    fn a_listener_added_next_to_a_sibling_takes_over_its_routes() {
+        let mut proxy = test_proxy();
+        let catch_all = SocketAddress::new_v4(0, 0, 0, 0, provide_port());
+        let by_sni = SocketAddress::new_v4(0, 0, 0, 0, provide_port());
+        for (token, address, sni) in [
+            (Token(0), catch_all, None),
+            (Token(2), by_sni, Some("example.com".to_owned())),
+        ] {
+            let config = ListenerBuilder::new_tcp(address)
+                .to_tcp(None)
+                .expect("could not build listener config");
+            proxy.add_listener(config, token).expect("add the listener");
+            proxy
+                .add_tcp_front(RequestTcpFrontend {
+                    cluster_id: "cluster-a".to_owned(),
+                    address,
+                    sni,
+                    ..Default::default()
+                })
+                .expect("add_tcp_front must succeed");
+        }
+        for (token, address) in [(Token(1), catch_all), (Token(3), by_sni)] {
+            let config = ListenerBuilder::new_tcp(address)
+                .with_interface(Some("lo"))
+                .to_tcp(None)
+                .expect("could not build listener config");
+            proxy.add_listener(config, token).expect("add the sibling");
+        }
+
+        assert_eq!(
+            proxy.listeners[&Token(1)].borrow().cluster_id.as_deref(),
+            Some("cluster-a"),
+            "the listener added after the frontend must route to its cluster"
+        );
+        let sibling = proxy.listeners[&Token(3)].borrow();
+        let (_, entries) = sibling
+            .sni_routes
+            .domain_lookup(b"example.com", true)
+            .expect("the listener added after the SNI frontend must route it");
+        assert_eq!(entries, &vec![(AlpnMatcher::Any, "cluster-a".into())]);
+    }
+
+    /// Traffic that arrives through an interface goes to the listener bound to
+    /// it, not to the listener on the same address bound to none: Linux
+    /// prefers the device-bound socket, and the two never share a
+    /// `SO_REUSEPORT` group. Here a bare `0.0.0.0:P` and a `lo`-bound
+    /// `0.0.0.0:P` both listen, a client connects through `127.0.0.1`, and
+    /// only the `lo` listener has a connection to accept.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn traffic_through_an_interface_reaches_the_listener_bound_to_it() {
+        let mut proxy = test_proxy();
+        let port = provide_port();
+        let address = SocketAddress::new_v4(0, 0, 0, 0, port);
+        for (token, interface) in [(Token(0), None), (Token(1), Some("lo"))] {
+            let config = ListenerBuilder::new_tcp(address)
+                .with_interface(interface)
+                .to_tcp(None)
+                .expect("could not build listener config");
+            proxy.add_listener(config, token).expect("add the listener");
+            let key = ListenerKey::new(address, interface);
+            if let Err(error) = proxy.activate_listener(&key, None) {
+                let message = error.to_string();
+                if message.contains("Operation not permitted") {
+                    eprintln!(
+                        "SKIPPED traffic_through_an_interface_reaches_the_listener_bound_to_it: \
+                         this environment may not bind a socket to an interface: {message}"
+                    );
+                    return;
+                }
+                panic!("activating {key}: {message}");
+            }
+        }
+
+        // Several connections: with the binding ignored, both sockets would
+        // share one `SO_REUSEPORT` group and each connection would land on
+        // either of them.
+        const CONNECTIONS: usize = 8;
+        let _clients: Vec<_> = (0..CONNECTIONS)
+            .map(|_| {
+                std::net::TcpStream::connect(("127.0.0.1", port))
+                    .expect("connect through the loopback interface")
+            })
+            .collect();
+        // The handshakes are complete once `connect` returns; poll briefly in
+        // case an accept queue entry is not visible yet.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut accepted = 0;
+        while accepted < CONNECTIONS {
+            match proxy.accept(ListenToken(1)) {
+                Ok(_) => accepted += 1,
+                Err(AcceptError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!(
+                    "the lo listener must accept every connection, got {accepted} of \
+                     {CONNECTIONS}: {error:?}"
+                ),
+            }
+        }
+        assert!(
+            matches!(proxy.accept(ListenToken(0)), Err(AcceptError::WouldBlock)),
+            "the listener bound to no interface must not receive loopback traffic"
+        );
     }
 
     #[test]

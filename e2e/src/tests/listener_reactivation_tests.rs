@@ -84,6 +84,7 @@ const ROUND_TRIP: Duration = Duration::from_millis(1500);
 /// must survive, not the file descriptor.
 fn cycle_listener(worker: &mut Worker, address: &SocketAddress, proxy: ListenerType) -> bool {
     worker.send_proxy_request_type(RequestType::DeactivateListener(DeactivateListener {
+        interface: None,
         address: address.clone(),
         proxy: proxy.into(),
         to_scm: false,
@@ -94,6 +95,7 @@ fn cycle_listener(worker: &mut Worker, address: &SocketAddress, proxy: ListenerT
         .unwrap_or(false);
 
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: address.clone(),
         proxy: proxy.into(),
         from_scm: false,
@@ -181,6 +183,7 @@ fn setup_udp_reactivation_worker(name: &str) -> (Worker, SocketAddr, SocketAddr)
             .expect("could not build udp listener config"),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.into(),
         proxy: ListenerType::Udp.into(),
         from_scm: false,
@@ -301,6 +304,7 @@ fn try_https_listener_serves_after_reactivation() -> State {
             .expect("could not build https listener config"),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: listener_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -407,6 +411,7 @@ fn try_tcp_listener_serves_after_reactivation() -> State {
             .expect("could not build tcp listener config"),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: listener_address.clone(),
         proxy: ListenerType::Tcp.into(),
         from_scm: false,
@@ -571,6 +576,7 @@ fn try_udp_add_remove_cycles_do_not_leak_a_listener() -> State {
                 .expect("could not build udp listener config"),
         ));
         worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+            interface: None,
             address: listener_address.clone(),
             proxy: ListenerType::Udp.into(),
             from_scm: false,
@@ -592,6 +598,7 @@ fn try_udp_add_remove_cycles_do_not_leak_a_listener() -> State {
         // No `DeactivateListener`: `RemoveListener` alone must release the
         // listener AND its slab slot.
         worker.send_proxy_request_type(RequestType::RemoveListener(RemoveListener {
+            interface: None,
             address: listener_address.clone(),
             proxy: ListenerType::Udp.into(),
         }));

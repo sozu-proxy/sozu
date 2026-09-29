@@ -98,6 +98,7 @@ fn setup_listener_with_back_timeout(
         listener_builder.to_tls(None).unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,

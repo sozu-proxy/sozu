@@ -67,6 +67,7 @@ fn setup_worker_with_cluster(
     });
     worker.send_proxy_request(Request {
         request_type: Some(RequestType::ActivateListener(ActivateListener {
+            interface: None,
             address: front_address.into(),
             proxy: ListenerType::Http.into(),
             from_scm: false,

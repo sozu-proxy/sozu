@@ -163,21 +163,21 @@ pub(crate) fn bind_tokio_listener(address: SocketAddr, context: &str) -> tokio::
 
 pub(crate) fn attach_reserved_http_listener(listeners: &mut Listeners, address: SocketAddr) {
     listeners.http.push((
-        address,
+        address.into(),
         into_listener_fd(address, "http listener reservation"),
     ));
 }
 
 pub(crate) fn attach_reserved_https_listener(listeners: &mut Listeners, address: SocketAddr) {
     listeners.tls.push((
-        address,
+        address.into(),
         into_listener_fd(address, "https listener reservation"),
     ));
 }
 
 pub(crate) fn attach_reserved_tcp_listener(listeners: &mut Listeners, address: SocketAddr) {
     listeners.tcp.push((
-        address,
+        address.into(),
         into_listener_fd(address, "tcp listener reservation"),
     ));
 }

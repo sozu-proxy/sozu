@@ -60,6 +60,7 @@ use std::{
 use crate::{
     ObjectKind,
     certificate::split_certificate_chain,
+    listener_key::{InterfaceError, ListenerKey, validate_listener_interface},
     logging::AccessLogFormat,
     proto::command::{
         ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
@@ -328,6 +329,17 @@ pub enum ConfigError {
     InvalidPath(PathBuf),
     #[error("listening address {0:?} is already used in the configuration")]
     ListenerAddressAlreadyInUse(SocketAddr),
+    #[error("listener {0} is already declared in the configuration")]
+    ListenerAlreadyDeclared(ListenerKey),
+    #[error(
+        "listeners sharing the address {0} on different interfaces must all use the same protocol"
+    )]
+    ListenerProtocolMismatchOnAddress(SocketAddr),
+    #[error("listener {address}: {error}")]
+    ListenerInterface {
+        address: SocketAddr,
+        error: InterfaceError,
+    },
     #[error("missing {0:?}")]
     Missing(MissingKind),
     #[error("could not get parent directory for file {0}")]
@@ -648,6 +660,12 @@ pub enum ConfigError {
 #[serde(deny_unknown_fields)]
 pub struct ListenerBuilder {
     pub address: SocketAddr,
+    /// Network interface the listening socket is bound to with
+    /// `SO_BINDTODEVICE` (e.g. `"wg0"`), for an address that is not known
+    /// ahead. Linux only: refused at config load on any other platform. Part
+    /// of the listener identity, so two listeners may share an `address` on
+    /// different interfaces.
+    pub interface: Option<String>,
     pub protocol: Option<ListenerProtocol>,
     pub public_address: Option<SocketAddr>,
     pub answer_301: Option<String>,
@@ -848,6 +866,7 @@ impl ListenerBuilder {
     fn new(address: SocketAddress, protocol: ListenerProtocol) -> ListenerBuilder {
         ListenerBuilder {
             address: address.into(),
+            interface: None,
             answer_301: None,
             answer_401: None,
             answer_400: None,
@@ -908,6 +927,29 @@ impl ListenerBuilder {
             sni_preread_timeout: None,
             sni_preread_max_bytes: None,
         }
+    }
+
+    /// Set the network interface the listener binds to; `None` clears it.
+    pub fn with_interface<S>(&mut self, interface: Option<S>) -> &mut Self
+    where
+        S: ToString,
+    {
+        self.interface = interface.map(|interface| interface.to_string());
+        self
+    }
+
+    /// The validated `interface`: a valid interface name, on a platform that
+    /// can bind a socket to an interface.
+    fn validated_interface(&self) -> Result<Option<String>, ConfigError> {
+        if let Some(interface) = &self.interface {
+            validate_listener_interface(interface).map_err(|error| {
+                ConfigError::ListenerInterface {
+                    address: self.address,
+                    error,
+                }
+            })?;
+        }
+        Ok(self.interface.clone())
     }
 
     pub fn with_public_address(&mut self, public_address: Option<SocketAddr>) -> &mut Self {
@@ -1187,8 +1229,10 @@ impl ListenerBuilder {
         let http_answers = self.get_http_answers()?;
         let answers = self.get_listener_answers()?;
 
+        let interface = self.validated_interface()?;
         let configuration = HttpListenerConfig {
             address: self.address.into(),
+            interface,
             public_address: self.public_address.map(|a| a.into()),
             expect_proxy: self.expect_proxy.unwrap_or(false),
             sticky_name: self.sticky_name.clone(),
@@ -1355,6 +1399,7 @@ impl ListenerBuilder {
         }
 
         let https_listener_config = HttpsListenerConfig {
+            interface: self.validated_interface()?,
             address: self.address.into(),
             sticky_name: self.sticky_name.clone(),
             public_address: self.public_address.map(|a| a.into()),
@@ -1471,6 +1516,7 @@ impl ListenerBuilder {
         }
 
         let tcp_listener_config = TcpListenerConfig {
+            interface: self.validated_interface()?,
             address: self.address.into(),
             public_address: self.public_address.map(|a| a.into()),
             expect_proxy: self.expect_proxy.unwrap_or(false),
@@ -1554,6 +1600,7 @@ impl ListenerBuilder {
         }
 
         Ok(UdpListenerConfig {
+            interface: self.validated_interface()?,
             address: self.address.into(),
             public_address: self.public_address.map(|a| a.into()),
             front_timeout: self.front_timeout.unwrap_or(DEFAULT_UDP_FRONT_TIMEOUT),
@@ -3384,14 +3431,15 @@ impl FileConfig {
             }
         };
 
-        let mut reserved_address: HashSet<SocketAddr> = HashSet::new();
+        let mut reserved_address: HashSet<ListenerKey> = HashSet::new();
 
         if let Some(listeners) = config.listeners.as_ref() {
             for listener in listeners.iter() {
-                if reserved_address.contains(&listener.address) {
-                    return Err(ConfigError::ListenerAddressAlreadyInUse(listener.address));
+                let key = ListenerKey::new(listener.address, listener.interface.as_deref());
+                if reserved_address.contains(&key) {
+                    return Err(ConfigError::ListenerAlreadyDeclared(key));
                 }
-                reserved_address.insert(listener.address);
+                reserved_address.insert(key);
             }
         }
 
@@ -3577,14 +3625,32 @@ impl ConfigBuilder {
     }
 
     fn populate_listeners(&mut self, listeners: Vec<ListenerBuilder>) -> Result<(), ConfigError> {
+        let mut declared: HashSet<ListenerKey> = HashSet::new();
         for listener in listeners.iter() {
-            if self.known_addresses.contains_key(&listener.address) {
-                return Err(ConfigError::ListenerAddressAlreadyInUse(listener.address));
+            // A listener is identified by (address, interface): two listeners
+            // may share an address on different interfaces, never both.
+            let key = ListenerKey::new(listener.address, listener.interface.as_deref());
+            if !declared.insert(key.clone()) {
+                if key.interface.is_none() {
+                    return Err(ConfigError::ListenerAddressAlreadyInUse(listener.address));
+                }
+                return Err(ConfigError::ListenerAlreadyDeclared(key));
             }
 
             let protocol = listener
                 .protocol
                 .ok_or(ConfigError::Missing(MissingKind::Protocol))?;
+
+            // Frontends name their listener by address alone, and resolve its
+            // protocol from `known_addresses`: listeners sharing an address on
+            // different interfaces must agree on it.
+            if let Some(known) = self.known_addresses.get(&listener.address)
+                && *known != protocol
+            {
+                return Err(ConfigError::ListenerProtocolMismatchOnAddress(
+                    listener.address,
+                ));
+            }
 
             self.known_addresses.insert(listener.address, protocol);
             if listener.expect_proxy == Some(true) {
@@ -4202,7 +4268,7 @@ impl Config {
         for listener in &self.tcp_listeners {
             v.push(WorkerRequest {
                 id: format!("CONFIG-{count}"),
-                content: RequestType::AddTcpListener(*listener).into(),
+                content: RequestType::AddTcpListener(listener.clone()).into(),
             });
             count += 1;
         }
@@ -4210,7 +4276,7 @@ impl Config {
         for listener in &self.udp_listeners {
             v.push(WorkerRequest {
                 id: format!("CONFIG-{count}"),
-                content: RequestType::AddUdpListener(*listener).into(),
+                content: RequestType::AddUdpListener(listener.clone()).into(),
             });
             count += 1;
         }
@@ -4231,6 +4297,7 @@ impl Config {
                 v.push(WorkerRequest {
                     id: format!("CONFIG-{count}"),
                     content: RequestType::ActivateListener(ActivateListener {
+                        interface: listener.interface.clone(),
                         address: listener.address,
                         proxy: ListenerType::Http.into(),
                         from_scm: false,
@@ -4244,6 +4311,7 @@ impl Config {
                 v.push(WorkerRequest {
                     id: format!("CONFIG-{count}"),
                     content: RequestType::ActivateListener(ActivateListener {
+                        interface: listener.interface.clone(),
                         address: listener.address,
                         proxy: ListenerType::Https.into(),
                         from_scm: false,
@@ -4257,6 +4325,7 @@ impl Config {
                 v.push(WorkerRequest {
                     id: format!("CONFIG-{count}"),
                     content: RequestType::ActivateListener(ActivateListener {
+                        interface: listener.interface.clone(),
                         address: listener.address,
                         proxy: ListenerType::Tcp.into(),
                         from_scm: false,
@@ -4270,6 +4339,7 @@ impl Config {
                 v.push(WorkerRequest {
                     id: format!("CONFIG-{count}"),
                     content: RequestType::ActivateListener(ActivateListener {
+                        interface: listener.interface.clone(),
                         address: listener.address,
                         proxy: ListenerType::Udp.into(),
                         from_scm: false,
@@ -5277,6 +5347,142 @@ mod tests {
             .as_ref()
             .expect("[clusters.dns.udp] block must carry onto the cluster");
         assert_eq!(udp.responses, Some(1));
+    }
+
+    /// The `interface` key round-trips from the TOML file into every
+    /// listener config and its activation, and a listener that omits it keeps
+    /// `interface = None` — today's behaviour. Two listeners may share an
+    /// address on different interfaces; the same (address, interface) twice is
+    /// still a duplicate.
+    #[test]
+    fn listener_interface_round_trips_from_the_config_file() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+            activate_listeners = true
+
+            [[listeners]]
+            protocol = "http"
+            address = "0.0.0.0:8080"
+            interface = "wg0"
+
+            [[listeners]]
+            protocol = "http"
+            address = "0.0.0.0:8080"
+            interface = "lo"
+
+            [[listeners]]
+            protocol = "http"
+            address = "0.0.0.0:8081"
+
+            [[listeners]]
+            protocol = "https"
+            address = "0.0.0.0:8443"
+            interface = "wg0"
+
+            [[listeners]]
+            protocol = "tcp"
+            address = "0.0.0.0:9000"
+            interface = "wg0"
+
+            [[listeners]]
+            protocol = "udp"
+            address = "0.0.0.0:5353"
+            interface = "wg0"
+        "#;
+
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("the interface key must parse");
+        let config = ConfigBuilder::new(file_config, "/tmp/test_config.toml")
+            .into_config()
+            .expect("listeners on one address with different interfaces must build");
+
+        let http: Vec<(String, Option<&str>)> = config
+            .http_listeners
+            .iter()
+            .map(|l| {
+                (
+                    SocketAddr::from(l.address).to_string(),
+                    l.interface.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            http,
+            vec![
+                ("0.0.0.0:8080".to_owned(), Some("wg0")),
+                ("0.0.0.0:8080".to_owned(), Some("lo")),
+                ("0.0.0.0:8081".to_owned(), None),
+            ]
+        );
+        assert_eq!(config.https_listeners[0].interface.as_deref(), Some("wg0"));
+        assert_eq!(config.tcp_listeners[0].interface.as_deref(), Some("wg0"));
+        assert_eq!(config.udp_listeners[0].interface.as_deref(), Some("wg0"));
+
+        let activations: Vec<Option<String>> = config
+            .generate_config_messages()
+            .expect("generate the config messages")
+            .into_iter()
+            .filter_map(|request| match request.content.request_type {
+                Some(RequestType::ActivateListener(activate)) => Some(activate.interface),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            activations,
+            vec![
+                Some("wg0".to_owned()),
+                Some("lo".to_owned()),
+                None,
+                Some("wg0".to_owned()),
+                Some("wg0".to_owned()),
+                Some("wg0".to_owned()),
+            ]
+        );
+
+        let duplicate = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol = "http"
+            address = "0.0.0.0:8080"
+            interface = "wg0"
+
+            [[listeners]]
+            protocol = "http"
+            address = "0.0.0.0:8080"
+            interface = "wg0"
+        "#;
+        let file_config: FileConfig = toml::from_str(duplicate).expect("parse");
+        assert!(
+            ConfigBuilder::new(file_config, "/tmp/test_config.toml")
+                .into_config()
+                .is_err(),
+            "the same (address, interface) twice must be refused"
+        );
+    }
+
+    /// An interface name the kernel would refuse is reported at config load,
+    /// naming the listener and the interface.
+    #[test]
+    fn invalid_listener_interface_rejected_at_config_load() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol = "http"
+            address = "0.0.0.0:8080"
+            interface = "wg/0"
+        "#;
+        let file_config: FileConfig = toml::from_str(toml_content).expect("parse");
+        let error = ConfigBuilder::new(file_config, "/tmp/test_config.toml")
+            .into_config()
+            .expect_err("an invalid interface name must be refused");
+        let message = error.to_string();
+        assert!(message.contains("0.0.0.0:8080"), "{message}");
+        assert!(message.contains("wg/0"), "{message}");
     }
 
     #[test]

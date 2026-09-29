@@ -165,6 +165,7 @@ fn setup_sni_worker(
 
     worker.send_proxy_request_type(RequestType::AddTcpListener(listener_config));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.into(),
         proxy: ListenerType::Tcp.into(),
         from_scm: false,

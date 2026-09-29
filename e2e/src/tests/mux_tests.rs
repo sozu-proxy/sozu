@@ -116,6 +116,7 @@ fn setup_proxy_protocol_test(
     });
     worker.send_proxy_request(Request {
         request_type: Some(RequestType::ActivateListener(ActivateListener {
+            interface: None,
             address: front_address.into(),
             proxy: ListenerType::Http.into(),
             from_scm: false,
@@ -1459,6 +1460,7 @@ fn setup_short_timeout_test(
     });
     worker.send_proxy_request(Request {
         request_type: Some(RequestType::ActivateListener(ActivateListener {
+            interface: None,
             address: front_address.into(),
             proxy: ListenerType::Http.into(),
             from_scm: false,
@@ -1934,6 +1936,7 @@ fn try_backend_refused_no_error_inflation() -> State {
     });
     worker.send_proxy_request(Request {
         request_type: Some(RequestType::ActivateListener(ActivateListener {
+            interface: None,
             address: front_address.into(),
             proxy: ListenerType::Http.into(),
             from_scm: false,

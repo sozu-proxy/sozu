@@ -571,6 +571,7 @@ impl CommandManager {
         match cmd {
             HttpsListenerCmd::Add {
                 address,
+                interface,
                 public_address,
                 answer_404,
                 answer_503,
@@ -584,6 +585,7 @@ impl CommandManager {
                 connect_timeout,
             } => {
                 let https_listener = ListenerBuilder::new_https(address.into())
+                    .with_interface(interface)
                     .with_public_address(public_address)
                     .with_answer_404_path(answer_404)
                     .with_answer_503_path(answer_503)
@@ -600,14 +602,14 @@ impl CommandManager {
 
                 self.send_request(RequestType::AddHttpsListener(https_listener).into())
             }
-            HttpsListenerCmd::Remove { address } => {
-                self.remove_listener(address.into(), ListenerType::Https)
+            HttpsListenerCmd::Remove { address, interface } => {
+                self.remove_listener(address.into(), interface, ListenerType::Https)
             }
-            HttpsListenerCmd::Activate { address } => {
-                self.activate_listener(address.into(), ListenerType::Https)
+            HttpsListenerCmd::Activate { address, interface } => {
+                self.activate_listener(address.into(), interface, ListenerType::Https)
             }
-            HttpsListenerCmd::Deactivate { address } => {
-                self.deactivate_listener(address.into(), ListenerType::Https)
+            HttpsListenerCmd::Deactivate { address, interface } => {
+                self.deactivate_listener(address.into(), interface, ListenerType::Https)
             }
             HttpsListenerCmd::Update {
                 address,
@@ -719,6 +721,7 @@ impl CommandManager {
         match cmd {
             HttpListenerCmd::Add {
                 address,
+                interface,
                 public_address,
                 answer_404,
                 answer_503,
@@ -730,6 +733,7 @@ impl CommandManager {
                 connect_timeout,
             } => {
                 let http_listener = ListenerBuilder::new_http(address.into())
+                    .with_interface(interface)
                     .with_public_address(public_address)
                     .with_answer_404_path(answer_404)
                     .with_answer_503_path(answer_503)
@@ -744,14 +748,14 @@ impl CommandManager {
 
                 self.send_request(RequestType::AddHttpListener(http_listener).into())
             }
-            HttpListenerCmd::Remove { address } => {
-                self.remove_listener(address.into(), ListenerType::Http)
+            HttpListenerCmd::Remove { address, interface } => {
+                self.remove_listener(address.into(), interface, ListenerType::Http)
             }
-            HttpListenerCmd::Activate { address } => {
-                self.activate_listener(address.into(), ListenerType::Http)
+            HttpListenerCmd::Activate { address, interface } => {
+                self.activate_listener(address.into(), interface, ListenerType::Http)
             }
-            HttpListenerCmd::Deactivate { address } => {
-                self.deactivate_listener(address.into(), ListenerType::Http)
+            HttpListenerCmd::Deactivate { address, interface } => {
+                self.deactivate_listener(address.into(), interface, ListenerType::Http)
             }
             HttpListenerCmd::Update {
                 address,
@@ -841,6 +845,7 @@ impl CommandManager {
         match cmd {
             TcpListenerCmd::Add {
                 address,
+                interface,
                 public_address,
                 expect_proxy,
                 sni_preread_timeout,
@@ -848,6 +853,7 @@ impl CommandManager {
             } => {
                 let mut listener_builder = ListenerBuilder::new_tcp(address.into());
                 listener_builder
+                    .with_interface(interface)
                     .with_public_address(public_address)
                     .with_expect_proxy(expect_proxy);
                 // No `with_sni_preread_timeout`/`with_sni_preread_max_bytes`
@@ -862,14 +868,14 @@ impl CommandManager {
 
                 self.send_request(RequestType::AddTcpListener(listener).into())
             }
-            TcpListenerCmd::Remove { address } => {
-                self.remove_listener(address.into(), ListenerType::Tcp)
+            TcpListenerCmd::Remove { address, interface } => {
+                self.remove_listener(address.into(), interface, ListenerType::Tcp)
             }
-            TcpListenerCmd::Activate { address } => {
-                self.activate_listener(address.into(), ListenerType::Tcp)
+            TcpListenerCmd::Activate { address, interface } => {
+                self.activate_listener(address.into(), interface, ListenerType::Tcp)
             }
-            TcpListenerCmd::Deactivate { address } => {
-                self.deactivate_listener(address.into(), ListenerType::Tcp)
+            TcpListenerCmd::Deactivate { address, interface } => {
+                self.deactivate_listener(address.into(), interface, ListenerType::Tcp)
             }
             TcpListenerCmd::Update {
                 address,
@@ -895,6 +901,7 @@ impl CommandManager {
         match cmd {
             UdpListenerCmd::Add {
                 address,
+                interface,
                 public_address,
                 front_timeout,
                 back_timeout,
@@ -903,6 +910,7 @@ impl CommandManager {
             } => {
                 let mut builder = ListenerBuilder::new_udp(address.into());
                 builder
+                    .with_interface(interface)
                     .with_public_address(public_address)
                     .with_front_timeout(front_timeout)
                     .with_back_timeout(back_timeout);
@@ -918,14 +926,14 @@ impl CommandManager {
 
                 self.send_request(RequestType::AddUdpListener(listener).into())
             }
-            UdpListenerCmd::Remove { address } => {
-                self.remove_listener(address.into(), ListenerType::Udp)
+            UdpListenerCmd::Remove { address, interface } => {
+                self.remove_listener(address.into(), interface, ListenerType::Udp)
             }
-            UdpListenerCmd::Activate { address } => {
-                self.activate_listener(address.into(), ListenerType::Udp)
+            UdpListenerCmd::Activate { address, interface } => {
+                self.activate_listener(address.into(), interface, ListenerType::Udp)
             }
-            UdpListenerCmd::Deactivate { address } => {
-                self.deactivate_listener(address.into(), ListenerType::Udp)
+            UdpListenerCmd::Deactivate { address, interface } => {
+                self.deactivate_listener(address.into(), interface, ListenerType::Udp)
             }
             UdpListenerCmd::Update {
                 address,
@@ -1241,10 +1249,12 @@ impl CommandManager {
     pub fn remove_listener(
         &mut self,
         address: SocketAddress,
+        interface: Option<String>,
         listener_type: ListenerType,
     ) -> Result<(), CtlError> {
         self.send_request(
             RequestType::RemoveListener(RemoveListener {
+                interface,
                 address,
                 proxy: listener_type.into(),
             })
@@ -1255,10 +1265,12 @@ impl CommandManager {
     pub fn activate_listener(
         &mut self,
         address: SocketAddress,
+        interface: Option<String>,
         listener_type: ListenerType,
     ) -> Result<(), CtlError> {
         self.send_request(
             RequestType::ActivateListener(ActivateListener {
+                interface,
                 address,
                 proxy: listener_type.into(),
                 from_scm: false,
@@ -1270,10 +1282,12 @@ impl CommandManager {
     pub fn deactivate_listener(
         &mut self,
         address: SocketAddress,
+        interface: Option<String>,
         listener_type: ListenerType,
     ) -> Result<(), CtlError> {
         self.send_request(
             RequestType::DeactivateListener(DeactivateListener {
+                interface,
                 address,
                 proxy: listener_type.into(),
                 to_scm: false,

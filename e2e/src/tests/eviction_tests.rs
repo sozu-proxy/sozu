@@ -112,6 +112,7 @@ fn try_evict_on_queue_full_accepts_after_eviction() -> State {
     });
     worker.send_proxy_request(Request {
         request_type: Some(RequestType::ActivateListener(ActivateListener {
+            interface: None,
             address: front_address.into(),
             proxy: ListenerType::Http.into(),
             from_scm: false,
@@ -240,6 +241,7 @@ fn try_evict_disabled_drops_overflow() -> State {
     });
     worker.send_proxy_request(Request {
         request_type: Some(RequestType::ActivateListener(ActivateListener {
+            interface: None,
             address: front_address.into(),
             proxy: ListenerType::Http.into(),
             from_scm: false,

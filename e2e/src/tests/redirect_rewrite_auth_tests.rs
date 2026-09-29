@@ -92,6 +92,7 @@ fn spawn_worker_with_http_listener(name: &str, front_address: std::net::SocketAd
     });
     worker.send_proxy_request(Request {
         request_type: Some(RequestType::ActivateListener(ActivateListener {
+            interface: None,
             address: front_address.into(),
             proxy: ListenerType::Http.into(),
             from_scm: true,
@@ -959,6 +960,7 @@ fn spawn_worker_with_https_listener(name: &str, front_address: std::net::SocketA
     });
     worker.send_proxy_request(Request {
         request_type: Some(RequestType::ActivateListener(ActivateListener {
+            interface: None,
             address: front_address.into(),
             proxy: ListenerType::Https.into(),
             from_scm: true,

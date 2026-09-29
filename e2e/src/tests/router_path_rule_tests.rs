@@ -110,6 +110,7 @@ fn try_path_equals_frontend_is_deduplicated_and_stops_routing_when_removed() -> 
             .expect("could not build the http listener config"),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.into(),
         proxy: ListenerType::Http.into(),
         from_scm: false,

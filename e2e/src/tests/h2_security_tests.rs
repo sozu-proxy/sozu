@@ -1636,6 +1636,7 @@ fn try_h2_multi_cluster_routing() -> State {
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -3858,6 +3859,7 @@ fn try_h2_flow_per_stream_idle_timeout() -> State {
     listener_config.h2_stream_idle_timeout_seconds = Some(1);
     worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,

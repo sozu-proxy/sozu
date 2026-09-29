@@ -15,6 +15,7 @@ use mio::{
 use rusty_ulid::Ulid;
 use socket2::SockRef;
 use sozu_command::{
+    listener_key::ListenerKey,
     logging::CachedTags,
     proto::command::{
         Cluster, HttpListenerConfig, ListenerType, RemoveListener, RequestHttpFrontend,
@@ -1000,10 +1001,26 @@ impl HttpProxy {
         config: HttpListenerConfig,
         token: Token,
     ) -> Result<Token, ProxyError> {
+        if self.listeners.contains_key(&token) {
+            return Err(ProxyError::ListenerAlreadyPresent);
+        }
+        let mut http_listener =
+            HttpListener::new(config, token).map_err(ProxyError::AddListener)?;
+        // Frontends name their listener by address alone, so a listener added
+        // next to one already on its address (on another interface) takes
+        // over the routes that one serves: every listener on an address holds
+        // the same routes, whenever it was added (sozu-proxy/sozu#719).
+        if let Some(sibling) = self
+            .listeners_at(http_listener.address)
+            .ok()
+            .and_then(|l| l.into_iter().next())
+        {
+            let sibling = sibling.borrow();
+            http_listener.fronts = sibling.fronts.clone();
+            http_listener.tags = sibling.tags.clone();
+        }
         match self.listeners.entry(token) {
             Entry::Vacant(entry) => {
-                let http_listener =
-                    HttpListener::new(config, token).map_err(ProxyError::AddListener)?;
                 entry.insert(Rc::new(RefCell::new(http_listener)));
                 Ok(token)
             }
@@ -1017,13 +1034,13 @@ impl HttpProxy {
 
     pub fn remove_listener(&mut self, remove: RemoveListener) -> Result<(), ProxyError> {
         let len = self.listeners.len();
-        let remove_address = remove.address.into();
+        let remove_address = remove.listener_key();
         self.listeners
-            .retain(|_, l| l.borrow().address != remove_address);
+            .retain(|_, l| !l.borrow().is(&remove_address));
 
         if !self.listeners.len() < len {
             info!(
-                "{} no HTTP listener to remove at address {:?}",
+                "{} no HTTP listener to remove at {}",
                 log_module_context!(),
                 remove_address
             );
@@ -1038,12 +1055,12 @@ impl HttpProxy {
     /// The event loop is single-threaded, so nothing can change the listener's
     /// `active` flag between this answer and the `activate_listener` call that
     /// acts on it.
-    pub fn inherited_socket_fate(&self, addr: &SocketAddr) -> crate::InheritedSocketFate {
+    pub fn inherited_socket_fate(&self, addr: &ListenerKey) -> crate::InheritedSocketFate {
         use crate::InheritedSocketFate;
         match self
             .listeners
             .values()
-            .find(|listener| listener.borrow().address == *addr)
+            .find(|listener| listener.borrow().is(addr))
         {
             None => InheritedSocketFate::Unclaimed,
             Some(listener) if listener.borrow().active => InheritedSocketFate::Refused,
@@ -1053,20 +1070,20 @@ impl HttpProxy {
 
     pub fn activate_listener(
         &self,
-        addr: &SocketAddr,
+        addr: &ListenerKey,
         tcp_listener: Option<MioTcpListener>,
     ) -> Result<Token, ProxyError> {
         let listener = self
             .listeners
             .values()
-            .find(|listener| listener.borrow().address == *addr)
-            .ok_or(ProxyError::NoListenerFound(addr.to_owned()))?;
+            .find(|listener| listener.borrow().is(addr))
+            .ok_or(ProxyError::NoListenerFound(addr.clone()))?;
 
         listener
             .borrow_mut()
             .activate(&self.registry, tcp_listener)
             .map_err(|listener_error| ProxyError::ListenerActivation {
-                address: *addr,
+                address: addr.address,
                 listener_error,
             })
     }
@@ -1079,14 +1096,14 @@ impl HttpProxy {
     /// touches the session slab. `Server` therefore reads the token here
     /// BEFORE dropping the listener, so that reserved slot is released exactly
     /// once, at the end of the lifetime.
-    pub fn listener_token(&self, address: SocketAddr) -> Option<Token> {
+    pub fn listener_token(&self, address: &ListenerKey) -> Option<Token> {
         self.listeners
             .iter()
-            .find(|(_, listener)| listener.borrow().address == address)
+            .find(|(_, listener)| listener.borrow().is(address))
             .map(|(token, _)| *token)
     }
 
-    pub fn give_back_listeners(&mut self) -> Vec<(SocketAddr, MioTcpListener)> {
+    pub fn give_back_listeners(&mut self) -> Vec<(ListenerKey, MioTcpListener)> {
         self.listeners
             .values()
             .filter_map(|listener| {
@@ -1095,7 +1112,7 @@ impl HttpProxy {
                     // Reset `active` so a subsequent `activate()` re-binds
                     // instead of short-circuiting on the stale flag.
                     owned.active = false;
-                    return Some((owned.address, listener));
+                    return Some((owned.key(), listener));
                 }
 
                 None
@@ -1105,13 +1122,13 @@ impl HttpProxy {
 
     pub fn give_back_listener(
         &mut self,
-        address: SocketAddr,
+        address: &ListenerKey,
     ) -> Result<(Token, MioTcpListener), ProxyError> {
         let listener = self
             .listeners
             .values()
-            .find(|listener| listener.borrow().address == address)
-            .ok_or(ProxyError::NoListenerFound(address))?;
+            .find(|listener| listener.borrow().is(address))
+            .ok_or(ProxyError::NoListenerFound(address.clone()))?;
 
         let mut owned = listener.borrow_mut();
 
@@ -1127,6 +1144,31 @@ impl HttpProxy {
         Ok((owned.token, taken_listener))
     }
 
+    /// Every listener on `address`, whatever its interface. Frontends and
+    /// certificates name their listener by address alone, so they apply to
+    /// all the listeners sharing that address on different interfaces.
+    fn listeners_at(
+        &self,
+        address: SocketAddr,
+    ) -> Result<Vec<Rc<RefCell<HttpListener>>>, ProxyError> {
+        let mut listeners: Vec<_> = self
+            .listeners
+            .iter()
+            .filter(|(_, listener)| listener.borrow().address == address)
+            .map(|(token, listener)| (*token, listener.clone()))
+            .collect();
+        // Token order, so a failure is reported the same way on every run.
+        listeners.sort_by_key(|(token, _)| *token);
+        let listeners: Vec<_> = listeners
+            .into_iter()
+            .map(|(_, listener)| listener)
+            .collect();
+        if listeners.is_empty() {
+            return Err(ProxyError::NoListenerFound(address.into()));
+        }
+        Ok(listeners)
+    }
+
     /// Apply a partial-update patch to the identified HTTP listener.
     pub fn update_listener(&mut self, patch: UpdateHttpListenerConfig) -> Result<(), ProxyError> {
         let address: std::net::SocketAddr = patch.address.into();
@@ -1134,7 +1176,7 @@ impl HttpProxy {
             .listeners
             .values()
             .find(|l| l.borrow().address == address)
-            .ok_or(ProxyError::NoListenerFound(address))?;
+            .ok_or(ProxyError::NoListenerFound(address.into()))?;
         listener
             .borrow_mut()
             .update_config(&patch)
@@ -1208,20 +1250,16 @@ impl HttpProxy {
             }
         })?;
 
-        let mut listener = self
-            .listeners
-            .values()
-            .find(|l| l.borrow().address == front.address)
-            .ok_or(ProxyError::NoListenerFound(front.address))?
-            .borrow_mut();
+        for listener in self.listeners_at(front.address)? {
+            let mut listener = listener.borrow_mut();
+            let hostname = front.hostname.to_owned();
+            let tags = front.tags.to_owned();
 
-        let hostname = front.hostname.to_owned();
-        let tags = front.tags.to_owned();
-
-        listener
-            .add_http_front(front)
-            .map_err(ProxyError::AddFrontend)?;
-        listener.set_tags(hostname, tags);
+            listener
+                .add_http_front(front.clone())
+                .map_err(ProxyError::AddFrontend)?;
+            listener.set_tags(hostname, tags);
+        }
         Ok(())
     }
 
@@ -1233,23 +1271,26 @@ impl HttpProxy {
             }
         })?;
 
-        let mut listener = self
-            .listeners
-            .values()
-            .find(|l| l.borrow().address == front.address)
-            .ok_or(ProxyError::NoListenerFound(front.address))?
-            .borrow_mut();
+        // Every listener on the address drops the route, even when another
+        // one fails: a sibling must never keep a route the others removed.
+        // The first failure, in token order, is the one reported.
+        let mut result = Ok(());
+        for listener in self.listeners_at(front.address)? {
+            let mut listener = listener.borrow_mut();
+            let hostname = front.hostname.to_owned();
 
-        let hostname = front.hostname.to_owned();
+            let removed = listener
+                .remove_http_front(front.clone())
+                .map_err(ProxyError::RemoveFrontend);
+            if result.is_ok() {
+                result = removed;
+            }
 
-        listener
-            .remove_http_front(front)
-            .map_err(ProxyError::RemoveFrontend)?;
-
-        if !listener.fronts.has_hostname(&hostname) {
-            listener.set_tags(hostname, None);
+            if !listener.fronts.has_hostname(&hostname) {
+                listener.set_tags(hostname, None);
+            }
         }
-        Ok(())
+        result
     }
 
     pub fn soft_stop(&mut self) -> Result<(), ProxyError> {
@@ -1300,6 +1341,17 @@ impl HttpProxy {
 }
 
 impl HttpListener {
+    /// This listener's identity: its address, plus the network interface its
+    /// socket is bound to when it has one.
+    pub fn key(&self) -> ListenerKey {
+        ListenerKey::new(self.address, self.config.interface.as_deref())
+    }
+
+    /// Whether this listener is the one `key` names.
+    pub fn is(&self, key: &ListenerKey) -> bool {
+        key.matches(&self.address, self.config.interface.as_deref())
+    }
+
     pub fn new(config: HttpListenerConfig, token: Token) -> Result<HttpListener, ListenerError> {
         let answers = Self::build_answers(&config)?;
         Ok(HttpListener {
@@ -1387,12 +1439,12 @@ impl HttpListener {
             }
             (Some(inherited), None) => inherited,
             (None, Some(parked)) => parked,
-            (None, None) => {
-                server_bind(address).map_err(|server_bind_error| ListenerError::Activation {
+            (None, None) => server_bind(address, self.config.interface.as_deref()).map_err(
+                |server_bind_error| ListenerError::Activation {
                     address,
                     error: server_bind_error.to_string(),
-                })?
-            }
+                },
+            )?,
         };
 
         // Once per listener, on whichever socket won above — freshly bound,
@@ -2832,5 +2884,117 @@ mod tests {
             "the peer address handed over must be the client's"
         );
         drop(parts.event_loop);
+    }
+}
+
+#[cfg(test)]
+mod listener_sibling_tests {
+    use sozu_command::{
+        config::ListenerBuilder,
+        proto::command::{PathRule, RequestHttpFrontend, RulePosition, SocketAddress},
+    };
+
+    use super::*;
+    use crate::testing::{ServerParts, prebuild_server, provide_port};
+
+    fn proxy() -> HttpProxy {
+        let ServerParts {
+            registry,
+            sessions,
+            pool,
+            backends,
+            ..
+        } = prebuild_server(16, 16384, false).expect("could not prebuild a test server");
+        HttpProxy::new(registry, sessions, pool, backends)
+    }
+
+    fn add(proxy: &mut HttpProxy, address: SocketAddress, interface: Option<&str>, token: usize) {
+        let config = ListenerBuilder::new_http(address)
+            .with_interface(interface)
+            .to_http(None)
+            .expect("could not build the listener config");
+        proxy
+            .add_listener(config, Token(token))
+            .expect("could not add the listener");
+    }
+
+    fn front(address: SocketAddress) -> RequestHttpFrontend {
+        RequestHttpFrontend {
+            cluster_id: Some("cluster-a".to_owned()),
+            address,
+            hostname: "example.com".to_owned(),
+            path: PathRule::prefix("/".to_owned()),
+            ..Default::default()
+        }
+    }
+
+    fn routes(proxy: &HttpProxy, token: usize) -> bool {
+        proxy.listeners[&Token(token)]
+            .borrow()
+            .fronts
+            .lookup("example.com", "/", &Method::Get)
+            .is_ok()
+    }
+
+    /// A listener added on an address that already serves frontends — `sozu
+    /// listener http add --interface`, or a reload adding one — takes them
+    /// over from the listener already there: frontends name their listener by
+    /// address, so it must route what its sibling routes from its first
+    /// connection (sozu-proxy/sozu#719).
+    #[test]
+    fn a_listener_added_next_to_a_sibling_takes_over_its_frontends() {
+        let mut proxy = proxy();
+        let address = SocketAddress::new_v4(0, 0, 0, 0, provide_port());
+        add(&mut proxy, address, None, 0);
+        proxy
+            .add_http_frontend(front(address))
+            .expect("add the frontend");
+        add(&mut proxy, address, Some("lo"), 1);
+
+        assert!(routes(&proxy, 0));
+        assert!(
+            routes(&proxy, 1),
+            "the listener added after the frontend must route it too"
+        );
+
+        proxy
+            .remove_http_frontend(front(address))
+            .expect("remove the frontend");
+        assert!(!routes(&proxy, 0));
+        assert!(!routes(&proxy, 1));
+    }
+
+    /// Removing a frontend reaches every listener on the address even when one
+    /// of them fails, and reports that failure: a sibling must never keep a
+    /// route the others dropped.
+    #[test]
+    fn removing_a_frontend_reaches_every_listener_and_reports_a_failure() {
+        let mut proxy = proxy();
+        let address = SocketAddress::new_v4(0, 0, 0, 0, provide_port());
+        add(&mut proxy, address, None, 0);
+        add(&mut proxy, address, Some("lo"), 1);
+        // Only the second listener holds the route, so removing it from the
+        // first one fails (a `Pre` rule that is not there is an error).
+        let pre = RequestHttpFrontend {
+            position: RulePosition::Pre.into(),
+            ..front(address)
+        };
+        let frontend = pre
+            .clone()
+            .to_frontend()
+            .expect("the test frontend must convert");
+        proxy.listeners[&Token(1)]
+            .borrow_mut()
+            .add_http_front(frontend)
+            .expect("add the route to one listener");
+
+        assert!(
+            proxy.remove_http_frontend(pre).is_err(),
+            "the listener that lacked the route must report it"
+        );
+        assert!(
+            !routes(&proxy, 1),
+            "the failure on one listener must not spare its sibling's route"
+        );
     }
 }

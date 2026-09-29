@@ -163,6 +163,7 @@ fn try_ppv2_local_cannot_forge_the_tcp_source_address() -> State {
             .expect("could not build the tcp listener config"),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.into(),
         proxy: ListenerType::Tcp.into(),
         from_scm: false,
@@ -284,6 +285,7 @@ fn try_ppv2_local_closes_an_expect_proxy_http_session() -> State {
     };
     worker.send_proxy_request_type(RequestType::AddHttpListener(http_listener));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.into(),
         proxy: ListenerType::Http.into(),
         from_scm: false,

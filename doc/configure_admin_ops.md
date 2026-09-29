@@ -184,7 +184,7 @@ already in `configure.md`.
 
 ### 5.1 Per-connection H2 stream-Vec shrink
 
-Commit: `e478cf8b`. Reference: `doc/configure.md:1224`.
+Commit: `e478cf8b`. Reference: `doc/configure.md:1266`.
 
 Each `ConnectionH2` keeps a `Vec<Stream>` of per-stream slots in the
 mux `Context`. Recycled slots accumulate over the connection's lifetime;
@@ -373,7 +373,7 @@ ratebar matches the sum of the labelled buckets.
 
 ### 5.5 `https.alpn.rejected.unsupported` counter
 
-Source: `HttpsSession::upgrade_handshake` (`lib/src/https.rs:514`).
+Source: `HttpsSession::upgrade_handshake` (`lib/src/https.rs:515`).
 Documented in `doc/configure.md`, in the `https.alpn.rejected.unsupported` row of the ALPN metrics table.
 
 Fires on the rustls accept path when the negotiated ALPN protocol is

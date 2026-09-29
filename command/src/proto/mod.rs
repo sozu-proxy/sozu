@@ -316,6 +316,7 @@ impl std::fmt::Debug for command::HttpListenerConfig {
 
         f.debug_struct("HttpListenerConfig")
             .field("address", &self.address)
+            .field("interface", &self.interface)
             .field("public_address", &self.public_address)
             .field("expect_proxy", &self.expect_proxy)
             .field("sticky_name_len", &self.sticky_name.len())
@@ -421,6 +422,7 @@ impl std::fmt::Debug for command::HttpsListenerConfig {
 
         f.debug_struct("HttpsListenerConfig")
             .field("address", &self.address)
+            .field("interface", &self.interface)
             .field("public_address", &self.public_address)
             .field("expect_proxy", &self.expect_proxy)
             .field("sticky_name_len", &self.sticky_name.len())
@@ -1119,7 +1121,7 @@ mod tests {
             content: request.clone(),
         };
         let state = ConfigState {
-            https_listeners: BTreeMap::from([(address, listener.clone())]),
+            https_listeners: BTreeMap::from([(address.into(), listener.clone())]),
             ..Default::default()
         };
         let debug_outputs = [

@@ -167,7 +167,7 @@ fn query_https_listener(
     // `ListListeners` is handled by the master command server, not the
     // worker; this e2e harness only has a worker, so read directly from the
     // mirror `ConfigState` kept in sync by `send_proxy_request`.
-    worker.state.https_listeners.get(&addr).cloned()
+    worker.state.https_listeners.get(&addr.into()).cloned()
 }
 
 // ============================================================================
@@ -197,6 +197,7 @@ fn setup_https_test_with_address(
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -275,6 +276,7 @@ fn setup_https_with_rst_threshold(
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(listener));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -447,6 +449,7 @@ fn try_strict_sni_binding_toggle() -> State {
     https_listener.strict_sni_binding = Some(true);
     worker.send_proxy_request_type(RequestType::AddHttpsListener(https_listener));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -760,6 +763,7 @@ fn try_alpn_protocols_rebuild() -> State {
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -937,6 +941,7 @@ fn test_http_answers_replace_preserves_cluster_overrides() {
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -1179,6 +1184,7 @@ fn try_update_on_deactivated_listener() -> State {
 
     // Step 1: deactivate.
     worker.send_proxy_request_type(RequestType::DeactivateListener(DeactivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         to_scm: false,
@@ -1203,6 +1209,7 @@ fn try_update_on_deactivated_listener() -> State {
 
     // Step 3: reactivate.
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,

@@ -247,6 +247,7 @@ fn try_h1_per_cluster_override() -> State {
     });
     worker.send_proxy_request(Request {
         request_type: Some(RequestType::ActivateListener(ActivateListener {
+            interface: None,
             address: front_address.into(),
             proxy: ListenerType::Http.into(),
             from_scm: false,
@@ -401,6 +402,7 @@ fn try_tcp_graceful_close_on_limit() -> State {
     });
     worker.send_proxy_request(Request {
         request_type: Some(RequestType::ActivateListener(ActivateListener {
+            interface: None,
             address: front_address.into(),
             proxy: ListenerType::Tcp.into(),
             from_scm: false,

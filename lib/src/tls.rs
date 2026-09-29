@@ -253,7 +253,9 @@ impl TryFrom<&AddCertificate> for CertifiedKeyWrapper {
 /// for a given domain name.
 /// Certificates are stored in a hashmap that may contain unreachable certificates if
 /// no domain name points to it.
-#[derive(Default)]
+/// `Clone` lets an HTTPS listener added next to a sibling on the same address
+/// take over its certificates (`HttpsProxy::add_listener`, `lib/src/https.rs`).
+#[derive(Default, Clone)]
 pub struct CertificateResolver {
     /// routing one domain name to one certificate for fast resolving
     pub domains: TrieNode<Fingerprint>,

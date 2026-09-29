@@ -36,6 +36,25 @@ pub enum ServerBindError {
     SocketCreationError(std::io::Error),
     #[error("Invalid socket address '{address}': {error}")]
     InvalidSocketAddress { address: String, error: String },
+    #[error(
+        "could not bind the listener {address} to the network interface '{interface}' \
+         (SO_BINDTODEVICE): {error}. The interface must exist when the listener is activated, \
+         and on Linux kernels before 5.7 binding a socket to an interface requires the \
+         CAP_NET_RAW capability"
+    )]
+    BindToDevice {
+        address: SocketAddr,
+        interface: String,
+        error: std::io::Error,
+    },
+    #[error(
+        "the listener {address} names the network interface '{interface}', but binding a \
+         socket to an interface (SO_BINDTODEVICE) is only supported on Linux"
+    )]
+    BindToDeviceUnsupported {
+        address: SocketAddr,
+        interface: String,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -1601,9 +1620,58 @@ impl SocketHandler for FrontRustls {
     }
 }
 
-pub fn server_bind(addr: SocketAddr) -> Result<TcpListener, ServerBindError> {
+/// Bind `sock`, the listening socket for `addr`, to the network `interface`
+/// (`SO_BINDTODEVICE`), before `bind(2)`: the listener then accepts only what
+/// arrives through that interface, whatever address it holds, which is what
+/// lets a listener follow an interface whose address is not known ahead (a
+/// WireGuard `wg0`). `None` leaves the socket unbound, as before interfaces
+/// existed.
+///
+/// The option is set before `bind(2)` so that two listeners on the same
+/// address, bound to different interfaces, can both bind under
+/// `SO_REUSEADDR`/`SO_REUSEPORT`. It survives the SCM hand-off of an upgrade:
+/// it is a property of the socket, not of the process.
+fn bind_to_device(
+    sock: &Socket,
+    addr: SocketAddr,
+    interface: Option<&str>,
+) -> Result<(), ServerBindError> {
+    let Some(interface) = interface else {
+        return Ok(());
+    };
+    #[cfg(target_os = "linux")]
+    {
+        sock.bind_device(Some(interface.as_bytes()))
+            .map_err(|error| ServerBindError::BindToDevice {
+                address: addr,
+                interface: interface.to_owned(),
+                error,
+            })?;
+        debug_assert!(
+            sock.device().map_or(true, |device| device.as_deref()
+                == Some(interface.as_bytes())),
+            "a socket bound to an interface must report that interface"
+        );
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = sock;
+        Err(ServerBindError::BindToDeviceUnsupported {
+            address: addr,
+            interface: interface.to_owned(),
+        })
+    }
+}
+
+pub fn server_bind(
+    addr: SocketAddr,
+    interface: Option<&str>,
+) -> Result<TcpListener, ServerBindError> {
     let sock = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))
         .map_err(ServerBindError::SocketCreationError)?;
+
+    bind_to_device(&sock, addr, interface)?;
 
     // set so_reuseaddr, but only on unix (mirrors what libstd does)
     if cfg!(unix) {
@@ -1678,9 +1746,11 @@ pub fn server_bind(addr: SocketAddr) -> Result<TcpListener, ServerBindError> {
 /// receives datagrams directly. The returned `mio::net::UdpSocket` is the one
 /// listener socket the UDP datapath demuxes many flows over (one-socket-many-
 /// flows; per-flow return sockets are created by [`udp_connect`]).
-pub fn udp_bind(addr: SocketAddr) -> Result<UdpSocket, ServerBindError> {
+pub fn udp_bind(addr: SocketAddr, interface: Option<&str>) -> Result<UdpSocket, ServerBindError> {
     let sock = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))
         .map_err(ServerBindError::SocketCreationError)?;
+
+    bind_to_device(&sock, addr, interface)?;
 
     // set so_reuseaddr, but only on unix (mirrors what libstd does)
     if cfg!(unix) {
@@ -2082,6 +2152,100 @@ pub mod stats {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Binding a listener to an interface needs `CAP_NET_RAW` on kernels
+    /// before 5.7; an environment without it cannot run the positive test.
+    #[cfg(target_os = "linux")]
+    fn lacks_bind_to_device_permission(error: &ServerBindError) -> bool {
+        matches!(
+            error,
+            ServerBindError::BindToDevice { error, .. }
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+        )
+    }
+
+    /// `server_bind` and `udp_bind` bind a listener with an `interface` to
+    /// that interface (`SO_BINDTODEVICE`, read back with `getsockopt`), and a
+    /// listener without one to none — today's behaviour.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bind_sets_so_bindtodevice_to_the_listener_interface() {
+        use socket2::SockRef;
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        let tcp = match server_bind(addr, Some("lo")) {
+            Ok(listener) => listener,
+            Err(error) if lacks_bind_to_device_permission(&error) => {
+                eprintln!(
+                    "SKIPPED bind_sets_so_bindtodevice_to_the_listener_interface: this \
+                     environment may not bind a socket to an interface (needs CAP_NET_RAW \
+                     before Linux 5.7): {error}"
+                );
+                return;
+            }
+            Err(error) => panic!("binding a TCP listener to lo: {error}"),
+        };
+        assert_eq!(
+            SockRef::from(&tcp)
+                .device()
+                .expect("getsockopt(SO_BINDTODEVICE)"),
+            Some(b"lo".to_vec()),
+            "the TCP listener must be bound to lo"
+        );
+
+        let udp = udp_bind(addr, Some("lo")).expect("binding a UDP listener to lo");
+        assert_eq!(
+            SockRef::from(&udp)
+                .device()
+                .expect("getsockopt(SO_BINDTODEVICE)"),
+            Some(b"lo".to_vec()),
+            "the UDP listener must be bound to lo"
+        );
+
+        let plain = server_bind(addr, None).expect("binding a TCP listener");
+        assert_eq!(
+            SockRef::from(&plain)
+                .device()
+                .expect("getsockopt(SO_BINDTODEVICE)"),
+            None,
+            "a listener without interface stays bound to no interface"
+        );
+    }
+
+    /// An interface that does not exist fails the bind with an explicit error
+    /// naming the listener address and the interface, and pointing at the two
+    /// usual causes: the interface must exist, and pre-5.7 kernels require
+    /// `CAP_NET_RAW`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bind_to_a_missing_interface_names_the_interface_and_the_capability() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        for result in [
+            server_bind(addr, Some("sozu-nosuch0")).map(|_| ()),
+            udp_bind(addr, Some("sozu-nosuch0")).map(|_| ()),
+        ] {
+            let error = result.expect_err("binding to a missing interface must fail");
+            assert!(
+                matches!(&error, ServerBindError::BindToDevice { interface, .. } if interface == "sozu-nosuch0"),
+                "{error:?}"
+            );
+            let message = error.to_string();
+            for needle in [
+                "127.0.0.1:0",
+                "'sozu-nosuch0'",
+                "SO_BINDTODEVICE",
+                "must exist",
+                "CAP_NET_RAW",
+                "5.7",
+            ] {
+                assert!(
+                    message.contains(needle),
+                    "{needle:?} missing from: {message}"
+                );
+            }
+        }
+    }
 
     /// Address a handler caches. Deliberately non-loopback so it can never
     /// collide with the ephemeral address a live `getpeername(2)` reports for

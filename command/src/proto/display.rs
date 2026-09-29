@@ -669,6 +669,7 @@ pub fn print_listeners(listeners_list: &ListenersList) -> Result<(), DisplayErro
         table.add_row(row!["TCP frontends"]);
         table.add_row(row![
             "socket address",
+            "interface",
             "public address",
             "expect proxy",
             "front timeout",
@@ -679,6 +680,7 @@ pub fn print_listeners(listeners_list: &ListenersList) -> Result<(), DisplayErro
         for tcp_listener in listeners_list.tcp_listeners.values() {
             table.add_row(row![
                 format!("{:?}", tcp_listener.address),
+                tcp_listener.interface.as_deref().unwrap_or("-"),
                 format!("{:?}", tcp_listener.public_address),
                 tcp_listener.expect_proxy,
                 tcp_listener.front_timeout,
@@ -700,6 +702,7 @@ pub fn print_listeners(listeners_list: &ListenersList) -> Result<(), DisplayErro
         // it carries datagram-specific knobs instead.
         table.add_row(row![
             "socket address",
+            "interface",
             "public address",
             "front timeout",
             "back timeout",
@@ -710,6 +713,7 @@ pub fn print_listeners(listeners_list: &ListenersList) -> Result<(), DisplayErro
         for udp_listener in listeners_list.udp_listeners.values() {
             table.add_row(row![
                 format!("{:?}", udp_listener.address),
+                udp_listener.interface.as_deref().unwrap_or("-"),
                 format!("{:?}", udp_listener.public_address),
                 udp_listener.front_timeout,
                 udp_listener.back_timeout,
@@ -1222,6 +1226,7 @@ impl Display for HttpListenerConfig {
         let mut table = Table::new();
         table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
         table.add_row(row!["socket address", format!("{:?}", self.address)]);
+        table.add_row(row!["interface", self.interface.as_deref().unwrap_or("-")]);
         table.add_row(row!["public address", format!("{:?}", self.public_address),]);
         for http_answer_row in CustomHttpAnswers::to_rows(&self.http_answers) {
             table.add_row(http_answer_row);
@@ -1284,6 +1289,7 @@ impl Display for HttpsListenerConfig {
         }
 
         table.add_row(row!["socket address", format!("{:?}", self.address)]);
+        table.add_row(row!["interface", self.interface.as_deref().unwrap_or("-")]);
         table.add_row(row!["public address", format!("{:?}", self.public_address)]);
         for http_answer_row in CustomHttpAnswers::to_rows(&self.http_answers) {
             table.add_row(http_answer_row);

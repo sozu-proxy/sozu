@@ -988,6 +988,11 @@ pub enum HttpListenerCmd {
         #[clap(short = 'a')]
         address: SocketAddr,
         #[clap(
+            long = "interface",
+            help = "network interface to bind the listener to (SO_BINDTODEVICE, Linux only), e.g. wg0; part of the listener identity, so listeners may share an address on different interfaces"
+        )]
+        interface: Option<String>,
+        #[clap(
             long = "public-address",
             help = "a different IP than the one the socket sees, for logs and forwarded headers"
         )]
@@ -1038,6 +1043,11 @@ pub enum HttpListenerCmd {
             help = "listener address, format: IP:port"
         )]
         address: SocketAddr,
+        #[clap(
+            long = "interface",
+            help = "network interface of the listener, when it was added with one"
+        )]
+        interface: Option<String>,
     },
     #[clap(name = "activate")]
     Activate {
@@ -1047,6 +1057,11 @@ pub enum HttpListenerCmd {
             help = "listener address, format: IP:port"
         )]
         address: SocketAddr,
+        #[clap(
+            long = "interface",
+            help = "network interface of the listener, when it was added with one"
+        )]
+        interface: Option<String>,
     },
     #[clap(name = "deactivate")]
     Deactivate {
@@ -1056,6 +1071,11 @@ pub enum HttpListenerCmd {
             help = "listener address, format: IP:port"
         )]
         address: SocketAddr,
+        #[clap(
+            long = "interface",
+            help = "network interface of the listener, when it was added with one"
+        )]
+        interface: Option<String>,
     },
     #[clap(name = "update", about = "Patch a running HTTP listener in place")]
     Update {
@@ -1229,6 +1249,11 @@ pub enum HttpsListenerCmd {
         #[clap(short = 'a')]
         address: SocketAddr,
         #[clap(
+            long = "interface",
+            help = "network interface to bind the listener to (SO_BINDTODEVICE, Linux only), e.g. wg0; part of the listener identity, so listeners may share an address on different interfaces"
+        )]
+        interface: Option<String>,
+        #[clap(
             long = "public-address",
             help = "a different IP than the one the socket sees, for logs and forwarded headers"
         )]
@@ -1286,6 +1311,11 @@ pub enum HttpsListenerCmd {
             help = "listener address, format: IP:port"
         )]
         address: SocketAddr,
+        #[clap(
+            long = "interface",
+            help = "network interface of the listener, when it was added with one"
+        )]
+        interface: Option<String>,
     },
     #[clap(name = "activate")]
     Activate {
@@ -1295,6 +1325,11 @@ pub enum HttpsListenerCmd {
             help = "listener address, format: IP:port"
         )]
         address: SocketAddr,
+        #[clap(
+            long = "interface",
+            help = "network interface of the listener, when it was added with one"
+        )]
+        interface: Option<String>,
     },
     #[clap(name = "deactivate")]
     Deactivate {
@@ -1304,6 +1339,11 @@ pub enum HttpsListenerCmd {
             help = "listener address, format: IP:port"
         )]
         address: SocketAddr,
+        #[clap(
+            long = "interface",
+            help = "network interface of the listener, when it was added with one"
+        )]
+        interface: Option<String>,
     },
     #[clap(name = "update", about = "Patch a running HTTPS listener in place")]
     Update {
@@ -1540,6 +1580,11 @@ pub enum TcpListenerCmd {
         )]
         address: SocketAddr,
         #[clap(
+            long = "interface",
+            help = "network interface to bind the listener to (SO_BINDTODEVICE, Linux only), e.g. wg0; part of the listener identity, so listeners may share an address on different interfaces"
+        )]
+        interface: Option<String>,
+        #[clap(
             long = "public-address",
             help = "a different IP than the one the socket sees, for logs and forwarded headers"
         )]
@@ -1568,6 +1613,11 @@ pub enum TcpListenerCmd {
             help = "listener address, format: IP:port"
         )]
         address: SocketAddr,
+        #[clap(
+            long = "interface",
+            help = "network interface of the listener, when it was added with one"
+        )]
+        interface: Option<String>,
     },
     #[clap(name = "activate")]
     Activate {
@@ -1577,6 +1627,11 @@ pub enum TcpListenerCmd {
             help = "listener address, format: IP:port"
         )]
         address: SocketAddr,
+        #[clap(
+            long = "interface",
+            help = "network interface of the listener, when it was added with one"
+        )]
+        interface: Option<String>,
     },
     #[clap(name = "deactivate")]
     Deactivate {
@@ -1586,6 +1641,11 @@ pub enum TcpListenerCmd {
             help = "listener address, format: IP:port"
         )]
         address: SocketAddr,
+        #[clap(
+            long = "interface",
+            help = "network interface of the listener, when it was added with one"
+        )]
+        interface: Option<String>,
     },
     #[clap(name = "update", about = "Patch a running TCP listener in place")]
     Update {
@@ -1638,6 +1698,11 @@ pub enum UdpListenerCmd {
         )]
         address: SocketAddr,
         #[clap(
+            long = "interface",
+            help = "network interface to bind the listener to (SO_BINDTODEVICE, Linux only), e.g. wg0; part of the listener identity, so listeners may share an address on different interfaces"
+        )]
+        interface: Option<String>,
+        #[clap(
             long = "public-address",
             help = "a different IP than the one the socket sees, for logs and forwarded headers"
         )]
@@ -1671,6 +1736,11 @@ pub enum UdpListenerCmd {
             help = "listener address, format: IP:port"
         )]
         address: SocketAddr,
+        #[clap(
+            long = "interface",
+            help = "network interface of the listener, when it was added with one"
+        )]
+        interface: Option<String>,
     },
     #[clap(name = "activate")]
     Activate {
@@ -1680,6 +1750,11 @@ pub enum UdpListenerCmd {
             help = "listener address, format: IP:port"
         )]
         address: SocketAddr,
+        #[clap(
+            long = "interface",
+            help = "network interface of the listener, when it was added with one"
+        )]
+        interface: Option<String>,
     },
     #[clap(name = "deactivate")]
     Deactivate {
@@ -1689,6 +1764,11 @@ pub enum UdpListenerCmd {
             help = "listener address, format: IP:port"
         )]
         address: SocketAddr,
+        #[clap(
+            long = "interface",
+            help = "network interface of the listener, when it was added with one"
+        )]
+        interface: Option<String>,
     },
     #[clap(name = "update", about = "Patch a running UDP listener in place")]
     Update {
@@ -1896,6 +1976,64 @@ mod tests {
                 cmd: super::ListenerCmd::Https { cmd },
             } => cmd,
             other => panic!("expected listener https subcommand, got {other:?}"),
+        }
+    }
+
+    /// `--interface` is accepted wherever a listener is named: added, and
+    /// then targeted by remove / activate / deactivate.
+    #[test]
+    fn listener_commands_parse_the_interface_flag() {
+        use super::*;
+
+        let parse = |args: &[&str]| -> ListenerCmd {
+            let mut argv = vec!["sozu", "listener"];
+            argv.extend_from_slice(args);
+            match Args::try_parse_from(argv)
+                .expect("clap should accept --interface")
+                .cmd
+            {
+                SubCmd::Listener { cmd } => cmd,
+                other => panic!("expected a listener subcommand, got {other:?}"),
+            }
+        };
+
+        match parse(&["http", "add", "-a", "0.0.0.0:80", "--interface", "wg0"]) {
+            ListenerCmd::Http {
+                cmd: HttpListenerCmd::Add { interface, .. },
+            } => assert_eq!(interface.as_deref(), Some("wg0")),
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse(&[
+            "https",
+            "activate",
+            "-a",
+            "0.0.0.0:443",
+            "--interface",
+            "wg0",
+        ]) {
+            ListenerCmd::Https {
+                cmd: HttpsListenerCmd::Activate { interface, .. },
+            } => assert_eq!(interface.as_deref(), Some("wg0")),
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse(&[
+            "tcp",
+            "deactivate",
+            "-a",
+            "0.0.0.0:22",
+            "--interface",
+            "wg0",
+        ]) {
+            ListenerCmd::Tcp {
+                cmd: TcpListenerCmd::Deactivate { interface, .. },
+            } => assert_eq!(interface.as_deref(), Some("wg0")),
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse(&["udp", "remove", "-a", "0.0.0.0:53"]) {
+            ListenerCmd::Udp {
+                cmd: UdpListenerCmd::Remove { interface, .. },
+            } => assert_eq!(interface, None, "--interface stays optional"),
+            other => panic!("unexpected {other:?}"),
         }
     }
 

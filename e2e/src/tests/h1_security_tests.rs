@@ -2017,6 +2017,7 @@ fn spawn_auth_gated_worker(
     });
     worker.send_proxy_request(Request {
         request_type: Some(RequestType::ActivateListener(ActivateListener {
+            interface: None,
             address: front_address.into(),
             proxy: ListenerType::Http.into(),
             from_scm: true,
@@ -2330,6 +2331,7 @@ fn try_h1_custom_answer_with_out_of_range_status_does_not_kill_the_worker() -> S
     );
 
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.into(),
         proxy: ListenerType::Http.into(),
         from_scm: false,
@@ -2530,6 +2532,7 @@ fn spawn_unframed_worker(
                     .expect("default HTTP listener must build"),
             ));
             worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+                interface: None,
                 address: front_address.into(),
                 proxy: ListenerType::Http.into(),
                 from_scm: true,
@@ -2545,6 +2548,7 @@ fn spawn_unframed_worker(
                     .expect("default HTTPS listener must build"),
             ));
             worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+                interface: None,
                 address: front_address.into(),
                 proxy: ListenerType::Https.into(),
                 from_scm: false,

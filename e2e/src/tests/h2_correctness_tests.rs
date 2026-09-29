@@ -296,6 +296,7 @@ fn try_h2_idle_stream_timeout_frees_slot() -> State {
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -442,6 +443,7 @@ fn try_h2_window_stall_response_reaped() -> State {
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -568,6 +570,7 @@ fn try_h2_window_stall_inbound_drip_reaped() -> State {
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -693,6 +696,7 @@ fn try_h2_window_stall_wu_drip_reaped() -> State {
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -835,6 +839,7 @@ fn try_h2_window_stall_silent_reaped() -> State {
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -973,6 +978,7 @@ fn try_h2_backend_upload_window_stall_reaped() -> State {
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -1116,6 +1122,7 @@ fn try_h2_active_upload_survives_idle_timeout() -> State {
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -1249,6 +1256,7 @@ fn try_h2_idle_stream_no_data_cancelled() -> State {
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -1410,6 +1418,7 @@ fn try_h2_stranded_expect_write_survives_cancellation() -> State {
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -1605,6 +1614,7 @@ fn try_h2_stranded_expect_write_peer_rst_survives() -> State {
         .unwrap();
     worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -2672,6 +2682,7 @@ fn setup_single_h1_backend_listener(
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,

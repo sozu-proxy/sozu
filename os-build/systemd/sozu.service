@@ -26,6 +26,11 @@ Restart=on-failure
 
 LimitNOFILE=65536
 
+# No User=, CapabilityBoundingSet= or AmbientCapabilities= here: Sōzu runs as
+# root, so a listener `interface` (SO_BINDTODEVICE) binds on every kernel. A
+# drop-in that restricts capabilities on a kernel before 5.7 must keep
+# CAP_NET_RAW in both sets for such a listener; see doc/configure.md.
+
 # Since systemd 229, should be in [Unit] but in order to support systemd <229,
 # it is also supported to have it here.
 StartLimitInterval=10

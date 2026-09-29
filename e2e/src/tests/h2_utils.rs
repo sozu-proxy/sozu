@@ -1089,6 +1089,7 @@ pub(crate) fn setup_h2_test(
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -1161,6 +1162,7 @@ pub(crate) fn setup_h2_test_with_large_bodies(
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
@@ -1226,6 +1228,7 @@ pub(crate) fn setup_h2_listener_only(name: &str) -> (Worker, u16, SocketAddress)
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
         address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,

@@ -14,6 +14,26 @@
   `hyperv_clocksource_tsc_page`, `arch_sys_counter` or `riscv_clocksource`. An unreadable file,
   or a non-Linux system, is skipped. Documented in `doc/debugging_strategies.md`.
 
+- **`feat(listener)`: bind a listener to a network interface
+  ([#719](https://github.com/sozu-proxy/sozu/issues/719)).** A new optional `interface` key on
+  `http`, `https`, `tcp` and `udp` listeners (and `--interface` on `sozu listener <protocol>
+  add|remove|activate|deactivate`) binds the listening socket to that interface with
+  `SO_BINDTODEVICE` before `bind(2)`, so Sōzu can listen on an interface whose address is not
+  known ahead, such as a WireGuard `wg0`. Linux only: any other platform refuses the key at
+  config load. The interface must exist when the listener is activated, and kernels before 5.7
+  require `CAP_NET_RAW`; a failure names the listener address and the interface. The interface
+  is part of the listener identity, so two listeners may share an address on different
+  interfaces; state files, `ListListeners` and the upgrade hand-off key such a listener
+  `<address>%<interface>`, while a listener without interface keeps its bare-address key and
+  every saved state loads unchanged. Frontends and certificates still name their listener by
+  address and apply to every listener on it, and a listener added next to one already on its
+  address takes over that listener's frontends and certificates. `interface` is not patchable,
+  and an `Update*Listener` patch that matches several listeners on one address is refused.
+  **Upgrade the main process and every worker before using `interface`**: an older worker ignores
+  the key and binds on every interface. Downgrading while a listener names an interface is not
+  supported: an older Sōzu cannot read the `<address>%<interface>` key in a saved state or an
+  upgrade hand-off. Documented in `doc/configure.md`.
+
 - **`feat(metrics)`: count peer resets on TCP and TLS sockets
   ([#434](https://github.com/sozu-proxy/sozu/issues/434)).** A client that aborts its
   connection with a TCP RST instead of closing it cleanly is not necessarily an error, yet it

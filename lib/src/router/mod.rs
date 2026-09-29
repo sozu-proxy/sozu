@@ -82,6 +82,9 @@ impl fmt::Debug for RouterError {
     }
 }
 
+/// `Clone` lets a listener added next to a sibling on the same address take
+/// over its routes (`HttpProxy::add_listener`, `lib/src/http.rs`).
+#[derive(Clone)]
 pub struct Router {
     pre: Vec<(DomainRule, PathRule, MethodRule, Route)>,
     pub tree: TrieNode<Vec<(PathRule, MethodRule, Route)>>,
