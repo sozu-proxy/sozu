@@ -104,7 +104,7 @@ fn build_traceparent(trace_id: &[u8; 32], parent_id: &[u8; 16]) -> [u8; 55] {
 
 /// Whether a `Connection` field value lists `option` (RFC 9110 §7.6.1): a
 /// comma-separated list of case-insensitive tokens with optional whitespace.
-fn has_connection_option(value: &[u8], option: &[u8]) -> bool {
+pub(crate) fn has_connection_option(value: &[u8], option: &[u8]) -> bool {
     value
         .split(|byte| *byte == b',')
         .any(|listed| compare_no_case(listed.trim_ascii(), option))

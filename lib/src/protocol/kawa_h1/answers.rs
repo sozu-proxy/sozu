@@ -25,7 +25,7 @@ use kawa::{
 };
 use sozu_command::proto::command::CustomHttpAnswers;
 
-use super::parser::compare_no_case;
+use super::{editor::has_connection_option, parser::compare_no_case};
 use crate::{protocol::http::DefaultAnswer, sozu_command::state::ClusterId};
 
 #[derive(Clone)]
@@ -89,9 +89,10 @@ pub struct Replacement {
 pub struct Template {
     /// HTTP status code parsed from the template's status line.
     status: u16,
-    /// `false` when the parsed template carries `Connection: close`. Used by
-    /// callers to flip `keep_alive_frontend` once the rendered answer is
-    /// queued.
+    /// `false` when one of the parsed template's `Connection` lines lists the
+    /// `close` option (RFC 9110 §7.6.1, matched by `has_connection_option` in
+    /// `lib/src/protocol/kawa_h1/editor.rs`). Used by callers to flip
+    /// `keep_alive_frontend` once the rendered answer is queued.
     keep_alive: bool,
     kawa: DefaultAnswerStream,
     body_replacements: Vec<Replacement>,
@@ -236,7 +237,7 @@ impl Template {
                     let val_data = val.data(buf);
                     let key_data = key.data(buf);
                     if compare_no_case(key_data, b"connection")
-                        && compare_no_case(val_data, b"close")
+                        && has_connection_option(val_data, b"close")
                     {
                         keep_alive = false;
                     }
@@ -1901,6 +1902,72 @@ mod tests {
         assert!(
             has_body,
             "literal body bytes must survive into the rendered response"
+        );
+    }
+
+    /// `Template::new` decides whether a template closes the frontend
+    /// connection from its `Connection` lines. That field value is a
+    /// comma-separated list of case-insensitive options (RFC 9110 §7.6.1), so
+    /// an operator template listing `close` beside another option still
+    /// closes, while an option that merely starts with `close` does not.
+    ///
+    /// To SEE THIS RED: in `Template::new`, compare the whole `Connection`
+    /// value with `compare_no_case(val_data, b"close")` instead of calling
+    /// `has_connection_option`. The list-valued cases then keep the frontend
+    /// alive.
+    #[test]
+    fn a_template_listing_the_close_option_closes_the_connection() {
+        let keep_alive_of = |connection: &str| {
+            let body =
+                format!("HTTP/1.1 503 Service Unavailable\r\nConnection: {connection}\r\n\r\n");
+            Template::new(Some(503), &body, &[])
+                .expect("a header-only template compiles")
+                .keep_alive
+        };
+
+        for closing in [
+            "close",
+            "Close",
+            "keep-alive, close",
+            "close, x-custom",
+            " x-custom ,CLOSE ",
+        ] {
+            assert!(
+                !keep_alive_of(closing),
+                "`Connection: {closing}` lists the close option and must close"
+            );
+        }
+        for persistent in ["closed", "keep-alive", "x-close", "clo se"] {
+            assert!(
+                keep_alive_of(persistent),
+                "`Connection: {persistent}` does not list the close option"
+            );
+        }
+
+        let lines = "HTTP/1.1 503 Service Unavailable\r\nConnection: keep-alive\r\nConnection: x-custom, close\r\n\r\n";
+        let template =
+            Template::new(Some(503), lines, &[]).expect("a header-only template compiles");
+        assert!(
+            !template.keep_alive,
+            "a close option on any `Connection` line must close"
+        );
+    }
+
+    /// Every built-in template, and the fallback, carries a lone
+    /// `Connection: close` and so closes the frontend connection.
+    #[test]
+    fn every_built_in_template_closes_the_connection() {
+        let answers = HttpAnswers::new(&BTreeMap::new()).expect("built-in templates parse");
+        assert_eq!(answers.listener_answers.len(), 14);
+        for (name, template) in &answers.listener_answers {
+            assert!(
+                !template.keep_alive,
+                "built-in template {name} must close the connection"
+            );
+        }
+        assert!(
+            !answers.fallback.keep_alive,
+            "the fallback template must close the connection"
         );
     }
 

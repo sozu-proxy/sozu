@@ -3585,6 +3585,19 @@
 
 ### 🐛 Fixed
 
+- **`fix(h1)`: read an answer template's `Connection` value as an option list
+  ([#1702](https://github.com/sozu-proxy/sozu/issues/1702)).** `Template::new`
+  (`lib/src/protocol/kawa_h1/answers.rs`) decided whether a template closes the frontend
+  connection by comparing the whole `Connection` value with `close`, so an operator template
+  carrying `Connection: keep-alive, close` or `Connection: close, x-custom` kept the client
+  connection open after an answer whose framing may rely on the close. It now matches the `close`
+  option with `has_connection_option` (`lib/src/protocol/kawa_h1/editor.rs`), the case-insensitive
+  comma-list matcher the request and response paths already use (RFC 9110 §7.6.1);
+  `Connection: closed` still does not close. The built-in templates, which all carry a lone
+  `Connection: close`, behave as before. Documented in `doc/configure.md`. Covered by
+  `a_template_listing_the_close_option_closes_the_connection` and
+  `every_built_in_template_closes_the_connection`.
+
 - **`fix(state)`: record hot updates of `elide_x_real_ip` and `send_x_real_ip` in the main
   state ([#1688](https://github.com/sozu-proxy/sozu/issues/1688)).** An
   `UpdateHttpListener` / `UpdateHttpsListener` patch of either flag reached the workers, which
