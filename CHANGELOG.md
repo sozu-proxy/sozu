@@ -426,6 +426,19 @@
 
 ### 🔄 Changed
 
+- **`docs(mux)`: name the remaining `L7Proxy::backends` caller
+  ([#1684](https://github.com/sozu-proxy/sozu/issues/1684)).** Correction to the `BackendDialer`
+  entry under 🔄 Changed ([#1340](https://github.com/sozu-proxy/sozu/issues/1340), Q12, second part),
+  to `lib/src/protocol/mux/LIFECYCLE.md` §3.2 and to the description of
+  [#1550](https://github.com/sozu-proxy/sozu/pull/1550), which counted `.backends()` in `lib/` and
+  `bin/` as 2 → 0. `L7Proxy::backends` still has one production caller: `Mux::dial_backend`
+  (`lib/src/protocol/mux/mod.rs`) calls it to reach the `BackendMap` its `RegistryDialer` lends to
+  `Router::backend_from_request`. The refactor moved that call out of `router.rs`; it did not remove
+  it: `.backends()` in `lib/` and `bin/` still counts 2, the production call in `Mux::dial_backend`
+  and a test fixture in `router.rs`. Only the production references to `L7Proxy` and
+  `Rc<RefCell<Backend>>` in `router.rs` went to zero, as the entry says. Both documents now name the
+  caller. Documentation only, no code change.
+
 - **`docs`: rule order within a frontend `position`, and what a reload does not change, are
   documented ([#952](https://github.com/sozu-proxy/sozu/issues/952)).** `doc/configure.md` gains a
   "Rule order within `PRE` and `POST`" section: `PRE` rules, then the routing trie, then `POST`
@@ -3472,9 +3485,10 @@
   `BackendList::add_backend` rewrites `Backend::sticky_id` in place on a live entry.
 
   No behaviour change, and no allocation added or removed: the per-selection candidate `Vec` in
-  `BackendList::available_backends` is untouched and out of scope. `L7Proxy::backends` now has no
-  caller; removing it from the trait is left for separate work. `backend_from_request` had no
-  test. `a_second_selection_observes_the_first_dials_connection` dials twice under `LeastLoaded`
+  `BackendList::available_backends` is untouched and out of scope. `L7Proxy::backends` keeps one
+  caller, `Mux::dial_backend` (see the correction under 🔄 Changed); removing it from the trait is
+  left for separate work. `backend_from_request` had no test.
+  `a_second_selection_observes_the_first_dials_connection` dials twice under `LeastLoaded`
   on connections and requires two different backends — red, both on `backend-a`, when the
   dial's increment is removed. `a_cookie_pins_only_a_frontend_that_sticks` pins that a frontend
   which does not stick ignores the client's cookie — red when the caller maps every request to
