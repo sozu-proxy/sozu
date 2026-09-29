@@ -1371,7 +1371,9 @@ impl HttpContext {
                             // proxy remove the field; the element Sōzu adds
                             // then goes to an earlier well-formed line or a
                             // synthesised one, so it is always parseable
-                            // and last.
+                            // and last. The counter is the operator-visible
+                            // trace of the removal; the log stays at debug.
+                            incr!(names::http::FORWARDED_MALFORMED_ELIDED);
                             debug!(
                                 "{} eliding a malformed client Forwarded header",
                                 self.log_context()
@@ -3733,6 +3735,73 @@ mod tests {
                 forwarded_lines(&out),
                 vec!["for=\"6.6.6.6".to_owned()],
                 "{mode:?} passes a client Forwarded through as sent: {out}"
+            );
+        }
+    }
+
+    /// Read a process-local counter by raw key, treating an absent key as 0.
+    /// `dump_local_proxy_metrics` does not drain, and `METRICS` is
+    /// thread-local, so a test reads its own increments only.
+    fn proxy_counter(key: &str) -> i64 {
+        use sozu_command::proto::command::filtered_metrics::Inner;
+        crate::metrics::METRICS.with(|metrics| {
+            metrics
+                .borrow_mut()
+                .dump_local_proxy_metrics()
+                .get(key)
+                .and_then(|fm| fm.inner.as_ref())
+                .and_then(|inner| match inner {
+                    Inner::Count(v) => Some(*v),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        })
+    }
+
+    /// Each client `Forwarded` line Sōzu removes as malformed is counted
+    /// once in `http.forwarded_malformed_elided`, so an operator behind a
+    /// non-conforming upstream load balancer sees the chain being dropped
+    /// without enabling `debug` logs. A well-formed line, and every line in
+    /// `x_forwarded` and `none` (which pass `Forwarded` through), counts
+    /// nothing.
+    ///
+    /// TO SEE THIS RED: in `HttpContext::on_request_headers`, drop the
+    /// `incr!(names::http::FORWARDED_MALFORMED_ELIDED)` on the elision path.
+    #[test]
+    fn a_malformed_client_forwarded_elision_is_counted_once_per_line() {
+        const MALFORMED: &[u8] = b"GET / HTTP/1.1\r\nHost: example.com\r\n\
+            Forwarded: for=\"6.6.6.6\r\n\r\n";
+        const TWO_MALFORMED_AROUND_VALID: &[u8] = b"GET / HTTP/1.1\r\nHost: example.com\r\n\
+            Forwarded: for=1.2.3.4:80\r\n\
+            Forwarded: for=192.0.2.7\r\n\
+            Forwarded: for=2001:db8::1\r\n\r\n";
+        let elided = || proxy_counter(names::http::FORWARDED_MALFORMED_ELIDED);
+
+        for mode in [ForwardedHeaders::Both, ForwardedHeaders::Rfc7239] {
+            let before = elided();
+            forwarded_in_mode(mode, CLIENT_CHAIN_REQUEST);
+            assert_eq!(elided(), before, "{mode:?}: a valid line is not counted");
+
+            let before = elided();
+            forwarded_in_mode(mode, MALFORMED);
+            assert_eq!(elided(), before + 1, "{mode:?}: one malformed line");
+
+            let before = elided();
+            forwarded_in_mode(mode, TWO_MALFORMED_AROUND_VALID);
+            assert_eq!(
+                elided(),
+                before + 2,
+                "{mode:?}: each removed line counts once, the valid one not"
+            );
+        }
+        for mode in [ForwardedHeaders::XForwarded, ForwardedHeaders::None] {
+            let before = elided();
+            forwarded_in_mode(mode, MALFORMED);
+            forwarded_in_mode(mode, TWO_MALFORMED_AROUND_VALID);
+            assert_eq!(
+                elided(),
+                before,
+                "{mode:?} passes a client Forwarded through and counts nothing"
             );
         }
     }

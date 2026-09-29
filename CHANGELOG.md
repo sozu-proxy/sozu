@@ -4,6 +4,20 @@
 
 ### ✨ Added
 
+- **`feat(http)`: count the malformed client `Forwarded` lines Sōzu removes
+  ([#1692](https://github.com/sozu-proxy/sozu/issues/1692)).** Since
+  [#1685](https://github.com/sozu-proxy/sozu/pull/1685), the `both` and `rfc7239`
+  `forwarded_headers` modes remove a client `Forwarded` line that is not a well-formed RFC 7239 §4
+  list, including common non-conforming values such as an unquoted port (`for=1.2.3.4:80`) or an
+  unquoted IPv6 address (`for=2001:db8::1`); the only trace was a `debug!` line. A new proxy
+  counter, `http.forwarded_malformed_elided`, is incremented once per removed line, on the removal
+  branch only, with no allocation. `x_forwarded` and `none` pass such a line through and count
+  nothing. Documented in `doc/configure.md` and `doc/observability.md`. The comment above the H2
+  trailer drop list in `lib/src/protocol/mux/pkawa.rs` no longer claims every managed header is
+  "either synthesised or removed" on the HEADERS pass: `none` touches no forwarding header, and
+  `x_forwarded` leaves `Forwarded` alone. Covered by
+  `a_malformed_client_forwarded_elision_is_counted_once_per_line`.
+
 - **`feat(main)`: warn at startup when the kernel clocksource is slow
   ([#500](https://github.com/sozu-proxy/sozu/issues/500)).** Sōzu calls `Instant::now()` on
   every request for timeouts and metrics; with a clocksource the vDSO cannot read, such as

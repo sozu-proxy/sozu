@@ -1507,13 +1507,15 @@ pub fn handle_trailer(
         // ── Spoof-vector elision per RFC 9110 §6.5 ──
         //
         // RFC 9110 §6.5 forbids trailers from carrying message-routing
-        // semantics. The client-attribution headers below are rewritten
-        // by sōzu on the initial-HEADERS pass (the whole `X-Forwarded-*`
-        // family it manages, whatever the listener's `forwarded_headers`
-        // mode: each one is either synthesised or removed there); admitting them
-        // as trailers would let a naive H2 client smuggle a spoofed
-        // value to a backend that merges trailers into its header view.
-        // Drop them unconditionally — keys are already lower-case here
+        // semantics. The client-attribution headers below are the ones
+        // sōzu manages on the initial-HEADERS pass; depending on the
+        // listener's `forwarded_headers` mode it synthesises, extends,
+        // removes or passes each one through as sent (`none` touches no
+        // forwarding header, and `x_forwarded` leaves `Forwarded` alone).
+        // Whatever the mode, a trailer copy never went through that pass,
+        // so admitting them as trailers would let a naive H2 client smuggle
+        // a spoofed value to a backend that merges trailers into its header
+        // view. Drop them unconditionally — keys are already lower-case here
         // (`classify_invalid_h2_header` rejects any uppercase byte per
         // RFC 9113 §8.2.2), so a byte-equality check is sufficient.
         // `incr!` records the rejection so dashboards observe the
