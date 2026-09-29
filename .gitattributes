@@ -1,0 +1,10 @@
+# Parallel pull requests each insert their entry at the top of an
+# `## [Unreleased]` subsection of CHANGELOG.md, so every pair of them conflicts
+# on the same few lines. Git's built-in `union` driver resolves such a hunk by
+# keeping both sides' lines, ours first, without conflict markers. That is safe
+# only while each entry is a self-contained block (one bullet and its indented
+# continuation lines): two edits to the SAME existing line are also kept both,
+# silently, so review the merged file when a change rewrites an entry.
+# GitHub's own mergeability check does not apply this driver; it helps local
+# `git merge` and `git rebase` only.
+CHANGELOG.md merge=union
