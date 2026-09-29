@@ -3585,6 +3585,16 @@
 
 ### 🐛 Fixed
 
+- **`fix(state)`: record hot updates of `elide_x_real_ip` and `send_x_real_ip` in the main
+  state ([#1688](https://github.com/sozu-proxy/sozu/issues/1688)).** An
+  `UpdateHttpListener` / `UpdateHttpsListener` patch of either flag reached the workers, which
+  applied it, but `ConfigState::update_http_listener` and
+  `ConfigState::update_https_listener` (`command/src/state.rs`) never wrote it, so the main
+  process kept the value the listener was created with. `sozu listener list` and `SaveState`
+  showed that old value, and the state replayed to a new worker on upgrade or restart restored
+  it, silently reverting the hot change. Both functions now patch the two flags like the other
+  optional listener knobs; an absent field still preserves the recorded value.
+
 - **`fix(h1)`: keep the `Connection` options while shutting down
   ([#1690](https://github.com/sozu-proxy/sozu/issues/1690)).** While Sōzu shut down
   (`HttpContext::closing`), `HttpContext::on_request_headers` and
