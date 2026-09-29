@@ -1676,7 +1676,32 @@ const SPOOF_TRAILERS: &str = concat!(
     "\r\n",
 );
 
-/// Where the chunked request of `try_h1_trailer_spoof_headers_dropped` is
+/// Trailer section of the forbidden-field variants (sozu-proxy/sozu#1701):
+/// one field of each category RFC 9110 §6.5.1 keeps out of trailers
+/// (framing, routing, request modifiers, authentication, content processing)
+/// plus a connection-specific one (RFC 9110 §7.6.1), each carrying the
+/// forged value `6.6.6.6` (`6666` for `Content-Length`), and one legitimate
+/// field that must survive.
+const FORBIDDEN_TRAILERS: &str = concat!(
+    "Content-Length: 6666\r\n",
+    "Transfer-Encoding: 6.6.6.6\r\n",
+    "Host: 6.6.6.6\r\n",
+    "If-Match: 6.6.6.6\r\n",
+    "Authorization: 6.6.6.6\r\n",
+    "Cookie: 6.6.6.6\r\n",
+    "Content-Type: 6.6.6.6\r\n",
+    "Connection: 6.6.6.6\r\n",
+    "Grpc-Status: 0\r\n",
+    "\r\n",
+);
+
+/// Whether `forwarded` carries a forged trailer value of `SPOOF_TRAILERS`
+/// or `FORBIDDEN_TRAILERS`.
+fn carries_forged_trailer(forwarded: &str) -> bool {
+    forwarded.contains("6.6.6.6") || forwarded.contains("6666")
+}
+
+/// Where the chunked request of `try_h1_trailer_fields_dropped` is
 /// cut into separate writes.
 #[derive(Clone, Copy)]
 enum TrailerSplit {
@@ -1688,12 +1713,16 @@ enum TrailerSplit {
     InsideTrailers,
 }
 
-fn try_h1_trailer_spoof_headers_dropped(split: TrailerSplit) -> State {
+/// Send a chunked request whose trailer section is `trailers`, cut as
+/// `split` says, and check the backend receives none of its forged values
+/// while `Grpc-Status` and the chunk framing survive.
+fn try_h1_trailer_fields_dropped(kind: &str, trailers: &str, split: TrailerSplit) -> State {
     let label = match split {
-        TrailerSplit::None => "TRAILER-SPOOF",
-        TrailerSplit::AfterLastChunk => "TRAILER-SPOOF-SPLIT",
-        TrailerSplit::InsideTrailers => "TRAILER-SPOOF-SPLIT-INSIDE",
+        TrailerSplit::None => format!("TRAILER-{kind}"),
+        TrailerSplit::AfterLastChunk => format!("TRAILER-{kind}-SPLIT"),
+        TrailerSplit::InsideTrailers => format!("TRAILER-{kind}-SPLIT-INSIDE"),
     };
+    let label = label.as_str();
     let front_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
@@ -1714,8 +1743,8 @@ fn try_h1_trailer_spoof_headers_dropped(split: TrailerSplit) -> State {
         "Hello\r\n",
         "0\r\n",
     );
-    let request = format!("{head}{SPOOF_TRAILERS}");
-    let first_field = SPOOF_TRAILERS
+    let request = format!("{head}{trailers}");
+    let first_field = trailers
         .find("\r\n")
         .expect("the trailer section has a first field")
         + 2;
@@ -1757,8 +1786,8 @@ fn try_h1_trailer_spoof_headers_dropped(split: TrailerSplit) -> State {
     worker.soft_stop();
     worker.wait_for_server_stop();
 
-    if forwarded.contains("6.6.6.6") {
-        println!("{label}: FAIL — a spoofed forwarding trailer reached the backend");
+    if carries_forged_trailer(&forwarded) {
+        println!("{label}: FAIL — a spoofed or forbidden trailer reached the backend");
         return State::Fail;
     }
     // The legitimate trailer survives, and the chunked framing stays valid:
@@ -1775,8 +1804,9 @@ fn try_h1_trailer_spoof_headers_dropped(split: TrailerSplit) -> State {
 /// (`lib/src/protocol/mux/h1.rs`), not by `ConnectionH1::readable`, once the
 /// first response is written: its trailer section must be filtered there
 /// too.
-fn try_h1_pipelined_trailer_spoof_headers_dropped() -> State {
-    let label = "TRAILER-SPOOF-PIPELINED";
+fn try_h1_pipelined_trailer_fields_dropped(kind: &str, trailers: &str) -> State {
+    let label = format!("TRAILER-{kind}-PIPELINED");
+    let label = label.as_str();
     let front_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
@@ -1787,7 +1817,7 @@ fn try_h1_pipelined_trailer_spoof_headers_dropped() -> State {
     backend.connect();
 
     let request = format!(
-        "{}{}{SPOOF_TRAILERS}",
+        "{}{}{trailers}",
         "GET /first HTTP/1.1\r\nHost: localhost\r\n\r\n",
         concat!(
             "POST /api HTTP/1.1\r\n",
@@ -1834,8 +1864,8 @@ fn try_h1_pipelined_trailer_spoof_headers_dropped() -> State {
         println!("{label}: FAIL — the pipelined request never reached the backend");
         return State::Fail;
     }
-    if first.contains("6.6.6.6") || second.contains("6.6.6.6") {
-        println!("{label}: FAIL — a spoofed forwarding trailer reached the backend");
+    if carries_forged_trailer(&first) || carries_forged_trailer(&second) {
+        println!("{label}: FAIL — a spoofed or forbidden trailer reached the backend");
         return State::Fail;
     }
     if !second.ends_with("0\r\nGrpc-Status: 0\r\n\r\n") {
@@ -1851,7 +1881,7 @@ fn test_h1_pipelined_trailer_spoof_headers_dropped() {
         repeat_until_error_or(
             5,
             "H1 security: spoofed forwarding trailers of a pipelined chunked request never reach the backend",
-            try_h1_pipelined_trailer_spoof_headers_dropped,
+            || try_h1_pipelined_trailer_fields_dropped("SPOOF", SPOOF_TRAILERS),
         ),
         State::Success,
     );
@@ -1863,7 +1893,7 @@ fn test_h1_trailer_spoof_headers_dropped() {
         repeat_until_error_or(
             5,
             "H1 security: spoofed forwarding headers in a chunked trailer section never reach the backend",
-            || try_h1_trailer_spoof_headers_dropped(TrailerSplit::None),
+            || try_h1_trailer_fields_dropped("SPOOF", SPOOF_TRAILERS, TrailerSplit::None),
         ),
         State::Success,
     );
@@ -1875,7 +1905,7 @@ fn test_h1_trailer_spoof_headers_dropped_split_inside_trailers() {
         repeat_until_error_or(
             5,
             "H1 security: spoofed forwarding trailers split across two writes never reach the backend",
-            || try_h1_trailer_spoof_headers_dropped(TrailerSplit::InsideTrailers),
+            || try_h1_trailer_fields_dropped("SPOOF", SPOOF_TRAILERS, TrailerSplit::InsideTrailers),
         ),
         State::Success,
     );
@@ -1887,7 +1917,217 @@ fn test_h1_trailer_spoof_headers_dropped_split() {
         repeat_until_error_or(
             5,
             "H1 security: spoofed forwarding trailers sent after the last chunk never reach the backend",
-            || try_h1_trailer_spoof_headers_dropped(TrailerSplit::AfterLastChunk),
+            || try_h1_trailer_fields_dropped("SPOOF", SPOOF_TRAILERS, TrailerSplit::AfterLastChunk),
+        ),
+        State::Success,
+    );
+}
+
+#[test]
+fn test_h1_trailer_forbidden_fields_dropped() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H1 security: trailer fields RFC 9110 §6.5.1 forbids never reach the backend",
+            || try_h1_trailer_fields_dropped("FORBIDDEN", FORBIDDEN_TRAILERS, TrailerSplit::None),
+        ),
+        State::Success,
+    );
+}
+
+#[test]
+fn test_h1_trailer_forbidden_fields_dropped_split() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H1 security: forbidden trailer fields sent after the last chunk never reach the backend",
+            || try_h1_trailer_fields_dropped(
+                "FORBIDDEN",
+                FORBIDDEN_TRAILERS,
+                TrailerSplit::AfterLastChunk
+            ),
+        ),
+        State::Success,
+    );
+}
+
+#[test]
+fn test_h1_trailer_forbidden_fields_dropped_split_inside_trailers() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H1 security: forbidden trailer fields split across two writes never reach the backend",
+            || try_h1_trailer_fields_dropped(
+                "FORBIDDEN",
+                FORBIDDEN_TRAILERS,
+                TrailerSplit::InsideTrailers
+            ),
+        ),
+        State::Success,
+    );
+}
+
+#[test]
+fn test_h1_pipelined_trailer_forbidden_fields_dropped() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H1 security: forbidden trailer fields of a pipelined chunked request never reach the backend",
+            || try_h1_pipelined_trailer_fields_dropped("FORBIDDEN", FORBIDDEN_TRAILERS),
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 13a bis: the trailer section of a chunked request is bounded
+//
+// sozu-proxy/sozu#1701: the H2 frontend refuses a trailer block of more than
+// `h2_max_header_fields` fields (128 by default) in `pkawa::handle_trailer`;
+// the H1 frontend applies the same listener value to a chunked request's
+// trailer section. At the bound the request is forwarded whole; one field
+// over, the client is answered 400 and the field that went over never
+// reaches the backend. The split variant forwards the head and body first,
+// so the backend already holds the request when the trailers arrive.
+// =========================================================================
+
+/// The default `h2_max_header_fields`, which the test listeners keep.
+const DEFAULT_MAX_TRAILER_FIELDS: usize = 128;
+
+/// A trailer section of `count` distinct legitimate fields.
+fn numbered_trailers(count: usize) -> String {
+    let mut trailers = String::new();
+    for i in 0..count {
+        trailers.push_str(&format!("X-T{i}: {i}\r\n"));
+    }
+    trailers.push_str("\r\n");
+    trailers
+}
+
+fn try_h1_trailer_field_limit(count: usize, split: bool) -> State {
+    let label = format!("TRAILER-LIMIT-{count}{}", if split { "-SPLIT" } else { "" });
+    let label = label.as_str();
+    let over = count > DEFAULT_MAX_TRAILER_FIELDS;
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) =
+        setup_sync_test(label, config, listeners, state, front_address, 1, false);
+    let mut backend = backends.pop().unwrap();
+    backend.set_response("HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\npong");
+    backend.connect();
+
+    let head = concat!(
+        "POST /api HTTP/1.1\r\n",
+        "Host: localhost\r\n",
+        "Transfer-Encoding: chunked\r\n",
+        "Connection: close\r\n",
+        "\r\n",
+        "5\r\n",
+        "Hello\r\n",
+        "0\r\n",
+    );
+    let trailers = numbered_trailers(count);
+    let mut stream = raw_connect(front_address);
+    if split {
+        stream.write_all(head.as_bytes()).expect("write head");
+        thread::sleep(Duration::from_millis(100));
+        stream
+            .write_all(trailers.as_bytes())
+            .expect("write trailers");
+    } else {
+        stream
+            .write_all(format!("{head}{trailers}").as_bytes())
+            .expect("write request");
+    }
+
+    // The backend may or may not be reached before the trailer section is
+    // parsed; poll it for the whole window either way.
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut accepted = false;
+    while Instant::now() < deadline {
+        if backend.accept(0) {
+            accepted = true;
+            break;
+        }
+    }
+    let forwarded = if accepted {
+        backend_drain(&mut backend, 0, Duration::from_millis(300))
+    } else {
+        String::new()
+    };
+    if accepted && !over {
+        backend.send(0);
+    }
+    let response = raw_read(&mut stream).unwrap_or_default();
+    println!(
+        "{label}: backend accepted={accepted} received {} bytes ending {:?}, client got {:?}",
+        forwarded.len(),
+        &forwarded[forwarded.len().saturating_sub(40)..],
+        response.lines().next()
+    );
+    drop(stream);
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    let last = format!("X-T{}: ", count - 1);
+    if over {
+        if !response.starts_with("HTTP/1.1 400") {
+            println!("{label}: FAIL — an over-bound trailer section was not answered 400");
+            return State::Fail;
+        }
+        if forwarded.contains(&last) {
+            println!("{label}: FAIL — the field over the bound reached the backend");
+            return State::Fail;
+        }
+        if split && !accepted {
+            println!("{label}: FAIL — the head of the split request never reached the backend");
+            return State::Fail;
+        }
+    } else {
+        if !response.starts_with("HTTP/1.1 200") {
+            println!("{label}: FAIL — a trailer section at the bound was refused");
+            return State::Fail;
+        }
+        if !forwarded.ends_with(&format!("{last}{}\r\n\r\n", count - 1)) {
+            println!("{label}: FAIL — the trailer section at the bound was not forwarded whole");
+            return State::Fail;
+        }
+    }
+    State::Success
+}
+
+#[test]
+fn test_h1_trailer_field_limit_at_bound_forwarded() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H1 security: a trailer section of h2_max_header_fields fields is forwarded whole",
+            || try_h1_trailer_field_limit(DEFAULT_MAX_TRAILER_FIELDS, false),
+        ),
+        State::Success,
+    );
+}
+
+#[test]
+fn test_h1_trailer_field_limit_exceeded_rejected() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H1 security: a trailer section over h2_max_header_fields is answered 400",
+            || try_h1_trailer_field_limit(DEFAULT_MAX_TRAILER_FIELDS + 1, false),
+        ),
+        State::Success,
+    );
+}
+
+#[test]
+fn test_h1_trailer_field_limit_exceeded_rejected_split() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H1 security: a trailer section over h2_max_header_fields sent after the body is answered 400",
+            || try_h1_trailer_field_limit(DEFAULT_MAX_TRAILER_FIELDS + 1, true),
         ),
         State::Success,
     );

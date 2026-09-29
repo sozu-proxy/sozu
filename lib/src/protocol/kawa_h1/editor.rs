@@ -705,6 +705,19 @@ pub struct HttpContext {
     /// `elide_x_real_ip` and `send_x_real_ip`: `X-Real-IP` belongs to
     /// neither family. `Both`, the default, is the historical behaviour.
     pub forwarded_headers: ForwardedHeaders,
+    /// Most trailer fields an H1 chunked request may carry, elided ones
+    /// included; one more makes `HttpContext::filter_request_trailers`
+    /// reject the request. Mirrors the listener's `h2_max_header_fields`,
+    /// the bound `pkawa::handle_trailer` (`lib/src/protocol/mux/pkawa.rs`)
+    /// applies to an H2 trailer block, so both frontends admit the same
+    /// number of trailer fields. Set from the mux `Context` at stream
+    /// creation (see `Context::create_stream`); listener-scoped and never
+    /// reset across keep-alive requests.
+    pub max_trailer_fields: u32,
+    /// Trailer fields of the current H1 request counted so far by
+    /// `HttpContext::filter_request_trailers`. Request-scoped: `reset`
+    /// zeroes it, so each pipelined request has its own budget.
+    pub trailer_fields: u32,
     /// Negotiated TLS protocol version as a short label (e.g. `"TLSv1.3"`).
     /// Captured from `rustls_version_label` at handshake completion and
     /// propagated from the mux `Context`. `None` for plaintext listeners.
@@ -992,8 +1005,9 @@ fn correlation_header_name(name: &str) -> kawa::Store {
 /// Header names a request trailer section may never carry past Sōzu, in
 /// lower case. This is the single list shared by both frontends:
 /// `pkawa::handle_trailer` (`lib/src/protocol/mux/pkawa.rs`) drops them from
-/// an H2 trailer HEADERS frame, and [`elide_request_trailer_spoof_vectors`]
-/// from an H1 chunked trailer section.
+/// an H2 trailer HEADERS frame, and [`HttpContext::filter_request_trailers`]
+/// from an H1 chunked trailer section, which also drops
+/// [`TRAILER_FORBIDDEN_FIELDS`].
 ///
 /// RFC 9110 §6.5.1 forbids trailers from carrying fields that affect message
 /// routing or request semantics. Each name here is client attribution that
@@ -1025,87 +1039,96 @@ pub fn is_trailer_spoof_vector(name: &[u8]) -> bool {
         .any(|spoofed| compare_no_case(name, spoofed))
 }
 
-/// Elide every [`TRAILER_SPOOF_VECTOR_HEADERS`] field that the last
-/// `kawa::h1::parse` appended to the trailer section of a chunked H1
-/// request, and return how many were elided.
+/// Header names RFC 9110 §6.5.1 keeps out of a trailer section, in lower
+/// case: fields "whose evaluation is necessary prior to receiving the
+/// content, such as those that describe message framing, routing,
+/// authentication, request modifiers, response controls, or content
+/// format", plus the connection-specific fields of RFC 9110 §7.6.1.
 ///
-/// kawa's H1 parser has no trailer callback: its `ParsingPhase::Trailers`
-/// arm pushes each trailer field as a `Block::Header` after the `Flags`
-/// block that carries `end_body` (the last chunk), then closes the section
-/// with a `Flags` block carrying `end_header` and `end_stream`. Call this
-/// after each `kawa::h1::parse` of a frontend request, with
-/// `first_new_block` set to `kawa.blocks.len()` read just before that
-/// parse. It walks back from the end of the queue over the closing block
-/// and the trailer fields, and stops at the first other block (the
-/// `end_body` marker) or at `first_new_block`. It never reaches the header
-/// block, which ends with its own `end_header` marker before the chunks.
+/// RFC 9110 names only the categories. The concrete names are the ones its
+/// predecessor, RFC 7230 §4.1.2, gave as examples for each category, read
+/// on the request side:
 ///
-/// Stopping at `first_new_block` keeps the total walk linear in the number
-/// of trailer fields: every field queued before that parse was already
-/// examined by the call that followed the parse which queued it, so a
-/// client that trickles one trailer line per segment while the backend is
-/// not writable does not make each call re-walk the whole section. Parsing
-/// only appends blocks, and `prepare` only drains them from the front
-/// between parses, so the fields past `first_new_block` are exactly the new
-/// ones even when earlier trailer fields were already forwarded.
+/// - framing: `Content-Length`, `Transfer-Encoding`;
+/// - routing: `Host`;
+/// - request modifiers, "controls and conditionals in Section 5 of
+///   \[RFC7231\]": `Cache-Control`, `Expect`, `Max-Forwards`, `Pragma`,
+///   `Range`, `TE` (RFC 7231 §5.1) and `If-Match`, `If-None-Match`,
+///   `If-Modified-Since`, `If-Unmodified-Since`, `If-Range` (RFC 7231 §5.2);
+/// - authentication, "see \[RFC7235\] and \[RFC6265\]": `Authorization`,
+///   `Proxy-Authorization`, `Cookie`;
+/// - how to process the content: `Content-Encoding`, `Content-Type`,
+///   `Content-Range`, `Trailer`.
 ///
-/// An elided field is skipped by kawa's H1 converter and by the H2 one, so
-/// the last chunk and the closing empty line are still written: the chunk
-/// framing stays valid even when every trailer field is dropped. A request
-/// that is not chunked, or has not reached its trailer section, returns
-/// before touching a block, so the walk costs nothing on the common path.
+/// Response control data (RFC 7231 §7.1) describes a response, and has no
+/// request-side meaning to protect. The connection-specific fields
+/// `Connection`, `Keep-Alive`, `Proxy-Connection` and `Upgrade` are added
+/// because RFC 9110 §7.6.1 has an intermediary remove them before
+/// forwarding, trailer or not, and a trailer copy never reaches the
+/// header-block handling that does so. `TE` and `Transfer-Encoding` are in
+/// that §7.6.1 list too.
 ///
-/// Only requests are filtered: a response trailer travels towards the
-/// client, which does not take client attribution from it.
-pub fn elide_request_trailer_spoof_vectors(
-    kawa: &mut GenericHttpStream,
-    first_new_block: usize,
-) -> usize {
-    if !matches!(kawa.kind, kawa::Kind::Request)
-        || kawa.body_size != kawa::BodySize::Chunked
-        || !matches!(
-            kawa.parsing_phase,
-            kawa::ParsingPhase::Trailers | kawa::ParsingPhase::Terminated
-        )
-    {
-        return 0;
-    }
-    // Pre: the caller read the length before a parse, which only appends.
-    debug_assert!(
-        first_new_block <= kawa.blocks.len(),
-        "first_new_block must be a block count read before the parse"
-    );
-    let first_new_block = first_new_block.min(kawa.blocks.len());
-    let buf = kawa.storage.buffer();
-    let mut elided = 0;
-    for block in kawa.blocks.range_mut(first_new_block..).rev() {
-        match block {
-            kawa::Block::Flags(kawa::Flags {
-                end_body: false,
-                end_chunk: false,
-                end_header: true,
-                end_stream: true,
-            }) => {}
-            kawa::Block::Header(pair) => {
-                if !pair.is_elided() && is_trailer_spoof_vector(pair.key.data(buf)) {
-                    pair.elide();
-                    elided += 1;
-                    incr!(names::http::TRAILER_SPOOF_VECTOR_ELIDED);
-                }
-                // Post: no spoof-vector trailer field survives the walk.
-                debug_assert!(
-                    pair.is_elided() || !is_trailer_spoof_vector(pair.key.data(buf)),
-                    "a spoof-vector trailer field must be elided"
-                );
-            }
-            _ => break,
-        }
-    }
-    debug_assert!(
-        elided <= kawa.blocks.len() - first_new_block,
-        "only blocks appended by the last parse are elided"
-    );
-    elided
+/// RFC 7230 §4.1.2 says why a recipient must not act on them: "A recipient
+/// MUST ignore (or consider as an error) any fields that are forbidden to be
+/// sent in a trailer, since processing them as if they were present in the
+/// header section might bypass external security filters."
+/// [`HttpContext::filter_request_trailers`] ignores them by eliding them:
+/// RFC 9112 §7.1.2 lets a recipient "selectively retain or discard the
+/// received trailer fields".
+pub const TRAILER_FORBIDDEN_FIELDS: [&[u8]; 25] = [
+    // framing
+    b"content-length",
+    b"transfer-encoding",
+    // routing
+    b"host",
+    // request modifiers: controls
+    b"cache-control",
+    b"expect",
+    b"max-forwards",
+    b"pragma",
+    b"range",
+    b"te",
+    // request modifiers: conditionals
+    b"if-match",
+    b"if-none-match",
+    b"if-modified-since",
+    b"if-unmodified-since",
+    b"if-range",
+    // authentication
+    b"authorization",
+    b"proxy-authorization",
+    b"cookie",
+    // how to process the content
+    b"content-encoding",
+    b"content-type",
+    b"content-range",
+    b"trailer",
+    // connection-specific
+    b"connection",
+    b"keep-alive",
+    b"proxy-connection",
+    b"upgrade",
+];
+
+/// Returns true if `name`, in any case, is one of
+/// [`TRAILER_FORBIDDEN_FIELDS`].
+pub fn is_trailer_forbidden_field(name: &[u8]) -> bool {
+    TRAILER_FORBIDDEN_FIELDS
+        .iter()
+        .any(|forbidden| compare_no_case(name, forbidden))
+}
+
+/// What [`HttpContext::filter_request_trailers`] did to the trailer fields
+/// the last parse appended.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TrailerFilterOutcome {
+    /// Fields elided because they are in [`TRAILER_SPOOF_VECTOR_HEADERS`].
+    pub spoof_vectors: usize,
+    /// Fields elided because they are in [`TRAILER_FORBIDDEN_FIELDS`].
+    pub forbidden: usize,
+    /// The trailer section went over `HttpContext::max_trailer_fields`, and
+    /// the request was marked in error.
+    pub over_limit: bool,
 }
 
 impl kawa::h1::ParserCallbacks<Checkout> for HttpContext {
@@ -1166,6 +1189,8 @@ impl HttpContext {
             elide_x_real_ip,
             send_x_real_ip,
             forwarded_headers: ForwardedHeaders::Both,
+            max_trailer_fields: crate::protocol::mux::H2FloodConfig::default().max_header_fields(),
+            trailer_fields: 0,
             tls_version: None,
             tls_cipher: None,
             tls_alpn: None,
@@ -1516,7 +1541,7 @@ impl HttpContext {
                         // `TRAILER_SPOOF_VECTOR_HEADERS`, dropped from H2
                         // trailer HEADERS frames by `pkawa::handle_trailer`
                         // and from H1 chunked trailers by
-                        // `elide_request_trailer_spoof_vectors`.
+                        // `HttpContext::filter_request_trailers`.
                         debug_assert!(
                             self.elide_x_real_ip,
                             "X-Real-IP is only elided when anti-spoofing is enabled"
@@ -2078,6 +2103,137 @@ impl HttpContext {
         shared
     }
 
+    /// Police the trailer fields that the last `kawa::h1::parse` appended
+    /// to the trailer section of a chunked H1 request.
+    ///
+    /// - A field in [`TRAILER_SPOOF_VECTOR_HEADERS`] (client attribution,
+    ///   sozu-proxy/sozu#1689) or in [`TRAILER_FORBIDDEN_FIELDS`] (framing,
+    ///   routing, request modifiers, authentication, content processing and
+    ///   connection-specific fields, RFC 9110 §6.5.1, sozu-proxy/sozu#1701)
+    ///   is elided, and counted in `http.trailer.spoof_vector_elided` or
+    ///   `http.trailer.forbidden_field_elided`.
+    /// - Every field, elided or not, counts against `max_trailer_fields`,
+    ///   as `pkawa::handle_trailer` (`lib/src/protocol/mux/pkawa.rs`) counts
+    ///   an H2 trailer block. The field that goes over the limit marks the
+    ///   request in error, so the caller's existing parse-error path answers
+    ///   400 (or cuts a response that already started), and
+    ///   `http.trailer.field_limit_exceeded` is incremented.
+    ///
+    /// kawa's H1 parser has no trailer callback: its `ParsingPhase::Trailers`
+    /// arm pushes each trailer field as a `Block::Header` after the `Flags`
+    /// block that carries `end_body` (the last chunk), then closes the
+    /// section with a `Flags` block carrying `end_header` and `end_stream`.
+    /// Call this after each `kawa::h1::parse` of a frontend request, with
+    /// `first_new_block` set to `kawa.blocks.len()` read just before that
+    /// parse. It walks back from the end of the queue over the closing block
+    /// and the trailer fields, and stops at the first other block (the
+    /// `end_body` marker) or at `first_new_block`. It never reaches the
+    /// header block, which ends with its own `end_header` marker before the
+    /// chunks.
+    ///
+    /// Stopping at `first_new_block` keeps the total walk linear in the
+    /// number of trailer fields: every field queued before that parse was
+    /// already examined, and counted in `trailer_fields`, by the call that
+    /// followed the parse which queued it, so a client that trickles one
+    /// trailer line per segment while the backend is not writable does not
+    /// make each call re-walk the whole section. Parsing only appends
+    /// blocks, and `prepare` only drains them from the front between parses,
+    /// so the fields past `first_new_block` are exactly the new ones even
+    /// when earlier trailer fields were already forwarded. That is also why
+    /// the count lives in `trailer_fields` rather than in the queue.
+    ///
+    /// An elided field is skipped by kawa's H1 converter and by the H2 one,
+    /// so the last chunk and the closing empty line are still written: the
+    /// chunk framing stays valid even when every trailer field is dropped.
+    /// A request that is not chunked, or has not reached its trailer
+    /// section, returns before touching a block, so the walk costs nothing
+    /// and allocates nothing on the common path.
+    ///
+    /// Only requests are filtered: a response trailer travels towards the
+    /// client, which does not take client attribution from it.
+    pub fn filter_request_trailers(
+        &mut self,
+        kawa: &mut GenericHttpStream,
+        first_new_block: usize,
+    ) -> TrailerFilterOutcome {
+        let mut outcome = TrailerFilterOutcome::default();
+        if !matches!(kawa.kind, kawa::Kind::Request)
+            || kawa.body_size != kawa::BodySize::Chunked
+            || !matches!(
+                kawa.parsing_phase,
+                kawa::ParsingPhase::Trailers | kawa::ParsingPhase::Terminated
+            )
+        {
+            return outcome;
+        }
+        // Pre: the caller read the length before a parse, which only appends.
+        debug_assert!(
+            first_new_block <= kawa.blocks.len(),
+            "first_new_block must be a block count read before the parse"
+        );
+        // Pre: the count never passes the limit, the field that would have
+        // passed it turned the request into an error, which stops parsing.
+        debug_assert!(
+            self.trailer_fields <= self.max_trailer_fields,
+            "an admitted trailer section fits max_trailer_fields"
+        );
+        let first_new_block = first_new_block.min(kawa.blocks.len());
+        let buf = kawa.storage.buffer();
+        let mut fields: u32 = 0;
+        for block in kawa.blocks.range_mut(first_new_block..).rev() {
+            match block {
+                kawa::Block::Flags(kawa::Flags {
+                    end_body: false,
+                    end_chunk: false,
+                    end_header: true,
+                    end_stream: true,
+                }) => {}
+                kawa::Block::Header(pair) => {
+                    fields = fields.saturating_add(1);
+                    if pair.is_elided() {
+                        continue;
+                    }
+                    let key = pair.key.data(buf);
+                    if is_trailer_spoof_vector(key) {
+                        pair.elide();
+                        outcome.spoof_vectors += 1;
+                        incr!(names::http::TRAILER_SPOOF_VECTOR_ELIDED);
+                    } else if is_trailer_forbidden_field(key) {
+                        pair.elide();
+                        outcome.forbidden += 1;
+                        incr!(names::http::TRAILER_FORBIDDEN_FIELD_ELIDED);
+                    }
+                    // Post: no spoof-vector or forbidden field survives.
+                    debug_assert!(
+                        pair.is_elided()
+                            || !(is_trailer_spoof_vector(pair.key.data(buf))
+                                || is_trailer_forbidden_field(pair.key.data(buf))),
+                        "a spoof-vector or forbidden trailer field must be elided"
+                    );
+                }
+                _ => break,
+            }
+        }
+        self.trailer_fields = self.trailer_fields.saturating_add(fields);
+        if self.trailer_fields > self.max_trailer_fields {
+            outcome.over_limit = true;
+            incr!(names::http::TRAILER_FIELD_LIMIT_EXCEEDED);
+            kawa.parsing_phase
+                .error("trailer section exceeds max_trailer_fields".into());
+        }
+        // Post: only blocks appended by the last parse are touched, and a
+        // section over the limit never leaves the request forwardable.
+        debug_assert!(
+            outcome.spoof_vectors + outcome.forbidden <= kawa.blocks.len() - first_new_block,
+            "only blocks appended by the last parse are elided"
+        );
+        debug_assert!(
+            !outcome.over_limit || kawa.is_error(),
+            "a trailer section over the limit marks the request in error"
+        );
+        outcome
+    }
+
     /// Prepare this context for the next request of a keep-alive connection,
     /// which `request_id` identifies.
     ///
@@ -2103,6 +2259,7 @@ impl HttpContext {
         let elide_before = self.elide_x_real_ip;
         let send_before = self.send_x_real_ip;
         let forwarded_headers_before = self.forwarded_headers;
+        let max_trailer_fields_before = self.max_trailer_fields;
         let tls_version_before = self.tls_version;
         let tls_cipher_before = self.tls_cipher;
         let tls_alpn_before = self.tls_alpn;
@@ -2127,9 +2284,10 @@ impl HttpContext {
         self.www_authenticate = None;
         self.original_authority = None;
         self.headers_response.clear();
+        self.trailer_fields = 0;
         // Note: tls_server_name, tls_version, tls_cipher, tls_alpn,
         // strict_sni_binding, elide_x_real_ip, send_x_real_ip,
-        // forwarded_headers are
+        // forwarded_headers and max_trailer_fields are
         // connection-scoped — set once at handshake completion and reused
         // across every keep-alive request, so reset() intentionally leaves
         // them in place. So is forwarding_hop, rendered from connection-
@@ -2143,7 +2301,8 @@ impl HttpContext {
                 && self.path.is_none()
                 && self.status.is_none()
                 && self.x_request_id.is_none()
-                && self.headers_response.is_empty(),
+                && self.headers_response.is_empty()
+                && self.trailer_fields == 0,
             "reset() must clear all request-scoped state"
         );
         debug_assert!(
@@ -2164,6 +2323,7 @@ impl HttpContext {
                 && self.elide_x_real_ip == elide_before
                 && self.send_x_real_ip == send_before
                 && self.forwarded_headers == forwarded_headers_before
+                && self.max_trailer_fields == max_trailer_fields_before
                 && self.tls_version == tls_version_before
                 && self.tls_cipher == tls_cipher_before
                 && self.tls_alpn == tls_alpn_before,
@@ -4827,7 +4987,15 @@ mod tests {
         }
     }
 
-    // ── chunked request trailers: spoof-vector elision ─────────────────
+    // ── chunked request trailers: elision and field bound ──────────────
+
+    /// Filter the trailer fields of `kawa` appended after `first_new_block`
+    /// with a fresh context, and return how many spoof vectors were elided.
+    fn elide_spoof_vectors(kawa: &mut GenericHttpStream, first_new_block: usize) -> usize {
+        make_context()
+            .filter_request_trailers(kawa, first_new_block)
+            .spoof_vectors
+    }
 
     /// Head and body of a chunked request, up to and including the
     /// last-chunk line, so a test can send its trailer section separately.
@@ -4843,8 +5011,8 @@ mod tests {
     /// case of the name, while a legitimate trailer and the chunk framing
     /// survive: last-chunk, the surviving field, then the empty line.
     ///
-    /// TO SEE THIS RED: make `elide_request_trailer_spoof_vectors` return
-    /// `0` before its walk.
+    /// TO SEE THIS RED: make `HttpContext::filter_request_trailers` return
+    /// before its walk.
     #[test]
     fn a_chunked_request_trailer_section_loses_its_spoof_vector_fields() {
         let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
@@ -4853,12 +5021,12 @@ mod tests {
         assert!(kawa.is_terminated(), "the trailer section ends the request");
 
         assert_eq!(
-            elide_request_trailer_spoof_vectors(&mut kawa, 0),
+            elide_spoof_vectors(&mut kawa, 0),
             TRAILER_SPOOF_VECTOR_HEADERS.len(),
             "every spoof-vector trailer field is elided once"
         );
         assert_eq!(
-            elide_request_trailer_spoof_vectors(&mut kawa, 0),
+            elide_spoof_vectors(&mut kawa, 0),
             0,
             "a second walk finds nothing left to elide"
         );
@@ -4883,7 +5051,7 @@ mod tests {
         let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
         let mut kawa = parse_message(&mut pool, kawa::Kind::Request, CHUNKED_HEAD);
         assert_eq!(kawa.parsing_phase, kawa::ParsingPhase::Trailers);
-        assert_eq!(elide_request_trailer_spoof_vectors(&mut kawa, 0), 0);
+        assert_eq!(elide_spoof_vectors(&mut kawa, 0), 0);
         let head = serialized_request(&mut kawa);
         assert!(
             kawa.blocks.is_empty(),
@@ -4896,7 +5064,7 @@ mod tests {
         let before = kawa.blocks.len();
         kawa::h1::parse(&mut kawa, &mut make_context());
         assert!(kawa.is_terminated(), "the trailer section ends the request");
-        assert_eq!(elide_request_trailer_spoof_vectors(&mut kawa, before), 2);
+        assert_eq!(elide_spoof_vectors(&mut kawa, before), 2);
         let wire = serialized_request(&mut kawa);
         assert!(
             wire.starts_with(&head) && !wire.contains("6.6.6.6"),
@@ -4932,7 +5100,7 @@ mod tests {
         for (kind, bytes) in cases {
             let mut kawa = parse_message(&mut pool, kind, bytes);
             assert_eq!(
-                elide_request_trailer_spoof_vectors(&mut kawa, 0),
+                elide_spoof_vectors(&mut kawa, 0),
                 0,
                 "{kind:?} {:?}: nothing to elide",
                 kawa.parsing_phase
@@ -4945,15 +5113,24 @@ mod tests {
         }
     }
 
-    /// Append `bytes` to `kawa`, parse them, and elide the trailer fields
-    /// that parse appended, as `ConnectionH1::readable` does. Returns the
-    /// number of fields elided.
-    fn feed_and_elide(kawa: &mut GenericHttpStream, bytes: &[u8]) -> usize {
+    /// Append `bytes` to `kawa`, parse them, and filter the trailer fields
+    /// that parse appended with `context`, as `ConnectionH1::readable` does.
+    fn feed_and_filter(
+        context: &mut HttpContext,
+        kawa: &mut GenericHttpStream,
+        bytes: &[u8],
+    ) -> TrailerFilterOutcome {
         kawa.storage.space()[..bytes.len()].copy_from_slice(bytes);
         kawa.storage.fill(bytes.len());
         let before = kawa.blocks.len();
         kawa::h1::parse(kawa, &mut make_context());
-        elide_request_trailer_spoof_vectors(kawa, before)
+        context.filter_request_trailers(kawa, before)
+    }
+
+    /// [`feed_and_filter`] with a fresh context, returning how many spoof
+    /// vectors were elided.
+    fn feed_and_elide(kawa: &mut GenericHttpStream, bytes: &[u8]) -> usize {
+        feed_and_filter(&mut make_context(), kawa, bytes).spoof_vectors
     }
 
     /// The trailer section itself may be split across reads, and the first
@@ -4962,8 +5139,8 @@ mod tests {
     /// next. Both must be elided, and the legitimate field and the closing
     /// empty line of the section survive.
     ///
-    /// TO SEE THIS RED: make `elide_request_trailer_spoof_vectors` return
-    /// `0` before its walk.
+    /// TO SEE THIS RED: make `HttpContext::filter_request_trailers` return
+    /// before its walk.
     #[test]
     fn a_trailer_section_split_across_reads_is_filtered_in_each_part() {
         let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
@@ -5006,7 +5183,8 @@ mod tests {
     /// which queued it: here it was deliberately never filtered, and the
     /// bounded walk must not reach it.
     ///
-    /// TO SEE THIS RED: ignore `first_new_block` and walk the whole queue
+    /// TO SEE THIS RED: ignore `first_new_block` in
+    /// `HttpContext::filter_request_trailers` and walk the whole queue
     /// (`range_mut(0..)`); the call then also elides the older field.
     #[test]
     fn a_trailer_walk_stops_at_the_blocks_queued_before_the_parse() {
@@ -5048,5 +5226,158 @@ mod tests {
                 .any(|key| key.eq_ignore_ascii_case(b"X-Forwarded-For")),
             "a block queued before the parse is outside the walk, got {older:?}"
         );
+    }
+
+    /// A trailer section carrying one field of each RFC 9110 §6.5.1
+    /// category in mixed case, with the forged value `6.6.6.6`, plus two
+    /// legitimate fields that must survive.
+    const FORBIDDEN_TRAILERS: &[u8] = b"Content-Length: 6666\r\nTRANSFER-ENCODING: 6.6.6.6\r\nHost: 6.6.6.6\r\nExpect: 6.6.6.6\r\nIf-Match: 6.6.6.6\r\nauthorization: 6.6.6.6\r\nCookie: 6.6.6.6\r\nContent-Type: 6.6.6.6\r\nTrailer: 6.6.6.6\r\nConnection: 6.6.6.6\r\nGrpc-Status: 0\r\nX-Checksum: abc\r\n\r\n";
+
+    /// RFC 9110 §6.5.1, sozu-proxy/sozu#1701: an H1 chunked request cannot
+    /// carry a framing, routing, request-modifier, authentication, content
+    /// processing or connection-specific field in its trailer section,
+    /// whatever the case of the name; legitimate trailers and the chunk
+    /// framing survive.
+    ///
+    /// TO SEE THIS RED: drop the `is_trailer_forbidden_field` branch of
+    /// `HttpContext::filter_request_trailers`.
+    #[test]
+    fn a_chunked_request_trailer_section_loses_its_forbidden_fields() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let bytes = [CHUNKED_HEAD, FORBIDDEN_TRAILERS].concat();
+        let mut kawa = parse_message(&mut pool, kawa::Kind::Request, &bytes);
+        assert!(kawa.is_terminated(), "the trailer section ends the request");
+
+        let mut context = make_context();
+        let outcome = context.filter_request_trailers(&mut kawa, 0);
+        assert_eq!(
+            outcome,
+            TrailerFilterOutcome {
+                spoof_vectors: 0,
+                forbidden: 10,
+                over_limit: false,
+            },
+            "every forbidden trailer field is elided once"
+        );
+        assert_eq!(context.trailer_fields, 12, "every field is counted");
+        assert!(!kawa.is_error(), "a section within the bound is admitted");
+        let wire = serialized_request(&mut kawa);
+        assert!(
+            !wire.contains("6.6.6.6") && !wire.contains("6666"),
+            "no forbidden trailer may reach the backend, got {wire:?}"
+        );
+        assert!(
+            wire.ends_with("\r\n\r\n5\r\nHello\r\n0\r\nGrpc-Status: 0\r\nX-Checksum: abc\r\n\r\n"),
+            "the legitimate trailers and the chunk framing survive, got {wire:?}"
+        );
+    }
+
+    /// Every name of `TRAILER_FORBIDDEN_FIELDS` is recognised in upper case
+    /// too, and no spoof vector is double-listed in it, so each elided field
+    /// lands in exactly one metric.
+    #[test]
+    fn trailer_forbidden_fields_are_matched_without_case_and_disjoint_from_spoof_vectors() {
+        for name in TRAILER_FORBIDDEN_FIELDS {
+            assert!(
+                is_trailer_forbidden_field(&name.to_ascii_uppercase()),
+                "{:?} is matched in upper case",
+                String::from_utf8_lossy(name)
+            );
+            assert!(
+                !is_trailer_spoof_vector(name),
+                "{:?} is in both lists",
+                String::from_utf8_lossy(name)
+            );
+        }
+        for legit in [
+            &b"grpc-status"[..],
+            b"grpc-message",
+            b"x-checksum",
+            b"digest",
+        ] {
+            assert!(!is_trailer_forbidden_field(legit));
+        }
+    }
+
+    /// Build a trailer section of `count` distinct legitimate fields.
+    fn numbered_trailers(count: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for i in 0..count {
+            bytes.extend_from_slice(format!("X-T{i}: {i}\r\n").as_bytes());
+        }
+        bytes.extend_from_slice(b"\r\n");
+        bytes
+    }
+
+    /// sozu-proxy/sozu#1701: a trailer section may carry up to
+    /// `max_trailer_fields` fields, the bound `h2_max_header_fields` puts on
+    /// an H2 trailer block; one more marks the request in error, so the
+    /// caller answers 400 before any of it is forwarded. Elided fields count
+    /// too, as they do on the H2 path.
+    ///
+    /// TO SEE THIS RED: drop the `max_trailer_fields` comparison of
+    /// `HttpContext::filter_request_trailers`.
+    #[test]
+    fn a_trailer_section_over_the_field_bound_is_an_error() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        for (count, over) in [(4, false), (5, true)] {
+            let bytes = [CHUNKED_HEAD, &numbered_trailers(count)].concat();
+            let mut kawa = parse_message(&mut pool, kawa::Kind::Request, &bytes);
+            assert!(kawa.is_terminated());
+            let mut context = make_context();
+            context.max_trailer_fields = 4;
+            let outcome = context.filter_request_trailers(&mut kawa, 0);
+            assert_eq!(
+                outcome.over_limit, over,
+                "{count} fields against a bound of 4"
+            );
+            assert_eq!(kawa.is_error(), over, "{count} fields against a bound of 4");
+        }
+
+        // An elided field still counts.
+        let bytes = [
+            CHUNKED_HEAD,
+            b"Host: a\r\nHost: b\r\nX-Forwarded-For: c\r\n\r\n".as_slice(),
+        ]
+        .concat();
+        let mut kawa = parse_message(&mut pool, kawa::Kind::Request, &bytes);
+        let mut context = make_context();
+        context.max_trailer_fields = 2;
+        let outcome = context.filter_request_trailers(&mut kawa, 0);
+        assert!(outcome.over_limit && kawa.is_error(), "elided fields count");
+    }
+
+    /// The bound covers the whole trailer section, not one read: a client
+    /// trickling one field per segment, each forwarded before the next
+    /// arrives, is still refused once the running count passes the bound,
+    /// and `reset` gives the next pipelined request a budget of its own.
+    ///
+    /// TO SEE THIS RED: count only the fields of the current walk (compare
+    /// `fields` instead of `self.trailer_fields` to the bound).
+    #[test]
+    fn the_trailer_field_bound_spans_reads_and_resets_per_request() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let mut kawa = parse_message(&mut pool, kawa::Kind::Request, CHUNKED_HEAD);
+        let mut context = make_context();
+        context.max_trailer_fields = 2;
+        assert_eq!(
+            context.filter_request_trailers(&mut kawa, 0),
+            Default::default()
+        );
+        for (i, line) in [&b"X-A: 1\r\n"[..], b"X-B: 2\r\n"].into_iter().enumerate() {
+            let outcome = feed_and_filter(&mut context, &mut kawa, line);
+            assert!(!outcome.over_limit && !kawa.is_error(), "field {i} fits");
+            serialized_request(&mut kawa);
+            assert!(kawa.blocks.is_empty(), "field {i} was forwarded");
+        }
+        let outcome = feed_and_filter(&mut context, &mut kawa, b"X-C: 3\r\n");
+        assert!(
+            outcome.over_limit && kawa.is_error(),
+            "the third field goes over"
+        );
+
+        context.reset(Ulid::generate());
+        assert_eq!(context.trailer_fields, 0, "reset clears the running count");
+        assert_eq!(context.max_trailer_fields, 2, "reset keeps the bound");
     }
 }

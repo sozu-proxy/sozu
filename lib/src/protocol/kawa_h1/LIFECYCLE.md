@@ -484,7 +484,7 @@ them red on the branch, pin kawa 0.7.1 (`kawa = { version = "=0.7.1", … }` in
 the root `Cargo.toml`, then `cargo update -p kawa --precise 0.7.1`) and
 delete it.
 
-### 2.3 Request trailers never carry client attribution
+### 2.3 Request trailers never carry client attribution or header-only fields
 
 `HttpContext::on_request_headers` edits the header block only. kawa's H1
 parser calls no callback for a chunked request's trailer section: its
@@ -494,18 +494,67 @@ section with a `Flags` block carrying `end_header` and `end_stream`. Until
 sozu-proxy/sozu#1689 those fields reached the backend verbatim, so a client
 could append `X-Forwarded-For`, `Forwarded` or `X-Real-IP` to its body and
 hand a forged address to a backend that merges trailers into its header view.
+Until sozu-proxy/sozu#1701 the same went for `Content-Length`, `Host`,
+`Authorization` and every other field whose meaning is fixed by the header
+block, and nothing bounded the number of trailer fields but the buffer.
 
-`elide_request_trailer_spoof_vectors` (`editor.rs`) closes that path. Both
+`HttpContext::filter_request_trailers` (`editor.rs`) closes both paths. Both
 frontend parse sites of `ConnectionH1` (`lib/src/protocol/mux/h1.rs`) call it
 right after `kawa::h1::parse`: `ConnectionH1::readable`, and the keep-alive
-branch of `ConnectionH1::writable` that parses a pipelined request. It elides
-every field named in `TRAILER_SPOOF_VECTOR_HEADERS` (`editor.rs`), compared
-without case: `X-Real-IP`, `X-Forwarded-For`, `Forwarded`, `X-Request-Id`,
-`X-Forwarded-Proto`, `X-Forwarded-Port` and `X-Forwarded-Host`. The H2 filter
-`pkawa::handle_trailer` (`lib/src/protocol/mux/pkawa.rs`) reads the same list,
-so the two frontends drop the same names. Each elided H1 field increments
-`http.trailer.spoof_vector_elided`.
+branch of `ConnectionH1::writable` that parses a pipelined request.
 
+- **Client attribution.** Every field named in `TRAILER_SPOOF_VECTOR_HEADERS`
+  (`editor.rs`), compared without case, is elided: `X-Real-IP`,
+  `X-Forwarded-For`, `Forwarded`, `X-Request-Id`, `X-Forwarded-Proto`,
+  `X-Forwarded-Port` and `X-Forwarded-Host`. The H2 filter
+  `pkawa::handle_trailer` (`lib/src/protocol/mux/pkawa.rs`) reads the same
+  list, so the two frontends drop the same names. Each elided H1 field
+  increments `http.trailer.spoof_vector_elided`.
+- **Header-only fields.** Every field named in `TRAILER_FORBIDDEN_FIELDS`
+  (`editor.rs`), compared without case, is elided and increments
+  `http.trailer.forbidden_field_elided`. RFC 9110 §6.5.1 keeps out of a
+  trailer section the fields "whose evaluation is necessary prior to receiving
+  the content, such as those that describe message framing, routing,
+  authentication, request modifiers, response controls, or content format",
+  but names only those categories; the list takes the names RFC 7230 §4.1.2
+  gave for each of them on the request side (`Content-Length`,
+  `Transfer-Encoding`; `Host`; the controls and conditionals of RFC 7231
+  §5.1–§5.2; `Authorization`, `Proxy-Authorization`, `Cookie`;
+  `Content-Encoding`, `Content-Type`, `Content-Range`, `Trailer`) and adds the
+  connection-specific `Connection`, `Keep-Alive`, `Proxy-Connection` and
+  `Upgrade`, which RFC 9110 §7.6.1 has an intermediary remove before
+  forwarding.
+- **Elided, not refused.** RFC 7230 §4.1.2 has a recipient "ignore (or
+  consider as an error)" a forbidden trailer field, and RFC 9112 §7.1.2 lets a
+  recipient "selectively retain or discard the received trailer fields".
+  Eliding keeps the request whole for the backend, which already holds its
+  head and body when the trailer section arrives, and matches how the H2
+  frontend drops a spoof vector.
+- **Field bound.** Every trailer field, elided or not, counts against
+  `HttpContext::max_trailer_fields`, which `Context::create_stream`
+  (`lib/src/protocol/mux/mod.rs`) copies from the listener's
+  `h2_max_header_fields`: `pkawa::handle_trailer` counts an H2 trailer block
+  against the same value, elided fields included. The running count lives in
+  `HttpContext::trailer_fields`, because `prepare` may already have drained
+  the earlier fields towards the backend; `HttpContext::reset` zeroes it for
+  the next pipelined request. The field that goes over the bound marks the
+  kawa in error, so the parse-error branch of the call site answers it: 400
+  when no response started, or a cut response when the backend already
+  answered (the `Position::Server` arms of that branch in
+  `ConnectionH1::readable`). The field over the bound is never forwarded. The request
+  is refused rather than trimmed, as H2 resets the stream with
+  `ENHANCE_YOUR_CALM`, because a peer sending that many trailer fields is
+  either broken or probing, and no default answer exists for 431; 400 is the
+  answer every other H1 framing violation gets. Each refusal increments
+  `http.trailer.field_limit_exceeded`.
+- **`Trailer` header.** The advisory `Trailer` request header is left as
+  sent, even when it names a field the filter drops. RFC 9110 §6.6.2 makes it
+  a hint: "there is no guarantee that a sender of Trailer will always follow
+  through by sending the named fields", and "if an intermediary discards the
+  trailer section in transit, the Trailer field could provide a hint of what
+  metadata was lost". The header block is also usually forwarded before the
+  trailer section is read, so pruning it would mean rewriting every such list
+  at header time.
 - **Where the walk stops.** Each call site reads `kawa.blocks.len()` just
   before `kawa::h1::parse` and passes it as `first_new_block`. The walk goes
   back from the end of the block queue over the closing `Flags` block and the
@@ -514,33 +563,49 @@ so the two frontends drop the same names. Each elided H1 field increments
   marker before the chunks, so it is never reached.
 - **Linear cost.** A parse only appends blocks and `prepare` only drains them
   from the front between parses, so the fields past `first_new_block` are
-  exactly the ones that parse added, and every older field was examined by
-  the call after the parse that queued it. A client trickling one trailer line
-  per segment while the backend is not writable therefore costs one block per
-  line, not a re-walk of the whole section. A trailer section split across
-  reads, its first part already forwarded, is filtered part by part.
+  exactly the ones that parse added, and every older field was examined, and
+  counted, by the call after the parse that queued it. A client trickling one
+  trailer line per segment while the backend is not writable therefore costs
+  one block per line, not a re-walk of the whole section. A trailer section
+  split across reads, its first part already forwarded, is filtered part by
+  part.
 - **Framing.** An elided field has an empty key, which kawa's H1 converter and
   the H2 converter skip; the last chunk (`0\r\n`) and the closing empty line
   are still written, so the chunk framing stays valid when every trailer field
-  is dropped. The advisory `Trailer` header is left as sent.
+  is dropped.
 - **Cost.** A request that is not chunked, or has not reached its trailer
   section, returns on the kind, `body_size` and `parsing_phase` checks before
-  any block is read.
+  any block is read, and nothing is allocated.
 - **Responses are not filtered.** A response trailer travels towards the
   client, which takes no client attribution from it; `on_response_headers`
   keeps its own rules.
 
+The H2 frontend does not yet apply `TRAILER_FORBIDDEN_FIELDS`: `pkawa::handle_trailer`
+rejects the connection-specific fields (RFC 9113 §8.2.2) but forwards, for
+instance, a `Content-Length` or `Host` trailer.
+
 Covered by `a_chunked_request_trailer_section_loses_its_spoof_vector_fields`,
+`a_chunked_request_trailer_section_loses_its_forbidden_fields`,
+`trailer_forbidden_fields_are_matched_without_case_and_disjoint_from_spoof_vectors`,
+`a_trailer_section_over_the_field_bound_is_an_error`,
+`the_trailer_field_bound_spans_reads_and_resets_per_request`,
 `a_trailer_section_parsed_after_the_last_chunk_was_forwarded_is_filtered`,
 `a_trailer_section_split_across_reads_is_filtered_in_each_part`,
 `a_trailer_walk_stops_at_the_blocks_queued_before_the_parse` and
 `trailer_elision_leaves_headers_and_responses_alone` (unit, in `editor.rs`),
 and by `test_h1_trailer_spoof_headers_dropped`,
 `test_h1_trailer_spoof_headers_dropped_split`,
-`test_h1_trailer_spoof_headers_dropped_split_inside_trailers` and
-`test_h1_pipelined_trailer_spoof_headers_dropped`
+`test_h1_trailer_spoof_headers_dropped_split_inside_trailers`,
+`test_h1_pipelined_trailer_spoof_headers_dropped`,
+`test_h1_trailer_forbidden_fields_dropped`,
+`test_h1_trailer_forbidden_fields_dropped_split`,
+`test_h1_trailer_forbidden_fields_dropped_split_inside_trailers`,
+`test_h1_pipelined_trailer_forbidden_fields_dropped`,
+`test_h1_trailer_field_limit_at_bound_forwarded`,
+`test_h1_trailer_field_limit_exceeded_rejected` and
+`test_h1_trailer_field_limit_exceeded_rejected_split`
 (`e2e/src/tests/h1_security_tests.rs`), which read the bytes the backend
-receives.
+receives and the answer the client gets.
 
 ---
 

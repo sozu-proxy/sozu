@@ -1280,7 +1280,7 @@ per-listener with safe compile-time defaults:
 | `h2_max_header_list_size`               | 65536                   | Maximum accumulated HPACK-decoded header list size per request (`SETTINGS_MAX_HEADER_LIST_SIZE`, RFC 9113 §6.5.2). Accounted as name + value + 32 octets per field, per §6.5.2; the per-field overhead also bounds the field count.                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `h2_stream_idle_timeout_seconds`        | `max(30, back_timeout)` | Per-stream idle timeout in seconds. An open H2 stream that receives no meaningful application data (non-empty DATA or HEADERS) for this duration is cancelled (`RST_STREAM` / `CANCEL`) to defend against slow-multiplex Slowloris. When unset the listener inherits `back_timeout` (floored at 30 s) so streams are not cancelled before the backend socket budget elapses; set explicitly to cap the per-stream deadline below `back_timeout` when under a slow-multiplex attack. Active uploads that trickle DATA frames reset the timer on each frame. The same deadline also governs a second, independent guard: a stream whose buffered response cannot drain because the peer keeps its receive window exhausted (HTTP/2 window-stall / `WINDOW_UPDATE`-drip) is reaped too. That flow-control-stall guard is NOT refreshed by inbound activity, so neither an inbound DATA drip nor a `WINDOW_UPDATE(+1)` drip can keep a window-stalled stream alive: the deadline clears only on a genuinely open send window or once cumulative outbound progress reaches one max DATA frame (16 KiB), so a trickle below that floor ages out and is reaped, while legitimate slow-but-steady transfers (sustaining more than ~0.5 KiB/s at the 30 s default) are unaffected. The guard is bidirectional — it also reaps a stalled request **upload** to a slow H2 backend (returning the client a 502), so raise this timeout if you proxy large uploads to slow H2 backends. A continuously window-blocked peer sustaining less than ~0.5 KiB/s for a full timeout is the one disclosed residual (raise the timeout to tolerate it). |
 | `h2_max_header_table_size`              | 65536                   | Maximum HPACK dynamic table size (`SETTINGS_HEADER_TABLE_SIZE`) accepted from the peer. Caps the peer-advertised value to prevent unbounded HPACK encoder memory growth.                                                                                                                                                                                                                                                                                                                                                                                   |
-| `h2_max_header_fields`                  | 128                     | Maximum number of materialized header fields, enforced per HEADERS block and (independently) per trailers block — HPACK fields plus expanded cookie crumbs (RFC 9113 §8.2.3). Bounds the HPACK indexed-reference "header bomb", where 1-byte indexed references amplify into per-entry bookkeeping; cookie crumbs are counted individually (cf. Apache CVE-2026-49975). Minimum: 1. |
+| `h2_max_header_fields`                  | 128                     | Maximum number of materialized header fields, enforced per HEADERS block and (independently) per trailers block — HPACK fields plus expanded cookie crumbs (RFC 9113 §8.2.3). Bounds the HPACK indexed-reference "header bomb", where 1-byte indexed references amplify into per-entry bookkeeping; cookie crumbs are counted individually (cf. Apache CVE-2026-49975). The same value bounds the trailer section of an HTTP/1.1 chunked request, where one field more is answered 400 (#1701). Minimum: 1. |
 | `h2_graceful_shutdown_deadline_seconds` | 5                       | Maximum wall-clock seconds to wait for in-flight H2 streams after `GOAWAY(NO_ERROR)` has been sent during soft-stop. This includes a request whose header block is still arriving when the soft-stop lands. Once the deadline elapses the connection is forcibly closed, after a final `GOAWAY(NO_ERROR)` whose `last_stream_id` excludes a stream whose header block never completed. Set to `0` to disable the forced close entirely — shutdown then waits for every stream to drain naturally (use with caution: a long-running request can delay the whole soft-stop indefinitely).                                                                                                                                                                         |
 
 _Configuration example:_
@@ -1403,9 +1403,28 @@ flags say (RFC 9110 §6.5.1): `X-Real-IP`, `X-Forwarded-For`, `Forwarded`,
 the single list `TRAILER_SPOOF_VECTOR_HEADERS`
 (`lib/src/protocol/kawa_h1/editor.rs`). H2 trailer HEADERS frames are filtered by
 `pkawa::handle_trailer` (`lib/src/protocol/mux/pkawa.rs`) and H1 chunked trailer
-sections by `elide_request_trailer_spoof_vectors` (`editor.rs`), so a client
-cannot spoof its address as a trailer to bypass the anti-spoof (#1689). Every
-other trailer field, such as `grpc-status`, is forwarded.
+sections by `HttpContext::filter_request_trailers` (`editor.rs`), so a client
+cannot spoof its address as a trailer to bypass the anti-spoof (#1689).
+
+The H1 path also elides every field RFC 9110 §6.5.1 keeps out of a trailer
+section because its evaluation is needed before the content: framing
+(`Content-Length`, `Transfer-Encoding`), routing (`Host`), request modifiers
+(`Cache-Control`, `Expect`, `Max-Forwards`, `Pragma`, `Range`, `TE`, and the
+`If-*` conditionals), authentication (`Authorization`, `Proxy-Authorization`,
+`Cookie`), content processing (`Content-Encoding`, `Content-Type`,
+`Content-Range`, `Trailer`) and the connection-specific `Connection`,
+`Keep-Alive`, `Proxy-Connection` and `Upgrade` (RFC 9110 §7.6.1), the list
+`TRAILER_FORBIDDEN_FIELDS` (`lib/src/protocol/kawa_h1/editor.rs`). RFC 7230
+§4.1.2 has a recipient ignore such a field "since processing them as if they
+were present in the header section might bypass external security filters",
+and RFC 9112 §7.1.2 lets it discard any trailer field, so the request is still
+forwarded without them rather than refused (#1701). An H1 trailer section is
+also bounded by the listener's `h2_max_header_fields`, the bound the H2 frontend
+applies to a trailer block: one field more, elided fields included, answers the
+request 400, or cuts the response when the backend already started it. The
+advisory `Trailer` request header is forwarded as sent, since RFC 9110 §6.6.2
+makes it a hint the sender need not follow through. Every other trailer field,
+such as `grpc-status`, is forwarded.
 
 Both knobs are runtime-patchable via `UpdateHttpListenerConfig` /
 `UpdateHttpsListenerConfig`. Patches apply immediately to all H1 sessions and to
@@ -1459,7 +1478,7 @@ element is Sōzu's. Other `X-Forwarded-*` names (for example
 `X-Forwarded-Prefix`) are not forwarding attestations Sōzu manages and pass
 through in every mode. A trailer cannot smuggle a forwarding header past the
 mode: `pkawa::handle_trailer` (`lib/src/protocol/mux/pkawa.rs`) for an H2
-trailer block, and `elide_request_trailer_spoof_vectors`
+trailer block, and `HttpContext::filter_request_trailers`
 (`lib/src/protocol/kawa_h1/editor.rs`) for an H1 chunked trailer section, drop
 `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Port` and
 `X-Forwarded-Host` from trailers in every mode.
@@ -2527,7 +2546,7 @@ immediately after the patch is acknowledged.
 | `h2_stream_shrink_ratio`                  | `u32` (≥ 2)     | per-connection setup | `2`                     | Stream-slot Vec shrink threshold                                                                                                                             |
 | `h2_max_header_list_size`                 | `u32` (≥ 1)     | per-connection setup | `65536`                 | HPACK decoded header budget (`SETTINGS_MAX_HEADER_LIST_SIZE`). `0` refuses every request.                                                                    |
 | `h2_max_header_table_size`                | `u32` (≥ 1)     | per-connection setup | `65536`                 | HPACK dynamic table size cap (`SETTINGS_HEADER_TABLE_SIZE`)                                                                                                  |
-| `h2_max_header_fields`                    | `u32` (≥ 1)     | per-connection setup | `128`                   | Materialized header fields per HEADERS/trailers block, cookie crumbs included (RFC 9113 §8.2.3). `0` refuses every request.                                   |
+| `h2_max_header_fields`                    | `u32` (≥ 1)     | per-connection setup | `128`                   | Materialized header fields per HEADERS/trailers block, cookie crumbs included (RFC 9113 §8.2.3); also the H1 chunked request trailer bound. `0` refuses every request. |
 | `h2_stream_idle_timeout_seconds`          | `u32`           | per-connection setup | `max(30, back_timeout)` | Per-stream idle timeout (slow-multiplex Slowloris defence). When unset, inherits `back_timeout` floored at 30 s; set explicitly to cap below `back_timeout`. |
 | `h2_graceful_shutdown_deadline_seconds`   | `u32`           | per-connection setup | `5`                     | Forced-close deadline after `GOAWAY(NO_ERROR)` on soft-stop. `0` = wait forever.                                                                             |
 
@@ -3065,6 +3084,8 @@ Incremented when Sōzu generates a default error response instead of proxying:
 | `http.frontend.transfer_encoding_smuggling`  | counter | proxy | H1 request rejected (400) for ambiguous `Transfer-Encoding` framing: more than one non-elided `Transfer-Encoding` header, or one whose final coding is not `chunked` (e.g. `chunked, gzip`), or one present without kawa adopting chunked framing (RFC 9110 §7.6 / RFC 9112 §6.1; #726). Whitespace around a coding is not ambiguity — kawa >= 0.7.1 excludes it from the field value (RFC 9112 §5), so `chunked\t` frames as chunked and is forwarded canonically rather than counted here |
 | `http.frontend.content_length_invalid`      | counter | proxy | H1 request rejected (400) by Sōzu's own check because its forwarded `Content-Length` value is not `1*DIGIT` — e.g. `+5`, which kawa 0.7.1 framed as 5 and forwarded verbatim (RFC 9110 §8.6 / RFC 9112 §6.3; #1652). Since kawa 0.7.2 the parser refuses such a value first, so the request is still answered 400 but this counter stays at zero unless kawa regresses (defense in depth). A leading-zero value such as `005` is `1*DIGIT` and is not counted. Also counted in `http.frontend_parse_errors` |
 | `http.backend_parse_errors`                  | counter | proxy | Backend response parsing failures                                                                                                                                                              |
+| `http.trailer.field_limit_exceeded`       | counter | proxy | H1 chunked requests refused because their trailer section carried more fields than the listener's `h2_max_header_fields`, elided fields included (#1701). One increment per request; the request is answered 400, or its response cut if the backend already started it |
+| `http.trailer.forbidden_field_elided`     | counter | proxy | Trailer fields elided from an H1 chunked request because RFC 9110 §6.5.1 keeps their name out of trailers: framing, routing, request modifiers, authentication, content processing or connection-specific fields, the list `TRAILER_FORBIDDEN_FIELDS` (#1701). One increment per field; the request is still forwarded |
 | `http.trailer.spoof_vector_elided`          | counter | proxy | Trailer fields elided from an H1 chunked request because their name is a forwarding header a trailer must not carry — `X-Real-IP`, `X-Forwarded-For`, `Forwarded`, `X-Request-Id`, `X-Forwarded-Proto`, `X-Forwarded-Port` or `X-Forwarded-Host`, in any case (RFC 9110 §6.5.1; #1689). One increment per field; the request is still forwarded. The H2 frontend counts the same drop in `h2.trailer.spoof_vector_elided` |
 | `http.backend.content_length_invalid`       | counter | proxy | H1 backend response discarded and answered 502 by Sōzu's own check because its `Content-Length` value is not `1*DIGIT` (RFC 9112 §6.3; #1652). Since kawa 0.7.2 the parser refuses such a response first — still 502 — so this counter stays at zero unless kawa regresses (defense in depth). Also counted in `http.backend_parse_errors` |
 

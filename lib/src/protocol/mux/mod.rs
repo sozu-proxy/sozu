@@ -1204,6 +1204,9 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             // Mirror the listener's forwarding header family the same way:
             // a hot update reaches the next stream (H2) or connection (H1).
             http_context.forwarded_headers = listener.get_forwarded_headers();
+            // The H1 trailer field bound is the listener's H2 one, so both
+            // frontends admit the same number of trailer fields (#1701).
+            http_context.max_trailer_fields = listener.get_h2_flood_config().max_header_fields();
             // Propagate the connection-scoped TLS metadata onto every
             // per-stream HttpContext so the access log can record it without
             // touching the rustls session on every request. These are

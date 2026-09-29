@@ -9610,6 +9610,8 @@ mod tests {
             elide_x_real_ip: false,
             send_x_real_ip: false,
             forwarded_headers: sozu_command_lib::proto::command::ForwardedHeaders::Both,
+            max_trailer_fields: 128,
+            trailer_fields: 0,
             tls_version: None,
             tls_cipher: None,
             tls_alpn: None,

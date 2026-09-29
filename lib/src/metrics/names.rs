@@ -331,6 +331,17 @@ pub mod http {
     pub const STATUS_4XX: &str = "http.status.4xx";
     pub const STATUS_5XX: &str = "http.status.5xx";
     pub const STATUS_OTHER: &str = "http.status.other";
+    /// H1 chunked requests rejected because their trailer section carried
+    /// more fields than the listener's `h2_max_header_fields`, the bound the
+    /// H2 frontend applies to a trailer block (sozu-proxy/sozu#1701). One
+    /// increment per request; the request is answered 400.
+    pub const TRAILER_FIELD_LIMIT_EXCEEDED: &str = "http.trailer.field_limit_exceeded";
+    /// Trailer fields elided from an H1 chunked request because their name is
+    /// one of `editor::TRAILER_FORBIDDEN_FIELDS` (framing, routing, request
+    /// modifiers, authentication, content processing or connection-specific
+    /// fields a trailer must not carry, RFC 9110 §6.5.1;
+    /// sozu-proxy/sozu#1701). One increment per field.
+    pub const TRAILER_FORBIDDEN_FIELD_ELIDED: &str = "http.trailer.forbidden_field_elided";
     /// Trailer fields elided from an H1 chunked request because their name is
     /// one of `editor::TRAILER_SPOOF_VECTOR_HEADERS` (client attribution a
     /// trailer must not carry, RFC 9110 §6.5.1; sozu-proxy/sozu#1689). One

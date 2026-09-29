@@ -1396,7 +1396,7 @@ where
 /// `lib/src/protocol/kawa_h1/editor.rs`; the router also injects
 /// `X-Forwarded-Host` on a host rewrite), listed once in
 /// `TRAILER_SPOOF_VECTOR_HEADERS` (same file) so the H1 trailer path
-/// (`elide_request_trailer_spoof_vectors`) drops exactly the same names:
+/// (`HttpContext::filter_request_trailers`) drops exactly the same names:
 ///   * `X-Real-IP` is replaced by the post-PROXY-v2 peer IP when
 ///     `send_x_real_ip = true` and stripped client-side when
 ///     `elide_x_real_ip = true`.
