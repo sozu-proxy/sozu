@@ -5994,6 +5994,76 @@ mod tests {
         }
     }
 
+    /// sozu#633: `hostname = "*"` with `position = "POST"` is the catch-all
+    /// `doc/configure.md` documents — `DomainRule::Any`, which matches every
+    /// host, an IP literal or a single-label name included — while the same
+    /// `*` on the trie (the default position) is the one-label wildcard and
+    /// matches only a single-label host. The last block pins that a `Post`
+    /// rule is consulted only once the trie matched nothing.
+    ///
+    /// To SEE THIS RED: in `DomainRule::from_str`, change the `s == "*"`
+    /// test to `s == "**"`. A bare `*` then falls through to the literal
+    /// arm, and the `127.0.0.1` row fails with `left: None, right:
+    /// Some("REGEX-HOST")`.
+    #[test]
+    fn a_bare_star_hostname_is_a_catch_all_on_post_and_one_label_on_the_trie() {
+        for host in [
+            "127.0.0.1",
+            "localhost",
+            "penguin.linux.test",
+            "10.0.0.7",
+            "www.example.com",
+        ] {
+            assert_eq!(
+                regex_host_routes(RulePosition::Post, "*", host).as_deref(),
+                Some("REGEX-HOST"),
+                "Post: `*` is the catch-all and must route {host:?}",
+            );
+        }
+
+        for (host, must_route) in [
+            ("localhost", true),
+            ("127.0.0.1", false),
+            ("penguin.linux.test", false),
+            ("www.example.com", false),
+        ] {
+            assert_eq!(
+                regex_host_routes(RulePosition::Tree, "*", host).is_some(),
+                must_route,
+                "Tree: `*` is exactly one label, against {host:?}",
+            );
+        }
+
+        let mut router = Router::new();
+        for (hostname, position, cluster_id) in [
+            ("*", RulePosition::Post, "CATCH-ALL"),
+            ("www.example.com", RulePosition::Tree, "EXAMPLE"),
+        ] {
+            let mut front = test_http_frontend();
+            front.hostname = hostname.to_owned();
+            front.position = position;
+            front.cluster_id = Some(cluster_id.into());
+            router
+                .add_http_front(&front)
+                .unwrap_or_else(|error| panic!("{hostname:?} must build: {error}"));
+        }
+        for (host, expected) in [
+            ("www.example.com", "EXAMPLE"),
+            ("127.0.0.1", "CATCH-ALL"),
+            ("api.example.com", "CATCH-ALL"),
+        ] {
+            assert_eq!(
+                router
+                    .lookup(host, "/", &Method::Get)
+                    .ok()
+                    .and_then(|result| result.cluster_id)
+                    .as_deref(),
+                Some(expected),
+                "a `Post` catch-all answers only what the trie did not: {host:?}",
+            );
+        }
+    }
+
     /// A `.*` inside a regex segment does not stop at the label boundary, and
     /// where it stops depends on the rule POSITION — the two hostname paths
     /// genuinely differ here. A trie rule matches each segment against one

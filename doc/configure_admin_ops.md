@@ -184,7 +184,7 @@ already in `configure.md`.
 
 ### 5.1 Per-connection H2 stream-Vec shrink
 
-Commit: `e478cf8b`. Reference: `doc/configure.md:1222`.
+Commit: `e478cf8b`. Reference: `doc/configure.md:1224`.
 
 Each `ConnectionH2` keeps a `Vec<Stream>` of per-stream slots in the
 mux `Context`. Recycled slots accumulate over the connection's lifetime;
