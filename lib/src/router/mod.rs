@@ -531,7 +531,10 @@ impl Router {
     /// are left untouched.
     ///
     /// Called from `lib/src/https.rs::HttpsListener::update_config` when
-    /// an `UpdateHttpsListenerConfig.hsts` patch is applied.
+    /// an `UpdateHttpsListenerConfig.hsts` patch is applied, and from
+    /// `HttpsProxy::add_listener` (`lib/src/https.rs`) when a listener copies the routes of a
+    /// sibling on the same address, so each listener resolves inheritance
+    /// against its own default.
     ///
     /// Two refresh paths:
     ///
@@ -540,7 +543,9 @@ impl Router {
     ///    `Strict-Transport-Security` entry and appending a freshly
     ///    rendered one when `new_hsts` resolves to an enabled value
     ///    (`enabled = Some(true)`). The existing operator
-    ///    `Append`/`Set` response headers stay in place.
+    ///    `Append`/`Set` response headers stay in place. An inheriting
+    ///    frontend added while the listener had no default holds no
+    ///    `Strict-Transport-Security` entry yet and gains one here.
     ///
     /// 2. **`Route::ClusterId(id)` and `Route::Deny`** (lightweight
     ///    "no policy" shapes): when `new_hsts` resolves to enabled,
@@ -1832,10 +1837,13 @@ pub struct Frontend {
     pub headers_response: Rc<[HeaderEdit]>,
     pub required_auth: bool,
     pub tags: Option<Rc<CachedTags>>,
-    /// `true` when the materialised HSTS edit (if any) in
-    /// [`Self::headers_response`] came from the listener-default
-    /// `HttpsListenerConfig.hsts` rather than the per-frontend
-    /// `RequestHttpFrontend.hsts` block. Consulted by
+    /// `true` when the frontend declared no per-frontend
+    /// `RequestHttpFrontend.hsts` block, so the HSTS edit (if any) in
+    /// [`Self::headers_response`] follows the listener-default
+    /// `HttpsListenerConfig.hsts` — including when that default was
+    /// absent at add time, so a default set later, or the default of a
+    /// listener the frontend is copied into, still reaches it
+    /// (sozu-proxy/sozu#1691). Consulted by
     /// [`Router::refresh_inheriting_hsts`] so a
     /// `UpdateHttpsListenerConfig.hsts` patch reflows the new default
     /// onto inheriting frontends without overwriting explicit
@@ -1857,8 +1865,10 @@ pub enum HstsOrigin {
     /// passed `--hsts-*` on the CLI). Listener-default patches do NOT
     /// refresh this entry.
     Explicit,
-    /// `front.hsts` was filled in by `add_https_frontend` from the
-    /// listener-default `HttpsListenerConfig.hsts`. A future
+    /// The frontend declared no `hsts`, and `add_https_frontend` filled
+    /// `front.hsts` in from the listener-default
+    /// `HttpsListenerConfig.hsts` — `None` when the listener has no
+    /// default. A future
     /// `UpdateHttpsListenerConfig.hsts` patch will refresh this entry
     /// via [`Router::refresh_inheriting_hsts`].
     InheritedFromListenerDefault,
@@ -1952,12 +1962,13 @@ impl Frontend {
         // HSTS is read from `front.hsts` directly inside the function;
         // an explicit parameter would be redundant since `front` is
         // already in scope and the field is the single source of truth.
-        // The `hsts_origin` parameter records *where* `front.hsts` came
-        // from so [`Router::refresh_inheriting_hsts`] can reflow listener
-        // defaults without disturbing explicit per-frontend overrides.
+        // The `hsts_origin` parameter records whether the frontend declared
+        // its own `hsts` (whatever the listener default was at add time) so
+        // [`Router::refresh_inheriting_hsts`] can reflow listener defaults
+        // without disturbing explicit per-frontend overrides.
         let hsts = front.hsts.as_ref();
         let inherits_listener_hsts =
-            matches!(hsts_origin, HstsOrigin::InheritedFromListenerDefault) && hsts.is_some();
+            matches!(hsts_origin, HstsOrigin::InheritedFromListenerDefault);
         let cluster_id = front.cluster_id.clone();
         let tags = front
             .tags

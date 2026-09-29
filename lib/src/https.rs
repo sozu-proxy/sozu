@@ -1919,8 +1919,8 @@ impl HttpsListener {
         // operator must signal one or the other on every update.
         //
         // Inheriting frontends are refreshed in place via
-        // `Router::refresh_inheriting_hsts`: every frontend whose HSTS
-        // came from the previous listener default
+        // `Router::refresh_inheriting_hsts`: every frontend that declared no
+        // `hsts` of its own at add time
         // (`Frontend.inherits_listener_hsts == true`) gets its
         // `headers_response` re-materialised against the new value.
         // Explicit per-frontend overrides
@@ -2070,8 +2070,9 @@ impl HttpsProxy {
         {
             let sibling = sibling.borrow();
             https_listener.fronts = sibling.fronts.clone();
-            // Frontends that inherited the sibling's listener-default HSTS
-            // inherit this listener's default instead.
+            // Frontends that declared no `hsts` of their own inherit this
+            // listener's default instead of the sibling's, whether or not the
+            // sibling had one (sozu-proxy/sozu#1691).
             https_listener
                 .fronts
                 .refresh_inheriting_hsts(https_listener.config.hsts.as_ref());
@@ -2474,14 +2475,16 @@ impl HttpsProxy {
             // `enabled = Some(false)` on the frontend is the explicit-disable
             // signal: it stays as-is and suppresses the inherited default.
             //
-            // The `hsts_origin` flag is passed through to the router so the
-            // resulting `Frontend` carries the inheritance bit; a later
-            // `UpdateHttpsListenerConfig.hsts` patch will then refresh this
-            // entry via `Router::refresh_inheriting_hsts` without disturbing
-            // explicit per-frontend overrides.
-            // Each listener on the address resolves the inheritance against its
-            // own default, on its own copy of the frontend.
-            let hsts_origin = if front.hsts.is_none() && listener.config.hsts.is_some() {
+            // The `hsts_origin` flag records the frontend's own intent — it
+            // declared no `hsts` — rather than whether a default existed, so
+            // the resulting `Frontend` carries the inheritance bit even when
+            // the listener has no default yet. A later
+            // `UpdateHttpsListenerConfig.hsts` patch, or the copy into a
+            // listener added on the same address (`HttpsProxy::add_listener`), then
+            // resolves it against that listener's own default via
+            // `Router::refresh_inheriting_hsts` without disturbing explicit
+            // per-frontend overrides (sozu-proxy/sozu#1691).
+            let hsts_origin = if front.hsts.is_none() {
                 front.hsts = listener.config.hsts;
                 crate::router::HstsOrigin::InheritedFromListenerDefault
             } else {
@@ -4085,7 +4088,9 @@ mod tests {
 mod listener_sibling_tests {
     use sozu_command::{
         config::ListenerBuilder,
-        proto::command::{CertificateAndKey, PathRule, RequestHttpFrontend, SocketAddress},
+        proto::command::{
+            CertificateAndKey, HstsConfig, PathRule, RequestHttpFrontend, SocketAddress,
+        },
     };
 
     use super::*;
@@ -4189,5 +4194,145 @@ mod listener_sibling_tests {
             .expect("remove the frontend");
         assert!(!routes(&proxy, 0));
         assert!(!routes(&proxy, 1));
+    }
+    fn hsts(max_age: u32) -> HstsConfig {
+        HstsConfig {
+            enabled: Some(true),
+            max_age: Some(max_age),
+            ..Default::default()
+        }
+    }
+
+    fn add_with_hsts(
+        proxy: &mut HttpsProxy,
+        address: SocketAddress,
+        interface: Option<&str>,
+        token: usize,
+        hsts: Option<HstsConfig>,
+    ) {
+        let mut config = ListenerBuilder::new_https(address)
+            .with_interface(interface)
+            .to_tls(None)
+            .expect("could not build the listener config");
+        config.hsts = hsts;
+        proxy
+            .add_listener(config, Token(token))
+            .expect("could not add the listener");
+    }
+
+    /// A frontend carrying policy (here, tags) so the router stores it as a
+    /// `Route::Frontend` rather than the lightweight `Route::ClusterId`.
+    fn tagged_front(address: SocketAddress) -> RequestHttpFrontend {
+        RequestHttpFrontend {
+            tags: BTreeMap::from([("owner".to_owned(), "team-a".to_owned())]),
+            ..front(address)
+        }
+    }
+
+    /// The `Strict-Transport-Security` value the listener emits for
+    /// `example.com/`, if any.
+    fn served_hsts(proxy: &HttpsProxy, token: usize) -> Option<String> {
+        let route = proxy.listeners[&Token(token)]
+            .borrow()
+            .fronts
+            .lookup("example.com", "/", &Method::Get)
+            .expect("the listener must route example.com");
+        route
+            .headers_response
+            .iter()
+            .find(|edit| edit.key.eq_ignore_ascii_case(b"strict-transport-security"))
+            .map(|edit| String::from_utf8_lossy(&edit.val).into_owned())
+    }
+
+    fn patch_hsts(proxy: &HttpsProxy, token: usize, address: SocketAddress, hsts: HstsConfig) {
+        proxy.listeners[&Token(token)]
+            .borrow_mut()
+            .update_config(&UpdateHttpsListenerConfig {
+                address,
+                hsts: Some(hsts),
+                ..Default::default()
+            })
+            .expect("patch the listener HSTS default");
+    }
+
+    /// A policy-carrying frontend with no `hsts` of its own, added while the
+    /// listener on its address had no HSTS default, is copied into a listener
+    /// added later on that address. Each listener serves its own default: the
+    /// new listener its HSTS header, the first one none (sozu-proxy/sozu#1691).
+    #[test]
+    fn a_copied_frontend_without_hsts_inherits_the_new_listener_default() {
+        let mut proxy = proxy();
+        let address = SocketAddress::new_v4(0, 0, 0, 0, provide_port());
+        add_with_hsts(&mut proxy, address, None, 0, None);
+        proxy
+            .add_https_frontend(tagged_front(address))
+            .expect("add the frontend");
+        add_with_hsts(&mut proxy, address, Some("lo"), 1, Some(hsts(100)));
+
+        assert_eq!(served_hsts(&proxy, 0), None);
+        assert_eq!(
+            served_hsts(&proxy, 1).as_deref(),
+            Some("max-age=100"),
+            "the listener added after the frontend must serve its own HSTS default"
+        );
+
+        // Both copies keep following their own listener's default.
+        patch_hsts(&proxy, 0, address, hsts(200));
+        patch_hsts(&proxy, 1, address, hsts(300));
+        assert_eq!(served_hsts(&proxy, 0).as_deref(), Some("max-age=200"));
+        assert_eq!(served_hsts(&proxy, 1).as_deref(), Some("max-age=300"));
+    }
+
+    /// A frontend with its own `hsts` keeps it on every listener of its
+    /// address, whatever their defaults, at copy time and on later patches.
+    #[test]
+    fn a_frontend_with_explicit_hsts_is_never_overridden_by_a_listener_default() {
+        let mut proxy = proxy();
+        let address = SocketAddress::new_v4(0, 0, 0, 0, provide_port());
+        add_with_hsts(&mut proxy, address, None, 0, Some(hsts(100)));
+        proxy
+            .add_https_frontend(RequestHttpFrontend {
+                hsts: Some(hsts(42)),
+                ..tagged_front(address)
+            })
+            .expect("add the frontend");
+        add_with_hsts(&mut proxy, address, Some("lo"), 1, Some(hsts(300)));
+
+        assert_eq!(served_hsts(&proxy, 0).as_deref(), Some("max-age=42"));
+        assert_eq!(served_hsts(&proxy, 1).as_deref(), Some("max-age=42"));
+
+        patch_hsts(&proxy, 0, address, hsts(500));
+        patch_hsts(&proxy, 1, address, hsts(600));
+        assert_eq!(served_hsts(&proxy, 0).as_deref(), Some("max-age=42"));
+        assert_eq!(served_hsts(&proxy, 1).as_deref(), Some("max-age=42"));
+    }
+
+    /// On a single listener, patching the HSTS default reaches a
+    /// policy-carrying frontend that declared no `hsts` of its own, whether
+    /// the listener had a default when the frontend was added or not.
+    #[test]
+    fn a_listener_hsts_patch_refreshes_every_frontend_without_its_own_hsts() {
+        for initial in [None, Some(hsts(100))] {
+            let mut proxy = proxy();
+            let address = SocketAddress::new_v4(0, 0, 0, 0, provide_port());
+            add_with_hsts(&mut proxy, address, None, 0, initial);
+            proxy
+                .add_https_frontend(tagged_front(address))
+                .expect("add the frontend");
+
+            patch_hsts(&proxy, 0, address, hsts(700));
+            assert_eq!(served_hsts(&proxy, 0).as_deref(), Some("max-age=700"));
+
+            patch_hsts(
+                &proxy,
+                0,
+                address,
+                HstsConfig {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(served_hsts(&proxy, 0), None);
+        }
     }
 }
