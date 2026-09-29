@@ -1507,6 +1507,15 @@ RENAMED_TESTS = {
     # corrected oracle.
     "the_round_robin_cursor_is_connection_global_so_only_the_leading_bucket_rotates":
         "every_urgency_bucket_rotates_its_own_incremental_tail",
+    # sozu#1684 removed `Random::new` and `PowerOfTwo::new`: the OS seed now
+    # enters through `BackendMap::new`, so the two seed-correlation guards
+    # moved to `backends.rs` and assert the property there. The CHANGELOG
+    # cites the old names on purpose, both in the entry that added them and
+    # in the one that moved them.
+    "random_new_instances_are_not_correlated":
+        "random_policies_seeded_by_the_os_are_not_correlated",
+    "power_of_two_new_instances_are_not_correlated":
+        "power_of_two_policies_seeded_by_the_os_are_not_correlated",
 }
 
 # Sentence-shaped identifiers that survive both filters and are not test names.

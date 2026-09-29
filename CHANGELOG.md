@@ -464,6 +464,65 @@
 
 ### 🔄 Changed
 
+- **BREAKING (library API) — `refactor(lib)`: backend selection and backoff take their clock and
+  their randomness from the caller ([#1684](https://github.com/sozu-proxy/sozu/issues/1684)).** The
+  last ambient reads on the selection path are gone: `ExponentialBackoffPolicy` read
+  `Instant::now()` and `.elapsed()` and drew its jitter from `rand::rng()` (`lib/src/retry.rs`),
+  `PeakEWMA` read `Instant::now()` on construction and on every observation (`lib/src/lib.rs`), and
+  `Random::new` / `PowerOfTwo::new` seeded from `SysRng` (`lib/src/load_balancing.rs`). Neither
+  `retry.rs`, `load_balancing.rs` nor the `PeakEWMA` impl reads a clock or an ambient RNG in
+  production code any more, so a simulator can drive selection from its own clock and seed.
+
+  Time is a parameter, as in the UDP core: `RetryPolicy::fail(now, rng)`, `succeed(now)` and
+  `can_try(now)`; `PeakEWMA::new(now)`, `observe(rtt, now)` and `get(active, now)`;
+  `Candidates::new(.., now)` with `Candidates::now()`; `Backend::can_open(now)`, `try_connect(now,
+  rng)`, `set_connection_time(dur, now)` and `peak_ewma_connection(now)`;
+  `BackendList::next_available_backend(now)`, `next_available_backend_with_key(key, now)`,
+  `available_backends(backup, now)` and `find_sticky(.., now)`;
+  `BackendMap::backend_from_cluster_id(.., now)`, `backend_from_cluster_id_with_key(.., key, now)`
+  and `backend_from_sticky_session(.., now)`; `BackendSource::select(.., now)`. The mux passes
+  `Context::now`, its one clock sample per pass, where each call used to read the clock again; the
+  UDP core passes the admission's `now`. `ExponentialBackoffPolicy` records no instant before its
+  first attempt, which changes nothing: its window is zero until then. Randomness comes from one
+  `StdRng` per `BackendMap`: `BackendMap::new` seeds it from the OS once and `BackendMap::with_seed`
+  from a `u64`. It seeds every cluster's policy, through `BackendList::with_seed`,
+  `set_load_balancing_policy(.., seed)` and `import_configuration_state(.., seed)`, and supplies the
+  jitter of every backoff window (`BackendMap::rng`). `Backend::new_at(.., now)` builds a backend at
+  an injected instant; `Backend::new` stays the production default and stamps the wall clock.
+
+  **Removed:** `Random::new`, `impl Default for Random`, `PowerOfTwo::new` and `impl Default for
+  PeakEWMA`; `with_seed` and `PeakEWMA::new(now)` replace them. Two production defaults stay outside
+  those files: `Backend::new`'s construction stamp, and the TCP proxy (`lib/src/tcp.rs`), which is
+  not simulated and selects at `Instant::now()` with jitter from `rand::rng()`.
+
+  No allocation and no dynamic dispatch is added: the clock is a 16-byte `Instant` passed by value,
+  and the RNG is a generic `&mut R: Rng`. Selection in steady state still allocates nothing
+  (`backend_selection_allocates_nothing_in_steady_state`, 3 tiers × 10 policies × 256 selections),
+  the pinned pick sequences are unchanged, and a dial through `Mux::dial_backend` still makes 6
+  allocations. `size_of::<BackendMap>()` goes 152 → 472 bytes for its generator, once per worker;
+  `Backend`, `BackendList`, `PeakEWMA`, `ExponentialBackoffPolicy` and `MuxClear` keep their sizes.
+  A failed backend connection in the mux now borrows the worker's `BackendMap` once, for its jitter.
+
+  New tests, each seen red first: `the_backoff_window_follows_the_injected_clock` and
+  `one_seed_yields_one_sequence_of_backoff_windows` (`retry.rs`),
+  `one_map_seed_yields_one_selection_sequence`,
+  `a_cluster_created_by_adding_a_backend_is_seeded_by_the_map`,
+  `importing_a_state_seeds_its_clusters_in_a_fixed_order` and
+  `the_connection_time_average_decays_on_the_injected_clock` (`backends.rs`). A seeded map seeds
+  every list it creates, including one `BackendMap::add_backend` creates before any policy is set,
+  and `BackendMap::import_configuration_state` hands out seeds in cluster-id order rather than in
+  its `HashMap`'s per-process iteration order. `random_new_instances_are_not_correlated` and
+  `power_of_two_new_instances_are_not_correlated` move to `backends.rs` as
+  `random_policies_seeded_by_the_os_are_not_correlated` and
+  `power_of_two_policies_seeded_by_the_os_are_not_correlated`, since the OS seed now enters through
+  `BackendMap::new`; they also require two clusters of one map to diverge.
+  `power_of_two_tie_break_is_decided_by_the_coin_flip_not_by_sample_position` read the sampled
+  pair's order from wall-clock `PeakEWMA` stamps, which one injected instant per selection makes
+  equal; it now replays the pair from a generator seeded alike, over three backends, and asserts
+  that every pick falls inside the replayed pair, so a change to the sampling fails the test instead
+  of weakening it; the coin-flip assertion is unchanged. Documented in `doc/testing.md` §5 and
+  `lib/src/protocol/mux/LIFECYCLE.md` §9.
+
 - **`docs(mux)`: name the remaining `L7Proxy::backends` caller
   ([#1684](https://github.com/sozu-proxy/sozu/issues/1684)).** Correction to the `BackendDialer`
   entry under 🔄 Changed ([#1340](https://github.com/sozu-proxy/sozu/issues/1340), Q12, second part),

@@ -1613,6 +1613,10 @@ impl SessionMetrics {
 
 /// exponentially weighted moving average with high sensibility to latency bursts
 ///
+/// It reads no clock: construction, [`Self::observe`] and [`Self::get`] each
+/// take the instant they happen at, so the decay a simulator observes is a
+/// function of the instants it supplies (#1684).
+///
 /// cf Finagle for the original implementation: <https://github.com/twitter/finagle/blob/9cc08d15216497bb03a1cafda96b7266cfbbcff1/finagle-core/src/main/scala/com/twitter/finagle/loadbalancer/PeakEwma.scala>
 #[derive(Debug, PartialEq, Clone)]
 pub struct PeakEWMA {
@@ -1629,27 +1633,25 @@ pub struct PeakEWMA {
     pub last_event: Instant,
 }
 
-impl Default for PeakEWMA {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl PeakEWMA {
-    // hardcoded default values for now
-    pub fn new() -> Self {
+    /// A fresh average created at `now`, which the first decay is measured
+    /// from. Hardcoded default values for now.
+    pub fn new(now: Instant) -> Self {
         PeakEWMA {
             // 1s
             decay: 1_000_000_000f64,
             // 50ms
             rtt: 50_000_000f64,
-            last_event: Instant::now(),
+            last_event: now,
         }
     }
 
-    pub fn observe(&mut self, rtt: f64) {
-        let now = Instant::now();
-        let dur = now - self.last_event;
+    /// Fold an observed `rtt` (in nanoseconds) made at `now` into the average.
+    ///
+    /// An instant earlier than the last event decays nothing: the elapsed
+    /// time saturates at zero.
+    pub fn observe(&mut self, rtt: f64, now: Instant) {
+        let dur = now.saturating_duration_since(self.last_event);
 
         // if latency is rising, we will immediately raise the cost
         if rtt > self.rtt {
@@ -1663,10 +1665,12 @@ impl PeakEWMA {
         self.last_event = now;
     }
 
-    pub fn get(&mut self, active_requests: usize) -> f64 {
+    /// The cost of a backend with `active_requests` in flight, as seen at
+    /// `now`.
+    pub fn get(&mut self, active_requests: usize, now: Instant) -> f64 {
         // decay the current value
         // (we might not have seen a request in a long time)
-        self.observe(0.0);
+        self.observe(0.0, now);
 
         (active_requests + 1) as f64 * self.rtt
     }

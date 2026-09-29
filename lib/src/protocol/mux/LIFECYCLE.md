@@ -1968,7 +1968,16 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     `Context::backend_streams` entry owes. The health and latency writes
     (`Backend::failures`, `retry_policy`, `set_connection_time`) are NOT part
     of this balance and stay immediate at their embedder-side call sites,
-    because the load balancer reads `retry_policy`.
+    because the load balancer reads `retry_policy`. The retry policy and the
+    connection-time average read no clock or ambient RNG: they take the
+    pass's `Context::now`, and a failure draws its backoff jitter from the
+    worker's `BackendMap` generator, the one that seeds every load-balancing
+    policy. The connection time itself is still measured as
+    `start.elapsed()`
+    ([#1684](https://github.com/sozu-proxy/sozu/issues/1684)). Selection
+    itself judges backoff windows and connection-time decay against the same
+    `Context::now`, which `RegistryDialer` carries into
+    `BackendMap::backend_from_cluster_id`.
 
     A `BackendId` names a session-scoped slot rather than the backend's id or
     address. A reload that replaces a registry entry mid-session builds a new
