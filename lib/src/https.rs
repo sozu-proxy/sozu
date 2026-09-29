@@ -800,6 +800,10 @@ impl HttpsSession {
             // timeout started when the socket was accepted.
             timeouts: mux::MuxTimeouts::new(handshake.container_frontend_timeout),
             backend_registry: mux::BackendRegistry::default(),
+            // Read once, at the upgrade: the proxy is not borrowed while a
+            // session runs, and `HttpsProxy::backends` is never reassigned,
+            // so this is the map the session would have reached on every dial.
+            backends: Rc::clone(&self.proxy.borrow().backends),
         }))
     }
 
@@ -2935,10 +2939,6 @@ impl L7Proxy for HttpsProxy {
         // source-IP) accounting before the slab slot is reused.
         sessions.untrack_all_cluster_ip(token);
         sessions.slab.try_remove(token.0).is_some()
-    }
-
-    fn backends(&self) -> Rc<RefCell<BackendMap>> {
-        self.backends.clone()
     }
 
     fn clusters(&self) -> &HashMap<ClusterId, Cluster> {

@@ -364,7 +364,7 @@ use sozu_command::{
 };
 use tls::CertificateResolverError;
 
-use crate::{backends::BackendMap, metrics::names, router::RouteResult};
+use crate::{metrics::names, router::RouteResult};
 
 /// Anything that can be registered in mio (subscribe to kernel events)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1012,8 +1012,6 @@ pub trait L7Proxy {
     /// Remove the session from the session manager slab.
     /// Returns true if the session was actually there before deletion
     fn remove_session(&self, token: Token) -> bool;
-
-    fn backends(&self) -> Rc<RefCell<BackendMap>>;
 
     fn clusters(&self) -> &HashMap<ClusterId, Cluster>;
 

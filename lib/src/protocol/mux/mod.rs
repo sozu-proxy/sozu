@@ -1550,6 +1550,14 @@ pub struct Mux<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> {
     /// still resolve when the drain reaches it, and an index that moved would
     /// silently mis-charge it.
     pub(crate) backend_registry: BackendRegistry,
+    /// The worker's backend set, which `Mux::dial_backend` lends to
+    /// `Router::backend_from_request` through a `RegistryDialer`.
+    ///
+    /// Handed over when the session is built rather than read through
+    /// `L7Proxy` on every dial: `HttpProxy` and `HttpsProxy` never reassign
+    /// their `backends` field, so this is the same map, and a dial no longer
+    /// borrows the proxy or clones the handle to reach it.
+    pub(crate) backends: Rc<RefCell<BackendMap>>,
     /// Per-session correlation ID generated at construction time. Included in
     /// every log line emitted from this module so all events for a single
     /// frontend connection can be reassembled (independent of the ephemeral
@@ -2307,6 +2315,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     fn dial_backend(
         router: &mut Router,
         backend_registry: &mut BackendRegistry,
+        backends: &RefCell<BackendMap>,
         stream_id: GlobalStreamId,
         context: &mut Context<L>,
         session: &Rc<RefCell<dyn ProxySession>>,
@@ -2322,7 +2331,6 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         // borrows the map, and the `RefMut` drops before `add_session` and
         // `register_socket` borrow the proxy below.
         let (socket, backend) = {
-            let backends = proxy.borrow().backends();
             let mut backends = backends.borrow_mut();
             let mut dialer = RegistryDialer {
                 backends: &mut backends,
@@ -3061,6 +3069,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         } => Self::dial_backend(
                             &mut self.router,
                             &mut self.backend_registry,
+                            &self.backends,
                             stream_id,
                             context,
                             &session,
@@ -4116,6 +4125,7 @@ mod tests {
             session_ulid: Ulid::generate(),
             timeouts: MuxTimeouts::new(TimeoutContainer::new_empty(Duration::from_secs(30))),
             backend_registry: BackendRegistry::default(),
+            backends: Rc::default(),
         };
         assert!(
             !mux.frontend.has_pending_write(),
@@ -4199,6 +4209,7 @@ mod tests {
             session_ulid: Ulid::generate(),
             timeouts: MuxTimeouts::new(TimeoutContainer::new_empty(Duration::from_secs(30))),
             backend_registry: BackendRegistry::default(),
+            backends: Rc::default(),
         };
 
         assert!(
@@ -4265,6 +4276,7 @@ mod tests {
             session_ulid: Ulid::generate(),
             timeouts: MuxTimeouts::new(TimeoutContainer::new_empty(Duration::from_secs(30))),
             backend_registry: BackendRegistry::default(),
+            backends: Rc::default(),
         };
         assert!(
             !mux.frontend.graceful_shutdown_deadline_elapsed(),
@@ -4455,6 +4467,7 @@ mod tests {
             session_ulid: Ulid::generate(),
             timeouts: MuxTimeouts::new(TimeoutContainer::new_empty(frontend_timeout)),
             backend_registry: BackendRegistry::default(),
+            backends: Rc::default(),
         };
         (mux, peer)
     }
@@ -5210,6 +5223,7 @@ mod tests {
             session_ulid: Ulid::generate(),
             timeouts: MuxTimeouts::new(TimeoutContainer::new_empty(Duration::from_secs(30))),
             backend_registry: BackendRegistry::default(),
+            backends: Rc::default(),
         };
 
         let mut metrics = SessionMetrics::new(None);
@@ -5251,9 +5265,6 @@ mod tests {
             unreachable!("Mux::close without a backend never asks the proxy")
         }
         fn remove_session(&self, _token: Token) -> bool {
-            unreachable!("Mux::close without a backend never asks the proxy")
-        }
-        fn backends(&self) -> Rc<RefCell<crate::backends::BackendMap>> {
             unreachable!("Mux::close without a backend never asks the proxy")
         }
         fn clusters(
@@ -5865,6 +5876,7 @@ mod tests {
             session_ulid,
             timeouts: MuxTimeouts::new(TimeoutContainer::new_empty(Duration::from_secs(60))),
             backend_registry: BackendRegistry::default(),
+            backends: Rc::default(),
         }
     }
 
@@ -6162,9 +6174,6 @@ mod tests {
         }
         fn remove_session(&self, _token: Token) -> bool {
             true
-        }
-        fn backends(&self) -> Rc<RefCell<crate::backends::BackendMap>> {
-            unreachable!("closing a backend only removes its session")
         }
         fn clusters(
             &self,

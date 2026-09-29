@@ -19291,6 +19291,7 @@ mod tests {
                 crate::timer::TimeoutContainer::new_empty(Duration::from_secs(30)),
             ),
             backend_registry: crate::protocol::mux::BackendRegistry::default(),
+            backends: Rc::default(),
         };
         let mut metrics = SessionMetrics::new(None);
 

@@ -2568,6 +2568,9 @@ mod backend_selection_order_tests {
     /// rebuilds from scratch.
     struct RoutingFixture {
         proxy: Rc<RefCell<dyn L7Proxy>>,
+        /// The map `proxy` was built over, which a `Mux` receives at
+        /// construction.
+        backends: Rc<RefCell<crate::backends::BackendMap>>,
         listener: Rc<RefCell<HttpListener>>,
         pool: Rc<RefCell<Pool>>,
     }
@@ -2581,6 +2584,7 @@ mod backend_selection_order_tests {
         let parts =
             crate::testing::prebuild_server(32, 65_536, false).expect("test server must build");
         let pool = parts.pool.clone();
+        let backends = Rc::clone(&parts.backends);
         let mut proxy = HttpProxy::new(parts.registry, parts.sessions, parts.pool, parts.backends);
         let listener_token = Token(0);
         proxy
@@ -2613,6 +2617,7 @@ mod backend_selection_order_tests {
             .expect("the registered listener must be reachable");
         RoutingFixture {
             proxy: Rc::new(RefCell::new(proxy)),
+            backends,
             listener,
             pool,
         }
@@ -3682,7 +3687,7 @@ mod backend_selection_order_tests {
         let fixture = routing_fixture();
         let upstream =
             std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener must bind");
-        fixture.proxy.borrow().backends().borrow_mut().add_backend(
+        fixture.backends.borrow_mut().add_backend(
             H1_CLUSTER,
             Backend::new(
                 "dial-backend",
@@ -3740,6 +3745,7 @@ mod backend_selection_order_tests {
         Mux::<mio::net::TcpStream, HttpListener>::dial_backend(
             &mut router,
             &mut backend_registry,
+            &fixture.backends,
             stream_id,
             &mut context,
             &session,
