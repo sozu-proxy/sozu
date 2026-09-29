@@ -121,6 +121,41 @@ mutable companion to the Kawa parser. Its `kawa::h1::ParserCallbacks` impl
   itself: `HttpContext` also serves H2 frontends, where that flag sends a
   GOAWAY (`ConnectionH2::write_streams`, `lib/src/protocol/mux/h2.rs`).
 
+  The status line carries Sōzu's own version, not the backend's (RFC 9110
+  §6.2, sozu-proxy/sozu#16). kawa's H1 converter writes `HTTP/1.1` for
+  `Version::V11` and `Version::V20` but `HTTP/1.0` for `Version::V10`, so
+  `on_response_headers` rewrites an HTTP/1.0 response to `Version::V11`; the
+  H2 converter ignores the version. HTTP/1.1 is persistent by default where
+  HTTP/1.0 is not (RFC 9112 §9.3), so the same branch clears
+  `keep_alive_backend` for an HTTP/1.0 response that lacks a `keep-alive`
+  connection option, has a close-delimited body, or carries
+  `Transfer-Encoding` (faulty framing in HTTP/1.0, RFC 9112 §6.1). It then
+  merges the response's `Connection` options into one line ending in
+  `close` (RFC 9112 §9.6): every option that nominates a hop-by-hop field
+  survives (RFC 9110 §7.6.1), and only the `keep-alive` the close
+  contradicts is dropped. That flag then does what a backend
+  `Connection: close` does above: the backend EOF ends a close-delimited
+  body, and the H1 client connection closes after the response, so a
+  backend that answers HTTP/1.0 without `keep-alive` costs its H1 clients a
+  new connection per response. The H2 converter drops the merged line with
+  every connection-specific one, and the H2 connection stays open. A 1xx is
+  left alone apart from its version: its persistence belongs to the final
+  response, which runs the callback again, and a 101 keeps its
+  `Connection: Upgrade`. A persistent HTTP/1.0 response
+  (`Connection: keep-alive` with a length) keeps both connections and its
+  header. The `close` option is matched as a list token, for every version,
+  so `Connection: keep-alive, close` closes the backend too. Covered by
+  `an_http10_keep_alive_response_is_forwarded_as_http11`,
+  `an_http10_response_without_keep_alive_is_forwarded_as_http11_with_close`,
+  `a_close_option_in_a_connection_list_closes_the_backend`,
+  `a_non_persistent_http10_response_keeps_its_connection_options`,
+  `a_chunked_http10_response_closes_the_backend`,
+  `an_http10_101_keeps_its_connection_upgrade`,
+  `an_http10_100_leaves_persistence_to_the_final_response` (unit, in
+  `editor.rs`), the `test_h1_http10_*` rows of
+  `e2e/src/tests/mux_tests.rs` and the `test_h2_http10_*` rows of
+  `e2e/src/tests/h2_correctness_tests.rs`.
+
 `HttpContext::extract_route` (`editor.rs`) hands the mux router the
 authority, path and method it needs, and `HttpContext::log_context`
 (`editor.rs`) is the canonical helper for producing the
@@ -365,9 +400,10 @@ still end the stream.
   phase still the initial one, then frames a request whose DATA follows as
   chunked — unless the callback terminated it. `Empty` alone would drop those
   bodies (`an_h2_request_is_left_for_pkawa_to_frame`).
-- **Responses are untouched.** `on_response_headers` never runs this rule, so
-  a response without length stays close-delimited, ended by
-  `ConnectionH1::terminate_close_delimited`.
+- **Responses keep their framing.** `on_response_headers` never runs this
+  rule, so a response without length stays close-delimited, ended by
+  `ConnectionH1::terminate_close_delimited`. Only an HTTP/1.0 response has
+  its version and `Connection` header edited (§2), never its length.
 - **Interactions.** `Expect: 100-continue` with no length has no body to wait
   for. A WebSocket `GET` with `Upgrade` has no body either; the 101 still
   switches to the pipe. Bytes a client sends behind the upgrade request

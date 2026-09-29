@@ -3043,6 +3043,69 @@ fn test_h1_close_delimited_body_read_with_the_eof_closes_client() {
     );
 }
 
+/// An HTTP/1.0 backend behind an HTTP/1.1 client (sozu-proxy/sozu#16).
+///
+/// Sōzu answers in its own version (RFC 9110 §6.2), so the status line reads
+/// `HTTP/1.1`. An HTTP/1.0 response without `Connection: keep-alive` is not
+/// persistent (RFC 9112 §9.3), which HTTP/1.1 no longer implies: the response
+/// carries `Connection: close` and the client connection closes after the
+/// body. Before the fix the backend's `HTTP/1.0` reached the client verbatim,
+/// and the close-delimited body never ended: the backend connection was
+/// taken for persistent, so its EOF was not the end of the body.
+#[test]
+fn test_h1_http10_close_delimited_response_is_forwarded_as_http11() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H1: an HTTP/1.0 close-delimited response reaches an HTTP/1.1 client \
+             as HTTP/1.1 with Connection: close, then the connection closes",
+            || try_h1_backend_connection_close_closes_client(
+                "H1-HTTP10-CLOSE-DELIM",
+                "HTTP/1.0 200 OK\r\n\r\nabcd",
+                true,
+                "abcd",
+            ),
+        ),
+        State::Success,
+    );
+}
+
+#[test]
+fn test_h1_http10_close_delimited_response_read_with_the_eof_is_forwarded_as_http11() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H1: an HTTP/1.0 close-delimited response read together with the \
+             backend EOF reaches the client as HTTP/1.1 with Connection: close",
+            || try_h1_backend_connection_close_closes_client(
+                "H1-HTTP10-CLOSE-DELIM-EOF",
+                "HTTP/1.0 200 OK\r\n\r\nabcd",
+                false,
+                "abcd",
+            ),
+        ),
+        State::Success,
+    );
+}
+
+#[test]
+fn test_h1_http10_content_length_response_is_forwarded_as_http11() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H1: a non-persistent HTTP/1.0 Content-Length response reaches the \
+             client as HTTP/1.1 with Connection: close, then the connection closes",
+            || try_h1_backend_connection_close_closes_client(
+                "H1-HTTP10-CL",
+                "HTTP/1.0 200 OK\r\nContent-Length: 10\r\n\r\n0123456789",
+                true,
+                "0123456789",
+            ),
+        ),
+        State::Success,
+    );
+}
+
 /// Two pipelined requests, the first answered with a close-delimited body: the
 /// second response must never follow that body (sozu-proxy/sozu#1642).
 ///

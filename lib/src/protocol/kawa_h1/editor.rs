@@ -99,6 +99,14 @@ fn build_traceparent(trace_id: &[u8; 32], parent_id: &[u8; 16]) -> [u8; 55] {
     buf
 }
 
+/// Whether a `Connection` field value lists `option` (RFC 9110 §7.6.1): a
+/// comma-separated list of case-insensitive tokens with optional whitespace.
+fn has_connection_option(value: &[u8], option: &[u8]) -> bool {
+    value
+        .split(|byte| *byte == b',')
+        .any(|listed| compare_no_case(listed.trim_ascii(), option))
+}
+
 /// `true` when `bytes` contains no CR or LF — the anti-injection
 /// invariant for any header value Sōzu serialises onto the wire. A value
 /// carrying a raw CR/LF could split one header into two (request/response
@@ -370,7 +378,8 @@ fn extended_chain(client: &[u8], hop: &[u8]) -> kawa::Store {
 #[derive(Debug)]
 pub struct HttpContext {
     // ========== Write only
-    /// set to false if Kawa finds a "Connection" header with a "close" value in the response
+    /// set to false if Kawa finds a "Connection" header with a "close" value in the response,
+    /// or if the response is a non-persistent HTTP/1.0 one (RFC 9112 §9.3)
     pub keep_alive_backend: bool,
     /// set to false if Kawa finds a "Connection" header with a "close" value in the request
     pub keep_alive_frontend: bool,
@@ -1388,6 +1397,7 @@ impl HttpContext {
     /// Callback for response:
     ///
     /// - edit headers (connection, set-cookie, sozu-id)
+    /// - forward an HTTP/1.0 response as HTTP/1.1 (RFC 9110 §6.2)
     /// - save information:
     ///   - status code
     ///   - reason
@@ -1451,9 +1461,22 @@ impl HttpContext {
             response.parsing_phase = kawa::ParsingPhase::Terminated;
         }
 
+        let (is_http10, is_interim) = match &response.detached.status_line {
+            kawa::StatusLine::Response { version, code, .. } => (
+                matches!(version, kawa::Version::V10),
+                (100..200).contains(code),
+            ),
+            _ => (false, false),
+        };
+
         // If found:
         // - set Connection to "close" if closing is set
-        // - set keep_alive_backend to false if Connection is "close"
+        // - set keep_alive_backend to false if Connection lists "close"
+        // - note a "close" and a "keep-alive" option, and Transfer-Encoding
+        //   (HTTP/1.0)
+        let mut announces_close = false;
+        let mut asks_keep_alive = false;
+        let mut has_transfer_encoding = false;
         for block in &mut response.blocks {
             match block {
                 kawa::Block::Header(header) if !header.is_elided() => {
@@ -1461,14 +1484,105 @@ impl HttpContext {
                     if compare_no_case(key, b"connection") {
                         if self.closing {
                             header.val = kawa::Store::Static(b"close");
+                            announces_close = true;
                         } else {
                             let val = header.val.data(buf);
-                            self.keep_alive_backend &= !compare_no_case(val, b"close");
+                            let is_close = has_connection_option(val, b"close");
+                            announces_close |= is_close;
+                            self.keep_alive_backend &= !is_close;
+                            asks_keep_alive |= has_connection_option(val, b"keep-alive");
                         }
+                    } else if compare_no_case(key, b"transfer-encoding") {
+                        has_transfer_encoding = true;
                     }
                 }
                 _ => {}
             }
+        }
+
+        // RFC 9110 §6.2: Sōzu answers in its own version, HTTP/1.1, whatever
+        // the backend spoke. kawa serialises `Version::V10` as `HTTP/1.0` for
+        // an H1 client (the H2 converter ignores the version), so only an
+        // HTTP/1.0 response needs rewriting.
+        //
+        // HTTP/1.0 is not persistent unless the response asks to be with a
+        // `keep-alive` connection option (RFC 9112 §9.3); a close-delimited
+        // body (RFC 9112 §6.3 rule 8) ends with the close whatever it asked,
+        // and `Transfer-Encoding` in an HTTP/1.0 message is faulty framing
+        // that closes the connection after it (RFC 9112 §6.1). Forwarded as
+        // HTTP/1.1 the client would read it as persistent, so a
+        // non-persistent one clears `keep_alive_backend`, which lets the
+        // backend EOF end a close-delimited body
+        // (`ConnectionH1::terminate_close_delimited`,
+        // `lib/src/protocol/mux/h1.rs`) and closes an H1 client connection
+        // after the response (`ConnectionH1::writable`), and announces that
+        // close (RFC 9112 §9.6): its `Connection` options are merged into one
+        // line ending in `close`, keeping every field they nominate
+        // hop-by-hop (RFC 9110 §7.6.1) and dropping only the `keep-alive`
+        // the close contradicts. The H2 converter drops that line with every
+        // connection-specific header.
+        //
+        // An interim 1xx says nothing about the connection: its persistence
+        // belongs to the final response, which runs this callback again, and
+        // a 101 must keep its `Connection: Upgrade` (RFC 9110 §7.8).
+        if is_http10 {
+            if !is_interim {
+                let close_delimited = response.parsing_phase == kawa::ParsingPhase::Body
+                    && response.body_size == kawa::BodySize::Empty;
+                if !asks_keep_alive || close_delimited || has_transfer_encoding {
+                    self.keep_alive_backend = false;
+                }
+                if !self.keep_alive_backend || self.closing {
+                    let mut options = Vec::with_capacity(32);
+                    for block in &mut response.blocks {
+                        if let kawa::Block::Header(header) = block
+                            && !header.is_elided()
+                            && compare_no_case(header.key.data(buf), b"connection")
+                        {
+                            for option in header.val.data(buf).split(|byte| *byte == b',') {
+                                let option = option.trim_ascii();
+                                if !option.is_empty()
+                                    && !compare_no_case(option, b"keep-alive")
+                                    && !compare_no_case(option, b"close")
+                                {
+                                    options.extend_from_slice(option);
+                                    options.extend_from_slice(b", ");
+                                }
+                            }
+                            header.elide();
+                        }
+                    }
+                    options.extend_from_slice(b"close");
+                    debug_assert!(
+                        is_crlf_free(&options),
+                        "the merged Connection options must be CR/LF-free (anti-injection)"
+                    );
+                    response.push_block(kawa::Block::Header(kawa::Pair {
+                        key: kawa::Store::Static(b"Connection"),
+                        val: kawa::Store::from_vec(options),
+                    }));
+                    announces_close = true;
+                }
+            }
+            if let kawa::StatusLine::Response { version, .. } = &mut response.detached.status_line {
+                *version = kawa::Version::V11;
+            }
+            // Post: the backend's version never reaches the client, and a
+            // response the backend will not keep announces the close.
+            debug_assert!(
+                matches!(
+                    response.detached.status_line,
+                    kawa::StatusLine::Response {
+                        version: kawa::Version::V11,
+                        ..
+                    }
+                ),
+                "an HTTP/1.0 response must be forwarded as HTTP/1.1"
+            );
+            debug_assert!(
+                self.keep_alive_backend || announces_close,
+                "a non-persistent HTTP/1.0 response must carry Connection: close"
+            );
         }
 
         // If the sticky_session is set and differs from the one found in the request
@@ -3289,5 +3403,306 @@ mod tests {
 
         assert!(!kawa.is_terminated(), "an H2 request body may still follow");
         assert_eq!(kawa.parsing_phase, phase_before);
+    }
+
+    /// A backend response parsed by kawa's H1 parser on a context the test
+    /// keeps, so it can read what `on_response_headers` recorded.
+    fn parse_response(
+        pool: &mut crate::pool::Pool,
+        bytes: &[u8],
+    ) -> (GenericHttpStream, HttpContext) {
+        let mut ctx = make_context();
+        let mut kawa: GenericHttpStream = kawa::Kawa::new(
+            kawa::Kind::Response,
+            kawa::Buffer::new(
+                pool.checkout()
+                    .expect("the test pool must hand out a buffer"),
+            ),
+        );
+        kawa.storage.space()[..bytes.len()].copy_from_slice(bytes);
+        kawa.storage.fill(bytes.len());
+        kawa::h1::parse(&mut kawa, &mut ctx);
+        assert!(!kawa.is_error(), "premise: the response must parse");
+        (kawa, ctx)
+    }
+
+    /// RFC 9110 §6.2: Sōzu answers its client in its own HTTP version, not
+    /// the backend's. An HTTP/1.0 response that asked to persist
+    /// (`Connection: keep-alive`, RFC 9112 §9.3) with a `Content-Length` is
+    /// forwarded as HTTP/1.1 and keeps both connections.
+    ///
+    /// TO SEE THIS RED, delete the `Version::V10` branch of
+    /// `HttpContext::on_response_headers`: the status line keeps `HTTP/1.0`.
+    #[test]
+    fn an_http10_keep_alive_response_is_forwarded_as_http11() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let (mut kawa, ctx) = parse_response(
+            &mut pool,
+            b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\nhello",
+        );
+        assert!(kawa.is_terminated(), "premise: the whole body was parsed");
+        assert!(
+            ctx.keep_alive_backend,
+            "a keep-alive HTTP/1.0 response keeps the backend connection"
+        );
+        let wire = serialized_request(&mut kawa);
+        assert!(
+            wire.starts_with("HTTP/1.1 200 OK\r\n"),
+            "the status line carries Sōzu's version, got {wire:?}"
+        );
+        assert!(
+            !wire.contains("HTTP/1.0"),
+            "the backend's version must not reach the client, got {wire:?}"
+        );
+        assert!(
+            !wire.to_ascii_lowercase().contains("connection: close"),
+            "a persistent response must not announce a close, got {wire:?}"
+        );
+        assert!(
+            wire.ends_with("\r\n\r\nhello"),
+            "the body follows, got {wire:?}"
+        );
+    }
+
+    /// An HTTP/1.0 response without `Connection: keep-alive` is not
+    /// persistent (RFC 9112 §9.3): the backend closes after it. Forwarded as
+    /// HTTP/1.1, the client would take it for persistent, so the response
+    /// carries `Connection: close` (RFC 9112 §9.6) and `keep_alive_backend`
+    /// is cleared, which closes the client connection after the response
+    /// (`ConnectionH1::writable`) and lets the backend EOF end a
+    /// close-delimited body (`ConnectionH1::terminate_close_delimited`).
+    ///
+    /// TO SEE THIS RED, delete the `Version::V10` branch of
+    /// `HttpContext::on_response_headers`: the status line keeps `HTTP/1.0`
+    /// and `keep_alive_backend` stays set.
+    #[test]
+    fn an_http10_response_without_keep_alive_is_forwarded_as_http11_with_close() {
+        let cases: [(&str, &[u8], &str); 3] = [
+            ("close-delimited", b"HTTP/1.0 200 OK\r\n\r\nabcd", "abcd"),
+            (
+                "content-length",
+                b"HTTP/1.0 200 OK\r\nContent-Length: 4\r\n\r\nabcd",
+                "abcd",
+            ),
+            (
+                // A close-delimited body ends only with the close (RFC 9112
+                // §6.3 rule 8), whatever the backend claimed.
+                "keep-alive but close-delimited",
+                b"HTTP/1.0 200 OK\r\nConnection: keep-alive\r\n\r\nabcd",
+                "abcd",
+            ),
+        ];
+        for (label, bytes, body) in cases {
+            let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+            let (mut kawa, ctx) = parse_response(&mut pool, bytes);
+            assert!(
+                !ctx.keep_alive_backend,
+                "{label}: a non-persistent HTTP/1.0 response closes the backend"
+            );
+            let wire = serialized_request(&mut kawa);
+            assert!(
+                wire.starts_with("HTTP/1.1 200 OK\r\n"),
+                "{label}: the status line carries Sōzu's version, got {wire:?}"
+            );
+            let (head, forwarded_body) = wire
+                .split_once("\r\n\r\n")
+                .expect("the response head ends with an empty line");
+            let connection: Vec<&str> = head
+                .split("\r\n")
+                .filter(|line| line.to_ascii_lowercase().starts_with("connection:"))
+                .collect();
+            assert_eq!(
+                connection,
+                ["Connection: close"],
+                "{label}: exactly one Connection: close announces the close, got {wire:?}"
+            );
+            assert_eq!(forwarded_body, body, "{label}: the body is forwarded");
+        }
+    }
+
+    /// The `Connection` lines of a serialised response head.
+    fn connection_lines(wire: &str) -> Vec<&str> {
+        let (head, _) = wire
+            .split_once("\r\n\r\n")
+            .expect("the response head ends with an empty line");
+        head.split("\r\n")
+            .filter(|line| line.to_ascii_lowercase().starts_with("connection:"))
+            .collect()
+    }
+
+    /// `close` is a connection option like any other (RFC 9110 §7.6.1): a
+    /// list that carries it closes the backend connection, whatever else it
+    /// lists and in whichever `Connection` line, for HTTP/1.1 as for HTTP/1.0.
+    ///
+    /// TO SEE THIS RED, compare the whole `Connection` value with `close` in
+    /// `HttpContext::on_response_headers` instead of each of its options.
+    #[test]
+    fn a_close_option_in_a_connection_list_closes_the_backend() {
+        let cases: [(&str, &[u8]); 3] = [
+            (
+                "HTTP/1.0 list",
+                b"HTTP/1.0 200 OK\r\nContent-Length: 4\r\nConnection: keep-alive, close\r\n\r\nabcd",
+            ),
+            (
+                "HTTP/1.1 list",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: keep-alive, Close \r\n\r\nabcd",
+            ),
+            (
+                "HTTP/1.1 second line",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: x-custom\r\nConnection: close\r\n\r\nabcd",
+            ),
+        ];
+        for (label, bytes) in cases {
+            let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+            let (mut kawa, ctx) = parse_response(&mut pool, bytes);
+            assert!(
+                !ctx.keep_alive_backend,
+                "{label}: a close option closes the backend"
+            );
+            let wire = serialized_request(&mut kawa);
+            assert!(
+                connection_lines(&wire)
+                    .iter()
+                    .any(|line| line.to_ascii_lowercase().contains("close")),
+                "{label}: the close is still announced, got {wire:?}"
+            );
+        }
+    }
+
+    /// Removing a `Connection` header would turn the fields it nominates as
+    /// hop-by-hop into end-to-end ones (RFC 9110 §7.6.1). A non-persistent
+    /// HTTP/1.0 response keeps its other options and gains `close`; only
+    /// `keep-alive`, which the close contradicts, is dropped.
+    ///
+    /// TO SEE THIS RED, elide the backend's `Connection` headers and push a
+    /// bare `Connection: close` instead of extending the option list.
+    #[test]
+    fn a_non_persistent_http10_response_keeps_its_connection_options() {
+        let cases: [(&str, &[u8], &str); 3] = [
+            (
+                "nominated field",
+                b"HTTP/1.0 200 OK\r\nConnection: x-custom\r\nX-Custom: 1\r\n\r\nabcd",
+                "Connection: x-custom, close",
+            ),
+            (
+                "keep-alive dropped",
+                b"HTTP/1.0 200 OK\r\nConnection: keep-alive, x-custom\r\n\r\nabcd",
+                "Connection: x-custom, close",
+            ),
+            (
+                "two lines merged",
+                b"HTTP/1.0 200 OK\r\nConnection: x-one\r\nConnection: x-two\r\n\r\nabcd",
+                "Connection: x-one, x-two, close",
+            ),
+        ];
+        for (label, bytes, want) in cases {
+            let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+            let (mut kawa, ctx) = parse_response(&mut pool, bytes);
+            assert!(!ctx.keep_alive_backend, "{label}: premise, not persistent");
+            let wire = serialized_request(&mut kawa);
+            assert_eq!(
+                connection_lines(&wire),
+                [want],
+                "{label}: the options survive beside close, got {wire:?}"
+            );
+        }
+    }
+
+    /// RFC 9112 §6.1: an HTTP/1.0 message with `Transfer-Encoding` has
+    /// faulty framing and its connection closes after it, `keep-alive` or
+    /// not.
+    ///
+    /// TO SEE THIS RED, drop the `Transfer-Encoding` clause from the HTTP/1.0
+    /// persistence test of `HttpContext::on_response_headers`.
+    #[test]
+    fn a_chunked_http10_response_closes_the_backend() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let (mut kawa, ctx) = parse_response(
+            &mut pool,
+            b"HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n4\r\nabcd\r\n0\r\n\r\n",
+        );
+        assert!(kawa.is_terminated(), "premise: the chunked body ended");
+        assert!(
+            !ctx.keep_alive_backend,
+            "a chunked HTTP/1.0 response closes the backend"
+        );
+        let wire = serialized_request(&mut kawa);
+        assert_eq!(
+            connection_lines(&wire),
+            ["Connection: close"],
+            "got {wire:?}"
+        );
+    }
+
+    /// An interim response says nothing about the connection: a 101 from an
+    /// HTTP/1.0 backend keeps its `Connection: Upgrade`, without which the
+    /// client does not switch protocols (RFC 9110 §7.8).
+    ///
+    /// TO SEE THIS RED, apply the HTTP/1.0 persistence rewrite of
+    /// `HttpContext::on_response_headers` to 1xx responses too.
+    #[test]
+    fn an_http10_101_keeps_its_connection_upgrade() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let (mut kawa, ctx) = parse_response(
+            &mut pool,
+            b"HTTP/1.0 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        );
+        assert!(
+            ctx.keep_alive_backend,
+            "a 101 leaves keep_alive_backend alone"
+        );
+        let wire = serialized_request(&mut kawa);
+        assert!(
+            wire.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+            "got {wire:?}"
+        );
+        assert_eq!(
+            connection_lines(&wire),
+            ["Connection: Upgrade"],
+            "the upgrade must survive, got {wire:?}"
+        );
+    }
+
+    /// A 100 from an HTTP/1.0 backend leaves the persistence of the final
+    /// response to that response: the backend context outlives the interim
+    /// response, so a 100 that cleared `keep_alive_backend` would close a
+    /// persistent final response.
+    ///
+    /// TO SEE THIS RED, apply the HTTP/1.0 persistence rewrite of
+    /// `HttpContext::on_response_headers` to 1xx responses too.
+    #[test]
+    fn an_http10_100_leaves_persistence_to_the_final_response() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 2, 4096);
+        let mut ctx = make_context();
+        for (bytes, label) in [
+            (&b"HTTP/1.0 100 Continue\r\n\r\n"[..], "100"),
+            (
+                &b"HTTP/1.0 200 OK\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\nabcd"[..],
+                "final",
+            ),
+        ] {
+            let mut kawa: GenericHttpStream = kawa::Kawa::new(
+                kawa::Kind::Response,
+                kawa::Buffer::new(
+                    pool.checkout()
+                        .expect("the test pool must hand out a buffer"),
+                ),
+            );
+            kawa.storage.space()[..bytes.len()].copy_from_slice(bytes);
+            kawa.storage.fill(bytes.len());
+            kawa::h1::parse(&mut kawa, &mut ctx);
+            assert!(kawa.is_terminated(), "{label}: premise, parsed whole");
+            assert!(
+                ctx.keep_alive_backend,
+                "{label}: a 100 then a keep-alive response keep the backend"
+            );
+            let wire = serialized_request(&mut kawa);
+            assert!(
+                connection_lines(&wire)
+                    .iter()
+                    .all(|line| !line.to_ascii_lowercase().contains("close")),
+                "{label}: no close is announced, got {wire:?}"
+            );
+        }
     }
 }
