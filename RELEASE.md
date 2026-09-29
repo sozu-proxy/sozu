@@ -11,7 +11,7 @@ In cases of changes to:
 - the configuration file format: update `bin/config.toml`, `doc/configure.md`, and `doc/how_to_use.md`
 - the configuration state: update `lib/src/lib.rs` documentation, and examples in `lib/examples`
 - the command messages: update `command/README.md` and `lib/src/lib.rs`
-- the user-visible behaviour: add an entry under `## [Unreleased]` in `CHANGELOG.md`
+- the user-visible behaviour: add an entry under `## [Unreleased]` in `CHANGELOG.md`. `.gitattributes` merges that file with Git's `union` driver, so a local merge or rebase keeps both sides' entries without a conflict (GitHub's mergeability check ignores it); write each entry as one self-contained bullet block, and check the blank line between adjacent entries after such a merge
 
 ### Testing
 
