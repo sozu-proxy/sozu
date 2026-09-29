@@ -386,6 +386,7 @@ capture holds is owned by the request:
 | `get_strict_sni_binding`          | `HttpContext::strict_sni_binding` | `Router::route_from_request` (`router.rs`) |
 | `get_elide_x_real_ip`             | `HttpContext::elide_x_real_ip` | `HttpContext::on_request_headers` (`editor.rs`), `pkawa::handle_trailer` |
 | `get_send_x_real_ip`              | `HttpContext::send_x_real_ip` | idem |
+| `get_forwarded_headers`           | `HttpContext::forwarded_headers` | `HttpContext::on_request_headers` (`editor.rs`), `apply_request_rewrites_and_headers` (`router.rs`) |
 | `get_answers`                     | `Stream::answers` (`stream.rs`) | every `set_default_answer` / `forcefully_terminate_answer` site |
 
 `Stream::answers` is a handle, not a copy — `Template` owns a `kawa::Kawa` and

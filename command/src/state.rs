@@ -21,14 +21,14 @@ use crate::{
     proto::{
         command::{
             ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
-            ClusterInformation, CustomHttpAnswers, DeactivateListener, FrontendFilters,
-            HealthChecksList, HttpListenerConfig, HttpsListenerConfig, InitialState,
-            ListedFrontends, ListenerType, ListenersList, PathRule, QueryCertificatesFilters,
-            RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate, Request,
-            RequestCounts, RequestHttpFrontend, RequestTcpFrontend, RequestUdpFrontend,
-            SetHealthCheck, SocketAddress, TcpListenerConfig, UdpListenerConfig,
-            UpdateHttpListenerConfig, UpdateHttpsListenerConfig, UpdateTcpListenerConfig,
-            UpdateUdpListenerConfig, WorkerRequest, request::RequestType,
+            ClusterInformation, CustomHttpAnswers, DeactivateListener, ForwardedHeaders,
+            FrontendFilters, HealthChecksList, HttpListenerConfig, HttpsListenerConfig,
+            InitialState, ListedFrontends, ListenerType, ListenersList, PathRule,
+            QueryCertificatesFilters, RemoveBackend, RemoveCertificate, RemoveListener,
+            ReplaceCertificate, Request, RequestCounts, RequestHttpFrontend, RequestTcpFrontend,
+            RequestUdpFrontend, SetHealthCheck, SocketAddress, TcpListenerConfig,
+            UdpListenerConfig, UpdateHttpListenerConfig, UpdateHttpsListenerConfig,
+            UpdateTcpListenerConfig, UpdateUdpListenerConfig, WorkerRequest, request::RequestType,
         },
         display::format_request_type,
     },
@@ -631,6 +631,11 @@ impl ConfigState {
     }
 
     fn add_http_listener(&mut self, listener: &HttpListenerConfig) -> Result<(), StateError> {
+        // Refuse an unknown mode before storing anything: the worker would
+        // otherwise read it as the default while the state records it.
+        if let Some(v) = listener.forwarded_headers {
+            validate_forwarded_headers(v)?;
+        }
         let address = validated_listener_key(listener.listener_key())?;
         let before = self.http_listeners.len();
         match self.http_listeners.entry(address.clone()) {
@@ -660,6 +665,11 @@ impl ConfigState {
     }
 
     fn add_https_listener(&mut self, listener: &HttpsListenerConfig) -> Result<(), StateError> {
+        // Refuse an unknown mode before storing anything: the worker would
+        // otherwise read it as the default while the state records it.
+        if let Some(v) = listener.forwarded_headers {
+            validate_forwarded_headers(v)?;
+        }
         let address = validated_listener_key(listener.listener_key())?;
         let before = self.https_listeners.len();
         match self.https_listeners.entry(address.clone()) {
@@ -917,6 +927,10 @@ impl ConfigState {
             validate_sozu_id_header(v)?;
             listener.sozu_id_header = Some(v.to_owned());
         }
+        if let Some(v) = patch.forwarded_headers {
+            validate_forwarded_headers(v)?;
+            listener.forwarded_headers = Some(v);
+        }
         Ok(())
     }
 
@@ -1038,6 +1052,10 @@ impl ConfigState {
         if let Some(ref v) = patch.sozu_id_header {
             validate_sozu_id_header(v)?;
             listener.sozu_id_header = Some(v.to_owned());
+        }
+        if let Some(v) = patch.forwarded_headers {
+            validate_forwarded_headers(v)?;
+            listener.forwarded_headers = Some(v);
         }
         Ok(())
     }
@@ -3292,6 +3310,19 @@ pub fn validate_sozu_id_header(value: &str) -> Result<(), StateError> {
         }
     }
     Ok(())
+}
+
+/// Validate a `forwarded_headers` wire value: it must name a
+/// [`ForwardedHeaders`] variant. prost decodes an unknown enum number into the
+/// raw `i32`, and the listener getter would silently read it as the default;
+/// a patch carrying one is refused instead.
+pub fn validate_forwarded_headers(value: i32) -> Result<(), StateError> {
+    ForwardedHeaders::try_from(value)
+        .map(|_| ())
+        .map_err(|_| StateError::InvalidValue {
+            field: "forwarded_headers",
+            reason: "must be one of both, x_forwarded, rfc7239, none",
+        })
 }
 
 /// TCP and UDP frontends are keyed by cluster id: with a cluster filter, look
@@ -6424,6 +6455,157 @@ mod tests {
 
         let listener = state.https_listeners.get(&ListenerKey::from(addr)).unwrap();
         assert_eq!(listener.sozu_id_header.as_deref(), Some("X-Edge-Id"));
+    }
+
+    /// sozu#322: an `AddHttpListener` / `AddHttpsListener` carrying a
+    /// `forwarded_headers` wire value that names no `ForwardedHeaders`
+    /// variant is refused and stores nothing, as an update carrying one is.
+    /// Without this the state would record the raw number while the worker
+    /// reads it as the default. A known value is accepted.
+    #[test]
+    fn add_listener_rejects_an_unknown_forwarded_headers_value() {
+        let http = SocketAddress::new_v4(0, 0, 0, 0, 8080);
+        let https = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+
+        let http_error = state
+            .dispatch(
+                &RequestType::AddHttpListener(HttpListenerConfig {
+                    forwarded_headers: Some(42),
+                    ..make_http_listener(http)
+                })
+                .into(),
+            )
+            .unwrap_err();
+        let https_error = state
+            .dispatch(
+                &RequestType::AddHttpsListener(HttpsListenerConfig {
+                    forwarded_headers: Some(-1),
+                    ..make_https_listener(https)
+                })
+                .into(),
+            )
+            .unwrap_err();
+        for error in [http_error, https_error] {
+            assert!(
+                matches!(
+                    error,
+                    StateError::InvalidValue {
+                        field: "forwarded_headers",
+                        ..
+                    }
+                ),
+                "expected InvalidValue for an unknown mode, got: {error}"
+            );
+        }
+        assert!(state.http_listeners.is_empty() && state.https_listeners.is_empty());
+
+        state
+            .dispatch(
+                &RequestType::AddHttpListener(HttpListenerConfig {
+                    forwarded_headers: Some(ForwardedHeaders::Rfc7239 as i32),
+                    ..make_http_listener(http)
+                })
+                .into(),
+            )
+            .expect("a known mode must be accepted on an HTTP listener");
+        state
+            .dispatch(
+                &RequestType::AddHttpsListener(HttpsListenerConfig {
+                    forwarded_headers: Some(ForwardedHeaders::None as i32),
+                    ..make_https_listener(https)
+                })
+                .into(),
+            )
+            .expect("a known mode must be accepted on an HTTPS listener");
+    }
+
+    /// sozu#322: `forwarded_headers` is hot-updatable on HTTP and HTTPS
+    /// listeners — the main-process state records the patched mode, so a
+    /// `ListListeners`, a `SaveState` and an upgrade replay all carry it —
+    /// and a wire value naming no `ForwardedHeaders` variant is refused.
+    #[test]
+    fn update_listener_forwarded_headers_applies_and_rejects_unknown_values() {
+        let http = SocketAddress::new_v4(0, 0, 0, 0, 8080);
+        let https = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpListener(make_http_listener(http)).into())
+            .unwrap();
+        state
+            .dispatch(&RequestType::AddHttpsListener(make_https_listener(https)).into())
+            .unwrap();
+
+        state
+            .dispatch(
+                &RequestType::UpdateHttpListener(UpdateHttpListenerConfig {
+                    address: http,
+                    forwarded_headers: Some(ForwardedHeaders::Rfc7239 as i32),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("a known mode must be accepted on an HTTP listener");
+        state
+            .dispatch(
+                &RequestType::UpdateHttpsListener(UpdateHttpsListenerConfig {
+                    address: https,
+                    forwarded_headers: Some(ForwardedHeaders::None as i32),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("a known mode must be accepted on an HTTPS listener");
+        assert_eq!(
+            state.http_listeners[&http.into()].forwarded_headers(),
+            ForwardedHeaders::Rfc7239
+        );
+        assert_eq!(
+            state.https_listeners[&https.into()].forwarded_headers(),
+            ForwardedHeaders::None
+        );
+
+        let http_error = state
+            .dispatch(
+                &RequestType::UpdateHttpListener(UpdateHttpListenerConfig {
+                    address: http,
+                    forwarded_headers: Some(42),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .unwrap_err();
+        let https_error = state
+            .dispatch(
+                &RequestType::UpdateHttpsListener(UpdateHttpsListenerConfig {
+                    address: https,
+                    forwarded_headers: Some(-1),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .unwrap_err();
+        for error in [http_error, https_error] {
+            assert!(
+                matches!(
+                    error,
+                    StateError::InvalidValue {
+                        field: "forwarded_headers",
+                        ..
+                    }
+                ),
+                "expected InvalidValue for an unknown mode, got: {error}"
+            );
+        }
+        // A refused patch leaves the recorded mode as it was.
+        assert_eq!(
+            state.http_listeners[&http.into()].forwarded_headers(),
+            ForwardedHeaders::Rfc7239
+        );
+        assert_eq!(
+            state.https_listeners[&https.into()].forwarded_headers(),
+            ForwardedHeaders::None
+        );
     }
 
     /// h2_graceful_shutdown_deadline_seconds = 0 must be allowed (means "wait forever").

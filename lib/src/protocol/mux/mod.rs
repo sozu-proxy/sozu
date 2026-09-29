@@ -1201,6 +1201,9 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             // HttpContext so the routing layer can honor operator opt-outs
             // without reaching back into the listener on every request.
             http_context.strict_sni_binding = listener.get_strict_sni_binding();
+            // Mirror the listener's forwarding header family the same way:
+            // a hot update reaches the next stream (H2) or connection (H1).
+            http_context.forwarded_headers = listener.get_forwarded_headers();
             // Propagate the connection-scoped TLS metadata onto every
             // per-stream HttpContext so the access log can record it without
             // touching the rustls session on every request. These are

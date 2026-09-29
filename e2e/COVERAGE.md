@@ -62,6 +62,7 @@ actually exercise. The decision matrix:
 | HTTP Basic auth                  | ✓                    | ✓      | ✓     | ✓      | All cells; auth gate is router-layer.                               |
 | 301/302/308 redirect             | ✓                    | ✓      | ✓     | ✓      | All cells; redirect renders same answer-template.                   |
 | X-Real-IP injection              | (✓)                  | ✓      | (✓)   | ✓      | H1-backend cells (h1-h1, h2-h1) assert frontend forwarding only — `AsyncBackend` does not currently expose request bytes for the strip/inject assertion (tracked as a future `AsyncBackend` enhancement). H2 trailer-elision needs H2 frontend cells specifically. |
+| `forwarded_headers = rfc7239`    | (✓)                  | ✓      | (✓)   | ✓      | Same `AsyncBackend` limit as X-Real-IP: H1-backend cells assert forwarding only. The H1 raw-byte assertions for `rfc7239` and `none` live in `tests::test_forwarded_headers_{rfc7239,none}_h1`. |
 | Per-IP `429` limit               | ✓                    | ✓      | ✓     | ✓      | All cells; one of each cert kind is enough.                         |
 | `evict_on_queue_full`            | ✓                    | ✓      | ✓     | ✓      | All cells.                                                          |
 | Custom answer template           | ✓                    | ✓      | ✓     | ✓      | All cells.                                                          |
@@ -120,6 +121,9 @@ each):
   spoof stripped, proxy-generated header reaches the backend.
   Initial-HEADERS only; H2 trailer-frame elision is a separate
   targeted test scaffolded at `tests::test_x_real_ip_elide_h2_trailer`.
+- **Forwarded headers `rfc7239`** (`with_forwarded_headers` on the
+  HTTPS listener) — the client `Forwarded` chain is extended with
+  Sōzu's element and no `X-Forwarded-*` header reaches the backend.
 
 Deferred from matrix coverage (existing single-cell tests stay
 authoritative until connection-pinning helpers land):

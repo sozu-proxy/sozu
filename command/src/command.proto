@@ -278,6 +278,9 @@ message UpdateHttpListenerConfig {
     optional bool send_x_real_ip                    = 40;
     // Maximum materialized header fields per request — see HttpListenerConfig.
     optional uint32 h2_max_header_fields            = 41;
+    // Which forwarding header family the listener emits — see
+    // HttpListenerConfig.
+    optional ForwardedHeaders forwarded_headers     = 42;
 }
 
 // Partial-update patch for a running HTTPS listener.
@@ -380,6 +383,9 @@ message UpdateHttpsListenerConfig {
     optional HstsConfig hsts                        = 41;
     // Maximum materialized header fields per request — see HttpsListenerConfig.
     optional uint32 h2_max_header_fields            = 42;
+    // Which forwarding header family the listener emits — see
+    // HttpsListenerConfig.
+    optional ForwardedHeaders forwarded_headers     = 43;
 }
 
 // Partial-update patch for a running TCP listener.
@@ -540,6 +546,10 @@ message HttpListenerConfig {
     // historical behaviour). Not patchable: changing it needs a rebind, so it
     // is absent from the Update*ListenerConfig patches.
     optional string interface = 35;
+    // Which forwarding header family is added to every forwarded request:
+    // `X-Forwarded-*`, RFC 7239 `Forwarded`, both, or none. Independent of
+    // `elide_x_real_ip` and `send_x_real_ip`. Default: both.
+    optional ForwardedHeaders forwarded_headers = 36 [default = FORWARDED_HEADERS_BOTH];
 }
 
 // details of an HTTPS listener
@@ -691,6 +701,10 @@ message HttpsListenerConfig {
     // historical behaviour). Not patchable: changing it needs a rebind, so it
     // is absent from the Update*ListenerConfig patches.
     optional string interface = 48;
+    // Which forwarding header family is added to every forwarded request:
+    // `X-Forwarded-*`, RFC 7239 `Forwarded`, both, or none. Independent of
+    // `elide_x_real_ip` and `send_x_real_ip`. Default: both.
+    optional ForwardedHeaders forwarded_headers = 49 [default = FORWARDED_HEADERS_BOTH];
 }
 
 // details of an TCP listener
@@ -858,6 +872,22 @@ message RemoveListener {
     // listener identity is (address, interface). Absent targets the listener
     // added without an interface.
     optional string interface = 3;
+}
+
+// The forwarding header family an HTTP or HTTPS listener adds to every
+// forwarded request. `BOTH` is 0 so an absent field, or a listener written
+// before the field existed, keeps the historical behaviour.
+enum ForwardedHeaders {
+    // `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Port` and RFC 7239
+    // `Forwarded`, each extended or synthesised.
+    FORWARDED_HEADERS_BOTH = 0;
+    // Only the `X-Forwarded-*` family; a client `Forwarded` passes through.
+    FORWARDED_HEADERS_X_FORWARDED = 1;
+    // Only RFC 7239 `Forwarded`; client `X-Forwarded-For`, `-Proto`, `-Port`
+    // and `-Host` are removed.
+    FORWARDED_HEADERS_RFC7239 = 2;
+    // No forwarding header is added; client ones pass through untouched.
+    FORWARDED_HEADERS_NONE = 3;
 }
 
 enum ListenerType {

@@ -28,6 +28,9 @@
 //!   `with_send_x_real_ip` on the HTTPS listener) — a client-supplied
 //!   `X-Real-IP` is stripped and a proxy-generated one carrying the
 //!   peer IP reaches the backend.
+//! - **Forwarded headers `rfc7239`** (`with_forwarded_headers` on the
+//!   HTTPS listener) — the client `Forwarded` chain is extended with
+//!   Sōzu's element and no `X-Forwarded-*` header reaches the backend.
 //!
 //! Per-IP `429` and `evict_on_queue_full` are listener-policy
 //! features whose existing single-cell coverage in
@@ -41,7 +44,7 @@ use std::time::Duration;
 
 use hyper::{Request as HyperRequest, Uri};
 use sozu_command_lib::{
-    config::ListenerBuilder,
+    config::{ForwardedHeadersMode, ListenerBuilder},
     proto::command::{
         ActivateListener, AddCertificate, CertificateAndKey, Cluster, ListenerType, RedirectPolicy,
         RedirectScheme, RequestHttpFrontend, SocketAddress, request::RequestType,
@@ -187,6 +190,7 @@ macro_rules! protocol_pair_matrix {
 struct ListenerOpts {
     elide_x_real_ip: bool,
     send_x_real_ip: bool,
+    forwarded_headers: Option<ForwardedHeadersMode>,
 }
 
 /// Bring up a single-worker HTTPS listener at a freshly-allocated
@@ -214,6 +218,9 @@ fn bring_up_https_listener(
     }
     if listener_opts.send_x_real_ip {
         listener_builder.with_send_x_real_ip(true);
+    }
+    if let Some(mode) = listener_opts.forwarded_headers {
+        listener_builder.with_forwarded_headers(mode);
     }
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         listener_builder
@@ -761,6 +768,7 @@ fn try_x_real_ip_elide_send_cell(frontend_h2: bool, backend_h2: bool) -> State {
         ListenerOpts {
             elide_x_real_ip: true,
             send_x_real_ip: true,
+            forwarded_headers: None,
         },
     );
     let back_address = create_local_address();
@@ -835,4 +843,104 @@ protocol_pair_matrix!(
     x_real_ip_elide_send,
     try_x_real_ip_elide_send_cell,
     "x-real-ip elide+send"
+);
+
+// ═════════════════════════════════════════════════════════════════════
+// Feature 5 — forwarded_headers = rfc7239 (sozu#322)
+// ═════════════════════════════════════════════════════════════════════
+//
+// The listener emits only RFC 7239 `Forwarded`. The request carries a
+// client `Forwarded` chain plus client `X-Forwarded-For`/`-Proto`; the H2
+// backend must record the chain extended with Sōzu's element and no
+// `X-Forwarded-*` header. As in feature 4, the H1-backend cells only
+// confirm the request is forwarded, `AsyncBackend` exposing no request
+// bytes. The editor is shared by H1 and H2 frontends, so the `h2_h2`
+// cell is the one that proves an H2 frontend honours the mode.
+
+fn try_forwarded_headers_rfc7239_cell(frontend_h2: bool, backend_h2: bool) -> State {
+    let cluster_id = "matrix_fwd_cluster";
+    let (mut worker, front_address, front_port) = bring_up_https_listener(
+        "MATRIX-FWD-RFC7239",
+        ListenerOpts {
+            forwarded_headers: Some(ForwardedHeadersMode::Rfc7239),
+            ..Default::default()
+        },
+    );
+    let back_address = create_local_address();
+    install_cluster_and_frontend(
+        &mut worker,
+        cluster_id,
+        backend_h2,
+        |c| c,
+        Worker::default_http_frontend(cluster_id, front_address),
+        back_address,
+    );
+
+    let backend = CellBackend::start(back_address, backend_h2);
+    let client = build_frontend_client(frontend_h2);
+    let uri = build_uri(front_port, "/");
+    let req = HyperRequest::builder()
+        .method("GET")
+        .uri(uri)
+        .header("forwarded", "for=192.0.2.7")
+        .header("x-forwarded-for", "192.0.2.7")
+        .header("x-forwarded-proto", "http")
+        .body(String::new())
+        .expect("forwarded request builds");
+    let status = send_request(&client, req);
+
+    let captured = if backend_h2 {
+        backend.captured_request_headers_h2()
+    } else {
+        Vec::new()
+    };
+    let backend_hits = backend.responses_sent();
+    worker.soft_stop();
+    let stop_ok = worker.wait_for_server_stop();
+
+    if status != Some(200) {
+        eprintln!("forwarded rfc7239 cell: expected 200 from backend, got {status:?}");
+        return State::Fail;
+    }
+    if backend_hits == 0 {
+        eprintln!("forwarded rfc7239 cell: backend received no request");
+        return State::Fail;
+    }
+
+    if backend_h2 {
+        let x_forwarded = captured
+            .iter()
+            .any(|(k, _)| k.to_ascii_lowercase().starts_with("x-forwarded-"));
+        if x_forwarded {
+            eprintln!(
+                "forwarded rfc7239 cell: an X-Forwarded-* header reached the backend; headers={captured:?}"
+            );
+            return State::Fail;
+        }
+        let forwarded: Vec<&[u8]> = captured
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("forwarded"))
+            .map(|(_, v)| v.as_slice())
+            .collect();
+        let extended = matches!(
+            forwarded.as_slice(),
+            [value] if value.starts_with(b"for=192.0.2.7, proto=https;for=\"127.0.0.1:")
+        );
+        if !extended {
+            eprintln!(
+                "forwarded rfc7239 cell: the client chain was not extended once; headers={captured:?}"
+            );
+            return State::Fail;
+        }
+    }
+    if !stop_ok {
+        return State::Fail;
+    }
+    State::Success
+}
+
+protocol_pair_matrix!(
+    forwarded_headers_rfc7239,
+    try_forwarded_headers_rfc7239_cell,
+    "forwarded_headers rfc7239"
 );

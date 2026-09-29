@@ -352,7 +352,10 @@ checks as defense in depth, then edits the request in place
   `X-Real-IP` with `send_x_real_ip`) come from a `ForwardingHop` rendered once
   per connection and shared through `kawa::Store::Shared`, a reference-count
   bump per header; a client-supplied chain is extended into one exact-size copy
-  ([#1643](https://github.com/sozu-proxy/sozu/pull/1643));
+  ([#1643](https://github.com/sozu-proxy/sozu/pull/1643)). The listener's
+  `forwarded_headers` mode picks which family is emitted — both by default,
+  `X-Forwarded-*` only, `Forwarded` only, or neither
+  ([#322](https://github.com/sozu-proxy/sozu/issues/322));
 - the request id is rendered once on the stack and copied once into an
   `Rc<str>` that the generated `X-Request-Id`, the access log and both
   `Sozu-Id` headers share ([#1628](https://github.com/sozu-proxy/sozu/pull/1628)).

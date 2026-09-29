@@ -35,16 +35,17 @@ use sozu_command::{
     config::{DEFAULT_ALPN_PROTOCOLS, DEFAULT_CIPHER_LIST},
     listener_key::ListenerKey,
     proto::command::{
-        AddCertificate, CertificateSummary, CertificatesByAddress, Cluster, HttpsListenerConfig,
-        ListOfCertificatesByAddress, ListenerType, RemoveCertificate, RemoveListener,
-        ReplaceCertificate, RequestHttpFrontend, ResponseContent, TlsVersion,
+        AddCertificate, CertificateSummary, CertificatesByAddress, Cluster, ForwardedHeaders,
+        HttpsListenerConfig, ListOfCertificatesByAddress, ListenerType, RemoveCertificate,
+        RemoveListener, ReplaceCertificate, RequestHttpFrontend, ResponseContent, TlsVersion,
         UpdateHttpsListenerConfig, WorkerRequest, WorkerResponse, request::RequestType,
         response_content::ContentType,
     },
     ready::Ready,
     response::HttpFrontend,
     state::{
-        ClusterId, validate_alpn_protocols, validate_h2_flood_knobs_https, validate_sozu_id_header,
+        ClusterId, validate_alpn_protocols, validate_forwarded_headers,
+        validate_h2_flood_knobs_https, validate_sozu_id_header,
     },
 };
 
@@ -1420,6 +1421,12 @@ impl L7ListenerHandler for HttpsListener {
         self.config.send_x_real_ip.unwrap_or(false)
     }
 
+    fn get_forwarded_headers(&self) -> ForwardedHeaders {
+        // An unknown wire value reads as the default, like prost's own
+        // getter; `update_config` and the main-process state refuse one.
+        self.config.forwarded_headers()
+    }
+
     fn get_h2_stream_idle_timeout(&self) -> std::time::Duration {
         // Inherit `back_timeout` when the knob is unset so listeners tuned for
         // long-running backends do not cancel streams at the 30 s security
@@ -1478,6 +1485,11 @@ impl HttpsListener {
         config: HttpsListenerConfig,
         token: Token,
     ) -> Result<HttpsListener, ListenerError> {
+        // Defense in depth, as `update_config`: the main-process state
+        // refuses an unknown mode, a raw protobuf client may not.
+        if let Some(v) = config.forwarded_headers {
+            validate_forwarded_headers(v)?;
+        }
         let resolver = Arc::new(MutexCertificateResolver::default());
 
         let server_config = Arc::new(Self::create_rustls_context(&config, resolver.to_owned())?);
@@ -1745,6 +1757,9 @@ impl HttpsListener {
         if let Some(ref hdr) = patch.sozu_id_header {
             validate_sozu_id_header(hdr)?;
         }
+        if let Some(v) = patch.forwarded_headers {
+            validate_forwarded_headers(v)?;
+        }
 
         // --- simple field patches ---
         if let Some(v) = patch.public_address {
@@ -1782,6 +1797,9 @@ impl HttpsListener {
         }
         if let Some(v) = patch.send_x_real_ip {
             self.config.send_x_real_ip = Some(v);
+        }
+        if let Some(v) = patch.forwarded_headers {
+            self.config.forwarded_headers = Some(v);
         }
 
         // --- H2 flood knobs ---
@@ -3562,6 +3580,22 @@ mod tests {
             trie.domain_lookup(b"hello.sub.test.example.com", true),
             Some(&("hello.sub.test.example.com".as_bytes().to_vec(), 2u8))
         );
+    }
+
+    /// sozu#322: the HTTPS twin of `lib/src/http.rs`'s
+    /// `a_listener_with_an_unknown_forwarded_headers_value_is_refused`.
+    #[test]
+    fn a_listener_with_an_unknown_forwarded_headers_value_is_refused() {
+        let build = |forwarded_headers: Option<i32>| {
+            let mut cfg = ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 1043))
+                .to_tls(None)
+                .expect("default HTTPS listener config");
+            cfg.forwarded_headers = forwarded_headers;
+            HttpsListener::try_new(cfg, Token(0))
+        };
+        assert!(build(Some(-1)).is_err(), "an unknown mode must be refused");
+        let listener = build(Some(ForwardedHeaders::None as i32)).expect("a known mode");
+        assert_eq!(listener.get_forwarded_headers(), ForwardedHeaders::None);
     }
 
     /// The HTTPS twin of `lib/src/http.rs`'s

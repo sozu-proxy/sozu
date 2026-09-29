@@ -328,6 +328,15 @@ address = "0.0.0.0:8080"
 # `elide_x_real_ip`. Default: false.
 # send_x_real_ip = false
 
+# Forwarding header family added to every forwarded request (doc/configure.md,
+# "Forwarding headers"). Default: "both".
+# - "both": X-Forwarded-For/-Proto/-Port and RFC 7239 Forwarded
+# - "x_forwarded": only X-Forwarded-*; a client Forwarded passes through
+# - "rfc7239": only Forwarded; client X-Forwarded-For/-Proto/-Port/-Host removed
+# - "none": nothing added; client headers pass through untrusted and untouched
+# Independent of `elide_x_real_ip` and `send_x_real_ip`.
+# forwarded_headers = "both"
+
 # Example for a HTTPS listener
 [[listeners]]
 protocol = "https"
@@ -376,6 +385,15 @@ address = "0.0.0.0:8443"
 # to every forwarded request. Independently combinable with
 # `elide_x_real_ip`. Default: false.
 # send_x_real_ip = false
+
+# Forwarding header family added to every forwarded request (doc/configure.md,
+# "Forwarding headers"). Default: "both".
+# - "both": X-Forwarded-For/-Proto/-Port and RFC 7239 Forwarded
+# - "x_forwarded": only X-Forwarded-*; a client Forwarded passes through
+# - "rfc7239": only Forwarded; client X-Forwarded-For/-Proto/-Port/-Host removed
+# - "none": nothing added; client headers pass through untrusted and untouched
+# Independent of `elide_x_real_ip` and `send_x_real_ip`.
+# forwarded_headers = "both"
 
 # HSTS = HTTP Strict Transport Security (RFC 6797). Listener-level default
 # inherited by every HTTPS frontend on this listener that does not declare

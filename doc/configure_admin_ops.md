@@ -56,7 +56,7 @@ field controls:
 
 - **From the next request.** The per-request knobs — `sticky_name`,
   `sozu_id_header`, `strict_sni_binding`, `elide_x_real_ip`, `send_x_real_ip`,
-  and the custom error pages of `--answer` / `http_answers` — are captured by
+  `forwarded_headers`, and the custom error pages of `--answer` / `http_answers` — are captured by
   each request when it arrives and held until that request finishes. A request
   already in flight when you run the update completes under the configuration
   it started with, including any error page it ends up serving; the next
@@ -373,7 +373,8 @@ ratebar matches the sum of the labelled buckets.
 
 ### 5.5 `https.alpn.rejected.unsupported` counter
 
-Source: `HttpsSession::upgrade_handshake` (`lib/src/https.rs:515`).
+Source: `HttpsSession::upgrade_handshake` (`lib/src/https.rs`), its branch for an
+ALPN value other than `h2` and `http/1.1`.
 Documented in `doc/configure.md`, in the `https.alpn.rejected.unsupported` row of the ALPN metrics table.
 
 Fires on the rustls accept path when the negotiated ALPN protocol is

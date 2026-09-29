@@ -1391,7 +1391,7 @@ where
 ///
 /// RFC 9110 §6.5 forbids trailers from carrying fields that affect
 /// "message framing, message routing, or response semantics." sōzu
-/// rewrites four client-attribution headers on the initial HEADERS pass
+/// rewrites seven client-attribution headers on the initial HEADERS pass
 /// (`HttpContext::on_request_headers` in
 /// `lib/src/protocol/kawa_h1/editor.rs`):
 ///   * `X-Real-IP` is replaced by the post-PROXY-v2 peer IP when
@@ -1401,12 +1401,15 @@ where
 ///   * `Forwarded` (RFC 7239) has a `proto=…;for=…;by=…` clause appended.
 ///   * `X-Request-Id` is preserved verbatim (de-facto correlation
 ///     header used by Envoy/HAProxy/most LBs).
+///   * `X-Forwarded-Proto`, `X-Forwarded-Port` and `X-Forwarded-Host` are
+///     synthesised (`both`, `x_forwarded`) or removed (`rfc7239`)
+///     according to the listener's `forwarded_headers` mode.
 ///
 /// A naive H2 client could otherwise smuggle any of those by sending
 /// them as a trailer block: an H2 backend that merges trailers into
 /// its header view (gRPC-style, or anything that uses
 /// `headers::extend(trailers.iter())`) would observe an attacker-
-/// controlled value. The four elisions below run **unconditionally** —
+/// controlled value. The seven elisions below run **unconditionally** —
 /// the spec already prohibits them, the operator gains no observability
 /// or routing signal from a trailer-side copy, and forwarding them is
 /// strictly a spoof vector.
@@ -1504,8 +1507,10 @@ pub fn handle_trailer(
         // ── Spoof-vector elision per RFC 9110 §6.5 ──
         //
         // RFC 9110 §6.5 forbids trailers from carrying message-routing
-        // semantics. The four client-attribution headers below are
-        // rewritten by sōzu on the initial-HEADERS pass; admitting them
+        // semantics. The client-attribution headers below are rewritten
+        // by sōzu on the initial-HEADERS pass (the whole `X-Forwarded-*`
+        // family it manages, whatever the listener's `forwarded_headers`
+        // mode: each one is either synthesised or removed there); admitting them
         // as trailers would let a naive H2 client smuggle a spoofed
         // value to a backend that merges trailers into its header view.
         // Drop them unconditionally — keys are already lower-case here
@@ -1515,7 +1520,13 @@ pub fn handle_trailer(
         // attempted smuggle without spamming logs.
         if matches!(
             k.as_ref(),
-            b"x-real-ip" | b"x-forwarded-for" | b"forwarded" | b"x-request-id"
+            b"x-real-ip"
+                | b"x-forwarded-for"
+                | b"forwarded"
+                | b"x-request-id"
+                | b"x-forwarded-proto"
+                | b"x-forwarded-port"
+                | b"x-forwarded-host"
         ) {
             events.push(MetricEvent::TrailerSpoofVectorElided);
             return;
@@ -3015,9 +3026,16 @@ mod tests {
         );
     }
 
-    /// Each of the four spoof-vector headers must be dropped on its own,
+    /// Each of the spoof-vector headers must be dropped on its own,
     /// so a single-trailer attempt cannot bypass the filter just because
-    /// the others are absent.
+    /// the others are absent. `x-forwarded-proto`, `-port` and `-host`
+    /// are the rest of the `X-Forwarded-*` family the initial-HEADERS
+    /// pass manages: `forwarded_headers = "rfc7239"` removes them there,
+    /// and `both` / `x_forwarded` synthesise them, so a trailer copy is the
+    /// same spoof vector in every mode (sozu#322).
+    ///
+    /// TO SEE THIS RED: drop `x-forwarded-proto` from the spoof-vector
+    /// match in `handle_trailer`.
     #[test]
     fn handle_trailer_drops_each_spoof_header_individually() {
         for &name in &[
@@ -3025,6 +3043,9 @@ mod tests {
             b"x-forwarded-for",
             b"forwarded",
             b"x-request-id",
+            b"x-forwarded-proto",
+            b"x-forwarded-port",
+            b"x-forwarded-host",
         ] {
             let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
             let kawa = decode_trailer(&mut pool, &[(name, b"v")]);

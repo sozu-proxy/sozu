@@ -18,12 +18,16 @@ use sozu_command::{
     listener_key::ListenerKey,
     logging::CachedTags,
     proto::command::{
-        Cluster, HttpListenerConfig, ListenerType, RemoveListener, RequestHttpFrontend,
-        UpdateHttpListenerConfig, WorkerRequest, WorkerResponse, request::RequestType,
+        Cluster, ForwardedHeaders, HttpListenerConfig, ListenerType, RemoveListener,
+        RequestHttpFrontend, UpdateHttpListenerConfig, WorkerRequest, WorkerResponse,
+        request::RequestType,
     },
     ready::Ready,
     response::HttpFrontend,
-    state::{ClusterId, validate_h2_flood_knobs_http, validate_sozu_id_header},
+    state::{
+        ClusterId, validate_forwarded_headers, validate_h2_flood_knobs_http,
+        validate_sozu_id_header,
+    },
 };
 
 use crate::metrics::names;
@@ -968,6 +972,12 @@ impl L7ListenerHandler for HttpListener {
     fn get_send_x_real_ip(&self) -> bool {
         self.config.send_x_real_ip.unwrap_or(false)
     }
+
+    fn get_forwarded_headers(&self) -> ForwardedHeaders {
+        // An unknown wire value reads as the default, like prost's own
+        // getter; `update_config` and the main-process state refuse one.
+        self.config.forwarded_headers()
+    }
 }
 
 pub struct HttpProxy {
@@ -1353,6 +1363,11 @@ impl HttpListener {
     }
 
     pub fn new(config: HttpListenerConfig, token: Token) -> Result<HttpListener, ListenerError> {
+        // Defense in depth, as `update_config`: the main-process state
+        // refuses an unknown mode, a raw protobuf client may not.
+        if let Some(v) = config.forwarded_headers {
+            validate_forwarded_headers(v)?;
+        }
         let answers = Self::build_answers(&config)?;
         Ok(HttpListener {
             active: false,
@@ -1498,6 +1513,9 @@ impl HttpListener {
         if let Some(ref hdr) = patch.sozu_id_header {
             validate_sozu_id_header(hdr)?;
         }
+        if let Some(v) = patch.forwarded_headers {
+            validate_forwarded_headers(v)?;
+        }
 
         if let Some(v) = patch.public_address {
             self.config.public_address = Some(v);
@@ -1528,6 +1546,9 @@ impl HttpListener {
         }
         if let Some(v) = patch.send_x_real_ip {
             self.config.send_x_real_ip = Some(v);
+        }
+        if let Some(v) = patch.forwarded_headers {
+            self.config.forwarded_headers = Some(v);
         }
 
         // H2 flood knobs
@@ -2598,6 +2619,25 @@ mod tests {
             Some("cluster_3")
         );
         assert!(frontend5.is_err());
+    }
+
+    /// sozu#322: the worker refuses a listener whose `forwarded_headers`
+    /// wire value names no `ForwardedHeaders` variant — a raw protobuf
+    /// `AddHttpListener` must not silently run the default — and honours a
+    /// known one.
+    #[test]
+    fn a_listener_with_an_unknown_forwarded_headers_value_is_refused() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 1041);
+        let build = |forwarded_headers: Option<i32>| {
+            let mut cfg = ListenerBuilder::new_http(address)
+                .to_http(None)
+                .expect("default HTTP listener config");
+            cfg.forwarded_headers = forwarded_headers;
+            HttpListener::new(cfg, Token(0))
+        };
+        assert!(build(Some(42)).is_err(), "an unknown mode must be refused");
+        let listener = build(Some(ForwardedHeaders::Rfc7239 as i32)).expect("a known mode");
+        assert_eq!(listener.get_forwarded_headers(), ForwardedHeaders::Rfc7239);
     }
 
     #[test]

@@ -356,7 +356,9 @@ use socket::ServerBindError;
 use sozu_command::{
     AsStr, ObjectKind,
     logging::{CachedTags, LogContext},
-    proto::command::{Cluster, ListenerType, RequestHttpFrontend, WorkerRequest, WorkerResponse},
+    proto::command::{
+        Cluster, ForwardedHeaders, ListenerType, RequestHttpFrontend, WorkerRequest, WorkerResponse,
+    },
     ready::Ready,
     state::ClusterId,
 };
@@ -645,6 +647,19 @@ pub trait L7ListenerHandler {
     /// `HttpContext::on_request_headers`.
     fn get_send_x_real_ip(&self) -> bool {
         false
+    }
+
+    /// Which forwarding header family to add to every forwarded request:
+    /// `X-Forwarded-*`, RFC 7239 `Forwarded`, both, or none.
+    ///
+    /// Defaults to [`ForwardedHeaders::Both`] — the historical behaviour.
+    /// Operators choose another mode via
+    /// `HttpListenerConfig::forwarded_headers` (and the equivalent on HTTPS
+    /// listeners). Independent of [`Self::get_elide_x_real_ip`] and
+    /// [`Self::get_send_x_real_ip`]. The emission and elision branches live
+    /// in `HttpContext::on_request_headers`, so they cover H1 and H2 alike.
+    fn get_forwarded_headers(&self) -> ForwardedHeaders {
+        ForwardedHeaders::Both
     }
 
     /// Per-stream idle timeout for H2 connections. An open stream that makes

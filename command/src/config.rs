@@ -64,7 +64,7 @@ use crate::{
     logging::AccessLogFormat,
     proto::command::{
         ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
-        CustomHttpAnswers, Header, HeaderPosition, HealthCheckConfig, HstsConfig,
+        CustomHttpAnswers, ForwardedHeaders, Header, HeaderPosition, HealthCheckConfig, HstsConfig,
         HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
         LoadBalancingParams, LoadMetric, MetricDetail, MetricsConfiguration, PathRule,
         ProtobufAccessLogFormat, ProxyProtocolConfig, RedirectPolicy, RedirectScheme, Request,
@@ -790,6 +790,10 @@ pub struct ListenerBuilder {
     /// IP) is appended to every forwarded request. Independently combinable
     /// with `elide_x_real_ip`. Default: false.
     pub send_x_real_ip: Option<bool>,
+    /// Which forwarding header family this listener adds to every forwarded
+    /// request (see [`ForwardedHeadersMode`]). Independent of
+    /// `elide_x_real_ip` and `send_x_real_ip`. Default: `both`.
+    pub forwarded_headers: Option<ForwardedHeadersMode>,
     /// Per-status HTTP answer templates at listener scope — the **global
     /// default** that fires whenever no cluster-level override matches.
     /// Map key is the HTTP status code (e.g. `"503"`); map value is
@@ -920,6 +924,7 @@ impl ListenerBuilder {
             disable_http11: None,
             elide_x_real_ip: None,
             send_x_real_ip: None,
+            forwarded_headers: None,
             answers: None,
             hsts: None,
             max_rx_datagram_size: None,
@@ -1011,6 +1016,13 @@ impl ListenerBuilder {
     /// Default: false.
     pub fn with_send_x_real_ip(&mut self, send_x_real_ip: bool) -> &mut Self {
         self.send_x_real_ip = Some(send_x_real_ip);
+        self
+    }
+
+    /// Which forwarding header family this listener adds to every forwarded
+    /// request. Default: [`ForwardedHeadersMode::Both`].
+    pub fn with_forwarded_headers(&mut self, forwarded_headers: ForwardedHeadersMode) -> &mut Self {
+        self.forwarded_headers = Some(forwarded_headers);
         self
     }
 
@@ -1263,6 +1275,9 @@ impl ListenerBuilder {
             sozu_id_header: self.sozu_id_header.clone(),
             elide_x_real_ip: Some(self.elide_x_real_ip.unwrap_or(false)),
             send_x_real_ip: Some(self.send_x_real_ip.unwrap_or(false)),
+            forwarded_headers: Some(ForwardedHeaders::from(
+                self.forwarded_headers.unwrap_or_default(),
+            ) as i32),
             ..Default::default()
         };
 
@@ -1446,6 +1461,9 @@ impl ListenerBuilder {
             sozu_id_header: self.sozu_id_header.clone(),
             elide_x_real_ip: Some(self.elide_x_real_ip.unwrap_or(false)),
             send_x_real_ip: Some(self.send_x_real_ip.unwrap_or(false)),
+            forwarded_headers: Some(ForwardedHeaders::from(
+                self.forwarded_headers.unwrap_or_default(),
+            ) as i32),
             hsts: match self.hsts.as_ref() {
                 Some(h) => Some(h.to_proto("listener")?),
                 None => None,
@@ -1779,6 +1797,52 @@ impl From<MetricDetail> for MetricDetailLevel {
             MetricDetail::DetailFrontend => MetricDetailLevel::Frontend,
             MetricDetail::DetailCluster => MetricDetailLevel::Cluster,
             MetricDetail::DetailBackend => MetricDetailLevel::Backend,
+        }
+    }
+}
+
+/// The forwarding header family an HTTP or HTTPS listener adds to every
+/// forwarded request, as spelled in the TOML configuration
+/// (`forwarded_headers = "both"`). The wire form is [`ForwardedHeaders`].
+///
+/// - `both` — **default**, the historical behaviour: `X-Forwarded-For`,
+///   `X-Forwarded-Proto`, `X-Forwarded-Port` and RFC 7239 `Forwarded`, a
+///   client-supplied chain extended with this hop.
+/// - `x_forwarded` — only the `X-Forwarded-*` family, handled as in `both`;
+///   a client-supplied `Forwarded` passes through untouched.
+/// - `rfc7239` — only `Forwarded` (RFC 7239 §4), a client-supplied chain
+///   extended with this hop; a client-supplied `X-Forwarded-For`,
+///   `X-Forwarded-Proto`, `X-Forwarded-Port` or `X-Forwarded-Host` is removed.
+/// - `none` — no forwarding header is added and client-supplied ones pass
+///   through untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForwardedHeadersMode {
+    #[default]
+    Both,
+    XForwarded,
+    Rfc7239,
+    None,
+}
+
+impl From<ForwardedHeadersMode> for ForwardedHeaders {
+    fn from(mode: ForwardedHeadersMode) -> Self {
+        match mode {
+            ForwardedHeadersMode::Both => ForwardedHeaders::Both,
+            ForwardedHeadersMode::XForwarded => ForwardedHeaders::XForwarded,
+            ForwardedHeadersMode::Rfc7239 => ForwardedHeaders::Rfc7239,
+            ForwardedHeadersMode::None => ForwardedHeaders::None,
+        }
+    }
+}
+
+impl From<ForwardedHeaders> for ForwardedHeadersMode {
+    fn from(headers: ForwardedHeaders) -> Self {
+        match headers {
+            ForwardedHeaders::Both => ForwardedHeadersMode::Both,
+            ForwardedHeaders::XForwarded => ForwardedHeadersMode::XForwarded,
+            ForwardedHeaders::Rfc7239 => ForwardedHeadersMode::Rfc7239,
+            ForwardedHeaders::None => ForwardedHeadersMode::None,
         }
     }
 }
@@ -5959,6 +6023,70 @@ mod tests {
             error.contains("unknown variant `Post`, expected one of `PRE`, `POST`, `TREE`"),
             "unexpected error: {error}",
         );
+    }
+
+    /// sozu#322: `forwarded_headers` is a per-listener enum spelled
+    /// `both`, `x_forwarded`, `rfc7239` or `none`. Each value reaches the
+    /// wire config of an HTTP and an HTTPS listener, an absent key is
+    /// `both` (the historical behaviour), and any other spelling is refused
+    /// by serde instead of silently falling back to the default.
+    #[test]
+    fn forwarded_headers_parses_every_mode_defaults_to_both_and_rejects_others() {
+        let listeners = |value: Option<&str>| {
+            let line = value
+                .map(|value| format!("forwarded_headers = \"{value}\""))
+                .unwrap_or_default();
+            format!(
+                r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol = "http"
+            address  = "127.0.0.1:8080"
+            {line}
+
+            [[listeners]]
+            protocol = "https"
+            address  = "127.0.0.1:8443"
+            {line}
+            "#
+            )
+        };
+        let load = |value: Option<&str>| {
+            let file_config: FileConfig =
+                toml::from_str(&listeners(value)).expect("the listeners must parse");
+            let config = ConfigBuilder::new(file_config, "/tmp/test_config.toml")
+                .into_config()
+                .expect("the listeners must load");
+            (
+                config.http_listeners[0].forwarded_headers,
+                config.https_listeners[0].forwarded_headers,
+            )
+        };
+
+        for (spelling, expected) in [
+            (None, ForwardedHeaders::Both),
+            (Some("both"), ForwardedHeaders::Both),
+            (Some("x_forwarded"), ForwardedHeaders::XForwarded),
+            (Some("rfc7239"), ForwardedHeaders::Rfc7239),
+            (Some("none"), ForwardedHeaders::None),
+        ] {
+            let expected = Some(expected as i32);
+            assert_eq!(load(spelling), (expected, expected), "{spelling:?}");
+        }
+
+        for invalid in ["RFC7239", "x-forwarded", "forwarded", ""] {
+            let error = toml::from_str::<FileConfig>(&listeners(Some(invalid)))
+                .expect_err("an unknown forwarded_headers value must be refused")
+                .to_string();
+            assert!(
+                error.contains(&format!(
+                    "unknown variant `{invalid}`, expected one of `both`, `x_forwarded`, `rfc7239`, `none`"
+                )),
+                "{invalid:?}: unexpected error: {error}",
+            );
+        }
     }
 
     /// `hostname` on a TCP frontend maps to the wire `sni` field, exact
