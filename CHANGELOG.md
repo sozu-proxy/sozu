@@ -3503,6 +3503,17 @@
 
 ### 🐛 Fixed
 
+- **`fix(h1)`: honour a `close` option in a request `Connection` list.** A client that sent
+  `Connection: keep-alive, close` or `Connection: close, TE` kept its connection open after the
+  response: `HttpContext::on_request_headers` (`lib/src/protocol/kawa_h1/editor.rs`) compared
+  the whole field value with `close`, while `Connection` is a comma-separated list of
+  case-insensitive options (RFC 9110 §7.6.1) and a `close` among them asks for the connection
+  to close after the response (RFC 9112 §9.6). The request side now matches `close` as a list
+  token across every `Connection` line, as the response side does since the HTTP/1.0 fix below,
+  so such a client connection closes after its response. A single `close`, a request without
+  it, and the forwarded `Connection` lines are unchanged; a token such as `closed` is not the
+  option. An H2 client is unaffected: it never carries `Connection`.
+
 - **`fix(h1)`: forward HTTP/1.0 backend responses as HTTP/1.1
   ([#16](https://github.com/sozu-proxy/sozu/issues/16)).** A backend's `HTTP/1.0` status line
   reached the client verbatim; Sōzu now answers in its own version (RFC 9110 §6.2).

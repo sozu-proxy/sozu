@@ -100,7 +100,19 @@ mutable companion to the Kawa parser. Its `kawa::h1::ParserCallbacks` impl
   that rendering (`kawa::Store::Shared`), while a client-supplied chain,
   which is request-scoped, is extended into an exact-size copy of its own.
   It also ends a request that declares no body after its headers should
-  kawa not have done so already — defense in depth since kawa 0.7.2 (§2.2);
+  kawa not have done so already — defense in depth since kawa 0.7.2 (§2.2).
+  A request whose `Connection` lines list the `close` option clears
+  `keep_alive_frontend`, so `ConnectionH1::writable`
+  (`lib/src/protocol/mux/h1.rs`) closes the client connection after the
+  response (RFC 9112 §9.6). `close` is matched as a case-insensitive list
+  token across every `Connection` line (RFC 9110 §7.6.1), as
+  `on_response_headers` matches it, so `Connection: keep-alive, close` and
+  `Connection: close, TE` close too and `closed` does not; the lines are
+  forwarded as sent. Covered by
+  `a_close_option_in_a_request_connection_list_closes_the_client` (unit, in
+  `editor.rs`) and
+  `test_h1_client_connection_close_option_in_a_list_closes_client`
+  (`e2e/src/tests/mux_tests.rs`);
 - `on_response_headers` (`editor.rs`) — captures `:status`, `:reason`,
   optionally rewrites `Set-Cookie` for sticky sessions. The reason is kept
   for the access log as the `'static` phrase RFC 9110 §15 registers for the

@@ -1075,7 +1075,8 @@ impl HttpContext {
 
         // If found:
         // - set Connection to "close" if closing is set
-        // - set keep_alive_frontend to false if Connection is "close"
+        // - set keep_alive_frontend to false if Connection lists "close"
+        //   (RFC 9110 §7.6.1, RFC 9112 §9.6), as on the response side
         // - update value of X-Forwarded-Proto
         // - update value of X-Forwarded-Port
         // - store X-Forwarded-For
@@ -1101,7 +1102,7 @@ impl HttpContext {
                             header.val = kawa::Store::Static(b"close");
                         } else {
                             let val = header.val.data(buf);
-                            self.keep_alive_frontend &= !compare_no_case(val, b"close");
+                            self.keep_alive_frontend &= !has_connection_option(val, b"close");
                         }
                     } else if compare_no_case(key, b"X-Forwarded-Proto") {
                         has_x_proto = true;
@@ -3565,6 +3566,104 @@ mod tests {
                     .iter()
                     .any(|line| line.to_ascii_lowercase().contains("close")),
                 "{label}: the close is still announced, got {wire:?}"
+            );
+        }
+    }
+
+    /// A client request parsed by kawa's H1 parser on a context the test
+    /// keeps, so it can read what `on_request_headers` recorded.
+    fn parse_request(
+        pool: &mut crate::pool::Pool,
+        bytes: &[u8],
+    ) -> (GenericHttpStream, HttpContext) {
+        let mut ctx = make_context();
+        let mut kawa: GenericHttpStream = kawa::Kawa::new(
+            kawa::Kind::Request,
+            kawa::Buffer::new(
+                pool.checkout()
+                    .expect("the test pool must hand out a buffer"),
+            ),
+        );
+        kawa.storage.space()[..bytes.len()].copy_from_slice(bytes);
+        kawa.storage.fill(bytes.len());
+        kawa::h1::parse(&mut kawa, &mut ctx);
+        assert!(!kawa.is_error(), "premise: the request must parse");
+        (kawa, ctx)
+    }
+
+    /// `close` is a connection option of the request too (RFC 9110 §7.6.1),
+    /// and a client that sends it asks for the connection to close after the
+    /// response (RFC 9112 §9.6): a list that carries it clears
+    /// `keep_alive_frontend`, whatever else it lists and in whichever
+    /// `Connection` line, as `on_response_headers` already does for the
+    /// backend. A token that merely starts with `close` is not the option,
+    /// and the forwarded `Connection` lines are left as the client sent them.
+    ///
+    /// TO SEE THIS RED, compare the whole field value with `close` in
+    /// `HttpContext::on_request_headers` instead of matching a list token:
+    /// the three list cases keep the client connection.
+    #[test]
+    fn a_close_option_in_a_request_connection_list_closes_the_client() {
+        let cases: [(&str, &[u8], bool); 7] = [
+            (
+                "single close",
+                b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+                false,
+            ),
+            (
+                "keep-alive then close",
+                b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive, close\r\n\r\n",
+                false,
+            ),
+            (
+                "close then TE",
+                b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close, TE\r\nTE: trailers\r\n\r\n",
+                false,
+            ),
+            (
+                "close listed in the second line",
+                b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\nConnection: TE, Close \r\nTE: trailers\r\n\r\n",
+                false,
+            ),
+            (
+                "closed is not close",
+                b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: closed\r\n\r\n",
+                true,
+            ),
+            (
+                "keep-alive only",
+                b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\n\r\n",
+                true,
+            ),
+            (
+                "no Connection",
+                b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                true,
+            ),
+        ];
+        for (label, bytes, keeps) in cases {
+            let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+            let (mut kawa, ctx) = parse_request(&mut pool, bytes);
+            assert_eq!(
+                ctx.keep_alive_frontend, keeps,
+                "{label}: keep_alive_frontend"
+            );
+            assert!(
+                ctx.keep_alive_backend,
+                "{label}: the request never decides the backend's persistence"
+            );
+            let sent: Vec<String> = connection_lines(&String::from_utf8_lossy(bytes))
+                .iter()
+                .map(|line| line.to_ascii_lowercase().replace(' ', ""))
+                .collect();
+            let wire = serialized_request(&mut kawa);
+            let forwarded: Vec<String> = connection_lines(&wire)
+                .iter()
+                .map(|line| line.to_ascii_lowercase().replace(' ', ""))
+                .collect();
+            assert_eq!(
+                forwarded, sent,
+                "{label}: the Connection lines are forwarded as sent, got {wire:?}"
             );
         }
     }
