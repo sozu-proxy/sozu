@@ -262,6 +262,8 @@ mod tests {
         assert_eq!(acc.data(), b"later-bytes");
     }
 
+    // The guard is a `debug_assert!`, compiled out of release builds.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "already active")]
     fn begin_while_in_progress_panics_in_debug() {
@@ -270,6 +272,8 @@ mod tests {
         acc.begin(b"two");
     }
 
+    // The guard is a `debug_assert!`, compiled out of release builds.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "no reassembly in progress")]
     fn append_while_idle_panics_in_debug() {
@@ -277,6 +281,8 @@ mod tests {
         acc.append(b"stray");
     }
 
+    // The guard is a `debug_assert!`, compiled out of release builds.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "no reassembly in progress")]
     fn finish_while_idle_panics_in_debug() {

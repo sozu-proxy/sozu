@@ -910,6 +910,8 @@ mod tests {
         }
     }
 
+    // Asserts on `trace!` output: gate on the same condition that compiles it in.
+    #[cfg(any(debug_assertions, feature = "logs-trace"))]
     #[test]
     fn certificate_resolver_logs_redact_matching_sni_and_fingerprint() {
         const SNI_SECRET: &str = "resolver-sni-secret.example";
@@ -963,6 +965,8 @@ mod tests {
         );
     }
 
+    // Asserts on `trace!` output: gate on the same condition that compiles it in.
+    #[cfg(any(debug_assertions, feature = "logs-trace"))]
     #[test]
     fn certificate_resolver_logs_redact_fallback_sni() {
         const SNI_SECRET: &str = "fallback-sni-secret.example";
