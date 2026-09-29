@@ -1408,6 +1408,12 @@ captured at their handshake** (same connection-scoped-capture semantic as
 therefore observe a delayed flag flip — this is the established mux precedent,
 not a new defect.
 
+The main process records both patched values in its `ConfigState`
+(`ConfigState::update_http_listener` / `ConfigState::update_https_listener`,
+`command/src/state.rs`), so `sozu listener list`, `SaveState` and the state
+replayed to a new worker on upgrade or restart carry the hot value rather than
+the one the listener was created with.
+
 ```toml
 [[listeners]]
 address = "0.0.0.0:443"

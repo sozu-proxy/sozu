@@ -12,8 +12,8 @@ use sozu_command_lib::{
     proto::command::{
         ActivateListener, AddCertificate, CertificateAndKey, Cluster, CustomHttpAnswers,
         HealthCheckConfig, ListenerType, QueryMetricsOptions, RemoveBackend, RequestHttpFrontend,
-        ResponseStatus, SetHealthCheck, SocketAddress, TlsVersion, filtered_metrics,
-        request::RequestType, response_content::ContentType,
+        ResponseStatus, SetHealthCheck, SocketAddress, TlsVersion, UpdateHttpListenerConfig,
+        filtered_metrics, request::RequestType, response_content::ContentType,
     },
     scm_socket::Listeners,
     state::ConfigState,
@@ -5018,6 +5018,7 @@ fn test_h1_pipelining() {
 // * `test_x_real_ip_elide_only`     — client header stripped; nothing injected.
 // * `test_x_real_ip_send_and_elide` — full anti-spoof + send, exercised through PROXY-v2.
 // * `test_x_real_ip_elide_h2_trailer` — H2 trailer regression (Codex finding); scaffold pending.
+// * `test_x_real_ip_hot_update_survives_upgrade` — a hot patch of both flags survives a worker upgrade.
 // ---------------------------------------------------------------------------
 
 /// Helper: spin up a single-worker HTTP listener with the two `X-Real-IP`
@@ -5304,6 +5305,98 @@ fn try_x_real_ip_send_and_elide() -> State {
     }
 }
 
+/// A hot `UpdateHttpListener` of both X-Real-IP flags must survive a worker
+/// upgrade (sozu#1688). The harness seeds the new worker from its mirror
+/// `ConfigState`, the same `ConfigState::update_http_listener`
+/// (`command/src/state.rs`) the main process runs, so a patch the state does
+/// not record is silently reverted by the upgrade.
+///
+/// The listener starts with both flags off, a patch turns both on, and each
+/// worker then receives a request carrying a spoofed `X-Real-IP: 1.2.3.4`:
+/// the backend must see the proxy-generated loopback value and not the spoof,
+/// on the old worker (the patch applied) and on the new one (the patch kept).
+fn try_x_real_ip_hot_update_survives_upgrade() -> State {
+    let (mut worker, front_address, back_address) =
+        setup_x_real_ip_test("X-REAL-IP-HOT-UPGRADE", false, false, false);
+
+    worker.send_proxy_request_type(RequestType::UpdateHttpListener(UpdateHttpListenerConfig {
+        address: front_address.into(),
+        elide_x_real_ip: Some(true),
+        send_x_real_ip: Some(true),
+        ..Default::default()
+    }));
+    match worker.read_proxy_response() {
+        Some(response) if response.status == ResponseStatus::Ok as i32 => {}
+        other => {
+            println!("UpdateHttpListener was not acknowledged: {other:?}");
+            return State::Fail;
+        }
+    }
+
+    let spoofed_request = "\
+        GET /api HTTP/1.1\r\n\
+        Host: localhost\r\n\
+        Connection: close\r\n\
+        X-Real-IP: 1.2.3.4\r\n\
+        Content-Length: 4\r\n\
+        \r\n\
+        ping";
+    let forwarded_as_patched = |request: Option<String>, stage: &str| match request {
+        Some(req) => {
+            let lower = req.to_lowercase();
+            if lower.contains("x-real-ip: 1.2.3.4") {
+                println!("{stage}: spoofed X-Real-IP was not elided:\n{req}");
+                false
+            } else if !lower.contains("x-real-ip: 127.0.0.1") {
+                println!("{stage}: proxy X-Real-IP was not injected:\n{req}");
+                false
+            } else {
+                true
+            }
+        }
+        None => {
+            println!("{stage}: backend received no request");
+            false
+        }
+    };
+
+    let mut backend = SyncBackend::new("BACKEND_0", back_address, http_ok_response("pong"));
+    backend.connect();
+
+    let mut client = Client::new("client", front_address, spoofed_request);
+    client.connect();
+    client.send();
+    backend.accept(0);
+    let before_upgrade = backend.receive(0);
+    backend.send(0);
+    let _ = client.receive();
+    if !forwarded_as_patched(before_upgrade, "before upgrade") {
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    let mut new_worker = worker.upgrade("X-REAL-IP-HOT-UPGRADE-NEW");
+
+    let mut client = Client::new("client", front_address, spoofed_request);
+    client.connect();
+    client.send();
+    backend.accept(1);
+    let after_upgrade = backend.receive(1);
+    backend.send(1);
+    let _ = client.receive();
+
+    new_worker.soft_stop();
+    worker.wait_for_server_stop();
+    new_worker.wait_for_server_stop();
+
+    if forwarded_as_patched(after_upgrade, "after upgrade") {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
 #[test]
 fn test_x_real_ip_neither() {
     assert_eq!(
@@ -5347,6 +5440,18 @@ fn test_x_real_ip_send_and_elide() {
             10,
             "X-Real-IP: elide + send + PROXY-v2 — spoof stripped, peer IP from PROXY frame",
             try_x_real_ip_send_and_elide,
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_x_real_ip_hot_update_survives_upgrade() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "X-Real-IP: a hot update of both flags survives a worker upgrade",
+            try_x_real_ip_hot_update_survives_upgrade,
         ),
         State::Success
     );

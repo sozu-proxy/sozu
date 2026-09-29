@@ -864,6 +864,12 @@ impl ConfigState {
         if let Some(v) = patch.request_timeout {
             listener.request_timeout = v;
         }
+        if let Some(v) = patch.elide_x_real_ip {
+            listener.elide_x_real_ip = Some(v);
+        }
+        if let Some(v) = patch.send_x_real_ip {
+            listener.send_x_real_ip = Some(v);
+        }
         if let Some(patch_answers) = patch.http_answers.as_ref() {
             merge_custom_http_answers(&mut listener.http_answers, patch_answers);
         }
@@ -977,6 +983,12 @@ impl ConfigState {
         }
         if let Some(v) = patch.request_timeout {
             listener.request_timeout = v;
+        }
+        if let Some(v) = patch.elide_x_real_ip {
+            listener.elide_x_real_ip = Some(v);
+        }
+        if let Some(v) = patch.send_x_real_ip {
+            listener.send_x_real_ip = Some(v);
         }
         if let Some(patch_answers) = patch.http_answers.as_ref() {
             merge_custom_http_answers(&mut listener.http_answers, patch_answers);
@@ -6685,6 +6697,178 @@ mod tests {
             ),
             "expected InvalidValue, got: {err}"
         );
+    }
+
+    // ── X-Real-IP knobs (sozu#1688) ─────────────────────────────────────────────
+
+    /// A hot patch of `elide_x_real_ip` / `send_x_real_ip` on an HTTP listener
+    /// is recorded in the main state, which `listener list` and `SaveState`
+    /// read.
+    #[test]
+    fn update_http_listener_x_real_ip_patch_applied() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8080);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpListener(make_http_listener(addr)).into())
+            .unwrap();
+
+        let patch = UpdateHttpListenerConfig {
+            address: addr,
+            elide_x_real_ip: Some(true),
+            send_x_real_ip: Some(true),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpListener(patch).into())
+            .expect("HTTP update must succeed");
+
+        let listener = state.http_listeners.get(&ListenerKey::from(addr)).unwrap();
+        assert_eq!(listener.elide_x_real_ip, Some(true));
+        assert_eq!(listener.send_x_real_ip, Some(true));
+        // untouched
+        assert_eq!(listener.front_timeout, 60);
+    }
+
+    /// An absent X-Real-IP field preserves the recorded value, and patching one
+    /// knob never writes the other.
+    #[test]
+    fn update_http_listener_x_real_ip_absent_preserves_existing() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8080);
+        let mut state = ConfigState::new();
+        let listener = HttpListenerConfig {
+            elide_x_real_ip: Some(true),
+            send_x_real_ip: Some(false),
+            ..make_http_listener(addr)
+        };
+        state
+            .dispatch(&RequestType::AddHttpListener(listener).into())
+            .unwrap();
+
+        let patch = UpdateHttpListenerConfig {
+            address: addr,
+            send_x_real_ip: Some(true),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpListener(patch).into())
+            .expect("HTTP update must succeed");
+
+        let listener = state.http_listeners.get(&ListenerKey::from(addr)).unwrap();
+        assert_eq!(listener.elide_x_real_ip, Some(true));
+        assert_eq!(listener.send_x_real_ip, Some(true));
+    }
+
+    /// A hot patch of the X-Real-IP knobs on an HTTPS listener is recorded in
+    /// the main state.
+    #[test]
+    fn update_https_listener_x_real_ip_patch_applied() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpsListener(make_https_listener(addr)).into())
+            .unwrap();
+
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            elide_x_real_ip: Some(true),
+            send_x_real_ip: Some(true),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .expect("HTTPS update must succeed");
+
+        let listener = state.https_listeners.get(&ListenerKey::from(addr)).unwrap();
+        assert_eq!(listener.elide_x_real_ip, Some(true));
+        assert_eq!(listener.send_x_real_ip, Some(true));
+        // untouched
+        assert_eq!(listener.front_timeout, 60);
+    }
+
+    /// An absent X-Real-IP field preserves the recorded HTTPS value, and
+    /// patching one knob never writes the other.
+    #[test]
+    fn update_https_listener_x_real_ip_absent_preserves_existing() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        let listener = HttpsListenerConfig {
+            elide_x_real_ip: Some(false),
+            send_x_real_ip: Some(true),
+            ..make_https_listener(addr)
+        };
+        state
+            .dispatch(&RequestType::AddHttpsListener(listener).into())
+            .unwrap();
+
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            elide_x_real_ip: Some(true),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .expect("HTTPS update must succeed");
+
+        let listener = state.https_listeners.get(&ListenerKey::from(addr)).unwrap();
+        assert_eq!(listener.elide_x_real_ip, Some(true));
+        assert_eq!(listener.send_x_real_ip, Some(true));
+    }
+
+    /// The hot X-Real-IP values survive `generate_requests`, the replay a new
+    /// worker receives on upgrade or restart: replaying it must not revert them.
+    #[test]
+    fn update_listener_x_real_ip_survives_generate_requests_replay() {
+        let http_addr = SocketAddress::new_v4(0, 0, 0, 0, 8080);
+        let https_addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpListener(make_http_listener(http_addr)).into())
+            .unwrap();
+        state
+            .dispatch(&RequestType::AddHttpsListener(make_https_listener(https_addr)).into())
+            .unwrap();
+        state
+            .dispatch(
+                &RequestType::UpdateHttpListener(UpdateHttpListenerConfig {
+                    address: http_addr,
+                    elide_x_real_ip: Some(true),
+                    send_x_real_ip: Some(true),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .unwrap();
+        state
+            .dispatch(
+                &RequestType::UpdateHttpsListener(UpdateHttpsListenerConfig {
+                    address: https_addr,
+                    elide_x_real_ip: Some(true),
+                    send_x_real_ip: Some(true),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .unwrap();
+
+        let mut replayed = ConfigState::new();
+        for request in state.generate_requests() {
+            replayed
+                .dispatch(&request)
+                .expect("could not replay generated request");
+        }
+
+        let http = replayed
+            .http_listeners
+            .get(&ListenerKey::from(http_addr))
+            .expect("replayed HTTP listener");
+        assert_eq!(http.elide_x_real_ip, Some(true));
+        assert_eq!(http.send_x_real_ip, Some(true));
+        let https = replayed
+            .https_listeners
+            .get(&ListenerKey::from(https_addr))
+            .expect("replayed HTTPS listener");
+        assert_eq!(https.elide_x_real_ip, Some(true));
+        assert_eq!(https.send_x_real_ip, Some(true));
     }
 
     // ── update_tcp_listener ────────────────────────────────────────────────────
