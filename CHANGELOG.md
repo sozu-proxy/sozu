@@ -376,6 +376,24 @@
 
 ### 🔄 Changed
 
+- **`docs`: the catch-all hostname, `hostname = "*"` with `position = "POST"`, is documented
+  ([#633](https://github.com/sozu-proxy/sozu/issues/633)).** A `POST` frontend on a bare `*` is
+  `DomainRule::Any`: it is consulted after the routing trie and answers every request no other
+  frontend matched, IP literals such as `127.0.0.1` and single-label hosts such as `localhost`
+  included. This has existed since the router rewrite, but neither `doc/configure.md` nor
+  `bin/config.toml` mentioned `position` as a TOML key. `doc/configure.md` gains a "Catch-all
+  hostname" section with a TOML example; it states that `position` only accepts the upper-case
+  `"PRE"`, `"POST"` and `"TREE"` (`"Post"` fails the load with ``unknown variant `Post` ``), that
+  on the trie a bare `*` stays the single-label wildcard (`localhost` routes, `127.0.0.1` and
+  `www.example.com` do not), and that `sozu frontend http|https add` always creates a `TREE` rule,
+  so the catch-all is TOML-only. `bin/config.toml` documents the key and carries a commented
+  example, and `doc/configure_admin_ops.md` follows its `doc/configure.md` citation two lines down.
+  No behaviour change. Regression coverage:
+  `a_bare_star_hostname_is_a_catch_all_on_post_and_one_label_on_the_trie` (lookup on both positions,
+  and a `POST` catch-all beside a trie frontend) and
+  `a_catch_all_post_frontend_loads_from_toml_and_rejects_a_mixed_case_position` (TOML parsing down to
+  the `AddHttpFrontend` request).
+
 - **`chore(deps)`: every dependency upgraded to its latest release, with no major bump and no
   MSRV change ([#1675](https://github.com/sozu-proxy/sozu/pull/1675)).** Checked against the crates.io sparse index on 2026-09-28, 58 of the 66
   registry requirements across the workspace and `fuzz/` manifests already named their latest

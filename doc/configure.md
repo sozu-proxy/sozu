@@ -907,6 +907,8 @@ frontends = [
   { address = "0.0.0.0:8443", hostname = "lolcatho.st", certificate = "../lib/assets/certificate.pem", key = "../lib/assets/key.pem", certificate_chain = "../lib/assets/certificate_chain.pem" }
 ]
 # additional options for frontends: sticky_session (boolean)
+# position: "TREE" (default), "PRE" or "POST", in upper case — see
+# "Catch-all hostname" below for `hostname = "*"` with `position = "POST"`
 
 backends  = [
   { address = "127.0.0.1:1026" }
@@ -1710,6 +1712,46 @@ configuration, but overlap is now resolved by a stated rule rather than by the
 shape of the trie. (Before the fix, an exact name added *after* a regex segment
 that matched it attached its rule to that segment instead of getting its own
 node, and the whole regex family served it — sozu#1351.)
+
+### Catch-all hostname
+
+A frontend can answer every request that no other frontend claimed, whatever
+its `Host:` — an IP literal such as `127.0.0.1` or `10.0.0.7`, a single-label
+name such as `localhost`, or any fully qualified name. Declare `hostname = "*"`
+with `position = "POST"`:
+
+```toml
+[clusters.fallback]
+protocol = "http"
+frontends = [
+  # every request the other frontends did not match
+  { address = "0.0.0.0:8080", hostname = "*", position = "POST" },
+]
+backends = [
+  { address = "127.0.0.1:1026" }
+]
+```
+
+`position` chooses where the rule is evaluated. `TREE`, the default, places the
+frontend in the routing trie with every other hostname. `PRE` rules are tried
+one by one before the trie, and `POST` rules are tried one by one after it, so a
+`POST` rule only answers requests that no `PRE` rule and no trie frontend
+matched. The value is an enum spelled in upper case: `"PRE"`, `"POST"` or
+`"TREE"`. Any other spelling, `"Post"` included, fails the configuration load
+with ``unknown variant `Post`, expected one of `PRE`, `POST`, `TREE` ``.
+
+A bare `*` means something different in each place. On `PRE` or `POST` it is the
+catch-all: it matches every host. On the trie it is the single-label wildcard of
+"Hostname precedence" above, so a `TREE` frontend on `*` answers `localhost`
+but neither `127.0.0.1` nor `www.example.com`. Declare the catch-all on `POST`
+rather than `PRE`, which would answer every request before the trie is
+consulted. `a_bare_star_hostname_is_a_catch_all_on_post_and_one_label_on_the_trie`
+and `a_catch_all_post_frontend_loads_from_toml_and_rejects_a_mixed_case_position`
+pin this behaviour.
+
+The `sozu frontend http add` and `sozu frontend https add` commands always
+create a `TREE` rule and take no position argument, so a catch-all frontend can
+only be declared in the configuration file.
 
 ### Hostname case
 

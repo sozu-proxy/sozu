@@ -5694,6 +5694,67 @@ mod tests {
         );
     }
 
+    /// sozu#633: the catch-all frontend `doc/configure.md` documents —
+    /// `hostname = "*"` with `position = "POST"` — loads from TOML and
+    /// reaches the worker as a `Post` rule on `*`. The position is an enum
+    /// spelled in upper case: `"Post"` is refused with the serde message the
+    /// documentation quotes, rather than silently falling back to `TREE`.
+    ///
+    /// To SEE THIS RED: in `command/build.rs`, drop the
+    /// `#[serde(rename_all = "SCREAMING_SNAKE_CASE")]` enum attribute. The
+    /// first `toml::from_str` then fails with
+    /// "unknown variant `POST`, expected one of `Pre`, `Post`, `Tree`".
+    #[test]
+    fn a_catch_all_post_frontend_loads_from_toml_and_rejects_a_mixed_case_position() {
+        let catch_all = |position: &str| {
+            format!(
+                r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol = "http"
+            address  = "127.0.0.1:8080"
+
+            [clusters.fallback]
+            protocol = "http"
+            frontends = [
+              {{ address = "127.0.0.1:8080", hostname = "*", position = "{position}" }}
+            ]
+            backends = [
+              {{ address = "10.0.0.1:8000" }}
+            ]
+        "#
+            )
+        };
+
+        let file_config: FileConfig = toml::from_str(&catch_all("POST"))
+            .expect("an upper-case `position = \"POST\"` must parse");
+        let config = ConfigBuilder::new(file_config, "/tmp/test_config.toml")
+            .into_config()
+            .expect("a catch-all POST frontend must load");
+        let messages = config
+            .generate_config_messages()
+            .expect("Could not generate config messages");
+        let frontend = messages
+            .iter()
+            .find_map(|m| match &m.content.request_type {
+                Some(RequestType::AddHttpFrontend(f)) => Some(f),
+                _ => None,
+            })
+            .expect("AddHttpFrontend must be present");
+        assert_eq!(frontend.hostname, "*");
+        assert_eq!(frontend.position, RulePosition::Post as i32);
+
+        let error = toml::from_str::<FileConfig>(&catch_all("Post"))
+            .expect_err("a mixed-case `position = \"Post\"` must be refused")
+            .to_string();
+        assert!(
+            error.contains("unknown variant `Post`, expected one of `PRE`, `POST`, `TREE`"),
+            "unexpected error: {error}",
+        );
+    }
+
     /// `hostname` on a TCP frontend maps to the wire `sni` field, exact
     /// hostnames and a single leading `*.` wildcard are both accepted.
     #[test]

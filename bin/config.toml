@@ -568,6 +568,9 @@ load_balancing = "ROUND_ROBIN"
 # - hostname: host name of the cluster
 # - path = "/api" # optional. A routing rule for incoming requests. The path of the request must match it. Can be a prefix (default), a regex, or a strictly equal path.
 # - path_type = PREFIX | REGEX | EQUALS # defaults to PREFIX
+# - position = TREE | PRE | POST # defaults to TREE, upper case only. PRE rules are tried before the
+#   routing tree, POST rules after it. `hostname = "*"` with `position = "POST"` is a catch-all
+#   that answers every request no other frontend matched (IP literals and single-label hosts included)
 # - sticky_session = false # activates sticky sessions for this cluster
 # - https_redirect = false #  activates automatic redirection to HTTPS for this cluster
 # - custom_tag: a tag to retrieve a frontend with the CLI or in the logs
@@ -578,6 +581,8 @@ frontends = [
     { address = "0.0.0.0:8080", hostname = "lolcatho.st", tags = { key = "value" }, path = "/api" },
     # HTTPS frontends also have an optional `tls_versions` key like the HTTPS listeners
     { address = "0.0.0.0:8443", hostname = "lolcatho.st", tags = { key = "value" }, certificate = "../lib/assets/certificate.pem", key = "../lib/assets/key.pem", certificate_chain = "../lib/assets/certificate_chain.pem" },
+    # catch-all: answers every request no other frontend matched, see "Catch-all hostname" in doc/configure.md
+    # { address = "0.0.0.0:8080", hostname = "*", position = "POST" },
 ]
 
 # backends configuration
