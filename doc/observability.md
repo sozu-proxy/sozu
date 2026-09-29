@@ -194,6 +194,20 @@ recovers as new sessions arrive. Operators who want to reset counts but
 keep live gauges intact should not use `sozu metrics clear` — wait for
 the cumulative counters to roll over in their dashboard math instead.
 
+### A removed client `Forwarded` line
+
+`http.forwarded_malformed_elided` is a proxy-scoped counter with no label. It
+is incremented once for each client `Forwarded` line that
+`HttpContext::on_request_headers` (`lib/src/protocol/kawa_h1/editor.rs`)
+removes because its value is not a well-formed RFC 7239 §4 list, which happens
+only in the `both` and `rfc7239` `forwarded_headers` modes. The request is
+still forwarded, with Sōzu's own element on an earlier well-formed line or on a
+line of its own, so the counter is not an error rate: a steady non-zero value
+names an upstream proxy whose chain the backend no longer receives. The
+matching `debug!` line carries the request context for a single occurrence.
+The increment sits on the removal branch alone, so a well-formed line pays
+nothing for it. See `forwarded_headers` in [`configure.md`](configure.md).
+
 ## Log primitives
 
 Structured prefixes via per-protocol `log_context!` / `log_module_context!` /

@@ -297,6 +297,11 @@ pub mod http {
     pub const E2E_HTTP11: &str = "http.e2e.http11";
     pub const EARLY_RESPONSE_CLOSE: &str = "http.early_response_close";
     pub const FAILED_BACKEND_MATCHING: &str = "http.failed_backend_matching";
+    /// Client `Forwarded` lines removed because their value is not a
+    /// well-formed RFC 7239 §4 list, counted once per removed line. Only the
+    /// `both` and `rfc7239` `forwarded_headers` modes, which extend the chain,
+    /// remove such a line; the request itself is still forwarded.
+    pub const FORWARDED_MALFORMED_ELIDED: &str = "http.forwarded_malformed_elided";
     /// Requests rejected because a Transfer-Encoding header survived parsing without
     /// kawa adopting chunked framing (CL.TE request-smuggling defense, CWE-444).
     pub const FRONTEND_TE_SMUGGLING: &str = "http.frontend.transfer_encoding_smuggling";

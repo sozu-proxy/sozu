@@ -1457,7 +1457,11 @@ removed instead of extended. An unclosed quoted-string such as
 element then goes to an earlier well-formed `Forwarded` line, or into a
 `Forwarded` header of its own, and is always parseable and last. A well-formed
 chain is extended exactly as before. `x_forwarded` and `none` do not touch
-`Forwarded`, so there a malformed line passes through as sent.
+`Forwarded`, so there a malformed line passes through as sent. Each removed
+line increments the proxy counter `http.forwarded_malformed_elided` once, so a
+non-conforming upstream proxy whose chain is being dropped — for example one
+that writes an unquoted port (`for=1.2.3.4:80`) or an unquoted IPv6 address
+(`for=2001:db8::1`) — shows up on the dashboard, not only in a `debug` log.
 
 A listener whose `forwarded_headers` wire value names no mode is refused when
 it is added or updated, by the main process and by the worker alike.
@@ -3743,6 +3747,7 @@ guaranteed not to underflow on close / timeout / shed / error paths.
 | `http.infinite_loop.error`     | counter | proxy            | HTTP event loop safety breaker triggered                     |
 | `http.failed_backend_matching` | counter | proxy            | Frontend matched but no backend could be selected            |
 | `http.early_response_close`    | counter | proxy            | Client closed before response was fully sent                 |
+| `http.forwarded_malformed_elided` | counter | proxy          | Client `Forwarded` line removed as not RFC 7239 §4, once per line (`both` and `rfc7239` only) |
 | `http.trusting.x_proto`        | counter | proxy            | Request had an existing `X-Forwarded-Proto` header (trusted) |
 | `http.trusting.x_proto.diff`   | counter | proxy            | Trusted `X-Forwarded-Proto` differed from actual protocol    |
 | `http.trusting.x_port`         | counter | proxy            | Request had an existing `X-Forwarded-Port` header (trusted)  |

@@ -98,7 +98,9 @@ mutable companion to the Kawa parser. Its `kawa::h1::ParserCallbacks` impl
   (`strips_x_forwarded`, `editor.rs`). In the modes that extend a client
   `Forwarded` chain, a line that is not a well-formed RFC 7239 §4 list
   (`is_valid_forwarded`, `editor.rs`) is elided rather than extended, so
-  Sōzu's element is never swallowed by an unclosed quoted-string. It injects the `Sozu-Id`
+  Sōzu's element is never swallowed by an unclosed quoted-string; each
+  elided line increments `http.forwarded_malformed_elided`
+  (`names::http::FORWARDED_MALFORMED_ELIDED`). It injects the `Sozu-Id`
   correlation header named by `sozu_id_header`. The hop is rendered once per
   connection (`ForwardingHop`, `HttpContext::forwarding_hop`, `editor.rs`)
   from its only inputs — the protocol, the public address and the peer
