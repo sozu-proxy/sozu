@@ -36,6 +36,7 @@ use sozu_command_lib::{
         UpdateUdpListenerConfig, WorkerInfo, WorkerInfos, WorkerRequest, WorkerResponse,
         WorkerResponses, request::RequestType, response_content::ContentType,
     },
+    proto::display::forwarded_headers_label,
     sd_notify,
     state::ConfigState,
 };
@@ -4430,6 +4431,16 @@ fn format_patch_diff_http(
     diff_opt_copy!(h2_graceful_shutdown_deadline_seconds);
     diff_opt_copy!(h2_max_window_update_stream0_per_window);
     diff_opt_str!(sozu_id_header);
+    if let Some(v) = p.forwarded_headers {
+        let old = current
+            .and_then(|c| c.forwarded_headers)
+            .map(forwarded_headers_label)
+            .unwrap_or_else(|| "?".to_owned());
+        parts.push(format!(
+            "forwarded_headers={old}→{}",
+            forwarded_headers_label(v)
+        ));
+    }
     if parts.is_empty() {
         "(no-op)".to_owned()
     } else {
@@ -4531,6 +4542,16 @@ fn format_patch_diff_https(
     diff_opt_copy!(h2_graceful_shutdown_deadline_seconds);
     diff_opt_copy!(h2_max_window_update_stream0_per_window);
     diff_opt_str!(sozu_id_header);
+    if let Some(v) = p.forwarded_headers {
+        let old = current
+            .and_then(|c| c.forwarded_headers)
+            .map(forwarded_headers_label)
+            .unwrap_or_else(|| "?".to_owned());
+        parts.push(format!(
+            "forwarded_headers={old}→{}",
+            forwarded_headers_label(v)
+        ));
+    }
     if parts.is_empty() {
         "(no-op)".to_owned()
     } else {

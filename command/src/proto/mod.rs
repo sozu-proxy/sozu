@@ -337,6 +337,7 @@ impl std::fmt::Debug for command::HttpListenerConfig {
             .field("answers_value_len", &answers_value_len)
             .field("elide_x_real_ip", &self.elide_x_real_ip)
             .field("send_x_real_ip", &self.send_x_real_ip)
+            .field("forwarded_headers", &self.forwarded_headers)
             .finish_non_exhaustive()
     }
 }
@@ -365,6 +366,7 @@ impl std::fmt::Debug for command::UpdateHttpListenerConfig {
             .field("answers_count", &answers_count)
             .field("answers_key_len", &answers_key_len)
             .field("answers_value_len", &answers_value_len)
+            .field("forwarded_headers", &self.forwarded_headers)
             .finish_non_exhaustive()
     }
 }
@@ -403,6 +405,7 @@ impl std::fmt::Debug for command::UpdateHttpsListenerConfig {
             .field("answers_count", &answers_count)
             .field("answers_key_len", &answers_key_len)
             .field("answers_value_len", &answers_value_len)
+            .field("forwarded_headers", &self.forwarded_headers)
             .finish_non_exhaustive()
     }
 }
@@ -520,6 +523,7 @@ impl std::fmt::Debug for command::HttpsListenerConfig {
             .field("answers_value_len", &answers_value_len)
             .field("elide_x_real_ip", &self.elide_x_real_ip)
             .field("send_x_real_ip", &self.send_x_real_ip)
+            .field("forwarded_headers", &self.forwarded_headers)
             .field("hsts", &self.hsts)
             .field("h2_max_header_fields", &self.h2_max_header_fields)
             .finish()

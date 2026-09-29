@@ -34,6 +34,30 @@
   supported: an older Sōzu cannot read the `<address>%<interface>` key in a saved state or an
   upgrade hand-off. Documented in `doc/configure.md`.
 
+- **`feat(listener)`: make forwarded headers configurable per listener
+  ([#322](https://github.com/sozu-proxy/sozu/issues/322)).** Sōzu added both forwarding header
+  families to every request, unconditionally. HTTP and HTTPS listeners gain
+  `forwarded_headers = "both" | "x_forwarded" | "rfc7239" | "none"`. `both` is the default and
+  is byte-for-byte the previous behaviour on well-formed requests. `x_forwarded` emits only `X-Forwarded-For`,
+  `X-Forwarded-Proto` and `X-Forwarded-Port`, and lets a client `Forwarded` pass through.
+  `rfc7239` emits only `Forwarded`, extending a client chain (RFC 7239 §4). It **removes** a
+  client `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Port` or `X-Forwarded-Host`
+  (RFC 7239 §8.1), because a client value passed through would reach the backend without Sōzu's
+  hop after it. `none` adds nothing and passes every client header through untouched, a trust
+  caveat documented in `doc/configure.md`. A `rewrite_host` sends `X-Forwarded-Host` only in
+  `both` and `x_forwarded`. The mode is independent of `elide_x_real_ip` / `send_x_real_ip`.
+  It applies to H1 and H2 frontends alike. It is hot-updatable through `UpdateHttpListenerConfig`
+  / `UpdateHttpsListenerConfig` (new field `forwarded_headers`, wire enum `ForwardedHeaders`) and
+  `sozu listener {http,https} {add,update} --forwarded-headers <mode>`. The main-process state
+  and the worker refuse an unknown wire value on add and on update. `ForwardingHop` still renders
+  every value once per connection, so the default path allocates exactly as before. Two fixes
+  also reach the default `both`. First, a client `Forwarded` line that is not a well-formed
+  RFC 7239 §4 list, such as an unclosed `for="6.6.6.6`, is removed instead of extended; extending
+  it used to swallow Sōzu's element into the client's quoted-string. A well-formed chain is
+  extended byte for byte as before. Second, H2 trailers now also drop `X-Forwarded-Proto`,
+  `X-Forwarded-Port` and `X-Forwarded-Host`, beside the `X-Forwarded-For` / `Forwarded` /
+  `X-Real-IP` / `X-Request-Id` they already dropped.
+
 - **`feat(metrics)`: count peer resets on TCP and TLS sockets
   ([#434](https://github.com/sozu-proxy/sozu/issues/434)).** A client that aborts its
   connection with a TCP RST instead of closing it cleanly is not necessarily an error, yet it

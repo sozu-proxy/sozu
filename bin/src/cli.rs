@@ -1,7 +1,10 @@
 use std::{collections::BTreeMap, io::IsTerminal, net::SocketAddr, path::PathBuf};
 
 use clap::{ArgAction, CommandFactory, FromArgMatches, Parser, Subcommand};
-use sozu_command_lib::proto::command::{LoadBalancingAlgorithms, TlsVersion};
+use sozu_command_lib::{
+    config::ForwardedHeadersMode,
+    proto::command::{LoadBalancingAlgorithms, TlsVersion},
+};
 
 #[derive(Parser, PartialEq, Eq, Clone, Debug)]
 #[clap(author, version, about)]
@@ -300,6 +303,36 @@ pub enum TopDetail {
     Cluster,
     /// Adds per-backend aggregation (cluster + backend, highest cardinality).
     Backend,
+}
+
+/// `--forwarded-headers` clap value enum for `sozu listener {http,https}`.
+/// Mirrors `ForwardedHeadersMode` with the TOML spellings, without leaking
+/// the configuration type into the CLI surface.
+#[derive(clap::ValueEnum, PartialEq, Eq, Clone, Copy, Debug)]
+pub enum ForwardedHeadersArg {
+    /// `X-Forwarded-*` and RFC 7239 `Forwarded` (the default).
+    #[value(name = "both")]
+    Both,
+    /// Only the `X-Forwarded-*` family.
+    #[value(name = "x_forwarded")]
+    XForwarded,
+    /// Only RFC 7239 `Forwarded`; client `X-Forwarded-*` headers are removed.
+    #[value(name = "rfc7239")]
+    Rfc7239,
+    /// No forwarding header; client ones pass through untouched.
+    #[value(name = "none")]
+    None,
+}
+
+impl From<ForwardedHeadersArg> for ForwardedHeadersMode {
+    fn from(arg: ForwardedHeadersArg) -> Self {
+        match arg {
+            ForwardedHeadersArg::Both => ForwardedHeadersMode::Both,
+            ForwardedHeadersArg::XForwarded => ForwardedHeadersMode::XForwarded,
+            ForwardedHeadersArg::Rfc7239 => ForwardedHeadersMode::Rfc7239,
+            ForwardedHeadersArg::None => ForwardedHeadersMode::None,
+        }
+    }
 }
 
 /// `--glyphs` clap value enum for `sozu top`. Three modes mirroring btop:
@@ -1034,6 +1067,12 @@ pub enum HttpListenerCmd {
             help = "maximum time to connect to a backend server"
         )]
         connect_timeout: Option<u32>,
+        #[clap(
+            long = "forwarded-headers",
+            value_enum,
+            help = "forwarding header family added to every forwarded request (default: both)"
+        )]
+        forwarded_headers: Option<ForwardedHeadersArg>,
     },
     #[clap(name = "remove")]
     Remove {
@@ -1211,6 +1250,12 @@ pub enum HttpListenerCmd {
             help = "Name of the correlation header injected per request (e.g. \"Sozu-Id\")"
         )]
         sozu_id_header: Option<String>,
+        #[clap(
+            long = "forwarded-headers",
+            value_enum,
+            help = "forwarding header family added to every forwarded request (default: both)"
+        )]
+        forwarded_headers: Option<ForwardedHeadersArg>,
 
         // Listener-default HTTP answer bodies (file paths)
         #[clap(long, help = "path to file for the 301 answer body")]
@@ -1302,6 +1347,12 @@ pub enum HttpsListenerCmd {
             help = "maximum time to connect to a backend server"
         )]
         connect_timeout: Option<u32>,
+        #[clap(
+            long = "forwarded-headers",
+            value_enum,
+            help = "forwarding header family added to every forwarded request (default: both)"
+        )]
+        forwarded_headers: Option<ForwardedHeadersArg>,
     },
     #[clap(name = "remove")]
     Remove {
@@ -1503,6 +1554,12 @@ pub enum HttpsListenerCmd {
             help = "Name of the correlation header injected per request (e.g. \"Sozu-Id\")"
         )]
         sozu_id_header: Option<String>,
+        #[clap(
+            long = "forwarded-headers",
+            value_enum,
+            help = "forwarding header family added to every forwarded request (default: both)"
+        )]
+        forwarded_headers: Option<ForwardedHeadersArg>,
 
         // Listener-default HTTP answer bodies (file paths)
         #[clap(long, help = "path to file for the 301 answer body")]
@@ -2035,6 +2092,45 @@ mod tests {
             } => assert_eq!(interface, None, "--interface stays optional"),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    /// sozu#322: `--forwarded-headers` takes the TOML spellings on
+    /// `listener https update`, and any other spelling is refused.
+    #[test]
+    fn listener_https_update_parses_forwarded_headers() {
+        use super::*;
+
+        let parse = |value: &str| {
+            Args::try_parse_from([
+                "sozu",
+                "listener",
+                "https",
+                "update",
+                "-a",
+                "127.0.0.1:443",
+                "--forwarded-headers",
+                value,
+            ])
+        };
+        for (value, expected) in [
+            ("both", ForwardedHeadersArg::Both),
+            ("x_forwarded", ForwardedHeadersArg::XForwarded),
+            ("rfc7239", ForwardedHeadersArg::Rfc7239),
+            ("none", ForwardedHeadersArg::None),
+        ] {
+            let args = parse(value).expect("clap should accept a known --forwarded-headers");
+            let HttpsListenerCmd::Update {
+                forwarded_headers, ..
+            } = extract_https_update(args)
+            else {
+                panic!("expected HttpsListenerCmd::Update");
+            };
+            assert_eq!(forwarded_headers, Some(expected), "{value}");
+        }
+        assert!(
+            parse("x-forwarded").is_err(),
+            "an unknown --forwarded-headers spelling must be refused"
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::{
 };
 
 use sozu_command_lib::{
-    config::{FileConfig, ListenerBuilder},
+    config::{FileConfig, ForwardedHeadersMode, ListenerBuilder},
     info,
     logging::setup_default_logging,
     proto::command::{
@@ -5347,6 +5347,240 @@ fn test_x_real_ip_send_and_elide() {
             10,
             "X-Real-IP: elide + send + PROXY-v2 — spoof stripped, peer IP from PROXY frame",
             try_x_real_ip_send_and_elide,
+        ),
+        State::Success
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Per-listener forwarding header family (`forwarded_headers`, sozu#322).
+//
+// * `test_forwarded_headers_rfc7239_h1` — only `Forwarded` is added (the
+//   client chain extended); client `X-Forwarded-*` headers are removed.
+// * `test_forwarded_headers_none_h1`    — nothing is added; client headers
+//   pass through untouched, and `send_x_real_ip` still injects `X-Real-IP`.
+// The default (`both`) is pinned by every existing forwarding test.
+// ---------------------------------------------------------------------------
+
+/// Helper: a single-worker HTTP listener in forwarding header mode `mode`
+/// with `send_x_real_ip` on, one cluster, one frontend and one backend
+/// address. Returns `(worker, front, back)`.
+pub fn setup_forwarded_headers_test(
+    name: &str,
+    mode: ForwardedHeadersMode,
+) -> (Worker, SocketAddr, SocketAddr) {
+    let front_address = create_local_address();
+    let back_address = create_local_address();
+
+    let (config, mut listeners, state) = Worker::empty_config();
+    crate::port_registry::attach_reserved_http_listener(&mut listeners, front_address);
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
+
+    let http_listener = {
+        let mut builder = ListenerBuilder::new_http(front_address.into());
+        builder.with_forwarded_headers(mode);
+        builder.with_send_x_real_ip(true);
+        builder
+            .to_http(None)
+            .expect("could not build HTTP listener")
+    };
+
+    worker.send_proxy_request_type(RequestType::AddHttpListener(http_listener));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
+        address: front_address.into(),
+        proxy: ListenerType::Http.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpFrontend(Worker::default_http_frontend(
+        "cluster_0",
+        front_address,
+    )));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    (worker, front_address, back_address)
+}
+
+/// A request carrying a client chain of both forwarding families.
+pub const FORWARDED_CLIENT_CHAIN_REQUEST: &str = "\
+    GET /api HTTP/1.1\r\n\
+    Host: localhost\r\n\
+    Connection: close\r\n\
+    X-Forwarded-For: 192.0.2.7\r\n\
+    Forwarded: for=192.0.2.7\r\n\
+    X-Forwarded-Proto: https\r\n\
+    X-Forwarded-Port: 443\r\n\
+    Content-Length: 4\r\n\
+    \r\n\
+    ping";
+
+/// Send `request` through a listener in `mode` and return the lower-cased
+/// request the backend received.
+fn forwarded_headers_round_trip(
+    name: &str,
+    mode: ForwardedHeadersMode,
+    request: &str,
+) -> Option<String> {
+    let (mut worker, front_address, back_address) = setup_forwarded_headers_test(name, mode);
+
+    let mut backend = SyncBackend::new("BACKEND_0", back_address, http_ok_response("pong"));
+    backend.connect();
+
+    let mut client = Client::new("client", front_address, request);
+    client.connect();
+    client.send();
+
+    backend.accept(0);
+    let request = backend.receive(0);
+    println!("backend received request: {request:?}");
+
+    backend.send(0);
+    let _ = client.receive();
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    request.map(|request| request.to_lowercase())
+}
+
+/// `rfc7239`: the backend sees the client `Forwarded` chain extended with
+/// Sōzu's element and no `X-Forwarded-*` header at all — neither the
+/// client's nor a synthesised one.
+fn try_forwarded_headers_rfc7239_h1() -> State {
+    let Some(request) = forwarded_headers_round_trip(
+        "FORWARDED-RFC7239-H1",
+        ForwardedHeadersMode::Rfc7239,
+        FORWARDED_CLIENT_CHAIN_REQUEST,
+    ) else {
+        println!("backend received no request");
+        return State::Fail;
+    };
+    if !request.contains("forwarded: for=192.0.2.7, proto=http;for=\"127.0.0.1:") {
+        println!("the client Forwarded chain was not extended:\n{request}");
+        return State::Fail;
+    }
+    if request.contains("x-forwarded-") {
+        println!("an X-Forwarded-* header reached the backend in rfc7239 mode:\n{request}");
+        return State::Fail;
+    }
+    if !request.contains("x-real-ip: 127.0.0.1") {
+        println!("send_x_real_ip must stay independent of the mode:\n{request}");
+        return State::Fail;
+    }
+    State::Success
+}
+
+/// `none`: every client forwarding header reaches the backend exactly as
+/// sent and Sōzu adds none of its own.
+fn try_forwarded_headers_none_h1() -> State {
+    let Some(request) = forwarded_headers_round_trip(
+        "FORWARDED-NONE-H1",
+        ForwardedHeadersMode::None,
+        FORWARDED_CLIENT_CHAIN_REQUEST,
+    ) else {
+        println!("backend received no request");
+        return State::Fail;
+    };
+    for expected in [
+        "\r\nx-forwarded-for: 192.0.2.7\r\n",
+        "\r\nforwarded: for=192.0.2.7\r\n",
+        "\r\nx-forwarded-proto: https\r\n",
+        "\r\nx-forwarded-port: 443\r\n",
+        "\r\nx-real-ip: 127.0.0.1\r\n",
+    ] {
+        if !request.contains(expected) {
+            println!("expected {expected:?} in:\n{request}");
+            return State::Fail;
+        }
+    }
+    for header in [
+        "x-forwarded-for:",
+        "forwarded:",
+        "x-forwarded-proto:",
+        "x-forwarded-port:",
+    ] {
+        if request.matches(&format!("\r\n{header}")).count() != 1 {
+            println!("{header} must appear exactly once, as the client sent it:\n{request}");
+            return State::Fail;
+        }
+    }
+    State::Success
+}
+
+/// `rfc7239` with a malformed client `Forwarded` (an unclosed
+/// quoted-string): the line is elided rather than extended, so the backend
+/// sees exactly one well-formed `Forwarded` line, Sōzu's own element, instead
+/// of an element swallowed into the client's quoted-string.
+fn try_forwarded_headers_rfc7239_malformed_client_forwarded_h1() -> State {
+    let Some(request) = forwarded_headers_round_trip(
+        "FORWARDED-RFC7239-MALFORMED-H1",
+        ForwardedHeadersMode::Rfc7239,
+        "GET /api HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Connection: close\r\n\
+         Forwarded: for=\"6.6.6.6\r\n\
+         Content-Length: 4\r\n\
+         \r\n\
+         ping",
+    ) else {
+        println!("backend received no request");
+        return State::Fail;
+    };
+    let forwarded: Vec<&str> = request
+        .split("\r\n")
+        .filter_map(|line| line.strip_prefix("forwarded: "))
+        .collect();
+    match forwarded.as_slice() {
+        [line] if line.starts_with("proto=http;for=\"127.0.0.1:") && !line.contains("6.6.6.6") => {
+            State::Success
+        }
+        _ => {
+            println!("expected one well-formed Forwarded line of Sōzu's own:\n{request}");
+            State::Fail
+        }
+    }
+}
+
+#[test]
+fn test_forwarded_headers_rfc7239_malformed_client_forwarded_h1() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "forwarded_headers = rfc7239: a malformed client Forwarded is elided (H1)",
+            try_forwarded_headers_rfc7239_malformed_client_forwarded_h1,
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_forwarded_headers_rfc7239_h1() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "forwarded_headers = rfc7239: only Forwarded, client X-Forwarded-* removed (H1)",
+            try_forwarded_headers_rfc7239_h1,
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_forwarded_headers_none_h1() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "forwarded_headers = none: nothing added, client headers untouched (H1)",
+            try_forwarded_headers_none_h1,
         ),
         State::Success
     );

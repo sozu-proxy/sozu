@@ -18,6 +18,7 @@
 //! 12. [`test_no_op_patch`]                         — address-only patch is no-op, state unchanged
 //! 13. [`test_hot_upgrade_replay`]                  — patched value survives upgrade fd-passing
 //! 14. [`test_load_state_merge_semantics`]          — LoadState after update preserves live value
+//! 15. [`test_forwarded_headers_hot_change`]        — forwarded_headers patched live (both → rfc7239)
 
 use std::{
     io::{Read, Write},
@@ -29,11 +30,11 @@ use std::{
 
 use rustls::ClientConfig;
 use sozu_command_lib::{
-    config::ListenerBuilder,
+    config::{ForwardedHeadersMode, ListenerBuilder},
     proto::command::{
         ActivateListener, AddCertificate, CertificateAndKey, Cluster, CustomHttpAnswers,
-        DeactivateListener, ListenerType, RequestHttpFrontend, ResponseStatus, SocketAddress,
-        UpdateHttpsListenerConfig, request::RequestType,
+        DeactivateListener, ForwardedHeaders, ListenerType, RequestHttpFrontend, ResponseStatus,
+        SocketAddress, UpdateHttpListenerConfig, UpdateHttpsListenerConfig, request::RequestType,
     },
 };
 use tempfile::NamedTempFile;
@@ -45,13 +46,19 @@ use super::h2_utils::{
     rejected_with_goaway_or_rst, verify_sozu_alive,
 };
 use crate::{
+    http_utils::http_ok_response,
     mock::{
-        aggregator::SimpleAggregator, async_backend::BackendHandle as AsyncBackend,
-        https_client::Verifier,
+        aggregator::SimpleAggregator, async_backend::BackendHandle as AsyncBackend, client::Client,
+        https_client::Verifier, sync_backend::Backend as SyncBackend,
     },
     port_registry::provide_port,
     sozu::worker::Worker,
-    tests::{State, repeat_until_error_or, tests::create_local_address},
+    tests::{
+        State, repeat_until_error_or,
+        tests::{
+            FORWARDED_CLIENT_CHAIN_REQUEST, create_local_address, setup_forwarded_headers_test,
+        },
+    },
 };
 
 // ============================================================================
@@ -1776,4 +1783,81 @@ fn test_load_state_merge_semantics() {
     for mut b in backends {
         b.stop_and_get_aggregator();
     }
+}
+
+// ============================================================================
+// Test 15: forwarded_headers hot change
+// ============================================================================
+
+/// Patch `forwarded_headers` on a running HTTP listener from the default
+/// `both` to `rfc7239` (sozu#322).
+///
+/// An H1 connection snapshots the listener once, when it opens
+/// (`Context::create_stream`, `lib/src/protocol/mux/mod.rs`), so the first
+/// request and the patched second one each ride a connection of their own.
+/// The first reaches the backend with both families and the client
+/// `X-Forwarded-For` extended; the second with only the extended
+/// `Forwarded` chain and no `X-Forwarded-*` header.
+fn try_forwarded_headers_hot_change() -> State {
+    let (mut worker, front_address, back_address) =
+        setup_forwarded_headers_test("FORWARDED-HEADERS-PATCH", ForwardedHeadersMode::Both);
+    let mut backend = SyncBackend::new("BACKEND_0", back_address, http_ok_response("pong"));
+    backend.connect();
+
+    let mut round_trip = |client_id: usize| {
+        let mut client = Client::new("client", front_address, FORWARDED_CLIENT_CHAIN_REQUEST);
+        client.connect();
+        client.send();
+        backend.accept(client_id);
+        let request = backend.receive(client_id);
+        backend.send(client_id);
+        let _ = client.receive();
+        request.map(|request| request.to_lowercase())
+    };
+
+    let before = round_trip(0);
+
+    worker.send_proxy_request_type(RequestType::UpdateHttpListener(UpdateHttpListenerConfig {
+        address: front_address.into(),
+        forwarded_headers: Some(ForwardedHeaders::Rfc7239 as i32),
+        ..Default::default()
+    }));
+    let patch_ok = worker
+        .read_proxy_response()
+        .is_some_and(|resp| resp.status == ResponseStatus::Ok as i32);
+
+    let after = round_trip(1);
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    println!("FORWARDED-HEADERS-PATCH: before={before:?}\nafter={after:?}");
+
+    let (Some(before), Some(after)) = (before, after) else {
+        println!("FORWARDED-HEADERS-PATCH: the backend missed a request");
+        return State::Fail;
+    };
+    let before_ok = before.contains("\r\nx-forwarded-for: 192.0.2.7, 127.0.0.1\r\n")
+        && before.contains("\r\nforwarded: for=192.0.2.7, proto=http;for=\"127.0.0.1:");
+    let after_ok = !after.contains("x-forwarded-")
+        && after.contains("\r\nforwarded: for=192.0.2.7, proto=http;for=\"127.0.0.1:");
+    println!(
+        "FORWARDED-HEADERS-PATCH: patch_ok={patch_ok} before_ok={before_ok} after_ok={after_ok}"
+    );
+    if patch_ok && before_ok && after_ok && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_forwarded_headers_hot_change() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "listener update: forwarded_headers both → rfc7239 on the next connection",
+            try_forwarded_headers_hot_change
+        ),
+        State::Success
+    );
 }

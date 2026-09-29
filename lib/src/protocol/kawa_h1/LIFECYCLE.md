@@ -91,11 +91,20 @@ mutable companion to the Kawa parser. Its `kawa::h1::ParserCallbacks` impl
   `stream.kind`;
 - `on_request_headers` (`editor.rs`) — captures the `:method`, authority,
   path; copies `X-Forwarded-For` into `xff_chain` for the access log; appends
-  the configured `Forwarded`/`X-Forwarded-*` hop; injects the `Sozu-Id`
+  the `Forwarded`/`X-Forwarded-*` hop of the families the listener's
+  `forwarded_headers` mode emits (`HttpContext::forwarded_headers`,
+  `editor.rs`) — both, one, or none — and, in `rfc7239` mode only, elides a
+  client `X-Forwarded-For`, `-Proto`, `-Port` or `-Host`
+  (`strips_x_forwarded`, `editor.rs`). In the modes that extend a client
+  `Forwarded` chain, a line that is not a well-formed RFC 7239 §4 list
+  (`is_valid_forwarded`, `editor.rs`) is elided rather than extended, so
+  Sōzu's element is never swallowed by an unclosed quoted-string. It injects the `Sozu-Id`
   correlation header named by `sozu_id_header`. The hop is rendered once per
   connection (`ForwardingHop`, `HttpContext::forwarding_hop`, `editor.rs`)
   from its only inputs — the protocol, the public address and the peer
-  address — and rendered again only when one of them changes: a synthesised
+  address — and rendered again only when one of them changes. The hop does
+  not depend on the mode: every value is rendered and the mode only gates
+  what is emitted, so `X-Real-IP` keeps its rendering under `none`. A synthesised
   `X-Forwarded-For`, `Forwarded`, `X-Real-IP` or `X-Forwarded-Port` shares
   that rendering (`kawa::Store::Shared`), while a client-supplied chain,
   which is request-scoped, is extended into an exact-size copy of its own.
@@ -519,7 +528,8 @@ a wedged session, or a security regression.
    `HttpContext::reset` (`editor.rs`) clears the per-request fields but
    preserves the per-connection ULID (`session_id`, `editor.rs`), the
    SNI-derived TLS state, the connection's rendered forwarding values
-   (`forwarding_hop`, `editor.rs`), and the rendered `sozu_id_header` label
+   (`forwarding_hop`, `editor.rs`) and the listener's `forwarded_headers`
+   mode, and the rendered `sozu_id_header` label
    (`editor.rs`). The request id (`HttpContext::id`, `editor.rs`) IS
    rotated per request: `reset` takes the next request's id as its argument,
    and the keep-alive branch of `ConnectionH1::writable`

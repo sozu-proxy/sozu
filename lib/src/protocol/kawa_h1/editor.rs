@@ -16,7 +16,10 @@ use std::{
 };
 
 use rusty_ulid::Ulid;
-use sozu_command_lib::logging::{CachedTags, LogContext};
+use sozu_command_lib::{
+    logging::{CachedTags, LogContext},
+    proto::command::ForwardedHeaders,
+};
 
 use crate::metrics::names;
 use crate::{
@@ -239,6 +242,151 @@ fn write_forwarded_suffix(
 /// rendered hop starts with it, and a synthesised header shares the same
 /// rendering from just past it (`kawa::Store::Shared`'s start offset).
 const HOP_SEPARATOR: &[u8] = b", ";
+
+/// Whether a listener in `mode` adds the `X-Forwarded-*` family
+/// (`X-Forwarded-For`, `-Proto`, `-Port`, and `-Host` on a host rewrite).
+pub(crate) fn emits_x_forwarded(mode: ForwardedHeaders) -> bool {
+    matches!(mode, ForwardedHeaders::Both | ForwardedHeaders::XForwarded)
+}
+
+/// Whether a listener in `mode` adds an RFC 7239 `Forwarded` element.
+pub(crate) fn emits_rfc7239(mode: ForwardedHeaders) -> bool {
+    matches!(mode, ForwardedHeaders::Both | ForwardedHeaders::Rfc7239)
+}
+
+/// Whether a listener in `mode` removes a client-supplied
+/// `X-Forwarded-For`, `-Proto`, `-Port` or `-Host`: only `rfc7239` does, so
+/// that the backend sees one forwarding family, whose last element Sōzu
+/// wrote (RFC 7239 §8.1: the header fields a client sends cannot be
+/// trusted).
+pub(crate) fn strips_x_forwarded(mode: ForwardedHeaders) -> bool {
+    mode == ForwardedHeaders::Rfc7239
+}
+
+/// Whether `key` names one of the `X-Forwarded-*` headers the editor
+/// manages: the ones `strips_x_forwarded` removes.
+fn is_managed_x_forwarded(key: &[u8]) -> bool {
+    compare_no_case(key, b"X-Forwarded-For")
+        || compare_no_case(key, b"X-Forwarded-Proto")
+        || compare_no_case(key, b"X-Forwarded-Port")
+        || compare_no_case(key, b"X-Forwarded-Host")
+}
+
+/// Whether `byte` is an RFC 9110 §5.6.2 `tchar`.
+fn is_tchar(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// Whether `value` is a well-formed RFC 7239 §4 `Forwarded` field value:
+///
+/// ```text
+/// Forwarded         = 1#forwarded-element
+/// forwarded-element = [ forwarded-pair ] *( ";" [ forwarded-pair ] )
+/// forwarded-pair    = token "=" value
+/// value             = token / quoted-string
+/// ```
+///
+/// with `token` and `quoted-string` from RFC 9110 §5.6.2 / §5.6.4. As RFC
+/// 9110 §5.6.1 asks of a list recipient, empty list elements and optional
+/// whitespace around `,` are accepted; whitespace is also tolerated around
+/// `;`. An empty value is an empty list. What matters is that a parser reads
+/// the value as a sequence of complete elements, so the element Sōzu appends
+/// after a `, ` is read as one of its own: an unclosed quoted-string would
+/// swallow it.
+fn is_valid_forwarded(value: &[u8]) -> bool {
+    let skip_ows = |i: &mut usize| {
+        while *i < value.len() && matches!(value[*i], b' ' | b'\t') {
+            *i += 1;
+        }
+    };
+    let mut i = 0;
+    loop {
+        // One forwarded-element: optional pairs separated by `;`.
+        loop {
+            skip_ows(&mut i);
+            if i < value.len() && is_tchar(value[i]) {
+                // token "="
+                while i < value.len() && is_tchar(value[i]) {
+                    i += 1;
+                }
+                if value.get(i) != Some(&b'=') {
+                    return false;
+                }
+                i += 1;
+                // value = token / quoted-string
+                match value.get(i) {
+                    Some(b'"') => {
+                        i += 1;
+                        loop {
+                            match value.get(i) {
+                                None => return false,
+                                Some(b'"') => {
+                                    i += 1;
+                                    break;
+                                }
+                                Some(b'\\') => match value.get(i + 1) {
+                                    Some(&escaped)
+                                        if escaped == b'\t'
+                                            || escaped == b' '
+                                            || (0x21..=0x7e).contains(&escaped)
+                                            || escaped >= 0x80 =>
+                                    {
+                                        i += 2
+                                    }
+                                    _ => return false,
+                                },
+                                Some(&byte)
+                                    if byte == b'\t'
+                                        || byte == b' '
+                                        || byte == 0x21
+                                        || (0x23..=0x7e).contains(&byte)
+                                        || byte >= 0x80 =>
+                                {
+                                    i += 1
+                                }
+                                Some(_) => return false,
+                            }
+                        }
+                    }
+                    Some(&byte) if is_tchar(byte) => {
+                        while i < value.len() && is_tchar(value[i]) {
+                            i += 1;
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+            skip_ows(&mut i);
+            if value.get(i) == Some(&b';') {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        match value.get(i) {
+            None => return true,
+            Some(b',') => i += 1,
+            Some(_) => return false,
+        }
+    }
+}
 
 /// The forwarding values of one connection, rendered once from the inputs
 /// they depend on and shared by every request that reuses those inputs.
@@ -497,6 +645,14 @@ pub struct HttpContext {
     /// without a peer), no header is appended — identical to the
     /// existing X-Forwarded-For / Forwarded synthesis behaviour.
     pub send_x_real_ip: bool,
+    /// Which forwarding header family `on_request_headers` adds to the
+    /// request. Mirrors `HttpListenerConfig::forwarded_headers` /
+    /// `HttpsListenerConfig::forwarded_headers`. Set from the mux `Context`
+    /// at stream creation (see `Context::create_stream`); listener-scoped
+    /// and never reset across keep-alive requests. Independent of
+    /// `elide_x_real_ip` and `send_x_real_ip`: `X-Real-IP` belongs to
+    /// neither family. `Both`, the default, is the historical behaviour.
+    pub forwarded_headers: ForwardedHeaders,
     /// Negotiated TLS protocol version as a short label (e.g. `"TLSv1.3"`).
     /// Captured from `rustls_version_label` at handshake completion and
     /// propagated from the mux `Context`. `None` for plaintext listeners.
@@ -838,6 +994,7 @@ impl HttpContext {
             strict_sni_binding: true,
             elide_x_real_ip,
             send_x_real_ip,
+            forwarded_headers: ForwardedHeaders::Both,
             tls_version: None,
             tls_cipher: None,
             tls_alpn: None,
@@ -1082,6 +1239,15 @@ impl HttpContext {
         // - store X-Forwarded-For
         // - store Forwarded
         // - store User-Agent
+        let forwarded_headers = self.forwarded_headers;
+        let emits_x_forwarded = emits_x_forwarded(forwarded_headers);
+        let emits_rfc7239 = emits_rfc7239(forwarded_headers);
+        let strips_x_forwarded = strips_x_forwarded(forwarded_headers);
+        // A mode that strips the client X-Forwarded-* family never adds it.
+        debug_assert!(
+            !(strips_x_forwarded && emits_x_forwarded),
+            "a mode that strips X-Forwarded-* must not emit it"
+        );
         let mut x_for = None;
         let mut forwarded = None;
         let mut has_x_port = false;
@@ -1104,6 +1270,35 @@ impl HttpContext {
                             let val = header.val.data(buf);
                             self.keep_alive_frontend &= !has_connection_option(val, b"close");
                         }
+                    } else if strips_x_forwarded && is_managed_x_forwarded(key) {
+                        // `rfc7239`: a client X-Forwarded-For, -Proto,
+                        // -Port or -Host is removed, not trusted. The
+                        // X-Forwarded-For value is still recorded for the
+                        // access log, which keeps what the client attested.
+                        if compare_no_case(key, b"X-Forwarded-For") {
+                            self.xff_chain = header
+                                .val
+                                .data_opt(buf)
+                                .and_then(|data| from_utf8(data).ok())
+                                .map(ToOwned::to_owned);
+                        }
+                        header.elide();
+                        // Post: the client value never reaches the backend.
+                        debug_assert!(
+                            header.is_elided(),
+                            "a client X-Forwarded-* header must be elided in rfc7239 mode"
+                        );
+                    } else if !emits_x_forwarded
+                        && (compare_no_case(key, b"X-Forwarded-Proto")
+                            || compare_no_case(key, b"X-Forwarded-Port"))
+                    {
+                        // `none`: Sōzu takes no stance on a client
+                        // X-Forwarded-Proto or -Port — it neither trusts nor
+                        // replaces them, so they pass through as sent.
+                        debug_assert!(
+                            forwarded_headers == ForwardedHeaders::None,
+                            "only `none` passes a client X-Forwarded-Proto/-Port through"
+                        );
                     } else if compare_no_case(key, b"X-Forwarded-Proto") {
                         has_x_proto = true;
                         // header.val = kawa::Store::Static(proto.as_bytes());
@@ -1167,7 +1362,28 @@ impl HttpContext {
                             "client X-Real-IP must be elided when elide_x_real_ip is set"
                         );
                     } else if compare_no_case(key, b"Forwarded") {
-                        forwarded = Some(header);
+                        if emits_rfc7239
+                            && !is_valid_forwarded(header.val.data_opt(buf).unwrap_or_default())
+                        {
+                            // A malformed client chain cannot be extended:
+                            // an unclosed quoted-string would swallow the
+                            // element appended after it. RFC 7239 §4 lets a
+                            // proxy remove the field; the element Sōzu adds
+                            // then goes to an earlier well-formed line or a
+                            // synthesised one, so it is always parseable
+                            // and last.
+                            debug!(
+                                "{} eliding a malformed client Forwarded header",
+                                self.log_context()
+                            );
+                            header.elide();
+                            debug_assert!(
+                                header.is_elided(),
+                                "a malformed client Forwarded must be elided"
+                            );
+                        } else {
+                            forwarded = Some(header);
+                        }
                     } else if compare_no_case(key, b"User-Agent") {
                         self.user_agent = header
                             .val
@@ -1249,15 +1465,17 @@ impl HttpContext {
             let has_forwarded = forwarded.is_some();
 
             // A client-supplied chain is request-scoped: it is extended into
-            // one exact-size copy (`extended_chain`), never kept.
-            if let Some(header) = x_for {
+            // one exact-size copy (`extended_chain`), never kept. A mode
+            // that does not emit a family leaves its client chain as sent
+            // (`rfc7239` elided the X-Forwarded-For lines in the walk above).
+            if emits_x_forwarded && let Some(header) = x_for {
                 header.val = extended_chain(header.val.data(buf), &x_forwarded_for_hop);
             }
-            if let Some(header) = &mut forwarded {
+            if emits_rfc7239 && let Some(header) = &mut forwarded {
                 header.val = extended_chain(header.val.data(buf), &forwarded_hop);
             }
 
-            if !has_x_for {
+            if emits_x_forwarded && !has_x_for {
                 let blocks_before = request.blocks.len();
                 request.push_block(kawa::Block::Header(kawa::Pair {
                     key: kawa::Store::Static(b"X-Forwarded-For"),
@@ -1269,7 +1487,7 @@ impl HttpContext {
                     "creating X-Forwarded-For must push exactly one block"
                 );
             }
-            if !has_forwarded {
+            if emits_rfc7239 && !has_forwarded {
                 let blocks_before = request.blocks.len();
                 request.push_block(kawa::Block::Header(kawa::Pair {
                     key: kawa::Store::Static(b"Forwarded"),
@@ -1287,7 +1505,9 @@ impl HttpContext {
             // even when the upstream presented PROXY-v2). Folded into the
             // peer arm so missing peers (raw socket, no PROXY-v2) skip the
             // injection silently — identical to the X-Forwarded-For /
-            // Forwarded synthesis behaviour above. It shares the
+            // Forwarded synthesis behaviour above. `X-Real-IP` belongs to
+            // neither forwarding family, so `forwarded_headers` never gates
+            // it: the hop is rendered in every mode. It shares the
             // X-Forwarded-For rendering of the peer. Any client-supplied
             // `X-Real-IP` was either elided in the block walk (if
             // `elide_x_real_ip` is on) or passes through; this header is
@@ -1319,13 +1539,13 @@ impl HttpContext {
             self.otel = Some(otel);
         }
 
-        if !has_x_port {
+        if emits_x_forwarded && !has_x_port {
             request.push_block(kawa::Block::Header(kawa::Pair {
                 key: kawa::Store::Static(b"X-Forwarded-Port"),
                 val: kawa::Store::Shared(port_hop, 0),
             }));
         }
-        if !has_x_proto {
+        if emits_x_forwarded && !has_x_proto {
             request.push_block(kawa::Block::Header(kawa::Pair {
                 key: kawa::Store::Static(b"X-Forwarded-Proto"),
                 val: kawa::Store::Static(proto.as_bytes()),
@@ -1392,6 +1612,17 @@ impl HttpContext {
         debug_assert!(
             request.blocks.len() >= blocks_at_entry,
             "header editing must never drop a block from the request"
+        );
+        // Postcondition: `rfc7239` forwards no X-Forwarded-* header the
+        // editor manages, client-supplied or synthesised.
+        debug_assert!(
+            !strips_x_forwarded
+                || request.blocks.iter().all(|block| match block {
+                    kawa::Block::Header(header) if !header.is_elided() =>
+                        !is_managed_x_forwarded(header.key.data(request.storage.buffer())),
+                    _ => true,
+                }),
+            "rfc7239 mode must forward no X-Forwarded-For/-Proto/-Port/-Host"
         );
     }
 
@@ -1724,6 +1955,7 @@ impl HttpContext {
         let strict_sni_before = self.strict_sni_binding;
         let elide_before = self.elide_x_real_ip;
         let send_before = self.send_x_real_ip;
+        let forwarded_headers_before = self.forwarded_headers;
         let tls_version_before = self.tls_version;
         let tls_cipher_before = self.tls_cipher;
         let tls_alpn_before = self.tls_alpn;
@@ -1749,7 +1981,8 @@ impl HttpContext {
         self.original_authority = None;
         self.headers_response.clear();
         // Note: tls_server_name, tls_version, tls_cipher, tls_alpn,
-        // strict_sni_binding, elide_x_real_ip, send_x_real_ip are
+        // strict_sni_binding, elide_x_real_ip, send_x_real_ip,
+        // forwarded_headers are
         // connection-scoped — set once at handshake completion and reused
         // across every keep-alive request, so reset() intentionally leaves
         // them in place. So is forwarding_hop, rendered from connection-
@@ -1783,6 +2016,7 @@ impl HttpContext {
             self.strict_sni_binding == strict_sni_before
                 && self.elide_x_real_ip == elide_before
                 && self.send_x_real_ip == send_before
+                && self.forwarded_headers == forwarded_headers_before
                 && self.tls_version == tls_version_before
                 && self.tls_cipher == tls_cipher_before
                 && self.tls_alpn == tls_alpn_before,
@@ -3226,6 +3460,338 @@ mod tests {
             ),
             "a new protocol is rendered"
         );
+    }
+
+    // ── forwarding header family (`forwarded_headers`) ─────────────────
+
+    /// A request carrying a client chain of every forwarding header the
+    /// editor manages: two `X-Forwarded-For` lines, a `Forwarded` chain,
+    /// `X-Forwarded-Proto`, `X-Forwarded-Port` and `X-Forwarded-Host`.
+    const CLIENT_CHAIN_REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: example.com\r\n\
+        X-Forwarded-For: 198.51.100.1\r\n\
+        X-Forwarded-For: 192.0.2.7\r\n\
+        Forwarded: for=192.0.2.7\r\n\
+        X-Forwarded-Proto: https\r\n\
+        X-Forwarded-Port: 443\r\n\
+        X-Forwarded-Host: public.example\r\n\
+        X-Real-IP: 203.0.113.9\r\n\
+        X-Request-Id: client-chosen\r\n\r\n";
+
+    /// The request `on_request_headers` forwards for `request` on a
+    /// connection from `10.0.0.1:54321` to `127.0.0.1:8080` whose listener
+    /// has the forwarding header family `mode` and `send_x_real_ip` on,
+    /// with the context left for the caller to inspect.
+    fn forwarded_in_mode(mode: ForwardedHeaders, request: &[u8]) -> (String, HttpContext) {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let mut kawa = warm_request_kawa(&mut pool);
+        let mut ctx = forwarding_context(
+            Protocol::HTTP,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 54321),
+            true,
+        );
+        ctx.forwarded_headers = mode;
+        allocations_of_request_parse(&mut ctx, &mut kawa, request);
+        (serialized_request(&mut kawa), ctx)
+    }
+
+    /// `both`, the default, is the historical behaviour, pinned byte for
+    /// byte: a bare request gains the whole `X-Forwarded-*` family and a
+    /// `Forwarded` element; a client chain is extended (the last
+    /// `X-Forwarded-For` line and the last `Forwarded` line), and a client
+    /// `X-Forwarded-Proto`, `-Port` or `-Host` is kept as sent.
+    #[test]
+    fn forwarded_headers_both_adds_both_families_and_extends_client_chains() {
+        let (bare, ctx) = forwarded_in_mode(ForwardedHeaders::Both, BARE_REQUEST);
+        let id = ctx.id.to_string();
+        let traceparent = synthesised_traceparent_line(&ctx);
+        assert_eq!(
+            bare,
+            format!(
+                "GET / HTTP/1.1\r\nHost: example.com\r\n\
+                 X-Forwarded-For: 10.0.0.1\r\n\
+                 Forwarded: proto=http;for=\"10.0.0.1:54321\";by=127.0.0.1\r\n\
+                 X-Real-IP: 10.0.0.1\r\n\
+                 {traceparent}\
+                 X-Forwarded-Port: 8080\r\n\
+                 X-Forwarded-Proto: http\r\n\
+                 X-Request-Id: {id}\r\n\
+                 Sozu-Id: {id}\r\n\r\n"
+            )
+        );
+
+        let (chained, ctx) = forwarded_in_mode(ForwardedHeaders::Both, CLIENT_CHAIN_REQUEST);
+        let id = ctx.id.to_string();
+        let traceparent = synthesised_traceparent_line(&ctx);
+        assert_eq!(
+            chained,
+            format!(
+                "GET / HTTP/1.1\r\nHost: example.com\r\n\
+                 X-Forwarded-For: 198.51.100.1\r\n\
+                 X-Forwarded-For: 192.0.2.7, 10.0.0.1\r\n\
+                 Forwarded: for=192.0.2.7, proto=http;for=\"10.0.0.1:54321\";by=127.0.0.1\r\n\
+                 X-Forwarded-Proto: https\r\n\
+                 X-Forwarded-Port: 443\r\n\
+                 X-Forwarded-Host: public.example\r\n\
+                 X-Real-IP: 203.0.113.9\r\n\
+                 X-Request-Id: client-chosen\r\n\
+                 X-Real-IP: 10.0.0.1\r\n\
+                 {traceparent}\
+                 Sozu-Id: {id}\r\n\r\n"
+            )
+        );
+        assert_eq!(ctx.xff_chain.as_deref(), Some("192.0.2.7"));
+    }
+
+    /// `x_forwarded` handles the `X-Forwarded-*` family exactly as `both`
+    /// does and adds no `Forwarded`: a client `Forwarded` chain passes
+    /// through as sent, neither extended nor removed.
+    ///
+    /// TO SEE THIS RED: in `HttpContext::on_request_headers`, drop the
+    /// `emits_rfc7239` guard on the `Forwarded` extension and synthesis.
+    #[test]
+    fn forwarded_headers_x_forwarded_adds_only_the_x_forwarded_family() {
+        let (bare, ctx) = forwarded_in_mode(ForwardedHeaders::XForwarded, BARE_REQUEST);
+        let id = ctx.id.to_string();
+        let traceparent = synthesised_traceparent_line(&ctx);
+        assert_eq!(
+            bare,
+            format!(
+                "GET / HTTP/1.1\r\nHost: example.com\r\n\
+                 X-Forwarded-For: 10.0.0.1\r\n\
+                 X-Real-IP: 10.0.0.1\r\n\
+                 {traceparent}\
+                 X-Forwarded-Port: 8080\r\n\
+                 X-Forwarded-Proto: http\r\n\
+                 X-Request-Id: {id}\r\n\
+                 Sozu-Id: {id}\r\n\r\n"
+            )
+        );
+
+        let (chained, ctx) = forwarded_in_mode(ForwardedHeaders::XForwarded, CLIENT_CHAIN_REQUEST);
+        let id = ctx.id.to_string();
+        let traceparent = synthesised_traceparent_line(&ctx);
+        assert_eq!(
+            chained,
+            format!(
+                "GET / HTTP/1.1\r\nHost: example.com\r\n\
+                 X-Forwarded-For: 198.51.100.1\r\n\
+                 X-Forwarded-For: 192.0.2.7, 10.0.0.1\r\n\
+                 Forwarded: for=192.0.2.7\r\n\
+                 X-Forwarded-Proto: https\r\n\
+                 X-Forwarded-Port: 443\r\n\
+                 X-Forwarded-Host: public.example\r\n\
+                 X-Real-IP: 203.0.113.9\r\n\
+                 X-Request-Id: client-chosen\r\n\
+                 X-Real-IP: 10.0.0.1\r\n\
+                 {traceparent}\
+                 Sozu-Id: {id}\r\n\r\n"
+            )
+        );
+        assert_eq!(ctx.xff_chain.as_deref(), Some("192.0.2.7"));
+    }
+
+    /// `rfc7239` adds only `Forwarded`: its own element is appended to the
+    /// last client `Forwarded` line (RFC 7239 §4) or synthesised, and every
+    /// client `X-Forwarded-For`, `-Proto`, `-Port` and `-Host` line is
+    /// removed, so the backend sees one forwarding family whose last element
+    /// Sōzu wrote. The client `X-Forwarded-For` is still recorded for the
+    /// access log, and `X-Real-IP` is untouched by the mode.
+    ///
+    /// TO SEE THIS RED: in `HttpContext::on_request_headers`, drop the
+    /// `strips_x_forwarded` branch that elides the client headers.
+    #[test]
+    fn forwarded_headers_rfc7239_adds_only_forwarded_and_strips_client_x_forwarded() {
+        let (bare, ctx) = forwarded_in_mode(ForwardedHeaders::Rfc7239, BARE_REQUEST);
+        let id = ctx.id.to_string();
+        let traceparent = synthesised_traceparent_line(&ctx);
+        assert_eq!(
+            bare,
+            format!(
+                "GET / HTTP/1.1\r\nHost: example.com\r\n\
+                 Forwarded: proto=http;for=\"10.0.0.1:54321\";by=127.0.0.1\r\n\
+                 X-Real-IP: 10.0.0.1\r\n\
+                 {traceparent}\
+                 X-Request-Id: {id}\r\n\
+                 Sozu-Id: {id}\r\n\r\n"
+            )
+        );
+
+        let (chained, ctx) = forwarded_in_mode(ForwardedHeaders::Rfc7239, CLIENT_CHAIN_REQUEST);
+        let id = ctx.id.to_string();
+        let traceparent = synthesised_traceparent_line(&ctx);
+        assert_eq!(
+            chained,
+            format!(
+                "GET / HTTP/1.1\r\nHost: example.com\r\n\
+                 Forwarded: for=192.0.2.7, proto=http;for=\"10.0.0.1:54321\";by=127.0.0.1\r\n\
+                 X-Real-IP: 203.0.113.9\r\n\
+                 X-Request-Id: client-chosen\r\n\
+                 X-Real-IP: 10.0.0.1\r\n\
+                 {traceparent}\
+                 Sozu-Id: {id}\r\n\r\n"
+            )
+        );
+        assert_eq!(ctx.xff_chain.as_deref(), Some("192.0.2.7"));
+    }
+
+    /// `none` adds no forwarding header of either family and leaves every
+    /// client one as sent, while `X-Real-IP` — governed by `send_x_real_ip`
+    /// alone — is still injected.
+    ///
+    /// TO SEE THIS RED: in `HttpContext::on_request_headers`, drop the
+    /// `emits_x_forwarded` guard on the `X-Forwarded-*` synthesis.
+    #[test]
+    fn forwarded_headers_none_adds_nothing_and_passes_client_headers_through() {
+        let (bare, ctx) = forwarded_in_mode(ForwardedHeaders::None, BARE_REQUEST);
+        let id = ctx.id.to_string();
+        let traceparent = synthesised_traceparent_line(&ctx);
+        assert_eq!(
+            bare,
+            format!(
+                "GET / HTTP/1.1\r\nHost: example.com\r\n\
+                 X-Real-IP: 10.0.0.1\r\n\
+                 {traceparent}\
+                 X-Request-Id: {id}\r\n\
+                 Sozu-Id: {id}\r\n\r\n"
+            )
+        );
+
+        let (chained, ctx) = forwarded_in_mode(ForwardedHeaders::None, CLIENT_CHAIN_REQUEST);
+        let id = ctx.id.to_string();
+        let traceparent = synthesised_traceparent_line(&ctx);
+        assert_eq!(
+            chained,
+            format!(
+                "GET / HTTP/1.1\r\nHost: example.com\r\n\
+                 X-Forwarded-For: 198.51.100.1\r\n\
+                 X-Forwarded-For: 192.0.2.7\r\n\
+                 Forwarded: for=192.0.2.7\r\n\
+                 X-Forwarded-Proto: https\r\n\
+                 X-Forwarded-Port: 443\r\n\
+                 X-Forwarded-Host: public.example\r\n\
+                 X-Real-IP: 203.0.113.9\r\n\
+                 X-Request-Id: client-chosen\r\n\
+                 X-Real-IP: 10.0.0.1\r\n\
+                 {traceparent}\
+                 Sozu-Id: {id}\r\n\r\n"
+            )
+        );
+        assert_eq!(ctx.xff_chain.as_deref(), Some("192.0.2.7"));
+    }
+
+    /// A client `Forwarded` value is only extended when it is a well-formed
+    /// RFC 7239 §4 list. An unclosed quoted-string would otherwise swallow
+    /// Sōzu's element into the client's value
+    /// (`for="6.6.6.6, proto=http;for="10.0.0.1:54321";by=127.0.0.1`), and
+    /// the backend would read neither the client's element nor Sōzu's.
+    /// In `both` and `rfc7239` — the modes that extend the chain — a
+    /// malformed line is elided (RFC 7239 §4 lets a proxy remove the field),
+    /// so the element Sōzu writes is always well-formed and last; a
+    /// well-formed earlier line is extended instead. `x_forwarded` and
+    /// `none` do not touch `Forwarded`, so the line passes through as sent.
+    ///
+    /// TO SEE THIS RED: in `HttpContext::on_request_headers`, drop the
+    /// `is_valid_forwarded` check on the client `Forwarded` line.
+    #[test]
+    fn a_malformed_client_forwarded_is_elided_where_the_chain_is_extended() {
+        const MALFORMED: &[u8] = b"GET / HTTP/1.1\r\nHost: example.com\r\n\
+            Forwarded: for=\"6.6.6.6\r\n\r\n";
+        const VALID_THEN_MALFORMED: &[u8] = b"GET / HTTP/1.1\r\nHost: example.com\r\n\
+            Forwarded: for=192.0.2.7\r\n\
+            Forwarded: for=\"6.6.6.6\r\n\r\n";
+        let forwarded_lines = |out: &str| -> Vec<String> {
+            out.split("\r\n")
+                .filter_map(|line| line.strip_prefix("Forwarded: "))
+                .map(ToOwned::to_owned)
+                .collect()
+        };
+        let hop = "proto=http;for=\"10.0.0.1:54321\";by=127.0.0.1";
+
+        for mode in [ForwardedHeaders::Both, ForwardedHeaders::Rfc7239] {
+            let (out, _) = forwarded_in_mode(mode, MALFORMED);
+            assert_eq!(
+                forwarded_lines(&out),
+                vec![hop.to_owned()],
+                "{mode:?}: {out}"
+            );
+            let (out, _) = forwarded_in_mode(mode, VALID_THEN_MALFORMED);
+            let lines = forwarded_lines(&out);
+            assert_eq!(
+                lines,
+                vec![format!("for=192.0.2.7, {hop}")],
+                "{mode:?}: {out}"
+            );
+            assert!(
+                lines.iter().all(|line| is_valid_forwarded(line.as_bytes())),
+                "{mode:?}: the forwarded chain must be well-formed: {lines:?}"
+            );
+        }
+        for mode in [ForwardedHeaders::XForwarded, ForwardedHeaders::None] {
+            let (out, _) = forwarded_in_mode(mode, MALFORMED);
+            assert_eq!(
+                forwarded_lines(&out),
+                vec!["for=\"6.6.6.6".to_owned()],
+                "{mode:?} passes a client Forwarded through as sent: {out}"
+            );
+        }
+    }
+
+    /// `is_valid_forwarded` accepts the RFC 7239 §4 grammar — a list of
+    /// `;`-separated `token=value` pairs, `value` a token or a quoted-string
+    /// (RFC 9110 §5.6.4) — and refuses anything that would make a parser
+    /// misread the element appended after it.
+    #[test]
+    fn is_valid_forwarded_follows_the_rfc7239_grammar() {
+        for valid in [
+            &b""[..],
+            b"for=192.0.2.7",
+            b"For=\"[2001:db8:cafe::17]:4711\"",
+            b"for=192.0.2.60;proto=http;by=203.0.113.43",
+            b"for=192.0.2.43, for=198.51.100.17",
+            b"for=192.0.2.43,for=\"[2001:db8:cafe::17]\",for=unknown",
+            b"for=_gazonk",
+            b"for=\"\\\"quoted\\\"\"",
+            b"for=a;",
+            b"for=a ; by=b",
+            b"for=a, , for=b",
+            b"proto=http;for=\"10.0.0.1:54321\";by=127.0.0.1",
+        ] {
+            assert!(
+                is_valid_forwarded(valid),
+                "{:?} is valid",
+                String::from_utf8_lossy(valid)
+            );
+        }
+        for invalid in [
+            &b"for=\"6.6.6.6"[..],
+            b"for=\"6.6.6.6\\\"",
+            b"for=",
+            b"=192.0.2.7",
+            b"for",
+            b"for=a b",
+            b"for=a\"b\"",
+            b"for=\"a\"b",
+            b"for = a",
+            b"for=a\x01",
+            b"for=\"a\x7f\"",
+        ] {
+            assert!(
+                !is_valid_forwarded(invalid),
+                "{:?} is invalid",
+                String::from_utf8_lossy(invalid)
+            );
+        }
+    }
+
+    /// The mode is listener-scoped: `reset` carries it to the next request
+    /// of a keep-alive connection.
+    #[test]
+    fn forwarded_headers_survives_reset() {
+        let mut ctx = make_context();
+        ctx.forwarded_headers = ForwardedHeaders::Rfc7239;
+        ctx.reset(Ulid::generate());
+        assert_eq!(ctx.forwarded_headers, ForwardedHeaders::Rfc7239);
     }
 
     // ── request framing: no Content-Length, no Transfer-Encoding ───────

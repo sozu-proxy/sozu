@@ -16,7 +16,7 @@ use crate::{
         command::{
             AggregatedMetrics, AvailableMetrics, CertificateAndKey, CertificateSummary,
             CertificatesWithFingerprints, ClusterMetrics, CustomHttpAnswers, Event, EventKind,
-            FilteredMetrics, HealthChecksList, HttpEndpoint, HttpListenerConfig,
+            FilteredMetrics, ForwardedHeaders, HealthChecksList, HttpEndpoint, HttpListenerConfig,
             HttpsListenerConfig, ListOfCertificatesByAddress, ListedFrontends, ListenersList,
             MetricDetailStatus, ProtobufEndpoint, QueryCertificatesFilters, RequestCounts,
             Response, ResponseContent, ResponseStatus, RunState, SocketAddress, TlsVersion,
@@ -1275,6 +1275,9 @@ impl Display for HttpListenerConfig {
         if let Some(v) = self.send_x_real_ip {
             table.add_row(row!["send X-Real-IP (peer IP)", v]);
         }
+        if let Some(v) = self.forwarded_headers {
+            table.add_row(row!["forwarded headers", forwarded_headers_label(v)]);
+        }
         write!(f, "{table}")
     }
 }
@@ -1357,7 +1360,22 @@ impl Display for HttpsListenerConfig {
         if let Some(v) = self.send_x_real_ip {
             table.add_row(row!["send X-Real-IP (peer IP)", v]);
         }
+        if let Some(v) = self.forwarded_headers {
+            table.add_row(row!["forwarded headers", forwarded_headers_label(v)]);
+        }
         write!(f, "{table}")
+    }
+}
+
+/// The TOML spelling of a `forwarded_headers` wire value, or the raw number
+/// when it names no [`ForwardedHeaders`] variant.
+pub fn forwarded_headers_label(value: i32) -> String {
+    match ForwardedHeaders::try_from(value) {
+        Ok(ForwardedHeaders::Both) => "both".to_owned(),
+        Ok(ForwardedHeaders::XForwarded) => "x_forwarded".to_owned(),
+        Ok(ForwardedHeaders::Rfc7239) => "rfc7239".to_owned(),
+        Ok(ForwardedHeaders::None) => "none".to_owned(),
+        Err(_) => format!("unknown ({value})"),
     }
 }
 

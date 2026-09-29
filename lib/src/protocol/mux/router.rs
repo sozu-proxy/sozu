@@ -106,7 +106,7 @@ use super::{BackendId, BackendStatus, Connection, Context, GlobalStreamId, Posit
 use crate::{
     BackendConnectionError, L7ListenerHandler, ListenerHandler, Readiness, RetrieveClusterError,
     backends::BackendError,
-    protocol::http::editor::{HeaderEditMode, HeaderEditSnapshot, HttpContext},
+    protocol::http::editor::{HeaderEditMode, HeaderEditSnapshot, HttpContext, emits_x_forwarded},
     router::{HeaderEdit, RouteResult},
     server::CONN_RETRIES,
     socket::SessionTcpStream,
@@ -1457,7 +1457,12 @@ pub struct DialedBackend {
 ///    the kawa parser. The pre-rewrite authority is read from
 ///    `context.authority`, which no rewrite touches, and recorded in
 ///    `context.original_authority` only here, so a request without a
-///    host rewrite copies no authority.
+///    host rewrite copies no authority. `X-Forwarded-Host` belongs to the
+///    `X-Forwarded-*` family, so it is injected (and a client one
+///    replaced) only when the listener's `forwarded_headers` mode emits
+///    that family (`both`, `x_forwarded`); `rfc7239` and `none` convey no
+///    pre-rewrite authority, and under `none` a client `X-Forwarded-Host`
+///    passes through as sent.
 ///    Dedup rule: the synthetic Host AND any pre-existing Host header
 ///    are dropped in the retain pass below before the rewritten Host is
 ///    appended, so the wire never carries two `Host:` headers.
@@ -1528,6 +1533,10 @@ fn apply_request_rewrites_and_headers(
     let host_lower = b"host";
     let xfh_lower = b"x-forwarded-host";
     let rewriting_host = rewritten_host.is_some();
+    // X-Forwarded-Host discloses the rewrite only in a mode that emits the
+    // X-Forwarded-* family; `rfc7239` already elided a client one in
+    // `HttpContext::on_request_headers`, and `none` leaves it as sent.
+    let synthesises_xfh = rewriting_host && emits_x_forwarded(context.forwarded_headers);
     let mut keys_to_drop: Vec<Vec<u8>> = Vec::with_capacity(headers_request.len() + 2);
     let mut to_insert: Vec<Block> = Vec::with_capacity(headers_request.len() + 2);
     // Track whether any operator-supplied edit names Host or
@@ -1556,7 +1565,7 @@ fn apply_request_rewrites_and_headers(
     if rewriting_host || operator_overrides_host {
         keys_to_drop.push(host_lower.to_vec());
     }
-    if rewriting_host || operator_overrides_xfh {
+    if synthesises_xfh || operator_overrides_xfh {
         keys_to_drop.push(xfh_lower.to_vec());
     }
 
@@ -1606,7 +1615,7 @@ fn apply_request_rewrites_and_headers(
                 val: Store::from_string(new_host.to_owned()),
             }));
         }
-        if let Some(orig) = original_authority.as_deref() {
+        if synthesises_xfh && let Some(orig) = original_authority.as_deref() {
             synth.push(Block::Header(Pair {
                 key: Store::Static(b"X-Forwarded-Host"),
                 val: Store::from_string(orig.to_owned()),
@@ -1821,7 +1830,9 @@ mod tests {
 
     use sozu_command::{
         config::ListenerBuilder,
-        proto::command::{PathRule, RequestHttpFrontend, RulePosition, SocketAddress},
+        proto::command::{
+            ForwardedHeaders, PathRule, RequestHttpFrontend, RulePosition, SocketAddress,
+        },
     };
 
     use super::{Router, RoutingView, authority_matches_sni};
@@ -2049,6 +2060,127 @@ mod tests {
                 forwarded_host.as_deref(),
                 expected.map(str::as_bytes),
                 "{authority}: X-Forwarded-Host carries the authority the client sent, on a rewrite only",
+            );
+        }
+    }
+
+    /// On a host rewrite, `X-Forwarded-Host` follows the listener's
+    /// `forwarded_headers` mode: `both` and `x_forwarded` replace a client
+    /// one with the authority the client sent, `rfc7239` and `none` inject
+    /// none, and `none` leaves a client one as sent. (`rfc7239` elided the
+    /// client one earlier, in `HttpContext::on_request_headers`.)
+    ///
+    /// To SEE THIS RED: in `apply_request_rewrites_and_headers`, set
+    /// `synthesises_xfh` to `rewriting_host` alone. `rfc7239` and `none` then
+    /// carry `X-Forwarded-Host: rewrite.example.com`.
+    #[test]
+    fn a_host_rewrite_discloses_x_forwarded_host_only_in_x_forwarded_modes() {
+        let port = crate::testing::provide_port();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, port);
+        let config = ListenerBuilder::new_http(address)
+            .to_http(None)
+            .expect("test http listener config must build");
+        let parts = crate::testing::prebuild_server(10, 16_384, false)
+            .expect("test server parts must build");
+        let pool = parts.pool.clone();
+        let mut proxy = HttpProxy::new(parts.registry, parts.sessions, parts.pool, parts.backends);
+        let token = mio::Token(0);
+        proxy
+            .add_listener(config, token)
+            .expect("test listener must register");
+        proxy
+            .add_http_frontend(RequestHttpFrontend {
+                cluster_id: Some("cluster-322".to_owned()),
+                address,
+                hostname: "rewrite.example.com".to_owned(),
+                path: PathRule::prefix("/".to_owned()),
+                position: RulePosition::Tree.into(),
+                rewrite_host: Some("internal.example.com".to_owned()),
+                ..Default::default()
+            })
+            .expect("the rewriting frontend must register");
+        let listener = proxy
+            .get_listener(&token)
+            .expect("the registered listener must be reachable");
+        let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(proxy));
+        let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+
+        for (mode, client_xfh, expected) in [
+            (
+                ForwardedHeaders::Both,
+                true,
+                vec![b"rewrite.example.com".to_vec()],
+            ),
+            (
+                ForwardedHeaders::XForwarded,
+                true,
+                vec![b"rewrite.example.com".to_vec()],
+            ),
+            (ForwardedHeaders::Rfc7239, false, vec![]),
+            (
+                ForwardedHeaders::None,
+                true,
+                vec![b"client.example".to_vec()],
+            ),
+        ] {
+            let mut context = HttpContext::new(
+                rusty_ulid::Ulid::generate(),
+                rusty_ulid::Ulid::generate(),
+                crate::Protocol::HTTP,
+                "127.0.0.1:80"
+                    .parse()
+                    .expect("test public address must parse"),
+                None,
+                "SOZUBALANCEID".to_owned(),
+                "Sozu-Id".to_owned(),
+                false,
+                false,
+            );
+            context.forwarded_headers = mode;
+            context.authority = Some("rewrite.example.com".to_owned());
+            context.path = Some("/".to_owned());
+            context.method = Some(Method::Get);
+            let mut stream = Stream::new(
+                &mut PoolBufferSource::new(Rc::downgrade(&pool)),
+                context,
+                crate::protocol::mux::test_support::test_answers(),
+                65_535,
+            )
+            .expect("test stream must check out its buffers");
+            if client_xfh {
+                stream.front.push_block(kawa::Block::Header(kawa::Pair {
+                    key: kawa::Store::Static(b"X-Forwarded-Host"),
+                    val: kawa::Store::Static(b"client.example"),
+                }));
+            }
+            let split = &mut stream;
+            let proxy_ref = proxy.borrow();
+            let view = RoutingView::new(proxy_ref.clusters(), proxy_ref.kind());
+            router
+                .route_from_request(&mut split.context, &mut split.front, &listener, &view)
+                .unwrap_or_else(|error| panic!("{mode:?} must route: {error}"));
+
+            let buffer = split.front.storage.buffer();
+            let forwarded_hosts: Vec<Vec<u8>> = split
+                .front
+                .blocks
+                .iter()
+                .filter_map(|block| match block {
+                    kawa::Block::Header(pair)
+                        if !pair.is_elided()
+                            && pair
+                                .key
+                                .data(buffer)
+                                .eq_ignore_ascii_case(b"X-Forwarded-Host") =>
+                    {
+                        Some(pair.val.data(buffer).to_vec())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                forwarded_hosts, expected,
+                "{mode:?}: X-Forwarded-Host after a host rewrite"
             );
         }
     }

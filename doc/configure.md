@@ -1417,6 +1417,88 @@ elide_x_real_ip = true   # strip client-supplied X-Real-IP before forwarding
 send_x_real_ip  = true   # inject a proxy-generated X-Real-IP carrying the peer IP
 ```
 
+#### Forwarding headers: `X-Forwarded-*` and RFC 7239 `Forwarded`
+
+The listener-scoped `forwarded_headers` key chooses which forwarding header
+family Sōzu adds to every request it forwards. It applies to HTTP and HTTPS
+listeners alike, and to HTTP/1 and HTTP/2 frontends alike, since both go through
+`HttpContext::on_request_headers` (`lib/src/protocol/kawa_h1/editor.rs`).
+
+| Value         | Sōzu adds                                                                                                     | A client-supplied header                                                                                                                               |
+| ------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `both`        | Default, the historical behaviour: `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Port` and `Forwarded` | `X-Forwarded-For` and `Forwarded` chains are extended with this hop; an existing `X-Forwarded-Proto` / `X-Forwarded-Port` is kept as sent              |
+| `x_forwarded` | `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Port`                                                    | Same as `both` for the `X-Forwarded-*` family; `Forwarded` passes through untouched                                                                    |
+| `rfc7239`     | `Forwarded` only (`proto=…;for="…";by=…`, RFC 7239 §4–§6)                                                     | `Forwarded` is extended with this hop (RFC 7239 §4); `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Port` and `X-Forwarded-Host` are **removed** |
+| `none`        | nothing                                                                                                       | Every forwarding header passes through untouched                                                                                                       |
+
+`rfc7239` removes the four `X-Forwarded-*` headers Sōzu itself manages rather
+than passing them through or converting them. RFC 7239 §8.1 states that a
+forwarding header "cannot be relied upon to be correct, as it may be modified
+[…] by every node on the way to the server, including the client". In this mode
+Sōzu no longer appends its hop to `X-Forwarded-For`, so a client value passed
+through would reach the backend with nothing Sōzu wrote after it, which is weaker
+than `both`. Converting it into `Forwarded` elements, which RFC 7239 §7.4
+encourages only "if it can be done in a sensible way", is not attempted either.
+§7.4 warns that the order of pre-existing mixed headers cannot be known, and the
+converted elements would be exactly as untrusted. RFC 7239 §4 allows a proxy to
+remove forwarding fields, so the backend is left with one family whose last
+element is Sōzu's. Other `X-Forwarded-*` names (for example
+`X-Forwarded-Prefix`) are not forwarding attestations Sōzu manages and pass
+through in every mode. An H2 trailer block cannot smuggle a forwarding header
+past the mode: `pkawa::handle_trailer` (`lib/src/protocol/mux/pkawa.rs`) drops
+`Forwarded`, `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Port` and
+`X-Forwarded-Host` from trailers in every mode.
+
+In the two modes that extend a client `Forwarded` chain, `both` and `rfc7239`,
+a client `Forwarded` line that is not a well-formed RFC 7239 §4 list is
+removed instead of extended. An unclosed quoted-string such as
+`Forwarded: for="6.6.6.6` would otherwise swallow the element Sōzu appends
+(`for="6.6.6.6, proto=http;for=…`), so a backend would read neither. Sōzu's
+element then goes to an earlier well-formed `Forwarded` line, or into a
+`Forwarded` header of its own, and is always parseable and last. A well-formed
+chain is extended exactly as before. `x_forwarded` and `none` do not touch
+`Forwarded`, so there a malformed line passes through as sent.
+
+A listener whose `forwarded_headers` wire value names no mode is refused when
+it is added or updated, by the main process and by the worker alike.
+
+A frontend `rewrite_host` sends the pre-rewrite authority as
+`X-Forwarded-Host` in `both` and `x_forwarded`, replacing a client one. In
+`rfc7239` and `none` no `X-Forwarded-Host` is injected and the original
+authority is not conveyed; under `none` a client `X-Forwarded-Host` passes
+through as sent. Sōzu's `Forwarded` element carries `proto`, `for` and `by` in
+every mode that emits it, never `host`.
+
+> **Trust caveat.** With `none`, and with `x_forwarded` for `Forwarded`,
+> Sōzu passes client-supplied forwarding headers through without adding its
+> own hop, so the backend cannot tell a value the client forged from one an
+> upstream proxy wrote. Use those modes only when every client reaches Sōzu
+> through a trusted proxy that sets the headers itself, or when the backend
+> ignores them.
+
+`forwarded_headers` is independent of `elide_x_real_ip` and `send_x_real_ip`:
+`X-Real-IP` belongs to neither family, and `send_x_real_ip = true` still injects
+it under `none`. The access log's `xff_chain` records a client `X-Forwarded-For`
+in every mode, including when `rfc7239` removes it from the forwarded request.
+The `http.trusting.x_proto` and `http.trusting.x_port` counters (and their
+`.diff` variants) count only in `both` and `x_forwarded`, the modes in which a
+client `X-Forwarded-Proto` / `X-Forwarded-Port` is kept in place of Sōzu's own.
+
+The key is runtime-patchable with `UpdateHttpListenerConfig` /
+`UpdateHttpsListenerConfig` (`sozu listener {http,https} update
+--forwarded-headers <mode>`) and takes effect at the same boundary as
+`send_x_real_ip`: the next HTTP/2 stream, and the next HTTP/1.1 connection
+(`doc/configure_admin_ops.md`, "When a patch takes effect on traffic already in
+flight").
+
+```toml
+[[listeners]]
+address = "0.0.0.0:443"
+protocol = "https"
+
+forwarded_headers = "rfc7239"   # both (default) | x_forwarded | rfc7239 | none
+```
+
 #### TLS handshake log severity cheat-sheet
 
 Sōzu tiers the log severity of every rustls handshake error by root cause so
@@ -2118,8 +2200,8 @@ look-around becomes a real operator constraint.
 The PROXY-protocol forwarding/expecting flags `send_proxy = true` and
 `expect_proxy = true` on a backend or frontend are valid **only** for clusters
 with `protocol = "tcp"`. HTTP/HTTPS clusters use the forwarding HTTP headers
-(`X-Forwarded-For`, `X-Real-IP`, and — once v2.1.0 lands — RFC 7239 `Forwarded`)
-instead.
+(`X-Forwarded-For`, `X-Real-IP` and RFC 7239 `Forwarded`, chosen per listener by
+`forwarded_headers`) instead.
 
 Setting `send_proxy = true` on an HTTP/HTTPS cluster is silently ignored at
 runtime. This contradicts a literal reading of
@@ -2410,6 +2492,7 @@ immediately after the patch is acknowledged.
 | `request_timeout`                         | `u32` (seconds) | session-at-accept    | `10`                    | Max time to send a complete request                                                                                                                          |
 | `http_answers`                            | file paths      | session-at-accept    | built-in defaults       | Listener-default HTTP error bodies (301/401/404/408/413/421/502/503/504/507). Per-cluster `answer_503` overrides are preserved.                              |
 | `sozu_id_header`                          | `string`        | session-at-accept    | `"Sozu-Id"`             | Correlation header name (RFC 9110 §5.1 token; reject empty or containing CR/LF/colon/space)                                                                  |
+| `forwarded_headers`                       | enum            | session-at-accept    | `both`                  | `both` \| `x_forwarded` \| `rfc7239` \| `none` — forwarding header family added to requests (see "Forwarding headers")                                       |
 | `h2_max_rst_stream_per_window`            | `u32` (≥ 1)     | per-connection setup | `100`                   | RST_STREAM flood cap — CVE-2023-44487, CVE-2019-9514                                                                                                         |
 | `h2_max_ping_per_window`                  | `u32` (≥ 1)     | per-connection setup | `100`                   | PING flood cap — CVE-2019-9512                                                                                                                               |
 | `h2_max_settings_per_window`              | `u32` (≥ 1)     | per-connection setup | `50`                    | SETTINGS flood cap — CVE-2019-9515                                                                                                                           |

@@ -9609,6 +9609,7 @@ mod tests {
             strict_sni_binding: false,
             elide_x_real_ip: false,
             send_x_real_ip: false,
+            forwarded_headers: sozu_command_lib::proto::command::ForwardedHeaders::Both,
             tls_version: None,
             tls_cipher: None,
             tls_alpn: None,

@@ -9,13 +9,13 @@ use sozu_command_lib::{
     certificate::{
         decode_fingerprint, get_fingerprint_from_certificate_path, load_full_certificate,
     },
-    config::{ListenerBuilder, validate_health_check_config},
+    config::{ForwardedHeadersMode, ListenerBuilder, validate_health_check_config},
     proto::command::{
         ActivateListener, AddBackend, AddCertificate, AlpnProtocols, Cluster, CountRequests,
-        CustomHttpAnswers, DeactivateListener, FrontendFilters, HardStop, HealthCheckConfig,
-        ListListeners, ListedFrontends, ListenerType, LoadBalancingParams, MetricsConfiguration,
-        PathRule, ProxyProtocolConfig, QueryCertificatesFilters, QueryClusterByDomain,
-        QueryClustersHashes, QueryHealthChecks, QueryMaxConnectionsPerIp,
+        CustomHttpAnswers, DeactivateListener, ForwardedHeaders, FrontendFilters, HardStop,
+        HealthCheckConfig, ListListeners, ListedFrontends, ListenerType, LoadBalancingParams,
+        MetricsConfiguration, PathRule, ProxyProtocolConfig, QueryCertificatesFilters,
+        QueryClusterByDomain, QueryClustersHashes, QueryHealthChecks, QueryMaxConnectionsPerIp,
         QueryMaxConnectionsPerSubnet, RemoveBackend, RemoveCertificate, RemoveListener,
         ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend, RequestUdpFrontend,
         ResponseContent, RulePosition, SetHealthCheck, SocketAddress, SoftStop, Status,
@@ -29,9 +29,9 @@ use sozu_command_lib::{
 use super::CtlError;
 use crate::{
     cli::{
-        BackendCmd, ClusterCmd, ClusterH2Cmd, ConnectionLimitCmd, HealthCheckCmd, HttpFrontendCmd,
-        HttpListenerCmd, HttpsListenerCmd, MetricsCmd, SubnetConnectionLimitCmd, TcpFrontendCmd,
-        TcpListenerCmd, UdpFrontendCmd, UdpListenerCmd,
+        BackendCmd, ClusterCmd, ClusterH2Cmd, ConnectionLimitCmd, ForwardedHeadersArg,
+        HealthCheckCmd, HttpFrontendCmd, HttpListenerCmd, HttpsListenerCmd, MetricsCmd,
+        SubnetConnectionLimitCmd, TcpFrontendCmd, TcpListenerCmd, UdpFrontendCmd, UdpListenerCmd,
     },
     ctl::CommandManager,
 };
@@ -583,8 +583,13 @@ impl CommandManager {
                 back_timeout,
                 request_timeout,
                 connect_timeout,
+                forwarded_headers,
             } => {
-                let https_listener = ListenerBuilder::new_https(address.into())
+                let mut builder = ListenerBuilder::new_https(address.into());
+                if let Some(mode) = forwarded_headers {
+                    builder.with_forwarded_headers(mode.into());
+                }
+                let https_listener = builder
                     .with_interface(interface)
                     .with_public_address(public_address)
                     .with_answer_404_path(answer_404)
@@ -646,6 +651,7 @@ impl CommandManager {
                 h2_graceful_shutdown_deadline_seconds,
                 h2_max_window_update_stream0_per_window,
                 sozu_id_header,
+                forwarded_headers,
                 answer_301,
                 answer_401,
                 answer_404,
@@ -697,6 +703,7 @@ impl CommandManager {
                 h2_graceful_shutdown_deadline_seconds,
                 h2_max_window_update_stream0_per_window,
                 sozu_id_header,
+                forwarded_headers,
                 answer_301,
                 answer_401,
                 answer_404,
@@ -731,8 +738,13 @@ impl CommandManager {
                 back_timeout,
                 request_timeout,
                 connect_timeout,
+                forwarded_headers,
             } => {
-                let http_listener = ListenerBuilder::new_http(address.into())
+                let mut builder = ListenerBuilder::new_http(address.into());
+                if let Some(mode) = forwarded_headers {
+                    builder.with_forwarded_headers(mode.into());
+                }
+                let http_listener = builder
                     .with_interface(interface)
                     .with_public_address(public_address)
                     .with_answer_404_path(answer_404)
@@ -786,6 +798,7 @@ impl CommandManager {
                 h2_graceful_shutdown_deadline_seconds,
                 h2_max_window_update_stream0_per_window,
                 sozu_id_header,
+                forwarded_headers,
                 answer_301,
                 answer_401,
                 answer_404,
@@ -826,6 +839,7 @@ impl CommandManager {
                 h2_graceful_shutdown_deadline_seconds,
                 h2_max_window_update_stream0_per_window,
                 sozu_id_header,
+                forwarded_headers,
                 answer_301,
                 answer_401,
                 answer_404,
@@ -990,6 +1004,7 @@ impl CommandManager {
         h2_graceful_shutdown_deadline_seconds: Option<u32>,
         h2_max_window_update_stream0_per_window: Option<u32>,
         sozu_id_header: Option<String>,
+        forwarded_headers: Option<ForwardedHeadersArg>,
         answer_301: Option<PathBuf>,
         answer_401: Option<PathBuf>,
         answer_404: Option<PathBuf>,
@@ -1044,6 +1059,8 @@ impl CommandManager {
             h2_graceful_shutdown_deadline_seconds,
             h2_max_window_update_stream0_per_window,
             sozu_id_header,
+            forwarded_headers: forwarded_headers
+                .map(|mode| ForwardedHeaders::from(ForwardedHeadersMode::from(mode)) as i32),
             ..Default::default()
         };
         self.send_request(RequestType::UpdateHttpListener(patch).into())
@@ -1088,6 +1105,7 @@ impl CommandManager {
         h2_graceful_shutdown_deadline_seconds: Option<u32>,
         h2_max_window_update_stream0_per_window: Option<u32>,
         sozu_id_header: Option<String>,
+        forwarded_headers: Option<ForwardedHeadersArg>,
         answer_301: Option<PathBuf>,
         answer_401: Option<PathBuf>,
         answer_404: Option<PathBuf>,
@@ -1187,6 +1205,8 @@ impl CommandManager {
             h2_graceful_shutdown_deadline_seconds,
             h2_max_window_update_stream0_per_window,
             sozu_id_header,
+            forwarded_headers: forwarded_headers
+                .map(|mode| ForwardedHeaders::from(ForwardedHeadersMode::from(mode)) as i32),
             hsts,
             ..Default::default()
         };
