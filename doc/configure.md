@@ -2279,7 +2279,10 @@ synthesised. Operators who want a Content-Length include one; those who rely on
 
 When a template carries `Connection: close`, the response will close the
 frontend connection after delivery; a custom template without that header keeps
-frontend keep-alive on. The HAProxy parallel is `errorfile NNN /path`.
+frontend keep-alive on. The value is read as a comma-separated list of
+case-insensitive options, on every `Connection` line of the template, so
+`Connection: keep-alive, close` and `Connection: close, x-custom` close too,
+while `Connection: closed` does not. The HAProxy parallel is `errorfile NNN /path`.
 
 The legacy `answer_NNN = "/path"` per-status fields under `[listeners.<name>]`
 continue to work — they are merged into the new map at load time so existing
