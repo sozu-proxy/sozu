@@ -55,6 +55,14 @@ pub mod backend {
     pub const RESPONSE_TIME: &str = "backend_response_time";
     pub const REQUESTS: &str = "requests";
     pub const FAIL_OPEN: &str = "backends.fail_open";
+    /// Shuffle sharding (sozu-proxy/sozu#524), per cluster: a selection whose
+    /// client shard had no backend able to take a connection, and which the
+    /// cluster's `FALLBACK` mode sent to a backend outside the shard.
+    pub const SHARD_SPILLOVER: &str = "backend.shard.spillover";
+    /// Shuffle sharding, per cluster: a selection whose client shard had no
+    /// backend able to take a connection, refused by the cluster's `STRICT`
+    /// mode (HTTP answers 503, TCP closes).
+    pub const SHARD_EXHAUSTED: &str = "backend.shard.exhausted";
 
     // Connection-lifecycle transition counters, emitted per
     // `(cluster_id, backend_id)` from both proxies: the mux (H1 and H2) and

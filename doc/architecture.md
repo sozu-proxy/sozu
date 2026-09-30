@@ -429,7 +429,9 @@ Sōzu detects broken servers and redirects traffic only to healthy ones, with se
 round robin (default), random, least_loaded, power of two, HRW and Maglev.
 The last two are consistent-hashing policies that pin each client to one
 backend: on the flow key for UDP, on the client source IP (or a configured
-header or cookie) for HTTP, HTTPS and TCP. See
+header or cookie) for HTTP, HTTPS and TCP. Any policy can be combined with
+shuffle sharding, which restricts each client to a shard of backends drawn
+from the HRW ranking of its key. See
 `doc/configure.md` for what each one selects and how much backend load it
 reads.
 

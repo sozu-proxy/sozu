@@ -737,9 +737,30 @@ fn affinity_key_label(cluster: &Cluster) -> String {
     }
 }
 
+/// A cluster's shuffle sharding, for the cluster table: `off`, or
+/// `<percent>% from <min> backends, <mode>`.
+fn shuffle_sharding_label(cluster: &Cluster) -> String {
+    match cluster.shard_percent {
+        None => String::from("off"),
+        Some(percent) => format!(
+            "{percent}% from {} backends, {}",
+            cluster
+                .shard_min_backends
+                .unwrap_or(crate::config::DEFAULT_SHARD_MIN_BACKENDS),
+            cluster.shard_mode().as_str_name()
+        ),
+    }
+}
+
 fn print_cluster_infos(worker_responses: &WorkerResponses) -> Result<(), DisplayError> {
     let mut cluster_table = create_cluster_table(
-        vec!["id", "sticky_session", "https_redirect", "affinity_key"],
+        vec![
+            "id",
+            "sticky_session",
+            "https_redirect",
+            "affinity_key",
+            "shuffle_sharding",
+        ],
         &worker_responses.map,
     );
 
@@ -823,6 +844,11 @@ fn print_cluster_infos(worker_responses: &WorkerResponses) -> Result<(), Display
             cell!(
                 configuration
                     .map(affinity_key_label)
+                    .unwrap_or_else(|| String::from("-"))
+            ),
+            cell!(
+                configuration
+                    .map(shuffle_sharding_label)
                     .unwrap_or_else(|| String::from("-"))
             ),
         ];

@@ -157,13 +157,11 @@ patch. See `CommandManager::cluster_h2_command`
 (`bin/src/ctl/request_builder.rs`):
 
 1. The CLI emits a `QueryClusterById(my-cluster)` request and waits
-   synchronously for the master's response (`request_builder.rs:406-407`).
+   synchronously for the master's response.
 2. It locates the matching `ClusterInformation` in the response and
-   extracts the current `ClusterConfiguration`
-   (`request_builder.rs:409-415`).
+   extracts the current `ClusterConfiguration`.
 3. It rewrites the `http2` field on the extracted configuration and
-   re-submits as a full `AddCluster(updated)`
-   (`request_builder.rs:417-422`). The supervisor treats `AddCluster`
+   re-submits as a full `AddCluster(updated)`. The supervisor treats `AddCluster`
    as upsert, so this acts as a targeted edit even though no dedicated
    "patch cluster" verb exists.
 
@@ -184,7 +182,8 @@ already in `configure.md`.
 
 ### 5.1 Per-connection H2 stream-Vec shrink
 
-Commit: `e478cf8b`. Reference: `doc/configure.md:1317`.
+Commit: `e478cf8b`. Reference: the `h2_stream_shrink_ratio` row under "H2
+connection tuning" in `doc/configure.md`.
 
 Each `ConnectionH2` keeps a `Vec<Stream>` of per-stream slots in the
 mux `Context`. Recycled slots accumulate over the connection's lifetime;

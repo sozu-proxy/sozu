@@ -18,7 +18,7 @@ use sozu_command_lib::{
         QueryClusterByDomain, QueryClustersHashes, QueryHealthChecks, QueryMaxConnectionsPerIp,
         QueryMaxConnectionsPerSubnet, RemoveBackend, RemoveCertificate, RemoveListener,
         ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend, RequestUdpFrontend,
-        ResponseContent, RulePosition, SetHealthCheck, SocketAddress, SoftStop, Status,
+        ResponseContent, RulePosition, SetHealthCheck, ShardMode, SocketAddress, SoftStop, Status,
         SubscribeEvents, TlsVersion, UpdateHttpListenerConfig, UpdateHttpsListenerConfig,
         UpdateTcpListenerConfig, UpdateUdpListenerConfig, request::RequestType,
         response_content::ContentType,
@@ -185,6 +185,9 @@ impl CommandManager {
                 answer,
                 affinity_header,
                 affinity_cookie,
+                shard_percent,
+                shard_min_backends,
+                shard_strict,
             } => {
                 let proxy_protocol = match (send_proxy, expect_proxy) {
                     (true, true) => Some(ProxyProtocolConfig::RelayHeader),
@@ -236,6 +239,19 @@ impl CommandManager {
                     )
                 })?;
 
+                let shard_mode = shard_strict.then_some(ShardMode::Strict as i32);
+                sozu_command_lib::config::validate_shuffle_sharding(
+                    shard_percent,
+                    shard_min_backends,
+                    shard_mode,
+                )
+                .map_err(|reason| {
+                    CtlError::ArgsNeeded(
+                        "valid --shard-percent / --shard-min-backends".to_string(),
+                        reason.to_owned(),
+                    )
+                })?;
+
                 // Resolve each `--answer code=value` entry. The
                 // right-hand side is the literal template body by
                 // default; `file://<path>` opts into reading the body
@@ -282,6 +298,9 @@ impl CommandManager {
                         www_authenticate,
                         affinity_header,
                         affinity_cookie,
+                        shard_percent,
+                        shard_min_backends,
+                        shard_mode,
                         ..Default::default()
                     })
                     .into(),

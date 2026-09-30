@@ -1297,6 +1297,29 @@ message Cluster {
     // cookie, matched case-sensitively. Mutually exclusive with
     // `affinity_header`.
     optional string affinity_cookie = 19;
+    // Shuffle sharding (sozu-proxy/sozu#524): restrict each client's
+    // selection to a shard of k backends, the top k of the rendezvous (HRW)
+    // ranking of its affinity key over the cluster's primary backends, where
+    // k = max(2, ceil(shard_percent * N / 100)), capped at N. Off when unset.
+    // 1..=100. The cluster's `load_balancing` policy picks inside the shard.
+    optional uint32 shard_percent = 20;
+    // Sharding applies only while the cluster has at least this many primary
+    // backends; below it the cluster selects over all of them. At least 2;
+    // defaults to 8. Requires `shard_percent`.
+    optional uint32 shard_min_backends = 21;
+    // What happens when no backend of a client's shard can take a
+    // connection. Requires `shard_percent`.
+    optional ShardMode shard_mode = 22;
+}
+
+// See `Cluster.shard_mode`.
+enum ShardMode {
+    // Spill over to the rest of the cluster (counted in
+    // `backend.shard.spillover`).
+    FALLBACK = 0;
+    // Refuse: no backend is selected, HTTP answers 503 and TCP closes
+    // (counted in `backend.shard.exhausted`).
+    STRICT = 1;
 }
 
 message HealthCheckConfig {

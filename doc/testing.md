@@ -129,6 +129,8 @@ Notes:
   `a_request_on_a_reused_backend_connection_allocates_nothing` and
   `stamping_a_dialled_backend_allocates_nothing` (`lib/src/protocol/mux/router.rs`,
   [#1579](https://github.com/sozu-proxy/sozu/issues/1579)),
+  `a_sharded_selection_allocates_nothing` (`lib/src/backends.rs`,
+  [#524](https://github.com/sozu-proxy/sozu/issues/524)),
   `deriving_an_affinity_key_allocates_nothing` (`lib/src/protocol/mux/router.rs`,
   [#524](https://github.com/sozu-proxy/sozu/issues/524)),
   `creating_a_debug_history_allocates_nothing` (`lib/src/protocol/mux/debug.rs`,

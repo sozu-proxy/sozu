@@ -27,6 +27,17 @@ request does not carry it:
 sozu --config /etc/sozu/config.toml cluster add --id <my_cluster_id> --load-balancing-policy hrw --affinity-header X-Tenant
 ```
 
+`--shard-percent <1..=100>` shuffle-shards the cluster: each client is served by
+the top `max(2, ceil(percent × N / 100))` backends of the HRW ranking of its key,
+and the load-balancing policy picks inside that shard. `--shard-min-backends`
+(default 8) is the backend count from which sharding applies, and
+`--shard-strict` answers 503 instead of spilling over when a client's whole
+shard is down (see "Shuffle sharding" in `doc/configure.md`):
+
+```bash
+sozu --config /etc/sozu/config.toml cluster add --id <my_cluster_id> --load-balancing-policy least_loaded --shard-percent 25
+```
+
 To create a cluster with HTTP/2 backend connections enabled:
 
 ```bash

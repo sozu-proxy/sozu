@@ -9,7 +9,12 @@ use rand::{
     rngs::StdRng,
 };
 
-use crate::{backends::Backend, sozu_command::proto::command::LoadMetric};
+use sozu_command::config::DEFAULT_SHARD_MIN_BACKENDS;
+
+use crate::{
+    backends::Backend,
+    sozu_command::proto::command::{LoadMetric, ShardMode},
+};
 
 /// Default weight applied when a backend declares no explicit
 /// `load_balancing_parameters.weight`. Mirrors the value used by the
@@ -124,6 +129,77 @@ pub fn affinity_key_from_value(value: &[u8]) -> u64 {
     h.write_u8(AFFINITY_DOMAIN_VALUE);
     h.write(value);
     splitmix64_finalize(h.finish())
+}
+
+/// A cluster's shuffle-sharding policy (sozu-proxy/sozu#524).
+///
+/// Shuffle sharding (Colm MacCárthaigh, *Workload isolation using shuffle
+/// sharding*, Amazon Builders' Library, 2019) gives each client a shard: a
+/// small subset of the cluster's backends, drawn so that two clients rarely
+/// share all of theirs. A client that overloads or poisons its shard then
+/// takes down only the clients whose shard is entirely inside its own. With
+/// `N` backends in shards of `k` there are `C(N, k)` shards, against `N / k`
+/// with plain partitioning: `C(8, 2) = 28` against 4.
+///
+/// Here a client's shard is the top `k` of the rendezvous (HRW) ranking of
+/// its affinity key over the cluster's primary backends ([`hrw_score`];
+/// David Thaler and Chinya Ravishankar, *Using name-based mappings to
+/// increase hit rates*, IEEE/ACM Transactions on Networking, 1998). That
+/// makes a shard stable: removing a backend outside a client's shard leaves
+/// the shard unchanged, and adding one can only displace the shard's
+/// lowest-ranked member, so a change of `N` moves clients only at the tail of
+/// their ranking. The cluster's load-balancing policy then selects inside the
+/// shard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShuffleSharding {
+    /// Share of the primary backends in a shard, `1..=100`.
+    pub percent: u32,
+    /// Sharding applies only from this many primary backends.
+    pub min_backends: u32,
+    /// What an exhausted shard does.
+    pub mode: ShardMode,
+}
+
+impl ShuffleSharding {
+    /// The sharding a cluster configures, `None` when `shard_percent` is
+    /// unset. `shard_min_backends` defaults to
+    /// [`DEFAULT_SHARD_MIN_BACKENDS`], `shard_mode` to `FALLBACK`.
+    pub fn from_cluster(
+        shard_percent: Option<u32>,
+        shard_min_backends: Option<u32>,
+        shard_mode: Option<i32>,
+    ) -> Option<Self> {
+        let percent = shard_percent?;
+        Some(Self {
+            percent,
+            min_backends: shard_min_backends.unwrap_or(DEFAULT_SHARD_MIN_BACKENDS),
+            mode: shard_mode
+                .and_then(|mode| ShardMode::try_from(mode).ok())
+                .unwrap_or(ShardMode::Fallback),
+        })
+    }
+
+    /// The shard size `k` for a cluster of `primaries` primary backends:
+    /// `max(2, ceil(percent × primaries / 100))`, capped at `primaries`.
+    /// `None` below `min_backends`, where the cluster is not sharded.
+    pub fn shard_size(&self, primaries: usize) -> Option<usize> {
+        if primaries < self.min_backends as usize || primaries == 0 {
+            return None;
+        }
+        let k = (self.percent as usize * primaries)
+            .div_ceil(100)
+            .max(2)
+            .min(primaries);
+        debug_assert!(
+            (1..=primaries).contains(&k),
+            "a shard holds at least one and at most every primary backend"
+        );
+        debug_assert!(
+            k >= 2 || primaries < 2,
+            "a shard keeps room for a retry whenever the cluster has two backends"
+        );
+        Some(k)
+    }
 }
 
 /// Smallest prime `>= n`. Maglev requires a prime table size `M`: it keeps the
@@ -784,26 +860,40 @@ impl Rendezvous {
     /// Continuous weighted-rendezvous score for a (key, backend) pair.
     /// Larger is better. See the struct docs for the formula.
     fn score(&self, key: u64, backend: &Backend) -> f64 {
-        let weight = backend_weight(backend) as f64;
-        // Map the 64-bit hash into the open interval (0, 1). Guard the
-        // endpoints so `ln` stays finite: 0 would give -inf, 1 would give 0.
-        let h = hash_backend(self.seed, key, &backend.address);
-        // (h + 0.5) / 2^64 keeps the value strictly inside (0, 1).
-        let unit = (h as f64 + 0.5) / (u64::MAX as f64 + 1.0);
-        // `unit` must land strictly inside (0, 1) so `ln(unit) < 0` and the
-        // score stays a positive, finite number — the whole HRW ordering relies
-        // on a well-defined comparable score for every backend.
-        debug_assert!(
-            unit > 0.0 && unit < 1.0,
-            "HRW unit must lie strictly inside (0, 1), got {unit}"
-        );
-        let score = -weight / unit.ln();
-        debug_assert!(
-            score.is_finite() && score > 0.0,
-            "HRW score must be finite and positive, got {score}"
-        );
-        score
+        hrw_score_with_seed(self.seed, key, backend)
     }
+}
+
+/// The weighted rendezvous (HRW) score of `backend` for the affinity `key`,
+/// under [`DEFAULT_HASH_SEED`]: the score [`Rendezvous`] ranks a cluster's
+/// backends by. Larger is better. Shuffle sharding
+/// ([`ShuffleSharding`]) takes a client's shard as the top of this ranking,
+/// and a test that needs to predict a shard computes it with this function.
+pub fn hrw_score(key: u64, backend: &Backend) -> f64 {
+    hrw_score_with_seed(DEFAULT_HASH_SEED, key, backend)
+}
+
+/// [`hrw_score`] under an explicit seed. See [`Rendezvous`] for the formula.
+fn hrw_score_with_seed(seed: u64, key: u64, backend: &Backend) -> f64 {
+    let weight = backend_weight(backend) as f64;
+    // Map the 64-bit hash into the open interval (0, 1). Guard the
+    // endpoints so `ln` stays finite: 0 would give -inf, 1 would give 0.
+    let h = hash_backend(seed, key, &backend.address);
+    // (h + 0.5) / 2^64 keeps the value strictly inside (0, 1).
+    let unit = (h as f64 + 0.5) / (u64::MAX as f64 + 1.0);
+    // `unit` must land strictly inside (0, 1) so `ln(unit) < 0` and the
+    // score stays a positive, finite number — the whole HRW ordering relies
+    // on a well-defined comparable score for every backend.
+    debug_assert!(
+        unit > 0.0 && unit < 1.0,
+        "HRW unit must lie strictly inside (0, 1), got {unit}"
+    );
+    let score = -weight / unit.ln();
+    debug_assert!(
+        score.is_finite() && score > 0.0,
+        "HRW score must be finite and positive, got {score}"
+    );
+    score
 }
 
 impl LoadBalancingAlgorithm for Rendezvous {
@@ -2260,5 +2350,39 @@ mod test {
             affinity_key_from_value(b"tenant-a"),
             affinity_key_from_value(b"tenant-b")
         );
+    }
+
+    /// #524: `k = max(2, ceil(percent × N / 100))`, capped at N, and no
+    /// shard at all below `min_backends`.
+    #[test]
+    fn a_shard_size_follows_the_decided_formula() {
+        let sharding = |percent, min_backends| ShuffleSharding {
+            percent,
+            min_backends,
+            mode: ShardMode::Fallback,
+        };
+        for (percent, min_backends, primaries, expected) in [
+            (1, 8, 8, Some(2)),     // ceil(0.08) = 1, floored at 2
+            (25, 8, 8, Some(2)),    // exactly 2
+            (30, 8, 10, Some(3)),   // exactly 3
+            (50, 8, 9, Some(5)),    // ceil(4.5)
+            (34, 8, 100, Some(34)), // exactly 34
+            (100, 8, 12, Some(12)), // every backend
+            (25, 8, 7, None),       // below the threshold
+            (25, 2, 2, Some(2)),    // the smallest cluster that shards
+            (1, 2, 3, Some(2)),     // floored at 2
+        ] {
+            assert_eq!(
+                sharding(percent, min_backends).shard_size(primaries),
+                expected,
+                "percent={percent} min={min_backends} N={primaries}"
+            );
+        }
+        assert_eq!(
+            ShuffleSharding::from_cluster(Some(10), None, None),
+            Some(sharding(10, DEFAULT_SHARD_MIN_BACKENDS)),
+            "min_backends defaults to 8 and the mode to FALLBACK"
+        );
+        assert_eq!(ShuffleSharding::from_cluster(None, Some(4), Some(1)), None);
     }
 }

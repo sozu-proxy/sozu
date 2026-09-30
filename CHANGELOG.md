@@ -4,6 +4,47 @@
 
 ### ✨ Added
 
+- **`feat(lb)`: shuffle sharding over the HRW ranking
+  ([#524](https://github.com/sozu-proxy/sozu/issues/524)).** A cluster can now serve each client
+  from a shard of its backends instead of all of them, so a client that overloads or poisons its
+  backends takes down only the clients whose shard lies inside its own — the isolation of *Workload
+  isolation using shuffle sharding* (Colm MacCárthaigh, Amazon Builders' Library, 2019):
+  `C(N, k)` shards against `N / k` partitions, 28 against 4 for eight backends in shards of two.
+  A client's shard is the top `k = max(2, ceil(shard_percent × N / 100))` (capped at `N`) of the
+  rendezvous (HRW; Thaler and Ravishankar, IEEE/ACM ToN 1998) ranking of its client key — the
+  source IP, or the `affinity_header` / `affinity_cookie` value — over the cluster's configured
+  primary backends, so a shard is the same on every worker and moves only at its tail when a
+  backend is added or removed; the cluster's `load_balancing` policy then picks inside the shard,
+  and retries stay in it. New cluster keys `shard_percent` (`1..=100`, off when unset),
+  `shard_min_backends` (default 8, at least 2; below it the cluster is not sharded) and
+  `shard_mode` (`FALLBACK`, the default, spills an exhausted shard over to the rest of the
+  cluster; `STRICT` answers 503 / closes), as `Cluster` proto fields 20–22, TOML keys,
+  `--shard-percent` / `--shard-min-backends` / `--shard-strict` on `sozu cluster add`, and a
+  `shuffle_sharding` column in the cluster table; validated at config load and on every
+  `AddCluster`. New per-cluster counters `backend.shard.spillover` and
+  `backend.shard.exhausted`. A sticky cookie naming a live backend still wins, even outside the
+  shard, and connection reuse still wins. With a shard of 3 or more, the request that finds its
+  whole shard down exhausts its three connection attempts inside the shard (503); the next one
+  spills over or is refused at once. Selection stays allocation-free:
+  `a_sharded_selection_allocates_nothing` holds it at zero. Documented under "Shuffle sharding" in
+  `doc/configure.md`, covered by `e2e/src/tests/shuffle_sharding_tests.rs` (in-shard, fallback,
+  strict, and re-adding the cluster without `shard_percent`) and the `backends` unit tests
+  (formula, weighted HRW top-k, tail-only change, strict isolation, strict refusal with an
+  unhealthy shard, shard-restricted fail-open with and without a healthy backup, fallback
+  fail-open picks inside the shard not counted as spill-overs, sticky precedence). The main
+  process and every worker validate the shard knobs on `AddCluster`.
+
+  **Before enabling it.** Nothing changes on upgrade: sharding is off until `shard_percent` is
+  set. **Upgrade the main process and every worker before setting `shard_*`**: an older worker
+  ignores fields 20–22 and serves unsharded. An older `sozu` CLI that patches a cluster by
+  read-modify-write (`QueryClusterById` → `AddCluster`, as `sozu cluster h2 enable|disable` does)
+  drops the fields and silently disables sharding, so upgrade the CLI too. Once set, a sharded
+  cluster derives a client key under every policy, not only `HRW` and `MAGLEV`, and every client
+  sharing one source IP — behind a NAT, or an L4 load balancer that does not send the PROXY
+  protocol — shares one shard of `k` backends. Enable the PROXY protocol or key on a header or
+  cookie before sharding such a cluster. `STRICT` never uses the backup tier: with every primary
+  backend failing its health checks it fails open inside the shard even when a backup is healthy.
+
 - **`feat(lb)`: key `HRW`/`MAGLEV` on a request header or cookie
   ([#524](https://github.com/sozu-proxy/sozu/issues/524)).** Two new optional HTTP/HTTPS cluster
   keys, `affinity_header` and `affinity_cookie` (`Cluster` proto fields 18 and 19,

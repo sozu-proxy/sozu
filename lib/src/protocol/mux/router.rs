@@ -1457,9 +1457,22 @@ pub trait BackendSelector {
     ) -> Result<SelectedBackend, BackendError>;
 }
 
+/// Whether selection for `cluster` reads a client affinity key: its policy
+/// is `HRW` or `MAGLEV`, or it shards (`shard_percent`), which ranks each
+/// client's shard by the key under any policy (sozu-proxy/sozu#524). Every
+/// other cluster derives no key and pays nothing.
+pub(crate) fn cluster_reads_affinity_key(cluster: &Cluster) -> bool {
+    cluster.shard_percent.is_some()
+        || matches!(
+            cluster.load_balancing(),
+            LoadBalancingAlgorithms::Hrw | LoadBalancingAlgorithms::Maglev
+        )
+}
+
 /// The client affinity key of a request routed to `cluster`, for the `HRW`
-/// and `MAGLEV` policies to pin the client with; `None` for every other
-/// policy, which would ignore it.
+/// and `MAGLEV` policies to pin the client with and for shuffle sharding to
+/// rank its shard by; `None` for every other cluster, which would ignore it
+/// ([`cluster_reads_affinity_key`]).
 ///
 /// The key is the hash of the cluster's `affinity_header` value (first
 /// occurrence, name matched case-insensitively) or `affinity_cookie` value
@@ -1488,10 +1501,7 @@ pub(super) fn affinity_key(
     session_address: Option<SocketAddr>,
     sticky: StickyCookie<'_>,
 ) -> Option<u64> {
-    if !matches!(
-        cluster.load_balancing(),
-        LoadBalancingAlgorithms::Hrw | LoadBalancingAlgorithms::Maglev
-    ) {
+    if !cluster_reads_affinity_key(cluster) {
         return None;
     }
     // `validate_affinity_key` (`command/src/config.rs`) refuses a cluster
@@ -4603,11 +4613,14 @@ mod affinity_key_tests {
     const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: example.com\r\nx-tenant: acme\r\n\
         Cookie: theme=dark; tenant=globex\r\nX-Empty: \r\n\r\n";
 
-    /// Only `HRW` and `MAGLEV` read a key; every other policy gets `None`, so
-    /// a cluster that does not use one pays nothing and selects exactly as
-    /// before.
+    /// Only `HRW`, `MAGLEV` and a sharded cluster read a key; every other
+    /// cluster gets `None`, pays nothing and selects exactly as before.
+    ///
+    /// TO SEE THIS RED: drop the `shard_percent` arm of
+    /// `cluster_reads_affinity_key`; the sharded round-robin cluster then
+    /// derives no key and is silently not sharded.
     #[test]
-    fn only_hrw_and_maglev_clusters_derive_a_key() {
+    fn only_hrw_maglev_and_sharded_clusters_derive_a_key() {
         let mut pool = Pool::with_capacity(1, 1, 4096);
         let front = parsed(&mut pool, REQUEST);
         for policy in [
@@ -4627,6 +4640,17 @@ mod affinity_key_tests {
                 "{policy:?} does not read a key"
             );
         }
+        // #524: a sharded cluster reads the key under any policy, to rank
+        // the client's shard by.
+        let sharded_round_robin = Cluster {
+            shard_percent: Some(25),
+            ..cluster(LoadBalancingAlgorithms::RoundRobin, None, None)
+        };
+        assert_eq!(
+            affinity_key(&sharded_round_robin, &front, Some(CLIENT), NO_STICKY),
+            Some(affinity_key_from_ip(CLIENT.ip())),
+            "a sharded cluster derives a key whatever its policy"
+        );
         for policy in [
             LoadBalancingAlgorithms::Hrw,
             LoadBalancingAlgorithms::Maglev,

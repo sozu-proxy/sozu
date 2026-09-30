@@ -21,7 +21,7 @@ use sozu_command::{
     },
     listener_key::ListenerKey,
     logging::{EndpointRecord, LogContext, ansi_palette},
-    proto::command::{LoadBalancingAlgorithms, request::RequestType},
+    proto::command::request::RequestType,
 };
 
 use crate::metrics::names;
@@ -33,6 +33,7 @@ use crate::{
     backends::{Backend, BackendMap},
     load_balancing::affinity_key_from_ip,
     pool::{Checkout, Pool},
+    protocol::mux::router::cluster_reads_affinity_key,
     protocol::{
         Pipe,
         pipe::WebSocketContext,
@@ -1700,10 +1701,7 @@ impl TcpSession {
                 (
                     c.max_connections_per_ip,
                     c.max_connections_per_subnet,
-                    matches!(
-                        c.load_balancing,
-                        LoadBalancingAlgorithms::Hrw | LoadBalancingAlgorithms::Maglev
-                    ),
+                    c.reads_affinity_key,
                 )
             })
             .unwrap_or((None, None, false));
@@ -1737,11 +1735,11 @@ impl TcpSession {
             self.cluster_ip_tracked = true;
         }
 
-        // `HRW` and `MAGLEV` pin a TCP client on its source IP — the
-        // PROXY-v2 source when the listener expects one, as for the gate
-        // above. A TCP session has no request to read a header or cookie
-        // from, so the source IP is the only key. Every other policy ignores
-        // a key, so none is derived for it.
+        // `HRW` and `MAGLEV` pin a TCP client on its source IP, and shuffle
+        // sharding ranks its shard by it — the PROXY-v2 source when the
+        // listener expects one, as for the gate above. A TCP session has no
+        // request to read a header or cookie from, so the source IP is the
+        // only key. Any other cluster ignores a key, so none is derived.
         let affinity_key = if keyed {
             self.effective_session_address()
                 .map(|address| affinity_key_from_ip(address.ip()))
@@ -2749,10 +2747,10 @@ fn route_key_and_matcher(sni: &str, alpn: Vec<String>) -> (Vec<u8>, AlpnMatcher)
 #[derive(Debug)]
 pub struct ClusterConfiguration {
     proxy_protocol: Option<ProxyProtocolConfig>,
-    /// The cluster's policy, read at selection time for one reason: `HRW`
-    /// and `MAGLEV` need the client's affinity key, which
-    /// `TcpSession::connect_to_backend` derives only for them.
-    load_balancing: LoadBalancingAlgorithms,
+    /// Whether selection reads the client's affinity key: the policy is
+    /// `HRW` or `MAGLEV`, or the cluster shards. `TcpSession::connect_to_backend`
+    /// derives the key only then.
+    reads_affinity_key: bool,
     /// Per-cluster override of the global per-(cluster, source-IP)
     /// connection limit. `None` inherits the global default,
     /// `Some(0)` is explicit "unlimited", `Some(n > 0)` overrides.
@@ -3109,7 +3107,7 @@ impl ProxyConfiguration for TcpProxy {
                     proxy_protocol: cluster
                         .proxy_protocol
                         .and_then(|n| ProxyProtocolConfig::try_from(n).ok()),
-                    load_balancing: cluster.load_balancing(),
+                    reads_affinity_key: cluster_reads_affinity_key(&cluster),
                     max_connections_per_ip: cluster.max_connections_per_ip,
                     max_connections_per_subnet: cluster.max_connections_per_subnet,
                 };

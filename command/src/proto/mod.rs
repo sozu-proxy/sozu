@@ -195,6 +195,9 @@ impl std::fmt::Debug for command::Cluster {
                 "affinity_cookie_len",
                 &self.affinity_cookie.as_ref().map(String::len),
             )
+            .field("shard_percent", &self.shard_percent)
+            .field("shard_min_backends", &self.shard_min_backends)
+            .field("shard_mode", &self.shard_mode)
             .finish_non_exhaustive()
     }
 }
