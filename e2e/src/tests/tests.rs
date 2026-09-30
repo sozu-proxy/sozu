@@ -2446,6 +2446,92 @@ fn try_http_behaviors() -> State {
     State::Success
 }
 
+/// RFC 9110 §15.2: every 1xx status is interim and a client must accept any
+/// number of them before the final response, not only 100 and 103. Here an H1
+/// keep-alive backend answers `interim` (102 Processing, or the unassigned 150)
+/// and only then the final 200: the client must receive both, in order, and
+/// the same frontend and backend connections must then carry a second
+/// exchange, which they cannot if the interim response ended the stream.
+fn try_h1_interim_response_before_final(interim: &str) -> State {
+    let front_address = create_local_address();
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_sync_test(
+        "H1-INTERIM",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+    let mut backend = backends.pop().expect("backend");
+    let mut client = Client::new(
+        "client",
+        front_address,
+        http_request("GET", "/api", "ping", "localhost"),
+    );
+
+    backend.connect();
+    client.connect();
+    client.send();
+    backend.accept(0);
+    if backend.receive(0).is_none() {
+        println!("the backend never received the request");
+        return State::Fail;
+    }
+
+    backend.set_response(format!("HTTP/1.1 {interim}\r\n\r\n"));
+    backend.send(0);
+    let expected_interim = format!("HTTP/1.1 {interim}\r\n");
+    match read_until(&mut client, Duration::from_secs(1), |seen| {
+        seen.ends_with("\r\n\r\n")
+    }) {
+        ReadOutcome::Complete(seen) if seen.starts_with(&expected_interim) => {}
+        other => {
+            println!("expected the interim {interim:?}, got {other:?}");
+            return State::Fail;
+        }
+    }
+
+    backend.set_response(http_ok_response("pong"));
+    backend.send(0);
+    match read_until(&mut client, Duration::from_secs(1), |seen| {
+        seen.ends_with("\r\n\r\npong")
+    }) {
+        ReadOutcome::Complete(seen) if seen.starts_with("HTTP/1.1 200 OK\r\n") => {}
+        other => {
+            println!("expected the final 200 after {interim:?}, got {other:?}");
+            return State::Fail;
+        }
+    }
+
+    // Second exchange on the same frontend and the same backend connection.
+    client.set_request(http_request("GET", "/api", "ping2", "localhost"));
+    client.send();
+    match backend.receive(0) {
+        Some(request) if request.ends_with("ping2") => {}
+        other => {
+            println!("the kept-alive backend did not receive the second request: {other:?}");
+            return State::Fail;
+        }
+    }
+    backend.set_response(http_ok_response("pong2"));
+    backend.send(0);
+    match read_until(&mut client, Duration::from_secs(1), |seen| {
+        seen.ends_with("\r\n\r\npong2")
+    }) {
+        ReadOutcome::Complete(seen) if seen.starts_with("HTTP/1.1 200 OK\r\n") => {}
+        other => {
+            println!("expected the second 200, got {other:?}");
+            return State::Fail;
+        }
+    }
+
+    worker.hard_stop();
+    worker.wait_for_server_stop();
+    State::Success
+}
+
 fn try_builtin_404_default_answer_closes_connection() -> State {
     let front_address: SocketAddr = create_local_address();
 
@@ -3906,6 +3992,30 @@ fn test_upgrade_interface_bound_listener() {
             3,
             "Upgrade: a listener bound to an interface keeps serving after a worker upgrade",
             try_upgrade_interface_bound_listener
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_h1_interim_102_before_final() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H1: a 102 Processing is forwarded as interim, the final 200 follows on a kept-alive backend",
+            || try_h1_interim_response_before_final("102 Processing")
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_h1_interim_150_before_final() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H1: an unassigned 150 is forwarded as interim, the final 200 follows on a kept-alive backend",
+            || try_h1_interim_response_before_final("150 Unassigned")
         ),
         State::Success
     );
