@@ -543,7 +543,20 @@ branch of `ConnectionH1::writable` that parses a pipelined request.
   kawa in error, so the parse-error branch of the call site answers it: 400
   when no response started, or a cut response when the backend already
   answered (the `Position::Server` arms of that branch in
-  `ConnectionH1::readable`). The field over the bound is never forwarded. The request
+  `ConnectionH1::readable`). Both arms first end the backend stream when the
+  stream is linked, because the head and body may already sit on the backend
+  as a request cut before its trailer section. On an H1 backend the
+  connection then closes and is never pooled. The 400 arm clears the response
+  before it replaces it, because a complete response would return the
+  connection to the keep-alive pool; the cut-response arm clears
+  `keep_alive_backend` for the same reason. On an H2 backend only that stream
+  ends: `ConnectionH2::end_stream` (`lib/src/protocol/mux/h2.rs`) resets it with
+  `RST_STREAM(CANCEL)` when its request reached the wire, and the shared
+  connection stays open for its other streams. The client connection is at
+  most as persistent as the answer's `Connection` header: `ConnectionH1::writable`
+  keeps it only when both `keep_alive_frontend` and `keep_alive_backend` hold,
+  so a client `Connection: close`, or a backend response that closes, still
+  closes it (sozu-proxy/sozu#1716). The field over the bound is never forwarded. The request
   is refused rather than trimmed, as H2 resets the stream with
   `ENHANCE_YOUR_CALM`, because a peer sending that many trailer fields is
   either broken or probing, and no default answer exists for 431; 400 is the

@@ -2196,6 +2196,184 @@ fn test_h1_trailer_field_limit_exceeded_rejected_split() {
 }
 
 // =========================================================================
+// Test 13a ter: a request rejected after part of it reached the backend
+// closes that backend connection
+//
+// The over-bound trailer section of a split chunked request is parsed after
+// its head and body were already forwarded, so the backend holds a request
+// cut before its trailer section. The rejection answers the client 400, and
+// must also close that backend connection: left open, it waits for the rest
+// of a request that never comes, and still delivers whatever it answers into
+// the stream slot the next request on the same client connection reuses.
+// That next request is then served from a fresh backend connection.
+//
+// The listener's 400 answer here carries no `Connection: close`, the
+// operator-supported way to keep the client connection alive after a
+// default answer (`set_default_answer`, `lib/src/protocol/mux/answers.rs`).
+// With the builtin 400, which closes the client connection, the session
+// close tears the backend down too, and hides the leak.
+// =========================================================================
+
+/// To SEE THIS RED: in `ConnectionH1::readable`
+/// (`lib/src/protocol/mux/h1.rs`), remove the block that ends the linked
+/// backend stream before the `Position::Server` arm answers 400. In a debug
+/// build, which is how e2e runs, the test goes red on the worker's panic: the
+/// `backend_streams` invariant of `Mux::ready_inner` fails at the end of the
+/// pass that answered 400, so the worker dies and the harness reports a
+/// broken command channel before any assertion here runs. In a release
+/// build, which has no invariant check, the test goes red on `backend_closed`:
+/// the backend connection is never closed and keeps the cut request for as
+/// long as the client connection lives.
+fn try_h1_trailer_field_limit_split_closes_backend() -> State {
+    let label = "TRAILER-LIMIT-SPLIT-BACKEND-CLOSE";
+    let front_address = create_local_address();
+    let back_address = create_local_address();
+
+    let (config, mut listeners, state) = Worker::empty_config();
+    attach_reserved_http_listener(&mut listeners, front_address);
+    let mut worker = Worker::start_new_worker_owned(label, config, listeners, state);
+
+    let mut listener_config = ListenerBuilder::new_http(front_address.into())
+        .to_http(None)
+        .expect("could not build the http listener config");
+    listener_config.answers.insert(
+        "400".to_owned(),
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".to_owned(),
+    );
+    worker.send_proxy_request_type(RequestType::AddHttpListener(listener_config));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
+        address: front_address.into(),
+        proxy: ListenerType::Http.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpFrontend(Worker::default_http_frontend(
+        "cluster_0",
+        front_address,
+    )));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let mut backend = SyncBackend::new(
+        "BACKEND_0",
+        back_address,
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\npong",
+    );
+    backend.connect();
+
+    // A keep-alive request: nothing on the client side asks for a close.
+    let head = concat!(
+        "POST /api HTTP/1.1\r\n",
+        "Host: localhost\r\n",
+        "Transfer-Encoding: chunked\r\n",
+        "\r\n",
+        "5\r\n",
+        "Hello\r\n",
+        "0\r\n",
+    );
+    let trailers = numbered_trailers(DEFAULT_MAX_TRAILER_FIELDS + 1);
+    let mut stream = raw_connect(front_address);
+    stream.write_all(head.as_bytes()).expect("write head");
+
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut accepted = false;
+    while Instant::now() < deadline {
+        if backend.accept(0) {
+            accepted = true;
+            break;
+        }
+    }
+    let forwarded = if accepted {
+        backend_drain(&mut backend, 0, Duration::from_millis(300))
+    } else {
+        String::new()
+    };
+    stream
+        .write_all(trailers.as_bytes())
+        .expect("write trailers");
+    let response = raw_read(&mut stream).unwrap_or_default();
+
+    // The backend connection must close well within this window. The client
+    // connection stays open throughout, so only sozu ending the backend
+    // stream can close it.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut backend_closed = false;
+    while accepted && Instant::now() < deadline {
+        if !backend.is_connected(0) {
+            backend_closed = true;
+            break;
+        }
+        // Drain whatever else arrived, so `is_connected` peeks at the EOF.
+        backend.receive(0);
+    }
+    // The reset stream slot serves the next request on the same client
+    // connection, from a fresh backend connection.
+    stream
+        .write_all(b"GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("write the follow-up request");
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut reaccepted = false;
+    while Instant::now() < deadline {
+        if backend.accept(1) {
+            reaccepted = true;
+            break;
+        }
+    }
+    if reaccepted {
+        backend_drain(&mut backend, 1, Duration::from_millis(200));
+        backend.send(1);
+    }
+    let follow_up = raw_read(&mut stream).unwrap_or_default();
+    println!(
+        "{label}: backend accepted={accepted} received {} bytes ending {:?}, client got {:?}, backend_closed={backend_closed}, follow-up got {follow_up:?}",
+        forwarded.len(),
+        &forwarded[forwarded.len().saturating_sub(24)..],
+        response.lines().next()
+    );
+    drop(stream);
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    if !accepted || !forwarded.ends_with("0\r\n") {
+        println!("{label}: FAIL — the head and body never reached the backend before the trailers");
+        return State::Fail;
+    }
+    if !response.starts_with("HTTP/1.1 400") {
+        println!("{label}: FAIL — the over-bound trailer section was not answered 400");
+        return State::Fail;
+    }
+    if !backend_closed {
+        println!("{label}: FAIL — the backend connection holding the cut request stayed open");
+        return State::Fail;
+    }
+    if !reaccepted || !follow_up.starts_with("HTTP/1.1 200") || !follow_up.ends_with("pong") {
+        println!("{label}: FAIL — the next request on the client connection was not served");
+        return State::Fail;
+    }
+    State::Success
+}
+
+#[test]
+fn test_h1_trailer_field_limit_exceeded_split_closes_backend() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H1 security: a request rejected after part of it was forwarded closes the backend connection",
+            try_h1_trailer_field_limit_split_closes_backend,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
 // Test 13b: a Content-Length that is not 1*DIGIT is never forwarded
 //
 // RFC 9110 §8.6: `Content-Length = 1*DIGIT`, and a sender MUST NOT forward
