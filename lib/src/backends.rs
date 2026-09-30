@@ -338,6 +338,43 @@ impl Backend {
         }
     }
 
+    /// Reserve a connection on this backend for a dial about to start.
+    ///
+    /// `active_connections += 1`, exactly the count a successful
+    /// [`Self::try_connect`] takes, but before the connect: selection takes it
+    /// under the same borrow as the choice (`BackendMap::reserve_backend`).
+    /// Only a `Normal` backend can be chosen, and only a `Normal` backend
+    /// accepts the reservation.
+    pub fn reserve_connection(&mut self) -> Result<(), BackendError> {
+        match self.inc_connections() {
+            Some(_) => Ok(()),
+            None => Err(BackendError::Status(self.status.to_owned())),
+        }
+    }
+
+    /// Release the reservation of a dial whose connect failed at `now`, and
+    /// record the failure: `failures += 1` and the retry policy's backoff,
+    /// whose jitter is drawn from `rng`.
+    ///
+    /// Leaves the backend where a failed [`Self::try_connect`] leaves it: the
+    /// reservation it releases is the count that call never took.
+    pub fn release_failed_dial<R: Rng + ?Sized>(&mut self, now: Instant, rng: &mut R) {
+        let (connections_before, failures_before) = (self.active_connections, self.failures);
+        self.dec_connections();
+        self.failures += 1;
+        self.retry_policy.fail(now, rng);
+        debug_assert_eq!(
+            self.active_connections,
+            connections_before.saturating_sub(1),
+            "a failed dial must release exactly its one reservation (saturating at 0)"
+        );
+        debug_assert_eq!(
+            self.failures,
+            failures_before + 1,
+            "a failed dial must advance the failure counter by exactly one"
+        );
+    }
+
     /// Record that a connection took `dur` to establish, observed at `now`.
     pub fn set_connection_time(&mut self, dur: Duration, now: Instant) {
         self.connection_time.observe(dur.as_nanos() as f64, now);
@@ -730,44 +767,18 @@ impl BackendMap {
     }
 
     /// Select a backend of `cluster_id` at `now` and connect to it.
+    /// Select a backend of `cluster_id` at `now` and connect to it.
+    ///
+    /// The TCP proxy's entry point: it selects and connects in one call, and
+    /// `Backend::try_connect` counts the connection once it is established.
+    /// The HTTP mux reserves with [`Self::reserve_backend`] instead and
+    /// connects on its own side.
     pub fn backend_from_cluster_id(
         &mut self,
         cluster_id: &str,
         now: Instant,
     ) -> Result<(Rc<RefCell<Backend>>, TcpStream), BackendError> {
-        let cluster_backends = self
-            .backends
-            .get_mut(cluster_id)
-            .ok_or(BackendError::NoBackendForCluster(cluster_id.to_owned()))?;
-
-        if cluster_backends.backends.is_empty() {
-            // Drop the &mut BackendList borrow before the &self helper call.
-            // `total == 0` falls into the "never report AllDown" branch in
-            // record_cluster_availability, so this just publishes the (0, 0)
-            // gauges.
-            let _ = cluster_backends;
-            self.record_cluster_availability(cluster_id);
-            return Err(BackendError::NoBackendForCluster(cluster_id.to_owned()));
-        }
-        // Past the empty guard there is at least one backend to pick from.
-        debug_assert!(
-            !cluster_backends.backends.is_empty(),
-            "selection runs only on a non-empty backend list"
-        );
-
-        let next_backend = match cluster_backends.next_available_backend(now) {
-            Some(nb) => nb,
-            None => {
-                // Drop the &mut BackendList before the &self helper call.
-                // The helper observes (available=0, total>0) and emits the
-                // Available -> AllDown transition (log + counter + Event)
-                // exactly once per regime entry. Subsequent calls in the
-                // same AllDown regime are no-ops.
-                let _ = cluster_backends;
-                self.record_cluster_availability(cluster_id);
-                return Err(BackendError::NoBackendForCluster(cluster_id.to_owned()));
-            }
-        };
+        let next_backend = self.select_backend(cluster_id, now)?;
 
         let tcp_stream = {
             let mut borrowed_backend = next_backend.borrow_mut();
@@ -798,7 +809,6 @@ impl BackendMap {
         // not borrowed here (the inner block dropped `borrowed_backend`),
         // so the helper's `BackendList::evaluate_availability` walk is
         // free to call `borrow()` on every backend.
-        let _ = cluster_backends;
         self.record_cluster_availability(cluster_id);
 
         // The selected backend is a live member of the cluster it was drawn
@@ -812,6 +822,100 @@ impl BackendMap {
         );
 
         Ok((next_backend.clone(), tcp_stream))
+    }
+
+    /// Select a backend of `cluster_id` at `now` and reserve a connection on
+    /// it, without connecting (#1684).
+    ///
+    /// The reservation is `active_connections += 1`, taken under the same
+    /// borrow as the choice, so the next selection weighs it exactly as it
+    /// weighed the connection `Backend::try_connect` used to count at the
+    /// dial. The caller connects, and a connection that fails to start
+    /// releases the reservation through [`Backend::release_failed_dial`]; one
+    /// that starts keeps it, and its close releases it like any other.
+    pub fn reserve_backend(
+        &mut self,
+        cluster_id: &str,
+        now: Instant,
+    ) -> Result<Rc<RefCell<Backend>>, BackendError> {
+        let backend = self.select_backend(cluster_id, now)?;
+        backend.borrow_mut().reserve_connection()?;
+        // Re-evaluate on a successful selection, as the connecting path does
+        // on a successful connect, so an AllDown -> Available recovery is
+        // reported the moment a request reaches a backend again.
+        self.record_cluster_availability(cluster_id);
+        Ok(backend)
+    }
+
+    /// Reserve a connection on the backend of `cluster_id` that
+    /// `sticky_session` names, if it can take one at `now`, falling back to
+    /// [`Self::reserve_backend`].
+    pub fn reserve_sticky_backend(
+        &mut self,
+        cluster_id: &str,
+        sticky_session: &str,
+        now: Instant,
+    ) -> Result<Rc<RefCell<Backend>>, BackendError> {
+        let sticky = self
+            .backends
+            .get_mut(cluster_id)
+            .and_then(|cluster_backends| cluster_backends.find_sticky(sticky_session, now))
+            .cloned();
+        match sticky {
+            Some(backend) => {
+                backend.borrow_mut().reserve_connection()?;
+                Ok(backend)
+            }
+            None => {
+                debug!(
+                    "Couldn't find a backend corresponding to sticky_session {} for cluster {}",
+                    sticky_session, cluster_id
+                );
+                self.reserve_backend(cluster_id, now)
+            }
+        }
+    }
+
+    /// Choose a backend of `cluster_id` at `now`, publishing the cluster's
+    /// availability when nothing can be chosen.
+    fn select_backend(
+        &mut self,
+        cluster_id: &str,
+        now: Instant,
+    ) -> Result<Rc<RefCell<Backend>>, BackendError> {
+        let cluster_backends = self
+            .backends
+            .get_mut(cluster_id)
+            .ok_or(BackendError::NoBackendForCluster(cluster_id.to_owned()))?;
+
+        if cluster_backends.backends.is_empty() {
+            // Drop the &mut BackendList borrow before the &self helper call.
+            // `total == 0` falls into the "never report AllDown" branch in
+            // record_cluster_availability, so this just publishes the (0, 0)
+            // gauges.
+            let _ = cluster_backends;
+            self.record_cluster_availability(cluster_id);
+            return Err(BackendError::NoBackendForCluster(cluster_id.to_owned()));
+        }
+        // Past the empty guard there is at least one backend to pick from.
+        debug_assert!(
+            !cluster_backends.backends.is_empty(),
+            "selection runs only on a non-empty backend list"
+        );
+
+        match cluster_backends.next_available_backend(now) {
+            Some(backend) => Ok(backend),
+            None => {
+                // Drop the &mut BackendList before the &self helper call.
+                // The helper observes (available=0, total>0) and emits the
+                // Available -> AllDown transition (log + counter + Event)
+                // exactly once per regime entry. Subsequent calls in the
+                // same AllDown regime are no-ops.
+                let _ = cluster_backends;
+                self.record_cluster_availability(cluster_id);
+                Err(BackendError::NoBackendForCluster(cluster_id.to_owned()))
+            }
+        }
     }
 
     /// Select a backend for `cluster_id`, optionally pinned by an affinity

@@ -657,8 +657,9 @@ impl SessionManager {
     ///   `TcpSession::connect_to_backend` (`lib/src/tcp.rs`) becomes
     ///   `SessionResult::Close` in the same event-loop pass.
     /// - A registered, `Normal` backend that is down may not fail on the
-    ///   dial at all. `Backend::try_connect` (`lib/src/backends.rs`) is
-    ///   non-blocking: a refusal the kernel reports synchronously —
+    ///   dial at all. The dial — `Mux::dial_backend`
+    ///   (`lib/src/protocol/mux/mod.rs`) for HTTP, `Backend::try_connect`
+    ///   (`lib/src/backends.rs`) for TCP — is non-blocking: a refusal the kernel reports synchronously —
     ///   the common case for a closed port on loopback — surfaces as
     ///   `BackendError::ConnectionFailures` and takes the answer path
     ///   above, while an `EINPROGRESS` connect returns `Ok` and its

@@ -464,6 +464,48 @@
 
 ### 🔄 Changed
 
+- **BREAKING (library API) — `refactor(mux)`: selection reserves a connection and the mux dials it;
+  a failed dial releases the reservation through the ledger
+  ([#1684](https://github.com/sozu-proxy/sozu/issues/1684)).** The backend-set capability
+  `Router::backend_from_request` borrows used to select **and** dial in one call, because
+  `Backend::try_connect` counted the connection outside the delta ledger and the next selection had
+  to see it. Selection now takes that count itself: `BackendMap::reserve_backend` and
+  `reserve_sticky_backend` raise the chosen backend's `active_connections` under the same borrow as
+  the choice, and `Mux::dial_backend` connects to `BackendId::address` afterwards. A `connect(2)`
+  that fails pushes the new `BackendChange::DialFailed(Instant)`, which releases the reservation and
+  records the failure (`failures += 1`, `retry_policy.fail`, jitter from the worker's `BackendMap`
+  generator). The drain before each selection applies it, so the next selection sees the backend
+  exactly where a failed `Backend::try_connect` left it. `lib/src/protocol/mux/LIFECYCLE.md` §9
+  invariant 14 gains the rule "selection reserves, failure releases".
+
+  Renamed: `router::BackendDialer` → `router::BackendSelector`, `BackendDialer::select_and_dial` →
+  `BackendSelector::select`, `router::DialedBackend` → `router::SelectedBackend`, which loses its
+  `socket` field, and the crate-private `RegistryDialer` → `RegistrySelector`.
+  `Router::backend_from_request` returns `BackendId` instead of `(TcpStream, BackendId)`. Added:
+  `BackendId::new(slot, backend_id, address)`, so a simulator's own selector can mint ids, and it
+  needs no `mio` because a selector holds no socket; `BackendMap::reserve_backend` and
+  `reserve_sticky_backend`; `Backend::reserve_connection` and `release_failed_dial`.
+  `BackendRegistry::apply_all` takes the worker's map, borrowed only to draw a `DialFailed` jitter.
+  The TCP proxy keeps `BackendMap::backend_from_cluster_id` and `Backend::try_connect`, unchanged.
+
+  No behaviour change on a successful dial, and none in what a selection reads: the reservation is
+  the count `try_connect` took, moved before the connect. The AllDown → Available availability event
+  is published after a successful selection rather than after a successful connect. No allocation is
+  added: a dial through `Mux::dial_backend` still makes 6, steady-state selection 0, and
+  `size_of::<BackendChange>()` stays 16 bytes with the `Instant` payload. Three exits past a
+  successful connect — `Connection::new_h2_client` returning `None`, a refused
+  `Connection::start_stream` and the `register_socket` rollback — never released the count
+  `try_connect` took and do not release the reservation now; LIFECYCLE §9 names them.
+
+  New tests, each seen red first: `a_second_selection_observes_the_first_selections_reservation`,
+  formerly `a_second_selection_observes_the_first_dials_connection`, now selects twice with no dial
+  in between; `power_of_two_weighs_every_reservation`;
+  `a_failed_dial_releases_its_reservation_and_records_the_failure`;
+  `a_synchronously_failed_dial_releases_its_reservation`, which dials the limited broadcast address;
+  and `a_successful_dial_counts_its_connection_once` (all `router.rs`). The `invariant_14_*` tests
+  keep every assertion; their ledger helper gains an unreachable `DialFailed` arm. Documented in
+  `doc/testing.md` §5, `doc/lifetime_of_a_session.md` and `doc/benchmark.md`.
+
 - **BREAKING (library API) — `refactor(lib)`: backend selection and backoff take their clock and
   their randomness from the caller ([#1684](https://github.com/sozu-proxy/sozu/issues/1684)).** The
   last ambient reads on the selection path are gone: `ExponentialBackoffPolicy` read

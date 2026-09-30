@@ -390,11 +390,13 @@ from a copy of the bytes it sent (`ReplayOnFreshBackend`, `mux/LIFECYCLE.md`
 §8.5). Keeping that copy costs one allocation per request on a reused
 connection (the replay capture of `ConnectionH1::writable`).
 
-Otherwise `Mux::dial_backend` lends the router a `BackendDialer` for one call;
-`BackendDialer::select_and_dial` picks a backend through the cluster's
+Otherwise `Mux::dial_backend` lends the router a `BackendSelector` for one call;
+`BackendSelector::select` picks a backend through the cluster's
 load-balancing policy over a borrowed `Candidates` view (no candidate `Vec`, no
 `Rc` clone but the chosen one,
-[#1557](https://github.com/sozu-proxy/sozu/pull/1557)), then connects it:
+[#1557](https://github.com/sozu-proxy/sozu/pull/1557)) and reserves a
+connection on it, and `Mux::dial_backend` then connects it
+([#1684](https://github.com/sozu-proxy/sozu/issues/1684)):
 `socket(2)`, a non-blocking `connect(2)`, `setsockopt(TCP_NODELAY)` and
 `epoll_ctl(EPOLL_CTL_ADD)` on a new slab token. The backend's identity is
 interned once per session in the `BackendRegistry`, so a redial or a reuse

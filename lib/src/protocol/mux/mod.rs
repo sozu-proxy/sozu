@@ -323,6 +323,23 @@ pub struct BackendId {
 }
 
 impl BackendId {
+    /// An id for the backend at `address`, named `backend_id`, in `slot` of
+    /// whichever registry mints it (#1684).
+    ///
+    /// The worker's mux never calls this: its ids come from the session's
+    /// `BackendRegistry`, which interns the backend it names and is the only
+    /// thing that can resolve a slot back to it. This is for an embedder that
+    /// owns its own selector — a simulator implementing
+    /// [`router::BackendSelector`] — and numbers its backends itself. A slot
+    /// means something only to the registry that issued it.
+    pub fn new(slot: usize, backend_id: Rc<str>, address: SocketAddr) -> Self {
+        BackendId {
+            slot: BackendSlot(slot),
+            backend_id,
+            address,
+        }
+    }
+
     /// The slot this id names. Module-private on purpose — see [`Mux::backend`]
     /// for the crate-visible resolution path.
     fn slot(&self) -> BackendSlot {
@@ -349,10 +366,10 @@ pub struct BackendDelta {
 
 /// The accounting operations [`BackendDelta`] can carry.
 ///
-/// Deliberately only the two counters invariant 14 is about. The health and
-/// latency writes the mux also makes (`failures`, `retry_policy`,
-/// `connection_time`) are NOT here: they are not part of the balance, and the
-/// load balancer reads `retry_policy`, so they stay immediate at their
+/// The two counters invariant 14 is about, plus the release of a
+/// reservation whose dial never started. The other health and latency writes
+/// the mux makes (`failures` and `retry_policy` on an asynchronous connect
+/// failure, `connection_time`) are NOT here: they stay immediate at their
 /// existing embedder-side call sites rather than being deferred to a drain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendChange {
@@ -362,6 +379,13 @@ pub enum BackendChange {
     StreamsEnded(usize),
     /// `Backend::dec_connections()` — the connection to this backend closed.
     ConnectionClosed,
+    /// The `connect(2)` of a dial failed at this instant (#1684): release the
+    /// reservation selection took (`Backend::dec_connections()`), and record
+    /// the failure (`failures += 1`, `retry_policy.fail`), as
+    /// `Backend::release_failed_dial` does. The drain before the next
+    /// selection applies it, so that selection sees the backend exactly as a
+    /// failed `Backend::try_connect` left it.
+    DialFailed(Instant),
 }
 
 /// The embedder's table of registry handles, indexed by [`BackendSlot`].
@@ -478,9 +502,13 @@ impl BackendRegistry {
     /// for the next change: the charge `Connection::start_stream` records on
     /// every request would otherwise reallocate it each time (#1583). The
     /// capacity is bounded by the most deltas a single pass has pushed.
-    pub(crate) fn apply_all(&self, deltas: &mut Vec<BackendDelta>) {
+    ///
+    /// `backends` is the worker's backend map, borrowed only to draw the
+    /// backoff jitter of a [`BackendChange::DialFailed`] from its generator;
+    /// every other change leaves it untouched.
+    pub(crate) fn apply_all(&self, deltas: &mut Vec<BackendDelta>, backends: &RefCell<BackendMap>) {
         for delta in deltas.drain(..) {
-            self.apply(delta);
+            self.apply(delta, backends);
         }
     }
 
@@ -489,7 +517,7 @@ impl BackendRegistry {
     /// The before/after pair-assertions that used to sit at each emitting
     /// site live here now: this is where both halves are observable, and one
     /// copy covers every emitter instead of each carrying its own.
-    fn apply(&self, delta: BackendDelta) {
+    fn apply(&self, delta: BackendDelta, backends: &RefCell<BackendMap>) {
         let Some(backend) = self.get(delta.slot) else {
             // Unreachable while the vector only grows, which it does. Report
             // rather than panic: losing one charge is a drifting gauge, and
@@ -540,6 +568,12 @@ impl BackendRegistry {
                     "a ConnectionClosed delta must release exactly one backend connection \
                      (saturating at 0)"
                 );
+            }
+            BackendChange::DialFailed(at) => {
+                // The one change that draws randomness, so the only one that
+                // borrows the map. `release_failed_dial` carries the
+                // before/after assertions for both halves.
+                backend.release_failed_dial(at, backends.borrow_mut().rng());
             }
         }
         trace!(
@@ -1554,7 +1588,7 @@ pub struct Mux<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> {
     /// silently mis-charge it.
     pub(crate) backend_registry: BackendRegistry,
     /// The worker's backend set, which `Mux::dial_backend` lends to
-    /// `Router::backend_from_request` through a `RegistryDialer`.
+    /// `Router::backend_from_request` through a `RegistrySelector`.
     ///
     /// Handed over when the session is built rather than read through
     /// `L7Proxy` on every dial: `HttpProxy` and `HttpsProxy` never reassign
@@ -1655,7 +1689,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Mux<Front, L>
     /// reader of the counters this drains.
     pub(crate) fn apply_backend_deltas(&mut self) {
         self.backend_registry
-            .apply_all(&mut self.context.backend_deltas);
+            .apply_all(&mut self.context.backend_deltas, &self.backends);
     }
 }
 
@@ -2330,12 +2364,12 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         frontend_should_stick: bool,
     ) -> Result<(), BackendConnectionError> {
         // One `borrow_mut` of the worker's `BackendMap` for exactly the
-        // selection and its dial, and no longer: nothing else on this path
-        // borrows the map, and the `RefMut` drops before `add_session` and
-        // `register_socket` borrow the proxy below.
-        let (socket, backend) = {
+        // selection and its reservation, and no longer: nothing else on this
+        // path borrows the map, and the `RefMut` drops before the dial and
+        // before `add_session` and `register_socket` borrow the proxy below.
+        let backend = {
             let mut backends = backends.borrow_mut();
-            let mut dialer = RegistryDialer {
+            let mut selector = RegistrySelector {
                 backends: &mut backends,
                 registry: backend_registry,
                 now: context.now,
@@ -2344,8 +2378,36 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 &cluster_id,
                 frontend_should_stick,
                 &mut context.streams[stream_id].context,
-                &mut dialer,
+                &mut selector,
             )?
+        };
+
+        // Selection reserved a connection on `backend`; the dial is ours
+        // (#1684). A `connect(2)` that fails releases that reservation and
+        // records the failure through the ledger, which the drain before the
+        // next selection applies — the backend is then exactly where a failed
+        // `Backend::try_connect` used to leave it.
+        let socket = match mio::net::TcpStream::connect(backend.address) {
+            Ok(socket) => socket,
+            Err(io_error) => {
+                context.backend_deltas.push(BackendDelta {
+                    slot: backend.slot(),
+                    change: BackendChange::DialFailed(context.now),
+                });
+                // The count the backend will hold once the delta is applied,
+                // as `Backend::try_connect`'s error reported it.
+                let failures = backend_registry
+                    .handle(&backend)
+                    .map_or(1, |handle| handle.borrow().failures + 1);
+                return Err(BackendConnectionError::Backend(
+                    BackendError::ConnectionFailures {
+                        cluster_id: cluster_id.to_string(),
+                        backend_address: backend.address,
+                        failures,
+                        error: io_error.to_string(),
+                    },
+                ));
+            }
         };
 
         if let Err(e) = socket.set_nodelay(true) {
@@ -3022,11 +3084,13 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 // stream linking in the same pass seeing the first stream's
                 // charge, exactly as it did when the charge was applied in
                 // place. It is also what makes the view each selection reads
-                // current: `Backend::try_connect` increments
-                // `active_connections` synchronously at the dial, inside this
-                // same loop iteration, so the next iteration's selection sees
-                // it (#1340, Question 6's second wrinkle).
-                self.backend_registry.apply_all(&mut context.backend_deltas);
+                // current: selection reserves `active_connections` itself
+                // (`BackendMap::reserve_backend`), and a `connect(2)` that
+                // failed in the previous iteration left a `DialFailed`
+                // release on the ledger, applied here before the next
+                // selection reads the counters (#1684).
+                self.backend_registry
+                    .apply_all(&mut context.backend_deltas, &self.backends);
                 // Build the routing view once for this decision, from a single
                 // `proxy.borrow()`. Holding one `Ref` for the call is what
                 // gives every read inside it the same cluster map; the two
@@ -3817,15 +3881,15 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     }
 }
 
-/// The embedder's [`router::BackendDialer`]: the worker's backend set and this
-/// session's registry, lent together for one selection.
+/// The embedder's [`router::BackendSelector`]: the worker's backend set and
+/// this session's registry, lent together for one selection.
 ///
 /// It is the one place a registry handle becomes an opaque [`BackendId`]: the
-/// backend is chosen and dialled by the `BackendMap`, named by the session's
+/// backend is chosen and reserved by the `BackendMap`, named by the session's
 /// table, and the `Rc` goes no further. Everything past
-/// [`router::BackendDialer::select_and_dial`] — and every `Position::Client`
-/// built from it — holds the id, never the handle.
-struct RegistryDialer<'a> {
+/// [`router::BackendSelector::select`] — the dial in `Mux::dial_backend`, and
+/// every `Position::Client` built from it — holds the id, never the handle.
+struct RegistrySelector<'a> {
     backends: &'a mut BackendMap,
     registry: &'a mut BackendRegistry,
     /// The pass's clock sample, [`Context::now`]: selection judges backoff
@@ -3834,19 +3898,19 @@ struct RegistryDialer<'a> {
     now: Instant,
 }
 
-impl router::BackendDialer for RegistryDialer<'_> {
-    fn select_and_dial(
+impl router::BackendSelector for RegistrySelector<'_> {
+    fn select(
         &mut self,
         cluster_id: &str,
         affinity: router::Affinity<'_>,
-    ) -> Result<router::DialedBackend, BackendError> {
-        let (handle, socket) = match affinity {
+    ) -> Result<router::SelectedBackend, BackendError> {
+        let handle = match affinity {
             router::Affinity::Sticky(Some(cookie)) => self
                 .backends
-                .backend_from_sticky_session(cluster_id, cookie, self.now)?,
-            router::Affinity::Sticky(None) | router::Affinity::Unpinned => self
-                .backends
-                .backend_from_cluster_id(cluster_id, self.now)?,
+                .reserve_sticky_backend(cluster_id, cookie, self.now)?,
+            router::Affinity::Sticky(None) | router::Affinity::Unpinned => {
+                self.backends.reserve_backend(cluster_id, self.now)?
+            }
         };
         let sticky_session = match affinity {
             router::Affinity::Sticky(_) => {
@@ -3861,16 +3925,15 @@ impl router::BackendDialer for RegistryDialer<'_> {
             router::Affinity::Unpinned => None,
         };
         let backend = self.registry.id_for(&handle);
-        // The id names the handle the map just dialled, not a copy of it.
+        // The id names the handle the map just reserved, not a copy of it.
         debug_assert!(
             self.registry
                 .get(backend.slot())
                 .is_some_and(|known| Rc::ptr_eq(known, &handle)),
-            "the minted id must resolve to the very backend that was dialled"
+            "the minted id must resolve to the very backend that was reserved"
         );
-        Ok(router::DialedBackend {
+        Ok(router::SelectedBackend {
             backend,
-            socket,
             sticky_session,
         })
     }

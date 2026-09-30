@@ -587,19 +587,22 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   deliberately idempotent within a token.
 
   Backend selection no longer reaches the handle either (Question 12's second
-  part). `Router::backend_from_request` is lent a `BackendDialer`
-  (`router.rs`) for one call, whose single method selects a backend **and**
-  dials it; `Mux::dial_backend` implements it over the worker's `BackendMap`
-  and the session's `BackendRegistry`, so the router receives an opaque
-  `BackendId` and its socket and never an `Rc<RefCell<Backend>>`. It is a
+  part). `Router::backend_from_request` is lent a `BackendSelector`
+  (`router.rs`) for one call, whose single method selects a backend **and
+  reserves** a connection on it; `Mux::dial_backend` implements it over the
+  worker's `BackendMap` and the session's `BackendRegistry`
+  (`RegistrySelector`), so the router receives an opaque `BackendId` and
+  never an `Rc<RefCell<Backend>>`, and then dials `BackendId::address` itself
+  ([#1684](https://github.com/sozu-proxy/sozu/issues/1684)). It is a
   capability rather than a data view like `RoutingView` because selection
   mutates — the round-robin cursor, the fail-open latch, `PeakEWMA`, the
   Maglev table, the availability latch — and a snapshot of N backends each
-  behind its own `RefCell` cannot be lent without allocating. Selection and
-  dial are one call because the dial's own connection count is outside the
-  ledger (see "Drain before any read" under invariant 14 in §9): splitting them
-  would open a window between reading the counters and dialling that the code
-  has never had. `a_second_selection_observes_the_first_dials_connection`
+  behind its own `RefCell` cannot be lent without allocating. Selecting
+  reserves under the same borrow as the choice, and a failed `connect(2)`
+  releases through the ledger (see "Selection reserves, failure releases"
+  under invariant 14 in §9), so no window opens between reading the counters
+  and the connection they count.
+  `a_second_selection_observes_the_first_selections_reservation`
   (`router.rs`) holds that property. The map itself is `Mux::backends`,
   handed over when the session is built (`HttpSession::new`, or the proxy's
   field at the expect-proxy and TLS-handshake upgrades); `L7Proxy` has no
@@ -1923,12 +1926,9 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     Two ordering rules the emit/apply split has to keep, both load-bearing:
 
     * **Drain before any read.** The load balancer `Router::backend_from_request`
-      reaches through its `BackendDialer` is the only reader of
+      reaches through its `BackendSelector` is the only reader of
       `active_requests`, `active_connections` and `connection_time` on this
-      path. `active_connections` is the one it reads that the ledger does not
-      carry: `Backend::try_connect` raises it at the dial, which is why the
-      dialer selects and dials in one call rather than returning a choice to
-      dial later. `Mux::ready_inner` drains immediately before each
+      path. `Mux::ready_inner` drains immediately before each
       `Router::plan_connect`, and the four `Mux` wrappers that owe the timer wheel
       a reschedule (`ready`, `timeout`, `close`, `shutting_down`) drain on the
       way out. FIFO application plus drain-before-read leaves the counters at
@@ -1939,6 +1939,34 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
       `Vec`, so the ledger keeps its capacity and the charge
       `Connection::start_stream` records on every request does not reallocate
       it (#1583).
+    * **Selection reserves, failure releases.** `active_connections` is
+      raised by selection itself, not by the dial: `BackendMap::reserve_backend`
+      (`lib/src/backends.rs`) takes the reservation under the same borrow as
+      the choice, so the next selection weighs it before anything connects —
+      the view a select-and-dial in one call gave, without the dial in the
+      selector ([#1684](https://github.com/sozu-proxy/sozu/issues/1684)).
+      `Mux::dial_backend` then connects to the reserved backend. A
+      `connect(2)` that fails pushes `BackendChange::DialFailed`, whose
+      application releases the reservation and records the failure
+      (`failures += 1`, `retry_policy.fail`); the drain before the next
+      selection applies it, so that selection sees the backend exactly where
+      a failed `Backend::try_connect` left it. A dial that connects keeps the
+      reservation as its connection's count, and the connection's
+      `ConnectionClosed` releases it. Pinned by
+      `a_second_selection_observes_the_first_selections_reservation`,
+      `power_of_two_weighs_every_reservation`,
+      `a_failed_dial_releases_its_reservation_and_records_the_failure`,
+      `a_synchronously_failed_dial_releases_its_reservation` and
+      `a_successful_dial_counts_its_connection_once` (`router.rs`).
+
+      The rule covers `connect(2)` failure and nothing else. Three exits of
+      `Mux::dial_backend` past a successful connect drop the connection
+      without releasing its reservation: `Connection::new_h2_client`
+      returning `None` (buffer pool exhausted), a refused
+      `Connection::start_stream`, and the `register_socket` rollback, which
+      releases `active_requests` but not `active_connections`. They leaked
+      the count `Backend::try_connect` took before #1684 in exactly the same
+      way, and still do.
     * **Charge only a stream that started.** `Connection::start_stream`
       records `StreamsStarted` *after* the inner start returns true. The
       pre-#1340 shape charged first and undid the charge on refusal; a ledger
@@ -1976,8 +2004,8 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     `start.elapsed()`
     ([#1684](https://github.com/sozu-proxy/sozu/issues/1684)). Selection
     itself judges backoff windows and connection-time decay against the same
-    `Context::now`, which `RegistryDialer` carries into
-    `BackendMap::backend_from_cluster_id`.
+    `Context::now`, which `RegistrySelector` carries into
+    `BackendMap::reserve_backend`.
 
     A `BackendId` names a session-scoped slot rather than the backend's id or
     address. A reload that replaces a registry entry mid-session builds a new

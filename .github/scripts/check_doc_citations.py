@@ -1516,6 +1516,12 @@ RENAMED_TESTS = {
         "random_policies_seeded_by_the_os_are_not_correlated",
     "power_of_two_new_instances_are_not_correlated":
         "power_of_two_policies_seeded_by_the_os_are_not_correlated",
+    # sozu#1684 moved the HTTP dial out of selection: the second selection now
+    # observes the first one's reservation, taken before anything connects.
+    # The CHANGELOG entry of the refactor that introduced it cites the old
+    # name on purpose.
+    "a_second_selection_observes_the_first_dials_connection":
+        "a_second_selection_observes_the_first_selections_reservation",
 }
 
 # Sentence-shaped identifiers that survive both filters and are not test names.

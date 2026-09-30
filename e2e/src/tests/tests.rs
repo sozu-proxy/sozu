@@ -477,7 +477,9 @@ pub fn try_sync(nb_clients: usize, nb_requests: usize) -> State {
 ///
 /// To SEE THIS RED: insert `std::thread::sleep(Duration::from_millis(150))`
 /// immediately before the `mio::net::TcpStream::connect` in
-/// `Backend::try_connect` (`lib/src/backends.rs`). Measured 2026-09-22:
+/// `Mux::dial_backend` (`lib/src/protocol/mux/mod.rs`); it was in
+/// `Backend::try_connect` (`lib/src/backends.rs`) until #1684 moved the HTTP
+/// dial out of selection. Measured 2026-09-22, at that earlier site:
 /// `reconnecting to another backend took 165.363581ms, over the 100ms
 /// budget`, failing on the first of the 100 iterations with the re-route
 /// itself intact (`backend2` served `(1, 1)`, status 200), so the budget

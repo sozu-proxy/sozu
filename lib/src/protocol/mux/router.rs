@@ -93,7 +93,7 @@ use std::{
     time::Duration,
 };
 
-use mio::{Token, net::TcpStream};
+use mio::Token;
 use sozu_command::{
     logging::ansi_palette,
     proto::command::{Cluster, ListenerType, RedirectPolicy, RedirectScheme},
@@ -1310,16 +1310,19 @@ impl Router {
     /// the listener again here would be exactly the mid-request reload leak
     /// `LIFECYCLE.md` §2.5 rules out.
     ///
-    /// Takes no proxy handle either: the backend set arrives as `dialer`, a
-    /// capability borrowed for this one call (see [`BackendDialer`]).
+    /// Takes no proxy handle either: the backend set arrives as `selector`, a
+    /// capability borrowed for this one call (see [`BackendSelector`]).
+    ///
+    /// Returns the chosen backend, reserved but not dialled: the caller
+    /// connects to [`BackendId::address`] (#1684).
     pub fn backend_from_request(
         &mut self,
         cluster_id: &str,
         frontend_should_stick: bool,
         context: &mut HttpContext,
-        dialer: &mut dyn BackendDialer,
-    ) -> Result<(TcpStream, BackendId), BackendConnectionError> {
-        // Spelled out rather than folded into the dialer's signature: a
+        selector: &mut dyn BackendSelector,
+    ) -> Result<BackendId, BackendConnectionError> {
+        // Spelled out rather than folded into the selector's signature: a
         // cookie the client sent to a frontend that does not stick is
         // ignored, exactly as the `(false, Some(_))` arm of the match this
         // replaced ignored it.
@@ -1328,16 +1331,16 @@ impl Router {
         } else {
             Affinity::Unpinned
         };
-        let dialed = dialer
-            .select_and_dial(cluster_id, affinity)
+        let selected = selector
+            .select(cluster_id, affinity)
             .map_err(|backend_error| {
                 trace!("{} {}", log_module_context!(context), backend_error);
                 BackendConnectionError::Backend(backend_error)
             })?;
         debug_assert_eq!(
-            dialed.sticky_session.is_some(),
+            selected.sticky_session.is_some(),
             frontend_should_stick,
-            "a dialer resolves a sticky cookie exactly when the frontend sticks"
+            "a selector resolves a sticky cookie exactly when the frontend sticks"
         );
 
         // `context.sticky_name` is the name `Context::create_stream` captured
@@ -1347,19 +1350,20 @@ impl Router {
         // request would then have been matched on the old name and answered
         // with a `Set-Cookie` under the new one. A reload applies from the
         // next request (`LIFECYCLE.md` §2.5).
-        if let Some(sticky_session) = dialed.sticky_session {
+        if let Some(sticky_session) = selected.sticky_session {
             context.sticky_session = Some(sticky_session);
         }
 
-        context.backend_id = Some(Rc::clone(&dialed.backend.backend_id));
-        context.backend_address = Some(dialed.backend.address);
+        context.backend_id = Some(Rc::clone(&selected.backend.backend_id));
+        context.backend_address = Some(selected.backend.address);
 
-        Ok((dialed.socket, dialed.backend))
+        Ok(selected.backend)
     }
 }
 
 /// The worker's backend set, as the one capability
-/// [`Router::backend_from_request`] needs from it: pick a backend and dial it.
+/// [`Router::backend_from_request`] needs from it: pick a backend and reserve
+/// a connection on it.
 ///
 /// Question 12 of [#1340](https://github.com/sozu-proxy/sozu/issues/1340)
 /// asked for a borrowed view of backend load state, "the same shape"
@@ -1373,22 +1377,21 @@ impl Router {
 /// that fits is the UDP core's `BackendSource` (`lib/src/protocol/udp/mod.rs`),
 /// a `&mut dyn` the core calls and the embedder implements.
 ///
-/// # Why selecting and dialling are one call
+/// # Selection reserves, a failed dial releases
 ///
-/// There is no staleness to bound between reading the load counters and the
-/// dial, because nothing runs between them: `BackendMap::backend_from_cluster_id`
-/// (`lib/src/backends.rs`) selects and calls `Backend::try_connect` under one
-/// `borrow_mut`, the worker is single-threaded, and the connect is
-/// non-blocking. `Backend::try_connect` increments `active_connections`
-/// directly rather than through a [`super::BackendDelta`], so no drain point
-/// covers it; the second stream linking in the same pass sees the first one's
-/// connection only because the increment lands before the next selection.
-/// That is LIFECYCLE §9 invariant 14's "drain before any read" rule, and it
-/// holds as long as selection and dial are one synchronous step. A method that
-/// returned a chosen backend for the caller to dial later would open exactly
-/// the window it closes, so this one returns the backend and its socket
-/// together: a selection that has not been dialled is not a value that can
-/// exist.
+/// The selector returns a backend and no socket: the embedder dials
+/// [`BackendId::address`] itself, which is what lets a selector exist without
+/// an OS socket type (#1684). What keeps the load balancer honest is that
+/// selecting **reserves**: the embedder's selector raises the chosen
+/// backend's `active_connections` under the same borrow as the choice
+/// (`BackendMap::reserve_backend`), so the second stream linking in the same
+/// pass weighs the first one's connection before it has been dialled, exactly
+/// as it weighed the connection `Backend::try_connect` used to count at the
+/// dial. A `connect(2)` that fails releases the reservation through the
+/// ledger (`BackendChange::DialFailed`), and LIFECYCLE §9 invariant 14's
+/// drain before each selection applies it before anything reads the counters
+/// again. A dial that succeeds keeps the reservation as its connection's
+/// count, and the connection's close releases it.
 ///
 /// # Why a trait and not `&mut BackendMap`
 ///
@@ -1398,14 +1401,13 @@ impl Router {
 /// session's `BackendRegistry` (`lib/src/protocol/mux/mod.rs`) as well. The
 /// embedder's implementation holds both, so no registry handle reaches this
 /// file at all. It is also what lets a simulator stand in for the backend set:
-/// `sim/tests/h2_simulation.rs` does not reach backend selection today, and
-/// this is the seam it would plug into.
+/// such a selector mints its ids with [`BackendId::new`] and needs no socket.
 ///
 /// `Router` has no lifetime parameter, so it cannot keep the `&mut` it is
 /// lent; the `Rc<RefCell<dyn L7Proxy>>` this replaced was `'static` and
 /// `Clone`, and nothing stopped it being stored.
-pub trait BackendDialer {
-    /// Select a backend of `cluster_id` and open a connection to it.
+pub trait BackendSelector {
+    /// Select a backend of `cluster_id` and reserve a connection on it.
     ///
     /// Under [`Affinity::Sticky`] the result carries the cookie value to
     /// answer with, read from the chosen backend under the same borrow as the
@@ -1414,11 +1416,11 @@ pub trait BackendDialer {
     /// (`lib/src/backends.rs`) rewrites it in place on the live registry entry
     /// when an existing backend is re-added, and `BackendId` carries only what
     /// cannot change for the life of an entry.
-    fn select_and_dial(
+    fn select(
         &mut self,
         cluster_id: &str,
         affinity: Affinity<'_>,
-    ) -> Result<DialedBackend, BackendError>;
+    ) -> Result<SelectedBackend, BackendError>;
 }
 
 /// Whether a request is pinned to a backend by its sticky-session cookie.
@@ -1432,13 +1434,12 @@ pub enum Affinity<'a> {
     Sticky(Option<&'a str>),
 }
 
-/// What [`BackendDialer::select_and_dial`] answers: the chosen backend, the
-/// socket already dialled to it, and — only under [`Affinity::Sticky`] — the
-/// cookie value that pins the client to it.
+/// What [`BackendSelector::select`] answers: the chosen backend, whose
+/// [`BackendId::address`] the caller dials, and — only under
+/// [`Affinity::Sticky`] — the cookie value that pins the client to it.
 #[derive(Debug)]
-pub struct DialedBackend {
+pub struct SelectedBackend {
     pub backend: BackendId,
-    pub socket: TcpStream,
     pub sticky_session: Option<String>,
 }
 
@@ -3433,7 +3434,7 @@ mod backend_selection_order_tests {
                 StreamState::Linked(backend_token)
             );
             context.unlink_stream(stream_id);
-            backend_registry.apply_all(&mut context.backend_deltas);
+            backend_registry.apply_all(&mut context.backend_deltas, &fixture.backends);
             context.streams[stream_id].forget_upstream_replay();
             context.streams[stream_id].state = StreamState::Link;
             let Some(Connection::H1(h1)) = router.backends.get_mut(&backend_token) else {
@@ -3612,7 +3613,7 @@ mod backend_selection_order_tests {
                 );
                 let before = allocations();
                 context.unlink_stream(stream_id);
-                backend_registry.apply_all(&mut context.backend_deltas);
+                backend_registry.apply_all(&mut context.backend_deltas, &fixture.backends);
                 allocated += allocations() - before;
                 let stream = &mut context.streams[stream_id];
                 stream.forget_upstream_replay();
@@ -3785,6 +3786,143 @@ mod backend_selection_order_tests {
         );
     }
 
+    /// Dial one fresh stream of `H1_CLUSTER` through `Mux::dial_backend`
+    /// against a single backend at `address`, then drain the ledger as the
+    /// next pass would. Returns the dial's result and the backend.
+    fn dial_one(
+        address: std::net::SocketAddr,
+    ) -> (Result<(), BackendConnectionError>, Rc<RefCell<Backend>>) {
+        use crate::{Protocol, ProxySession, protocol::mux::Mux, server::ListenSession};
+
+        let fixture = routing_fixture();
+        fixture.backends.borrow_mut().add_backend(
+            H1_CLUSTER,
+            Backend::new("dial-once", address, None, None, None),
+        );
+        let backend = fixture
+            .backends
+            .borrow_mut()
+            .backends
+            .get_mut(H1_CLUSTER)
+            .and_then(|list| list.find_backend(&address).cloned())
+            .expect("the backend was just added");
+        let mut context = Context::new(
+            Ulid::generate(),
+            Rc::downgrade(&fixture.pool),
+            fixture.listener.clone(),
+            None,
+            "127.0.0.1:80"
+                .parse()
+                .expect("test public address must parse"),
+        );
+        let stream_id = context
+            .create_stream(Ulid::generate(), 65_535)
+            .expect("the test pool must hand out a stream");
+        {
+            let stream = &mut context.streams[stream_id];
+            stream.state = StreamState::Link;
+            stream.context.authority = Some(H1_AUTHORITY.to_owned());
+            stream.context.path = Some("/".to_owned());
+            stream.context.method = Some(Method::Get);
+        }
+        let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+        let mut backend_registry = BackendRegistry::default();
+        let plan = {
+            let proxy_ref = fixture.proxy.borrow();
+            let view = RoutingView::new(proxy_ref.clusters(), proxy_ref.kind());
+            router
+                .plan_connect(stream_id, &mut context, &view)
+                .map(decided)
+                .expect("an empty router must ask for a dial")
+        };
+        let ConnectPlan::Dial {
+            cluster_id,
+            h2,
+            frontend_should_stick,
+        } = plan
+        else {
+            panic!("premise: an empty router has nothing to reuse, so it must ask for a dial")
+        };
+        let session: Rc<RefCell<dyn ProxySession>> = Rc::new(RefCell::new(ListenSession {
+            protocol: Protocol::HTTPListen,
+        }));
+        let dialed = Mux::<mio::net::TcpStream, HttpListener>::dial_backend(
+            &mut router,
+            &mut backend_registry,
+            &fixture.backends,
+            stream_id,
+            &mut context,
+            &session,
+            &fixture.proxy,
+            cluster_id,
+            h2,
+            frontend_should_stick,
+        );
+        backend_registry.apply_all(&mut context.backend_deltas, &fixture.backends);
+        (dialed, backend)
+    }
+
+    /// #1684: a dial that connects counts its connection once. Selection
+    /// reserved it, and the dial keeps that reservation as the connection's
+    /// count rather than taking a second one.
+    ///
+    /// TO SEE THIS RED: call `inc_connections` on the dialled backend in
+    /// `Mux::dial_backend` after the connect succeeds, as
+    /// `Backend::try_connect` does for the TCP proxy; the backend then holds
+    /// two connections for one dial.
+    #[test]
+    fn a_successful_dial_counts_its_connection_once() {
+        let upstream =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener must bind");
+        let (dialed, backend) = dial_one(
+            upstream
+                .local_addr()
+                .expect("a bound listener has an address"),
+        );
+        dialed.expect("the loopback backend must dial");
+        let backend = backend.borrow();
+        assert_eq!(
+            backend.active_connections, 1,
+            "one dial must hold exactly one connection on its backend"
+        );
+        assert_eq!(backend.failures, 0, "a successful dial records no failure");
+    }
+
+    /// #1684: a `connect(2)` that fails synchronously releases the reservation
+    /// selection took and records the failure, once the ledger is drained.
+    ///
+    /// `255.255.255.255` is the limited broadcast address: connecting a TCP
+    /// socket to it fails before any packet leaves (`ENETUNREACH`, or
+    /// `EACCES` where a default route exists). The dial is asserted to fail,
+    /// so a host where it somehow connected fails this test loudly instead of
+    /// passing it vacuously.
+    ///
+    /// TO SEE THIS RED: return the error from `Mux::dial_backend` without
+    /// pushing the `BackendChange::DialFailed` delta; the reservation then
+    /// outlives the failed dial.
+    #[test]
+    fn a_synchronously_failed_dial_releases_its_reservation() {
+        let (dialed, backend) = dial_one("255.255.255.255:80".parse().expect("a literal address"));
+        assert!(
+            matches!(
+                dialed,
+                Err(BackendConnectionError::Backend(
+                    crate::backends::BackendError::ConnectionFailures { failures: 1, .. }
+                ))
+            ),
+            "a connect to the broadcast address must fail synchronously, got {dialed:?}"
+        );
+        let backend = backend.borrow();
+        assert_eq!(
+            backend.active_connections, 0,
+            "the failed dial must release the reservation selection took"
+        );
+        assert_eq!(
+            backend.failures, 1,
+            "the failed dial must count one failure"
+        );
+    }
+
     /// #1610: a session's first backend connection is stored without a heap
     /// allocation, and the connections still iterate in `Token` order however
     /// they were inserted and removed.
@@ -3841,17 +3979,19 @@ mod backend_selection_order_tests {
     }
 }
 
-/// [`Router::backend_from_request`] against the embedder's real dialer.
+/// [`Router::backend_from_request`] against the embedder's real selector.
 ///
 /// Question 12 of [#1340](https://github.com/sozu-proxy/sozu/issues/1340)
-/// replaced the proxy handle this function took with a [`BackendDialer`]; it
-/// had no test before that change. Each fixture owns its own `BackendMap` and
-/// `BackendRegistry`, so nothing here depends on a proxy, a listener or a
-/// session.
+/// replaced the proxy handle this function took with a backend-set capability,
+/// now a [`BackendSelector`] (#1684); it had no test before that change. Each
+/// fixture owns its own `BackendMap` and `BackendRegistry`, so nothing here
+/// depends on a proxy, a listener or a session — and, since selection no
+/// longer dials, on any socket.
 #[cfg(test)]
-mod backend_dialer_tests {
+mod backend_selector_tests {
     use std::{
-        net::TcpListener,
+        cell::RefCell,
+        net::SocketAddr,
         time::{Duration, Instant},
     };
 
@@ -3862,59 +4002,60 @@ mod backend_dialer_tests {
         backends::{Backend, BackendMap},
         protocol::{
             http::editor::HttpContext,
-            mux::{BackendId, BackendRegistry, RegistryDialer},
+            mux::{BackendChange, BackendDelta, BackendId, BackendRegistry, RegistrySelector},
         },
+        retry::{RetryAction, RetryPolicy},
     };
 
     const CLUSTER: &str = "cluster-1340-q12";
     const STICKY_B: &str = "sticky-b";
 
-    /// Two backends on two bound listeners, so both connects succeed, under
-    /// `LeastLoaded` on connections. The policy matters: round-robin would
-    /// alternate whatever the counters said, and a test that passes without
-    /// reading the load observes nothing.
+    /// Two backends under `policy` on connections. The addresses are never
+    /// dialled: selection reserves, and only a caller of the selector connects.
+    /// `LeastLoaded` is the default because round-robin would alternate
+    /// whatever the counters said, and a test that passes without reading the
+    /// load observes nothing.
     struct Fixture {
-        backends: BackendMap,
+        backends: RefCell<BackendMap>,
         registry: BackendRegistry,
         router: Router,
-        // Held for the listening sockets' lifetime, never read.
-        _listeners: [TcpListener; 2],
+        now: Instant,
     }
 
-    fn fixture() -> Fixture {
-        let bind = || TcpListener::bind("127.0.0.1:0").expect("a loopback listener must bind");
-        let listeners = [bind(), bind()];
-        let address = |i: usize| {
-            listeners[i]
-                .local_addr()
-                .expect("a bound listener has an address")
-        };
-        let mut backends = BackendMap::new();
+    fn fixture_with(policy: LoadBalancingAlgorithms) -> Fixture {
+        let now = Instant::now();
+        let address = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
+        let mut backends = BackendMap::with_seed(0x1684);
         backends.set_load_balancing_policy_for_cluster(
             CLUSTER,
-            LoadBalancingAlgorithms::LeastLoaded,
+            policy,
             Some(LoadMetric::Connections),
         );
         backends.add_backend(
             CLUSTER,
-            Backend::new("backend-a", address(0), None, None, None),
+            Backend::new_at("backend-a", address(9501), None, None, None, now),
         );
         backends.add_backend(
             CLUSTER,
-            Backend::new(
+            Backend::new_at(
                 "backend-b",
-                address(1),
+                address(9502),
                 Some(STICKY_B.to_owned()),
                 None,
                 None,
+                now,
             ),
         );
         Fixture {
-            backends,
+            backends: RefCell::new(backends),
             registry: BackendRegistry::default(),
             router: Router::new(Duration::from_secs(10), Duration::from_secs(10)),
-            _listeners: listeners,
+            now,
         }
+    }
+
+    fn fixture() -> Fixture {
+        fixture_with(LoadBalancingAlgorithms::LeastLoaded)
     }
 
     fn request(cookie: Option<&str>) -> HttpContext {
@@ -3936,48 +4077,55 @@ mod backend_dialer_tests {
     }
 
     impl Fixture {
-        fn dial(&mut self, should_stick: bool, context: &mut HttpContext) -> BackendId {
-            let mut dialer = RegistryDialer {
-                backends: &mut self.backends,
+        fn select(&mut self, should_stick: bool, context: &mut HttpContext) -> BackendId {
+            let mut backends = self.backends.borrow_mut();
+            let mut selector = RegistrySelector {
+                backends: &mut backends,
                 registry: &mut self.registry,
-                now: Instant::now(),
+                now: self.now,
             };
-            let (_socket, backend) = self
+            let backend = self
                 .router
-                .backend_from_request(CLUSTER, should_stick, context, &mut dialer)
-                .expect("a cluster with two reachable backends must dial");
+                .backend_from_request(CLUSTER, should_stick, context, &mut selector)
+                .expect("a cluster with two available backends must select");
             assert_eq!(
                 context.backend_id.as_deref(),
                 Some(&*backend.backend_id),
-                "the request must be stamped with the backend it was dialled to"
+                "the request must be stamped with the backend it was reserved on"
             );
             backend
         }
 
-        fn active_connections(&self, backend: &BackendId) -> usize {
+        fn backend(&self, id: &BackendId) -> std::cell::Ref<'_, Backend> {
             self.registry
-                .handle(backend)
+                .handle(id)
                 .expect("an id this fixture minted must resolve")
                 .borrow()
-                .active_connections
+        }
+
+        fn active_connections(&self, backend: &BackendId) -> usize {
+            self.backend(backend).active_connections
         }
     }
 
-    /// Two streams linking in one pass must spread under `LeastLoaded`.
+    /// Two streams linking in one pass must spread under `LeastLoaded`, and
+    /// no dial happens in between.
     ///
     /// The second selection reads `active_connections`, which only the first
-    /// dial can have raised: `Backend::try_connect` increments it at the dial,
-    /// and no delta drain covers that increment. So this holds only if
-    /// selection and dial are one step and the second selection reads live
-    /// counters. A view that froze the counters before the first selection
-    /// would send both streams to `backend-a`, and so would a dial that
-    /// stopped counting its connection.
+    /// selection's reservation can have raised: nothing here connects, and no
+    /// delta drain runs. So this holds only if selecting reserves under the
+    /// same borrow as the choice (#1684). A selector that stopped reserving —
+    /// counting the connection at the dial instead — would send both streams
+    /// to `backend-a`.
+    ///
+    /// TO SEE THIS RED: make `Backend::reserve_connection` return `Ok(())`
+    /// without calling `inc_connections`.
     #[test]
-    fn a_second_selection_observes_the_first_dials_connection() {
+    fn a_second_selection_observes_the_first_selections_reservation() {
         let mut fixture = fixture();
 
-        let first = fixture.dial(false, &mut request(None));
-        let second = fixture.dial(false, &mut request(None));
+        let first = fixture.select(false, &mut request(None));
+        let second = fixture.select(false, &mut request(None));
 
         assert_eq!(
             &*first.backend_id, "backend-a",
@@ -3986,9 +4134,8 @@ mod backend_dialer_tests {
         assert_ne!(
             first.backend_id,
             second.backend_id,
-            "the second selection landed on the first one's backend: either \
-             the selection read load counters taken before the first dial, or \
-             the first dial did not count its connection \
+            "the second selection landed on the first one's backend: the first \
+             selection did not reserve its connection \
              (first={} active={}, second={} active={})",
             first.backend_id,
             fixture.active_connections(&first),
@@ -4001,21 +4148,102 @@ mod backend_dialer_tests {
                 fixture.active_connections(&second)
             ),
             (1, 1),
-            "each dial must count exactly one connection on the backend it chose"
+            "each selection must reserve exactly one connection on the backend it chose"
+        );
+    }
+
+    /// #1684: power-of-two-choices weighs every reservation too.
+    ///
+    /// With two backends the sample is the whole set, so each selection must
+    /// take the one with fewer reserved connections, and a tie resolves by
+    /// coin flip. Over any run of selections the two counts therefore never
+    /// drift more than one apart, and together they count every selection.
+    ///
+    /// TO SEE THIS RED: make `Backend::reserve_connection` return `Ok(())`
+    /// without calling `inc_connections`; nothing is reserved and the total
+    /// stays at zero.
+    #[test]
+    fn power_of_two_weighs_every_reservation() {
+        const SELECTIONS: usize = 64;
+        let mut fixture = fixture_with(LoadBalancingAlgorithms::PowerOfTwo);
+        let first = fixture.select(false, &mut request(None));
+        let mut ids = vec![first];
+        for selections in 2..=SELECTIONS {
+            let before: Vec<usize> = ids
+                .iter()
+                .map(|id| fixture.active_connections(id))
+                .collect();
+            let picked = fixture.select(false, &mut request(None));
+            if !ids.iter().any(|id| id.backend_id == picked.backend_id) {
+                ids.push(picked.clone());
+            }
+            let loads: Vec<usize> = ids
+                .iter()
+                .map(|id| fixture.active_connections(id))
+                .collect();
+            assert_eq!(
+                loads.iter().sum::<usize>(),
+                selections,
+                "{selections} selections must hold {selections} reservations, got {loads:?}"
+            );
+            if ids.len() == 2 {
+                let (low, high) = (loads[0].min(loads[1]), loads[0].max(loads[1]));
+                assert!(
+                    high - low <= 1,
+                    "power-of-two let the reservations drift apart: {loads:?} (before {before:?})"
+                );
+            }
+        }
+        assert_eq!(ids.len(), 2, "both backends must be used");
+    }
+
+    /// #1684: a dial whose `connect(2)` fails releases its reservation and
+    /// records the failure, once the ledger is drained.
+    ///
+    /// TO SEE THIS RED: drop `self.dec_connections()` from
+    /// `Backend::release_failed_dial`; the reservation then outlives the
+    /// failed dial.
+    #[test]
+    fn a_failed_dial_releases_its_reservation_and_records_the_failure() {
+        let mut fixture = fixture();
+        let backend = fixture.select(false, &mut request(None));
+        assert_eq!(
+            fixture.active_connections(&backend),
+            1,
+            "selection reserves"
+        );
+
+        let mut deltas = vec![BackendDelta {
+            slot: backend.slot(),
+            change: BackendChange::DialFailed(fixture.now),
+        }];
+        fixture.registry.apply_all(&mut deltas, &fixture.backends);
+
+        assert!(deltas.is_empty(), "the drain empties the ledger");
+        let released = fixture.backend(&backend);
+        assert_eq!(
+            released.active_connections, 0,
+            "a failed dial must release the reservation selection took"
+        );
+        assert_eq!(released.failures, 1, "a failed dial must count one failure");
+        assert_eq!(
+            released.retry_policy.can_try(fixture.now),
+            Some(RetryAction::WAIT),
+            "a failed dial must arm the backoff at the instant it failed"
         );
     }
 
     /// A cookie pins the request only when its frontend sticks.
     ///
     /// The call this replaced matched on `(frontend_should_stick, cookie)`
-    /// and sent `(false, Some(_))` to the load balancer; the dialer now takes
+    /// and sent `(false, Some(_))` to the load balancer; the selector now takes
     /// an [`super::Affinity`] built by the caller, so that arm is the one a
     /// signature change could flip without a compile error.
     #[test]
     fn a_cookie_pins_only_a_frontend_that_sticks() {
         let mut unpinned = fixture();
         let mut context = request(Some(STICKY_B));
-        let backend = unpinned.dial(false, &mut context);
+        let backend = unpinned.select(false, &mut context);
         assert_eq!(
             &*backend.backend_id, "backend-a",
             "a frontend that does not stick must ignore the client's cookie"
@@ -4027,16 +4255,21 @@ mod backend_dialer_tests {
 
         let mut pinned = fixture();
         let mut context = request(Some(STICKY_B));
-        let backend = pinned.dial(true, &mut context);
+        let backend = pinned.select(true, &mut context);
         assert_eq!(
             &*backend.backend_id, "backend-b",
             "a sticky frontend must follow the cookie to its backend"
         );
         assert_eq!(context.sticky_session.as_deref(), Some(STICKY_B));
+        assert_eq!(
+            pinned.active_connections(&backend),
+            1,
+            "a sticky selection reserves like any other"
+        );
 
         let mut fallback = fixture();
         let mut context = request(None);
-        let backend = fallback.dial(true, &mut context);
+        let backend = fallback.select(true, &mut context);
         assert_eq!(
             context.sticky_session.as_deref(),
             Some(&*backend.backend_id),
@@ -4045,70 +4278,51 @@ mod backend_dialer_tests {
         );
     }
 
-    /// #1579: stamping a dialled backend onto the request allocates nothing.
+    /// #1579: stamping a selected backend onto the request allocates nothing.
     ///
     /// `Router::backend_from_request` runs once per backend dial and writes
     /// the chosen backend's id into `HttpContext::backend_id`. The id arrives
-    /// as the `Rc<str>` of the dialled `BackendId`, so the stamp is a
-    /// reference-count increment. The dialer is a stub handing out sockets
-    /// connected beforehand, so the count covers the router's own work and
-    /// not `connect(2)` or the load balancer.
+    /// as the `Rc<str>` of the selected `BackendId`, so the stamp is a
+    /// reference-count increment. The selector is a stub that always answers
+    /// one id, so the count covers the router's own work and not the load
+    /// balancer. It needs no socket: a selector does not dial (#1684).
     ///
-    /// TO SEE THIS RED: stamp `Some(dialed.backend.backend_id.to_string().into())`
+    /// TO SEE THIS RED: stamp `Some(selected.backend.backend_id.to_string().into())`
     /// instead of the `Rc` clone; the assertion then reports two allocations
     /// per dial.
     #[test]
     fn stamping_a_dialled_backend_allocates_nothing() {
         use std::hint::black_box;
 
-        use mio::net::TcpStream;
-
-        use super::{Affinity, BackendDialer, DialedBackend};
+        use super::{Affinity, BackendSelector, SelectedBackend};
         use crate::{backends::BackendError, test_allocations::allocations};
 
         const DIALS: usize = 64;
 
-        /// Hands out one pre-connected socket per dial, always for `backend`.
-        struct StubDialer {
+        /// Always answers `backend`, minted as a simulator would mint it.
+        struct StubSelector {
             backend: BackendId,
-            sockets: Vec<TcpStream>,
         }
 
-        impl BackendDialer for StubDialer {
-            fn select_and_dial(
+        impl BackendSelector for StubSelector {
+            fn select(
                 &mut self,
                 _cluster_id: &str,
                 _affinity: Affinity<'_>,
-            ) -> Result<DialedBackend, BackendError> {
-                let socket = self
-                    .sockets
-                    .pop()
-                    .expect("the stub holds one socket per dial");
-                Ok(DialedBackend {
+            ) -> Result<SelectedBackend, BackendError> {
+                Ok(SelectedBackend {
                     backend: self.backend.clone(),
-                    socket,
                     sticky_session: None,
                 })
             }
         }
 
-        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener must bind");
-        let address = listener
-            .local_addr()
-            .expect("a bound listener has an address");
-        let backend = std::rc::Rc::new(std::cell::RefCell::new(Backend::new(
-            "stamped-backend",
-            address,
-            None,
-            None,
-            None,
-        )));
-        let mut registry = BackendRegistry::default();
-        let mut dialer = StubDialer {
-            backend: registry.id_for(&backend),
-            sockets: (0..=DIALS)
-                .map(|_| TcpStream::connect(address).expect("a loopback connect must start"))
-                .collect(),
+        let mut selector = StubSelector {
+            backend: BackendId::new(
+                0,
+                std::rc::Rc::from("stamped-backend"),
+                SocketAddr::from(([127, 0, 0, 1], 9503)),
+            ),
         };
         let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
         let mut context = request(None);
@@ -4116,20 +4330,20 @@ mod backend_dialer_tests {
         // Warm-up: the first stamp fills the slot the later ones overwrite.
         drop(
             router
-                .backend_from_request(CLUSTER, false, &mut context, &mut dialer)
-                .expect("the stub dialer always dials"),
+                .backend_from_request(CLUSTER, false, &mut context, &mut selector)
+                .expect("the stub selector always selects"),
         );
         let mut allocated = 0;
         for _ in 0..DIALS {
             let before = allocations();
-            let dialed = router.backend_from_request(
+            let selected = router.backend_from_request(
                 black_box(CLUSTER),
                 false,
                 black_box(&mut context),
-                &mut dialer,
+                &mut selector,
             );
             allocated += allocations() - before;
-            drop(dialed.expect("the stub dialer always dials"));
+            drop(selected.expect("the stub selector always selects"));
         }
 
         assert_eq!(context.backend_id.as_deref(), Some("stamped-backend"));
