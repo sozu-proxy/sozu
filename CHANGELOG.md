@@ -3852,6 +3852,30 @@
   `an_h2_client_the_pool_cannot_build_releases_its_reservation`,
   `a_refused_stream_start_releases_its_reservation` and
   `a_socket_the_poller_refuses_releases_its_reservation`.
+- **`fix(h1)`: a request rejected after its stream was linked closes the backend connection
+  ([#1716](https://github.com/sozu-proxy/sozu/issues/1716)).** When the H1 frontend rejected a
+  request after part of it had gone to the backend, for example a chunked request whose trailer
+  section goes over `h2_max_header_fields` (#1707) when that section arrives after the head and
+  body, the `Position::Server` arms of the parse-error branch in `ConnectionH1::readable`
+  (`lib/src/protocol/mux/h1.rs`) answered the client 400, or cut a response already started. They
+  did not end the backend stream. That backend connection kept a request cut before its trailer
+  section and stayed attached to the stream slot until the client session closed. The next
+  request on a kept-alive client connection reuses that slot. The `backend_streams` reverse index
+  also still listed the connection, which panics debug builds in `Mux::ready_inner`. Both arms now
+  end the backend stream first, as the `Position::Client` arm and the timeout paths already do.
+  An H1 backend connection closes and is never returned to the keep-alive pool, even when its
+  response was already complete. On an H2 backend only that stream ends, with
+  `RST_STREAM(CANCEL)` once its request reached the wire, and the shared connection stays open.
+  The client gets the same answer as before. The client connection is at most as persistent as
+  the 400 answer's `Connection` header: a client `Connection: close`, or a backend response that
+  closes, still closes it. The fix covers every frontend parse error that lands after linking,
+  not only the trailer bound. Documented in `lib/src/protocol/kawa_h1/LIFECYCLE.md`. Covered by
+  `test_h1_trailer_field_limit_exceeded_split_closes_backend`
+  (`e2e/src/tests/h1_security_tests.rs`), which sends the request in two segments, then a
+  follow-up request on the same client connection, behind a 400 answer that keeps that connection
+  alive, and by the unit test
+  `a_request_error_after_a_linked_response_started_ends_the_backend_stream`
+  (`lib/src/protocol/mux/h1.rs`) for the cut-response arm.
 - **`fix(h1)`: read an answer template's `Connection` value as an option list
   ([#1702](https://github.com/sozu-proxy/sozu/issues/1702)).** `Template::new`
   (`lib/src/protocol/kawa_h1/answers.rs`) decided whether a template closes the frontend

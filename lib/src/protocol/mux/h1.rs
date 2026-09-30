@@ -520,6 +520,16 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         "{} H1 request rejected after its response started: closing",
                         log_context!(self)
                     );
+                    // The backend holds part of the rejected request: end its
+                    // stream so an H1 connection closes, never pooled even
+                    // when its response is complete (sozu-proxy/sozu#1716).
+                    // The client connection closes below whatever this flag
+                    // says, so clearing it only reaches the backend.
+                    if let StreamState::Linked(token) = stream.state {
+                        stream.context.keep_alive_backend = false;
+                        endpoint.end_stream(token, stream_id, context);
+                    }
+                    let stream = &mut context.streams[stream_id];
                     forcefully_terminate_answer(
                         stream,
                         &mut self.readiness,
@@ -533,6 +543,24 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 }
                 Position::Server => {
                     incr!(names::http::FRONTEND_PARSE_ERRORS);
+                    // A request rejected after its stream was linked, such
+                    // as a trailer section over `h2_max_header_fields` read
+                    // after the head and body were forwarded, left part of
+                    // itself on the backend. End the backend stream before
+                    // the answer replaces the response, so the connection
+                    // closes and leaves the reverse index, instead of
+                    // holding a cut request attached to this stream slot
+                    // (sozu-proxy/sozu#1716). The response is cleared first
+                    // because a complete one would return an H1 connection
+                    // to the keep-alive pool; the 400 replaces it anyway. An
+                    // H2 backend only resets this stream. The client
+                    // connection is at most as persistent as the answer's
+                    // `Connection` header.
+                    if let StreamState::Linked(token) = stream.state {
+                        stream.back.clear();
+                        endpoint.end_stream(token, stream_id, context);
+                    }
+                    let stream = &mut context.streams[stream_id];
                     let answers = answers_rc.borrow();
                     set_default_answer(stream, &mut self.readiness, 400, &answers);
                 }
@@ -2398,6 +2426,142 @@ mod tests {
             "the response is cut and the session closes, got {:?} / {:?}",
             context.streams[0].back.parsing_phase,
             result
+        );
+    }
+
+    /// A request that fails to parse after its stream was linked, and after
+    /// the backend's complete response already started on the wire, cuts that
+    /// response and also ends the backend stream (sozu-proxy/sozu#1716). The
+    /// backend connection holds part of the rejected request, so it must leave
+    /// the `backend_streams` reverse index and be disconnected. It must not stay
+    /// attached to the stream slot, and must not go back to the keep-alive pool,
+    /// although its response is complete.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH1::readable`, delete the block of the
+    /// `Position::Server if stream.back.consumed` arm that clears
+    /// `keep_alive_backend` and calls `endpoint.end_stream`. The reverse index
+    /// then still lists the stream: `the rejected stream must leave the
+    /// backend reverse index`. Keeping `end_stream` but not the flag instead
+    /// pools the connection: `a backend holding part of a rejected request
+    /// must be disconnected, not pooled`.
+    #[test]
+    fn a_request_error_after_a_linked_response_started_ends_the_backend_stream() {
+        const BACKEND: mio::Token = mio::Token(1);
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let mut context = test_context(&pool);
+        context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("the test pool must hand out stream buffers");
+        let (front_socket, mut front_peer) = connected_socket();
+        let mut frontend =
+            Connection::new_h1_server(Ulid::generate(), front_socket, Duration::from_secs(60));
+        if let Connection::H1(server) = &mut frontend {
+            server.stream = Some(0);
+        }
+        let (back_socket, mut back_peer) = connected_socket();
+        let backend_ulid = Ulid::generate();
+        let mut client = h1_of(Connection::new_h1_client(
+            backend_ulid,
+            SessionTcpStream::new(back_socket, backend_ulid, None),
+            "test-cluster".into(),
+            test_backend_id(cached_peer()),
+            Duration::from_secs(60),
+        ));
+        if let Position::Client(_, _, status) = &mut client.position {
+            *status = BackendStatus::KeepAlive;
+        }
+        let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+
+        // The request head and a first chunk: the stream is routed.
+        front_peer
+            .write_all(
+                b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHello\r\n",
+            )
+            .expect("the loopback peer must accept the staged request head");
+        for _ in 0..64 {
+            frontend.readiness_mut().event.insert(Ready::READABLE);
+            frontend.readable(&mut context, EndpointClient(&mut router));
+            if context.streams[0].state == StreamState::Link {
+                break;
+            }
+        }
+        assert_eq!(
+            context.streams[0].state,
+            StreamState::Link,
+            "premise: the request head must be parsed and queued for linking"
+        );
+
+        // What the router does with a pooled backend connection.
+        assert!(
+            client.start_stream(0, &mut context),
+            "premise: the pooled backend must accept the stream"
+        );
+        context.link_stream(0, BACKEND);
+        router.backends.insert(BACKEND, Connection::H1(client));
+
+        // The backend answers early and completely, and that response has
+        // started on the client's wire.
+        back_peer
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .expect("the loopback backend peer must accept the response");
+        for _ in 0..64 {
+            let Some(backend) = router.backends.get_mut(&BACKEND) else {
+                unreachable!("the backend was inserted")
+            };
+            backend.readiness_mut().event.insert(Ready::READABLE);
+            backend.readable(&mut context, EndpointServer(&mut frontend));
+            if context.streams[0].back.is_terminated() {
+                break;
+            }
+        }
+        assert!(
+            context.streams[0].back.is_terminated(),
+            "premise: the backend response must be read whole"
+        );
+        context.streams[0].back.consumed = true;
+
+        // A malformed chunk-size line rejects the request.
+        front_peer
+            .write_all(b"ZZ\r\n")
+            .expect("the loopback peer must accept the malformed chunk");
+        let mut result = MuxResult::Continue;
+        for _ in 0..64 {
+            frontend.readiness_mut().event.insert(Ready::READABLE);
+            result = frontend.readable(&mut context, EndpointClient(&mut router));
+            if context.streams[0].front.is_error() {
+                break;
+            }
+        }
+        assert!(
+            context.streams[0].front.is_error(),
+            "premise: the malformed chunk must be rejected by the parse"
+        );
+        assert!(
+            matches!(result, MuxResult::CloseSession),
+            "the started response is cut and the session closes, got {result:?}"
+        );
+
+        assert!(
+            context
+                .backend_streams
+                .get(&BACKEND)
+                .is_none_or(|ids| !ids.contains(&0)),
+            "the rejected stream must leave the backend reverse index"
+        );
+        let Some(Connection::H1(client)) = router.backends.get(&BACKEND) else {
+            unreachable!("the backend was inserted as H1")
+        };
+        assert_eq!(
+            client.stream, None,
+            "the backend connection must no longer carry the rejected stream"
+        );
+        assert!(
+            matches!(
+                client.position,
+                Position::Client(_, _, BackendStatus::Disconnecting)
+            ),
+            "a backend holding part of a rejected request must be disconnected, not pooled"
         );
     }
 
