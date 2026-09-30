@@ -4529,7 +4529,7 @@ mod listener_lifecycle_tests {
     /// surface. Same shape as `accept_ready_tests::server_with_tcp_listener`,
     /// minus the pre-installed listener — `Server::new` builds its own UDP
     /// proxy, which is the one these tests exercise.
-    fn bare_server() -> Server {
+    pub(super) fn bare_server() -> Server {
         let ServerParts {
             event_loop,
             sessions,
@@ -5171,6 +5171,87 @@ mod listener_lifecycle_tests {
                 "cycle {cycle}: base_sessions_count must track the reserved slots"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod add_cluster_validation_tests {
+    use sozu_command::proto::command::{LoadBalancingParams, ShardMode};
+
+    use super::listener_lifecycle_tests::bare_server;
+    use super::*;
+    use crate::{backends::ShardOutcome, load_balancing::affinity_key_from_ip};
+
+    const CLUSTER: &str = "sharded";
+    const ADD_CLUSTER_ID: &str = "test-add-invalid-shard";
+
+    /// The worker mirrors `validate_shuffle_sharding` on `AddCluster`
+    /// (#524): an `AddCluster` that reaches the worker without the master's
+    /// check, as a TOML reload or a `LoadState` can, with `shard_percent`
+    /// outside `1..=100` is answered with an error and leaves the cluster
+    /// unsharded.
+    ///
+    /// TO SEE THIS RED: delete the `validate_shuffle_sharding` check from the
+    /// `AddCluster` arm of `Server::notify_proxys`; the worker then answers
+    /// `Ok` and arms a shard of two over the four backends.
+    #[test]
+    fn an_add_cluster_with_an_invalid_shard_percent_is_refused_and_unsharded() {
+        let mut server = bare_server();
+        server.notify_proxys(WorkerRequest {
+            id: ADD_CLUSTER_ID.to_owned(),
+            content: RequestType::AddCluster(Cluster {
+                cluster_id: CLUSTER.to_owned(),
+                load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
+                // The only invalid knob: `shard_min_backends` and
+                // `shard_mode` are valid on their own.
+                shard_percent: Some(0),
+                shard_min_backends: Some(2),
+                shard_mode: Some(ShardMode::Strict as i32),
+                ..Default::default()
+            })
+            .into(),
+        });
+        let response = QUEUE
+            .with(|queue| {
+                queue
+                    .borrow()
+                    .iter()
+                    .find(|response| response.id == ADD_CLUSTER_ID)
+                    .cloned()
+            })
+            .expect("the worker must answer the AddCluster");
+        assert_eq!(
+            response.status,
+            ResponseStatus::Failure as i32,
+            "an invalid shard_percent must be refused: {response:?}"
+        );
+        assert_eq!(response.message, "shard_percent must lie in 1..=100");
+
+        for index in 0..4u16 {
+            server.notify_proxys(WorkerRequest {
+                id: format!("test-add-backend-{index}"),
+                content: RequestType::AddBackend(AddBackend {
+                    cluster_id: CLUSTER.to_owned(),
+                    backend_id: format!("{CLUSTER}-{index}"),
+                    address: SocketAddr::from(([127, 0, 0, 1], 23_000 + index)).into(),
+                    load_balancing_parameters: Some(LoadBalancingParams::default()),
+                    sticky_id: None,
+                    backup: None,
+                })
+                .into(),
+            });
+        }
+        let key = affinity_key_from_ip(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let mut backends = server.backends.borrow_mut();
+        let list = backends
+            .backends
+            .get_mut(CLUSTER)
+            .expect("the backends must have created the cluster's list");
+        assert_eq!(
+            list.select_with_key(Some(key), Instant::now()).1,
+            ShardOutcome::Unsharded,
+            "a refused AddCluster must not arm a shard"
+        );
     }
 }
 
