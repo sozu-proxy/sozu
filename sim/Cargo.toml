@@ -22,7 +22,7 @@ publish = false
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 
 # The harness is an integration test (tests/udp_simulation.rs, tests/tcp_preread_sim.rs,
-# tests/metrics_lease_sim.rs, tests/h2_simulation.rs) gated on `--cfg tokio_unstable` (which moonpool-sim needs
+# tests/metrics_lease_sim.rs, tests/h2_simulation.rs, tests/backend_selection_sim.rs) gated on `--cfg tokio_unstable` (which moonpool-sim needs
 # for tokio `RngSeed` scheduler determinism). Gating the dev-deps on the SAME cfg means
 # cargo only resolves and COMPILES the async moonpool/tokio closures when the flag is
 # set — so a plain `cargo test --workspace` (no flag) builds empty 0-test binaries here

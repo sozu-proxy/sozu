@@ -23,6 +23,26 @@
   connections are keyed as configured. The value is hashed where it lies in the request buffer:
   `deriving_an_affinity_key_allocates_nothing` holds the derivation at zero allocations.
   Documented under "Client affinity" in `doc/configure.md`.
+- **`test(sim)`: backend selection runs under deterministic simulation
+  ([#1684](https://github.com/sozu-proxy/sozu/issues/1684)).** `sim/tests/backend_selection_sim.rs`
+  drives `Router::backend_from_request` through a `BackendSelector` the harness owns, over a real
+  `BackendMap::with_seed` whose backends are built with `Backend::new_at`, under moonpool-sim. Each
+  seed draws a policy per cluster (round-robin, random, least-loaded on connections or connection
+  time, power-of-two on either, HRW), then a workload of sticky and unpinned requests, dials that
+  connect or fail, closes and clock advances. After every step each backend's `active_connections`
+  must equal the harness's shadow of the reservation rule, and after the final drain every count
+  must be zero. The sweep runs 64 seeds by default and is a new step of the per-PR `udp-simulation`
+  job.
+
+  `backend_selection_simulation_is_deterministic` runs eight seeds twice each and requires
+  byte-identical traces of every decision: cluster, backend, `BackendId` slot in minting order,
+  sticky answer, reservation, release and close. The trace holds no instant. The test also checks
+  absolute values: selections, failed dials, closes and sticky answers all occurred, at least one
+  cluster drew a map-seeded policy, and a fresh backoff window closes one second later on the
+  harness's clock, which a leaked wall-clock read would fail. Each check was seen red: a wall-clock
+  `now` fails the window check, a `BackendMap::new()` in place of the seeded map fails the
+  byte-identical traces, and a selection that stops reserving fails the shadow check. Documented,
+  with the recipe, in `doc/testing.md` §5; `sim/Cargo.toml` still has no `mio`.
 
 - **`feat(http)`: count the malformed client `Forwarded` lines Sōzu removes
   ([#1692](https://github.com/sozu-proxy/sozu/issues/1692)).** Since
@@ -6278,6 +6298,14 @@
 
 
 ### ➖ Removed
+
+- **BREAKING (library API) — `refactor(lib)`: `BackendMap::backend_from_sticky_session` is removed
+  ([#1684](https://github.com/sozu-proxy/sozu/issues/1684)).** Once the mux reserved through
+  `BackendMap::reserve_sticky_backend`, its only callers were its own three tests. They now exercise
+  `reserve_sticky_backend`, and the one that found a recorded backend asserts which backend it
+  reached and that the reservation was taken, where it used to accept any connected result. An
+  embedder that selected and connected in one call uses `reserve_sticky_backend` and dials the
+  backend's address, as `Mux::dial_backend` does. No runtime behaviour changes.
 
 - **BREAKING (library API) — `refactor(mux)`: `L7Proxy::backends` is removed
   ([#1684](https://github.com/sozu-proxy/sozu/issues/1684)).** Its one production caller was
