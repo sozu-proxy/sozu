@@ -927,6 +927,7 @@ impl ConfigState {
         if let Some(patch_answers) = patch.http_answers.as_ref() {
             merge_custom_http_answers(&mut listener.http_answers, patch_answers);
         }
+        merge_answers(&mut listener.answers, &patch.answers);
         // H2 flood knobs
         if let Some(v) = patch.h2_max_rst_stream_per_window {
             listener.h2_max_rst_stream_per_window = Some(v);
@@ -1004,11 +1005,13 @@ impl ConfigState {
     /// [`Self::update_http_listener`]: every fallible check runs before the
     /// first write.
     ///
-    /// `hsts` is checked but not stored here: the worker owns the listener
-    /// HSTS default. The check exists so the main process refuses the same
-    /// patch every worker refuses (`ListenerError::HstsEnabledRequired` in
+    /// `hsts` is recorded as a full-object replacement, as the workers apply
+    /// it, so `SaveState`, `ListListeners` and the replay to a new worker
+    /// carry the patched listener default (sozu-proxy/sozu#1715). The
+    /// `enabled` check makes the main process refuse the same patch every
+    /// worker refuses (`ListenerError::HstsEnabledRequired` in
     /// `HttpsListener::update_config`, `lib/src/https.rs`) instead of
-    /// recording its other fields while no worker applies them.
+    /// recording its fields while no worker applies them.
     fn update_https_listener(
         &mut self,
         patch: &UpdateHttpsListenerConfig,
@@ -1069,7 +1072,12 @@ impl ConfigState {
         if let Some(patch_answers) = patch.http_answers.as_ref() {
             merge_custom_http_answers(&mut listener.http_answers, patch_answers);
         }
+        merge_answers(&mut listener.answers, &patch.answers);
         // HTTPS-only knobs
+        // Full-object replacement, as the worker applies it.
+        if let Some(hsts) = patch.hsts {
+            listener.hsts = Some(hsts);
+        }
         if let Some(ref alpn_wrapper) = patch.alpn_protocols {
             // Empty values vec = reset to default (runtime treats empty as default)
             listener.alpn_protocols = alpn_wrapper.values.clone();
@@ -3320,6 +3328,18 @@ pub fn validate_h2_flood_knobs_https_listener(
 /// Rejects empty strings and strings containing CR, LF, colon, space, or tab —
 /// a conservative approximation of the token grammar that covers all practical
 /// injection vectors without a full RFC 9110 tokenizer.
+/// Merge the `answers` map of a listener patch into the listener's stored
+/// map, as `HttpListener::update_config` and `HttpsListener::update_config`
+/// (`lib/src/http.rs`, `lib/src/https.rs`) do on the workers: a non-empty
+/// body replaces the template of its status, an empty body preserves it.
+fn merge_answers(stored: &mut BTreeMap<String, String>, patch: &BTreeMap<String, String>) {
+    for (code, body) in patch {
+        if !body.is_empty() {
+            stored.insert(code.to_owned(), body.to_owned());
+        }
+    }
+}
+
 /// Merge a `CustomHttpAnswers` patch into the listener's stored answers,
 /// preserving any field not present in the patch.
 ///
@@ -6915,6 +6935,129 @@ mod tests {
         assert_eq!(listener.h2_max_rst_stream_per_window, Some(25));
         // untouched
         assert_eq!(listener.back_timeout, 30);
+    }
+
+    /// sozu-proxy/sozu#1715: the `answers` map of an HTTP listener patch is
+    /// recorded in the main state as the workers apply it
+    /// (`HttpListener::update_config`, `lib/src/http.rs`): a non-empty body
+    /// replaces the stored template for its status, an empty body preserves
+    /// it, and the other statuses are untouched. Without it `SaveState`,
+    /// `ListListeners` and the replay to an upgraded worker lose the patch.
+    #[test]
+    fn update_http_listener_records_the_answers_map() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8080);
+        let mut state = ConfigState::new();
+        let mut listener = make_http_listener(addr);
+        listener.answers = [
+            ("404".to_owned(), "stored 404".to_owned()),
+            ("503".to_owned(), "stored 503".to_owned()),
+        ]
+        .into();
+        state
+            .dispatch(&RequestType::AddHttpListener(listener).into())
+            .unwrap();
+
+        let patch = UpdateHttpListenerConfig {
+            address: addr,
+            answers: [
+                ("404".to_owned(), String::new()),
+                ("503".to_owned(), "patched 503".to_owned()),
+                ("429".to_owned(), "patched 429".to_owned()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpListener(patch).into())
+            .expect("HTTP update must succeed");
+
+        let listener = state.http_listeners.get(&ListenerKey::from(addr)).unwrap();
+        assert_eq!(
+            listener.answers.get("404").map(String::as_str),
+            Some("stored 404"),
+            "an empty body preserves the stored template"
+        );
+        assert_eq!(
+            listener.answers.get("503").map(String::as_str),
+            Some("patched 503")
+        );
+        assert_eq!(
+            listener.answers.get("429").map(String::as_str),
+            Some("patched 429")
+        );
+        assert_eq!(listener.answers.len(), 3);
+    }
+
+    /// sozu-proxy/sozu#1715: an HTTPS listener patch records its `answers`
+    /// map and its `hsts` block in the main state as the workers apply them
+    /// (`HttpsListener::update_config`, `lib/src/https.rs`). `hsts` is a
+    /// full-object replacement, and a patch without it keeps the recorded
+    /// policy.
+    #[test]
+    fn update_https_listener_records_the_answers_map_and_hsts() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        let mut listener = make_https_listener(addr);
+        listener.answers = [("404".to_owned(), "stored 404".to_owned())].into();
+        listener.hsts = Some(HstsConfig {
+            enabled: Some(true),
+            max_age: Some(300),
+            include_subdomains: Some(true),
+            ..Default::default()
+        });
+        state
+            .dispatch(&RequestType::AddHttpsListener(listener).into())
+            .unwrap();
+
+        let disabled = HstsConfig {
+            enabled: Some(false),
+            ..Default::default()
+        };
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            answers: [
+                ("404".to_owned(), String::new()),
+                ("503".to_owned(), "patched 503".to_owned()),
+            ]
+            .into(),
+            hsts: Some(disabled),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .expect("HTTPS update must succeed");
+
+        let listener = state.https_listeners.get(&ListenerKey::from(addr)).unwrap();
+        assert_eq!(
+            listener.answers.get("404").map(String::as_str),
+            Some("stored 404"),
+            "an empty body preserves the stored template"
+        );
+        assert_eq!(
+            listener.answers.get("503").map(String::as_str),
+            Some("patched 503")
+        );
+        assert_eq!(listener.answers.len(), 2);
+        assert_eq!(
+            listener.hsts,
+            Some(disabled),
+            "the patched hsts block replaces the stored one whole"
+        );
+
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            front_timeout: Some(15),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .expect("HTTPS update must succeed");
+        let listener = state.https_listeners.get(&ListenerKey::from(addr)).unwrap();
+        assert_eq!(
+            listener.hsts,
+            Some(disabled),
+            "a patch without hsts keeps the recorded policy"
+        );
     }
 
     /// HTTP listener: flood knob 0 is rejected.
