@@ -51,6 +51,7 @@ mod mux_tests;
 mod protocol_pair_matrix;
 mod proxy_protocol_local_tests;
 mod redirect_rewrite_auth_tests;
+mod remove_cluster_tests;
 mod router_hostname_tests;
 mod router_path_rule_tests;
 mod shuffle_sharding_tests;

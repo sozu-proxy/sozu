@@ -668,6 +668,14 @@ impl UdpProxy {
             .map(|(token, _)| *token)
     }
 
+    /// The cluster the listener at `address` routes to, for tests that drive
+    /// the proxy through `Server::notify_proxys` (`lib/src/server.rs`).
+    #[cfg(test)]
+    pub(crate) fn listener_cluster(&self, address: &ListenerKey) -> Option<ClusterId> {
+        let token = self.listener_token(address)?;
+        self.cluster_for_listener.get(&token).cloned()
+    }
+
     /// Build the [`UdpListenerSession`] that drives this listener's datagrams.
     /// The server inserts the returned session into the slab **at the listener
     /// token**, replacing the `ListenSession` placeholder, so the generic

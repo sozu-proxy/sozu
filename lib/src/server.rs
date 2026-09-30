@@ -34,7 +34,7 @@ use sozu_command::{
     },
     ready::Ready,
     scm_socket::{Listeners, ScmSocket, ScmSocketError},
-    state::{ClusterId, ConfigState},
+    state::{ClusterId, ConfigState, StateError},
 };
 
 use crate::metrics::names;
@@ -140,6 +140,19 @@ pub fn push_event(event: Event) {
             content: Some(ContentType::Event(event).into()),
         });
     });
+}
+
+/// Whether `request` removes a frontend, of any protocol.
+fn is_frontend_removal(request: &Request) -> bool {
+    matches!(
+        request.request_type,
+        Some(
+            RequestType::RemoveHttpFrontend(_)
+                | RequestType::RemoveHttpsFrontend(_)
+                | RequestType::RemoveTcpFrontend(_)
+                | RequestType::RemoveUdpFrontend(_)
+        )
+    )
 }
 
 /// Build the `WorkerMetricDetailStatus` content payload returned in
@@ -2570,7 +2583,48 @@ impl Server {
     }
 
     pub fn notify_proxys(&mut self, request: WorkerRequest) {
+        // Read before the dispatch below: `ConfigState::remove_cluster`
+        // (`command/src/state.rs`) removes these objects from the state, and
+        // the `RemoveCluster` arm removes them from the proxies.
+        let cluster_objects = match &request.content.request_type {
+            Some(RequestType::RemoveCluster(cluster_id)) => {
+                self.config_state.cluster_removal_requests(cluster_id)
+            }
+            _ => Vec::new(),
+        };
+
         if let Err(e) = self.config_state.dispatch(&request.content) {
+            if self
+                .config_state
+                .removed_with_its_cluster(&request.content, &e)
+            {
+                // The object went with its cluster (`RemoveCluster` cascades),
+                // for instance when a main process that predates the cascade
+                // follows its `RemoveCluster` with the removal of each object.
+                // There is nothing left to remove: answer ok rather than fail
+                // on a missing route.
+                debug!("{} already removed with its cluster: {}", request.id, e);
+                push_queue(WorkerResponse::ok(request.id));
+                return;
+            }
+            if is_frontend_removal(&request.content)
+                && matches!(e, StateError::NotFound { .. } | StateError::NoChange)
+            {
+                // The state holds no frontend of the named cluster under
+                // this identity: `NotFound` when it holds none of that
+                // cluster at all (or the route key is another cluster's),
+                // `NoChange` when the TCP or UDP frontends it holds for that
+                // cluster do not include this one. The proxies look a
+                // frontend up by address, hostname and path, or by listener,
+                // whatever cluster owns it: applying the removal to them
+                // could evict another cluster's route or listener mapping.
+                // Refuse it without touching them.
+                push_queue(WorkerResponse::error(
+                    request.id,
+                    format!("Could not execute order on config state: {e}"),
+                ));
+                return;
+            }
             error!("Could not execute order on config state: {}", e);
         }
 
@@ -2612,6 +2666,7 @@ impl Server {
                 //not returning because the message must still be handled by each proxy
             }
             Some(RequestType::RemoveCluster(ref cluster_id)) => {
+                self.remove_cluster_objects(&req_id, cluster_id, cluster_objects);
                 self.remove_health_check_state(cluster_id);
                 METRICS.with(|metrics| {
                     (*metrics.borrow_mut()).remove_cluster(cluster_id);
@@ -2784,6 +2839,65 @@ impl Server {
             .add_backend(&add_backend.cluster_id, new_backend);
 
         WorkerResponse::ok(req_id)
+    }
+
+    /// Remove from the proxies and the `BackendMap` the frontends and backends
+    /// of a cluster being removed, `requests` being the removal orders
+    /// `ConfigState::cluster_removal_requests` (`command/src/state.rs`)
+    /// returned for it. Each object goes through the removal its own order
+    /// takes, so the router, the tags, the TCP and UDP listener to cluster
+    /// mappings and the per-backend metrics are cleaned the same way.
+    ///
+    /// A session already established keeps the backend connection it holds
+    /// and drains on it; only new requests and connections stop routing. A
+    /// failure is logged and does not stop the others: the `RemoveCluster`
+    /// answer stays the single response the main process waits for.
+    fn remove_cluster_objects(&mut self, req_id: &str, cluster_id: &str, requests: Vec<Request>) {
+        for request in requests {
+            let result = match request.request_type {
+                Some(RequestType::RemoveHttpFrontend(front)) => {
+                    self.http.borrow_mut().remove_http_frontend(front)
+                }
+                Some(RequestType::RemoveHttpsFrontend(front)) => self
+                    .https
+                    .borrow_mut()
+                    .remove_https_frontend(front)
+                    .map(|_| ()),
+                Some(RequestType::RemoveTcpFrontend(front)) => {
+                    self.tcp.borrow_mut().remove_tcp_front(front)
+                }
+                Some(RequestType::RemoveUdpFrontend(front)) => {
+                    self.udp.borrow_mut().remove_udp_front(front)
+                }
+                Some(RequestType::RemoveBackend(backend)) => {
+                    let response = self.remove_backend(req_id, &backend);
+                    debug_assert_eq!(
+                        response.status,
+                        ResponseStatus::Ok as i32,
+                        "Server::remove_backend always answers ok"
+                    );
+                    Ok(())
+                }
+                other => {
+                    debug_assert!(
+                        false,
+                        "cluster_removal_requests only returns frontend and backend removals, got {other:?}"
+                    );
+                    Ok(())
+                }
+            };
+            if let Err(error) = result {
+                warn!(
+                    "{} removing cluster {}: could not remove one of its objects: {}",
+                    req_id, cluster_id, error
+                );
+            }
+        }
+        self.backends.borrow_mut().remove_cluster(cluster_id);
+        debug_assert!(
+            !self.backends.borrow().backends.contains_key(cluster_id),
+            "a removed cluster must leave no backend list behind"
+        );
     }
 
     fn remove_health_check_state(&mut self, cluster_id: &str) {
@@ -5258,6 +5372,417 @@ mod add_cluster_validation_tests {
 /// The SCM hand-off a worker upgrade performs: the retiring worker's listening
 /// sockets travel to the new worker over the SCM socket, and the new worker
 /// must ADOPT them instead of binding fresh ones.
+/// `RemoveCluster` removes the cluster's frontends and backends from the
+/// worker's proxies, the way `ConfigState::remove_cluster`
+/// (`command/src/state.rs`) removes them from the state.
+#[cfg(test)]
+mod remove_cluster_cascade_tests {
+    use sozu_command::{
+        config::ListenerBuilder,
+        proto::command::{
+            LoadBalancingParams, PathRule, RequestHttpFrontend, RequestTcpFrontend,
+            RequestUdpFrontend, RulePosition, SocketAddress,
+        },
+    };
+
+    use super::listener_lifecycle_tests::bare_server;
+    use super::*;
+    use crate::{L7ListenerHandler, protocol::http::parser::Method, testing::provide_port};
+
+    const REMOVED: &str = "cascade_removed";
+    const KEPT: &str = "cascade_kept";
+
+    /// The answers the worker queues for `request`. Events it queues along
+    /// the way (a removed backend's, for instance) are not answers and are
+    /// left out.
+    fn send(server: &mut Server, id: &str, request: RequestType) -> Vec<WorkerResponse> {
+        server.notify_proxys(WorkerRequest {
+            id: id.to_owned(),
+            content: request.into(),
+        });
+        QUEUE.with(|queue| {
+            queue
+                .borrow_mut()
+                .drain(..)
+                .filter(|response| response.id != "EVENT")
+                .collect()
+        })
+    }
+
+    fn http_front(cluster_id: Option<&str>, hostname: &str, path: &str) -> RequestHttpFrontend {
+        RequestHttpFrontend {
+            cluster_id: cluster_id.map(str::to_owned),
+            hostname: hostname.to_owned(),
+            path: PathRule::prefix(path.to_owned()),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 0),
+            ..Default::default()
+        }
+    }
+
+    fn backend(cluster_id: &str, port: u16) -> AddBackend {
+        AddBackend {
+            cluster_id: cluster_id.to_owned(),
+            backend_id: format!("{cluster_id}-0"),
+            address: SocketAddress::new_v4(127, 0, 0, 1, port),
+            load_balancing_parameters: Some(LoadBalancingParams::default()),
+            ..Default::default()
+        }
+    }
+
+    /// The route an HTTP request to `hostname` + `path` resolves to on the
+    /// worker's only HTTP listener, as a cluster id (`Some(None)` for a route
+    /// that names no cluster), or `None` when nothing routes it.
+    fn http_route(
+        server: &Server,
+        address: SocketAddress,
+        hostname: &str,
+        path: &str,
+    ) -> Option<Option<String>> {
+        let http = server.http.borrow();
+        let token = http
+            .listener_token(&SocketAddr::from(address).into())
+            .expect("the test HTTP listener must own a token");
+        let listener = http
+            .get_listener(&token)
+            .expect("the test HTTP listener must exist");
+        listener
+            .borrow()
+            .frontend_from_request(hostname, path, &Method::Get)
+            .ok()
+            .map(|route| route.cluster_id.map(|id| id.to_string()))
+    }
+
+    /// A removed cluster's HTTP routes and backends are gone from the worker,
+    /// while another cluster's and a route that names no cluster stay. The
+    /// worker answers the `RemoveCluster` once, and a removal of one of the
+    /// cluster's objects sent afterwards (what a main process that predates
+    /// the cascade still sends) answers ok instead of failing on a route the
+    /// cascade already removed.
+    #[test]
+    fn remove_cluster_removes_its_routes_and_backends_from_the_worker() {
+        let mut server = bare_server();
+        let http_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let tcp_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+
+        let mut removed_front = http_front(Some(REMOVED), "removed.test", "/");
+        removed_front.address = http_address;
+        // A pre-rule: unlike a tree rule, removing it twice is an error in
+        // `Router::remove_pre_rule` (`lib/src/router/mod.rs`).
+        removed_front.position = RulePosition::Pre.into();
+        let mut deny_front = http_front(None, "removed.test", "/deny");
+        deny_front.address = http_address;
+        let mut kept_front = http_front(Some(KEPT), "kept.test", "/");
+        kept_front.address = http_address;
+        let removed_tcp_front = RequestTcpFrontend {
+            cluster_id: REMOVED.to_owned(),
+            address: tcp_address,
+            ..Default::default()
+        };
+
+        let setup = vec![
+            RequestType::AddHttpListener(
+                ListenerBuilder::new_http(http_address)
+                    .to_http(None)
+                    .expect("could not build the test HTTP listener config"),
+            ),
+            RequestType::AddTcpListener(
+                ListenerBuilder::new_tcp(tcp_address)
+                    .to_tcp(None)
+                    .expect("could not build the test TCP listener config"),
+            ),
+            RequestType::AddCluster(Cluster {
+                cluster_id: REMOVED.to_owned(),
+                ..Default::default()
+            }),
+            RequestType::AddCluster(Cluster {
+                cluster_id: KEPT.to_owned(),
+                ..Default::default()
+            }),
+            RequestType::AddHttpFrontend(removed_front.clone()),
+            RequestType::AddHttpFrontend(deny_front),
+            RequestType::AddHttpFrontend(kept_front),
+            RequestType::AddTcpFrontend(removed_tcp_front.clone()),
+            RequestType::AddBackend(backend(REMOVED, 1026)),
+            RequestType::AddBackend(backend(KEPT, 1027)),
+        ];
+        for (index, request) in setup.into_iter().enumerate() {
+            for response in send(&mut server, &format!("setup-{index}"), request) {
+                assert_eq!(
+                    response.status,
+                    ResponseStatus::Ok as i32,
+                    "setup must succeed: {response:?}"
+                );
+            }
+        }
+        assert_eq!(
+            http_route(&server, http_address, "removed.test", "/"),
+            Some(Some(REMOVED.to_owned())),
+            "premise: the removed cluster's hostname routes to it"
+        );
+
+        let responses = send(
+            &mut server,
+            "remove-cluster",
+            RequestType::RemoveCluster(REMOVED.to_owned()),
+        );
+        assert_eq!(
+            responses.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["remove-cluster"],
+            "the worker must answer the RemoveCluster exactly once: {responses:?}"
+        );
+        assert_eq!(
+            responses[0].status,
+            ResponseStatus::Ok as i32,
+            "RemoveCluster must succeed: {responses:?}"
+        );
+
+        assert_eq!(
+            http_route(&server, http_address, "removed.test", "/"),
+            None,
+            "the removed cluster's hostname must no longer route"
+        );
+        assert_eq!(
+            http_route(&server, http_address, "removed.test", "/deny"),
+            Some(None),
+            "a route that names no cluster must survive the removal of a cluster on its hostname"
+        );
+        assert_eq!(
+            http_route(&server, http_address, "kept.test", "/"),
+            Some(Some(KEPT.to_owned())),
+            "another cluster's route must stay"
+        );
+        let backends = server.backends.borrow();
+        assert!(
+            !backends.backends.contains_key(REMOVED),
+            "the removed cluster's backends must be gone from the BackendMap"
+        );
+        assert!(
+            backends.backends.contains_key(KEPT),
+            "another cluster's backends must stay"
+        );
+        drop(backends);
+
+        for (index, request) in [
+            RequestType::RemoveHttpFrontend(removed_front),
+            RequestType::RemoveTcpFrontend(removed_tcp_front),
+            RequestType::RemoveBackend(RemoveBackend {
+                cluster_id: REMOVED.to_owned(),
+                backend_id: format!("{REMOVED}-0"),
+                address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
+            }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let responses = send(&mut server, &format!("follow-up-{index}"), request);
+            assert!(
+                !responses.is_empty()
+                    && responses
+                        .iter()
+                        .all(|r| r.status == ResponseStatus::Ok as i32),
+                "a removal the cascade already performed must answer ok: {responses:?}"
+            );
+        }
+    }
+
+    /// The route key names no cluster, so cluster B can take the key cluster
+    /// A's frontend used. A removal of A's frontend arriving afterwards must
+    /// leave B's route in the worker's router, whether A is gone (the removal
+    /// answers ok: A's frontend went with A) or still there (refused).
+    #[test]
+    fn a_stale_frontend_removal_never_removes_another_clusters_route() {
+        let http_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let route = |cluster_id: &str| {
+            let mut front = http_front(Some(cluster_id), "reused.test", "/");
+            front.address = http_address;
+            front
+        };
+        let cluster = |cluster_id: &str| {
+            RequestType::AddCluster(Cluster {
+                cluster_id: cluster_id.to_owned(),
+                ..Default::default()
+            })
+        };
+        let listener = || {
+            RequestType::AddHttpListener(
+                ListenerBuilder::new_http(http_address)
+                    .to_http(None)
+                    .expect("could not build the test HTTP listener config"),
+            )
+        };
+
+        for (a_is_gone, setup, expected_status) in [
+            (
+                true,
+                vec![
+                    listener(),
+                    cluster("stale_a"),
+                    RequestType::AddHttpFrontend(route("stale_a")),
+                    RequestType::RemoveCluster("stale_a".to_owned()),
+                    cluster("stale_b"),
+                    RequestType::AddHttpFrontend(route("stale_b")),
+                ],
+                ResponseStatus::Ok,
+            ),
+            (
+                false,
+                vec![
+                    listener(),
+                    cluster("stale_a"),
+                    cluster("stale_b"),
+                    RequestType::AddHttpFrontend(route("stale_b")),
+                ],
+                ResponseStatus::Failure,
+            ),
+        ] {
+            let mut server = bare_server();
+            for (index, request) in setup.into_iter().enumerate() {
+                for response in send(&mut server, &format!("setup-{index}"), request) {
+                    assert_eq!(
+                        response.status,
+                        ResponseStatus::Ok as i32,
+                        "setup must succeed: {response:?}"
+                    );
+                }
+            }
+            assert_eq!(
+                http_route(&server, http_address, "reused.test", "/"),
+                Some(Some("stale_b".to_owned())),
+                "premise: cluster B owns the route"
+            );
+
+            let responses = send(
+                &mut server,
+                "stale-removal",
+                RequestType::RemoveHttpFrontend(route("stale_a")),
+            );
+            assert_eq!(
+                responses.iter().map(|r| r.status).collect::<Vec<_>>(),
+                vec![expected_status as i32],
+                "A gone: {a_is_gone}, answers: {responses:?}"
+            );
+            assert_eq!(
+                http_route(&server, http_address, "reused.test", "/"),
+                Some(Some("stale_b".to_owned())),
+                "cluster B's route must survive a stale removal naming cluster A (A gone: {a_is_gone})"
+            );
+        }
+    }
+
+    /// TCP and UDP frontends are removed from their listener by address,
+    /// whatever cluster owns it. Cluster A frees address X, B takes X, and A
+    /// comes back with a frontend on Y. A stale removal of A's frontend on X
+    /// then finds A's frontend list but no match in it (`NoChange`, not
+    /// `NotFound`), and must still leave B's listener on X alone.
+    #[test]
+    fn a_stale_tcp_or_udp_frontend_removal_never_unmaps_another_clusters_listener() {
+        let cluster = |cluster_id: &str| {
+            RequestType::AddCluster(Cluster {
+                cluster_id: cluster_id.to_owned(),
+                ..Default::default()
+            })
+        };
+        for udp in [false, true] {
+            let x = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+            let y = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+            let listener = |address: SocketAddress| {
+                if udp {
+                    RequestType::AddUdpListener(
+                        ListenerBuilder::new_udp(address)
+                            .to_udp(None)
+                            .expect("could not build the test UDP listener config"),
+                    )
+                } else {
+                    RequestType::AddTcpListener(
+                        ListenerBuilder::new_tcp(address)
+                            .to_tcp(None)
+                            .expect("could not build the test TCP listener config"),
+                    )
+                }
+            };
+            let front = |cluster_id: &str, address: SocketAddress| {
+                if udp {
+                    (
+                        RequestType::AddUdpFrontend(RequestUdpFrontend {
+                            cluster_id: cluster_id.to_owned(),
+                            address,
+                            ..Default::default()
+                        }),
+                        RequestType::RemoveUdpFrontend(RequestUdpFrontend {
+                            cluster_id: cluster_id.to_owned(),
+                            address,
+                            ..Default::default()
+                        }),
+                    )
+                } else {
+                    (
+                        RequestType::AddTcpFrontend(RequestTcpFrontend {
+                            cluster_id: cluster_id.to_owned(),
+                            address,
+                            ..Default::default()
+                        }),
+                        RequestType::RemoveTcpFrontend(RequestTcpFrontend {
+                            cluster_id: cluster_id.to_owned(),
+                            address,
+                            ..Default::default()
+                        }),
+                    )
+                }
+            };
+            let owner = |server: &Server| {
+                let key = SocketAddr::from(x).into();
+                if udp {
+                    server.udp.borrow().listener_cluster(&key)
+                } else {
+                    server.tcp.borrow().listener_cluster(&key)
+                }
+                .map(|id| id.to_string())
+            };
+
+            let mut server = bare_server();
+            for (index, request) in [
+                listener(x),
+                listener(y),
+                cluster("stale_a"),
+                front("stale_a", x).0,
+                RequestType::RemoveCluster("stale_a".to_owned()),
+                cluster("stale_b"),
+                front("stale_b", x).0,
+                cluster("stale_a"),
+                front("stale_a", y).0,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                for response in send(&mut server, &format!("setup-{index}"), request) {
+                    assert_eq!(
+                        response.status,
+                        ResponseStatus::Ok as i32,
+                        "setup must succeed (udp: {udp}): {response:?}"
+                    );
+                }
+            }
+            assert_eq!(
+                owner(&server).as_deref(),
+                Some("stale_b"),
+                "premise: cluster B owns the listener on X (udp: {udp})"
+            );
+
+            let responses = send(&mut server, "stale-removal", front("stale_a", x).1);
+            assert_eq!(
+                responses.iter().map(|r| r.status).collect::<Vec<_>>(),
+                vec![ResponseStatus::Failure as i32],
+                "the stale removal must be refused (udp: {udp}): {responses:?}"
+            );
+            assert_eq!(
+                owner(&server).as_deref(),
+                Some("stale_b"),
+                "cluster B must keep the listener on X after a stale removal naming A (udp: {udp})"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod scm_listener_handoff_tests {
     use std::{

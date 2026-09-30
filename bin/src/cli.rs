@@ -489,7 +489,10 @@ pub enum ClusterCmd {
         #[clap(short = 'd', long = "domain", help = "cluster domain name")]
         domain: Option<String>,
     },
-    #[clap(name = "remove", about = "Remove a cluster")]
+    #[clap(
+        name = "remove",
+        about = "Remove a cluster, with every frontend and backend that names it"
+    )]
     Remove {
         #[clap(short = 'i', long = "id", help = "cluster id")]
         id: String,

@@ -2881,6 +2881,14 @@ impl TcpProxy {
             .map(|(token, _)| *token)
     }
 
+    /// The no-SNI cluster the listener at `address` routes to, for tests
+    /// that drive the proxy through `Server::notify_proxys` (`lib/src/server.rs`).
+    #[cfg(test)]
+    pub(crate) fn listener_cluster(&self, address: &ListenerKey) -> Option<ClusterId> {
+        let token = self.listener_token(address)?;
+        self.listeners[&token].borrow().cluster_id.clone()
+    }
+
     pub fn give_back_listeners(&mut self) -> Vec<(ListenerKey, MioTcpListener)> {
         self.listeners
             .values()

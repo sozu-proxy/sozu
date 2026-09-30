@@ -104,6 +104,39 @@ sozu --config /etc/sozu/config.toml cluster h2 disable --id <my_cluster_id>
 This queries the current cluster configuration, updates the `http2` flag, and re-applies it
 to all workers without affecting other cluster settings.
 
+## Remove a cluster
+
+```bash
+sozu --config /etc/sozu/config.toml cluster remove --id <my_cluster_id>
+```
+
+Removing a cluster also removes every frontend (HTTP, HTTPS, TCP and UDP) and every backend
+that names it, in the main process state and in every worker. A request to one of its
+hostnames then gets the listener's 404, unless another cluster's wildcard or catch-all route
+also covers that hostname: that route then serves it. A new connection on one of its TCP
+listeners is closed. A session established before the removal keeps its backend connection
+until it closes. A frontend that names no cluster (a deny or answer route) stays, even on the
+removed cluster's hostname.
+
+There is no separate `frontend … remove` or `backend remove` to send afterwards. Sent anyway,
+it answers ok and changes nothing, since its object went with the cluster; it never removes an
+object another cluster owns, even one that took over the same address, hostname and path. To
+serve the cluster again, add the cluster first, then its frontends and backends.
+
+A frontend or backend removal naming a cluster that does not exist, because it was removed or
+never added (a typo after `id`, or `id <cluster>` where the route was added with `deny`), gets the
+same ok answer and
+removes nothing. The answer says so, and names the cluster, or the route with no cluster, that
+holds the same key:
+
+```text
+nothing to remove: cluster my_clstr does not exist (removed, or never added), and none of its
+frontends or backends either; this key belongs to cluster my_cluster, left in place
+```
+
+To remove that route, send the removal again with `id <cluster>` for the cluster it names, or
+with `deny` for a route with no cluster.
+
 ## Check the status of sozu
 
 It shows a list of workers and show information about their statuses.

@@ -975,6 +975,15 @@ backends  = [
 ]
 ```
 
+A cluster owns the frontends and backends declared under it. Removing the
+cluster at runtime (`sozu cluster remove`, the `RemoveCluster` order) removes
+them with it, for every protocol, in the main process state and in every
+worker: a request to its hostnames gets the listener's 404 (unless another
+cluster's wildcard or catch-all route also covers the hostname, which then
+serves it), a new connection on its TCP listeners is closed, and a session
+already established drains on the backend connection it holds. A frontend with no cluster (a deny or answer
+route) is not removed. See "Remove a cluster" in `doc/configure_cli.md`.
+
 The load balancing policies differ in what they select and in how much of the
 backend set they read on every request:
 

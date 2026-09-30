@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{
         BTreeMap, BTreeSet, HashMap, HashSet, btree_map::Entry as BTreeMapEntry,
         hash_map::DefaultHasher,
@@ -501,6 +502,42 @@ impl ConfigState {
         self.udp_fronts.values().map(|v| v.len()).sum()
     }
 
+    /// Frontends (every protocol) and backends whose owning cluster satisfies
+    /// `owned`. A frontend without a `cluster_id` is never counted. Used by
+    /// `remove_cluster`'s assertions, and compiled unconditionally for the
+    /// same reason as [`Self::count_tcp_frontends_raw`].
+    fn count_objects_where(&self, owned: impl Fn(&str) -> bool) -> usize {
+        let keyed = |cluster_id: &ClusterId, len: usize| if owned(cluster_id) { len } else { 0 };
+        let routed = |front: &HttpFrontend| front.cluster_id.as_deref().is_some_and(&owned);
+        self.backends
+            .iter()
+            .map(|(k, v)| keyed(k, v.len()))
+            .sum::<usize>()
+            + self
+                .tcp_fronts
+                .iter()
+                .map(|(k, v)| keyed(k, v.len()))
+                .sum::<usize>()
+            + self
+                .udp_fronts
+                .iter()
+                .map(|(k, v)| keyed(k, v.len()))
+                .sum::<usize>()
+            + self.http_fronts.values().filter(|f| routed(f)).count()
+            + self.https_fronts.values().filter(|f| routed(f)).count()
+    }
+
+    fn count_objects_owned_by(&self, cluster_id: &str) -> usize {
+        self.count_objects_where(|owner| owner == cluster_id)
+    }
+
+    /// Debug builds only: it walks every frontend and backend, which a
+    /// release `remove_cluster` must not pay for.
+    #[cfg(debug_assertions)]
+    fn count_objects_not_owned_by(&self, cluster_id: &str) -> usize {
+        self.count_objects_where(|owner| owner != cluster_id)
+    }
+
     /// Increments the count for this request type
     fn increment_request_count(&mut self, request: &Request) {
         if let Some(request_type) = &request.request_type {
@@ -590,10 +627,26 @@ impl ConfigState {
         Ok(())
     }
 
+    /// Remove a cluster together with every frontend and backend that names
+    /// it, for every protocol. A frontend without a `cluster_id` (a deny or
+    /// answer route) names no cluster and stays. A cluster the state does not
+    /// hold is `NotFound`, and then nothing is removed, not even a frontend
+    /// that names it.
     fn remove_cluster(&mut self, cluster_id: &str) -> Result<(), StateError> {
         let before = self.clusters.len();
         match self.clusters.remove(cluster_id) {
             Some(_) => {
+                #[cfg(debug_assertions)]
+                let owned_by_others = self.count_objects_not_owned_by(cluster_id);
+
+                self.backends.remove(cluster_id);
+                self.tcp_fronts.remove(cluster_id);
+                self.udp_fronts.remove(cluster_id);
+                self.http_fronts
+                    .retain(|_, front| front.cluster_id.as_deref() != Some(cluster_id));
+                self.https_fronts
+                    .retain(|_, front| front.cluster_id.as_deref() != Some(cluster_id));
+
                 debug_assert!(
                     !self.clusters.contains_key(cluster_id),
                     "remove_cluster must evict the cluster"
@@ -602,6 +655,17 @@ impl ConfigState {
                     self.clusters.len(),
                     before - 1,
                     "remove_cluster must drop exactly one entry"
+                );
+                debug_assert_eq!(
+                    self.count_objects_owned_by(cluster_id),
+                    0,
+                    "remove_cluster must leave no frontend or backend naming the cluster"
+                );
+                #[cfg(debug_assertions)]
+                debug_assert_eq!(
+                    self.count_objects_not_owned_by(cluster_id),
+                    owned_by_others,
+                    "remove_cluster must not touch a frontend or backend of another cluster"
                 );
                 Ok(())
             }
@@ -617,6 +681,156 @@ impl ConfigState {
                 })
             }
         }
+    }
+
+    /// The removal orders for every frontend and backend
+    /// `ConfigState::remove_cluster` would remove with `cluster_id`, or none when
+    /// the state does not hold that cluster. A worker reads them from its own
+    /// state before applying a `RemoveCluster` to it, then applies them to
+    /// its proxies so they drop what the state drops.
+    pub fn cluster_removal_requests(&self, cluster_id: &str) -> Vec<Request> {
+        if !self.clusters.contains_key(cluster_id) {
+            return Vec::new();
+        }
+        let owned = |front: &&HttpFrontend| front.cluster_id.as_deref() == Some(cluster_id);
+        let mut requests: Vec<Request> = Vec::new();
+        requests.extend(
+            self.http_fronts
+                .values()
+                .filter(owned)
+                .map(|front| RequestType::RemoveHttpFrontend(front.clone().into()).into()),
+        );
+        requests.extend(
+            self.https_fronts
+                .values()
+                .filter(owned)
+                .map(|front| RequestType::RemoveHttpsFrontend(front.clone().into()).into()),
+        );
+        requests.extend(
+            self.tcp_fronts
+                .get(cluster_id)
+                .into_iter()
+                .flatten()
+                .map(|front| RequestType::RemoveTcpFrontend(front.clone().into()).into()),
+        );
+        requests.extend(
+            self.udp_fronts
+                .get(cluster_id)
+                .into_iter()
+                .flatten()
+                .map(|front| RequestType::RemoveUdpFrontend(front.clone().into()).into()),
+        );
+        requests.extend(
+            self.backends
+                .get(cluster_id)
+                .into_iter()
+                .flatten()
+                .map(|backend| {
+                    RequestType::RemoveBackend(RemoveBackend {
+                        cluster_id: backend.cluster_id.to_string(),
+                        backend_id: backend.backend_id.clone(),
+                        address: SocketAddress::from(backend.address),
+                    })
+                    .into()
+                }),
+        );
+        debug_assert_eq!(
+            requests.len(),
+            self.count_objects_owned_by(cluster_id),
+            "one removal order per frontend or backend the cluster owns"
+        );
+        requests
+    }
+
+    /// Whether `error`, the answer [`Self::dispatch`] gave to `request`,
+    /// means the frontend or backend `request` removes already went away
+    /// with its cluster: the removal found nothing to remove (`NotFound`),
+    /// and the state does not hold the cluster it names either, so
+    /// `RemoveCluster` removed it. Such a removal has nothing left to do and
+    /// is answered ok, which keeps `sozu cluster remove` followed by the
+    /// removal of each of its frontends working. A frontend without a
+    /// `cluster_id` names no cluster and never matches.
+    ///
+    /// It never covers an object another cluster owns: a frontend removal
+    /// matches only a frontend of the cluster it names (see
+    /// `remove_frontend_from`), so its `NotFound` leaves such an object alone.
+    pub fn removed_with_its_cluster(&self, request: &Request, error: &StateError) -> bool {
+        if !matches!(error, StateError::NotFound { .. }) {
+            return false;
+        }
+        let cluster_id = match &request.request_type {
+            Some(
+                RequestType::RemoveHttpFrontend(front) | RequestType::RemoveHttpsFrontend(front),
+            ) => front.cluster_id.as_deref(),
+            Some(RequestType::RemoveTcpFrontend(front)) => Some(front.cluster_id.as_str()),
+            Some(RequestType::RemoveUdpFrontend(front)) => Some(front.cluster_id.as_str()),
+            Some(RequestType::RemoveBackend(backend)) => Some(backend.cluster_id.as_str()),
+            _ => None,
+        };
+        cluster_id.is_some_and(|cluster_id| !self.clusters.contains_key(cluster_id))
+    }
+
+    /// The answer to a removal [`Self::removed_with_its_cluster`] accepts.
+    /// The same answer covers a cluster that never existed, a typo for
+    /// instance, so it says the cluster does not exist and, when another
+    /// cluster (or a route with no cluster) now holds the same key or
+    /// address, which one: that object is not removed.
+    pub fn removed_with_its_cluster_message(&self, request: &Request) -> String {
+        let (cluster_id, owner) = match &request.request_type {
+            Some(RequestType::RemoveHttpFrontend(front)) => (
+                front.cluster_id.clone(),
+                self.http_fronts
+                    .get(&front.to_string())
+                    .map(|stored| stored.cluster_id.as_deref().map(str::to_owned)),
+            ),
+            Some(RequestType::RemoveHttpsFrontend(front)) => (
+                front.cluster_id.clone(),
+                self.https_fronts
+                    .get(&front.to_string())
+                    .map(|stored| stored.cluster_id.as_deref().map(str::to_owned)),
+            ),
+            Some(RequestType::RemoveTcpFrontend(front)) => {
+                let address: SocketAddr = front.address.into();
+                let sni = front.sni.as_deref().map(str::to_ascii_lowercase);
+                let alpn = canonical_tcp_alpn(&front.alpn);
+                (
+                    Some(front.cluster_id.clone()),
+                    self.tcp_fronts
+                        .values()
+                        .flatten()
+                        .find(|stored| tcp_frontend_matches(stored, address, &sni, &alpn))
+                        .map(|stored| Some(stored.cluster_id.to_string())),
+                )
+            }
+            Some(RequestType::RemoveUdpFrontend(front)) => {
+                let address: SocketAddr = front.address.into();
+                (
+                    Some(front.cluster_id.clone()),
+                    self.udp_fronts
+                        .values()
+                        .flatten()
+                        .find(|stored| stored.address == address)
+                        .map(|stored| Some(stored.cluster_id.to_string())),
+                )
+            }
+            Some(RequestType::RemoveBackend(backend)) => (Some(backend.cluster_id.clone()), None),
+            _ => (None, None),
+        };
+        let mut message = format!(
+            "nothing to remove: cluster {} does not exist (removed, or never added), \
+             and none of its frontends or backends either",
+            cluster_id.as_deref().unwrap_or("<none>")
+        );
+        match owner {
+            Some(Some(owner)) => message.push_str(&format!(
+                "; this key belongs to cluster {owner}, left in place"
+            )),
+            Some(None) => {
+                message.push_str("; this key belongs to a route with no cluster, left in place")
+            }
+            None => {}
+        }
+        message
     }
 
     fn set_health_check(&mut self, set: &SetHealthCheck) -> Result<(), StateError> {
@@ -1351,10 +1565,22 @@ impl ConfigState {
     ) -> Result<(), StateError> {
         let key = front.to_string();
         let before = fronts.len();
-        fronts.remove(&key).ok_or(StateError::NotFound {
-            kind,
-            id: front.to_string(),
-        })?;
+        // The route key names no cluster: a key freed by one cluster's
+        // removal can be taken by another. Match the stored frontend only if
+        // it belongs to the cluster the removal names, or a late removal for
+        // the first cluster would evict the second one's route.
+        match fronts.get(&key) {
+            Some(stored) if stored.cluster_id.as_deref() == front.cluster_id.as_deref() => {
+                fronts.remove(&key);
+            }
+            _ => {
+                debug_assert_eq!(fronts.len(), before, "a refused removal must not mutate");
+                return Err(StateError::NotFound {
+                    kind,
+                    id: front.to_string(),
+                });
+            }
+        }
         debug_assert!(
             !fronts.contains_key(&key),
             "removing a frontend must evict the route key"
@@ -2636,19 +2862,41 @@ impl ConfigState {
             }
         }
 
+        let mut removed_clusters: Vec<&ClusterId> = Vec::new();
         for (cluster_id, res) in diff_map(self.clusters.iter(), other.clusters.iter()) {
             match res {
                 DiffResult::Added | DiffResult::Changed => v.push(
                     RequestType::AddCluster(other.clusters.get(cluster_id).unwrap().clone()).into(),
                 ),
                 DiffResult::Removed => {
+                    removed_clusters.push(cluster_id);
                     v.push(RequestType::RemoveCluster(cluster_id.to_string()).into())
                 }
             }
         }
 
+        // `base` is `self` once every `RemoveCluster` above has cascaded
+        // (`Self::remove_cluster`). The frontend and backend diffs start from
+        // it, not from `self`: they emit no removal the cascade already
+        // performs, which would otherwise find nothing left to remove, and
+        // they add back an object `other` still holds for a removed cluster.
+        // Without a removed cluster, `base` is `self` itself, not a copy.
+        let base: Cow<'_, ConfigState> = if removed_clusters.is_empty() {
+            Cow::Borrowed(self)
+        } else {
+            let mut cascaded = self.clone();
+            for cluster_id in &removed_clusters {
+                let removed = cascaded.remove_cluster(cluster_id);
+                debug_assert!(
+                    removed.is_ok(),
+                    "a cluster diff_map reports removed must exist in self"
+                );
+            }
+            Cow::Owned(cascaded)
+        };
+
         for ((cluster_id, backend_id), res) in diff_map(
-            self.backends.iter().flat_map(|(cluster_id, v)| {
+            base.backends.iter().flat_map(|(cluster_id, v)| {
                 v.iter()
                     .map(move |backend| ((cluster_id, &backend.backend_id), backend))
             }),
@@ -2667,7 +2915,7 @@ impl ConfigState {
                     v.push(RequestType::AddBackend(backend.clone().to_add_backend()).into());
                 }
                 DiffResult::Removed => {
-                    let backend = self
+                    let backend = base
                         .backends
                         .get(cluster_id)
                         .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
@@ -2683,7 +2931,7 @@ impl ConfigState {
                     );
                 }
                 DiffResult::Changed => {
-                    let backend = self
+                    let backend = base
                         .backends
                         .get(cluster_id)
                         .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
@@ -2709,7 +2957,7 @@ impl ConfigState {
         }
 
         let mut my_http_fronts: HashSet<(&str, &HttpFrontend)> = HashSet::new();
-        for (route, front) in self.http_fronts.iter() {
+        for (route, front) in base.http_fronts.iter() {
             my_http_fronts.insert((route, front));
         }
         let mut their_http_fronts: HashSet<(&str, &HttpFrontend)> = HashSet::new();
@@ -2729,7 +2977,7 @@ impl ConfigState {
         }
 
         let mut my_https_fronts: HashSet<(&String, &HttpFrontend)> = HashSet::new();
-        for (route, front) in self.https_fronts.iter() {
+        for (route, front) in base.https_fronts.iter() {
             my_https_fronts.insert((route, front));
         }
         let mut their_https_fronts: HashSet<(&String, &HttpFrontend)> = HashSet::new();
@@ -2748,7 +2996,7 @@ impl ConfigState {
         }
 
         let mut my_tcp_fronts: HashSet<(&ClusterId, &TcpFrontend)> = HashSet::new();
-        for (cluster_id, front_list) in self.tcp_fronts.iter() {
+        for (cluster_id, front_list) in base.tcp_fronts.iter() {
             for front in front_list.iter() {
                 my_tcp_fronts.insert((cluster_id, front));
             }
@@ -2772,7 +3020,7 @@ impl ConfigState {
         }
 
         let mut my_udp_fronts: HashSet<(&ClusterId, &UdpFrontend)> = HashSet::new();
-        for (cluster_id, front_list) in self.udp_fronts.iter() {
+        for (cluster_id, front_list) in base.udp_fronts.iter() {
             for front in front_list.iter() {
                 my_udp_fronts.insert((cluster_id, front));
             }
@@ -4513,21 +4761,10 @@ mod tests {
             )
             .expect("Could not execute request");
 
+        // `cluster_2` is gone from `state2`: its `RemoveCluster` also removes
+        // its frontend and its backend, so the diff emits no separate
+        // `RemoveHttpFrontend`/`RemoveBackend` for them.
         let e: Vec<Request> = vec![
-            RequestType::RemoveHttpFrontend(RequestHttpFrontend {
-                cluster_id: Some(String::from("cluster_2")),
-                hostname: String::from("test.local"),
-                path: PathRule::prefix(String::from("/abc")),
-                address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
-                ..Default::default()
-            })
-            .into(),
-            RequestType::RemoveBackend(RemoveBackend {
-                cluster_id: String::from("cluster_2"),
-                backend_id: String::from("cluster_2-0"),
-                address: SocketAddress::new_v4(192, 167, 1, 2, 1026),
-            })
-            .into(),
             RequestType::AddBackend(AddBackend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-2"),
@@ -4573,6 +4810,393 @@ mod tests {
         println!("state 3 hashes: {hash3:#?}");
 
         assert_eq!(diff, expected_diff);
+    }
+
+    /// One cluster per id in `cluster_ids`, each owning one object of every
+    /// kind a cluster can own: an HTTP, an HTTPS, a TCP and a UDP frontend,
+    /// and a backend. Every state also carries a deny route
+    /// (`cluster_id: None`) on `cascade_a`'s hostname, which belongs to no
+    /// cluster and must outlive the removal of `cascade_a`.
+    fn state_with_clusters_owning_every_object_kind(cluster_ids: &[&str]) -> ConfigState {
+        let mut state = ConfigState::new();
+        for cluster_id in cluster_ids {
+            let port = match *cluster_id {
+                "cascade_a" => 9200,
+                "cascade_b" => 9300,
+                other => panic!("no test ports reserved for {other}"),
+            };
+            let requests: Vec<Request> = vec![
+                RequestType::AddCluster(Cluster {
+                    cluster_id: cluster_id.to_string(),
+                    ..Default::default()
+                })
+                .into(),
+                RequestType::AddHttpFrontend(RequestHttpFrontend {
+                    cluster_id: Some(cluster_id.to_string()),
+                    hostname: format!("{cluster_id}.test"),
+                    path: PathRule::prefix(String::from("/")),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+                    ..Default::default()
+                })
+                .into(),
+                RequestType::AddHttpsFrontend(RequestHttpFrontend {
+                    cluster_id: Some(cluster_id.to_string()),
+                    hostname: format!("{cluster_id}.test"),
+                    path: PathRule::prefix(String::from("/")),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
+                    ..Default::default()
+                })
+                .into(),
+                RequestType::AddTcpFrontend(RequestTcpFrontend {
+                    cluster_id: cluster_id.to_string(),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, port),
+                    ..Default::default()
+                })
+                .into(),
+                RequestType::AddUdpFrontend(RequestUdpFrontend {
+                    cluster_id: cluster_id.to_string(),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, port + 1),
+                    ..Default::default()
+                })
+                .into(),
+                RequestType::AddBackend(AddBackend {
+                    cluster_id: cluster_id.to_string(),
+                    backend_id: format!("{cluster_id}-0"),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, port + 2),
+                    load_balancing_parameters: Some(LoadBalancingParams::default()),
+                    ..Default::default()
+                })
+                .into(),
+            ];
+            for request in &requests {
+                state
+                    .dispatch(request)
+                    .unwrap_or_else(|e| panic!("could not apply {request:?}: {e}"));
+            }
+        }
+        state
+            .dispatch(&RequestType::AddHttpFrontend(cascade_deny_route()).into())
+            .expect("could not add the deny route");
+        state
+    }
+
+    /// A route that belongs to no cluster, on the hostname `cascade_a` serves.
+    fn cascade_deny_route() -> RequestHttpFrontend {
+        RequestHttpFrontend {
+            cluster_id: None,
+            hostname: String::from("cascade_a.test"),
+            path: PathRule::prefix(String::from("/deny")),
+            address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+            ..Default::default()
+        }
+    }
+
+    /// The cluster a routing request names, if any.
+    fn cluster_named_by(request: &Request) -> Option<&str> {
+        match request.request_type.as_ref()? {
+            RequestType::AddCluster(cluster) => Some(&cluster.cluster_id),
+            RequestType::RemoveCluster(cluster_id) => Some(cluster_id),
+            RequestType::AddHttpFrontend(front)
+            | RequestType::RemoveHttpFrontend(front)
+            | RequestType::AddHttpsFrontend(front)
+            | RequestType::RemoveHttpsFrontend(front) => front.cluster_id.as_deref(),
+            RequestType::AddTcpFrontend(front) | RequestType::RemoveTcpFrontend(front) => {
+                Some(&front.cluster_id)
+            }
+            RequestType::AddUdpFrontend(front) | RequestType::RemoveUdpFrontend(front) => {
+                Some(&front.cluster_id)
+            }
+            RequestType::AddBackend(backend) => Some(&backend.cluster_id),
+            RequestType::RemoveBackend(backend) => Some(&backend.cluster_id),
+            _ => None,
+        }
+    }
+
+    /// Every routing map two states must agree on.
+    fn assert_same_routing(actual: &ConfigState, expected: &ConfigState, context: &str) {
+        assert_eq!(actual.clusters, expected.clusters, "{context}: clusters");
+        assert_eq!(actual.backends, expected.backends, "{context}: backends");
+        assert_eq!(
+            actual.http_fronts, expected.http_fronts,
+            "{context}: http_fronts"
+        );
+        assert_eq!(
+            actual.https_fronts, expected.https_fronts,
+            "{context}: https_fronts"
+        );
+        assert_eq!(
+            actual.tcp_fronts, expected.tcp_fronts,
+            "{context}: tcp_fronts"
+        );
+        assert_eq!(
+            actual.udp_fronts, expected.udp_fronts,
+            "{context}: udp_fronts"
+        );
+    }
+
+    /// Removing a cluster removes, for every protocol, the frontends and the
+    /// backends that name it, and nothing else: another cluster's objects and
+    /// a deny route on the removed cluster's own hostname stay.
+    #[test]
+    fn remove_cluster_removes_its_frontends_and_backends_for_every_protocol() {
+        let mut state = state_with_clusters_owning_every_object_kind(&["cascade_a", "cascade_b"]);
+        let expected = state_with_clusters_owning_every_object_kind(&["cascade_b"]);
+
+        state
+            .dispatch(&RequestType::RemoveCluster(String::from("cascade_a")).into())
+            .expect("removing an existing cluster must succeed");
+
+        assert_same_routing(&state, &expected, "after RemoveCluster(cascade_a)");
+        assert!(
+            state
+                .http_fronts
+                .values()
+                .any(|front| front.cluster_id.is_none() && front.hostname == "cascade_a.test"),
+            "a route that names no cluster must survive the removal of a cluster on its hostname"
+        );
+
+        // The cascade already removed the frontend: an explicit removal sent
+        // afterwards has nothing left to remove, and is recognised as such
+        // (the main process and the workers answer it ok).
+        let late: Request = RequestType::RemoveHttpFrontend(RequestHttpFrontend {
+            cluster_id: Some(String::from("cascade_a")),
+            hostname: String::from("cascade_a.test"),
+            path: PathRule::prefix(String::from("/")),
+            address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+            ..Default::default()
+        })
+        .into();
+        let err = state
+            .dispatch(&late)
+            .expect_err("the cascade must already have removed the frontend");
+        assert!(
+            matches!(err, StateError::NotFound { .. }),
+            "expected NotFound, got: {err}"
+        );
+        assert!(
+            state.removed_with_its_cluster(&late, &err),
+            "a removal of an object that went with its cluster must be recognised"
+        );
+
+        // A removal naming a cluster that never existed (a typo) is answered
+        // the same way, and the answer says which route holds the key: here
+        // the deny route, which the removal leaves in place.
+        let mut typo = cascade_deny_route();
+        typo.cluster_id = Some(String::from("cascade_typo"));
+        let typo: Request = RequestType::RemoveHttpFrontend(typo).into();
+        let err = state
+            .dispatch(&typo)
+            .expect_err("a removal naming another cluster must not match the deny route");
+        assert!(state.removed_with_its_cluster(&typo, &err));
+        let answer = state.removed_with_its_cluster_message(&typo);
+        assert!(
+            answer.contains("this key belongs to a route with no cluster, left in place"),
+            "the ok answer must say the deny route holds the key: {answer}"
+        );
+        assert!(
+            state
+                .http_fronts
+                .values()
+                .any(|front| front.cluster_id.is_none() && front.hostname == "cascade_a.test"),
+            "the deny route must survive a removal naming a cluster that never existed"
+        );
+    }
+
+    /// The HTTP/HTTPS route key (`address;hostname;path;method`) names no
+    /// cluster, so a route key freed by a cluster removal can be taken by
+    /// another cluster. A removal still in flight for the first cluster must
+    /// then leave the second cluster's route alone, whether the first
+    /// cluster is gone or still there.
+    #[test]
+    fn a_stale_frontend_removal_never_removes_another_clusters_route() {
+        let route = |cluster_id: &str| RequestHttpFrontend {
+            cluster_id: Some(cluster_id.to_owned()),
+            hostname: String::from("reused.test"),
+            path: PathRule::prefix(String::from("/")),
+            address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+            ..Default::default()
+        };
+        let cluster = |cluster_id: &str| {
+            RequestType::AddCluster(Cluster {
+                cluster_id: cluster_id.to_owned(),
+                ..Default::default()
+            })
+        };
+        let owner =
+            |state: &ConfigState, fronts: fn(&ConfigState) -> &BTreeMap<String, HttpFrontend>| {
+                fronts(state)
+                    .get(&route("stale_b").to_string())
+                    .and_then(|front| front.cluster_id.as_deref().map(str::to_owned))
+            };
+
+        for (add, remove, fronts) in [
+            (
+                RequestType::AddHttpFrontend as fn(RequestHttpFrontend) -> RequestType,
+                RequestType::RemoveHttpFrontend as fn(RequestHttpFrontend) -> RequestType,
+                (|state: &ConfigState| &state.http_fronts)
+                    as fn(&ConfigState) -> &BTreeMap<String, HttpFrontend>,
+            ),
+            (
+                RequestType::AddHttpsFrontend,
+                RequestType::RemoveHttpsFrontend,
+                |state: &ConfigState| &state.https_fronts,
+            ),
+        ] {
+            // RemoveCluster(A), then B takes the route key A used, then a
+            // stale removal of A's frontend arrives.
+            let mut state = ConfigState::new();
+            for request in [
+                cluster("stale_a"),
+                add(route("stale_a")),
+                RequestType::RemoveCluster(String::from("stale_a")),
+                cluster("stale_b"),
+                add(route("stale_b")),
+            ] {
+                state
+                    .dispatch(&request.clone().into())
+                    .unwrap_or_else(|e| panic!("could not apply {request:?}: {e}"));
+            }
+            let stale: Request = remove(route("stale_a")).into();
+            let err = state
+                .dispatch(&stale)
+                .expect_err("a removal naming cluster A must not match cluster B's route");
+            assert!(
+                state.removed_with_its_cluster(&stale, &err),
+                "A is gone, so its frontend went with it: {err}"
+            );
+            let answer = state.removed_with_its_cluster_message(&stale);
+            assert!(
+                answer.contains("cluster stale_a does not exist")
+                    && answer.contains("this key belongs to cluster stale_b, left in place"),
+                "the ok answer must name the key's current owner: {answer}"
+            );
+            assert_eq!(
+                owner(&state, fronts).as_deref(),
+                Some("stale_b"),
+                "cluster B's route must survive a stale removal naming cluster A"
+            );
+
+            // Same stale removal while A still exists: refused, and not
+            // mistaken for an object removed with its cluster.
+            let mut state = ConfigState::new();
+            for request in [
+                cluster("stale_a"),
+                cluster("stale_b"),
+                add(route("stale_b")),
+            ] {
+                state
+                    .dispatch(&request.clone().into())
+                    .unwrap_or_else(|e| panic!("could not apply {request:?}: {e}"));
+            }
+            let err = state
+                .dispatch(&stale)
+                .expect_err("a removal naming cluster A must not match cluster B's route");
+            assert!(
+                !state.removed_with_its_cluster(&stale, &err),
+                "A still exists: the removal is refused, not already done"
+            );
+            assert_eq!(
+                owner(&state, fronts).as_deref(),
+                Some("stale_b"),
+                "cluster B's route must survive a removal naming cluster A"
+            );
+        }
+    }
+
+    /// `diff` towards a state without a cluster emits the `RemoveCluster`
+    /// alone: the cascade covers the cluster's frontends and backends, and a
+    /// separate removal of one of them would find nothing left to remove.
+    #[test]
+    fn diff_removing_a_cluster_relies_on_the_cascade() {
+        let before = state_with_clusters_owning_every_object_kind(&["cascade_a", "cascade_b"]);
+        let after = state_with_clusters_owning_every_object_kind(&["cascade_b"]);
+
+        let diff = before.diff(&after);
+        assert_eq!(
+            diff,
+            vec![Request::from(RequestType::RemoveCluster(String::from(
+                "cascade_a"
+            )))],
+            "the cascade must be the only removal the diff emits"
+        );
+
+        let mut replayed = before.clone();
+        for request in &diff {
+            replayed
+                .dispatch(request)
+                .unwrap_or_else(|e| panic!("could not replay {request:?}: {e}"));
+        }
+        assert_same_routing(&replayed, &after, "replaying diff(before, after)");
+    }
+
+    /// A target state may keep a frontend whose cluster it no longer holds.
+    /// The cascade removes that frontend with its cluster, so `diff` must add
+    /// it back after the `RemoveCluster`.
+    #[test]
+    fn diff_re_adds_a_frontend_the_target_keeps_for_a_removed_cluster() {
+        let before = state_with_clusters_owning_every_object_kind(&["cascade_a", "cascade_b"]);
+        let kept = RequestHttpFrontend {
+            cluster_id: Some(String::from("cascade_a")),
+            hostname: String::from("cascade_a.test"),
+            path: PathRule::prefix(String::from("/")),
+            address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+            ..Default::default()
+        };
+        let mut after = state_with_clusters_owning_every_object_kind(&["cascade_b"]);
+        after
+            .dispatch(&RequestType::AddHttpFrontend(kept.clone()).into())
+            .expect("a frontend may name a cluster the state does not hold");
+
+        let diff = before.diff(&after);
+        let removal = diff
+            .iter()
+            .position(|r| r.request_type == Some(RequestType::RemoveCluster("cascade_a".into())))
+            .expect("the diff must remove cascade_a");
+        let re_add = diff
+            .iter()
+            .position(|r| r.request_type == Some(RequestType::AddHttpFrontend(kept.clone())))
+            .expect("the diff must add back the frontend the cascade removes");
+        assert!(
+            removal < re_add,
+            "the frontend must be added back after its cluster is removed: {diff:?}"
+        );
+
+        let mut replayed = before.clone();
+        for request in &diff {
+            replayed
+                .dispatch(request)
+                .unwrap_or_else(|e| panic!("could not replay {request:?}: {e}"));
+        }
+        assert_same_routing(&replayed, &after, "replaying diff(before, after)");
+    }
+
+    /// SaveState/LoadState and a worker upgrade replay `generate_requests`:
+    /// once a cluster is removed, none of its frontends or backends may come
+    /// back through that replay.
+    #[test]
+    fn a_removed_cluster_leaves_nothing_for_load_state_to_replay() {
+        let mut state = state_with_clusters_owning_every_object_kind(&["cascade_a", "cascade_b"]);
+        state
+            .dispatch(&RequestType::RemoveCluster(String::from("cascade_a")).into())
+            .expect("removing an existing cluster must succeed");
+
+        let requests = state.generate_requests();
+        let leaked: Vec<&Request> = requests
+            .iter()
+            .filter(|request| cluster_named_by(request) == Some("cascade_a"))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "LoadState would replay objects of the removed cluster: {leaked:?}"
+        );
+
+        let mut replayed = ConfigState::new();
+        for request in &requests {
+            replayed
+                .dispatch(request)
+                .unwrap_or_else(|e| panic!("could not replay {request:?}: {e}"));
+        }
+        assert_same_routing(&replayed, &state, "replaying generate_requests");
     }
 
     #[test]
