@@ -609,8 +609,12 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   `backends` method any more, so a dial borrows neither the proxy nor a
   fresh handle to reach it ([#1684](https://github.com/sozu-proxy/sozu/issues/1684)).
   `BackendSelector::select` also takes the request's client affinity
-  key, which `HRW` and `MAGLEV` pin the client with
-  ([#524](https://github.com/sozu-proxy/sozu/issues/524)).
+  key, which `HRW` and `MAGLEV` pin the client with and a shuffle-sharded
+  cluster ranks the client's shard by
+  ([#524](https://github.com/sozu-proxy/sozu/issues/524)). Sharding itself
+  lives below the selector, in `BackendList::select_with_key`
+  (`lib/src/backends.rs`): it narrows the candidates to the shard before the
+  cluster's policy runs, so the router and the reservation are unchanged.
   `Router::plan_connect` derives it (`affinity_key`, `router.rs`) right after
   `route_from_request`, where both the routed cluster and the request's header
   blocks are in hand, and stores it in `HttpContext::affinity_key` beside

@@ -14,7 +14,7 @@ use rand::{
 use sozu_command::{
     proto::command::{
         Event, EventKind, HealthCheckConfig, LoadBalancingAlgorithms, LoadBalancingParams,
-        LoadMetric,
+        LoadMetric, ShardMode,
     },
     state::ClusterId,
 };
@@ -24,7 +24,7 @@ use crate::{
     PeakEWMA,
     load_balancing::{
         Candidates, LeastLoaded, LoadBalancingAlgorithm, Maglev, PowerOfTwo, Random, Rendezvous,
-        RoundRobin,
+        RoundRobin, ShuffleSharding, hrw_score,
     },
     retry::{self, RetryPolicy},
     server::{self, push_event},
@@ -918,7 +918,9 @@ impl BackendMap {
             "selection runs only on a non-empty backend list"
         );
 
-        match cluster_backends.next_available_backend_with_key(key, now) {
+        let (picked, outcome) = cluster_backends.select_with_key(key, now);
+        record_shard_outcome(cluster_id, outcome, picked.is_some());
+        match picked {
             Some(backend) => Ok(backend),
             None => {
                 // Drop the &mut BackendList before the &self helper call.
@@ -967,7 +969,9 @@ impl BackendMap {
             "keyed selection runs only on a non-empty backend list"
         );
 
-        let next_backend = match cluster_backends.next_available_backend_with_key(key, now) {
+        let (picked, outcome) = cluster_backends.select_with_key(key, now);
+        record_shard_outcome(cluster_id, outcome, picked.is_some());
+        let next_backend = match picked {
             Some(nb) => nb,
             None => {
                 let _ = cluster_backends;
@@ -1045,6 +1049,18 @@ impl BackendMap {
         cluster_backends.set_load_balancing_policy(lb_algo, metric, seed);
     }
 
+    /// Set or clear the shuffle sharding of `cluster_id`, creating its
+    /// backend list if the cluster's backends have not arrived yet, as
+    /// [`Self::set_load_balancing_policy_for_cluster`] does.
+    pub fn set_shuffle_sharding_for_cluster(
+        &mut self,
+        cluster_id: &str,
+        shuffle_sharding: Option<ShuffleSharding>,
+    ) {
+        self.get_or_create_backend_list_for_cluster(cluster_id)
+            .set_shuffle_sharding(shuffle_sharding);
+    }
+
     pub fn get_or_create_backend_list_for_cluster(&mut self, cluster_id: &str) -> &mut BackendList {
         let rng = &mut self.rng;
         self.backends
@@ -1097,6 +1113,32 @@ pub struct BackendList {
     /// room for every backend, so a selection never allocates and clones no
     /// `Rc` but the one it returns.
     candidates: Vec<usize>,
+    /// The cluster's shuffle sharding, `None` when it is off
+    /// (sozu-proxy/sozu#524). Set by [`Self::set_shuffle_sharding`].
+    shuffle_sharding: Option<ShuffleSharding>,
+    /// Reused scratch for a keyed selection's shard: the HRW score of each
+    /// primary backend and its position. Reserved in `add_backend` like
+    /// `candidates`, so computing a shard never allocates.
+    shard_scores: Vec<(f64, usize)>,
+    /// The positions of the current selection's shard members, sorted.
+    shard: Vec<usize>,
+}
+
+/// How shuffle sharding shaped one selection, for the caller that knows the
+/// cluster to count it under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShardOutcome {
+    /// Sharding is off, inactive below `shard_min_backends`, or the request
+    /// had no key: the whole cluster was eligible.
+    Unsharded,
+    /// The selection stayed inside the client's shard.
+    InShard,
+    /// No member of the shard could take a connection and `FALLBACK`
+    /// selected over the rest of the cluster.
+    SpilledOver,
+    /// No member of the shard could take a connection and `STRICT` selected
+    /// nothing.
+    Exhausted,
 }
 
 impl Default for BackendList {
@@ -1123,6 +1165,9 @@ impl BackendList {
             fail_open_warned: false,
             availability: Cell::new(ClusterAvailability::Available),
             candidates: Vec::new(),
+            shuffle_sharding: None,
+            shard_scores: Vec::new(),
+            shard: Vec::new(),
         }
     }
 
@@ -1249,8 +1294,81 @@ impl BackendList {
         // plane, so no selection ever grows it.
         self.candidates.clear();
         self.candidates.reserve(self.backends.len());
+        self.shard_scores.clear();
+        self.shard_scores.reserve(self.backends.len());
+        self.shard.clear();
+        self.shard.reserve(self.backends.len());
         #[cfg(debug_assertions)]
         self.check_invariants();
+    }
+
+    /// Set or clear the cluster's shuffle sharding. Takes effect from the
+    /// next selection.
+    pub fn set_shuffle_sharding(&mut self, shuffle_sharding: Option<ShuffleSharding>) {
+        self.shuffle_sharding = shuffle_sharding;
+    }
+
+    /// Fill `self.shard` with the positions of `key`'s shard, sorted, and
+    /// say whether sharding applies to this selection at all.
+    ///
+    /// The shard is the top `k` of the HRW ranking of `key` over the
+    /// **configured** primary backends, healthy or not: a backend going down
+    /// must not pull another one into the shard, or a shard could never be
+    /// exhausted and isolation would leak exactly when it matters. Ties are
+    /// broken by list position so the shard is a function of the scores.
+    /// Partitioning with `select_nth_unstable_by` is `O(N)`; the two buffers
+    /// are reserved by `add_backend`, so this allocates nothing.
+    fn compute_shard(&mut self, key: Option<u64>) -> bool {
+        let (Some(sharding), Some(key)) = (self.shuffle_sharding, key) else {
+            return false;
+        };
+        // Size the shard before hashing anything, so a cluster below
+        // `shard_min_backends` pays one walk of `backup` flags and no hash.
+        let primaries = self
+            .backends
+            .iter()
+            .filter(|backend| !backend.borrow().backup)
+            .count();
+        let Some(k) = sharding.shard_size(primaries) else {
+            return false;
+        };
+        self.shard_scores.clear();
+        for (index, backend) in self.backends.iter().enumerate() {
+            let backend = backend.borrow();
+            if !backend.backup {
+                self.shard_scores.push((hrw_score(key, &backend), index));
+            }
+        }
+        debug_assert_eq!(
+            self.shard_scores.len(),
+            primaries,
+            "one score per primary backend"
+        );
+        let by_rank = |a: &(f64, usize), b: &(f64, usize)| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1));
+        if k < self.shard_scores.len() {
+            self.shard_scores.select_nth_unstable_by(k - 1, by_rank);
+        }
+        self.shard.clear();
+        self.shard
+            .extend(self.shard_scores[..k].iter().map(|&(_, index)| index));
+        self.shard.sort_unstable();
+        debug_assert_eq!(self.shard.len(), k, "a shard holds exactly k backends");
+        debug_assert!(
+            self.shard
+                .iter()
+                .all(|&index| !self.backends[index].borrow().backup),
+            "a shard holds primary backends only"
+        );
+        true
+    }
+
+    /// Keep only the candidates that belong to the current shard; the
+    /// candidates stay in list order, as `Candidates::new` requires.
+    fn retain_shard_candidates(&mut self) -> usize {
+        let shard = &self.shard;
+        self.candidates
+            .retain(|index| shard.binary_search(index).is_ok());
+        self.candidates.len()
     }
 
     /// Remove every backend at `backend_address` and return the list of
@@ -1377,10 +1495,67 @@ impl BackendList {
         key: Option<u64>,
         now: Instant,
     ) -> Option<Rc<RefCell<Backend>>> {
+        self.select_with_key(key, now).0
+    }
+
+    /// [`Self::next_available_backend_with_key`], also saying how shuffle
+    /// sharding shaped the selection, for [`BackendMap`] to count under the
+    /// cluster's id.
+    ///
+    /// Tiers, in order: the primary backends that can open, then the backup
+    /// backends, then fail-open over every backend whose retry policy allows
+    /// a try. When the cluster shards and `key` is known, the primary tier is
+    /// first narrowed to the client's shard. An exhausted shard then either
+    /// spills over to the unsharded tiers (`FALLBACK`) or ends the selection
+    /// empty (`STRICT`), except in the fail-open regime — no backend of the
+    /// whole cluster can open — where `STRICT` fails open inside its shard
+    /// only.
+    pub(crate) fn select_with_key(
+        &mut self,
+        key: Option<u64>,
+        now: Instant,
+    ) -> (Option<Rc<RefCell<Backend>>>, ShardOutcome) {
+        let sharded = self.compute_shard(key);
+        let strict = sharded
+            && self
+                .shuffle_sharding
+                .is_some_and(|sharding| sharding.mode == ShardMode::Strict);
+        let mut outcome = if sharded {
+            ShardOutcome::InShard
+        } else {
+            ShardOutcome::Unsharded
+        };
+
         let mut available =
             self.collect_candidates(|backend| is_tier_candidate(backend, false, now));
+        if sharded {
+            // Primary backends able to take a connection, inside the shard
+            // or not: under `STRICT` they, and only they, decide between
+            // refusing and failing open. Backups sit outside every shard, so
+            // a healthy backup must not turn a strict shard's fail-open into
+            // a refusal.
+            let primaries_can_open = available != 0;
+            let in_shard = self.retain_shard_candidates();
+            if in_shard != 0 {
+                available = in_shard;
+            } else if strict {
+                if primaries_can_open {
+                    // Primary backends outside the shard could serve, but
+                    // strict isolation forbids them.
+                    return (None, ShardOutcome::Exhausted);
+                }
+                // Fail-open regime of the primary tier: fall through with an
+                // empty primary tier; the backup tier is skipped below for a
+                // strict shard, and fail-open is narrowed to the shard.
+                available = 0;
+            } else {
+                outcome = ShardOutcome::SpilledOver;
+                available =
+                    self.collect_candidates(|backend| is_tier_candidate(backend, false, now));
+            }
+        }
 
-        if available == 0 {
+        if available == 0 && !strict {
             available = self.collect_candidates(|backend| is_tier_candidate(backend, true, now));
         }
 
@@ -1404,7 +1579,18 @@ impl BackendList {
                 }),
                 "selection must return a backend present in the live list"
             );
-            return picked;
+            debug_assert!(
+                outcome != ShardOutcome::InShard
+                    || picked.as_ref().is_none_or(|b| {
+                        let addr = b.borrow().address;
+                        self.shard
+                            .iter()
+                            .any(|&index| self.backends[index].borrow().address == addr)
+                    }),
+                "an in-shard selection must return a member of the shard"
+            );
+            let outcome = self.settle_spill_outcome(outcome, picked.as_ref());
+            return (picked, outcome);
         }
 
         // Fail-open: when no backend passes the full `can_open()` gate,
@@ -1415,16 +1601,23 @@ impl BackendList {
         // still respecting the per-backend back-off window — hammering a
         // backend at line rate during its back-off would defeat the back-off
         // itself. Ref: Amazon "Implementing Health Checks".
-        let available = self.collect_candidates(|backend| {
+        let mut available = self.collect_candidates(|backend| {
             backend.status == BackendStatus::Normal
                 && matches!(
                     backend.retry_policy.can_try(now),
                     Some(retry::RetryAction::OKAY)
                 )
         });
+        if strict {
+            // A strict shard fails open inside itself only.
+            available = self.retain_shard_candidates();
+            if available == 0 {
+                return (None, ShardOutcome::Exhausted);
+            }
+        }
 
         if available == 0 {
-            return None;
+            return (None, outcome);
         }
 
         // Latched warning + per-decision counter: the warn! fires once on
@@ -1439,8 +1632,32 @@ impl BackendList {
         }
         count!(names::backend::FAIL_OPEN, 1);
 
-        self.load_balancing
-            .next_available_backend(key, Candidates::new(&self.backends, &self.candidates, now))
+        let picked = self
+            .load_balancing
+            .next_available_backend(key, Candidates::new(&self.backends, &self.candidates, now));
+        let outcome = self.settle_spill_outcome(outcome, picked.as_ref());
+        (picked, outcome)
+    }
+
+    /// A `FALLBACK` selection that left its exhausted shard but whose pick is
+    /// a shard member after all — fail-open over the whole cluster can land
+    /// back in the shard — stayed in the shard, and is not a spill-over.
+    fn settle_spill_outcome(
+        &self,
+        outcome: ShardOutcome,
+        picked: Option<&Rc<RefCell<Backend>>>,
+    ) -> ShardOutcome {
+        match (outcome, picked) {
+            (ShardOutcome::SpilledOver, Some(picked))
+                if self
+                    .shard
+                    .iter()
+                    .any(|&index| Rc::ptr_eq(&self.backends[index], picked)) =>
+            {
+                ShardOutcome::InShard
+            }
+            _ => outcome,
+        }
     }
 
     /// Replace the cluster's policy. `seed` seeds the policies that draw at
@@ -1481,6 +1698,22 @@ impl BackendList {
                 self.load_balancing = Box::new(maglev);
             }
         }
+    }
+}
+
+/// Count what shuffle sharding did to one selection of `cluster_id`: a
+/// spill-over that found a backend outside the shard, or a strict refusal.
+/// A selection that stayed in its shard, or was not sharded, counts nothing.
+fn record_shard_outcome(cluster_id: &str, outcome: ShardOutcome, picked: bool) {
+    match outcome {
+        ShardOutcome::SpilledOver if picked => {
+            incr!(names::backend::SHARD_SPILLOVER, Some(cluster_id), None);
+        }
+        ShardOutcome::Exhausted => {
+            debug_assert!(!picked, "a strict exhausted shard selects nothing");
+            incr!(names::backend::SHARD_EXHAUSTED, Some(cluster_id), None);
+        }
+        ShardOutcome::Unsharded | ShardOutcome::InShard | ShardOutcome::SpilledOver => {}
     }
 }
 
@@ -2312,6 +2545,500 @@ mod backends_test {
             replay(&mut twin).to_bits(),
             replay(&mut again).to_bits(),
             "one sequence of instants must yield one average, bit for bit"
+        );
+    }
+
+    // ----- #524: shuffle sharding over the HRW ranking -----
+
+    /// `n` primary backends on distinct loopback ports, under `policy`, sharded
+    /// by `sharding`.
+    fn sharded_list(
+        n: u16,
+        policy: LoadBalancingAlgorithms,
+        sharding: Option<ShuffleSharding>,
+    ) -> BackendList {
+        let now = Instant::now();
+        let mut list = BackendList::with_seed(524);
+        list.set_load_balancing_policy(policy, Some(LoadMetric::Connections), 524);
+        for index in 0..n {
+            list.add_backend(Backend::new_at(
+                &format!("shard-{index}"),
+                SocketAddr::from(([127, 0, 0, 1], 20_000 + index)),
+                None,
+                None,
+                None,
+                now,
+            ));
+        }
+        list.set_shuffle_sharding(sharding);
+        list
+    }
+
+    fn sharding(percent: u32, min_backends: u32, mode: ShardMode) -> Option<ShuffleSharding> {
+        Some(ShuffleSharding {
+            percent,
+            min_backends,
+            mode,
+        })
+    }
+
+    /// The addresses of `key`'s shard in `list`, and its members ranked best
+    /// first.
+    fn shard_of(list: &mut BackendList, key: u64) -> Vec<SocketAddr> {
+        assert!(list.compute_shard(Some(key)), "the list must shard");
+        let mut ranked: Vec<(f64, SocketAddr)> = list
+            .shard
+            .iter()
+            .map(|&index| {
+                let backend = list.backends[index].borrow();
+                (hrw_score(key, &backend), backend.address)
+            })
+            .collect();
+        ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+        ranked.into_iter().map(|(_, address)| address).collect()
+    }
+
+    /// #524: a shard is the top `k` of the key's HRW ranking over every
+    /// primary backend — the same backends whatever their order in the list,
+    /// on every call.
+    #[test]
+    fn a_shard_is_the_top_of_the_hrw_ranking() {
+        let unweighted_list = || {
+            sharded_list(
+                12,
+                LoadBalancingAlgorithms::RoundRobin,
+                sharding(25, 8, ShardMode::Fallback),
+            )
+        };
+        let mut unweighted = unweighted_list();
+        // The same backends with non-uniform weights: the ranking is the
+        // weighted HRW score, so heavier backends rank higher more often.
+        let mut weighted = unweighted_list();
+        for (index, backend) in weighted.backends.iter().enumerate() {
+            backend.borrow_mut().load_balancing_parameters = Some(LoadBalancingParams {
+                weight: 10 + 90 * (index as i32 % 4),
+            });
+        }
+        let mut weights_moved_a_shard = false;
+        for list in [&mut unweighted, &mut weighted] {
+            for key in 0..64u64 {
+                let shard = shard_of(list, key);
+                assert_eq!(shard.len(), 3, "25% of 12 backends is a shard of 3");
+                assert_eq!(shard, shard_of(list, key), "a shard is deterministic");
+                let mut everyone: Vec<(f64, SocketAddr)> = list
+                    .backends
+                    .iter()
+                    .map(|backend| {
+                        let backend = backend.borrow();
+                        (hrw_score(key, &backend), backend.address)
+                    })
+                    .collect();
+                everyone.sort_by(|a, b| b.0.total_cmp(&a.0));
+                let top: Vec<SocketAddr> = everyone.iter().take(3).map(|(_, a)| *a).collect();
+                assert_eq!(shard, top, "key {key}: the shard is the HRW top 3");
+            }
+        }
+        for key in 0..64u64 {
+            weights_moved_a_shard |= shard_of(&mut unweighted, key) != shard_of(&mut weighted, key);
+        }
+        assert!(
+            weights_moved_a_shard,
+            "the weighted ranking must differ from the unweighted one for some key"
+        );
+    }
+
+    /// #524: a change of N moves a client only at the tail of its ranking.
+    /// Adding a backend with k unchanged replaces at most the lowest-ranked
+    /// member; adding one that makes k grow keeps every member; removing a
+    /// non-member changes nothing, and removing a member keeps the others.
+    ///
+    /// TO SEE THIS RED: rank by list position instead of HRW score in
+    /// `BackendList::compute_shard`; adding a backend then reshuffles shards
+    /// that should not move.
+    #[test]
+    fn a_shard_changes_only_at_its_tail_when_backends_change() {
+        let now = Instant::now();
+        let extra = |port: u16| {
+            Backend::new_at(
+                &format!("extra-{port}"),
+                SocketAddr::from(([127, 0, 0, 1], port)),
+                None,
+                None,
+                None,
+                now,
+            )
+        };
+        for key in 0..128u64 {
+            // 10% of 10 and of 11 both give k = max(2, ceil(1.0 | 1.1)) = 2,
+            // so k stays 2 across the add.
+            let mut list = sharded_list(
+                10,
+                LoadBalancingAlgorithms::RoundRobin,
+                sharding(10, 8, ShardMode::Fallback),
+            );
+            let before = shard_of(&mut list, key);
+            list.add_backend(extra(21_000));
+            let after = shard_of(&mut list, key);
+            let lost: Vec<_> = before.iter().filter(|a| !after.contains(a)).collect();
+            assert!(lost.len() <= 1, "key {key}: at most one member displaced");
+            if let Some(lost) = lost.first() {
+                assert_eq!(
+                    Some(*lost),
+                    before.last(),
+                    "key {key}: only the lowest-ranked member may be displaced"
+                );
+            }
+
+            // k grows with N: every member stays.
+            let mut list = sharded_list(
+                10,
+                LoadBalancingAlgorithms::RoundRobin,
+                sharding(20, 8, ShardMode::Fallback),
+            );
+            let before = shard_of(&mut list, key);
+            list.add_backend(extra(21_001));
+            let after = shard_of(&mut list, key);
+            assert_eq!((before.len(), after.len()), (2, 3));
+            assert!(
+                before.iter().all(|a| after.contains(a)),
+                "key {key}: a growing shard keeps its members"
+            );
+
+            // Removing a non-member changes nothing; removing a member keeps
+            // the others.
+            let mut list = sharded_list(
+                10,
+                LoadBalancingAlgorithms::RoundRobin,
+                sharding(20, 8, ShardMode::Fallback),
+            );
+            let before = shard_of(&mut list, key);
+            let outsider = list
+                .backends
+                .iter()
+                .map(|b| b.borrow().address)
+                .find(|a| !before.contains(a))
+                .expect("a shard of 2 among 10 leaves outsiders");
+            list.remove_backend(&outsider);
+            assert_eq!(shard_of(&mut list, key), before, "key {key}");
+            list.remove_backend(&before[0]);
+            assert!(
+                shard_of(&mut list, key).contains(&before[1]),
+                "key {key}: removing one member keeps the other"
+            );
+        }
+    }
+
+    /// #524: every selection of a keyed client stays in its shard, under a
+    /// policy that would otherwise visit every backend.
+    #[test]
+    fn a_sharded_selection_stays_in_the_shard() {
+        let now = Instant::now();
+        for policy in [
+            LoadBalancingAlgorithms::RoundRobin,
+            LoadBalancingAlgorithms::LeastLoaded,
+            LoadBalancingAlgorithms::Random,
+            LoadBalancingAlgorithms::Hrw,
+        ] {
+            let mut list = sharded_list(8, policy, sharding(25, 8, ShardMode::Fallback));
+            for key in 0..32u64 {
+                let shard = shard_of(&mut list, key);
+                for _ in 0..8 {
+                    let (picked, outcome) = list.select_with_key(Some(key), now);
+                    let picked = picked.expect("a healthy shard selects").borrow().address;
+                    assert_eq!(outcome, ShardOutcome::InShard);
+                    assert!(
+                        shard.contains(&picked),
+                        "{policy:?} key {key}: {picked} is outside {shard:?}"
+                    );
+                }
+            }
+            // No key, or fewer primaries than the threshold: not sharded.
+            assert_eq!(list.select_with_key(None, now).1, ShardOutcome::Unsharded);
+            let mut small = sharded_list(7, policy, sharding(25, 8, ShardMode::Fallback));
+            assert_eq!(
+                small.select_with_key(Some(1), now).1,
+                ShardOutcome::Unsharded
+            );
+        }
+    }
+
+    /// Put every member of `key`'s shard out of selection, as a failed
+    /// connection does: its retry policy enters its back-off window.
+    fn fail_shard(list: &mut BackendList, key: u64) -> Vec<SocketAddr> {
+        let shard = shard_of(list, key);
+        let now = Instant::now();
+        for backend in &list.backends {
+            let mut backend = backend.borrow_mut();
+            if shard.contains(&backend.address) {
+                backend.retry_policy.fail(now, &mut rand::rng());
+            }
+        }
+        shard
+    }
+
+    /// #524: with its whole shard down, `STRICT` selects nothing although the
+    /// rest of the cluster is healthy, and `FALLBACK` spills over to a backend
+    /// outside the shard.
+    ///
+    /// TO SEE THIS RED: in `BackendList::select_with_key`, spill over in both
+    /// modes (drop the `strict` early return); the strict selection then
+    /// finds a backend outside the shard.
+    #[test]
+    fn an_exhausted_shard_refuses_in_strict_and_spills_in_fallback() {
+        let now = Instant::now();
+        for key in 0..32u64 {
+            let mut strict = sharded_list(
+                8,
+                LoadBalancingAlgorithms::RoundRobin,
+                sharding(25, 8, ShardMode::Strict),
+            );
+            fail_shard(&mut strict, key);
+            let (picked, outcome) = strict.select_with_key(Some(key), now);
+            assert!(picked.is_none(), "key {key}: strict never leaves the shard");
+            assert_eq!(outcome, ShardOutcome::Exhausted);
+
+            let mut fallback = sharded_list(
+                8,
+                LoadBalancingAlgorithms::RoundRobin,
+                sharding(25, 8, ShardMode::Fallback),
+            );
+            let shard = fail_shard(&mut fallback, key);
+            let (picked, outcome) = fallback.select_with_key(Some(key), now);
+            let picked = picked.expect("fallback spills over").borrow().address;
+            assert_eq!(outcome, ShardOutcome::SpilledOver);
+            assert!(
+                !shard.contains(&picked),
+                "key {key}: the spill leaves the shard"
+            );
+        }
+    }
+
+    /// #524: a strict shard fails open inside itself only. When no backend of
+    /// the whole cluster passes its health check (the fail-open regime), a
+    /// strict selection still picks a shard member.
+    #[test]
+    fn a_strict_shard_fails_open_inside_itself() {
+        let now = Instant::now();
+        for key in 0..16u64 {
+            let mut list = sharded_list(
+                8,
+                LoadBalancingAlgorithms::RoundRobin,
+                sharding(25, 8, ShardMode::Strict),
+            );
+            let shard = shard_of(&mut list, key);
+            for backend in &list.backends {
+                backend.borrow_mut().health.status = HealthStatus::Unhealthy;
+            }
+            let (picked, outcome) = list.select_with_key(Some(key), now);
+            let picked = picked.expect("fail-open still routes").borrow().address;
+            assert!(
+                shard.contains(&picked),
+                "key {key}: fail-open stays in the shard"
+            );
+            assert_eq!(outcome, ShardOutcome::InShard);
+        }
+    }
+
+    /// Fail every member of `key`'s shard by health check, as a probe does:
+    /// they stay `Normal` with an `OKAY` retry policy, so fail-open may still
+    /// pick them.
+    fn unhealthy_shard(list: &mut BackendList, key: u64) -> Vec<SocketAddr> {
+        let shard = shard_of(list, key);
+        for backend in &list.backends {
+            let mut backend = backend.borrow_mut();
+            if shard.contains(&backend.address) {
+                backend.health.status = HealthStatus::Unhealthy;
+            }
+        }
+        shard
+    }
+
+    /// #524 review L3: `STRICT` refuses when its shard fails its health
+    /// checks while primary backends outside it are healthy — the fail-open
+    /// regime is not reached, because the cluster is not all down.
+    ///
+    /// TO SEE THIS RED: make the `primaries_can_open` guard of
+    /// `BackendList::select_with_key` false; the strict shard then fails open
+    /// and picks one of its unhealthy members.
+    #[test]
+    fn a_strict_shard_failing_health_checks_refuses_while_others_are_healthy() {
+        let now = Instant::now();
+        for key in 0..32u64 {
+            let mut list = sharded_list(
+                8,
+                LoadBalancingAlgorithms::RoundRobin,
+                sharding(25, 8, ShardMode::Strict),
+            );
+            unhealthy_shard(&mut list, key);
+            let (picked, outcome) = list.select_with_key(Some(key), now);
+            assert!(
+                picked.is_none(),
+                "key {key}: strict must refuse, not fail open"
+            );
+            assert_eq!(outcome, ShardOutcome::Exhausted);
+        }
+    }
+
+    /// #524 review M1: backups sit outside every shard, so a healthy backup
+    /// must not decide a strict shard's fate. With every primary failing its
+    /// health checks, a strict shard fails open inside itself whether or not
+    /// a backup is healthy.
+    ///
+    /// TO SEE THIS RED: count the backup tier in `primaries_can_open`
+    /// (`available != 0 || <any backup can open>`); the healthy backup then
+    /// turns the fail-open into a refusal.
+    #[test]
+    fn a_healthy_backup_does_not_turn_a_strict_fail_open_into_a_refusal() {
+        let now = Instant::now();
+        for key in 0..32u64 {
+            let mut list = sharded_list(
+                8,
+                LoadBalancingAlgorithms::RoundRobin,
+                sharding(25, 8, ShardMode::Strict),
+            );
+            let shard = shard_of(&mut list, key);
+            for backend in &list.backends {
+                backend.borrow_mut().health.status = HealthStatus::Unhealthy;
+            }
+            list.add_backend(Backend::new_at(
+                "healthy-backup",
+                SocketAddr::from(([127, 0, 0, 1], 23_000)),
+                None,
+                None,
+                Some(true),
+                now,
+            ));
+            let (picked, outcome) = list.select_with_key(Some(key), now);
+            let picked = picked
+                .expect("a strict shard fails open inside itself")
+                .borrow()
+                .address;
+            assert!(
+                shard.contains(&picked),
+                "key {key}: never the backup, never outside"
+            );
+            assert_eq!(outcome, ShardOutcome::InShard);
+        }
+    }
+
+    /// #524 review L2: in `FALLBACK`, fail-open over the whole cluster can
+    /// pick a member of the exhausted shard; that pick stayed in the shard
+    /// and must not count as a spill-over.
+    ///
+    /// TO SEE THIS RED: drop the `settle_spill_outcome` call after the
+    /// fail-open pick in `BackendList::select_with_key`; an in-shard pick is
+    /// then reported `SpilledOver`.
+    #[test]
+    fn a_fallback_fail_open_pick_inside_the_shard_is_not_a_spill_over() {
+        let now = Instant::now();
+        let key = 3;
+        let mut list = sharded_list(
+            8,
+            LoadBalancingAlgorithms::RoundRobin,
+            sharding(25, 8, ShardMode::Fallback),
+        );
+        let shard = shard_of(&mut list, key);
+        for backend in &list.backends {
+            backend.borrow_mut().health.status = HealthStatus::Unhealthy;
+        }
+        let (mut in_shard, mut outside) = (0, 0);
+        // Round-robin over the fail-open set visits every backend in 8 picks.
+        for _ in 0..8 {
+            let (picked, outcome) = list.select_with_key(Some(key), now);
+            let picked = picked.expect("fail-open routes").borrow().address;
+            if shard.contains(&picked) {
+                assert_eq!(outcome, ShardOutcome::InShard, "{picked} is a shard member");
+                in_shard += 1;
+            } else {
+                assert_eq!(outcome, ShardOutcome::SpilledOver, "{picked} is outside");
+                outside += 1;
+            }
+        }
+        assert_eq!(
+            (in_shard, outside),
+            (2, 6),
+            "round-robin visits every backend once"
+        );
+    }
+
+    /// #524: a sticky cookie naming a live backend wins, even outside the
+    /// client's shard.
+    #[test]
+    fn a_sticky_backend_outside_the_shard_wins() {
+        let now = Instant::now();
+        let key = 7;
+        let mut map = BackendMap::with_seed(524);
+        map.set_load_balancing_policy_for_cluster(
+            "sharded",
+            LoadBalancingAlgorithms::RoundRobin,
+            None,
+        );
+        for index in 0..8u16 {
+            map.add_backend(
+                "sharded",
+                Backend::new_at(
+                    &format!("shard-{index}"),
+                    SocketAddr::from(([127, 0, 0, 1], 22_000 + index)),
+                    Some(format!("sticky-{index}")),
+                    None,
+                    None,
+                    now,
+                ),
+            );
+        }
+        map.set_shuffle_sharding_for_cluster("sharded", sharding(25, 8, ShardMode::Strict));
+        let list = map.backends.get_mut("sharded").expect("the cluster exists");
+        let shard = shard_of(list, key);
+        let outsider = list
+            .backends
+            .iter()
+            .find(|b| !shard.contains(&b.borrow().address))
+            .map(|b| {
+                b.borrow()
+                    .sticky_id
+                    .clone()
+                    .expect("every backend has a sticky id")
+            })
+            .expect("a shard of 2 among 8 leaves outsiders");
+        let reserved = map
+            .reserve_sticky_backend("sharded", &outsider, Some(key), now)
+            .expect("the sticky backend is live");
+        assert_eq!(
+            reserved.borrow().sticky_id.as_deref(),
+            Some(outsider.as_str())
+        );
+        assert!(!shard.contains(&reserved.borrow().address));
+    }
+
+    /// #524: a sharded selection allocates nothing: the scores, the shard and
+    /// the candidates live in buffers `add_backend` reserved.
+    ///
+    /// TO SEE THIS RED: collect the shard into a fresh `Vec` in
+    /// `BackendList::compute_shard`; each selection then allocates.
+    #[test]
+    fn a_sharded_selection_allocates_nothing() {
+        use std::hint::black_box;
+
+        use crate::test_allocations::allocations;
+
+        let now = Instant::now();
+        let mut list = sharded_list(
+            16,
+            LoadBalancingAlgorithms::LeastLoaded,
+            sharding(25, 8, ShardMode::Fallback),
+        );
+        // Warm-up: the first selection may settle lazily built policy state.
+        drop(list.select_with_key(Some(0), now));
+        let mut allocated = 0;
+        for key in 0..256u64 {
+            let before = allocations();
+            let picked = black_box(&mut list).select_with_key(black_box(Some(key)), now);
+            allocated += allocations() - before;
+            assert_eq!(picked.1, ShardOutcome::InShard);
+        }
+        assert_eq!(
+            allocated, 0,
+            "256 sharded selections made {allocated} allocations"
         );
     }
 }

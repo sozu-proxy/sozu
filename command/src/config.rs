@@ -69,9 +69,9 @@ use crate::{
         LoadBalancingParams, LoadMetric, MetricDetail, MetricsConfiguration, PathRule,
         ProtobufAccessLogFormat, ProxyProtocolConfig, RedirectPolicy, RedirectScheme, Request,
         RequestHttpFrontend, RequestTcpFrontend, RequestUdpFrontend, RulePosition, ServerConfig,
-        ServerMetricsConfig, SocketAddress, TcpListenerConfig, TlsVersion, UdpAffinityKey,
-        UdpClusterConfig, UdpHealthConfig, UdpHealthMode, UdpListenerConfig, WorkerRequest,
-        request::RequestType,
+        ServerMetricsConfig, ShardMode, SocketAddress, TcpListenerConfig, TlsVersion,
+        UdpAffinityKey, UdpClusterConfig, UdpHealthConfig, UdpHealthMode, UdpListenerConfig,
+        WorkerRequest, request::RequestType,
     },
 };
 
@@ -363,6 +363,12 @@ pub enum ConfigError {
     /// [`validate_affinity_key`], or is set on a TCP cluster.
     #[error("cluster {cluster_id}: {reason}")]
     InvalidAffinityKey {
+        cluster_id: String,
+        reason: &'static str,
+    },
+    /// A cluster's shuffle-sharding knobs break [`validate_shuffle_sharding`].
+    #[error("cluster {cluster_id}: {reason}")]
+    InvalidShuffleSharding {
         cluster_id: String,
         reason: &'static str,
     },
@@ -2558,6 +2564,43 @@ pub fn validate_affinity_key(
     }
 }
 
+/// Default `shard_min_backends`: the reference fleet of *Workload isolation
+/// using shuffle sharding* (Colm MacCárthaigh, Amazon Builders' Library,
+/// 2019), eight workers in shards of two. Below it the combinations are too
+/// few to isolate anything: with four backends in shards of two, six shards
+/// exist and nearly every pair of clients overlaps.
+pub const DEFAULT_SHARD_MIN_BACKENDS: u32 = 8;
+
+/// Validate a cluster's shuffle-sharding knobs (sozu-proxy/sozu#524).
+///
+/// `shard_percent` turns sharding on and must lie in `1..=100`;
+/// `shard_min_backends` must be at least 2, the smallest shard; and
+/// `shard_min_backends` or `shard_mode` without `shard_percent` is refused
+/// rather than silently inert. Called at config load and on every
+/// `AddCluster`.
+pub fn validate_shuffle_sharding(
+    shard_percent: Option<u32>,
+    shard_min_backends: Option<u32>,
+    shard_mode: Option<i32>,
+) -> Result<(), &'static str> {
+    let Some(percent) = shard_percent else {
+        if shard_min_backends.is_some() || shard_mode.is_some() {
+            return Err("shard_min_backends and shard_mode require shard_percent");
+        }
+        return Ok(());
+    };
+    if !(1..=100).contains(&percent) {
+        return Err("shard_percent must lie in 1..=100");
+    }
+    if shard_min_backends.is_some_and(|minimum| minimum < 2) {
+        return Err("shard_min_backends must be at least 2, the smallest shard");
+    }
+    if shard_mode.is_some_and(|mode| ShardMode::try_from(mode).is_err()) {
+        return Err("shard_mode must be FALLBACK or STRICT");
+    }
+    Ok(())
+}
+
 /// Validate a [`HealthCheckConfig`] for the rules every layer relies on:
 /// strict positive thresholds and a URI that cannot smuggle a second
 /// HTTP message on the wire (RFC 9110 §5.1 — request-target). Used by
@@ -2694,6 +2737,20 @@ pub struct FileClusterConfig {
     /// Same as `affinity_header`, on the value of this request cookie.
     #[serde(default)]
     pub affinity_cookie: Option<String>,
+    /// Shuffle sharding: restrict each client to a shard of
+    /// `max(2, ceil(shard_percent × N / 100))` of the cluster's N primary
+    /// backends, the top of the rendezvous ranking of its affinity key.
+    /// Off when unset. See [`validate_shuffle_sharding`].
+    #[serde(default)]
+    pub shard_percent: Option<u32>,
+    /// Sharding applies only from this many primary backends; defaults to
+    /// [`DEFAULT_SHARD_MIN_BACKENDS`].
+    #[serde(default)]
+    pub shard_min_backends: Option<u32>,
+    /// `FALLBACK` (default) spills an exhausted shard over to the rest of the
+    /// cluster; `STRICT` refuses.
+    #[serde(default)]
+    pub shard_mode: Option<ShardMode>,
 }
 
 /// UDP backend health-check configuration, parsed from
@@ -2789,6 +2846,15 @@ impl FileClusterConfig {
             self.affinity_cookie.as_deref(),
         )
         .map_err(|reason| ConfigError::InvalidAffinityKey {
+            cluster_id: cluster_id.to_owned(),
+            reason,
+        })?;
+        validate_shuffle_sharding(
+            self.shard_percent,
+            self.shard_min_backends,
+            self.shard_mode.map(|mode| mode as i32),
+        )
+        .map_err(|reason| ConfigError::InvalidShuffleSharding {
             cluster_id: cluster_id.to_owned(),
             reason,
         })?;
@@ -2888,6 +2954,9 @@ impl FileClusterConfig {
                     retry_after: self.retry_after,
                     health_check: self.health_check.as_ref().map(|hc| hc.to_proto()),
                     udp,
+                    shard_percent: self.shard_percent,
+                    shard_min_backends: self.shard_min_backends,
+                    shard_mode: self.shard_mode,
                 }))
             }
             FileClusterProtocolConfig::Http => {
@@ -2941,6 +3010,9 @@ impl FileClusterConfig {
                     udp,
                     affinity_header: self.affinity_header,
                     affinity_cookie: self.affinity_cookie,
+                    shard_percent: self.shard_percent,
+                    shard_min_backends: self.shard_min_backends,
+                    shard_mode: self.shard_mode,
                 }))
             }
         }
@@ -3168,6 +3240,16 @@ pub struct HttpClusterConfig {
     /// [`FileClusterConfig::affinity_cookie`].
     #[serde(default)]
     pub affinity_cookie: Option<String>,
+    /// Shuffle-sharding share of the backends. See
+    /// [`FileClusterConfig::shard_percent`].
+    #[serde(default)]
+    pub shard_percent: Option<u32>,
+    /// See [`FileClusterConfig::shard_min_backends`].
+    #[serde(default)]
+    pub shard_min_backends: Option<u32>,
+    /// See [`FileClusterConfig::shard_mode`].
+    #[serde(default)]
+    pub shard_mode: Option<ShardMode>,
 }
 
 impl HttpClusterConfig {
@@ -3193,6 +3275,9 @@ impl HttpClusterConfig {
                 udp: self.udp.clone(),
                 affinity_header: self.affinity_header.clone(),
                 affinity_cookie: self.affinity_cookie.clone(),
+                shard_percent: self.shard_percent,
+                shard_min_backends: self.shard_min_backends,
+                shard_mode: self.shard_mode.map(|mode| mode as i32),
             })
             .into(),
         ];
@@ -3311,6 +3396,16 @@ pub struct TcpClusterConfig {
     /// `[clusters.<id>.udp]` block on this cluster.
     #[serde(default)]
     pub udp: Option<UdpClusterConfig>,
+    /// Shuffle-sharding share of the backends. See
+    /// [`FileClusterConfig::shard_percent`].
+    #[serde(default)]
+    pub shard_percent: Option<u32>,
+    /// See [`FileClusterConfig::shard_min_backends`].
+    #[serde(default)]
+    pub shard_min_backends: Option<u32>,
+    /// See [`FileClusterConfig::shard_mode`].
+    #[serde(default)]
+    pub shard_mode: Option<ShardMode>,
 }
 
 impl TcpClusterConfig {
@@ -3337,6 +3432,9 @@ impl TcpClusterConfig {
                 // A TCP cluster always keys on the source IP.
                 affinity_header: None,
                 affinity_cookie: None,
+                shard_percent: self.shard_percent,
+                shard_min_backends: self.shard_min_backends,
+                shard_mode: self.shard_mode.map(|mode| mode as i32),
             })
             .into(),
         ];
@@ -5406,6 +5504,54 @@ mod tests {
             assert!(
                 validate_affinity_key(None, Some(bad)).is_err(),
                 "cookie {bad:?} must be refused"
+            );
+        }
+    }
+
+    /// #524: shard knobs travel from the TOML file to the `AddCluster`
+    /// order, and an invalid combination is refused at load.
+    #[test]
+    fn shuffle_sharding_reaches_the_add_cluster_order_and_is_validated() {
+        let parse = |extra: &str| -> FileClusterConfig {
+            toml::from_str(&format!(
+                "protocol = \"http\"\nfrontends = []\nbackends = []\n{extra}"
+            ))
+            .expect("the cluster must parse")
+        };
+        let ClusterConfig::Http(http) =
+            parse("shard_percent = 25\nshard_min_backends = 4\nshard_mode = \"STRICT\"\n")
+                .to_cluster_config("sharded", &HashSet::new())
+                .expect("a valid sharded cluster builds")
+        else {
+            panic!("an http cluster must build as one");
+        };
+        let orders = http.generate_requests().expect("the orders must build");
+        let Some(RequestType::AddCluster(cluster)) =
+            orders.first().and_then(|order| order.request_type.as_ref())
+        else {
+            panic!("the orders must lead with an AddCluster");
+        };
+        assert_eq!(
+            (
+                cluster.shard_percent,
+                cluster.shard_min_backends,
+                cluster.shard_mode
+            ),
+            (Some(25), Some(4), Some(ShardMode::Strict as i32))
+        );
+        for bad in [
+            "shard_percent = 0\n",
+            "shard_percent = 101\n",
+            "shard_percent = 25\nshard_min_backends = 1\n",
+            "shard_min_backends = 8\n",
+            "shard_mode = \"STRICT\"\n",
+        ] {
+            assert!(
+                matches!(
+                    parse(bad).to_cluster_config("sharded", &HashSet::new()),
+                    Err(ConfigError::InvalidShuffleSharding { .. })
+                ),
+                "{bad:?} must be refused"
             );
         }
     }

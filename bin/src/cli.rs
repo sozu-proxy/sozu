@@ -553,14 +553,31 @@ pub enum ClusterCmd {
         #[clap(
             long = "affinity-header",
             conflicts_with = "affinity_cookie",
-            help = "With the 'hrw' or 'maglev' policy on an HTTP/HTTPS cluster, pin each client on the value of this request header instead of its source IP. A request without the header is pinned on its source IP."
+            help = "With the 'hrw' or 'maglev' policy on an HTTP/HTTPS cluster, pin each client on the value of this request header instead of its source IP; shuffle sharding (--shard-percent) reads the same key under any policy. A request without the header is keyed on its source IP."
         )]
         affinity_header: Option<String>,
         #[clap(
             long = "affinity-cookie",
-            help = "With the 'hrw' or 'maglev' policy on an HTTP/HTTPS cluster, pin each client on the value of this request cookie instead of its source IP. A request without the cookie is pinned on its source IP."
+            help = "With the 'hrw' or 'maglev' policy on an HTTP/HTTPS cluster, pin each client on the value of this request cookie instead of its source IP; shuffle sharding (--shard-percent) reads the same key under any policy. A request without the cookie is keyed on its source IP."
         )]
         affinity_cookie: Option<String>,
+        #[clap(
+            long = "shard-percent",
+            help = "Shuffle sharding: restrict each client to a shard of max(2, ceil(percent x N / 100)) of the cluster's N primary backends, the top of the rendezvous ranking of its affinity key (1..=100). Off when unset."
+        )]
+        shard_percent: Option<u32>,
+        #[clap(
+            long = "shard-min-backends",
+            requires = "shard_percent",
+            help = "Shard only while the cluster has at least this many primary backends (default 8, at least 2)."
+        )]
+        shard_min_backends: Option<u32>,
+        #[clap(
+            long = "shard-strict",
+            requires = "shard_percent",
+            help = "When no backend of a client's shard can take a connection, refuse (503) instead of spilling over to the rest of the cluster."
+        )]
+        shard_strict: bool,
     },
     #[clap(
         name = "h2",

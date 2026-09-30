@@ -44,6 +44,7 @@ use crate::{
     features::FEATURES,
     health_check::HealthChecker,
     http, https,
+    load_balancing::ShuffleSharding,
     metrics::METRICS,
     pool::Pool,
     tcp,
@@ -2589,6 +2590,16 @@ impl Server {
                     push_queue(worker_response_error(req_id, reason));
                     return;
                 }
+                // Same mirror for the shuffle-sharding knobs (#524): a worker
+                // never arms a shard the master would have refused.
+                if let Err(reason) = sozu_command::config::validate_shuffle_sharding(
+                    cluster.shard_percent,
+                    cluster.shard_min_backends,
+                    cluster.shard_mode,
+                ) {
+                    push_queue(worker_response_error(req_id, reason));
+                    return;
+                }
                 self.add_cluster(cluster);
                 // Re-arm the metric drain tombstone in case this cluster id
                 // was previously removed — without this the drain would
@@ -2746,6 +2757,14 @@ impl Server {
             cluster
                 .load_metric
                 .and_then(|n| LoadMetric::try_from(n).ok()),
+        );
+        backends.set_shuffle_sharding_for_cluster(
+            &cluster.cluster_id,
+            ShuffleSharding::from_cluster(
+                cluster.shard_percent,
+                cluster.shard_min_backends,
+                cluster.shard_mode,
+            ),
         );
         backends.set_health_check_config(&cluster.cluster_id, cluster.health_check.to_owned());
         backends.set_cluster_http2(&cluster.cluster_id, cluster.http2.unwrap_or(false));

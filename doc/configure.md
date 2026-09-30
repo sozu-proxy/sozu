@@ -1038,7 +1038,9 @@ for a cluster that already has a TCP frontend, and an `AddTcpFrontend` joining a
 cluster that names one — and the configuration file refuses either key on a
 `protocol = "tcp"` cluster. Both keys are hot-updatable: re-adding the cluster
 (`AddCluster`) applies the new key source from the next dial. Every other
-policy ignores both and derives no key, so it selects exactly as before.
+policy ignores both and derives no key, so it selects exactly as before —
+unless the cluster is shuffle-sharded (see "Shuffle sharding"), which derives
+the key under every policy to draw the client's shard.
 
 A client header the listener's forwarding or anti-spoofing policy removes
 (`X-Forwarded-For` under a `forwarded_headers` mode that strips the client's
@@ -1072,6 +1074,119 @@ protocol, all clients share one or a few source IPs and so land on one or a few
 backends. Switch those clusters to another policy, enable the PROXY protocol on
 the balancer and the listener, or key them with `affinity_header` /
 `affinity_cookie`.
+
+#### Shuffle sharding
+
+Shuffle sharding isolates clients from one another: each client is served by a
+small **shard** of the cluster's backends instead of all of them, so a client
+that overloads or poisons its backends takes down only the clients whose shard
+lies entirely inside its own. Colm MacCárthaigh's
+[*Workload isolation using shuffle sharding*](https://aws.amazon.com/builders-library/workload-isolation-using-shuffle-sharding/)
+(Amazon Builders' Library, 2019) is the reference: with `N` backends in shards
+of `k` there are `C(N, k)` distinct shards against `N / k` plain partitions —
+eight backends in shards of two give `C(8, 2) = 28` shards instead of 4
+partitions, so any two clients share their whole shard with probability 1/28
+instead of 1/4. The gain grows quickly with `N` and is negligible on small
+clusters, which is why sharding applies only from `shard_min_backends`.
+
+Sōzu takes a client's shard as the top `k` of the
+[rendezvous (HRW) ranking](https://doi.org/10.1109/90.663936) (David Thaler and
+Chinya Ravishankar, *Using name-based mappings to increase hit rates*, IEEE/ACM
+Transactions on Networking, 1998) of its client key — the same key and the same
+weighted score `HRW` uses, see "Client affinity" — over the cluster's
+**configured** primary backends, healthy or not. That makes a shard:
+
+- **the same on every worker and across restarts**, since the key and the
+  ranking are pure functions of the client and the backend addresses. On HTTP,
+  HTTPS and TCP the key hash is Sōzu's own seeded FNV and does not change
+  between builds; on UDP the flow key comes from the standard library's
+  `DefaultHasher`, whose algorithm Rust does not promise to keep across
+  toolchain versions, so a UDP client's shard may move after an upgrade built
+  with another Rust version;
+- **stable**: removing a backend outside a client's shard does not change the
+  shard, and adding one can displace only its lowest-ranked member, so a
+  change of `N` moves clients only at the tail of their ranking;
+- **exhaustible**: a member that goes down does not pull another backend into
+  the shard. Isolation that silently widened under failure would not isolate.
+
+The ranking reads `weight` exactly as `HRW` does, whatever the cluster's policy:
+a heavier backend ranks higher for more keys and so appears in more shards. Its
+share of shards is not proportional to its weight once `k > 1`, though: the
+weight raises its chance of ranking in a client's top `k`, a chance that
+saturates as it approaches every shard.
+
+| key | default | description |
+|---|---|---|
+| `shard_percent` | unset (off) | Share of the primary backends in a shard, `1..=100`: `k = max(2, ceil(shard_percent × N / 100))`, capped at `N`. The floor of 2 keeps a retry possible inside the shard. |
+| `shard_min_backends` | `8` | Shard only while the cluster has at least this many primary backends; below it the cluster selects over all of them, exactly as without sharding. At least 2. |
+| `shard_mode` | `"FALLBACK"` | When no backend of a client's shard can take a connection: `"FALLBACK"` selects over the rest of the cluster (backup tier and fail-open included) and counts `backend.shard.spillover`; `"STRICT"` selects nothing — HTTP answers 503, TCP closes the connection — and counts `backend.shard.exhausted`. |
+
+`shard_min_backends` and `shard_mode` are refused without `shard_percent`, and
+all three are hot-updatable (`AddCluster`), from the next selection. From the
+CLI: `sozu cluster add … --shard-percent 25 [--shard-min-backends 8]
+[--shard-strict]`.
+
+```toml
+[clusters.tenants]
+protocol = "http"
+load_balancing = "LEAST_LOADED"   # picks inside the shard
+shard_percent = 25                # k = 2 on 8 backends, 3 on 12, 5 on 20
+# shard_min_backends = 8
+# shard_mode = "STRICT"
+# affinity_header = "X-Tenant"    # shard tenants rather than source IPs
+```
+
+How it composes with the rest of selection:
+
+- **The cluster's policy picks inside the shard.** Sharding narrows the
+  candidates; `load_balancing` then chooses among them as usual —
+  `LEAST_LOADED` or `POWER_OF_TWO` balance a client over its shard, `HRW` pins
+  it to its shard's top member with the rest of the shard as failover. A
+  sharded cluster derives a client key under every policy, not only `HRW` and
+  `MAGLEV`.
+- **Retries stay in the shard.** A failed connection puts the backend in its
+  back-off window, and the next attempt selects again inside the same shard.
+  Each request has three connection attempts (`CONN_RETRIES`): with a shard of
+  2, a request whose two shard members both refuse spills over (`FALLBACK`) or
+  is answered 503 (`STRICT`) on its third attempt; with a shard of 3 or more,
+  that request exhausts its attempts inside the shard and is answered 503, and
+  the next request, finding the members in back-off, spills over or is
+  refused at once.
+- **A sticky session wins.** On a frontend with `sticky_session`, a cookie
+  naming a live backend is honoured even outside the client's shard; a client
+  without a usable cookie selects inside its shard.
+- **Connection reuse wins.** As for the client key, a request that reuses a
+  backend connection its session already holds follows that connection.
+- **Backups are outside every shard.** The shard is drawn from the primary
+  backends. `FALLBACK` reaches the backup tier only after spilling over.
+  `STRICT` never uses a backup, and backups do not take part in its decision:
+  when no member of the shard can take a connection, `STRICT` refuses if any
+  other **primary** backend could, and otherwise — every primary backend
+  failing its health checks, the fail-open regime of the primary tier — fails
+  open inside the shard, picking a member that is administratively up and out
+  of its back-off window, whether or not a backup is healthy.
+- **No key, no shard.** A request with no source address (and no configured
+  header or cookie) selects over the whole cluster.
+- **Every datapath.** Sharding lives in the cluster's backend list, so a UDP
+  cluster that sets it shards its flows by their flow key too.
+
+**Before enabling it.** Sharding is off unless `shard_percent` is set, so
+upgrading changes nothing by itself. Before setting it:
+
+- **Upgrade the main process and every worker first.** An older worker ignores
+  `Cluster` fields 20–22 (`shard_percent`, `shard_min_backends`, `shard_mode`)
+  and serves the cluster unsharded, so a partially upgraded fleet shards only
+  on its upgraded workers.
+- **Retire older `sozu` CLIs.** An older CLI that patches a cluster by reading
+  it back and re-sending it — `sozu cluster h2 enable|disable`, a
+  `QueryClusterById` → `AddCluster` read-modify-write — does not know the new
+  fields, drops them from the `AddCluster` it sends, and so silently turns
+  sharding off.
+- **Check the client key.** The shard follows it: behind a NAT, or an L4 load
+  balancer that does not send the PROXY protocol, every client shares one
+  source IP and so one shard — every request of the cluster then lands on `k`
+  backends. Enable the PROXY protocol, or key on a header or cookie, before
+  sharding such a cluster.
 
 **The "load reads" column is not the per-request cost of the policy.** Every
 selection, under every policy, first builds the candidate set: Sōzu walks the
@@ -3193,6 +3308,8 @@ Incremented when Sōzu generates a default error response instead of proxying:
 | `backend.down`                      | counter | proxy            | Backend marked as unhealthy (retry policy triggered)                                                                                                                                                                                                                                                                                   |
 | `backend.connections.error`         | counter | proxy            | Backend connection failures                                                                                                                                                                                                                                                                                                            |
 | `backend.connect.retries_exhausted` | counter | cluster, backend | Per-session backend-connect retry budget (`CONN_RETRIES = 3`) was exhausted. Emitted once per event at the TCP, HTTP/1, and HTTP/2-mux gates. Alert on this counter's rate instead of grepping `WARN` / `ERROR` logs — the underlying log line is `warn!` since the condition is peer-driven backpressure, not a Sōzu invariant break. |
+| `backend.shard.spillover`           | counter | cluster          | Shuffle sharding `FALLBACK`: a selection found no backend of the client's shard able to take a connection and chose one outside the shard (a fail-open pick that lands back inside the shard is not counted). See "Shuffle sharding". |
+| `backend.shard.exhausted`           | counter | cluster          | Shuffle sharding `STRICT`: a selection found no backend of the client's shard able to take a connection and chose none (HTTP 503, TCP close, UDP flow not admitted). See "Shuffle sharding". |
 | `backend.retry.stale_upstream`      | counter | cluster, backend | A request written onto a POOLED H1 keep-alive backend connection that then closed without answering was re-issued on a fresh backend instead of being answered `502 Bad Gateway`. Labelled with the **stale** backend — the one that did not answer. One client request can increment this more than once. See "Stale-upstream retry" below, which covers how to read a rate that tracks the request rate. |
 | `backend.retry.captures_armed`      | gauge   | proxy            | Request captures currently armed for a stale-upstream replay, summed over every live stream of this worker. Ceiling 512. To read the capture heap the bound is `2 * gauge * buffer_size`, not `gauge * buffer_size` — the write path grows a capture with `Vec::reserve`, so a multi-write capture can allocate twice what it carries. See "Capture budget" below. |
 | `backend.retry.captures_declined`   | counter | proxy            | An idempotent request written onto a pooled keep-alive upstream was not captured because 512 captures were already armed on this worker. Nothing was refused: the request proceeds un-replayable, and answers normally unless its upstream turns out to be stale. An **upper bound on lost retries, not a count of them** — most declined requests never needed the capture. Compare against `backend.retry.stale_upstream` before reading anything into its rate. Non-idempotent requests are never captured, so they never appear here. Only moves while `backend.retry.captures_armed` sits at the ceiling. |

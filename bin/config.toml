@@ -593,6 +593,16 @@ load_balancing = "ROUND_ROBIN"
 # on its source IP. At most one of the two; refused on a TCP cluster.
 # affinity_header = "X-Tenant"
 # affinity_cookie = "tenant"
+# Shuffle sharding (off when unset): serve each client from a shard of
+# max(2, ceil(shard_percent x N / 100)) of the N primary backends, the top of
+# the HRW ranking of its key (source IP, or the header/cookie above). The
+# load_balancing policy picks inside the shard. Applies from
+# shard_min_backends (default 8) backends. shard_mode "FALLBACK" (default)
+# spills an exhausted shard over to the rest of the cluster, "STRICT" refuses
+# (503). See "Shuffle sharding" in doc/configure.md.
+# shard_percent = 25
+# shard_min_backends = 8
+# shard_mode = "FALLBACK"
 
 # frontends configuration
 # this specifies which listeners; domains, certificates that will be configured for a cluster

@@ -545,6 +545,16 @@ impl ConfigState {
                 reason,
             });
         }
+        if let Err(reason) = crate::config::validate_shuffle_sharding(
+            cluster.shard_percent,
+            cluster.shard_min_backends,
+            cluster.shard_mode,
+        ) {
+            return Err(StateError::InvalidValue {
+                field: "shuffle_sharding",
+                reason,
+            });
+        }
         // A TCP session has no request to read a header or a cookie from and
         // always keys on the source IP, so a cluster serving TCP frontends
         // may not name one: the configuration would claim a key the proxy
@@ -6387,6 +6397,56 @@ mod tests {
             "unexpected error: {err:?}"
         );
         assert_eq!(state.clusters["tcp"].affinity_header, None);
+    }
+
+    #[test]
+    fn add_cluster_with_invalid_shuffle_sharding_rejected() {
+        for (percent, minimum, mode) in [
+            (Some(0), None, None),
+            (Some(101), None, None),
+            (Some(50), Some(1), None),
+            (None, Some(8), None),
+            (None, None, Some(1)),
+            (Some(50), None, Some(7)),
+        ] {
+            let mut state = ConfigState::new();
+            let err = state
+                .dispatch(
+                    &RequestType::AddCluster(Cluster {
+                        cluster_id: String::from("sharded"),
+                        shard_percent: percent,
+                        shard_min_backends: minimum,
+                        shard_mode: mode,
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect_err("invalid shuffle sharding must be refused");
+            assert!(
+                matches!(
+                    err,
+                    StateError::InvalidValue {
+                        field: "shuffle_sharding",
+                        ..
+                    }
+                ),
+                "({percent:?}, {minimum:?}, {mode:?}): unexpected error {err:?}"
+            );
+            assert!(state.clusters.is_empty());
+        }
+        let mut state = ConfigState::new();
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("sharded"),
+                    shard_percent: Some(25),
+                    shard_min_backends: Some(4),
+                    shard_mode: Some(1),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("a valid sharded cluster is accepted");
     }
 
     #[test]
