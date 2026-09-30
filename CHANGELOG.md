@@ -6293,6 +6293,36 @@
 
 ### 🔐 Security
 
+- **`fix(h1)`: chunked request trailers drop the fields RFC 9110 §6.5.1 keeps out of trailers,
+  and are bounded ([#1701](https://github.com/sozu-proxy/sozu/issues/1701)).** After #1689 the H1
+  frontend still forwarded every other trailer field verbatim, including framing, routing and
+  authentication fields such as `Content-Length`, `Transfer-Encoding`, `Host` or `Authorization`,
+  which a backend merging trailers into its header view would act on although the client could
+  not set them in the header section; and nothing but the buffer bounded the number of trailer
+  fields, whereas H2 caps a trailer block at `h2_max_header_fields`. The #1689 trailer filter,
+  now the method `HttpContext::filter_request_trailers` (`lib/src/protocol/kawa_h1/editor.rs`),
+  also elides, in any case, the 25 names of the new
+  `TRAILER_FORBIDDEN_FIELDS`: framing (`Content-Length`, `Transfer-Encoding`), routing (`Host`),
+  request modifiers (`Cache-Control`, `Expect`, `Max-Forwards`, `Pragma`, `Range`, `TE`,
+  `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, `If-Range`),
+  authentication (`Authorization`, `Proxy-Authorization`, `Cookie`), content processing
+  (`Content-Encoding`, `Content-Type`, `Content-Range`, `Trailer`) and the connection-specific
+  `Connection`, `Keep-Alive`, `Proxy-Connection` and `Upgrade` (RFC 9110 §7.6.1). The names are
+  the examples RFC 7230 §4.1.2 gave for each category RFC 9110 §6.5.1 lists. They are elided
+  rather than refused, as RFC 7230 §4.1.2 ("MUST ignore (or consider as an error)") and RFC 9112
+  §7.1.2 ("MAY selectively retain or discard") allow, so the request, whose head and body the
+  backend may already hold, is still forwarded. Each elided field increments the new
+  `http.trailer.forbidden_field_elided` counter. A trailer section is also bounded by the
+  listener's `h2_max_header_fields` (128 by default), elided fields included, as on the H2 path:
+  the field over the bound is never forwarded, the request is answered 400 (or its response cut
+  if the backend already started it), and `http.trailer.field_limit_exceeded` is incremented. The
+  count runs across reads and is reset for each pipelined request. The advisory `Trailer` request
+  header is forwarded as sent: RFC 9110 §6.6.2 makes it a hint. The walk still covers only the
+  blocks the last parse appended, and a request without a trailer section returns before any
+  block is read and allocates nothing. The H2 frontend is unchanged. Documented in
+  `lib/src/protocol/kawa_h1/LIFECYCLE.md` §2.3 and `doc/configure.md`. Covered by four new
+  `editor.rs` unit tests and seven new e2e tests in `e2e/src/tests/h1_security_tests.rs`.
+
 - **`fix(h1)`: chunked request trailers can no longer carry spoofed forwarding headers
   ([#1689](https://github.com/sozu-proxy/sozu/issues/1689)).** kawa's H1 parser pushes the
   trailer fields of a chunked request after its last chunk with no callback, so
@@ -6300,7 +6330,7 @@
   HTTP/1.1 client could append `X-Forwarded-For: 6.6.6.6`, `Forwarded: for=6.6.6.6` or
   `X-Real-IP: 6.6.6.6` to its body and hand a forged client address to any backend that merges
   trailers into its header view (CWE-348). RFC 9110 §6.5.1 forbids trailers from carrying such
-  fields. The new `elide_request_trailer_spoof_vectors` (`lib/src/protocol/kawa_h1/editor.rs`)
+  fields. A new trailer filter, `HttpContext::filter_request_trailers` since #1701 (`lib/src/protocol/kawa_h1/editor.rs`),
   runs after each frontend `kawa::h1::parse` in `ConnectionH1` and elides, in any case,
   `X-Real-IP`, `X-Forwarded-For`, `Forwarded`, `X-Request-Id`, `X-Forwarded-Proto`,
   `X-Forwarded-Port` and `X-Forwarded-Host` from the trailer section, whether it arrives with the
