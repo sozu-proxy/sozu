@@ -309,6 +309,10 @@ pub mod http {
     pub const E2E_H2: &str = "http.e2e.h2";
     pub const E2E_HTTP11: &str = "http.e2e.http11";
     pub const EARLY_RESPONSE_CLOSE: &str = "http.early_response_close";
+    /// H1 client connections closed because a response completed before its
+    /// request was received whole (a backend answering an upload early): the
+    /// rest of the body is never read as a request (sozu-proxy/sozu#1721).
+    pub const CLOSE_REQUEST_INCOMPLETE: &str = "http.close.request_incomplete";
     pub const FAILED_BACKEND_MATCHING: &str = "http.failed_backend_matching";
     /// Client `Forwarded` lines removed because their value is not a
     /// well-formed RFC 7239 §4 list, counted once per removed line. Only the
