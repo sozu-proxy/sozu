@@ -989,49 +989,6 @@ impl BackendMap {
         Ok((backend_id, address))
     }
 
-    /// Connect to the backend of `cluster_id` that `sticky_session` names, at
-    /// `now`, falling back to [`Self::backend_from_cluster_id`] under the
-    /// client's affinity `key`.
-    ///
-    /// A cookie naming a live backend wins over the key: the key only decides
-    /// where a client without a usable cookie lands.
-    pub fn backend_from_sticky_session(
-        &mut self,
-        cluster_id: &str,
-        sticky_session: &str,
-        key: Option<u64>,
-        now: Instant,
-    ) -> Result<(Rc<RefCell<Backend>>, TcpStream), BackendError> {
-        let rng = &mut self.rng;
-        let sticky_conn = self
-            .backends
-            .get_mut(cluster_id)
-            .and_then(|cluster_backends| cluster_backends.find_sticky(sticky_session, now))
-            .map(|backend| {
-                let mut borrowed = backend.borrow_mut();
-                let conn = borrowed.try_connect(now, rng);
-
-                conn.map(|tcp_stream| (backend.clone(), tcp_stream))
-                    .inspect_err(|_| {
-                        error!(
-                            "could not connect {} to {:?} using session {} ({} failures)",
-                            cluster_id, borrowed.address, sticky_session, borrowed.failures
-                        )
-                    })
-            });
-
-        match sticky_conn {
-            Some(backend_and_stream) => backend_and_stream,
-            None => {
-                debug!(
-                    "Couldn't find a backend corresponding to sticky_session {} for cluster {}",
-                    sticky_session, cluster_id
-                );
-                self.backend_from_cluster_id(cluster_id, key, now)
-            }
-        }
-    }
-
     pub fn set_load_balancing_policy_for_cluster(
         &mut self,
         cluster_id: &str,
@@ -1574,47 +1531,31 @@ mod backends_test {
         let cluster_id = "mycluster";
         let sticky_session = "server-2";
 
-        let (sender, receiver) = channel();
-        let backend_addr = run_mock_tcp_server(receiver);
+        for (index, port) in [(1u16, 9001u16), (2, 9000), (3, 9002)] {
+            backend_map.add_backend(
+                cluster_id,
+                Backend::new(
+                    &format!("{cluster_id}-{index}"),
+                    SocketAddr::from(([127, 0, 0, 1], port)),
+                    Some(format!("server-{index}")),
+                    None,
+                    None,
+                ),
+            );
+        }
 
-        backend_map.add_backend(
-            cluster_id,
-            Backend::new(
-                &format!("{cluster_id}-1"),
-                "127.0.0.1:9001".parse().unwrap(),
-                Some("server-1".to_string()),
-                None,
-                None,
-            ),
+        let backend = backend_map
+            .reserve_sticky_backend(cluster_id, sticky_session, None, Instant::now())
+            .expect("the backend the sticky session names can take a connection");
+        let backend = backend.borrow();
+        assert_eq!(
+            backend.backend_id, "mycluster-2",
+            "a sticky session must reach the backend it names"
         );
-        backend_map.add_backend(
-            cluster_id,
-            Backend::new(
-                &format!("{cluster_id}-2"),
-                "127.0.0.1:9000".parse().unwrap(),
-                Some("server-2".to_string()),
-                None,
-                None,
-            ),
+        assert_eq!(
+            backend.active_connections, 1,
+            "reaching it reserves a connection"
         );
-        // sticky backend
-        backend_map.add_backend(
-            cluster_id,
-            Backend::new(
-                &format!("{cluster_id}-3"),
-                backend_addr,
-                Some("server-3".to_string()),
-                None,
-                None,
-            ),
-        );
-
-        assert!(
-            backend_map
-                .backend_from_sticky_session(cluster_id, sticky_session, None, Instant::now())
-                .is_ok()
-        );
-        sender.send(()).unwrap();
     }
 
     #[test]
@@ -1626,7 +1567,7 @@ mod backends_test {
 
         assert!(
             backend_map
-                .backend_from_sticky_session(cluster_id, sticky_session, None, Instant::now())
+                .reserve_sticky_backend(cluster_id, sticky_session, None, Instant::now())
                 .is_err()
         );
     }
@@ -1639,7 +1580,7 @@ mod backends_test {
 
         assert!(
             backend_map
-                .backend_from_sticky_session(
+                .reserve_sticky_backend(
                     mycluster_not_recorded,
                     sticky_session,
                     None,

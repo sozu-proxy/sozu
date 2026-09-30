@@ -662,6 +662,9 @@ jobs:
       - name: H2 core simulation sweep (debug, asserts live)
         run: cargo test -p sozu-sim --locked --test h2_simulation -- --nocapture
 
+      - name: Backend selection simulation sweep (debug, asserts live)
+        run: cargo test -p sozu-sim --locked --test backend_selection_sim -- --nocapture
+
   # ┌──────────────────────────────────────────────────────────────┐
   # │ Group D — Bombardier load benches (folded from benchmark.yml) │
   # └──────────────────────────────────────────────────────────────┘

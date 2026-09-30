@@ -87,6 +87,7 @@ catching.
 | **Fuzz** | `fuzz/fuzz_targets/*` (out-of-workspace `sozu-fuzz` crate) | nightly toolchain + `cargo-fuzz` | `fuzz` CI job (nightly toolchain, 300 s/target on every push/PR); `#[ignore]`-style runtime skip when prereqs absent | yes (300 s/target); daily 900 s sweep in `simulation-sweep.yml` |
 | **Deterministic simulation** | `sim/tests/h2_simulation.rs` (`sozu-sim`, moonpool-sim) — the byte-in / byte-out H2 core (`ConnectionH2`) driven over two in-memory byte queues, [#1359](https://github.com/sozu-proxy/sozu/issues/1359) C4 | same `--cfg tokio_unstable` gating as below | per-PR `udp-simulation` job (same job, added step, modest sweep); widened via `SOZU_H2_SIM_*` env knobs | yes |
 | **Deterministic simulation** | `sim/tests/udp_simulation.rs` (`sozu-sim`, moonpool-sim) | `RUSTFLAGS="--cfg tokio_unstable"` (scoped to the sim — cfg-gated, off by default) | per-PR `udp-simulation` job (modest sweep) + nightly deep swarm; widened via env knobs | yes |
+| **Deterministic simulation** | `sim/tests/backend_selection_sim.rs` (`sozu-sim`, moonpool-sim) — HTTP backend selection through `Router::backend_from_request` and a selector the harness owns over a seeded `BackendMap`, [#1684](https://github.com/sozu-proxy/sozu/issues/1684) | same `--cfg tokio_unstable` gating as below | per-PR `udp-simulation` job (same job, added step, 64 seeds); widened via `SOZU_BACKEND_SELECTION_SIM_*` env knobs | yes |
 | **Deterministic simulation** | `sim/tests/tcp_preread_sim.rs` (`sozu-sim`, moonpool-sim) — TCP SNI-preread core, [#1279](https://github.com/sozu-proxy/sozu/issues/1279) | same `--cfg tokio_unstable` gating as above | per-PR `udp-simulation` job (same job, added step, modest sweep) + nightly `tcp-preread-simulation-sweep` job in `simulation-sweep.yml` (deep swarm); widened via `SOZU_TCP_PREREAD_SIM_*` env knobs | yes |
 | **Deterministic simulation** | `sim/tests/metrics_lease_sim.rs` (`sozu-sim`, moonpool-sim) — metrics cardinality-lease core (`Aggregator::lease_apply`/`lease_clear`/`lease_tick` plus the `remove_cluster`/`add_cluster`/`remove_backend` tombstone) | same `--cfg tokio_unstable` gating as above | no CI job yet — run manually with the command below; widened via `SOZU_METRICS_LEASE_SIM_*` env knobs | no (not yet wired into CI — see this section's closing note) |
 | **Regression guards** | `lib/tests/log_layout.rs` | nothing | runs in `cargo test -p sozu-lib`; build-time `cargo:warning=` echo from `lib/build.rs` | yes |
@@ -312,6 +313,9 @@ RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim --test metrics_lease_sim
 
 # Deterministic H2-core simulation (same crate, same cfg gating):
 RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim --test h2_simulation
+
+# Deterministic backend-selection simulation (same crate, same cfg gating):
+RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim --test backend_selection_sim
 ```
 
 ### Simulation sweep + single-seed replay
@@ -679,8 +683,9 @@ extraction makes, and this is the first time it has been collected in full.
 **Backend selection and backoff** take their time and randomness from the
 caller too (#1684), so a simulator that reaches them drives them from its own
 clock and seed. Every selection entry point takes `now`:
-`BackendMap::backend_from_cluster_id`, `backend_from_sticky_session` and
-`backend_from_cluster_id_with_key`, `BackendList::next_available_backend`,
+`BackendMap::backend_from_cluster_id`, `reserve_backend`,
+`reserve_sticky_backend` and `backend_from_cluster_id_with_key`,
+`BackendList::next_available_backend`,
 `Backend::can_open`, and the `RetryPolicy` and `PeakEWMA` methods beneath
 them. Randomness comes from one generator per `BackendMap`:
 `BackendMap::with_seed(seed)` seeds every cluster's `Random` and `PowerOfTwo`
@@ -700,6 +705,38 @@ no `mio`. Such a selector numbers its backends itself and mints their ids with
 the session's `BackendRegistry` instead. Whatever implements it must keep the
 reservation rule of `mux/LIFECYCLE.md` §9 invariant 14: selecting counts the
 connection, and a dial that fails releases it.
+
+`sim/tests/backend_selection_sim.rs` is the worked example, and the recipe for
+driving selection from a simulator:
+
+1. **Build the backend set from the seed.** `BackendMap::with_seed` with a value
+   drawn from moonpool's RNG, and every backend with `Backend::new_at(.., base)`
+   at one base `Instant` captured per run.
+2. **Keep the clock yourself.** Hold a `Duration` offset advanced only by seeded
+   draws and pass `base + offset` to everything that takes `now`. As in
+   `h2_simulation.rs`, `Workload::run` never awaits, because `BackendMap` holds
+   `Rc`s and moonpool's `Workload` future must be `Send`.
+3. **Own the selector.** Implement `router::BackendSelector` over the map's
+   `reserve_backend` / `reserve_sticky_backend`, numbering slots in minting
+   order and minting ids with `BackendId::new`. Then play the embedder: decide
+   whether each dial connects, call `Backend::release_failed_dial` with the
+   map's `rng()` on a failure, and `set_connection_time` plus
+   `retry_policy.succeed` on a connect.
+4. **Shadow the reservation rule.** Count `+1` per selection, `-1` per failed
+   dial and per close, and compare with every backend's `active_connections`
+   after every step.
+5. **Trace decisions, never instants.** Record the cluster, backend, slot and
+   sticky answer of each selection and every reservation, release and close.
+   The determinism guard runs eight seeds twice each and requires byte-identical
+   traces, then checks absolute values: selections, failures and closes all
+   happened, at least one cluster used a map-seeded policy, and a fresh
+   backoff window closes exactly one second later on the harness's clock. That
+   last check is the one a leaked `Instant::now()` fails, because two runs that
+   both read the wall clock would still agree with each other.
+
+Replay one seed and print its trace with
+`SOZU_BACKEND_SELECTION_SIM_SEED=<seed>`; `_SEEDS` (default and minimum 64) and
+`_STEPS` (default 400) widen the sweep.
 
 ---
 
