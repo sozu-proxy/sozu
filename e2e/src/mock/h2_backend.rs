@@ -8,7 +8,7 @@ use std::{
     thread,
 };
 
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, body::Bytes, service::service_fn};
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
@@ -34,6 +34,9 @@ pub struct RecordedH2Request {
     pub authority: String,
     pub path: String,
     pub headers: Vec<(String, Vec<u8>)>,
+    /// The request trailer fields, recorded only by a backend started with
+    /// [`H2Backend::start_recording_trailers`]; empty otherwise.
+    pub trailers: Vec<(String, Vec<u8>)>,
 }
 
 /// An HTTP/2 mock backend that accepts cleartext H2 connections (h2c).
@@ -52,6 +55,27 @@ pub struct H2Backend {
 
 impl H2Backend {
     pub fn start(name: impl Into<String>, address: SocketAddr, body: impl Into<String>) -> Self {
+        Self::start_inner(name, address, body, false)
+    }
+
+    /// Like [`H2Backend::start`], but read each request body to its end
+    /// before answering, and record its trailer fields in
+    /// [`RecordedH2Request::trailers`]. Opt-in, because waiting for the body
+    /// changes when the response is sent.
+    pub fn start_recording_trailers(
+        name: impl Into<String>,
+        address: SocketAddr,
+        body: impl Into<String>,
+    ) -> Self {
+        Self::start_inner(name, address, body, true)
+    }
+
+    fn start_inner(
+        name: impl Into<String>,
+        address: SocketAddr,
+        body: impl Into<String>,
+        record_trailers: bool,
+    ) -> Self {
         let name = name.into();
         let body: Bytes = Bytes::from(body.into());
         let stop = Arc::new(AtomicBool::new(false));
@@ -131,7 +155,7 @@ impl H2Backend {
                                 // tests can assert on the rewritten authority
                                 // / path / forwarded headers that reached the
                                 // backend wire.
-                                let recorded = RecordedH2Request {
+                                let mut recorded = RecordedH2Request {
                                     method: req.method().as_str().to_owned(),
                                     authority: req
                                         .uri()
@@ -146,7 +170,31 @@ impl H2Backend {
                                             (k.as_str().to_owned(), v.as_bytes().to_vec())
                                         })
                                         .collect(),
+                                    trailers: Vec::new(),
                                 };
+                                if record_trailers {
+                                    match req.into_body().collect().await {
+                                        Ok(collected) => {
+                                            recorded.trailers = collected
+                                                .trailers()
+                                                .map(|trailers| {
+                                                    trailers
+                                                        .iter()
+                                                        .map(|(k, v)| {
+                                                            (
+                                                                k.as_str().to_owned(),
+                                                                v.as_bytes().to_vec(),
+                                                            )
+                                                        })
+                                                        .collect()
+                                                })
+                                                .unwrap_or_default();
+                                        }
+                                        Err(e) => {
+                                            eprintln!("{name}: request body error: {e}");
+                                        }
+                                    }
+                                }
                                 if let Ok(mut log) = req_log.lock() {
                                     log.push(recorded);
                                 }

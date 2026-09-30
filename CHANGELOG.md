@@ -6513,6 +6513,35 @@
 
 ### 🔐 Security
 
+- **`fix(mux-h2)`: H2 request trailers drop the fields RFC 9110 §6.5.1 keeps out of trailers
+  ([#1714](https://github.com/sozu-proxy/sozu/issues/1714)).** #1701 made the H1 frontend elide
+  the 25 names of `TRAILER_FORBIDDEN_FIELDS` from a chunked trailer section, but the H2 trailer
+  filter `pkawa::handle_trailer` (`lib/src/protocol/mux/pkawa.rs`) still checked only
+  `TRAILER_SPOOF_VECTOR_HEADERS`. An H2 client could therefore hand an H1 backend (chunked
+  trailer section) or an H2 backend (trailer HEADERS frame) a `Content-Length`, `Authorization`,
+  `Cookie`, `Cache-Control`, `If-Match`, `Content-Type` or any other forbidden field that
+  bypassed the header-block handling; `H2BlockConverter` only removed `Host` and `Trailer` on
+  its way to an H2 backend. `pkawa::handle_trailer` now elides every request trailer field the
+  shared list names while it decodes the frame, before a backend is chosen, so the set of
+  trailer fields left for either backend protocol is the same (their framing is not covered
+  here), and each elided field increments the new
+  `h2.trailer.forbidden_field_elided` counter, the H2 counterpart of
+  `http.trailer.forbidden_field_elided`. The check runs after `classify_invalid_h2_header`, so
+  the connection-specific names both lists hold (`Connection`, `Keep-Alive`, `Proxy-Connection`,
+  `Transfer-Encoding`, `Upgrade`, a `TE` other than `trailers`) still reset the stream as
+  RFC 9113 §8.2.2 requires, and after the field count, so an elided field still counts against
+  `h2_max_header_fields`. Other trailer fields, such as `grpc-status`, are forwarded, and
+  response trailers are unchanged, as on H1. Documented in
+  `lib/src/protocol/kawa_h1/LIFECYCLE.md` §2.3 and `doc/configure.md`. `te: trailers`, the one
+  `TE` value RFC 9113 §8.2.2 allows, passes that check and is then elided and counted. The
+  `h2.trailers_dropped_content_length` row of `doc/configure.md` now says it counts trailer
+  blocks on a `Content-Length`-framed message, not a `content-length` trailer field. Covered by
+  six new `pkawa.rs` unit tests (including the field bound and a name taken from the HPACK
+  dynamic table) and by `test_h2_trailer_forbidden_fields_dropped_h1_backend` and
+  `test_h2_trailer_forbidden_fields_dropped_h2_backend` in
+  `e2e/src/tests/h2_security_header_injection.rs`, whose H2 backend mock gains an opt-in
+  `H2Backend::start_recording_trailers`.
+
 - **`fix(h1)`: chunked request trailers drop the fields RFC 9110 §6.5.1 keeps out of trailers,
   and are bounded ([#1701](https://github.com/sozu-proxy/sozu/issues/1701)).** After #1689 the H1
   frontend still forwarded every other trailer field verbatim, including framing, routing and
