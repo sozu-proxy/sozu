@@ -427,6 +427,59 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         result
     }
 
+    /// Drop the trailer block of a Content-Length-framed message before it
+    /// is written to this H1 peer, and return whether one was dropped.
+    ///
+    /// HTTP/1.1 carries a trailer section only with chunked coding (RFC 9112
+    /// §7.1) and a length-framed message ends with its last body byte
+    /// (§6.3), while `pkawa::handle_trailer` queues an H2 trailer block for
+    /// every peer, so an H2 peer still receives it. A trailer block is the
+    /// run of `Header` blocks before a closing `Flags { end_header,
+    /// end_stream }` that does not follow the `StatusLine` or `Cookies` of a
+    /// header section. Its fields are removed and its closing flags lose
+    /// `end_header`, so kawa's H1 serializer writes nothing after the body
+    /// (RFC 9110 §6.5.1 lets a recipient discard trailers). An H2 trailer
+    /// block is queued whole, and kawa's H1 serializer drains every queued
+    /// block in one `prepare`, so the block is never split across passes.
+    fn drop_length_framed_trailers(kawa: &mut super::GenericHttpStream) -> bool {
+        if !matches!(kawa.body_size, kawa::BodySize::Length(_)) {
+            return false;
+        }
+        let Some(kawa::Block::Flags(kawa::Flags {
+            end_header: true,
+            end_stream: true,
+            ..
+        })) = kawa.blocks.back()
+        else {
+            return false;
+        };
+        let closing = kawa.blocks.len() - 1;
+        let first_field = kawa
+            .blocks
+            .range(..closing)
+            .rposition(|block| !matches!(block, kawa::Block::Header(_)))
+            .map_or(0, |before| before + 1);
+        if first_field > 0
+            && matches!(
+                kawa.blocks[first_field - 1],
+                kawa::Block::StatusLine | kawa::Block::Cookies
+            )
+        {
+            return false;
+        }
+        kawa.blocks.drain(first_field..closing);
+        if let Some(kawa::Block::Flags(flags)) = kawa.blocks.back_mut() {
+            flags.end_header = false;
+        }
+        warn!(
+            "{} trailers of a Content-Length-framed message dropped towards an H1 peer \
+             (RFC 9112 §7.1); omit Content-Length to have them forwarded",
+            log_module_context!()
+        );
+        incr!(names::h2::TRAILERS_DROPPED_CONTENT_LENGTH);
+        true
+    }
+
     /// End a response body at the backend's EOF.
     ///
     /// Only a body with neither `Content-Length` nor chunked coding
@@ -937,6 +990,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             let edits = std::mem::take(&mut parts.context.headers_response);
             super::shared::apply_response_header_edits(kawa, &edits);
         }
+        Self::drop_length_framed_trailers(kawa);
         kawa.prepare(&mut kawa::h1::BlockConverter);
         // SAFETY: the descriptors `gather` pushes borrow memory `kawa` owns:
         // a `Store::Slice` or `Detached` points into `kawa.storage`, while an
@@ -3872,6 +3926,189 @@ mod tests {
             request(false) - request(true),
             1,
             "a fresh H1 backend must size its descriptor vector in one allocation"
+        );
+    }
+
+    /// What kawa's H1 serializer writes for a `kind` message framed by
+    /// `Content-Length: 5`, holding `hello`, after `pkawa::handle_trailer`
+    /// queued an H2 trailer block of `fields` and the H1 write path ran
+    /// `drop_length_framed_trailers`, which returns whether it dropped one.
+    fn h1_bytes_of_a_length_framed_message(
+        kind: kawa::Kind,
+        fields: &[(&[u8], &[u8])],
+    ) -> (bool, String) {
+        let mut pool = Pool::with_capacity(1, 1, 4096);
+        let checkout = pool
+            .checkout()
+            .expect("the test pool must hand out a buffer");
+        let mut kawa: super::super::GenericHttpStream =
+            kawa::Kawa::new(kind, kawa::Buffer::new(checkout));
+        kawa.body_size = kawa::BodySize::Length(5);
+        // One DATA frame, as `handle_data` queues it for a length-framed
+        // message.
+        kawa.push_block(kawa::Block::Chunk(kawa::Chunk {
+            data: kawa::Store::Static(b"hello"),
+        }));
+        let mut encoder = super::super::hpack::Encoder::new();
+        let mut encoded = Vec::new();
+        for &(name, value) in fields {
+            encoder.encode_header_into((name, value), &mut encoded);
+        }
+        let result = super::super::pkawa::handle_trailer(
+            &mut kawa,
+            &encoded,
+            true,
+            &mut super::super::hpack::Decoder::new(),
+            super::super::h2::MAX_HEADER_LIST_SIZE as u32,
+            u32::MAX,
+            false,
+            &mut Vec::new(),
+        );
+        assert!(result.is_ok(), "handle_trailer failed: {:?}", result.err());
+
+        let dropped = ConnectionH1::<mio::net::TcpStream>::drop_length_framed_trailers(&mut kawa);
+        kawa.prepare(&mut kawa::h1::BlockConverter);
+        let buffer = kawa.storage.buffer();
+        let bytes: Vec<u8> = kawa
+            .out
+            .iter()
+            .flat_map(|block| match block {
+                kawa::OutBlock::Store(store) => store.data(buffer).to_vec(),
+                kawa::OutBlock::Delimiter => Vec::new(),
+            })
+            .collect();
+        (dropped, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// An H2 trailer block on a Content-Length-framed message adds nothing
+    /// after the body on HTTP/1.1, which carries trailers only with chunked
+    /// coding (RFC 9112 §6.3, §7.1): the fields and the empty line are
+    /// dropped, for a request towards an H1 backend and for a response
+    /// towards an H1 client, with one trailer field or none.
+    ///
+    /// TO SEE THIS RED: make `drop_length_framed_trailers` return `false`
+    /// before touching the block queue.
+    #[test]
+    fn a_length_framed_message_writes_no_trailer_to_an_h1_peer() {
+        let with_field: &[(&[u8], &[u8])] = &[(b"grpc-status", b"0")];
+        for kind in [kawa::Kind::Request, kawa::Kind::Response] {
+            for fields in [with_field, &[]] {
+                assert_eq!(
+                    h1_bytes_of_a_length_framed_message(kind, fields),
+                    (true, "hello".to_owned()),
+                    "{kind:?} with {} trailer field(s)",
+                    fields.len()
+                );
+            }
+        }
+    }
+
+    /// The header section of a length-framed message closed with
+    /// `end_stream` (a message with no body) is not a trailer block: it is
+    /// written whole.
+    #[test]
+    fn a_length_framed_header_section_is_not_taken_for_trailers() {
+        let mut pool = Pool::with_capacity(1, 1, 4096);
+        let checkout = pool
+            .checkout()
+            .expect("the test pool must hand out a buffer");
+        let mut kawa: super::super::GenericHttpStream =
+            kawa::Kawa::new(kawa::Kind::Response, kawa::Buffer::new(checkout));
+        kawa.body_size = kawa::BodySize::Length(0);
+        kawa.push_block(kawa::Block::StatusLine);
+        kawa.push_block(kawa::Block::Header(kawa::Pair {
+            key: kawa::Store::Static(b"Content-Length"),
+            val: kawa::Store::Static(b"0"),
+        }));
+        kawa.push_block(kawa::Block::Flags(kawa::Flags {
+            end_body: false,
+            end_chunk: false,
+            end_header: true,
+            end_stream: true,
+        }));
+        assert!(!ConnectionH1::<mio::net::TcpStream>::drop_length_framed_trailers(&mut kawa));
+        assert_eq!(kawa.blocks.len(), 3, "the header section stays whole");
+    }
+
+    /// A `Cookies` block belongs to a header section: a length-framed
+    /// request whose header section ends with its cookies and closes with
+    /// `end_stream` is not a trailer block, and is written whole.
+    ///
+    /// TO SEE THIS RED: drop the `kawa::Block::Cookies` arm from the
+    /// header-section guard of `drop_length_framed_trailers`.
+    #[test]
+    fn a_length_framed_header_section_ending_with_cookies_is_not_taken_for_trailers() {
+        let mut pool = Pool::with_capacity(1, 1, 4096);
+        let checkout = pool
+            .checkout()
+            .expect("the test pool must hand out a buffer");
+        let mut kawa: super::super::GenericHttpStream =
+            kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(checkout));
+        kawa.body_size = kawa::BodySize::Length(0);
+        kawa.push_block(kawa::Block::StatusLine);
+        kawa.push_block(kawa::Block::Header(kawa::Pair {
+            key: kawa::Store::Static(b"Content-Length"),
+            val: kawa::Store::Static(b"0"),
+        }));
+        kawa.push_block(kawa::Block::Cookies);
+        kawa.push_block(kawa::Block::Flags(kawa::Flags {
+            end_body: false,
+            end_chunk: false,
+            end_header: true,
+            end_stream: true,
+        }));
+        assert!(!ConnectionH1::<mio::net::TcpStream>::drop_length_framed_trailers(&mut kawa));
+        assert_eq!(kawa.blocks.len(), 4, "the header section stays whole");
+        assert!(
+            matches!(
+                kawa.blocks.back(),
+                Some(kawa::Block::Flags(kawa::Flags {
+                    end_header: true,
+                    ..
+                }))
+            ),
+            "the header section keeps its closing empty line"
+        );
+    }
+
+    /// A response to HEAD declares the length of the body it does not carry
+    /// (RFC 9110 §9.3.2): its header section alone ends the message with
+    /// `end_stream`, under a non-zero `Content-Length`. It is not a trailer
+    /// block, and is written whole.
+    ///
+    /// TO SEE THIS RED: drop the `kawa::Block::StatusLine` arm from the
+    /// header-section guard of `drop_length_framed_trailers`.
+    #[test]
+    fn a_header_only_head_response_is_not_taken_for_trailers() {
+        let mut pool = Pool::with_capacity(1, 1, 4096);
+        let checkout = pool
+            .checkout()
+            .expect("the test pool must hand out a buffer");
+        let mut kawa: super::super::GenericHttpStream =
+            kawa::Kawa::new(kawa::Kind::Response, kawa::Buffer::new(checkout));
+        kawa.body_size = kawa::BodySize::Length(5);
+        kawa.push_block(kawa::Block::StatusLine);
+        kawa.push_block(kawa::Block::Header(kawa::Pair {
+            key: kawa::Store::Static(b"Content-Length"),
+            val: kawa::Store::Static(b"5"),
+        }));
+        kawa.push_block(kawa::Block::Flags(kawa::Flags {
+            end_body: false,
+            end_chunk: false,
+            end_header: true,
+            end_stream: true,
+        }));
+        assert!(!ConnectionH1::<mio::net::TcpStream>::drop_length_framed_trailers(&mut kawa));
+        assert_eq!(kawa.blocks.len(), 3, "the header section stays whole");
+        assert!(
+            matches!(
+                kawa.blocks.back(),
+                Some(kawa::Block::Flags(kawa::Flags {
+                    end_header: true,
+                    ..
+                }))
+            ),
+            "the header section keeps its closing empty line"
         );
     }
 

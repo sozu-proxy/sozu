@@ -1334,9 +1334,9 @@ where
     // Content-Length (`body_size == BodySize::Length(_)`) and later sends a
     // trailer HEADERS frame, the H1 backend cannot receive those trailers —
     // HTTP/1.1 only carries trailers with chunked transfer-coding. In that
-    // case the trailers are silently dropped by `handle_trailer`'s caller
-    // (no Transfer-Encoding can be retro-fitted once the request line and
-    // headers have already gone out on the wire). Peers that require
+    // case the H1 write path drops them (`drop_length_framed_trailers`,
+    // `h1.rs`; no Transfer-Encoding can be retro-fitted once the request line
+    // and headers have already gone out on the wire). Peers that require
     // trailer delivery should omit Content-Length; the branch below then
     // upgrades the framing to chunked and H2BlockConverter on the back side
     // passes the trailer block through intact.
@@ -1650,25 +1650,10 @@ pub fn handle_trailer(
         }),
     );
 
-    // RFC 9110 §6.5: if the request/response was framed with a
-    // fixed Content-Length (not chunked), the H1-side serializer cannot emit
-    // trailers — HTTP/1.1 only carries trailers with chunked transfer-coding.
-    // The trailer block stays in kawa but the downstream writer will never
-    // reach it. Emit a visible signal so operators chasing "vanished gRPC
-    // trailers" have something to grep, without changing the drop behaviour
-    // (changing it would retroactively need to rewrite the framing, which
-    // is not possible once headers are on the wire).
-    if matches!(kawa.body_size, BodySize::Length(_)) {
-        warn!(
-            "{} H2 trailers arrived on a Content-Length-framed stream; \
-             trailers will be silently dropped by the H1 serializer \
-             (RFC 9110 §6.5). Peer should omit Content-Length for trailer \
-             delivery to upgrade framing to chunked.",
-            log_module_context!()
-        );
-        events.push(MetricEvent::TrailersDroppedContentLength);
-    }
-
+    // A message framed by Content-Length keeps its trailer block here, for
+    // every peer: `H2BlockConverter` forwards it to an H2 peer, and the H1
+    // write path drops it (`drop_length_framed_trailers`, `h1.rs`), because
+    // HTTP/1.1 carries trailers only with chunked coding (RFC 9112 §7.1).
     kawa.push_block(Block::Flags(Flags {
         end_body: false,
         end_chunk: false,
@@ -3501,6 +3486,45 @@ mod tests {
         assert!(
             !has_te,
             "Transfer-Encoding must not be retro-fitted when Content-Length was declared"
+        );
+    }
+
+    /// A trailer block on a Content-Length-framed message is filtered and
+    /// kept like any other: the spoof-vector and forbidden-field elisions
+    /// run and are counted, and the remaining fields stay queued for an H2
+    /// peer. Only the H1 write path drops the block
+    /// (`drop_length_framed_trailers`, `h1.rs`).
+    ///
+    /// TO SEE THIS RED: return from the decode closure of `handle_trailer`
+    /// before the elision checks when `body_size` is `BodySize::Length`.
+    #[test]
+    fn handle_trailer_filters_and_keeps_a_length_framed_block() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let mut kawa = kawa_past_headers(&mut pool, Kind::Request);
+        kawa.body_size = BodySize::Length(5);
+
+        let (result, events, kept) = run_trailer(
+            &mut kawa,
+            &[
+                (b"content-length", b"6666"),
+                (b"x-forwarded-for", b"5.6.7.8"),
+                (b"grpc-status", b"0"),
+            ],
+        );
+
+        assert!(result.is_ok(), "handle_trailer failed: {:?}", result.err());
+        assert_eq!(kept, vec![b"grpc-status".to_vec()]);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, MetricEvent::TrailerForbiddenFieldElided)),
+            "the forbidden-field elision must be counted: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, MetricEvent::TrailerSpoofVectorElided)),
+            "the spoof-vector elision must be counted: {events:?}"
         );
     }
 }
