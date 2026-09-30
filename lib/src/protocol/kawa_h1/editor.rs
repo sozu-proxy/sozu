@@ -633,6 +633,14 @@ pub struct HttpContext {
     pub id: Ulid,
     pub backend_id: Option<Rc<str>>,
     pub cluster_id: Option<sozu_command_lib::state::ClusterId>,
+    /// The client affinity key `Router::plan_connect`
+    /// (`lib/src/protocol/mux/router.rs`) derived for this request when its
+    /// cluster selects with `HRW` or `MAGLEV`: the hash of the cluster's
+    /// `affinity_header` / `affinity_cookie` value, else of the client source
+    /// IP. `None` under every other policy. Stored next to `cluster_id` for the
+    /// same reason: a replay finds the request's header blocks drained and
+    /// reuses the key the first attempt derived.
+    pub affinity_key: Option<u64>,
     /// the value of the protocol Kawa should write in the Forwarded headers of the request
     pub protocol: Protocol,
     /// the value of the public address Kawa should write in the Forwarded headers of the request
@@ -1159,6 +1167,7 @@ impl HttpContext {
             id: request_id,
             backend_id: None,
             cluster_id: None,
+            affinity_key: None,
 
             closing: false,
             keep_alive_backend: true,
@@ -2272,6 +2281,7 @@ impl HttpContext {
         self.keep_alive_backend = true;
         self.keep_alive_frontend = true;
         self.sticky_session_found = None;
+        self.affinity_key = None;
         self.method = None;
         self.authority = None;
         self.path = None;

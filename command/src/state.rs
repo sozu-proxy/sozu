@@ -190,6 +190,11 @@ fn certificate_error_kind(error: &CertificateError) -> &'static str {
     }
 }
 
+/// Why a cluster may not both name an affinity header or cookie and serve a
+/// TCP frontend.
+const TCP_CLUSTER_AFFINITY_KEY: &str = "a TCP frontend always keys on the client source IP: \
+    affinity_header and affinity_cookie apply to HTTP/HTTPS clusters only";
+
 /// The `ConfigState` represents the state of Sōzu's business, which is to forward traffic
 /// from frontends to backends. Hence, it contains all details about:
 ///
@@ -526,6 +531,33 @@ impl ConfigState {
             return Err(StateError::InvalidValue {
                 field: "health_check",
                 reason,
+            });
+        }
+        // Same gate for the client affinity key: a name no request can carry,
+        // or both a header and a cookie, would key selection on something
+        // other than what the cluster declares.
+        if let Err(reason) = crate::config::validate_affinity_key(
+            cluster.affinity_header.as_deref(),
+            cluster.affinity_cookie.as_deref(),
+        ) {
+            return Err(StateError::InvalidValue {
+                field: "affinity_key",
+                reason,
+            });
+        }
+        // A TCP session has no request to read a header or a cookie from and
+        // always keys on the source IP, so a cluster serving TCP frontends
+        // may not name one: the configuration would claim a key the proxy
+        // does not use. `add_tcp_frontend` holds the other order.
+        if (cluster.affinity_header.is_some() || cluster.affinity_cookie.is_some())
+            && self
+                .tcp_fronts
+                .get(cluster.cluster_id.as_str())
+                .is_some_and(|fronts| !fronts.is_empty())
+        {
+            return Err(StateError::InvalidValue {
+                field: "affinity_key",
+                reason: TCP_CLUSTER_AFFINITY_KEY,
             });
         }
         let cluster = cluster.clone();
@@ -1489,6 +1521,21 @@ impl ConfigState {
     /// is touched -- an early `Err` return is a true no-op on `self`.
     fn add_tcp_frontend(&mut self, front: &RequestTcpFrontend) -> Result<(), StateError> {
         let address: SocketAddr = front.address.into();
+
+        // The other order of `add_cluster`'s check: a TCP frontend may not
+        // join a cluster that keys on a request header or cookie.
+        if self
+            .clusters
+            .get(front.cluster_id.as_str())
+            .is_some_and(|cluster| {
+                cluster.affinity_header.is_some() || cluster.affinity_cookie.is_some()
+            })
+        {
+            return Err(StateError::InvalidTcpFrontend {
+                address,
+                reason: TCP_CLUSTER_AFFINITY_KEY.to_owned(),
+            });
+        }
 
         // Canonicalize first: shape-validate and lowercase `sni` through the
         // SAME `validate_sni_pattern` config-load and the worker use, and
@@ -6232,6 +6279,101 @@ mod tests {
     /// this guard, TOML reload / SaveState / direct API AddCluster requests
     /// bypass the SetHealthCheck-side check and let an attacker-controlled
     /// health-check URI smuggle CR/LF into outbound HTTP/1.1 probes.
+    #[test]
+    fn a_tcp_frontend_and_an_affinity_key_never_share_a_cluster() {
+        use crate::proto::command::RequestTcpFrontend;
+
+        let keyed = |cluster_id: &str| -> Request {
+            RequestType::AddCluster(Cluster {
+                cluster_id: cluster_id.to_owned(),
+                affinity_header: Some(String::from("X-Tenant")),
+                ..Default::default()
+            })
+            .into()
+        };
+        let tcp_front = |cluster_id: &str, port: u16| -> Request {
+            RequestType::AddTcpFrontend(RequestTcpFrontend {
+                cluster_id: cluster_id.to_owned(),
+                address: SocketAddress::new_v4(127, 0, 0, 1, port),
+                ..Default::default()
+            })
+            .into()
+        };
+
+        // A keyed cluster refuses a TCP frontend.
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&keyed("keyed"))
+            .expect("a keyed cluster is valid");
+        let err = state
+            .dispatch(&tcp_front("keyed", 4000))
+            .expect_err("a TCP frontend may not join a keyed cluster");
+        assert!(
+            matches!(err, StateError::InvalidTcpFrontend { .. }),
+            "unexpected error: {err:?}"
+        );
+        assert!(state.tcp_fronts.get("keyed").is_none_or(Vec::is_empty));
+
+        // A cluster serving a TCP frontend refuses a key.
+        let mut state = ConfigState::new();
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("tcp"),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("a plain cluster is valid");
+        state
+            .dispatch(&tcp_front("tcp", 4001))
+            .expect("a TCP frontend may join a plain cluster");
+        let err = state
+            .dispatch(&keyed("tcp"))
+            .expect_err("a cluster serving TCP may not name a key");
+        assert!(
+            matches!(
+                err,
+                StateError::InvalidValue {
+                    field: "affinity_key",
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(state.clusters["tcp"].affinity_header, None);
+    }
+
+    #[test]
+    fn add_cluster_with_two_affinity_key_sources_rejected() {
+        let mut state = ConfigState::new();
+        let err = state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("keyed"),
+                    affinity_header: Some(String::from("X-Tenant")),
+                    affinity_cookie: Some(String::from("tenant")),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect_err("a cluster keyed on both a header and a cookie must be refused");
+        assert!(
+            matches!(
+                err,
+                StateError::InvalidValue {
+                    field: "affinity_key",
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            state.clusters.is_empty(),
+            "a refused cluster must not be stored"
+        );
+    }
+
     #[test]
     fn add_cluster_invalid_health_check_uri_rejected() {
         use crate::proto::command::HealthCheckConfig;

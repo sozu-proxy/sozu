@@ -950,9 +950,14 @@ protocol = "http"
 
 # per cluster load balancing algorithm. The possible values are
 # "ROUND_ROBIN", "RANDOM", "LEAST_LOADED", "POWER_OF_TWO", "HRW" and
-# "MAGLEV". HRW and MAGLEV are flow-affine policies designed for UDP
-# clusters (see "UDP clusters" below). Defaults to "ROUND_ROBIN"
+# "MAGLEV". HRW and MAGLEV pin each client to one backend (see "Client
+# affinity" below, and "UDP clusters"). Defaults to "ROUND_ROBIN"
 # load_balancing = "ROUND_ROBIN"
+
+# with HRW or MAGLEV, key each client on a request header or cookie instead of
+# its source IP (HTTP clusters only, at most one of the two)
+# affinity_header = "X-Tenant"
+# affinity_cookie = "tenant"
 
 # force cluster to redirect http traffic to https
 # https_redirect = true
@@ -979,19 +984,94 @@ backend set they read on every request:
 | `RANDOM` | one backend drawn at random, weighted by `weight` | none |
 | `LEAST_LOADED` | the least loaded backend of the whole set | `n` |
 | `POWER_OF_TWO` | two backends drawn at random, the less loaded of the two wins | 2 |
-| `HRW` | rendezvous hashing on the flow key, scaled by `weight` (see "UDP clusters") | none |
-| `MAGLEV` | consistent hashing on the flow key, slot share proportional to `weight` (see "UDP clusters") | none |
+| `HRW` | rendezvous hashing on the client key, scaled by `weight` (see "Client affinity") | none |
+| `MAGLEV` | consistent hashing on the client key, slot share proportional to `weight` (see "Client affinity") | none |
 
 **Three policies honour `weight` and three ignore it.** `RANDOM`, `HRW` and
 `MAGLEV` read it; `ROUND_ROBIN`, `LEAST_LOADED` and `POWER_OF_TWO` do not, so
 a `weight` set on a cluster using one of those three has no effect. `RANDOM`
 feeds it straight into its weighted draw. `HRW` multiplies each backend's
 rendezvous score by it, and `MAGLEV` gives each backend a share of lookup-table
-slots proportional to it — but both only on the flow-keyed path: asked for a
-backend with no flow key, each falls back to `ROUND_ROBIN` and the weight stops
-being read. In practice that means `weight` is live for `HRW`/`MAGLEV` on UDP
-clusters (the datapath that supplies a flow key) and inert for them elsewhere.
+slots proportional to it — but both only on the keyed path: asked for a
+backend with no client key, each falls back to `ROUND_ROBIN` and the weight
+stops being read. Every datapath supplies a key (below), so that fallback is
+reached only by a request with no source address.
 An unset `weight` defaults to 100 wherever one is read.
+
+#### Client affinity
+
+`HRW` and `MAGLEV` pin each client to one backend: whenever Sōzu dials a new
+backend connection for a client, the same client key lands on the same backend,
+on every worker and across restarts, for as long as that backend stays in the
+cluster and healthy. When a backend is added or removed only the keys it wins
+or held move. The key is:
+
+| datapath | client key |
+|---|---|
+| UDP | the flow key, per `[clusters.<id>.udp] affinity_key` (see "UDP clusters") |
+| TCP | the client source IP |
+| HTTP, HTTPS | the value of `affinity_header` or `affinity_cookie` when set and present in the request, else the client source IP |
+
+The client source IP is the source announced by the PROXY protocol when the
+listener (HTTP/HTTPS `expect_proxy`) or the cluster (TCP) expects one, else the
+socket peer. An IPv4 client reported by a dual-stack listener as
+`::ffff:a.b.c.d` keys as `a.b.c.d`.
+
+| key | default | description |
+|---|---|---|
+| `affinity_header` | unset | Key HTTP/HTTPS clients on the value of this request header, its name matched case-insensitively, first occurrence. A request without it, or with it empty, is keyed on its source IP. |
+| `affinity_cookie` | unset | Same, on the value of this request cookie, its name matched exactly (RFC 6265). |
+
+At most one of the two may be set, and the name must be an RFC 9110 token.
+`Host` and `Cookie` are refused as `affinity_header`: Sōzu keeps neither as a
+header (H1 folds `Host` into the request authority, H2 sends `:authority`, and
+cookies are parsed into a jar — key on one with `affinity_cookie`). An
+`affinity_cookie` named like the listener's sticky-session cookie is read from
+the value Sōzu captured before removing that cookie from the request. Values
+are hashed raw, as sent: a quoted cookie value and its unquoted spelling are
+two different keys.
+
+A cluster that names either key may not serve a TCP frontend: a TCP session
+has no request to read one from and always keys on the source IP. The main
+process refuses the combination in both orders — an `AddCluster` naming a key
+for a cluster that already has a TCP frontend, and an `AddTcpFrontend` joining a
+cluster that names one — and the configuration file refuses either key on a
+`protocol = "tcp"` cluster. Both keys are hot-updatable: re-adding the cluster
+(`AddCluster`) applies the new key source from the next dial. Every other
+policy ignores both and derives no key, so it selects exactly as before.
+
+A client header the listener's forwarding or anti-spoofing policy removes
+(`X-Forwarded-For` under a `forwarded_headers` mode that strips the client's
+copy, `X-Real-IP` with `elide_x_real_ip`, a malformed `Forwarded` line) is gone
+before the key is derived, so keying on it falls back to the source IP.
+
+Three behaviours to know:
+
+- **A sticky session wins.** On a frontend with `sticky_session`, a cookie
+  naming a live backend is honoured; the key decides only where a client
+  without a usable sticky cookie lands.
+- **Connection reuse wins; the key applies only when a new backend connection
+  is dialled.** A request that reuses a backend connection its session already
+  holds — an H1 keep-alive connection, an H2 multiplexed one — goes where that
+  connection goes, whatever its own key. Behind an upstream proxy or CDN that
+  multiplexes several tenants over warm keep-alive or H2 connections, the
+  tenants of one such connection therefore follow that connection's backend,
+  not their own key; the key spreads them only over the connections the proxy
+  opens. Clients that reach Sōzu on their own connections are keyed as
+  configured.
+- **A header or cookie key is chosen by the client.** It spreads clients over
+  backends; it does not stop a client from picking its backend by picking its
+  value, exactly as a sticky-session cookie does not.
+
+**Check before upgrading to a release carrying [#524](https://github.com/sozu-proxy/sozu/issues/524).**
+An HTTP, HTTPS or TCP cluster already configured with `HRW` or `MAGLEV` ran
+round-robin before it — the policy received no key — and now pins each client by
+its source IP. Review such clusters whose clients reach Sōzu from few addresses:
+behind a NAT, or behind an L4 load balancer that does not send the PROXY
+protocol, all clients share one or a few source IPs and so land on one or a few
+backends. Switch those clusters to another policy, enable the PROXY protocol on
+the balancer and the listener, or key them with `affinity_header` /
+`affinity_cookie`.
 
 **The "load reads" column is not the per-request cost of the policy.** Every
 selection, under every policy, first builds the candidate set: Sōzu walks the
@@ -1075,7 +1155,7 @@ knobs (flow affinity, teardown counters, PROXY-protocol, health checks) under an
 optional `[clusters.<id>.udp]` block.
 
 Two source-hash algorithms are added for flow-affine UDP selection (both are
-also valid for the existing `load_balancing` field):
+also valid for HTTP, HTTPS and TCP clusters, see "Client affinity"):
 
 | `load_balancing` | Affinity | Notes                                                                                                                                  |
 | ---------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------- |

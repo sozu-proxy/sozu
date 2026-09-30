@@ -563,11 +563,14 @@ protocol = "http"
 #                  computing a global minimum, which is what stops several
 #                  independently seeded workers from converging on the same
 #                  "least loaded" backend.
-#   HRW, MAGLEV  - flow-affine policies designed for UDP clusters. Both read
-#                  `weight` — HRW scales its rendezvous score by it, MAGLEV
-#                  gives each backend a proportional share of lookup-table
-#                  slots — but only when a flow key is supplied; with none
-#                  they fall back to ROUND_ROBIN and ignore it.
+#   HRW, MAGLEV  - client-affine policies: each pins a client to one backend
+#                  on a key — the flow key on UDP; on HTTP, HTTPS and TCP the
+#                  client source IP (the PROXY-protocol source when the
+#                  listener expects one), or `affinity_header` /
+#                  `affinity_cookie` below. Both read `weight` — HRW scales
+#                  its rendezvous score by it, MAGLEV gives each backend a
+#                  proportional share of lookup-table slots. A request with
+#                  no key (no source address) falls back to ROUND_ROBIN.
 #
 # `weight` is honoured by RANDOM, HRW and MAGLEV, and ignored by ROUND_ROBIN,
 # LEAST_LOADED and POWER_OF_TWO. It defaults to 100 wherever it is read.
@@ -584,6 +587,12 @@ protocol = "http"
 load_balancing = "ROUND_ROBIN"
 # metric evaluating the load on the backend. available options: connections, requests, connection_time
 # load_metric = "connections"
+# With HRW or MAGLEV on an HTTP cluster, key each client on the value of a
+# request header (name matched case-insensitively) or of a cookie (name matched
+# exactly) instead of its source IP; a request that does not carry it is keyed
+# on its source IP. At most one of the two; refused on a TCP cluster.
+# affinity_header = "X-Tenant"
+# affinity_cookie = "tenant"
 
 # frontends configuration
 # this specifies which listeners; domains, certificates that will be configured for a cluster

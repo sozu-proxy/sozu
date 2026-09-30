@@ -1282,6 +1282,21 @@ message Cluster {
     // the boot-time `ServerConfig.subnet_ipv4_prefix` /
     // `subnet_ipv6_prefix` and is NOT overridable per cluster.
     optional uint64 max_connections_per_subnet = 17;
+    // Client affinity key of an HTTP/HTTPS cluster whose `load_balancing` is
+    // HRW or MAGLEV: the value of this request header, matched
+    // case-insensitively, first occurrence. A request that does not carry it
+    // is keyed on its source IP (the PROXY-protocol source when the listener
+    // expects one). Ignored by every other policy and by TCP clusters, which
+    // always key on the source IP: the main state refuses a cluster that
+    // names a key and serves a TCP frontend. `Host` and `Cookie` are refused
+    // (never kept as headers). Mutually exclusive with `affinity_cookie`. The
+    // key is read only when a new backend connection is dialled; a request
+    // reusing one follows it.
+    optional string affinity_header = 18;
+    // Same as `affinity_header`, keyed on the raw value of this request
+    // cookie, matched case-sensitively. Mutually exclusive with
+    // `affinity_header`.
+    optional string affinity_cookie = 19;
 }
 
 message HealthCheckConfig {
@@ -1305,12 +1320,14 @@ enum LoadBalancingAlgorithms {
     RANDOM = 1;
     LEAST_LOADED = 2;
     POWER_OF_TWO = 3;
-    // Highest-Random-Weight / rendezvous hashing — flow-affine backend
-    // selection for UDP. Maps a 4-tuple flow key to a backend that survives
-    // minimal disruption on backend add/remove.
+    // Highest-Random-Weight / rendezvous hashing — client-affine backend
+    // selection. Maps a client key (the UDP flow key; the source IP, or the
+    // cluster's `affinity_header` / `affinity_cookie`, on HTTP, HTTPS and
+    // TCP) to a backend that survives minimal disruption on backend
+    // add/remove.
     HRW = 4;
     // Maglev consistent hashing — precomputed lookup table for even, stable
-    // backend distribution across the flow keyspace.
+    // backend distribution across the same client keyspace as HRW.
     MAGLEV = 5;
 }
 

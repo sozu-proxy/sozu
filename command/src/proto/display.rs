@@ -15,13 +15,13 @@ use crate::{
         DisplayError,
         command::{
             AggregatedMetrics, AvailableMetrics, CertificateAndKey, CertificateSummary,
-            CertificatesWithFingerprints, ClusterMetrics, CustomHttpAnswers, Event, EventKind,
-            FilteredMetrics, ForwardedHeaders, HealthChecksList, HttpEndpoint, HttpListenerConfig,
-            HttpsListenerConfig, ListOfCertificatesByAddress, ListedFrontends, ListenersList,
-            MetricDetailStatus, ProtobufEndpoint, QueryCertificatesFilters, RequestCounts,
-            Response, ResponseContent, ResponseStatus, RunState, SocketAddress, TlsVersion,
-            WorkerInfos, WorkerMetrics, WorkerResponses, filtered_metrics, protobuf_endpoint,
-            request::RequestType, response_content::ContentType,
+            CertificatesWithFingerprints, Cluster, ClusterMetrics, CustomHttpAnswers, Event,
+            EventKind, FilteredMetrics, ForwardedHeaders, HealthChecksList, HttpEndpoint,
+            HttpListenerConfig, HttpsListenerConfig, ListOfCertificatesByAddress, ListedFrontends,
+            ListenersList, MetricDetailStatus, ProtobufEndpoint, QueryCertificatesFilters,
+            RequestCounts, Response, ResponseContent, ResponseStatus, RunState, SocketAddress,
+            TlsVersion, WorkerInfos, WorkerMetrics, WorkerResponses, filtered_metrics,
+            protobuf_endpoint, request::RequestType, response_content::ContentType,
         },
     },
 };
@@ -727,9 +727,19 @@ pub fn print_listeners(listeners_list: &ListenersList) -> Result<(), DisplayErro
     Ok(())
 }
 
+/// What a cluster keys `HRW`/`MAGLEV` selection on, for the cluster table:
+/// `header:<name>`, `cookie:<name>`, or `source_ip`, the default.
+fn affinity_key_label(cluster: &Cluster) -> String {
+    match (&cluster.affinity_header, &cluster.affinity_cookie) {
+        (Some(header), _) => format!("header:{header}"),
+        (None, Some(cookie)) => format!("cookie:{cookie}"),
+        (None, None) => String::from("source_ip"),
+    }
+}
+
 fn print_cluster_infos(worker_responses: &WorkerResponses) -> Result<(), DisplayError> {
     let mut cluster_table = create_cluster_table(
-        vec!["id", "sticky_session", "https_redirect"],
+        vec!["id", "sticky_session", "https_redirect", "affinity_key"],
         &worker_responses.map,
     );
 
@@ -801,28 +811,21 @@ fn print_cluster_infos(worker_responses: &WorkerResponses) -> Result<(), Display
     println!("Cluster level configuration:\n");
 
     for (cluster_info, workers_the_cluster_is_present_on) in cluster_infos.iter() {
-        let mut row = Vec::new();
-        row.push(cell!(
-            cluster_info
-                .configuration
-                .as_ref()
-                .map(|conf| conf.cluster_id.to_owned())
-                .unwrap_or_else(|| String::from("None"))
-        ));
-        row.push(cell!(
-            cluster_info
-                .configuration
-                .as_ref()
-                .map(|conf| conf.sticky_session)
-                .unwrap_or_else(|| false)
-        ));
-        row.push(cell!(
-            cluster_info
-                .configuration
-                .as_ref()
-                .map(|conf| conf.https_redirect)
-                .unwrap_or_else(|| false)
-        ));
+        let configuration = cluster_info.configuration.as_ref();
+        let mut row = vec![
+            cell!(
+                configuration
+                    .map(|conf| conf.cluster_id.to_owned())
+                    .unwrap_or_else(|| String::from("None"))
+            ),
+            cell!(configuration.is_some_and(|conf| conf.sticky_session)),
+            cell!(configuration.is_some_and(|conf| conf.https_redirect)),
+            cell!(
+                configuration
+                    .map(affinity_key_label)
+                    .unwrap_or_else(|| String::from("-"))
+            ),
+        ];
 
         for worker in workers_the_cluster_is_present_on {
             if worker_ids.contains(worker) {

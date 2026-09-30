@@ -767,18 +767,24 @@ impl BackendMap {
     }
 
     /// Select a backend of `cluster_id` at `now` and connect to it.
-    /// Select a backend of `cluster_id` at `now` and connect to it.
     ///
     /// The TCP proxy's entry point: it selects and connects in one call, and
     /// `Backend::try_connect` counts the connection once it is established.
     /// The HTTP mux reserves with [`Self::reserve_backend`] instead and
     /// connects on its own side.
+    ///
+    /// `key` is the client's affinity key, which `HRW` and `MAGLEV` pin the
+    /// client on and every other policy ignores: the HTTP, HTTPS and TCP
+    /// datapaths pass the one they derived for a cluster using either
+    /// policy, and `None` otherwise (see
+    /// [`BackendList::next_available_backend_with_key`]).
     pub fn backend_from_cluster_id(
         &mut self,
         cluster_id: &str,
+        key: Option<u64>,
         now: Instant,
     ) -> Result<(Rc<RefCell<Backend>>, TcpStream), BackendError> {
-        let next_backend = self.select_backend(cluster_id, now)?;
+        let next_backend = self.select_backend(cluster_id, key, now)?;
 
         let tcp_stream = {
             let mut borrowed_backend = next_backend.borrow_mut();
@@ -833,12 +839,16 @@ impl BackendMap {
     /// dial. The caller connects, and a connection that fails to start
     /// releases the reservation through [`Backend::release_failed_dial`]; one
     /// that starts keeps it, and its close releases it like any other.
+    ///
+    /// `key` is the client's affinity key, as for
+    /// [`Self::backend_from_cluster_id`].
     pub fn reserve_backend(
         &mut self,
         cluster_id: &str,
+        key: Option<u64>,
         now: Instant,
     ) -> Result<Rc<RefCell<Backend>>, BackendError> {
-        let backend = self.select_backend(cluster_id, now)?;
+        let backend = self.select_backend(cluster_id, key, now)?;
         backend.borrow_mut().reserve_connection()?;
         // Re-evaluate on a successful selection, as the connecting path does
         // on a successful connect, so an AllDown -> Available recovery is
@@ -849,11 +859,15 @@ impl BackendMap {
 
     /// Reserve a connection on the backend of `cluster_id` that
     /// `sticky_session` names, if it can take one at `now`, falling back to
-    /// [`Self::reserve_backend`].
+    /// [`Self::reserve_backend`] under the client's affinity `key`.
+    ///
+    /// A cookie naming a live backend wins over the key: the key only decides
+    /// where a client without a usable cookie lands.
     pub fn reserve_sticky_backend(
         &mut self,
         cluster_id: &str,
         sticky_session: &str,
+        key: Option<u64>,
         now: Instant,
     ) -> Result<Rc<RefCell<Backend>>, BackendError> {
         let sticky = self
@@ -871,7 +885,7 @@ impl BackendMap {
                     "Couldn't find a backend corresponding to sticky_session {} for cluster {}",
                     sticky_session, cluster_id
                 );
-                self.reserve_backend(cluster_id, now)
+                self.reserve_backend(cluster_id, key, now)
             }
         }
     }
@@ -881,6 +895,7 @@ impl BackendMap {
     fn select_backend(
         &mut self,
         cluster_id: &str,
+        key: Option<u64>,
         now: Instant,
     ) -> Result<Rc<RefCell<Backend>>, BackendError> {
         let cluster_backends = self
@@ -903,7 +918,7 @@ impl BackendMap {
             "selection runs only on a non-empty backend list"
         );
 
-        match cluster_backends.next_available_backend(now) {
+        match cluster_backends.next_available_backend_with_key(key, now) {
             Some(backend) => Ok(backend),
             None => {
                 // Drop the &mut BackendList before the &self helper call.
@@ -975,11 +990,16 @@ impl BackendMap {
     }
 
     /// Connect to the backend of `cluster_id` that `sticky_session` names, at
-    /// `now`, falling back to [`Self::backend_from_cluster_id`].
+    /// `now`, falling back to [`Self::backend_from_cluster_id`] under the
+    /// client's affinity `key`.
+    ///
+    /// A cookie naming a live backend wins over the key: the key only decides
+    /// where a client without a usable cookie lands.
     pub fn backend_from_sticky_session(
         &mut self,
         cluster_id: &str,
         sticky_session: &str,
+        key: Option<u64>,
         now: Instant,
     ) -> Result<(Rc<RefCell<Backend>>, TcpStream), BackendError> {
         let rng = &mut self.rng;
@@ -1007,7 +1027,7 @@ impl BackendMap {
                     "Couldn't find a backend corresponding to sticky_session {} for cluster {}",
                     sticky_session, cluster_id
                 );
-                self.backend_from_cluster_id(cluster_id, now)
+                self.backend_from_cluster_id(cluster_id, key, now)
             }
         }
     }
@@ -1344,7 +1364,9 @@ impl BackendList {
     /// `key` is only consulted by consistent-hashing policies (HRW/Maglev);
     /// every other policy ignores it, so `next_available_backend_with_key(None)`
     /// is byte-for-byte the legacy behavior. The UDP datapath calls this with
-    /// `Some(flow_hash)` to keep a client flow pinned to one backend.
+    /// `Some(flow_hash)` to keep a client flow pinned to one backend; HTTP,
+    /// HTTPS and TCP reach it through [`BackendMap::backend_from_cluster_id`]
+    /// with the client affinity key of a cluster that uses HRW or Maglev.
     ///
     /// `now` is the instant the selection happens at: it decides which
     /// backends are out of their backoff window and how far each
@@ -1447,8 +1469,9 @@ impl BackendList {
                     metric.unwrap_or(LoadMetric::Connections),
                 ))
             }
-            // Affinity policies (used by the UDP datapath). They consult the
-            // optional hash key; with `None` they fall back to round-robin.
+            // Affinity policies. They consult the client key every datapath
+            // derives (UDP flow key; HTTP/HTTPS/TCP source IP, header or
+            // cookie); with `None` they fall back to round-robin.
             LoadBalancingAlgorithms::Hrw => self.load_balancing = Box::new(Rendezvous::new()),
             LoadBalancingAlgorithms::Maglev => {
                 let mut maglev = Maglev::new();
@@ -1512,7 +1535,7 @@ mod backends_test {
 
         assert!(
             backend_map
-                .backend_from_cluster_id(cluster_id, Instant::now())
+                .backend_from_cluster_id(cluster_id, None, Instant::now())
                 .is_ok()
         );
         sender.send(()).unwrap();
@@ -1529,7 +1552,7 @@ mod backends_test {
 
         assert!(
             backend_map
-                .backend_from_cluster_id(cluster_not_recorded, Instant::now())
+                .backend_from_cluster_id(cluster_not_recorded, None, Instant::now())
                 .is_err()
         );
     }
@@ -1540,7 +1563,7 @@ mod backends_test {
 
         assert!(
             backend_map
-                .backend_from_cluster_id("dumb", Instant::now())
+                .backend_from_cluster_id("dumb", None, Instant::now())
                 .is_err()
         );
     }
@@ -1588,7 +1611,7 @@ mod backends_test {
 
         assert!(
             backend_map
-                .backend_from_sticky_session(cluster_id, sticky_session, Instant::now())
+                .backend_from_sticky_session(cluster_id, sticky_session, None, Instant::now())
                 .is_ok()
         );
         sender.send(()).unwrap();
@@ -1603,7 +1626,7 @@ mod backends_test {
 
         assert!(
             backend_map
-                .backend_from_sticky_session(cluster_id, sticky_session, Instant::now())
+                .backend_from_sticky_session(cluster_id, sticky_session, None, Instant::now())
                 .is_err()
         );
     }
@@ -1616,7 +1639,12 @@ mod backends_test {
 
         assert!(
             backend_map
-                .backend_from_sticky_session(mycluster_not_recorded, sticky_session, Instant::now())
+                .backend_from_sticky_session(
+                    mycluster_not_recorded,
+                    sticky_session,
+                    None,
+                    Instant::now()
+                )
                 .is_err()
         );
     }

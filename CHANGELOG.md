@@ -4,6 +4,26 @@
 
 ### ✨ Added
 
+- **`feat(lb)`: key `HRW`/`MAGLEV` on a request header or cookie
+  ([#524](https://github.com/sozu-proxy/sozu/issues/524)).** Two new optional HTTP/HTTPS cluster
+  keys, `affinity_header` and `affinity_cookie` (`Cluster` proto fields 18 and 19,
+  `--affinity-header` / `--affinity-cookie` on `sozu cluster add`, an `affinity_key` column in the
+  cluster table), key a client on the value of that header (name matched case-insensitively,
+  first occurrence) or cookie (name matched exactly) instead of its source IP. A request that does
+  not carry it, or carries it empty, is keyed on its source IP. Values are hashed raw: a quoted
+  cookie value and its unquoted spelling are two keys. A cookie named like the listener's
+  sticky-session cookie is read from the value Sōzu captured before removing it. At most one of the
+  two, each an RFC 9110 token; `Host` and `Cookie` are refused as header names (Sōzu never keeps
+  them as headers). A cluster that names either may not serve a TCP frontend, refused both ways
+  in the main state and at config load. **The key is read only when Sōzu dials a new backend
+  connection:** a request that reuses a backend connection its session already holds (an H1
+  keep-alive, an H2 multiplexed connection) goes where that connection goes. Behind an upstream
+  proxy or CDN that multiplexes tenants over warm keep-alive or H2 connections, tenants therefore
+  follow the connection's backend rather than their own key; clients reaching Sōzu on their own
+  connections are keyed as configured. The value is hashed where it lies in the request buffer:
+  `deriving_an_affinity_key_allocates_nothing` holds the derivation at zero allocations.
+  Documented under "Client affinity" in `doc/configure.md`.
+
 - **`feat(http)`: count the malformed client `Forwarded` lines Sōzu removes
   ([#1692](https://github.com/sozu-proxy/sozu/issues/1692)).** Since
   [#1685](https://github.com/sozu-proxy/sozu/pull/1685), the `both` and `rfc7239`
@@ -3698,6 +3718,37 @@
   `Connection: close`, behave as before. Documented in `doc/configure.md`. Covered by
   `a_template_listing_the_close_option_closes_the_connection` and
   `every_built_in_template_closes_the_connection`.
+- **`fix(lb)`: `HRW` and `MAGLEV` pin clients on HTTP, HTTPS and TCP clusters as documented
+  ([#524](https://github.com/sozu-proxy/sozu/issues/524)).** Only the UDP datapath handed the
+  consistent-hashing policies a key; HTTP, HTTPS and TCP selected with none, so a cluster
+  configured with `HRW` or `MAGLEV` silently fell back to round-robin and a client's requests
+  visited every backend in turn. These datapaths now pass the client's source IP — the
+  PROXY-protocol source when one is expected, an IPv4-mapped address keyed as its IPv4 form — or
+  the configured `affinity_header` / `affinity_cookie` value, hashed with the fixed-seed hash the
+  policies already use, so every worker and every restart sends one client to one backend. A
+  sticky cookie naming a live backend still wins, and connection reuse still wins: the key applies
+  only when a new backend connection is dialled. Clusters under every other policy derive no key
+  and select exactly as before. `BackendMap::backend_from_cluster_id`,
+  `BackendMap::backend_from_sticky_session`, `BackendMap::reserve_backend`,
+  `BackendMap::reserve_sticky_backend` and `BackendSelector::select` take the key as a new
+  parameter.
+
+  **Check before upgrading.** An HTTP, HTTPS or TCP cluster already configured with `HRW` or
+  `MAGLEV` ran round-robin until now and now pins each client by its source IP. Review such
+  clusters whose clients reach Sōzu from few addresses: behind a NAT, or behind an L4 load balancer
+  that does not send the PROXY protocol, every client shares one or a few source IPs and so lands
+  on one or a few backends. Switch those clusters to another policy, enable the PROXY protocol on
+  the balancer and the listener, or key on a header or cookie with `affinity_header` /
+  `affinity_cookie`.
+
+  Covered by `e2e/src/tests/affinity_key_tests.rs`, which predicts each key's backend with the
+  library's own `Rendezvous` and fails under the former round-robin fallback on HTTP (source IP and
+  header), HTTPS (source IP and cookie), HTTP/2 (header and cookie) and TCP (PROXY-v2 source), and
+  pins that two keys on one H1 keep-alive or one H2 client connection reach the same backend
+  (`test_h1_keep_alive_connection_keeps_its_backend_whatever_the_key`,
+  `test_h2_connection_keeps_its_backend_whatever_the_key`); and by
+  `a_keyed_request_stays_on_one_backend_under_hrw` and
+  `a_sticky_cookie_wins_over_the_affinity_key`.
 
 - **`fix(state)`: record hot updates of `elide_x_real_ip` and `send_x_real_ip` in the main
   state ([#1688](https://github.com/sozu-proxy/sozu/issues/1688)).** An

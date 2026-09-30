@@ -187,6 +187,14 @@ impl std::fmt::Debug for command::Cluster {
             .field("retry_after", &self.retry_after)
             .field("health_check_present", &self.health_check.is_some())
             .field("udp_present", &self.udp.is_some())
+            .field(
+                "affinity_header_len",
+                &self.affinity_header.as_ref().map(String::len),
+            )
+            .field(
+                "affinity_cookie_len",
+                &self.affinity_cookie.as_ref().map(String::len),
+            )
             .finish_non_exhaustive()
     }
 }

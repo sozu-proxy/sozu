@@ -88,25 +88,35 @@
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap},
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     rc::Rc,
     time::Duration,
 };
 
+use kawa::Block;
 use mio::Token;
 use sozu_command::{
     logging::ansi_palette,
-    proto::command::{Cluster, ListenerType, RedirectPolicy, RedirectScheme},
+    proto::command::{
+        Cluster, ListenerType, LoadBalancingAlgorithms, RedirectPolicy, RedirectScheme,
+    },
     state::ClusterId,
 };
 
 #[cfg(debug_assertions)]
 use super::DebugEvent;
-use super::{BackendId, BackendStatus, Connection, Context, GlobalStreamId, Position, StreamState};
+use super::{
+    BackendId, BackendStatus, Connection, Context, GenericHttpStream, GlobalStreamId, Position,
+    StreamState,
+};
 use crate::{
     BackendConnectionError, L7ListenerHandler, ListenerHandler, Readiness, RetrieveClusterError,
     backends::BackendError,
-    protocol::http::editor::{HeaderEditMode, HeaderEditSnapshot, HttpContext, emits_x_forwarded},
+    load_balancing::{affinity_key_from_ip, affinity_key_from_value},
+    protocol::http::{
+        editor::{HeaderEditMode, HeaderEditSnapshot, HttpContext, emits_x_forwarded},
+        parser::compare_no_case,
+    },
     router::{HeaderEdit, RouteResult},
     server::CONN_RETRIES,
     socket::SessionTcpStream,
@@ -639,6 +649,23 @@ impl Router {
             let routed = self
                 .route_from_request(stream_context_ref, front_ref, &context.listener, view)
                 .map_err(BackendConnectionError::RetrieveClusterError)?;
+            // Derived here, where the routed cluster and the request's header
+            // blocks are both in hand, and stored beside the cluster id: a
+            // replay finds the blocks drained and reuses this key, as it
+            // reuses the cluster.
+            let context = &stream.context;
+            let key = view.cluster(&routed).and_then(|cluster| {
+                affinity_key(
+                    cluster,
+                    &stream.front,
+                    context.session_address,
+                    StickyCookie {
+                        name: &context.sticky_name,
+                        value: context.sticky_session_found.as_deref(),
+                    },
+                )
+            });
+            stream.context.affinity_key = key;
             stream.context.cluster_id = Some(routed);
         }
         let stream_context = &stream.context;
@@ -1332,7 +1359,7 @@ impl Router {
             Affinity::Unpinned
         };
         let selected = selector
-            .select(cluster_id, affinity)
+            .select(cluster_id, affinity, context.affinity_key)
             .map_err(|backend_error| {
                 trace!("{} {}", log_module_context!(context), backend_error);
                 BackendConnectionError::Backend(backend_error)
@@ -1416,11 +1443,112 @@ pub trait BackendSelector {
     /// (`lib/src/backends.rs`) rewrites it in place on the live registry entry
     /// when an existing backend is re-added, and `BackendId` carries only what
     /// cannot change for the life of an entry.
+    ///
+    /// `key` is the client affinity key `affinity_key` in this module derived
+    /// for the request, `None` unless the cluster selects with `HRW` or
+    /// `MAGLEV`. It decides where the load balancer sends a request the sticky
+    /// cookie did not pin, and nothing else: a cookie naming a live backend
+    /// still wins.
     fn select(
         &mut self,
         cluster_id: &str,
         affinity: Affinity<'_>,
+        key: Option<u64>,
     ) -> Result<SelectedBackend, BackendError>;
+}
+
+/// The client affinity key of a request routed to `cluster`, for the `HRW`
+/// and `MAGLEV` policies to pin the client with; `None` for every other
+/// policy, which would ignore it.
+///
+/// The key is the hash of the cluster's `affinity_header` value (first
+/// occurrence, name matched case-insensitively) or `affinity_cookie` value
+/// (name matched case-sensitively, RFC 6265), and, when the request does not
+/// carry that header or cookie, or carries it empty, of the client's source
+/// IP — `session_address`, the PROXY-protocol source when the listener
+/// expects one. With no source address either, there is no key, and the
+/// policies fall back to round-robin as they always did.
+///
+/// A cookie named like the listener's sticky-session cookie is read from the
+/// value `HttpContext::on_request_headers` captured, since that cookie is
+/// elided from the jar before routing. Values are hashed raw, as sent: a
+/// quoted cookie value and its unquoted spelling are two different keys.
+///
+/// It reads the header blocks and cookie jar where they lie in the request
+/// buffer and hashes the bytes in place: no copy, no allocation. The hash is
+/// the seeded FNV of `crate::load_balancing`, so every worker and every
+/// restart derives the same key for the same client.
+///
+/// A header or cookie value is chosen by the client, so a client can choose
+/// its backend under this option — exactly as it can with a sticky-session
+/// cookie. It spreads clients; it does not isolate them from one another.
+pub(super) fn affinity_key(
+    cluster: &Cluster,
+    front: &GenericHttpStream,
+    session_address: Option<SocketAddr>,
+    sticky: StickyCookie<'_>,
+) -> Option<u64> {
+    if !matches!(
+        cluster.load_balancing(),
+        LoadBalancingAlgorithms::Hrw | LoadBalancingAlgorithms::Maglev
+    ) {
+        return None;
+    }
+    // `validate_affinity_key` (`command/src/config.rs`) refuses a cluster
+    // naming both on every `AddCluster` the master accepts; the header is
+    // read first should a worker ever receive both.
+    let buf = front.storage.buffer();
+    let value = if let Some(name) = cluster.affinity_header.as_deref() {
+        front.blocks.iter().find_map(|block| match block {
+            Block::Header(header)
+                if !header.is_elided()
+                    && compare_no_case(header.key.data(buf), name.as_bytes()) =>
+            {
+                Some(header.val.data(buf))
+            }
+            _ => None,
+        })
+    } else if let Some(name) = cluster.affinity_cookie.as_deref() {
+        if name == sticky.name {
+            // `HttpContext::on_request_headers` has already elided this
+            // cookie from the jar (Sōzu's own session cookie never reaches a
+            // backend) and captured its value, so the key reads the capture.
+            sticky.value.map(str::as_bytes)
+        } else {
+            front.detached.jar.iter().find_map(|cookie| {
+                (!cookie.is_elided() && cookie.key.data(buf) == name.as_bytes())
+                    .then(|| cookie.val.data(buf))
+            })
+        }
+    } else {
+        None
+    };
+    // Pre: a request value is read only for a cluster that names one.
+    debug_assert!(
+        value.is_none() || cluster.affinity_header.is_some() || cluster.affinity_cookie.is_some(),
+        "a header or cookie value keys only a cluster that configured its name"
+    );
+    let key = match value.filter(|value| !value.is_empty()) {
+        Some(value) => Some(affinity_key_from_value(value)),
+        None => session_address.map(|address| affinity_key_from_ip(address.ip())),
+    };
+    // Post: under a keyed policy the only request left without a key is one
+    // that carries no usable value AND has no source address.
+    debug_assert!(
+        key.is_some() || session_address.is_none(),
+        "a request with a source address must always be keyed"
+    );
+    key
+}
+
+/// The listener's sticky-session cookie as the request arrived with it: its
+/// name, and the value `HttpContext::on_request_headers` captured before
+/// eliding it from the cookie jar. [`affinity_key`] reads it when a cluster's
+/// `affinity_cookie` names that same cookie.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct StickyCookie<'a> {
+    pub(super) name: &'a str,
+    pub(super) value: Option<&'a str>,
 }
 
 /// Whether a request is pinned to a backend by its sticky-session cookie.
@@ -4278,6 +4406,69 @@ mod backend_selector_tests {
         );
     }
 
+    /// [`fixture`] under `HRW`, the policy that reads the affinity key.
+    fn hrw_fixture() -> Fixture {
+        fixture_with(LoadBalancingAlgorithms::Hrw)
+    }
+
+    /// A request whose `plan_connect` derived `key`.
+    fn keyed_request(cookie: Option<&str>, key: u64) -> HttpContext {
+        let mut context = request(cookie);
+        context.affinity_key = Some(key);
+        context
+    }
+
+    /// #524: the key a request carries reaches the load balancer, so `HRW`
+    /// sends one key to one backend selection after selection.
+    ///
+    /// TO SEE THIS RED: pass `None` instead of `context.affinity_key` to
+    /// `BackendSelector::select` in `Router::backend_from_request`;
+    /// `HRW` then round-robins and the second selection of each key lands on
+    /// the other backend.
+    #[test]
+    fn a_keyed_request_stays_on_one_backend_under_hrw() {
+        let mut fixture = hrw_fixture();
+        for key in 0..16u64 {
+            let first = fixture.select(false, &mut keyed_request(None, key));
+            for _ in 0..3 {
+                let again = fixture.select(false, &mut keyed_request(None, key));
+                assert_eq!(
+                    again.backend_id, first.backend_id,
+                    "key {key} must stay on one backend under HRW"
+                );
+            }
+        }
+    }
+
+    /// #524: a sticky cookie naming a live backend wins over the key; the key
+    /// only decides where a request the cookie did not pin lands.
+    #[test]
+    fn a_sticky_cookie_wins_over_the_affinity_key() {
+        let mut fixture = hrw_fixture();
+        let key = (0..64u64)
+            .find(|&key| {
+                &*fixture
+                    .select(false, &mut keyed_request(None, key))
+                    .backend_id
+                    == "backend-a"
+            })
+            .expect("HRW sends some of 64 keys to each of two backends");
+
+        let mut context = keyed_request(Some(STICKY_B), key);
+        let backend = fixture.select(true, &mut context);
+        assert_eq!(
+            &*backend.backend_id, "backend-b",
+            "the cookie must pin the request whatever its key says"
+        );
+
+        let mut context = keyed_request(None, key);
+        let backend = fixture.select(true, &mut context);
+        assert_eq!(
+            &*backend.backend_id, "backend-a",
+            "without a cookie a sticky frontend follows the key"
+        );
+    }
+
     /// #1579: stamping a selected backend onto the request allocates nothing.
     ///
     /// `Router::backend_from_request` runs once per backend dial and writes
@@ -4309,6 +4500,7 @@ mod backend_selector_tests {
                 &mut self,
                 _cluster_id: &str,
                 _affinity: Affinity<'_>,
+                _key: Option<u64>,
             ) -> Result<SelectedBackend, BackendError> {
                 Ok(SelectedBackend {
                     backend: self.backend.clone(),
@@ -4351,6 +4543,256 @@ mod backend_selector_tests {
             allocated, 0,
             "{DIALS} dials made {allocated} heap allocations stamping the \
              backend onto the request, expected none"
+        );
+    }
+}
+
+/// [`affinity_key`]: which request bytes key `HRW` and `MAGLEV`, and that
+/// deriving the key costs no allocation (#524).
+#[cfg(test)]
+mod affinity_key_tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use sozu_command::proto::command::{Cluster, LoadBalancingAlgorithms};
+
+    use super::{StickyCookie, affinity_key};
+    use crate::{
+        load_balancing::{affinity_key_from_ip, affinity_key_from_value},
+        pool::Pool,
+        protocol::mux::GenericHttpStream,
+    };
+
+    /// A listener sticky cookie the requests below do not carry.
+    const NO_STICKY: StickyCookie<'static> = StickyCookie {
+        name: "SOZUBALANCEID",
+        value: None,
+    };
+
+    const CLIENT: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 40_000);
+
+    /// A request kawa parsed from `request`, on its own pool buffer.
+    fn parsed(pool: &mut Pool, request: &[u8]) -> GenericHttpStream {
+        let mut kawa: GenericHttpStream = kawa::Kawa::new(
+            kawa::Kind::Request,
+            kawa::Buffer::new(
+                pool.checkout()
+                    .expect("the test pool must hand out a buffer"),
+            ),
+        );
+        kawa.storage.space()[..request.len()].copy_from_slice(request);
+        kawa.storage.fill(request.len());
+        kawa::h1::parse(&mut kawa, &mut kawa::h1::NoCallbacks);
+        assert!(kawa.is_main_phase(), "premise: the request must parse");
+        kawa
+    }
+
+    fn cluster(
+        policy: LoadBalancingAlgorithms,
+        header: Option<&str>,
+        cookie: Option<&str>,
+    ) -> Cluster {
+        Cluster {
+            cluster_id: "affinity".to_owned(),
+            load_balancing: policy as i32,
+            affinity_header: header.map(ToOwned::to_owned),
+            affinity_cookie: cookie.map(ToOwned::to_owned),
+            ..Default::default()
+        }
+    }
+
+    const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: example.com\r\nx-tenant: acme\r\n\
+        Cookie: theme=dark; tenant=globex\r\nX-Empty: \r\n\r\n";
+
+    /// Only `HRW` and `MAGLEV` read a key; every other policy gets `None`, so
+    /// a cluster that does not use one pays nothing and selects exactly as
+    /// before.
+    #[test]
+    fn only_hrw_and_maglev_clusters_derive_a_key() {
+        let mut pool = Pool::with_capacity(1, 1, 4096);
+        let front = parsed(&mut pool, REQUEST);
+        for policy in [
+            LoadBalancingAlgorithms::RoundRobin,
+            LoadBalancingAlgorithms::Random,
+            LoadBalancingAlgorithms::LeastLoaded,
+            LoadBalancingAlgorithms::PowerOfTwo,
+        ] {
+            assert_eq!(
+                affinity_key(
+                    &cluster(policy, Some("X-Tenant"), None),
+                    &front,
+                    Some(CLIENT),
+                    NO_STICKY
+                ),
+                None,
+                "{policy:?} does not read a key"
+            );
+        }
+        for policy in [
+            LoadBalancingAlgorithms::Hrw,
+            LoadBalancingAlgorithms::Maglev,
+        ] {
+            assert_eq!(
+                affinity_key(
+                    &cluster(policy, None, None),
+                    &front,
+                    Some(CLIENT),
+                    NO_STICKY
+                ),
+                Some(affinity_key_from_ip(CLIENT.ip())),
+                "{policy:?} keys on the source IP by default"
+            );
+        }
+    }
+
+    /// The configured header keys the request, its name matched without
+    /// regard to case; a header the request lacks, or carries empty, falls
+    /// back to the source IP; with no source address either there is no key.
+    #[test]
+    fn a_configured_header_keys_the_request_and_the_source_ip_is_the_fallback() {
+        let mut pool = Pool::with_capacity(1, 1, 4096);
+        let front = parsed(&mut pool, REQUEST);
+        let hrw = LoadBalancingAlgorithms::Hrw;
+        assert_eq!(
+            affinity_key(
+                &cluster(hrw, Some("X-Tenant"), None),
+                &front,
+                Some(CLIENT),
+                NO_STICKY
+            ),
+            Some(affinity_key_from_value(b"acme"))
+        );
+        assert_eq!(
+            affinity_key(
+                &cluster(hrw, Some("X-Absent"), None),
+                &front,
+                Some(CLIENT),
+                NO_STICKY
+            ),
+            Some(affinity_key_from_ip(CLIENT.ip()))
+        );
+        assert_eq!(
+            affinity_key(
+                &cluster(hrw, Some("X-Empty"), None),
+                &front,
+                Some(CLIENT),
+                NO_STICKY
+            ),
+            Some(affinity_key_from_ip(CLIENT.ip())),
+            "an empty value keys nothing and falls back to the source IP"
+        );
+        assert_eq!(
+            affinity_key(
+                &cluster(hrw, Some("X-Absent"), None),
+                &front,
+                None,
+                NO_STICKY
+            ),
+            None,
+            "no header and no source address: no key, and the policy round-robins"
+        );
+    }
+
+    /// The configured cookie keys the request, its name matched exactly
+    /// (RFC 6265 cookie names are case-sensitive).
+    #[test]
+    fn a_configured_cookie_keys_the_request() {
+        let mut pool = Pool::with_capacity(1, 1, 4096);
+        let front = parsed(&mut pool, REQUEST);
+        let maglev = LoadBalancingAlgorithms::Maglev;
+        assert_eq!(
+            affinity_key(
+                &cluster(maglev, None, Some("tenant")),
+                &front,
+                Some(CLIENT),
+                NO_STICKY
+            ),
+            Some(affinity_key_from_value(b"globex"))
+        );
+        assert_eq!(
+            affinity_key(
+                &cluster(maglev, None, Some("Tenant")),
+                &front,
+                Some(CLIENT),
+                NO_STICKY
+            ),
+            Some(affinity_key_from_ip(CLIENT.ip())),
+            "a cookie name differing in case is another cookie"
+        );
+    }
+
+    /// #524: deriving the key allocates nothing: the header blocks and the
+    /// cookie jar are read where they lie and hashed in place.
+    ///
+    /// TO SEE THIS RED: copy the value out before hashing it in
+    /// `affinity_key`, e.g. `affinity_key_from_value(&value.to_vec())`; each
+    /// derivation then makes one allocation.
+    #[test]
+    fn deriving_an_affinity_key_allocates_nothing() {
+        use std::hint::black_box;
+
+        use crate::test_allocations::allocations;
+
+        const DERIVATIONS: usize = 64;
+        let mut pool = Pool::with_capacity(1, 1, 4096);
+        let front = parsed(&mut pool, REQUEST);
+        let clusters = [
+            cluster(LoadBalancingAlgorithms::Hrw, None, None),
+            cluster(LoadBalancingAlgorithms::Hrw, Some("X-Tenant"), None),
+            cluster(LoadBalancingAlgorithms::Maglev, None, Some("tenant")),
+            cluster(LoadBalancingAlgorithms::Maglev, Some("X-Absent"), None),
+        ];
+        let mut allocated = 0;
+        for cluster in &clusters {
+            for _ in 0..DERIVATIONS {
+                let before = allocations();
+                let key = affinity_key(
+                    black_box(cluster),
+                    black_box(&front),
+                    Some(CLIENT),
+                    NO_STICKY,
+                );
+                allocated += allocations() - before;
+                assert!(key.is_some());
+            }
+        }
+        assert_eq!(
+            allocated,
+            0,
+            "{} derivations made {allocated} heap allocations, expected none",
+            DERIVATIONS * clusters.len()
+        );
+    }
+
+    /// A cluster keying on the listener's own sticky-session cookie reads the
+    /// value captured before that cookie was elided from the jar; without the
+    /// capture it would never find the cookie and always fall back to the
+    /// source IP.
+    ///
+    /// TO SEE THIS RED: drop the sticky-name arm of `affinity_key`, so the
+    /// lookup reads only the jar.
+    #[test]
+    fn an_affinity_cookie_named_like_the_sticky_cookie_reads_its_captured_value() {
+        let mut pool = Pool::with_capacity(1, 1, 4096);
+        // The sticky cookie is already gone from the jar, as
+        // `on_request_headers` leaves it.
+        let front = parsed(&mut pool, REQUEST);
+        let hrw = cluster(LoadBalancingAlgorithms::Hrw, None, Some("SOZUBALANCEID"));
+        assert_eq!(
+            affinity_key(
+                &hrw,
+                &front,
+                Some(CLIENT),
+                StickyCookie {
+                    name: "SOZUBALANCEID",
+                    value: Some("backend-7"),
+                },
+            ),
+            Some(affinity_key_from_value(b"backend-7"))
+        );
+        assert_eq!(
+            affinity_key(&hrw, &front, Some(CLIENT), NO_STICKY),
+            Some(affinity_key_from_ip(CLIENT.ip())),
+            "no sticky cookie on the request: the source IP keys it"
         );
     }
 }
