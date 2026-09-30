@@ -263,6 +263,11 @@ pub mod h2 {
         "h2.signal.writable.rearmed.priority_update";
 
     pub const TRAILERS_DROPPED_CONTENT_LENGTH: &str = "h2.trailers_dropped_content_length";
+    /// Request trailer fields elided by `pkawa::handle_trailer` because their
+    /// name is one of `editor::TRAILER_FORBIDDEN_FIELDS` (sozu-proxy/sozu#1714).
+    /// One increment per field; the request is still forwarded. The H1
+    /// frontend counts the same drop in `http::TRAILER_FORBIDDEN_FIELD_ELIDED`.
+    pub const TRAILER_FORBIDDEN_FIELD_ELIDED: &str = "h2.trailer.forbidden_field_elided";
     pub const TRAILER_SPOOF_VECTOR_ELIDED: &str = "h2.trailer.spoof_vector_elided";
     pub const WINDOW_UPDATE_DROPPED: &str = "h2.window_update_dropped";
 
@@ -348,7 +353,8 @@ pub mod http {
     /// one of `editor::TRAILER_FORBIDDEN_FIELDS` (framing, routing, request
     /// modifiers, authentication, content processing or connection-specific
     /// fields a trailer must not carry, RFC 9110 §6.5.1;
-    /// sozu-proxy/sozu#1701). One increment per field.
+    /// sozu-proxy/sozu#1701). One increment per field. The H2 frontend
+    /// counts the same drop in `h2::TRAILER_FORBIDDEN_FIELD_ELIDED`.
     pub const TRAILER_FORBIDDEN_FIELD_ELIDED: &str = "http.trailer.forbidden_field_elided";
     /// Trailer fields elided from an H1 chunked request because their name is
     /// one of `editor::TRAILER_SPOOF_VECTOR_HEADERS` (client attribution a

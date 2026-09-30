@@ -512,8 +512,10 @@ branch of `ConnectionH1::writable` that parses a pipelined request.
   increments `http.trailer.spoof_vector_elided`.
 - **Header-only fields.** Every field named in `TRAILER_FORBIDDEN_FIELDS`
   (`editor.rs`), compared without case, is elided and increments
-  `http.trailer.forbidden_field_elided`. RFC 9110 §6.5.1 keeps out of a
-  trailer section the fields "whose evaluation is necessary prior to receiving
+  `http.trailer.forbidden_field_elided`. `pkawa::handle_trailer` reads the
+  same list for an H2 request trailer block and counts each drop in
+  `h2.trailer.forbidden_field_elided` (sozu-proxy/sozu#1714). RFC 9110
+  §6.5.1 keeps out of a trailer section the fields "whose evaluation is necessary prior to receiving
   the content, such as those that describe message framing, routing,
   authentication, request modifiers, response controls, or content format",
   but names only those categories; the list takes the names RFC 7230 §4.1.2
@@ -580,9 +582,16 @@ branch of `ConnectionH1::writable` that parses a pipelined request.
   client, which takes no client attribution from it; `on_response_headers`
   keeps its own rules.
 
-The H2 frontend does not yet apply `TRAILER_FORBIDDEN_FIELDS`: `pkawa::handle_trailer`
-rejects the connection-specific fields (RFC 9113 §8.2.2) but forwards, for
-instance, a `Content-Length` or `Host` trailer.
+The H2 frontend applies `TRAILER_FORBIDDEN_FIELDS` too (sozu-proxy/sozu#1714):
+`pkawa::handle_trailer` elides a request trailer field the list names while it
+decodes the trailer HEADERS frame, before a backend is chosen, so the set of
+trailer fields left for an H1 or an H2 backend is the same; this says nothing
+about how each backend protocol frames them. The connection-specific names the
+list shares with RFC 9113 §8.2.2 (`Connection`, `Keep-Alive`,
+`Proxy-Connection`, `Transfer-Encoding`, `Upgrade`, and a `TE` other than
+`trailers`) never reach that check: `classify_invalid_h2_header` refuses them
+first and the stream is reset, as for a header block. Response trailers keep
+these fields on both frontends.
 
 Covered by `a_chunked_request_trailer_section_loses_its_spoof_vector_fields`,
 `a_chunked_request_trailer_section_loses_its_forbidden_fields`,
@@ -605,7 +614,17 @@ and by `test_h1_trailer_spoof_headers_dropped`,
 `test_h1_trailer_field_limit_exceeded_rejected` and
 `test_h1_trailer_field_limit_exceeded_rejected_split`
 (`e2e/src/tests/h1_security_tests.rs`), which read the bytes the backend
-receives and the answer the client gets.
+receives and the answer the client gets. The H2 side is covered by
+`test_handle_trailer_elides_forbidden_request_fields`,
+`test_handle_trailer_still_refuses_connection_specific_fields`,
+`test_handle_trailer_elides_te_trailers`,
+`test_handle_trailer_elided_fields_count_against_the_bound`,
+`test_handle_trailer_elides_a_forbidden_name_from_the_dynamic_table` and
+`test_handle_trailer_keeps_forbidden_names_in_responses` (unit, in
+`lib/src/protocol/mux/pkawa.rs`), and by
+`test_h2_trailer_forbidden_fields_dropped_h1_backend` and
+`test_h2_trailer_forbidden_fields_dropped_h2_backend`
+(`e2e/src/tests/h2_security_header_injection.rs`).
 
 ---
 

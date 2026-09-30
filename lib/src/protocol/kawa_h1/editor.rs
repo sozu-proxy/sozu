@@ -1014,8 +1014,8 @@ fn correlation_header_name(name: &str) -> kawa::Store {
 /// lower case. This is the single list shared by both frontends:
 /// `pkawa::handle_trailer` (`lib/src/protocol/mux/pkawa.rs`) drops them from
 /// an H2 trailer HEADERS frame, and [`HttpContext::filter_request_trailers`]
-/// from an H1 chunked trailer section, which also drops
-/// [`TRAILER_FORBIDDEN_FIELDS`].
+/// from an H1 chunked trailer section. Both also drop
+/// [`TRAILER_FORBIDDEN_FIELDS`] from a request trailer section.
 ///
 /// RFC 9110 §6.5.1 forbids trailers from carrying fields that affect message
 /// routing or request semantics. Each name here is client attribution that
@@ -1082,7 +1082,10 @@ pub fn is_trailer_spoof_vector(name: &[u8]) -> bool {
 /// header section might bypass external security filters."
 /// [`HttpContext::filter_request_trailers`] ignores them by eliding them:
 /// RFC 9112 §7.1.2 lets a recipient "selectively retain or discard the
-/// received trailer fields".
+/// received trailer fields". `pkawa::handle_trailer`
+/// (`lib/src/protocol/mux/pkawa.rs`) elides them from an H2 request trailer
+/// block the same way (sozu-proxy/sozu#1714), once `classify_invalid_h2_header`
+/// has refused the connection-specific ones as RFC 9113 §8.2.2 requires.
 pub const TRAILER_FORBIDDEN_FIELDS: [&[u8]; 25] = [
     // framing
     b"content-length",

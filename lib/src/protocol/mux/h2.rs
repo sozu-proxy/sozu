@@ -1177,6 +1177,8 @@ pub(super) enum MetricEvent {
     HeaderRejected { reason_key: &'static str },
     /// A trailer field that could spoof a client-identity header was elided.
     TrailerSpoofVectorElided,
+    /// A request trailer field named in `TRAILER_FORBIDDEN_FIELDS` was elided.
+    TrailerForbiddenFieldElided,
     /// Trailers were dropped because the message carried a Content-Length.
     TrailersDroppedContentLength,
 
@@ -1303,6 +1305,9 @@ pub(super) fn record_metric(event: MetricEvent) {
         }
         MetricEvent::TrailerSpoofVectorElided => {
             incr!(names::h2::TRAILER_SPOOF_VECTOR_ELIDED)
+        }
+        MetricEvent::TrailerForbiddenFieldElided => {
+            incr!(names::h2::TRAILER_FORBIDDEN_FIELD_ELIDED)
         }
         MetricEvent::TrailersDroppedContentLength => {
             incr!(names::h2::TRAILERS_DROPPED_CONTENT_LENGTH)

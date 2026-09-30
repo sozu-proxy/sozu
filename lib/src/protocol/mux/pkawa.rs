@@ -17,7 +17,10 @@ use sozu_command::logging::ansi_palette;
 use crate::{
     pool::Checkout,
     protocol::{
-        http::{editor::TRAILER_SPOOF_VECTOR_HEADERS, parser::compare_no_case},
+        http::{
+            editor::{TRAILER_FORBIDDEN_FIELDS, TRAILER_SPOOF_VECTOR_HEADERS},
+            parser::compare_no_case,
+        },
         mux::{
             GenericHttpStream, StreamId,
             h2::MetricEvent,
@@ -1417,6 +1420,20 @@ where
 /// or routing signal from a trailer-side copy, and forwarding them is
 /// strictly a spoof vector.
 ///
+/// ── Forbidden-field elision per RFC 9110 §6.5.1 ──
+///
+/// A request trailer field named in `TRAILER_FORBIDDEN_FIELDS`
+/// (`lib/src/protocol/kawa_h1/editor.rs`) — framing, routing, request
+/// modifiers, authentication and content-processing fields — is elided as
+/// well, and counted in `h2.trailer.forbidden_field_elided`, the list and the
+/// rule `HttpContext::filter_request_trailers` applies to an H1 chunked
+/// trailer section (sozu-proxy/sozu#1714). The connection-specific names that
+/// list shares with RFC 9113 §8.2.2 never get that far:
+/// `classify_invalid_h2_header` refuses them first as a malformed field
+/// block. A response trailer keeps these fields, as on H1. The elision runs
+/// in the frontend decode, before a backend is chosen, so the set of
+/// trailer fields left for an H1 or an H2 backend is the same.
+///
 /// `elide_x_real_ip` is kept as an explicit parameter for symmetry
 /// with the initial-HEADERS path's listener flag, but the trailer-side
 /// elision of `x-real-ip` no longer depends on it — the listener flag
@@ -1527,6 +1544,23 @@ pub fn handle_trailer(
         // attempted smuggle without spamming logs.
         if TRAILER_SPOOF_VECTOR_HEADERS.contains(&k.as_ref()) {
             events.push(MetricEvent::TrailerSpoofVectorElided);
+            return;
+        }
+        // ── Forbidden-field elision per RFC 9110 §6.5.1 ──
+        //
+        // The request-side names of `TRAILER_FORBIDDEN_FIELDS`
+        // (`lib/src/protocol/kawa_h1/editor.rs`, shared with the H1 trailer
+        // path): a trailer copy of `content-length`, `host`, `authorization`,
+        // `cookie`, a conditional or a content-processing field never went
+        // through the header-block handling, and RFC 7230 §4.1.2 has a
+        // recipient ignore it. Checked after `classify_invalid_h2_header`,
+        // so the connection-specific names both lists hold keep their
+        // RFC 9113 §8.2.2 stream error, and after the field count, so an
+        // elided field still counts against `max_header_fields`. Keys are
+        // lower-case here, as for the spoof vectors above. Responses are
+        // left alone, as `HttpContext::filter_request_trailers` leaves them.
+        if matches!(kawa.kind, Kind::Request) && TRAILER_FORBIDDEN_FIELDS.contains(&k.as_ref()) {
+            events.push(MetricEvent::TrailerForbiddenFieldElided);
             return;
         }
         let start = kawa.storage.end as u32;
@@ -2753,6 +2787,278 @@ mod tests {
             &mut Vec::new(),
         );
         assert!(err.is_err(), "LF in trailer value must be rejected");
+    }
+
+    // ── handle_trailer: forbidden-field elision (sozu-proxy/sozu#1714) ────
+
+    /// A kawa of `kind` past its initial HEADERS, so `handle_header` would
+    /// route the next field block to `handle_trailer`.
+    fn kawa_past_headers(pool: &mut crate::pool::Pool, kind: Kind) -> GenericHttpStream {
+        use kawa::Buffer;
+        let checkout = pool.checkout().expect("checkout");
+        let mut kawa: GenericHttpStream = kawa::Kawa::new(kind, Buffer::new(checkout));
+        kawa.push_block(Block::StatusLine);
+        kawa
+    }
+
+    /// What `run_trailer` observed: the result of `handle_trailer`, the
+    /// metric events it recorded and the trailer names it kept.
+    type TrailerRun = (Result<(), (H2Error, bool)>, Vec<MetricEvent>, Vec<Vec<u8>>);
+
+    /// Run `handle_trailer` over `fields`, HPACK-encoded.
+    fn run_trailer(kawa: &mut GenericHttpStream, fields: &[(&[u8], &[u8])]) -> TrailerRun {
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
+        let mut encoded = Vec::new();
+        for (name, value) in fields {
+            encoder.encode_header_into((*name, *value), &mut encoded);
+        }
+        let mut decoder = crate::protocol::mux::hpack::Decoder::new();
+        let mut events = Vec::new();
+        let result = handle_trailer(
+            kawa,
+            &encoded,
+            true,
+            &mut decoder,
+            crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE as u32,
+            u32::MAX,
+            false,
+            &mut events,
+        );
+        let buf = kawa.storage.buffer();
+        let kept = kawa
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Header(Pair { key, .. }) => Some(key.data(buf).to_vec()),
+                _ => None,
+            })
+            .collect();
+        (result, events, kept)
+    }
+
+    /// Every request trailer field named in `TRAILER_FORBIDDEN_FIELDS` is
+    /// elided and counted, and the other fields are kept, whatever backend
+    /// the request goes to: the kawa filtered here is what both the H1
+    /// serializer and `H2BlockConverter` read.
+    ///
+    /// TO SEE THIS RED: drop the `TRAILER_FORBIDDEN_FIELDS` check from the
+    /// decode closure of `handle_trailer`.
+    #[test]
+    fn test_handle_trailer_elides_forbidden_request_fields() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 16384);
+        let mut kawa = kawa_past_headers(&mut pool, Kind::Request);
+        // Every forbidden name that `classify_invalid_h2_header` does not
+        // already refuse as connection-specific (RFC 9113 §8.2.2).
+        let connection_specific: [&[u8]; 6] = [
+            b"connection",
+            b"keep-alive",
+            b"proxy-connection",
+            b"transfer-encoding",
+            b"upgrade",
+            b"te",
+        ];
+        let forbidden: Vec<&[u8]> = TRAILER_FORBIDDEN_FIELDS
+            .iter()
+            .copied()
+            .filter(|name| !connection_specific.contains(name))
+            .collect();
+        assert_eq!(
+            forbidden.len(),
+            TRAILER_FORBIDDEN_FIELDS.len() - connection_specific.len()
+        );
+        let mut fields: Vec<(&[u8], &[u8])> = vec![(b"x-checksum", b"abc123")];
+        fields.extend(forbidden.iter().map(|name| (*name, &b"forged"[..])));
+        fields.push((b"grpc-status", b"0"));
+
+        let (result, events, kept) = run_trailer(&mut kawa, &fields);
+
+        assert!(
+            result.is_ok(),
+            "forbidden fields are elided, not refused: {result:?}"
+        );
+        assert_eq!(
+            kept,
+            vec![b"x-checksum".to_vec(), b"grpc-status".to_vec()],
+            "only the fields outside TRAILER_FORBIDDEN_FIELDS reach the backend"
+        );
+        let elided = events
+            .iter()
+            .filter(|event| matches!(event, MetricEvent::TrailerForbiddenFieldElided))
+            .count();
+        assert_eq!(elided, forbidden.len(), "one increment per elided field");
+        assert_eq!(events.len(), forbidden.len(), "no other metric event");
+        assert!(matches!(kawa.parsing_phase, ParsingPhase::Terminated));
+    }
+
+    /// The connection-specific names `TRAILER_FORBIDDEN_FIELDS` shares with
+    /// RFC 9113 §8.2.2 keep their stream error instead of being elided.
+    #[test]
+    fn test_handle_trailer_still_refuses_connection_specific_fields() {
+        // `te` carries `x` here, not `trailers`, the one value RFC 9113
+        // §8.2.2 allows.
+        for name in [
+            &b"connection"[..],
+            b"keep-alive",
+            b"proxy-connection",
+            b"transfer-encoding",
+            b"upgrade",
+            b"te",
+        ] {
+            let mut pool = crate::pool::Pool::with_capacity(1, 1, 16384);
+            let mut kawa = kawa_past_headers(&mut pool, Kind::Request);
+            let (result, events, _) = run_trailer(&mut kawa, &[(name, b"x")]);
+            assert!(
+                matches!(result, Err((H2Error::ProtocolError, false))),
+                "{} must stay a malformed trailer: {result:?}",
+                String::from_utf8_lossy(name)
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, MetricEvent::TrailerForbiddenFieldElided)),
+                "a refused field is not counted as elided"
+            );
+        }
+    }
+
+    /// `te: trailers` is the one `te` value RFC 9113 §8.2.2 allows, so it
+    /// passes `classify_invalid_h2_header`; as a request trailer it is then
+    /// elided and counted like any other name of `TRAILER_FORBIDDEN_FIELDS`.
+    ///
+    /// TO SEE THIS RED: drop the `TRAILER_FORBIDDEN_FIELDS` check from the
+    /// decode closure of `handle_trailer`.
+    #[test]
+    fn test_handle_trailer_elides_te_trailers() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 16384);
+        let mut kawa = kawa_past_headers(&mut pool, Kind::Request);
+        let (result, events, kept) =
+            run_trailer(&mut kawa, &[(b"te", b"trailers"), (b"grpc-status", b"0")]);
+        assert!(
+            result.is_ok(),
+            "`te: trailers` is elided, not refused: {result:?}"
+        );
+        assert_eq!(kept, vec![b"grpc-status".to_vec()]);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(matches!(
+            events[0],
+            MetricEvent::TrailerForbiddenFieldElided
+        ));
+    }
+
+    /// An elided field still counts against `max_header_fields`, as on H1:
+    /// three fields, two of them forbidden, against a bound of two, are
+    /// refused with ENHANCE_YOUR_CALM.
+    ///
+    /// TO SEE THIS RED: in `handle_trailer`, move the forbidden-field check
+    /// above the `field_count` increment.
+    #[test]
+    fn test_handle_trailer_elided_fields_count_against_the_bound() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 16384);
+        let mut kawa = kawa_past_headers(&mut pool, Kind::Request);
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
+        let mut encoded = Vec::new();
+        for field in [
+            (&b"authorization"[..], &b"Bearer forged"[..]),
+            (b"cookie", b"session=forged"),
+            (b"grpc-status", b"0"),
+        ] {
+            encoder.encode_header_into(field, &mut encoded);
+        }
+        let mut decoder = crate::protocol::mux::hpack::Decoder::new();
+        let mut events = Vec::new();
+        let result = handle_trailer(
+            &mut kawa,
+            &encoded,
+            true,
+            &mut decoder,
+            crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE as u32,
+            2,
+            false,
+            &mut events,
+        );
+        assert!(
+            matches!(result, Err((H2Error::EnhanceYourCalm, false))),
+            "the third field goes over the bound of two: {result:?}"
+        );
+    }
+
+    /// The name of a forbidden trailer field may come from the HPACK dynamic
+    /// table rather than a literal: `authorization` is inserted by an earlier
+    /// field block on the same connection, and the trailer block names it by
+    /// index 62 (the first dynamic entry, RFC 7541 §2.3.3). It is still
+    /// elided and counted.
+    ///
+    /// TO SEE THIS RED: drop the `TRAILER_FORBIDDEN_FIELDS` check from the
+    /// decode closure of `handle_trailer`.
+    #[test]
+    fn test_handle_trailer_elides_a_forbidden_name_from_the_dynamic_table() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 16384);
+        let mut kawa = kawa_past_headers(&mut pool, Kind::Request);
+        let mut decoder = crate::protocol::mux::hpack::Decoder::new();
+        // Literal with incremental indexing, new name: adds
+        // `authorization: prime` to the dynamic table at index 62.
+        let mut prime = vec![0x40, 13];
+        prime.extend_from_slice(b"authorization");
+        prime.push(5);
+        prime.extend_from_slice(b"prime");
+        decoder
+            .decode_with_cb(&prime, |_, _| {})
+            .expect("the priming block decodes");
+        // Literal with incremental indexing, name indexed at 62, then a
+        // literal without indexing for `grpc-status: 0`.
+        let mut trailers = vec![0x40 | 62, 6];
+        trailers.extend_from_slice(b"forged");
+        trailers.extend_from_slice(&[0x00, 11]);
+        trailers.extend_from_slice(b"grpc-status");
+        trailers.extend_from_slice(&[1, b'0']);
+        let mut events = Vec::new();
+        let result = handle_trailer(
+            &mut kawa,
+            &trailers,
+            true,
+            &mut decoder,
+            crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE as u32,
+            u32::MAX,
+            false,
+            &mut events,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        let buf = kawa.storage.buffer();
+        let kept: Vec<Vec<u8>> = kawa
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Header(Pair { key, .. }) => Some(key.data(buf).to_vec()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kept, vec![b"grpc-status".to_vec()]);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(matches!(
+            events[0],
+            MetricEvent::TrailerForbiddenFieldElided
+        ));
+    }
+
+    /// A response trailer is left alone, as `HttpContext::filter_request_trailers`
+    /// leaves H1 response trailers alone.
+    #[test]
+    fn test_handle_trailer_keeps_forbidden_names_in_responses() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 16384);
+        let mut kawa = kawa_past_headers(&mut pool, Kind::Response);
+        let (result, events, kept) = run_trailer(
+            &mut kawa,
+            &[
+                (b"content-type", b"application/grpc"),
+                (b"grpc-status", b"0"),
+            ],
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            kept,
+            vec![b"content-type".to_vec(), b"grpc-status".to_vec()]
+        );
+        assert!(events.is_empty(), "{events:?}");
     }
 
     #[test]

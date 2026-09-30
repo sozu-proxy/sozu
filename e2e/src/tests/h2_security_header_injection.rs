@@ -20,14 +20,28 @@
 //! * `host` vs `:authority` — mismatch → PROTOCOL_ERROR; case-insensitive
 //!   match → deduplicated to a single `Host:` line on the H1 wire
 //!   (FIX-6 — commit `4b8fbd3a`).
+//! * Request trailers — the fields of `editor::TRAILER_FORBIDDEN_FIELDS`
+//!   are elided from an H2 trailer block before an H1 or an H2 backend
+//!   receives it (sozu-proxy/sozu#1714).
 //!
 //! Raw-byte H2 is used for every request path: hyper refuses CRLF in values
 //! and collapses duplicate pseudo-headers at its HPACK encoder, so the only
 //! way to exercise sozu's filter is to build the header block by hand.
 
-use std::{io::Write, net::SocketAddr, thread, time::Duration};
+use std::{
+    io::Write,
+    net::SocketAddr,
+    thread,
+    time::{Duration, Instant},
+};
 
-use sozu_command_lib::proto::command::request::RequestType;
+use sozu_command_lib::{
+    config::ListenerBuilder,
+    proto::command::{
+        ActivateListener, AddCertificate, CertificateAndKey, Cluster, ListenerType,
+        RequestHttpFrontend, SocketAddress, request::RequestType,
+    },
+};
 
 use super::h2_utils::{
     H2_FRAME_HEADERS, H2Frame, collect_response_frames, h2_handshake, log_frames,
@@ -35,7 +49,11 @@ use super::h2_utils::{
     stream_status_matches, teardown, verify_sozu_alive,
 };
 use crate::{
-    mock::{raw_h2_response_backend::RawH2ResponseBackend, sync_backend::Backend as SyncBackend},
+    mock::{
+        h2_backend::H2Backend, raw_h2_response_backend::RawH2ResponseBackend,
+        sync_backend::Backend as SyncBackend,
+    },
+    port_registry::provide_port,
     sozu::worker::Worker,
     tests::{State, repeat_until_error_or, tests::create_local_address},
 };
@@ -781,6 +799,228 @@ fn test_h2_invalid_status_rejected() {
             2,
             "H2 security: upstream :status abc/20/+200/00200 does not reach client as 200 (FIX-2 c3f9e090)",
             try_h2_invalid_status_rejected
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Request trailers — `TRAILER_FORBIDDEN_FIELDS` (sozu-proxy/sozu#1714)
+// ============================================================================
+
+/// Trailer fields of the forbidden-field cases: one legitimate field, then
+/// one field of each RFC 9110 §6.5.1 category the H2 frontend does not
+/// already refuse as connection-specific (framing, routing, request
+/// modifiers, authentication, content processing), each carrying `forged`.
+/// `grpc-status` comes first, so a forbidden field that leaks lands after
+/// it in the trailer section.
+const FORBIDDEN_H2_TRAILERS: [(&[u8], &[u8]); 8] = [
+    (b"grpc-status", b"0"),
+    (b"content-length", b"6666"),
+    (b"host", b"forged.example"),
+    (b"cache-control", b"forged"),
+    (b"if-match", b"\"forged\""),
+    (b"authorization", b"Bearer forged"),
+    (b"cookie", b"session=forged"),
+    (b"content-type", b"text/forged"),
+];
+
+/// Send, on stream 1, a `POST /` with no `content-length`, a DATA frame
+/// without END_STREAM, and a trailer HEADERS frame holding
+/// `FORBIDDEN_H2_TRAILERS` with END_STREAM. Without a declared length the
+/// request is chunked towards an H1 backend, which then carries trailers.
+fn send_h2_post_with_forbidden_trailers(tls: &mut impl Write) {
+    let mut block = request_prefix_localhost();
+    block[0] = 0x83; // :method POST
+    tls.write_all(&H2Frame::headers(1, block, true, false).encode())
+        .unwrap();
+    tls.write_all(&H2Frame::data(1, b"hello".to_vec(), false).encode())
+        .unwrap();
+    let mut trailers = Vec::new();
+    for (name, value) in FORBIDDEN_H2_TRAILERS {
+        push_literal(&mut trailers, name, value);
+    }
+    tls.write_all(&H2Frame::headers(1, trailers, true, true).encode())
+        .unwrap();
+    tls.flush().unwrap();
+}
+
+/// H2 frontend, H1 backend: the only trailer field the backend reads after
+/// the body is `grpc-status`. This checks which fields survive, not that the
+/// chunked framing around them is well formed.
+fn try_h2_trailer_forbidden_fields_dropped_h1_backend() -> State {
+    let (mut worker, mut backend, front_port) =
+        setup_h2_with_sync_backend("H2-SEC-TRAILER-FORBIDDEN-H1");
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+    send_h2_post_with_forbidden_trailers(&mut tls);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut accepted = false;
+    while Instant::now() < deadline {
+        if backend.accept(0) {
+            accepted = true;
+            break;
+        }
+    }
+    // Drain the whole window, not one read: the assertion is about bytes
+    // that must not appear, so a late segment must be read too.
+    let mut received = String::new();
+    let window = Instant::now();
+    while accepted && window.elapsed() < Duration::from_millis(500) {
+        if let Some(chunk) = backend.receive(0) {
+            received.push_str(&chunk);
+        }
+    }
+    println!("trailer-forbidden H2->H1 — backend received {received:?}");
+    if accepted {
+        backend.send(0);
+    }
+    let frames = collect_response_frames(&mut tls, 300, 2, 300);
+    log_frames("trailer-forbidden H2->H1", &frames);
+    let has_response = stream_status_matches(&frames, 1, 200);
+
+    backend.disconnect();
+    drop(tls);
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    // After the body chunk come exactly the legitimate field and the empty
+    // line. The last-chunk line `0\r\n` is skipped when present: the H2->H1
+    // path does not write it yet, and that framing defect is fixed
+    // separately, so this test only checks which fields survive.
+    let trailer_section = received.find("\r\nhello\r\n").map(|at| {
+        let rest = &received[at + "\r\nhello\r\n".len()..];
+        rest.strip_prefix("0\r\n")
+            .unwrap_or(rest)
+            .to_ascii_lowercase()
+    });
+    let only_legitimate = trailer_section.as_deref() == Some("grpc-status: 0\r\n\r\n");
+    let leaked = received.contains("forged");
+    if accepted && only_legitimate && !leaked && has_response && stopped {
+        State::Success
+    } else {
+        println!(
+            "trailer-forbidden H2->H1 FAIL — accepted={accepted} \
+             trailer_section={trailer_section:?} leaked={leaked} \
+             response={has_response} stopped={stopped}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_trailer_forbidden_fields_dropped_h1_backend() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 security: forbidden request trailer fields never reach an H1 backend (#1714)",
+            try_h2_trailer_forbidden_fields_dropped_h1_backend
+        ),
+        State::Success
+    );
+}
+
+/// Sōzu listener + an `http2` cluster whose backend records the request
+/// trailers it receives. Returns the running `Worker`, the backend and the
+/// HTTPS front port.
+fn setup_h2_with_h2_trailer_backend(name: &str) -> (Worker, H2Backend, u16) {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        ListenerBuilder::new_https(front_address.clone())
+            .to_tls(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Cluster {
+        http2: Some(true),
+        ..Worker::default_cluster("cluster_0")
+    }));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: CertificateAndKey {
+            certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+            key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+            certificate_chain: vec![],
+            versions: vec![],
+            names: vec![],
+        },
+        expired_at: None,
+    }));
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    let backend = H2Backend::start_recording_trailers(format!("{name}-BACK"), back_address, "pong");
+    worker.read_to_last();
+    (worker, backend, front_port)
+}
+
+/// H2 frontend, H2 backend: the trailer HEADERS frame the backend decodes
+/// holds `grpc-status` and nothing else. `H2BlockConverter` already drops
+/// `host` on its own; the other forbidden fields rely on the frontend.
+fn try_h2_trailer_forbidden_fields_dropped_h2_backend() -> State {
+    let (mut worker, mut backend, front_port) =
+        setup_h2_with_h2_trailer_backend("H2-SEC-TRAILER-FORBIDDEN-H2");
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+    send_h2_post_with_forbidden_trailers(&mut tls);
+
+    let frames = collect_response_frames(&mut tls, 500, 5, 500);
+    log_frames("trailer-forbidden H2->H2", &frames);
+    let has_response = stream_status_matches(&frames, 1, 200);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut recorded = backend.recorded_requests();
+    while recorded.is_empty() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+        recorded = backend.recorded_requests();
+    }
+    println!("trailer-forbidden H2->H2 — backend recorded {recorded:?}");
+
+    drop(tls);
+    backend.stop();
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    let trailers = recorded.first().map(|request| request.trailers.clone());
+    let only_legitimate =
+        trailers.as_deref() == Some(&[("grpc-status".to_owned(), b"0".to_vec())][..]);
+    if recorded.len() == 1 && only_legitimate && has_response && stopped {
+        State::Success
+    } else {
+        println!(
+            "trailer-forbidden H2->H2 FAIL — requests={} trailers={trailers:?} \
+             response={has_response} stopped={stopped}",
+            recorded.len()
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_trailer_forbidden_fields_dropped_h2_backend() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 security: forbidden request trailer fields never reach an H2 backend (#1714)",
+            try_h2_trailer_forbidden_fields_dropped_h2_backend
         ),
         State::Success
     );
