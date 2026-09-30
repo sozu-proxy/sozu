@@ -3767,6 +3767,22 @@
 
 ### 🐛 Fixed
 
+- **`fix(mux)`: release the backend connection reservation of an abandoned dial
+  ([#1713](https://github.com/sozu-proxy/sozu/issues/1713)).** Selection reserves a connection on
+  the chosen backend (`active_connections += 1`) before the mux dials it, and only a failed
+  `connect(2)` released it. Three exits past a successful connect dropped the new connection and
+  kept the reservation: an H2 backend connection the buffer pool could not build
+  (`Connection::new_h2_client` returning `None`), a refused `Connection::start_stream`, and a
+  failed `register_socket` (fd pressure). Each hit left the backend's `active_connections` one too
+  high for the worker's lifetime, which skews least-loaded, power-of-two and PeakEWMA selection
+  and keeps a removed backend from ever draining to `Closed`. `Mux::dial_backend`
+  (`lib/src/protocol/mux/mod.rs`) now releases the reservation once for every exit of the new
+  `Mux::attach_dialed`, as `BackendChange::ConnectionClosed`: these are local failures, so no
+  failure or backoff is recorded against the backend. Documented in
+  `lib/src/protocol/mux/LIFECYCLE.md`. Covered by
+  `an_h2_client_the_pool_cannot_build_releases_its_reservation`,
+  `a_refused_stream_start_releases_its_reservation` and
+  `a_socket_the_poller_refuses_releases_its_reservation`.
 - **`fix(h1)`: read an answer template's `Connection` value as an option list
   ([#1702](https://github.com/sozu-proxy/sozu/issues/1702)).** `Template::new`
   (`lib/src/protocol/kawa_h1/answers.rs`) decided whether a template closes the frontend

@@ -528,7 +528,7 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   pool, then answers a `ConnectPlan` — `Attached` when it completed the attach
   from the pool, `Dial` when it needs a backend opened. It performs no dial, no
   `setsockopt`, no slab insertion and no epoll registration; `Mux::dial_backend`
-  does all of those, in the order `Router::connect` used, and hands the result
+  and the `Mux::attach_dialed` it calls do all of those, in the order `Router::connect` used, and hands the result
   to `Router::commit_dialed`. `a_dial_plan_performs_no_effect_of_its_own`
   (`router.rs`) pins the purity half: a `Dial` that had already dialled would
   still be a `Dial`, so the test asserts on the state the router and the stream
@@ -565,7 +565,7 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   reference-counted `Arc<str>`, so that id is itself a handle on the route
   table's allocation, and so are the keys `SessionManager::track_cluster_ip`
   stores and the id a dial hands over: `ConnectPlan::Dial` carries a handle
-  and `Mux::dial_backend` moves it into the new connection's
+  and `Mux::attach_dialed` moves it into the new connection's
   `Position::Client`. No step of a request copies its cluster id.
 
   Two things make the split hard to get wrong rather than merely documented.
@@ -1970,21 +1970,33 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
       selection applies it, so that selection sees the backend exactly where
       a failed `Backend::try_connect` left it. A dial that connects keeps the
       reservation as its connection's count, and the connection's
-      `ConnectionClosed` releases it. Pinned by
+      `ConnectionClosed` releases it.
+
+      A dial that connects but is then abandoned releases it too
+      ([#1713](https://github.com/sozu-proxy/sozu/issues/1713)). Every exit
+      past a successful connect lives in `Mux::attach_dialed`:
+      `Connection::new_h2_client` returning `None` (buffer pool exhausted),
+      a refused `Connection::start_stream`, and the `register_socket`
+      rollback, whose `Connection::release_start_stream_charge` pairs any
+      `active_requests` charge `start_stream` took — none for a fresh dial,
+      which is still `BackendStatus::Connecting` and was never charged.
+      `Connection` has no
+      `Drop`, so dropping the connection releases nothing; instead
+      `Mux::dial_backend` pushes one `ConnectionClosed` for whichever of them
+      returned `Err`, a single release point a new exit cannot bypass. It is
+      not `DialFailed`: these are local failures, and recording one against
+      the backend's `failures` and `retry_policy` would steer traffic away
+      from a healthy backend. Before #1713 all three leaked the reservation,
+      as they had leaked the count `Backend::try_connect` took before #1684.
+      Pinned by
       `a_second_selection_observes_the_first_selections_reservation`,
       `power_of_two_weighs_every_reservation`,
       `a_failed_dial_releases_its_reservation_and_records_the_failure`,
-      `a_synchronously_failed_dial_releases_its_reservation` and
-      `a_successful_dial_counts_its_connection_once` (`router.rs`).
-
-      The rule covers `connect(2)` failure and nothing else. Three exits of
-      `Mux::dial_backend` past a successful connect drop the connection
-      without releasing its reservation: `Connection::new_h2_client`
-      returning `None` (buffer pool exhausted), a refused
-      `Connection::start_stream`, and the `register_socket` rollback, which
-      releases `active_requests` but not `active_connections`. They leaked
-      the count `Backend::try_connect` took before #1684 in exactly the same
-      way, and still do.
+      `a_synchronously_failed_dial_releases_its_reservation`,
+      `a_successful_dial_counts_its_connection_once`,
+      `an_h2_client_the_pool_cannot_build_releases_its_reservation`,
+      `a_refused_stream_start_releases_its_reservation` and
+      `a_socket_the_poller_refuses_releases_its_reservation` (`router.rs`).
     * **Charge only a stream that started.** `Connection::start_stream`
       records `StreamsStarted` *after* the inner start returns true. The
       pre-#1340 shape charged first and undid the charge on refusal; a ledger
@@ -3008,7 +3020,7 @@ backpressure.
 (`memoized_rtt`, `Connection::rtt`). The H1 forwarding values are rendered once
 per frontend connection (`ForwardingHop`, `kawa_h1/LIFECYCLE.md` §2). A backend
 connection costs `socket`, `connect`, `setsockopt(TCP_NODELAY)` and
-`epoll_ctl(EPOLL_CTL_ADD)` when it is dialled (`Mux::dial_backend`), and its
+`epoll_ctl(EPOLL_CTL_ADD)` when it is dialled (`Mux::dial_backend`, `Mux::attach_dialed`), and its
 `close(2)` with no `EPOLL_CTL_DEL`; a `shutdown(SHUT_WR)` only while its peer has
 not closed (`shutdown_write`).
 

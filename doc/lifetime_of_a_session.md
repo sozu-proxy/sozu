@@ -874,10 +874,10 @@ minimum set to read a session's life from a dashboard:
   backpressure and time-integrated saturation (`SessionManager::check_limits`,
   `SessionManager::decr`, the `ACCEPT_SATURATION_TICK` block of `Server::run`).
 - `backend.pool.size` — open backend connections (`+1` in
-  `Mux::dial_backend`; `-1` in `Mux::close` for the backends still open at
+  `Mux::attach_dialed`; `-1` in `Mux::close` for the backends still open at
   session teardown, in `Connection::pre_close_client_bookkeeping` for a backend
   closed through `Connection::close` — the dead-backend sweep of
-  `Mux::ready_inner` included — and in `Mux::dial_backend`'s rollback when the
+  `Mux::ready_inner` included — and in `Mux::attach_dialed`'s rollback when the
   mio registration of a new backend socket fails).
 - `requests`, `bytes_in`, `bytes_out`, `backend_response_time`,
   `backend_header_time` — per-cluster and per-backend counters and timings

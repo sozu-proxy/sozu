@@ -612,8 +612,9 @@ impl SessionManager {
     /// backend selection and the dial. Six fallible exits follow the
     /// claim and none of them releases. Since sozu-proxy/sozu#1519 they
     /// sit in two functions rather than one: `Router::plan_connect`
-    /// keeps the two pool-reuse refusals, and `Mux::dial_backend`
-    /// (`lib/src/protocol/mux/mod.rs`) owns the four on the fresh-dial
+    /// keeps the two pool-reuse refusals, and `Mux::dial_backend` with the
+    /// `Mux::attach_dialed` it calls (`lib/src/protocol/mux/mod.rs`) own the
+    /// four on the fresh-dial
     /// path — backend selection, buffer-pool exhaustion, the new
     /// connection refusing the stream, and the `L7Proxy::register_socket`
     /// rollback, which restores its gauges and slab entry but not the
