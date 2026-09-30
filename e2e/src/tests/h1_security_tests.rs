@@ -1695,10 +1695,72 @@ const FORBIDDEN_TRAILERS: &str = concat!(
     "\r\n",
 );
 
-/// Whether `forwarded` carries a forged trailer value of `SPOOF_TRAILERS`
-/// or `FORBIDDEN_TRAILERS`.
-fn carries_forged_trailer(forwarded: &str) -> bool {
-    forwarded.contains("6.6.6.6") || forwarded.contains("6666")
+/// Split a field value into whole tokens: `,`, `;`, `=`, `"` and whitespace
+/// separate them, `:` does not, so `for="127.0.0.1:56666"` stays one token.
+fn field_value_tokens(value: &str) -> impl Iterator<Item = &str> {
+    value
+        .split(|c: char| matches!(c, ',' | ';' | '=' | '"') || c.is_ascii_whitespace())
+        .filter(|token| !token.is_empty())
+}
+
+/// Whether `forwarded` carries a forged field of `trailers`, the
+/// `SPOOF_TRAILERS` or `FORBIDDEN_TRAILERS` section it was sent with: a
+/// field line whose name is a forged field's name and whose value holds that
+/// field's forged value (`6.6.6.6`, `6666`, the address of `for=6.6.6.6`) as
+/// a whole token. `X-Forwarded-For: 127.0.0.1, 6.6.6.6` or `Forwarded:
+/// for=6.6.6.6, proto=http` match; Sōzu's own `Forwarded:
+/// proto=http;for="127.0.0.1:56666"` or `X-Forwarded-Port: 16666` cannot,
+/// whatever ephemeral port or request id they carry.
+fn carries_forged_trailer(forwarded: &str, trailers: &str) -> bool {
+    let forged: Vec<(&str, &str)> = trailers
+        .split("\r\n")
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| !name.eq_ignore_ascii_case("Grpc-Status"))
+        .filter_map(|(name, value)| Some((name.trim(), field_value_tokens(value).last()?)))
+        .collect();
+    forwarded
+        .split("\r\n")
+        .filter_map(|line| line.split_once(':'))
+        .any(|(name, value)| {
+            forged.iter().any(|(forged_name, forged_value)| {
+                name.trim().eq_ignore_ascii_case(forged_name)
+                    && field_value_tokens(value).any(|token| token == *forged_value)
+            })
+        })
+}
+
+#[test]
+fn carries_forged_trailer_matches_forged_fields_not_substrings() {
+    // CI run 36681162463: a clean request whose `Forwarded` source port is
+    // 56666 was taken for a forged `Content-Length: 6666`.
+    let clean = concat!(
+        "POST /api HTTP/1.1\r\n",
+        "Host: localhost\r\n",
+        "Transfer-Encoding: chunked\r\n",
+        "X-Forwarded-For: 127.0.0.1\r\n",
+        "X-Forwarded-Proto: http\r\n",
+        "X-Forwarded-Port: 16666\r\n",
+        "Forwarded: proto=http;for=\"127.0.0.1:56666\";by=127.0.0.1:6666\r\n",
+        "Sozu-Id: 01K6666666666666666666666\r\n",
+        "\r\n",
+        "5\r\nHello\r\n0\r\nGrpc-Status: 0\r\n\r\n",
+    );
+    for trailers in [SPOOF_TRAILERS, FORBIDDEN_TRAILERS] {
+        assert!(!carries_forged_trailer(clean, trailers), "{trailers:?}");
+        // Every forged field still matches, alone or merged into a list.
+        for field in trailers.split("\r\n").filter(|f| f.contains(':')) {
+            let leaked = format!("{clean}{field}\r\n");
+            assert_eq!(
+                carries_forged_trailer(&leaked, trailers),
+                !field.starts_with("Grpc-Status"),
+                "{field:?}"
+            );
+        }
+    }
+    let merged = format!("{clean}X-Forwarded-For: 127.0.0.1, 6.6.6.6\r\n");
+    assert!(carries_forged_trailer(&merged, SPOOF_TRAILERS));
+    let merged = format!("{clean}forwarded: for=6.6.6.6, proto=http\r\n");
+    assert!(carries_forged_trailer(&merged, SPOOF_TRAILERS));
 }
 
 /// Where the chunked request of `try_h1_trailer_fields_dropped` is
@@ -1786,7 +1848,7 @@ fn try_h1_trailer_fields_dropped(kind: &str, trailers: &str, split: TrailerSplit
     worker.soft_stop();
     worker.wait_for_server_stop();
 
-    if carries_forged_trailer(&forwarded) {
+    if carries_forged_trailer(&forwarded, trailers) {
         println!("{label}: FAIL — a spoofed or forbidden trailer reached the backend");
         return State::Fail;
     }
@@ -1864,7 +1926,7 @@ fn try_h1_pipelined_trailer_fields_dropped(kind: &str, trailers: &str) -> State 
         println!("{label}: FAIL — the pipelined request never reached the backend");
         return State::Fail;
     }
-    if carries_forged_trailer(&first) || carries_forged_trailer(&second) {
+    if carries_forged_trailer(&first, trailers) || carries_forged_trailer(&second, trailers) {
         println!("{label}: FAIL — a spoofed or forbidden trailer reached the backend");
         return State::Fail;
     }
