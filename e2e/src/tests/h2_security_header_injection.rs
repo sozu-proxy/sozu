@@ -374,6 +374,115 @@ fn test_h2_host_authority_match_deduplicated() {
 }
 
 // ============================================================================
+// Request trailers towards an H1 backend — the last chunk precedes them
+// ============================================================================
+
+/// Send, on stream 1, a `POST /` with no `content-length`, a DATA frame
+/// holding `hello` without END_STREAM, and a trailer HEADERS frame holding
+/// `trailers` with END_STREAM, then return the bytes the H1 backend reads.
+/// Without a declared length the request is chunked towards the backend.
+fn h2_post_with_trailers_as_seen_by_h1_backend(name: &str, trailers: &[(&[u8], &[u8])]) -> String {
+    let (mut worker, mut backend, front_port) = setup_h2_with_sync_backend(name);
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    let mut block = request_prefix_localhost();
+    block[0] = 0x83; // :method POST
+    tls.write_all(&H2Frame::headers(1, block, true, false).encode())
+        .unwrap();
+    tls.write_all(&H2Frame::data(1, b"hello".to_vec(), false).encode())
+        .unwrap();
+    let mut trailer_block = Vec::new();
+    for (name, value) in trailers {
+        push_literal(&mut trailer_block, name, value);
+    }
+    tls.write_all(&H2Frame::headers(1, trailer_block, true, true).encode())
+        .unwrap();
+    tls.flush().unwrap();
+
+    let accepted = (0..200).any(|_| {
+        if backend.accept(0) {
+            true
+        } else {
+            thread::sleep(Duration::from_millis(10));
+            false
+        }
+    });
+    // Read the whole window, not one segment: the request is complete only
+    // once its trailer section is closed, which may arrive in a later read.
+    let mut received = String::new();
+    for _ in 0..5 {
+        if !accepted {
+            break;
+        }
+        if let Some(chunk) = backend.receive(0) {
+            received.push_str(&chunk);
+        }
+    }
+    println!("{name} — backend received {received:?}");
+    if accepted {
+        backend.send(0);
+    }
+    let _ = collect_response_frames(&mut tls, 300, 2, 300);
+
+    backend.disconnect();
+    drop(tls);
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    received
+}
+
+/// The chunked body an H1 backend reads for an H2 request carrying trailers
+/// ends with the last chunk `0\r\n`, then the trailer section, then the empty
+/// line (RFC 9112 §7.1). Without the last chunk a backend parses the first
+/// trailer field as a chunk-size line: a strict one refuses the request, a
+/// lenient one desynchronizes the keep-alive connection.
+///
+/// TO SEE THIS RED: remove the `end_body` `Flags` block `handle_trailer`
+/// (`lib/src/protocol/mux/pkawa.rs`) pushes before the trailer fields.
+fn try_h2_request_trailers_follow_last_chunk_h1_backend() -> State {
+    let cases: [(&str, &[(&[u8], &[u8])], &str); 2] = [
+        (
+            "H2-TRAILER-LAST-CHUNK-H1",
+            &[(b"grpc-status", b"0")],
+            "5\r\nhello\r\n0\r\ngrpc-status: 0\r\n\r\n",
+        ),
+        // Every trailer field is elided: the last chunk and the empty line
+        // still end the body.
+        (
+            "H2-TRAILER-LAST-CHUNK-ELIDED-H1",
+            &[(b"x-real-ip", b"1.2.3.4")],
+            "5\r\nhello\r\n0\r\n\r\n",
+        ),
+    ];
+    for (name, trailers, expected_body) in cases {
+        let received = h2_post_with_trailers_as_seen_by_h1_backend(name, trailers);
+        let (head, body) = received.split_once("\r\n\r\n").unwrap_or((&received, ""));
+        let chunked = head
+            .to_ascii_lowercase()
+            .contains("\r\ntransfer-encoding: chunked");
+        if !chunked || body != expected_body {
+            println!("{name} FAIL — chunked={chunked} body={body:?} expected={expected_body:?}");
+            return State::Fail;
+        }
+    }
+    State::Success
+}
+
+#[test]
+fn test_h2_request_trailers_follow_last_chunk_h1_backend() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2->H1: request trailers follow the last chunk (RFC 9112 §7.1)",
+            try_h2_request_trailers_follow_last_chunk_h1_backend
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
 // FIX-4 — `:scheme` must be `http` or `https`
 // ============================================================================
 

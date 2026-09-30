@@ -2901,7 +2901,29 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     `test_h2_graceful_drain_deadline_with_a_linked_stream_sends_final_goaway`
     (`e2e/src/tests/h2_tests.rs`, all red before the change) and
     `a_draining_h2_session_waits_for_a_stream_awaiting_its_link`.
-
+32. **An H2 trailer block ends a chunked H1 body with the last chunk.**
+    Once it has accepted a trailer block, `pkawa::handle_trailer` queues
+    `Flags { end_body: true }` in front of the trailer fields and closes them
+    with `Flags { end_header, end_stream }`, the block shape kawa's H1 parser
+    gives a chunked trailer section; a refused block adds no marker. kawa's
+    H1 serializer writes the last chunk `0\r\n` for the `end_body` block of
+    a chunked message, so an H1 peer reads `0\r\n`, the trailer fields and
+    the empty line (RFC 9112 §7.1), in both directions: a request from an H2
+    client to an H1 backend, and a response from an H2 backend to an H1
+    client. A block with no field left (empty, or every field elided) ends
+    the body with `0\r\n\r\n`. `H2BlockConverter` ignores `end_body`: an
+    H2 peer gets one trailer HEADERS frame with END_STREAM when a field is
+    left, and an empty DATA frame with END_STREAM otherwise. Before
+    sozu-proxy/sozu#1722 the block had no `end_body` marker: the backend read
+    `5\r\nhello\r\ngrpc-status: 0\r\n\r\n` and took the first trailer
+    field for a chunk-size line, which breaks the request framing on a
+    keep-alive backend connection, and a block with no field left gave
+    `5\r\nhello\r\n\r\n`, a body that never ends. Pinned by
+    `handle_trailer_follows_the_last_chunk_on_h1`,
+    `handle_trailer_with_every_field_elided_ends_the_chunked_body_on_h1`
+    (`pkawa.rs`) and `test_h2_request_trailers_follow_last_chunk_h1_backend`
+    (`e2e/src/tests/h2_security_header_injection.rs`), all red before the
+    change.
 
 ---
 
