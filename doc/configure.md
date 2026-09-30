@@ -4002,6 +4002,7 @@ guaranteed not to underflow on close / timeout / shed / error paths.
 | `http.infinite_loop.error`     | counter | proxy            | HTTP event loop safety breaker triggered                     |
 | `http.failed_backend_matching` | counter | proxy            | Frontend matched but no backend could be selected            |
 | `http.early_response_close`    | counter | proxy            | Client closed before response was fully sent                 |
+| `http.close.request_incomplete` | counter | proxy          | H1 client connection closed because the response completed before the request was received whole (the rest of the body is never read as a request) |
 | `http.forwarded_malformed_elided` | counter | proxy          | Client `Forwarded` line removed as not RFC 7239 §4, once per line (`both` and `rfc7239` only) |
 | `http.trusting.x_proto`        | counter | proxy            | Request had an existing `X-Forwarded-Proto` header (trusted) |
 | `http.trusting.x_proto.diff`   | counter | proxy            | Trusted `X-Forwarded-Proto` differed from actual protocol    |

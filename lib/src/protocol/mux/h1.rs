@@ -1004,14 +1004,29 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     // the frontend timeout, and appended the next pipelined
                     // response to the body (sozu-proxy/sozu#1642).
                     //
+                    // The request must have been received whole as well: a
+                    // backend, or a default answer, may answer early (a 413 or
+                    // a 401 on an upload) while the client is still sending
+                    // the body. RFC 9112 §9.3 lets a connection carry another
+                    // message only once the previous one is complete, and the
+                    // rest of that body belongs to the answered request.
+                    // Resetting the parser here would read it as a new
+                    // request (sozu-proxy/sozu#1721), so the connection closes
+                    // instead. Whether the request was also fully written to
+                    // the backend decides only whether that backend may be
+                    // pooled: `ConnectionH1::end_stream` checks it, and a
+                    // default answer leaves a request it never forwarded.
+                    //
                     // Pre: the decision is taken once, when the whole response
                     // has left, never while part of it is still queued.
                     debug_assert!(
                         stream.back.is_terminated() && stream.back.is_completed(),
                         "the keep-alive decision must follow a completely written response"
                     );
-                    let keep_alive =
-                        stream.context.keep_alive_frontend && stream.context.keep_alive_backend;
+                    let request_complete = stream.front.is_terminated();
+                    let keep_alive = request_complete
+                        && stream.context.keep_alive_frontend
+                        && stream.context.keep_alive_backend;
                     if keep_alive {
                         self.timeout_deadline = now.checked_add(self.timeout_duration);
                         if let StreamState::Linked(token) = old_state {
@@ -1090,15 +1105,40 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                             // else: incomplete parse, wait for more data via READABLE
                         }
                     } else {
-                        // Pair: at least one side asked for the close. A
+                        // Pair: at least one side asked for the close, or
+                        // the request was not received whole. A
                         // pipelined request already buffered is dropped with
                         // the connection, never answered on it; the client
                         // retries it on a new connection (RFC 9112 §9.3.2).
                         debug_assert!(
-                            !stream.context.keep_alive_frontend
+                            !request_complete
+                                || !stream.context.keep_alive_frontend
                                 || !stream.context.keep_alive_backend,
-                            "the frontend closes only when one side asked to"
+                            "the frontend closes only when one side asked to or the request is incomplete"
                         );
+                        // A TLS close is deferred until `close_notify` is
+                        // flushed, and `writable` runs again: mark the stream
+                        // closing so that pass takes the `closing-context`
+                        // exit above, instead of completing the response a
+                        // second time (a second access log and counters) and
+                        // re-taking the keep-alive decision after
+                        // `close_notify`.
+                        stream.context.closing = true;
+                        if stream.context.keep_alive_frontend && stream.context.keep_alive_backend {
+                            // Both sides wanted to keep it: only the
+                            // incomplete request closes it.
+                            debug_assert!(
+                                !request_complete,
+                                "with both sides keeping alive, only an incomplete request closes"
+                            );
+                            debug!(
+                                "{} H1 closing the frontend after a response that completed before its request on stream {}",
+                                log_context!(self),
+                                stream_id
+                            );
+                            incr!(names::http::CLOSE_REQUEST_INCOMPLETE);
+                            return self.defer_close_for_tls_flush("request-incomplete");
+                        }
                         if !stream.context.keep_alive_backend {
                             debug!(
                                 "{} H1 closing the frontend after a response carrying the backend's Connection: close on stream {}",
@@ -1336,7 +1376,16 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 // keep alive should probably be used only if the http context is fully reset
                 // in case end_stream occurs due to an error the connection state is probably
                 // unrecoverable and should be terminated
-                if stream_context.keep_alive_backend && stream.back.is_terminated() {
+                // Both messages must be complete: a backend that answered
+                // before the whole request was written to it still expects
+                // the rest of the body, and would read the next request
+                // pooled onto it as that body (RFC 9112 §9.3,
+                // sozu-proxy/sozu#1721).
+                if stream_context.keep_alive_backend
+                    && stream.back.is_terminated()
+                    && stream.front.is_terminated()
+                    && stream.front.is_completed()
+                {
                     *status = BackendStatus::KeepAlive;
                 } else {
                     self.force_disconnect();
@@ -2450,6 +2499,9 @@ mod tests {
                 let stream = &mut context.streams[0];
                 stream.state = StreamState::Linked(BACKEND);
                 stream.context.keep_alive_frontend = true;
+                // The staged request is complete and fully written: only then
+                // may either connection outlive it (sozu-proxy/sozu#1721).
+                stream.front.parsing_phase = kawa::ParsingPhase::Terminated;
                 stream.metrics.service_start();
                 stream.metrics.backend_id = Some("test-backend".into());
                 stream.metrics.backend_start();
@@ -2528,6 +2580,265 @@ mod tests {
             rtts.windows(2).all(|pair| pair[0] == pair[1]),
             "every request of one connection reports that connection's one \
              sample, got: {rtts:?}"
+        );
+    }
+
+    /// A backend connection that answered before the whole request was
+    /// written to it still expects the rest of the body: `end_stream` must not
+    /// pool it, or the next request would be read as that body
+    /// (sozu-proxy/sozu#1721). The same connection, once the request is
+    /// complete too, is pooled: that half pins the guard is not a blanket
+    /// refusal.
+    ///
+    /// A request received whole but not yet fully written upstream is just
+    /// as incomplete for that backend.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH1::end_stream`, drop the two
+    /// `stream.front` conditions from the `BackendStatus::Connected` arm. The
+    /// incomplete request then leaves the connection `KeepAlive`.
+    #[test]
+    fn a_backend_that_answered_before_the_whole_request_is_not_pooled() {
+        const BACKEND: mio::Token = mio::Token(1);
+        // (request phase, request bytes still unwritten, pooled?)
+        for (request_phase, unwritten, expect_pooled) in [
+            (kawa::ParsingPhase::Body, false, false),
+            (kawa::ParsingPhase::Chunks { first: false }, false, false),
+            (kawa::ParsingPhase::Terminated, true, false),
+            (kawa::ParsingPhase::Terminated, false, true),
+        ] {
+            let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+            let mut context = test_context(&pool);
+            context
+                .create_stream(Ulid::generate(), 1 << 16)
+                .expect("the test pool must hand out stream buffers");
+            let (back_socket, _back_peer) = connected_socket();
+            let backend_ulid = Ulid::generate();
+            let mut client = h1_of(Connection::new_h1_client(
+                backend_ulid,
+                SessionTcpStream::new(back_socket, backend_ulid, None),
+                "test-cluster".into(),
+                test_backend_id(cached_peer()),
+                Duration::from_secs(60),
+            ));
+            if let Position::Client(_, _, status) = &mut client.position {
+                *status = BackendStatus::Connected;
+            }
+            client.stream = Some(0);
+            let stream = &mut context.streams[0];
+            stream.state = StreamState::Linked(BACKEND);
+            stream.context.keep_alive_backend = true;
+            // The response is complete; the request is as staged.
+            stream.back.parsing_phase = kawa::ParsingPhase::Terminated;
+            stream.front.parsing_phase = request_phase;
+            if unwritten {
+                // Received whole, but its end was never written upstream.
+                stream
+                    .front
+                    .blocks
+                    .push_back(kawa::Block::Flags(kawa::Flags {
+                        end_body: true,
+                        end_chunk: false,
+                        end_header: false,
+                        end_stream: true,
+                    }));
+            }
+
+            client.end_stream(0, &mut context);
+
+            let pooled = matches!(
+                client.position,
+                Position::Client(_, _, BackendStatus::KeepAlive)
+            );
+            assert_eq!(
+                pooled,
+                expect_pooled,
+                "a request in {request_phase:?} (unwritten bytes: {unwritten}) must {}pool the backend connection",
+                if expect_pooled { "" } else { "not " }
+            );
+        }
+    }
+
+    /// A frontend socket whose `close_notify` is left pending by the close and
+    /// flushed by the next write, as a TLS socket whose peer had not drained
+    /// it yet: the close is deferred, and `writable` runs again on the same
+    /// connection once the flush went through.
+    #[derive(Debug)]
+    struct PendingCloseNotifySocket {
+        stream: mio::net::TcpStream,
+        closing: bool,
+    }
+
+    impl SocketHandler for PendingCloseNotifySocket {
+        fn socket_read(&mut self, buf: &mut [u8]) -> (usize, SocketResult) {
+            self.stream.socket_read(buf)
+        }
+
+        fn socket_write(&mut self, buf: &[u8]) -> (usize, SocketResult) {
+            self.stream.socket_write(buf)
+        }
+
+        fn socket_write_vectored(&mut self, bufs: &[IoSlice]) -> (usize, SocketResult) {
+            // The pending `close_notify` leaves with this write.
+            self.closing = false;
+            self.stream.socket_write_vectored(bufs)
+        }
+
+        fn socket_wants_write(&self) -> bool {
+            self.closing
+        }
+
+        fn socket_close(&mut self) {
+            self.closing = true;
+        }
+
+        fn socket_ref(&self) -> &mio::net::TcpStream {
+            &self.stream
+        }
+
+        fn socket_mut(&mut self) -> &mut mio::net::TcpStream {
+            &mut self.stream
+        }
+
+        fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+            self.stream.peer_addr().ok()
+        }
+
+        fn protocol(&self) -> crate::socket::TransportProtocol {
+            crate::socket::TransportProtocol::Tcp
+        }
+
+        fn read_error(&self) {}
+
+        fn write_error(&self) {}
+    }
+
+    /// Once `writable` decided to close after a response, a deferred TLS
+    /// close must not run the completion again: the next pass would log the
+    /// request a second time, count it twice, and re-take the keep-alive
+    /// decision after `close_notify` — keeping the connection if the body
+    /// finished in between (sozu-proxy/sozu#1721).
+    ///
+    /// TO SEE THIS RED: in `ConnectionH1::writable`, delete the
+    /// `stream.context.closing = true;` of the close path. The second pass
+    /// then logs a second `H1::Complete` line and resets the stream to
+    /// `Idle` instead of closing the session.
+    #[test]
+    fn a_deferred_tls_close_completes_the_response_once() {
+        const BACKEND: mio::Token = mio::Token(1);
+        let (states_sender, states_receiver) = std::sync::mpsc::channel();
+
+        let output = crate::capture_test_logs(move || {
+            let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+            let mut context = test_context(&pool);
+            context
+                .create_stream(Ulid::generate(), 1 << 16)
+                .expect("the test pool must hand out stream buffers");
+            let (front_socket, front_peer) = connected_socket();
+            front_peer
+                .set_nonblocking(true)
+                .expect("the frontend peer is drained without blocking");
+            let mut frontend = Connection::new_h1_server(
+                Ulid::generate(),
+                PendingCloseNotifySocket {
+                    stream: front_socket,
+                    closing: false,
+                },
+                Duration::from_secs(60),
+            );
+            if let Connection::H1(server) = &mut frontend {
+                server.stream = Some(0);
+            }
+            let (back_socket, mut back_peer) = connected_socket();
+            let backend_ulid = Ulid::generate();
+            let mut client = h1_of(Connection::new_h1_client(
+                backend_ulid,
+                SessionTcpStream::new(back_socket, backend_ulid, None),
+                "test-cluster".into(),
+                test_backend_id(cached_peer()),
+                Duration::from_secs(60),
+            ));
+            if let Position::Client(_, _, status) = &mut client.position {
+                *status = BackendStatus::KeepAlive;
+            }
+            assert!(
+                client.start_stream(0, &mut context),
+                "premise: the backend must accept the request"
+            );
+            let stream = &mut context.streams[0];
+            stream.state = StreamState::Linked(BACKEND);
+            stream.context.keep_alive_frontend = true;
+            // An upload still in its body: the response completes first.
+            stream.front.parsing_phase = kawa::ParsingPhase::Body;
+            stream.metrics.service_start();
+            stream.metrics.backend_id = Some("test-backend".into());
+            stream.metrics.backend_start();
+            stream.metrics.backend_connected();
+
+            back_peer
+                .write_all(b"HTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\n\r\n")
+                .expect("the loopback backend peer must accept the response");
+            for _ in 0..64 {
+                client.readiness.event.insert(Ready::READABLE);
+                client.readable(&mut context, EndpointServer(&mut frontend));
+                if context.streams[0].back.is_terminated() {
+                    break;
+                }
+            }
+            assert!(
+                context.streams[0].back.is_terminated(),
+                "premise: the early response must be read whole"
+            );
+            let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+            router.backends.insert(BACKEND, Connection::H1(client));
+
+            let mut states = Vec::new();
+            for pass in 0..2 {
+                if pass == 1 {
+                    // The body finishes after the close began.
+                    context.streams[0].front.parsing_phase = kawa::ParsingPhase::Terminated;
+                }
+                frontend.readiness_mut().event.insert(Ready::WRITABLE);
+                let result = frontend.writable(&mut context, EndpointClient(&mut router));
+                states.push((result, context.streams[0].state));
+                if pass == 0 {
+                    assert_eq!(
+                        context.streams[0].state,
+                        StreamState::Unlinked,
+                        "premise: the first pass completes the response and closes"
+                    );
+                }
+            }
+            states_sender
+                .send(states)
+                .expect("the test thread must report its states");
+        });
+
+        let states = states_receiver
+            .recv()
+            .expect("the test thread must report its states");
+        let completions = output
+            .lines()
+            .filter(|line| line.contains("H1::Complete"))
+            .count();
+        assert_eq!(
+            completions, 1,
+            "the response must be completed and logged once, got: {output}"
+        );
+        for (pass, (_, state)) in states.iter().enumerate() {
+            assert_ne!(
+                *state,
+                StreamState::Idle,
+                "pass {pass}: no keep-alive reset after the close began"
+            );
+        }
+        assert!(
+            matches!(states[0].0, MuxResult::Continue),
+            "the first pass defers the close behind the pending close_notify"
+        );
+        assert!(
+            matches!(states[1].0, MuxResult::CloseSession),
+            "once close_notify is flushed the session closes, got {:?}",
+            states[1].0
         );
     }
 

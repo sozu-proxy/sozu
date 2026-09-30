@@ -6554,6 +6554,33 @@
   `e2e/src/tests/h2_security_header_injection.rs`, whose H2 backend mock gains an opt-in
   `H2Backend::start_recording_trailers`.
 
+- **`fix(h1)`: keep neither connection alive after a response that completed before its request
+  ([#1721](https://github.com/sozu-proxy/sozu/issues/1721)).** When a backend answered an H1
+  request completely and early (a 413 or a 401 on an upload) while the client was still sending
+  the body, `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`) applied keep-alive as soon as
+  the response had left. Its reset put the request parser back to the status line, so the rest of
+  the body was parsed as a new request that sozu routed, edited and forwarded as its own — a
+  request-smuggling primitive; and `ConnectionH1::end_stream` pooled the backend connection
+  although it still expected that body, so the next request was sent into it. The client
+  connection is now kept only once the request was received whole; otherwise it closes once the
+  response is flushed (`request-incomplete`), as it already did for a backend `Connection: close`
+  — this also covers a default answer whose keep-alive template answers an incomplete request.
+  The backend connection is pooled only once the request was also fully written to it, and is
+  disconnected otherwise (RFC 9112 §9.3); this guard also covers an H2 client that resets a
+  stream after the whole response but before its END_STREAM. A request pipelined behind such an
+  upload is dropped with the connection and retried by the client. Sozu does not drain the rest of
+  the body, so a client still uploading may see a connection reset instead of reading the early
+  response; a bounded lingering drain is left to a follow-up. Each such close increments the new
+  `http.close.request_incomplete` counter. Every close this path takes now also marks the stream
+  closing, so a TLS close deferred behind `close_notify` no longer completes the response a second
+  time on the next `writable` pass — which logged the request twice (the second line `413` with
+  zero durations and bytes), counted it twice, and re-took the keep-alive decision after
+  `close_notify`. Documented in `lib/src/protocol/mux/LIFECYCLE.md` and `doc/configure.md`.
+  Covered by the e2e
+  `test_h1_early_response_mid_content_length_upload` and
+  `test_h1_early_response_mid_chunked_upload`, and the unit
+  `a_backend_that_answered_before_the_whole_request_is_not_pooled` and
+  `a_deferred_tls_close_completes_the_response_once`.
 - **`fix(h1)`: chunked request trailers drop the fields RFC 9110 §6.5.1 keeps out of trailers,
   and are bounded ([#1701](https://github.com/sozu-proxy/sozu/issues/1701)).** After #1689 the H1
   frontend still forwarded every other trailer field verbatim, including framing, routing and

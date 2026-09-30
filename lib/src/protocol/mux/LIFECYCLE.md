@@ -1657,6 +1657,52 @@ Pinned by the e2e `test_h1_close_delimited_body_closes_client`,
 `test_h1_framed_keep_alive_responses_keep_the_client` and
 `test_h2_*_keeps_the_h2_connection`.
 
+**Neither connection outlives a response that completed before its request**
+(sozu-proxy/sozu#1721). A backend may answer early — a 413 or a 401 on an
+upload — while the client is still sending the body, and so may a default
+answer whose template keeps the connection. RFC 9112 §9.3 lets a connection
+carry another message only once the previous one is complete, and the rest of
+that body belongs to the request already answered. The same `Terminated`
+branch of `ConnectionH1::writable` therefore also requires `stream.front` to be
+terminated (received whole) before it keeps the client, and otherwise takes
+`defer_close_for_tls_flush("request-incomplete")`. It does not require the
+request to have been written upstream: a default answer leaves unsent a
+request it never forwarded, and a keep-alive template stays keep-alive. The keep-alive reset
+`stream.front.clear()` puts the parser back to its status line while
+`front.storage` is kept for pipelining, so keeping the connection used to parse
+the rest of the body as a new request — routed, edited and forwarded like any
+other, a request-smuggling primitive. On the close path the parser is not
+reset, so the remaining body bytes are read as the body they are and dropped
+with the connection. Symmetrically, `ConnectionH1::end_stream` moves a
+`Connected` backend to `BackendStatus::KeepAlive` only when the request is
+terminated and completed as well as the response; otherwise it disconnects,
+because that backend still expects the rest of the body and would read the
+next request pooled onto it as that body. That backend guard serves both
+frontends: an H2 frontend already defers `try_recycle_server_stream` until
+the client's END_STREAM, but a client RST_STREAM after the whole response
+reaches `end_stream` with the request still incomplete. An H2 backend takes a
+different path: a stream it carries is never reused, and when one ends the
+connection sends RST_STREAM(CANCEL) unless `back_received_end_of_stream &&
+front.is_terminated()` (`fully_completed` in `ConnectionH2`). That test asks
+whether the request was received whole, not whether it was fully written: a
+request received whole whose last DATA frames or END_STREAM are still queued
+toward the backend is forgotten without a reset, leaving that stream open on
+the backend. This change does not alter the H2 backend path. The close costs a client that pipelined behind its upload
+that pipelined request, which it retries on a new connection (§9.3.2); and a
+client that has not yet read the response when the close arrives may see a
+reset instead, exactly as with a backend `Connection: close` response
+mid-upload. Sozu does not drain the rest of the body to keep the connection.
+The close sets `stream.context.closing`, as every close this branch takes does:
+a TLS close is deferred until `close_notify` is flushed and `writable` runs
+again, and that pass then takes the `closing-context` exit instead of
+completing the response a second time — which logged the request twice and
+re-took the keep-alive decision after `close_notify`. Each close for an
+incomplete request increments `http.close.request_incomplete`. Pinned by the
+e2e `test_h1_early_response_mid_content_length_upload` and
+`test_h1_early_response_mid_chunked_upload`, and the unit
+`a_backend_that_answered_before_the_whole_request_is_not_pooled` and
+`a_deferred_tls_close_completes_the_response_once`.
+
 ### 8.5 Stale-upstream replay (`ReplayOnFreshBackend`)
 
 `end_stream_decision` splits "the backend closed without answering" in four,

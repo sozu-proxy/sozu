@@ -1408,6 +1408,180 @@ fn test_h1_connection_close_terminates() {
 }
 
 // =========================================================================
+// Early response while the request body is still uploading
+//
+// A backend may answer before it read the whole request body: a 413 or a
+// 401 on an upload. The response is then complete while the request is not.
+// RFC 9112 §9.3 lets a connection outlive a message only once that message
+// is complete in both directions: the rest of the body belongs to the
+// request the backend already answered, never to a new one. Two things must
+// hold once such a response has left:
+//
+// - the rest of the client's body is never parsed as a new request (that is
+//   a request-smuggling primitive: the attacker's body becomes a request
+//   sozu routes and edits as its own);
+// - the backend connection that still expects that body is never reused
+//   for another request, which it would read as the rest of the body.
+// =========================================================================
+
+/// How the request under test frames its body.
+#[derive(Clone, Copy, Debug)]
+enum EarlyResponseFraming {
+    ContentLength,
+    Chunked,
+}
+
+/// `true` when `forwarded` carries `request_line` as a request sozu itself
+/// forwarded — its head carries the `Sozu-Id` sozu adds to every request it
+/// sends — rather than as body bytes passed through verbatim.
+fn forwarded_as_request(forwarded: &str, request_line: &str) -> bool {
+    forwarded.split(request_line).skip(1).any(|after| {
+        let head = after.split("\r\n\r\n").next().unwrap_or_default();
+        head.split("\r\n").any(|line| line.starts_with("Sozu-Id: "))
+    })
+}
+
+fn try_h1_early_response_mid_upload(framing: EarlyResponseFraming) -> State {
+    let label = format!("EARLY-RESPONSE-{framing:?}");
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) =
+        setup_sync_test(&label, config, listeners, state, front_address, 1, false);
+    let mut backend = backends.pop().unwrap();
+    backend.connect();
+
+    // The rest of the body is, byte for byte, a request of its own.
+    let smuggled = "GET /smuggled HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let (head, first_part, rest) = match framing {
+        EarlyResponseFraming::ContentLength => {
+            let prefix = "0123456789";
+            (
+                format!(
+                    "POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+                    prefix.len() + smuggled.len()
+                ),
+                prefix.to_owned(),
+                smuggled.to_owned(),
+            )
+        }
+        EarlyResponseFraming::Chunked => (
+            "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
+                .to_owned(),
+            // The chunk-size line leaves first; its data leaves after the
+            // response.
+            format!("{:x}\r\n", smuggled.len()),
+            format!("{smuggled}\r\n0\r\n\r\n"),
+        ),
+    };
+    let second = "GET /second HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+    let mut stream = raw_connect(front_address);
+    stream
+        .write_all(format!("{head}{first_part}").as_bytes())
+        .expect("write the request head and the start of its body");
+
+    if !backend_accepts_within(&mut backend, 0, Duration::from_secs(2)) {
+        println!("{label}: the upload never reached the backend");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+    let upload = backend_drain(&mut backend, 0, Duration::from_millis(300));
+    if !upload.contains("POST /upload HTTP/1.1") {
+        println!("{label}: the backend did not receive the upload head: {upload:?}");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    // The early, complete, keep-alive response.
+    backend.set_response("HTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\n\r\n");
+    backend.send(0);
+    let early = read_status_lines(&mut stream, 1, Duration::from_secs(2));
+    if !early.contains("HTTP/1.1 413") {
+        println!("{label}: the client did not receive the early 413: {early:?}");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    // The client finishes its body, then sends a second request. Sozu may
+    // already have closed the connection: a failed write is fine.
+    let _ = stream.write_all(format!("{rest}{second}").as_bytes());
+
+    // Whatever reaches the backend now, on the connection that still expects
+    // the rest of the body or on a new one. Anything forwarded as a request
+    // is answered, so a smuggled request would also reach the client.
+    backend.set_response("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let on_reused = backend_drain(&mut backend, 0, Duration::from_millis(500));
+    if !sozu_ids(&on_reused).is_empty() {
+        backend.send(0);
+    }
+    let on_fresh = if backend_accepts_within(&mut backend, 1, Duration::from_millis(300)) {
+        let received = backend_drain(&mut backend, 1, Duration::from_millis(300));
+        if !sozu_ids(&received).is_empty() {
+            backend.send(1);
+        }
+        received
+    } else {
+        String::new()
+    };
+    let after = read_status_lines(&mut stream, 1, Duration::from_millis(500));
+    println!("{label}: backend connection 0 after the 413: {on_reused:?}");
+    println!("{label}: backend connection 1: {on_fresh:?}");
+    println!("{label}: client after the 413: {after:?}");
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    // Client side: the rest of the body was never routed as a request.
+    let smuggled_line = "GET /smuggled HTTP/1.1\r\n";
+    if forwarded_as_request(&on_reused, smuggled_line)
+        || forwarded_as_request(&on_fresh, smuggled_line)
+    {
+        println!("{label}: the rest of the body was forwarded as a request");
+        return State::Fail;
+    }
+    // Nor did the client get an answer to it.
+    if after.contains("HTTP/1.1 200") {
+        println!("{label}: the client received a response to the rest of its body");
+        return State::Fail;
+    }
+    // Backend side: the connection that answered early, whose request is
+    // still incomplete, carried no further request.
+    if !sozu_ids(&on_reused).is_empty() {
+        println!("{label}: a request was sent on the backend connection that answered early");
+        return State::Fail;
+    }
+    State::Success
+}
+
+#[test]
+fn test_h1_early_response_mid_content_length_upload() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H1 security: an early response ends neither a Content-Length upload nor its backend connection",
+            || try_h1_early_response_mid_upload(EarlyResponseFraming::ContentLength),
+        ),
+        State::Success,
+    );
+}
+
+#[test]
+fn test_h1_early_response_mid_chunked_upload() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H1 security: an early response ends neither a chunked upload nor its backend connection",
+            || try_h1_early_response_mid_upload(EarlyResponseFraming::Chunked),
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
 // Test 13: CL.TE request smuggling via an ambiguous Transfer-Encoding
 // (regression of #726)
 //
