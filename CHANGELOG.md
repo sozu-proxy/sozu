@@ -3837,6 +3837,22 @@
   `listener_patches_are_refused_by_the_main_process_exactly_when_a_worker_refuses_them` and
   `test_rejected_patch_changes_nothing`.
 
+- **`fix(state)`: record the `answers` map and the HTTPS `hsts` block of a listener patch in the
+  main state ([#1715](https://github.com/sozu-proxy/sozu/issues/1715)).** An
+  `UpdateHttpListener` / `UpdateHttpsListener` patch carrying the `answers` map, or an HTTPS
+  patch carrying `hsts` (as `sozu listener https update --hsts-*` sends), reached the workers,
+  which applied it in `HttpListener::update_config` (`lib/src/http.rs`) and
+  `HttpsListener::update_config` (`lib/src/https.rs`), but `ConfigState::update_http_listener`
+  and `ConfigState::update_https_listener` (`command/src/state.rs`) only validated them and
+  merged the legacy `http_answers`. `ListListeners` and `SaveState` showed the listener as it was
+  created, and the state replayed to a new worker on upgrade or restart restored its old
+  templates and HSTS default, silently reverting the hot change. Both functions now merge the
+  `answers` map as the workers do — a non-empty body replaces the template of its status, an
+  empty one preserves it — and the HTTPS one stores `hsts` as a full-object replacement; an
+  absent field still preserves the recorded value. Documented in `doc/configure.md` (HSTS
+  partial update). Covered by `update_http_listener_records_the_answers_map` and
+  `update_https_listener_records_the_answers_map_and_hsts`.
+
 - **`fix(state)`: record hot updates of `elide_x_real_ip` and `send_x_real_ip` in the main
   state ([#1688](https://github.com/sozu-proxy/sozu/issues/1688)).** An
   `UpdateHttpListener` / `UpdateHttpsListener` patch of either flag reached the workers, which
