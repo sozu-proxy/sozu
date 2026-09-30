@@ -3750,6 +3750,32 @@
   `a_keyed_request_stays_on_one_backend_under_hrw` and
   `a_sticky_cookie_wins_over_the_affinity_key`.
 
+- **`fix(state)`: apply a listener patch all-or-nothing, in the main process and on the workers
+  ([#1703](https://github.com/sozu-proxy/sozu/issues/1703)).** `ConfigState::update_http_listener`
+  and `ConfigState::update_https_listener` (`command/src/state.rs`) wrote a patch field by field
+  and checked `alpn_protocols`, `sozu_id_header` and `forwarded_headers` in between, so a patch
+  refused on one of them kept the fields written before it: `sozu listener list`, `SaveState` and
+  upgrade replay then showed a configuration nobody asked for. The workers did the same with an
+  answer template that does not parse and with an `hsts` block without `enabled`, which
+  `HttpsListener::update_config` checked last, after committing the new rustls context and
+  templates. Every check now runs before the first write in the main state, and the workers apply
+  the patch to a copy of the listener configuration and commit it, with its rebuilt rustls context
+  and answer registry, only once everything succeeded. The main process also refuses the two
+  patches only the workers refused before: a template that does not parse, checked before dispatch
+  with the worker's own `HttpAnswers::validate_patch_templates`, and an `hsts` block without
+  `enabled` (`StateError::InvalidValue`). A legacy `http_answers` template shadowed by a template
+  the listener already holds is now parsed too, so an unparseable one is refused instead of being
+  stored unused. The template check runs before dispatch, so a patch carrying an unparseable
+  template for an unknown address now reports the template error rather than `NotFound`, and a
+  `LoadState` replay skips such a recorded patch with a warning instead of re-sending it to the
+  workers. TCP patches validate nothing past the listener lookup and were already
+  all-or-nothing. Covered by `update_http_listener_rejected_patch_leaves_the_state_unchanged`,
+  `update_https_listener_rejected_patch_leaves_the_state_unchanged`,
+  `update_tcp_listener_rejected_patch_leaves_the_state_unchanged`,
+  `a_rejected_patch_leaves_the_listener_unchanged` (HTTP and HTTPS workers),
+  `listener_patches_are_refused_by_the_main_process_exactly_when_a_worker_refuses_them` and
+  `test_rejected_patch_changes_nothing`.
+
 - **`fix(state)`: record hot updates of `elide_x_real_ip` and `send_x_real_ip` in the main
   state ([#1688](https://github.com/sozu-proxy/sozu/issues/1688)).** An
   `UpdateHttpListener` / `UpdateHttpsListener` patch of either flag reached the workers, which

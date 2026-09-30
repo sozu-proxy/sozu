@@ -19,6 +19,7 @@
 //! 13. [`test_hot_upgrade_replay`]                  — patched value survives upgrade fd-passing
 //! 14. [`test_load_state_merge_semantics`]          — LoadState after update preserves live value
 //! 15. [`test_forwarded_headers_hot_change`]        — forwarded_headers patched live (both → rfc7239)
+//! 16. [`test_rejected_patch_changes_nothing`]      — a refused patch leaves the live listener as it was
 
 use std::{
     io::{Read, Write},
@@ -1857,6 +1858,76 @@ fn test_forwarded_headers_hot_change() {
             5,
             "listener update: forwarded_headers both → rfc7239 on the next connection",
             try_forwarded_headers_hot_change
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test 16: rejected_patch_changes_nothing
+// ============================================================================
+
+/// A patch the worker refuses changes nothing on the live listener
+/// (sozu-proxy/sozu#1703). The patch switches `forwarded_headers` from `both`
+/// to `rfc7239` — a field that validates — and carries a 503 answer template
+/// that does not parse. The worker used to write every field into its live
+/// configuration before building the templates, so it answered `Failure`
+/// yet served the next connection in `rfc7239` mode. It must keep `both`.
+fn try_rejected_patch_changes_nothing() -> State {
+    let (mut worker, front_address, back_address) =
+        setup_forwarded_headers_test("REJECTED-PATCH", ForwardedHeadersMode::Both);
+    let mut backend = SyncBackend::new("BACKEND_0", back_address, http_ok_response("pong"));
+    backend.connect();
+
+    let mut round_trip = |client_id: usize| {
+        let mut client = Client::new("client", front_address, FORWARDED_CLIENT_CHAIN_REQUEST);
+        client.connect();
+        client.send();
+        backend.accept(client_id);
+        let request = backend.receive(client_id);
+        backend.send(client_id);
+        let _ = client.receive();
+        request.map(|request| request.to_lowercase())
+    };
+
+    worker.send_proxy_request_type(RequestType::UpdateHttpListener(UpdateHttpListenerConfig {
+        address: front_address.into(),
+        forwarded_headers: Some(ForwardedHeaders::Rfc7239 as i32),
+        answers: [("503".to_owned(), "not a valid http response".to_owned())].into(),
+        ..Default::default()
+    }));
+    let patch_refused = worker
+        .read_proxy_response()
+        .is_some_and(|resp| resp.status == ResponseStatus::Failure as i32);
+
+    let after = round_trip(0);
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    println!("REJECTED-PATCH: after={after:?}");
+
+    let Some(after) = after else {
+        println!("REJECTED-PATCH: the backend missed the request");
+        return State::Fail;
+    };
+    // Still `both`: the client `X-Forwarded-For` extended, and `Forwarded`.
+    let unchanged = after.contains("\r\nx-forwarded-for: 192.0.2.7, 127.0.0.1\r\n")
+        && after.contains("\r\nforwarded: for=192.0.2.7, proto=http;for=\"127.0.0.1:");
+    println!("REJECTED-PATCH: patch_refused={patch_refused} unchanged={unchanged}");
+    if patch_refused && unchanged && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_rejected_patch_changes_nothing() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "listener update: a refused patch leaves forwarded_headers as it was",
+            try_rejected_patch_changes_nothing
         ),
         State::Success
     );
