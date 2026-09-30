@@ -713,6 +713,18 @@
   and got the cell's pod evicted twice under its 8Gi ephemeral-storage limit. Main on its own
   cache peaks at 5.50GB; an exact cache hit is untouched.
 
+- **`chore(deps)`: dependencies updated, and off the yanked `yoke-derive` 0.8.3.**
+  `yoke-derive` 0.8.3, which the upgrade above had locked, was yanked from crates.io, and the
+  `cargo-audit` job of `ci.yml` runs `cargo audit --deny warnings`, so it failed on every branch
+  with `Crate: yoke-derive, Version: 0.8.3, Warning: yanked`. Checked against the crates.io sparse
+  index on 2026-09-30, all 66 registry requirements across the workspace and `fuzz/` manifests
+  already name their latest release, semver-major included, so no manifest changes. `cargo update`
+  then moves a single locked package in `Cargo.lock` and in `fuzz/Cargo.lock`: `yoke-derive`
+  0.8.3 → 0.8.4, with its dependency list unchanged. `yoke` stays at 0.8.3, which is not yanked.
+  `generic-array` stays at 0.14.7, which `crypto-common` 0.1.7 pins exactly. `yoke-derive` 0.8.4
+  declares `rust-version` 1.82, so the MSRV stays 1.93.1. `cargo audit --deny warnings` passes on
+  both lockfiles. No code change and no new dependency.
+
 - **`docs`: the H1 keep-alive TLS allocation gap of `doc/hot_path_zero_copy.md` is attributed per
   request and per connection ([#1669](https://github.com/sozu-proxy/sozu/pull/1669)).** §2.3 now explains that the 20.25–20.30 heap operations per request
   over TLS, against 7.80 in clear, are about 4 per request plus about 168 per connection (8.4 per
