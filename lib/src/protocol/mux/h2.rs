@@ -19963,6 +19963,12 @@ mod tests {
                 BackendChange::StreamsStarted(count) => net += count as i64,
                 BackendChange::StreamsEnded(count) => net -= count as i64,
                 BackendChange::ConnectionClosed => closed += 1,
+                // Only `Mux::dial_backend` emits it, and no scenario here
+                // dials: an H2 connection's own paths never release a
+                // reservation.
+                BackendChange::DialFailed(_) => {
+                    unreachable!("no invariant-14 scenario dials a backend")
+                }
             }
         }
         (net, closed)
@@ -20043,8 +20049,9 @@ mod tests {
 
     /// Apply a ledger and read the counter it leaves behind.
     fn settle(fixture: &mut LedgerFixture, context: &mut Context<TestListener>) -> usize {
+        let backends = RefCell::new(crate::backends::BackendMap::with_seed(0));
         for delta in std::mem::take(&mut context.backend_deltas) {
-            fixture.registry.apply(delta);
+            fixture.registry.apply(delta, &backends);
         }
         fixture.backend.borrow().active_requests
     }
@@ -20272,8 +20279,9 @@ mod tests {
             (0, 0),
             "and the charge must be released when that request ends"
         );
+        let backends = RefCell::new(crate::backends::BackendMap::with_seed(0));
         for delta in std::mem::take(&mut context.backend_deltas) {
-            registry.apply(delta);
+            registry.apply(delta, &backends);
         }
         assert_eq!(
             backend.borrow().active_requests,

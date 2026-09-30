@@ -293,8 +293,8 @@ connect(12, {sa_family=AF_INET, sin_port=htons(1052), sin_addr=inet_addr("127.0.
 > same `connect` syscall is reached through `Mux::dial_backend`
 > (`lib/src/protocol/mux/mod.rs`), which calls `Router::backend_from_request`
 > (`lib/src/protocol/mux/router.rs`) — its only call site — lending it the
-> `BackendDialer` whose `select_and_dial` issues the connect through
-> `Backend::try_connect` (`lib/src/backends.rs`), all under the mux `ready` pass. Routing itself decides one
+> `BackendSelector` whose `select` reserves a backend, then issues the
+> connect itself (sozu#1684), all under the mux `ready` pass. Routing itself decides one
 > step earlier, in `Router::plan_connect`
 > (`lib/src/protocol/mux/router.rs`), which performs no syscall at all. The
 > technique this section teaches is unchanged.

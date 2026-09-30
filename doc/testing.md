@@ -689,6 +689,16 @@ average decays from. Two production defaults remain outside these files and
 are not simulated: `Backend::new`'s stamp, and the TCP proxy (`tcp.rs`), which
 selects at `Instant::now()` and draws its backoff jitter from `rand::rng()`.
 
+The mux's own seam into selection is `router::BackendSelector`, which
+`Router::backend_from_request` borrows for one call. A selector answers a
+`BackendId` and never a socket (#1684): the embedder dials, so a simulator can
+implement one without an OS socket type, and `sim/Cargo.toml` still carries
+no `mio`. Such a selector numbers its backends itself and mints their ids with
+`BackendId::new(slot, backend_id, address)`; the worker's mux mints through
+the session's `BackendRegistry` instead. Whatever implements it must keep the
+reservation rule of `mux/LIFECYCLE.md` §9 invariant 14: selecting counts the
+connection, and a dial that fails releases it.
+
 ---
 
 ## 6. Fuzzing

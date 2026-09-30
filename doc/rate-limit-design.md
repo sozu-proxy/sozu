@@ -203,7 +203,8 @@ connection**, so the slot comes back with it:
   close in the same event-loop pass.
 
 A registered, healthy-status backend that is down may not fail on the
-dial at all. `Backend::try_connect` (`lib/src/backends.rs`) is
+dial at all. The dial — `Mux::dial_backend` (`lib/src/protocol/mux/mod.rs`)
+for HTTP, `Backend::try_connect` (`lib/src/backends.rs`) for TCP — is
 non-blocking: a refusal the kernel reports synchronously — the common
 case for a closed port on loopback — surfaces as
 `BackendError::ConnectionFailures` and takes the answer path above,
