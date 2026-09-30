@@ -377,7 +377,10 @@ pub enum BackendChange {
     StreamsStarted(usize),
     /// `Backend::active_requests -= n`, saturating — `n` streams left it.
     StreamsEnded(usize),
-    /// `Backend::dec_connections()` — the connection to this backend closed.
+    /// `Backend::dec_connections()` — the connection to this backend closed,
+    /// or a dial that connected was abandoned before its connection was
+    /// registered (`Mux::dial_backend`, #1713): either way the reservation
+    /// selection took is released, and no failure is recorded.
     ConnectionClosed,
     /// The `connect(2)` of a dial failed at this instant (#1684): release the
     /// reservation selection took (`Backend::dec_connections()`), and record
@@ -2333,18 +2336,14 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     /// `BackendMap`, a `connect(2)`, `setsockopt`, the session slab, the mio
     /// registry — and the order is the one `Router::plan_connect` used, unchanged.
     ///
-    /// SECURITY (CWE-400): every stateful side-effect (the
-    /// `backend.connections` / `backend.pool.size` /
-    /// `connections_per_backend` gauges, the slab session, the mio
-    /// registration, the router-map entry, `stream.metrics.backend_start`) is
-    /// deferred until AFTER both the `Connection` constructor and
-    /// `start_stream` have succeeded. If either fails this returns `Err`
-    /// without leaking a slab entry, an epoll registration, a gauge counter
-    /// or a router-map entry. The `TcpStream` lives on the stack and is moved
-    /// into the `Connection`; on failure the `Connection` — or the raw
-    /// `TcpStream`, for the pool-exhaustion branch that drops inside
-    /// `Connection::new_h2_client` — is dropped, closing the fd. No token is
-    /// allocated before that point, so there is nothing to roll back.
+    /// The one side-effect taken before the dial is the reservation selection
+    /// raises on the backend (`active_connections += 1`,
+    /// `BackendMap::reserve_backend`), and this function releases it on
+    /// every exit that returns `Err`: a failed `connect(2)` through
+    /// `BackendChange::DialFailed`, which also records the backend's
+    /// failure, and every later exit — all of [`Self::attach_dialed`]'s —
+    /// through one `BackendChange::ConnectionClosed`, which records none,
+    /// because there the backend did not fail (#1713).
     ///
     /// Taken as free functions over `&mut` fields rather than `&mut self` so
     /// the caller can keep its `&mut self.context` binding across the call.
@@ -2410,6 +2409,62 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             }
         };
 
+        // Past the connect, the reservation belongs to the connection built
+        // on `socket`. An exit that abandons it drops the connection
+        // unregistered, and `Connection` has no `Drop` that would release
+        // anything, so the release is taken here, once, for every such exit:
+        // `Connection::new_h2_client` finding no buffer, a refused
+        // `Connection::start_stream`, and the `register_socket` rollback
+        // (#1713). It is `ConnectionClosed`, not `DialFailed`: each of those
+        // is a local failure, and charging it to the backend's failure count
+        // and backoff would steer traffic away from a healthy backend.
+        let slot = backend.slot();
+        let attached = Self::attach_dialed(
+            router, stream_id, context, session, proxy, cluster_id, h2, backend, socket,
+        );
+        if attached.is_err() {
+            context.backend_deltas.push(BackendDelta {
+                slot,
+                change: BackendChange::ConnectionClosed,
+            });
+            debug_assert!(
+                !matches!(context.streams[stream_id].state, StreamState::Linked(_)),
+                "an abandoned dial must not have linked its stream"
+            );
+        }
+        attached
+    }
+
+    /// Build, start and register the connection of a dial whose `connect(2)`
+    /// succeeded, and hand it to `Router::commit_dialed`.
+    ///
+    /// SECURITY (CWE-400): every stateful side-effect (the
+    /// `backend.connections` / `backend.pool.size` /
+    /// `connections_per_backend` gauges, the slab session, the mio
+    /// registration, the router-map entry, `stream.metrics.backend_start`) is
+    /// deferred until AFTER both the `Connection` constructor and
+    /// `start_stream` have succeeded. If either fails this returns `Err`
+    /// without leaking a slab entry, an epoll registration, a gauge counter
+    /// or a router-map entry. The `TcpStream` lives on the stack and is moved
+    /// into the `Connection`; on failure the `Connection` — or the raw
+    /// `TcpStream`, for the pool-exhaustion branch that drops inside
+    /// `Connection::new_h2_client` — is dropped, closing the fd. No token is
+    /// allocated before that point, so there is nothing to roll back. The
+    /// backend's reservation is the caller's to release: every `Err` here
+    /// drops the connection, and [`Self::dial_backend`] releases it once for
+    /// all of them.
+    #[allow(clippy::too_many_arguments)]
+    fn attach_dialed(
+        router: &mut Router,
+        stream_id: GlobalStreamId,
+        context: &mut Context<L>,
+        session: &Rc<RefCell<dyn ProxySession>>,
+        proxy: &Rc<RefCell<dyn L7Proxy>>,
+        cluster_id: sozu_command::state::ClusterId,
+        h2: bool,
+        backend: BackendId,
+        socket: mio::net::TcpStream,
+    ) -> Result<(), BackendConnectionError> {
         if let Err(e) = socket.set_nodelay(true) {
             error!(
                 "{} error setting nodelay on back socket({:?}): {:?}",
@@ -3096,7 +3151,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 // gives every read inside it the same cluster map; the two
                 // sites used to take separate borrows. A second immutable
                 // borrow inside (`plan_connect`'s limit gate, and
-                // `dial_backend`'s `add_session` / `register_socket`) is fine
+                // `attach_dialed`'s `add_session` / `register_socket`) is fine
                 // — nothing on this path borrows the proxy mutably.
                 let proxy_ref = proxy.borrow();
                 let view = router::RoutingView::new(proxy_ref.clusters(), proxy_ref.kind());

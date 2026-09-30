@@ -836,9 +836,13 @@ impl BackendMap {
     /// The reservation is `active_connections += 1`, taken under the same
     /// borrow as the choice, so the next selection weighs it exactly as it
     /// weighed the connection `Backend::try_connect` used to count at the
-    /// dial. The caller connects, and a connection that fails to start
-    /// releases the reservation through [`Backend::release_failed_dial`]; one
-    /// that starts keeps it, and its close releases it like any other.
+    /// dial. The caller connects. A `connect(2)` that fails releases the
+    /// reservation through [`Backend::release_failed_dial`], which also
+    /// records the failure. A dial that connects but is abandoned before its
+    /// connection is registered releases it with a plain
+    /// `Backend::dec_connections`, recording no failure (the mux's
+    /// `BackendChange::ConnectionClosed`, #1713). A connection that starts
+    /// keeps it, and its close releases it like any other.
     ///
     /// `key` is the client's affinity key, as for
     /// [`Self::backend_from_cluster_id`].

@@ -167,7 +167,8 @@ path they live in two functions:
 - **`Router::plan_connect`** keeps the two pool-reuse refusals — a
   reused connection that vanished from the router's backend map, and a
   reused backend that refuses one more stream.
-- **`Mux::dial_backend`** (`lib/src/protocol/mux/mod.rs`) owns the four
+- **`Mux::dial_backend`** and the **`Mux::attach_dialed`** it calls
+  (`lib/src/protocol/mux/mod.rs`) own the four
   on the fresh-dial path — backend selection with nothing available, a
   buffer pool with nothing left, the freshly-built connection refusing
   the stream, and a `L7Proxy::register_socket` that fails. The last one

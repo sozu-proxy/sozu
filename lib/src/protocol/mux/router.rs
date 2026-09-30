@@ -973,7 +973,7 @@ impl Router {
         // into `Router::commit_dialed`.
         //
         // The new connection's `Position::Client` shares the routed id: the
-        // plan carries a handle on it and `Mux::dial_backend` moves it there.
+        // plan carries a handle on it and `Mux::attach_dialed` moves it there.
         Ok(ConnectPlan::Dial {
             cluster_id: cluster_id.clone(),
             h2,
@@ -1417,8 +1417,11 @@ impl Router {
 /// dial. A `connect(2)` that fails releases the reservation through the
 /// ledger (`BackendChange::DialFailed`), and LIFECYCLE §9 invariant 14's
 /// drain before each selection applies it before anything reads the counters
-/// again. A dial that succeeds keeps the reservation as its connection's
-/// count, and the connection's close releases it.
+/// again. A dial that connects but is abandoned before its connection is
+/// registered — no buffer for an H2 client, a refused stream start, a failed
+/// `register_socket` — releases it through `BackendChange::ConnectionClosed`,
+/// recording no failure (#1713). A dial that succeeds keeps the reservation
+/// as its connection's count, and the connection's close releases it.
 ///
 /// # Why a trait and not `&mut BackendMap`
 ///
@@ -3813,9 +3816,9 @@ mod backend_selection_order_tests {
     /// the route table, the stream's `HttpContext::cluster_id`, the
     /// `ConnectPlan::Dial` and the new connection's `Position::Client` all
     /// point at the one allocation the route table made when the frontend was
-    /// added. `Mux::dial_backend` moves the plan's handle into the connection.
+    /// added. `Mux::attach_dialed` moves the plan's handle into the connection.
     ///
-    /// TO SEE THIS RED: build the connection in `Mux::dial_backend` from
+    /// TO SEE THIS RED: build the connection in `Mux::attach_dialed` from
     /// `ClusterId::from(&*cluster_id)`, or stamp the plan in
     /// `Router::decide_after_gate` with one; the connection then owns a
     /// second copy at another address.
@@ -3930,18 +3933,79 @@ mod backend_selection_order_tests {
     fn dial_one(
         address: std::net::SocketAddr,
     ) -> (Result<(), BackendConnectionError>, Rc<RefCell<Backend>>) {
+        dial_with(address, DialFault::None)
+    }
+
+    /// A local failure `dial_with` stages between the plan and the dial, each
+    /// reaching one exit of `Mux::attach_dialed`, past a successful `connect(2)`.
+    enum DialFault {
+        /// No fault: the dial runs as it does in production.
+        None,
+        /// Every buffer of the pool is checked out, so
+        /// `Connection::new_h2_client` returns `None`. Dials `H2_CLUSTER`.
+        PoolExhausted,
+        /// The request already holds output encoded for another connection,
+        /// so `ConnectionH2::start_stream` refuses it (#1632). Dials
+        /// `H2_CLUSTER`.
+        StartRefused,
+        /// `L7Proxy::register_socket` fails, as it does under fd pressure.
+        /// Dials `H1_CLUSTER`.
+        RegisterRefused,
+    }
+
+    /// The fixture's proxy, except that registering a socket fails.
+    ///
+    /// Everything `Mux::dial_backend` calls besides `register_socket` goes to
+    /// the real proxy, so the slab session it adds is removed from it again.
+    struct RegisterRefuses(Rc<RefCell<dyn L7Proxy>>);
+
+    impl L7Proxy for RegisterRefuses {
+        fn kind(&self) -> ListenerType {
+            self.0.borrow().kind()
+        }
+        fn register_socket(
+            &self,
+            _socket: &mut mio::net::TcpStream,
+            _token: Token,
+            _interest: mio::Interest,
+        ) -> Result<(), std::io::Error> {
+            Err(std::io::Error::from_raw_os_error(24)) // EMFILE
+        }
+        fn add_session(&self, session: Rc<RefCell<dyn crate::ProxySession>>) -> Token {
+            self.0.borrow().add_session(session)
+        }
+        fn remove_session(&self, token: Token) -> bool {
+            self.0.borrow().remove_session(token)
+        }
+        fn clusters(&self) -> &HashMap<sozu_command::state::ClusterId, Cluster> {
+            unreachable!("Mux::dial_backend never reads the cluster table")
+        }
+        fn sessions(&self) -> Rc<RefCell<crate::server::SessionManager>> {
+            self.0.borrow().sessions()
+        }
+    }
+
+    /// [`dial_one`] with `fault` staged before the dial.
+    fn dial_with(
+        address: std::net::SocketAddr,
+        fault: DialFault,
+    ) -> (Result<(), BackendConnectionError>, Rc<RefCell<Backend>>) {
         use crate::{Protocol, ProxySession, protocol::mux::Mux, server::ListenSession};
 
+        let (cluster, authority) = match fault {
+            DialFault::PoolExhausted | DialFault::StartRefused => (H2_CLUSTER, H2_AUTHORITY),
+            DialFault::None | DialFault::RegisterRefused => (H1_CLUSTER, H1_AUTHORITY),
+        };
         let fixture = routing_fixture();
         fixture.backends.borrow_mut().add_backend(
-            H1_CLUSTER,
+            cluster,
             Backend::new("dial-once", address, None, None, None),
         );
         let backend = fixture
             .backends
             .borrow_mut()
             .backends
-            .get_mut(H1_CLUSTER)
+            .get_mut(cluster)
             .and_then(|list| list.find_backend(&address).cloned())
             .expect("the backend was just added");
         let mut context = Context::new(
@@ -3959,7 +4023,7 @@ mod backend_selection_order_tests {
         {
             let stream = &mut context.streams[stream_id];
             stream.state = StreamState::Link;
-            stream.context.authority = Some(H1_AUTHORITY.to_owned());
+            stream.context.authority = Some(authority.to_owned());
             stream.context.path = Some("/".to_owned());
             stream.context.method = Some(Method::Get);
         }
@@ -3981,6 +4045,31 @@ mod backend_selection_order_tests {
         else {
             panic!("premise: an empty router has nothing to reuse, so it must ask for a dial")
         };
+        assert_eq!(
+            h2,
+            cluster == H2_CLUSTER,
+            "premise: the plan must dial the protocol the cluster declares"
+        );
+        // Held until the dial returns: dropping a checkout gives it back.
+        let mut exhausted = Vec::new();
+        let mut proxy = fixture.proxy.clone();
+        match fault {
+            DialFault::None => {}
+            DialFault::PoolExhausted => {
+                while let Some(buffer) = fixture.pool.borrow_mut().checkout() {
+                    exhausted.push(buffer);
+                }
+            }
+            DialFault::StartRefused => {
+                context.streams[stream_id]
+                    .front
+                    .out
+                    .push_back(kawa::OutBlock::Store(kawa::Store::Static(b"encoded")));
+            }
+            DialFault::RegisterRefused => {
+                proxy = Rc::new(RefCell::new(RegisterRefuses(fixture.proxy.clone())));
+            }
+        }
         let session: Rc<RefCell<dyn ProxySession>> = Rc::new(RefCell::new(ListenSession {
             protocol: Protocol::HTTPListen,
         }));
@@ -3991,10 +4080,15 @@ mod backend_selection_order_tests {
             stream_id,
             &mut context,
             &session,
-            &fixture.proxy,
+            &proxy,
             cluster_id,
             h2,
             frontend_should_stick,
+        );
+        drop(exhausted);
+        assert!(
+            dialed.is_ok() || router.backends.is_empty(),
+            "a dial that failed must keep no backend connection, got {dialed:?}"
         );
         backend_registry.apply_all(&mut context.backend_deltas, &fixture.backends);
         (dialed, backend)
@@ -4059,6 +4153,81 @@ mod backend_selection_order_tests {
             backend.failures, 1,
             "the failed dial must count one failure"
         );
+    }
+
+    /// #1713: dial one stream with `fault` staged against a listening
+    /// backend, and assert the dial failed with `expected` and left the
+    /// backend exactly as it found it: the reservation selection took is
+    /// released, and no failure is recorded, because the backend did not fail.
+    fn assert_a_local_failure_releases_the_reservation(
+        fault: DialFault,
+        expected: fn(&BackendConnectionError) -> bool,
+    ) {
+        use crate::retry::{RetryAction, RetryPolicy};
+
+        let upstream =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener must bind");
+        let (dialed, backend) = dial_with(
+            upstream
+                .local_addr()
+                .expect("a bound listener has an address"),
+            fault,
+        );
+        assert!(
+            dialed.as_ref().is_err_and(expected),
+            "premise: the staged fault must fail the dial at its exit, got {dialed:?}"
+        );
+        let backend = backend.borrow();
+        assert_eq!(
+            backend.active_connections, 0,
+            "a dial abandoned after its connect must release the reservation \
+             selection took"
+        );
+        assert_eq!(
+            backend.failures, 0,
+            "a local failure must not count against the backend"
+        );
+        assert_eq!(
+            backend.retry_policy.can_try(std::time::Instant::now()),
+            Some(RetryAction::OKAY),
+            "a local failure must not arm the backend's backoff"
+        );
+    }
+
+    /// #1713: `Connection::new_h2_client` returning `None` (buffer pool
+    /// exhausted) releases the reservation.
+    ///
+    /// TO SEE THIS RED: in `Mux::dial_backend`, return the error of
+    /// `Mux::attach_dialed` without pushing the `BackendChange::ConnectionClosed`
+    /// delta; the backend then keeps `active_connections == 1`.
+    #[test]
+    fn an_h2_client_the_pool_cannot_build_releases_its_reservation() {
+        assert_a_local_failure_releases_the_reservation(DialFault::PoolExhausted, |error| {
+            matches!(error, BackendConnectionError::MaxBuffers)
+        });
+    }
+
+    /// #1713: a refused `Connection::start_stream` releases the reservation.
+    ///
+    /// TO SEE THIS RED: as for
+    /// [`an_h2_client_the_pool_cannot_build_releases_its_reservation`].
+    #[test]
+    fn a_refused_stream_start_releases_its_reservation() {
+        assert_a_local_failure_releases_the_reservation(DialFault::StartRefused, |error| {
+            matches!(error, BackendConnectionError::MaxSessionsMemory)
+        });
+    }
+
+    /// #1713: the `register_socket` rollback releases the reservation, not
+    /// only the gauges, `active_requests` and the slab session.
+    ///
+    /// TO SEE THIS RED: as for
+    /// [`an_h2_client_the_pool_cannot_build_releases_its_reservation`].
+    #[test]
+    fn a_socket_the_poller_refuses_releases_its_reservation() {
+        assert_a_local_failure_releases_the_reservation(DialFault::RegisterRefused, |error| {
+            matches!(error, BackendConnectionError::MaxSessionsMemory)
+        });
     }
 
     /// #1610: a session's first backend connection is stored without a heap
