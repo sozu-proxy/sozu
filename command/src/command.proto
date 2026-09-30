@@ -53,7 +53,9 @@ message Request {
     Status status = 12;
     // add a cluster
     Cluster add_cluster = 13;
-    // remove a cluster giving its id
+    // remove a cluster giving its id, with every HTTP, HTTPS, TCP and UDP
+    // frontend and every backend that names it (a frontend without a
+    // cluster_id stays)
     string remove_cluster = 14;
     // add an HTTP frontend
     RequestHttpFrontend add_http_frontend = 15;

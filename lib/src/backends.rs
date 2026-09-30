@@ -629,6 +629,23 @@ impl BackendMap {
         }
     }
 
+    /// Forget everything the map holds for `cluster_id`: its backend list,
+    /// with the load-balancing policy and shuffle sharding it carries, its
+    /// health-check configuration and its `http2` hint. A session that already
+    /// holds one of its backends keeps it until the session closes;
+    /// [`Self::close_backend_connection`] ignores a cluster that is gone.
+    pub fn remove_cluster(&mut self, cluster_id: &str) {
+        self.backends.remove(cluster_id);
+        self.health_check_configs.remove(cluster_id);
+        self.cluster_http2.remove(cluster_id);
+        debug_assert!(
+            !self.backends.contains_key(cluster_id)
+                && !self.health_check_configs.contains_key(cluster_id)
+                && !self.cluster_http2.contains_key(cluster_id),
+            "remove_cluster must leave nothing keyed by the cluster"
+        );
+    }
+
     /// Record (or clear) the `cluster.http2` backend-capability hint for
     /// `cluster_id`. The health checker reads the resulting map at probe
     /// time so the wire format follows what the mux router will use to

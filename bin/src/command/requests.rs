@@ -2900,13 +2900,26 @@ pub fn worker_request(
         .map_or(Ok(()), |request_type| {
             validate_request(request_type, RequestOrigin::Authored)
         })
-        .map_err(|reason| (AuditErrorCode::InvalidInput, reason))
+        .map_err(|reason| (Some(AuditErrorCode::InvalidInput), reason))
         .and_then(|()| {
-            server
-                .state
-                .dispatch(&request)
-                .map_err(|error| (AuditErrorCode::DispatchError, error.to_string()))
+            server.state.dispatch(&request).map_err(|error| {
+                // The object went with its cluster (`RemoveCluster`
+                // cascades): nothing is left to remove, so the removal is
+                // answered ok below instead of "not found". Never an object
+                // of another cluster: see `ConfigState::removed_with_its_cluster`.
+                let error_code = if server.state.removed_with_its_cluster(&request, &error) {
+                    None
+                } else {
+                    Some(AuditErrorCode::DispatchError)
+                };
+                (error_code, error.to_string())
+            })
         });
+    let (apply_result, removed_with_its_cluster) = match apply_result {
+        Err((None, reason)) => (Ok(()), Some(reason)),
+        Err((Some(error_code), reason)) => (Err((error_code, reason)), None),
+        Ok(()) => (Ok(()), None),
+    };
 
     if let Err((error_code, reason)) = apply_result {
         // INVARIANT: neither a rejected validation nor a rejected dispatch may
@@ -2961,6 +2974,25 @@ pub fn worker_request(
         client.finish_failure(format!(
             "could not apply request on the main process state: {reason}",
         ));
+        return;
+    }
+
+    if let Some(reason) = removed_with_its_cluster {
+        // Nothing to remove and nothing to fan out: the main process state
+        // and every worker of this release already dropped the object with
+        // its cluster.
+        debug_assert_eq!(
+            server.state.hash_state(),
+            state_hash_before,
+            "a removal of an object already removed with its cluster must not mutate ConfigState"
+        );
+        if let Some(mut entry) = audit {
+            entry.extras.reason = Some(reason);
+            entry.extras.elapsed_ms = Some(elapsed_ms(started_at));
+            entry.extras.request_sha256 = Some(request_sha256);
+            audit_emit(server, client, entry, AuditResult::Ok);
+        }
+        client.finish_ok(server.state.removed_with_its_cluster_message(&request));
         return;
     }
 

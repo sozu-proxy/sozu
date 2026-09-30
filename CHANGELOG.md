@@ -545,6 +545,63 @@
 
 ### 🔄 Changed
 
+- **BEHAVIOUR CHANGE — `feat(state)`: removing a cluster removes its frontends and backends
+  ([#1723](https://github.com/sozu-proxy/sozu/issues/1723)).** `RemoveCluster` (`sozu cluster
+  remove`) used to remove the cluster definition alone: its HTTP, HTTPS, TCP and UDP frontends and
+  its backends stayed in the main process state and in every worker, still routed traffic, still
+  appeared in `sozu frontend list` / `sozu backend list`, and came back through SaveState/LoadState
+  and upgrades. `ConfigState::remove_cluster` now removes, with the cluster, every frontend and
+  backend that names it, for every protocol; a frontend without a `cluster_id` (a deny or answer
+  route) names no cluster and stays. A worker reads the same objects from its own state
+  (`ConfigState::cluster_removal_requests`) and drops them from its proxies through the removal each
+  one's own order takes, so the router, the tags, the TCP and UDP listener to cluster mappings and
+  the per-backend metrics are cleaned the same way, then forgets the cluster's backend list in the
+  shared `BackendMap` (`BackendMap::remove_cluster`). A request to the removed cluster's hostname
+  now gets the listener's 404, unless another cluster's wildcard or catch-all route also covers
+  that hostname, which then serves it; a new connection on its TCP listener is closed instead of
+  forwarded; a session established before the removal keeps its backend connection and drains on
+  it.
+
+  An HTTP or HTTPS frontend removal now matches only a frontend of the cluster it names. The route
+  key (`address;hostname;path;method`) names no cluster, so once `RemoveCluster(A)` freed a key
+  and cluster B took it, a late `RemoveHttpFrontend` naming A used to remove B's route from the
+  main process and from every worker. The main process and each worker's state now refuse it. A
+  worker applies to none of its proxies a frontend removal its state refused, as not found or as
+  changing nothing: the proxies look routes, TCP listeners and UDP listeners up without their
+  cluster. TCP and UDP frontend removals were already scoped to the named cluster in the state,
+  but not in the proxies: `TcpProxy::remove_tcp_front` and `UdpProxy::remove_udp_front` strip a
+  listener's cluster by address alone, so once cluster A came back with a frontend on another
+  address, a stale removal of A's old frontend used to unmap the listener cluster B had taken. `ConfigState::diff` towards a state without a cluster emits the `RemoveCluster` alone, no
+  longer followed by a `Remove*Frontend` / `RemoveBackend` per object, and adds back after it any
+  frontend or backend the target state still holds for that cluster. Covered by the `state` tests
+  `remove_cluster_removes_its_frontends_and_backends_for_every_protocol`,
+  `diff_removing_a_cluster_relies_on_the_cascade`,
+  `diff_re_adds_a_frontend_the_target_keeps_for_a_removed_cluster` and
+  `a_removed_cluster_leaves_nothing_for_load_state_to_replay` and
+  `a_stale_frontend_removal_never_removes_another_clusters_route`, the worker tests
+  `remove_cluster_removes_its_routes_and_backends_from_the_worker`,
+  `a_stale_frontend_removal_never_removes_another_clusters_route` and
+  `a_stale_tcp_or_udp_frontend_removal_never_unmaps_another_clusters_listener`, and
+  `e2e/src/tests/remove_cluster_tests.rs` (HTTP and TCP).
+
+  **Upgrading.** Upgrade the main process and every worker before relying on the cascade: an older
+  worker applies `RemoveCluster` to the cluster definition alone and keeps routing its frontends to
+  its backends. The other mix diverges too: an older main process keeps the removed cluster's
+  frontends and backends in its own state, where `sozu frontend list` still shows them and
+  SaveState saves them, while the workers of this release have dropped them; its next LoadState or
+  upgrade replays them into the workers. A `Remove*Frontend` / `RemoveBackend` sent after the
+  `RemoveCluster` of the same cluster, whose object went with the cluster, is answered ok by the
+  main process and by every worker without touching anything, so scripts such as
+  `sozu cluster remove … && sozu frontend http remove …` keep working; it never matches an object
+  another cluster owns. The same ok answer covers a cluster id that never existed: `sozu frontend
+  http remove … id <typo>`, or a deny route removed with a bogus id, used to remove the route
+  whatever its cluster and now answers ok and removes nothing. The answer says the cluster does not
+  exist and names the cluster (or the route with no cluster) that holds the key, so the mistake is
+  visible. A caller that re-adds frontends or backends after removing a cluster must
+  re-add the cluster first. A frontend already left behind by an earlier release, whose cluster is
+  gone, is not touched by a later `RemoveCluster` (the cluster is not found); remove it with
+  `sozu frontend … remove`.
+
 - **BREAKING (library API) — `refactor(mux)`: selection reserves a connection and the mux dials it;
   a failed dial releases the reservation through the ledger
   ([#1684](https://github.com/sozu-proxy/sozu/issues/1684)).** The backend-set capability

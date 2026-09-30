@@ -149,7 +149,8 @@ HashSet<String>`) so subsequent emissions for the same cluster id are
 dropped on the floor rather than resurrecting the row via
 `entry().or_default()`. This matters in production: the per-proxy
 `remove_cluster` paths in `lib/src/http.rs` / `https.rs` / `tcp.rs`
-drop cluster config but do NOT close in-flight sessions, so long-lived
+drop cluster config, and `Server::notify_proxys` drops the cluster's
+frontends and backends, but none of them closes in-flight sessions, so long-lived
 H2 / WebSocket / TCP sessions continue emitting access-log /
 response-time / gauge metrics for the removed cluster. Without the
 tombstone those emissions would keep growing the cluster row until the
