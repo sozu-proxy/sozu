@@ -756,8 +756,9 @@ pub struct ListenerBuilder {
     /// Shrink threshold ratio for recycled stream slots. Default: 2.
     pub h2_stream_shrink_ratio: Option<u32>,
     /// H2 flood detection: floor of the connection-lifetime cap on RST_STREAM
-    /// frames received (CVE-2023-44487); trips once the count exceeds both
-    /// this value and the streams a backend answered. Default: 200000.
+    /// frames received (CVE-2023-44487); trips once the count exceeds this
+    /// value and the resets received after a response started or on a closed
+    /// stream exceed the streams a backend answered. Default: 200000.
     pub h2_max_rst_stream_lifetime: Option<u64>,
     /// H2 flood detection: floor of the cap on "abusive" (pre-response-start)
     /// RST_STREAM frames (Rapid Reset signature, CVE-2023-44487); trips once

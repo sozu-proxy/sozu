@@ -59,8 +59,10 @@
 //!   before a response than `streams_opened`, i.e. more than half of all
 //!   backend-routed streams reset before their response — and cap a peer that stays
 //!   under the per-window threshold forever. The received-RST counter's ratio
-//!   is all of `streams_opened`, which only resets of streams already gone
-//!   (RST_STREAM on a closed stream) can exceed: that is what it bounds.
+//!   counts the resets outside the pre-response count — after a response
+//!   started, or of a stream already gone — against `streams_opened`; a
+//!   stream reset after its response is counted in `streams_opened` before
+//!   the check, so cancelling answered streams never exceeds it.
 //! - Never-decaying PING and SETTINGS lifetime ceilings
 //!   (`total_ping_received_lifetime`, `total_settings_received_lifetime`).
 //! - The stream-0 WINDOW_UPDATE credit (`window_update_stream0_credit`): each
@@ -163,12 +165,13 @@ const DEFAULT_MAX_RST_STREAM_PER_WINDOW: u32 = 2000;
 /// Floor of the connection-lifetime cap on RST_STREAM frames received
 /// (CVE-2023-44487 Rapid Reset).
 ///
-/// The cap trips only once the count exceeds BOTH this floor and the
-/// streams a backend answered on the connection (`H2FloodDetector`'s
-/// `streams_opened`). A pre-response reset is already capped by
-/// [`DEFAULT_MAX_RST_STREAM_ABUSIVE_LIFETIME`] and a reset after the response
-/// started counts its stream as answered, so what this cap effectively bounds
-/// is RST_STREAM frames on streams that are already gone.
+/// The cap trips once the count exceeds this floor AND the resets received
+/// after a response started or on a stream already gone exceed the streams a
+/// backend answered on the connection (`H2FloodDetector`'s `streams_opened`).
+/// Pre-response resets are left to
+/// [`DEFAULT_MAX_RST_STREAM_ABUSIVE_LIFETIME`], and a stream reset after its
+/// response started counts as answered before the check, so a client that
+/// cancels answered streams never trips it.
 const DEFAULT_MAX_RST_STREAM_LIFETIME: u64 = 200_000;
 /// Floor of the cap on RST_STREAM frames received BEFORE the backend
 /// response started — the cheap-for-client / expensive-for-us resets that
@@ -302,8 +305,9 @@ pub struct H2FloodConfig {
     /// Maximum accumulated protocol anomalies before ENHANCE_YOUR_CALM
     max_glitch_count: u32,
     /// Floor of the connection-lifetime cap on RST_STREAM frames received
-    /// (CVE-2023-44487): trips when the count exceeds both this floor and the
-    /// streams a backend answered on the connection.
+    /// (CVE-2023-44487): trips when the count exceeds this floor and the
+    /// resets received after a response started or on a stream already gone
+    /// exceed the streams a backend answered on the connection.
     max_rst_stream_lifetime: u64,
     /// Floor of the cap on "abusive" (pre-response-start) RST_STREAM frames —
     /// the Rapid Reset signature (CVE-2023-44487): trips when the count
@@ -596,9 +600,10 @@ pub(super) struct H2FloodDetector {
     rst_stream_count: u32,
     /// Lifetime RST_STREAM frames received on this connection.
     ///
-    /// Never decays, but only trips while it also exceeds
-    /// [`Self::streams_opened`]; in practice it bounds RST_STREAM frames on
-    /// streams that are already gone.
+    /// Never decays, but only trips while the resets outside
+    /// [`Self::total_abusive_rst_received_lifetime`] — after a response
+    /// started, or of a stream already gone — also exceed
+    /// [`Self::streams_opened`].
     total_rst_received_lifetime: u64,
     /// Lifetime RST_STREAM frames received that targeted a stream whose
     /// backend response had not yet started, on a frontend connection. These
@@ -618,9 +623,11 @@ pub(super) struct H2FloodDetector {
     total_rst_streams_emitted_lifetime: u64,
     /// The denominator the three RST caps above compare against. On a
     /// frontend connection, the answered streams that were routed to a
-    /// backend — answered by it, or answered 502/503/504 by Sōzu when the
-    /// backend failed — counted when the stream completes, or when the client
-    /// resets it after the response started; on a backend connection, the
+    /// backend — answered by it, or answered 502/503/504 by Sōzu after a
+    /// backend was selected and failed or while every backend of the cluster
+    /// was failing — counted when the stream completes,
+    /// or when the client resets it after the response started (before the
+    /// reset is checked against the caps); on a backend connection, the
     /// streams Sōzu opened (see `routed_to_a_backend` in
     /// `lib/src/protocol/mux/h2.rs`).
     ///
@@ -848,6 +855,28 @@ impl H2FloodDetector {
             .saturating_add(self.total_rst_streams_emitted_lifetime)
     }
 
+    /// Account one RST_STREAM received, in the order the caps need: when
+    /// `answered` — a frontend stream routed to a backend whose response
+    /// started — the stream first counts toward [`Self::streams_opened`],
+    /// then the reset goes through [`Self::record_rst_lifetime`]. Counting the
+    /// stream after the check would leave each check one answered stream
+    /// short, and a client that cancels every stream after its response
+    /// would trip the received-RST cap just past its floor.
+    pub(super) fn record_rst_received(
+        &mut self,
+        response_started: bool,
+        answered: bool,
+    ) -> Option<H2FloodViolation> {
+        debug_assert!(
+            response_started || !answered,
+            "a stream reset before its response is never an answered one"
+        );
+        if answered {
+            self.record_stream_opened();
+        }
+        self.record_rst_lifetime(response_started)
+    }
+
     /// Increment the lifetime RST_STREAM counters and return a
     /// [`H2FloodViolation`] if either the global or the abusive
     /// (pre-response-start) cap has been exceeded.
@@ -858,14 +887,13 @@ impl H2FloodDetector {
     /// passes `true` for every reset a backend sends on a backend connection:
     /// Sōzu opened that stream, so the reset costs the backend, not Sōzu.
     ///
-    /// The global cap trips once the count exceeds both
-    /// `max_rst_stream_lifetime` and the streams a backend answered; the abusive one once
-    /// it exceeds `max_rst_stream_abusive_lifetime` while the pre-response
-    /// resets exceed the answered streams.
-    pub(super) fn record_rst_lifetime(
-        &mut self,
-        response_started: bool,
-    ) -> Option<H2FloodViolation> {
+    /// The global cap trips once the count exceeds `max_rst_stream_lifetime`
+    /// while the resets outside the pre-response count — after a response
+    /// started, or of a stream already gone — exceed the streams a backend
+    /// answered; the abusive one once it exceeds
+    /// `max_rst_stream_abusive_lifetime` while the pre-response resets exceed
+    /// the answered streams.
+    fn record_rst_lifetime(&mut self, response_started: bool) -> Option<H2FloodViolation> {
         let total_before = self.total_rst_received_lifetime;
         let abusive_before = self.total_abusive_rst_received_lifetime;
         self.total_rst_received_lifetime = self.total_rst_received_lifetime.saturating_add(1);
@@ -891,10 +919,14 @@ impl H2FloodDetector {
             "abusive RST count is a subset of total received RST count"
         );
         self.debug_assert_invariants();
+        // Pre-response resets are the abusive cap's business below; counting
+        // them here too would let a few of them push a client that cancels
+        // its answered streams past the answered-stream count.
         if Self::exceeds_floor_and_ratio(
             self.total_rst_received_lifetime,
             self.config.max_rst_stream_lifetime,
-            self.total_rst_received_lifetime,
+            self.total_rst_received_lifetime
+                .saturating_sub(self.total_abusive_rst_received_lifetime),
             self.streams_opened,
         ) {
             return Some(H2FloodViolation {

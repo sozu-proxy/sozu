@@ -5167,7 +5167,7 @@ impl ConnectionH2 {
     ///
     /// The second path is separately rate-limited: it is preceded by
     /// `H2FloodDetector::record_glitch` + `check_flood_or_return!`, whose
-    /// `DEFAULT_MAX_GLITCH_COUNT` (100) bounds it inside one flood window, and
+    /// `DEFAULT_MAX_GLITCH_COUNT` (2000) bounds it inside one flood window, and
     /// the window can only half-decay when `Mux::ready_inner` resamples
     /// `context.now` on a new outer iteration — which is strictly after an
     /// inner iteration that already ran `writable()`, since `arm_writable`
@@ -5386,25 +5386,23 @@ impl ConnectionH2 {
     }
 }
 
-/// Recover the [`H2Error`] code that the converter's `initialize`
-/// chokepoint will encode into the synthesised RST_STREAM frame for a
-/// kawa stuck in [`kawa::ParsingPhase::Error`]. Mirrors the parse +
-/// fallback at `lib/src/protocol/mux/converter.rs::initialize` so the
-/// flood-accounting helper sees the same code that lands on the wire.
 /// Whether an answered frontend stream counts toward the RST caps'
 /// denominator (`H2FloodDetector`'s `streams_opened`,
 /// `lib/src/protocol/mux/h2_flood_detector.rs`): it was routed to a backend.
-/// A backend answered it, a backend was selected for it, or Sōzu answered it
-/// 502/503/504 because the cluster's backends failed, are down or timed out
-/// — so a backend outage does not turn the client's ordinary cancels into a
-/// Rapid Reset verdict. A stream Sōzu answers without routing it (no route,
-/// a redirect, 401, 421, 429, a refusal) does not count: the peer opens
-/// those for free, and counting them would let filler streams dilute the
-/// ratio.
+/// A backend answered it, a backend was selected for it — including when
+/// Sōzu then answered 502/503/504 because that backend refused the
+/// connection, failed or timed out — or its cluster has backends and none
+/// could be selected because all of them are failing (`backends_unavailable`).
+/// So a backend outage does not turn the client's ordinary cancels into a
+/// Rapid Reset verdict. A stream answered before any backend was selected
+/// for another reason does not count, whatever its status: no route, a
+/// redirect, 401, 421, 429, a refusal, a 503 for a cluster with no backend,
+/// or a session or buffer limit hit before selection. The peer opens those
+/// for free, and counting them would let filler streams dilute the ratio.
 fn routed_to_a_backend(stream: &crate::protocol::mux::Stream) -> bool {
     stream.metrics.backend_headers_received.is_some()
         || stream.context.backend_id.is_some()
-        || matches!(stream.context.status, Some(502..=504))
+        || stream.context.backends_unavailable
 }
 
 /// Who decided a proxy-emitted `RST_STREAM`, for flood accounting.
@@ -5427,6 +5425,11 @@ enum RstOrigin {
     Local,
 }
 
+/// Recover the [`H2Error`] code that the converter's `initialize`
+/// chokepoint will encode into the synthesised RST_STREAM frame for a
+/// kawa stuck in [`kawa::ParsingPhase::Error`]. Mirrors the parse +
+/// fallback at `lib/src/protocol/mux/converter.rs::initialize` so the
+/// flood-accounting helper sees the same code that lands on the wire.
 fn rst_error_from_kawa<T: kawa::AsBuffer>(kawa: &kawa::Kawa<T>) -> H2Error {
     match kawa.parsing_phase {
         kawa::ParsingPhase::Error {
@@ -6766,8 +6769,8 @@ impl ConnectionH2 {
         // Additional CVE-2023-44487 mitigation: connection-lifetime caps on
         // RST_STREAM frames received. The per-window counter above
         // half-decays, so a patient client could keep resetting forever; the
-        // lifetime counters cap that, relative to the streams the connection
-        // opened so benign cancels never accumulate toward a fixed ceiling.
+        // lifetime counters cap that, relative to the streams a backend
+        // answered so benign cancels never accumulate toward a fixed ceiling.
         // Streams whose backend response has not yet started count toward a
         // much lower "abusive" cap (more than half of the streams, past a
         // floor) — the Rapid Reset signature, where the attacker pays one RST
@@ -6780,18 +6783,31 @@ impl ConnectionH2 {
         // before answering — `REFUSED_STREAM` under load, a `CANCEL` from its
         // own timeout — costs the backend, not Sōzu. Those resets never count
         // as pre-response.
-        let response_started = self.position.is_client()
-            || match self.stream_table.streams().get(&rst_stream.stream_id) {
+        //
+        // On a frontend connection, a stream reset after its response started
+        // is an answered stream: it counts toward the caps' denominator
+        // (`routed_to_a_backend`) before the caps are checked, so a client
+        // that cancels every stream after its response never has one more
+        // reset than answered streams.
+        let (response_started, answered) =
+            match self.stream_table.streams().get(&rst_stream.stream_id) {
                 Some(global_stream_id) => {
                     let stream = &context.streams[*global_stream_id];
-                    !stream.back.is_initial()
+                    let started = !stream.back.is_initial();
+                    (
+                        self.position.is_client() || started,
+                        self.position.is_server() && started && routed_to_a_backend(stream),
+                    )
                 }
                 // Stream already gone (e.g. closed, not yet registered) —
                 // treat as response-started to avoid over-counting benign
                 // races as abusive.
-                None => true,
+                None => (true, false),
             };
-        if let Some(violation) = self.flood_detector.record_rst_lifetime(response_started) {
+        if let Some(violation) = self
+            .flood_detector
+            .record_rst_received(response_started, answered)
+        {
             return self.handle_flood_violation(violation);
         }
         // Rapid Reset signature (CVE-2023-44487): a RST that arrives before the
@@ -6835,11 +6851,6 @@ impl ConnectionH2 {
                 }
                 Position::Client(..) => {}
                 Position::Server => {
-                    // Counted only once a response started: a stream reset
-                    // before it is a pre-response reset, never an answered one.
-                    if response_started && routed_to_a_backend(stream) {
-                        self.flood_detector.record_stream_opened();
-                    }
                     self.distribute_overhead(&mut stream.metrics, rst_byte_totals);
                     // This is a special case, normally, all stream are terminated by the server
                     // when the last byte of the response is written. Here, the reset is requested
@@ -9951,6 +9962,7 @@ mod tests {
             tags: None,
             forwarding_hop: None,
             access_log_message: None,
+            backends_unavailable: false,
         };
         Stream::new(
             &mut PoolBufferSource::new(Rc::downgrade(pool)),
@@ -14812,7 +14824,7 @@ mod tests {
             if connection
                 .core
                 .flood_detector
-                .record_rst_lifetime(false)
+                .record_rst_received(false, false)
                 .is_some()
             {
                 tripped_at = Some(n);
@@ -20943,6 +20955,263 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── RST caps: what a frontend reset counts toward ───────────────────
+
+    /// A frontend H2 connection whose received-RST lifetime cap has the floor
+    /// `lifetime_floor`, every other threshold at its default, so the
+    /// scenarios below reach the cap in a handful of resets instead of
+    /// 200 000.
+    fn frontend_rst_fixture(
+        lifetime_floor: u64,
+    ) -> (
+        Rc<RefCell<Pool>>,
+        H2Shell<mio::net::TcpStream>,
+        std::net::TcpStream,
+        Context<TestListener>,
+        Router,
+    ) {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(8, 512, 16_384)));
+        let (mut connection, peer) = test_h2_connection(&pool, None);
+        let config = H2FloodConfig::from_optional(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(lifetime_floor),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        connection.core.flood_detector =
+            h2_flood_detector::H2FloodDetector::new(config, connection.core.now);
+        let context = test_context(&pool);
+        let router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        (pool, connection, peer, context, router)
+    }
+
+    /// Register client stream `stream_id` on `connection` as a stream routed
+    /// to a backend, with its response started or not.
+    fn open_routed_frontend_stream(
+        connection: &mut H2Shell<mio::net::TcpStream>,
+        context: &mut Context<TestListener>,
+        stream_id: StreamId,
+        response_started: bool,
+    ) {
+        let gid = context
+            .create_stream(Ulid::generate(), 65_535)
+            .expect("the test pool must hand out stream buffers");
+        let stream = &mut context.streams[gid];
+        stream.context.backend_id = Some(Rc::from("probe-backend"));
+        if response_started {
+            stream.back.parsing_phase = kawa::ParsingPhase::Body;
+        }
+        let now = connection.core.now;
+        connection.core.stream_table.register(stream_id, gid, now);
+    }
+
+    /// Feed one client `RST_STREAM(CANCEL)` for `stream_id` through
+    /// `handle_rst_stream_frame`, and report whether the connection is now
+    /// going away.
+    fn client_cancels(
+        connection: &mut H2Shell<mio::net::TcpStream>,
+        context: &mut Context<TestListener>,
+        router: &mut Router,
+        stream_id: StreamId,
+    ) -> bool {
+        let _ = connection.core.handle_rst_stream_frame(
+            parser::RstStream {
+                stream_id,
+                error_code: H2Error::Cancel as u32,
+            },
+            context,
+            EndpointClient(router),
+        );
+        matches!(connection.core.state, H2State::GoAway | H2State::Error)
+    }
+
+    /// A client that cancels every stream after its response started — a
+    /// gRPC client abandoning server streams, a browser leaving a page while
+    /// downloads run — resets exactly as many streams as a backend answered.
+    /// The received-RST lifetime cap must never trip on it.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::handle_rst_stream_frame`, count the
+    /// reset stream with `record_stream_opened` after `record_rst_lifetime`
+    /// instead of before. Each check then sees one more reset than answered
+    /// streams, and the reset just past the floor sends GOAWAY.
+    #[test]
+    fn resets_after_the_response_never_trip_the_lifetime_cap() {
+        let (_pool, mut connection, _peer, mut context, mut router) = frontend_rst_fixture(4);
+        for n in 0..64u32 {
+            let stream_id = 2 * n + 1;
+            open_routed_frontend_stream(&mut connection, &mut context, stream_id, true);
+            assert!(
+                !client_cancels(&mut connection, &mut context, &mut router, stream_id),
+                "reset {} of a stream whose response started must not send GOAWAY",
+                n + 1
+            );
+        }
+    }
+
+    /// A mix of cancels: one stream in ten reset before its response,
+    /// seventeen in twenty after it, the rest completed. The pre-response
+    /// resets are the pre-response cap's business; the received-RST lifetime
+    /// cap compares only the other resets with the answered streams, and must
+    /// not trip.
+    ///
+    /// TO SEE THIS RED: in `H2FloodDetector::record_rst_lifetime`, compare
+    /// `total_rst_received_lifetime` instead of the resets outside the
+    /// pre-response count with `streams_opened`. The pre-response resets then
+    /// push the count past the answered streams and the cap sends GOAWAY.
+    #[test]
+    fn pre_response_resets_do_not_count_toward_the_lifetime_cap() {
+        let (_pool, mut connection, _peer, mut context, mut router) = frontend_rst_fixture(4);
+        let mut stream_id = 1;
+        for block in 0..5 {
+            for slot in 0..20 {
+                if slot == 19 {
+                    // A stream that completed: counted where the recycle path
+                    // counts it (`try_recycle_server_stream`).
+                    connection.core.flood_detector.record_stream_opened();
+                    continue;
+                }
+                let response_started = slot >= 2;
+                open_routed_frontend_stream(
+                    &mut connection,
+                    &mut context,
+                    stream_id,
+                    response_started,
+                );
+                assert!(
+                    !client_cancels(&mut connection, &mut context, &mut router, stream_id),
+                    "block {block}, slot {slot}: a 10 % pre-response / 85 % \
+                     post-response / 5 % clean mix must not send GOAWAY"
+                );
+                stream_id += 2;
+            }
+        }
+    }
+
+    /// The received-RST lifetime cap still bounds resets of streams that are
+    /// already gone: here every answered stream is reset twice, so these
+    /// resets outnumber the answered streams as soon as the floor is passed.
+    /// Guard against neutering the cap.
+    #[test]
+    fn resets_of_streams_already_gone_trip_the_lifetime_cap() {
+        let (_pool, mut connection, _peer, mut context, mut router) = frontend_rst_fixture(4);
+        let mut tripped_after = None;
+        for n in 0..16u32 {
+            let stream_id = 2 * n + 1;
+            open_routed_frontend_stream(&mut connection, &mut context, stream_id, true);
+            if client_cancels(&mut connection, &mut context, &mut router, stream_id)
+                || client_cancels(&mut connection, &mut context, &mut router, stream_id)
+            {
+                tripped_after = Some(n + 1);
+                break;
+            }
+        }
+        assert_eq!(
+            tripped_after,
+            Some(3),
+            "the reset that takes the count past the floor of 4 while the \
+             resets outnumber the answered streams must send GOAWAY"
+        );
+    }
+
+    /// A stream Sōzu answers 502/503/504 without selecting a backend — no
+    /// backend in the cluster, the session or buffer limit hit before a
+    /// backend was picked, a routing error — never cost a backend anything,
+    /// and must not count toward the RST caps' denominator.
+    ///
+    /// TO SEE THIS RED: add `|| matches!(stream.context.status,
+    /// Some(502..=504))` back to `routed_to_a_backend`.
+    #[test]
+    fn a_5xx_answered_without_a_backend_is_not_routed() {
+        let pool = make_pool_for_invariant_16();
+        let (mut connection, _peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let answers = context.listener.borrow().get_answers().clone();
+        for code in [502, 503, 504] {
+            let gid = context
+                .create_stream(Ulid::generate(), 65_535)
+                .expect("the test pool must hand out stream buffers");
+            crate::protocol::mux::answers::set_default_answer(
+                &mut context.streams[gid],
+                &mut connection.core.readiness,
+                code,
+                &answers.borrow(),
+            );
+            let stream = &context.streams[gid];
+            assert_eq!(stream.context.status, Some(code), "premise");
+            assert!(
+                !routed_to_a_backend(stream),
+                "a {code} answered before any backend was selected must not count"
+            );
+            context.streams[gid].state = StreamState::Recycle;
+        }
+    }
+
+    /// A stream answered 502/503/504 after a backend was selected for it —
+    /// the backend refused the connection, timed out, or reset — keeps
+    /// counting, so a backend outage does not turn the client's ordinary
+    /// cancels into a Rapid Reset verdict.
+    ///
+    /// TO SEE THIS RED: drop `|| stream.context.backend_id.is_some()` from
+    /// `routed_to_a_backend`.
+    ///
+    /// Past the first failures the outage no longer selects a backend at all:
+    /// every backend is backing off and the 503 is answered with
+    /// `backends_unavailable` set, which counts the same way.
+    ///
+    /// TO SEE THIS RED for the second half: drop
+    /// `|| stream.context.backends_unavailable` from `routed_to_a_backend`;
+    /// `test_h2_cancels_during_a_backend_outage_keep_the_connection` then
+    /// fails end to end too.
+    #[test]
+    fn a_5xx_answered_during_a_backend_outage_is_routed() {
+        let pool = make_pool_for_invariant_16();
+        let (mut connection, _peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let answers = context.listener.borrow().get_answers().clone();
+        for code in [502, 503, 504] {
+            let gid = context
+                .create_stream(Ulid::generate(), 65_535)
+                .expect("the test pool must hand out stream buffers");
+            context.streams[gid].context.backend_id = Some(Rc::from("down-backend"));
+            crate::protocol::mux::answers::set_default_answer(
+                &mut context.streams[gid],
+                &mut connection.core.readiness,
+                code,
+                &answers.borrow(),
+            );
+            let stream = &context.streams[gid];
+            assert_eq!(stream.context.status, Some(code), "premise");
+            assert!(
+                routed_to_a_backend(stream),
+                "a {code} answered for a selected backend must count"
+            );
+            context.streams[gid].state = StreamState::Recycle;
+        }
+        let gid = context
+            .create_stream(Ulid::generate(), 65_535)
+            .expect("the test pool must hand out stream buffers");
+        context.streams[gid].context.backends_unavailable = true;
+        crate::protocol::mux::answers::set_default_answer(
+            &mut context.streams[gid],
+            &mut connection.core.readiness,
+            503,
+            &answers.borrow(),
+        );
+        assert!(
+            routed_to_a_backend(&context.streams[gid]),
+            "a 503 for a cluster whose backends are all failing must count"
+        );
     }
 
     /// An inbound `GOAWAY` retires every stream above `last_stream_id`

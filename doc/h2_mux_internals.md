@@ -275,7 +275,7 @@ Configurable thresholds with safe compile-time defaults:
 | Field | Default | CVE | Attack |
 |-------|---------|-----|--------|
 | `max_rst_stream_per_window` | 2000 | CVE-2023-44487, CVE-2019-9514 | Rapid Reset / Reset Flood (per-window) |
-| `max_rst_stream_lifetime` | 200 000 | CVE-2023-44487 | Floor; trips past it once received resets exceed the streams a backend answered (in practice: resets of closed streams) |
+| `max_rst_stream_lifetime` | 200 000 | CVE-2023-44487 | Floor; trips past it once the resets received after a response started or on a closed stream exceed the streams a backend answered |
 | `max_rst_stream_abusive_lifetime` | 1000 | CVE-2023-44487 | Floor; Rapid Reset signature (pre-response-start RST), trips past it once pre-response and provoked resets are more than half of the backend-routed streams |
 | `max_rst_stream_emitted_lifetime` | 10 000 | CVE-2025-8671 | Floor; MadeYouReset (peer-provoked server-emitted RST_STREAM), same shared ratio |
 | `max_ping_per_window` | 2000 | CVE-2019-9512 | Ping Flood |

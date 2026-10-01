@@ -3769,10 +3769,11 @@ fn h2_basic_get_header_block() -> Vec<u8> {
 /// exceeds a share of the streams a backend answered:
 ///
 ///   * `total_rst_received_lifetime` (`DEFAULT_MAX_RST_STREAM_LIFETIME = 200 000`,
-///     more than the streams a backend answered),
+///     the resets after a response or on a closed stream outnumbering the
+///     streams a backend answered),
 ///   * `total_abusive_rst_received_lifetime`
-///     (`DEFAULT_MAX_RST_STREAM_ABUSIVE_LIFETIME = 1000`, more than half of
-///     the streams a backend answered).
+///     (`DEFAULT_MAX_RST_STREAM_ABUSIVE_LIFETIME = 1000`, the pre-response
+///     resets outnumbering the streams a backend answered).
 ///
 /// Every stream here is reset before its response, so at the 1001st abusive
 /// RST Sozu must emit `GOAWAY(ENHANCE_YOUR_CALM)`.

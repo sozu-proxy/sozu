@@ -1533,9 +1533,13 @@ catch patient-attacker patterns that stay just below the per-window threshold.
 Each configured value is a **floor**, not a fixed ceiling: a cap trips only once
 its count exceeds the floor and the ratio below is crossed. The ratio is taken
 over the **backend-routed** streams of the connection: those a backend
-answered, and those Sōzu answered 502, 503 or 504 because the backend failed,
-was down or timed out. A stream Sōzu refuses or answers without routing it (no
-route, redirect, 401, 421, 429) does not count. The two pre-response caps share
+answered, those Sōzu answered 502, 503 or 504 after selecting a backend that
+then refused the connection, failed or timed out, and those it answered 503
+because every backend of the cluster was failing its health check or backing
+off after connection failures. A stream answered before any backend was
+selected for another reason does not count, whatever its status: no route,
+redirect, 401, 421, 429, a refusal, a 503 for a cluster with no backend, or a
+session or buffer limit hit before selection. The two pre-response caps share
 one count — resets the client sent before a response plus resets it provoked —
 and trip once more than half of the backend-routed streams were reset before
 their response. A connection whose client cancels a minority of its requests
@@ -1545,14 +1549,15 @@ floor. This is the shape of Envoy's premature-reset guard, which closes a
 connection once at least half of its streams, and at least 250 of them, were
 reset before a response; Sōzu's floors are higher.
 
-`h2_max_rst_stream_lifetime` compares against all of the answered streams: a
-pre-response reset is already capped above and a reset after the response
-started counts its stream as answered, so what it effectively bounds is
-RST_STREAM frames on streams that are already closed.
+`h2_max_rst_stream_lifetime` leaves pre-response resets to the caps above: past
+its floor, it trips once the resets received after a response started or on a
+stream already closed outnumber the streams a backend answered. A stream reset
+after its response started counts as answered before the check, so a client
+that cancels its streams after their responses never trips it.
 
 | Parameter                            | Default | Description                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | ------------------------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `h2_max_rst_stream_lifetime`         | 200000  | Floor of the cap on RST_STREAM frames **received** on this connection; trips once the count also exceeds the streams a backend answered, which in practice bounds resets of already-closed streams. |
+| `h2_max_rst_stream_lifetime`         | 200000  | Floor of the cap on RST_STREAM frames **received** on this connection; trips once the resets received after a response started or on an already-closed stream also outnumber the streams a backend answered. |
 | `h2_max_rst_stream_abusive_lifetime` | 1000    | Floor of the cap on "abusive" **received** RST_STREAM frames — resets the client sends on a frontend connection before the response starts, the Rapid Reset signature (CVE-2023-44487); trips once these resets plus the resets the client provoked are more than half of the backend-routed streams. Resets a backend sends on a backend connection never count as abusive: Sōzu opened those streams. |
 | `h2_max_rst_stream_emitted_lifetime` | 10000   | Floor of the cap on RST_STREAM frames **emitted by the server** that the peer provoked (CVE-2025-8671 "MadeYouReset"): Content-Length mismatch, header parse error, oversized header block, PRIORITY self-dependency, zero-increment or overflowing `WINDOW_UPDATE` on an open stream. Trips once these resets plus the pre-response resets the client sent are more than half of the backend-routed streams. Each one also counts as a glitch. Resets Sōzu decides on its own are **not** counted: the idle-stream reaper's `CANCEL`, `REFUSED_STREAM` from its concurrency limit, back-pressure or buffer pool, `STREAM_CLOSED` for DATA on a closed stream, and the error a failing backend response produces. `NoError` resets are not counted either. Crossing the cap emits `GOAWAY(EnhanceYourCalm)`. |
 
@@ -2799,9 +2804,9 @@ immediately after the patch is acknowledged.
 | `h2_max_continuation_frames`              | `u32` (≥ 1)     | per-connection setup | `20`                    | CONTINUATION flood cap — CVE-2024-27316                                                                                                                      |
 | `h2_max_glitch_count`                     | `u32` (≥ 1)     | per-connection setup | `2000`                  | Cumulative protocol-anomaly budget                                                                                                                           |
 | `h2_max_window_update_stream0_per_window` | `u32` (≥ 1)     | per-connection setup | `2000`                  | Unsolicited stream-0 WINDOW_UPDATE flood cap (two per DATA frame sent are not counted)                                                                       |
-| `h2_max_rst_stream_lifetime`              | `u64` (≥ 1)     | per-connection setup | `200000`                | Floor of the received RST_STREAM cap (also needs more resets than streams a backend answered) — CVE-2023-44487                                                          |
-| `h2_max_rst_stream_abusive_lifetime`      | `u64` (≥ 1)     | per-connection setup | `1000`                  | Floor of the pre-response RST_STREAM cap (also needs more than half of the streams a backend answered) — Rapid Reset signature                                          |
-| `h2_max_rst_stream_emitted_lifetime`      | `u64` (≥ 1)     | per-connection setup | `10000`                 | Floor of the peer-provoked server-emitted RST_STREAM cap (also needs more than half of the streams a backend answered) — CVE-2025-8671                                  |
+| `h2_max_rst_stream_lifetime`              | `u64` (≥ 1)     | per-connection setup | `200000`                | Floor of the received RST_STREAM cap (also needs the resets after a response or on a closed stream to exceed the streams a backend answered) — CVE-2023-44487           |
+| `h2_max_rst_stream_abusive_lifetime`      | `u64` (≥ 1)     | per-connection setup | `1000`                  | Floor of the pre-response RST_STREAM cap (also needs the pre-response resets, received plus provoked, to exceed the streams a backend answered) — Rapid Reset signature |
+| `h2_max_rst_stream_emitted_lifetime`      | `u64` (≥ 1)     | per-connection setup | `10000`                 | Floor of the peer-provoked server-emitted RST_STREAM cap (also needs the pre-response resets, received plus provoked, to exceed the streams a backend answered) — CVE-2025-8671 |
 | `h2_initial_connection_window`            | `u32`           | per-connection setup | `1048576`               | Connection receive window advertised to the peer (bytes, RFC 9113 §6.9.2); not enforced on inbound DATA                                                      |
 | `h2_max_concurrent_streams`               | `u32` (≥ 1)     | per-connection setup | `100`                   | `SETTINGS_MAX_CONCURRENT_STREAMS`                                                                                                                            |
 | `h2_stream_shrink_ratio`                  | `u32` (≥ 2)     | per-connection setup | `2`                     | Stream-slot Vec shrink threshold                                                                                                                             |

@@ -479,8 +479,9 @@ message HttpListenerConfig {
     // total_slots > active_streams * ratio. Default: 2.
     optional uint32 h2_stream_shrink_ratio = 21;
     // Floor of the connection-lifetime cap on RST_STREAM frames received
-    // (CVE-2023-44487): trips once the count exceeds both this value and the
-    // streams a backend answered on the connection. Default: 200000.
+    // (CVE-2023-44487): trips once the count exceeds this value and the
+    // resets received after a response started or on a closed stream exceed
+    // the streams a backend answered on the connection. Default: 200000.
     optional uint64 h2_max_rst_stream_lifetime = 22;
     // Floor of the cap on "abusive" (pre-response-start) RST_STREAM frames
     // received on a frontend H2 connection — the Rapid Reset signature: trips
@@ -624,8 +625,9 @@ message HttpsListenerConfig {
     // total_slots > active_streams * ratio. Default: 2.
     optional uint32 h2_stream_shrink_ratio = 31;
     // Floor of the connection-lifetime cap on RST_STREAM frames received
-    // (CVE-2023-44487): trips once the count exceeds both this value and the
-    // streams a backend answered on the connection. Default: 200000.
+    // (CVE-2023-44487): trips once the count exceeds this value and the
+    // resets received after a response started or on a closed stream exceed
+    // the streams a backend answered on the connection. Default: 200000.
     optional uint64 h2_max_rst_stream_lifetime = 32;
     // Floor of the cap on "abusive" (pre-response-start) RST_STREAM frames
     // received on a frontend H2 connection — the Rapid Reset signature: trips

@@ -504,10 +504,11 @@ cipher_list = [
 
 # H2 RST_STREAM caps. See `doc/configure.md` for the full flood-detection
 # surface; these three catch patient-attacker patterns that stay under the
-# per-window counters. Each value is a floor: the cap trips once the count
-# exceeds both the floor and a share of the streams the connection opened
-# (all of them for received resets, half for the other two), so benign
-# cancels on a long-lived connection never add up to it.
+# per-window counters. Each value is a floor: past it, the received cap trips
+# once the resets after a response or on a closed stream exceed the streams a
+# backend answered, the other two once the pre-response resets (received plus
+# provoked) exceed them, so benign cancels on a long-lived connection never
+# add up to a cap.
 # h2_max_rst_stream_lifetime = 200000         # received RST (CVE-2023-44487)
 # h2_max_rst_stream_abusive_lifetime = 1000   # received pre-response RST (Rapid Reset)
 # h2_max_rst_stream_emitted_lifetime = 10000  # peer-provoked server RST (CVE-2025-8671 MadeYouReset)
