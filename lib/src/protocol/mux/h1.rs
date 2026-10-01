@@ -451,7 +451,18 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         if status == SocketResult::Closed && self.position.is_client() {
             self.readiness.event.insert(Ready::HUP);
         }
-        if update_readiness_after_read(size, status, &mut self.readiness) {
+        // A backend buffer can hold bytes no socket event will announce: a
+        // backend that writes an interim 1xx and what follows it (another
+        // 1xx, the final response) at once leaves the rest unparsed when the
+        // interim is forwarded and cleared (`kawa::Kawa::clear` keeps the
+        // storage). The writable arms that clear it re-arm this read with
+        // `Readiness::signal_pending_read`, and those bytes are parsed here
+        // even though the socket has nothing new. A frontend buffer is left
+        // alone: its leftover bytes are pipelined requests, which wait for
+        // the response in flight.
+        let buffered_response =
+            self.position.is_client() && !kawa.storage.unparsed_data().is_empty();
+        if update_readiness_after_read(size, status, &mut self.readiness) && !buffered_response {
             // size=0: the socket returned EOF (Closed) or WouldBlock.
             // For a close-delimited backend response (no Content-Length, no
             // chunked), a graceful EOF IS the end-of-body signal. Terminate
@@ -949,10 +960,13 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                             kawa.clear();
                             stream.metrics.backend_stop();
                             if let StreamState::Linked(token) = stream.state {
-                                endpoint
-                                    .readiness_mut(token)
-                                    .interest
-                                    .insert(Ready::READABLE);
+                                // The final response may already sit in the
+                                // backend buffer, read with the 100: no
+                                // socket event will announce it, so the read
+                                // is re-armed, not only its interest.
+                                let backend = endpoint.readiness_mut(token);
+                                backend.interest.insert(Ready::READABLE);
+                                backend.signal_pending_read();
                             }
                             return MuxResult::Continue;
                         }
@@ -972,11 +986,13 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                             // The final response will emit the access log.
                             // Calling it here would double-decrement http.active_requests.
                             if let StreamState::Linked(token) = stream.state {
-                                // after an interim response, we expect the backend to send its final response
-                                endpoint
-                                    .readiness_mut(token)
-                                    .interest
-                                    .insert(Ready::READABLE);
+                                // after an interim response, we expect the backend to send its final
+                                // response, which may already sit in the backend buffer, read with
+                                // the interim: no socket event will announce it, so the read is
+                                // re-armed, not only its interest.
+                                let backend = endpoint.readiness_mut(token);
+                                backend.interest.insert(Ready::READABLE);
+                                backend.signal_pending_read();
                                 kawa.clear();
                                 stream.metrics.backend_stop();
                                 return MuxResult::Continue;
