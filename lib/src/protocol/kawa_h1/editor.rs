@@ -5275,8 +5275,13 @@ mod tests {
         assert_eq!(context.trailer_fields, 12, "every field is counted");
         assert!(!kawa.is_error(), "a section within the bound is admitted");
         let wire = serialized_request(&mut kawa);
+        // The forged `Content-Length` is matched on its whole field line: a
+        // bare `6666` also occurs in the random `traceparent` and request ids.
         assert!(
-            !wire.contains("6.6.6.6") && !wire.contains("6666"),
+            !wire.contains("6.6.6.6")
+                && !wire
+                    .to_ascii_lowercase()
+                    .contains("\r\ncontent-length: 6666\r\n"),
             "no forbidden trailer may reach the backend, got {wire:?}"
         );
         assert!(
