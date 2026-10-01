@@ -467,6 +467,37 @@ impl<Front: SocketHandler> Connection<Front> {
         }
     }
 
+    /// The backend this connection was dialled to, when it is a pooled
+    /// backend connection carrying no stream: an H1 keep-alive, or a
+    /// connected H2 connection whose stream table is empty. `None` for a
+    /// frontend, a dial in progress, a connection being dropped, and any
+    /// connection that still carries a stream.
+    pub(super) fn idle_pooled_backend(&self) -> Option<&BackendId> {
+        match self {
+            Connection::H1(c) => match &c.position {
+                Position::Client(_, backend, BackendStatus::KeepAlive) if c.stream.is_none() => {
+                    Some(backend)
+                }
+                _ => None,
+            },
+            Connection::H2(c) => match &c.core.position {
+                Position::Client(_, backend, BackendStatus::Connected)
+                    if c.core.stream_count() == 0 =>
+                {
+                    Some(backend)
+                }
+                _ => None,
+            },
+        }
+    }
+
+    /// Drop this connection: its status becomes `Disconnecting` and its
+    /// readiness carries `HUP`, which `Mux::ready_inner`'s dead-backend
+    /// sweep closes on its next pass.
+    pub(super) fn force_disconnect(&mut self) -> MuxResult {
+        forward!(self, force_disconnect())
+    }
+
     /// `now` is the caller's clock snapshot; H2 arms the graceful-shutdown
     /// budget from it. H1 has no multiplex to drain and ignores it.
     pub(super) fn graceful_goaway(&mut self, now: Instant) -> MuxResult {

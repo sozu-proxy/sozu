@@ -3116,6 +3116,34 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     }
                 }
 
+                // A pooled connection whose backend left the configuration
+                // is never reused (`Router::decide_after_gate`); once it
+                // carries no stream it has nothing left to do, so drop it
+                // rather than leave it idle until the session ends. The HUP
+                // `force_disconnect` raises sends it through the dead-backend
+                // sweep above on the next iteration, which releases its
+                // connection on the backend and lets a `Closing` backend
+                // reach `Closed`.
+                for (token, backend) in self.router.backends.iter_mut() {
+                    let retired = backend
+                        .idle_pooled_backend()
+                        .is_some_and(|id| self.backend_registry.is_retired(id))
+                        && self
+                            .context
+                            .backend_streams
+                            .get(token)
+                            .is_none_or(|ids| ids.is_empty());
+                    if retired {
+                        debug!(
+                            "{} closing idle backend connection {:?}: its backend was removed",
+                            log_context_lite!(self),
+                            token
+                        );
+                        backend.force_disconnect();
+                        all_backends_readiness_are_empty = false;
+                    }
+                }
+
                 // A frontend HUP is handled here as it is on entry: nothing
                 // else in this loop acts on one. Once no output is left to
                 // flush, this check closes the session, including after a
