@@ -18,7 +18,7 @@ use sozu_command_lib::{
 };
 
 use crate::{
-    http_utils::http_request,
+    http_utils::{http_ok_response, http_request},
     mock::{client::Client, sync_backend::Backend as SyncBackend},
     sozu::worker::Worker,
     tests::{State, repeat_until_error_or, setup_sync_test},
@@ -231,6 +231,100 @@ fn test_remove_cluster_stops_tcp_routing() {
             3,
             "RemoveCluster: the TCP listener closes new connections, an established session drains",
             try_remove_cluster_stops_tcp_routing,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// HTTP: a re-added cluster never reuses its previous incarnation's backend
+// =========================================================================
+
+fn try_readded_cluster_does_not_reuse_removed_backend() -> State {
+    let front_address = create_local_address();
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_sync_test(
+        "READD-CLUSTER-HTTP",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+    let mut removed = backends.pop().expect("setup_sync_test returns one backend");
+    removed.connect();
+
+    // Premise: the client's first request leaves the proxy holding a kept-alive
+    // connection to the backend it is about to remove.
+    let mut client = Client::new(
+        "CLIENT",
+        front_address,
+        http_request("GET", "/api", "ping", "localhost"),
+    );
+    client.connect();
+    client.send();
+    removed.accept(0);
+    removed.receive(0);
+    removed.send(0);
+    match client.receive_response(ANSWER_BUDGET) {
+        Some(response) if response.starts_with("HTTP/1.1 200") => {}
+        other => {
+            println!("the premise failed, the backend did not answer: {other:?}");
+            stop(worker);
+            return State::Undecided;
+        }
+    }
+
+    // The cluster is removed, then added again under the same id with a
+    // different backend.
+    let current_address = create_local_address();
+    let mut current = SyncBackend::new("CURRENT", current_address, http_ok_response("current"));
+    current.connect();
+    worker.send_proxy_request_type(RequestType::RemoveCluster("cluster_0".to_owned()));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpFrontend(Worker::default_http_frontend(
+        "cluster_0",
+        front_address,
+    )));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-current",
+        current_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    // The next request on the kept-alive frontend connection must reach the
+    // backend the configuration now names.
+    client.send();
+    let stale = removed.receive(0);
+    println!("removed backend received: {stale:?}");
+    let dialled = current.accept(0);
+    let answered = dialled && current.receive(0).is_some() && current.send(0).is_some();
+    let response = client.receive_response(ANSWER_BUDGET);
+    println!("response after the cluster was re-added: {response:?}");
+
+    let stopped = stop(worker);
+    let served_by_current = response
+        .as_deref()
+        .is_some_and(|r| r.starts_with("HTTP/1.1 200") && r.ends_with("current"));
+    if stale.is_none() && answered && served_by_current && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_readded_cluster_does_not_reuse_removed_backend() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "RemoveCluster then AddCluster: a kept-alive frontend reaches the re-added cluster's backend, not the removed one",
+            try_readded_cluster_does_not_reuse_removed_backend,
         ),
         State::Success,
     );
