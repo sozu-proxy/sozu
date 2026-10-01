@@ -4013,10 +4013,12 @@
     `max_inbound_window_update_frames_per_data_frame_sent`), and
     `h2_max_window_update_stream0_per_window` now bounds only unsolicited ones.
   - `h2_max_rst_stream_lifetime`, `h2_max_rst_stream_abusive_lifetime` and
-    `h2_max_rst_stream_emitted_lifetime` are now floors: each cap trips once its count also exceeds
-    the streams a backend answered on the connection (received resets) or half of them (pre-response
-    and peer-provoked emitted resets, counted together), the shape of Envoy's premature-reset
-    guard. Streams Sōzu refuses, answers itself or that are reset before a response do not count.
+    `h2_max_rst_stream_emitted_lifetime` are now floors. Past its floor, the received-reset cap
+    trips once received resets exceed the answered backend-routed streams; the pre-response and
+    peer-provoked emitted caps, counted together, trip once more than half of the backend-routed
+    streams were reset before their response — the shape of Envoy's premature-reset guard.
+    Backend-routed streams are those a backend answered or Sōzu answered 502/503/504; streams Sōzu
+    refuses or answers without routing do not count.
   - Resets Sōzu decides on its own — idle reaper `CANCEL`, `REFUSED_STREAM` from its concurrency
     limit, back-pressure or buffer pool, `STREAM_CLOSED` for DATA on a closed stream, the
     converter's error on a backend failure — no longer count toward the CVE-2025-8671
@@ -4041,7 +4043,8 @@
     `h2_max_header_table_size`, the PRIORITY map size and the buffer sizes.
   - A refused stream counts as a glitch once the client has acknowledged Sōzu's SETTINGS (buffer-pool
     refusals excepted), and its id is no longer kept in the per-connection reset set.
-  - The stored stream-0 `WINDOW_UPDATE` credit is capped at twice the per-window threshold.
+  - The stored stream-0 `WINDOW_UPDATE` credit is capped at two per recently sent DATA frame plus
+    twice the per-window threshold; it decays with the flood window once DATA stops.
   - `doc/configure.md` now states what each knob counts, its exemptions and its defaults.
 
   Covered by `h2_flood_threshold_tests.rs` (sixty pre-response cancels keep the connection; a

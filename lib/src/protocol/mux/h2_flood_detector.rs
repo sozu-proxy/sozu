@@ -55,8 +55,9 @@
 //!   Each trips only once it exceeds both its configured floor and a share of
 //!   `streams_opened` — the streams a backend answered, see that field — so a
 //!   long-lived connection never accumulates benign cancels toward a fixed
-//!   ceiling. The two pre-response counters share one ratio, more than half
-//!   of `streams_opened` reset before a response, and cap a peer that stays
+//!   ceiling. The two pre-response counters share one ratio — more resets
+//!   before a response than `streams_opened`, i.e. more than half of all
+//!   backend-routed streams reset before their response — and cap a peer that stays
 //!   under the per-window threshold forever. The received-RST counter's ratio
 //!   is all of `streams_opened`, which only resets of streams already gone
 //!   (RST_STREAM on a closed stream) can exceed: that is what it bounds.
@@ -173,8 +174,9 @@ const DEFAULT_MAX_RST_STREAM_LIFETIME: u64 = 200_000;
 /// response started — the cheap-for-client / expensive-for-us resets that
 /// characterise Rapid Reset (CVE-2023-44487).
 ///
-/// The cap trips once the count exceeds BOTH this floor and half of the
-/// streams a backend answered on the connection: the shape of Envoy's premature-reset
+/// The cap trips once the count exceeds this floor AND pre-response resets
+/// outnumber the streams a backend answered on the connection — more than
+/// half of the backend-routed streams reset before their response: the shape of Envoy's premature-reset
 /// guard (`ConnectionManagerImpl::maybeDrainDueToPrematureResets`,
 /// `source/common/http/conn_manager_impl.cc`, which closes a connection once
 /// at least half of its streams, and at least 250 of 500, were reset
@@ -199,7 +201,8 @@ const DEFAULT_MAX_RST_STREAM_ABUSIVE_LIFETIME: u64 = 1000;
 /// (idle reaper `CANCEL`, `REFUSED_STREAM` from its own concurrency limit or
 /// buffer pool, `STREAM_CLOSED` for DATA on a closed stream, converter
 /// `INTERNAL_ERROR` on a backend failure). The cap trips once the count
-/// exceeds BOTH this floor and half of the streams a backend answered, the same shape as
+/// exceeds this floor AND pre-response resets outnumber the streams a backend
+/// answered, the same shape as
 /// [`DEFAULT_MAX_RST_STREAM_ABUSIVE_LIFETIME`]. hyper's `h2` caps the same
 /// class at a flat 1024 per connection (`DEFAULT_LOCAL_RESET_COUNT_MAX`,
 /// `src/proto/mod.rs`); a MadeYouReset client provokes one reset per stream
@@ -304,11 +307,13 @@ pub struct H2FloodConfig {
     max_rst_stream_lifetime: u64,
     /// Floor of the cap on "abusive" (pre-response-start) RST_STREAM frames —
     /// the Rapid Reset signature (CVE-2023-44487): trips when the count
-    /// exceeds both this floor and half of the streams a backend answered.
+    /// exceeds this floor and pre-response resets outnumber the streams a
+    /// backend answered.
     max_rst_stream_abusive_lifetime: u64,
     /// Floor of the cap on **peer-provoked** RST_STREAM frames the server
     /// emits (CVE-2025-8671 "MadeYouReset"): trips when the count exceeds
-    /// both this floor and half of the streams a backend answered. Resets Sōzu decides on
+    /// this floor and pre-response resets outnumber the streams a backend
+    /// answered. Resets Sōzu decides on
     /// its own and graceful `NoError` cancels are not counted.
     max_rst_stream_emitted_lifetime: u64,
     /// Maximum accumulated HPACK-decoded header list size per request
@@ -600,7 +605,7 @@ pub(super) struct H2FloodDetector {
     /// are the "Rapid Reset" signature — cheap for the attacker, expensive
     /// for the proxy — and trip once they exceed the configured floor while,
     /// together with [`Self::total_rst_streams_emitted_lifetime`], they exceed
-    /// half of [`Self::streams_opened`].
+    /// [`Self::streams_opened`].
     total_abusive_rst_received_lifetime: u64,
     /// Lifetime RST_STREAM frames **emitted by the server** that the peer
     /// provoked (CVE-2025-8671 "MadeYouReset" mitigation): content-length
@@ -608,27 +613,33 @@ pub(super) struct H2FloodDetector {
     /// rejection, zero-increment or overflowing WINDOW_UPDATE on an open
     /// stream. Resets Sōzu decides on its own are never recorded here. Trips
     /// once it exceeds the configured floor while, together with
-    /// [`Self::total_abusive_rst_received_lifetime`], it exceeds half of
+    /// [`Self::total_abusive_rst_received_lifetime`], it exceeds
     /// [`Self::streams_opened`].
     total_rst_streams_emitted_lifetime: u64,
     /// The denominator the three RST caps above compare against. On a
-    /// frontend connection, the streams whose response came from a backend
-    /// (counted when the stream completes, or when the client resets it after
-    /// the response started); on a backend connection, the streams Sōzu
-    /// opened.
+    /// frontend connection, the answered streams that were routed to a
+    /// backend — answered by it, or answered 502/503/504 by Sōzu when the
+    /// backend failed — counted when the stream completes, or when the client
+    /// resets it after the response started; on a backend connection, the
+    /// streams Sōzu opened (see `routed_to_a_backend` in
+    /// `lib/src/protocol/mux/h2.rs`).
     ///
-    /// A frontend stream Sōzu refuses, answers itself (a default answer) or
-    /// sees reset before any response does not count: the peer opens those
-    /// for free, so counting them would let filler streams dilute the ratio
-    /// a Rapid Reset or MadeYouReset client must stay under. A stream a
-    /// backend answered cost the peer a full request, the same price as the
-    /// reset it would offset.
+    /// A frontend stream Sōzu refuses, answers without routing it, or sees
+    /// reset before any response does not count: the peer opens those for
+    /// free, so counting them would let filler streams dilute the ratio a
+    /// Rapid Reset or MadeYouReset client must stay under. Excluding the
+    /// streams reset before a response is also what makes
+    /// `pre-response resets > streams_opened` the 50 % line.
     streams_opened: u64,
     /// Stream-0 WINDOW_UPDATE frames the peer may still send without counting
     /// toward [`Self::window_update_stream0_count`]: each DATA frame the proxy
     /// sends adds [`WINDOW_UPDATE_STREAM0_CREDIT_PER_DATA_FRAME`], each
-    /// stream-0 WINDOW_UPDATE received spends one.
+    /// stream-0 WINDOW_UPDATE received spends one. Clamped to
+    /// [`Self::window_update_stream0_credit_cap`].
     window_update_stream0_credit: u64,
+    /// DATA frames sent recently: incremented per DATA frame, halved at each
+    /// window roll like the rate counters. Sizes the credit cap.
+    data_frames_recent: u64,
     /// PING frames received in current window (CVE-2019-9512)
     ping_count: u32,
     /// Lifetime PING frames received on this connection.
@@ -715,6 +726,7 @@ impl H2FloodDetector {
             total_rst_streams_emitted_lifetime: 0,
             streams_opened: 0,
             window_update_stream0_credit: 0,
+            data_frames_recent: 0,
             ping_count: 0,
             total_ping_received_lifetime: 0,
             settings_count: 0,
@@ -780,6 +792,7 @@ impl H2FloodDetector {
     /// ever owes updates for the DATA still in flight.
     pub(super) fn record_data_frames_sent(&mut self, frames: u64) {
         let before = self.window_update_stream0_credit;
+        self.data_frames_recent = self.data_frames_recent.saturating_add(frames);
         let cap = self.window_update_stream0_credit_cap();
         self.window_update_stream0_credit = self
             .window_update_stream0_credit
@@ -798,34 +811,38 @@ impl H2FloodDetector {
 
     /// Ceiling on the stored stream-0 WINDOW_UPDATE credit:
     /// [`WINDOW_UPDATE_STREAM0_CREDIT_PER_DATA_FRAME`] times the configured
-    /// per-window threshold (4000 at the defaults). A peer acknowledging every
-    /// 16 KiB frame of a 15 MiB window owes fewer than a thousand updates.
+    /// per-window threshold plus the DATA frames sent recently. The recent
+    /// part covers every update a peer can still owe for DATA in flight,
+    /// however fast the download; it halves at each window roll, so once the
+    /// download stops the credit falls back to the per-window part instead of
+    /// staying banked for a later flood.
     fn window_update_stream0_credit_cap(&self) -> u64 {
         u64::from(self.config.max_window_update_stream0_per_window)
+            .saturating_add(self.data_frames_recent)
             .saturating_mul(WINDOW_UPDATE_STREAM0_CREDIT_PER_DATA_FRAME)
     }
 
     /// True once `count` exceeds `floor` and `ratio_count` exceeds
-    /// `streams_opened / divisor` (compared as
-    /// `ratio_count * divisor > streams_opened`, so no rounding). Shared by
-    /// the three RST caps: the floor keeps a short connection from tripping
-    /// on a handful of resets, the ratio keeps a long one from accumulating
-    /// benign resets toward a fixed ceiling.
+    /// `streams_opened`. Shared by the three RST caps: the floor keeps a
+    /// short connection from tripping on a handful of resets, the ratio keeps
+    /// a long one from accumulating benign resets toward a fixed ceiling.
     fn exceeds_floor_and_ratio(
         count: u64,
         floor: u64,
         ratio_count: u64,
         streams_opened: u64,
-        divisor: u64,
     ) -> bool {
-        count > floor && ratio_count.saturating_mul(divisor) > streams_opened
+        count > floor && ratio_count > streams_opened
     }
 
     /// Streams reset before a response, whichever side sent the RST: the
     /// pre-response resets the peer sent plus the resets it provoked Sōzu
-    /// into. Both pre-response caps compare this one count against half of
-    /// the streams a backend answered, so a peer cannot reset every stream by splitting
-    /// the resets between the two kinds.
+    /// into. Both pre-response caps trip once this one count exceeds the
+    /// streams a backend answered. Those exclude the streams reset before
+    /// their response, so `resets > answered` is `resets > half of all
+    /// streams` — the same 50 % line as Envoy's premature-reset guard — and a
+    /// peer cannot reset every stream by splitting the resets between the two
+    /// kinds.
     fn pre_response_resets(&self) -> u64 {
         self.total_abusive_rst_received_lifetime
             .saturating_add(self.total_rst_streams_emitted_lifetime)
@@ -843,7 +860,8 @@ impl H2FloodDetector {
     ///
     /// The global cap trips once the count exceeds both
     /// `max_rst_stream_lifetime` and the streams a backend answered; the abusive one once
-    /// it exceeds both `max_rst_stream_abusive_lifetime` and half of them.
+    /// it exceeds `max_rst_stream_abusive_lifetime` while the pre-response
+    /// resets exceed the answered streams.
     pub(super) fn record_rst_lifetime(
         &mut self,
         response_started: bool,
@@ -878,7 +896,6 @@ impl H2FloodDetector {
             self.config.max_rst_stream_lifetime,
             self.total_rst_received_lifetime,
             self.streams_opened,
-            1,
         ) {
             return Some(H2FloodViolation {
                 error: H2Error::EnhanceYourCalm,
@@ -893,7 +910,6 @@ impl H2FloodDetector {
             self.config.max_rst_stream_abusive_lifetime,
             self.pre_response_resets(),
             self.streams_opened,
-            2,
         ) {
             return Some(H2FloodViolation {
                 error: H2Error::EnhanceYourCalm,
@@ -907,8 +923,9 @@ impl H2FloodDetector {
     }
 
     /// Increment the lifetime **peer-provoked** server-emitted RST_STREAM
-    /// counter and return a [`H2FloodViolation`] once it exceeds both
-    /// `max_rst_stream_emitted_lifetime` and half of the streams a backend answered.
+    /// counter and return a [`H2FloodViolation`] once it exceeds
+    /// `max_rst_stream_emitted_lifetime` while the pre-response resets exceed
+    /// the streams a backend answered.
     ///
     /// The only caller is `ConnectionH2::account_emitted_rst`, for a
     /// non-`NoError` reset whose origin is `RstOrigin::PeerProvoked`: a frame
@@ -931,7 +948,6 @@ impl H2FloodDetector {
             self.config.max_rst_stream_emitted_lifetime,
             self.pre_response_resets(),
             self.streams_opened,
-            2,
         ) {
             return Some(H2FloodViolation {
                 error: H2Error::EnhanceYourCalm,
@@ -1112,6 +1128,10 @@ impl H2FloodDetector {
             self.settings_count /= 2;
             self.empty_data_count /= 2;
             self.window_update_stream0_count /= 2;
+            self.data_frames_recent /= 2;
+            self.window_update_stream0_credit = self
+                .window_update_stream0_credit
+                .min(self.window_update_stream0_credit_cap());
             self.glitch_count /= 2;
             self.window_start = now;
             // Half-decay invariant: each rate-based counter is exactly halved
@@ -1833,12 +1853,12 @@ mod tests {
     /// streams is reached at once, so the cap trips right past the floor.
     #[test]
     fn test_flood_detector_rapid_reset_trips_just_past_the_floor() {
+        // A stream reset before its response is never answered, so it never
+        // counts toward `streams_opened`.
         let mut detector = H2FloodDetector::new(H2FloodConfig::default(), Instant::now());
         for _ in 0..DEFAULT_MAX_RST_STREAM_ABUSIVE_LIFETIME {
-            detector.record_stream_opened();
             assert!(detector.record_rst_lifetime(false).is_none());
         }
-        detector.record_stream_opened();
         let violation = detector
             .record_rst_lifetime(false)
             .expect("a reset of every opened stream must trip past the floor");
@@ -1849,13 +1869,13 @@ mod tests {
         assert_eq!(violation.count, DEFAULT_MAX_RST_STREAM_ABUSIVE_LIFETIME + 1);
     }
 
-    /// Past the floor, the pre-response cap holds at half of the streams
-    /// opened: a peer that cancels more than half of its streams trips, one
-    /// that cancels less than half does not.
+    /// Past the floor, the pre-response cap holds at half of all streams:
+    /// `streams_opened` counts the answered ones and excludes the reset
+    /// ones, so more resets than answered streams is more than half.
     #[test]
     fn test_flood_detector_pre_response_cap_is_half_of_streams_opened() {
         let mut detector = H2FloodDetector::new(H2FloodConfig::default(), Instant::now());
-        for _ in 0..10_000 {
+        for _ in 0..5000 {
             detector.record_stream_opened();
         }
         for _ in 0..5000 {
@@ -1863,8 +1883,39 @@ mod tests {
         }
         assert!(
             detector.record_rst_lifetime(false).is_some(),
-            "5001 pre-response resets over 10 000 streams is more than half"
+            "5001 pre-response resets beside 5000 answered streams is more than half"
         );
+    }
+
+    /// Forty percent of streams cancelled before their response, over a
+    /// connection long enough to pass the floor many times, never trips;
+    /// sixty percent does.
+    #[test]
+    fn test_flood_detector_pre_response_cap_trips_only_above_half() {
+        let mut detector = H2FloodDetector::new(H2FloodConfig::default(), Instant::now());
+        for round in 0..10_000 {
+            for _ in 0..3 {
+                detector.record_stream_opened();
+            }
+            for _ in 0..2 {
+                assert!(
+                    detector.record_rst_lifetime(false).is_none(),
+                    "40% pre-response cancels must not trip (round {round})"
+                );
+            }
+        }
+
+        let mut flood = H2FloodDetector::new(H2FloodConfig::default(), Instant::now());
+        let mut tripped = false;
+        for _ in 0..10_000 {
+            for _ in 0..2 {
+                flood.record_stream_opened();
+            }
+            for _ in 0..3 {
+                tripped |= flood.record_rst_lifetime(false).is_some();
+            }
+        }
+        assert!(tripped, "60% pre-response cancels must trip past the floor");
     }
 
     /// Peer-provoked emitted resets follow the same shape: a minority over a
@@ -1886,10 +1937,8 @@ mod tests {
 
         let mut flood = H2FloodDetector::new(H2FloodConfig::default(), Instant::now());
         for _ in 0..DEFAULT_MAX_RST_STREAM_EMITTED_LIFETIME {
-            flood.record_stream_opened();
             assert!(flood.record_rst_emitted().is_none());
         }
-        flood.record_stream_opened();
         assert!(
             flood.record_rst_emitted().is_some(),
             "one provoked reset per opened stream must trip past the floor"
@@ -1907,7 +1956,7 @@ mod tests {
             ..H2FloodConfig::default()
         };
         let mut detector = H2FloodDetector::new(config, Instant::now());
-        for _ in 0..200 {
+        for _ in 0..100 {
             detector.record_stream_opened();
         }
         let mut tripped = false;
@@ -1917,7 +1966,7 @@ mod tests {
         }
         assert!(
             tripped,
-            "120 pre-response resets over 200 streams is more than half"
+            "120 pre-response resets beside 100 answered streams is more than half"
         );
     }
 
@@ -1992,21 +2041,49 @@ mod tests {
         assert_eq!(detector.window_update_stream0_count, 1);
     }
 
-    /// A long download cannot bank credit for a later flood: the stored
-    /// credit stops at its cap, and updates past it count again.
+    /// A long download cannot bank credit for a later flood: once the DATA
+    /// stops, the credit falls back to twice the per-window threshold within
+    /// a few windows, and updates past it count again.
     #[test]
     fn test_flood_detector_window_update_credit_is_capped() {
         let now = Instant::now();
         let mut detector = H2FloodDetector::new(H2FloodConfig::default(), now);
-        let cap = detector.window_update_stream0_credit_cap();
         detector.record_data_frames_sent(1_000_000);
-        assert_eq!(detector.window_update_stream0_credit, cap);
-        for _ in 0..cap {
+        assert_eq!(detector.window_update_stream0_credit, 2_000_000);
+        let mut at = now;
+        for _ in 0..32 {
+            at += FLOOD_WINDOW_DURATION;
+            assert!(detector.check_flood(at).is_none());
+        }
+        let floor = u64::from(DEFAULT_MAX_WINDOW_UPDATE_STREAM0_PER_WINDOW)
+            * WINDOW_UPDATE_STREAM0_CREDIT_PER_DATA_FRAME;
+        assert_eq!(detector.window_update_stream0_credit, floor);
+        for _ in 0..floor {
             detector.record_window_update_stream0();
         }
         assert_eq!(detector.window_update_stream0_count, 0);
         detector.record_window_update_stream0();
         assert_eq!(detector.window_update_stream0_count, 1);
+    }
+
+    /// A fast download with the peer's acknowledgements lagging a full
+    /// window behind is not counted, even at a low threshold: the cap grows
+    /// with the DATA in flight.
+    #[test]
+    fn test_flood_detector_window_update_credit_covers_data_in_flight() {
+        let now = Instant::now();
+        let config = H2FloodConfig {
+            max_window_update_stream0_per_window: 100,
+            ..H2FloodConfig::default()
+        };
+        let mut detector = H2FloodDetector::new(config, now);
+        // 15 MiB of 16 KiB frames sent before the first update arrives.
+        detector.record_data_frames_sent(960);
+        for _ in 0..960 {
+            detector.record_window_update_stream0();
+        }
+        assert!(detector.check_flood(now).is_none());
+        assert_eq!(detector.window_update_stream0_count, 0);
     }
 
     // ── H2FloodConfig ──────────────────────────────────────────────────

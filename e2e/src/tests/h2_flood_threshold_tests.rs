@@ -22,6 +22,11 @@
 //!    proxy sent is credited, not counted toward
 //!    `h2_max_window_update_stream0_per_window` — which the test sets to the
 //!    former default of 100 so a per-frame client would cross it.
+//! 3. [`test_h2_cancels_during_a_backend_outage_keep_the_connection`] — with
+//!    the backend down, a client whose requests Sōzu answers 503 and which
+//!    cancels one request in three before any answer keeps its connection
+//!    past the pre-response floor: a stream routed to a cluster and answered
+//!    by Sōzu counts as answered.
 
 use std::{
     io::{Read, Write},
@@ -32,19 +37,22 @@ use std::{
 use super::h2_utils::{
     CHROME146_CONN_WINDOW_UPDATE_DELTA, CHROME146_INITIAL_WINDOW_SIZE, H2_ERROR_ENHANCE_YOUR_CALM,
     H2_FLAG_END_STREAM, H2_FRAME_DATA, H2_FRAME_GOAWAY, H2_FRAME_HEADERS, H2_FRAME_RST_STREAM,
-    H2Frame, advance_one_frame, h2_handshake, h2_handshake_with_initial_window, raw_h2_connection,
-    setup_h2_test, stream_status_matches, teardown,
+    H2Frame, advance_one_frame, decode_status, h2_handshake, h2_handshake_with_initial_window,
+    raw_h2_connection, setup_h2_listener_only, setup_h2_test, stream_status_matches, teardown,
 };
 use crate::{
     mock::{aggregator::SimpleAggregator, async_backend::BackendHandle as AsyncBackend},
     sozu::worker::Worker,
-    tests::{State, provide_port, repeat_until_error_or, tests::create_local_address},
+    tests::{
+        State, provide_port, repeat_until_error_or,
+        tests::{create_local_address, create_unbound_local_address},
+    },
 };
 use sozu_command_lib::{
     config::ListenerBuilder,
     proto::command::{
-        ActivateListener, AddCertificate, CertificateAndKey, ListenerType, RequestHttpFrontend,
-        SocketAddress, request::RequestType,
+        ActivateListener, AddCertificate, CertificateAndKey, Cluster, ListenerType,
+        RequestHttpFrontend, SocketAddress, request::RequestType,
     },
 };
 
@@ -403,6 +411,108 @@ fn test_h2_per_frame_connection_window_updates_do_not_trip() {
             2,
             "H2: per-DATA-frame stream-0 WINDOW_UPDATEs do not trip the flood detector",
             try_h2_per_frame_connection_window_updates_do_not_trip,
+        ),
+        State::Success
+    );
+}
+
+// ── 3. cancels during a backend outage ──────────────────────────────────
+
+/// Rounds of two answered requests and one cancelled before its answer:
+/// past the `h2_max_rst_stream_abusive_lifetime` floor (1000) with a third
+/// of the streams cancelled.
+const OUTAGE_ROUNDS: u32 = 1100;
+
+fn try_h2_cancels_during_a_backend_outage_keep_the_connection() -> State {
+    let (mut worker, front_port, _) = setup_h2_listener_only("H2-OUTAGE-CANCELS");
+    // The default 503 template carries `Connection: close`, which drains the
+    // whole H2 connection after the first answer; a template without it keeps
+    // the connection open for the rounds below.
+    worker.send_proxy_request_type(RequestType::AddCluster(Cluster {
+        answer_503: Some(String::from(
+            "HTTP/1.1 503 Service Unavailable\r\nCache-Control: no-cache\r\nContent-Length: 0\r\n\r\n",
+        )),
+        ..Worker::default_cluster("cluster_0")
+    }));
+    // A backend nothing listens on: every routed request is answered 503.
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        create_unbound_local_address(),
+        None,
+    )));
+    worker.read_to_last();
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    let mut carry = Vec::new();
+    let mut calm = false;
+    let mut answered = 0u32;
+    let mut next_id: u32 = 1;
+    for _ in 0..OUTAGE_ROUNDS {
+        let (first, second, cancelled) = (next_id, next_id + 2, next_id + 4);
+        next_id += 6;
+        let mut wire = H2Frame::headers(first, get_root_header_block(), true, true).encode();
+        wire.extend_from_slice(
+            &H2Frame::headers(second, get_root_header_block(), true, true).encode(),
+        );
+        wire.extend_from_slice(
+            &H2Frame::headers(cancelled, get_root_header_block(), true, true).encode(),
+        );
+        wire.extend_from_slice(&H2Frame::rst_stream(cancelled, 0x8).encode());
+        if tls.write_all(&wire).and_then(|_| tls.flush()).is_err() {
+            break;
+        }
+        let frames = pump_frames(&mut tls, &mut carry, Duration::from_secs(5), |frames| {
+            (stream_status_matches(frames, first, 503)
+                && stream_status_matches(frames, second, 503))
+                || frames.iter().any(|(ft, _, _, _)| *ft == H2_FRAME_GOAWAY)
+        });
+        if goaway_with_calm(&frames) {
+            calm = true;
+            break;
+        }
+        if !(stream_status_matches(&frames, first, 503)
+            && stream_status_matches(&frames, second, 503))
+        {
+            let statuses: Vec<(u32, Option<u16>)> = frames
+                .iter()
+                .filter(|(ft, _, _, _)| *ft == H2_FRAME_HEADERS)
+                .map(|(_, _, sid, payload)| (*sid, decode_status(payload)))
+                .collect();
+            println!(
+                "outage cancels: round starting at stream {first} got no 503 pair; \
+                 {} frames, statuses {statuses:?}",
+                frames.len()
+            );
+            break;
+        }
+        answered += 2;
+    }
+
+    println!(
+        "outage cancels: answered={answered} cancelled={} goaway(ENHANCE_YOUR_CALM)={calm}",
+        answered / 2
+    );
+    let stopped = teardown(tls, front_port, worker, Vec::new());
+    if !calm && answered == 2 * OUTAGE_ROUNDS && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+/// During a backend outage, 503 answers count as answered streams, so
+/// cancelling a third of the requests before their answer does not trip
+/// the pre-response reset cap.
+#[test]
+fn test_h2_cancels_during_a_backend_outage_keep_the_connection() {
+    assert_eq!(
+        repeat_until_error_or(
+            1,
+            "H2: client cancels during a backend outage keep the connection",
+            try_h2_cancels_during_a_backend_outage_keep_the_connection,
         ),
         State::Success
     );

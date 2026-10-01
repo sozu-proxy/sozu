@@ -4771,7 +4771,7 @@ impl ConnectionH2 {
                     global_stream_id
                 );
                 self.metric_events.push(MetricEvent::EndToEndH2Request);
-                if stream.metrics.backend_headers_received.is_some() {
+                if routed_to_a_backend(stream) {
                     self.flood_detector.record_stream_opened();
                 }
                 let (token, events) =
@@ -5391,6 +5391,22 @@ impl ConnectionH2 {
 /// kawa stuck in [`kawa::ParsingPhase::Error`]. Mirrors the parse +
 /// fallback at `lib/src/protocol/mux/converter.rs::initialize` so the
 /// flood-accounting helper sees the same code that lands on the wire.
+/// Whether an answered frontend stream counts toward the RST caps'
+/// denominator (`H2FloodDetector`'s `streams_opened`,
+/// `lib/src/protocol/mux/h2_flood_detector.rs`): it was routed to a backend.
+/// A backend answered it, a backend was selected for it, or Sōzu answered it
+/// 502/503/504 because the cluster's backends failed, are down or timed out
+/// — so a backend outage does not turn the client's ordinary cancels into a
+/// Rapid Reset verdict. A stream Sōzu answers without routing it (no route,
+/// a redirect, 401, 421, 429, a refusal) does not count: the peer opens
+/// those for free, and counting them would let filler streams dilute the
+/// ratio.
+fn routed_to_a_backend(stream: &crate::protocol::mux::Stream) -> bool {
+    stream.metrics.backend_headers_received.is_some()
+        || stream.context.backend_id.is_some()
+        || matches!(stream.context.status, Some(502..=504))
+}
+
 /// Who decided a proxy-emitted `RST_STREAM`, for flood accounting.
 ///
 /// Only a reset the peer provoked counts toward the CVE-2025-8671
@@ -6819,7 +6835,9 @@ impl ConnectionH2 {
                 }
                 Position::Client(..) => {}
                 Position::Server => {
-                    if stream.metrics.backend_headers_received.is_some() {
+                    // Counted only once a response started: a stream reset
+                    // before it is a pre-response reset, never an answered one.
+                    if response_started && routed_to_a_backend(stream) {
                         self.flood_detector.record_stream_opened();
                     }
                     self.distribute_overhead(&mut stream.metrics, rst_byte_totals);

@@ -761,12 +761,14 @@ pub struct ListenerBuilder {
     pub h2_max_rst_stream_lifetime: Option<u64>,
     /// H2 flood detection: floor of the cap on "abusive" (pre-response-start)
     /// RST_STREAM frames (Rapid Reset signature, CVE-2023-44487); trips once
-    /// the count exceeds both this value and half of the streams a backend answered.
+    /// the count exceeds this value and more than half of the
+    /// backend-routed streams were reset before their response.
     /// Default: 1000.
     pub h2_max_rst_stream_abusive_lifetime: Option<u64>,
     /// H2 flood detection: floor of the cap on **server-emitted** RST_STREAM
     /// frames the peer provoked (CVE-2025-8671 "MadeYouReset"); trips once the
-    /// count exceeds both this value and half of the streams a backend answered. Resets
+    /// count exceeds this value and more than half of the
+    /// backend-routed streams were reset before their response. Resets
     /// Sōzu decides on its own and `NoError` resets are not counted.
     /// Default: 10000.
     pub h2_max_rst_stream_emitted_lifetime: Option<u64>,
