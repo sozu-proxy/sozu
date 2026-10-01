@@ -3933,6 +3933,18 @@
   (`e2e/src/tests/h2_tests.rs`) and
   `a_hup_during_the_flush_that_starts_a_linger_drains_before_closing` (`lib/src/protocol/mux/mod.rs`).
 
+- **`fix(mux)`: refresh the backend-work flag after the frontend write
+  ([#1771](https://github.com/sozu-proxy/sozu/issues/1771)).** With an HTTP/2 frontend in front of
+  an HTTP/1.1 backend that wrote interim responses and the final response at once, the client got
+  the interim HEADERS and the final response stalled until the backend hung up. `Mux::ready_inner`
+  (`lib/src/protocol/mux/mod.rs`) recorded whether any backend had work before the frontend
+  write; forwarding a 1xx re-arms the backend read (`ConnectionH2::handle_1xx_reset`, and
+  `ConnectionH1::writable`'s interim arms), but only a resumed parked backend refreshed the flag,
+  so the loop could exit with a backend armed and no socket event left to wake it. The flag is now
+  refreshed from every backend's readiness after the frontend write. RFC 9110 §15.2. Covered by
+  `test_h2_to_h1_103_and_final_in_one_write` and `test_h2_to_h1_102_103_and_final_in_one_write`
+  (`e2e/src/tests/h2_tests.rs`).
+
 - **`fix(h1)`: forward a final response read together with a 1xx
   ([#1759](https://github.com/sozu-proxy/sozu/issues/1759)).** When an HTTP/1.1 backend wrote an
   interim response and what follows it (another 1xx, the final response) at once, an HTTP/1.1
@@ -4013,6 +4025,34 @@
   `a_linger_started_by_a_timeout_write_keeps_its_own_deadline`,
   `a_408_to_a_silent_client_closes_without_lingering` and
   `a_silent_client_is_closed_at_the_linger_deadline`.
+
+- **`fix(mux)`: close a pooled connection to a removed backend once it is idle
+  ([#1760](https://github.com/sozu-proxy/sozu/issues/1760)).** A connection whose backend left the
+  configuration is no longer reused (#1735), but it stayed open until its frontend session ended,
+  so the removed backend kept a connection and never went from `Closing` to `Closed`.
+  `Mux::ready_inner` (`lib/src/protocol/mux/mod.rs`) now drops such a connection as soon as it
+  carries no stream: an H1 keep-alive, or an H2 connection with an empty stream table. A connection
+  that was already idle when its backend was removed is closed on its session's next event.
+  `RemovedBackendHasNoConnections` is unchanged: it is emitted when the session that last used the
+  backend closes. **Behaviour change:** a reload that changes a backend's weight, `sticky_id` or
+  `backup` is applied as `RemoveBackend` then `AddBackend` (`ConfigState::diff`), so live sessions
+  now drop their pooled connection to that backend and dial it again. Documented in
+  `lib/src/protocol/mux/LIFECYCLE.md`. Covered by `test_removed_backend_is_neither_reused_nor_kept`
+  (`e2e/src/tests/remove_cluster_tests.rs`) and, for the reuse skip of #1735 in each of its three
+  arms, `a_retired_backend_connection_is_never_reused` (`lib/src/protocol/mux/router.rs`).
+
+- **`fix(mux-h2)`: a default answer ends its own stream, not the H2 connection
+  ([#1740](https://github.com/sozu-proxy/sozu/issues/1740)).** Every built-in answer template
+  carries `Connection: close`, which clears `keep_alive_frontend`; the H2 write pass read that bit
+  when the answered stream retired and sent `GOAWAY`, so one 4xx/5xx default answer drained the
+  connection and refused every later stream. `Connection` is an HTTP/1.1 option (RFC 9113
+  §8.2.2) and the H2 converter already strips it: `ConnectionH2::poll_write_target`
+  (`lib/src/protocol/mux/h2.rs`) no longer reads `keep_alive_frontend`. HTTP/1.1 is unchanged.
+  On H2, the per-(cluster, source IP) slot claimed by a failed dial is now held until the
+  connection closes, one slot per (connection, cluster) as for a successful dial
+  (`doc/rate-limit-design.md`). Covered by the e2e `test_h2_default_answer_terminates_stream`
+  (now asserts no `GOAWAY`), `test_h2_default_answer_502_spares_other_streams` and
+  `test_h2_failed_dial_keeps_connection_and_one_slot`.
 
 - **`fix(mux)`: never reuse a pooled connection to a removed backend
   ([#1735](https://github.com/sozu-proxy/sozu/issues/1735)).** The pool-reuse scan of

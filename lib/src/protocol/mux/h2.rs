@@ -1441,9 +1441,9 @@ pub enum H2WriteTarget {
     /// [`ConnectionH2::handle_write`], and no finalize — this is the pass's
     /// result.
     ///
-    /// Three sites, and none of them may become a [`Self::Finalize`]: the
-    /// resume path's stall, the MadeYouReset emitted-RST cap trip, and the
-    /// close-frontend GOAWAY. Folding any of them into `Finalize` would run
+    /// Two sites, and neither may become a [`Self::Finalize`]: the resume
+    /// path's stall and the MadeYouReset emitted-RST cap trip. Folding either
+    /// into `Finalize` would run
     /// LIFECYCLE §9 invariant 16's readiness policy over a pass that must not
     /// reach it.
     Done(MuxResult),
@@ -3157,7 +3157,7 @@ impl ConnectionH2 {
                         }
                     }
                     if pass.stalled {
-                        // The FIRST of the three terminators that must not
+                        // The FIRST of the two terminators that must not
                         // finalize: the scheduler pass never began, so LIFECYCLE
                         // §9 invariant 16's readiness policy has nothing to
                         // decide and the park must survive untouched.
@@ -3515,8 +3515,10 @@ impl ConnectionH2 {
                         && kawa.is_completed()
                         && !Self::handle_1xx_reset(kawa, stream_state, endpoint)
                     {
-                        let close_frontend = matches!(self.position, Position::Server)
-                            && !parts.context.keep_alive_frontend;
+                        // `keep_alive_frontend` is not read here: a default
+                        // answer's `Connection: close` is an HTTP/1.1
+                        // connection option, stripped from H2 (RFC 9113
+                        // §8.2.2). The answer ends its own stream only.
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 
@@ -3530,12 +3532,8 @@ impl ConnectionH2 {
                             client_rtt,
                             server_rtt,
                         ) {
-                            pass.completed_streams.push((
-                                dead_id,
-                                global_stream_id,
-                                token,
-                                close_frontend,
-                            ));
+                            pass.completed_streams
+                                .push((dead_id, global_stream_id, token));
                             // LIFECYCLE §9 invariant 17: leave the census INSIDE
                             // the scheduler loop so later streams see the reduced
                             // count. The post-loop retirement at remove_dead_stream
@@ -3557,10 +3555,8 @@ impl ConnectionH2 {
                 }
                 H2WritePhase::End => {
                     // FIRST statement of the arm, before any `return` it can
-                    // take: this is what makes the converter's three pooled
-                    // buffers reach `HpackState` on the close-frontend GOAWAY
-                    // exit below, and it leaves the pass holding `None` for the
-                    // rest of its life. The phase moves to `Ended` in the same
+                    // take: it leaves the pass holding `None` for the rest of
+                    // its life. The phase moves to `Ended` in the same
                     // breath so a re-entry cannot reach this statement twice.
                     let (converter_pass, order, census) = pass.release_scheduler_pass();
                     pass.phase = H2WritePhase::Ended;
@@ -3582,7 +3578,7 @@ impl ConnectionH2 {
                     // moved, not copied: the pass never owned an allocation of its own.
                     let (converter_out, lowercase_buf, cookie_buf) = converter_pass.into_buffers();
                     // Publish `ready_incremental_streams` (and any window/stream drift the
-                    // pass produced) before the two early returns below, so no pass
+                    // pass produced) before the early return below, so no pass
                     // samples without emitting.
                     self.gauge_connection_state();
                     // Account every RST that the converter emitted during this pass
@@ -3614,8 +3610,7 @@ impl ConnectionH2 {
                     // accounting above, so a MadeYouReset cap trip that returns a GOAWAY
                     // early skips both exactly as it did before the inversion.
                     self.scheduler.end_pass(order, census);
-                    let mut close_frontend_after_completed_stream = false;
-                    for (dead_id, global_stream_id, token, close_frontend) in
+                    for (dead_id, global_stream_id, token) in
                         std::mem::take(&mut pass.completed_streams)
                     {
                         // Retirement is deferred out of the loop on purpose, and this is
@@ -3633,7 +3628,6 @@ impl ConnectionH2 {
                         // before `endpoint.end_stream()` can trigger teardown and observe
                         // a stale `Recycle` entry in `self.stream_table.streams()`.
                         self.remove_dead_stream(dead_id, global_stream_id);
-                        close_frontend_after_completed_stream |= close_frontend;
                         if let Some(token) = token {
                             remove_backend_stream(
                                 &mut context.backend_streams,
@@ -3642,15 +3636,6 @@ impl ConnectionH2 {
                             );
                             endpoint.end_stream(token, global_stream_id, context);
                         }
-                    }
-                    // The THIRD terminator that must not finalize: this pass ends
-                    // in a GOAWAY, so invariant 16 has no readiness to decide.
-                    if close_frontend_after_completed_stream && !self.drain.draining() {
-                        return H2WriteTarget::Done(if self.stream_table.streams().is_empty() {
-                            self.goaway(H2Error::NoError)
-                        } else {
-                            self.graceful_goaway(self.now)
-                        });
                     }
                     return H2WriteTarget::Finalize {
                         socket_write: pass.socket_write,

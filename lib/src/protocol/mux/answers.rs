@@ -314,6 +314,8 @@ pub(crate) fn set_default_answer_with_retry_after(
     // templates carry `Connection: close`, which flips the frontend
     // keep-alive bit to false; cluster operators can opt back into
     // keep-alive by shipping a custom template without that header.
+    // Only an H1 frontend reads the bit: on H2 the header is stripped
+    // (RFC 9113 §8.2.2) and the answer ends its own stream only.
     if !keep_alive {
         context.keep_alive_frontend = false;
     }

@@ -547,6 +547,24 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   carries. A backend added again, even at the same address, is a new `Rc` in a
   new slot, so the next request dials it.
 
+  Once a retired connection carries no stream — an H1 `KeepAlive`, or an H2
+  `Connected` connection with an empty stream table — `Mux::ready_inner` drops
+  it (`Connection::idle_pooled_backend`, then `Connection::force_disconnect`).
+  The HUP that raises sends it through the dead-backend sweep on the next
+  iteration, which releases its connection on the backend, so a `Closing`
+  backend reaches `Closed` instead of holding a parked socket until the session
+  ends. The check runs on every pass of the session, so a connection idle
+  before the removal is closed on the session's next event. The
+  `RemovedBackendHasNoConnections` event is still tied to the session: it is
+  emitted when the last `Rc` of the backend drops, and the session's
+  `BackendRegistry` holds one until the session closes.
+
+  A reload that changes a backend's weight, `sticky_id` or `backup` reaches the
+  workers as `RemoveBackend` then `AddBackend` (`ConfigState::diff`,
+  `command/src/state.rs`). The removal retires the backend, so every session
+  drops its pooled connection to it and dials the re-added backend, where an
+  in-place update used to keep the connection.
+
   That is what took `Rc<RefCell<dyn ProxySession>>` out of the router entirely —
   its single use was `L7Proxy::add_session`, which is the embedder's.
 
@@ -1706,9 +1724,14 @@ response can never follow the close-delimited body; the client retries it on
 a new connection (§9.3.2). Before this, the client waited for more body until
 the frontend timeout and the next pipelined response was appended to the
 body. This is an H1-frontend decision only: `keep_alive_frontend` is not
-cleared, because `ConnectionH2::write_streams` reads it to send GOAWAY, and an
-H2 client neither sees `Connection` (RFC 9113 §8.2.2) nor needs the close to
-end the body, which carries END_STREAM. HAProxy's `h1_set_cli_conn_mode`
+cleared, because an H2 client neither sees `Connection` (RFC 9113 §8.2.2) nor
+needs the close to end the body, which carries END_STREAM. The H2 write pass
+does not read `keep_alive_frontend` at all: a default answer whose template
+carries `Connection: close` clears it, and on an H2 frontend that answer ends
+its own stream and nothing else — no GOAWAY, the other streams continue
+(sozu-proxy/sozu#1740). Pinned by the e2e
+`test_h2_default_answer_terminates_stream` and
+`test_h2_default_answer_502_spares_other_streams`. HAProxy's `h1_set_cli_conn_mode`
 (`src/mux_h1.c`) closes the client on a response without a known length as
 well; sozu does not re-frame such a body as chunked to keep the connection.
 Pinned by the e2e `test_h1_close_delimited_body_closes_client`,
