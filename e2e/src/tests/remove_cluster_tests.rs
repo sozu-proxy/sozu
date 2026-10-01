@@ -5,6 +5,10 @@
 //! its hostname stops routing, a new connection on its TCP listener is closed
 //! instead of forwarded, and a session established before the removal drains
 //! on the backend connection it already holds.
+//!
+//! A pooled backend connection is never reused once its backend has left the
+//! configuration, whether with its cluster or alone (`RemoveBackend`), and the
+//! proxy closes it as soon as it carries no request.
 
 use std::{
     io::{ErrorKind, Read},
@@ -14,7 +18,7 @@ use std::{
 
 use sozu_command_lib::{
     config::ListenerBuilder,
-    proto::command::{ActivateListener, ListenerType, request::RequestType},
+    proto::command::{ActivateListener, ListenerType, RemoveBackend, request::RequestType},
 };
 
 use crate::{
@@ -325,6 +329,100 @@ fn test_readded_cluster_does_not_reuse_removed_backend() {
             3,
             "RemoveCluster then AddCluster: a kept-alive frontend reaches the re-added cluster's backend, not the removed one",
             try_readded_cluster_does_not_reuse_removed_backend,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// HTTP: a backend removed from a surviving cluster loses its pooled
+// connection
+// =========================================================================
+
+fn try_removed_backend_is_neither_reused_nor_kept() -> State {
+    let front_address = create_local_address();
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_sync_test(
+        "REMOVE-BACKEND-HTTP",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+    let mut removed = backends.pop().expect("setup_sync_test returns one backend");
+    removed.connect();
+
+    // Premise: the client's first request leaves the proxy holding a kept-alive
+    // connection to the backend it is about to remove.
+    let mut client = Client::new(
+        "CLIENT",
+        front_address,
+        http_request("GET", "/api", "ping", "localhost"),
+    );
+    client.connect();
+    client.send();
+    removed.accept(0);
+    removed.receive(0);
+    removed.send(0);
+    match client.receive_response(ANSWER_BUDGET) {
+        Some(response) if response.starts_with("HTTP/1.1 200") => {}
+        other => {
+            println!("the premise failed, the backend did not answer: {other:?}");
+            stop(worker);
+            return State::Undecided;
+        }
+    }
+
+    // The cluster stays; its only backend is replaced by another one.
+    let current_address = create_local_address();
+    let mut current = SyncBackend::new("CURRENT", current_address, http_ok_response("current"));
+    current.connect();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-current",
+        current_address,
+        None,
+    )));
+    worker.send_proxy_request_type(RequestType::RemoveBackend(RemoveBackend {
+        cluster_id: "cluster_0".to_owned(),
+        backend_id: "cluster_0-0".to_owned(),
+        address: removed.address.into(),
+    }));
+    worker.read_to_last();
+
+    // The next request on the kept-alive frontend connection reaches the
+    // configured backend, and the proxy drops its idle connection to the
+    // removed one.
+    client.send();
+    let stale = removed.receive(0);
+    println!("removed backend received: {stale:?}");
+    let dialled = current.accept(0);
+    let answered = dialled && current.receive(0).is_some() && current.send(0).is_some();
+    let response = client.receive_response(ANSWER_BUDGET);
+    println!("response after the backend was replaced: {response:?}");
+    let still_connected = removed.is_connected(0);
+    println!("removed backend still connected: {still_connected}");
+
+    let stopped = stop(worker);
+    let served_by_current = response
+        .as_deref()
+        .is_some_and(|r| r.starts_with("HTTP/1.1 200") && r.ends_with("current"));
+    if stale.is_none() && answered && served_by_current && !still_connected && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_removed_backend_is_neither_reused_nor_kept() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "RemoveBackend in a surviving cluster: a kept-alive frontend reaches the remaining backend and the removed backend's pooled connection is closed",
+            try_removed_backend_is_neither_reused_nor_kept,
         ),
         State::Success,
     );

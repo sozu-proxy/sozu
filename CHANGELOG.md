@@ -3968,6 +3968,21 @@
   `a_408_to_a_silent_client_closes_without_lingering` and
   `a_silent_client_is_closed_at_the_linger_deadline`.
 
+- **`fix(mux)`: close a pooled connection to a removed backend once it is idle
+  ([#1760](https://github.com/sozu-proxy/sozu/issues/1760)).** A connection whose backend left the
+  configuration is no longer reused (#1735), but it stayed open until its frontend session ended,
+  so the removed backend kept a connection and never went from `Closing` to `Closed`.
+  `Mux::ready_inner` (`lib/src/protocol/mux/mod.rs`) now drops such a connection as soon as it
+  carries no stream: an H1 keep-alive, or an H2 connection with an empty stream table. A connection
+  that was already idle when its backend was removed is closed on its session's next event.
+  `RemovedBackendHasNoConnections` is unchanged: it is emitted when the session that last used the
+  backend closes. **Behaviour change:** a reload that changes a backend's weight, `sticky_id` or
+  `backup` is applied as `RemoveBackend` then `AddBackend` (`ConfigState::diff`), so live sessions
+  now drop their pooled connection to that backend and dial it again. Documented in
+  `lib/src/protocol/mux/LIFECYCLE.md`. Covered by `test_removed_backend_is_neither_reused_nor_kept`
+  (`e2e/src/tests/remove_cluster_tests.rs`) and, for the reuse skip of #1735 in each of its three
+  arms, `a_retired_backend_connection_is_never_reused` (`lib/src/protocol/mux/router.rs`).
+
 - **`fix(mux-h2)`: a default answer ends its own stream, not the H2 connection
   ([#1740](https://github.com/sozu-proxy/sozu/issues/1740)).** Every built-in answer template
   carries `Connection: close`, which clears `keep_alive_frontend`; the H2 write pass read that bit
