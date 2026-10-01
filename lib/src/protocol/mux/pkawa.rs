@@ -1457,6 +1457,9 @@ pub fn handle_trailer(
     if !end_stream {
         return Err((H2Error::ProtocolError, false));
     }
+    // Where the trailer fields start, for the end-of-body marker queued in
+    // front of them once the block is accepted.
+    let first_trailer_block = kawa.blocks.len();
     let max_header_fields = max_header_fields as usize;
     let mut invalid_trailers = false;
     let mut budget_exceeded = false;
@@ -1629,6 +1632,22 @@ pub fn handle_trailer(
     debug_assert!(
         !budget_exceeded && !invalid_trailers && decoded_bytes <= max_decoded,
         "an accepted trailer block must fit the budget and pass validation"
+    );
+    // The trailer block ends the body. Mark it before the trailer fields, as
+    // kawa's H1 parser does on a zero-size chunk: kawa's H1 serializer writes
+    // the last chunk `0\r\n` for this block on a chunked message (RFC 9112
+    // §7.1), so the fields follow it instead of standing where a backend or
+    // an H1 client reads a chunk-size line, and a block with no field left
+    // still ends the body with `0\r\n\r\n`. Queued only once the block is
+    // accepted, so a refused one adds no marker. `H2BlockConverter` ignores it.
+    kawa.blocks.insert(
+        first_trailer_block,
+        Block::Flags(Flags {
+            end_body: true,
+            end_chunk: false,
+            end_header: false,
+            end_stream: false,
+        }),
     );
 
     // RFC 9110 §6.5: if the request/response was framed with a
@@ -3366,6 +3385,92 @@ mod tests {
         let kawa = decode_trailer(&mut pool, &[(b"grpc-status", b"0")]);
         let surviving = surviving_trailer_keys(&kawa);
         assert_eq!(surviving, vec![b"grpc-status".to_vec()]);
+    }
+
+    /// Run `handle_trailer` over `fields` on a chunked `kind` kawa that holds
+    /// one `hello` chunk, framed as `handle_data` frames a DATA frame for H1,
+    /// and return what kawa's H1 serializer writes for it.
+    fn h1_body_after_trailer(kind: Kind, fields: &[(&[u8], &[u8])]) -> String {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let mut kawa = make_generic_kawa(&mut pool, kind);
+        kawa.body_size = BodySize::Chunked;
+        kawa.push_block(Block::ChunkHeader(kawa::ChunkHeader {
+            length: Store::Static(b"5"),
+        }));
+        kawa.push_block(Block::Chunk(kawa::Chunk {
+            data: Store::Static(b"hello"),
+        }));
+        kawa.push_block(Block::Flags(Flags {
+            end_body: false,
+            end_chunk: true,
+            end_header: false,
+            end_stream: false,
+        }));
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
+        let mut encoded = Vec::new();
+        for &(name, value) in fields {
+            encoder.encode_header_into((name, value), &mut encoded);
+        }
+        let result = handle_trailer(
+            &mut kawa,
+            &encoded,
+            true,
+            &mut crate::protocol::mux::hpack::Decoder::new(),
+            crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE as u32,
+            u32::MAX,
+            false,
+            &mut Vec::new(),
+        );
+        assert!(result.is_ok(), "handle_trailer failed: {:?}", result.err());
+
+        kawa.prepare(&mut kawa::h1::BlockConverter);
+        let buffer = kawa.storage.buffer();
+        let serialized: Vec<u8> = kawa
+            .out
+            .iter()
+            .flat_map(|block| match block {
+                kawa::OutBlock::Store(store) => store.data(buffer).to_vec(),
+                kawa::OutBlock::Delimiter => Vec::new(),
+            })
+            .collect();
+        String::from_utf8(serialized).expect("the serialized body must be UTF-8")
+    }
+
+    /// A trailer block ends a chunked body with the last chunk `0\r\n`
+    /// before its fields (RFC 9112 §7.1), in both directions an H2 peer
+    /// sends trailers to an H1 one: a request towards an H1 backend and a
+    /// response from an H2 backend towards an H1 client. Without it the
+    /// first trailer field stands where the H1 peer reads a chunk-size line.
+    ///
+    /// TO SEE THIS RED: remove the `end_body` `Flags` block `handle_trailer`
+    /// queues before the trailer fields.
+    #[test]
+    fn handle_trailer_follows_the_last_chunk_on_h1() {
+        for kind in [Kind::Request, Kind::Response] {
+            assert_eq!(
+                h1_body_after_trailer(kind, &[(b"grpc-status", b"0")]),
+                "5\r\nhello\r\n0\r\ngrpc-status: 0\r\n\r\n",
+                "{kind:?}: the trailer section must follow the last chunk"
+            );
+        }
+    }
+
+    /// A trailer block with no field left, every one elided, still ends the
+    /// chunked body with `0\r\n\r\n`. Without the last chunk the H1 peer
+    /// read `5\r\nhello\r\n\r\n`, a body that never ends, and waited for
+    /// the next chunk.
+    ///
+    /// TO SEE THIS RED: remove the `end_body` `Flags` block `handle_trailer`
+    /// queues before the trailer fields.
+    #[test]
+    fn handle_trailer_with_every_field_elided_ends_the_chunked_body_on_h1() {
+        for kind in [Kind::Request, Kind::Response] {
+            assert_eq!(
+                h1_body_after_trailer(kind, &[(b"x-real-ip", b"1.2.3.4")]),
+                "5\r\nhello\r\n0\r\n\r\n",
+                "{kind:?}: an emptied trailer block must still end the body"
+            );
+        }
     }
 
     /// H2 request declaring Content-Length keeps the Length framing: the

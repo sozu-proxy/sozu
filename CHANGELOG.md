@@ -6692,6 +6692,27 @@
   `lib/src/protocol/kawa_h1/LIFECYCLE.md` §2.3 and `doc/configure.md`. Covered by four new
   `editor.rs` unit tests and seven new e2e tests in `e2e/src/tests/h1_security_tests.rs`.
 
+- **`fix(mux-h2)`: an H2 trailer block ends a chunked HTTP/1.1 body with the last chunk
+  ([#1722](https://github.com/sozu-proxy/sozu/issues/1722)).** A request from an H2 client with no
+  `content-length` is chunked towards an H1 backend, but when it ended with a trailer HEADERS
+  frame the backend read `5\r\nhello\r\ngrpc-status: 0\r\n\r\n`: no last chunk `0\r\n`
+  (RFC 9112 §7.1) before the trailer fields. A strict backend took `grpc-status: 0` for an invalid
+  chunk-size line and refused the request; a lenient one could read the rest of the keep-alive
+  connection as body, a desynchronization vector. A response from an H2 backend to an H1 client
+  lost its last chunk the same way; H1 to H1 and H2 to H2 were not affected. A trailer block with
+  no field left, empty or with every field elided, left the chunked body unterminated
+  (`5\r\nhello\r\n\r\n`), so the H1 peer waited for a next chunk that never came; it now ends
+  with `0\r\n\r\n`.
+  `pkawa::handle_trailer` (`lib/src/protocol/mux/pkawa.rs`) closed the trailer block with a
+  single `Flags` block without `end_body`, the marker for which kawa's H1 serializer writes the
+  last chunk. Once it has accepted the block, it now queues `Flags { end_body: true }` before the
+  trailer fields, the shape kawa's H1 parser gives a chunked trailer section; `H2BlockConverter`
+  ignores that marker. Documented in `lib/src/protocol/mux/LIFECYCLE.md` §9 invariant 32. Covered
+  by `handle_trailer_follows_the_last_chunk_on_h1` and
+  `handle_trailer_with_every_field_elided_ends_the_chunked_body_on_h1` (unit, request and
+  response) and `test_h2_request_trailers_follow_last_chunk_h1_backend`
+  (`e2e/src/tests/h2_security_header_injection.rs`), all red before the change.
+
 - **`fix(h1)`: chunked request trailers can no longer carry spoofed forwarding headers
   ([#1689](https://github.com/sozu-proxy/sozu/issues/1689)).** kawa's H1 parser pushes the
   trailer fields of a chunked request after its last chunk with no callback, so
