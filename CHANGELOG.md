@@ -3875,6 +3875,18 @@
   (`e2e/src/tests/h2_tests.rs`) and
   `a_hup_during_the_flush_that_starts_a_linger_drains_before_closing` (`lib/src/protocol/mux/mod.rs`).
 
+- **`fix(mux)`: refresh the backend-work flag after the frontend write
+  ([#1771](https://github.com/sozu-proxy/sozu/issues/1771)).** With an HTTP/2 frontend in front of
+  an HTTP/1.1 backend that wrote interim responses and the final response at once, the client got
+  the interim HEADERS and the final response stalled until the backend hung up. `Mux::ready_inner`
+  (`lib/src/protocol/mux/mod.rs`) recorded whether any backend had work before the frontend
+  write; forwarding a 1xx re-arms the backend read (`ConnectionH2::handle_1xx_reset`, and
+  `ConnectionH1::writable`'s interim arms), but only a resumed parked backend refreshed the flag,
+  so the loop could exit with a backend armed and no socket event left to wake it. The flag is now
+  refreshed from every backend's readiness after the frontend write. RFC 9110 §15.2. Covered by
+  `test_h2_to_h1_103_and_final_in_one_write` and `test_h2_to_h1_102_103_and_final_in_one_write`
+  (`e2e/src/tests/h2_tests.rs`).
+
 - **`fix(h1)`: forward a final response read together with a 1xx
   ([#1759](https://github.com/sozu-proxy/sozu/issues/1759)).** When an HTTP/1.1 backend wrote an
   interim response and what follows it (another 1xx, the final response) at once, an HTTP/1.1

@@ -5511,6 +5511,152 @@ fn test_h2_frontend_hangup_does_not_spin() {
     );
 }
 
+// ---- H2-to-H1 interim and final response in one backend write ----
+
+/// An H1 keep-alive backend that answers the first request it reads with
+/// `response`, in ONE write, then keeps the connection open until stopped,
+/// so nothing but those bytes can deliver the response: no hang-up ends it.
+fn start_one_write_backend(
+    address: SocketAddr,
+    response: String,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let listener = bind_std_listener(address, "one-write backend");
+        listener
+            .set_nonblocking(true)
+            .expect("could not set nonblocking");
+        let mut connection = None;
+        while !stop.load(Ordering::Relaxed) {
+            if connection.is_none() {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).ok();
+                        stream
+                            .set_read_timeout(Some(Duration::from_millis(200)))
+                            .ok();
+                        stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
+                        let request = super::h2_utils::read_until_header_end(
+                            &mut stream,
+                            Duration::from_secs(2),
+                        );
+                        if !request.is_empty() {
+                            let _ = stream.write_all(response.as_bytes());
+                            let _ = stream.flush();
+                        }
+                        connection = Some(stream);
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => {}
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(connection);
+    })
+}
+
+/// RFC 9110 §15.2 / RFC 9113 §8.1: an H2 client must receive every interim
+/// response as its own HEADERS frame, then the final response, on the same
+/// stream. Here the H1 backend writes `interims` and the final 200 in one
+/// write and keeps the connection open: the final response must reach the
+/// client from those bytes alone.
+fn try_h2_to_h1_interims_and_final_in_one_write(interims: &[u16]) -> State {
+    let (mut worker, front_port, front_address) = setup_h2_listener_only("H2-1XX-ONE-WRITE");
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let mut response = String::new();
+    for code in interims {
+        response.push_str(&format!("HTTP/1.1 {code} Interim\r\n\r\n"));
+    }
+    response.push_str("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\npong");
+    let stop = Arc::new(AtomicBool::new(false));
+    let backend = start_one_write_backend(back_address, response, stop.clone());
+
+    let mut tls = raw_h2_connection(front_address.into());
+    h2_handshake(&mut tls);
+    let mut header_block = vec![
+        0x82, // :method GET (static idx 2)
+        0x87, // :scheme https (static idx 7)
+        0x84, // :path / (static idx 4)
+    ];
+    // :authority localhost — name at static idx 1, literal value.
+    header_block.push(0x41);
+    header_block.push(9);
+    header_block.extend_from_slice(b"localhost");
+    tls.write_all(&H2Frame::headers(1, header_block, true, true).encode())
+        .unwrap();
+    let _ = tls.flush();
+
+    let frames = collect_response_frames(&mut tls, 300, 10, 200);
+    log_frames("H2 interims and final in one write", &frames);
+    drop(tls);
+
+    let statuses: Vec<Option<u16>> = frames
+        .iter()
+        .filter(|(ft, _, sid, _)| *ft == super::h2_utils::H2_FRAME_HEADERS && *sid == 1)
+        .map(|(_, _, _, payload)| super::h2_utils::decode_status(payload))
+        .collect();
+    let mut expected: Vec<Option<u16>> = interims.iter().map(|code| Some(*code)).collect();
+    expected.push(Some(200));
+    let body: Vec<u8> = frames
+        .iter()
+        .filter(|(ft, _, sid, _)| *ft == super::h2_utils::H2_FRAME_DATA && *sid == 1)
+        .flat_map(|(_, _, _, payload)| payload.clone())
+        .collect();
+    let ended = frames
+        .iter()
+        .any(|(_, flags, sid, _)| *sid == 1 && flags & H2_FLAG_END_STREAM != 0);
+    println!(
+        "H2 interims and final in one write - statuses {statuses:?} (expected {expected:?}), \
+         body {body:?}, END_STREAM {ended}"
+    );
+
+    let still_alive = verify_sozu_alive(front_port);
+    stop.store(true, Ordering::Relaxed);
+    let _ = backend.join();
+    worker.soft_stop();
+    let _ = worker.wait_for_server_stop();
+
+    if still_alive && statuses == expected && body == b"pong" && ended {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_to_h1_103_and_final_in_one_write() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2-to-H1: a 103 and the final 200 written at once both reach the client",
+            || try_h2_to_h1_interims_and_final_in_one_write(&[103])
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_h2_to_h1_102_103_and_final_in_one_write() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2-to-H1: a 102, a 103 and the final 200 written at once all reach the client",
+            || try_h2_to_h1_interims_and_final_in_one_write(&[102, 103])
+        ),
+        State::Success
+    );
+}
+
 // ---- H2-to-H1 large headers ----
 
 /// Send an H2 request with many large custom headers through sozu to an H1
