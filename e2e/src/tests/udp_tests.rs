@@ -1192,38 +1192,55 @@ fn try_udp_every_idle_flow_is_torn_down() -> State {
         .map(|(i, b)| UdpBackend::bind(format!("BK{i}"), *b, 1).spawn())
         .collect();
 
-    let mut ok = true;
-    let mut expect_reply = |client: &UdpClient, payload: &str| {
-        let got = client
-            .round_trip(payload.as_bytes(), RT)
-            .as_deref()
-            .and_then(strip_reply_tag)
-            .map(|(_, p)| p);
-        if got.as_deref() != Some(payload.as_bytes()) {
+    // Whether `reply` is the backend echo of `payload`; logs it when not.
+    let own_reply = |payload: &str, reply: Option<Vec<u8>>| {
+        let got = reply.as_deref().and_then(strip_reply_tag).map(|(_, p)| p);
+        let own = got.as_deref() == Some(payload.as_bytes());
+        if !own {
             println!("{payload}: expected its own reply, got {got:?}");
-            ok = false;
         }
+        own
     };
+    let expect_reply = |client: &UdpClient, payload: &str| {
+        own_reply(payload, client.round_trip(payload.as_bytes(), RT))
+    };
+
+    let mut ok = true;
 
     let a = UdpClient::new("A", front);
     let b = UdpClient::new("B", front);
     for round in 0..3 {
-        expect_reply(&a, &format!("A-{round}"));
-        expect_reply(&b, &format!("B-{round}"));
+        ok &= expect_reply(&a, &format!("A-{round}"));
+        ok &= expect_reply(&b, &format!("B-{round}"));
     }
-    for i in 0..30 {
-        let once = UdpClient::new(format!("ONCE{i}"), front);
-        expect_reply(&once, &format!("ONCE{i}"));
+    // The 31 new flows are opened in one burst, then their replies collected,
+    // so the whole set is live at once: opened one round trip after another,
+    // a loaded host can take longer than the idle timeout to get through them
+    // and the first flows are (rightly) reaped before the count below.
+    let mut fresh: Vec<(UdpClient, String)> = (0..30)
+        .map(|i| {
+            (
+                UdpClient::new(format!("ONCE{i}"), front),
+                format!("ONCE{i}"),
+            )
+        })
+        .collect();
+    fresh.push((UdpClient::new("R", front), "R-1".to_owned()));
+    for (client, payload) in &fresh {
+        client.send(payload.as_bytes());
     }
-    let returning = UdpClient::new("R", front);
-    expect_reply(&returning, "R-1");
+    for (client, payload) in &fresh {
+        ok &= own_reply(payload, client.recv(RT));
+    }
+    let (returning, _) = fresh.pop().expect("the returning client was pushed last");
+    drop(fresh);
 
     let open_before = connected_upstream_sockets(&backends);
     // Every flow is now silent; wait well past the idle timeout.
     std::thread::sleep(Duration::from_secs(u64::from(IDLE_TIMEOUT_SECS) * 3));
     let open_after_idle = connected_upstream_sockets(&backends);
 
-    expect_reply(&returning, "R-2");
+    ok &= expect_reply(&returning, "R-2");
     let peers: Vec<SocketAddr> = handles
         .iter()
         .flat_map(|h| h.observed())
