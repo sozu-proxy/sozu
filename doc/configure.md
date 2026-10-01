@@ -796,7 +796,11 @@ address        = "0.0.0.0:53"
 # public_address = "203.0.113.10:53"
 
 # client / upstream flow idle timeout, in seconds. A flow is reaped once it has
-# been idle for this long. Defaults to 30.
+# been idle for this long, which closes its upstream socket and frees its
+# `max_flows` slot. A client datagram pushes the flow's deadline to now +
+# `front_timeout`, a backend reply to now + `back_timeout`. These listener
+# keys are the only UDP idle timeout: `[clusters.<id>.udp]` has none, so the
+# cluster defaults never disable it. Defaults to 30.
 front_timeout  = 30
 back_timeout   = 30
 
@@ -1017,7 +1021,7 @@ or held move. The key is:
 
 | datapath | client key |
 |---|---|
-| UDP | the flow key, per `[clusters.<id>.udp] affinity_key` (see "UDP clusters") |
+| UDP | the client source IP, or source IP and port, per `[clusters.<id>.udp] affinity_key` (see "UDP clusters") |
 | TCP | the client source IP |
 | HTTP, HTTPS | the value of `affinity_header` or `affinity_cookie` when set and present in the request, else the client source IP |
 
@@ -1108,7 +1112,8 @@ weighted score `HRW` uses, see "Client affinity" — over the cluster's
 - **the same on every worker and across restarts**, since the key and the
   ranking are pure functions of the client and the backend addresses. On HTTP,
   HTTPS and TCP the key hash is Sōzu's own seeded FNV and does not change
-  between builds; on UDP the flow key comes from the standard library's
+  between builds; on UDP the affinity key (the source IP, or source IP and port
+  per `affinity_key`) is hashed with the standard library's
   `DefaultHasher`, whose algorithm Rust does not promise to keep across
   toolchain versions, so a UDP client's shard may move after an upgrade built
   with another Rust version;
@@ -1177,7 +1182,8 @@ How it composes with the rest of selection:
 - **No key, no shard.** A request with no source address (and no configured
   header or cookie) selects over the whole cluster.
 - **Every datapath.** Sharding lives in the cluster's backend list, so a UDP
-  cluster that sets it shards its flows by their flow key too.
+  cluster that sets it shards its flows by their affinity key too (the source
+  IP, or source IP and port per `affinity_key`).
 
 **Before enabling it.** Sharding is off unless `shard_percent` is set, so
 upgrading changes nothing by itself. Before setting it:
@@ -1295,7 +1301,7 @@ The `[clusters.<id>.udp]` block:
 
 | Key                             | Default      | Description                                                                                                                                   |
 | ------------------------------- | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `affinity_key`                  | `SOURCE_IP`  | Flow affinity key for hash LBs. `SOURCE_IP` pins every port from one client to one backend; `SOURCE_IP_PORT` keys on the full source 2-tuple. |
+| `affinity_key`                  | `SOURCE_IP`  | Backend affinity key for hash LBs. `SOURCE_IP` pins every port from one client to one backend; `SOURCE_IP_PORT` keys on the full source 2-tuple. It only selects the backend: a flow is always one client source IP and port, with its own upstream socket, and replies return to that source. |
 | `responses`                     | `0`          | Expected replies per flow. A DNS flow sets `responses = 1` so the flow closes immediately after its single reply; `0` = unlimited (syslog-style fire-and-forget). |
 | `requests`                      | `0`          | Maximum client datagrams per flow before teardown. `0` = unlimited.                                                                           |
 | `send_proxy_protocol`           | `false`      | Prepend a PROXY protocol **v2** header (carrying the real client `SocketAddr`) to the backend. By default it is sent on the **first** datagram of the flow only. Backend PPv2-over-UDP parse support is not guaranteed by the spec — verify per backend. |
@@ -1446,7 +1452,8 @@ h2_max_glitch_count = 100             # Cumulative protocol violations
 `h2_max_glitch_count` is a catch-all counter for _low-severity_ protocol drift
 that no other flood counter covers. It is incremented on stream-close races
 (`RST_STREAM` / `WINDOW_UPDATE` / `DATA` on a closed stream), `WINDOW_UPDATE`
-with zero increment on a closed stream, and unknown SETTINGS identifiers. The
+with zero increment on a closed stream, unknown SETTINGS identifiers, and each
+received `GOAWAY` (a graceful close sends at most two, RFC 9113 §6.8). The
 counter uses a 1-second sliding window with _half-decay_ (it halves at each
 window roll rather than resetting), so a threshold of `N` tolerates a one-shot
 burst of `N` glitches or a sustained rate of roughly `N/2` glitches per second.
@@ -2753,7 +2760,7 @@ immediately after the patch is acknowledged.
 | `front_timeout`                           | `u32` (seconds) | session-at-accept    | `60`                    | Max idle time on the client socket                                                                                                                           |
 | `back_timeout`                            | `u32` (seconds) | session-at-accept    | `30`                    | Max idle time on the backend socket                                                                                                                          |
 | `connect_timeout`                         | `u32` (seconds) | session-at-accept    | `3`                     | Max time to establish a backend connection                                                                                                                   |
-| `request_timeout`                         | `u32` (seconds) | session-at-accept    | `10`                    | Max time to send a complete request; also bounds the lingering close of an H1 connection answered before its request was received whole (RFC 9112 §9.6) |
+| `request_timeout`                         | `u32` (seconds) | session-at-accept    | `10`                    | Max time to send a complete request; also bounds the lingering close of an H1 connection answered before its request was received whole (RFC 9112 §9.6), and of an H2 connection after its final GOAWAY(NO_ERROR) |
 | `http_answers`                            | file paths      | session-at-accept    | built-in defaults       | Listener-default HTTP error bodies (301/401/404/408/413/421/502/503/504/507). Per-cluster `answer_503` overrides are preserved.                              |
 | `sozu_id_header`                          | `string`        | session-at-accept    | `"Sozu-Id"`             | Correlation header name (RFC 9110 §5.1 token; reject empty or containing CR/LF/colon/space)                                                                  |
 | `forwarded_headers`                       | enum            | session-at-accept    | `both`                  | `both` \| `x_forwarded` \| `rfc7239` \| `none` — forwarding header family added to requests (see "Forwarding headers")                                       |
@@ -3715,7 +3722,7 @@ a hot loop regression.
 | `h2.signal.writable.rearmed.peer_headers`                | counter | proxy | Fired in `mux/h2.rs::handle_headers_frame` when an H2 HEADERS frame wakes the linked peer. Non-zero only on clusters that use H2 to the origin.                                                                                                                                                                              |
 | `h2.signal.writable.rearmed.control_queue`               | counter | proxy | Fired in `mux/h2.rs::flush_pending_control_frames` when a queued WINDOW_UPDATE or RST_STREAM forces an extra writable pass. Pairs with `h2.frames.tx.window_update` / `h2.frames.tx.rst_stream`. Persistent non-zero rate without matching tx growth points to a control-frame queue that fills faster than it drains.       |
 | `h2.streams.ready_incremental.by_urgency`                | gauge   | proxy | Sum across live connections of each connection's last post-scheduling-pass count of ready incremental streams, itself summed over that connection's urgency buckets (RFC 9218 §4). Emitted as a signed lifecycle delta with `impl Drop for H2Shell` teardown, so a connection's contribution leaves the aggregate when it closes. Debug hint for scheduler fairness — a consistently non-zero value under load means the round-robin is active.  |
-| `h2.trailers_dropped_content_length`                     | counter | proxy | Fired in `mux/pkawa.rs::handle_trailer` when an accepted H2 trailer block arrives on a message framed by `Content-Length` (`BodySize::Length`), whatever fields the block holds: HTTP/1.1 carries trailers only with chunked transfer-coding, so an H1 peer never receives them (RFC 9110 §6.5). It does not count a `content-length` trailer field, which is elided and counted in `h2.trailer.forbidden_field_elided`. Spikes correlate with gRPC clients that declare a length; aggregate cardinality is bounded.                           |
+| `h2.trailers_dropped_content_length`                     | counter | proxy | Fired in `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`) when an H2 trailer block of a message framed by `Content-Length` (`BodySize::Length`) is about to be written to an H1 peer, a backend or a client: HTTP/1.1 carries trailers only with chunked coding (RFC 9112 §7.1), so the block is dropped (RFC 9110 §6.5.1) and nothing follows the body. An H2 peer receives these trailers. A `content-length` trailer field is still elided and counted in `h2.trailer.forbidden_field_elided`. Omit `Content-Length` to have trailers forwarded to an H1 peer. |
 | `h2.trailer.forbidden_field_elided`                      | counter | proxy | Request trailer fields elided by `pkawa::handle_trailer` (`lib/src/protocol/mux/pkawa.rs`) because their name is one of `TRAILER_FORBIDDEN_FIELDS`, the list the H1 frontend counts in `http.trailer.forbidden_field_elided` (RFC 9110 §6.5.1; #1714). One increment per field; the request is still forwarded. The connection-specific names of that list are refused earlier as a malformed field block (RFC 9113 §8.2.2) and are not counted here, except `te: trailers`: RFC 9113 §8.2.2 allows that value, so it passes that check and is then elided and counted here like any other forbidden name |
 | `h1.backend_eof_before_message_complete`                 | counter | proxy | Fired in `ConnectionH1::terminate_close_delimited` (`lib/src/protocol/mux/h1.rs`) when a `Connection: close` H1 backend closes the socket before the response body is fully delivered (a chunked body without its terminating zero chunk, or a `Content-Length` body short of its length), and in the close-delimited arm of `ConnectionH2::end_stream` (`lib/src/protocol/mux/h2.rs`) when such a backend goes away without that EOF being read (socket error, backend timeout). Only a body with neither framing ends cleanly at the close. The H2 frontend surfaces it as `RST_STREAM(InternalError)`; the H1 frontend closes the client connection without completing the response. Non-zero rate maps to backend application crashes or restarts mid-response. |
 
