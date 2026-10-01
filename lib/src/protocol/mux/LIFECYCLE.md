@@ -1799,6 +1799,34 @@ e2e `test_h1_early_response_mid_content_length_upload`,
 `a_408_to_a_silent_client_closes_without_lingering` and
 `a_silent_client_is_closed_at_the_linger_deadline`.
 
+**An H2 trailer block on a `Content-Length`-framed message is dropped towards
+an H1 peer only.** HTTP/1.1 carries a trailer section only with chunked coding
+(RFC 9112 §7.1), a length-framed message ends with its last body byte (§6.3),
+and the framing cannot become chunked once the header section is sent.
+`pkawa::handle_trailer` validates, elides and queues the trailer block as for
+any message, so `H2BlockConverter` forwards it to an H2 peer as a HEADERS
+frame with END_STREAM. `ConnectionH1::writable` (`h1.rs`) calls
+`ConnectionH1::drop_length_framed_trailers` before its `kawa.prepare`: for a
+`BodySize::Length` message whose queue ends with a trailer block (the
+`Header` blocks before a closing `Flags { end_header, end_stream }` that do
+not follow a header section's `StatusLine` or `Cookies`), it removes the
+fields and clears `end_header`, so kawa's H1 serializer writes nothing after
+the body, for a request to an H1 backend and a response to an H1 client.
+RFC 9110 §6.5.1 lets a recipient discard trailers; each dropped block logs a
+`warn!` and increments `h2.trailers_dropped_content_length`, at the write, so
+a stream reset before it is not counted. An H2 trailer block is queued whole
+and kawa's H1 serializer drains the queue in one pass, so a block is never
+split across writes. Before sozu-proxy/sozu#1730 the fields and a closing
+empty line were written after the body. Pinned by
+`a_length_framed_message_writes_no_trailer_to_an_h1_peer`,
+`a_length_framed_header_section_is_not_taken_for_trailers`,
+`a_length_framed_header_section_ending_with_cookies_is_not_taken_for_trailers`,
+`a_header_only_head_response_is_not_taken_for_trailers` (`h1.rs`),
+`a_length_framed_trailer_block_reaches_an_h2_peer` (`converter.rs`),
+`handle_trailer_filters_and_keeps_a_length_framed_block` (`pkawa.rs`) and
+`test_h2_length_framed_request_trailers_keep_h1_backend_framing`
+(`e2e/src/tests/h2_security_header_injection.rs`).
+
 ### 8.5 Stale-upstream replay (`ReplayOnFreshBackend`)
 
 `end_stream_decision` splits "the backend closed without answering" in four,

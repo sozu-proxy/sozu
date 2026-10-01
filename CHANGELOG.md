@@ -6924,6 +6924,21 @@
   rows of `e2e/src/tests/h1_security_tests.rs`. Documented in `doc/configure.md` and
   `lib/src/protocol/kawa_h1/LIFECYCLE.md`.
 
+- **`fix(mux-h1)`: H2→H1: drop the trailer fields of a `Content-Length`-framed message instead of
+  writing them after the body ([#1730](https://github.com/sozu-proxy/sozu/issues/1730)).**
+  HTTP/1.1 carries a trailer section only with chunked coding (RFC 9112 §6.3, §7.1), but kawa's
+  H1 serializer wrote the trailer fields and a closing empty line of an H2 message framed by
+  `content-length` after the body, for a request to an H1 backend and for a response to an H1
+  client. `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`) now drops such a trailer block
+  before writing (RFC 9110 §6.5.1), so the message ends with its body, and counts it in
+  `h2.trailers_dropped_content_length`, whose `doc/configure.md` row now describes that.
+  `pkawa::handle_trailer` still
+  validates, elides and queues the block, so an H2 peer keeps these trailers and the
+  `h2.trailer.*_elided` counters are unchanged. Documented in `lib/src/protocol/mux/LIFECYCLE.md`
+  §8.4. Covered by unit tests in `h1.rs`, `converter.rs` and `pkawa.rs` and by
+  `test_h2_length_framed_request_trailers_keep_h1_backend_framing`
+  (`e2e/src/tests/h2_security_header_injection.rs`).
+
 - **`fix(h1)`: a request without `Content-Length` or `Transfer-Encoding` no longer swallows
   the requests pipelined behind it ([#1650](https://github.com/sozu-proxy/sozu/issues/1650)).**
   kawa 0.7.1 parses such a request as close-delimited: `kawa::h1::parse` enters
