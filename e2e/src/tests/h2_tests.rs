@@ -5431,6 +5431,86 @@ fn test_h2_to_h1_1xx_informational_forwarded() {
     );
 }
 
+// ---- H2 frontend hang-up after a completed exchange ----
+
+/// A client that hangs up its H2 connection once its response is complete
+/// raises HUP on the frontend. `Mux::ready_inner` handles a frontend HUP
+/// (close, or delay the close for a pending flush), and nothing else in its
+/// inner loop can make progress on one. That loop must therefore close the
+/// session, or yield, once the frontend has nothing left to read or write:
+/// it must not count the HUP as pending work and spin to its iteration
+/// budget, which `http.infinite_loop.error` records.
+fn try_h2_frontend_hangup_does_not_spin() -> State {
+    let (mut worker, front_port, front_address) = setup_h2_listener_only("H2-HUP-NO-SPIN");
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let mut backend = ContinueBackend::start(back_address);
+
+    let mut tls = raw_h2_connection(front_address.into());
+    h2_handshake(&mut tls);
+    let mut header_block = vec![
+        0x82, // :method GET (static idx 2)
+        0x87, // :scheme https (static idx 7)
+        0x84, // :path / (static idx 4)
+    ];
+    // :authority localhost — name at static idx 1, literal value.
+    header_block.push(0x41);
+    header_block.push(9);
+    header_block.extend_from_slice(b"localhost");
+    tls.write_all(&H2Frame::headers(1, header_block, true, true).encode())
+        .unwrap();
+    let _ = tls.flush();
+
+    let frames = collect_response_frames(&mut tls, 300, 10, 200);
+    log_frames("H2 frontend hang-up", &frames);
+    let answered = frames
+        .iter()
+        .any(|(_, flags, sid, _)| *sid == 1 && flags & H2_FLAG_END_STREAM != 0);
+    // The client hangs up with the exchange complete.
+    drop(tls);
+    thread::sleep(Duration::from_millis(500));
+
+    let spins = query_proxy_count(
+        &mut worker,
+        sozu_lib::metrics::names::http::INFINITE_LOOP_ERROR,
+    );
+    let still_alive = verify_sozu_alive(front_port);
+    println!(
+        "H2 frontend hang-up - answered {answered}, {} {spins}, alive {still_alive}",
+        sozu_lib::metrics::names::http::INFINITE_LOOP_ERROR
+    );
+
+    backend.stop();
+    worker.soft_stop();
+    let _ = worker.wait_for_server_stop();
+
+    if answered && spins == 0 && still_alive {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_frontend_hangup_does_not_spin() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: a client hang-up after a complete exchange does not spin the session loop",
+            try_h2_frontend_hangup_does_not_spin
+        ),
+        State::Success
+    );
+}
+
 // ---- H2-to-H1 large headers ----
 
 /// Send an H2 request with many large custom headers through sozu to an H1

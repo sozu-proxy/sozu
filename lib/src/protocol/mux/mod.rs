@@ -3116,7 +3116,37 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     }
                 }
 
-                if self.frontend.readiness().filter_interest().is_empty()
+                // A frontend HUP is handled here as it is on entry: nothing
+                // else in this loop acts on one. Once no output is left to
+                // flush, this check closes the session, including after a
+                // flush the entry check delayed the close for and the
+                // writable arm above completed. A lingering frontend is left
+                // to its drain, as on entry: it reads the client's last bytes
+                // to the EOF before it closes, and closing it here would leave
+                // them unread and reset the connection. While output is
+                // pending, the HUP alone is not work this loop can progress:
+                // it stops when the frontend has nothing to read or write,
+                // and the next readiness event resumes the flush. Counting
+                // the HUP as work spun the loop to `MAX_LOOP_ITERATIONS`
+                // after every client hang-up.
+                if self.frontend.readiness().event.is_hup()
+                    && !self.frontend.is_lingering()
+                    && !self
+                        .frontend
+                        .has_pending_write_including_streams(&self.context)
+                    && !self.delay_close_for_frontend_flush("frontend HUP")
+                {
+                    debug!(
+                        "{} Mux closing on frontend HUP: {:?}",
+                        log_context!(self),
+                        self.frontend
+                    );
+                    return SessionResult::Close;
+                }
+                let frontend_work = self.frontend.readiness().filter_interest();
+                if !frontend_work.is_readable()
+                    && !frontend_work.is_writable()
+                    && !frontend_work.is_error()
                     && all_backends_readiness_are_empty
                 {
                     break;
@@ -5292,6 +5322,159 @@ mod tests {
         let mut head = [0u8; 12];
         std::io::Read::read_exact(&mut peer, &mut head).expect("the 408 reaches the client");
         assert_eq!(&head, b"HTTP/1.1 408", "the client gets its 408");
+    }
+
+    /// A frontend socket standing for TLS: its output is buffered behind the
+    /// socket (`socket_wants_write`) until the next write flushes it, and a
+    /// close queues a `close_notify` the same way.
+    #[derive(Debug)]
+    struct BufferedTlsSocket {
+        stream: mio::net::TcpStream,
+        buffered: bool,
+    }
+
+    impl SocketHandler for BufferedTlsSocket {
+        fn socket_read(&mut self, buf: &mut [u8]) -> (usize, SocketResult) {
+            self.stream.socket_read(buf)
+        }
+
+        fn socket_write(&mut self, buf: &[u8]) -> (usize, SocketResult) {
+            self.stream.socket_write(buf)
+        }
+
+        fn socket_write_vectored(&mut self, bufs: &[std::io::IoSlice]) -> (usize, SocketResult) {
+            // What was buffered leaves with this write.
+            self.buffered = false;
+            self.stream.socket_write_vectored(bufs)
+        }
+
+        fn socket_wants_write(&self) -> bool {
+            self.buffered
+        }
+
+        fn socket_close(&mut self) {
+            self.buffered = true;
+        }
+
+        fn socket_ref(&self) -> &mio::net::TcpStream {
+            &self.stream
+        }
+
+        fn socket_mut(&mut self) -> &mut mio::net::TcpStream {
+            &mut self.stream
+        }
+
+        fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+            self.stream.peer_addr().ok()
+        }
+
+        fn protocol(&self) -> crate::socket::TransportProtocol {
+            crate::socket::TransportProtocol::Tcp
+        }
+
+        fn read_error(&self) {}
+
+        fn write_error(&self) {}
+    }
+
+    /// A TLS client hangs up while the answer to its partly received request
+    /// is still buffered: the entry check of `Mux::ready_inner` delays the
+    /// close for that flush, and the flush, then the `close_notify`, start
+    /// the lingering close inside the loop (RFC 9112 §9.6,
+    /// `ConnectionH1::start_linger`). The in-loop HUP check must leave that
+    /// frontend to its drain, as the entry check does: closing it there
+    /// leaves the rest of the request unread, and the close resets the
+    /// connection.
+    ///
+    /// TO SEE THIS RED: drop `!self.frontend.is_lingering()` from the in-loop
+    /// HUP check of `Mux::ready_inner`. The pass then closes the session
+    /// before the drain read anything.
+    #[test]
+    fn a_hup_during_the_flush_that_starts_a_linger_drains_before_closing() {
+        use std::io::{Read, Write};
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (socket, mut peer) = connected_socket();
+        let frontend_timeout = Duration::from_secs(60);
+        let mut frontend = Connection::new_h1_server(
+            Ulid::generate(),
+            BufferedTlsSocket {
+                stream: socket,
+                buffered: true,
+            },
+            frontend_timeout,
+        );
+        let mut context = test_context(&pool);
+        context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("test context must create a stream");
+        let partial = b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 64\r\n\r\npart";
+        {
+            let Connection::H1(h1) = &mut frontend else {
+                unreachable!("new_h1_server builds an H1 connection")
+            };
+            h1.stream = Some(0);
+            let stream = &mut context.streams[0];
+            let storage = &mut stream.front.storage;
+            storage.space()[..partial.len()].copy_from_slice(partial);
+            storage.fill(partial.len());
+            let answers_rc = stream.answers.clone();
+            let answers = answers_rc.borrow();
+            set_default_answer(stream, &mut h1.readiness, 408, &answers);
+        }
+        let mut mux = Mux {
+            configured_frontend_timeout: frontend_timeout,
+            frontend_token: Token(0),
+            frontend,
+            router: Router::new(Duration::from_secs(30), Duration::from_secs(30)),
+            context,
+            session_ulid: Ulid::generate(),
+            timeouts: MuxTimeouts::new(TimeoutContainer::new_empty(frontend_timeout)),
+            backend_registry: BackendRegistry::default(),
+            backends: Rc::default(),
+        };
+
+        // The client sends more of its body, then hangs up: one edge
+        // carries both, as `EPOLLIN|EPOLLRDHUP`.
+        peer.write_all(b"more").expect("the client peer writes");
+        peer.shutdown(std::net::Shutdown::Write)
+            .expect("the client peer sends its FIN");
+        std::thread::sleep(Duration::from_millis(20));
+        mux.frontend.readiness_mut().event = Ready::READABLE | Ready::HUP;
+
+        let session: Rc<RefCell<dyn ProxySession>> = Rc::new(RefCell::new(NoDialSession));
+        let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(RemoveOnlyProxy));
+        let mut metrics = SessionMetrics::new(None);
+        let result = mux.ready(session, proxy, &mut metrics);
+        let Connection::H1(h1) = &mux.frontend else {
+            unreachable!("the frontend is H1")
+        };
+        let linger = h1.linger;
+        assert!(
+            matches!(result, SessionResult::Close),
+            "the drain meets the client's EOF and closes, got {result:?}"
+        );
+        assert!(
+            matches!(linger, h1::Linger::Draining { remaining, .. } if remaining < h1::LINGER_MAX_BYTES),
+            "the session must drain the rest of the request before it closes, got {linger:?}"
+        );
+        drop(mux);
+
+        peer.set_nonblocking(false)
+            .expect("the peer reads blocking");
+        peer.set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("the peer read is bounded");
+        let mut received = Vec::new();
+        let outcome = peer.read_to_end(&mut received);
+        assert!(
+            received.starts_with(b"HTTP/1.1 408"),
+            "the client gets its answer, got {:?}",
+            String::from_utf8_lossy(&received)
+        );
+        assert!(
+            outcome.is_ok(),
+            "the response ends with the FIN, not a reset: {outcome:?}"
+        );
     }
 
     /// A client that never sends its EOF is closed at the linger deadline.

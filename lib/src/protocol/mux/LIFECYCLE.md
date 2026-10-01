@@ -1093,6 +1093,11 @@ deadlines are compared against `ConnectionH2.now` (§7.5):
 6. Loop budget (`MAX_LOOP_ITERATIONS = 10_000`, `mod.rs`) is a hard backstop
    in `Mux::ready_inner`, whose `counter` is declared above BOTH of its loops,
    so the budget is shared across every outer iteration of one `ready()` call.
+   A frontend HUP never counts as work against it: the inner loop closes the
+   session on one once no output is left to flush, except on a lingering
+   frontend (§8.4), which it leaves to drain the client's last bytes to the
+   EOF, as the entry check does. Its exit check counts only frontend
+   READABLE, WRITABLE and ERROR interest.
 
 Steps 1-4 all run inside one `readable()`/`writable()` call and therefore all
 read the same `ConnectionH2.now` — see §7.5.
