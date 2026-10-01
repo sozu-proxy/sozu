@@ -46,7 +46,10 @@ use crate::{
         hpack_state,
         parser::{self, Frame, FrameHeader, FrameType, H2Error, Headers, WindowUpdate},
         pkawa, remove_backend_stream, serializer, set_default_answer,
-        shared::{EndStreamAction, drain_tls_close_notify, end_stream_decision},
+        shared::{
+            EndStreamAction, LINGER_MAX_BYTES, Linger, LingerRead, drain_discard,
+            drain_tls_close_notify, end_stream_decision,
+        },
         update_readiness_after_read, update_readiness_after_write,
     },
     socket::{SocketHandler, SocketResult},
@@ -968,6 +971,18 @@ pub struct ConnectionH2 {
     /// [`H2ForceDisconnectTarget`] for why the target is parked here rather
     /// than returned.
     pending_force_disconnect: Option<H2ForceDisconnectTarget>,
+    /// How long the lingering close after a final GOAWAY may drain: the
+    /// listener's `request_timeout`, which a frontend connection is built
+    /// with. Unused on a backend connection.
+    linger_timeout: Duration,
+    /// Lingering-close state, set by [`H2Shell::writable`] when the
+    /// connection closes after its final GOAWAY. See
+    /// [`super::shared::Linger`].
+    pub(super) linger: Linger,
+    /// Whether the final GOAWAY this connection queued carried `NO_ERROR`.
+    /// Only such a close lingers: one that answers a protocol error or a
+    /// flood does not keep reading from that peer.
+    pub(super) graceful_goaway: bool,
 }
 /// Renders the peer address this connection snapshotted at construction,
 /// where it used to render the socket behind it.
@@ -1179,8 +1194,6 @@ pub(super) enum MetricEvent {
     TrailerSpoofVectorElided,
     /// A request trailer field named in `TRAILER_FORBIDDEN_FIELDS` was elided.
     TrailerForbiddenFieldElided,
-    /// Trailers were dropped because the message carried a Content-Length.
-    TrailersDroppedContentLength,
 
     // ── Shared leaves reached from the core ─────────────────────────────
     /// Bytes read on a frontend connection.
@@ -1309,9 +1322,6 @@ pub(super) fn record_metric(event: MetricEvent) {
         MetricEvent::TrailerForbiddenFieldElided => {
             incr!(names::h2::TRAILER_FORBIDDEN_FIELD_ELIDED)
         }
-        MetricEvent::TrailersDroppedContentLength => {
-            incr!(names::h2::TRAILERS_DROPPED_CONTENT_LENGTH)
-        }
 
         MetricEvent::FrontendBytesIn(bytes) => count!(names::backend::BYTES_IN, bytes),
         MetricEvent::BackendBytesIn(bytes) => count!(names::backend::BACK_BYTES_IN, bytes),
@@ -1431,9 +1441,9 @@ pub enum H2WriteTarget {
     /// [`ConnectionH2::handle_write`], and no finalize — this is the pass's
     /// result.
     ///
-    /// Three sites, and none of them may become a [`Self::Finalize`]: the
-    /// resume path's stall, the MadeYouReset emitted-RST cap trip, and the
-    /// close-frontend GOAWAY. Folding any of them into `Finalize` would run
+    /// Two sites, and neither may become a [`Self::Finalize`]: the resume
+    /// path's stall and the MadeYouReset emitted-RST cap trip. Folding either
+    /// into `Finalize` would run
     /// LIFECYCLE §9 invariant 16's readiness policy over a pass that must not
     /// reach it.
     Done(MuxResult),
@@ -1837,7 +1847,12 @@ impl ConnectionH2 {
     /// connection's clock snapshot. Replaces the old
     /// `TimeoutContainer::reset()` at the same three call sites, and reads
     /// `self.now` rather than the real clock (invariant 20).
+    ///
+    /// A no-op while lingering: the linger deadline bounds the whole drain.
     pub fn arm_timeout(&mut self) {
+        if self.is_lingering() {
+            return;
+        }
         self.timeout_deadline = self.now.checked_add(self.timeout_duration);
     }
 
@@ -1854,7 +1869,36 @@ impl ConnectionH2 {
     /// that mirror it into `self.now`.
     pub fn set_timeout_duration(&mut self, duration: Duration, now: Instant) {
         self.timeout_duration = duration;
-        self.timeout_deadline = now.checked_add(duration);
+        if !self.is_lingering() {
+            self.timeout_deadline = now.checked_add(duration);
+        }
+    }
+
+    /// Whether the connection is draining what its client still sends after
+    /// its final GOAWAY (see [`super::shared::Linger`]).
+    pub(super) fn is_lingering(&self) -> bool {
+        matches!(self.linger, Linger::Draining { .. })
+    }
+
+    /// Whether a close the next writable pass decides should linger instead:
+    /// a frontend whose final GOAWAY carried `NO_ERROR` (a graceful drain,
+    /// a soft stop, an answer to the client's own GOAWAY), whose client has
+    /// not hung up, and which does not drain already — or one whose linger
+    /// is already [`Linger::Pending`] behind a TLS `close_notify`. The client
+    /// may still be sending frames it wrote before it read the GOAWAY (RFC
+    /// 9113 §6.8); closing with them unread, or receiving more, makes the
+    /// kernel reset the connection and discard the response bytes still
+    /// queued.
+    fn lingers_instead_of_closing(&self) -> bool {
+        if matches!(self.linger, Linger::Pending { .. }) {
+            return true;
+        }
+        self.position.is_server()
+            && matches!(self.state, H2State::GoAway)
+            && self.graceful_goaway
+            && self.drain.draining()
+            && !self.frontend_hung_up_while_draining()
+            && matches!(self.linger, Linger::Off)
     }
 
     /// Shared constructor for both server and client H2 connections.
@@ -1914,6 +1958,9 @@ impl ConnectionH2 {
             // timeout right after registering its socket. The adapter reflects
             // this onto the wheel on its next reschedule.
             timeout_deadline: now.checked_add(timeout_duration),
+            linger_timeout: timeout_duration,
+            linger: Linger::Off,
+            graceful_goaway: false,
             flow_control: h2_flow_control::H2FlowControl::new(DEFAULT_INITIAL_WINDOW_SIZE as i32),
             pending_table_size_update: None,
             parked_header_block: false,
@@ -3172,7 +3219,7 @@ impl ConnectionH2 {
                         }
                     }
                     if pass.stalled {
-                        // The FIRST of the three terminators that must not
+                        // The FIRST of the two terminators that must not
                         // finalize: the scheduler pass never began, so LIFECYCLE
                         // §9 invariant 16's readiness policy has nothing to
                         // decide and the park must survive untouched.
@@ -3522,8 +3569,10 @@ impl ConnectionH2 {
                         && kawa.is_completed()
                         && !Self::handle_1xx_reset(kawa, stream_state, endpoint)
                     {
-                        let close_frontend = matches!(self.position, Position::Server)
-                            && !parts.context.keep_alive_frontend;
+                        // `keep_alive_frontend` is not read here: a default
+                        // answer's `Connection: close` is an HTTP/1.1
+                        // connection option, stripped from H2 (RFC 9113
+                        // §8.2.2). The answer ends its own stream only.
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 
@@ -3537,12 +3586,8 @@ impl ConnectionH2 {
                             client_rtt,
                             server_rtt,
                         ) {
-                            pass.completed_streams.push((
-                                dead_id,
-                                global_stream_id,
-                                token,
-                                close_frontend,
-                            ));
+                            pass.completed_streams
+                                .push((dead_id, global_stream_id, token));
                             // LIFECYCLE §9 invariant 17: leave the census INSIDE
                             // the scheduler loop so later streams see the reduced
                             // count. The post-loop retirement at remove_dead_stream
@@ -3564,10 +3609,8 @@ impl ConnectionH2 {
                 }
                 H2WritePhase::End => {
                     // FIRST statement of the arm, before any `return` it can
-                    // take: this is what makes the converter's three pooled
-                    // buffers reach `HpackState` on the close-frontend GOAWAY
-                    // exit below, and it leaves the pass holding `None` for the
-                    // rest of its life. The phase moves to `Ended` in the same
+                    // take: it leaves the pass holding `None` for the rest of
+                    // its life. The phase moves to `Ended` in the same
                     // breath so a re-entry cannot reach this statement twice.
                     let (converter_pass, order, census) = pass.release_scheduler_pass();
                     pass.phase = H2WritePhase::Ended;
@@ -3589,7 +3632,7 @@ impl ConnectionH2 {
                     // moved, not copied: the pass never owned an allocation of its own.
                     let (converter_out, lowercase_buf, cookie_buf) = converter_pass.into_buffers();
                     // Publish `ready_incremental_streams` (and any window/stream drift the
-                    // pass produced) before the two early returns below, so no pass
+                    // pass produced) before the early return below, so no pass
                     // samples without emitting.
                     self.gauge_connection_state();
                     // Account every RST that the converter emitted during this pass
@@ -3618,8 +3661,7 @@ impl ConnectionH2 {
                     // accounting above, so a MadeYouReset cap trip that returns a GOAWAY
                     // early skips both exactly as it did before the inversion.
                     self.scheduler.end_pass(order, census);
-                    let mut close_frontend_after_completed_stream = false;
-                    for (dead_id, global_stream_id, token, close_frontend) in
+                    for (dead_id, global_stream_id, token) in
                         std::mem::take(&mut pass.completed_streams)
                     {
                         // Retirement is deferred out of the loop on purpose, and this is
@@ -3637,7 +3679,6 @@ impl ConnectionH2 {
                         // before `endpoint.end_stream()` can trigger teardown and observe
                         // a stale `Recycle` entry in `self.stream_table.streams()`.
                         self.remove_dead_stream(dead_id, global_stream_id);
-                        close_frontend_after_completed_stream |= close_frontend;
                         if let Some(token) = token {
                             remove_backend_stream(
                                 &mut context.backend_streams,
@@ -3646,15 +3687,6 @@ impl ConnectionH2 {
                             );
                             endpoint.end_stream(token, global_stream_id, context);
                         }
-                    }
-                    // The THIRD terminator that must not finalize: this pass ends
-                    // in a GOAWAY, so invariant 16 has no readiness to decide.
-                    if close_frontend_after_completed_stream && !self.drain.draining() {
-                        return H2WriteTarget::Done(if self.stream_table.streams().is_empty() {
-                            self.goaway(H2Error::NoError)
-                        } else {
-                            self.graceful_goaway(self.now)
-                        });
                     }
                     return H2WriteTarget::Finalize {
                         socket_write: pass.socket_write,
@@ -5596,6 +5628,7 @@ impl ConnectionH2 {
     ) -> MuxResult {
         self.state = H2State::Error;
         self.drain.enter_final_goaway();
+        self.graceful_goaway = error == H2Error::NoError;
         self.stream_table.set_expect_read(None);
         // Disarm the SETTINGS ACK timer: once we've committed to GOAWAY, the
         // timeout check at `readable()` / `flush_pending_control_frames()` must
@@ -5734,6 +5767,14 @@ impl ConnectionH2 {
     /// - or the elapsed time is still within the configured budget.
     pub fn graceful_shutdown_deadline_elapsed(&self) -> bool {
         self.drain.deadline_elapsed(self.now)
+    }
+
+    /// Arm the graceful-shutdown budget of a connection a proxy soft-stop
+    /// finds already draining, which `graceful_goaway` is not called for: a
+    /// peer GOAWAY drains without arming it. See
+    /// `H2DrainState::arm_deadline_if_unarmed` (`h2_drain.rs`).
+    pub fn arm_graceful_shutdown_deadline(&mut self, now: Instant) {
+        self.drain.arm_deadline_if_unarmed(now);
     }
 
     /// True when the reaper has queued control frames (`RST_STREAM`) into
@@ -7075,6 +7116,12 @@ impl ConnectionH2 {
         L: ListenerHandler + L7ListenerHandler,
     {
         self.attribute_bytes_to_overhead();
+        // A peer sends at most two GOAWAY frames in a graceful close (RFC
+        // 9113 §6.8). Each one counts toward the glitch budget, so a peer
+        // repeating GOAWAY on a connection kept open by its in-flight
+        // streams is bounded, as is the log line below.
+        self.flood_detector.record_glitch();
+        check_flood_or_return!(self);
         let error_name =
             H2Error::try_from(goaway.error_code).map_or("UNKNOWN_ERROR", |e| e.as_str());
         if goaway.error_code == H2Error::NoError as u32 {
@@ -7087,9 +7134,11 @@ impl ConnectionH2 {
             );
         } else {
             // Peer-originated failure: no variant of H2Error from a peer
-            // implies a sozu bug. Impact handling is separate (retry above
-            // `last_stream_id`, RST_STREAM for consumed streams) and logs
-            // its own details below, so the summary drops to `warn!`.
+            // implies a sozu bug. On a backend connection, impact handling
+            // is separate (retry above `last_stream_id`, RST_STREAM for
+            // consumed streams) and logs its own details below; a frontend
+            // connection retires nothing. Either way the summary drops to
+            // `warn!`.
             warn!(
                 "{} Received GOAWAY: last_stream_id={}, error={}, debug_data={:?}",
                 log_context!(self),
@@ -7107,19 +7156,37 @@ impl ConnectionH2 {
             .peer_last_stream_id()
             .expect("observe_peer_goaway just recorded this");
 
-        // Streams with ID > last_stream_id were NOT processed by the peer.
-        // Mark them for retry (StreamState::Link) so they can be retried
-        // on a new connection.
+        // RFC 9113 §6.8: `last_stream_id` bounds the streams the GOAWAY
+        // RECEIVER initiated. On a frontend connection (Position::Server)
+        // that is server-initiated streams, which sozu never opens (no
+        // push), so every stream here was opened by the GOAWAY sender and
+        // is unaffected: each runs to completion, `draining` refuses any new
+        // one (`create_stream`), and the connection closes once the last
+        // completes (the `draining && streams().is_empty()` finalize step).
+        //
+        // On a backend connection (Position::Client) the streams are
+        // sozu-initiated: those with ID > last_stream_id were NOT processed
+        // by the peer and are retried (StreamState::Link) on a new
+        // connection; those at or below it run to completion.
         // IMPORTANT: do NOT call endpoint.end_stream() here — that would
         // remove the stream from the frontend's H2 stream map and send
         // RST_STREAM to the client, killing the request instead of retrying it.
         let mut retry_streams = Vec::new();
-        for (&stream_id, &global_stream_id) in self.stream_table.streams() {
-            if stream_id > peer_last_stream_id {
-                retry_streams.push((stream_id, global_stream_id));
+        if matches!(self.position, Position::Client(..)) {
+            for (&stream_id, &global_stream_id) in self.stream_table.streams() {
+                if stream_id > peer_last_stream_id {
+                    retry_streams.push((stream_id, global_stream_id));
+                }
             }
         }
         for (stream_id, global_stream_id) in &retry_streams {
+            // `endpoint` is the frontend side (`EndpointServer`) only on a
+            // backend connection: its `readiness_mut` is what the answers
+            // below must arm so they reach the client.
+            debug_assert!(
+                matches!(self.position, Position::Client(..)),
+                "only a backend connection retires streams on a received GOAWAY"
+            );
             // Remove from reverse index before transitioning away from Linked.
             if let StreamState::Linked(token) = context.streams[*global_stream_id].state {
                 remove_backend_stream(&mut context.backend_streams, token, *global_stream_id);
@@ -7208,8 +7275,9 @@ impl ConnectionH2 {
             return self.goaway(H2Error::NoError);
         }
 
-        // Otherwise, let remaining streams (ID <= last_stream_id) complete.
-        // The connection will be closed when all streams finish.
+        // Otherwise, let the remaining streams complete: every stream on a
+        // frontend connection, those at or below `last_stream_id` on a
+        // backend one. The connection is closed when all streams finish.
         MuxResult::Continue
     }
 
@@ -7689,9 +7757,19 @@ impl ConnectionH2 {
                     // (RFC 9113 §5.1.1). A block parked unsent is dropped with
                     // it and resets the encoder's table on the next pass
                     // (`ConnectionH2::parked_header_block`).
+                    //
+                    // "Fully completed" means END_STREAM went both ways: the
+                    // response's was read, and the request's was handed to
+                    // the output, which flushes in order. A request received
+                    // whole is not enough: a backend may answer early, before
+                    // the rest of the body reached it (RFC 9113 §8.1), and a
+                    // stream forgotten with its tail unsent stays open on the
+                    // backend, holding one of its MAX_CONCURRENT_STREAMS
+                    // slots (§5.1.2) for this connection's lifetime.
                     let stream = &context.streams[stream_gid];
-                    let fully_completed =
-                        stream.back_received_end_of_stream && stream.front.is_terminated();
+                    let fully_completed = stream.back_received_end_of_stream
+                        && stream.front.is_terminated()
+                        && stream.front.is_completed();
                     let opened_on_the_wire = stream.front.consumed;
                     #[cfg(debug_assertions)]
                     let queued_before = self.output.len();
@@ -8781,8 +8859,109 @@ impl<Front: SocketHandler> H2Shell<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
+        if self.core.is_lingering() {
+            // Entry point: adopt the mux's snapshot, as `poll_read_target`
+            // would. `graceful_shutdown_deadline_elapsed` reads it, and a
+            // snapshot frozen at the linger's start would keep a soft stop's
+            // budget from ever elapsing.
+            self.core.adopt_now(context.now);
+            return self.drain_linger(context.now);
+        }
         let result = self.readable_inner(context, endpoint);
         self.settled(result)
+    }
+
+    /// Turn a close decided by a writable pass that began after the final
+    /// GOAWAY ([`ConnectionH2::lingers_instead_of_closing`]) into a lingering
+    /// close, unless the client hung up meanwhile: queue and
+    /// flush `close_notify` first (a TLS alert must precede the FIN), then
+    /// shut the write side down, so the FIN follows everything sent, and
+    /// read what the client still sends until [`Self::drain_linger`] closes.
+    /// Any other result is returned unchanged.
+    fn linger_instead_of_closing(&mut self, result: MuxResult) -> MuxResult {
+        if !matches!(result, MuxResult::CloseSession) || self.core.frontend_hung_up_while_draining()
+        {
+            return result;
+        }
+        let deadline = match self.core.linger {
+            Linger::Pending { deadline } => deadline,
+            _ => match self.core.now.checked_add(self.core.linger_timeout) {
+                Some(deadline) => deadline,
+                None => return MuxResult::CloseSession,
+            },
+        };
+        if self.initiate_close_notify() {
+            // `close_notify` is pending: the next writable pass flushes it
+            // and closes again, which lands here once nothing is left. The
+            // state is `Error` by then, so the pending linger is what keeps
+            // that pass eligible.
+            self.core.linger = Linger::Pending { deadline };
+            return MuxResult::Continue;
+        }
+        if let Err(e) = super::shutdown_write(self.socket.socket_ref(), false) {
+            debug!(
+                "{} H2 closing without lingering after the final GOAWAY: shutdown failed: {:?}",
+                log_context!(self.core),
+                e
+            );
+            return MuxResult::CloseSession;
+        }
+        debug!(
+            "{} H2 lingering after the final GOAWAY: draining what the client still sends",
+            log_context!(self.core)
+        );
+        self.core.linger = Linger::Draining {
+            deadline,
+            remaining: LINGER_MAX_BYTES,
+        };
+        // Fixed, never re-armed: the deadline bounds the whole drain.
+        self.core.timeout_deadline = Some(deadline);
+        self.core.readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
+        self.core.readiness.event.remove(Ready::WRITABLE);
+        // Edge-triggered epoll will not report bytes already queued.
+        self.core.readiness.event.insert(Ready::READABLE);
+        MuxResult::Continue
+    }
+
+    /// Read and drop what the client still sends while lingering. Closes on
+    /// the client's EOF, a socket error, the byte budget, or the deadline;
+    /// otherwise waits for the next READABLE.
+    fn drain_linger(&mut self, now: Instant) -> MuxResult {
+        let Linger::Draining {
+            deadline,
+            mut remaining,
+        } = self.core.linger
+        else {
+            unreachable!("drain_linger runs only while lingering");
+        };
+        if now >= deadline {
+            debug!(
+                "{} H2 lingering close: deadline reached",
+                log_context!(self.core)
+            );
+            return MuxResult::CloseSession;
+        }
+        let result = match drain_discard(self.socket.socket_ref(), &mut remaining, |size| {
+            record_metric(MetricEvent::FrontendBytesIn(size as i64));
+        }) {
+            LingerRead::Wait => {
+                self.core.readiness.event.remove(Ready::READABLE);
+                MuxResult::Continue
+            }
+            LingerRead::Close => {
+                debug!(
+                    "{} H2 lingering close: EOF, error or {} bytes left of the budget",
+                    log_context!(self.core),
+                    remaining
+                );
+                MuxResult::CloseSession
+            }
+        };
+        self.core.linger = Linger::Draining {
+            deadline,
+            remaining,
+        };
+        result
     }
 
     fn readable_inner<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
@@ -8858,8 +9037,24 @@ impl<Front: SocketHandler> H2Shell<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
+        if self.core.is_lingering() {
+            // Entry point: adopt the mux's snapshot, as `writable_inner` does.
+            self.core.adopt_now(context.now);
+            // The write side is shut down: nothing is left to write.
+            self.core.readiness.interest.remove(Ready::WRITABLE);
+            self.core.readiness.event.remove(Ready::WRITABLE);
+            return MuxResult::Continue;
+        }
+        // Asked before the pass: the close it decides moves the state from
+        // `GoAway` to `Error` (`ConnectionH2::force_disconnect`).
+        let after_final_goaway = self.core.lingers_instead_of_closing();
         let result = self.writable_inner(context, endpoint);
-        self.settled(result)
+        let result = self.settled(result);
+        if after_final_goaway {
+            self.linger_instead_of_closing(result)
+        } else {
+            result
+        }
     }
 
     fn writable_inner<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
@@ -15920,6 +16115,107 @@ mod tests {
         );
     }
 
+    /// A backend may answer early, before the whole request reached it
+    /// (RFC 9113 §8.1). When the stream then ends with the request received
+    /// whole from the client but its tail still unsent toward the backend,
+    /// the backend never sees END_STREAM: forgetting the stream without a
+    /// reset leaves it open (half-closed) on the backend, holding one of the
+    /// backend's MAX_CONCURRENT_STREAMS slots for this connection's lifetime
+    /// (RFC 9113 §5.1.2). The stream must be cancelled, exactly once.
+    ///
+    /// TO SEE THIS RED: in the `Position::Client` arm of
+    /// [`ConnectionH2::end_stream`], drop `&& stream.front.is_completed()`
+    /// from `fully_completed`. The backend then reads no RST_STREAM: `the
+    /// backend must read RST_STREAM(1, CANCEL) once`, `right` holding that
+    /// frame and `left` nothing.
+    #[test]
+    fn a_backend_stream_answered_before_its_request_was_written_is_cancelled() {
+        let LinkedBackend {
+            _pool,
+            mut connection,
+            mut peer,
+            mut context,
+            mut router,
+            gid,
+        } = backend_with_a_linked_stream(
+            H2State::Header,
+            BackendStatus::Connected,
+            Ready::READABLE | Ready::HUP | Ready::ERROR,
+        );
+        // A request received whole from the client: its HEADERS, then a
+        // 4-byte body closed with END_STREAM.
+        let kawa = &mut context.streams[gid].front;
+        kawa.detached.status_line = kawa::StatusLine::Request {
+            version: kawa::Version::V20,
+            method: kawa::Store::Static(b"POST"),
+            uri: kawa::Store::Static(b"/"),
+            authority: kawa::Store::Static(b"example.com"),
+            path: kawa::Store::Static(b"/"),
+        };
+        kawa.push_block(kawa::Block::StatusLine);
+        kawa.push_block(kawa::Block::Header(kawa::Pair {
+            key: kawa::Store::Static(b"content-length"),
+            val: kawa::Store::Static(b"4"),
+        }));
+        kawa.push_block(kawa::Block::Flags(kawa::Flags {
+            end_body: false,
+            end_chunk: false,
+            end_header: true,
+            end_stream: false,
+        }));
+        kawa.push_block(kawa::Block::Chunk(kawa::Chunk {
+            data: kawa::Store::Static(b"body"),
+        }));
+        kawa.push_block(kawa::Block::Flags(kawa::Flags {
+            end_body: true,
+            end_chunk: false,
+            end_header: false,
+            end_stream: true,
+        }));
+        kawa.body_size = kawa::BodySize::Length(4);
+        kawa.parsing_phase = kawa::ParsingPhase::Terminated;
+        // The backend grants the stream no send window: its HEADERS leave,
+        // its body waits.
+        context.streams[gid].window = 0;
+        let sent = drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+        let frames = peer_frames(&sent).expect("whole frames");
+        assert!(
+            frames
+                .iter()
+                .any(|(kind, flags, id, _)| *kind == 1 && *id == 1 && flags & 0x1 == 0)
+                && !frames.iter().any(|(kind, _, _, _)| *kind == 0),
+            "premise: the HEADERS left without END_STREAM and no DATA, got {frames:?}"
+        );
+        let stream = &context.streams[gid];
+        assert!(
+            stream.front.consumed && stream.front.is_terminated() && !stream.front.is_completed(),
+            "premise: the request was received whole but not written whole"
+        );
+        // The backend's complete response arrived: its END_STREAM was read.
+        context.streams[gid].back_received_end_of_stream = true;
+
+        connection.end_stream(gid, &mut context);
+        // Ending it again must not reset it a second time.
+        connection.end_stream(gid, &mut context);
+        let received =
+            drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+
+        assert_eq!(
+            received,
+            orphan_frame(3, 0, 1, 4, &(H2Error::Cancel as u32).to_be_bytes()),
+            "the backend must read RST_STREAM(1, CANCEL) once"
+        );
+        assert!(
+            connection.core.stream_table.is_empty(),
+            "the stream is retired from the backend connection"
+        );
+        assert!(
+            matches!(connection.core.state, H2State::Header),
+            "the shared connection stays up, got {:?}",
+            connection.core.state
+        );
+    }
+
     /// The liveness half of the `ServerSettings` fix: the write readiness
     /// withdrawn while the server's SETTINGS are awaited comes back with
     /// them, and a request linked during the handshake goes out after the
@@ -18776,12 +19072,75 @@ mod tests {
         !socket.socket_wants_write()
     }
 
+    /// A TLS frontend whose final GOAWAY went out without `close_notify`
+    /// behind it: the close its next writable pass decides queues the alert
+    /// first and waits a pass for it, then starts the lingering close. The
+    /// first pass's close moves the state to `Error`; the pending linger is
+    /// what keeps the second pass from closing outright. The client reads
+    /// the alert, then the EOF of the half-close.
+    ///
+    /// TO SEE THIS RED: in `H2Shell::linger_instead_of_closing`, drop the
+    /// `self.core.linger = Linger::Pending { deadline };` before the deferral.
+    /// The second pass then returns `CloseSession`.
+    #[test]
+    fn a_linger_deferred_behind_close_notify_starts_on_the_next_pass() {
+        use std::io::Read as _;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut connection, mut peer, mut client) = rustls_h2_connection(&pool, H2State::GoAway);
+        connection.core.drain.__test_set_draining();
+        connection.core.graceful_goaway = true;
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        let first = connection.writable(&mut context, EndpointClient(&mut router));
+        assert!(
+            matches!(first, MuxResult::Continue) && !connection.core.is_lingering(),
+            "the first pass waits for close_notify, got {first:?}"
+        );
+        let mut second = MuxResult::Continue;
+        for _ in 0..MAX_DRIVE_TICKS {
+            connection.core.readiness.event.insert(Ready::WRITABLE);
+            second = connection.writable(&mut context, EndpointClient(&mut router));
+            if connection.core.is_lingering() || !matches!(second, MuxResult::Continue) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            matches!(second, MuxResult::Continue) && connection.core.is_lingering(),
+            "once close_notify is out the connection lingers, got {second:?}"
+        );
+
+        let mut received = Vec::new();
+        let mut closed = false;
+        for _ in 0..MAX_DRIVE_TICKS {
+            drain_peer(&mut client, &mut peer, &mut received);
+            let mut plaintext = [0u8; 16];
+            match client.reader().read(&mut plaintext) {
+                Ok(0) => {
+                    closed = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::yield_now()
+                }
+                Err(error) => panic!("the client must see a clean close: {error:?}"),
+            }
+        }
+        assert!(
+            closed,
+            "the client reads close_notify, then the end of the stream"
+        );
+    }
+
     /// The final GOAWAY and the TLS `close_notify` leave in ONE write, and the
     /// peer reads the GOAWAY before the close.
     ///
     /// Drives what a client GOAWAY on an idle connection sets off:
-    /// `goaway(NoError)`, the `writable` pass that flushes it and closes, and
-    /// `close`. Every TLS write in between is counted through
+    /// `goaway(NoError)`, the `writable` pass that flushes it and starts the
+    /// lingering close, and `close`. Every TLS write in between is counted through
     /// `crate::socket::tls_writes`, which counts each `write_tls` holding at
     /// least one record, i.e. each `writev(2)` `FrontRustls` issues. The wire
     /// is then read raw, so the ORDER is checked on the records themselves
@@ -18813,9 +19172,12 @@ mod tests {
             "premise: the GOAWAY must serialise, got {queued:?}"
         );
         let result = connection.writable(&mut context, EndpointClient(&mut router));
+        // The close that pass decides is a lingering one: the write side is
+        // shut down behind the GOAWAY and `close_notify`, and what the client
+        // still sends is drained (`H2Shell::linger_instead_of_closing`).
         assert!(
-            matches!(result, MuxResult::CloseSession),
-            "the pass that flushed the final GOAWAY must close, got {result:?}"
+            matches!(result, MuxResult::Continue) && connection.core.is_lingering(),
+            "the pass that flushed the final GOAWAY must start the lingering close, got {result:?}"
         );
         connection.close(&mut context, EndpointClient(&mut router));
         assert_eq!(

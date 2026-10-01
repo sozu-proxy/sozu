@@ -17,6 +17,9 @@
 //! - TCP: a TCP listener with `max_connections_per_ip = 1` accepts the
 //!   first connection but closes the second one gracefully (FIN, no
 //!   RST) without dialing the backend.
+//! - HTTP/2: a failed dial answers its stream and keeps the connection,
+//!   which holds one slot: a retry on it is admitted, a second
+//!   connection from the same IP gets 429.
 //!
 //! Tests run in serial within this module to keep `connections.rejected_per_cluster_ip`
 //! deterministic per-test and to avoid port-allocator contention with
@@ -26,14 +29,14 @@ use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use sozu_command_lib::{
     config::{FileConfig, ListenerBuilder},
     proto::command::{
-        ActivateListener, Cluster, ListenerType, Request, RequestTcpFrontend, ServerConfig,
-        request::RequestType,
+        ActivateListener, AddCertificate, CertificateAndKey, Cluster, ListenerType, Request,
+        RequestTcpFrontend, ServerConfig, SocketAddress, request::RequestType,
     },
 };
 
@@ -42,10 +45,15 @@ use crate::{
     mock::{client::Client, sync_backend::Backend as SyncBackend},
     port_registry::{attach_reserved_http_listener, attach_reserved_tcp_listener},
     sozu::worker::Worker,
-    tests::{State, repeat_until_error_or, setup_sync_test},
+    tests::{State, provide_port, repeat_until_error_or, setup_sync_test},
 };
 
-use super::tests::create_local_address;
+use super::h2_utils::{
+    H2_FLAG_END_STREAM, H2Frame, contains_goaway, h2_handshake, log_frames, parse_h2_frames,
+    raw_h2_connection, read_all_available, stream_status_matches,
+};
+
+use super::tests::{create_local_address, create_unbound_local_address};
 
 // ── Test fixtures ──────────────────────────────────────────────────────────
 
@@ -479,6 +487,156 @@ fn test_tcp_graceful_close_on_limit() {
             3,
             "TCP per-(cluster, IP) limit closes second connection gracefully",
             try_tcp_graceful_close_on_limit,
+        ),
+        State::Success,
+    );
+}
+
+// ── Test 5: H2 failed dial keeps the connection and one slot ───────────────
+
+/// HPACK block for `GET /` on `localhost`.
+fn h2_get_localhost() -> Vec<u8> {
+    let mut block = vec![0x82, 0x84, 0x87, 0x41, 9];
+    block.extend_from_slice(b"localhost");
+    block
+}
+
+fn h2_stream_ended(frames: &[(u8, u8, u32, Vec<u8>)], stream_id: u32) -> bool {
+    frames
+        .iter()
+        .any(|(_, flags, sid, _)| *sid == stream_id && flags & H2_FLAG_END_STREAM != 0)
+}
+
+/// Read frames until `stream_id` ends, a GOAWAY arrives, or 10 s pass: a
+/// refused dial may be retried before it is answered.
+fn h2_read_stream(tls: &mut impl Read, stream_id: u32) -> Vec<(u8, u8, u32, Vec<u8>)> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut bytes = Vec::new();
+    loop {
+        bytes.extend(read_all_available(tls, Duration::from_millis(100)));
+        let frames = parse_h2_frames(&bytes);
+        if h2_stream_ended(&frames, stream_id)
+            || contains_goaway(&frames)
+            || Instant::now() >= deadline
+        {
+            return frames;
+        }
+    }
+}
+
+/// On an H2 frontend, a failed dial is answered on its stream only
+/// (sozu-proxy/sozu#1740): the connection stays open and keeps the one
+/// slot it claimed for the cluster. A retry on the same connection is
+/// admitted again — the slot is per connection, not per stream — while a
+/// second connection from the same IP is refused with 429.
+fn try_h2_failed_dial_keeps_connection_and_one_slot() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let (_, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let config = config_with_limit(1, 0);
+    let mut worker = Worker::start_new_worker_owned("PER-IP-H2-DIAL", config, listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        ListenerBuilder::new_https(front_address.clone())
+            .to_tls(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(
+        Worker::default_http_frontend("cluster_0", front_address.clone().into()),
+    ));
+    // Nothing listens there: every dial is refused.
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        create_unbound_local_address(),
+        None,
+    )));
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: CertificateAndKey {
+            certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+            key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+            certificate_chain: vec![],
+            versions: vec![],
+            names: vec![],
+        },
+        expired_at: None,
+    }));
+    worker.read_to_last();
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut first = raw_h2_connection(front_addr);
+    h2_handshake(&mut first);
+    first
+        .sock
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("set read timeout");
+    first
+        .write_all(&H2Frame::headers(1, h2_get_localhost(), true, true).encode())
+        .unwrap();
+    first.flush().unwrap();
+    let mut frames = h2_read_stream(&mut first, 1);
+
+    // Retry on the same connection once the first answer is out.
+    first
+        .write_all(&H2Frame::headers(3, h2_get_localhost(), true, true).encode())
+        .unwrap();
+    first.flush().unwrap();
+    frames.extend(h2_read_stream(&mut first, 3));
+
+    // A second connection from the same IP while the first one is open.
+    let mut second = raw_h2_connection(front_addr);
+    h2_handshake(&mut second);
+    second
+        .sock
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("set read timeout");
+    second
+        .write_all(&H2Frame::headers(1, h2_get_localhost(), true, true).encode())
+        .unwrap();
+    second.flush().unwrap();
+    let second_frames = h2_read_stream(&mut second, 1);
+
+    let first_answered = stream_status_matches(&frames, 1, 503) && h2_stream_ended(&frames, 1);
+    let retry_admitted = stream_status_matches(&frames, 3, 503) && h2_stream_ended(&frames, 3);
+    let no_goaway = !contains_goaway(&frames);
+    let second_refused = stream_status_matches(&second_frames, 1, 429);
+
+    drop(first);
+    drop(second);
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    if stopped && first_answered && retry_admitted && no_goaway && second_refused {
+        State::Success
+    } else {
+        println!(
+            "H2 failed dial - stopped={stopped}, first_answered={first_answered}, \
+             retry_admitted={retry_admitted}, no_goaway={no_goaway}, \
+             second_refused={second_refused}"
+        );
+        log_frames("H2 failed dial, first connection", &frames);
+        log_frames("H2 failed dial, second connection", &second_frames);
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_failed_dial_keeps_connection_and_one_slot() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: a failed dial keeps the connection and holds one per-IP slot",
+            try_h2_failed_dial_keeps_connection_and_one_slot
         ),
         State::Success,
     );

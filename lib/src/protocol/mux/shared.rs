@@ -14,6 +14,8 @@
 //! client reports that as a TLS decode error or an unexpected eof. The
 //! drain loop and its round cap are documented on the helper itself.
 
+use std::time::Instant;
+
 use kawa::AsBuffer;
 
 use crate::{
@@ -22,6 +24,86 @@ use crate::{
 };
 
 use super::Stream;
+
+/// Most request bytes a lingering close reads and discards before it closes
+/// anyway (RFC 9112 §9.6).
+///
+/// The drain exists so that the client's in-flight body does not make the
+/// kernel answer the close with a reset, which destroys any part of the
+/// response the client has not read yet. 4 MiB is the default ceiling of
+/// Linux's send-buffer autotuning (`net.ipv4.tcp_wmem`), so it covers what a
+/// client can already have queued when it sees the FIN, while bounding the
+/// work one connection can make sozu do after its response.
+pub(super) const LINGER_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Size of one lingering read. A stack buffer: the drain allocates nothing.
+pub(super) const LINGER_READ_CHUNK: usize = 16 * 1024;
+
+/// Lingering close of a frontend that closes while its client may still be
+/// sending: an H1 connection whose request was not received whole when its
+/// response ended (RFC 9112 §9.6), or an H2 connection after its final
+/// GOAWAY (RFC 9113 §6.8 leaves the peer free to send until it reads it).
+///
+/// Closing a socket whose receive queue still holds data, or that receives
+/// data after the close, makes the kernel send a reset, and a reset discards
+/// whatever part of the response is still queued. So the close is staged:
+/// the write side is shut down once the response and any TLS `close_notify`
+/// are flushed, then the rest of the request is read and dropped until the
+/// client closes, [`LINGER_MAX_BYTES`] are read, or the deadline passes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Linger {
+    /// The connection closes without draining.
+    Off,
+    /// The close is decided but something is still to flush (the H1
+    /// response's TLS `close_notify`, or the H2 final GOAWAY's): once it is
+    /// out, shut the write side down and start draining.
+    Pending { deadline: Instant },
+    /// The write side is shut down; the rest of the request is being read
+    /// and dropped.
+    Draining { deadline: Instant, remaining: usize },
+}
+
+/// What one [`drain_discard`] pass decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LingerRead {
+    /// The socket has nothing more for now: wait for the next READABLE.
+    Wait,
+    /// The client closed, the read failed, or the byte budget is spent.
+    Close,
+}
+
+/// Read and drop what a lingering frontend's client still sends, from the raw
+/// socket — also under TLS: after `close_notify` nothing the client sends is
+/// decrypted, only dropped. Reads into a stack buffer until `WouldBlock`
+/// ([`LingerRead::Wait`]), the client's EOF, an error, or `remaining` reaches
+/// zero ([`LingerRead::Close`]); `remaining` is decremented by every byte
+/// read, and `on_read` is told each read's size.
+pub(super) fn drain_discard(
+    socket: &mio::net::TcpStream,
+    remaining: &mut usize,
+    mut on_read: impl FnMut(usize),
+) -> LingerRead {
+    use std::io::{ErrorKind, Read};
+    let mut buf = [0u8; LINGER_READ_CHUNK];
+    let mut socket = socket;
+    loop {
+        if *remaining == 0 {
+            return LingerRead::Close;
+        }
+        let len = (*remaining).min(buf.len());
+        match socket.read(&mut buf[..len]) {
+            Ok(0) => return LingerRead::Close,
+            Ok(size) => {
+                debug_assert!(size <= *remaining, "a read never exceeds its buffer");
+                *remaining -= size;
+                on_read(size);
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return LingerRead::Wait,
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(_) => return LingerRead::Close,
+        }
+    }
+}
 
 /// Decision returned by [`end_stream_decision`] for the server-side end-of-stream path.
 ///

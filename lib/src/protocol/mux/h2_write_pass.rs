@@ -184,7 +184,7 @@ pub struct H2WritePass {
     /// connection overhead pool, and retiring inline would let a later
     /// completer of the same pass see that count while other streams are still
     /// live.
-    pub(super) completed_streams: Vec<(StreamId, GlobalStreamId, Option<mio::Token>, bool)>,
+    pub(super) completed_streams: Vec<(StreamId, GlobalStreamId, Option<mio::Token>)>,
     /// Whether any scheduler-loop flush reached the socket at all. Set by the
     /// MAIN LOOP only — the resume path passes `None` for this flag — and read
     /// by `finalize_write` to decide whether it owes its own flush.
@@ -310,9 +310,8 @@ impl H2WritePass {
     /// Close the scheduler half of the pass and hand its three values back.
     ///
     /// Called exactly once, as the FIRST statement of [`H2WritePhase::End`] —
-    /// before any `return` that arm can take, which is what makes the
-    /// converter's buffers reach `HpackState` on the close-frontend GOAWAY
-    /// exit. The MadeYouReset cap trip still drops them, because it returns
+    /// before any `return` that arm can take. The MadeYouReset cap trip
+    /// drops the converter's buffers, because it returns
     /// between `H2ConverterPass::into_buffers` and the `put_*` calls exactly
     /// as the pre-image did. The caller moves the pass to
     /// [`H2WritePhase::Ended`] in the same breath, so "exactly once" is

@@ -581,7 +581,7 @@ must be attributed proportionally.
 
 A **free function**, not a method:
 
-```rust lib/src/protocol/mux/h2.rs:470-478
+```rust lib/src/protocol/mux/h2.rs:473-481
 fn distribute_overhead(
     metrics: &mut SessionMetrics,
     overhead_bin: &mut usize,
@@ -658,7 +658,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:4758-4771
+```rust lib/src/protocol/mux/h2.rs:4790-4803
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -684,7 +684,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:4806-4812
+```rust lib/src/protocol/mux/h2.rs:4838-4844
 let events = stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -716,7 +716,7 @@ taken at the top of `H2WritePhase::Flush`'s post-flush tail
 (`ConnectionH2::poll_write_target`, `lib/src/protocol/mux/h2.rs`) and passes `stream.linked_token()` straight
 out of it:
 
-```rust lib/src/protocol/mux/h2.rs:3527-3528
+```rust lib/src/protocol/mux/h2.rs:3576-3577
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 ```
@@ -1069,7 +1069,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8779-8783
+```rust lib/src/protocol/mux/h2.rs:8857-8861
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1223,7 +1223,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8856-8860
+```rust lib/src/protocol/mux/h2.rs:9035-9039
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1462,9 +1462,9 @@ read side: a read pass performs exactly one `socket_read`, while a write pass
 performs an unbounded number of vectored writes. `H2WriteTarget::Finalize`
 carries `bytes_written` as well as `socket_write` because `finalize_write`
 reads it as `made_progress`, and that alone selects `RetainPendingBack` over
-`Quiesce` (LIFECYCLE §9 invariant 16); three sites end a pass **without**
-finalizing and are `Done(MuxResult)` instead — the resume path's stall, the
-MadeYouReset emitted-RST cap trip, and the close-frontend GOAWAY.
+`Quiesce` (LIFECYCLE §9 invariant 16); two sites end a pass **without**
+finalizing and are `Done(MuxResult)` instead — the resume path's stall and the
+MadeYouReset emitted-RST cap trip.
 
 `poll_write_target` walks the pass through `H2WritePhase`, and the phase is
 what makes a re-entry after a transmit different from a first entry:
@@ -1697,7 +1697,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:8282
+```rust lib/src/protocol/mux/h2.rs:8360
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -1740,6 +1740,14 @@ H2 stream state, GOAWAY sequencing, and rustls buffering interact:
   budget elapses, `ConnectionH2::goaway_before_forced_close` queues the final
   GOAWAY before the forced close; its `last_stream_id` excludes a stream whose
   opening block never completed.
+- A GOAWAY received from the client (`ConnectionH2::handle_goaway_frame`,
+  `Position::Server`) retires no stream: its `last_stream_id` bounds the
+  streams the receiver initiated (RFC 9113 §6.8), and sozu pushes none. It
+  marks the connection draining, so new client streams are refused, every
+  in-flight request completes, and the final GOAWAY follows once no stream
+  remains. A soft-stop on such a connection arms the graceful-shutdown budget
+  that the peer GOAWAY did not arm. Each received GOAWAY counts as a glitch. Only a GOAWAY from an H2 backend (`Position::Client`) retires the
+  streams above its `last_stream_id`: re-linked, answered `503`, or reset.
 - `ConnectionH2::prune_inactive_streams_while_closing()` removes H2 stream-ID
   mappings for streams that never became active before a connection-level close
   (for example, partial or oversized HEADERS blocks that were abandoned during
@@ -1749,6 +1757,12 @@ H2 stream state, GOAWAY sequencing, and rustls buffering interact:
   frontend H2 connection. Once the final GOAWAY has been queued, all stream
   mappings are gone, and the peer has already hung up, the remaining rustls
   backlog is no longer deliverable and the session may close immediately.
+- While the peer is still there, a close after a final GOAWAY(NO_ERROR)
+  lingers instead (`H2Shell::linger_instead_of_closing`): `close_notify` is
+  flushed, the write side is shut down, and what the client still sends is
+  read and dropped until its EOF, 4 MiB, or `request_timeout`. Closing with
+  those frames unread made Linux reset the connection and discard response
+  bytes the client had not read yet. See `LIFECYCLE.md` §8.1.
 - `FrontRustls::peer_disconnected` suppresses new TLS writes after EOF/HUP so
   the close path does not keep retrying application writes to a dead peer.
 - HTTPS uses `shutdown(Write)` rather than `shutdown(Both)`. On Linux,
@@ -1917,7 +1931,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:6922-6924
+```rust lib/src/protocol/mux/h2.rs:6963-6965
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1925,7 +1939,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:6936-6942
+```rust lib/src/protocol/mux/h2.rs:6977-6983
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.

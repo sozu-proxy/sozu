@@ -2446,6 +2446,102 @@ fn try_http_behaviors() -> State {
     State::Success
 }
 
+/// An H1 keep-alive backend writes its interim responses and its final 200
+/// in ONE write, so they reach sozu in one read. Each interim is forwarded and
+/// then cleared from the back buffer, and the bytes that follow it are already
+/// buffered: no further socket event will announce them. The client must
+/// still receive every interim, in order, then the final 200, and the same
+/// connections must carry a second exchange.
+fn try_h1_interim_and_final_in_one_write(interims: &[&str]) -> State {
+    let front_address = create_local_address();
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_sync_test(
+        "H1-INTERIM-ONE-WRITE",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+    let mut backend = backends.pop().expect("backend");
+    let mut client = Client::new(
+        "client",
+        front_address,
+        http_request("GET", "/api", "ping", "localhost"),
+    );
+
+    backend.connect();
+    client.connect();
+    client.send();
+    backend.accept(0);
+    if backend.receive(0).is_none() {
+        println!("the backend never received the request");
+        return State::Fail;
+    }
+
+    let mut response = String::new();
+    for interim in interims {
+        response.push_str(&format!("HTTP/1.1 {interim}\r\n\r\n"));
+    }
+    response.push_str(&http_ok_response("pong"));
+    backend.set_response(response);
+    backend.send(0);
+    match read_until(&mut client, Duration::from_secs(1), |seen| {
+        seen.ends_with("\r\n\r\npong")
+    }) {
+        ReadOutcome::Complete(seen) => {
+            let mut rest = seen.as_str();
+            for interim in interims {
+                let line = format!("HTTP/1.1 {interim}\r\n");
+                let Some(rest_after) = rest.strip_prefix(line.as_str()) else {
+                    println!("expected the interim {interim:?} next, got {rest:?}");
+                    return State::Fail;
+                };
+                let Some(end) = rest_after.find("\r\n\r\n") else {
+                    println!("the interim {interim:?} has no end of head: {rest_after:?}");
+                    return State::Fail;
+                };
+                rest = &rest_after[end + 4..];
+            }
+            if !rest.starts_with("HTTP/1.1 200 OK\r\n") {
+                println!("expected the final 200 after {interims:?}, got {rest:?}");
+                return State::Fail;
+            }
+        }
+        other => {
+            println!("expected {interims:?} then the final 200, got {other:?}");
+            return State::Fail;
+        }
+    }
+
+    // Second exchange on the same frontend and the same backend connection.
+    client.set_request(http_request("GET", "/api", "ping2", "localhost"));
+    client.send();
+    match backend.receive(0) {
+        Some(request) if request.ends_with("ping2") => {}
+        other => {
+            println!("the kept-alive backend did not receive the second request: {other:?}");
+            return State::Fail;
+        }
+    }
+    backend.set_response(http_ok_response("pong2"));
+    backend.send(0);
+    match read_until(&mut client, Duration::from_secs(1), |seen| {
+        seen.ends_with("\r\n\r\npong2")
+    }) {
+        ReadOutcome::Complete(seen) if seen.starts_with("HTTP/1.1 200 OK\r\n") => {}
+        other => {
+            println!("expected the second 200, got {other:?}");
+            return State::Fail;
+        }
+    }
+
+    worker.hard_stop();
+    worker.wait_for_server_stop();
+    State::Success
+}
+
 /// RFC 9110 §15.2: every 1xx status is interim and a client must accept any
 /// number of them before the final response, not only 100 and 103. Here an H1
 /// keep-alive backend answers `interim` (102 Processing, or the unassigned 150)
@@ -3992,6 +4088,46 @@ fn test_upgrade_interface_bound_listener() {
             3,
             "Upgrade: a listener bound to an interface keeps serving after a worker upgrade",
             try_upgrade_interface_bound_listener
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_h1_interim_103_and_final_in_one_write() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H1: a 103 and the final 200 written at once both reach the client",
+            || try_h1_interim_and_final_in_one_write(&["103 Early Hints"])
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_h1_interim_102_and_final_in_one_write() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H1: a 102 and the final 200 written at once both reach the client",
+            || try_h1_interim_and_final_in_one_write(&["102 Processing"])
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_h1_several_interims_and_final_in_one_write() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H1: 102, 103 and 150 then the final 200 written at once all reach the client",
+            || try_h1_interim_and_final_in_one_write(&[
+                "102 Processing",
+                "103 Early Hints",
+                "150 Unassigned"
+            ])
         ),
         State::Success
     );
