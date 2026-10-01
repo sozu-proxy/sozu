@@ -467,6 +467,37 @@ impl<Front: SocketHandler> Connection<Front> {
         }
     }
 
+    /// The backend this connection was dialled to, when it is a pooled
+    /// backend connection carrying no stream: an H1 keep-alive, or a
+    /// connected H2 connection whose stream table is empty. `None` for a
+    /// frontend, a dial in progress, a connection being dropped, and any
+    /// connection that still carries a stream.
+    pub(super) fn idle_pooled_backend(&self) -> Option<&BackendId> {
+        match self {
+            Connection::H1(c) => match &c.position {
+                Position::Client(_, backend, BackendStatus::KeepAlive) if c.stream.is_none() => {
+                    Some(backend)
+                }
+                _ => None,
+            },
+            Connection::H2(c) => match &c.core.position {
+                Position::Client(_, backend, BackendStatus::Connected)
+                    if c.core.stream_count() == 0 =>
+                {
+                    Some(backend)
+                }
+                _ => None,
+            },
+        }
+    }
+
+    /// Drop this connection: its status becomes `Disconnecting` and its
+    /// readiness carries `HUP`, which `Mux::ready_inner`'s dead-backend
+    /// sweep closes on its next pass.
+    pub(super) fn force_disconnect(&mut self) -> MuxResult {
+        forward!(self, force_disconnect())
+    }
+
     /// `now` is the caller's clock snapshot; H2 arms the graceful-shutdown
     /// budget from it. H1 has no multiplex to drain and ignores it.
     pub(super) fn graceful_goaway(&mut self, now: Instant) -> MuxResult {
@@ -499,12 +530,14 @@ impl<Front: SocketHandler> Connection<Front> {
         }
     }
 
-    /// True while an H1 frontend drains the rest of a request after its
-    /// response, before it closes. H2 never lingers. See [`super::h1::Linger`].
+    /// True while a frontend drains what its client still sends before it
+    /// closes: an H1 connection after a response that completed before its
+    /// request, an H2 connection after its final GOAWAY. See
+    /// [`super::shared::Linger`].
     pub(super) fn is_lingering(&self) -> bool {
         match self {
             Connection::H1(c) => c.is_lingering(),
-            Connection::H2(_) => false,
+            Connection::H2(c) => c.core.is_lingering(),
         }
     }
 
@@ -524,6 +557,16 @@ impl<Front: SocketHandler> Connection<Front> {
         match self {
             Connection::H1(_) => false,
             Connection::H2(c) => c.core.graceful_shutdown_deadline_elapsed(),
+        }
+    }
+
+    /// Arm the H2 graceful-shutdown budget on a connection already draining
+    /// when the proxy soft-stops. H1 has no budget and ignores it. See
+    /// [`h2::ConnectionH2::arm_graceful_shutdown_deadline`].
+    pub(super) fn arm_graceful_shutdown_deadline(&mut self, now: Instant) {
+        match self {
+            Connection::H1(_) => {}
+            Connection::H2(c) => c.core.arm_graceful_shutdown_deadline(now),
         }
     }
 
