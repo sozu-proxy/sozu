@@ -113,7 +113,7 @@
 //! concern either.
 
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     time::{Duration, Instant},
 };
 
@@ -139,12 +139,20 @@ pub(super) struct H2StreamTable {
     /// sent, preventing duplicate RST_STREAM frames on the wire.
     rst_sent: HashSet<StreamId>,
     /// RFC 9113 §5.1: the most recent streams evicted from `rst_sent`, at
-    /// most [`RESET_STREAMS_REMEMBERED`], oldest first. Frames the peer sent
+    /// most [`RESET_STREAMS_REMEMBERED`], oldest first, with
+    /// `reset_evicted` holding the same ids for lookup. Frames the peer sent
     /// before it read our RST_STREAM may still arrive on them and are
     /// ignored rather than treated as a protocol error; §5.1 lets an
     /// endpoint limit how long it does so, and the bound keeps a peer that
-    /// provokes resets from growing this set.
-    reset_evicted: VecDeque<StreamId>,
+    /// provokes resets from growing these.
+    reset_order: VecDeque<StreamId>,
+    reset_evicted: HashSet<StreamId>,
+    /// RFC 9113 §6.9: DATA bytes a peer may still send on a stream this
+    /// endpoint reset without abusing it, keyed by stream: the receive
+    /// window it was granted, consumed as its DATA is ignored. Created on
+    /// the first ignored DATA frame; dropped with the stream's id from
+    /// `reset_order`.
+    reset_data_allowance: HashMap<StreamId, u32>,
     /// Per-stream wall-clock timestamp of last meaningful activity (DATA or
     /// HEADERS frame receipt) — the bidirectional-silence (slow-multiplex)
     /// reap guard. `BTreeMap` for deterministic reap order — see the module
@@ -200,7 +208,9 @@ impl H2StreamTable {
             expect_read,
             expect_write: None,
             rst_sent: HashSet::new(),
-            reset_evicted: VecDeque::new(),
+            reset_order: VecDeque::new(),
+            reset_evicted: HashSet::new(),
+            reset_data_allowance: HashMap::new(),
             stream_last_activity_at: BTreeMap::new(),
             stream_fc_stalled_since: BTreeMap::new(),
             stream_fc_stalled_progress: BTreeMap::new(),
@@ -298,11 +308,14 @@ impl H2StreamTable {
         } else {
             RemoveOutcome::NotPresent
         };
-        if self.rst_sent.remove(&stream_id) {
-            if self.reset_evicted.len() == RESET_STREAMS_REMEMBERED {
-                self.reset_evicted.pop_front();
+        if self.rst_sent.remove(&stream_id) && self.reset_evicted.insert(stream_id) {
+            if self.reset_order.len() == RESET_STREAMS_REMEMBERED
+                && let Some(oldest) = self.reset_order.pop_front()
+            {
+                self.reset_evicted.remove(&oldest);
+                self.reset_data_allowance.remove(&oldest);
             }
-            self.reset_evicted.push_back(stream_id);
+            self.reset_order.push_back(stream_id);
         }
         self.stream_last_activity_at.remove(&stream_id);
         self.stream_fc_stalled_since.remove(&stream_id);
@@ -386,6 +399,32 @@ impl H2StreamTable {
     /// has the frames that then arrive on it ignored.
     pub(super) fn reset_by_us(&self, stream_id: StreamId) -> bool {
         self.rst_sent.contains(&stream_id) || self.reset_evicted.contains(&stream_id)
+    }
+
+    /// Charge `len` bytes of DATA ignored on a stream this endpoint reset
+    /// against what the peer may legitimately still have in flight on it,
+    /// `granted` bytes (the stream's receive window, RFC 9113 §6.9), and
+    /// return whether they fit. DATA beyond it is no in-flight remainder.
+    pub(super) fn charge_reset_stream_data(
+        &mut self,
+        stream_id: StreamId,
+        len: u32,
+        granted: u32,
+    ) -> bool {
+        let allowance = self
+            .reset_data_allowance
+            .entry(stream_id)
+            .or_insert(granted);
+        match allowance.checked_sub(len) {
+            Some(left) => {
+                *allowance = left;
+                true
+            }
+            None => {
+                *allowance = 0;
+                false
+            }
+        }
     }
 
     /// Narrow escape hatch for the two sites that need raw `&mut

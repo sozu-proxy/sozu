@@ -1463,11 +1463,17 @@ kept in lock-step:
   re-enters the reset flow for the same stream. When `H2StreamTable::remove`
   evicts an id from `rst_sent`, it keeps it among the last
   `RESET_STREAMS_REMEMBERED` reset streams, so `H2StreamTable::reset_by_us`
-  still recognises it and the read side ignores the frames the peer sent
-  before reading the reset (RFC 9113 §5.1) instead of answering
-  GOAWAY(STREAM_CLOSED) or a second RST_STREAM (sozu-proxy/sozu#1783). Pinned
-  by `frames_on_a_backend_stream_sozu_reset_are_ignored` (`h2.rs`) and
-  `reset_by_us_outlives_eviction_for_the_last_streams_only`
+  still recognises it and the read side ignores the DATA and HEADERS frames
+  (with their CONTINUATION frames) the peer sent before reading the reset
+  (RFC 9113 §5.1) instead of answering GOAWAY(STREAM_CLOSED) or a second
+  RST_STREAM (sozu-proxy/sozu#1783). A header block is still decoded whole
+  for HPACK, and DATA within the stream's receive window counts no glitch.
+  Pinned by `frames_on_a_backend_stream_sozu_reset_are_ignored`,
+  `frames_on_a_client_stream_sozu_reset_are_ignored`,
+  `data_on_a_reset_backend_stream_counts_a_glitch_beyond_its_window_only`,
+  `data_on_a_tracked_backend_stream_sozu_reset_is_ignored`,
+  `a_continuation_of_a_refused_header_block_is_discarded_with_it` (`h2.rs`)
+  and `reset_by_us_outlives_eviction_for_the_last_streams_only`
   (`h2_stream_table.rs`).
 - **MadeYouReset queued cap** via `H2ControlTx`'s lifetime counter (capped at
   `MAX_PENDING_RST_STREAMS = 200`, `h2_control_tx.rs`). Each freshly queued RST

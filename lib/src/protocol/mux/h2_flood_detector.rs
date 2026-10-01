@@ -837,6 +837,12 @@ impl H2FloodDetector {
     /// pattern (a frame on a closed stream, an unknown SETTINGS identifier, a
     /// zero-increment WINDOW_UPDATE on an already-closed stream, ...) toward
     /// the cumulative, half-decaying glitch counter.
+    /// The glitch counter, for tests that pin what counts as a glitch.
+    #[cfg(test)]
+    pub(super) fn glitch_count(&self) -> u32 {
+        self.glitch_count
+    }
+
     pub(super) fn record_glitch(&mut self) {
         let before = self.glitch_count;
         self.glitch_count += 1;

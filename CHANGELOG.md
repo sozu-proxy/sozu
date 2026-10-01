@@ -3836,18 +3836,28 @@
 
 ### 🐛 Fixed
 
-- **`fix(mux-h2)`: ignore frames on a stream Sōzu reset instead of closing the connection
-  ([#1783](https://github.com/sozu-proxy/sozu/issues/1783)).** After Sōzu sent RST_STREAM on a
-  stream, a frame the peer had sent before reading the reset was treated as a protocol error: a
-  HEADERS frame was answered GOAWAY(STREAM_CLOSED), ending every other stream of the
-  connection, and a DATA frame a second RST_STREAM(STREAM_CLOSED). RFC 9113 §5.1 requires such
-  frames to be ignored. `H2StreamTable::remove` (`lib/src/protocol/mux/h2_stream_table.rs`) now
-  remembers the last 64 reset streams it evicts, and `ConnectionH2::handle_read`
-  (`lib/src/protocol/mux/h2.rs`) ignores the frames on a stream `H2StreamTable::reset_by_us`
-  recognises: a HEADERS block is still decoded to keep the HPACK dynamic table in sync (§4.3), a
-  DATA payload is only credited to connection flow control (§6.9), and each counts as a glitch.
-  Documented in `lib/src/protocol/mux/LIFECYCLE.md` and `doc/h2_mux_internals.md`. Covered by
-  `frames_on_a_backend_stream_sozu_reset_are_ignored` (`h2.rs`) and
+- **`fix(mux-h2)`: ignore DATA and HEADERS on a stream Sōzu reset instead of closing the
+  connection ([#1783](https://github.com/sozu-proxy/sozu/issues/1783)).** After Sōzu sent
+  RST_STREAM on a stream, a frame the peer had sent before reading the reset was treated as a
+  protocol error: a HEADERS frame was answered GOAWAY(STREAM_CLOSED), ending every other stream
+  of the connection, and a DATA frame a second RST_STREAM(STREAM_CLOSED). RFC 9113 §5.1 requires
+  such frames to be ignored. `H2StreamTable::remove` (`lib/src/protocol/mux/h2_stream_table.rs`)
+  now remembers the last 64 reset streams it evicts, and `ConnectionH2::handle_read`
+  (`lib/src/protocol/mux/h2.rs`) ignores DATA and HEADERS on a stream
+  `H2StreamTable::reset_by_us` recognises. A header block, with the CONTINUATION frames
+  completing it, is still decoded to keep the HPACK dynamic table in sync (§4.3); a DATA payload
+  is only credited to connection flow control (§6.9). Neither counts as a flood glitch while the
+  DATA fits the stream's 65 535-byte receive window; DATA beyond it does. WINDOW_UPDATE,
+  PRIORITY and RST_STREAM keep their handling, and other frame types keep theirs (PUSH_PROMISE
+  stays a connection error). The CONTINUATION frames of a header block Sōzu refuses, for
+  example at SETTINGS_MAX_CONCURRENT_STREAMS, were taken for standalone frames and answered
+  GOAWAY(PROTOCOL_ERROR); they are now discarded with the block. Documented in
+  `lib/src/protocol/mux/LIFECYCLE.md` and `doc/h2_mux_internals.md`. Covered by
+  `frames_on_a_backend_stream_sozu_reset_are_ignored`,
+  `frames_on_a_client_stream_sozu_reset_are_ignored`,
+  `data_on_a_reset_backend_stream_counts_a_glitch_beyond_its_window_only`,
+  `data_on_a_tracked_backend_stream_sozu_reset_is_ignored`,
+  `a_continuation_of_a_refused_header_block_is_discarded_with_it` (`h2.rs`) and
   `reset_by_us_outlives_eviction_for_the_last_streams_only` (`h2_stream_table.rs`).
 
 - **`fix(h1)`: handle every 1xx other than 101 as an interim response
