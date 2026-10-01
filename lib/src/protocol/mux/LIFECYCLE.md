@@ -547,6 +547,24 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   carries. A backend added again, even at the same address, is a new `Rc` in a
   new slot, so the next request dials it.
 
+  Once a retired connection carries no stream — an H1 `KeepAlive`, or an H2
+  `Connected` connection with an empty stream table — `Mux::ready_inner` drops
+  it (`Connection::idle_pooled_backend`, then `Connection::force_disconnect`).
+  The HUP that raises sends it through the dead-backend sweep on the next
+  iteration, which releases its connection on the backend, so a `Closing`
+  backend reaches `Closed` instead of holding a parked socket until the session
+  ends. The check runs on every pass of the session, so a connection idle
+  before the removal is closed on the session's next event. The
+  `RemovedBackendHasNoConnections` event is still tied to the session: it is
+  emitted when the last `Rc` of the backend drops, and the session's
+  `BackendRegistry` holds one until the session closes.
+
+  A reload that changes a backend's weight, `sticky_id` or `backup` reaches the
+  workers as `RemoveBackend` then `AddBackend` (`ConfigState::diff`,
+  `command/src/state.rs`). The removal retires the backend, so every session
+  drops its pooled connection to it and dials the re-added backend, where an
+  in-place update used to keep the connection.
+
   That is what took `Rc<RefCell<dyn ProxySession>>` out of the router entirely —
   its single use was `L7Proxy::add_session`, which is the embedder's.
 
