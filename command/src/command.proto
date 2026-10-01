@@ -470,7 +470,7 @@ message HttpListenerConfig {
     optional uint32 h2_max_glitch_count = 18;
     // H2 connection tuning parameters.
     // Connection-level receive window size in bytes (RFC 9113 §6.9.2).
-    // Default: 1048576 (1MB). The RFC default of 65535 is too small for proxying.
+    // Default: 16777216 (16 MiB). Credit is returned per half window received.
     optional uint32 h2_initial_connection_window = 19;
     // Maximum concurrent H2 streams the proxy accepts (SETTINGS_MAX_CONCURRENT_STREAMS).
     // Default: 100.
@@ -606,7 +606,7 @@ message HttpsListenerConfig {
     optional uint32 h2_max_glitch_count = 28;
     // H2 connection tuning parameters.
     // Connection-level receive window size in bytes (RFC 9113 §6.9.2).
-    // Default: 1048576 (1MB). The RFC default of 65535 is too small for proxying.
+    // Default: 16777216 (16 MiB). Credit is returned per half window received.
     optional uint32 h2_initial_connection_window = 29;
     // Maximum concurrent H2 streams the proxy accepts (SETTINGS_MAX_CONCURRENT_STREAMS).
     // Default: 100.

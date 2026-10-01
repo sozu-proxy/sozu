@@ -545,6 +545,17 @@
 
 ### 🔄 Changed
 
+- **`fix(mux-h2)`: emit fewer connection-level `WINDOW_UPDATE` frames when receiving DATA
+  ([#1744](https://github.com/sozu-proxy/sozu/issues/1744)).** The default
+  `h2_initial_connection_window` is now 16777216 (16 MiB) instead of 1048576 (1 MiB). Sōzu returns
+  connection credit in one stream-0 `WINDOW_UPDATE` per half window received (RFC 9113 §6.9), so a
+  64 MiB transfer now costs 8 such frames instead of 125, as H2 server receiving a request body and
+  as H2 client receiving a backend response; at LAN speed the former rate could trip a peer's
+  stream-0 `WINDOW_UPDATE` flood detection, Sōzu's own included. The window is advertised, not
+  enforced, and memory stays bounded by the buffer pool. Stream-level credit is still returned per
+  DATA frame. Listeners that set `h2_initial_connection_window` explicitly keep their value.
+  Covered by `e2e/src/tests/h2_window_update_tests.rs`.
+
 - **BEHAVIOUR CHANGE — `feat(state)`: removing a cluster removes its frontends and backends
   ([#1723](https://github.com/sozu-proxy/sozu/issues/1723)).** `RemoveCluster` (`sozu cluster
   remove`) used to remove the cluster definition alone: its HTTP, HTTPS, TCP and UDP frontends and

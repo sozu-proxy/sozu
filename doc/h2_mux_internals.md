@@ -455,7 +455,7 @@ When absent (`None`), the built-in defaults apply:
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `initial_connection_window` | 1048576 (1MB) | Connection receive window **advertised** to the peer (RFC 9113 §6.9.2), clamped to [65535, 2^31-1]. Not enforced on inbound DATA — see below |
+| `initial_connection_window` | 16777216 (16 MiB) | Connection receive window **advertised** to the peer (RFC 9113 §6.9.2), clamped to [65535, 2^31-1]. Credit is returned in one stream-0 `WINDOW_UPDATE` per half window received. Not enforced on inbound DATA — see below |
 | `max_concurrent_streams` | 100 | `SETTINGS_MAX_CONCURRENT_STREAMS`, also sizes the pending WINDOW_UPDATE cap |
 | `stream_shrink_ratio` | 2 | Stream Vec shrink threshold: `total > active * ratio`, minimum 2 |
 

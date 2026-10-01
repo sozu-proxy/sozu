@@ -241,11 +241,11 @@ pub(super) fn next_stream_id(
     Some((issued, next))
 }
 
-/// Enlarged connection-level receive window (1 MB).
-/// The RFC 9113 default is 65 535 bytes, which is too small for high-throughput
-/// proxying and causes excessive WINDOW_UPDATE round-trips. 1 MB matches the
-/// initial window used by HAProxy, the h2 crate, and other production proxies.
-const ENLARGED_CONNECTION_WINDOW: u32 = 1_048_576;
+/// Connection receive window (16 MiB), advertised and not enforced (see
+/// `lib/src/protocol/mux/h2_flow_control.rs`). Credit returns in one stream-0 WINDOW_UPDATE per
+/// half window received, one per 8 MiB, well under peers' stream-0 flood limits (Chromium uses
+/// 15 MB, Envoy 24 MiB). The buffer pool bounds memory: DATA is read only when its buffer has room.
+const ENLARGED_CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
 
 /// H2 client connection preface size: 24-byte magic + 9-byte SETTINGS frame header
 pub const CLIENT_PREFACE_SIZE: usize = 24 + parser::FRAME_HEADER_SIZE;
