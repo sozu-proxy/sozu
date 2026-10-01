@@ -5169,6 +5169,16 @@
   changeset deliberately does not widen — a deadline raised to make a run land is the defect
   #1453 exists to remove.
 
+- **`test(e2e)`: the graceful-shutdown large-transfer test waits for its request instead of
+  racing its own soft stop.** `test_h2_graceful_shutdown_completes_large_transfer`
+  (`e2e/src/tests/h2_tests.rs`) slept a fixed 200 ms before `soft_stop`, assuming the request had
+  reached the backend by then. Under load it had not: the worker rightly refused the
+  not-yet-opened connection or stream and the test failed without exercising the drain. The
+  backend now holds its response (`DelayedH2Backend::start_held`), the test waits until the
+  request has reached it, triggers `soft_stop`, then releases the 512 KiB response, so the
+  response is still owed when the soft stop is issued, at any load. No production code changed
+  (sozu-proxy/sozu#1736).
+
 - **`fix(parser)`: the HTTP method token is matched case-sensitively, so Sōzu and the origin
   agree on what method a request carries.** `Method::new`
   (`lib/src/protocol/kawa_h1/parser.rs`) compared with `compare_no_case`, so a request line
