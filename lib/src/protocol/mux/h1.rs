@@ -465,7 +465,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
     /// trailer HEADERS frame or an empty DATA frame nothing is written after
     /// the head. DATA carrying a payload on such a response never reaches
     /// this queue: `ConnectionH2::handle_data_frame` resets the backend
-    /// stream first (RFC 9113 §8.1.1). The header section is the last queued `StatusLine` (an
+    /// stream of a 204 or a 304 and discards the payload of a response to
+    /// HEAD first (RFC 9110 §6.4.1). The header section is the last queued `StatusLine` (an
     /// informational head queued before it is left whole) up to its first
     /// closing `Flags { end_header }`; when it is no longer queued, kawa's
     /// H1 serializer already wrote it whole, since it drains every queued
