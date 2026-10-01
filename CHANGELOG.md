@@ -3866,14 +3866,14 @@
   An H1 backend connection closes and is never returned to the keep-alive pool, even when its
   response was already complete. On an H2 backend only that stream ends, with
   `RST_STREAM(CANCEL)` once its request reached the wire, and the shared connection stays open.
-  The client gets the same answer as before. The client connection is at most as persistent as
-  the 400 answer's `Connection` header: a client `Connection: close`, or a backend response that
-  closes, still closes it. The fix covers every frontend parse error that lands after linking,
-  not only the trailer bound. Documented in `lib/src/protocol/kawa_h1/LIFECYCLE.md`. Covered by
+  The client gets the same answer as before, and its connection then closes, because the
+  rejected request was never received whole (#1721). The fix covers every frontend parse error
+  that lands after linking, not only the trailer bound. Documented in
+  `lib/src/protocol/kawa_h1/LIFECYCLE.md`. Covered by
   `test_h1_trailer_field_limit_exceeded_split_closes_backend`
-  (`e2e/src/tests/h1_security_tests.rs`), which sends the request in two segments, then a
-  follow-up request on the same client connection, behind a 400 answer that keeps that connection
-  alive, and by the unit test
+  (`e2e/src/tests/h1_security_tests.rs`), which sends the request in two segments behind a 400
+  answer that does not ask for a close, and checks that both connections close after the 400,
+  and by the unit test
   `a_request_error_after_a_linked_response_started_ends_the_backend_stream`
   (`lib/src/protocol/mux/h1.rs`) for the cut-response arm.
 - **`fix(h1)`: read an answer template's `Connection` value as an option list

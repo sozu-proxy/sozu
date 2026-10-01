@@ -552,11 +552,11 @@ branch of `ConnectionH1::writable` that parses a pipelined request.
   `keep_alive_backend` for the same reason. On an H2 backend only that stream
   ends: `ConnectionH2::end_stream` (`lib/src/protocol/mux/h2.rs`) resets it with
   `RST_STREAM(CANCEL)` when its request reached the wire, and the shared
-  connection stays open for its other streams. The client connection is at
-  most as persistent as the answer's `Connection` header: `ConnectionH1::writable`
-  keeps it only when both `keep_alive_frontend` and `keep_alive_backend` hold,
-  so a client `Connection: close`, or a backend response that closes, still
-  closes it (sozu-proxy/sozu#1716). The field over the bound is never forwarded. The request
+  connection stays open for its other streams (sozu-proxy/sozu#1716). The
+  client connection closes once the answer is flushed, whatever the answer's
+  `Connection` header says: the rejected request was never received whole, so
+  `ConnectionH1::writable` reads no further request from that connection
+  (RFC 9112 §6.3, sozu-proxy/sozu#1721). The field over the bound is never forwarded. The request
   is refused rather than trimmed, as H2 resets the stream with
   `ENHANCE_YOUR_CALM`, because a peer sending that many trailer fields is
   either broken or probing, and no default answer exists for 431; 400 is the
