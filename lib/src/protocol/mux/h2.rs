@@ -5643,6 +5643,14 @@ impl ConnectionH2 {
         self.drain.deadline_elapsed(self.now)
     }
 
+    /// Arm the graceful-shutdown budget of a connection a proxy soft-stop
+    /// finds already draining, which `graceful_goaway` is not called for: a
+    /// peer GOAWAY drains without arming it. See
+    /// `H2DrainState::arm_deadline_if_unarmed` (`h2_drain.rs`).
+    pub fn arm_graceful_shutdown_deadline(&mut self, now: Instant) {
+        self.drain.arm_deadline_if_unarmed(now);
+    }
+
     /// True when the reaper has queued control frames (`RST_STREAM`) into
     /// `h2_control_tx::H2ControlTx` that have not yet been serialized. Kept SEPARATE
     /// from [`H2Shell::has_pending_write`] because that probe gates connection close
@@ -6932,6 +6940,12 @@ impl ConnectionH2 {
         L: ListenerHandler + L7ListenerHandler,
     {
         self.attribute_bytes_to_overhead();
+        // A peer sends at most two GOAWAY frames in a graceful close (RFC
+        // 9113 §6.8). Each one counts toward the glitch budget, so a peer
+        // repeating GOAWAY on a connection kept open by its in-flight
+        // streams is bounded, as is the log line below.
+        self.flood_detector.record_glitch();
+        check_flood_or_return!(self);
         let error_name =
             H2Error::try_from(goaway.error_code).map_or("UNKNOWN_ERROR", |e| e.as_str());
         if goaway.error_code == H2Error::NoError as u32 {
@@ -6944,9 +6958,11 @@ impl ConnectionH2 {
             );
         } else {
             // Peer-originated failure: no variant of H2Error from a peer
-            // implies a sozu bug. Impact handling is separate (retry above
-            // `last_stream_id`, RST_STREAM for consumed streams) and logs
-            // its own details below, so the summary drops to `warn!`.
+            // implies a sozu bug. On a backend connection, impact handling
+            // is separate (retry above `last_stream_id`, RST_STREAM for
+            // consumed streams) and logs its own details below; a frontend
+            // connection retires nothing. Either way the summary drops to
+            // `warn!`.
             warn!(
                 "{} Received GOAWAY: last_stream_id={}, error={}, debug_data={:?}",
                 log_context!(self),
@@ -6964,19 +6980,37 @@ impl ConnectionH2 {
             .peer_last_stream_id()
             .expect("observe_peer_goaway just recorded this");
 
-        // Streams with ID > last_stream_id were NOT processed by the peer.
-        // Mark them for retry (StreamState::Link) so they can be retried
-        // on a new connection.
+        // RFC 9113 §6.8: `last_stream_id` bounds the streams the GOAWAY
+        // RECEIVER initiated. On a frontend connection (Position::Server)
+        // that is server-initiated streams, which sozu never opens (no
+        // push), so every stream here was opened by the GOAWAY sender and
+        // is unaffected: each runs to completion, `draining` refuses any new
+        // one (`create_stream`), and the connection closes once the last
+        // completes (the `draining && streams().is_empty()` finalize step).
+        //
+        // On a backend connection (Position::Client) the streams are
+        // sozu-initiated: those with ID > last_stream_id were NOT processed
+        // by the peer and are retried (StreamState::Link) on a new
+        // connection; those at or below it run to completion.
         // IMPORTANT: do NOT call endpoint.end_stream() here — that would
         // remove the stream from the frontend's H2 stream map and send
         // RST_STREAM to the client, killing the request instead of retrying it.
         let mut retry_streams = Vec::new();
-        for (&stream_id, &global_stream_id) in self.stream_table.streams() {
-            if stream_id > peer_last_stream_id {
-                retry_streams.push((stream_id, global_stream_id));
+        if matches!(self.position, Position::Client(..)) {
+            for (&stream_id, &global_stream_id) in self.stream_table.streams() {
+                if stream_id > peer_last_stream_id {
+                    retry_streams.push((stream_id, global_stream_id));
+                }
             }
         }
         for (stream_id, global_stream_id) in &retry_streams {
+            // `endpoint` is the frontend side (`EndpointServer`) only on a
+            // backend connection: its `readiness_mut` is what the answers
+            // below must arm so they reach the client.
+            debug_assert!(
+                matches!(self.position, Position::Client(..)),
+                "only a backend connection retires streams on a received GOAWAY"
+            );
             // Remove from reverse index before transitioning away from Linked.
             if let StreamState::Linked(token) = context.streams[*global_stream_id].state {
                 remove_backend_stream(&mut context.backend_streams, token, *global_stream_id);
@@ -7065,8 +7099,9 @@ impl ConnectionH2 {
             return self.goaway(H2Error::NoError);
         }
 
-        // Otherwise, let remaining streams (ID <= last_stream_id) complete.
-        // The connection will be closed when all streams finish.
+        // Otherwise, let the remaining streams complete: every stream on a
+        // frontend connection, those at or below `last_stream_id` on a
+        // backend one. The connection is closed when all streams finish.
         MuxResult::Continue
     }
 

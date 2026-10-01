@@ -3876,6 +3876,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 "{} shutting_down: already draining, skipping duplicate GOAWAY",
                 log_context!(self)
             );
+            // A peer GOAWAY drains without arming the graceful-shutdown
+            // budget, which only `graceful_goaway` arms: arm it here, once,
+            // so the forced-close check below still bounds this session.
+            self.frontend.arm_graceful_shutdown_deadline(now);
             // shut_down_sessions() runs outside ready(), so retry flushing any
             // previously-buffered GOAWAY/TLS records on each pass.
             self.frontend.flush_output_buffer();

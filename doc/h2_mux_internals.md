@@ -1069,7 +1069,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8636-8640
+```rust lib/src/protocol/mux/h2.rs:8671-8675
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1202,7 +1202,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8814-8818
+```rust lib/src/protocol/mux/h2.rs:8849-8853
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1676,7 +1676,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:8139
+```rust lib/src/protocol/mux/h2.rs:8174
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -1719,6 +1719,14 @@ H2 stream state, GOAWAY sequencing, and rustls buffering interact:
   budget elapses, `ConnectionH2::goaway_before_forced_close` queues the final
   GOAWAY before the forced close; its `last_stream_id` excludes a stream whose
   opening block never completed.
+- A GOAWAY received from the client (`ConnectionH2::handle_goaway_frame`,
+  `Position::Server`) retires no stream: its `last_stream_id` bounds the
+  streams the receiver initiated (RFC 9113 §6.8), and sozu pushes none. It
+  marks the connection draining, so new client streams are refused, every
+  in-flight request completes, and the final GOAWAY follows once no stream
+  remains. A soft-stop on such a connection arms the graceful-shutdown budget
+  that the peer GOAWAY did not arm. Each received GOAWAY counts as a glitch. Only a GOAWAY from an H2 backend (`Position::Client`) retires the
+  streams above its `last_stream_id`: re-linked, answered `503`, or reset.
 - `ConnectionH2::prune_inactive_streams_while_closing()` removes H2 stream-ID
   mappings for streams that never became active before a connection-level close
   (for example, partial or oversized HEADERS blocks that were abandoned during
@@ -1902,7 +1910,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:6779-6781
+```rust lib/src/protocol/mux/h2.rs:6787-6789
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1910,7 +1918,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:6793-6799
+```rust lib/src/protocol/mux/h2.rs:6801-6807
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.

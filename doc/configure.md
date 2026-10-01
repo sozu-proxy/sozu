@@ -1452,7 +1452,8 @@ h2_max_glitch_count = 100             # Cumulative protocol violations
 `h2_max_glitch_count` is a catch-all counter for _low-severity_ protocol drift
 that no other flood counter covers. It is incremented on stream-close races
 (`RST_STREAM` / `WINDOW_UPDATE` / `DATA` on a closed stream), `WINDOW_UPDATE`
-with zero increment on a closed stream, and unknown SETTINGS identifiers. The
+with zero increment on a closed stream, unknown SETTINGS identifiers, and each
+received `GOAWAY` (a graceful close sends at most two, RFC 9113 §6.8). The
 counter uses a 1-second sliding window with _half-decay_ (it halves at each
 window roll rather than resetting), so a threshold of `N` tolerates a one-shot
 burst of `N` glitches or a sustained rate of roughly `N/2` glitches per second.

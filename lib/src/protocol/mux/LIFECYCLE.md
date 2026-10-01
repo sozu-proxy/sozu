@@ -850,7 +850,9 @@ one block inside a method that does several unrelated things:
 - `ConnectionH2::handle_continuation_header_state` CONTINUATION oversize
   (`h2.rs`).
 - `ConnectionH2::handle_rst_stream_frame` peer RST (`h2.rs`).
-- `ConnectionH2::handle_goaway_frame` retry loop (`h2.rs`).
+- `ConnectionH2::handle_goaway_frame` retry loop (`h2.rs`), `Position::Client`
+  only: on a frontend connection `last_stream_id` bounds server-initiated
+  streams (RFC 9113 §6.8), which sozu never opens, so nothing is retired.
 - `ConnectionH2::end_stream` client-side retirement (`h2.rs`).
 
 No call site in this file performs `self.streams.remove(...)` inline: it
@@ -1605,7 +1607,7 @@ private fields. `begin_graceful_drain` arms `started_at` from the `now` it is
 handed, and the `debug_assert!` guarding that assignment states the invariant
 the budget rests on:
 
-```rust lib/src/protocol/mux/h2_drain.rs:206-209
+```rust lib/src/protocol/mux/h2_drain.rs:207-210
 debug_assert!(
     self.started_at.is_none(),
     "begin_graceful_drain must arm started_at exactly once, on the first call"
@@ -1621,8 +1623,17 @@ listener knob `h2_graceful_shutdown_deadline_seconds` (proto field
 `0` maps to `graceful_shutdown_deadline = None`, which disables the forced-close
 branch entirely — shutdown then reverts to "wait for every stream to drain"
 semantics. Peer-initiated drains received via `handle_goaway_frame` deliberately
-do **not** arm `started_at`: the budget only applies to the proxy's own
-soft-stop.
+do **not** arm `started_at` when they happen: the budget only applies to the
+proxy's own soft-stop. A soft-stop that finds the connection already draining
+skips `graceful_goaway`, so `Mux::shutting_down` arms the budget itself through
+`H2DrainState::arm_deadline_if_unarmed`, once, from that pass's `now`
+(`test_h2_client_goaway_then_soft_stop_honors_deadline`). A client GOAWAY on a
+frontend connection leaves every in-flight stream running until it completes
+(RFC 9113 §6.8: the sender's own streams are unaffected); `draining` refuses
+new streams and the final GOAWAY follows once the stream table is empty
+(`test_h2_client_goaway_keeps_in_flight_response`). Each received GOAWAY counts
+toward the glitch budget, which bounds a peer that repeats it
+(`test_h2_repeated_client_goaway_is_bounded`).
 
 ### 8.4 `Connection::end_stream` (backend-side retirement)
 

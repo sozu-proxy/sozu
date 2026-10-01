@@ -3969,6 +3969,27 @@
   Documented in `lib/src/protocol/mux/LIFECYCLE.md`. Covered by
   `test_readded_cluster_does_not_reuse_removed_backend` (`e2e/src/tests/remove_cluster_tests.rs`)
   and `removing_a_backend_or_its_cluster_marks_it_closing` (`lib/src/backends.rs`).
+
+- **`fix(mux-h2)`: a GOAWAY received from an H2 client no longer drops its in-flight requests
+  ([#1745](https://github.com/sozu-proxy/sozu/issues/1745)).** `ConnectionH2::handle_goaway_frame`
+  (`lib/src/protocol/mux/h2.rs`) retired every stream above the GOAWAY's `last_stream_id` on both
+  connection positions. On a frontend connection that id bounds server-initiated streams (RFC 9113
+  §6.8), which sozu never opens, so a client `GOAWAY(NO_ERROR, 0)` cut every response in flight and
+  closed the connection. The retire loop now runs on backend connections only. On a frontend
+  connection a received GOAWAY marks the connection draining: new client streams are refused, every
+  in-flight stream completes, and sozu sends its final GOAWAY once none remains. This also removes
+  the frontend path that armed the backend's readiness instead of the frontend's when it reset a
+  retired stream. Backend GOAWAY handling is unchanged: streams above `last_stream_id` are re-linked,
+  answered `503` or reset, and those at or below it complete. A soft-stop reaching a connection a
+  peer GOAWAY already drains now arms the `h2_graceful_shutdown_deadline_seconds` budget
+  (`H2DrainState::arm_deadline_if_unarmed`, called from `Mux::shutting_down`), which only
+  `graceful_goaway` used to arm. Each received GOAWAY counts toward `h2_max_glitch_count`, so a
+  peer repeating it on a connection its streams keep open is bounded. Documented in
+  `doc/h2_mux_internals.md`, `doc/configure.md` and `lib/src/protocol/mux/LIFECYCLE.md`. Covered by
+  `test_h2_client_goaway_keeps_in_flight_response`,
+  `test_h2_client_goaway_then_soft_stop_honors_deadline`, `test_h2_repeated_client_goaway_is_bounded`
+  and `soft_stop_after_a_peer_goaway_arms_the_budget_once`.
+
 - **`fix(mux)`: release the backend connection reservation of an abandoned dial
   ([#1713](https://github.com/sozu-proxy/sozu/issues/1713)).** Selection reserves a connection on
   the chosen backend (`active_connections += 1`) before the mux dials it, and only a failed
