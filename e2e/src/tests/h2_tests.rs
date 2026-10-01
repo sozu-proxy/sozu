@@ -5712,7 +5712,7 @@ fn try_tls_h1_stalled_reader_does_not_exhaust_loop_budget() -> State {
     let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
     let conn = rustls::ClientConnection::new(Arc::new(tls_config), server_name.to_owned()).unwrap();
     let addr: SocketAddr = SocketAddr::from(front_address);
-    let tcp = std::net::TcpStream::connect(addr).expect("could not connect to sozu");
+    let tcp = super::h2_utils::connect_with_small_receive_buffer(addr);
     tcp.set_read_timeout(Some(Duration::from_secs(5))).ok();
     let mut tls = rustls::StreamOwned::new(conn, tcp);
     let sent = tls

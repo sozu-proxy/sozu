@@ -925,8 +925,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             if self.socket.socket_wants_write() {
                 let (size, status) = self.socket.socket_write_vectored(&[]);
                 let _ = update_readiness_after_write(size, status, &mut self.readiness);
-                // Not after `WouldBlock`: see the same check below.
-                if self.socket.socket_wants_write() && status != SocketResult::WouldBlock {
+                // Only after `Continue`: see the same check below.
+                if self.socket.socket_wants_write() && status == SocketResult::Continue {
                     self.readiness.signal_pending_write();
                 }
             }
@@ -1054,14 +1054,17 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         self.position.count_bytes_out(parts.metrics, size);
         let should_yield = update_readiness_after_write(size, status, &mut self.readiness);
         if self.socket.socket_wants_write() {
-            // A socket that answered `WouldBlock` is full: the kernel raises
-            // the next WRITABLE edge once the peer reads, so no synthetic
-            // event is queued. Re-raising it here while rustls still held the
-            // records the kernel refused made `Mux::ready_inner` call this
-            // write again on every inner iteration, each answering
-            // `WouldBlock`, until `MAX_LOOP_ITERATIONS` counted
-            // `http.infinite_loop.error` (sozu-proxy/sozu#1780).
-            if status != SocketResult::WouldBlock {
+            // Only a write that answered `Continue` queues a synthetic
+            // event. A socket that answered `WouldBlock` is full: the kernel
+            // raises the next WRITABLE edge once the peer reads. Re-raising
+            // it here while rustls still held the records the kernel refused
+            // made `Mux::ready_inner` call this write again on every inner
+            // iteration, each answering `WouldBlock`, until
+            // `MAX_LOOP_ITERATIONS` counted `http.infinite_loop.error`
+            // (sozu-proxy/sozu#1780). An `Error` or `Closed` write has nothing
+            // to retry either: the TLS socket marks its transport dead, and
+            // the hang-up that follows closes the session.
+            if status == SocketResult::Continue {
                 self.readiness.signal_pending_write();
                 // Pair the queued-write signal with the socket's own report: we
                 // only synthesize a WRITABLE event when the socket still has bytes
@@ -1073,7 +1076,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             } else {
                 debug_assert!(
                     !self.readiness.event.is_writable(),
-                    "a write that answered WouldBlock must leave WRITABLE to the next edge"
+                    "a write that did not answer Continue must leave WRITABLE to the next edge"
                 );
             }
             return MuxResult::Continue;
@@ -3238,6 +3241,113 @@ mod tests {
         fn read_error(&self) {}
 
         fn write_error(&self) {}
+    }
+
+    /// A frontend socket that still reports buffered TLS records and answers
+    /// every write with `status`, as a TLS socket whose peer stopped reading
+    /// (`WouldBlock`) or whose write met a socket error (`Error`).
+    #[derive(Debug)]
+    struct StuckTlsSocket {
+        stream: mio::net::TcpStream,
+        status: SocketResult,
+    }
+
+    impl SocketHandler for StuckTlsSocket {
+        fn socket_read(&mut self, buf: &mut [u8]) -> (usize, SocketResult) {
+            self.stream.socket_read(buf)
+        }
+
+        fn socket_write(&mut self, _buf: &[u8]) -> (usize, SocketResult) {
+            (0, self.status)
+        }
+
+        fn socket_write_vectored(&mut self, _bufs: &[IoSlice]) -> (usize, SocketResult) {
+            (0, self.status)
+        }
+
+        fn socket_wants_write(&self) -> bool {
+            true
+        }
+
+        fn socket_ref(&self) -> &mio::net::TcpStream {
+            &self.stream
+        }
+
+        fn socket_mut(&mut self) -> &mut mio::net::TcpStream {
+            &mut self.stream
+        }
+
+        fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+            self.stream.peer_addr().ok()
+        }
+
+        fn protocol(&self) -> crate::socket::TransportProtocol {
+            crate::socket::TransportProtocol::Tls1_3
+        }
+
+        fn read_error(&self) {}
+
+        fn write_error(&self) {}
+    }
+
+    /// A TLS flush that did not answer `Continue` leaves WRITABLE to the next
+    /// kernel edge, even while the socket still reports records: re-raising
+    /// it would make `Mux::ready_inner` retry the same refused or failed
+    /// write on every inner iteration until `MAX_LOOP_ITERATIONS`
+    /// (sozu-proxy/sozu#1780).
+    ///
+    /// Both flushes are covered: the one with no stream, and the TLS-only
+    /// flush of a stream with nothing left to write.
+    ///
+    /// TO SEE THIS RED: in either flush of `ConnectionH1::writable`, compare
+    /// `status != SocketResult::WouldBlock` instead of
+    /// `status == SocketResult::Continue`. The `Error` case then re-raises
+    /// WRITABLE.
+    #[test]
+    fn a_tls_flush_that_did_not_continue_leaves_writable_to_the_kernel() {
+        for (status, with_stream) in [
+            (SocketResult::WouldBlock, false),
+            (SocketResult::Error, false),
+            (SocketResult::WouldBlock, true),
+            (SocketResult::Error, true),
+        ] {
+            let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+            let mut context = test_context(&pool);
+            if with_stream {
+                context
+                    .create_stream(Ulid::generate(), 1 << 16)
+                    .expect("the test pool must hand out stream buffers");
+            }
+            let (socket, _peer) = connected_socket();
+            let mut frontend = Connection::new_h1_server(
+                Ulid::generate(),
+                StuckTlsSocket {
+                    stream: socket,
+                    status,
+                },
+                Duration::from_secs(60),
+            );
+            if let Connection::H1(server) = &mut frontend {
+                server.stream = with_stream.then_some(0);
+            }
+            let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+            frontend.readiness_mut().interest.insert(Ready::WRITABLE);
+            frontend.readiness_mut().event.insert(Ready::WRITABLE);
+
+            let result = frontend.writable(&mut context, EndpointClient(&mut router));
+
+            assert!(matches!(result, MuxResult::Continue));
+            assert!(
+                frontend.has_pending_write(),
+                "premise: the socket must still report records"
+            );
+            assert!(
+                !frontend.readiness().event.is_writable(),
+                "a flush that answered {status:?} (stream: {with_stream}) must not re-raise \
+                 WRITABLE, got {:?}",
+                frontend.readiness()
+            );
+        }
     }
 
     /// Once `writable` decided to close after a response, a deferred TLS
