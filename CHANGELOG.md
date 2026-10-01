@@ -3893,6 +3893,18 @@
   (`e2e/src/tests/h2_tests.rs`) and
   `a_hup_during_the_flush_that_starts_a_linger_drains_before_closing` (`lib/src/protocol/mux/mod.rs`).
 
+- **`fix(mux)`: refresh the backend-work flag after the frontend write
+  ([#1771](https://github.com/sozu-proxy/sozu/issues/1771)).** With an HTTP/2 frontend in front of
+  an HTTP/1.1 backend that wrote interim responses and the final response at once, the client got
+  the interim HEADERS and the final response stalled until the backend hung up. `Mux::ready_inner`
+  (`lib/src/protocol/mux/mod.rs`) recorded whether any backend had work before the frontend
+  write; forwarding a 1xx re-arms the backend read (`ConnectionH2::handle_1xx_reset`, and
+  `ConnectionH1::writable`'s interim arms), but only a resumed parked backend refreshed the flag,
+  so the loop could exit with a backend armed and no socket event left to wake it. The flag is now
+  refreshed from every backend's readiness after the frontend write. RFC 9110 §15.2. Covered by
+  `test_h2_to_h1_103_and_final_in_one_write` and `test_h2_to_h1_102_103_and_final_in_one_write`
+  (`e2e/src/tests/h2_tests.rs`).
+
 - **`fix(h1)`: forward a final response read together with a 1xx
   ([#1759](https://github.com/sozu-proxy/sozu/issues/1759)).** When an HTTP/1.1 backend wrote an
   interim response and what follows it (another 1xx, the final response) at once, an HTTP/1.1
@@ -3974,6 +3986,34 @@
   `a_408_to_a_silent_client_closes_without_lingering` and
   `a_silent_client_is_closed_at_the_linger_deadline`.
 
+- **`fix(mux)`: close a pooled connection to a removed backend once it is idle
+  ([#1760](https://github.com/sozu-proxy/sozu/issues/1760)).** A connection whose backend left the
+  configuration is no longer reused (#1735), but it stayed open until its frontend session ended,
+  so the removed backend kept a connection and never went from `Closing` to `Closed`.
+  `Mux::ready_inner` (`lib/src/protocol/mux/mod.rs`) now drops such a connection as soon as it
+  carries no stream: an H1 keep-alive, or an H2 connection with an empty stream table. A connection
+  that was already idle when its backend was removed is closed on its session's next event.
+  `RemovedBackendHasNoConnections` is unchanged: it is emitted when the session that last used the
+  backend closes. **Behaviour change:** a reload that changes a backend's weight, `sticky_id` or
+  `backup` is applied as `RemoveBackend` then `AddBackend` (`ConfigState::diff`), so live sessions
+  now drop their pooled connection to that backend and dial it again. Documented in
+  `lib/src/protocol/mux/LIFECYCLE.md`. Covered by `test_removed_backend_is_neither_reused_nor_kept`
+  (`e2e/src/tests/remove_cluster_tests.rs`) and, for the reuse skip of #1735 in each of its three
+  arms, `a_retired_backend_connection_is_never_reused` (`lib/src/protocol/mux/router.rs`).
+
+- **`fix(mux-h2)`: a default answer ends its own stream, not the H2 connection
+  ([#1740](https://github.com/sozu-proxy/sozu/issues/1740)).** Every built-in answer template
+  carries `Connection: close`, which clears `keep_alive_frontend`; the H2 write pass read that bit
+  when the answered stream retired and sent `GOAWAY`, so one 4xx/5xx default answer drained the
+  connection and refused every later stream. `Connection` is an HTTP/1.1 option (RFC 9113
+  §8.2.2) and the H2 converter already strips it: `ConnectionH2::poll_write_target`
+  (`lib/src/protocol/mux/h2.rs`) no longer reads `keep_alive_frontend`. HTTP/1.1 is unchanged.
+  On H2, the per-(cluster, source IP) slot claimed by a failed dial is now held until the
+  connection closes, one slot per (connection, cluster) as for a successful dial
+  (`doc/rate-limit-design.md`). Covered by the e2e `test_h2_default_answer_terminates_stream`
+  (now asserts no `GOAWAY`), `test_h2_default_answer_502_spares_other_streams` and
+  `test_h2_failed_dial_keeps_connection_and_one_slot`.
+
 - **`fix(mux)`: never reuse a pooled connection to a removed backend
   ([#1735](https://github.com/sozu-proxy/sozu/issues/1735)).** The pool-reuse scan of
   `Router::decide_after_gate` (`lib/src/protocol/mux/router.rs`) matched an H1 keep-alive or H2
@@ -3987,6 +4027,39 @@
   Documented in `lib/src/protocol/mux/LIFECYCLE.md`. Covered by
   `test_readded_cluster_does_not_reuse_removed_backend` (`e2e/src/tests/remove_cluster_tests.rs`)
   and `removing_a_backend_or_its_cluster_marks_it_closing` (`lib/src/backends.rs`).
+
+- **`fix(h2)`: reset a backend stream answered before its request was written
+  ([#1734](https://github.com/sozu-proxy/sozu/issues/1734)).** `ConnectionH2::end_stream`
+  (`lib/src/protocol/mux/h2.rs`) skipped the RST_STREAM on a backend stream once the response's
+  END_STREAM was read and the request was received whole from the client, even when the rest of
+  that request was still queued toward the backend. A backend that answers early (RFC 9113 §8.1)
+  then never saw the request's END_STREAM: the stream stayed half-closed on the backend and held
+  one of its `SETTINGS_MAX_CONCURRENT_STREAMS` slots (§5.1.2) for the connection's lifetime, while
+  sozu had already released its own. The skip now also requires the request to be written whole
+  (`front.is_completed()`); otherwise the stream is reset once with RST_STREAM(CANCEL). Documented
+  in `lib/src/protocol/mux/LIFECYCLE.md`. Covered by
+  `a_backend_stream_answered_before_its_request_was_written_is_cancelled`.
+
+- **`fix(mux-h2)`: a GOAWAY received from an H2 client no longer drops its in-flight requests
+  ([#1745](https://github.com/sozu-proxy/sozu/issues/1745)).** `ConnectionH2::handle_goaway_frame`
+  (`lib/src/protocol/mux/h2.rs`) retired every stream above the GOAWAY's `last_stream_id` on both
+  connection positions. On a frontend connection that id bounds server-initiated streams (RFC 9113
+  §6.8), which sozu never opens, so a client `GOAWAY(NO_ERROR, 0)` cut every response in flight and
+  closed the connection. The retire loop now runs on backend connections only. On a frontend
+  connection a received GOAWAY marks the connection draining: new client streams are refused, every
+  in-flight stream completes, and sozu sends its final GOAWAY once none remains. This also removes
+  the frontend path that armed the backend's readiness instead of the frontend's when it reset a
+  retired stream. Backend GOAWAY handling is unchanged: streams above `last_stream_id` are re-linked,
+  answered `503` or reset, and those at or below it complete. A soft-stop reaching a connection a
+  peer GOAWAY already drains now arms the `h2_graceful_shutdown_deadline_seconds` budget
+  (`H2DrainState::arm_deadline_if_unarmed`, called from `Mux::shutting_down`), which only
+  `graceful_goaway` used to arm. Each received GOAWAY counts toward `h2_max_glitch_count`, so a
+  peer repeating it on a connection its streams keep open is bounded. Documented in
+  `doc/h2_mux_internals.md`, `doc/configure.md` and `lib/src/protocol/mux/LIFECYCLE.md`. Covered by
+  `test_h2_client_goaway_keeps_in_flight_response`,
+  `test_h2_client_goaway_then_soft_stop_honors_deadline`, `test_h2_repeated_client_goaway_is_bounded`
+  and `soft_stop_after_a_peer_goaway_arms_the_budget_once`.
+
 - **`fix(mux)`: release the backend connection reservation of an abandoned dial
   ([#1713](https://github.com/sozu-proxy/sozu/issues/1713)).** Selection reserves a connection on
   the chosen backend (`active_connections += 1`) before the mux dials it, and only a failed
@@ -6908,6 +6981,21 @@
   `test_h1_trailer_spoof_headers_dropped*` and `test_h1_pipelined_trailer_spoof_headers_dropped`
   rows of `e2e/src/tests/h1_security_tests.rs`. Documented in `doc/configure.md` and
   `lib/src/protocol/kawa_h1/LIFECYCLE.md`.
+
+- **`fix(mux-h1)`: H2→H1: drop the trailer fields of a `Content-Length`-framed message instead of
+  writing them after the body ([#1730](https://github.com/sozu-proxy/sozu/issues/1730)).**
+  HTTP/1.1 carries a trailer section only with chunked coding (RFC 9112 §6.3, §7.1), but kawa's
+  H1 serializer wrote the trailer fields and a closing empty line of an H2 message framed by
+  `content-length` after the body, for a request to an H1 backend and for a response to an H1
+  client. `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`) now drops such a trailer block
+  before writing (RFC 9110 §6.5.1), so the message ends with its body, and counts it in
+  `h2.trailers_dropped_content_length`, whose `doc/configure.md` row now describes that.
+  `pkawa::handle_trailer` still
+  validates, elides and queues the block, so an H2 peer keeps these trailers and the
+  `h2.trailer.*_elided` counters are unchanged. Documented in `lib/src/protocol/mux/LIFECYCLE.md`
+  §8.4. Covered by unit tests in `h1.rs`, `converter.rs` and `pkawa.rs` and by
+  `test_h2_length_framed_request_trailers_keep_h1_backend_framing`
+  (`e2e/src/tests/h2_security_header_injection.rs`).
 
 - **`fix(h1)`: a request without `Content-Length` or `Transfer-Encoding` no longer swallows
   the requests pipelined behind it ([#1650](https://github.com/sozu-proxy/sozu/issues/1650)).**

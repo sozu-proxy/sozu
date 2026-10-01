@@ -587,6 +587,131 @@ fn test_h2_invalid_scheme_rejected() {
 }
 
 // ============================================================================
+// Request trailers on a Content-Length-framed request towards an H1 backend
+// ============================================================================
+
+/// Read what the backend receives on its connection `0` until a read
+/// returns nothing once something arrived. An empty read waits for the
+/// backend socket's 100 ms read timeout, so the loop does not spin.
+fn drain_backend(backend: &mut SyncBackend) -> String {
+    let mut received = String::new();
+    for _ in 0..5 {
+        match backend.receive(0) {
+            Some(chunk) => received.push_str(&chunk),
+            None if !received.is_empty() => break,
+            None => {}
+        }
+    }
+    received
+}
+
+/// An H2 request framed by `content-length` and ending with a trailer
+/// HEADERS frame, then a second request, both reach an H1 backend over one
+/// keep-alive connection. The bytes the backend reads are split by HTTP/1.1
+/// framing, not by reads: the first request ends after its head and its
+/// `content-length` of body (RFC 9112 §6.3), and the next byte must start
+/// the second request line, since HTTP/1.1 carries no trailer section after
+/// a length-delimited body (§7.1) and the trailer fields are dropped
+/// (RFC 9110 §6.5.1).
+///
+/// TO SEE THIS RED: make `ConnectionH1::drop_length_framed_trailers`
+/// (`lib/src/protocol/mux/h1.rs`) return `false` without touching the block
+/// queue.
+fn try_h2_length_framed_request_trailers_keep_h1_backend_framing() -> State {
+    let (mut worker, mut backend, front_port) =
+        setup_h2_with_sync_backend("H2-LENGTH-FRAMED-TRAILERS-H1");
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    let mut block = request_prefix_localhost();
+    block[0] = 0x83; // :method POST
+    push_literal(&mut block, b"content-length", b"5");
+    tls.write_all(&H2Frame::headers(1, block, true, false).encode())
+        .unwrap();
+    tls.write_all(&H2Frame::data(1, b"hello".to_vec(), false).encode())
+        .unwrap();
+    let mut trailers = Vec::new();
+    push_literal(&mut trailers, b"grpc-status", b"0");
+    tls.write_all(&H2Frame::headers(1, trailers, true, true).encode())
+        .unwrap();
+    tls.flush().unwrap();
+
+    let accepted = (0..200).any(|_| {
+        if backend.accept(0) {
+            true
+        } else {
+            thread::sleep(Duration::from_millis(10));
+            false
+        }
+    });
+    let first = if accepted {
+        drain_backend(&mut backend)
+    } else {
+        String::new()
+    };
+    println!("length-framed trailers — first request {first:?}");
+    if accepted {
+        backend.send(0);
+    }
+    let first_frames = collect_response_frames(&mut tls, 300, 2, 300);
+    let first_ok = stream_status_matches(&first_frames, 1, 200);
+
+    // Second request on the same H2 connection, served on the same
+    // keep-alive backend connection.
+    tls.write_all(&H2Frame::headers(3, request_prefix_localhost(), true, true).encode())
+        .unwrap();
+    tls.flush().unwrap();
+    let second = if accepted {
+        drain_backend(&mut backend)
+    } else {
+        String::new()
+    };
+    println!("length-framed trailers — second request {second:?}");
+    if accepted {
+        backend.send(0);
+    }
+    let second_frames = collect_response_frames(&mut tls, 300, 2, 300);
+    let second_ok = stream_status_matches(&second_frames, 3, 200);
+
+    backend.disconnect();
+    drop(tls);
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    // Split the connection's bytes by HTTP/1.1 framing: the first request is
+    // its head and its 5-byte body, and whatever follows is the next message.
+    let wire = format!("{first}{second}");
+    let (first_body, next) = match wire.split_once("\r\n\r\n") {
+        Some((_, rest)) if rest.len() >= 5 => (&rest[..5], &rest[5..]),
+        _ => ("", ""),
+    };
+    let second_parsed = next.starts_with("GET / HTTP/1.1\r\n");
+    if first_body == "hello" && first_ok && second_parsed && second_ok && stopped {
+        State::Success
+    } else {
+        println!(
+            "length-framed trailers FAIL — first_body={first_body:?} next={next:?} \
+             first_ok={first_ok} second_parsed={second_parsed} second_ok={second_ok} \
+             stopped={stopped}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_length_framed_request_trailers_keep_h1_backend_framing() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2->H1: trailers of a Content-Length-framed request are dropped (RFC 9110 §6.5.1)",
+            try_h2_length_framed_request_trailers_keep_h1_backend_framing
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
 // FIX-3 — `:path` syntax (starts with `/`, or `*` only for OPTIONS)
 // ============================================================================
 

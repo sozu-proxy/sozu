@@ -180,8 +180,8 @@ and it does not fork the error path either: `Mux::ready_inner` joins the
 plan and the dial into a single `Result` with `and_then`, so both halves
 land in one error arm. The decrement happens once, on session teardown.
 
-The claim is cheap because a failed dial **ends the frontend
-connection**, so the slot comes back with it:
+The claim is cheap on HTTP/1.1 because a failed dial **ends the
+frontend connection**, so the slot comes back with it:
 
 - That error arm, in `Mux::ready_inner`'s pending-link loop, answers the
   stream from the template registry rather than retrying, and no arm of
@@ -191,14 +191,11 @@ connection**, so the slot comes back with it:
 - **HTTP/1.1** — once the answer flushes, the response-complete branch
   of `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`) closes the
   session instead of taking the keep-alive reset. One flush.
-- **HTTP/2, the failed stream was the only one** — the write pass sends
-  a final `GOAWAY(NO_ERROR)` as that stream retires.
-- **HTTP/2, other streams still in flight** — the write pass sends the
-  advisory `GOAWAY` of a graceful drain instead, and a draining
-  connection **refuses** new peer streams. The window is therefore the
-  remaining lifetime of the streams already open, and the client cannot
-  extend it. The `h2_graceful_shutdown_deadline_seconds` forced close
-  does not apply here: it is armed only by the worker's soft-stop path.
+- **HTTP/2** — the answer ends its own stream only: `Connection` is an
+  HTTP/1.1 option (RFC 9113 §8.2.2), so the connection stays open and
+  serves its other streams (sozu-proxy/sozu#1740). The slot is held
+  until the client closes the connection or it times out, as with a
+  custom template that omits `Connection: close` (below).
 - **Raw TCP** — never reaches an answer. Any error out of
   `TcpSession::connect_to_backend` (`lib/src/tcp.rs`) becomes a session
   close in the same event-loop pass.
@@ -215,17 +212,19 @@ instead. The re-increment is idempotent within the session, so **one**
 slot — not one per attempt — is held for at most `CONN_RETRIES`
 attempts, each bounded by `connect_timeout`.
 
-The one configuration in which the slot is held for the connection's
-whole lifetime is a custom answer template that omits
+The slot is held for the connection's whole lifetime on an HTTP/2
+frontend, and on HTTP/1.1 with a custom answer template that omits
 `Connection: close` — the same keep-alive opt-in §3.4 records for the
-429 template. An operator who takes it holds one slot per failed dial
-until the client goes away, and should size
-`max_connections_per_ip` for that.
+429 template. Each such connection holds its one slot until the client
+goes away; size `max_connections_per_ip` for that. Pinned by the e2e
+`test_h2_failed_dial_keeps_connection_and_one_slot`.
 
 Releasing the slot on a dial failure would **loosen** the cap under
 precisely the conditions a client can induce, and would buy very
-little: the connection that provoked the failure is closed by the
-answer it provoked, so it cannot accumulate slots either way. Changing
+little: on HTTP/1.1 the connection that provoked the failure is closed
+by the answer it provoked; on HTTP/2 it keeps at most one slot per
+(connection, cluster), the same as a connection whose dial succeeded.
+Neither can accumulate slots. Changing
 this is its own decision, not part of a refactor
 (sozu-proxy/sozu#1521).
 

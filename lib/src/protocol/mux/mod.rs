@@ -3105,14 +3105,52 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             return SessionResult::Upgrade;
                         }
                     }
-                    // Cross-readiness: frontend wrote → wake parked backends.
-                    // If any backend resumes, invalidate the stale readiness
-                    // flag so the inner loop continues instead of breaking.
+                    // Cross-readiness: the frontend write can hand work back to
+                    // a backend — a parked one resumes once its peer drained
+                    // buffer space, and forwarding an interim 1xx re-arms the
+                    // backend read so the response bytes already buffered
+                    // behind it get parsed (`ConnectionH1::writable`'s interim
+                    // arms, `ConnectionH2::handle_1xx_reset`). The
+                    // `all_backends_readiness_are_empty` flag was recorded
+                    // before this write, so it is refreshed from every
+                    // backend's readiness now: a stale `true` would exit the
+                    // loop with a backend armed and no socket event left to
+                    // bring it back.
                     let context = &mut self.context;
                     for backend in self.router.backends.values_mut() {
-                        if backend.try_resume_reading(context) {
+                        if backend.try_resume_reading(context)
+                            || !backend.readiness().filter_interest().is_empty()
+                        {
                             all_backends_readiness_are_empty = false;
                         }
+                    }
+                }
+
+                // A pooled connection whose backend left the configuration
+                // is never reused (`Router::decide_after_gate`); once it
+                // carries no stream it has nothing left to do, so drop it
+                // rather than leave it idle until the session ends. The HUP
+                // `force_disconnect` raises sends it through the dead-backend
+                // sweep above on the next iteration, which releases its
+                // connection on the backend and lets a `Closing` backend
+                // reach `Closed`.
+                for (token, backend) in self.router.backends.iter_mut() {
+                    let retired = backend
+                        .idle_pooled_backend()
+                        .is_some_and(|id| self.backend_registry.is_retired(id))
+                        && self
+                            .context
+                            .backend_streams
+                            .get(token)
+                            .is_none_or(|ids| ids.is_empty());
+                    if retired {
+                        debug!(
+                            "{} closing idle backend connection {:?}: its backend was removed",
+                            log_context_lite!(self),
+                            token
+                        );
+                        backend.force_disconnect();
+                        all_backends_readiness_are_empty = false;
                     }
                 }
 
@@ -3876,6 +3914,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 "{} shutting_down: already draining, skipping duplicate GOAWAY",
                 log_context!(self)
             );
+            // A peer GOAWAY drains without arming the graceful-shutdown
+            // budget, which only `graceful_goaway` arms: arm it here, once,
+            // so the forced-close check below still bounds this session.
+            self.frontend.arm_graceful_shutdown_deadline(now);
             // shut_down_sessions() runs outside ready(), so retry flushing any
             // previously-buffered GOAWAY/TLS records on each pass.
             self.frontend.flush_output_buffer();

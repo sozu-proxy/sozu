@@ -29,7 +29,7 @@ use super::h2_utils::{
     collect_response_frames, contains_goaway, contains_goaway_with_error, contains_rst_stream,
     extract_rst_streams, goaway_error_code, h2_handshake, headers_status_matches, log_frames,
     parse_h2_frames, raw_h2_connection, raw_h2_connection_with_sni, read_all_available,
-    setup_h2_listener_only, setup_h2_test, verify_sozu_alive,
+    setup_h2_listener_only, setup_h2_test, stream_status_matches, verify_sozu_alive,
 };
 use crate::{
     mock::{
@@ -54,9 +54,9 @@ use hyper_util::{
 use sozu_command_lib::{
     config::{FileConfig, ListenerBuilder},
     proto::command::{
-        ActivateListener, AddCertificate, CertificateAndKey, ListenerType, QueryMetricsOptions,
-        RequestHttpFrontend, ResponseStatus, SocketAddress, filtered_metrics, request::RequestType,
-        response_content::ContentType,
+        ActivateListener, AddCertificate, CertificateAndKey, ListenerType, PathRule,
+        QueryMetricsOptions, RequestHttpFrontend, ResponseStatus, SocketAddress, filtered_metrics,
+        request::RequestType, response_content::ContentType,
     },
     scm_socket::Listeners,
     state::ConfigState,
@@ -5511,6 +5511,152 @@ fn test_h2_frontend_hangup_does_not_spin() {
     );
 }
 
+// ---- H2-to-H1 interim and final response in one backend write ----
+
+/// An H1 keep-alive backend that answers the first request it reads with
+/// `response`, in ONE write, then keeps the connection open until stopped,
+/// so nothing but those bytes can deliver the response: no hang-up ends it.
+fn start_one_write_backend(
+    address: SocketAddr,
+    response: String,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let listener = bind_std_listener(address, "one-write backend");
+        listener
+            .set_nonblocking(true)
+            .expect("could not set nonblocking");
+        let mut connection = None;
+        while !stop.load(Ordering::Relaxed) {
+            if connection.is_none() {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).ok();
+                        stream
+                            .set_read_timeout(Some(Duration::from_millis(200)))
+                            .ok();
+                        stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
+                        let request = super::h2_utils::read_until_header_end(
+                            &mut stream,
+                            Duration::from_secs(2),
+                        );
+                        if !request.is_empty() {
+                            let _ = stream.write_all(response.as_bytes());
+                            let _ = stream.flush();
+                        }
+                        connection = Some(stream);
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => {}
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(connection);
+    })
+}
+
+/// RFC 9110 §15.2 / RFC 9113 §8.1: an H2 client must receive every interim
+/// response as its own HEADERS frame, then the final response, on the same
+/// stream. Here the H1 backend writes `interims` and the final 200 in one
+/// write and keeps the connection open: the final response must reach the
+/// client from those bytes alone.
+fn try_h2_to_h1_interims_and_final_in_one_write(interims: &[u16]) -> State {
+    let (mut worker, front_port, front_address) = setup_h2_listener_only("H2-1XX-ONE-WRITE");
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let mut response = String::new();
+    for code in interims {
+        response.push_str(&format!("HTTP/1.1 {code} Interim\r\n\r\n"));
+    }
+    response.push_str("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\npong");
+    let stop = Arc::new(AtomicBool::new(false));
+    let backend = start_one_write_backend(back_address, response, stop.clone());
+
+    let mut tls = raw_h2_connection(front_address.into());
+    h2_handshake(&mut tls);
+    let mut header_block = vec![
+        0x82, // :method GET (static idx 2)
+        0x87, // :scheme https (static idx 7)
+        0x84, // :path / (static idx 4)
+    ];
+    // :authority localhost — name at static idx 1, literal value.
+    header_block.push(0x41);
+    header_block.push(9);
+    header_block.extend_from_slice(b"localhost");
+    tls.write_all(&H2Frame::headers(1, header_block, true, true).encode())
+        .unwrap();
+    let _ = tls.flush();
+
+    let frames = collect_response_frames(&mut tls, 300, 10, 200);
+    log_frames("H2 interims and final in one write", &frames);
+    drop(tls);
+
+    let statuses: Vec<Option<u16>> = frames
+        .iter()
+        .filter(|(ft, _, sid, _)| *ft == super::h2_utils::H2_FRAME_HEADERS && *sid == 1)
+        .map(|(_, _, _, payload)| super::h2_utils::decode_status(payload))
+        .collect();
+    let mut expected: Vec<Option<u16>> = interims.iter().map(|code| Some(*code)).collect();
+    expected.push(Some(200));
+    let body: Vec<u8> = frames
+        .iter()
+        .filter(|(ft, _, sid, _)| *ft == super::h2_utils::H2_FRAME_DATA && *sid == 1)
+        .flat_map(|(_, _, _, payload)| payload.clone())
+        .collect();
+    let ended = frames
+        .iter()
+        .any(|(_, flags, sid, _)| *sid == 1 && flags & H2_FLAG_END_STREAM != 0);
+    println!(
+        "H2 interims and final in one write - statuses {statuses:?} (expected {expected:?}), \
+         body {body:?}, END_STREAM {ended}"
+    );
+
+    let still_alive = verify_sozu_alive(front_port);
+    stop.store(true, Ordering::Relaxed);
+    let _ = backend.join();
+    worker.soft_stop();
+    let _ = worker.wait_for_server_stop();
+
+    if still_alive && statuses == expected && body == b"pong" && ended {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_to_h1_103_and_final_in_one_write() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2-to-H1: a 103 and the final 200 written at once both reach the client",
+            || try_h2_to_h1_interims_and_final_in_one_write(&[103])
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_h2_to_h1_102_103_and_final_in_one_write() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2-to-H1: a 102, a 103 and the final 200 written at once all reach the client",
+            || try_h2_to_h1_interims_and_final_in_one_write(&[102, 103])
+        ),
+        State::Success
+    );
+}
+
 // ---- H2-to-H1 large headers ----
 
 /// Send an H2 request with many large custom headers through sozu to an H1
@@ -7167,6 +7313,159 @@ fn test_h2_graceful_shutdown_deadline_configurable_short() {
     );
 }
 
+/// Soft-stop `worker` and wait for it on another thread, so a test can bound
+/// the wait and still let a late stop finish once it releases what blocks it.
+fn soft_stop_in_background(mut worker: Worker) -> std::sync::mpsc::Receiver<bool> {
+    worker.soft_stop();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(worker.wait_for_server_stop());
+    });
+    rx
+}
+
+/// Open one raw H2 connection on the graceful-deadline fixture and send a
+/// GET that its backend holds. Returns the connection once the request has
+/// reached the backend, or `None` if it never did.
+fn h2_raw_request_held_by_backend(
+    front_port: u16,
+    request_seen: &AtomicBool,
+    path: &str,
+) -> Option<rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>> {
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+    let block = super::h2_utils::build_chrome146_get_headers("localhost", path, None);
+    let headers = H2Frame::headers(1, block, true, true);
+    if tls.write_all(&headers.encode()).is_err() || tls.flush().is_err() {
+        return None;
+    }
+    let wait_start = Instant::now();
+    while !request_seen.load(Ordering::Relaxed) {
+        if wait_start.elapsed() > Duration::from_secs(5) {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Some(tls)
+}
+
+/// RFC 9113 §6.8: a client GOAWAY drains the frontend connection without
+/// arming the proxy's graceful-shutdown budget. A soft-stop that finds the
+/// connection already draining must still arm it, so the 1-second
+/// `h2_graceful_shutdown_deadline_seconds` bounds a stream the backend never
+/// answers.
+fn try_h2_client_goaway_then_soft_stop_honors_deadline() -> State {
+    let (worker, front_port, request_seen, release_response, mut backend) =
+        start_h2_graceful_deadline_fixture("H2-CLIENT-GOAWAY-DEADLINE", 1);
+
+    let Some(mut tls) =
+        h2_raw_request_held_by_backend(front_port, &request_seen, "/api/goaway-deadline")
+    else {
+        println!("H2 client GOAWAY deadline - request never reached backend");
+        release_response.store(true, Ordering::Relaxed);
+        let _ = soft_stop_in_background(worker).recv_timeout(Duration::from_secs(30));
+        let _ = backend.stop_and_get_aggregator();
+        return State::Fail;
+    };
+    let goaway = H2Frame::goaway(0, H2_ERROR_NO_ERROR);
+    if tls.write_all(&goaway.encode()).is_err() || tls.flush().is_err() {
+        println!("H2 client GOAWAY deadline - GOAWAY write failed");
+    }
+    // Keep reading the connection, as a client waiting on its response does.
+    let reader = thread::spawn(move || {
+        let _ = read_all_available(&mut tls, Duration::from_secs(20));
+    });
+    thread::sleep(Duration::from_millis(300));
+
+    let soft_stop_started = Instant::now();
+    let stopped = soft_stop_in_background(worker);
+    let stopped_in_time = stopped
+        .recv_timeout(Duration::from_secs(6))
+        .unwrap_or(false);
+    let elapsed = soft_stop_started.elapsed();
+    println!("H2 client GOAWAY deadline - stopped_in_time={stopped_in_time}, elapsed={elapsed:?}");
+
+    release_response.store(true, Ordering::Relaxed);
+    if !stopped_in_time {
+        let _ = stopped.recv_timeout(Duration::from_secs(30));
+    }
+    let _ = reader.join();
+    let _ = backend.stop_and_get_aggregator();
+
+    // Same bound as `try_h2_graceful_shutdown_deadline_configurable_short`.
+    if stopped_in_time && elapsed < Duration::from_secs(4) {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_client_goaway_then_soft_stop_honors_deadline() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: soft-stop after a client GOAWAY honors the graceful-shutdown deadline",
+            try_h2_client_goaway_then_soft_stop_honors_deadline
+        ),
+        State::Success
+    );
+}
+
+/// Each received GOAWAY counts toward the glitch budget
+/// (`h2_max_glitch_count`, default 100), so a client repeating GOAWAY on a
+/// connection its in-flight stream keeps open gets GOAWAY(ENHANCE_YOUR_CALM).
+fn try_h2_repeated_client_goaway_is_bounded() -> State {
+    let (worker, front_port, request_seen, release_response, mut backend) =
+        start_h2_graceful_deadline_fixture("H2-CLIENT-GOAWAY-REPEAT", 1);
+
+    let Some(mut tls) =
+        h2_raw_request_held_by_backend(front_port, &request_seen, "/api/goaway-repeat")
+    else {
+        println!("H2 repeated GOAWAY - request never reached backend");
+        release_response.store(true, Ordering::Relaxed);
+        let _ = soft_stop_in_background(worker).recv_timeout(Duration::from_secs(30));
+        let _ = backend.stop_and_get_aggregator();
+        return State::Fail;
+    };
+    let mut burst = Vec::new();
+    for _ in 0..150 {
+        burst.extend(H2Frame::goaway(0, H2_ERROR_NO_ERROR).encode());
+    }
+    let _ = tls.write_all(&burst);
+    let _ = tls.flush();
+    let frames = collect_response_frames(&mut tls, 200, 5, 300);
+    log_frames("H2 repeated GOAWAY", &frames);
+    let calmed = contains_goaway_with_error(&frames, H2_ERROR_ENHANCE_YOUR_CALM);
+
+    release_response.store(true, Ordering::Relaxed);
+    drop(tls);
+    let stopped = soft_stop_in_background(worker)
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap_or(false);
+    let _ = backend.stop_and_get_aggregator();
+
+    if calmed && stopped {
+        State::Success
+    } else {
+        println!("H2 repeated GOAWAY - calmed={calmed} stopped={stopped}");
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_repeated_client_goaway_is_bounded() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: repeated client GOAWAY frames trip the glitch budget",
+            try_h2_repeated_client_goaway_is_bounded
+        ),
+        State::Success
+    );
+}
+
 /// With a 60-second deadline configured, the forced close must NOT fire
 /// within the default 5-second window. The test waits 10 seconds past
 /// `soft_stop` and asserts the worker has not stopped yet. It then
@@ -7671,6 +7970,11 @@ fn test_h2_custom_error_page_rendering() {
     );
 }
 
+/// A default answer on an H2 frontend ends its own stream only. Every
+/// built-in template carries `Connection: close`, an HTTP/1.1 connection
+/// option that RFC 9113 §8.2.2 forbids in H2: the converter strips it, and
+/// the connection must stay open — no GOAWAY, and a stream opened after the
+/// answer is served.
 fn try_h2_default_answer_terminates_stream() -> State {
     let (mut worker, front_port, _front_address) =
         setup_h2_listener_only("H2-DEFAULT-ANSWER-END-STREAM");
@@ -7686,15 +7990,22 @@ fn try_h2_default_answer_terminates_stream() -> State {
     let headers = H2Frame::headers(1, minimal_h2_get_headers("unknown.example"), true, true);
     tls.write_all(&headers.encode()).unwrap();
     tls.flush().unwrap();
+    let mut frames = collect_response_frames(&mut tls, 100, 4, 50);
 
-    let frames = collect_response_frames(&mut tls, 100, 4, 50);
+    // A second stream once the first answer is out: a draining connection
+    // would refuse it.
+    let headers = H2Frame::headers(3, minimal_h2_get_headers("unknown.example"), true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+    frames.extend(collect_response_frames(&mut tls, 100, 4, 50));
     log_frames("H2 default answer end stream", &frames);
 
     // Decoded `:status` alone. The answer-body disjunct that used to stand
     // here widened the needle rather than guarding it, and the indexed
     // `0x8d` arm carries this assertion on its own (issue #1353).
-    let got_404 = headers_status_matches(&frames, b"404");
-    let got_end_stream = h2_stream_has_end_stream(&frames, 1);
+    let got_404 = stream_status_matches(&frames, 1, 404) && stream_status_matches(&frames, 3, 404);
+    let got_end_stream =
+        h2_stream_has_end_stream(&frames, 1) && h2_stream_has_end_stream(&frames, 3);
     let got_goaway = contains_goaway(&frames);
 
     drop(tls);
@@ -7704,7 +8015,7 @@ fn try_h2_default_answer_terminates_stream() -> State {
     worker.soft_stop();
     let success = worker.wait_for_server_stop();
 
-    if success && still_alive && got_404 && got_end_stream && got_goaway {
+    if success && still_alive && got_404 && got_end_stream && !got_goaway {
         State::Success
     } else {
         println!(
@@ -7720,8 +8031,126 @@ fn test_h2_default_answer_terminates_stream() {
     assert_eq!(
         repeat_until_error_or(
             5,
-            "H2: default answer terminates response stream and drains connection",
+            "H2: default answer ends its stream and keeps the connection open",
             try_h2_default_answer_terminates_stream
+        ),
+        State::Success
+    );
+}
+
+/// HPACK block for `<method> <path>` on `localhost`. `method` is a static
+/// table index (`0x82` GET, `0x83` POST); `:path` is a literal without
+/// indexing on static name index 4.
+fn h2_request_headers(method: u8, path: &str) -> Vec<u8> {
+    let mut block = vec![method, 0x87, 0x04, path.len() as u8];
+    block.extend_from_slice(path.as_bytes());
+    block.extend_from_slice(&[0x41, 9]);
+    block.extend_from_slice(b"localhost");
+    block
+}
+
+/// On one H2 connection, a stream answered by sozu's 502 default answer
+/// must not drain the connection: a stream in flight beside it and a stream
+/// opened after it both complete, and no GOAWAY is sent. The 502 template
+/// carries `Connection: close`, which only an H1 frontend may act on.
+fn try_h2_default_answer_502_spares_other_streams() -> State {
+    let (mut worker, mut backends, front_port) = setup_h2_test("H2-DEFAULT-ANSWER-502", 1);
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    // `/fail` routes to a backend that reads the request and closes without
+    // answering: sozu answers that stream 502.
+    let fail_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_fail",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        path: PathRule::prefix(String::from("/fail")),
+        ..Worker::default_http_frontend("cluster_fail", front_address.into())
+    }));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_fail",
+        "cluster_fail-0",
+        fail_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+    let closer = thread::spawn(move || {
+        let listener = bind_std_listener(fail_address, "closing backend");
+        listener
+            .set_nonblocking(true)
+            .expect("could not set nonblocking");
+        while !stop_clone.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).ok();
+                    stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    drop(stream);
+                }
+                Err(_) => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    });
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+    tls.sock
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("set read timeout");
+
+    // Stream 1 (POST, so it is never replayed) fails; stream 3 is in flight
+    // beside it.
+    let mut burst = H2Frame::headers(1, h2_request_headers(0x83, "/fail"), true, true).encode();
+    burst.extend(H2Frame::headers(3, h2_request_headers(0x82, "/"), true, true).encode());
+    tls.write_all(&burst).unwrap();
+    tls.flush().unwrap();
+    let mut frames = collect_response_frames(&mut tls, 300, 6, 100);
+
+    // Stream 5 is opened once the 502 is out.
+    let headers = H2Frame::headers(5, h2_request_headers(0x82, "/"), true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+    frames.extend(collect_response_frames(&mut tls, 300, 6, 100));
+    log_frames("H2 default answer 502 spares other streams", &frames);
+
+    let got_502 = stream_status_matches(&frames, 1, 502) && h2_stream_has_end_stream(&frames, 1);
+    let got_in_flight =
+        stream_status_matches(&frames, 3, 200) && h2_stream_has_end_stream(&frames, 3);
+    let got_after = stream_status_matches(&frames, 5, 200) && h2_stream_has_end_stream(&frames, 5);
+    let got_goaway = contains_goaway(&frames);
+
+    drop(tls);
+    stop.store(true, Ordering::Relaxed);
+    let _ = closer.join();
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+    for backend in backends.iter_mut() {
+        backend.stop_and_get_aggregator();
+    }
+
+    if success && got_502 && got_in_flight && got_after && !got_goaway {
+        State::Success
+    } else {
+        println!(
+            "H2 default answer 502 - success={success}, got_502={got_502}, \
+             got_in_flight={got_in_flight}, got_after={got_after}, got_goaway={got_goaway}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_default_answer_502_spares_other_streams() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: a 502 default answer ends its stream, not the connection",
+            try_h2_default_answer_502_spares_other_streams
         ),
         State::Success
     );

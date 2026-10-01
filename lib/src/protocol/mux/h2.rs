@@ -1194,8 +1194,6 @@ pub(super) enum MetricEvent {
     TrailerSpoofVectorElided,
     /// A request trailer field named in `TRAILER_FORBIDDEN_FIELDS` was elided.
     TrailerForbiddenFieldElided,
-    /// Trailers were dropped because the message carried a Content-Length.
-    TrailersDroppedContentLength,
 
     // ── Shared leaves reached from the core ─────────────────────────────
     /// Bytes read on a frontend connection.
@@ -1324,9 +1322,6 @@ pub(super) fn record_metric(event: MetricEvent) {
         MetricEvent::TrailerForbiddenFieldElided => {
             incr!(names::h2::TRAILER_FORBIDDEN_FIELD_ELIDED)
         }
-        MetricEvent::TrailersDroppedContentLength => {
-            incr!(names::h2::TRAILERS_DROPPED_CONTENT_LENGTH)
-        }
 
         MetricEvent::FrontendBytesIn(bytes) => count!(names::backend::BYTES_IN, bytes),
         MetricEvent::BackendBytesIn(bytes) => count!(names::backend::BACK_BYTES_IN, bytes),
@@ -1446,9 +1441,9 @@ pub enum H2WriteTarget {
     /// [`ConnectionH2::handle_write`], and no finalize — this is the pass's
     /// result.
     ///
-    /// Three sites, and none of them may become a [`Self::Finalize`]: the
-    /// resume path's stall, the MadeYouReset emitted-RST cap trip, and the
-    /// close-frontend GOAWAY. Folding any of them into `Finalize` would run
+    /// Two sites, and neither may become a [`Self::Finalize`]: the resume
+    /// path's stall and the MadeYouReset emitted-RST cap trip. Folding either
+    /// into `Finalize` would run
     /// LIFECYCLE §9 invariant 16's readiness policy over a pass that must not
     /// reach it.
     Done(MuxResult),
@@ -3133,7 +3128,7 @@ impl ConnectionH2 {
                         }
                     }
                     if pass.stalled {
-                        // The FIRST of the three terminators that must not
+                        // The FIRST of the two terminators that must not
                         // finalize: the scheduler pass never began, so LIFECYCLE
                         // §9 invariant 16's readiness policy has nothing to
                         // decide and the park must survive untouched.
@@ -3483,8 +3478,10 @@ impl ConnectionH2 {
                         && kawa.is_completed()
                         && !Self::handle_1xx_reset(kawa, stream_state, endpoint)
                     {
-                        let close_frontend = matches!(self.position, Position::Server)
-                            && !parts.context.keep_alive_frontend;
+                        // `keep_alive_frontend` is not read here: a default
+                        // answer's `Connection: close` is an HTTP/1.1
+                        // connection option, stripped from H2 (RFC 9113
+                        // §8.2.2). The answer ends its own stream only.
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 
@@ -3498,12 +3495,8 @@ impl ConnectionH2 {
                             client_rtt,
                             server_rtt,
                         ) {
-                            pass.completed_streams.push((
-                                dead_id,
-                                global_stream_id,
-                                token,
-                                close_frontend,
-                            ));
+                            pass.completed_streams
+                                .push((dead_id, global_stream_id, token));
                             // LIFECYCLE §9 invariant 17: leave the census INSIDE
                             // the scheduler loop so later streams see the reduced
                             // count. The post-loop retirement at remove_dead_stream
@@ -3525,10 +3518,8 @@ impl ConnectionH2 {
                 }
                 H2WritePhase::End => {
                     // FIRST statement of the arm, before any `return` it can
-                    // take: this is what makes the converter's three pooled
-                    // buffers reach `HpackState` on the close-frontend GOAWAY
-                    // exit below, and it leaves the pass holding `None` for the
-                    // rest of its life. The phase moves to `Ended` in the same
+                    // take: it leaves the pass holding `None` for the rest of
+                    // its life. The phase moves to `Ended` in the same
                     // breath so a re-entry cannot reach this statement twice.
                     let (converter_pass, order, census) = pass.release_scheduler_pass();
                     pass.phase = H2WritePhase::Ended;
@@ -3550,7 +3541,7 @@ impl ConnectionH2 {
                     // moved, not copied: the pass never owned an allocation of its own.
                     let (converter_out, lowercase_buf, cookie_buf) = converter_pass.into_buffers();
                     // Publish `ready_incremental_streams` (and any window/stream drift the
-                    // pass produced) before the two early returns below, so no pass
+                    // pass produced) before the early return below, so no pass
                     // samples without emitting.
                     self.gauge_connection_state();
                     // Account every RST that the converter emitted during this pass
@@ -3579,8 +3570,7 @@ impl ConnectionH2 {
                     // accounting above, so a MadeYouReset cap trip that returns a GOAWAY
                     // early skips both exactly as it did before the inversion.
                     self.scheduler.end_pass(order, census);
-                    let mut close_frontend_after_completed_stream = false;
-                    for (dead_id, global_stream_id, token, close_frontend) in
+                    for (dead_id, global_stream_id, token) in
                         std::mem::take(&mut pass.completed_streams)
                     {
                         // Retirement is deferred out of the loop on purpose, and this is
@@ -3598,7 +3588,6 @@ impl ConnectionH2 {
                         // before `endpoint.end_stream()` can trigger teardown and observe
                         // a stale `Recycle` entry in `self.stream_table.streams()`.
                         self.remove_dead_stream(dead_id, global_stream_id);
-                        close_frontend_after_completed_stream |= close_frontend;
                         if let Some(token) = token {
                             remove_backend_stream(
                                 &mut context.backend_streams,
@@ -3607,15 +3596,6 @@ impl ConnectionH2 {
                             );
                             endpoint.end_stream(token, global_stream_id, context);
                         }
-                    }
-                    // The THIRD terminator that must not finalize: this pass ends
-                    // in a GOAWAY, so invariant 16 has no readiness to decide.
-                    if close_frontend_after_completed_stream && !self.drain.draining() {
-                        return H2WriteTarget::Done(if self.stream_table.streams().is_empty() {
-                            self.goaway(H2Error::NoError)
-                        } else {
-                            self.graceful_goaway(self.now)
-                        });
                     }
                     return H2WriteTarget::Finalize {
                         socket_write: pass.socket_write,
@@ -5643,6 +5623,14 @@ impl ConnectionH2 {
         self.drain.deadline_elapsed(self.now)
     }
 
+    /// Arm the graceful-shutdown budget of a connection a proxy soft-stop
+    /// finds already draining, which `graceful_goaway` is not called for: a
+    /// peer GOAWAY drains without arming it. See
+    /// `H2DrainState::arm_deadline_if_unarmed` (`h2_drain.rs`).
+    pub fn arm_graceful_shutdown_deadline(&mut self, now: Instant) {
+        self.drain.arm_deadline_if_unarmed(now);
+    }
+
     /// True when the reaper has queued control frames (`RST_STREAM`) into
     /// `h2_control_tx::H2ControlTx` that have not yet been serialized. Kept SEPARATE
     /// from [`H2Shell::has_pending_write`] because that probe gates connection close
@@ -6932,6 +6920,12 @@ impl ConnectionH2 {
         L: ListenerHandler + L7ListenerHandler,
     {
         self.attribute_bytes_to_overhead();
+        // A peer sends at most two GOAWAY frames in a graceful close (RFC
+        // 9113 §6.8). Each one counts toward the glitch budget, so a peer
+        // repeating GOAWAY on a connection kept open by its in-flight
+        // streams is bounded, as is the log line below.
+        self.flood_detector.record_glitch();
+        check_flood_or_return!(self);
         let error_name =
             H2Error::try_from(goaway.error_code).map_or("UNKNOWN_ERROR", |e| e.as_str());
         if goaway.error_code == H2Error::NoError as u32 {
@@ -6944,9 +6938,11 @@ impl ConnectionH2 {
             );
         } else {
             // Peer-originated failure: no variant of H2Error from a peer
-            // implies a sozu bug. Impact handling is separate (retry above
-            // `last_stream_id`, RST_STREAM for consumed streams) and logs
-            // its own details below, so the summary drops to `warn!`.
+            // implies a sozu bug. On a backend connection, impact handling
+            // is separate (retry above `last_stream_id`, RST_STREAM for
+            // consumed streams) and logs its own details below; a frontend
+            // connection retires nothing. Either way the summary drops to
+            // `warn!`.
             warn!(
                 "{} Received GOAWAY: last_stream_id={}, error={}, debug_data={:?}",
                 log_context!(self),
@@ -6964,19 +6960,37 @@ impl ConnectionH2 {
             .peer_last_stream_id()
             .expect("observe_peer_goaway just recorded this");
 
-        // Streams with ID > last_stream_id were NOT processed by the peer.
-        // Mark them for retry (StreamState::Link) so they can be retried
-        // on a new connection.
+        // RFC 9113 §6.8: `last_stream_id` bounds the streams the GOAWAY
+        // RECEIVER initiated. On a frontend connection (Position::Server)
+        // that is server-initiated streams, which sozu never opens (no
+        // push), so every stream here was opened by the GOAWAY sender and
+        // is unaffected: each runs to completion, `draining` refuses any new
+        // one (`create_stream`), and the connection closes once the last
+        // completes (the `draining && streams().is_empty()` finalize step).
+        //
+        // On a backend connection (Position::Client) the streams are
+        // sozu-initiated: those with ID > last_stream_id were NOT processed
+        // by the peer and are retried (StreamState::Link) on a new
+        // connection; those at or below it run to completion.
         // IMPORTANT: do NOT call endpoint.end_stream() here — that would
         // remove the stream from the frontend's H2 stream map and send
         // RST_STREAM to the client, killing the request instead of retrying it.
         let mut retry_streams = Vec::new();
-        for (&stream_id, &global_stream_id) in self.stream_table.streams() {
-            if stream_id > peer_last_stream_id {
-                retry_streams.push((stream_id, global_stream_id));
+        if matches!(self.position, Position::Client(..)) {
+            for (&stream_id, &global_stream_id) in self.stream_table.streams() {
+                if stream_id > peer_last_stream_id {
+                    retry_streams.push((stream_id, global_stream_id));
+                }
             }
         }
         for (stream_id, global_stream_id) in &retry_streams {
+            // `endpoint` is the frontend side (`EndpointServer`) only on a
+            // backend connection: its `readiness_mut` is what the answers
+            // below must arm so they reach the client.
+            debug_assert!(
+                matches!(self.position, Position::Client(..)),
+                "only a backend connection retires streams on a received GOAWAY"
+            );
             // Remove from reverse index before transitioning away from Linked.
             if let StreamState::Linked(token) = context.streams[*global_stream_id].state {
                 remove_backend_stream(&mut context.backend_streams, token, *global_stream_id);
@@ -7065,8 +7079,9 @@ impl ConnectionH2 {
             return self.goaway(H2Error::NoError);
         }
 
-        // Otherwise, let remaining streams (ID <= last_stream_id) complete.
-        // The connection will be closed when all streams finish.
+        // Otherwise, let the remaining streams complete: every stream on a
+        // frontend connection, those at or below `last_stream_id` on a
+        // backend one. The connection is closed when all streams finish.
         MuxResult::Continue
     }
 
@@ -7546,9 +7561,19 @@ impl ConnectionH2 {
                     // (RFC 9113 §5.1.1). A block parked unsent is dropped with
                     // it and resets the encoder's table on the next pass
                     // (`ConnectionH2::parked_header_block`).
+                    //
+                    // "Fully completed" means END_STREAM went both ways: the
+                    // response's was read, and the request's was handed to
+                    // the output, which flushes in order. A request received
+                    // whole is not enough: a backend may answer early, before
+                    // the rest of the body reached it (RFC 9113 §8.1), and a
+                    // stream forgotten with its tail unsent stays open on the
+                    // backend, holding one of its MAX_CONCURRENT_STREAMS
+                    // slots (§5.1.2) for this connection's lifetime.
                     let stream = &context.streams[stream_gid];
-                    let fully_completed =
-                        stream.back_received_end_of_stream && stream.front.is_terminated();
+                    let fully_completed = stream.back_received_end_of_stream
+                        && stream.front.is_terminated()
+                        && stream.front.is_completed();
                     let opened_on_the_wire = stream.front.consumed;
                     #[cfg(debug_assertions)]
                     let queued_before = self.output.len();
@@ -15891,6 +15916,107 @@ mod tests {
             received,
             Vec::<u8>::new(),
             "the backend must receive nothing for a stream it never saw"
+        );
+    }
+
+    /// A backend may answer early, before the whole request reached it
+    /// (RFC 9113 §8.1). When the stream then ends with the request received
+    /// whole from the client but its tail still unsent toward the backend,
+    /// the backend never sees END_STREAM: forgetting the stream without a
+    /// reset leaves it open (half-closed) on the backend, holding one of the
+    /// backend's MAX_CONCURRENT_STREAMS slots for this connection's lifetime
+    /// (RFC 9113 §5.1.2). The stream must be cancelled, exactly once.
+    ///
+    /// TO SEE THIS RED: in the `Position::Client` arm of
+    /// [`ConnectionH2::end_stream`], drop `&& stream.front.is_completed()`
+    /// from `fully_completed`. The backend then reads no RST_STREAM: `the
+    /// backend must read RST_STREAM(1, CANCEL) once`, `right` holding that
+    /// frame and `left` nothing.
+    #[test]
+    fn a_backend_stream_answered_before_its_request_was_written_is_cancelled() {
+        let LinkedBackend {
+            _pool,
+            mut connection,
+            mut peer,
+            mut context,
+            mut router,
+            gid,
+        } = backend_with_a_linked_stream(
+            H2State::Header,
+            BackendStatus::Connected,
+            Ready::READABLE | Ready::HUP | Ready::ERROR,
+        );
+        // A request received whole from the client: its HEADERS, then a
+        // 4-byte body closed with END_STREAM.
+        let kawa = &mut context.streams[gid].front;
+        kawa.detached.status_line = kawa::StatusLine::Request {
+            version: kawa::Version::V20,
+            method: kawa::Store::Static(b"POST"),
+            uri: kawa::Store::Static(b"/"),
+            authority: kawa::Store::Static(b"example.com"),
+            path: kawa::Store::Static(b"/"),
+        };
+        kawa.push_block(kawa::Block::StatusLine);
+        kawa.push_block(kawa::Block::Header(kawa::Pair {
+            key: kawa::Store::Static(b"content-length"),
+            val: kawa::Store::Static(b"4"),
+        }));
+        kawa.push_block(kawa::Block::Flags(kawa::Flags {
+            end_body: false,
+            end_chunk: false,
+            end_header: true,
+            end_stream: false,
+        }));
+        kawa.push_block(kawa::Block::Chunk(kawa::Chunk {
+            data: kawa::Store::Static(b"body"),
+        }));
+        kawa.push_block(kawa::Block::Flags(kawa::Flags {
+            end_body: true,
+            end_chunk: false,
+            end_header: false,
+            end_stream: true,
+        }));
+        kawa.body_size = kawa::BodySize::Length(4);
+        kawa.parsing_phase = kawa::ParsingPhase::Terminated;
+        // The backend grants the stream no send window: its HEADERS leave,
+        // its body waits.
+        context.streams[gid].window = 0;
+        let sent = drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+        let frames = peer_frames(&sent).expect("whole frames");
+        assert!(
+            frames
+                .iter()
+                .any(|(kind, flags, id, _)| *kind == 1 && *id == 1 && flags & 0x1 == 0)
+                && !frames.iter().any(|(kind, _, _, _)| *kind == 0),
+            "premise: the HEADERS left without END_STREAM and no DATA, got {frames:?}"
+        );
+        let stream = &context.streams[gid];
+        assert!(
+            stream.front.consumed && stream.front.is_terminated() && !stream.front.is_completed(),
+            "premise: the request was received whole but not written whole"
+        );
+        // The backend's complete response arrived: its END_STREAM was read.
+        context.streams[gid].back_received_end_of_stream = true;
+
+        connection.end_stream(gid, &mut context);
+        // Ending it again must not reset it a second time.
+        connection.end_stream(gid, &mut context);
+        let received =
+            drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+
+        assert_eq!(
+            received,
+            orphan_frame(3, 0, 1, 4, &(H2Error::Cancel as u32).to_be_bytes()),
+            "the backend must read RST_STREAM(1, CANCEL) once"
+        );
+        assert!(
+            connection.core.stream_table.is_empty(),
+            "the stream is retired from the backend connection"
+        );
+        assert!(
+            matches!(connection.core.state, H2State::Header),
+            "the shared connection stays up, got {:?}",
+            connection.core.state
         );
     }
 
