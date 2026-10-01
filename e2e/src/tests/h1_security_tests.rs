@@ -2377,27 +2377,24 @@ fn test_h1_trailer_field_limit_exceeded_rejected_split() {
 // its head and body were already forwarded, so the backend holds a request
 // cut before its trailer section. The rejection answers the client 400, and
 // must also close that backend connection: left open, it waits for the rest
-// of a request that never comes, and still delivers whatever it answers into
-// the stream slot the next request on the same client connection reuses.
-// That next request is then served from a fresh backend connection.
+// of a request that never comes, and stays attached to the stream slot.
 //
-// The listener's 400 answer here carries no `Connection: close`, the
+// The client connection closes after the 400 too. The request was never
+// received whole, so its end cannot be found and no further request can be
+// read from that connection (RFC 9112 §6.3, sozu-proxy/sozu#1721). The
+// listener's 400 answer here carries no `Connection: close`, the
 // operator-supported way to keep the client connection alive after a
-// default answer (`set_default_answer`, `lib/src/protocol/mux/answers.rs`).
-// With the builtin 400, which closes the client connection, the session
-// close tears the backend down too, and hides the leak.
+// default answer (`set_default_answer`, `lib/src/protocol/mux/answers.rs`),
+// so the close can only come from the incomplete request.
 // =========================================================================
 
-/// To SEE THIS RED: in `ConnectionH1::readable`
-/// (`lib/src/protocol/mux/h1.rs`), remove the block that ends the linked
-/// backend stream before the `Position::Server` arm answers 400. In a debug
-/// build, which is how e2e runs, the test goes red on the worker's panic: the
-/// `backend_streams` invariant of `Mux::ready_inner` fails at the end of the
-/// pass that answered 400, so the worker dies and the harness reports a
-/// broken command channel before any assertion here runs. In a release
-/// build, which has no invariant check, the test goes red on `backend_closed`:
-/// the backend connection is never closed and keeps the cut request for as
-/// long as the client connection lives.
+/// This test no longer goes red when the block of `ConnectionH1::readable`
+/// (`lib/src/protocol/mux/h1.rs`) that ends the linked backend stream before
+/// the `Position::Server` arm answers 400 is removed: since
+/// sozu-proxy/sozu#1721, the incomplete request closes the client session,
+/// and that close tears the backend connection down too. It still pins the
+/// observable outcome: 400, then both connections closed, and no request
+/// read after the rejected one.
 fn try_h1_trailer_field_limit_split_closes_backend() -> State {
     let label = "TRAILER-LIMIT-SPLIT-BACKEND-CLOSE";
     let front_address = create_local_address();
@@ -2475,9 +2472,7 @@ fn try_h1_trailer_field_limit_split_closes_backend() -> State {
         .expect("write trailers");
     let response = raw_read(&mut stream).unwrap_or_default();
 
-    // The backend connection must close well within this window. The client
-    // connection stays open throughout, so only sozu ending the backend
-    // stream can close it.
+    // The backend connection must close well within this window.
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut backend_closed = false;
     while accepted && Instant::now() < deadline {
@@ -2488,26 +2483,35 @@ fn try_h1_trailer_field_limit_split_closes_backend() -> State {
         // Drain whatever else arrived, so `is_connected` peeks at the EOF.
         backend.receive(0);
     }
-    // The reset stream slot serves the next request on the same client
-    // connection, from a fresh backend connection.
-    stream
-        .write_all(b"GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .expect("write the follow-up request");
-    let deadline = Instant::now() + Duration::from_millis(500);
-    let mut reaccepted = false;
+    // The request was not received whole: sozu closes the client connection
+    // after the 400 instead of reading another request from it.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut client_closed = false;
+    let mut after = Vec::new();
+    let mut buf = [0u8; 1024];
     while Instant::now() < deadline {
-        if backend.accept(1) {
-            reaccepted = true;
-            break;
+        match stream.read(&mut buf) {
+            Ok(0) => {
+                client_closed = true;
+                break;
+            }
+            Ok(n) => after.extend_from_slice(&buf[..n]),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ConnectionReset
+                    || e.kind() == std::io::ErrorKind::BrokenPipe =>
+            {
+                client_closed = true;
+                break;
+            }
+            Err(_) => {}
         }
     }
-    if reaccepted {
-        backend_drain(&mut backend, 1, Duration::from_millis(200));
-        backend.send(1);
-    }
-    let follow_up = raw_read(&mut stream).unwrap_or_default();
+    let after = String::from_utf8_lossy(&after).to_string();
+    // A follow-up request, if the write still lands, reaches no backend.
+    let _ = stream.write_all(b"GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    let reaccepted = backend_accepts_within(&mut backend, 1, Duration::from_millis(300));
     println!(
-        "{label}: backend accepted={accepted} received {} bytes ending {:?}, client got {:?}, backend_closed={backend_closed}, follow-up got {follow_up:?}",
+        "{label}: backend accepted={accepted} received {} bytes ending {:?}, client got {:?}, backend_closed={backend_closed}, client_closed={client_closed}, after the 400 {after:?}, reaccepted={reaccepted}",
         forwarded.len(),
         &forwarded[forwarded.len().saturating_sub(24)..],
         response.lines().next()
@@ -2528,8 +2532,12 @@ fn try_h1_trailer_field_limit_split_closes_backend() -> State {
         println!("{label}: FAIL — the backend connection holding the cut request stayed open");
         return State::Fail;
     }
-    if !reaccepted || !follow_up.starts_with("HTTP/1.1 200") || !follow_up.ends_with("pong") {
-        println!("{label}: FAIL — the next request on the client connection was not served");
+    if !client_closed || !after.is_empty() {
+        println!("{label}: FAIL — the client connection was not closed after the 400");
+        return State::Fail;
+    }
+    if reaccepted {
+        println!("{label}: FAIL — a request after the 400 reached the backend");
         return State::Fail;
     }
     State::Success

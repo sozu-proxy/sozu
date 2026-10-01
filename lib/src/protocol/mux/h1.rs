@@ -554,8 +554,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     // because a complete one would return an H1 connection
                     // to the keep-alive pool; the 400 replaces it anyway. An
                     // H2 backend only resets this stream. The client
-                    // connection is at most as persistent as the answer's
-                    // `Connection` header.
+                    // connection closes once the answer is flushed: the
+                    // request was never received whole (sozu-proxy/sozu#1721).
                     if let StreamState::Linked(token) = stream.state {
                         stream.back.clear();
                         endpoint.end_stream(token, stream_id, context);
