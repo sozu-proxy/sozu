@@ -2105,7 +2105,13 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     not lost.
 12. **Loop budget.** Every inner loop in `Mux::ready` and
     `drive_frontend_shutdown_io` bounds iterations at
-    `MAX_LOOP_ITERATIONS = 10_000` (`mod.rs`).
+    `MAX_LOOP_ITERATIONS = 10_000` (`mod.rs`). A write that answered
+    `WouldBlock` never re-raises its own WRITABLE event: the kernel's next
+    edge resumes it. `ConnectionH1::writable` (`h1.rs`) signals a pending
+    write while the TLS socket still holds records only after a write that
+    did not block; re-raising it after a blocked one spun the inner loop to
+    the budget when a TLS client stopped reading
+    ([#1780](https://github.com/sozu-proxy/sozu/issues/1780)).
 13. **`shrink_trailing_recycle` runs only from `create_stream`.** Calling it
     from elsewhere can invalidate cached `GlobalStreamId` values (including
     `expect_write`/`expect_read`) that the caller is not prepared to re-check.

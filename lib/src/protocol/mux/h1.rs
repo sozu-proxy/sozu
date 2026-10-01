@@ -925,7 +925,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             if self.socket.socket_wants_write() {
                 let (size, status) = self.socket.socket_write_vectored(&[]);
                 let _ = update_readiness_after_write(size, status, &mut self.readiness);
-                if self.socket.socket_wants_write() {
+                // Not after `WouldBlock`: see the same check below.
+                if self.socket.socket_wants_write() && status != SocketResult::WouldBlock {
                     self.readiness.signal_pending_write();
                 }
             }
@@ -1053,14 +1054,28 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         self.position.count_bytes_out(parts.metrics, size);
         let should_yield = update_readiness_after_write(size, status, &mut self.readiness);
         if self.socket.socket_wants_write() {
-            self.readiness.signal_pending_write();
-            // Pair the queued-write signal with the socket's own report: we
-            // only synthesize a WRITABLE event when the socket still has bytes
-            // buffered (edge-triggered epoll won't re-fire on its own).
-            debug_assert!(
-                self.readiness.event.is_writable(),
-                "signal_pending_write must leave a WRITABLE event queued"
-            );
+            // A socket that answered `WouldBlock` is full: the kernel raises
+            // the next WRITABLE edge once the peer reads, so no synthetic
+            // event is queued. Re-raising it here while rustls still held the
+            // records the kernel refused made `Mux::ready_inner` call this
+            // write again on every inner iteration, each answering
+            // `WouldBlock`, until `MAX_LOOP_ITERATIONS` counted
+            // `http.infinite_loop.error` (sozu-proxy/sozu#1780).
+            if status != SocketResult::WouldBlock {
+                self.readiness.signal_pending_write();
+                // Pair the queued-write signal with the socket's own report: we
+                // only synthesize a WRITABLE event when the socket still has bytes
+                // buffered (edge-triggered epoll won't re-fire on its own).
+                debug_assert!(
+                    self.readiness.event.is_writable(),
+                    "signal_pending_write must leave a WRITABLE event queued"
+                );
+            } else {
+                debug_assert!(
+                    !self.readiness.event.is_writable(),
+                    "a write that answered WouldBlock must leave WRITABLE to the next edge"
+                );
+            }
             return MuxResult::Continue;
         }
         if !tls_only_flush && should_yield {

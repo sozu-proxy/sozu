@@ -123,7 +123,13 @@ helpers:
   next pump iteration writes them without waiting for another kernel wake-up.
 
 Forgetting either stalls the session: the bytes sit in a buffer and no event
-ever arrives. The `mux::answers` module documents this as the "invariant-15
+ever arrives. The converse also holds: a write that answered `WouldBlock` is
+waiting for the kernel's next writable edge, and a synthetic one would only
+repeat it. `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`) therefore
+signals a pending write while rustls still holds records only when its write
+did not answer `WouldBlock`; signalling after one ran `Mux::ready_inner` to
+`MAX_LOOP_ITERATIONS` whenever a TLS client stopped reading a large response
+([#1780](https://github.com/sozu-proxy/sozu/issues/1780)). The `mux::answers` module documents this as the "invariant-15
 pair" (`set_default_answer_arms_writable_and_signals`,
 `lib/src/protocol/mux/answers.rs`). The module doc of
 `lib/src/protocol/mux/connection.rs` names the canonical home of the invariant:
