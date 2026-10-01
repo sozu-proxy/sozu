@@ -3836,6 +3836,21 @@
 
 ### 🐛 Fixed
 
+- **`fix(mux)`: stop spinning the session loop on a frontend hang-up
+  ([#1774](https://github.com/sozu-proxy/sozu/issues/1774)).** `Mux::ready_inner`
+  (`lib/src/protocol/mux/mod.rs`) handled a frontend HUP only on entry. When it delayed the close
+  for a pending flush and that flush completed inside the inner loop, the frontend's remaining
+  readiness was HUP alone, which the loop's exit check counted as work although nothing in the
+  loop acts on it: every client hang-up of that shape ran the loop to `MAX_LOOP_ITERATIONS` and
+  counted an `http.infinite_loop.error` before the session closed. The inner loop now closes the
+  session on a frontend HUP once no output is left to flush, except on a lingering frontend, which
+  it leaves to drain the client's last bytes as the entry check does; its exit check counts only
+  frontend READABLE, WRITABLE and ERROR interest, so a flush blocked on the socket yields to the
+  next readiness event instead of spinning. Documented in `lib/src/protocol/mux/LIFECYCLE.md` and
+  `doc/lifetime_of_a_session.md`. Covered by `test_h2_frontend_hangup_does_not_spin`
+  (`e2e/src/tests/h2_tests.rs`) and
+  `a_hup_during_the_flush_that_starts_a_linger_drains_before_closing` (`lib/src/protocol/mux/mod.rs`).
+
 - **`fix(h1)`: handle every 1xx other than 101 as an interim response
   ([#1733](https://github.com/sozu-proxy/sozu/issues/1733)).** On an HTTP/1.1 frontend,
   `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`) kept the stream linked after a 100 or a
