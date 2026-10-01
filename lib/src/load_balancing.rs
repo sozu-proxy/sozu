@@ -359,7 +359,7 @@ impl Index<usize> for Candidates<'_> {
 pub trait LoadBalancingAlgorithm: Debug {
     /// Select the next backend among `candidates`.
     ///
-    /// `key` carries an optional affinity hash: the UDP flow key, or the
+    /// `key` carries an optional affinity hash: the UDP affinity key, or the
     /// client key of an HTTP, HTTPS or TCP request ([`affinity_key_from_ip`],
     /// [`affinity_key_from_value`]). The
     /// stateless/round-robin policies ignore it; the consistent-hashing
@@ -812,8 +812,8 @@ impl LoadBalancingAlgorithm for PowerOfTwo {
 ///
 /// For an affinity `key`, the chosen backend is the one maximizing a stable,
 /// per-(key, backend) score. With no key it degrades to plain round-robin;
-/// every datapath supplies one for a client it can identify (the UDP flow key,
-/// and the client key of HTTP, HTTPS and TCP, sozu-proxy/sozu#524), so the
+/// every datapath supplies one for a client it can identify (the UDP affinity
+/// key, and the client key of HTTP, HTTPS and TCP, sozu-proxy/sozu#524), so the
 /// fallback is reached only for a request with no source address.
 ///
 /// # Weighting

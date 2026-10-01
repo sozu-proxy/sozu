@@ -4327,6 +4327,150 @@ fn test_h2_peer_goaway_during_response_body() {
     );
 }
 
+/// RFC 9113 §6.8: a client's GOAWAY(NO_ERROR, last_stream_id = 0) bounds
+/// only the streams sozu (the receiver) initiated, and sozu initiates none.
+/// The client's own in-flight request must still be answered in full: the
+/// client keeps granting stream credit after its GOAWAY, and sozu keeps
+/// reading those WINDOW_UPDATEs, delivers the whole body with END_STREAM,
+/// then closes with its own GOAWAY(NO_ERROR).
+fn try_h2_client_goaway_keeps_in_flight_response() -> State {
+    use crate::mock::chunked_flush_h1_backend::{
+        ChunkedFlushConfig, ChunkedFlushH1Backend, TransferEncoding,
+    };
+
+    const BODY_SIZE: usize = 512 * 1024;
+    const STREAM_WINDOW_REFRESH: u32 = 32 * 1024;
+
+    let (worker, front_port, back_address) =
+        setup_single_h1_backend_listener("H2-COR-CLIENT-GOAWAY-IN-FLIGHT", None);
+
+    let backend = ChunkedFlushH1Backend::start(
+        back_address,
+        ChunkedFlushConfig {
+            body_size: BODY_SIZE,
+            chunk_size: 16 * 1024,
+            inter_chunk_delay: Duration::from_millis(10),
+            transfer_encoding: TransferEncoding::ContentLength,
+            tcp_nodelay: true,
+            truncate_at_byte: None,
+            body: None,
+            extra_response_headers: vec![],
+            content_type: None,
+        },
+    );
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    // Default 65 535-byte stream window: the body needs stream
+    // WINDOW_UPDATEs sent after the GOAWAY. The connection window is
+    // opened once, for the whole body.
+    h2_handshake_with_initial_window(&mut tls, 65_535);
+    let sid: u32 = 1;
+    let mut request = H2Frame::window_update(0, BODY_SIZE as u32).encode();
+    request.extend(H2Frame::headers(sid, build_minimal_h2_get_headers(), true, true).encode());
+    if tls.write_all(&request).is_err() || tls.flush().is_err() {
+        drop(backend);
+        return State::Fail;
+    }
+
+    tls.sock
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .ok();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut carry = Vec::new();
+    let mut rbuf = vec![0u8; 64 * 1024];
+    let mut body_bytes = 0usize;
+    let mut credit = 0u32;
+    let mut goaway_sent = false;
+    let mut end_stream_seen = false;
+    let mut got_rst = false;
+    let mut sozu_goaway: Option<(u32, u32)> = None;
+    let mut eof = false;
+    while sozu_goaway.is_none() && !got_rst && !eof && Instant::now() < deadline {
+        match tls.read(&mut rbuf) {
+            Ok(0) => eof = true,
+            Ok(n) => carry.extend_from_slice(&rbuf[..n]),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => eof = true,
+        }
+        let mut out = Vec::new();
+        while let Some((frame_type, flags, frame_sid, payload)) = advance_one_frame(&mut carry) {
+            match frame_type {
+                H2_FRAME_DATA if frame_sid == sid => {
+                    body_bytes += payload.len();
+                    credit += payload.len() as u32;
+                    if flags & H2_FLAG_END_STREAM != 0 {
+                        end_stream_seen = true;
+                    } else if credit >= STREAM_WINDOW_REFRESH {
+                        out.extend(H2Frame::window_update(sid, credit).encode());
+                        credit = 0;
+                    }
+                    if !goaway_sent {
+                        // The response is in flight: announce the client
+                        // will open no further stream.
+                        out.extend(H2Frame::goaway(0, H2_ERROR_NO_ERROR).encode());
+                        goaway_sent = true;
+                    }
+                }
+                H2_FRAME_RST_STREAM if frame_sid == sid => got_rst = true,
+                H2_FRAME_GOAWAY if payload.len() >= 8 => {
+                    let last = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
+                        & 0x7FFF_FFFF;
+                    let code = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                    sozu_goaway = Some((last, code));
+                }
+                _ => {}
+            }
+        }
+        if !out.is_empty()
+            && !end_stream_seen
+            && (tls.write_all(&out).is_err() || tls.flush().is_err())
+        {
+            eof = true;
+        }
+    }
+    let infra_ok = teardown(
+        tls,
+        front_port,
+        worker,
+        Vec::<AsyncBackend<SimpleAggregator>>::new(),
+    );
+    drop(backend);
+
+    let closed_gracefully = matches!(sozu_goaway, Some((_, H2_ERROR_NO_ERROR)));
+    if goaway_sent
+        && body_bytes == BODY_SIZE
+        && end_stream_seen
+        && !got_rst
+        && closed_gracefully
+        && infra_ok
+    {
+        State::Success
+    } else {
+        println!(
+            "FAIL: goaway_sent={goaway_sent} body_bytes={body_bytes}/{BODY_SIZE} \
+             end_stream={end_stream_seen} rst={got_rst} sozu_goaway={sozu_goaway:?} \
+             eof={eof} infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_client_goaway_keeps_in_flight_response() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 client GOAWAY(NO_ERROR, 0) mid-response \u{2014} the response completes, \
+             then sozu closes with GOAWAY(NO_ERROR)",
+            try_h2_client_goaway_keeps_in_flight_response
+        ),
+        State::Success
+    );
+}
+
 // ----------------------------------------------------------------------------
 // A `Connection: close` H1 backend that closes before its `Content-Length`
 // (sozu-proxy/sozu#1633)

@@ -153,8 +153,8 @@ produces the same run.
 Invariants asserted beyond "never panic": live flow count never exceeds
 the high-water mark of every `max_flows` cap ever set; the `CloseFlow` /
 `FlowCreated` gauge never underflows; a final long clock advance reaps
-every flow back to zero with no armed timer left (no fd / slab leak); the
-2-tuple `FlowKey` form always normalises the port to zero; the PPv2 header
+every flow back to zero with no armed timer left (no fd / slab leak); a
+`FlowKey` always keeps the full client source address, port included; the PPv2 header
 is never shorter than its 16-byte fixed prefix and prefixing accounts for
 every byte exactly.
 
