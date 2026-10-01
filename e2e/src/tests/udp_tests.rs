@@ -21,7 +21,8 @@ use sozu_command_lib::{
     config::ListenerBuilder,
     proto::command::{
         ActivateListener, Cluster, DeactivateListener, ListenerType, LoadBalancingAlgorithms,
-        RemoveListener, RequestUdpFrontend, UdpAffinityKey, UdpClusterConfig, request::RequestType,
+        QueryMetricsOptions, RemoveListener, RequestUdpFrontend, ResponseStatus, UdpAffinityKey,
+        UdpClusterConfig, filtered_metrics, request::RequestType, response_content::ContentType,
     },
 };
 
@@ -1155,8 +1156,48 @@ fn test_udp_idle_flow_is_torn_down() {
 // alternating sockets, thirty one-datagram sockets and one socket that will
 // speak again later open 33 flows. Once all of them have been silent past the
 // timeout, no connected upstream socket to any backend may remain, and the
-// returning socket must get a new flow on a new upstream socket.
+// returning socket must get a new flow on a new upstream socket: one more
+// `udp.flows.created`, one active flow and exactly one connected upstream
+// socket. The new socket's port is not compared with the old one's, since the
+// kernel may hand it the same ephemeral port.
 // =========================================================================
+
+/// The worker's `udp.flows.created` and `udp.flows.evicted` counters and its
+/// `udp.active_flows` gauge, in that order; an absent metric reads `0`.
+fn udp_flow_metrics(worker: &mut Worker) -> (i64, i64, u64) {
+    const CREATED: &str = "udp.flows.created";
+    const EVICTED: &str = "udp.flows.evicted";
+    const ACTIVE: &str = "udp.active_flows";
+    worker.send_proxy_request_type(RequestType::QueryMetrics(QueryMetricsOptions {
+        list: false,
+        cluster_ids: vec![],
+        backend_ids: vec![],
+        metric_names: vec![CREATED.to_owned(), EVICTED.to_owned(), ACTIVE.to_owned()],
+        no_clusters: true,
+        workers: false,
+    }));
+    let response = worker
+        .read_proxy_response()
+        .expect("worker should respond to metrics query");
+    assert_eq!(response.status, ResponseStatus::Ok as i32, "{response:?}");
+    let Some(ContentType::WorkerMetrics(metrics)) =
+        response.content.and_then(|content| content.content_type)
+    else {
+        panic!("metrics query returned no worker metrics");
+    };
+    let inner = |name: &str| metrics.proxy.get(name).and_then(|m| m.inner.clone());
+    let count = |name: &str| match inner(name) {
+        Some(filtered_metrics::Inner::Count(value)) => value,
+        None => 0,
+        other => panic!("{name} should be a count, got {other:?}"),
+    };
+    let active = match inner(ACTIVE) {
+        Some(filtered_metrics::Inner::Gauge(value)) => value,
+        None => 0,
+        other => panic!("{ACTIVE} should be a gauge, got {other:?}"),
+    };
+    (count(CREATED), count(EVICTED), active)
+}
 
 /// Connected UDP sockets of this process whose peer is one of `backends`:
 /// the proxy's per-flow upstream sockets, since the worker is a thread here.
@@ -1281,21 +1322,33 @@ fn try_udp_every_idle_flow_is_torn_down() -> State {
     drop(fresh);
 
     let open_before = connected_upstream_sockets(&backends);
+    let metrics_before = udp_flow_metrics(&mut worker);
     // Every flow is now silent; wait well past the idle timeout.
     std::thread::sleep(Duration::from_secs(u64::from(IDLE_TIMEOUT_SECS) * 3));
     let open_after_idle = connected_upstream_sockets(&backends);
+    let metrics_after_idle = udp_flow_metrics(&mut worker);
 
     ok &= expect_reply(&returning, "R-2");
+    let open_after_return = connected_upstream_sockets(&backends);
+    let metrics_after_return = udp_flow_metrics(&mut worker);
     let peers: Vec<SocketAddr> = handles
         .iter()
         .flat_map(|h| h.observed())
         .filter(|d| d.payload == b"R-1" || d.payload == b"R-2")
         .map(|d| d.peer)
         .collect();
-    let new_upstream = matches!(peers.as_slice(), [first, second] if first != second);
+    // (created, evicted, active): 33 flows open, all 33 evicted, then exactly
+    // one new flow, on exactly one connected upstream socket, carries R-2.
+    let new_flow = metrics_before == (33, 0, 33)
+        && metrics_after_idle == (33, 33, 0)
+        && metrics_after_return == (34, 33, 1)
+        && open_after_return == 1
+        && peers.len() == 2;
     println!(
         "idle many: open_before={open_before} open_after_idle={open_after_idle} \
-         returning peers={peers:?} replies_ok={ok}"
+         open_after_return={open_after_return} metrics(created, evicted, active) \
+         before={metrics_before:?} after_idle={metrics_after_idle:?} \
+         after_return={metrics_after_return:?} returning peers={peers:?} replies_ok={ok}"
     );
 
     for h in &handles {
@@ -1303,7 +1356,7 @@ fn try_udp_every_idle_flow_is_torn_down() -> State {
     }
     worker.soft_stop();
     let stopped = worker.wait_for_server_stop();
-    if ok && open_before == 33 && open_after_idle == 0 && new_upstream && stopped {
+    if ok && open_before == 33 && open_after_idle == 0 && new_flow && stopped {
         State::Success
     } else {
         State::Fail
