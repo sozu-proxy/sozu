@@ -215,14 +215,16 @@ attempts, each bounded by `connect_timeout`.
 The slot is held for the connection's whole lifetime on an HTTP/2
 frontend, and on HTTP/1.1 with a custom answer template that omits
 `Connection: close` — the same keep-alive opt-in §3.4 records for the
-429 template. An operator who takes it holds one slot per failed dial
-until the client goes away, and should size
-`max_connections_per_ip` for that.
+429 template. Each such connection holds its one slot until the client
+goes away; size `max_connections_per_ip` for that. Pinned by the e2e
+`test_h2_failed_dial_keeps_connection_and_one_slot`.
 
 Releasing the slot on a dial failure would **loosen** the cap under
 precisely the conditions a client can induce, and would buy very
-little: the connection that provoked the failure is closed by the
-answer it provoked, so it cannot accumulate slots either way. Changing
+little: on HTTP/1.1 the connection that provoked the failure is closed
+by the answer it provoked; on HTTP/2 it keeps at most one slot per
+(connection, cluster), the same as a connection whose dial succeeded.
+Neither can accumulate slots. Changing
 this is its own decision, not part of a refactor
 (sozu-proxy/sozu#1521).
 

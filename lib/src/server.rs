@@ -655,8 +655,8 @@ impl SessionManager {
     ///   `lib/src/protocol/kawa_h1/answers.rs` carries
     ///   `Connection: close`, so `set_default_answer_with_retry_after`
     ///   (`lib/src/protocol/mux/answers.rs`) clears
-    ///   `HttpContext::keep_alive_frontend`. That one bit is what closes
-    ///   the connection.
+    ///   `HttpContext::keep_alive_frontend`. On H1 that one bit is what
+    ///   closes the connection; H2 does not read it.
     /// - H1: once the answer flushes, the response-complete branch of
     ///   `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`) takes
     ///   `ConnectionH1::defer_close_for_tls_flush` instead of the
@@ -680,11 +680,12 @@ impl SessionManager {
     ///   the no-op above, so one slot — not one per attempt — is held
     ///   for at most `CONN_RETRIES` attempts.
     ///
-    /// The one configuration where the window IS the connection's whole
-    /// lifetime is an operator answer template that omits
-    /// `Connection: close`, the opt-out `doc/rate-limit-design.md`
-    /// already records for the 429 template. An operator who takes it
-    /// holds one slot per failed dial until the client goes away.
+    /// The window IS the connection's whole lifetime in two cases: any
+    /// H2 connection, and an H1 connection answered by an operator
+    /// template that omits `Connection: close` (the opt-out
+    /// `doc/rate-limit-design.md` records for the 429 template). Either
+    /// holds its one slot per (connection, cluster) until the client goes
+    /// away, as a connection whose dial succeeded does.
     pub fn track_cluster_ip(&mut self, token: Token, cluster_id: ClusterId, ip: IpAddr) {
         // Snapshot the forward count for this (cluster, ip) before the insert
         // so we can pair-assert the delta. Ungated `let`: read only inside the
