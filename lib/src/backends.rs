@@ -1676,7 +1676,7 @@ impl BackendList {
                 ))
             }
             // Affinity policies. They consult the client key every datapath
-            // derives (UDP flow key; HTTP/HTTPS/TCP source IP, header or
+            // derives (UDP affinity key; HTTP/HTTPS/TCP source IP, header or
             // cookie); with `None` they fall back to round-robin.
             LoadBalancingAlgorithms::Hrw => self.load_balancing = Box::new(Rendezvous::new()),
             LoadBalancingAlgorithms::Maglev => {
