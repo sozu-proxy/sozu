@@ -1712,9 +1712,9 @@ so the FIN follows the response, and leaves only READABLE in the interest.
 does nothing. `ConnectionH1::arm_timeout` is a no-op while lingering, so no
 caller moves the deadline: not a read, and not the re-arm `Mux::timeout_inner`
 runs after its write pass, which can itself start the linger when a timeout
-answer (408, 503, 504) or a pending flush completes in it. The session closes on the client's EOF — a frontend
-HUP makes `Mux::ready_inner` read to that EOF rather than close at once — on
-a socket error, after `LINGER_MAX_BYTES` (4 MiB) have been dropped, or at the
+answer (408, 503, 504) or a pending flush completes in it. The session
+closes on the client's EOF — a frontend HUP makes `Mux::ready_inner` read to
+that EOF rather than close at once — on a socket error, after `LINGER_MAX_BYTES` (4 MiB) have been dropped, or at the
 deadline: the listener's `request_timeout` from the response's completion,
 which `Mux::timeout_inner` enforces before any per-stream timeout handling.
 Nothing is allocated for the drain, and `Mux::shutting_down_inner` leaves a

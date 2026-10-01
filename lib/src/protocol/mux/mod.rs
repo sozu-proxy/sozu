@@ -4992,17 +4992,6 @@ mod tests {
         h1.timeout_deadline = Some(deadline);
     }
 
-    /// The timer wheel rounds a delay to the NEAREST tick and `Timer::poll`
-    /// fires everything whose tick has come, so an entry armed for deadline `D`
-    /// is handed over from `tick * round(D / tick) - tick/2` onwards — up to
-    /// 99 ms early with the default 100 ms tick. An early delivery is not an
-    /// expiry: `Mux::timeout` must leave the session alone.
-    ///
-    /// To SEE THIS RED: make `Mux::consume_timer_entry` return `true`
-    /// unconditionally (drop its `core_deadline.is_some_and(...)` early
-    /// return). The body then runs on an early delivery and this fails with
-    /// `access_log_message == Some("client_timeout")` — a session closed up to
-    /// 99 ms before its configured `front_timeout`.
     /// Fire the frontend timeout of `mux` now, on an H1 frontend whose
     /// lingering close may take `linger_timeout`, after `partial` request
     /// bytes arrived. Returns the result, the instants bracketing the call,
@@ -5129,6 +5118,17 @@ mod tests {
         );
     }
 
+    /// The timer wheel rounds a delay to the NEAREST tick and `Timer::poll`
+    /// fires everything whose tick has come, so an entry armed for deadline `D`
+    /// is handed over from `tick * round(D / tick) - tick/2` onwards — up to
+    /// 99 ms early with the default 100 ms tick. An early delivery is not an
+    /// expiry: `Mux::timeout` must leave the session alone.
+    ///
+    /// To SEE THIS RED: make `Mux::consume_timer_entry` return `true`
+    /// unconditionally (drop its `core_deadline.is_some_and(...)` early
+    /// return). The body then runs on an early delivery and this fails with
+    /// `access_log_message == Some("client_timeout")` — a session closed up to
+    /// 99 ms before its configured `front_timeout`.
     #[test]
     fn an_early_wheel_delivery_does_not_run_the_timeout_body() {
         let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
