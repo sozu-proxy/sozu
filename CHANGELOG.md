@@ -5170,6 +5170,14 @@
   changeset deliberately does not widen — a deadline raised to make a run land is the defect
   #1453 exists to remove.
 
+- **`test(h1)`: the forbidden-trailer unit test matches the forged `Content-Length` on its field
+  line.** `a_chunked_request_trailer_section_loses_its_forbidden_fields`
+  (`lib/src/protocol/kawa_h1/editor.rs`, #1707) rejected any serialized request containing the
+  bare substring `6666`, which the random `traceparent` ids synthesised under the `opentelemetry`
+  feature, and the random request ids, can carry, so the test failed about once in 1,500 runs.
+  It now rejects the case-insensitive `content-length: 6666` field line instead, and still fails
+  when the forged `Content-Length` trailer is forwarded. No production code changed.
+
 - **`test(e2e)`: the graceful-shutdown large-transfer test waits for its request instead of
   racing its own soft stop.** `test_h2_graceful_shutdown_completes_large_transfer`
   (`e2e/src/tests/h2_tests.rs`) slept a fixed 200 ms before `soft_stop`, assuming the request had
