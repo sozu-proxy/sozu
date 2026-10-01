@@ -5431,6 +5431,86 @@ fn test_h2_to_h1_1xx_informational_forwarded() {
     );
 }
 
+// ---- H2 frontend hang-up after a completed exchange ----
+
+/// A client that hangs up its H2 connection once its response is complete
+/// raises HUP on the frontend. `Mux::ready_inner` handles a frontend HUP
+/// (close, or delay the close for a pending flush), and nothing else in its
+/// inner loop can make progress on one. That loop must therefore close the
+/// session, or yield, once the frontend has nothing left to read or write:
+/// it must not count the HUP as pending work and spin to its iteration
+/// budget, which `http.infinite_loop.error` records.
+fn try_h2_frontend_hangup_does_not_spin() -> State {
+    let (mut worker, front_port, front_address) = setup_h2_listener_only("H2-HUP-NO-SPIN");
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let mut backend = ContinueBackend::start(back_address);
+
+    let mut tls = raw_h2_connection(front_address.into());
+    h2_handshake(&mut tls);
+    let mut header_block = vec![
+        0x82, // :method GET (static idx 2)
+        0x87, // :scheme https (static idx 7)
+        0x84, // :path / (static idx 4)
+    ];
+    // :authority localhost — name at static idx 1, literal value.
+    header_block.push(0x41);
+    header_block.push(9);
+    header_block.extend_from_slice(b"localhost");
+    tls.write_all(&H2Frame::headers(1, header_block, true, true).encode())
+        .unwrap();
+    let _ = tls.flush();
+
+    let frames = collect_response_frames(&mut tls, 300, 10, 200);
+    log_frames("H2 frontend hang-up", &frames);
+    let answered = frames
+        .iter()
+        .any(|(_, flags, sid, _)| *sid == 1 && flags & H2_FLAG_END_STREAM != 0);
+    // The client hangs up with the exchange complete.
+    drop(tls);
+    thread::sleep(Duration::from_millis(500));
+
+    let spins = query_proxy_count(
+        &mut worker,
+        sozu_lib::metrics::names::http::INFINITE_LOOP_ERROR,
+    );
+    let still_alive = verify_sozu_alive(front_port);
+    println!(
+        "H2 frontend hang-up - answered {answered}, {} {spins}, alive {still_alive}",
+        sozu_lib::metrics::names::http::INFINITE_LOOP_ERROR
+    );
+
+    backend.stop();
+    worker.soft_stop();
+    let _ = worker.wait_for_server_stop();
+
+    if answered && spins == 0 && still_alive {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_frontend_hangup_does_not_spin() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: a client hang-up after a complete exchange does not spin the session loop",
+            try_h2_frontend_hangup_does_not_spin
+        ),
+        State::Success
+    );
+}
+
 // ---- H2-to-H1 large headers ----
 
 /// Send an H2 request with many large custom headers through sozu to an H1
@@ -7082,6 +7162,159 @@ fn test_h2_graceful_shutdown_deadline_configurable_short() {
             3,
             "H2: graceful shutdown deadline (short) honored",
             try_h2_graceful_shutdown_deadline_configurable_short
+        ),
+        State::Success
+    );
+}
+
+/// Soft-stop `worker` and wait for it on another thread, so a test can bound
+/// the wait and still let a late stop finish once it releases what blocks it.
+fn soft_stop_in_background(mut worker: Worker) -> std::sync::mpsc::Receiver<bool> {
+    worker.soft_stop();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(worker.wait_for_server_stop());
+    });
+    rx
+}
+
+/// Open one raw H2 connection on the graceful-deadline fixture and send a
+/// GET that its backend holds. Returns the connection once the request has
+/// reached the backend, or `None` if it never did.
+fn h2_raw_request_held_by_backend(
+    front_port: u16,
+    request_seen: &AtomicBool,
+    path: &str,
+) -> Option<rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>> {
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+    let block = super::h2_utils::build_chrome146_get_headers("localhost", path, None);
+    let headers = H2Frame::headers(1, block, true, true);
+    if tls.write_all(&headers.encode()).is_err() || tls.flush().is_err() {
+        return None;
+    }
+    let wait_start = Instant::now();
+    while !request_seen.load(Ordering::Relaxed) {
+        if wait_start.elapsed() > Duration::from_secs(5) {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Some(tls)
+}
+
+/// RFC 9113 §6.8: a client GOAWAY drains the frontend connection without
+/// arming the proxy's graceful-shutdown budget. A soft-stop that finds the
+/// connection already draining must still arm it, so the 1-second
+/// `h2_graceful_shutdown_deadline_seconds` bounds a stream the backend never
+/// answers.
+fn try_h2_client_goaway_then_soft_stop_honors_deadline() -> State {
+    let (worker, front_port, request_seen, release_response, mut backend) =
+        start_h2_graceful_deadline_fixture("H2-CLIENT-GOAWAY-DEADLINE", 1);
+
+    let Some(mut tls) =
+        h2_raw_request_held_by_backend(front_port, &request_seen, "/api/goaway-deadline")
+    else {
+        println!("H2 client GOAWAY deadline - request never reached backend");
+        release_response.store(true, Ordering::Relaxed);
+        let _ = soft_stop_in_background(worker).recv_timeout(Duration::from_secs(30));
+        let _ = backend.stop_and_get_aggregator();
+        return State::Fail;
+    };
+    let goaway = H2Frame::goaway(0, H2_ERROR_NO_ERROR);
+    if tls.write_all(&goaway.encode()).is_err() || tls.flush().is_err() {
+        println!("H2 client GOAWAY deadline - GOAWAY write failed");
+    }
+    // Keep reading the connection, as a client waiting on its response does.
+    let reader = thread::spawn(move || {
+        let _ = read_all_available(&mut tls, Duration::from_secs(20));
+    });
+    thread::sleep(Duration::from_millis(300));
+
+    let soft_stop_started = Instant::now();
+    let stopped = soft_stop_in_background(worker);
+    let stopped_in_time = stopped
+        .recv_timeout(Duration::from_secs(6))
+        .unwrap_or(false);
+    let elapsed = soft_stop_started.elapsed();
+    println!("H2 client GOAWAY deadline - stopped_in_time={stopped_in_time}, elapsed={elapsed:?}");
+
+    release_response.store(true, Ordering::Relaxed);
+    if !stopped_in_time {
+        let _ = stopped.recv_timeout(Duration::from_secs(30));
+    }
+    let _ = reader.join();
+    let _ = backend.stop_and_get_aggregator();
+
+    // Same bound as `try_h2_graceful_shutdown_deadline_configurable_short`.
+    if stopped_in_time && elapsed < Duration::from_secs(4) {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_client_goaway_then_soft_stop_honors_deadline() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: soft-stop after a client GOAWAY honors the graceful-shutdown deadline",
+            try_h2_client_goaway_then_soft_stop_honors_deadline
+        ),
+        State::Success
+    );
+}
+
+/// Each received GOAWAY counts toward the glitch budget
+/// (`h2_max_glitch_count`, default 100), so a client repeating GOAWAY on a
+/// connection its in-flight stream keeps open gets GOAWAY(ENHANCE_YOUR_CALM).
+fn try_h2_repeated_client_goaway_is_bounded() -> State {
+    let (worker, front_port, request_seen, release_response, mut backend) =
+        start_h2_graceful_deadline_fixture("H2-CLIENT-GOAWAY-REPEAT", 1);
+
+    let Some(mut tls) =
+        h2_raw_request_held_by_backend(front_port, &request_seen, "/api/goaway-repeat")
+    else {
+        println!("H2 repeated GOAWAY - request never reached backend");
+        release_response.store(true, Ordering::Relaxed);
+        let _ = soft_stop_in_background(worker).recv_timeout(Duration::from_secs(30));
+        let _ = backend.stop_and_get_aggregator();
+        return State::Fail;
+    };
+    let mut burst = Vec::new();
+    for _ in 0..150 {
+        burst.extend(H2Frame::goaway(0, H2_ERROR_NO_ERROR).encode());
+    }
+    let _ = tls.write_all(&burst);
+    let _ = tls.flush();
+    let frames = collect_response_frames(&mut tls, 200, 5, 300);
+    log_frames("H2 repeated GOAWAY", &frames);
+    let calmed = contains_goaway_with_error(&frames, H2_ERROR_ENHANCE_YOUR_CALM);
+
+    release_response.store(true, Ordering::Relaxed);
+    drop(tls);
+    let stopped = soft_stop_in_background(worker)
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap_or(false);
+    let _ = backend.stop_and_get_aggregator();
+
+    if calmed && stopped {
+        State::Success
+    } else {
+        println!("H2 repeated GOAWAY - calmed={calmed} stopped={stopped}");
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_repeated_client_goaway_is_bounded() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: repeated client GOAWAY frames trip the glitch budget",
+            try_h2_repeated_client_goaway_is_bounded
         ),
         State::Success
     );

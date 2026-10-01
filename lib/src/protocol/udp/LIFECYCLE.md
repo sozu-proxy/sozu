@@ -95,10 +95,14 @@ A **flow** is a virtual client identified by a `FlowKey` (`mod.rs`):
 pub struct FlowKey { pub src: SocketAddr }
 ```
 
-`FlowKey::from_src` (`mod.rs`) keys on the **4-tuple** (source IP + port) when
-`affinity_with_port` is set, or the **2-tuple** (source IP, port normalised to
-`0`) otherwise — a per-cluster knob (`ClusterConfig::affinity_with_port`,
-`mod.rs`). The extractor is the only seam (`FlowKeyExtractor` trait,
+`FlowKey::from_src` (`mod.rs`) keys on the client **4-tuple** (source IP +
+port against the listener), whatever the cluster's affinity key. The
+per-cluster `affinity_with_port` knob (`ClusterConfig::affinity_with_port`,
+`mod.rs`) only shapes the backend-selection hash (§9): under the default
+`SOURCE_IP`, two sockets of one client IP are two flows, each with its own
+upstream socket and its own return address, that land on the same backend.
+Keying the table on the source IP alone merged them into one flow whose
+replies all went to the first socket's port (#1732). The extractor is the only seam (`FlowKeyExtractor` trait,
 `manager.rs`); the in-scope impl is `SourceTupleExtractor` (`manager.rs`),
 which also enforces "an empty datagram is not a valid flow trigger" (`SourceTupleExtractor::flow_key`).
 
@@ -355,7 +359,8 @@ carries the payload length, `mod.rs`). Byte-exact tests: the `tests` module of
 
 Selection is **performed by the core**, from a view the shell lends it. On a
 new flow `UdpManager::on_client_datagram` computes an affinity `key` from the
-flow key (`affinity_hash`, `manager.rs`) and calls `BackendSource::select`
+client source IP, plus its port when `affinity_with_port` is set
+(`affinity_hash`, `manager.rs`) and calls `BackendSource::select`
 (`mod.rs`) on the `backends` view that arrived with the datagram; the shell's
 view is `BackendMap`, whose impl (`backends.rs`) calls
 `BackendMap::backend_from_cluster_id_with_key`. No backend available →
