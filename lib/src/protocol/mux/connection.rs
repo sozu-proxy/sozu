@@ -527,6 +527,16 @@ impl<Front: SocketHandler> Connection<Front> {
         }
     }
 
+    /// Arm the H2 graceful-shutdown budget on a connection already draining
+    /// when the proxy soft-stops. H1 has no budget and ignores it. See
+    /// [`h2::ConnectionH2::arm_graceful_shutdown_deadline`].
+    pub(super) fn arm_graceful_shutdown_deadline(&mut self, now: Instant) {
+        match self {
+            Connection::H1(_) => {}
+            Connection::H2(c) => c.core.arm_graceful_shutdown_deadline(now),
+        }
+    }
+
     pub(super) fn has_pending_write(&self) -> bool {
         forward!(self, has_pending_write())
     }

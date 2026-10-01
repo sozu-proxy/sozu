@@ -5590,6 +5590,14 @@ impl ConnectionH2 {
         self.drain.deadline_elapsed(self.now)
     }
 
+    /// Arm the graceful-shutdown budget of a connection a proxy soft-stop
+    /// finds already draining, which `graceful_goaway` is not called for: a
+    /// peer GOAWAY drains without arming it. See
+    /// `H2DrainState::arm_deadline_if_unarmed` (`h2_drain.rs`).
+    pub fn arm_graceful_shutdown_deadline(&mut self, now: Instant) {
+        self.drain.arm_deadline_if_unarmed(now);
+    }
+
     /// True when the reaper has queued control frames (`RST_STREAM`) into
     /// `h2_control_tx::H2ControlTx` that have not yet been serialized. Kept SEPARATE
     /// from [`H2Shell::has_pending_write`] because that probe gates connection close
@@ -6879,6 +6887,12 @@ impl ConnectionH2 {
         L: ListenerHandler + L7ListenerHandler,
     {
         self.attribute_bytes_to_overhead();
+        // A peer sends at most two GOAWAY frames in a graceful close (RFC
+        // 9113 §6.8). Each one counts toward the glitch budget, so a peer
+        // repeating GOAWAY on a connection kept open by its in-flight
+        // streams is bounded, as is the log line below.
+        self.flood_detector.record_glitch();
+        check_flood_or_return!(self);
         let error_name =
             H2Error::try_from(goaway.error_code).map_or("UNKNOWN_ERROR", |e| e.as_str());
         if goaway.error_code == H2Error::NoError as u32 {
@@ -6891,9 +6905,11 @@ impl ConnectionH2 {
             );
         } else {
             // Peer-originated failure: no variant of H2Error from a peer
-            // implies a sozu bug. Impact handling is separate (retry above
-            // `last_stream_id`, RST_STREAM for consumed streams) and logs
-            // its own details below, so the summary drops to `warn!`.
+            // implies a sozu bug. On a backend connection, impact handling
+            // is separate (retry above `last_stream_id`, RST_STREAM for
+            // consumed streams) and logs its own details below; a frontend
+            // connection retires nothing. Either way the summary drops to
+            // `warn!`.
             warn!(
                 "{} Received GOAWAY: last_stream_id={}, error={}, debug_data={:?}",
                 log_context!(self),

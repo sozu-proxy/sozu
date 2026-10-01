@@ -3898,9 +3898,15 @@
   in-flight stream completes, and sozu sends its final GOAWAY once none remains. This also removes
   the frontend path that armed the backend's readiness instead of the frontend's when it reset a
   retired stream. Backend GOAWAY handling is unchanged: streams above `last_stream_id` are re-linked,
-  answered `503` or reset, and those at or below it complete. Documented in
-  `doc/h2_mux_internals.md` and `lib/src/protocol/mux/LIFECYCLE.md`. Covered by
-  `test_h2_client_goaway_keeps_in_flight_response`.
+  answered `503` or reset, and those at or below it complete. A soft-stop reaching a connection a
+  peer GOAWAY already drains now arms the `h2_graceful_shutdown_deadline_seconds` budget
+  (`H2DrainState::arm_deadline_if_unarmed`, called from `Mux::shutting_down`), which only
+  `graceful_goaway` used to arm. Each received GOAWAY counts toward `h2_max_glitch_count`, so a
+  peer repeating it on a connection its streams keep open is bounded. Documented in
+  `doc/h2_mux_internals.md`, `doc/configure.md` and `lib/src/protocol/mux/LIFECYCLE.md`. Covered by
+  `test_h2_client_goaway_keeps_in_flight_response`,
+  `test_h2_client_goaway_then_soft_stop_honors_deadline`, `test_h2_repeated_client_goaway_is_bounded`
+  and `soft_stop_after_a_peer_goaway_arms_the_budget_once`.
 - **`fix(mux)`: release the backend connection reservation of an abandoned dial
   ([#1713](https://github.com/sozu-proxy/sozu/issues/1713)).** Selection reserves a connection on
   the chosen backend (`active_connections += 1`) before the mux dials it, and only a failed

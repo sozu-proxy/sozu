@@ -220,6 +220,30 @@ impl H2DrainState {
         GracefulDrainDecision::SendInitial
     }
 
+    /// A proxy soft-stop reaching a connection that is already draining —
+    /// from a peer GOAWAY ([`Self::observe_peer_goaway`]) or a final GOAWAY
+    /// ([`Self::enter_final_goaway`]) — arms the forced-close budget from
+    /// `now` if nothing armed it yet. `Mux::shutting_down` skips
+    /// `graceful_goaway` on such a connection, so without this its
+    /// `started_at` stays `None` and the budget never applies. Idempotent:
+    /// an armed budget is never moved or extended (LIFECYCLE.md §8.3).
+    pub(super) fn arm_deadline_if_unarmed(&mut self, now: Instant) {
+        debug_assert!(
+            self.draining,
+            "only a draining connection skips begin_graceful_drain on soft-stop"
+        );
+        let started_at = self.started_at;
+        if started_at.is_none() {
+            self.started_at = Some(now);
+        }
+        debug_assert_eq!(
+            self.started_at,
+            Some(started_at.unwrap_or(now)),
+            "arming must keep an existing budget and arm a missing one from `now`"
+        );
+        self.debug_assert_invariants();
+    }
+
     /// `ConnectionH2::goaway` (the FINAL GOAWAY) marks the connection
     /// draining — idempotent, since the final GOAWAY can fire without a
     /// prior graceful drain (a flood violation, a SETTINGS-ACK timeout, a
@@ -290,9 +314,10 @@ impl H2DrainState {
     fn check_invariants(&self) {
         // The forced-close budget is armed only from `begin_graceful_drain`
         // (or the test backdoor mirroring it), which always sets `draining`
-        // in the same call, and `draining` is monotonic — never cleared once
-        // set (LIFECYCLE.md §8.3: only the proxy's own soft-stop arms the
-        // budget, and it arms exactly once).
+        // in the same call, or from `arm_deadline_if_unarmed`, which runs on
+        // an already-draining connection; `draining` is monotonic — never
+        // cleared once set (LIFECYCLE.md §8.3: only the proxy's own
+        // soft-stop arms the budget, and it arms exactly once).
         debug_assert!(
             self.started_at.is_none() || self.draining,
             "an armed forced-close budget must imply draining"
@@ -391,6 +416,27 @@ mod tests {
             drain.__test_started_at(),
             None,
             "a peer-initiated GOAWAY must not arm the proxy's forced-close budget"
+        );
+    }
+
+    #[test]
+    fn soft_stop_after_a_peer_goaway_arms_the_budget_once() {
+        let mut drain = H2DrainState::new(Some(Duration::from_secs(5)));
+        drain.observe_peer_goaway(0);
+        let armed_at = Instant::now();
+        drain.arm_deadline_if_unarmed(armed_at);
+        assert_eq!(
+            drain.__test_started_at(),
+            Some(armed_at),
+            "a soft-stop on a connection a peer GOAWAY drained must arm the budget"
+        );
+        assert!(!drain.deadline_elapsed(armed_at + Duration::from_secs(4)));
+        assert!(drain.deadline_elapsed(armed_at + Duration::from_secs(5)));
+        drain.arm_deadline_if_unarmed(armed_at + Duration::from_secs(3));
+        assert_eq!(
+            drain.__test_started_at(),
+            Some(armed_at),
+            "a later soft-stop pass must not move or extend the armed budget"
         );
     }
 
