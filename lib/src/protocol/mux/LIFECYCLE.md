@@ -1827,6 +1827,34 @@ empty line were written after the body. Pinned by
 `test_h2_length_framed_request_trailers_keep_h1_backend_framing`
 (`e2e/src/tests/h2_security_header_injection.rs`).
 
+**Nothing follows the head of a response without a body towards an H1
+client.** A response to HEAD, a 204 or a 304 has no body by definition
+(RFC 9110 §9.3.2, §15.3.5, §15.4.5), and an H1 client reads it as ending with
+its header section whatever its framing fields say (RFC 9112 §6.3 rule 1), so
+any byte after the head is read as the next response on a keep-alive
+connection. An H2 backend that sends such a header section without
+END_STREAM and without `content-length` gets chunked framing from
+`pkawa::handle_header`, and the end of its stream, an empty DATA frame or a
+trailer HEADERS frame, queues `Flags` that kawa's H1 serializer writes as the
+last chunk `0\r\n`, the trailer fields and an empty line. For a
+`Position::Server` pass whose `HttpContext` holds a HEAD method or a 204 or
+304 status (`ConnectionH1::response_has_no_body`), `ConnectionH1::writable`
+calls `ConnectionH1::drop_bodiless_response_framing` after
+`drop_length_framed_trailers` and before its `kawa.prepare`: every block
+after the header section (the last queued `StatusLine` up to its first
+closing `Flags { end_header }`, or the whole queue once the head is written) loses
+its `Header` fields and its `Flags` lose `end_body`, `end_chunk` and
+`end_header`, so nothing is written after the head. Each dropped trailer
+block logs a `warn!` and increments `h2.trailers_dropped_no_body`; a
+`Content-Length`-framed one is still dropped and counted by
+`drop_length_framed_trailers` first. The `Transfer-Encoding: chunked` field
+`pkawa::handle_header` adds to such a head is still written. Pinned by
+`a_bodiless_response_writes_nothing_after_its_head_to_an_h1_client`,
+`a_bodiless_response_trailer_block_queued_after_its_head_is_dropped`,
+`a_response_has_no_body_for_head_204_and_304_only` (`h1.rs`) and
+`test_h2_bodiless_response_trailers_keep_h1_client_framing`
+(`e2e/src/tests/h2_security_header_injection.rs`).
+
 ### 8.5 Stale-upstream replay (`ReplayOnFreshBackend`)
 
 `end_stream_decision` splits "the backend closed without answering" in four,
