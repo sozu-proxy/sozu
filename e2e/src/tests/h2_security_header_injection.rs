@@ -1356,6 +1356,95 @@ fn test_h2_backend_101_is_a_bad_gateway() {
     );
 }
 
+/// An H2 backend answers a `method` request with `:status` `status`, the
+/// extra `head` fields, a DATA frame carrying `hello` and, when `trailers`,
+/// a trailer HEADERS frame. Such a response has no body by definition
+/// (RFC 9110 §6.4.1) and DATA carrying a payload makes it malformed
+/// (RFC 9113 §8.1.1): the backend stream is reset and the payload never
+/// reaches the H1 client. Whatever the client reads after the head is either
+/// nothing, the connection being closed, or the next response, which must
+/// parse.
+///
+/// TO SEE THIS RED: remove the bodiless-response branch of
+/// `ConnectionH2::handle_data_frame` (`lib/src/protocol/mux/h2.rs`).
+fn try_h2_bodiless_response_data_never_reaches_h1_client(
+    method: &str,
+    status: &str,
+    head: &[(&[u8], &[u8])],
+    trailers: bool,
+) -> State {
+    let (mut worker, backend, mut h1_backend, front_addr) =
+        setup_h1_front_with_raw_h2_backend(&format!("H2-BODILESS-DATA-H1-{method}-{status}"));
+    backend.set_status(status);
+    for &(name, value) in head {
+        backend.push_header(name, value);
+    }
+    backend.set_body_with_delay(b"hello".to_vec(), Duration::ZERO);
+    if trailers {
+        backend.set_trailers(Some(vec![(b"grpc-status".to_vec(), b"0".to_vec())]));
+    }
+
+    let mut client = TcpStream::connect(front_addr).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    client
+        .write_all(format!("{method} / HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+        .unwrap();
+    let first = drain_client(&mut client);
+    println!("bodiless data {method} {status} — first response {first:?}");
+    // The connection may already be closed: then the write or the read
+    // below fails or returns nothing, which is a clean end.
+    let _ = client.write_all(b"GET / HTTP/1.1\r\nHost: other\r\n\r\n");
+    let second = drain_client(&mut client);
+    println!("bodiless data {method} {status} — second response {second:?}");
+
+    drop(client);
+    drop(backend);
+    h1_backend.stop_and_get_aggregator();
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    let wire = format!("{first}{second}");
+    let leaked = wire.contains("hello");
+    let first_ok = wire.starts_with("HTTP/1.1 ");
+    // After the first head, the next byte ends the connection or starts the
+    // next response.
+    let next = wire.split_once("\r\n\r\n").map_or("", |(_, rest)| rest);
+    let next_ok = next.is_empty() || next.starts_with("HTTP/1.1 ");
+    if first_ok && !leaked && next_ok && stopped {
+        State::Success
+    } else {
+        println!(
+            "bodiless data {method} {status} FAIL — first_ok={first_ok} leaked={leaked} \
+             next={next:?} stopped={stopped}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_bodiless_response_data_never_reaches_h1_client() {
+    let cases: [(&str, &str, &[(&[u8], &[u8])], bool); 2] = [
+        ("GET", "304", &[], true),
+        ("HEAD", "200", &[(b"content-length", b"5")], false),
+    ];
+    for (method, status, head, trailers) in cases {
+        assert_eq!(
+            repeat_until_error_or(
+                3,
+                "H2->H1: DATA on a response without a body resets the backend stream \
+                 (RFC 9113 §8.1.1)",
+                || try_h2_bodiless_response_data_never_reaches_h1_client(
+                    method, status, head, trailers
+                )
+            ),
+            State::Success,
+            "{method} answered {status}"
+        );
+    }
+}
+
 // ============================================================================
 // FIX-3 — `:path` syntax (starts with `/`, or `*` only for OPTIONS)
 // ============================================================================

@@ -1933,15 +1933,19 @@ and chunked framing, and a 1xx never completed, so an H1 client read a chunked
 `test_h2_bodiless_response_end_keeps_the_backend_connection`,
 `test_h2_backend_interim_response_reaches_the_client` and
 `test_h2_backend_101_is_a_bad_gateway`
-(`e2e/src/tests/h2_security_header_injection.rs`). A known gap remains: DATA
-carrying a payload on a 204, a 304 or a response to HEAD is still forwarded,
-written after the head to an H1 client and as DATA to an H2 client, because
-`ConnectionH2::content_length_exempt` (`h2.rs`) skips the `content-length`
-mismatch reset for HEAD, 204 and 304 and the chunks are not removed here. Pinned by
+(`e2e/src/tests/h2_security_header_injection.rs`). DATA carrying a payload on
+a 204, a 304 or a response to HEAD makes it malformed (RFC 9110 §6.4.1, RFC
+9113 §8.1.1): `ConnectionH2::handle_data_frame` (`h2.rs`) resets the backend
+stream with PROTOCOL_ERROR before the payload is queued
+(`ConnectionH2::backend_response_has_no_body`), where
+`ConnectionH2::content_length_exempt` skips the `content-length` checks for
+these responses. Pinned by
+`a_backend_response_has_no_body_for_head_204_and_304_only` (`h2.rs`),
 `a_bodiless_response_writes_nothing_after_its_head_to_an_h1_client`,
 `a_bodiless_response_trailer_block_queued_after_its_head_is_dropped`,
-`a_response_has_no_body_for_head_204_and_304_only` (`h1.rs`) and
-`test_h2_bodiless_response_trailers_keep_h1_client_framing`
+`a_response_has_no_body_for_head_204_and_304_only` (`h1.rs`),
+`test_h2_bodiless_response_trailers_keep_h1_client_framing` and
+`test_h2_bodiless_response_data_never_reaches_h1_client`
 (`e2e/src/tests/h2_security_header_injection.rs`).
 
 ### 8.5 Stale-upstream replay (`ReplayOnFreshBackend`)

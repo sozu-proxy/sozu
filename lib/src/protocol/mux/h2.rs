@@ -6204,6 +6204,17 @@ impl ConnectionH2 {
         false
     }
 
+    /// Whether a backend response has no content by definition: a response
+    /// to HEAD or a 204 or 304 (RFC 9110 §6.4.1). Only meaningful when
+    /// reading a backend response (`Position::Client`): on the server side
+    /// `context.status` describes the response, not the request being read.
+    fn backend_response_has_no_body(
+        context: &crate::protocol::kawa_h1::editor::HttpContext,
+    ) -> bool {
+        use crate::protocol::kawa_h1::parser::Method;
+        context.method == Some(Method::Head) || matches!(context.status, Some(204 | 304))
+    }
+
     fn handle_data_frame<E, L>(
         &mut self,
         data: parser::Data,
@@ -6247,6 +6258,8 @@ impl ConnectionH2 {
         // RFC 9113 §5.2: padding counts against flow-control windows.
         let wire_len = wire_payload_len as usize;
         let cl_exempt = self.content_length_exempt(&stream.context);
+        let no_body =
+            self.position.is_client() && Self::backend_response_has_no_body(&stream.context);
 
         // Extract declared content-length and update position-aware data counter
         let (data_received, declared_length) = {
@@ -6273,6 +6286,32 @@ impl ConnectionH2 {
             .account_received_bytes(wire_payload_len, conn_threshold)
         {
             self.queue_window_update(0, increment);
+        }
+
+        // RFC 9110 §6.4.1, RFC 9113 §8.1.1: a response to HEAD, a 204 or a
+        // 304 has no content, so DATA carrying a payload makes it malformed:
+        // reset the backend stream before the payload is queued, so it never
+        // reaches the client (an H1 client would read it as the start of the
+        // next response). `content_length_exempt` skips the length checks
+        // below for these responses, so they would not catch it.
+        if no_body && content_len > 0 {
+            error!(
+                "{} DATA with a {}-byte payload on a response without a body (RFC 9113 §8.1.1)",
+                log_context!(self),
+                content_len
+            );
+            if !self.flow_control.pending_window_updates_is_empty() {
+                self.readiness.arm_writable();
+            }
+            let result = self.reset_stream(
+                data.stream_id,
+                global_stream_id,
+                context,
+                endpoint,
+                H2Error::ProtocolError,
+            );
+            self.remove_dead_stream(data.stream_id, global_stream_id);
+            return result;
         }
 
         // RFC 9113 §8.1.1: if Content-Length is present, total DATA payload
@@ -10068,6 +10107,33 @@ mod tests {
         // Two buffer slots per stream (front + back), ten stream slots is
         // plenty for the tests below.
         Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)))
+    }
+
+    /// Which backend responses `handle_data_frame` resets on a DATA frame
+    /// carrying a payload: a response to HEAD, a 204 or a 304 has no content
+    /// (RFC 9110 §6.4.1, RFC 9113 §8.1.1).
+    #[test]
+    fn a_backend_response_has_no_body_for_head_204_and_304_only() {
+        use crate::protocol::kawa_h1::parser::Method;
+        let pool = make_pool_for_invariant_16();
+        let mut stream = make_stream_for_invariant_16(&pool, Ulid::generate());
+        let cases = [
+            (Some(Method::Head), Some(200), true),
+            (Some(Method::Get), Some(204), true),
+            (Some(Method::Get), Some(304), true),
+            (Some(Method::Get), Some(200), false),
+            (Some(Method::Post), Some(205), false),
+            (None, None, false),
+        ];
+        for (method, status, expected) in cases {
+            stream.context.method = method.clone();
+            stream.context.status = status;
+            assert_eq!(
+                ConnectionH2::backend_response_has_no_body(&stream.context),
+                expected,
+                "{method:?} {status:?}"
+            );
+        }
     }
 
     #[test]

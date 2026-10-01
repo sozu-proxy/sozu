@@ -7103,6 +7103,19 @@
   `test_h2_backend_interim_response_reaches_the_client` and
   `test_h2_backend_101_is_a_bad_gateway` (`e2e/src/tests/h2_security_header_injection.rs`).
 
+- **`fix(mux-h2)`: reset an H2 backend stream whose response without a body carries DATA
+  ([#1772](https://github.com/sozu-proxy/sozu/issues/1772)).** A response to HEAD, a 204 or a 304
+  has no content (RFC 9110 §6.4.1), and DATA carrying a payload makes it malformed (RFC 9113
+  §8.1.1), but `ConnectionH2::handle_data_frame` (`lib/src/protocol/mux/h2.rs`) forwarded that
+  payload, so an H1 client read it after the head, with a chunk-size line under chunked framing,
+  as the start of the next response. `ConnectionH2::content_length_exempt` skips the
+  `content-length` checks for these responses. The backend stream is now reset with
+  PROTOCOL_ERROR before the payload is queued, so it never reaches the client. Documented in
+  `lib/src/protocol/mux/LIFECYCLE.md` §8.4. Covered by
+  `a_backend_response_has_no_body_for_head_204_and_304_only` (`h2.rs`) and
+  `test_h2_bodiless_response_data_never_reaches_h1_client`
+  (`e2e/src/tests/h2_security_header_injection.rs`).
+
 - **`fix(mux-h1)`: H2→H1: write no last chunk or trailer section after the head of a response
   without a body to an H1 client ([#1761](https://github.com/sozu-proxy/sozu/issues/1761)).**
   A response to HEAD, a 204 or a 304 ends with its header section on HTTP/1.1 (RFC 9112 §6.3),
@@ -7115,7 +7128,8 @@
   of such a response (RFC 9110 §6.5.1) before writing, so a stream ended by a trailer HEADERS
   frame or an empty DATA frame writes nothing after the head, and counts a dropped block in the
   new `h2.trailers_dropped_no_body`, documented in `doc/configure.md`. DATA carrying a payload
-  on such a response is still written after the head, a known gap. Documented in
+  on such a response was still written after the head until
+  [#1772](https://github.com/sozu-proxy/sozu/issues/1772). Documented in
   `lib/src/protocol/mux/LIFECYCLE.md` §8.4. Covered by unit tests in `h1.rs` and by
   `test_h2_bodiless_response_trailers_keep_h1_client_framing`
   (`e2e/src/tests/h2_security_header_injection.rs`).
