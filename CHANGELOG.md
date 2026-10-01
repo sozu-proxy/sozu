@@ -3970,6 +3970,18 @@
   `test_readded_cluster_does_not_reuse_removed_backend` (`e2e/src/tests/remove_cluster_tests.rs`)
   and `removing_a_backend_or_its_cluster_marks_it_closing` (`lib/src/backends.rs`).
 
+- **`fix(h2)`: reset a backend stream answered before its request was written
+  ([#1734](https://github.com/sozu-proxy/sozu/issues/1734)).** `ConnectionH2::end_stream`
+  (`lib/src/protocol/mux/h2.rs`) skipped the RST_STREAM on a backend stream once the response's
+  END_STREAM was read and the request was received whole from the client, even when the rest of
+  that request was still queued toward the backend. A backend that answers early (RFC 9113 §8.1)
+  then never saw the request's END_STREAM: the stream stayed half-closed on the backend and held
+  one of its `SETTINGS_MAX_CONCURRENT_STREAMS` slots (§5.1.2) for the connection's lifetime, while
+  sozu had already released its own. The skip now also requires the request to be written whole
+  (`front.is_completed()`); otherwise the stream is reset once with RST_STREAM(CANCEL). Documented
+  in `lib/src/protocol/mux/LIFECYCLE.md`. Covered by
+  `a_backend_stream_answered_before_its_request_was_written_is_cancelled`.
+
 - **`fix(mux-h2)`: a GOAWAY received from an H2 client no longer drops its in-flight requests
   ([#1745](https://github.com/sozu-proxy/sozu/issues/1745)).** `ConnectionH2::handle_goaway_frame`
   (`lib/src/protocol/mux/h2.rs`) retired every stream above the GOAWAY's `last_stream_id` on both

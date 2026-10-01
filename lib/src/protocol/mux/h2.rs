@@ -7581,9 +7581,19 @@ impl ConnectionH2 {
                     // (RFC 9113 §5.1.1). A block parked unsent is dropped with
                     // it and resets the encoder's table on the next pass
                     // (`ConnectionH2::parked_header_block`).
+                    //
+                    // "Fully completed" means END_STREAM went both ways: the
+                    // response's was read, and the request's was handed to
+                    // the output, which flushes in order. A request received
+                    // whole is not enough: a backend may answer early, before
+                    // the rest of the body reached it (RFC 9113 §8.1), and a
+                    // stream forgotten with its tail unsent stays open on the
+                    // backend, holding one of its MAX_CONCURRENT_STREAMS
+                    // slots (§5.1.2) for this connection's lifetime.
                     let stream = &context.streams[stream_gid];
-                    let fully_completed =
-                        stream.back_received_end_of_stream && stream.front.is_terminated();
+                    let fully_completed = stream.back_received_end_of_stream
+                        && stream.front.is_terminated()
+                        && stream.front.is_completed();
                     let opened_on_the_wire = stream.front.consumed;
                     #[cfg(debug_assertions)]
                     let queued_before = self.output.len();
@@ -15926,6 +15936,107 @@ mod tests {
             received,
             Vec::<u8>::new(),
             "the backend must receive nothing for a stream it never saw"
+        );
+    }
+
+    /// A backend may answer early, before the whole request reached it
+    /// (RFC 9113 §8.1). When the stream then ends with the request received
+    /// whole from the client but its tail still unsent toward the backend,
+    /// the backend never sees END_STREAM: forgetting the stream without a
+    /// reset leaves it open (half-closed) on the backend, holding one of the
+    /// backend's MAX_CONCURRENT_STREAMS slots for this connection's lifetime
+    /// (RFC 9113 §5.1.2). The stream must be cancelled, exactly once.
+    ///
+    /// TO SEE THIS RED: in the `Position::Client` arm of
+    /// [`ConnectionH2::end_stream`], drop `&& stream.front.is_completed()`
+    /// from `fully_completed`. The backend then reads no RST_STREAM: `the
+    /// backend must read RST_STREAM(1, CANCEL) once`, `right` holding that
+    /// frame and `left` nothing.
+    #[test]
+    fn a_backend_stream_answered_before_its_request_was_written_is_cancelled() {
+        let LinkedBackend {
+            _pool,
+            mut connection,
+            mut peer,
+            mut context,
+            mut router,
+            gid,
+        } = backend_with_a_linked_stream(
+            H2State::Header,
+            BackendStatus::Connected,
+            Ready::READABLE | Ready::HUP | Ready::ERROR,
+        );
+        // A request received whole from the client: its HEADERS, then a
+        // 4-byte body closed with END_STREAM.
+        let kawa = &mut context.streams[gid].front;
+        kawa.detached.status_line = kawa::StatusLine::Request {
+            version: kawa::Version::V20,
+            method: kawa::Store::Static(b"POST"),
+            uri: kawa::Store::Static(b"/"),
+            authority: kawa::Store::Static(b"example.com"),
+            path: kawa::Store::Static(b"/"),
+        };
+        kawa.push_block(kawa::Block::StatusLine);
+        kawa.push_block(kawa::Block::Header(kawa::Pair {
+            key: kawa::Store::Static(b"content-length"),
+            val: kawa::Store::Static(b"4"),
+        }));
+        kawa.push_block(kawa::Block::Flags(kawa::Flags {
+            end_body: false,
+            end_chunk: false,
+            end_header: true,
+            end_stream: false,
+        }));
+        kawa.push_block(kawa::Block::Chunk(kawa::Chunk {
+            data: kawa::Store::Static(b"body"),
+        }));
+        kawa.push_block(kawa::Block::Flags(kawa::Flags {
+            end_body: true,
+            end_chunk: false,
+            end_header: false,
+            end_stream: true,
+        }));
+        kawa.body_size = kawa::BodySize::Length(4);
+        kawa.parsing_phase = kawa::ParsingPhase::Terminated;
+        // The backend grants the stream no send window: its HEADERS leave,
+        // its body waits.
+        context.streams[gid].window = 0;
+        let sent = drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+        let frames = peer_frames(&sent).expect("whole frames");
+        assert!(
+            frames
+                .iter()
+                .any(|(kind, flags, id, _)| *kind == 1 && *id == 1 && flags & 0x1 == 0)
+                && !frames.iter().any(|(kind, _, _, _)| *kind == 0),
+            "premise: the HEADERS left without END_STREAM and no DATA, got {frames:?}"
+        );
+        let stream = &context.streams[gid];
+        assert!(
+            stream.front.consumed && stream.front.is_terminated() && !stream.front.is_completed(),
+            "premise: the request was received whole but not written whole"
+        );
+        // The backend's complete response arrived: its END_STREAM was read.
+        context.streams[gid].back_received_end_of_stream = true;
+
+        connection.end_stream(gid, &mut context);
+        // Ending it again must not reset it a second time.
+        connection.end_stream(gid, &mut context);
+        let received =
+            drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+
+        assert_eq!(
+            received,
+            orphan_frame(3, 0, 1, 4, &(H2Error::Cancel as u32).to_be_bytes()),
+            "the backend must read RST_STREAM(1, CANCEL) once"
+        );
+        assert!(
+            connection.core.stream_table.is_empty(),
+            "the stream is retired from the backend connection"
+        );
+        assert!(
+            matches!(connection.core.state, H2State::Header),
+            "the shared connection stays up, got {:?}",
+            connection.core.state
         );
     }
 

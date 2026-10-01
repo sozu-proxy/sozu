@@ -1741,11 +1741,15 @@ the client's END_STREAM, but a client RST_STREAM after the whole response
 reaches `end_stream` with the request still incomplete. An H2 backend takes a
 different path: a stream it carries is never reused, and when one ends the
 connection sends RST_STREAM(CANCEL) unless `back_received_end_of_stream &&
-front.is_terminated()` (`fully_completed` in `ConnectionH2`). That test asks
-whether the request was received whole, not whether it was fully written: a
-request received whole whose last DATA frames or END_STREAM are still queued
-toward the backend is forgotten without a reset, leaving that stream open on
-the backend. This change does not alter the H2 backend path. The close costs a client that pipelined behind its upload
+front.is_terminated() && front.is_completed()` (`fully_completed` in
+`ConnectionH2`): the response's END_STREAM was read and the request's was
+handed to the output, which flushes in order. Received whole is not enough: a
+request whose last DATA frames or END_STREAM are still queued toward the
+backend — a backend that answered early may never open the window for them
+(RFC 9113 §8.1) — would otherwise be forgotten without a reset, leaving the
+stream half-closed on the backend and holding one of its
+MAX_CONCURRENT_STREAMS slots (§5.1.2) for the connection's lifetime. Pinned by
+the unit `a_backend_stream_answered_before_its_request_was_written_is_cancelled`. The close costs a client that pipelined behind its upload
 that pipelined request, which it retries on a new connection (§9.3.2).
 Sozu does not drain the rest of the body to keep the connection, but it drains
 it to close it: a socket closed with bytes still unread, or that receives more
