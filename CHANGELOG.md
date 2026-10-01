@@ -3982,6 +3982,18 @@
   `a_408_to_a_silent_client_closes_without_lingering` and
   `a_silent_client_is_closed_at_the_linger_deadline`.
 
+- **`fix(mux-h2)`: answer an invalid `SETTINGS_INITIAL_WINDOW_SIZE` with FLOW_CONTROL_ERROR
+  ([#1758](https://github.com/sozu-proxy/sozu/issues/1758)).** RFC 9113 §6.5.2 and §6.9.2 make a
+  value above 2^31-1, or a change that pushes a stream window past 2^31-1, a connection error of
+  type FLOW_CONTROL_ERROR; `ConnectionH2::handle_settings_frame` answered both with
+  GOAWAY(PROTOCOL_ERROR). It now sends GOAWAY(FLOW_CONTROL_ERROR), and
+  `ConnectionH2::update_initial_window_size` checks every stream window before changing any, so a
+  rejected value no longer leaves the windows walked before the overflowing one changed
+  (`lib/src/protocol/mux/h2.rs`). Covered by
+  `an_initial_window_above_the_maximum_is_a_flow_control_error` and
+  `a_settings_change_overflowing_a_stream_window_is_a_flow_control_error`; documented in
+  `doc/h2_mux_internals.md`.
+
 - **`fix(mux-h2)`: keep one stream send window per connection
   ([#1755](https://github.com/sozu-proxy/sozu/issues/1755)).** A stream relayed from an H2
   frontend to an H2 backend kept a single send window for both connections, although RFC 9113

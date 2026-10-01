@@ -56,14 +56,15 @@
 //! window — peer-granted credit for our own writes — and
 //! [`H2FlowControl::account_received_bytes`] only accumulates. No state in
 //! this module is decremented by an inbound DATA frame, so none can go
-//! negative, and no connection-level `FLOW_CONTROL_ERROR` is raised: the only
-//! `H2Error::FlowControlError` this connection emits at all comes from
-//! `ConnectionH2::handle_window_update_frame`, when an increment would grow a
-//! SEND window past 2^31-1 — GOAWAY for the connection window, RST_STREAM for
-//! a stream's. Every other flow-control-shaped rejection there is a
-//! `ProtocolError` (a zero increment; a `SETTINGS_INITIAL_WINDOW_SIZE` above
-//! 2^31-1, which `ConnectionH2::update_initial_window_size` reports to
-//! `ConnectionH2::handle_settings_frame`). Measured on
+//! negative, and no `FLOW_CONTROL_ERROR` is raised for inbound DATA: every
+//! `H2Error::FlowControlError` this connection emits is about a SEND window
+//! growing past 2^31-1. `ConnectionH2::handle_window_update_frame` raises it
+//! when an increment would — GOAWAY for the connection window, RST_STREAM for
+//! a stream's — and `ConnectionH2::handle_settings_frame` answers GOAWAY with
+//! it when `ConnectionH2::update_initial_window_size` rejects a
+//! `SETTINGS_INITIAL_WINDOW_SIZE` above 2^31-1 or one that would push a
+//! stream window past it (RFC 9113 §6.5.2, §6.9.2). A zero increment is a
+//! `ProtocolError`. Measured on
 //! sozu-proxy/sozu#1488: against 98303 octets advertised — the 65535 default
 //! plus one 32768 grant — **106496 octets of DATA were accepted, with no
 //! GOAWAY and no `FLOW_CONTROL_ERROR`**.

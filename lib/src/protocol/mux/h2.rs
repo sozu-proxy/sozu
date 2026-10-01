@@ -6998,7 +6998,15 @@ impl ConnectionH2 {
                 },
                 parser::SETTINGS_ENABLE_PUSH       => { self.peer_settings.settings_enable_push = v == 1;             is_error |= v > 1 },
                 parser::SETTINGS_MAX_CONCURRENT_STREAMS => { self.peer_settings.settings_max_concurrent_streams = v },
-                parser::SETTINGS_INITIAL_WINDOW_SIZE    => { is_error |= self.update_initial_window_size(v, context) },
+                parser::SETTINGS_INITIAL_WINDOW_SIZE    => {
+                    // RFC 9113 §6.5.2 / §6.9.2: a value above 2^31-1, or one
+                    // that pushes a stream window past it, is a connection
+                    // error of type FLOW_CONTROL_ERROR, not PROTOCOL_ERROR.
+                    if self.update_initial_window_size(v, context) {
+                        error!("{} INVALID SETTINGS_INITIAL_WINDOW_SIZE {}", log_context!(self), v);
+                        return self.goaway(H2Error::FlowControlError);
+                    }
+                },
                 parser::SETTINGS_MAX_FRAME_SIZE         => { self.peer_settings.settings_max_frame_size = v;           is_error |= !(MIN_MAX_FRAME_SIZE..MAX_MAX_FRAME_SIZE).contains(&v) },
                 parser::SETTINGS_MAX_HEADER_LIST_SIZE   => { self.peer_settings.settings_max_header_list_size = v },
                 parser::SETTINGS_ENABLE_CONNECT_PROTOCOL => { self.peer_settings.settings_enable_connect_protocol = v == 1; is_error |= v > 1 },
@@ -7443,6 +7451,13 @@ impl ConnectionH2 {
         MuxResult::Continue
     }
 
+    /// Apply a peer's `SETTINGS_INITIAL_WINDOW_SIZE` to every stream window
+    /// this connection holds (RFC 9113 §6.9.2). `true` when the value is
+    /// invalid — above 2^31-1, or a change that would push some stream
+    /// window past it — which the caller answers with
+    /// GOAWAY(FLOW_CONTROL_ERROR). Every window is checked before any is
+    /// changed, so a rejected value leaves all of them, and the recorded
+    /// setting, as they were.
     fn update_initial_window_size<L>(&mut self, value: u32, context: &mut Context<L>) -> bool
     where
         L: ListenerHandler + L7ListenerHandler,
@@ -7459,21 +7474,31 @@ impl ConnectionH2 {
                 return true;
             }
         };
+        // RFC 9113 §6.9.2: changes to SETTINGS_INITIAL_WINDOW_SIZE can cause
+        // stream windows to exceed 2^31-1, which is a flow control error.
+        // Checked for every stream first, so a rejection changes nothing.
+        // Only streams owned by this connection, and only this connection's
+        // leg of each (RFC 9113 §6.9): the other connection's window is its
+        // own.
+        let overflows = self
+            .stream_table
+            .streams()
+            .values()
+            .any(|&global_stream_id| {
+                context.streams[global_stream_id]
+                    .send_window_mut(&self.position)
+                    .checked_add(delta)
+                    .is_none()
+            });
+        if overflows {
+            return true;
+        }
         let mut open_window = false;
-        // Only update windows for streams owned by this connection
         for &global_stream_id in self.stream_table.streams().values() {
-            // RFC 9113 §6.9: the peer's setting sizes this connection's leg of
-            // the stream only; the other connection's window is its own.
             let stream_window = context.streams[global_stream_id].send_window_mut(&self.position);
-            // RFC 9113 §6.9.2: changes to SETTINGS_INITIAL_WINDOW_SIZE can cause
-            // stream windows to exceed 2^31-1, which is a flow control error.
-            match stream_window.checked_add(delta) {
-                Some(new_window) => {
-                    open_window |= *stream_window <= 0 && new_window > 0;
-                    *stream_window = new_window;
-                }
-                None => return true,
-            }
+            let new_window = *stream_window + delta;
+            open_window |= *stream_window <= 0 && new_window > 0;
+            *stream_window = new_window;
         }
         trace!(
             "{} UPDATE INIT WINDOW: {} {} {:?}",
@@ -12836,6 +12861,100 @@ mod tests {
                 "front window {front_window}: and leaves the frontend leg alone"
             );
         }
+    }
+
+    /// Feed `inbound` to a frontend connection carrying streams 1 and 3,
+    /// flush what it answers, and return the GOAWAY error codes it wrote.
+    fn goaway_codes_after(
+        connection: &mut H2Shell<PacedSocket>,
+        context: &mut Context<TestListener>,
+        router: &mut Router,
+        inbound: &[u8],
+    ) -> Vec<u32> {
+        connection.socket.inbound.extend(inbound);
+        for _ in 0..4 {
+            connection.core.readiness.event.insert(Ready::READABLE);
+            if connection.core.readiness.filter_interest().is_readable() {
+                connection.readable(context, EndpointClient(router));
+            }
+        }
+        connection.core.readiness.event.insert(Ready::WRITABLE);
+        connection.writable(context, EndpointClient(router));
+        peer_frames(&connection.socket.wire)
+            .expect("whole frames on the wire")
+            .iter()
+            .filter(|(kind, ..)| *kind == 7)
+            .map(|(_, _, _, payload)| {
+                u32::from_be_bytes(payload[4..8].try_into().expect("GOAWAY error code"))
+            })
+            .collect()
+    }
+
+    /// A SETTINGS frame carrying only `SETTINGS_INITIAL_WINDOW_SIZE = value`.
+    fn initial_window_settings(value: u32) -> Vec<u8> {
+        let mut payload = vec![0, 4];
+        payload.extend_from_slice(&value.to_be_bytes());
+        orphan_frame(4, 0, 0, 6, &payload)
+    }
+
+    /// RFC 9113 §6.5.2: a `SETTINGS_INITIAL_WINDOW_SIZE` above 2^31-1 "MUST
+    /// be treated as a connection error of type FLOW_CONTROL_ERROR".
+    ///
+    /// TO SEE THIS RED: answer the `SETTINGS_INITIAL_WINDOW_SIZE` arm of
+    /// `ConnectionH2::handle_settings_frame` with `H2Error::ProtocolError`:
+    /// `left: [1], right: [3]`. Verified 2026-10-01 (red on `c8779209`).
+    #[test]
+    fn an_initial_window_above_the_maximum_is_a_flow_control_error() {
+        let (_pool, mut connection, mut context, mut router, _peer) = two_requests_read(usize::MAX);
+        let codes = goaway_codes_after(
+            &mut connection,
+            &mut context,
+            &mut router,
+            &initial_window_settings(FLOW_CONTROL_MAX_WINDOW + 1),
+        );
+        assert_eq!(codes, vec![0x3], "GOAWAY(FLOW_CONTROL_ERROR)");
+    }
+
+    /// RFC 9113 §6.9.2: a SETTINGS change that pushes a stream window past
+    /// 2^31-1 is a connection error of type FLOW_CONTROL_ERROR. Stream 3's
+    /// window already stands at 2^31-1; raising the initial window by one
+    /// overflows it. The rejection is checked before any window moves, so
+    /// stream 1, walked first, keeps its window.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::update_initial_window_size`,
+    /// apply each delta as it is checked, returning on the first overflow:
+    /// `the rejected setting changes no stream window`, `left: 65536, right:
+    /// 65535`. Verified 2026-10-01 (red on `c8779209`).
+    #[test]
+    fn a_settings_change_overflowing_a_stream_window_is_a_flow_control_error() {
+        let (_pool, mut connection, mut context, mut router, _peer) = two_requests_read(usize::MAX);
+        let gid = |connection: &H2Shell<PacedSocket>, id: u32| {
+            *connection
+                .core
+                .stream_table
+                .streams()
+                .get(&id)
+                .expect("the stream is open")
+        };
+        let (first, third) = (gid(&connection, 1), gid(&connection, 3));
+        let mut inbound = orphan_frame(
+            8,
+            0,
+            3,
+            4,
+            &(FLOW_CONTROL_MAX_WINDOW - DEFAULT_INITIAL_WINDOW_SIZE).to_be_bytes(),
+        );
+        inbound.extend(initial_window_settings(DEFAULT_INITIAL_WINDOW_SIZE + 1));
+        let codes = goaway_codes_after(&mut connection, &mut context, &mut router, &inbound);
+        assert_eq!(
+            context.streams[third].front_window, FLOW_CONTROL_MAX_WINDOW as i32,
+            "premise: stream 3's window stands at 2^31-1"
+        );
+        assert_eq!(codes, vec![0x3], "GOAWAY(FLOW_CONTROL_ERROR)");
+        assert_eq!(
+            context.streams[first].front_window, DEFAULT_INITIAL_WINDOW_SIZE as i32,
+            "the rejected setting changes no stream window"
+        );
     }
 
     /// RFC 9113 §6.9 on the frontend leg: the client's WINDOW_UPDATE and
