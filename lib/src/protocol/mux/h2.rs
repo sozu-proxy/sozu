@@ -8082,6 +8082,18 @@ impl ConnectionH2 {
         // slot left.
         *context.streams[stream].send_window_mut(&self.position) =
             i32::try_from(self.peer_settings.settings_initial_window_size).unwrap_or(i32::MAX);
+        // Pre: the backend leg of the slot starts fresh, whether it comes
+        // from `Context::create_stream` or from an H1 frontend's keep-alive
+        // reset (sozu-proxy/sozu#1781): nothing has been received on it yet,
+        // or `handle_read` would refuse the response as arriving on a closed
+        // stream. The frontend leg may legitimately be done already: an H2
+        // client's request ends with END_STREAM before the backend is
+        // dialled.
+        debug_assert!(
+            !context.streams[stream].back_received_end_of_stream
+                && context.streams[stream].back_data_received == 0,
+            "a stream must open on a backend with a fresh backend leg"
+        );
         self.stream_table.register(stream_id, stream, self.now);
         self.readiness.arm_writable();
         true
