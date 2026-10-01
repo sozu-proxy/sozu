@@ -1147,3 +1147,115 @@ fn test_udp_idle_flow_is_torn_down() {
         State::Success,
     );
 }
+
+// =========================================================================
+// Test 15: every idle flow is torn down, however many there are (#1732).
+//
+// Default cluster knobs, `max_flows = 0`, a 2 s listener idle timeout. Two
+// alternating sockets, thirty one-datagram sockets and one socket that will
+// speak again later open 33 flows. Once all of them have been silent past the
+// timeout, no connected upstream socket to any backend may remain, and the
+// returning socket must get a new flow on a new upstream socket.
+// =========================================================================
+
+/// Connected (`ESTABLISHED`) IPv4 UDP sockets in this network namespace whose
+/// remote end is one of `backends`: the proxy's per-flow upstream sockets.
+fn connected_upstream_sockets(backends: &[SocketAddr]) -> usize {
+    let table = std::fs::read_to_string("/proc/net/udp").expect("read /proc/net/udp");
+    let ports: Vec<String> = backends
+        .iter()
+        .map(|b| format!(":{:04X}", b.port()))
+        .collect();
+    table
+        .lines()
+        .skip(1)
+        .filter(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            fields.len() > 3
+                && fields[3] == "01"
+                && ports.iter().any(|p| fields[2].ends_with(p.as_str()))
+        })
+        .count()
+}
+
+fn try_udp_every_idle_flow_is_torn_down() -> State {
+    const IDLE_TIMEOUT_SECS: u32 = 2;
+    let (mut worker, backends, front) = setup_udp_test_with_idle_timeout(
+        "UDP-IDLE-MANY",
+        udp_cluster(CLUSTER, LoadBalancingAlgorithms::Hrw),
+        3,
+        Some(IDLE_TIMEOUT_SECS),
+    );
+    let handles: Vec<_> = backends
+        .iter()
+        .enumerate()
+        .map(|(i, b)| UdpBackend::bind(format!("BK{i}"), *b, 1).spawn())
+        .collect();
+
+    let mut ok = true;
+    let mut expect_reply = |client: &UdpClient, payload: &str| {
+        let got = client
+            .round_trip(payload.as_bytes(), RT)
+            .as_deref()
+            .and_then(strip_reply_tag)
+            .map(|(_, p)| p);
+        if got.as_deref() != Some(payload.as_bytes()) {
+            println!("{payload}: expected its own reply, got {got:?}");
+            ok = false;
+        }
+    };
+
+    let a = UdpClient::new("A", front);
+    let b = UdpClient::new("B", front);
+    for round in 0..3 {
+        expect_reply(&a, &format!("A-{round}"));
+        expect_reply(&b, &format!("B-{round}"));
+    }
+    for i in 0..30 {
+        let once = UdpClient::new(format!("ONCE{i}"), front);
+        expect_reply(&once, &format!("ONCE{i}"));
+    }
+    let returning = UdpClient::new("R", front);
+    expect_reply(&returning, "R-1");
+
+    let open_before = connected_upstream_sockets(&backends);
+    // Every flow is now silent; wait well past the idle timeout.
+    std::thread::sleep(Duration::from_secs(u64::from(IDLE_TIMEOUT_SECS) * 3));
+    let open_after_idle = connected_upstream_sockets(&backends);
+
+    expect_reply(&returning, "R-2");
+    let peers: Vec<SocketAddr> = handles
+        .iter()
+        .flat_map(|h| h.observed())
+        .filter(|d| d.payload == b"R-1" || d.payload == b"R-2")
+        .map(|d| d.peer)
+        .collect();
+    let new_upstream = matches!(peers.as_slice(), [first, second] if first != second);
+    println!(
+        "idle many: open_before={open_before} open_after_idle={open_after_idle} \
+         returning peers={peers:?} replies_ok={ok}"
+    );
+
+    for h in &handles {
+        h.stop();
+    }
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    if ok && open_before == 33 && open_after_idle == 0 && new_upstream && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_udp_every_idle_flow_is_torn_down() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "UDP idle timeout: 33 silent flows all release their upstream sockets",
+            try_udp_every_idle_flow_is_torn_down,
+        ),
+        State::Success,
+    );
+}

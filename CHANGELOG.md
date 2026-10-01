@@ -3852,9 +3852,13 @@
   public in `sozu-lib` 2.2.1. Seen red first:
   `same_ip_clients_get_distinct_flows_and_their_own_replies` (`manager.rs`) and
   `test_udp_same_ip_clients_are_distinct_flows` (`e2e/src/tests/udp_tests.rs`). The idle
-  eviction reported in the same issue does not reproduce on this branch: it is the lost wakeup
-  fixed by "an idle UDP flow was never evicted after an early timer-wheel fire" below, which no
-  release carries yet; `test_udp_idle_flow_is_torn_down` is the end-to-end test that fix lacked.
+  eviction reported in the same issue (no idle flow ever closing its upstream socket) does not
+  reproduce on this branch: it is the lost wakeup fixed by "an idle UDP flow was never evicted
+  after an early timer-wheel fire" below, which no release carries yet. On 2.2.1 the 33-flow
+  scenario of `test_udp_every_idle_flow_is_torn_down` keeps every upstream socket past the idle
+  timeout on some runs, and adding that fix's one-line `armed_deadline` reset to 2.2.1 alone
+  makes it pass; `test_udp_idle_flow_is_torn_down` and `test_udp_every_idle_flow_is_torn_down`
+  are the end-to-end tests that fix lacked.
 
 - **`fix(h1)`: forward a final response read together with a 1xx
   ([#1759](https://github.com/sozu-proxy/sozu/issues/1759)).** When an HTTP/1.1 backend wrote an

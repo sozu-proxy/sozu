@@ -796,7 +796,11 @@ address        = "0.0.0.0:53"
 # public_address = "203.0.113.10:53"
 
 # client / upstream flow idle timeout, in seconds. A flow is reaped once it has
-# been idle for this long. Defaults to 30.
+# been idle for this long, which closes its upstream socket and frees its
+# `max_flows` slot. A client datagram pushes the flow's deadline to now +
+# `front_timeout`, a backend reply to now + `back_timeout`. These listener
+# keys are the only UDP idle timeout: `[clusters.<id>.udp]` has none, so the
+# cluster defaults never disable it. Defaults to 30.
 front_timeout  = 30
 back_timeout   = 30
 
