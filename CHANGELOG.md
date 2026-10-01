@@ -3836,6 +3836,20 @@
 
 ### 🐛 Fixed
 
+- **`fix(h1)`: forward a final response read together with a 1xx
+  ([#1759](https://github.com/sozu-proxy/sozu/issues/1759)).** When an HTTP/1.1 backend wrote an
+  interim response and what follows it (another 1xx, the final response) at once, an HTTP/1.1
+  frontend forwarded only the first 1xx. `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`)
+  clears the back buffer after an interim response, which keeps its unparsed bytes, and re-added
+  only the backend's `READABLE` interest: no socket event announces bytes already read, and
+  `ConnectionH1::readable` returned before parsing when its socket read brought nothing. The 100
+  and other-interim arms now also re-arm the backend read with `Readiness::signal_pending_read`,
+  and a backend `readable` parses its buffered bytes even when the socket has nothing new (a
+  frontend buffer is left alone: its leftover bytes are pipelined requests). RFC 9110 §15.2.
+  Covered by `test_h1_interim_103_and_final_in_one_write`,
+  `test_h1_interim_102_and_final_in_one_write` and
+  `test_h1_several_interims_and_final_in_one_write` (`e2e/src/tests/tests.rs`).
+
 - **`fix(h1)`: handle every 1xx other than 101 as an interim response
   ([#1733](https://github.com/sozu-proxy/sozu/issues/1733)).** On an HTTP/1.1 frontend,
   `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`) kept the stream linked after a 100 or a
