@@ -850,7 +850,9 @@ one block inside a method that does several unrelated things:
 - `ConnectionH2::handle_continuation_header_state` CONTINUATION oversize
   (`h2.rs`).
 - `ConnectionH2::handle_rst_stream_frame` peer RST (`h2.rs`).
-- `ConnectionH2::handle_goaway_frame` retry loop (`h2.rs`).
+- `ConnectionH2::handle_goaway_frame` retry loop (`h2.rs`), `Position::Client`
+  only: on a frontend connection `last_stream_id` bounds server-initiated
+  streams (RFC 9113 §6.8), which sozu never opens, so nothing is retired.
 - `ConnectionH2::end_stream` client-side retirement (`h2.rs`).
 
 No call site in this file performs `self.streams.remove(...)` inline: it
@@ -1093,6 +1095,11 @@ deadlines are compared against `ConnectionH2.now` (§7.5):
 6. Loop budget (`MAX_LOOP_ITERATIONS = 10_000`, `mod.rs`) is a hard backstop
    in `Mux::ready_inner`, whose `counter` is declared above BOTH of its loops,
    so the budget is shared across every outer iteration of one `ready()` call.
+   A frontend HUP never counts as work against it: the inner loop closes the
+   session on one once no output is left to flush, except on a lingering
+   frontend (§8.4), which it leaves to drain the client's last bytes to the
+   EOF, as the entry check does. Its exit check counts only frontend
+   READABLE, WRITABLE and ERROR interest.
 
 Steps 1-4 all run inside one `readable()`/`writable()` call and therefore all
 read the same `ConnectionH2.now` — see §7.5.
@@ -1392,6 +1399,35 @@ Two GOAWAY frames in `ConnectionH2::graceful_goaway` (`h2.rs`):
 `peer_gone_after_final_goaway` (`h2.rs`) guards against deadlock on a
 peer-side HUP after the final GOAWAY.
 
+**The close after a final GOAWAY(NO_ERROR) lingers.** The client may still be
+sending frames it wrote before it read the GOAWAY (RFC 9113 §6.8 lets it), and
+reading stops at the GOAWAY; a close with those frames unread, or followed by
+more, makes the kernel reset the connection and discard response bytes still
+queued in the socket. So when a `writable` pass that began in `H2State::GoAway`
+after a `NO_ERROR` GOAWAY (`ConnectionH2::graceful_goaway` set by
+`goaway_with_last_stream_id`) decides `CloseSession`, and the client has not
+hung up, `H2Shell::linger_instead_of_closing` stages the close the way §8.4
+does for H1, through the same `Linger` state and `shared::drain_discard`:
+`close_notify` first — when it is still pending the linger is
+`Linger::Pending` and the next pass, whose state is `Error` by then, resumes
+it — then `shutdown_write`, then the raw socket is read and dropped until the
+client's EOF, `LINGER_MAX_BYTES`, or the listener's `request_timeout`.
+`ConnectionH2::arm_timeout` and `set_timeout_duration` leave that deadline in
+place. A GOAWAY carrying an error (a protocol violation, a flood) does not
+linger: sozu does not keep reading from that peer. The lingering `readable`
+and `writable` passes adopt the pass's clock (`ConnectionH2::adopt_now`)
+before they return, so the bounds are: the linger deadline,
+`request_timeout` from the linger's start, which `Mux::timeout_inner`
+enforces; and, during a soft stop, the H2 listener's graceful-shutdown
+budget (§8.3) whenever it is armed and elapses first — `graceful_goaway`
+arms it when the soft stop sends its first GOAWAY. A drain that the client's
+own GOAWAY started does not arm that budget, so its linger runs to the linger
+deadline even during a soft stop. Pinned by
+`a_soft_stop_closes_a_lingering_h2_session_once_its_budget_elapses` (`mod.rs`),
+`an_h2_frontend_lingers_after_its_final_goaway_so_the_client_reads_everything`
+(`mod.rs`), `a_linger_deferred_behind_close_notify_starts_on_the_next_pass`
+and `the_final_goaway_and_close_notify_leave_in_one_tls_write` (`h2.rs`).
+
 ### 8.2 RST_STREAM
 
 Three directions:
@@ -1571,7 +1607,7 @@ private fields. `begin_graceful_drain` arms `started_at` from the `now` it is
 handed, and the `debug_assert!` guarding that assignment states the invariant
 the budget rests on:
 
-```rust lib/src/protocol/mux/h2_drain.rs:206-209
+```rust lib/src/protocol/mux/h2_drain.rs:207-210
 debug_assert!(
     self.started_at.is_none(),
     "begin_graceful_drain must arm started_at exactly once, on the first call"
@@ -1587,8 +1623,17 @@ listener knob `h2_graceful_shutdown_deadline_seconds` (proto field
 `0` maps to `graceful_shutdown_deadline = None`, which disables the forced-close
 branch entirely — shutdown then reverts to "wait for every stream to drain"
 semantics. Peer-initiated drains received via `handle_goaway_frame` deliberately
-do **not** arm `started_at`: the budget only applies to the proxy's own
-soft-stop.
+do **not** arm `started_at` when they happen: the budget only applies to the
+proxy's own soft-stop. A soft-stop that finds the connection already draining
+skips `graceful_goaway`, so `Mux::shutting_down` arms the budget itself through
+`H2DrainState::arm_deadline_if_unarmed`, once, from that pass's `now`
+(`test_h2_client_goaway_then_soft_stop_honors_deadline`). A client GOAWAY on a
+frontend connection leaves every in-flight stream running until it completes
+(RFC 9113 §6.8: the sender's own streams are unaffected); `draining` refuses
+new streams and the final GOAWAY follows once the stream table is empty
+(`test_h2_client_goaway_keeps_in_flight_response`). Each received GOAWAY counts
+toward the glitch budget, which bounds a peer that repeats it
+(`test_h2_repeated_client_goaway_is_bounded`).
 
 ### 8.4 `Connection::end_stream` (backend-side retirement)
 
@@ -1658,9 +1703,14 @@ response can never follow the close-delimited body; the client retries it on
 a new connection (§9.3.2). Before this, the client waited for more body until
 the frontend timeout and the next pipelined response was appended to the
 body. This is an H1-frontend decision only: `keep_alive_frontend` is not
-cleared, because `ConnectionH2::write_streams` reads it to send GOAWAY, and an
-H2 client neither sees `Connection` (RFC 9113 §8.2.2) nor needs the close to
-end the body, which carries END_STREAM. HAProxy's `h1_set_cli_conn_mode`
+cleared, because an H2 client neither sees `Connection` (RFC 9113 §8.2.2) nor
+needs the close to end the body, which carries END_STREAM. The H2 write pass
+does not read `keep_alive_frontend` at all: a default answer whose template
+carries `Connection: close` clears it, and on an H2 frontend that answer ends
+its own stream and nothing else — no GOAWAY, the other streams continue
+(sozu-proxy/sozu#1740). Pinned by the e2e
+`test_h2_default_answer_terminates_stream` and
+`test_h2_default_answer_502_spares_other_streams`. HAProxy's `h1_set_cli_conn_mode`
 (`src/mux_h1.c`) closes the client on a response without a known length as
 well; sozu does not re-frame such a body as chunked to keep the connection.
 Pinned by the e2e `test_h1_close_delimited_body_closes_client`,
@@ -1696,11 +1746,15 @@ the client's END_STREAM, but a client RST_STREAM after the whole response
 reaches `end_stream` with the request still incomplete. An H2 backend takes a
 different path: a stream it carries is never reused, and when one ends the
 connection sends RST_STREAM(CANCEL) unless `back_received_end_of_stream &&
-front.is_terminated()` (`fully_completed` in `ConnectionH2`). That test asks
-whether the request was received whole, not whether it was fully written: a
-request received whole whose last DATA frames or END_STREAM are still queued
-toward the backend is forgotten without a reset, leaving that stream open on
-the backend. This change does not alter the H2 backend path. The close costs a client that pipelined behind its upload
+front.is_terminated() && front.is_completed()` (`fully_completed` in
+`ConnectionH2`): the response's END_STREAM was read and the request's was
+handed to the output, which flushes in order. Received whole is not enough: a
+request whose last DATA frames or END_STREAM are still queued toward the
+backend — a backend that answered early may never open the window for them
+(RFC 9113 §8.1) — would otherwise be forgotten without a reset, leaving the
+stream half-closed on the backend and holding one of its
+MAX_CONCURRENT_STREAMS slots (§5.1.2) for the connection's lifetime. Pinned by
+the unit `a_backend_stream_answered_before_its_request_was_written_is_cancelled`. The close costs a client that pipelined behind its upload
 that pipelined request, which it retries on a new connection (§9.3.2).
 Sozu does not drain the rest of the body to keep the connection, but it drains
 it to close it: a socket closed with bytes still unread, or that receives more
@@ -1749,6 +1803,34 @@ e2e `test_h1_early_response_mid_content_length_upload`,
 `a_linger_started_by_a_timeout_write_keeps_its_own_deadline`,
 `a_408_to_a_silent_client_closes_without_lingering` and
 `a_silent_client_is_closed_at_the_linger_deadline`.
+
+**An H2 trailer block on a `Content-Length`-framed message is dropped towards
+an H1 peer only.** HTTP/1.1 carries a trailer section only with chunked coding
+(RFC 9112 §7.1), a length-framed message ends with its last body byte (§6.3),
+and the framing cannot become chunked once the header section is sent.
+`pkawa::handle_trailer` validates, elides and queues the trailer block as for
+any message, so `H2BlockConverter` forwards it to an H2 peer as a HEADERS
+frame with END_STREAM. `ConnectionH1::writable` (`h1.rs`) calls
+`ConnectionH1::drop_length_framed_trailers` before its `kawa.prepare`: for a
+`BodySize::Length` message whose queue ends with a trailer block (the
+`Header` blocks before a closing `Flags { end_header, end_stream }` that do
+not follow a header section's `StatusLine` or `Cookies`), it removes the
+fields and clears `end_header`, so kawa's H1 serializer writes nothing after
+the body, for a request to an H1 backend and a response to an H1 client.
+RFC 9110 §6.5.1 lets a recipient discard trailers; each dropped block logs a
+`warn!` and increments `h2.trailers_dropped_content_length`, at the write, so
+a stream reset before it is not counted. An H2 trailer block is queued whole
+and kawa's H1 serializer drains the queue in one pass, so a block is never
+split across writes. Before sozu-proxy/sozu#1730 the fields and a closing
+empty line were written after the body. Pinned by
+`a_length_framed_message_writes_no_trailer_to_an_h1_peer`,
+`a_length_framed_header_section_is_not_taken_for_trailers`,
+`a_length_framed_header_section_ending_with_cookies_is_not_taken_for_trailers`,
+`a_header_only_head_response_is_not_taken_for_trailers` (`h1.rs`),
+`a_length_framed_trailer_block_reaches_an_h2_peer` (`converter.rs`),
+`handle_trailer_filters_and_keeps_a_length_framed_block` (`pkawa.rs`) and
+`test_h2_length_framed_request_trailers_keep_h1_backend_framing`
+(`e2e/src/tests/h2_security_header_injection.rs`).
 
 ### 8.5 Stale-upstream replay (`ReplayOnFreshBackend`)
 

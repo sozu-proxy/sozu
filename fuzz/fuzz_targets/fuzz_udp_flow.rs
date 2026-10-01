@@ -135,8 +135,8 @@ impl<'a> Reader<'a> {
     /// A client source address drawn from a small, bounded pool so distinct
     /// flows actually collide on the flow table (otherwise every datagram is a
     /// brand-new flow and the table never sees reuse / eviction races). The
-    /// port pool is intentionally tiny so the 2-tuple vs 4-tuple keying knob
-    /// changes behaviour.
+    /// port pool is intentionally tiny so several ports of one IP coexist as
+    /// distinct flows that share an affinity key.
     fn client_addr(&mut self) -> SocketAddr {
         let id = self.u8();
         let port = 9000 + (self.u8() as u16 % 4);
@@ -347,11 +347,9 @@ fuzz_target!(|data: &[u8]| {
     // (the extractor must reject it) without ever panicking.
     assert!(extractor.flow_key(src, &[], &cfg).is_none());
 
-    // Both keying modes must round-trip without panicking, and the 2-tuple form
-    // must normalise the port to zero.
-    let _ = FlowKey::from_src(src, true);
-    let two_tuple = FlowKey::from_src(src, false);
-    assert_eq!(two_tuple.src.port(), 0, "2-tuple key must zero the port");
+    // The flow key is the full client source address, port included, whatever
+    // the affinity key (#1732).
+    assert_eq!(FlowKey::from_src(src).src, src, "the flow key keeps the port");
 
     // --- Part 3: PPv2 DGRAM framing on arbitrary addresses -----------------
 

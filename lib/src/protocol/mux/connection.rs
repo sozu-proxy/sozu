@@ -499,12 +499,14 @@ impl<Front: SocketHandler> Connection<Front> {
         }
     }
 
-    /// True while an H1 frontend drains the rest of a request after its
-    /// response, before it closes. H2 never lingers. See [`super::h1::Linger`].
+    /// True while a frontend drains what its client still sends before it
+    /// closes: an H1 connection after a response that completed before its
+    /// request, an H2 connection after its final GOAWAY. See
+    /// [`super::shared::Linger`].
     pub(super) fn is_lingering(&self) -> bool {
         match self {
             Connection::H1(c) => c.is_lingering(),
-            Connection::H2(_) => false,
+            Connection::H2(c) => c.core.is_lingering(),
         }
     }
 
@@ -524,6 +526,16 @@ impl<Front: SocketHandler> Connection<Front> {
         match self {
             Connection::H1(_) => false,
             Connection::H2(c) => c.core.graceful_shutdown_deadline_elapsed(),
+        }
+    }
+
+    /// Arm the H2 graceful-shutdown budget on a connection already draining
+    /// when the proxy soft-stops. H1 has no budget and ignores it. See
+    /// [`h2::ConnectionH2::arm_graceful_shutdown_deadline`].
+    pub(super) fn arm_graceful_shutdown_deadline(&mut self, now: Instant) {
+        match self {
+            Connection::H1(_) => {}
+            Connection::H2(c) => c.core.arm_graceful_shutdown_deadline(now),
         }
     }
 

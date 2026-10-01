@@ -1169,7 +1169,8 @@ enum TlsVersion {
 
 // How a UDP flow is keyed for backend affinity. SOURCE_IP keys on the
 // client source IP only (all ports from one client pin to one backend);
-// SOURCE_IP_PORT keys on the full 2-tuple (per-socket affinity).
+// SOURCE_IP_PORT keys on the full 2-tuple (per-socket affinity). It only
+// selects the backend: a flow is always one client source IP and port.
 enum UdpAffinityKey {
     SOURCE_IP = 0;
     SOURCE_IP_PORT = 1;

@@ -2031,6 +2031,91 @@ mod tests {
         frames
     }
 
+    /// An H2 trailer block on a Content-Length-framed message still reaches an
+    /// H2 peer: HEADERS with END_STREAM holding the fields, after the DATA.
+    /// Only the H1 write path drops such a block
+    /// (`ConnectionH1::drop_length_framed_trailers`, `h1.rs`), since HTTP/1.1
+    /// carries trailers only with chunked coding; H2 frames them on their own.
+    ///
+    /// TO SEE THIS RED: drop the trailer fields of a length-framed message in
+    /// `pkawa::handle_trailer`, or clear `end_header` on its closing flags.
+    #[test]
+    fn a_length_framed_trailer_block_reaches_an_h2_peer() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let checkout = pool
+            .checkout()
+            .expect("the test pool must hand out a buffer");
+        let mut kawa: crate::protocol::mux::GenericHttpStream =
+            Kawa::new(Kind::Request, Buffer::new(checkout));
+        kawa.body_size = kawa::BodySize::Length(5);
+        kawa.push_block(Block::Chunk(Chunk {
+            data: Store::Static(b"hello"),
+        }));
+        let mut trailer = Vec::new();
+        crate::protocol::mux::hpack::Encoder::new()
+            .encode_header_into((b"grpc-status", b"0"), &mut trailer);
+        let result = crate::protocol::mux::pkawa::handle_trailer(
+            &mut kawa,
+            &trailer,
+            true,
+            &mut crate::protocol::mux::hpack::Decoder::new(),
+            MAX_HEADER_LIST_SIZE as u32,
+            u32::MAX,
+            false,
+            &mut Vec::new(),
+        );
+        assert!(result.is_ok(), "handle_trailer failed: {:?}", result.err());
+
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
+        let mut pass = H2ConverterPass::new(
+            16384,
+            b"https",
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        let mut converter = pass.converter(&mut encoder, 1, 65535, false, 0);
+        kawa.prepare(&mut converter);
+        pass.reclaim(converter, &mut Vec::new());
+        let frames = take_out_frames(&mut kawa);
+
+        let mut peer = crate::protocol::mux::hpack::Decoder::new();
+        type Fields = Vec<(Vec<u8>, Vec<u8>)>;
+        let decoded: Vec<(u8, u8, Fields)> = frames
+            .iter()
+            .map(|(kind, flags, payload)| {
+                let mut fields = Vec::new();
+                if *kind == 0x1 {
+                    peer.decode_with_cb(payload, |name, value| {
+                        fields.push((name.into_owned(), value.into_owned()));
+                    })
+                    .expect("the trailer block decodes");
+                }
+                (*kind, *flags, fields)
+            })
+            .collect();
+        assert_eq!(
+            frames
+                .first()
+                .map(|(kind, flags, payload)| (*kind, *flags, payload.as_slice())),
+            Some((0x0, 0, &b"hello"[..])),
+            "the body goes first, without END_STREAM"
+        );
+        assert_eq!(
+            decoded.get(1..),
+            Some(
+                &[(
+                    0x1,
+                    parser::FLAG_END_HEADERS | parser::FLAG_END_STREAM,
+                    vec![(b"grpc-status".to_vec(), b"0".to_vec())],
+                )][..]
+            ),
+            "then one HEADERS frame with END_STREAM holding the trailer field: {frames:?}"
+        );
+    }
+
     /// H1 trailers that arrive in two reads must not be encoded before their
     /// last line (sozu-proxy/sozu#1627). kawa pushes one `Block::Header` per
     /// trailer line as it parses it, and the closing `Flags { end_header }`

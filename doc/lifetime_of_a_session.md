@@ -581,7 +581,12 @@ backend whose readiness has work, sweeps the backends found dead (their tokens
 collect in `Router::dead_backends`, reused across passes) and settles the
 per-backend accounting through `BackendRegistry::apply_all`, whose ledger keeps
 its capacity. The loop repeats while any connection still has interest and an
-event, bounded by `MAX_LOOP_ITERATIONS`.
+event, bounded by `MAX_LOOP_ITERATIONS`: it stops once the frontend has no
+READABLE, WRITABLE or ERROR interest with a matching event and every backend's
+readiness is empty. A frontend HUP is not work the loop can progress: each
+iteration closes the session on one once no output is left to flush, except on
+a lingering frontend, which drains the client's last bytes to the EOF first
+([#1774](https://github.com/sozu-proxy/sozu/issues/1774)).
 
 ## 9. TCP (pipe) session lifecycle
 
