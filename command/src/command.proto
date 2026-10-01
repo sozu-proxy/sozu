@@ -248,11 +248,11 @@ message UpdateHttpListenerConfig {
     optional uint32 h2_max_concurrent_streams        = 27;
     // Shrink threshold ratio for recycled stream slots; >= 1
     optional uint32 h2_stream_shrink_ratio           = 28;
-    // Absolute lifetime cap on RST_STREAM frames received (CVE-2023-44487)
+    // Floor of the lifetime cap on RST_STREAM frames received (CVE-2023-44487)
     optional uint64 h2_max_rst_stream_lifetime       = 29;
-    // Lifetime cap on abusive RST_STREAM frames — Rapid Reset signature
+    // Floor of the cap on pre-response RST_STREAM frames — Rapid Reset signature
     optional uint64 h2_max_rst_stream_abusive_lifetime   = 30;
-    // Absolute lifetime cap on RST_STREAM frames emitted by the server (CVE-2025-8671)
+    // Floor of the cap on peer-provoked RST_STREAM frames the server emits (CVE-2025-8671)
     optional uint64 h2_max_rst_stream_emitted_lifetime   = 31;
     // Maximum HPACK-decoded header list size per request (RFC 9113 §6.5.2)
     optional uint32 h2_max_header_list_size          = 32;
@@ -262,7 +262,7 @@ message UpdateHttpListenerConfig {
     optional uint32 h2_stream_idle_timeout_seconds   = 34;
     // Maximum wall-clock seconds to wait after GOAWAY(NO_ERROR). 0 = wait forever.
     optional uint32 h2_graceful_shutdown_deadline_seconds = 35;
-    // Maximum connection-level (stream 0) WINDOW_UPDATE frames per window; >= 1
+    // Maximum unsolicited connection-level (stream 0) WINDOW_UPDATE frames per window; >= 1
     optional uint32 h2_max_window_update_stream0_per_window = 36;
     // Name of the correlation header injected per request (e.g. "Sozu-Id")
     optional string sozu_id_header                   = 37;
@@ -345,11 +345,11 @@ message UpdateHttpsListenerConfig {
     optional uint32 h2_max_concurrent_streams        = 27;
     // Shrink threshold ratio for recycled stream slots; >= 1
     optional uint32 h2_stream_shrink_ratio           = 28;
-    // Absolute lifetime cap on RST_STREAM frames received (CVE-2023-44487)
+    // Floor of the lifetime cap on RST_STREAM frames received (CVE-2023-44487)
     optional uint64 h2_max_rst_stream_lifetime       = 29;
-    // Lifetime cap on abusive RST_STREAM frames — Rapid Reset signature
+    // Floor of the cap on pre-response RST_STREAM frames — Rapid Reset signature
     optional uint64 h2_max_rst_stream_abusive_lifetime   = 30;
-    // Absolute lifetime cap on RST_STREAM frames emitted by the server (CVE-2025-8671)
+    // Floor of the cap on peer-provoked RST_STREAM frames the server emits (CVE-2025-8671)
     optional uint64 h2_max_rst_stream_emitted_lifetime   = 31;
     // Maximum HPACK-decoded header list size per request (RFC 9113 §6.5.2)
     optional uint32 h2_max_header_list_size          = 32;
@@ -359,7 +359,7 @@ message UpdateHttpsListenerConfig {
     optional uint32 h2_stream_idle_timeout_seconds   = 34;
     // Maximum wall-clock seconds to wait after GOAWAY(NO_ERROR). 0 = wait forever.
     optional uint32 h2_graceful_shutdown_deadline_seconds = 35;
-    // Maximum connection-level (stream 0) WINDOW_UPDATE frames per window; >= 1
+    // Maximum unsolicited connection-level (stream 0) WINDOW_UPDATE frames per window; >= 1
     optional uint32 h2_max_window_update_stream0_per_window = 36;
     // Name of the correlation header injected per request (e.g. "Sozu-Id")
     optional string sozu_id_header                   = 37;
@@ -478,20 +478,25 @@ message HttpListenerConfig {
     // Shrink threshold ratio for recycled stream slots. Vec is shrunk when
     // total_slots > active_streams * ratio. Default: 2.
     optional uint32 h2_stream_shrink_ratio = 21;
-    // Absolute lifetime cap on RST_STREAM frames received on a single H2
-    // connection (CVE-2023-44487). Default: 10000.
+    // Floor of the connection-lifetime cap on RST_STREAM frames received
+    // (CVE-2023-44487): trips once the count exceeds both this value and the
+    // streams opened on the connection. Default: 200000.
     optional uint64 h2_max_rst_stream_lifetime = 22;
-    // Lifetime cap on "abusive" (pre-response-start) RST_STREAM frames
-    // received on a single H2 connection — the Rapid Reset signature.
-    // Default: 50.
+    // Floor of the cap on "abusive" (pre-response-start) RST_STREAM frames
+    // received on a frontend H2 connection — the Rapid Reset signature: trips
+    // once the count exceeds both this value and half of the streams opened.
+    // Default: 1000.
     optional uint64 h2_max_rst_stream_abusive_lifetime = 23;
-    // Absolute lifetime cap on RST_STREAM frames **emitted by the server**
-    // on a single H2 connection (CVE-2025-8671 "MadeYouReset"). Covers the
+    // Floor of the cap on RST_STREAM frames **emitted by the server** that
+    // the peer provoked (CVE-2025-8671 "MadeYouReset"): trips once the count
+    // exceeds both this value and half of the streams opened. Covers the
     // emission-direction-flipped sibling of Rapid Reset, where an attacker
     // sends legitimate-looking frames (Content-Length mismatch, header parse
     // error, rejected priority, zero-increment WINDOW_UPDATE on an open
-    // stream) that coerce the server into emitting RST_STREAM. Graceful
-    // `NoError` cancels are exempt. Default: 500.
+    // stream) that coerce the server into emitting RST_STREAM. Resets Sōzu
+    // decides on its own (idle CANCEL, REFUSED_STREAM, STREAM_CLOSED,
+    // backend-failure INTERNAL_ERROR) and `NoError` resets are not counted.
+    // Default: 10000.
     optional uint64 h2_max_rst_stream_emitted_lifetime = 27;
     // Maximum accumulated HPACK-decoded header list size per request
     // (SETTINGS_MAX_HEADER_LIST_SIZE, RFC 9113 §6.5.2). Default: 65536.
@@ -512,10 +517,12 @@ message HttpListenerConfig {
     // GOAWAY(NO_ERROR) before forcibly closing the connection. Default: 5.
     // Set to 0 to require streams to finish (no forced close).
     optional uint32 h2_graceful_shutdown_deadline_seconds = 28;
-    // Maximum connection-level (stream 0) WINDOW_UPDATE frames per second
-    // window. Caps non-zero stream-0 WINDOW_UPDATE floods that would otherwise
-    // stay under the generic glitch counter (zero-increment stream-0 updates
-    // already trigger GOAWAY per RFC 9113 §6.9). Default: 100.
+    // Maximum unsolicited connection-level (stream 0) WINDOW_UPDATE frames
+    // per second window. Each DATA frame the proxy sends entitles the peer to
+    // two that are not counted; only the excess counts. Caps non-zero stream-0
+    // WINDOW_UPDATE floods that would otherwise stay under the generic glitch
+    // counter (zero-increment stream-0 updates already trigger GOAWAY per
+    // RFC 9113 §6.9). Default: 2000.
     optional uint32 h2_max_window_update_stream0_per_window = 29;
     // Name of the correlation header Sozu injects into every request and
     // response to carry the per-request ULID. Default: "Sozu-Id". Operators
@@ -614,20 +621,25 @@ message HttpsListenerConfig {
     // Shrink threshold ratio for recycled stream slots. Vec is shrunk when
     // total_slots > active_streams * ratio. Default: 2.
     optional uint32 h2_stream_shrink_ratio = 31;
-    // Absolute lifetime cap on RST_STREAM frames received on a single H2
-    // connection (CVE-2023-44487). Default: 10000.
+    // Floor of the connection-lifetime cap on RST_STREAM frames received
+    // (CVE-2023-44487): trips once the count exceeds both this value and the
+    // streams opened on the connection. Default: 200000.
     optional uint64 h2_max_rst_stream_lifetime = 32;
-    // Lifetime cap on "abusive" (pre-response-start) RST_STREAM frames
-    // received on a single H2 connection — the Rapid Reset signature.
-    // Default: 50.
+    // Floor of the cap on "abusive" (pre-response-start) RST_STREAM frames
+    // received on a frontend H2 connection — the Rapid Reset signature: trips
+    // once the count exceeds both this value and half of the streams opened.
+    // Default: 1000.
     optional uint64 h2_max_rst_stream_abusive_lifetime = 33;
-    // Absolute lifetime cap on RST_STREAM frames **emitted by the server**
-    // on a single H2 connection (CVE-2025-8671 "MadeYouReset"). Covers the
+    // Floor of the cap on RST_STREAM frames **emitted by the server** that
+    // the peer provoked (CVE-2025-8671 "MadeYouReset"): trips once the count
+    // exceeds both this value and half of the streams opened. Covers the
     // emission-direction-flipped sibling of Rapid Reset, where an attacker
     // sends legitimate-looking frames (Content-Length mismatch, header parse
     // error, rejected priority, zero-increment WINDOW_UPDATE on an open
-    // stream) that coerce the server into emitting RST_STREAM. Graceful
-    // `NoError` cancels are exempt. Default: 500.
+    // stream) that coerce the server into emitting RST_STREAM. Resets Sōzu
+    // decides on its own (idle CANCEL, REFUSED_STREAM, STREAM_CLOSED,
+    // backend-failure INTERNAL_ERROR) and `NoError` resets are not counted.
+    // Default: 10000.
     optional uint64 h2_max_rst_stream_emitted_lifetime = 39;
     // Maximum accumulated HPACK-decoded header list size per request
     // (SETTINGS_MAX_HEADER_LIST_SIZE, RFC 9113 §6.5.2). Default: 65536.
@@ -660,10 +672,12 @@ message HttpsListenerConfig {
     // GOAWAY(NO_ERROR) before forcibly closing the connection. Default: 5.
     // Set to 0 to require streams to finish (no forced close).
     optional uint32 h2_graceful_shutdown_deadline_seconds = 40;
-    // Maximum connection-level (stream 0) WINDOW_UPDATE frames per second
-    // window. Caps non-zero stream-0 WINDOW_UPDATE floods that would otherwise
-    // stay under the generic glitch counter (zero-increment stream-0 updates
-    // already trigger GOAWAY per RFC 9113 §6.9). Default: 100.
+    // Maximum unsolicited connection-level (stream 0) WINDOW_UPDATE frames
+    // per second window. Each DATA frame the proxy sends entitles the peer to
+    // two that are not counted; only the excess counts. Caps non-zero stream-0
+    // WINDOW_UPDATE floods that would otherwise stay under the generic glitch
+    // counter (zero-increment stream-0 updates already trigger GOAWAY per
+    // RFC 9113 §6.9). Default: 2000.
     optional uint32 h2_max_window_update_stream0_per_window = 41;
     // Name of the correlation header Sozu injects into every request and
     // response to carry the per-request ULID. Default: "Sozu-Id". Operators

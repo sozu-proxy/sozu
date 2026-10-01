@@ -734,9 +734,11 @@ pub struct ListenerBuilder {
     pub h2_max_settings_per_window: Option<u32>,
     /// H2 flood detection: max empty DATA frames per second window (CVE-2019-9518)
     pub h2_max_empty_data_per_window: Option<u32>,
-    /// H2 flood detection: max connection-level (stream 0) WINDOW_UPDATE
-    /// frames per sliding window. Caps non-zero stream-0 WINDOW_UPDATE floods
-    /// that would otherwise stay under the generic glitch counter. Default: 100.
+    /// H2 flood detection: max unsolicited connection-level (stream 0)
+    /// WINDOW_UPDATE frames per sliding window — each DATA frame the proxy
+    /// sends entitles the peer to two that are not counted. Caps non-zero
+    /// stream-0 WINDOW_UPDATE floods that would otherwise stay under the
+    /// generic glitch counter. Default: 2000.
     pub h2_max_window_update_stream0_per_window: Option<u32>,
     /// Name of the correlation header Sozu injects into every request and
     /// response. Default: `Sozu-Id`. Operators can rebrand (e.g. `X-Edge-Id`)
@@ -744,7 +746,8 @@ pub struct ListenerBuilder {
     pub sozu_id_header: Option<String>,
     /// H2 flood detection: max CONTINUATION frames per header block (CVE-2024-27316)
     pub h2_max_continuation_frames: Option<u32>,
-    /// H2 flood detection: max accumulated protocol anomalies before ENHANCE_YOUR_CALM
+    /// H2 flood detection: max accumulated protocol anomalies before
+    /// ENHANCE_YOUR_CALM. Default: 2000.
     pub h2_max_glitch_count: Option<u32>,
     /// H2 connection-level receive window size in bytes (RFC 9113 §6.9.2). Default: 1048576 (1MB).
     pub h2_initial_connection_window: Option<u32>,
@@ -752,15 +755,20 @@ pub struct ListenerBuilder {
     pub h2_max_concurrent_streams: Option<u32>,
     /// Shrink threshold ratio for recycled stream slots. Default: 2.
     pub h2_stream_shrink_ratio: Option<u32>,
-    /// H2 flood detection: absolute lifetime cap on RST_STREAM frames
-    /// received on a single connection (CVE-2023-44487). Default: 10000.
+    /// H2 flood detection: floor of the connection-lifetime cap on RST_STREAM
+    /// frames received (CVE-2023-44487); trips once the count exceeds both
+    /// this value and the streams opened. Default: 200000.
     pub h2_max_rst_stream_lifetime: Option<u64>,
-    /// H2 flood detection: lifetime cap on "abusive" (pre-response-start)
-    /// RST_STREAM frames (Rapid Reset signature, CVE-2023-44487). Default: 50.
+    /// H2 flood detection: floor of the cap on "abusive" (pre-response-start)
+    /// RST_STREAM frames (Rapid Reset signature, CVE-2023-44487); trips once
+    /// the count exceeds both this value and half of the streams opened.
+    /// Default: 1000.
     pub h2_max_rst_stream_abusive_lifetime: Option<u64>,
-    /// H2 flood detection: absolute lifetime cap on **server-emitted**
-    /// RST_STREAM frames (CVE-2025-8671 "MadeYouReset"). Only non-`NoError`
-    /// resets count — graceful cancels are exempt. Default: 500.
+    /// H2 flood detection: floor of the cap on **server-emitted** RST_STREAM
+    /// frames the peer provoked (CVE-2025-8671 "MadeYouReset"); trips once the
+    /// count exceeds both this value and half of the streams opened. Resets
+    /// Sōzu decides on its own and `NoError` resets are not counted.
+    /// Default: 10000.
     pub h2_max_rst_stream_emitted_lifetime: Option<u64>,
     /// H2 flood detection: maximum accumulated HPACK-decoded header list
     /// size per request (SETTINGS_MAX_HEADER_LIST_SIZE, RFC 9113 §6.5.2).

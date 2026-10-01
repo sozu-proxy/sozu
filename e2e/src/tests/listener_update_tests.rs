@@ -275,9 +275,8 @@ fn setup_https_with_rst_threshold(
         .unwrap();
     listener.h2_max_rst_stream_per_window = Some(rst_threshold);
     // Push the other RST-related caps far above the per-window threshold so
-    // the test isolates the `h2_max_rst_stream_per_window` knob. Defaults
-    // (abusive=50, lifetime=10000, emitted=500) would trip first for a burst
-    // of 90+ resets.
+    // the test isolates the `h2_max_rst_stream_per_window` knob whatever
+    // their defaults are.
     listener.h2_max_rst_stream_abusive_lifetime = Some(100_000);
     listener.h2_max_rst_stream_lifetime = Some(1_000_000);
     listener.h2_max_rst_stream_emitted_lifetime = Some(100_000);

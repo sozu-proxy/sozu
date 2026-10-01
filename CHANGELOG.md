@@ -4001,6 +4001,50 @@
   `test_h2_client_goaway_keeps_in_flight_response`,
   `test_h2_client_goaway_then_soft_stop_honors_deadline`, `test_h2_repeated_client_goaway_is_bounded`
   and `soft_stop_after_a_peer_goaway_arms_the_budget_once`.
+- **`fix(mux-h2)`: raise H2 flood-protection defaults that tripped on legitimate traffic; make
+  RST caps decay; stop counting Sōzu-initiated resets
+  ([#1749](https://github.com/sozu-proxy/sozu/issues/1749)).** Ordinary browsers, large downloads,
+  high-cancellation clients and a Sōzu→Sōzu chain could be closed with
+  `GOAWAY(ENHANCE_YOUR_CALM)`.
+  - A stream-0 `WINDOW_UPDATE` that answers DATA Sōzu sent is no longer counted: each DATA frame
+    sent entitles the peer to two (the shape of Envoy's
+    `max_inbound_window_update_frames_per_data_frame_sent`), and
+    `h2_max_window_update_stream0_per_window` now bounds only unsolicited ones.
+  - `h2_max_rst_stream_lifetime`, `h2_max_rst_stream_abusive_lifetime` and
+    `h2_max_rst_stream_emitted_lifetime` are now floors: each cap trips once its count also exceeds
+    the streams opened on the connection (received resets) or half of them (pre-response and
+    peer-provoked emitted resets), the shape of Envoy's premature-reset guard.
+  - Resets Sōzu decides on its own — idle reaper `CANCEL`, `REFUSED_STREAM` from its concurrency
+    limit, back-pressure or buffer pool, `STREAM_CLOSED` for DATA on a closed stream, the
+    converter's error on a backend failure — no longer count toward the CVE-2025-8671
+    MadeYouReset cap. Peer-provoked resets (Content-Length mismatch, header parse error, oversized
+    header block, PRIORITY self-dependency, bad `WINDOW_UPDATE`) still do.
+  - On a backend connection, a `RST_STREAM` the backend sends before its response is no longer
+    counted as Rapid Reset.
+  - The pending `RST_STREAM` queue bound is now a bound on what is pending —
+    `MIN_PENDING_RST_STREAMS`, or four per advertised `h2_max_concurrent_streams` when larger —
+    instead of a lifetime count; a connection escalates to GOAWAY only when an RST could not be
+    queued.
+  - Every count default is twenty times its former value: `h2_max_rst_stream_per_window`,
+    `h2_max_ping_per_window` and `h2_max_empty_data_per_window` 100 → 2000,
+    `h2_max_settings_per_window` 50 → 1000, `h2_max_window_update_stream0_per_window` 100 → 2000,
+    `h2_max_glitch_count` 100 → 2000, `h2_max_rst_stream_lifetime` 10 000 → 200 000,
+    `h2_max_rst_stream_abusive_lifetime` 50 → 1000, `h2_max_rst_stream_emitted_lifetime`
+    500 → 10 000, the PING and SETTINGS lifetime ceilings 10 000 → 200 000, the pending
+    `RST_STREAM` queue floor 200 → 4000, and the `REFUSED_STREAM` count that halves the
+    advertised concurrency 50 → 1000 per 60 s. The memory bounds keep their values:
+    `h2_max_continuation_frames`, `h2_max_header_list_size`, `h2_max_header_fields`,
+    `h2_max_header_table_size`, the PRIORITY map size and the buffer sizes.
+  - A stream opened beyond the advertised `h2_max_concurrent_streams` now counts as a glitch
+    (RFC 9113 §5.1.2), as in nghttp2.
+  - `doc/configure.md` now states what each knob counts, its exemptions and its defaults.
+
+  Covered by `h2_flood_threshold_tests.rs` (sixty pre-response cancels keep the connection; a
+  per-DATA-frame stream-0 `WINDOW_UPDATE` client downloads 16 MiB),
+  `local_resets_are_not_charged_to_the_peer`,
+  `backend_resets_before_the_response_are_not_rapid_reset`, and the detector and control-queue
+  unit tests; the Rapid Reset, PING, SETTINGS, empty-DATA, WINDOW_UPDATE and glitch flood e2e
+  tests now send floods sized to the new thresholds and assert the same outcome.
 
 - **`fix(mux)`: release the backend connection reservation of an abandoned dial
   ([#1713](https://github.com/sozu-proxy/sozu/issues/1713)).** Selection reserves a connection on

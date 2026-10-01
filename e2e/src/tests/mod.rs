@@ -33,6 +33,7 @@ mod fuzz_tests;
 mod h1_security_tests;
 mod h2_clock_tests;
 mod h2_correctness_tests;
+mod h2_flood_threshold_tests;
 mod h2_hpack_tests;
 mod h2_log_context_tests;
 mod h2_priority_rearm_tests;

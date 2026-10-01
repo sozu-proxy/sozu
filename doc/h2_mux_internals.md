@@ -90,8 +90,8 @@ ConnectionH2
  |-- pending_table_size_update: Option<u32> // RFC 7541 s6.3 directive owed to the peer
  |-- control_tx: H2ControlTx                // Closed API (h2_control_tx.rs, private fields):
  |                                         // pending_rst_streams: Vec<(StreamId, H2Error)>,
- |                                         // total_rst_streams_queued (never-decaying, behind the
- |                                         // CVE-2025-8671 cap) and max_pending
+ |                                         // total_rst_streams_queued (log only), max_pending
+ |                                         // (bound on what is pending) and overflowed
  |-- settings_sent_at: Option<Instant>      // SETTINGS ACK timeout tracking
  |-- zero: GenericHttpStream                // Per-frame read landing zone: frame headers and
  |                                         // stream-0 payloads. Input only since #1604, and
@@ -1297,21 +1297,22 @@ application frames, in order:
    order, deterministic across processes — see that module's doc comment
 4. **Pending RST_STREAM frames**: Asks `H2ControlTx::drain_rst_streams_into`
    (`h2_control_tx.rs`) to serialize every queued frame into room reserved at
-   the end of the output queue, with flood detection (`MAX_PENDING_RST_STREAMS`
-   cap). Proxy-emitted RSTs (DATA-on-closed, `refuse_stream_and_discard`,
-   `reset_stream`, `cancel_timed_out_streams`) are queued via the canonical
-   `ConnectionH2::enqueue_rst` helper, which delegates to
-   `H2ControlTx::enqueue_rst` — dedupes through the wire-map's `rst_sent` set
-   (`H2StreamTable`, `h2_stream_table.rs`), bumps the lifetime counter, and
-   arms WRITABLE. The same `MAX_PENDING_RST_STREAMS` bounds the queue at the
-   insert: once that queue holds 200 entries a further
-   `enqueue_rst` queues nothing and returns `h2.rst_stream_dropped` plus an
-   `error!` line, because the connection has by then already met the
-   `total_rst_streams_queued >= MAX_PENDING_RST_STREAMS` half of the condition
-   this stage escalates to `GOAWAY(ENHANCE_YOUR_CALM)` before it drains
-   anything. The other half is the state gate
-   `!matches!(self.state, H2State::GoAway | H2State::Error)`, which the drain
-   below it does not share: after the first GOAWAY the queue can stay full
+   the end of the output queue. Proxy-emitted RSTs (DATA-on-closed,
+   `refuse_stream_and_discard`, `reset_stream`, `cancel_timed_out_streams`)
+   are queued via the canonical `ConnectionH2::enqueue_rst` helper, which
+   delegates to `H2ControlTx::enqueue_rst` — dedupes through the wire-map's
+   `rst_sent` set (`H2StreamTable`, `h2_stream_table.rs`), bumps the lifetime
+   count the session log reports, and arms WRITABLE — and then charges the
+   reset to the peer's CVE-2025-8671 MadeYouReset count only when its
+   `RstOrigin` is `PeerProvoked`. `pending_rst_bound` (at least
+   `MIN_PENDING_RST_STREAMS`, 4000) bounds what is pending at the insert:
+   once the queue is full a further `enqueue_rst` queues nothing, sets
+   `H2ControlTx::overflowed` and returns `h2.rst_stream_dropped` plus an
+   `error!` line, and this stage escalates to `GOAWAY(ENHANCE_YOUR_CALM)`
+   before it drains anything. Resets drained as they come never overflow it,
+   however many a connection emits over its lifetime. The escalation carries
+   a state gate, `!matches!(self.state, H2State::GoAway | H2State::Error)`,
+   which the drain below it does not share: after the first GOAWAY the queue can stay full
    without re-escalating, and a reap arriving then is dropped while the drain
    still serialises what is queued — bounded by `writable()`'s `GoAway` arm
    force-disconnecting on the same pass. The

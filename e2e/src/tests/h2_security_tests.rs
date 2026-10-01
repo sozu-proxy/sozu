@@ -3764,13 +3764,18 @@ fn h2_basic_get_header_block() -> Vec<u8> {
 ///
 /// Opens N streams; each one immediately follows its `HEADERS(END_STREAM)`
 /// with a `RST_STREAM(CANCEL)` before the backend response has a chance to
-/// start. The per-window counter caps at 100 but half-decays, so the audit
-/// added two lifetime counters:
+/// start. The per-window counter half-decays, so the audit added two
+/// connection-lifetime counters, each tripping past its floor once it also
+/// exceeds a share of the streams opened:
 ///
-///   * `total_rst_received_lifetime` (`DEFAULT_MAX_RST_STREAM_LIFETIME = 10 000`),
-///   * `total_abusive_rst_received_lifetime` (`DEFAULT_MAX_RST_STREAM_ABUSIVE_LIFETIME = 50`).
+///   * `total_rst_received_lifetime` (`DEFAULT_MAX_RST_STREAM_LIFETIME = 200 000`,
+///     more than the streams opened),
+///   * `total_abusive_rst_received_lifetime`
+///     (`DEFAULT_MAX_RST_STREAM_ABUSIVE_LIFETIME = 1000`, more than half of
+///     the streams opened).
 ///
-/// At the 51st abusive RST Sozu must emit `GOAWAY(ENHANCE_YOUR_CALM)`.
+/// Every stream here is reset before its response, so at the 1001st abusive
+/// RST Sozu must emit `GOAWAY(ENHANCE_YOUR_CALM)`.
 ///
 /// Reference: audit Pass 3 High #1 (RFC 9113 \u{00a7}5.1, \u{00a7}6.4, CVE-2023-44487).
 fn try_h2_flood_rapid_reset_abusive_lifetime() -> State {
@@ -3780,10 +3785,10 @@ fn try_h2_flood_rapid_reset_abusive_lifetime() -> State {
     let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
-    // Abusive budget is 50 — open 60 streams to ensure the 51st trips.
+    // Abusive floor is 1000 — open 1100 streams to ensure the 1001st trips.
     let header_block = h2_basic_get_header_block();
     let mut write_ok = true;
-    for i in 0..60u32 {
+    for i in 0..1100u32 {
         let stream_id = i * 2 + 1; // odd client stream IDs
         let headers = H2Frame::headers(stream_id, header_block.clone(), true, true);
         let rst = H2Frame::rst_stream(stream_id, 0x8 /* CANCEL */);
@@ -4150,7 +4155,7 @@ fn e2e_h2_flood_settings_entries_cap() {
 /// attacker that floods them on a recently-closed stream burns CPU without
 /// doing useful work. The fix increments `glitch_count` for each such frame
 /// and funnels it through `check_flood()` — so at the default
-/// `max_glitch_count = 100` threshold Sozu must emit
+/// `max_glitch_count = 2000` threshold Sozu must emit
 /// `GOAWAY(ENHANCE_YOUR_CALM)`.
 ///
 /// Reference: audit Pass 3 Low #5.
@@ -4172,10 +4177,10 @@ fn try_h2_flood_window_update_on_closed_stream() -> State {
     let response = collect_response_frames(&mut tls, 500, 3, 500);
     log_frames("WINDOW_UPDATE on closed - initial response", &response);
 
-    // Now spam 150 WINDOW_UPDATE frames for the closed stream 1. The default
-    // max_glitch_count is 100 — at the 101st frame sozu must ENHANCE_YOUR_CALM.
+    // Now spam 2100 WINDOW_UPDATE frames for the closed stream 1. The default
+    // max_glitch_count is 2000 — at the 2001st frame sozu must ENHANCE_YOUR_CALM.
     let mut batch = Vec::new();
-    for _ in 0..150u32 {
+    for _ in 0..2100u32 {
         batch.extend_from_slice(&H2Frame::window_update(1, 1).encode());
     }
     let write_ok = tls.write_all(&batch).is_ok() && tls.flush().is_ok();

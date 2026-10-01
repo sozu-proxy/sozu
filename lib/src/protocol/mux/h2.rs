@@ -291,7 +291,7 @@ pub(super) const HEADER_FIELD_SIZE_OVERHEAD: usize = 32;
 /// point we halve the advertised `SETTINGS_MAX_CONCURRENT_STREAMS` so the
 /// peer throttles its request rate instead of paying the RST round-trip for
 /// every new stream.
-const BACKPRESSURE_REFUSAL_THRESHOLD: u32 = 50;
+const BACKPRESSURE_REFUSAL_THRESHOLD: u32 = 1000;
 /// Sliding window used to detect refusal bursts for SETTINGS back-pressure.
 const BACKPRESSURE_WINDOW_DURATION: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -853,8 +853,8 @@ pub struct ConnectionH2 {
     /// If the peer does not ACK within SETTINGS_ACK_TIMEOUT, we send GOAWAY
     /// with SettingsTimeout error.
     pub settings_sent_at: Option<Instant>,
-    /// Queued proxy-emitted RST_STREAM frames and the never-decaying
-    /// lifetime counter behind the CVE-2025-8671 MadeYouReset cap,
+    /// Queued proxy-emitted RST_STREAM frames, their pending-queue bound and
+    /// the lifetime count the session log reports,
     /// encapsulated so nothing outside `h2_control_tx.rs` can reach the raw
     /// fields — see [`h2_control_tx::H2ControlTx`]. Frames are queued while
     /// refusing streams during `readable()`; the write happens in the
@@ -1977,7 +1977,7 @@ impl ConnectionH2 {
             },
             flood_detector: h2_flood_detector::H2FloodDetector::new(flood_config, now),
             settings_sent_at: None,
-            control_tx: h2_control_tx::H2ControlTx::new(),
+            control_tx: h2_control_tx::H2ControlTx::new(connection_config.max_concurrent_streams),
             discarded_field_block: None,
             close_notify_sent: false,
             max_pending_window_updates: 1 + connection_config.max_concurrent_streams as usize * 4,
@@ -2137,6 +2137,7 @@ impl ConnectionH2 {
                             return self.refuse_stream_and_discard(
                                 stream_id,
                                 H2Error::RefusedStream,
+                                RstOrigin::Local,
                                 header.payload_len,
                                 DiscardedFieldBlock::New {
                                     flags: header.flags,
@@ -2152,6 +2153,18 @@ impl ConnectionH2 {
                                 self.local_settings.settings_max_concurrent_streams,
                                 self.stream_table.len()
                             );
+                            // The refusal itself is not charged to the peer:
+                            // back-pressure lowers the local limit without
+                            // advertising it. A peer that exceeds the limit
+                            // it WAS advertised breaks RFC 9113 §5.1.2,
+                            // though, and that counts as a glitch — the
+                            // same accounting nghttp2 applies.
+                            if self.stream_table.len()
+                                >= self.connection_config.max_concurrent_streams as usize
+                            {
+                                self.flood_detector.record_glitch();
+                                check_flood_or_return!(self);
+                            }
                             // RFC 9113 §6.8: update highest_peer_stream_id BEFORE
                             // queueing RST_STREAM so GOAWAY reports the correct
                             // last_stream_id if the connection closes later.
@@ -2159,6 +2172,7 @@ impl ConnectionH2 {
                             return self.refuse_stream_and_discard(
                                 stream_id,
                                 H2Error::RefusedStream,
+                                RstOrigin::Local,
                                 header.payload_len,
                                 DiscardedFieldBlock::New {
                                     flags: header.flags,
@@ -2183,6 +2197,7 @@ impl ConnectionH2 {
                                 return self.refuse_stream_and_discard(
                                     stream_id,
                                     H2Error::RefusedStream,
+                                    RstOrigin::Local,
                                     header.payload_len,
                                     DiscardedFieldBlock::New {
                                         flags: header.flags,
@@ -2231,9 +2246,15 @@ impl ConnectionH2 {
                                     );
                                     self.flood_detector.record_glitch();
                                     check_flood_or_return!(self);
-                                    if let Some(result) =
-                                        self.enqueue_rst(header.stream_id, H2Error::StreamClosed)
-                                    {
+                                    // Local: the DATA is already counted as a
+                                    // glitch above, and is routinely the
+                                    // in-flight tail of a stream Sōzu itself
+                                    // reset (RFC 9113 §6.4).
+                                    if let Some(result) = self.enqueue_rst(
+                                        header.stream_id,
+                                        H2Error::StreamClosed,
+                                        RstOrigin::Local,
+                                    ) {
                                         return result;
                                     }
                                 }
@@ -2362,6 +2383,7 @@ impl ConnectionH2 {
                     return self.refuse_stream_and_discard(
                         stream_id,
                         H2Error::RefusedStream,
+                        RstOrigin::PeerProvoked,
                         payload_len,
                         DiscardedFieldBlock::Continuation {
                             prior_fragment,
@@ -3247,13 +3269,12 @@ impl ConnectionH2 {
                                 pass.census_mut().note_ineligible(urgency, is_incremental);
                             }
                             // Account for the RST that `initialize` is about to emit
-                            // for this stream. Without this the MadeYouReset lifetime
-                            // cap is evadable: any path that flips `parsing_phase` to
-                            // Error before reaching this gate (oversized inbound
-                            // trailers, malformed bodies, etc.) would land an
-                            // unaccounted RST on the wire. The accounting call is
-                            // deferred to after the loop so a cap trip cannot
-                            // preempt the remaining streams' writes; see
+                            // for this stream, so the per-error breakdown and the
+                            // global tx counter see every RST that reaches the wire:
+                            // any path that flips `parsing_phase` to Error before
+                            // reaching this gate (oversized trailers, malformed
+                            // bodies, etc.) would otherwise land an unaccounted RST.
+                            // The accounting call is deferred to after the loop; see
                             // `H2WritePass::freshly_emitted_rsts`.
                             if freshly_rst {
                                 pass.freshly_emitted_rsts.push(rst_error_from_kawa(kawa));
@@ -3318,9 +3339,20 @@ impl ConnectionH2 {
                         if matches!(self.position, Position::Client(..)) && !kawa.out.is_empty() {
                             *parts.front_bound_to_backend = true;
                         }
+                        let events_before = self.metric_events.len();
                         let remaining = pass
                             .converter_mut()
                             .reclaim(converter, &mut self.metric_events);
+                        // Each DATA frame the converter just wrote earns the
+                        // peer stream-0 WINDOW_UPDATE credit. `reclaim` appended
+                        // this prepare's events to the tail, one
+                        // `DataFrameSent` per DATA frame serialized.
+                        let data_frames_sent = self.metric_events[events_before..]
+                            .iter()
+                            .filter(|event| matches!(event, MetricEvent::DataFrameSent))
+                            .count() as u64;
+                        self.flood_detector
+                            .record_data_frames_sent(data_frames_sent);
                         pass.consumed = window - remaining;
                         // The pre-prepare gate above only inserts into
                         // `rst_sent` when `kawa.is_error()` is already true on
@@ -3333,12 +3365,10 @@ impl ConnectionH2 {
                         // RST_STREAM via the existing `initialize` chokepoint.
                         //
                         // Per Codex P2: the converter's direct RST emission
-                        // bypasses the metric/flood accounting that
-                        // `Self::reset_stream` performs. Mirror it here so a
-                        // peer that drives oversized headers across many
-                        // streams cannot escape the MadeYouReset emitted-RST
-                        // lifetime cap and so dashboards see the per-error
-                        // counter and the global tx counter.
+                        // bypasses the metric accounting that
+                        // `Self::reset_stream` performs. Mirror it here so
+                        // dashboards see the per-error counter and the global
+                        // tx counter.
                         //
                         // Per Codex P3: when an incremental stream flips to
                         // Error mid-prepare, the RFC 9218 §4 yield-after-one
@@ -3550,16 +3580,19 @@ impl ConnectionH2 {
                     self.gauge_connection_state();
                     // Account every RST that the converter emitted during this pass
                     // (pre-prepare gate + post-prepare HPACK over-budget abort) so
-                    // the global tx counter, the per-error breakdown, and the
-                    // MadeYouReset emitted-RST lifetime cap stay in step. If the
-                    // cap trips, propagate the GOAWAY result.
+                    // the global tx counter and the per-error breakdown stay in
+                    // step. These resets are `RstOrigin::Local` — what errored is
+                    // the message from the other side of the proxy, not a frame
+                    // this connection's peer sent — so they never feed the
+                    // MadeYouReset cap; the `Done` arm stays for the contract of
+                    // `Self::account_emitted_rst`.
                     //
                     // The SECOND terminator that must not finalize. It also sits
                     // between `into_buffers` and the `put_*` calls, so a cap trip
                     // drops the three buffers — the pre-image's behaviour, kept
                     // deliberately: the connection is sending a GOAWAY.
                     for error in std::mem::take(&mut pass.freshly_emitted_rsts) {
-                        if let Some(result) = self.account_emitted_rst(error) {
+                        if let Some(result) = self.account_emitted_rst(error, RstOrigin::Local) {
                             return H2WriteTarget::Done(result);
                         }
                     }
@@ -4340,19 +4373,18 @@ impl ConnectionH2 {
             }
         }
 
-        // Stage — RST_STREAM cap check + queue.
-        // Check the lifetime total (not just pending queue length) because
-        // writable() drains the queue between readable() calls, so the
-        // pending count alone may never reach the cap even under sustained
-        // misbehavior.
-        if !matches!(self.state, H2State::GoAway | H2State::Error)
-            && self.control_tx.lifetime_cap_reached()
-        {
+        // Stage — RST_STREAM overflow check + queue.
+        // The pending queue is bounded; an RST it had to refuse never reaches
+        // the wire, so the peer would believe that stream still live. Escalate
+        // before serialising anything. This is a bound on what is pending, not
+        // a lifetime cap: resets drained as they come never trip it, and the
+        // peer-provoked ones are capped by the flood detector instead.
+        if !matches!(self.state, H2State::GoAway | H2State::Error) && self.control_tx.overflowed() {
             error!(
-                "{} total RST_STREAM count {} exceeds cap {}, sending GOAWAY(ENHANCE_YOUR_CALM)",
+                "{} pending RST_STREAM queue overflowed its bound {} ({} queued over the connection), sending GOAWAY(ENHANCE_YOUR_CALM)",
                 log_context!(self),
+                self.control_tx.max_pending(),
                 self.control_tx.lifetime_queued(),
-                h2_control_tx::MAX_PENDING_RST_STREAMS
             );
             return H2ControlFlushTarget::Done(self.goaway(H2Error::EnhanceYourCalm));
         }
@@ -5006,29 +5038,27 @@ impl ConnectionH2 {
                     .push(MetricEvent::StreamReapedIdleTimeout),
                 other => debug!("{} unexpected reap reason {}", log_context!(self), other),
             }
-            // Route through the canonical chokepoint so dedupe (rst_sent),
-            // queued-cap accounting (`H2ControlTx`'s MadeYouReset lifetime
-            // counter against MAX_PENDING_RST_STREAMS), and edge-triggered-epoll arming
+            // Route through the canonical chokepoint so dedupe (rst_sent), the
+            // pending-queue bound, and edge-triggered-epoll arming
             // (Readiness::arm_writable) all stay consistent — see LIFECYCLE
-            // §8.2. The previous direct push bypassed all three: a peer
-            // that opens 200 streams and lets them all idle past
-            // stream_idle_timeout could push past the queued cap silently
-            // (no GOAWAY(ENHANCE_YOUR_CALM) escalation), a double-cancel
-            // pass would grow the pending queue instead of short-
-            // circuiting on the existing rst_sent membership, and the
-            // hand-rolled `interest.insert(WRITABLE) + signal_pending_write`
-            // pair below skipped invariant 15. Counting these RSTs against
-            // the cap is a deliberate behaviour change: 200 cumulative idle
-            // cancellations from one peer IS abusive (pinning
-            // MAX_CONCURRENT_STREAMS slots), and the GOAWAY(ENHANCE_YOUR_CALM)
-            // escalation tells the peer to reconnect with a clean state.
+            // §8.2. The previous direct push bypassed all three: a mass reap
+            // could push past the queue bound silently, a double-cancel pass
+            // would grow the pending queue instead of short-circuiting on the
+            // existing rst_sent membership, and the hand-rolled
+            // `interest.insert(WRITABLE) + signal_pending_write` pair skipped
+            // invariant 15.
             //
-            // We deliberately ignore the `Option<MuxResult>` flood-violation
-            // signal here — `cancel_timed_out_streams` returns `()` and is
-            // called as best-effort housekeeping during the read path. A
-            // flood violation that becomes visible mid-iteration will be
-            // re-detected on the next `record_rst_emitted` call (the
-            // counter is sticky), so dropping the early-return is safe.
+            // The CANCEL is Sōzu's own decision (`RstOrigin::Local`), so it is
+            // not charged to the peer's MadeYouReset count: an idle stream is
+            // also what a slow backend, a long poll or a paused download looks
+            // like, and an idle stream pins one MAX_CONCURRENT_STREAMS slot for
+            // the idle timeout without amplifying anything.
+            //
+            // We deliberately ignore the `Option<MuxResult>` signal here —
+            // `cancel_timed_out_streams` returns `()` and is called as
+            // best-effort housekeeping during the read path. A local reset
+            // never trips the flood detector, and a queue overflow is
+            // escalated by the next `flush_pending_control_frames`.
             //
             // A backend stream whose HEADERS never left is forgotten, not
             // reset: a RST_STREAM on a stream the backend has never seen is a
@@ -5042,7 +5072,7 @@ impl ConnectionH2 {
                     .is_some_and(|gid| !context.streams[gid].front.consumed);
             let queued_before = self.control_tx.lifetime_queued();
             if !never_opened {
-                let _ = self.enqueue_rst(sid, H2Error::Cancel);
+                let _ = self.enqueue_rst(sid, H2Error::Cancel, RstOrigin::Local);
             }
             debug_assert!(
                 !never_opened || self.control_tx.lifetime_queued() == queued_before,
@@ -5101,17 +5131,18 @@ impl ConnectionH2 {
     /// This is the canonical entry point for proxy-emitted stream resets:
     /// `DATA` on a closed stream, `MAX_CONCURRENT_STREAMS` refusal, and the
     /// per-stream error paths in [`Self::reset_stream`] all funnel through
-    /// here. Serialisation is independent of the owning `Stream` still
+    /// here. `origin` says whether the peer provoked the reset; see
+    /// [`RstOrigin`]. Serialisation is independent of the owning `Stream` still
     /// existing in `self.streams`, which is what lets us emit even after a
     /// caller has already called [`Self::remove_dead_stream`].
     ///
     /// Delegates the queueing itself to [`h2_control_tx::H2ControlTx::enqueue_rst`],
-    /// which owns the four invariants (dedupe via `rst_sent`, MadeYouReset
-    /// queued cap, the per-insert queue bound, edge-triggered-epoll arm via
+    /// which owns the invariants (dedupe via `rst_sent`, the per-insert queue
+    /// bound and its overflow flag, edge-triggered-epoll arm via
     /// [`Readiness::arm_writable`]) and covers them with unit tests that need no
     /// `ConnectionH2` fixture. What stays here is the accounting, because a
-    /// lifetime-cap trip converts to a connection-wide GOAWAY only this type
-    /// can return.
+    /// MadeYouReset cap trip converts to a connection-wide GOAWAY only this
+    /// type can return.
     ///
     /// Two of the call paths that reach here are never inspected by
     /// [`Self::check_invariants`], whose only production caller is
@@ -5135,7 +5166,12 @@ impl ConnectionH2 {
     /// pass in between. The per-insert bound inside
     /// [`h2_control_tx::H2ControlTx::enqueue_rst`] is what makes that reasoning
     /// unnecessary for correctness.
-    fn enqueue_rst(&mut self, wire_stream_id: StreamId, error: H2Error) -> Option<MuxResult> {
+    fn enqueue_rst(
+        &mut self,
+        wire_stream_id: StreamId,
+        error: H2Error,
+        origin: RstOrigin,
+    ) -> Option<MuxResult> {
         let outcome = self.control_tx.enqueue_rst(
             self.stream_table.rst_sent_mut(),
             &mut self.readiness,
@@ -5146,8 +5182,8 @@ impl ConnectionH2 {
         // Calling `enqueue_rst` for a stream that already has a queued
         // (or already-flushed) RST is the dedup short-circuit — counting
         // those would inflate `h2.frames.tx.rst_stream` /
-        // `h2.rst_stream.sent.*` and trip the CVE-2025-8671 MadeYouReset
-        // lifetime cap on frames that never reached the wire. An
+        // `h2.rst_stream.sent.*` and the CVE-2025-8671 MadeYouReset
+        // count on frames that never reached the wire. An
         // at-capacity refusal is accounted the same way, and for the same
         // reason: that frame never reaches the wire either.
         //
@@ -5159,11 +5195,11 @@ impl ConnectionH2 {
         // DATA-on-closed-stream paths bypassing the lifetime cap
         // (security review LISA-001 on commit `da845c71`).
         match outcome {
-            h2_control_tx::EnqueueRstOutcome::Queued => self.account_emitted_rst(error),
+            h2_control_tx::EnqueueRstOutcome::Queued => self.account_emitted_rst(error, origin),
             h2_control_tx::EnqueueRstOutcome::Deduped => None,
             // Drop + metric + contextual log, never a panic on the release
-            // path. No GOAWAY is raised here: reaching the cap implies
-            // `total_rst_streams_queued >= MAX_PENDING_RST_STREAMS`, which
+            // path. No GOAWAY is raised here: the refusal set
+            // `H2ControlTx::overflowed`, which
             // `flush_pending_control_frames` escalates to
             // `GOAWAY(ENHANCE_YOUR_CALM)` before its drain loop for as long as
             // the connection is not already in `H2State::GoAway`/`Error` — and
@@ -5176,7 +5212,7 @@ impl ConnectionH2 {
                 error!(
                     "{} RST_STREAM dropped: pending queue already at capacity ({}), stream={} error={:?}",
                     log_context!(self),
-                    h2_control_tx::MAX_PENDING_RST_STREAMS,
+                    self.control_tx.max_pending(),
                     wire_stream_id,
                     error
                 );
@@ -5187,9 +5223,10 @@ impl ConnectionH2 {
     }
 
     /// Single accounting site for proxy-emitted RST_STREAM frames.
-    /// Three things must happen for every emitted RST so flood-protection
-    /// stays honest: the global tx counter, the per-error breakdown,
-    /// and the MadeYouReset emitted-RST lifetime cap.
+    /// Every emitted RST bumps the global tx counter and the per-error
+    /// breakdown; only a non-`NoError` reset the peer provoked
+    /// ([`RstOrigin::PeerProvoked`]) also feeds the MadeYouReset emitted-RST
+    /// cap.
     ///
     /// Two distinct emission paths feed this helper:
     ///   * Queued frames — `Self::enqueue_rst` (and therefore every
@@ -5203,15 +5240,18 @@ impl ConnectionH2 {
     ///     RST_STREAM frames straight into `kawa.out` from inside
     ///     `kawa.prepare`. We collect those `H2Error` codes during the
     ///     `write_streams` loop and call this helper for each one
-    ///     after the loop, so a lifetime-cap trip cannot preempt the
-    ///     writes of the streams that follow.
+    ///     after the loop. They are all [`RstOrigin::Local`]: what errored
+    ///     is the message coming from the other side of the proxy — a
+    ///     backend response on a frontend connection, a client request on a
+    ///     backend one — never a frame this connection's peer sent.
     ///
     /// Returning `Some(MuxResult)` means the caller MUST short-circuit
     /// with that result — the flood detector tripped its lifetime cap
     /// and converted to a connection-wide GOAWAY.
-    fn account_emitted_rst(&mut self, error: H2Error) -> Option<MuxResult> {
+    fn account_emitted_rst(&mut self, error: H2Error, origin: RstOrigin) -> Option<MuxResult> {
         self.metric_events.push(MetricEvent::RstStreamSent(error));
-        if !matches!(error, H2Error::NoError)
+        if origin == RstOrigin::PeerProvoked
+            && !matches!(error, H2Error::NoError)
             && let Some(violation) = self.flood_detector.record_rst_emitted()
         {
             return Some(self.handle_flood_violation(violation));
@@ -5239,10 +5279,11 @@ impl ConnectionH2 {
         &mut self,
         stream_id: StreamId,
         error: H2Error,
+        origin: RstOrigin,
         payload_len: u32,
         discarded: DiscardedFieldBlock,
     ) -> MuxResult {
-        if let Some(result) = self.enqueue_rst(stream_id, error) {
+        if let Some(result) = self.enqueue_rst(stream_id, error, origin) {
             return result;
         }
         self.state = H2State::Discard;
@@ -5330,6 +5371,26 @@ impl ConnectionH2 {
 /// kawa stuck in [`kawa::ParsingPhase::Error`]. Mirrors the parse +
 /// fallback at `lib/src/protocol/mux/converter.rs::initialize` so the
 /// flood-accounting helper sees the same code that lands on the wire.
+/// Who decided a proxy-emitted `RST_STREAM`, for flood accounting.
+///
+/// Only a reset the peer provoked counts toward the CVE-2025-8671
+/// MadeYouReset cap (`H2FloodDetector::record_rst_emitted`,
+/// `lib/src/protocol/mux/h2_flood_detector.rs`). A reset Sōzu decides on its
+/// own — the idle reaper's `CANCEL`, a `REFUSED_STREAM` from its own
+/// concurrency limit, back-pressure or buffer pool, `STREAM_CLOSED` for DATA
+/// on a stream it already closed, the converter's error on a backend failure —
+/// says nothing about the peer, and counting it would end healthy connections
+/// for Sōzu's own decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RstOrigin {
+    /// A frame the peer sent forced the reset: Content-Length mismatch,
+    /// header parse error, oversized header block, PRIORITY
+    /// self-dependency, zero-increment or overflowing WINDOW_UPDATE.
+    PeerProvoked,
+    /// Sōzu reset the stream on its own initiative.
+    Local,
+}
+
 fn rst_error_from_kawa<T: kawa::AsBuffer>(kawa: &kawa::Kawa<T>) -> H2Error {
     match kawa.parsing_phase {
         kawa::ParsingPhase::Error {
@@ -5847,6 +5908,7 @@ impl ConnectionH2 {
         self.last_stream_id = (stream_id + 2) & !1;
         self.stream_table
             .register(stream_id, global_stream_id, self.now);
+        self.flood_detector.record_stream_opened();
         // Post-conditions: the stream is now reachable in both indices (see
         // `H2StreamTable::register`'s own postconditions), the active count
         // grew by exactly one (the id was not already present —
@@ -6666,31 +6728,34 @@ impl ConnectionH2 {
         // CVE-2023-44487 Rapid Reset + CVE-2019-9514: track RST_STREAM rate.
         self.flood_detector.record_rst_stream_window();
         check_flood_or_return!(self);
-        // Additional CVE-2023-44487 mitigation: lifetime cap on RST_STREAM
-        // frames received. The per-window counter above half-decays, so a
-        // patient client can keep ~50 RST/s forever; a never-decaying
-        // lifetime counter puts an absolute ceiling on that amplification.
+        // Additional CVE-2023-44487 mitigation: connection-lifetime caps on
+        // RST_STREAM frames received. The per-window counter above
+        // half-decays, so a patient client could keep resetting forever; the
+        // lifetime counters cap that, relative to the streams the connection
+        // opened so benign cancels never accumulate toward a fixed ceiling.
         // Streams whose backend response has not yet started count toward a
-        // much lower "abusive" ceiling — this is the signature Rapid Reset
-        // pattern where the attacker pays one RST frame and we pay a
-        // backend round-trip for each.
+        // much lower "abusive" cap (more than half of the streams, past a
+        // floor) — the Rapid Reset signature, where the attacker pays one RST
+        // frame and we pay a backend round-trip for each.
         //
         // "Response started" here means the Server has begun producing
-        // response bytes (backend kawa buffer past its initial phase). For
-        // the Client position the concept does not apply symmetrically
-        // (RSTs received from the backend are rare and benign), so we
-        // conservatively flag them as abusive too — lifetime cap still
-        // dominates in practice.
-        let response_started = match self.stream_table.streams().get(&rst_stream.stream_id) {
-            Some(global_stream_id) => {
-                let stream = &context.streams[*global_stream_id];
-                !stream.back.is_initial()
-            }
-            // Stream already gone (e.g. closed, not yet registered) —
-            // treat as response-started to avoid over-counting benign
-            // races as abusive.
-            None => true,
-        };
+        // response bytes (backend kawa buffer past its initial phase). On a
+        // backend connection (`Position::Client`) the Rapid Reset signature
+        // does not exist: Sōzu opened the stream, and a backend resetting it
+        // before answering — `REFUSED_STREAM` under load, a `CANCEL` from its
+        // own timeout — costs the backend, not Sōzu. Those resets never count
+        // as pre-response.
+        let response_started = self.position.is_client()
+            || match self.stream_table.streams().get(&rst_stream.stream_id) {
+                Some(global_stream_id) => {
+                    let stream = &context.streams[*global_stream_id];
+                    !stream.back.is_initial()
+                }
+                // Stream already gone (e.g. closed, not yet registered) —
+                // treat as response-started to avoid over-counting benign
+                // races as abusive.
+                None => true,
+            };
         if let Some(violation) = self.flood_detector.record_rst_lifetime(response_started) {
             return self.handle_flood_violation(violation);
         }
@@ -7520,10 +7585,12 @@ impl ConnectionH2 {
         //
         // `enqueue_rst` performs every accounting side-effect at queue
         // time (per-error counter, global tx counter, CVE-2025-8671
-        // MadeYouReset lifetime cap). Graceful `NoError` cancels —
-        // stream recycle, propagated client-side cancel — are exempt
-        // from the lifetime cap inside the accounting helper itself.
-        if let Some(result) = self.enqueue_rst(wire_stream_id, error) {
+        // MadeYouReset cap). Every caller of `reset_stream` answers a frame
+        // the peer sent (Content-Length mismatch, header parse error,
+        // PRIORITY self-dependency, zero-increment or overflowing
+        // WINDOW_UPDATE), so the reset is `RstOrigin::PeerProvoked`; a
+        // `NoError` reset is still exempt inside the accounting helper.
+        if let Some(result) = self.enqueue_rst(wire_stream_id, error, RstOrigin::PeerProvoked) {
             return result;
         }
         MuxResult::Continue
@@ -7883,6 +7950,7 @@ impl ConnectionH2 {
             return false;
         };
         self.stream_table.register(stream_id, stream, self.now);
+        self.flood_detector.record_stream_opened();
         self.readiness.arm_writable();
         true
     }
@@ -10842,11 +10910,14 @@ mod tests {
             "premise: this harness must report buffered TLS records, or the \
              re-arm is gated off and the assertion below could not fail"
         );
-        // One RST, well under `h2_control_tx::MAX_PENDING_RST_STREAMS`, so
-        // the lifetime cap check above this stage does not escalate to
-        // GOAWAY(ENHANCE_YOUR_CALM) and swallow the drain.
+        // One RST, well under the pending-queue bound, so the overflow check
+        // above this stage does not escalate to GOAWAY(ENHANCE_YOUR_CALM) and
+        // swallow the drain.
         assert!(
-            connection.core.enqueue_rst(1, H2Error::Cancel).is_none(),
+            connection
+                .core
+                .enqueue_rst(1, H2Error::Cancel, RstOrigin::Local)
+                .is_none(),
             "premise: a single RST must not trip the flood detector"
         );
         assert!(
@@ -14322,7 +14393,7 @@ mod tests {
     /// (no real time passes) and the 50th refusal lands in the same window as
     /// the first 49, so the `refuse_count_window` assertion fails first:
     /// ``assertion `left == right` failed: a refusal in a new window must
-    /// restart the count, not top up the old one / left: 50 / right: 1``. The
+    /// restart the count, not top up the old one / left: 1000 / right: 1``. The
     /// two assertions after it would also fail — `mcs_backpressure_applied`
     /// becomes true and `settings_max_concurrent_streams` is halved off a burst
     /// that actually spanned two windows.
@@ -14471,17 +14542,15 @@ mod tests {
     /// RST_STREAM between two `flush_pending_control_frames` passes:
     /// `cancel_timed_out_streams` walks the whole timed-out set and calls
     /// `enqueue_rst` for every entry inside ONE pass. The cap therefore has to
-    /// live at the insert, not at the drain — the drain-side
-    /// `total_rst_streams_queued >= MAX_PENDING_RST_STREAMS` short-circuit
-    /// bounds what is *written*, and says nothing about how large the queue got
-    /// before anyone looked. See sozu-proxy/sozu#1413.
+    /// live at the insert, not at the drain — a drain-side check bounds what
+    /// is *written*, and says nothing about how large the queue got before
+    /// anyone looked. See sozu-proxy/sozu#1413.
     ///
-    /// Reaching >200 concurrently-tracked streams in one sweep needs an
-    /// operator-raised `max_concurrent_streams` (default 100, clamped at
-    /// `MAX_SAFE_CONCURRENT_STREAMS` = 10 000) — that setting bounds the live
-    /// set the reaper walks, not the queue, which holds what every caller
-    /// queued since the last successful drain. This test registers the wire
-    /// ids on the stream table directly, exactly as its sibling
+    /// `h2_control_tx::pending_rst_bound` keeps the bound above four resets
+    /// per advertised concurrent stream, so a real sweep cannot reach it on
+    /// its own; the queue still holds what every caller queued since the last
+    /// successful drain. This test registers more wire ids than the bound on
+    /// the stream table directly, exactly as its sibling
     /// `per_stream_liveness_reaping_is_evaluated_against_the_connection_snapshot`
     /// does, because the accept path is not what is under test here.
     ///
@@ -14512,15 +14581,22 @@ mod tests {
         // itself holds one for its zero buffer, so the ceiling has to clear
         // `2 * REAPED` with room to spare or `create_stream` hands back
         // `None` — which is how the first draft of this test failed.
-        const REAPED: usize = h2_control_tx::MAX_PENDING_RST_STREAMS + 32;
-        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 2 * REAPED + 4, 16384)));
+        //
+        // A production bound (`h2_control_tx::pending_rst_bound`, at least
+        // `MIN_PENDING_RST_STREAMS`) would need thousands of streams and two
+        // pool buffers each; what is under test is that the queue honours
+        // its instance's bound, so the test installs a small one.
+        let bound = 200;
+        let reaped = bound + 32;
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 2 * reaped + 4, 16384)));
         let (mut connection, _peer) = test_h2_connection(&pool, None);
+        connection.core.control_tx = h2_control_tx::H2ControlTx::with_cap(bound);
         let mut context = test_context(&pool);
         let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
 
         let idle_timeout = connection.core.stream_idle_timeout;
         let armed_at = connection.core.now;
-        for i in 0..REAPED {
+        for i in 0..reaped {
             let gid = context
                 .create_stream(Ulid::generate(), 1 << 16)
                 .expect("test context must create a stream");
@@ -14539,9 +14615,70 @@ mod tests {
         #[cfg(debug_assertions)]
         connection.core.check_invariants(&context);
         assert!(
-            connection.core.control_tx.pending().len() <= h2_control_tx::MAX_PENDING_RST_STREAMS,
+            connection.core.control_tx.pending().len() <= bound,
             "a mass reap must stop queueing at the cap, got {} entries",
             connection.core.control_tx.pending().len()
+        );
+    }
+
+    /// Resets Sōzu emits on its own initiative — here the idle reaper's
+    /// `RST_STREAM(CANCEL)` — are not charged to the peer: neither the
+    /// CVE-2025-8671 MadeYouReset emitted-RST counter nor the pending RST
+    /// queue's bound may accumulate them across drains.
+    ///
+    /// Two sweeps of 150 reaped streams with a control flush between them:
+    /// 300 local resets in the connection's lifetime, never more than 150
+    /// pending at once.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::cancel_timed_out_streams`, pass
+    /// `RstOrigin::PeerProvoked` instead of `RstOrigin::Local` to
+    /// `ConnectionH2::enqueue_rst`. The emitted-RST counter then reads 300.
+    #[test]
+    fn local_resets_are_not_charged_to_the_peer() {
+        const PER_SWEEP: usize = 150;
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(
+            2,
+            4 * PER_SWEEP + 4,
+            16384,
+        )));
+        let (mut connection, _peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        let idle_timeout = connection.core.stream_idle_timeout;
+
+        for sweep in 0..2 {
+            let armed_at = connection.core.now;
+            for i in 0..PER_SWEEP {
+                let gid = context
+                    .create_stream(Ulid::generate(), 1 << 16)
+                    .expect("test context must create a stream");
+                let wire_id = 2 * (sweep * PER_SWEEP + i) as StreamId + 1;
+                connection
+                    .core
+                    .stream_table
+                    .register(wire_id, gid, armed_at);
+            }
+            context.now = armed_at + idle_timeout + Duration::from_millis(1);
+            connection.cancel_timed_out_streams(&mut context, &mut EndpointClient(&mut router));
+            // The SETTINGS-ACK watchdog is not under test.
+            connection.core.settings_sent_at = None;
+            let flushed = connection.core.flush_pending_control_frames();
+            assert!(
+                !matches!(flushed, H2ControlFlushTarget::Done(_)),
+                "sweep {sweep}: local resets must not end the connection"
+            );
+            assert!(
+                !matches!(connection.core.state, H2State::GoAway | H2State::Error),
+                "sweep {sweep}: local resets must not send GOAWAY"
+            );
+        }
+        assert_eq!(
+            connection
+                .core
+                .flood_detector
+                .total_rst_streams_emitted_lifetime(),
+            0,
+            "reaper CANCELs are Sōzu's decision, not the peer's"
         );
     }
 
@@ -20554,6 +20691,53 @@ mod tests {
             1,
             "one of the two streams is gone, so exactly one charge remains"
         );
+    }
+
+    /// On a backend connection (`Position::Client`) a `RST_STREAM` the backend
+    /// sends before its response starts — typically `REFUSED_STREAM` under
+    /// load — is not the Rapid Reset signature: Sōzu opened the stream and the
+    /// reset costs it nothing. Three hundred of them, sixty at a time, must
+    /// not trip the pre-response reset cap.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::handle_rst_stream_frame`, drop the
+    /// `self.position.is_client()` term from `response_started`. Every reset
+    /// then counts as pre-response, and with one reset per opened stream the
+    /// 251st crosses `h2_max_rst_stream_abusive_lifetime`.
+    #[test]
+    fn backend_resets_before_the_response_are_not_rapid_reset() {
+        const ROUNDS: usize = 5;
+        const PER_ROUND: usize = 60;
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(
+            4,
+            2 * ROUNDS * PER_ROUND + 8,
+            16_384,
+        )));
+        let mut context = test_context(&pool);
+        let mut fixture = ledger_fixture(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        for round in 0..ROUNDS {
+            let _gids = open_streams(&mut fixture, &mut context, PER_ROUND);
+            let Connection::H2(shell) = &mut fixture.connection else {
+                unreachable!("the fixture was built as H2");
+            };
+            let open: Vec<StreamId> = shell.core.stream_table.streams().keys().copied().collect();
+            assert_eq!(open.len(), PER_ROUND, "round {round}: premise");
+            for stream_id in open {
+                let _ = shell.core.handle_rst_stream_frame(
+                    parser::RstStream {
+                        stream_id,
+                        error_code: H2Error::RefusedStream as u32,
+                    },
+                    &mut context,
+                    EndpointClient(&mut router),
+                );
+                assert!(
+                    !matches!(shell.core.state, H2State::GoAway | H2State::Error),
+                    "round {round}: backend reset of stream {stream_id} must not send GOAWAY"
+                );
+            }
+        }
     }
 
     /// An inbound `GOAWAY` retires every stream above `last_stream_id`
