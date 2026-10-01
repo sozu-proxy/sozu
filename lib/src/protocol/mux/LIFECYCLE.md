@@ -1694,16 +1694,25 @@ it to close it: a socket closed with bytes still unread, or that receives more
 after the close, makes the kernel send a reset that discards whatever part of
 the response the client has not read yet. RFC 9112 §9.6 asks for a staged
 close instead, so whenever this branch closes with `stream.front` not
-terminated — `request-incomplete`, or a backend `Connection: close` response
-mid-upload — it sets `ConnectionH1::linger` to `Linger::Pending`, and ends the
+terminated but started — part of the head or of the body arrived — it sets
+`ConnectionH1::linger` to `Linger::Pending`. That covers `request-incomplete`,
+a backend `Connection: close` response mid-upload, and the answers sozu
+generates itself to a partly received request (400, 401, 413, 503, 504, or a
+408 after part of a head): each lingers, bounded by `request_timeout`. A
+request of which no byte arrived (the 408 `client_timeout` to a silent client,
+whose `stream.front` is still at `StatusLine` with empty storage) has nothing
+in flight to drain and closes at once, as before. Pending also ends the
 linked backend stream through `endpoint.end_stream`, which disconnects that
 backend. Once nothing is left to flush (the response, then any TLS
 `close_notify`), `defer_close_for_tls_flush` calls `start_linger` instead of
 returning `CloseSession`: it shuts the write side down with `shutdown_write`,
 so the FIN follows the response, and leaves only READABLE in the interest.
 `readable` then reads the raw socket and drops what it reads
-(`drain_linger`), before `arm_timeout`, so no read moves the deadline, and
-`writable` does nothing. The session closes on the client's EOF — a frontend
+(`drain_linger`), counting it in the frontend bytes-in metric, and `writable`
+does nothing. `ConnectionH1::arm_timeout` is a no-op while lingering, so no
+caller moves the deadline: not a read, and not the re-arm `Mux::timeout_inner`
+runs after its write pass, which can itself start the linger when a timeout
+answer (408, 503, 504) or a pending flush completes in it. The session closes on the client's EOF — a frontend
 HUP makes `Mux::ready_inner` read to that EOF rather than close at once — on
 a socket error, after `LINGER_MAX_BYTES` (4 MiB) have been dropped, or at the
 deadline: the listener's `request_timeout` from the response's completion,
@@ -1722,8 +1731,11 @@ e2e `test_h1_early_response_mid_content_length_upload`,
 `test_h1_early_response_survives_the_rest_of_the_upload`, and the unit
 `a_backend_that_answered_before_the_whole_request_is_not_pooled`,
 `a_deferred_tls_close_completes_the_response_once`,
-`a_lingering_close_half_closes_then_drains_to_the_client_eof` and
-`a_lingering_close_stops_at_its_byte_budget_and_its_deadline`.
+`a_lingering_close_half_closes_then_drains_to_the_client_eof`,
+`a_lingering_close_stops_at_its_byte_budget_and_its_deadline`,
+`a_linger_started_by_a_timeout_write_keeps_its_own_deadline`,
+`a_408_to_a_silent_client_closes_without_lingering` and
+`a_silent_client_is_closed_at_the_linger_deadline`.
 
 ### 8.5 Stale-upstream replay (`ReplayOnFreshBackend`)
 

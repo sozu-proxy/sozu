@@ -284,7 +284,15 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
 
     /// Push the deadline one full [`Self::timeout_duration`] out from `now`.
     /// Replaces the old `TimeoutContainer::reset()` at the same call sites.
+    ///
+    /// A no-op while lingering: the linger deadline bounds the whole drain,
+    /// and every caller — `readable`, `writable`, `Mux::timeout_inner`'s
+    /// re-arm after a write pass that may itself have started the linger —
+    /// must leave it in place.
     pub(super) fn arm_timeout(&mut self, now: Instant) {
+        if self.is_lingering() {
+            return;
+        }
         self.timeout_deadline = now.checked_add(self.timeout_duration);
     }
 
@@ -401,6 +409,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 Ok(size) => {
                     debug_assert!(size <= remaining, "a read never exceeds its buffer");
                     remaining -= size;
+                    // Bytes the client sent: counted like any frontend read.
+                    crate::protocol::mux::h2::record_metric(self.position.bytes_in_event(size));
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
                     self.readiness.event.remove(Ready::READABLE);
@@ -1310,11 +1320,17 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         // re-taking the keep-alive decision after
                         // `close_notify`.
                         stream.context.closing = true;
-                        if !request_complete {
-                            // The client may still be sending the body: drain
-                            // it once the response is flushed, so the close
-                            // does not reset the response away (RFC 9112
-                            // §9.6). The backend is done with either way.
+                        // No byte of the request arrived (a 408 to a silent
+                        // client): nothing is in flight, the close cannot
+                        // reset anything away, so it does not linger.
+                        let request_started =
+                            !matches!(stream.front.parsing_phase, kawa::ParsingPhase::StatusLine)
+                                || !stream.front.storage.is_empty();
+                        if !request_complete && request_started {
+                            // The client may still be sending the request:
+                            // drain it once the response is flushed, so the
+                            // close does not reset the response away (RFC
+                            // 9112 §9.6). The backend is done with either way.
                             self.linger = Linger::Pending {
                                 deadline: now + self.linger_timeout,
                             };
