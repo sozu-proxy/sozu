@@ -7039,6 +7039,30 @@
   rows of `e2e/src/tests/h1_security_tests.rs`. Documented in `doc/configure.md` and
   `lib/src/protocol/kawa_h1/LIFECYCLE.md`.
 
+- **`fix(mux-h2)`: add no `Transfer-Encoding` to a response without a body from an H2 backend,
+  and forward its 1xx ([#1776](https://github.com/sozu-proxy/sozu/issues/1776)).** When an H2
+  backend sent a header section without END_STREAM and without `content-length`,
+  `pkawa::handle_header` (`lib/src/protocol/mux/pkawa.rs`) added `Transfer-Encoding: chunked`
+  and framed the response chunked for an H1 client, including for a 1xx, a 204, a 304 and a
+  response to HEAD, which have no content by definition (RFC 9110 §6.4.1); RFC 9112 §6.1 forbids
+  the field in a 1xx or 204. A 1xx never completed either, so an H1 client read a chunked 103
+  and never the final response. Such a response now gains no framing. A 1xx is complete at its
+  head and the final response follows it. A 204, a 304 or a response to HEAD stays open until
+  the backend's END_STREAM, which reaches an H2 client; a response to HEAD marked complete at
+  its head used to leave an H2 client stream without END_STREAM and to reset the backend stream
+  with frames in flight, whose trailer HEADERS then cost the whole backend connection a
+  GOAWAY(STREAM_CLOSED). A `content-length` is removed from a 1xx or a 204, where a server MUST
+  NOT send it, and kept on a 304 or a response to HEAD (RFC 9110 §8.6). A `:status 101`, which
+  HTTP/2 does not support (RFC 9113 §8.6), is a stream error (PROTOCOL_ERROR) answered 502.
+  Documented in `lib/src/protocol/mux/LIFECYCLE.md` §8.4. Covered by
+  `a_bodiless_h2_response_gains_no_transfer_encoding_towards_an_h1_client` (`h1.rs`),
+  `a_101_response_is_a_stream_protocol_error` (`pkawa.rs`),
+  `test_h2_bodiless_response_head_has_no_transfer_encoding`,
+  `test_h2_bodiless_response_ends_the_h2_client_stream`,
+  `test_h2_bodiless_response_end_keeps_the_backend_connection`,
+  `test_h2_backend_interim_response_reaches_the_client` and
+  `test_h2_backend_101_is_a_bad_gateway` (`e2e/src/tests/h2_security_header_injection.rs`).
+
 - **`fix(mux-h1)`: H2→H1: write no last chunk or trailer section after the head of a response
   without a body to an H1 client ([#1761](https://github.com/sozu-proxy/sozu/issues/1761)).**
   A response to HEAD, a 204 or a 304 ends with its header section on HTTP/1.1 (RFC 9112 §6.3),

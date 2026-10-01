@@ -1858,11 +1858,10 @@ without a body towards an H1 client.** A response to HEAD, a 204 or a 304 has no
 (RFC 9110 §9.3.2, §15.3.5, §15.4.5), and an H1 client reads it as ending with
 its header section whatever its framing fields say (RFC 9112 §6.3 rule 1), so
 any byte after the head is read as the next response on a keep-alive
-connection. An H2 backend that sends such a header section without
-END_STREAM and without `content-length` gets chunked framing from
-`pkawa::handle_header`, and the end of its stream, an empty DATA frame or a
-trailer HEADERS frame, queues `Flags` that kawa's H1 serializer writes as the
-last chunk `0\r\n`, the trailer fields and an empty line. For a
+connection. The end of an H2 backend stream, an empty DATA frame or a trailer
+HEADERS frame, queues `Flags` that kawa's H1 serializer writes as the last
+chunk `0\r\n` under chunked framing, and as the trailer fields and an empty
+line. For a
 `Position::Server` pass whose `HttpContext` holds a HEAD method or a 204 or
 304 status (`ConnectionH1::response_has_no_body`), `ConnectionH1::writable`
 calls `ConnectionH1::drop_bodiless_response_framing` after
@@ -1874,10 +1873,45 @@ its `Header` fields and its `Flags` lose `end_body`, `end_chunk` and
 DATA frame nothing is written after the head. Each dropped trailer
 block logs a `warn!` and increments `h2.trailers_dropped_no_body`; a
 `Content-Length`-framed one is still dropped and counted by
-`drop_length_framed_trailers` first. The `Transfer-Encoding: chunked` field
-`pkawa::handle_header` adds to such a head is still written. A known gap
-remains: DATA carrying a payload on such a response is still written after the
-head (with a chunk-size line under chunked framing), because
+`drop_length_framed_trailers` first.
+
+`pkawa::handle_header` gives a response with no content by definition no
+framing: a response with a 1xx, 204 or 304 status, or to HEAD (which
+`HttpContext::on_response_headers` has already marked `Terminated`), whose
+header section arrives without END_STREAM gains no `Transfer-Encoding:
+chunked` field and no chunked framing (RFC 9112 §6.1 forbids the field in a
+1xx or 204). A `content-length` the backend sent is removed from a 1xx or a
+204, where a server MUST NOT send it, and passed through on a 304 or a
+response to HEAD (RFC 9110 §8.6). A 1xx is interim: like kawa's H1 parser,
+`handle_header` marks it complete (`ParsingPhase::Terminated`) at its head, and
+the final response follows on the same stream once the frontend has written
+it (`ConnectionH2::handle_1xx_reset` on an H2 frontend). A 204, a 304 or a
+response to HEAD stays open (`ParsingPhase::Body`) until the backend ends its
+stream with an empty DATA frame or a trailer HEADERS frame (RFC 9113 §8.1):
+released at its head, the backend stream would be reset by
+`ConnectionH2::end_stream` while those frames were in flight, and the
+closed-stream check of `ConnectionH2::handle_read` would answer the trailer HEADERS
+with GOAWAY(STREAM_CLOSED), ending every stream of the backend connection; an
+H2 frontend would also have sent the head without END_STREAM and retired the
+stream, so the client never saw it end. The backend's END_STREAM is what ends
+the response for every frontend: an H1 client reads the head alone, as above,
+and an H2 client receives the head without END_STREAM, then an empty DATA
+frame or the trailer HEADERS frame carrying it. A `:status 101` is malformed
+in HTTP/2 (RFC 9113 §8.6): `handle_header` refuses it as a stream error
+(PROTOCOL_ERROR), so the client gets a 502 rather than an upgrade attempt.
+Before sozu-proxy/sozu#1776 such a head gained `Transfer-Encoding: chunked`
+and chunked framing, and a 1xx never completed, so an H1 client read a chunked
+103 and never the final response. Pinned by
+`a_bodiless_h2_response_gains_no_transfer_encoding_towards_an_h1_client`
+(`h1.rs`), `a_101_response_is_a_stream_protocol_error` (`pkawa.rs`),
+`test_h2_bodiless_response_head_has_no_transfer_encoding`,
+`test_h2_bodiless_response_ends_the_h2_client_stream`,
+`test_h2_bodiless_response_end_keeps_the_backend_connection`,
+`test_h2_backend_interim_response_reaches_the_client` and
+`test_h2_backend_101_is_a_bad_gateway`
+(`e2e/src/tests/h2_security_header_injection.rs`). A known gap remains: DATA
+carrying a payload on a 204, a 304 or a response to HEAD is still forwarded,
+written after the head to an H1 client and as DATA to an H2 client, because
 `ConnectionH2::content_length_exempt` (`h2.rs`) skips the `content-length`
 mismatch reset for HEAD, 204 and 304 and the chunks are not removed here. Pinned by
 `a_bodiless_response_writes_nothing_after_its_head_to_an_h1_client`,
