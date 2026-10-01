@@ -4428,21 +4428,6 @@ fn test_h2_frames_after_our_rst_stream_are_ignored() {
     );
 }
 
-/// RFC 7540 §5.3.1: a stream cannot depend on itself. On an idle stream the
-/// PRIORITY frame is dropped: RFC 9113 §6.4 forbids RST_STREAM on an idle
-/// stream, and a PRIORITY frame does not change stream state (§6.3).
-#[test]
-fn test_h2_self_dependent_priority_on_idle_stream_keeps_the_connection() {
-    let offending = H2Frame::priority(5, 5, 16, false).encode();
-    let (frames, infra_ok) = run_beside_an_in_flight_stream("H2-PRIORITY-SELF-IDLE", &offending);
-    assert_stream_1_completed(&frames, infra_ok);
-    assert!(
-        extract_rst_streams(&frames).is_empty(),
-        "no RST_STREAM may name an idle stream: {:?}",
-        extract_rst_streams(&frames)
-    );
-}
-
 /// RFC 9113 §6.3: a PRIORITY frame with a length other than 5 octets is a
 /// stream error of type FRAME_SIZE_ERROR.
 #[test]

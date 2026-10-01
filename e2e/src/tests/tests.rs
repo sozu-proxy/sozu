@@ -4653,7 +4653,7 @@ fn test_alpn_prefer_h1_with_h2_client() {
 
 /// Run h2spec HTTP/2 conformance tests against Sozu.
 ///
-/// This test exercises 145 RFC 9113 conformance scenarios using h2spec 2.0.
+/// This test exercises 146 RFC 9113 conformance scenarios using h2spec 2.6.0.
 ///
 /// Requires the `h2spec` binary in PATH. Install via a prebuilt release or:
 ///   go install github.com/summerwind/h2spec/cmd/h2spec@latest

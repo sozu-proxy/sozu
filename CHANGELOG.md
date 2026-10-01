@@ -3882,12 +3882,15 @@
   the body phase is malformed, PROTOCOL_ERROR (§8.1.1); a PRIORITY frame whose length is not 5 is
   FRAME_SIZE_ERROR (§6.3). Frames on a stream Sōzu reset are ignored (§5.1), for the last 256 such
   streams on the connection, instead of drawing a second RST_STREAM (DATA) or a GOAWAY (HEADERS). A
-  self-dependent PRIORITY (RFC 7540 §5.3.1) on an idle stream is dropped, since RST_STREAM must not
-  name an idle stream (§6.4). Each RST_STREAM still feeds the emitted-RST flood accounting and each
-  dropped frame counts as a glitch; flood thresholds are unchanged. A HEADERS frame dropped this way
-  that lacks END_HEADERS still ends the connection when its CONTINUATION arrives, as for a refused
-  stream. Covered by five `e2e/src/tests/h2_security_tests.rs` tests that check another in-flight
-  stream completes.
+  self-dependent PRIORITY (RFC 7540 §5.3.1) on an idle stream still closes the connection, since
+  RST_STREAM must not name an idle stream (§6.4). Each RST_STREAM still feeds the emitted-RST flood
+  accounting and each ignored frame counts as a glitch; flood thresholds are unchanged. A dropped
+  HEADERS frame that lacks END_HEADERS is not decoded, so its CONTINUATION still ends the
+  connection, as for a refused stream: this covers the HEADERS that triggers a stream error (a
+  trailer block or a half-closed-stream HEADERS split across CONTINUATION) as well as late HEADERS
+  on a stream Sōzu reset. Covered by four `e2e/src/tests/h2_security_tests.rs` tests that check
+  another in-flight stream completes. The h2spec counts in `doc/h2_mux_internals.md` and
+  `e2e/README.md` now read 146, the number of cases h2spec 2.6.0 runs.
 
 - **`fix(mux)`: never reuse a pooled connection to a removed backend
   ([#1735](https://github.com/sozu-proxy/sozu/issues/1735)).** The pool-reuse scan of

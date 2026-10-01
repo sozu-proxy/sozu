@@ -386,7 +386,8 @@ impl H2StreamTable {
     /// either still tracked in `rst_sent` or among the last
     /// [`RECENTLY_RESET_CAPACITY`] retired streams. Frames the peer sent
     /// before it processed that RST_STREAM are ignored, not treated as an
-    /// error.
+    /// error. Scans the ring: for a stream still in the wire map,
+    /// [`Self::rst_sent_contains`] alone answers.
     pub(super) fn was_reset_locally(&self, stream_id: StreamId) -> bool {
         self.rst_sent.contains(&stream_id) || self.recently_reset.contains(&stream_id)
     }

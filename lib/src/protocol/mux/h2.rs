@@ -2004,7 +2004,7 @@ impl ConnectionH2 {
                     // RFC 9113 §5.1: frames the peer sent before it processed
                     // our RST_STREAM are ignored, after the minimal
                     // processing (HPACK, connection flow control).
-                    if carries_message && self.stream_table.was_reset_locally(stream_id) {
+                    if carries_message && self.stream_table.rst_sent_contains(stream_id) {
                         debug!(
                             "{} Ignoring {:?} on stream {} after sending RST_STREAM",
                             log_context!(self),
@@ -6678,16 +6678,13 @@ impl ConnectionH2 {
                 return result;
             } else {
                 // RFC 7540 §5.3.1 makes a self-dependency a stream error, but
-                // this stream is idle: RFC 9113 §6.4 forbids RST_STREAM on an
-                // idle stream, and PRIORITY changes no stream state (§6.3).
-                // Drop it; only the flood accounting sees it.
-                debug!(
-                    "{} Ignoring self-dependent PRIORITY on idle stream {}",
-                    log_context!(self),
-                    priority.stream_id
+                // this stream is idle and RFC 9113 §6.4 forbids RST_STREAM on
+                // an idle stream: the connection error is the only reply.
+                error!(
+                    "{} INVALID PRIORITY RECEIVED ON INVALID STREAM",
+                    log_context!(self)
                 );
-                self.flood_detector.record_glitch();
-                check_flood_or_return!(self);
+                return self.goaway(H2Error::ProtocolError);
             }
         }
         MuxResult::Continue
@@ -6713,7 +6710,7 @@ impl ConnectionH2 {
         self.attribute_bytes_to_overhead();
         if let Some(global_stream_id) = self.stream_table.get(stream_id)
             && context.streams[global_stream_id].state.is_open()
-            && !self.stream_table.was_reset_locally(stream_id)
+            && !self.stream_table.rst_sent_contains(stream_id)
         {
             debug!(
                 "{} PRIORITY frame of invalid length on stream {}, sending RST_STREAM(FRAME_SIZE_ERROR)",
