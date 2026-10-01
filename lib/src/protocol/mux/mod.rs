@@ -801,7 +801,11 @@ pub(super) fn tcp_info_reads() -> usize {
 /// Every write-side shutdown of the HTTP and HTTPS close paths goes through
 /// here: the frontend in `HttpSession::close` (`lib/src/http.rs`) and
 /// `HttpsSession::close` (`lib/src/https.rs`), the backends in `Mux::close`
-/// and in the dead-backend sweep of `Mux::ready_inner`. `peer_closed` comes
+/// and in the dead-backend sweep of `Mux::ready_inner`. An H1 frontend's
+/// lingering close (`ConnectionH1::start_linger`, `h1.rs`) calls it earlier,
+/// before it drains the rest of the request; the session close then repeats
+/// it: a no-op once the FIN is queued, or `ENOTCONN` once the connection is
+/// gone, which both callers already ignore. `peer_closed` comes
 /// from [`Connection::peer_closed`], which `HttpsSession::close` widens with
 /// `FrontRustls::peer_disconnected`.
 ///
@@ -2613,7 +2617,11 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     ) -> SessionResult {
         let mut counter = 0;
 
-        if self.frontend.readiness().event.is_hup()
+        if self.frontend.is_lingering() && self.frontend.readiness().event.is_hup() {
+            // A lingering frontend reads to the client's EOF before it closes:
+            // a close with its last bytes unread would still reset.
+            self.frontend.readiness_mut().event.insert(Ready::READABLE);
+        } else if self.frontend.readiness().event.is_hup()
             && !self.delay_close_for_frontend_flush("frontend HUP")
         {
             debug!(
@@ -3424,6 +3432,15 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             Connection::H1(_) => false,
             Connection::H2(_) => true,
         };
+        if self.frontend_token == token && self.frontend.is_lingering() {
+            // The lingering close's deadline: stop draining and close.
+            debug!(
+                "{} Mux lingering close deadline reached: {:?}",
+                log_context!(self),
+                self.frontend
+            );
+            return StateResult::CloseSession;
+        }
         let mut should_close = true;
         let mut should_write = false;
         if self.frontend_token == token {
@@ -3818,6 +3835,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         }
         if self.drive_frontend_shutdown_io() {
             return true;
+        }
+        if self.frontend.is_lingering() {
+            // Bounded by its own deadline, which the timer still enforces.
+            return false;
         }
         // Forced-close deadline: once the H2 listener's
         // `h2_graceful_shutdown_deadline_seconds` budget has elapsed from
@@ -6538,6 +6559,11 @@ mod tests {
         h1.readiness.event = Ready::from(event);
         mux.router.backends.insert(backend_token, connection);
         mux.context.link_stream(0, backend_token);
+        // A request received whole, from a client that asked to close: the
+        // response closes the frontend without a lingering drain (which
+        // would end this backend's stream at once).
+        mux.context.streams[0].front.parsing_phase = kawa::ParsingPhase::Terminated;
+        mux.context.streams[0].context.keep_alive_frontend = false;
         mux.frontend.readiness_mut().event = Ready::EMPTY;
 
         // The FIN lands after `epoll_wait` returned, before the pass reads.

@@ -1528,6 +1528,9 @@ fn try_h1_early_response_mid_upload(framing: EarlyResponseFraming) -> State {
         String::new()
     };
     let after = read_status_lines(&mut stream, 1, Duration::from_millis(500));
+    // Closing the client ends sozu's lingering drain of the rest of the
+    // request, instead of letting the soft stop wait for its deadline.
+    drop(stream);
     println!("{label}: backend connection 0 after the 413: {on_reused:?}");
     println!("{label}: backend connection 1: {on_fresh:?}");
     println!("{label}: client after the 413: {after:?}");
@@ -1576,6 +1579,174 @@ fn test_h1_early_response_mid_chunked_upload() {
             3,
             "H1 security: an early response ends neither a chunked upload nor its backend connection",
             || try_h1_early_response_mid_upload(EarlyResponseFraming::Chunked),
+        ),
+        State::Success,
+    );
+}
+
+/// Size of the body the client still sends after the early response in
+/// [`try_h1_early_response_survives_the_rest_of_the_upload`].
+const LINGER_UPLOAD_REST: usize = 2 * 1024 * 1024;
+
+/// Body of the early response in the same test: larger than the kernel
+/// buffers let sozu hand the client at once, so part of it is still queued in
+/// sozu's socket when sozu closes.
+const LINGER_RESPONSE_BODY: usize = 1024 * 1024;
+
+/// The client keeps sending the body while it reads an early, complete
+/// response. RFC 9112 §9.6: a server that closes while the client may still
+/// be sending must half-close and keep reading for a while, or the reset its
+/// close provokes can destroy the response before the client reads it.
+fn try_h1_early_response_survives_the_rest_of_the_upload() -> State {
+    let label = "EARLY-RESPONSE-LINGER";
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) =
+        setup_sync_test(label, config, listeners, state, front_address, 1, false);
+    let mut backend = backends.pop().unwrap();
+    backend.connect();
+
+    let first_part = "0123456789";
+    let head = format!(
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+        first_part.len() + LINGER_UPLOAD_REST
+    );
+    let mut stream = raw_connect(front_address);
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .write_all(format!("{head}{first_part}").as_bytes())
+        .expect("write the request head and the start of its body");
+
+    if !backend_accepts_within(&mut backend, 0, Duration::from_secs(2)) {
+        println!("{label}: the upload never reached the backend");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+    let upload = backend_drain(&mut backend, 0, Duration::from_millis(300));
+    if !upload.contains("POST /upload HTTP/1.1") {
+        println!("{label}: the backend did not receive the upload head: {upload:?}");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    // The early, complete, keep-alive response, written whole by its own
+    // thread: sozu takes it only as fast as the client reads.
+    let mut upstream = backend
+        .clients
+        .remove(&0)
+        .expect("the backend holds the upload connection");
+    upstream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let response_head =
+        format!("HTTP/1.1 413 Content Too Large\r\nContent-Length: {LINGER_RESPONSE_BODY}\r\n\r\n");
+    let responder = {
+        let response_head = response_head.clone();
+        thread::spawn(move || {
+            let result = upstream
+                .write_all(response_head.as_bytes())
+                .and_then(|()| upstream.write_all(&vec![b'x'; LINGER_RESPONSE_BODY]));
+            // Keep the backend connection open until the client is done.
+            (upstream, result)
+        })
+    };
+
+    // The client keeps sending its body: half of the rest, then, once the
+    // response has started to arrive, all but the last byte of the other
+    // half. The request is never complete, so the connection must close
+    // after the response, and body bytes keep arriving while it does.
+    let (response_started, wait_for_response) = std::sync::mpsc::channel();
+    let uploader = {
+        let mut stream = stream.try_clone().expect("clone the client stream");
+        thread::spawn(move || {
+            let chunk = vec![b'y'; 16 * 1024];
+            let mut sent = 0;
+            let mut send_until = |sent: &mut usize, limit: usize| {
+                while *sent < limit {
+                    let len = chunk.len().min(limit - *sent);
+                    stream.write_all(&chunk[..len])?;
+                    *sent += len;
+                }
+                Ok::<(), std::io::Error>(())
+            };
+            if let Err(e) = send_until(&mut sent, LINGER_UPLOAD_REST / 2) {
+                return (sent, Some(e));
+            }
+            let _ = wait_for_response.recv_timeout(Duration::from_secs(5));
+            if let Err(e) = send_until(&mut sent, LINGER_UPLOAD_REST - 1) {
+                return (sent, Some(e));
+            }
+            (sent, None)
+        })
+    };
+
+    // A client that reads a little later than it writes.
+    thread::sleep(Duration::from_millis(300));
+    let mut received = Vec::new();
+    let mut buf = [0u8; 16 * 1024];
+    let end = loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break Ok(()),
+            Ok(n) => {
+                if received.is_empty() {
+                    let _ = response_started.send(());
+                }
+                received.extend_from_slice(&buf[..n]);
+            }
+            Err(e) => break Err(e),
+        }
+    };
+    drop(stream);
+    let (sent, write_error) = uploader.join().expect("the uploader must not panic");
+    let (upstream, response_written) = responder.join().expect("the responder must not panic");
+    drop(upstream);
+    println!(
+        "{label}: sent {sent} of {LINGER_UPLOAD_REST} body bytes (write error: {write_error:?}), backend response written: {response_written:?}, received {} bytes, end: {end:?}",
+        received.len()
+    );
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    let text = String::from_utf8_lossy(&received);
+    let Some(body_start) = text.find("\r\n\r\n").map(|i| i + 4) else {
+        println!("{label}: the client did not receive the response head: {text:?}");
+        return State::Fail;
+    };
+    if !text.starts_with("HTTP/1.1 413") {
+        println!("{label}: the client did not receive the early 413");
+        return State::Fail;
+    }
+    let body = &received[body_start..];
+    if body.len() != LINGER_RESPONSE_BODY || body.iter().any(|&b| b != b'x') {
+        println!(
+            "{label}: the client received {} of the {LINGER_RESPONSE_BODY} response body bytes",
+            body.len()
+        );
+        return State::Fail;
+    }
+    if end.is_err() {
+        println!("{label}: the response did not end with a clean close");
+        return State::Fail;
+    }
+    State::Success
+}
+
+#[test]
+fn test_h1_early_response_survives_the_rest_of_the_upload() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H1: an early response reaches a client that keeps sending its body",
+            try_h1_early_response_survives_the_rest_of_the_upload,
         ),
         State::Success,
     );

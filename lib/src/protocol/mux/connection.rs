@@ -112,6 +112,9 @@ impl<Front: SocketHandler> Connection<Front> {
             reused_from_pool: false,
             io_slices: Vec::new(),
             rtt: Cell::new(None),
+            // A frontend is built with the listener's request timeout.
+            linger_timeout: timeout_duration,
+            linger: super::h1::Linger::Off,
         })
     }
     pub fn new_h1_client(
@@ -148,6 +151,8 @@ impl<Front: SocketHandler> Connection<Front> {
             reused_from_pool: false,
             io_slices: Vec::new(),
             rtt: Cell::new(None),
+            linger_timeout: Duration::ZERO,
+            linger: super::h1::Linger::Off,
         })
     }
 
@@ -491,6 +496,15 @@ impl<Front: SocketHandler> Connection<Front> {
         match self {
             Connection::H1(_) => false,
             Connection::H2(c) => c.core.peer_header_block_in_progress(),
+        }
+    }
+
+    /// True while an H1 frontend drains the rest of a request after its
+    /// response, before it closes. H2 never lingers. See [`super::h1::Linger`].
+    pub(super) fn is_lingering(&self) -> bool {
+        match self {
+            Connection::H1(c) => c.is_lingering(),
+            Connection::H2(_) => false,
         }
     }
 

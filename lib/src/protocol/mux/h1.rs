@@ -7,7 +7,7 @@
 
 use std::{
     cell::Cell,
-    io::IoSlice,
+    io::{ErrorKind, IoSlice, Read},
     time::{Duration, Instant},
 };
 
@@ -108,6 +108,41 @@ macro_rules! log_module_context {
         let (open, reset, _, _, _) = ansi_palette();
         format!("{open}MUX-H1{reset}\t >>>", open = open, reset = reset)
     }};
+}
+
+/// Most request bytes a lingering close reads and discards before it closes
+/// anyway (RFC 9112 §9.6).
+///
+/// The drain exists so that the client's in-flight body does not make the
+/// kernel answer the close with a reset, which destroys any part of the
+/// response the client has not read yet. 4 MiB is the default ceiling of
+/// Linux's send-buffer autotuning (`net.ipv4.tcp_wmem`), so it covers what a
+/// client can already have queued when it sees the FIN, while bounding the
+/// work one connection can make sozu do after its response.
+pub(super) const LINGER_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Size of one lingering read. A stack buffer: the drain allocates nothing.
+const LINGER_READ_CHUNK: usize = 16 * 1024;
+
+/// Lingering close of a frontend whose request was not received whole when
+/// its response ended (RFC 9112 §9.6).
+///
+/// Closing a socket whose receive queue still holds data, or that receives
+/// data after the close, makes the kernel send a reset, and a reset discards
+/// whatever part of the response is still queued. So the close is staged:
+/// the write side is shut down once the response and any TLS `close_notify`
+/// are flushed, then the rest of the request is read and dropped until the
+/// client closes, [`LINGER_MAX_BYTES`] are read, or the deadline passes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Linger {
+    /// The connection closes without draining.
+    Off,
+    /// The response ended before the request: once nothing is left to
+    /// flush, shut the write side down and start draining.
+    Pending { deadline: Instant },
+    /// The write side is shut down; the rest of the request is being read
+    /// and dropped.
+    Draining { deadline: Instant, remaining: usize },
 }
 
 /// HTTP/1.1 connection handler within the mux layer.
@@ -213,6 +248,12 @@ pub struct ConnectionH1<Front: SocketHandler> {
     /// same reason as `io_slices`: the struct literals live in
     /// `connection.rs`.
     pub(super) rtt: Cell<Option<Option<Duration>>>,
+    /// How long a lingering close may drain the rest of a request: the
+    /// listener's `request_timeout`, which a frontend connection is built
+    /// with. Unused on a backend connection.
+    pub(super) linger_timeout: Duration,
+    /// Lingering-close state of a frontend connection. See [`Linger`].
+    pub(super) linger: Linger,
 }
 
 impl<Front: SocketHandler> std::fmt::Debug for ConnectionH1<Front> {
@@ -275,9 +316,105 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 self.readiness
             );
             MuxResult::Continue
+        } else if let Linger::Pending { deadline } = self.linger {
+            self.start_linger(deadline, reason)
         } else {
             MuxResult::CloseSession
         }
+    }
+
+    /// Whether the connection is draining the rest of a request after its
+    /// response (see [`Linger`]).
+    pub(super) fn is_lingering(&self) -> bool {
+        matches!(self.linger, Linger::Draining { .. })
+    }
+
+    /// Shut the write side down after a fully flushed response, then read
+    /// what the client still sends until [`Self::drain_linger`] closes.
+    fn start_linger(&mut self, deadline: Instant, reason: &'static str) -> MuxResult {
+        debug_assert!(
+            self.position.is_server() && !self.socket.socket_wants_write(),
+            "a linger starts on a frontend with nothing left to flush"
+        );
+        // The FIN follows the response; the client reads it all, then EOF.
+        if let Err(e) = super::shutdown_write(self.socket.socket_ref(), false) {
+            debug!(
+                "{} H1 closing without lingering after {}: shutdown failed: {:?}",
+                log_context!(self),
+                reason,
+                e
+            );
+            return MuxResult::CloseSession;
+        }
+        debug!(
+            "{} H1 lingering after {}: draining the rest of the request",
+            log_context!(self),
+            reason
+        );
+        self.linger = Linger::Draining {
+            deadline,
+            remaining: LINGER_MAX_BYTES,
+        };
+        // Fixed, never re-armed: the deadline bounds the whole drain.
+        self.timeout_deadline = Some(deadline);
+        self.readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
+        self.readiness.event.remove(Ready::WRITABLE);
+        // Edge-triggered epoll will not report bytes already queued.
+        self.readiness.event.insert(Ready::READABLE);
+        MuxResult::Continue
+    }
+
+    /// Read and drop what the client still sends while lingering. Closes on
+    /// the client's EOF, a socket error, the byte budget, or the deadline;
+    /// otherwise waits for the next READABLE.
+    fn drain_linger(&mut self, now: Instant) -> MuxResult {
+        let Linger::Draining {
+            deadline,
+            mut remaining,
+        } = self.linger
+        else {
+            unreachable!("drain_linger runs only while draining");
+        };
+        if now >= deadline {
+            debug!(
+                "{} H1 lingering close: deadline reached",
+                log_context!(self)
+            );
+            return MuxResult::CloseSession;
+        }
+        let mut buf = [0u8; LINGER_READ_CHUNK];
+        let result = loop {
+            if remaining == 0 {
+                debug!(
+                    "{} H1 lingering close: {} bytes drained, closing",
+                    log_context!(self),
+                    LINGER_MAX_BYTES
+                );
+                break MuxResult::CloseSession;
+            }
+            let len = remaining.min(buf.len());
+            // The raw socket, also under TLS: after `close_notify` nothing
+            // the client sends is decrypted, only dropped.
+            let mut socket = self.socket.socket_ref();
+            match socket.read(&mut buf[..len]) {
+                Ok(0) => break MuxResult::CloseSession,
+                Ok(size) => {
+                    debug_assert!(size <= remaining, "a read never exceeds its buffer");
+                    remaining -= size;
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    self.readiness.event.remove(Ready::READABLE);
+                    break MuxResult::Continue;
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(_) => break MuxResult::CloseSession,
+            }
+        };
+        self.linger = Linger::Draining {
+            deadline,
+            remaining,
+        };
+        result
     }
 
     /// End a response body at the backend's EOF.
@@ -361,6 +498,10 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             log_context!(self),
             self.position
         );
+        if self.is_lingering() {
+            // Before `arm_timeout`: the linger deadline is never pushed out.
+            return self.drain_linger(context.now);
+        }
         let Some(stream_id) = self.stream else {
             error!(
                 "{} readable() called on H1 connection with no active stream",
@@ -743,6 +884,13 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             log_context!(self),
             self.position
         );
+        if self.is_lingering() {
+            // The write side is shut down: nothing is left to write, and the
+            // linger deadline is never pushed out.
+            self.readiness.interest.remove(Ready::WRITABLE);
+            self.readiness.event.remove(Ready::WRITABLE);
+            return MuxResult::Continue;
+        }
         let Some(stream_id) = self.stream else {
             if self.socket.socket_wants_write() {
                 let (size, status) = self.socket.socket_write_vectored(&[]);
@@ -1162,6 +1310,19 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         // re-taking the keep-alive decision after
                         // `close_notify`.
                         stream.context.closing = true;
+                        if !request_complete {
+                            // The client may still be sending the body: drain
+                            // it once the response is flushed, so the close
+                            // does not reset the response away (RFC 9112
+                            // §9.6). The backend is done with either way.
+                            self.linger = Linger::Pending {
+                                deadline: now + self.linger_timeout,
+                            };
+                            if let StreamState::Linked(token) = old_state {
+                                endpoint.end_stream(token, stream_id, context);
+                            }
+                        }
+                        let stream = &mut context.streams[stream_id];
                         if stream.context.keep_alive_frontend && stream.context.keep_alive_backend {
                             // Both sides wanted to keep it: only the
                             // incomplete request closes it.
@@ -3028,6 +3189,10 @@ mod tests {
     /// decision after `close_notify` — keeping the connection if the body
     /// finished in between (sozu-proxy/sozu#1721).
     ///
+    /// Once `close_notify` is flushed, the request still incomplete, the
+    /// connection starts its lingering close (RFC 9112 §9.6) and closes the
+    /// session once the client closes.
+    ///
     /// TO SEE THIS RED: in `ConnectionH1::writable`, delete the
     /// `stream.context.closing = true;` of the close path. The second pass
     /// then logs a second `H1::Complete` line and resets the stream to
@@ -3043,7 +3208,7 @@ mod tests {
             context
                 .create_stream(Ulid::generate(), 1 << 16)
                 .expect("the test pool must hand out stream buffers");
-            let (front_socket, front_peer) = connected_socket();
+            let (front_socket, mut front_peer) = connected_socket();
             front_peer
                 .set_nonblocking(true)
                 .expect("the frontend peer is drained without blocking");
@@ -3118,12 +3283,28 @@ mod tests {
                     );
                 }
             }
+            let Connection::H1(server) = &mut frontend else {
+                unreachable!("the frontend is H1");
+            };
+            let lingering = server.is_lingering();
+            let peer_eof = read_to_eof(&mut front_peer).is_some();
+            // The client closes: the drain meets its EOF and the session closes.
+            drop(front_peer);
+            let mut after_client_close = MuxResult::Continue;
+            for _ in 0..1000 {
+                server.readiness.event.insert(Ready::READABLE);
+                after_client_close = server.readable(&mut context, EndpointClient(&mut router));
+                if matches!(after_client_close, MuxResult::CloseSession) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
             states_sender
-                .send(states)
+                .send((states, lingering, peer_eof, after_client_close))
                 .expect("the test thread must report its states");
         });
 
-        let states = states_receiver
+        let (states, lingering, peer_eof, after_client_close) = states_receiver
             .recv()
             .expect("the test thread must report its states");
         let completions = output
@@ -3146,9 +3327,198 @@ mod tests {
             "the first pass defers the close behind the pending close_notify"
         );
         assert!(
-            matches!(states[1].0, MuxResult::CloseSession),
-            "once close_notify is flushed the session closes, got {:?}",
+            matches!(states[1].0, MuxResult::Continue) && lingering,
+            "once close_notify is flushed the connection lingers, got {:?}",
             states[1].0
+        );
+        assert!(
+            peer_eof,
+            "the lingering close sends the FIN after the response"
+        );
+        assert!(
+            matches!(after_client_close, MuxResult::CloseSession),
+            "the session closes once the client closed, got {after_client_close:?}"
+        );
+    }
+
+    /// Read `peer` until its EOF, retrying a nonblocking read for up to about
+    /// one second. `None` when no EOF arrived in that time.
+    fn read_to_eof(peer: &mut std::net::TcpStream) -> Option<Vec<u8>> {
+        let mut received = Vec::new();
+        let mut buf = [0u8; 4096];
+        for _ in 0..1000 {
+            match std::io::Read::read(peer, &mut buf) {
+                Ok(0) => return Some(received),
+                Ok(size) => received.extend_from_slice(&buf[..size]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
+    /// A frontend connection lingering over a live loopback socket, and the
+    /// client end of that socket.
+    fn lingering_frontend(
+        deadline: Instant,
+    ) -> (ConnectionH1<SessionTcpStream>, std::net::TcpStream) {
+        let (front_socket, front_peer) = connected_socket();
+        let ulid = Ulid::generate();
+        let mut server = h1_of(Connection::new_h1_server(
+            ulid,
+            SessionTcpStream::new(front_socket, ulid, None),
+            Duration::from_secs(10),
+        ));
+        server.linger = Linger::Pending { deadline };
+        assert!(
+            matches!(
+                server.defer_close_for_tls_flush("test"),
+                MuxResult::Continue
+            ),
+            "a pending linger starts instead of closing"
+        );
+        (server, front_peer)
+    }
+
+    /// Drive `readable` until it closes the session or reads everything
+    /// queued. Returns the last result.
+    fn drain_passes<L: ListenerHandler + L7ListenerHandler>(
+        server: &mut ConnectionH1<SessionTcpStream>,
+        context: &mut Context<L>,
+        router: &mut Router,
+    ) -> MuxResult {
+        let mut result = MuxResult::Continue;
+        for _ in 0..100 {
+            server.readiness.event.insert(Ready::READABLE);
+            result = server.readable(context, EndpointClient(router));
+            if matches!(result, MuxResult::CloseSession) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        result
+    }
+
+    /// RFC 9112 §9.6 lingering close: the write side is shut down first, the
+    /// rest of the request is read and dropped without pushing the deadline
+    /// out, and the drain ends on the client's EOF.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH1::readable`, move the
+    /// `if self.is_lingering()` early return after `self.arm_timeout(...)`:
+    /// the deadline moves with each read.
+    #[test]
+    fn a_lingering_close_half_closes_then_drains_to_the_client_eof() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let mut context = test_context(&pool);
+        context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("the test pool must hand out stream buffers");
+        let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (mut server, mut front_peer) = lingering_frontend(deadline);
+
+        assert!(server.is_lingering(), "the connection drains");
+        assert_eq!(
+            server.poll_timeout(),
+            Some(deadline),
+            "the drain is bounded"
+        );
+        assert!(
+            !server.readiness.interest.is_writable(),
+            "nothing is written while lingering"
+        );
+        assert_eq!(
+            read_to_eof(&mut front_peer),
+            Some(Vec::new()),
+            "the client sees the FIN while it may still send"
+        );
+
+        // The client keeps sending: sozu drops it, and the deadline stays.
+        front_peer
+            .write_all(&vec![b'y'; 100 * 1024])
+            .expect("the client may still send after the FIN");
+        context.now = Instant::now();
+        let result = drain_passes(&mut server, &mut context, &mut router);
+        assert!(
+            matches!(result, MuxResult::Continue),
+            "the drain waits for more, got {result:?}"
+        );
+        match server.linger {
+            Linger::Draining { remaining, .. } => assert_eq!(
+                remaining,
+                LINGER_MAX_BYTES - 100 * 1024,
+                "every byte sent is drained and counted"
+            ),
+            other => panic!("the connection must still drain, got {other:?}"),
+        }
+        assert_eq!(
+            server.poll_timeout(),
+            Some(deadline),
+            "a drained read never pushes the deadline out"
+        );
+
+        drop(front_peer);
+        let result = drain_passes(&mut server, &mut context, &mut router);
+        assert!(
+            matches!(result, MuxResult::CloseSession),
+            "the client's EOF ends the drain, got {result:?}"
+        );
+    }
+
+    /// The drain is bounded in bytes and in time: past either bound the
+    /// session closes although the client is still sending.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH1::drain_linger`, read `buf.len()`
+    /// bytes instead of `remaining.min(buf.len())` (the budget case reads
+    /// past its budget), or delete the `now >= deadline` check (the deadline
+    /// case keeps draining).
+    #[test]
+    fn a_lingering_close_stops_at_its_byte_budget_and_its_deadline() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let mut context = test_context(&pool);
+        context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("the test pool must hand out stream buffers");
+        let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+
+        // Byte budget: the client sends more than is left of it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (mut server, mut front_peer) = lingering_frontend(deadline);
+        server.linger = Linger::Draining {
+            deadline,
+            remaining: 1024,
+        };
+        front_peer
+            .write_all(&[b'y'; 4096])
+            .expect("the client may still send after the FIN");
+        context.now = Instant::now();
+        let result = drain_passes(&mut server, &mut context, &mut router);
+        assert!(
+            matches!(result, MuxResult::CloseSession),
+            "past its byte budget the drain closes, got {result:?}"
+        );
+        assert_eq!(
+            server.linger,
+            Linger::Draining {
+                deadline,
+                remaining: 0
+            },
+            "the drain read exactly its budget"
+        );
+
+        // Deadline: the client still sends when it passes.
+        let (mut server, mut front_peer) = lingering_frontend(deadline);
+        front_peer
+            .write_all(&[b'y'; 4096])
+            .expect("the client may still send after the FIN");
+        context.now = deadline;
+        server.readiness.event.insert(Ready::READABLE);
+        let result = server.readable(&mut context, EndpointClient(&mut router));
+        assert!(
+            matches!(result, MuxResult::CloseSession),
+            "past its deadline the drain closes, got {result:?}"
         );
     }
 
