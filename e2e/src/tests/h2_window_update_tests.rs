@@ -37,7 +37,9 @@ use crate::{
 
 /// Body size moved through Sōzu in each direction.
 const TRANSFER: usize = 64 * 1024 * 1024;
-/// Sōzu's default `h2_initial_connection_window`.
+/// Sōzu's default `h2_initial_connection_window`. Pinned here rather than
+/// read from `H2ConnectionConfig::default()`: the bound must not follow the
+/// value under test, or a smaller default would loosen it instead of failing.
 const CONNECTION_WINDOW: usize = 16 * 1024 * 1024;
 /// RFC 9113 §6.5.2 default, what Sōzu advertises as its stream window.
 const DEFAULT_STREAM_WINDOW: u32 = 65_535;

@@ -812,6 +812,12 @@ pub struct ConnectionH2 {
     /// `H2WritePhase::Start`. Set with `parked_header_block`, taken by
     /// whichever comes first.
     parked_data: i32,
+    /// Whether the one-shot stream-0 WINDOW_UPDATE that enlarges the
+    /// connection receive window to `H2ConnectionConfig::initial_connection_window`
+    /// was sent. A backend may send SETTINGS more than once; granting the
+    /// surplus again each time would push its send window past 2^31-1
+    /// (RFC 9113 §6.9.1).
+    connection_window_enlarged: bool,
     /// RFC 9113 §6.8 double-GOAWAY drain bookkeeping, encapsulated so
     /// nothing outside `h2_drain.rs` can reach the raw fields — see
     /// [`h2_drain::H2DrainState`].
@@ -1918,6 +1924,7 @@ impl ConnectionH2 {
             pending_table_size_update: None,
             parked_header_block: false,
             parked_data: 0,
+            connection_window_enlarged: false,
             drain: h2_drain::H2DrainState::new(graceful_shutdown_deadline),
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
             output: h2_output::H2Output::default(),
@@ -2692,6 +2699,7 @@ impl ConnectionH2 {
                     .connection_config
                     .initial_connection_window
                     .saturating_sub(DEFAULT_INITIAL_WINDOW_SIZE);
+                self.connection_window_enlarged = true;
                 if increment > 0 {
                     match self.output.push_frames(WINDOW_UPDATE_FRAME_SIZE, |buf| {
                         serializer::gen_window_update(buf, 0, increment).map(|(_, size)| size)
@@ -6772,10 +6780,10 @@ impl ConnectionH2 {
         // connections (Position::Client). The server side serialises it
         // beside its own SETTINGS in the `(ClientSettings, Server)` readable
         // arm, but the client needs to do it here after receiving the
-        // server's initial SETTINGS.
-        if self.position.is_client()
-            && self.flow_control.window() <= DEFAULT_INITIAL_WINDOW_SIZE as i32
-        {
+        // server's initial SETTINGS. Once only: a later SETTINGS frame must
+        // not grant the surplus again (RFC 9113 §6.9.1).
+        if self.position.is_client() && !self.connection_window_enlarged {
+            self.connection_window_enlarged = true;
             let increment = self
                 .connection_config
                 .initial_connection_window
@@ -20540,6 +20548,70 @@ mod tests {
             &wire[settings_len + 13..],
             &serializer::SETTINGS_ACKNOWLEDGEMENT,
             "the ACK of the client's SETTINGS must close the preface"
+        );
+    }
+
+    /// A backend that sends SETTINGS again, without granting any connection
+    /// credit, must not get the one-shot connection-window enlargement again:
+    /// each repeat would add `initial_connection_window - 65535` to its send
+    /// window until it passed 2^31-1 (RFC 9113 §6.9.1).
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::handle_settings_frame`, gate the
+    /// enlargement on `self.flow_control.window() <= DEFAULT_INITIAL_WINDOW_SIZE`
+    /// (our send window) instead of `connection_window_enlarged`. The three
+    /// SETTINGS then queue three grants, coalesced into one stream-0 frame
+    /// of three times the surplus. Verified 2026-10-01 against `3d3f077b`.
+    #[test]
+    fn repeated_backend_settings_enlarge_the_connection_window_once() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut connection, _peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        connection.core.position = Position::Client(
+            "settings-cluster".into(),
+            super::super::BackendId {
+                slot: super::super::BackendSlot(0),
+                backend_id: Rc::from("settings-backend"),
+                address: "127.0.0.1:1".parse().expect("a literal socket address"),
+            },
+            BackendStatus::Connected,
+        );
+        for _ in 0..3 {
+            let result = connection.core.handle_settings_frame(
+                parser::Settings {
+                    settings: vec![],
+                    ack: false,
+                },
+                &mut context,
+            );
+            assert!(
+                matches!(result, MuxResult::Continue),
+                "an empty SETTINGS must be accepted"
+            );
+        }
+
+        let mut buf = vec![0u8; 13 * 8];
+        let (written, frames) = connection
+            .core
+            .flow_control
+            .drain_window_updates_into(&mut buf);
+        let grants: Vec<(u32, u32)> = buf[..written]
+            .chunks_exact(13)
+            .map(|frame| {
+                (
+                    u32::from_be_bytes(frame[5..9].try_into().unwrap()),
+                    u32::from_be_bytes(frame[9..13].try_into().unwrap()),
+                )
+            })
+            .collect();
+        assert_eq!(frames, grants.len());
+        assert_eq!(
+            grants,
+            vec![(
+                0,
+                H2ConnectionConfig::default().initial_connection_window
+                    - DEFAULT_INITIAL_WINDOW_SIZE
+            )],
+            "three SETTINGS must enlarge the connection window exactly once"
         );
     }
 }
