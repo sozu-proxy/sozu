@@ -801,7 +801,11 @@ pub(super) fn tcp_info_reads() -> usize {
 /// Every write-side shutdown of the HTTP and HTTPS close paths goes through
 /// here: the frontend in `HttpSession::close` (`lib/src/http.rs`) and
 /// `HttpsSession::close` (`lib/src/https.rs`), the backends in `Mux::close`
-/// and in the dead-backend sweep of `Mux::ready_inner`. `peer_closed` comes
+/// and in the dead-backend sweep of `Mux::ready_inner`. An H1 frontend's
+/// lingering close (`ConnectionH1::start_linger`, `h1.rs`) calls it earlier,
+/// before it drains the rest of the request; the session close then repeats
+/// it: a no-op once the FIN is queued, or `ENOTCONN` once the connection is
+/// gone, which both callers already ignore. `peer_closed` comes
 /// from [`Connection::peer_closed`], which `HttpsSession::close` widens with
 /// `FrontRustls::peer_disconnected`.
 ///
@@ -2613,7 +2617,11 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     ) -> SessionResult {
         let mut counter = 0;
 
-        if self.frontend.readiness().event.is_hup()
+        if self.frontend.is_lingering() && self.frontend.readiness().event.is_hup() {
+            // A lingering frontend reads to the client's EOF before it closes:
+            // a close with its last bytes unread would still reset.
+            self.frontend.readiness_mut().event.insert(Ready::READABLE);
+        } else if self.frontend.readiness().event.is_hup()
             && !self.delay_close_for_frontend_flush("frontend HUP")
         {
             debug!(
@@ -3424,6 +3432,15 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             Connection::H1(_) => false,
             Connection::H2(_) => true,
         };
+        if self.frontend_token == token && self.frontend.is_lingering() {
+            // The lingering close's deadline: stop draining and close.
+            debug!(
+                "{} Mux lingering close deadline reached: {:?}",
+                log_context!(self),
+                self.frontend
+            );
+            return StateResult::CloseSession;
+        }
         let mut should_close = true;
         let mut should_write = false;
         if self.frontend_token == token {
@@ -3818,6 +3835,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         }
         if self.drive_frontend_shutdown_io() {
             return true;
+        }
+        if self.frontend.is_lingering() {
+            // Bounded by its own deadline, which the timer still enforces.
+            return false;
         }
         // Forced-close deadline: once the H2 listener's
         // `h2_graceful_shutdown_deadline_seconds` budget has elapsed from
@@ -4969,6 +4990,132 @@ mod tests {
             unreachable!("the helper builds an H1 backend")
         };
         h1.timeout_deadline = Some(deadline);
+    }
+
+    /// Fire the frontend timeout of `mux` now, on an H1 frontend whose
+    /// lingering close may take `linger_timeout`, after `partial` request
+    /// bytes arrived. Returns the result, the instants bracketing the call,
+    /// and the frontend's linger state and deadline afterwards.
+    fn fire_frontend_timeout_after(
+        partial: &[u8],
+        linger_timeout: Duration,
+    ) -> (
+        StateResult,
+        Instant,
+        Instant,
+        h1::Linger,
+        Option<Instant>,
+        std::net::TcpStream,
+    ) {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut mux, peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));
+        let mut metrics = SessionMetrics::new(None);
+        {
+            let Connection::H1(h1) = &mut mux.frontend else {
+                unreachable!("the helper builds an H1 frontend")
+            };
+            h1.linger_timeout = linger_timeout;
+        }
+        let storage = &mut mux.context.streams[0].front.storage;
+        storage.space()[..partial.len()].copy_from_slice(partial);
+        storage.fill(partial.len());
+        arm_frontend_at(&mut mux, Some(Instant::now() - Duration::from_millis(1)));
+
+        let before = Instant::now();
+        let result = mux.timeout(Token(0), &mut metrics);
+        let after = Instant::now();
+        let Connection::H1(h1) = &mux.frontend else {
+            unreachable!("the helper builds an H1 frontend")
+        };
+        (
+            result,
+            before,
+            after,
+            h1.linger,
+            mux.frontend.poll_timeout(),
+            peer,
+        )
+    }
+
+    /// A frontend timeout answers a partly received request (408), and the
+    /// write pass that sends the answer starts the lingering close. The
+    /// re-arm `Mux::timeout_inner` runs after that pass must not replace the
+    /// linger deadline (`request_timeout`, 5 s here) with the frontend
+    /// timeout (60 s).
+    ///
+    /// TO SEE THIS RED: remove the `is_lingering()` guard of
+    /// `ConnectionH1::arm_timeout`. The deadline is then about 60 s out.
+    #[test]
+    fn a_linger_started_by_a_timeout_write_keeps_its_own_deadline() {
+        let linger = Duration::from_secs(5);
+        let (result, before, after, state, deadline, _peer) =
+            fire_frontend_timeout_after(b"POST /upl", linger);
+
+        assert_eq!(result, StateResult::Continue, "the session lingers");
+        assert!(
+            matches!(state, h1::Linger::Draining { .. }),
+            "a partly received request is drained after its answer, got {state:?}"
+        );
+        let deadline = deadline.expect("a lingering frontend has a deadline");
+        assert!(
+            deadline >= before + linger && deadline <= after + linger,
+            "the deadline is the linger's, {:?} from the call",
+            deadline.saturating_duration_since(before)
+        );
+    }
+
+    /// A silent client — no byte of a request — gets its 408 and an
+    /// immediate close: nothing is in flight to drain.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH1::writable`, set the linger on
+    /// `!request_complete` alone, without `request_started`.
+    #[test]
+    fn a_408_to_a_silent_client_closes_without_lingering() {
+        let (result, _, _, state, _, mut peer) =
+            fire_frontend_timeout_after(b"", Duration::from_secs(5));
+
+        assert_eq!(
+            result,
+            StateResult::CloseSession,
+            "nothing was received: the 408 closes at once"
+        );
+        assert_eq!(state, h1::Linger::Off, "no linger for a silent client");
+        peer.set_nonblocking(false)
+            .expect("the peer reads blocking");
+        peer.set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("the peer read is bounded");
+        let mut head = [0u8; 12];
+        std::io::Read::read_exact(&mut peer, &mut head).expect("the 408 reaches the client");
+        assert_eq!(&head, b"HTTP/1.1 408", "the client gets its 408");
+    }
+
+    /// A client that never sends its EOF is closed at the linger deadline.
+    #[test]
+    fn a_silent_client_is_closed_at_the_linger_deadline() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut mux, _peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));
+        let mut metrics = SessionMetrics::new(None);
+        let deadline = Instant::now() - Duration::from_millis(1);
+        {
+            let Connection::H1(h1) = &mut mux.frontend else {
+                unreachable!("the helper builds an H1 frontend")
+            };
+            h1.linger = h1::Linger::Draining {
+                deadline,
+                remaining: h1::LINGER_MAX_BYTES,
+            };
+        }
+        arm_frontend_at(&mut mux, Some(deadline));
+
+        assert_eq!(
+            mux.timeout(Token(0), &mut metrics),
+            StateResult::CloseSession,
+            "the linger deadline closes the session"
+        );
+        assert_eq!(
+            mux.context.streams[0].context.access_log_message, None,
+            "no per-stream timeout answer for a lingering frontend"
+        );
     }
 
     /// The timer wheel rounds a delay to the NEAREST tick and `Timer::poll`
@@ -6538,6 +6685,11 @@ mod tests {
         h1.readiness.event = Ready::from(event);
         mux.router.backends.insert(backend_token, connection);
         mux.context.link_stream(0, backend_token);
+        // A request received whole, from a client that asked to close: the
+        // response closes the frontend without a lingering drain (which
+        // would end this backend's stream at once).
+        mux.context.streams[0].front.parsing_phase = kawa::ParsingPhase::Terminated;
+        mux.context.streams[0].context.keep_alive_frontend = false;
         mux.frontend.readiness_mut().event = Ready::EMPTY;
 
         // The FIN lands after `epoll_wait` returned, before the pass reads.

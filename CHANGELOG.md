@@ -3847,6 +3847,32 @@
   of an interim response on an unlinked stream is now `H1::Interim` (was `H1::EarlyHint`). Covered
   by `test_h1_interim_102_before_final` and `test_h1_interim_150_before_final`
   (`e2e/src/tests/tests.rs`), which also send a second exchange on the same connections.
+- **`fix(h1)`: linger before closing a connection whose request is still arriving
+  ([#1738](https://github.com/sozu-proxy/sozu/issues/1738)).** Since
+  [#1721](https://github.com/sozu-proxy/sozu/issues/1721), an H1 client connection whose response
+  completes before its request was received whole is closed once the response is flushed. The
+  close came while the client could still be sending the body: a socket closed with bytes unread,
+  or that receives more after the close, makes the kernel send a reset that discards whatever part
+  of the response the client had not read yet. RFC 9112 §9.6 asks for a staged close, and
+  `ConnectionH1` (`lib/src/protocol/mux/h1.rs`) now does one whenever part of the request arrived
+  but not all of it — `request-incomplete`, a backend `Connection: close` response mid-upload, and
+  the answers sozu generates to a partly received request (400, 401, 413, 503, 504), each bounded
+  by `request_timeout`; a request of which no byte arrived, such as the 408 to a silent client,
+  still closes at once. Once the response and any TLS
+  `close_notify` are flushed it shuts the write side down, so the FIN follows the response, then
+  reads and drops what the client still sends, and closes on the client's EOF, after 4 MiB, or
+  after the listener's `request_timeout` from the response's completion, whichever comes first. Nothing
+  pushes that deadline out, not even the timer re-arm that follows a timeout's write pass; drained
+  bytes count as frontend bytes in; the drain allocates nothing, and the backend stream is ended when
+  the linger begins. A soft stop leaves a lingering session to its own deadline. No new setting.
+  Documented in `lib/src/protocol/mux/LIFECYCLE.md` §8.4 and `doc/configure.md`. Covered by the
+  e2e `test_h1_early_response_survives_the_rest_of_the_upload` (a client that keeps uploading
+  while it reads a 1 MiB early response used to receive about 110 KiB of it, then a reset) and the
+  unit `a_lingering_close_half_closes_then_drains_to_the_client_eof`,
+  `a_lingering_close_stops_at_its_byte_budget_and_its_deadline`,
+  `a_linger_started_by_a_timeout_write_keeps_its_own_deadline`,
+  `a_408_to_a_silent_client_closes_without_lingering` and
+  `a_silent_client_is_closed_at_the_linger_deadline`.
 
 - **`fix(mux)`: release the backend connection reservation of an abandoned dial
   ([#1713](https://github.com/sozu-proxy/sozu/issues/1713)).** Selection reserves a connection on
