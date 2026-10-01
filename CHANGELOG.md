@@ -3874,6 +3874,19 @@
   `a_408_to_a_silent_client_closes_without_lingering` and
   `a_silent_client_is_closed_at_the_linger_deadline`.
 
+- **`fix(mux)`: never reuse a pooled connection to a removed backend
+  ([#1735](https://github.com/sozu-proxy/sozu/issues/1735)).** The pool-reuse scan of
+  `Router::decide_after_gate` (`lib/src/protocol/mux/router.rs`) matched an H1 keep-alive or H2
+  backend connection by cluster id alone. A cluster id outlives `RemoveCluster` followed by
+  `AddCluster` of the same id, and a cluster outlives `RemoveBackend`, so a session could send a
+  new request to a backend the configuration no longer held. `BackendList::remove_backend` and
+  `BackendMap::remove_cluster` (`lib/src/backends.rs`) now mark every backend they drop `Closing`;
+  the mux reads that status through `BackendRegistry::is_retired` and
+  `RoutingView::with_backend_retired`, and the scan skips such a connection. It drains the
+  requests it carries and takes no new one; the next request dials a configured backend.
+  Documented in `lib/src/protocol/mux/LIFECYCLE.md`. Covered by
+  `test_readded_cluster_does_not_reuse_removed_backend` (`e2e/src/tests/remove_cluster_tests.rs`)
+  and `removing_a_backend_or_its_cluster_marks_it_closing` (`lib/src/backends.rs`).
 - **`fix(mux)`: release the backend connection reservation of an abandoned dial
   ([#1713](https://github.com/sozu-proxy/sozu/issues/1713)).** Selection reserves a connection on
   the chosen backend (`active_connections += 1`) before the mux dials it, and only a failed

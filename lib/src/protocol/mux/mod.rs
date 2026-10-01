@@ -495,6 +495,19 @@ impl BackendRegistry {
         self.get(backend.slot())
     }
 
+    /// Whether the backend `backend` names has left the configuration.
+    ///
+    /// `BackendList::remove_backend` and `BackendMap::remove_cluster`
+    /// (`lib/src/backends.rs`) mark a backend `Closing` as they drop it, and
+    /// the registry still holds that very `Rc`. A backend added again later,
+    /// even at the same address, is a new `Rc` in a new slot, so a
+    /// connection dialled to the old one stays retired. Reads one `RefCell`
+    /// borrow and allocates nothing.
+    pub(crate) fn is_retired(&self, backend: &BackendId) -> bool {
+        self.get(backend.slot())
+            .is_some_and(|handle| handle.borrow().status != crate::backends::BackendStatus::Normal)
+    }
+
     /// Perform every accounting change in `deltas`, in the order they were
     /// pushed, and leave the ledger empty.
     ///
@@ -3162,7 +3175,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 // `attach_dialed`'s `add_session` / `register_socket`) is fine
                 // — nothing on this path borrows the proxy mutably.
                 let proxy_ref = proxy.borrow();
-                let view = router::RoutingView::new(proxy_ref.clusters(), proxy_ref.kind());
+                let backend_registry = &self.backend_registry;
+                let retired = |backend: &BackendId| backend_registry.is_retired(backend);
+                let view = router::RoutingView::new(proxy_ref.clusters(), proxy_ref.kind())
+                    .with_backend_retired(&retired);
                 match self
                     .router
                     .plan_connect(stream_id, context, &view)
@@ -3194,7 +3210,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 &resume,
                             );
                             self.router
-                                .plan_connect_resume(stream_id, context, resume, verdict)
+                                .plan_connect_resume(stream_id, context, &view, resume, verdict)
                         }
                     })
                     .and_then(|plan| match plan {

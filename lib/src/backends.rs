@@ -634,8 +634,16 @@ impl BackendMap {
     /// health-check configuration and its `http2` hint. A session that already
     /// holds one of its backends keeps it until the session closes;
     /// [`Self::close_backend_connection`] ignores a cluster that is gone.
+    /// Every backend it drops is marked `Closing`, as `BackendList::remove_backend`
+    /// marks the ones it drops, so a connection pooled on it drains the
+    /// requests it carries and takes no new one, even once a cluster of the
+    /// same id is added again.
     pub fn remove_cluster(&mut self, cluster_id: &str) {
-        self.backends.remove(cluster_id);
+        if let Some(list) = self.backends.remove(cluster_id) {
+            for backend in &list.backends {
+                backend.borrow_mut().set_closing();
+            }
+        }
         self.health_check_configs.remove(cluster_id);
         self.cluster_http2.remove(cluster_id);
         debug_assert!(
@@ -1360,9 +1368,12 @@ impl BackendList {
         let len_before = self.backends.len();
         let mut removed = Vec::new();
         self.backends.retain(|backend| {
-            let b = backend.borrow();
+            let mut b = backend.borrow_mut();
             if &b.address == backend_address {
                 removed.push(b.backend_id.clone());
+                // A session may still hold this backend: retire it so none
+                // of its pooled connections takes a new request.
+                b.set_closing();
                 false
             } else {
                 true
@@ -1750,6 +1761,32 @@ mod backends_test {
                 .is_ok()
         );
         sender.send(()).unwrap();
+    }
+
+    /// A session keeps the `Rc` of a backend it dialled after the map drops
+    /// it; the mux pool reads that handle's status to refuse reusing its
+    /// connection, so removal must leave it `Closing`.
+    #[test]
+    fn removing_a_backend_or_its_cluster_marks_it_closing() {
+        let mut backend_map = BackendMap::new();
+        let first: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let second: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+        backend_map.add_backend("foo", Backend::new("foo-1", first, None, None, None));
+        backend_map.add_backend("foo", Backend::new("foo-2", second, None, None, None));
+        let held: Vec<Rc<RefCell<Backend>>> = backend_map.backends["foo"].backends.clone();
+
+        backend_map.remove_backend("foo", &first);
+        assert_eq!(held[0].borrow().status, BackendStatus::Closing);
+        assert_eq!(held[1].borrow().status, BackendStatus::Normal);
+
+        backend_map.remove_cluster("foo");
+        assert_eq!(held[1].borrow().status, BackendStatus::Closing);
+
+        // The same address added again is a new backend, not the retired one.
+        backend_map.add_backend("foo", Backend::new("foo-2", second, None, None, None));
+        let readded = &backend_map.backends["foo"].backends[0];
+        assert!(!Rc::ptr_eq(readded, &held[1]));
+        assert_eq!(readded.borrow().status, BackendStatus::Normal);
     }
 
     #[test]

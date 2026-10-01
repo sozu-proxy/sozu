@@ -534,6 +534,19 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   still be a `Dial`, so the test asserts on the state the router and the stream
   are left in rather than on the returned value.
 
+  The pool scan matches a connection by the cluster id in its
+  `Position::Client`, and skips one whose backend has left the configuration.
+  A cluster id outlives `RemoveCluster` followed by `AddCluster` of the same
+  id, and a cluster outlives `RemoveBackend`, so the id alone does not say the
+  backend is still configured. `BackendList::remove_backend` and
+  `BackendMap::remove_cluster` (`lib/src/backends.rs`) mark every backend they
+  drop `Closing`. The session's `BackendRegistry` still holds that `Rc`, and
+  `BackendRegistry::is_retired` (`mod.rs`) reads its status for the
+  `RoutingView` the embedder builds (`RoutingView::with_backend_retired`,
+  `router.rs`). A retired connection takes no new stream and drains the ones it
+  carries. A backend added again, even at the same address, is a new `Rc` in a
+  new slot, so the next request dials it.
+
   That is what took `Rc<RefCell<dyn ProxySession>>` out of the router entirely —
   its single use was `L7Proxy::add_session`, which is the embedder's.
 

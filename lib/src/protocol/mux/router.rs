@@ -232,6 +232,9 @@ fn log_sni_authority_mismatch(
 pub(super) struct RoutingView<'a> {
     clusters: &'a HashMap<ClusterId, Cluster>,
     listener_kind: ListenerType,
+    /// Whether the backend a pooled connection was dialled to has left the
+    /// configuration. `None` treats every backend as current.
+    backend_retired: Option<&'a dyn Fn(&BackendId) -> bool>,
 }
 
 impl<'a> RoutingView<'a> {
@@ -242,7 +245,29 @@ impl<'a> RoutingView<'a> {
         Self {
             clusters,
             listener_kind,
+            backend_retired: None,
         }
+    }
+
+    /// Answer the pool-reuse scan's question "is this connection's backend
+    /// still configured?" with `retired`.
+    ///
+    /// A backend connection names its cluster by id, and a cluster id outlives
+    /// a `RemoveCluster` followed by an `AddCluster` of the same id, as it
+    /// outlives a `RemoveBackend`. Only the embedder can tell whether the
+    /// backend behind a [`BackendId`] is still part of the configuration, so
+    /// the reuse scan asks it here and never reuses a connection whose backend
+    /// is retired: that connection drains the streams it carries and takes no
+    /// new one.
+    pub(super) fn with_backend_retired(mut self, retired: &'a dyn Fn(&BackendId) -> bool) -> Self {
+        self.backend_retired = Some(retired);
+        self
+    }
+
+    /// Whether `backend` has left the configuration since a connection was
+    /// dialled to it.
+    fn is_retired(&self, backend: &BackendId) -> bool {
+        self.backend_retired.is_some_and(|retired| retired(backend))
     }
 
     /// The cluster `cluster_id` names, if the worker still holds one.
@@ -753,7 +778,7 @@ impl Router {
         // before, and is decided outright.
         let Some(ip) = stream_context.session_address.map(|sa| sa.ip()) else {
             return self
-                .decide_after_gate(stream_id, context, h2, frontend_should_stick)
+                .decide_after_gate(stream_id, context, view, h2, frontend_should_stick)
                 .map(ConnectStep::Decided);
         };
         Ok(ConnectStep::CheckIpLimit(ConnectResume {
@@ -776,6 +801,7 @@ impl Router {
         &mut self,
         stream_id: GlobalStreamId,
         context: &mut Context<L>,
+        view: &RoutingView<'_>,
         resume: ConnectResume,
         verdict: IpGateVerdict,
     ) -> Result<ConnectPlan, BackendConnectionError> {
@@ -794,7 +820,13 @@ impl Router {
                     .unwrap_or_default(),
             });
         }
-        self.decide_after_gate(stream_id, context, resume.h2, resume.frontend_should_stick)
+        self.decide_after_gate(
+            stream_id,
+            context,
+            view,
+            resume.h2,
+            resume.frontend_should_stick,
+        )
     }
 
     /// Everything the decision does once the gate has answered: the pool
@@ -809,6 +841,7 @@ impl Router {
         &mut self,
         stream_id: GlobalStreamId,
         context: &mut Context<L>,
+        view: &RoutingView<'_>,
         h2: bool,
         frontend_should_stick: bool,
     ) -> Result<ConnectPlan, BackendConnectionError> {
@@ -830,6 +863,9 @@ impl Router {
         - if no backend is to reuse, ask the router for a socket to the "next in line" backend
 
         H1 strategy: reuse the first KeepAlive backend for this cluster.
+
+        Either way, a connection whose backend has left the configuration is
+        never reused, even when a cluster of the same id is configured again.
          */
 
         let mut reuse_token = None;
@@ -844,6 +880,9 @@ impl Router {
                     continue;
                 }
                 (_, Position::Client(_, _, BackendStatus::Disconnecting)) => {}
+                // The cluster id matches, the backend no longer does.
+                (_, Position::Client(other_cluster_id, backend, _))
+                    if other_cluster_id == cluster_id && view.is_retired(backend) => {}
 
                 (true, Position::Client(other_cluster_id, _, BackendStatus::Connected)) => {
                     if other_cluster_id == cluster_id && !backend.is_draining() {
@@ -2961,7 +3000,8 @@ mod backend_selection_order_tests {
                 &resume,
             );
             let admitted = matches!(verdict, IpGateVerdict::Admitted);
-            let outcome = router.plan_connect_resume(stream_id, &mut context, resume, verdict);
+            let outcome =
+                router.plan_connect_resume(stream_id, &mut context, &view, resume, verdict);
             let retry_after = context.streams[stream_id].context.retry_after_seconds;
             (admitted, outcome, retry_after)
         };
@@ -3077,7 +3117,8 @@ mod backend_selection_order_tests {
                 &resume,
             );
             let admitted = matches!(verdict, IpGateVerdict::Admitted);
-            let outcome = router.plan_connect_resume(stream_id, &mut context, resume, verdict);
+            let outcome =
+                router.plan_connect_resume(stream_id, &mut context, &view, resume, verdict);
             (admitted, outcome)
         };
 
@@ -3586,10 +3627,16 @@ mod backend_selection_order_tests {
                 *status = BackendStatus::KeepAlive;
             }
         };
+        // The worker's retired-backend check rides the decision, so it is
+        // measured with it.
+        let clusters = HashMap::new();
+        let retired = |backend: &super::BackendId| backend_registry.is_retired(backend);
+        let view = RoutingView::new(&clusters, ListenerType::Http).with_backend_retired(&retired);
         // One request through the routing decision.
         let decision = |router: &mut Router, context: &mut Context<HttpListener>| -> usize {
             let before = allocations();
-            let plan = router.decide_after_gate(stream_id, black_box(&mut *context), false, false);
+            let plan =
+                router.decide_after_gate(stream_id, black_box(&mut *context), &view, false, false);
             let allocated = allocations() - before;
             assert!(
                 matches!(plan, Ok(ConnectPlan::Attached)),
@@ -3742,8 +3789,13 @@ mod backend_selection_order_tests {
                                 .expect("plan_connect stamps the routed cluster"),
                             &resume,
                         );
-                        let plan =
-                            router.plan_connect_resume(stream_id, &mut *context, resume, verdict);
+                        let plan = router.plan_connect_resume(
+                            stream_id,
+                            &mut *context,
+                            &view,
+                            resume,
+                            verdict,
+                        );
                         allocated += allocations() - before;
                         plan.expect("the gate is unlimited, so the stream is admitted")
                     }
