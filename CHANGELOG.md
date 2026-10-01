@@ -3874,6 +3874,21 @@
   `a_408_to_a_silent_client_closes_without_lingering` and
   `a_silent_client_is_closed_at_the_linger_deadline`.
 
+- **`fix(mux-h2)`: answer stream-scoped errors with RST_STREAM instead of GOAWAY.** Several
+  errors that RFC 9113 scopes to one stream closed the whole connection, ending every in-flight
+  stream on it. Now only the offending stream is reset, and its frame is still minimally processed
+  (HPACK decoded, DATA credited to the connection window): DATA or HEADERS on a half-closed
+  (remote) stream is a stream error STREAM_CLOSED (§5.1); a HEADERS frame without END_STREAM in
+  the body phase is malformed, PROTOCOL_ERROR (§8.1.1); a PRIORITY frame whose length is not 5 is
+  FRAME_SIZE_ERROR (§6.3). Frames on a stream Sōzu reset are ignored (§5.1), for the last 256 such
+  streams on the connection, instead of drawing a second RST_STREAM (DATA) or a GOAWAY (HEADERS). A
+  self-dependent PRIORITY (RFC 7540 §5.3.1) on an idle stream is dropped, since RST_STREAM must not
+  name an idle stream (§6.4). Each RST_STREAM still feeds the emitted-RST flood accounting and each
+  dropped frame counts as a glitch; flood thresholds are unchanged. A HEADERS frame dropped this way
+  that lacks END_HEADERS still ends the connection when its CONTINUATION arrives, as for a refused
+  stream. Covered by five `e2e/src/tests/h2_security_tests.rs` tests that check another in-flight
+  stream completes.
+
 - **`fix(mux)`: never reuse a pooled connection to a removed backend
   ([#1735](https://github.com/sozu-proxy/sozu/issues/1735)).** The pool-reuse scan of
   `Router::decide_after_gate` (`lib/src/protocol/mux/router.rs`) matched an H1 keep-alive or H2

@@ -1958,8 +1958,9 @@ impl ConnectionH2 {
     /// transition to `H2State::Frame` for the payload.
     ///
     /// Returns `MuxResult` — the caller should propagate the result directly.
-    fn handle_header_state<L>(&mut self, context: &mut Context<L>) -> MuxResult
+    fn handle_header_state<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
     where
+        E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
         let i = self.zero.storage.data();
@@ -1992,11 +1993,30 @@ impl ConnectionH2 {
                     || matches!(header.frame_type, FrameType::Unknown(_))
                 {
                     H2StreamId::Zero
-                } else if let Some(global_stream_id) = self.stream_table.streams().get(&stream_id) {
+                } else if let Some(global_stream_id) =
+                    self.stream_table.streams().get(&stream_id).copied()
+                {
                     let allowed_on_half_closed = header.frame_type == FrameType::WindowUpdate
                         || header.frame_type == FrameType::Priority
                         || header.frame_type == FrameType::RstStream;
-                    let stream = &context.streams[*global_stream_id];
+                    let carries_message = header.frame_type == FrameType::Data
+                        || header.frame_type == FrameType::Headers;
+                    // RFC 9113 §5.1: frames the peer sent before it processed
+                    // our RST_STREAM are ignored, after the minimal
+                    // processing (HPACK, connection flow control).
+                    if carries_message && self.stream_table.was_reset_locally(stream_id) {
+                        debug!(
+                            "{} Ignoring {:?} on stream {} after sending RST_STREAM",
+                            log_context!(self),
+                            header.frame_type,
+                            stream_id
+                        );
+                        self.flood_detector.record_glitch();
+                        check_flood_or_return!(self);
+                        self.discard_frame_payload(&header);
+                        return MuxResult::Continue;
+                    }
+                    let stream = &context.streams[global_stream_id];
                     // Use the position-aware end_of_stream flag:
                     // - Server reads from front (client requests)
                     // - Client reads from back (backend responses)
@@ -2012,6 +2032,24 @@ impl ConnectionH2 {
                         received_eos,
                         stream.state
                     );
+                    // RFC 9113 §5.1: DATA or HEADERS on a half-closed (remote)
+                    // stream is a stream error of type STREAM_CLOSED. Only that
+                    // stream is reset; the frame is still minimally processed.
+                    if carries_message && received_eos && stream.state.is_open() {
+                        debug!(
+                            "{} {:?} on half-closed (remote) stream {}, sending RST_STREAM(STREAM_CLOSED)",
+                            log_context!(self),
+                            header.frame_type,
+                            stream_id
+                        );
+                        return self.reset_stream_and_discard_frame(
+                            &header,
+                            global_stream_id,
+                            H2Error::StreamClosed,
+                            context,
+                            endpoint,
+                        );
+                    }
                     if !allowed_on_half_closed && (received_eos || !stream.state.is_open()) {
                         error!(
                             "{} CANNOT RECEIVE {:?} ON THIS STREAM {:?}",
@@ -2043,21 +2081,30 @@ impl ConnectionH2 {
                     } else {
                         stream.back.is_main_phase()
                     };
+                    //
+                    // RFC 9113 §8.1.1: such a message is malformed, a stream
+                    // error of type PROTOCOL_ERROR: only this stream is reset.
                     if header.frame_type == FrameType::Headers
                         && read_in_body
                         && header.flags & parser::FLAG_END_STREAM == 0
                     {
-                        error!(
+                        debug!(
                             "{} HEADERS without END_STREAM on open stream {} in body phase: trailers MUST carry END_STREAM",
                             log_context!(self),
                             stream_id
                         );
-                        return self.goaway(H2Error::ProtocolError);
+                        return self.reset_stream_and_discard_frame(
+                            &header,
+                            global_stream_id,
+                            H2Error::ProtocolError,
+                            context,
+                            endpoint,
+                        );
                     }
                     if header.frame_type == FrameType::Data {
                         H2StreamId::Other {
                             id: stream_id,
-                            gid: *global_stream_id,
+                            gid: global_stream_id,
                         }
                     } else {
                         H2StreamId::Zero
@@ -2177,22 +2224,51 @@ impl ConnectionH2 {
                                     // connection for other streams. The payload is
                                     // still routed through stream 0 so handle_frame
                                     // can do connection-level flow control accounting.
+                                    //
+                                    // A stream we reset is the exception: its
+                                    // late DATA is ignored (RFC 9113 §5.1), no
+                                    // second RST_STREAM.
+                                    self.flood_detector.record_glitch();
+                                    check_flood_or_return!(self);
+                                    if self.stream_table.was_reset_locally(header.stream_id) {
+                                        debug!(
+                                            "{} Ignoring DATA on stream {} after sending RST_STREAM",
+                                            log_context!(self),
+                                            header.stream_id
+                                        );
+                                    } else {
+                                        debug!(
+                                            "{} DATA on closed stream {}, sending RST_STREAM(STREAM_CLOSED)",
+                                            log_context!(self),
+                                            header.stream_id
+                                        );
+                                        if let Some(result) = self
+                                            .enqueue_rst(header.stream_id, H2Error::StreamClosed)
+                                        {
+                                            return result;
+                                        }
+                                    }
+                                }
+                                FrameType::Headers
+                                    if self.stream_table.was_reset_locally(header.stream_id) =>
+                                {
+                                    // RFC 9113 §5.1: frames received after we
+                                    // sent RST_STREAM are ignored, after the
+                                    // field block updates the HPACK decoder.
                                     debug!(
-                                        "{} DATA on closed stream {}, sending RST_STREAM(STREAM_CLOSED)",
+                                        "{} Ignoring HEADERS on stream {} after sending RST_STREAM",
                                         log_context!(self),
                                         header.stream_id
                                     );
                                     self.flood_detector.record_glitch();
                                     check_flood_or_return!(self);
-                                    if let Some(result) =
-                                        self.enqueue_rst(header.stream_id, H2Error::StreamClosed)
-                                    {
-                                        return result;
-                                    }
+                                    self.discard_frame_payload(&header);
+                                    return MuxResult::Continue;
                                 }
                                 _ => {
                                     // RFC 9113 §5.1: HEADERS or other frames on a
-                                    // closed stream → connection error STREAM_CLOSED.
+                                    // closed stream we did not reset → connection
+                                    // error STREAM_CLOSED, which §5.1 permits.
                                     error!(
                                         "{} Received {:?} on closed stream {}, sending GOAWAY(STREAM_CLOSED)",
                                         log_context!(self),
@@ -2736,7 +2812,7 @@ impl ConnectionH2 {
                 };
             }
             (H2State::Header, _) => {
-                return self.handle_header_state(context);
+                return self.handle_header_state(context, endpoint);
             }
             (H2State::ContinuationHeader(headers), _) => {
                 let headers = headers.clone();
@@ -2750,6 +2826,21 @@ impl ConnectionH2 {
                     Ok((_, frame)) => frame,
                     Err(error) => {
                         let error = error_nom_to_h2(error);
+                        // RFC 9113 §6.3: a PRIORITY frame of the wrong length
+                        // is a stream error, unlike every other frame size
+                        // error (§4.2). PRIORITY is read through stream 0.
+                        if header.frame_type == FrameType::Priority
+                            && error == H2Error::FrameSizeError
+                        {
+                            let priority_stream_id = header.stream_id;
+                            kawa.storage.end = kawa.storage.head;
+                            self.expect_header();
+                            return self.handle_priority_frame_size_error(
+                                priority_stream_id,
+                                context,
+                                endpoint,
+                            );
+                        }
                         error!("{} COULD NOT PARSE FRAME BODY", log_context!(self));
                         return self.goaway(error);
                     }
@@ -5198,11 +5289,66 @@ impl ConnectionH2 {
         if let Some(result) = self.enqueue_rst(stream_id, error) {
             return result;
         }
+        self.discard_field_block(payload_len, discarded);
+        self.record_refusal_for_backpressure();
+        MuxResult::Continue
+    }
+
+    /// Read and drop a HEADERS payload of `payload_len` bytes through
+    /// `H2State::Discard`, decoding its field block on the way so the HPACK
+    /// decoder stays in sync (RFC 9113 §4.3). Queues nothing.
+    fn discard_field_block(&mut self, payload_len: u32, discarded: DiscardedFieldBlock) {
         self.state = H2State::Discard;
         self.stream_table
             .set_expect_read(Some((H2StreamId::Zero, payload_len as usize)));
         self.discarded_field_block = Some(discarded);
-        self.record_refusal_for_backpressure();
+    }
+
+    /// Minimally process and drop the payload of the DATA or HEADERS frame
+    /// whose `header` was just parsed, for a stream that is reset or being
+    /// reset (RFC 9113 §5.1): a field block still updates the HPACK decoder,
+    /// DATA still counts toward the connection flow-control window.
+    fn discard_frame_payload(&mut self, header: &FrameHeader) {
+        debug_assert!(
+            matches!(header.frame_type, FrameType::Data | FrameType::Headers),
+            "only DATA and HEADERS payloads are discarded per stream"
+        );
+        if header.frame_type == FrameType::Headers {
+            self.discard_field_block(
+                header.payload_len,
+                DiscardedFieldBlock::New {
+                    flags: header.flags,
+                },
+            );
+        } else {
+            self.skip_orphaned_data_payload(header.payload_len as usize, header.payload_len);
+        }
+    }
+
+    /// RFC 9113 §5.4.2: answer a stream error on the open stream `header`
+    /// names with RST_STREAM(`error`), tear the stream down, and discard the
+    /// frame's payload ([`Self::discard_frame_payload`]). Every other stream
+    /// on the connection carries on. The RST_STREAM goes through
+    /// [`Self::reset_stream`], so it feeds the emitted-RST flood accounting.
+    fn reset_stream_and_discard_frame<E, L>(
+        &mut self,
+        header: &FrameHeader,
+        global_stream_id: GlobalStreamId,
+        error: H2Error,
+        context: &mut Context<L>,
+        endpoint: E,
+    ) -> MuxResult
+    where
+        E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        let result =
+            self.reset_stream(header.stream_id, global_stream_id, context, endpoint, error);
+        self.remove_dead_stream(header.stream_id, global_stream_id);
+        if !matches!(result, MuxResult::Continue) {
+            return result;
+        }
+        self.discard_frame_payload(header);
         MuxResult::Continue
     }
 
@@ -6531,13 +6677,66 @@ impl ConnectionH2 {
                 self.remove_dead_stream(priority.stream_id, global_stream_id);
                 return result;
             } else {
-                error!(
-                    "{} INVALID PRIORITY RECEIVED ON INVALID STREAM",
-                    log_context!(self)
+                // RFC 7540 §5.3.1 makes a self-dependency a stream error, but
+                // this stream is idle: RFC 9113 §6.4 forbids RST_STREAM on an
+                // idle stream, and PRIORITY changes no stream state (§6.3).
+                // Drop it; only the flood accounting sees it.
+                debug!(
+                    "{} Ignoring self-dependent PRIORITY on idle stream {}",
+                    log_context!(self),
+                    priority.stream_id
                 );
-                return self.goaway(H2Error::ProtocolError);
+                self.flood_detector.record_glitch();
+                check_flood_or_return!(self);
             }
         }
+        MuxResult::Continue
+    }
+
+    /// RFC 9113 §6.3: a PRIORITY frame with a length other than 5 octets is a
+    /// stream error of type FRAME_SIZE_ERROR. An open stream is reset; on an
+    /// idle, closed or already reset stream the frame is dropped, since
+    /// RST_STREAM must not name an idle stream (§6.4) and PRIORITY changes no
+    /// stream state. The frame's payload was already consumed.
+    fn handle_priority_frame_size_error<E, L>(
+        &mut self,
+        stream_id: StreamId,
+        context: &mut Context<L>,
+        endpoint: E,
+    ) -> MuxResult
+    where
+        E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        self.metric_events
+            .push(MetricEvent::FrameReceived(FrameType::Priority));
+        self.attribute_bytes_to_overhead();
+        if let Some(global_stream_id) = self.stream_table.get(stream_id)
+            && context.streams[global_stream_id].state.is_open()
+            && !self.stream_table.was_reset_locally(stream_id)
+        {
+            debug!(
+                "{} PRIORITY frame of invalid length on stream {}, sending RST_STREAM(FRAME_SIZE_ERROR)",
+                log_context!(self),
+                stream_id
+            );
+            let result = self.reset_stream(
+                stream_id,
+                global_stream_id,
+                context,
+                endpoint,
+                H2Error::FrameSizeError,
+            );
+            self.remove_dead_stream(stream_id, global_stream_id);
+            return result;
+        }
+        debug!(
+            "{} Ignoring PRIORITY frame of invalid length on stream {}",
+            log_context!(self),
+            stream_id
+        );
+        self.flood_detector.record_glitch();
+        check_flood_or_return!(self);
         MuxResult::Continue
     }
 
@@ -16956,7 +17155,7 @@ mod tests {
     }
 
     /// Regression test for B1 (review of `e1c3c2fb`): `handle_headers_frame`'s
-    /// RFC 9113 §5.3.1 self-dependency early return — `reset_stream` +
+    /// RFC 7540 §5.3.1 self-dependency early return — `reset_stream` +
     /// `remove_dead_stream` when a stream's own PRIORITY depends on itself —
     /// used to skip retiring `self.header_reassembly` before returning. When
     /// the aborted stream's block had gone through CONTINUATION reassembly
@@ -16995,7 +17194,7 @@ mod tests {
         // Stream 1: a legitimate multi-frame header block — split across
         // HEADERS + CONTINUATION, exactly like the sibling reassembly tests
         // — but the FIRST frame also carries an RFC 7540 PRIORITY field
-        // whose stream dependency is stream 1 itself (RFC 9113 §5.3.1: a
+        // whose stream dependency is stream 1 itself (RFC 7540 §5.3.1: a
         // stream cannot depend on itself).
         let mut peer_encoder = crate::protocol::mux::hpack::Encoder::new();
         let field_block = peer_encoder.encode([

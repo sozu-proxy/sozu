@@ -229,7 +229,7 @@ impl Prioriser {
                 stream_dependency,
                 weight: _,
             } => {
-                // RFC 9113 §5.3.1: a stream cannot depend on itself; signal
+                // RFC 7540 §5.3.1: a stream cannot depend on itself; signal
                 // the caller to RST_STREAM with PROTOCOL_ERROR. Otherwise the
                 // RFC 7540 priority tree is deprecated and silently ignored.
                 stream_dependency.stream_id == stream_id
