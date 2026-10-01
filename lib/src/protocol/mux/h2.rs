@@ -46,7 +46,10 @@ use crate::{
         hpack_state,
         parser::{self, Frame, FrameHeader, FrameType, H2Error, Headers, WindowUpdate},
         pkawa, remove_backend_stream, serializer, set_default_answer,
-        shared::{EndStreamAction, drain_tls_close_notify, end_stream_decision},
+        shared::{
+            EndStreamAction, LINGER_MAX_BYTES, Linger, LingerRead, drain_discard,
+            drain_tls_close_notify, end_stream_decision,
+        },
         update_readiness_after_read, update_readiness_after_write,
     },
     socket::{SocketHandler, SocketResult},
@@ -968,6 +971,18 @@ pub struct ConnectionH2 {
     /// [`H2ForceDisconnectTarget`] for why the target is parked here rather
     /// than returned.
     pending_force_disconnect: Option<H2ForceDisconnectTarget>,
+    /// How long the lingering close after a final GOAWAY may drain: the
+    /// listener's `request_timeout`, which a frontend connection is built
+    /// with. Unused on a backend connection.
+    linger_timeout: Duration,
+    /// Lingering-close state, set by [`H2Shell::writable`] when the
+    /// connection closes after its final GOAWAY. See
+    /// [`super::shared::Linger`].
+    pub(super) linger: Linger,
+    /// Whether the final GOAWAY this connection queued carried `NO_ERROR`.
+    /// Only such a close lingers: one that answers a protocol error or a
+    /// flood does not keep reading from that peer.
+    pub(super) graceful_goaway: bool,
 }
 /// Renders the peer address this connection snapshotted at construction,
 /// where it used to render the socket behind it.
@@ -1837,7 +1852,12 @@ impl ConnectionH2 {
     /// connection's clock snapshot. Replaces the old
     /// `TimeoutContainer::reset()` at the same three call sites, and reads
     /// `self.now` rather than the real clock (invariant 20).
+    ///
+    /// A no-op while lingering: the linger deadline bounds the whole drain.
     pub fn arm_timeout(&mut self) {
+        if self.is_lingering() {
+            return;
+        }
         self.timeout_deadline = self.now.checked_add(self.timeout_duration);
     }
 
@@ -1854,7 +1874,36 @@ impl ConnectionH2 {
     /// that mirror it into `self.now`.
     pub fn set_timeout_duration(&mut self, duration: Duration, now: Instant) {
         self.timeout_duration = duration;
-        self.timeout_deadline = now.checked_add(duration);
+        if !self.is_lingering() {
+            self.timeout_deadline = now.checked_add(duration);
+        }
+    }
+
+    /// Whether the connection is draining what its client still sends after
+    /// its final GOAWAY (see [`super::shared::Linger`]).
+    pub(super) fn is_lingering(&self) -> bool {
+        matches!(self.linger, Linger::Draining { .. })
+    }
+
+    /// Whether a close the next writable pass decides should linger instead:
+    /// a frontend whose final GOAWAY carried `NO_ERROR` (a graceful drain,
+    /// a soft stop, an answer to the client's own GOAWAY), whose client has
+    /// not hung up, and which does not drain already — or one whose linger
+    /// is already [`Linger::Pending`] behind a TLS `close_notify`. The client
+    /// may still be sending frames it wrote before it read the GOAWAY (RFC
+    /// 9113 §6.8); closing with them unread, or receiving more, makes the
+    /// kernel reset the connection and discard the response bytes still
+    /// queued.
+    fn lingers_instead_of_closing(&self) -> bool {
+        if matches!(self.linger, Linger::Pending { .. }) {
+            return true;
+        }
+        self.position.is_server()
+            && matches!(self.state, H2State::GoAway)
+            && self.graceful_goaway
+            && self.drain.draining()
+            && !self.frontend_hung_up_while_draining()
+            && matches!(self.linger, Linger::Off)
     }
 
     /// Shared constructor for both server and client H2 connections.
@@ -1914,6 +1963,9 @@ impl ConnectionH2 {
             // timeout right after registering its socket. The adapter reflects
             // this onto the wheel on its next reschedule.
             timeout_deadline: now.checked_add(timeout_duration),
+            linger_timeout: timeout_duration,
+            linger: Linger::Off,
+            graceful_goaway: false,
             flow_control: h2_flow_control::H2FlowControl::new(DEFAULT_INITIAL_WINDOW_SIZE as i32),
             pending_table_size_update: None,
             parked_header_block: false,
@@ -5450,6 +5502,7 @@ impl ConnectionH2 {
     ) -> MuxResult {
         self.state = H2State::Error;
         self.drain.enter_final_goaway();
+        self.graceful_goaway = error == H2Error::NoError;
         self.stream_table.set_expect_read(None);
         // Disarm the SETTINGS ACK timer: once we've committed to GOAWAY, the
         // timeout check at `readable()` / `flush_pending_control_frames()` must
@@ -8585,8 +8638,104 @@ impl<Front: SocketHandler> H2Shell<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
+        if self.core.is_lingering() {
+            return self.drain_linger(context.now);
+        }
         let result = self.readable_inner(context, endpoint);
         self.settled(result)
+    }
+
+    /// Turn a close decided by a writable pass that began after the final
+    /// GOAWAY ([`ConnectionH2::lingers_instead_of_closing`]) into a lingering
+    /// close, unless the client hung up meanwhile: queue and
+    /// flush `close_notify` first (a TLS alert must precede the FIN), then
+    /// shut the write side down, so the FIN follows everything sent, and
+    /// read what the client still sends until [`Self::drain_linger`] closes.
+    /// Any other result is returned unchanged.
+    fn linger_instead_of_closing(&mut self, result: MuxResult) -> MuxResult {
+        if !matches!(result, MuxResult::CloseSession) || self.core.frontend_hung_up_while_draining()
+        {
+            return result;
+        }
+        let deadline = match self.core.linger {
+            Linger::Pending { deadline } => deadline,
+            _ => match self.core.now.checked_add(self.core.linger_timeout) {
+                Some(deadline) => deadline,
+                None => return MuxResult::CloseSession,
+            },
+        };
+        if self.initiate_close_notify() {
+            // `close_notify` is pending: the next writable pass flushes it
+            // and closes again, which lands here once nothing is left. The
+            // state is `Error` by then, so the pending linger is what keeps
+            // that pass eligible.
+            self.core.linger = Linger::Pending { deadline };
+            return MuxResult::Continue;
+        }
+        if let Err(e) = super::shutdown_write(self.socket.socket_ref(), false) {
+            debug!(
+                "{} H2 closing without lingering after the final GOAWAY: shutdown failed: {:?}",
+                log_context!(self.core),
+                e
+            );
+            return MuxResult::CloseSession;
+        }
+        debug!(
+            "{} H2 lingering after the final GOAWAY: draining what the client still sends",
+            log_context!(self.core)
+        );
+        self.core.linger = Linger::Draining {
+            deadline,
+            remaining: LINGER_MAX_BYTES,
+        };
+        // Fixed, never re-armed: the deadline bounds the whole drain.
+        self.core.timeout_deadline = Some(deadline);
+        self.core.readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
+        self.core.readiness.event.remove(Ready::WRITABLE);
+        // Edge-triggered epoll will not report bytes already queued.
+        self.core.readiness.event.insert(Ready::READABLE);
+        MuxResult::Continue
+    }
+
+    /// Read and drop what the client still sends while lingering. Closes on
+    /// the client's EOF, a socket error, the byte budget, or the deadline;
+    /// otherwise waits for the next READABLE.
+    fn drain_linger(&mut self, now: Instant) -> MuxResult {
+        let Linger::Draining {
+            deadline,
+            mut remaining,
+        } = self.core.linger
+        else {
+            unreachable!("drain_linger runs only while lingering");
+        };
+        if now >= deadline {
+            debug!(
+                "{} H2 lingering close: deadline reached",
+                log_context!(self.core)
+            );
+            return MuxResult::CloseSession;
+        }
+        let result = match drain_discard(self.socket.socket_ref(), &mut remaining, |size| {
+            record_metric(MetricEvent::FrontendBytesIn(size as i64));
+        }) {
+            LingerRead::Wait => {
+                self.core.readiness.event.remove(Ready::READABLE);
+                MuxResult::Continue
+            }
+            LingerRead::Close => {
+                debug!(
+                    "{} H2 lingering close: EOF, error or {} bytes left of the budget",
+                    log_context!(self.core),
+                    remaining
+                );
+                MuxResult::CloseSession
+            }
+        };
+        self.core.linger = Linger::Draining {
+            deadline,
+            remaining,
+        };
+        result
     }
 
     fn readable_inner<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
@@ -8662,8 +8811,22 @@ impl<Front: SocketHandler> H2Shell<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
+        if self.core.is_lingering() {
+            // The write side is shut down: nothing is left to write.
+            self.core.readiness.interest.remove(Ready::WRITABLE);
+            self.core.readiness.event.remove(Ready::WRITABLE);
+            return MuxResult::Continue;
+        }
+        // Asked before the pass: the close it decides moves the state from
+        // `GoAway` to `Error` (`ConnectionH2::force_disconnect`).
+        let after_final_goaway = self.core.lingers_instead_of_closing();
         let result = self.writable_inner(context, endpoint);
-        self.settled(result)
+        let result = self.settled(result);
+        if after_final_goaway {
+            self.linger_instead_of_closing(result)
+        } else {
+            result
+        }
     }
 
     fn writable_inner<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
@@ -18580,12 +18743,75 @@ mod tests {
         !socket.socket_wants_write()
     }
 
+    /// A TLS frontend whose final GOAWAY went out without `close_notify`
+    /// behind it: the close its next writable pass decides queues the alert
+    /// first and waits a pass for it, then starts the lingering close. The
+    /// first pass's close moves the state to `Error`; the pending linger is
+    /// what keeps the second pass from closing outright. The client reads
+    /// the alert, then the EOF of the half-close.
+    ///
+    /// TO SEE THIS RED: in `H2Shell::linger_instead_of_closing`, drop the
+    /// `self.core.linger = Linger::Pending { deadline };` before the deferral.
+    /// The second pass then returns `CloseSession`.
+    #[test]
+    fn a_linger_deferred_behind_close_notify_starts_on_the_next_pass() {
+        use std::io::Read as _;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut connection, mut peer, mut client) = rustls_h2_connection(&pool, H2State::GoAway);
+        connection.core.drain.__test_set_draining();
+        connection.core.graceful_goaway = true;
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        let first = connection.writable(&mut context, EndpointClient(&mut router));
+        assert!(
+            matches!(first, MuxResult::Continue) && !connection.core.is_lingering(),
+            "the first pass waits for close_notify, got {first:?}"
+        );
+        let mut second = MuxResult::Continue;
+        for _ in 0..MAX_DRIVE_TICKS {
+            connection.core.readiness.event.insert(Ready::WRITABLE);
+            second = connection.writable(&mut context, EndpointClient(&mut router));
+            if connection.core.is_lingering() || !matches!(second, MuxResult::Continue) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            matches!(second, MuxResult::Continue) && connection.core.is_lingering(),
+            "once close_notify is out the connection lingers, got {second:?}"
+        );
+
+        let mut received = Vec::new();
+        let mut closed = false;
+        for _ in 0..MAX_DRIVE_TICKS {
+            drain_peer(&mut client, &mut peer, &mut received);
+            let mut plaintext = [0u8; 16];
+            match client.reader().read(&mut plaintext) {
+                Ok(0) => {
+                    closed = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::yield_now()
+                }
+                Err(error) => panic!("the client must see a clean close: {error:?}"),
+            }
+        }
+        assert!(
+            closed,
+            "the client reads close_notify, then the end of the stream"
+        );
+    }
+
     /// The final GOAWAY and the TLS `close_notify` leave in ONE write, and the
     /// peer reads the GOAWAY before the close.
     ///
     /// Drives what a client GOAWAY on an idle connection sets off:
-    /// `goaway(NoError)`, the `writable` pass that flushes it and closes, and
-    /// `close`. Every TLS write in between is counted through
+    /// `goaway(NoError)`, the `writable` pass that flushes it and starts the
+    /// lingering close, and `close`. Every TLS write in between is counted through
     /// `crate::socket::tls_writes`, which counts each `write_tls` holding at
     /// least one record, i.e. each `writev(2)` `FrontRustls` issues. The wire
     /// is then read raw, so the ORDER is checked on the records themselves
@@ -18617,9 +18843,12 @@ mod tests {
             "premise: the GOAWAY must serialise, got {queued:?}"
         );
         let result = connection.writable(&mut context, EndpointClient(&mut router));
+        // The close that pass decides is a lingering one: the write side is
+        // shut down behind the GOAWAY and `close_notify`, and what the client
+        // still sends is drained (`H2Shell::linger_instead_of_closing`).
         assert!(
-            matches!(result, MuxResult::CloseSession),
-            "the pass that flushed the final GOAWAY must close, got {result:?}"
+            matches!(result, MuxResult::Continue) && connection.core.is_lingering(),
+            "the pass that flushed the final GOAWAY must start the lingering close, got {result:?}"
         );
         connection.close(&mut context, EndpointClient(&mut router));
         assert_eq!(

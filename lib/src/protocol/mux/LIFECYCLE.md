@@ -1379,6 +1379,28 @@ Two GOAWAY frames in `ConnectionH2::graceful_goaway` (`h2.rs`):
 `peer_gone_after_final_goaway` (`h2.rs`) guards against deadlock on a
 peer-side HUP after the final GOAWAY.
 
+**The close after a final GOAWAY(NO_ERROR) lingers.** The client may still be
+sending frames it wrote before it read the GOAWAY (RFC 9113 §6.8 lets it), and
+reading stops at the GOAWAY; a close with those frames unread, or followed by
+more, makes the kernel reset the connection and discard response bytes still
+queued in the socket. So when a `writable` pass that began in `H2State::GoAway`
+after a `NO_ERROR` GOAWAY (`ConnectionH2::graceful_goaway` set by
+`goaway_with_last_stream_id`) decides `CloseSession`, and the client has not
+hung up, `H2Shell::linger_instead_of_closing` stages the close the way §8.4
+does for H1, through the same `Linger` state and `shared::drain_discard`:
+`close_notify` first — when it is still pending the linger is
+`Linger::Pending` and the next pass, whose state is `Error` by then, resumes
+it — then `shutdown_write`, then the raw socket is read and dropped until the
+client's EOF, `LINGER_MAX_BYTES`, or the listener's `request_timeout`.
+`ConnectionH2::arm_timeout` and `set_timeout_duration` leave that deadline in
+place. A GOAWAY carrying an error (a protocol violation, a flood) does not
+linger: sozu does not keep reading from that peer. During a soft stop the H2
+listener's graceful-shutdown budget (§8.3) still closes a lingering session
+when it elapses first. Pinned by
+`an_h2_frontend_lingers_after_its_final_goaway_so_the_client_reads_everything`
+(`mod.rs`), `a_linger_deferred_behind_close_notify_starts_on_the_next_pass`
+and `the_final_goaway_and_close_notify_leave_in_one_tls_write` (`h2.rs`).
+
 ### 8.2 RST_STREAM
 
 Three directions:

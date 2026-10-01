@@ -801,9 +801,10 @@ pub(super) fn tcp_info_reads() -> usize {
 /// Every write-side shutdown of the HTTP and HTTPS close paths goes through
 /// here: the frontend in `HttpSession::close` (`lib/src/http.rs`) and
 /// `HttpsSession::close` (`lib/src/https.rs`), the backends in `Mux::close`
-/// and in the dead-backend sweep of `Mux::ready_inner`. An H1 frontend's
-/// lingering close (`ConnectionH1::start_linger`, `h1.rs`) calls it earlier,
-/// before it drains the rest of the request; the session close then repeats
+/// and in the dead-backend sweep of `Mux::ready_inner`. A frontend's
+/// lingering close (`ConnectionH1::start_linger`, `h1.rs`, and
+/// `H2Shell::linger_instead_of_closing`, `h2.rs`) calls it earlier, before
+/// it drains what the client still sends; the session close then repeats
 /// it: a no-op once the FIN is queued, or `ENOTCONN` once the connection is
 /// gone, which both callers already ignore. `peer_closed` comes
 /// from [`Connection::peer_closed`], which `HttpsSession::close` widens with
@@ -3836,10 +3837,6 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         if self.drive_frontend_shutdown_io() {
             return true;
         }
-        if self.frontend.is_lingering() {
-            // Bounded by its own deadline, which the timer still enforces.
-            return false;
-        }
         // Forced-close deadline: once the H2 listener's
         // `h2_graceful_shutdown_deadline_seconds` budget has elapsed from
         // the moment `graceful_goaway` armed `drain.started_at`, stop
@@ -3859,9 +3856,18 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 "{} Mux shutting_down: graceful-shutdown deadline elapsed, forcing close",
                 log_context!(self)
             );
-            let _ = self.frontend.goaway_before_forced_close(&self.context);
-            self.frontend.flush_output_buffer();
+            // A lingering connection already sent its final GOAWAY and shut
+            // its write side down: the operator's budget closes it as is.
+            if !self.frontend.is_lingering() {
+                let _ = self.frontend.goaway_before_forced_close(&self.context);
+                self.frontend.flush_output_buffer();
+            }
             return true;
+        }
+        if self.frontend.is_lingering() {
+            // Bounded by its own deadline, which the timer still enforces,
+            // and for H2 by the graceful-shutdown budget just above.
+            return false;
         }
         if matches!(self.frontend, Connection::H2(_)) && self.frontend.is_draining() {
             for stream in &mut self.context.streams {
@@ -4193,6 +4199,122 @@ mod tests {
         },
         timer::TimeoutContainer,
     };
+
+    /// After its final GOAWAY, an H2 frontend closes while the client may
+    /// still be sending frames. A close with those frames unread, or followed
+    /// by more, makes the kernel reset the connection and discard the part of
+    /// the response still queued in the frontend's socket. The connection
+    /// must shut its write side down and drain instead (RFC 9112 §9.6, the
+    /// same lingering close as H1), so the client reads all of it, then EOF.
+    ///
+    /// The test emulates the session close `HttpsSession::close` performs —
+    /// `shutdown_write`, then `close(2)` — whenever `writable` asks for it.
+    #[test]
+    fn an_h2_frontend_lingers_after_its_final_goaway_so_the_client_reads_everything() {
+        use std::io::{Read, Write};
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (socket, mut peer) = connected_socket();
+        // A client that is slow to read: most of the response stays queued
+        // in the frontend's socket.
+        socket2::SockRef::from(&peer)
+            .set_recv_buffer_size(32 * 1024)
+            .expect("the client receive buffer must be settable");
+
+        let mut h2 = h2::H2Shell::new(
+            Ulid::generate(),
+            socket,
+            Position::Server,
+            &mut PoolBufferSource::new(Rc::downgrade(&pool)),
+            H2FloodConfig::default(),
+            H2ConnectionConfig::default(),
+            Duration::from_secs(30),
+            None,
+            Duration::from_secs(10),
+            None,
+            Ready::WRITABLE | Ready::HUP | Ready::ERROR,
+        )
+        .expect("a pool with free buffers must yield an H2 connection");
+        // The final GOAWAY is out: the next writable pass closes.
+        h2.core.state = H2State::GoAway;
+        h2.core.drain.__test_set_draining();
+        h2.core.graceful_goaway = true;
+
+        // The response, already handed to the kernel.
+        let mut queued = 0;
+        let chunk = [b'r'; 16 * 1024];
+        loop {
+            match (&h2.socket).write(&chunk) {
+                Ok(size) => queued += size,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("the response write failed: {e}"),
+            }
+            if queued >= 1024 * 1024 {
+                break;
+            }
+        }
+        // The client still sends frames after the GOAWAY.
+        peer.write_all(&[0u8; 1024])
+            .expect("the client may still send after the GOAWAY");
+        std::thread::sleep(Duration::from_millis(20));
+
+        let mut frontend = Connection::H2(h2);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        context.now = Instant::now();
+        let result = frontend.writable(&mut context, EndpointClient(&mut router));
+        let lingering = frontend.is_lingering();
+        let mut frontend = Some(frontend);
+        if matches!(result, MuxResult::CloseSession)
+            && let Some(closed) = frontend.take()
+        {
+            let _ = shutdown_write(closed.socket(), false);
+            drop(closed);
+        }
+
+        peer.set_nonblocking(false)
+            .expect("the client reads blocking");
+        peer.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("the client read is bounded");
+        let mut received = 0;
+        let mut buf = [0u8; 16 * 1024];
+        let end = loop {
+            match peer.read(&mut buf) {
+                Ok(0) => break Ok(()),
+                Ok(size) => received += size,
+                Err(e) => break Err(e),
+            }
+        };
+        assert_eq!(
+            received, queued,
+            "the client reads the whole response (end: {end:?})"
+        );
+        assert!(
+            end.is_ok(),
+            "the response ends with a clean EOF, got {end:?}"
+        );
+        assert!(
+            lingering && matches!(result, MuxResult::Continue),
+            "the frontend lingers instead of closing, got {result:?}"
+        );
+
+        // The client closes: the drain meets its EOF and the session closes.
+        let mut frontend = frontend.expect("a lingering frontend is kept");
+        drop(peer);
+        let mut after_client_close = MuxResult::Continue;
+        for _ in 0..1000 {
+            frontend.readiness_mut().event.insert(Ready::READABLE);
+            after_client_close = frontend.readable(&mut context, EndpointClient(&mut router));
+            if matches!(after_client_close, MuxResult::CloseSession) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            matches!(after_client_close, MuxResult::CloseSession),
+            "the client's EOF ends the drain, got {after_client_close:?}"
+        );
+    }
 
     /// `Mux::shutting_down` runs outside `ready()`, driven by
     /// `shut_down_sessions()`. It is therefore its own clock-sampling point,

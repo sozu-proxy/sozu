@@ -7,13 +7,14 @@
 
 use std::{
     cell::Cell,
-    io::{ErrorKind, IoSlice, Read},
+    io::IoSlice,
     time::{Duration, Instant},
 };
 
 use rusty_ulid::Ulid;
 use sozu_command::{logging::ansi_palette, ready::Ready};
 
+pub(super) use super::shared::{LINGER_MAX_BYTES, Linger};
 use crate::metrics::names;
 use crate::{
     L7ListenerHandler, ListenerHandler, Readiness,
@@ -22,7 +23,9 @@ use crate::{
         StreamState, forcefully_terminate_answer, memoized_rtt,
         parser::H2Error,
         remove_backend_stream, set_default_answer,
-        shared::{EndStreamAction, drain_tls_close_notify, end_stream_decision},
+        shared::{
+            EndStreamAction, LingerRead, drain_discard, drain_tls_close_notify, end_stream_decision,
+        },
         update_readiness_after_read, update_readiness_after_write,
     },
     socket::{SocketHandler, SocketResult},
@@ -108,41 +111,6 @@ macro_rules! log_module_context {
         let (open, reset, _, _, _) = ansi_palette();
         format!("{open}MUX-H1{reset}\t >>>", open = open, reset = reset)
     }};
-}
-
-/// Most request bytes a lingering close reads and discards before it closes
-/// anyway (RFC 9112 §9.6).
-///
-/// The drain exists so that the client's in-flight body does not make the
-/// kernel answer the close with a reset, which destroys any part of the
-/// response the client has not read yet. 4 MiB is the default ceiling of
-/// Linux's send-buffer autotuning (`net.ipv4.tcp_wmem`), so it covers what a
-/// client can already have queued when it sees the FIN, while bounding the
-/// work one connection can make sozu do after its response.
-pub(super) const LINGER_MAX_BYTES: usize = 4 * 1024 * 1024;
-
-/// Size of one lingering read. A stack buffer: the drain allocates nothing.
-const LINGER_READ_CHUNK: usize = 16 * 1024;
-
-/// Lingering close of a frontend whose request was not received whole when
-/// its response ended (RFC 9112 §9.6).
-///
-/// Closing a socket whose receive queue still holds data, or that receives
-/// data after the close, makes the kernel send a reset, and a reset discards
-/// whatever part of the response is still queued. So the close is staged:
-/// the write side is shut down once the response and any TLS `close_notify`
-/// are flushed, then the rest of the request is read and dropped until the
-/// client closes, [`LINGER_MAX_BYTES`] are read, or the deadline passes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Linger {
-    /// The connection closes without draining.
-    Off,
-    /// The response ended before the request: once nothing is left to
-    /// flush, shut the write side down and start draining.
-    Pending { deadline: Instant },
-    /// The write side is shut down; the rest of the request is being read
-    /// and dropped.
-    Draining { deadline: Instant, remaining: usize },
 }
 
 /// HTTP/1.1 connection handler within the mux layer.
@@ -390,34 +358,22 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             );
             return MuxResult::CloseSession;
         }
-        let mut buf = [0u8; LINGER_READ_CHUNK];
-        let result = loop {
-            if remaining == 0 {
-                debug!(
-                    "{} H1 lingering close: {} bytes drained, closing",
-                    log_context!(self),
-                    LINGER_MAX_BYTES
-                );
-                break MuxResult::CloseSession;
+        let position = &self.position;
+        let result = match drain_discard(self.socket.socket_ref(), &mut remaining, |size| {
+            // Bytes the client sent: counted like any frontend read.
+            crate::protocol::mux::h2::record_metric(position.bytes_in_event(size));
+        }) {
+            LingerRead::Wait => {
+                self.readiness.event.remove(Ready::READABLE);
+                MuxResult::Continue
             }
-            let len = remaining.min(buf.len());
-            // The raw socket, also under TLS: after `close_notify` nothing
-            // the client sends is decrypted, only dropped.
-            let mut socket = self.socket.socket_ref();
-            match socket.read(&mut buf[..len]) {
-                Ok(0) => break MuxResult::CloseSession,
-                Ok(size) => {
-                    debug_assert!(size <= remaining, "a read never exceeds its buffer");
-                    remaining -= size;
-                    // Bytes the client sent: counted like any frontend read.
-                    crate::protocol::mux::h2::record_metric(self.position.bytes_in_event(size));
-                }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                    self.readiness.event.remove(Ready::READABLE);
-                    break MuxResult::Continue;
-                }
-                Err(e) if e.kind() == ErrorKind::Interrupted => {}
-                Err(_) => break MuxResult::CloseSession,
+            LingerRead::Close => {
+                debug!(
+                    "{} H1 lingering close: EOF, error or {} bytes left of the budget",
+                    log_context!(self),
+                    remaining
+                );
+                MuxResult::CloseSession
             }
         };
         self.linger = Linger::Draining {
