@@ -2133,6 +2133,11 @@ impl ConnectionH2 {
                         // window could open arbitrary new streams between
                         // the initial and final GOAWAY emission.
                         if self.drain.draining() {
+                            // A refused stream costs a glitch, as below.
+                            if self.settings_sent_at.is_none() {
+                                self.flood_detector.record_glitch();
+                                check_flood_or_return!(self);
+                            }
                             self.stream_table.observe_peer_stream_id(stream_id);
                             return self.refuse_stream_and_discard(
                                 stream_id,
@@ -2153,15 +2158,17 @@ impl ConnectionH2 {
                                 self.local_settings.settings_max_concurrent_streams,
                                 self.stream_table.len()
                             );
-                            // The refusal itself is not charged to the peer:
-                            // back-pressure lowers the local limit without
-                            // advertising it. A peer that exceeds the limit
-                            // it WAS advertised breaks RFC 9113 §5.1.2,
-                            // though, and that counts as a glitch — the
-                            // same accounting nghttp2 applies.
-                            if self.stream_table.len()
-                                >= self.connection_config.max_concurrent_streams as usize
-                            {
+                            // Every refusal counts as a glitch once the peer
+                            // has acknowledged our SETTINGS (before that it
+                            // may legitimately exceed a limit it has not
+                            // seen, RFC 9113 §6.5.3). This includes the band
+                            // back-pressure opens below the advertised limit:
+                            // the glitch budget, not the refusal, is what
+                            // bounds a peer that keeps opening streams it is
+                            // refused. The reset itself stays
+                            // `RstOrigin::Local` and does not feed the
+                            // MadeYouReset cap.
+                            if self.settings_sent_at.is_none() {
                                 self.flood_detector.record_glitch();
                                 check_flood_or_return!(self);
                             }
@@ -4764,6 +4771,9 @@ impl ConnectionH2 {
                     global_stream_id
                 );
                 self.metric_events.push(MetricEvent::EndToEndH2Request);
+                if stream.metrics.backend_headers_received.is_some() {
+                    self.flood_detector.record_stream_opened();
+                }
                 let (token, events) =
                     Self::complete_server_stream(stream, listener, client_rtt, server_rtt);
                 self.metric_events.extend(events.into_iter().flatten());
@@ -5172,12 +5182,15 @@ impl ConnectionH2 {
         error: H2Error,
         origin: RstOrigin,
     ) -> Option<MuxResult> {
-        let outcome = self.control_tx.enqueue_rst(
-            self.stream_table.rst_sent_mut(),
-            &mut self.readiness,
-            wire_stream_id,
-            error,
-        );
+        // Only a registered stream's id goes into `rst_sent`: eviction from
+        // the stream table is what removes it again. A refused stream or a
+        // closed one was never (or is no longer) registered, and its id would
+        // otherwise stay in the set for the connection's lifetime.
+        let registered = self.stream_table.get(wire_stream_id).is_some();
+        let rst_sent = registered.then(|| self.stream_table.rst_sent_mut());
+        let outcome =
+            self.control_tx
+                .enqueue_rst(rst_sent, &mut self.readiness, wire_stream_id, error);
         // Account ONLY when a new RST actually entered the queue.
         // Calling `enqueue_rst` for a stream that already has a queued
         // (or already-flushed) RST is the dedup short-circuit — counting
@@ -5250,11 +5263,18 @@ impl ConnectionH2 {
     /// and converted to a connection-wide GOAWAY.
     fn account_emitted_rst(&mut self, error: H2Error, origin: RstOrigin) -> Option<MuxResult> {
         self.metric_events.push(MetricEvent::RstStreamSent(error));
-        if origin == RstOrigin::PeerProvoked
-            && !matches!(error, H2Error::NoError)
-            && let Some(violation) = self.flood_detector.record_rst_emitted()
-        {
-            return Some(self.handle_flood_violation(violation));
+        if origin == RstOrigin::PeerProvoked && !matches!(error, H2Error::NoError) {
+            if let Some(violation) = self.flood_detector.record_rst_emitted() {
+                return Some(self.handle_flood_violation(violation));
+            }
+            // A provoked reset answers a protocol error by the peer, so it is
+            // also a glitch: the per-window rate limit the ratio cap above
+            // lacks. None of the `PeerProvoked` call sites records a glitch
+            // of its own, so this is the only charge.
+            self.flood_detector.record_glitch();
+            if let Some(violation) = self.flood_detector.check_flood(self.now) {
+                return Some(self.handle_flood_violation(violation));
+            }
         }
         None
     }
@@ -5908,7 +5928,6 @@ impl ConnectionH2 {
         self.last_stream_id = (stream_id + 2) & !1;
         self.stream_table
             .register(stream_id, global_stream_id, self.now);
-        self.flood_detector.record_stream_opened();
         // Post-conditions: the stream is now reachable in both indices (see
         // `H2StreamTable::register`'s own postconditions), the active count
         // grew by exactly one (the id was not already present —
@@ -6800,6 +6819,9 @@ impl ConnectionH2 {
                 }
                 Position::Client(..) => {}
                 Position::Server => {
+                    if stream.metrics.backend_headers_received.is_some() {
+                        self.flood_detector.record_stream_opened();
+                    }
                     self.distribute_overhead(&mut stream.metrics, rst_byte_totals);
                     // This is a special case, normally, all stream are terminated by the server
                     // when the last byte of the response is written. Here, the reset is requested
@@ -7950,6 +7972,7 @@ impl ConnectionH2 {
             return false;
         };
         self.stream_table.register(stream_id, stream, self.now);
+        // Sōzu opened this stream; the backend peer cannot inflate the count.
         self.flood_detector.record_stream_opened();
         self.readiness.arm_writable();
         true
@@ -14618,6 +14641,170 @@ mod tests {
             connection.core.control_tx.pending().len() <= bound,
             "a mass reap must stop queueing at the cap, got {} entries",
             connection.core.control_tx.pending().len()
+        );
+    }
+
+    // ── flood accounting: refusals, provoked resets, the denominator ────
+
+    /// A peer that keeps opening streams Sōzu refuses neither grows the
+    /// connection's state nor escapes the flood detector: a refused stream
+    /// was never registered, so nothing ever removes its id from `rst_sent`,
+    /// and each refusal past the limit counts as a glitch.
+    ///
+    /// The refusals here fall in the band back-pressure opens, local limit
+    /// lowered below the advertised one, which cost nothing before.
+    #[test]
+    fn refused_streams_keep_rst_sent_bounded_and_trip_the_glitch_budget() {
+        use std::io::Write;
+
+        const BATCHES: u32 = 50;
+        const PER_BATCH: u32 = 1000;
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 8, 16384)));
+        let (mut connection, mut peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        connection.core.state = H2State::Header;
+        connection
+            .core
+            .stream_table
+            .set_expect_read(Some((H2StreamId::Zero, 9)));
+        connection
+            .core
+            .local_settings
+            .settings_max_concurrent_streams = 0;
+        // `:method GET`, `:path /`, `:scheme https`, then `:authority`
+        // as a literal without indexing: no HPACK table state to track.
+        let mut block = vec![0x82, 0x84, 0x87, 0x01, 0x09];
+        block.extend_from_slice(b"localhost");
+
+        let mut next_id: u32 = 1;
+        'batches: for _ in 0..BATCHES {
+            let mut wire = Vec::new();
+            for _ in 0..PER_BATCH {
+                wire.extend(orphan_frame(
+                    1,
+                    parser::FLAG_END_HEADERS | parser::FLAG_END_STREAM,
+                    next_id,
+                    block.len() as u32,
+                    &block,
+                ));
+                next_id += 2;
+            }
+            peer.write_all(&wire).expect("loopback write must complete");
+            peer.flush().expect("loopback flush must complete");
+            // One read pass handles one frame header or one payload: drive
+            // until the batch's last stream id has been seen.
+            let last_id = next_id - 2;
+            for _ in 0..(16 * PER_BATCH) {
+                connection.core.readiness.event.insert(Ready::READABLE);
+                connection.core.readiness.interest.insert(Ready::READABLE);
+                connection.readable(&mut context, EndpointClient(&mut router));
+                let _ = connection.core.flush_pending_control_frames();
+                connection.core.clear_output();
+                if matches!(connection.core.state, H2State::GoAway | H2State::Error) {
+                    break 'batches;
+                }
+                if connection.core.stream_table.highest_peer_stream_id() >= last_id
+                    && matches!(connection.core.state, H2State::Header)
+                {
+                    break;
+                }
+            }
+        }
+
+        assert!(
+            connection.core.stream_table.rst_sent_mut().len() < 100,
+            "refused stream ids must not accumulate in rst_sent, got {}",
+            connection.core.stream_table.rst_sent_mut().len()
+        );
+        assert!(
+            matches!(connection.core.state, H2State::GoAway | H2State::Error),
+            "endless refusals must trip the flood detector, got {:?} after {} streams",
+            connection.core.state,
+            next_id / 2
+        );
+    }
+
+    /// Every reset the peer provokes is a protocol error on its part and
+    /// counts as a glitch, so provoked resets have a per-window rate limit
+    /// independent of how many streams the connection served.
+    #[test]
+    fn peer_provoked_resets_count_as_glitches() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut connection, _peer) = test_h2_connection(&pool, None);
+        let now = connection.core.now;
+        for _ in 0..1_000_000 {
+            connection.core.flood_detector.record_stream_opened();
+        }
+        let glitch_budget = H2FloodConfig::default().max_glitch_count();
+        let mut tripped_at = None;
+        for n in 1..=(glitch_budget + 1) {
+            connection.core.now = now;
+            if connection
+                .core
+                .account_emitted_rst(H2Error::ProtocolError, RstOrigin::PeerProvoked)
+                .is_some()
+            {
+                tripped_at = Some(n);
+                break;
+            }
+        }
+        assert_eq!(
+            tripped_at,
+            Some(glitch_budget + 1),
+            "the provoked reset past the glitch budget must end the connection"
+        );
+    }
+
+    /// Streams the peer opens count toward the RST caps' denominator only
+    /// once a backend answers them: a stream Sōzu refuses, answers itself or
+    /// sees reset before a response cannot dilute the caps.
+    #[test]
+    fn unanswered_streams_do_not_dilute_the_reset_caps() {
+        const FLOOR: u64 = 10;
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 70, 16384)));
+        let (mut connection, _peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        connection.core.flood_detector = h2_flood_detector::H2FloodDetector::new(
+            H2FloodConfig::from_optional(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(FLOOR),
+                None,
+                None,
+                None,
+                None,
+            ),
+            connection.core.now,
+        );
+        for i in 0..30u32 {
+            connection
+                .core
+                .create_stream(2 * i + 1, &mut context)
+                .expect("the pool must hand out stream buffers");
+        }
+        let mut tripped_at = None;
+        for n in 1..=(FLOOR + 1) {
+            if connection
+                .core
+                .flood_detector
+                .record_rst_lifetime(false)
+                .is_some()
+            {
+                tripped_at = Some(n);
+                break;
+            }
+        }
+        assert_eq!(
+            tripped_at,
+            Some(FLOOR + 1),
+            "thirty unanswered streams must not raise the pre-response cap"
         );
     }
 

@@ -480,16 +480,16 @@ message HttpListenerConfig {
     optional uint32 h2_stream_shrink_ratio = 21;
     // Floor of the connection-lifetime cap on RST_STREAM frames received
     // (CVE-2023-44487): trips once the count exceeds both this value and the
-    // streams opened on the connection. Default: 200000.
+    // streams a backend answered on the connection. Default: 200000.
     optional uint64 h2_max_rst_stream_lifetime = 22;
     // Floor of the cap on "abusive" (pre-response-start) RST_STREAM frames
     // received on a frontend H2 connection — the Rapid Reset signature: trips
-    // once the count exceeds both this value and half of the streams opened.
+    // once the count exceeds both this value and half of the streams a backend answered.
     // Default: 1000.
     optional uint64 h2_max_rst_stream_abusive_lifetime = 23;
     // Floor of the cap on RST_STREAM frames **emitted by the server** that
     // the peer provoked (CVE-2025-8671 "MadeYouReset"): trips once the count
-    // exceeds both this value and half of the streams opened. Covers the
+    // exceeds both this value and half of the streams a backend answered. Covers the
     // emission-direction-flipped sibling of Rapid Reset, where an attacker
     // sends legitimate-looking frames (Content-Length mismatch, header parse
     // error, rejected priority, zero-increment WINDOW_UPDATE on an open
@@ -623,16 +623,16 @@ message HttpsListenerConfig {
     optional uint32 h2_stream_shrink_ratio = 31;
     // Floor of the connection-lifetime cap on RST_STREAM frames received
     // (CVE-2023-44487): trips once the count exceeds both this value and the
-    // streams opened on the connection. Default: 200000.
+    // streams a backend answered on the connection. Default: 200000.
     optional uint64 h2_max_rst_stream_lifetime = 32;
     // Floor of the cap on "abusive" (pre-response-start) RST_STREAM frames
     // received on a frontend H2 connection — the Rapid Reset signature: trips
-    // once the count exceeds both this value and half of the streams opened.
+    // once the count exceeds both this value and half of the streams a backend answered.
     // Default: 1000.
     optional uint64 h2_max_rst_stream_abusive_lifetime = 33;
     // Floor of the cap on RST_STREAM frames **emitted by the server** that
     // the peer provoked (CVE-2025-8671 "MadeYouReset"): trips once the count
-    // exceeds both this value and half of the streams opened. Covers the
+    // exceeds both this value and half of the streams a backend answered. Covers the
     // emission-direction-flipped sibling of Rapid Reset, where an attacker
     // sends legitimate-looking frames (Content-Length mismatch, header parse
     // error, rejected priority, zero-increment WINDOW_UPDATE on an open

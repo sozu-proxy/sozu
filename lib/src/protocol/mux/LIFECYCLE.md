@@ -1496,7 +1496,10 @@ kept in lock-step:
   the id is already present;
   `H2ControlTx::enqueue_rst` short-circuits on that branch so its queue and
   its lifetime counter stay consistent even when a cascading error path
-  re-enters the reset flow for the same stream.
+  re-enters the reset flow for the same stream. Only a registered stream's id is recorded:
+  `ConnectionH2::enqueue_rst` passes no set for a refused stream or a closed
+  one, because only the stream table's eviction removes an id again, and an
+  unregistered id would stay for the connection's lifetime.
 - **Lifetime count** via `H2ControlTx`'s `total_rst_streams_queued`: each
   freshly queued RST bumps it and nothing rewinds it. It is reported by the
   session log line and bounds nothing. The CVE-2025-8671 MadeYouReset cap is

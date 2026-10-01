@@ -1460,9 +1460,12 @@ that no other flood counter covers. It is incremented on stream-close races
 (`RST_STREAM` / `WINDOW_UPDATE` / `DATA` on a closed stream, one per frame —
 a cancelled upload with a full 1 MiB window in flight is about 64 of them),
 `WINDOW_UPDATE` with zero increment on a closed stream, unknown SETTINGS
-identifiers, a stream opened beyond the `h2_max_concurrent_streams` Sōzu
-advertised (RFC 9113 §5.1.2), and each received `GOAWAY` (a graceful close sends
-at most two, RFC 9113 §6.8). The counter uses a 1-second sliding window with
+identifiers, every stream Sōzu refuses once the client has acknowledged its
+SETTINGS (over its concurrency limit, including the lower limit back-pressure
+sets, or while the connection drains — buffer-pool refusals excepted), every
+reset the client provokes (see `h2_max_rst_stream_emitted_lifetime`), and each
+received `GOAWAY` (a graceful close sends at most two, RFC 9113 §6.8). The
+counter uses a 1-second sliding window with
 _half-decay_ (it halves at each window roll rather than resetting), so a
 threshold of `N` tolerates a one-shot burst of `N` glitches or a sustained rate
 of roughly `N/2` glitches per second.
@@ -1528,20 +1531,27 @@ and one on the **emitted** side (MadeYouReset, CVE-2025-8671). Together they
 catch patient-attacker patterns that stay just below the per-window threshold.
 
 Each configured value is a **floor**, not a fixed ceiling: a cap trips only once
-its count exceeds both the floor and a share of the streams the connection has
-opened — all of them for received resets, half of them for the other two. A
-long-lived connection that cancels a minority of its requests therefore never
-accumulates toward a cap, while a client that resets (or makes Sōzu reset)
-every stream it opens trips just past the floor. This is the shape of Envoy's
-premature-reset guard, which closes a connection once at least half of its
-streams, and at least 250 of them, were reset before a response; Sōzu's floors
-are higher.
+its count exceeds both the floor and a share of the streams a backend answered
+on the connection. A stream Sōzu refuses, answers itself or that is reset before
+any response does not count as answered. The two pre-response caps share one
+ratio: they trip once resets the client sent before a response plus resets it
+provoked exceed half of the answered streams. A long-lived connection that
+cancels a minority of its requests therefore never accumulates toward a cap,
+while a client that resets (or makes Sōzu reset) every stream it opens trips
+just past the floor. This is the shape of Envoy's premature-reset guard, which
+closes a connection once at least half of its streams, and at least 250 of
+them, were reset before a response; Sōzu's floors are higher.
+
+`h2_max_rst_stream_lifetime` compares against all of the answered streams: a
+pre-response reset is already capped above and a reset after the response
+started counts its stream as answered, so what it effectively bounds is
+RST_STREAM frames on streams that are already closed.
 
 | Parameter                            | Default | Description                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | ------------------------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `h2_max_rst_stream_lifetime`         | 200000  | Floor of the cap on RST_STREAM frames **received** on this connection; trips once the count also exceeds the streams opened. |
-| `h2_max_rst_stream_abusive_lifetime` | 1000    | Floor of the cap on "abusive" **received** RST_STREAM frames — resets the client sends on a frontend connection before the response starts, the Rapid Reset signature (CVE-2023-44487); trips once the count also exceeds half of the streams opened. Resets a backend sends on a backend connection never count as abusive: Sōzu opened those streams. |
-| `h2_max_rst_stream_emitted_lifetime` | 10000   | Floor of the cap on RST_STREAM frames **emitted by the server** that the peer provoked (CVE-2025-8671 "MadeYouReset"): Content-Length mismatch, header parse error, oversized header block, PRIORITY self-dependency, zero-increment or overflowing `WINDOW_UPDATE` on an open stream. Trips once the count also exceeds half of the streams opened. Resets Sōzu decides on its own are **not** counted: the idle-stream reaper's `CANCEL`, `REFUSED_STREAM` from its concurrency limit, back-pressure or buffer pool, `STREAM_CLOSED` for DATA on a closed stream, and the error a failing backend response produces. `NoError` resets are not counted either. Crossing the cap emits `GOAWAY(EnhanceYourCalm)`. |
+| `h2_max_rst_stream_lifetime`         | 200000  | Floor of the cap on RST_STREAM frames **received** on this connection; trips once the count also exceeds the streams a backend answered, which in practice bounds resets of already-closed streams. |
+| `h2_max_rst_stream_abusive_lifetime` | 1000    | Floor of the cap on "abusive" **received** RST_STREAM frames — resets the client sends on a frontend connection before the response starts, the Rapid Reset signature (CVE-2023-44487); trips once these resets plus the resets the client provoked exceed half of the streams a backend answered. Resets a backend sends on a backend connection never count as abusive: Sōzu opened those streams. |
+| `h2_max_rst_stream_emitted_lifetime` | 10000   | Floor of the cap on RST_STREAM frames **emitted by the server** that the peer provoked (CVE-2025-8671 "MadeYouReset"): Content-Length mismatch, header parse error, oversized header block, PRIORITY self-dependency, zero-increment or overflowing `WINDOW_UPDATE` on an open stream. Trips once these resets plus the pre-response resets the client sent exceed half of the streams a backend answered. Each one also counts as a glitch. Resets Sōzu decides on its own are **not** counted: the idle-stream reaper's `CANCEL`, `REFUSED_STREAM` from its concurrency limit, back-pressure or buffer pool, `STREAM_CLOSED` for DATA on a closed stream, and the error a failing backend response produces. `NoError` resets are not counted either. Crossing the cap emits `GOAWAY(EnhanceYourCalm)`. |
 
 _Configuration example:_
 
@@ -2786,9 +2796,9 @@ immediately after the patch is acknowledged.
 | `h2_max_continuation_frames`              | `u32` (≥ 1)     | per-connection setup | `20`                    | CONTINUATION flood cap — CVE-2024-27316                                                                                                                      |
 | `h2_max_glitch_count`                     | `u32` (≥ 1)     | per-connection setup | `2000`                  | Cumulative protocol-anomaly budget                                                                                                                           |
 | `h2_max_window_update_stream0_per_window` | `u32` (≥ 1)     | per-connection setup | `2000`                  | Unsolicited stream-0 WINDOW_UPDATE flood cap (two per DATA frame sent are not counted)                                                                       |
-| `h2_max_rst_stream_lifetime`              | `u64` (≥ 1)     | per-connection setup | `200000`                | Floor of the received RST_STREAM cap (also needs more resets than streams opened) — CVE-2023-44487                                                          |
-| `h2_max_rst_stream_abusive_lifetime`      | `u64` (≥ 1)     | per-connection setup | `1000`                  | Floor of the pre-response RST_STREAM cap (also needs more than half of the streams opened) — Rapid Reset signature                                          |
-| `h2_max_rst_stream_emitted_lifetime`      | `u64` (≥ 1)     | per-connection setup | `10000`                 | Floor of the peer-provoked server-emitted RST_STREAM cap (also needs more than half of the streams opened) — CVE-2025-8671                                  |
+| `h2_max_rst_stream_lifetime`              | `u64` (≥ 1)     | per-connection setup | `200000`                | Floor of the received RST_STREAM cap (also needs more resets than streams a backend answered) — CVE-2023-44487                                                          |
+| `h2_max_rst_stream_abusive_lifetime`      | `u64` (≥ 1)     | per-connection setup | `1000`                  | Floor of the pre-response RST_STREAM cap (also needs more than half of the streams a backend answered) — Rapid Reset signature                                          |
+| `h2_max_rst_stream_emitted_lifetime`      | `u64` (≥ 1)     | per-connection setup | `10000`                 | Floor of the peer-provoked server-emitted RST_STREAM cap (also needs more than half of the streams a backend answered) — CVE-2025-8671                                  |
 | `h2_initial_connection_window`            | `u32`           | per-connection setup | `1048576`               | Connection receive window advertised to the peer (bytes, RFC 9113 §6.9.2); not enforced on inbound DATA                                                      |
 | `h2_max_concurrent_streams`               | `u32` (≥ 1)     | per-connection setup | `100`                   | `SETTINGS_MAX_CONCURRENT_STREAMS`                                                                                                                            |
 | `h2_stream_shrink_ratio`                  | `u32` (≥ 2)     | per-connection setup | `2`                     | Stream-slot Vec shrink threshold                                                                                                                             |

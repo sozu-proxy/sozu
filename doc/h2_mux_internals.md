@@ -274,23 +274,25 @@ Configurable thresholds with safe compile-time defaults:
 
 | Field | Default | CVE | Attack |
 |-------|---------|-----|--------|
-| `max_rst_stream_per_window` | 100 | CVE-2023-44487, CVE-2019-9514 | Rapid Reset / Reset Flood (per-window) |
-| `max_rst_stream_lifetime` | 10 000 | CVE-2023-44487 | Rapid Reset, never-decaying lifetime ceiling |
-| `max_rst_stream_abusive_lifetime` | 50 | CVE-2023-44487 | Rapid Reset signature (pre-response-start RST) |
-| `max_rst_stream_emitted_lifetime` | 500 | CVE-2025-8671 | MadeYouReset (server-emitted RST_STREAM) |
-| `max_ping_per_window` | 100 | CVE-2019-9512 | Ping Flood |
-| `max_settings_per_window` | 50 | CVE-2019-9515 | Settings Flood |
-| `max_empty_data_per_window` | 100 | CVE-2019-9518 | Empty Frames Attack |
-| `max_window_update_stream0_per_window` | 100 | (rate cap) | Stream-0 WINDOW_UPDATE CPU-burn |
+| `max_rst_stream_per_window` | 2000 | CVE-2023-44487, CVE-2019-9514 | Rapid Reset / Reset Flood (per-window) |
+| `max_rst_stream_lifetime` | 200 000 | CVE-2023-44487 | Floor; trips past it once received resets exceed the streams a backend answered (in practice: resets of closed streams) |
+| `max_rst_stream_abusive_lifetime` | 1000 | CVE-2023-44487 | Floor; Rapid Reset signature (pre-response-start RST), trips past it once pre-response and provoked resets exceed half of the answered streams |
+| `max_rst_stream_emitted_lifetime` | 10 000 | CVE-2025-8671 | Floor; MadeYouReset (peer-provoked server-emitted RST_STREAM), same shared ratio |
+| `max_ping_per_window` | 2000 | CVE-2019-9512 | Ping Flood |
+| `max_settings_per_window` | 1000 | CVE-2019-9515 | Settings Flood |
+| `max_empty_data_per_window` | 2000 | CVE-2019-9518 | Empty Frames Attack |
+| `max_window_update_stream0_per_window` | 2000 | (rate cap) | Unsolicited stream-0 WINDOW_UPDATE CPU-burn (two per DATA frame sent are credited) |
 | `max_continuation_frames` | 20 | CVE-2024-27316 | CONTINUATION Flood (per-block frame count) |
 | `max_header_list_size` | 65536 (64 KiB) | CVE-2024-27316 | CONTINUATION Flood (per-block accumulated size) |
 | `max_header_table_size` | 65536 (64 KiB) | (HPACK memory) | Peer-advertised dynamic table size cap |
 | `max_header_fields` | 128 | (HPACK memory) | Indexed-reference "header bomb" |
-| `max_glitch_count` | 100 | (cumulative) | General protocol abuse |
+| `max_glitch_count` | 2000 | (cumulative) | General protocol abuse |
 
 The sliding window duration is 1 second (`FLOOD_WINDOW_DURATION`). The three
-`*_lifetime` counters deliberately never decay: a half-decaying window counter
-cannot see a patient attacker who stays under the per-second ceiling forever.
+`*_lifetime` counters never decay, but each trips only once it also exceeds a
+share of the streams a backend answered (`H2FloodDetector`'s `streams_opened`):
+benign resets on a long connection do not accumulate toward a fixed ceiling,
+while a client resetting every stream it opens trips just past the floor.
 The fields are private: `H2FloodConfig::new` and `H2FloodConfig::from_optional` are the
 only ways to build one, and both clamp every threshold to at least 1 — a zero
 threshold does not disable a check, it makes the first event that counter sees
@@ -2293,8 +2295,9 @@ locks those fixes in:
   request shape + per-stream `WINDOW_UPDATE` cadence from content-encoding
   interactions.
 
-`H2FloodDetector` caps stream-0 `WINDOW_UPDATE` frames at
-`DEFAULT_MAX_WINDOW_UPDATE_STREAM0_PER_WINDOW = 100` per sliding window
+`H2FloodDetector` caps unsolicited stream-0 `WINDOW_UPDATE` frames at
+`DEFAULT_MAX_WINDOW_UPDATE_STREAM0_PER_WINDOW = 2000` per sliding window, two
+per DATA frame sent being credited
 (`lib/src/protocol/mux/h2_flood_detector.rs`, enforced by
 `H2FloodDetector::check_flood`). The
 drain helper refreshes per-stream windows only; the one-shot conn-level bump

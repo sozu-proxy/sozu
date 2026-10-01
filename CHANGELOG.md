@@ -4003,6 +4003,8 @@
   and `soft_stop_after_a_peer_goaway_arms_the_budget_once`.
 - **`fix(mux-h2)`: raise H2 flood-protection defaults that tripped on legitimate traffic; make
   RST caps decay; stop counting Sōzu-initiated resets
+- **`fix(mux-h2)`: raise H2 flood-protection defaults that tripped on legitimate traffic; scale
+  RST caps with the streams a backend answered; stop counting Sōzu-initiated resets
   ([#1749](https://github.com/sozu-proxy/sozu/issues/1749)).** Ordinary browsers, large downloads,
   high-cancellation clients and a Sōzu→Sōzu chain could be closed with
   `GOAWAY(ENHANCE_YOUR_CALM)`.
@@ -4012,13 +4014,15 @@
     `h2_max_window_update_stream0_per_window` now bounds only unsolicited ones.
   - `h2_max_rst_stream_lifetime`, `h2_max_rst_stream_abusive_lifetime` and
     `h2_max_rst_stream_emitted_lifetime` are now floors: each cap trips once its count also exceeds
-    the streams opened on the connection (received resets) or half of them (pre-response and
-    peer-provoked emitted resets), the shape of Envoy's premature-reset guard.
+    the streams a backend answered on the connection (received resets) or half of them (pre-response
+    and peer-provoked emitted resets, counted together), the shape of Envoy's premature-reset
+    guard. Streams Sōzu refuses, answers itself or that are reset before a response do not count.
   - Resets Sōzu decides on its own — idle reaper `CANCEL`, `REFUSED_STREAM` from its concurrency
     limit, back-pressure or buffer pool, `STREAM_CLOSED` for DATA on a closed stream, the
     converter's error on a backend failure — no longer count toward the CVE-2025-8671
     MadeYouReset cap. Peer-provoked resets (Content-Length mismatch, header parse error, oversized
-    header block, PRIORITY self-dependency, bad `WINDOW_UPDATE`) still do.
+    header block, PRIORITY self-dependency, bad `WINDOW_UPDATE`) still do, and each also counts as
+    a glitch.
   - On a backend connection, a `RST_STREAM` the backend sends before its response is no longer
     counted as Rapid Reset.
   - The pending `RST_STREAM` queue bound is now a bound on what is pending —
@@ -4035,8 +4039,9 @@
     advertised concurrency 50 → 1000 per 60 s. The memory bounds keep their values:
     `h2_max_continuation_frames`, `h2_max_header_list_size`, `h2_max_header_fields`,
     `h2_max_header_table_size`, the PRIORITY map size and the buffer sizes.
-  - A stream opened beyond the advertised `h2_max_concurrent_streams` now counts as a glitch
-    (RFC 9113 §5.1.2), as in nghttp2.
+  - A refused stream counts as a glitch once the client has acknowledged Sōzu's SETTINGS (buffer-pool
+    refusals excepted), and its id is no longer kept in the per-connection reset set.
+  - The stored stream-0 `WINDOW_UPDATE` credit is capped at twice the per-window threshold.
   - `doc/configure.md` now states what each knob counts, its exemptions and its defaults.
 
   Covered by `h2_flood_threshold_tests.rs` (sixty pre-response cancels keep the connection; a

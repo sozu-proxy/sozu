@@ -3766,13 +3766,13 @@ fn h2_basic_get_header_block() -> Vec<u8> {
 /// with a `RST_STREAM(CANCEL)` before the backend response has a chance to
 /// start. The per-window counter half-decays, so the audit added two
 /// connection-lifetime counters, each tripping past its floor once it also
-/// exceeds a share of the streams opened:
+/// exceeds a share of the streams a backend answered:
 ///
 ///   * `total_rst_received_lifetime` (`DEFAULT_MAX_RST_STREAM_LIFETIME = 200 000`,
-///     more than the streams opened),
+///     more than the streams a backend answered),
 ///   * `total_abusive_rst_received_lifetime`
 ///     (`DEFAULT_MAX_RST_STREAM_ABUSIVE_LIFETIME = 1000`, more than half of
-///     the streams opened).
+///     the streams a backend answered).
 ///
 /// Every stream here is reset before its response, so at the 1001st abusive
 /// RST Sozu must emit `GOAWAY(ENHANCE_YOUR_CALM)`.

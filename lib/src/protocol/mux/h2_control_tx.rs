@@ -187,7 +187,12 @@ impl H2ControlTx {
     /// - **Dedupe** via `rst_sent`: at most one queued RST per wire stream
     ///   id. `HashSet::insert` returns `false` when the id is already
     ///   present; the short-circuit on that branch keeps the queue, the
-    ///   lifetime counter and the wire counts consistent.
+    ///   lifetime counter and the wire counts consistent. The caller passes
+    ///   `None` for a stream that was never registered (a refused stream, DATA
+    ///   on a closed one): only `H2StreamTable`'s eviction removes an id from
+    ///   `rst_sent`, so recording such an id would keep it there for the
+    ///   connection's lifetime, one entry per refused stream. Refused ids are
+    ///   fresh by construction, so they need no dedupe.
     /// - **Lifetime count**: each freshly queued RST bumps
     ///   `total_rst_streams_queued`, for the session log.
     /// - **Per-insert queue bound** (`max_pending`): the queue itself refuses
@@ -209,7 +214,7 @@ impl H2ControlTx {
     ///   scheduled on the next tick.
     pub(super) fn enqueue_rst(
         &mut self,
-        rst_sent: &mut HashSet<StreamId>,
+        rst_sent: Option<&mut HashSet<StreamId>>,
         readiness: &mut Readiness,
         wire_stream_id: StreamId,
         error: H2Error,
@@ -230,7 +235,9 @@ impl H2ControlTx {
             self.debug_assert_invariants();
             return EnqueueRstOutcome::Dropped;
         }
-        if !rst_sent.insert(wire_stream_id) {
+        if let Some(rst_sent) = rst_sent
+            && !rst_sent.insert(wire_stream_id)
+        {
             // Dedupe short-circuit: the id was already queued/flushed. We must
             // NOT touch any of the wire-count state, otherwise duplicate calls
             // inflate the MadeYouReset (CVE-2025-8671) lifetime cap with frames
@@ -255,12 +262,8 @@ impl H2ControlTx {
         self.total_rst_streams_queued += 1;
         readiness.arm_writable();
         // Post-condition: a freshly-queued RST advances both the pending Vec
-        // and the lifetime counter by exactly one, and the id is now tracked
-        // for dedupe.
-        debug_assert!(
-            rst_sent.contains(&wire_stream_id),
-            "freshly-queued RST must be recorded in rst_sent for future dedupe"
-        );
+        // and the lifetime counter by exactly one; a tracked id was recorded
+        // for dedupe by the `insert` above.
         debug_assert_eq!(
             self.pending_rst_streams.len(),
             pending_before + 1,
@@ -453,7 +456,7 @@ mod tests {
         let mut sent: HashSet<StreamId> = HashSet::new();
         let mut readiness = Readiness::new();
 
-        let first = tx.enqueue_rst(&mut sent, &mut readiness, 5, H2Error::ProtocolError);
+        let first = tx.enqueue_rst(Some(&mut sent), &mut readiness, 5, H2Error::ProtocolError);
         assert_eq!(
             first,
             EnqueueRstOutcome::Queued,
@@ -461,7 +464,7 @@ mod tests {
         );
         // Second call for the same stream must be a no-op AND report
         // `Deduped` so accounting in `ConnectionH2::enqueue_rst` skips this case.
-        let second = tx.enqueue_rst(&mut sent, &mut readiness, 5, H2Error::InternalError);
+        let second = tx.enqueue_rst(Some(&mut sent), &mut readiness, 5, H2Error::InternalError);
         assert_eq!(
             second,
             EnqueueRstOutcome::Deduped,
@@ -493,7 +496,7 @@ mod tests {
         let mut readiness = Readiness::new();
 
         for sid in [1u32, 3, 5, 7] {
-            tx.enqueue_rst(&mut sent, &mut readiness, sid, H2Error::ProtocolError);
+            tx.enqueue_rst(Some(&mut sent), &mut readiness, sid, H2Error::ProtocolError);
         }
 
         assert_eq!(tx.pending().len(), 4);
@@ -511,7 +514,12 @@ mod tests {
         assert!(!readiness.interest.is_writable());
         assert!(!readiness.event.is_writable());
 
-        tx.enqueue_rst(&mut sent, &mut readiness, 9, H2Error::FlowControlError);
+        tx.enqueue_rst(
+            Some(&mut sent),
+            &mut readiness,
+            9,
+            H2Error::FlowControlError,
+        );
 
         // Postcondition: invariant-15 — both `interest` and `event` WRITABLE
         // are raised so the next tick runs `writable()` under edge-triggered
@@ -538,7 +546,7 @@ mod tests {
         sent.insert(11);
         let mut readiness = Readiness::new();
 
-        tx.enqueue_rst(&mut sent, &mut readiness, 11, H2Error::ProtocolError);
+        tx.enqueue_rst(Some(&mut sent), &mut readiness, 11, H2Error::ProtocolError);
 
         assert!(
             tx.pending().is_empty(),
@@ -580,7 +588,7 @@ mod tests {
 
         for sid in [1u32, 3, 5, 7] {
             assert_eq!(
-                tx.enqueue_rst(&mut sent, &mut readiness, sid, H2Error::Cancel),
+                tx.enqueue_rst(Some(&mut sent), &mut readiness, sid, H2Error::Cancel),
                 EnqueueRstOutcome::Queued,
                 "every insert below the cap must be queued"
             );
@@ -593,7 +601,7 @@ mod tests {
 
         let mut at_capacity = Readiness::new();
         assert_eq!(
-            tx.enqueue_rst(&mut sent, &mut at_capacity, 9, H2Error::Cancel),
+            tx.enqueue_rst(Some(&mut sent), &mut at_capacity, 9, H2Error::Cancel),
             EnqueueRstOutcome::Dropped,
             "an insert at the cap must be refused"
         );
@@ -684,7 +692,7 @@ mod tests {
                 match step {
                     RstStep::Enqueue(id) => {
                         tx.enqueue_rst(
-                            &mut sent,
+                            Some(&mut sent),
                             &mut readiness,
                             2 * (id as StreamId % 64) + 1,
                             H2Error::ProtocolError,
@@ -692,7 +700,12 @@ mod tests {
                     }
                     RstStep::Reap(n) => {
                         for _ in 0..=(n % 96) {
-                            tx.enqueue_rst(&mut sent, &mut readiness, next_reaped, H2Error::Cancel);
+                            tx.enqueue_rst(
+                                Some(&mut sent),
+                                &mut readiness,
+                                next_reaped,
+                                H2Error::Cancel,
+                            );
                             next_reaped += 2;
                         }
                     }
@@ -729,7 +742,7 @@ mod tests {
         let mut rst_sent = HashSet::new();
         let mut readiness = readiness();
         for id in [1, 3, 5] {
-            tx.enqueue_rst(&mut rst_sent, &mut readiness, id, H2Error::Cancel);
+            tx.enqueue_rst(Some(&mut rst_sent), &mut readiness, id, H2Error::Cancel);
         }
         let mut buf = vec![0u8; RST_FRAME_SIZE * 8];
 
@@ -751,7 +764,7 @@ mod tests {
         let mut rst_sent = HashSet::new();
         let mut readiness = readiness();
         for id in [1, 3, 5, 7] {
-            tx.enqueue_rst(&mut rst_sent, &mut readiness, id, H2Error::Cancel);
+            tx.enqueue_rst(Some(&mut rst_sent), &mut readiness, id, H2Error::Cancel);
         }
         // Room for two whole frames and one byte of a third.
         let mut buf = vec![0u8; RST_FRAME_SIZE * 2 + 1];
@@ -772,7 +785,7 @@ mod tests {
         let mut tx = H2ControlTx::new(100);
         let mut rst_sent = HashSet::new();
         let mut readiness = readiness();
-        tx.enqueue_rst(&mut rst_sent, &mut readiness, 1, H2Error::Cancel);
+        tx.enqueue_rst(Some(&mut rst_sent), &mut readiness, 1, H2Error::Cancel);
         let mut buf = vec![0u8; RST_FRAME_SIZE - 1];
 
         let (bytes, frames) = tx.drain_rst_streams_into(&mut buf);
@@ -786,7 +799,7 @@ mod tests {
         let mut tx = H2ControlTx::new(100);
         let mut rst_sent = HashSet::new();
         let mut readiness = readiness();
-        tx.enqueue_rst(&mut rst_sent, &mut readiness, 1, H2Error::Cancel);
+        tx.enqueue_rst(Some(&mut rst_sent), &mut readiness, 1, H2Error::Cancel);
         let mut buf = vec![0u8; RST_FRAME_SIZE];
 
         let (bytes, frames) = tx.drain_rst_streams_into(&mut buf);
@@ -823,7 +836,7 @@ mod tests {
         for _ in 0..5 {
             for _ in 0..bound {
                 assert_eq!(
-                    tx.enqueue_rst(&mut rst_sent, &mut readiness, next, H2Error::Cancel),
+                    tx.enqueue_rst(Some(&mut rst_sent), &mut readiness, next, H2Error::Cancel),
                     EnqueueRstOutcome::Queued
                 );
                 next += 2;
@@ -848,7 +861,7 @@ mod tests {
         let mut readiness = readiness();
 
         for sid in [1u32, 3, 5, 7] {
-            tx.enqueue_rst(&mut sent, &mut readiness, sid, H2Error::Cancel);
+            tx.enqueue_rst(Some(&mut sent), &mut readiness, sid, H2Error::Cancel);
         }
         assert!(
             !tx.overflowed(),
@@ -856,7 +869,7 @@ mod tests {
         );
 
         assert_eq!(
-            tx.enqueue_rst(&mut sent, &mut readiness, 9, H2Error::Cancel),
+            tx.enqueue_rst(Some(&mut sent), &mut readiness, 9, H2Error::Cancel),
             EnqueueRstOutcome::Dropped
         );
         assert!(tx.overflowed(), "the refused insert records the overflow");
@@ -890,7 +903,7 @@ mod tests {
         let mut rst_sent = HashSet::new();
         let mut readiness = readiness();
         for id in [1, 3, 5] {
-            tx.enqueue_rst(&mut rst_sent, &mut readiness, id, H2Error::Cancel);
+            tx.enqueue_rst(Some(&mut rst_sent), &mut readiness, id, H2Error::Cancel);
         }
 
         tx.clear_pending();

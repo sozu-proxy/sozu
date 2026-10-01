@@ -1239,17 +1239,17 @@ pub enum HttpListenerCmd {
         h2_stream_shrink_ratio: Option<u32>,
         #[clap(
             long,
-            help = "Floor of the lifetime cap on RST_STREAM frames received; trips past it once more resets than streams opened (CVE-2023-44487)"
+            help = "Floor of the lifetime cap on RST_STREAM frames received; trips past it once more resets than streams a backend answered (CVE-2023-44487)"
         )]
         h2_max_rst_stream_lifetime: Option<u64>,
         #[clap(
             long,
-            help = "Floor of the cap on pre-response RST_STREAM frames; trips past it once more than half of the streams opened were reset (Rapid Reset, CVE-2023-44487)"
+            help = "Floor of the cap on pre-response RST_STREAM frames; trips past it once more than half of the streams a backend answered were reset (Rapid Reset, CVE-2023-44487)"
         )]
         h2_max_rst_stream_abusive_lifetime: Option<u64>,
         #[clap(
             long,
-            help = "Floor of the cap on peer-provoked RST_STREAM frames emitted by the server; trips past it once more than half of the streams opened (CVE-2025-8671)"
+            help = "Floor of the cap on peer-provoked RST_STREAM frames emitted by the server; trips past it once more than half of the streams a backend answered (CVE-2025-8671)"
         )]
         h2_max_rst_stream_emitted_lifetime: Option<u64>,
         #[clap(
@@ -1543,17 +1543,17 @@ pub enum HttpsListenerCmd {
         h2_stream_shrink_ratio: Option<u32>,
         #[clap(
             long,
-            help = "Floor of the lifetime cap on RST_STREAM frames received; trips past it once more resets than streams opened (CVE-2023-44487)"
+            help = "Floor of the lifetime cap on RST_STREAM frames received; trips past it once more resets than streams a backend answered (CVE-2023-44487)"
         )]
         h2_max_rst_stream_lifetime: Option<u64>,
         #[clap(
             long,
-            help = "Floor of the cap on pre-response RST_STREAM frames; trips past it once more than half of the streams opened were reset (Rapid Reset, CVE-2023-44487)"
+            help = "Floor of the cap on pre-response RST_STREAM frames; trips past it once more than half of the streams a backend answered were reset (Rapid Reset, CVE-2023-44487)"
         )]
         h2_max_rst_stream_abusive_lifetime: Option<u64>,
         #[clap(
             long,
-            help = "Floor of the cap on peer-provoked RST_STREAM frames emitted by the server; trips past it once more than half of the streams opened (CVE-2025-8671)"
+            help = "Floor of the cap on peer-provoked RST_STREAM frames emitted by the server; trips past it once more than half of the streams a backend answered (CVE-2025-8671)"
         )]
         h2_max_rst_stream_emitted_lifetime: Option<u64>,
         #[clap(
