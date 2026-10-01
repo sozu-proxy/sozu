@@ -796,7 +796,11 @@ address        = "0.0.0.0:53"
 # public_address = "203.0.113.10:53"
 
 # client / upstream flow idle timeout, in seconds. A flow is reaped once it has
-# been idle for this long. Defaults to 30.
+# been idle for this long, which closes its upstream socket and frees its
+# `max_flows` slot. A client datagram pushes the flow's deadline to now +
+# `front_timeout`, a backend reply to now + `back_timeout`. These listener
+# keys are the only UDP idle timeout: `[clusters.<id>.udp]` has none, so the
+# cluster defaults never disable it. Defaults to 30.
 front_timeout  = 30
 back_timeout   = 30
 
@@ -1017,7 +1021,7 @@ or held move. The key is:
 
 | datapath | client key |
 |---|---|
-| UDP | the flow key, per `[clusters.<id>.udp] affinity_key` (see "UDP clusters") |
+| UDP | the client source IP, or source IP and port, per `[clusters.<id>.udp] affinity_key` (see "UDP clusters") |
 | TCP | the client source IP |
 | HTTP, HTTPS | the value of `affinity_header` or `affinity_cookie` when set and present in the request, else the client source IP |
 
@@ -1108,7 +1112,8 @@ weighted score `HRW` uses, see "Client affinity" — over the cluster's
 - **the same on every worker and across restarts**, since the key and the
   ranking are pure functions of the client and the backend addresses. On HTTP,
   HTTPS and TCP the key hash is Sōzu's own seeded FNV and does not change
-  between builds; on UDP the flow key comes from the standard library's
+  between builds; on UDP the affinity key (the source IP, or source IP and port
+  per `affinity_key`) is hashed with the standard library's
   `DefaultHasher`, whose algorithm Rust does not promise to keep across
   toolchain versions, so a UDP client's shard may move after an upgrade built
   with another Rust version;
@@ -1177,7 +1182,8 @@ How it composes with the rest of selection:
 - **No key, no shard.** A request with no source address (and no configured
   header or cookie) selects over the whole cluster.
 - **Every datapath.** Sharding lives in the cluster's backend list, so a UDP
-  cluster that sets it shards its flows by their flow key too.
+  cluster that sets it shards its flows by their affinity key too (the source
+  IP, or source IP and port per `affinity_key`).
 
 **Before enabling it.** Sharding is off unless `shard_percent` is set, so
 upgrading changes nothing by itself. Before setting it:
@@ -1295,7 +1301,7 @@ The `[clusters.<id>.udp]` block:
 
 | Key                             | Default      | Description                                                                                                                                   |
 | ------------------------------- | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `affinity_key`                  | `SOURCE_IP`  | Flow affinity key for hash LBs. `SOURCE_IP` pins every port from one client to one backend; `SOURCE_IP_PORT` keys on the full source 2-tuple. |
+| `affinity_key`                  | `SOURCE_IP`  | Backend affinity key for hash LBs. `SOURCE_IP` pins every port from one client to one backend; `SOURCE_IP_PORT` keys on the full source 2-tuple. It only selects the backend: a flow is always one client source IP and port, with its own upstream socket, and replies return to that source. |
 | `responses`                     | `0`          | Expected replies per flow. A DNS flow sets `responses = 1` so the flow closes immediately after its single reply; `0` = unlimited (syslog-style fire-and-forget). |
 | `requests`                      | `0`          | Maximum client datagrams per flow before teardown. `0` = unlimited.                                                                           |
 | `send_proxy_protocol`           | `false`      | Prepend a PROXY protocol **v2** header (carrying the real client `SocketAddr`) to the backend. By default it is sent on the **first** datagram of the flow only. Backend PPv2-over-UDP parse support is not guaranteed by the spec — verify per backend. |
