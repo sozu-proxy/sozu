@@ -3968,6 +3968,19 @@
   `a_408_to_a_silent_client_closes_without_lingering` and
   `a_silent_client_is_closed_at_the_linger_deadline`.
 
+- **`fix(mux-h2)`: a default answer ends its own stream, not the H2 connection
+  ([#1740](https://github.com/sozu-proxy/sozu/issues/1740)).** Every built-in answer template
+  carries `Connection: close`, which clears `keep_alive_frontend`; the H2 write pass read that bit
+  when the answered stream retired and sent `GOAWAY`, so one 4xx/5xx default answer drained the
+  connection and refused every later stream. `Connection` is an HTTP/1.1 option (RFC 9113
+  §8.2.2) and the H2 converter already strips it: `ConnectionH2::poll_write_target`
+  (`lib/src/protocol/mux/h2.rs`) no longer reads `keep_alive_frontend`. HTTP/1.1 is unchanged.
+  On H2, the per-(cluster, source IP) slot claimed by a failed dial is now held until the
+  connection closes, one slot per (connection, cluster) as for a successful dial
+  (`doc/rate-limit-design.md`). Covered by the e2e `test_h2_default_answer_terminates_stream`
+  (now asserts no `GOAWAY`), `test_h2_default_answer_502_spares_other_streams` and
+  `test_h2_failed_dial_keeps_connection_and_one_slot`.
+
 - **`fix(mux)`: never reuse a pooled connection to a removed backend
   ([#1735](https://github.com/sozu-proxy/sozu/issues/1735)).** The pool-reuse scan of
   `Router::decide_after_gate` (`lib/src/protocol/mux/router.rs`) matched an H1 keep-alive or H2

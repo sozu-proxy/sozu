@@ -658,7 +658,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:4714-4727
+```rust lib/src/protocol/mux/h2.rs:4699-4712
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -684,7 +684,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:4762-4768
+```rust lib/src/protocol/mux/h2.rs:4747-4753
 let events = stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -716,7 +716,7 @@ taken at the top of `H2WritePhase::Flush`'s post-flush tail
 (`ConnectionH2::poll_write_target`, `lib/src/protocol/mux/h2.rs`) and passes `stream.linked_token()` straight
 out of it:
 
-```rust lib/src/protocol/mux/h2.rs:3483-3484
+```rust lib/src/protocol/mux/h2.rs:3485-3486
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 ```
@@ -1069,7 +1069,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8676-8680
+```rust lib/src/protocol/mux/h2.rs:8661-8665
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1202,7 +1202,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8854-8858
+```rust lib/src/protocol/mux/h2.rs:8839-8843
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1441,9 +1441,9 @@ read side: a read pass performs exactly one `socket_read`, while a write pass
 performs an unbounded number of vectored writes. `H2WriteTarget::Finalize`
 carries `bytes_written` as well as `socket_write` because `finalize_write`
 reads it as `made_progress`, and that alone selects `RetainPendingBack` over
-`Quiesce` (LIFECYCLE §9 invariant 16); three sites end a pass **without**
-finalizing and are `Done(MuxResult)` instead — the resume path's stall, the
-MadeYouReset emitted-RST cap trip, and the close-frontend GOAWAY.
+`Quiesce` (LIFECYCLE §9 invariant 16); two sites end a pass **without**
+finalizing and are `Done(MuxResult)` instead — the resume path's stall and the
+MadeYouReset emitted-RST cap trip.
 
 `poll_write_target` walks the pass through `H2WritePhase`, and the phase is
 what makes a re-entry after a transmit different from a first entry:
@@ -1676,7 +1676,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:8179
+```rust lib/src/protocol/mux/h2.rs:8164
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -1910,7 +1910,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:6782-6784
+```rust lib/src/protocol/mux/h2.rs:6767-6769
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1918,7 +1918,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:6796-6802
+```rust lib/src/protocol/mux/h2.rs:6781-6787
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.
