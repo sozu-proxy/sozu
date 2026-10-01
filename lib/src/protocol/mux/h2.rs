@@ -16158,7 +16158,7 @@ mod tests {
         kawa.parsing_phase = kawa::ParsingPhase::Terminated;
         // The backend grants the stream no send window: its HEADERS leave,
         // its body waits.
-        context.streams[gid].window = 0;
+        context.streams[gid].back_window = 0;
         let sent = drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
         let frames = peer_frames(&sent).expect("whole frames");
         assert!(
