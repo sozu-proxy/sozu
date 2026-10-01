@@ -4,6 +4,24 @@
 
 ### ✨ Added
 
+- **BREAKING (library API) — `feat(udp)`: opt-in per-source flow limit on UDP clusters.** Each
+  client source IP and port is its own UDP flow, with its own upstream socket and `max_flows` slot,
+  and nothing bounded the flows one source address held. A cluster's own `max_connections_per_ip`
+  and `max_connections_per_subnet` (with the worker's `subnet_ipv4_prefix` /
+  `subnet_ipv6_prefix`) now also cap the concurrent UDP flows per `(cluster, source IP)` and
+  `(cluster, masked source subnet)`. A datagram that would open a flow over either limit is
+  dropped (`DropReason::Shed`), counted in `udp.flows.shed` and the new
+  `udp.flows.shed.source_limit`; datagrams of existing flows are not affected, and a closed flow
+  frees its slot. The counters are per UDP listener and separate from the TCP/HTTP connection
+  counters. The global `max_connections_per_ip` / `max_connections_per_subnet` defaults do not
+  apply to UDP, so an existing configuration admits exactly the UDP flows it admitted before;
+  the limit is opt-in per cluster. Library API: `udp::ClusterConfig` gains `max_flows_per_ip`,
+  `max_flows_per_subnet`, `subnet_ipv4_prefix` and `subnet_ipv6_prefix`, and `udp::MetricEvent`
+  gains `FlowShedSourceLimit`. Documented in `doc/configure.md` ("UDP clusters") and
+  `doc/rate-limit-design.md` §3.5.1; covered by `test_udp_per_ip_flow_limit`
+  (`e2e/src/tests/udp_tests.rs`), the `manager.rs` unit tests and
+  `udp_flow_limits_come_from_the_cluster_not_the_global_defaults` (`server.rs`).
+
 - **`feat(lb)`: shuffle sharding over the HRW ranking
   ([#524](https://github.com/sozu-proxy/sozu/issues/524)).** A cluster can now serve each client
   from a shard of its backends instead of all of them, so a client that overloads or poisons its

@@ -5286,6 +5286,121 @@ mod listener_lifecycle_tests {
             );
         }
     }
+
+    /// The UDP per-source flow limit is opt-in per cluster: a global
+    /// `max_connections_per_ip` / `max_connections_per_subnet` — here set at
+    /// runtime, as an operator would for HTTP/TCP — never reaches a UDP
+    /// listener, while the cluster's own `max_connections_per_ip` does, and
+    /// sheds a new port of an address that holds its limit.
+    ///
+    /// To SEE THIS RED: in `UdpProxy::cluster_config_for`, replace
+    /// `per_ip.unwrap_or(0)` with
+    /// `per_ip.unwrap_or(self.sessions.borrow().max_connections_per_ip)`, so
+    /// UDP inherits the global default; the first assertion then reads `1`.
+    #[test]
+    fn udp_flow_limits_come_from_the_cluster_not_the_global_defaults() {
+        use std::{net::SocketAddr, time::Instant};
+
+        use crate::protocol::udp::{
+            BackendId, BackendSource, ManagerInput, MetricEvent, Output, UdpManager,
+        };
+
+        struct OneBackend;
+        impl BackendSource for OneBackend {
+            fn select(
+                &mut self,
+                _cluster: &str,
+                _key: Option<u64>,
+                _now: Instant,
+            ) -> Option<(BackendId, SocketAddr)> {
+                Some(("b".to_owned(), SocketAddr::from(([127, 0, 0, 1], 5353))))
+            }
+        }
+        // Feed one datagram from `port` of one address; `true` when it opened
+        // a flow, `false` when it was shed at the per-source limit.
+        fn admit(manager: &RefCell<UdpManager>, port: u16) -> bool {
+            let mut manager = manager.borrow_mut();
+            manager.handle_input(
+                ManagerInput::ClientDatagram {
+                    src: SocketAddr::from(([192, 0, 2, 1], port)),
+                    payload: b"q",
+                    backends: &mut OneBackend,
+                },
+                Instant::now(),
+            );
+            let mut opened = false;
+            let mut shed = false;
+            while let Some(out) = manager.poll_output() {
+                opened |= matches!(out, Output::OpenUpstream { .. });
+                shed |= matches!(out, Output::Metric(MetricEvent::FlowShedSourceLimit));
+            }
+            assert_ne!(opened, shed, "a datagram is either admitted or shed");
+            opened
+        }
+        fn add_cluster(server: &mut Server, max_connections_per_ip: Option<u64>) {
+            server.notify_proxys(WorkerRequest {
+                id: "test-add-cluster".to_owned(),
+                content: RequestType::AddCluster(Cluster {
+                    cluster_id: "udp-limits".to_owned(),
+                    max_connections_per_ip,
+                    ..Default::default()
+                })
+                .into(),
+            });
+        }
+
+        let mut server = bare_server();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let token = add_udp_listener(&mut server, address);
+        server.notify(WorkerRequest {
+            id: "test-set-per-ip".to_owned(),
+            content: RequestType::SetMaxConnectionsPerIp(1).into(),
+        });
+        server.notify(WorkerRequest {
+            id: "test-set-per-subnet".to_owned(),
+            content: RequestType::SetMaxConnectionsPerSubnet(1).into(),
+        });
+        add_cluster(&mut server, None);
+        server.notify_proxys(WorkerRequest {
+            id: "test-add-udp-front".to_owned(),
+            content: RequestType::AddUdpFrontend(RequestUdpFrontend {
+                cluster_id: "udp-limits".to_owned(),
+                address,
+                tags: Default::default(),
+            })
+            .into(),
+        });
+        let manager = server
+            .udp
+            .borrow()
+            .manager(token)
+            .expect("the UDP listener must own a flow manager");
+
+        {
+            let manager = manager.borrow();
+            let cfg = manager.cluster_config();
+            assert_eq!(
+                cfg.max_flows_per_ip, 0,
+                "the global per-IP default must not apply to UDP"
+            );
+            assert_eq!(
+                cfg.max_flows_per_subnet, 0,
+                "the global per-subnet default must not apply to UDP"
+            );
+        }
+        assert!(admit(&manager, 1000));
+        assert!(
+            admit(&manager, 1001),
+            "a global limit of 1 must not shed a second UDP flow"
+        );
+
+        add_cluster(&mut server, Some(2));
+        assert_eq!(manager.borrow().cluster_config().max_flows_per_ip, 2);
+        assert!(
+            !admit(&manager, 1002),
+            "the cluster's own limit of 2 counts the two open flows and sheds a third"
+        );
+    }
 }
 
 #[cfg(test)]

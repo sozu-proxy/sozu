@@ -240,6 +240,10 @@ pub enum MetricEvent {
     FlowEvicted,
     /// A new flow was shed at the cap (`udp.flows.shed`).
     FlowShed,
+    /// A new flow was shed because its source address or subnet already holds
+    /// the cluster's per-source flow limit (`udp.flows.shed` and
+    /// `udp.flows.shed.source_limit`).
+    FlowShedSourceLimit,
     /// A client→backend datagram was forwarded (`udp.datagrams.in`,
     /// `udp.bytes.in`). Carries the *payload* byte count (excludes any PPv2
     /// prefix the core adds).
@@ -274,6 +278,20 @@ pub struct ClusterConfig {
     pub send_proxy_protocol: bool,
     /// PPv2 on every datagram (true) vs first-datagram-only (false, default).
     pub proxy_protocol_every_datagram: bool,
+    /// Concurrent flows one source IP may hold on this cluster, per listener.
+    /// `0` = unlimited. Resolved by the shell from the cluster's own
+    /// `max_connections_per_ip`; the global default is not inherited, so an
+    /// absent value is unlimited.
+    pub max_flows_per_ip: u64,
+    /// Concurrent flows one source subnet may hold on this cluster, per
+    /// listener. `0` = unlimited. Resolved from `max_connections_per_subnet`
+    /// the same way; the subnet is the source IP masked to the two prefixes
+    /// below.
+    pub max_flows_per_subnet: u64,
+    /// IPv4 prefix length, in bits, of a subnet for `max_flows_per_subnet`.
+    pub subnet_ipv4_prefix: u32,
+    /// IPv6 prefix length, in bits, of a subnet for `max_flows_per_subnet`.
+    pub subnet_ipv6_prefix: u32,
 }
 
 impl Default for ClusterConfig {
@@ -287,6 +305,10 @@ impl Default for ClusterConfig {
             back_timeout: Duration::from_secs(30),
             send_proxy_protocol: false,
             proxy_protocol_every_datagram: false,
+            max_flows_per_ip: 0,
+            max_flows_per_subnet: 0,
+            subnet_ipv4_prefix: sozu_command::config::DEFAULT_SUBNET_IPV4_PREFIX,
+            subnet_ipv6_prefix: sozu_command::config::DEFAULT_SUBNET_IPV6_PREFIX,
         }
     }
 }
