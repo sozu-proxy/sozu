@@ -3860,6 +3860,21 @@
   makes it pass; `test_udp_idle_flow_is_torn_down` and `test_udp_every_idle_flow_is_torn_down`
   are the end-to-end tests that fix lacked.
 
+- **`fix(mux)`: stop spinning the session loop on a frontend hang-up
+  ([#1774](https://github.com/sozu-proxy/sozu/issues/1774)).** `Mux::ready_inner`
+  (`lib/src/protocol/mux/mod.rs`) handled a frontend HUP only on entry. When it delayed the close
+  for a pending flush and that flush completed inside the inner loop, the frontend's remaining
+  readiness was HUP alone, which the loop's exit check counted as work although nothing in the
+  loop acts on it: every client hang-up of that shape ran the loop to `MAX_LOOP_ITERATIONS` and
+  counted an `http.infinite_loop.error` before the session closed. The inner loop now closes the
+  session on a frontend HUP once no output is left to flush, except on a lingering frontend, which
+  it leaves to drain the client's last bytes as the entry check does; its exit check counts only
+  frontend READABLE, WRITABLE and ERROR interest, so a flush blocked on the socket yields to the
+  next readiness event instead of spinning. Documented in `lib/src/protocol/mux/LIFECYCLE.md` and
+  `doc/lifetime_of_a_session.md`. Covered by `test_h2_frontend_hangup_does_not_spin`
+  (`e2e/src/tests/h2_tests.rs`) and
+  `a_hup_during_the_flush_that_starts_a_linger_drains_before_closing` (`lib/src/protocol/mux/mod.rs`).
+
 - **`fix(h1)`: forward a final response read together with a 1xx
   ([#1759](https://github.com/sozu-proxy/sozu/issues/1759)).** When an HTTP/1.1 backend wrote an
   interim response and what follows it (another 1xx, the final response) at once, an HTTP/1.1
@@ -3885,6 +3900,35 @@
   of an interim response on an unlinked stream is now `H1::Interim` (was `H1::EarlyHint`). Covered
   by `test_h1_interim_102_before_final` and `test_h1_interim_150_before_final`
   (`e2e/src/tests/tests.rs`), which also send a second exchange on the same connections.
+- **`fix(h2)`: linger before closing after the final GOAWAY
+  ([#1764](https://github.com/sozu-proxy/sozu/issues/1764)).** Once an H2 frontend had flushed its
+  final GOAWAY, it stopped reading and closed the session at once. The client may still be
+  sending frames it wrote before it read the GOAWAY (RFC 9113 §6.8). A close with them unread, or
+  followed by more, makes the kernel send a reset, which discards the response bytes still queued
+  in sozu's socket, so the client could lose the end of a response it was otherwise served in full.
+  A close after a final GOAWAY(NO_ERROR) — graceful drain, soft stop, or the reply to the client's
+  own GOAWAY — now uses the lingering close of
+  [#1738](https://github.com/sozu-proxy/sozu/issues/1738) (`H2Shell::linger_instead_of_closing`,
+  `lib/src/protocol/mux/h2.rs`, sharing `Linger` and `drain_discard` with H1 in
+  `lib/src/protocol/mux/shared.rs`):
+  - TLS `close_notify` first, then the write side is shut down.
+  - What the client still sends is read from the raw socket and dropped until its EOF, 4 MiB,
+    or the listener's `request_timeout`.
+  - `ConnectionH2::arm_timeout` and `set_timeout_duration` leave that deadline in place.
+  - A GOAWAY carrying an error code does not linger.
+  - The linger is bounded by `request_timeout` from its start. During a soft stop, the H2
+    graceful-shutdown budget also closes it when that budget is armed and elapses first: the
+    lingering passes keep the connection's clock fresh. A drain the client's own GOAWAY started
+    does not arm that budget, so its linger runs to `request_timeout`.
+
+  Documented in `lib/src/protocol/mux/LIFECYCLE.md` §8.1, `doc/h2_mux_internals.md` and
+  `doc/configure.md`. Covered by the unit tests
+  `an_h2_frontend_lingers_after_its_final_goaway_so_the_client_reads_everything`,
+  `a_linger_deferred_behind_close_notify_starts_on_the_next_pass` and
+  `a_soft_stop_closes_a_lingering_h2_session_once_its_budget_elapses`.
+  `the_final_goaway_and_close_notify_leave_in_one_tls_write` now expects the pass that flushes
+  the final GOAWAY to start the lingering close.
+
 - **`fix(h1)`: linger before closing a connection whose request is still arriving
   ([#1738](https://github.com/sozu-proxy/sozu/issues/1738)).** Since
   [#1721](https://github.com/sozu-proxy/sozu/issues/1721), an H1 client connection whose response
