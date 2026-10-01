@@ -508,6 +508,18 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   `ConnectionH2::create_stream` (`h2.rs`) via `H2StreamTable::register`
   (`h2_stream_table.rs`) — cited by symbol on both ends because the call site's
   own line, `self.stream_table`, is one of thirteen identical lines in `h2.rs`.
+- **H1 keep-alive reuse.** An H1 frontend keeps its one slot for the next
+  request: the keep-alive branch of `ConnectionH1::writable` (`h1.rs`) resets
+  it in place instead of going through `Context::create_stream`, and clears
+  the same per-request fields that function's recycled-slot branch clears,
+  including `Stream::front_received_end_of_stream`,
+  `Stream::back_received_end_of_stream`, `Stream::front_data_received` and
+  `Stream::back_data_received`. An H2 backend connection
+  reads the end-of-stream flags to refuse a frame on a closed stream
+  (RFC 9113 §5.1): before sozu-proxy/sozu#1781 the stale flag of the first
+  response made it refuse the second response's HEADERS with
+  GOAWAY(STREAM_CLOSED), and the client got a 502. Pinned by
+  `test_h1_to_h2_keep_alive_second_request` (`e2e/src/tests/tests.rs`).
 - **Backend attach.** Two call sites, on the two paths a stream can reach a
   backend, both reached from `Mux::ready_inner`'s `pending_links` drain:
   `Router::plan_connect` calls `Context::link_stream` itself on the pool-reuse

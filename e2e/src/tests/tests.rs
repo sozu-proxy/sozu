@@ -5127,6 +5127,71 @@ fn test_h1_to_h2_basic_request() {
     );
 }
 
+/// H1 frontend → H2 backend, two requests on one keep-alive client
+/// connection: each is answered `200` with the backend's body. The second
+/// request is a new H2 stream on the backend connection, and the backend's
+/// response HEADERS on it must be accepted (RFC 9113 §5.1) whatever the
+/// first stream's end left on the reused client-side stream slot.
+fn try_h1_to_h2_keep_alive_second_request() -> State {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let (mut worker, mut backends, front_port) =
+        setup_h2_backend_test("H1-TO-H2-KEEP-ALIVE", 1, false);
+    let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connect to sozu");
+    client
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let mut answers = Vec::new();
+    for _ in 0..2 {
+        client
+            .write_all(b"GET /api HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut received = Vec::new();
+        let mut buffer = [0u8; 4096];
+        for _ in 0..10 {
+            match client.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    received.extend_from_slice(&buffer[..n]);
+                    if String::from_utf8_lossy(&received).contains("h2-pong0") {
+                        break;
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        answers.push(String::from_utf8_lossy(&received).into_owned());
+    }
+    println!("H1→H2 keep-alive answers: {answers:?}");
+    drop(client);
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    backends.iter_mut().for_each(|b| b.stop());
+
+    let answered = answers
+        .iter()
+        .all(|answer| answer.starts_with("HTTP/1.1 200 ") && answer.contains("h2-pong0"));
+    if stopped && answered {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h1_to_h2_keep_alive_second_request() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H1→H2: a second request on a keep-alive client connection is answered",
+            try_h1_to_h2_keep_alive_second_request
+        ),
+        State::Success
+    );
+}
+
 #[test]
 fn test_h2_to_h2_multiple_streams() {
     assert_eq!(
