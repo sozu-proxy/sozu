@@ -5152,9 +5152,12 @@ fn test_h1_to_h2_basic_request() {
 ///
 /// TO SEE THIS RED: in `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`),
 /// drop the clearing of `back_received_end_of_stream` from the keep-alive
-/// reset (the second response is refused and answered 502), or, in
+/// reset: in a debug build the fresh-backend-leg `debug_assert!` of
+/// `ConnectionH2::start_stream` panics on the second request, and in a
+/// release build that response is refused and answered 502. Or, in
 /// `ConnectionH2::start_stream` (`lib/src/protocol/mux/h2.rs`), stop sizing
-/// the backend leg's window (a POST after the first stalls).
+/// the backend leg's window: only the small-window variant fails, its fourth
+/// POST stalling.
 fn try_h1_to_h2_keep_alive_requests(small_backend_window: bool) -> State {
     use std::io::{Read, Write};
     use std::net::TcpStream;
