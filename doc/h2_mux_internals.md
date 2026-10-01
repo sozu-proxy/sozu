@@ -1069,7 +1069,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8583-8587
+```rust lib/src/protocol/mux/h2.rs:8602-8606
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1202,7 +1202,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8660-8664
+```rust lib/src/protocol/mux/h2.rs:8679-8683
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1676,7 +1676,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:8086
+```rust lib/src/protocol/mux/h2.rs:8105
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -1719,6 +1719,13 @@ H2 stream state, GOAWAY sequencing, and rustls buffering interact:
   budget elapses, `ConnectionH2::goaway_before_forced_close` queues the final
   GOAWAY before the forced close; its `last_stream_id` excludes a stream whose
   opening block never completed.
+- A GOAWAY received from the client (`ConnectionH2::handle_goaway_frame`,
+  `Position::Server`) retires no stream: its `last_stream_id` bounds the
+  streams the receiver initiated (RFC 9113 §6.8), and sozu pushes none. It
+  marks the connection draining, so new client streams are refused, every
+  in-flight request completes, and the final GOAWAY follows once no stream
+  remains. Only a GOAWAY from an H2 backend (`Position::Client`) retires the
+  streams above its `last_stream_id`: re-linked, answered `503`, or reset.
 - `ConnectionH2::prune_inactive_streams_while_closing()` removes H2 stream-ID
   mappings for streams that never became active before a connection-level close
   (for example, partial or oversized HEADERS blocks that were abandoned during

@@ -92,7 +92,8 @@ pub(super) struct H2DrainState {
     /// nothing in this module ever clears it back to `false`.
     draining: bool,
     /// Last stream ID from the peer's own GOAWAY (for retry decisions in
-    /// `ConnectionH2::handle_goaway_frame`).
+    /// `ConnectionH2::handle_goaway_frame`, on a backend connection only:
+    /// it bounds receiver-initiated streams, RFC 9113 §6.8).
     peer_last_stream_id: Option<StreamId>,
     /// Wall-clock snapshot captured the first time this connection entered
     /// `draining` during a PROXY-initiated soft-stop. Used together with
