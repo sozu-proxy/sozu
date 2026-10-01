@@ -437,7 +437,8 @@ For a given cluster, Sōzu keeps a list of backends to which the connection is r
 Sōzu detects broken servers and redirects traffic only to healthy ones, with several available loadbalancing algorithms:
 round robin (default), random, least_loaded, power of two, HRW and Maglev.
 The last two are consistent-hashing policies that pin each client to one
-backend: on the flow key for UDP, on the client source IP (or a configured
+backend: on the affinity key for UDP (the source IP, or source IP and port per
+`affinity_key`), on the client source IP (or a configured
 header or cookie) for HTTP, HTTPS and TCP. Any policy can be combined with
 shuffle sharding, which restricts each client to a shard of backends drawn
 from the HRW ranking of its key. See

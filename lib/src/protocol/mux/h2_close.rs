@@ -220,7 +220,8 @@ pub(super) fn error_close_action(tls_wants_write: bool) -> CloseAction {
 /// `ConnectionH2::force_disconnect`'s `Position::Server` arm.
 ///
 /// Returning `CloseSession` here triggers `shutdown(Write)`, which sends FIN —
-/// and any TLS records still in rustls's buffer are lost, which the client
+/// after a final GOAWAY(NO_ERROR), through the lingering close
+/// `H2Shell::linger_instead_of_closing` turns it into — and any TLS records still in rustls's buffer are lost, which the client
 /// reads as "TLS decode error / unexpected eof". So a connection with records
 /// pending keeps WRITABLE interest instead and lets the writable path flush.
 pub(super) fn force_disconnect_action(peer_gone: bool, tls_wants_write: bool) -> CloseAction {
