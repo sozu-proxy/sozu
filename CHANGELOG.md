@@ -3875,7 +3875,8 @@
   answer that does not ask for a close, and checks that both connections close after the 400,
   and by the unit test
   `a_request_error_after_a_linked_response_started_ends_the_backend_stream`
-  (`lib/src/protocol/mux/h1.rs`) for the cut-response arm.
+  (`lib/src/protocol/mux/h1.rs`) for the cut-response arm, and
+  `a_request_error_answered_400_after_linking_ends_the_backend_stream` for the 400 arm.
 - **`fix(h1)`: read an answer template's `Connection` value as an option list
   ([#1702](https://github.com/sozu-proxy/sozu/issues/1702)).** `Template::new`
   (`lib/src/protocol/kawa_h1/answers.rs`) decided whether a template closes the frontend
