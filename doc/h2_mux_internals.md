@@ -581,7 +581,7 @@ must be attributed proportionally.
 
 A **free function**, not a method:
 
-```rust lib/src/protocol/mux/h2.rs:470-478
+```rust lib/src/protocol/mux/h2.rs:473-481
 fn distribute_overhead(
     metrics: &mut SessionMetrics,
     overhead_bin: &mut usize,
@@ -658,7 +658,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:4667-4680
+```rust lib/src/protocol/mux/h2.rs:4719-4732
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -684,7 +684,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:4715-4721
+```rust lib/src/protocol/mux/h2.rs:4767-4773
 let events = stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -716,7 +716,7 @@ taken at the top of `H2WritePhase::Flush`'s post-flush tail
 (`ConnectionH2::poll_write_target`, `lib/src/protocol/mux/h2.rs`) and passes `stream.linked_token()` straight
 out of it:
 
-```rust lib/src/protocol/mux/h2.rs:3436-3437
+```rust lib/src/protocol/mux/h2.rs:3488-3489
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 ```
@@ -1069,7 +1069,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8618-8622
+```rust lib/src/protocol/mux/h2.rs:8671-8675
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1202,7 +1202,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8695-8699
+```rust lib/src/protocol/mux/h2.rs:8849-8853
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1676,7 +1676,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:8121
+```rust lib/src/protocol/mux/h2.rs:8174
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -1736,6 +1736,12 @@ H2 stream state, GOAWAY sequencing, and rustls buffering interact:
   frontend H2 connection. Once the final GOAWAY has been queued, all stream
   mappings are gone, and the peer has already hung up, the remaining rustls
   backlog is no longer deliverable and the session may close immediately.
+- While the peer is still there, a close after a final GOAWAY(NO_ERROR)
+  lingers instead (`H2Shell::linger_instead_of_closing`): `close_notify` is
+  flushed, the write side is shut down, and what the client still sends is
+  read and dropped until its EOF, 4 MiB, or `request_timeout`. Closing with
+  those frames unread made Linux reset the connection and discard response
+  bytes the client had not read yet. See `LIFECYCLE.md` §8.1.
 - `FrontRustls::peer_disconnected` suppresses new TLS writes after EOF/HUP so
   the close path does not keep retrying application writes to a dead peer.
 - HTTPS uses `shutdown(Write)` rather than `shutdown(Both)`. On Linux,
@@ -1904,7 +1910,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:6734-6736
+```rust lib/src/protocol/mux/h2.rs:6787-6789
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1912,7 +1918,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:6748-6754
+```rust lib/src/protocol/mux/h2.rs:6801-6807
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.

@@ -499,12 +499,14 @@ impl<Front: SocketHandler> Connection<Front> {
         }
     }
 
-    /// True while an H1 frontend drains the rest of a request after its
-    /// response, before it closes. H2 never lingers. See [`super::h1::Linger`].
+    /// True while a frontend drains what its client still sends before it
+    /// closes: an H1 connection after a response that completed before its
+    /// request, an H2 connection after its final GOAWAY. See
+    /// [`super::shared::Linger`].
     pub(super) fn is_lingering(&self) -> bool {
         match self {
             Connection::H1(c) => c.is_lingering(),
-            Connection::H2(_) => false,
+            Connection::H2(c) => c.core.is_lingering(),
         }
     }
 

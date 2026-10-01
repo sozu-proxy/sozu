@@ -1215,7 +1215,7 @@ pub struct UdpListenerSession {
     /// new-flow path where `OpenUpstream{flow}` immediately precedes the first
     /// `SendToBackend`.
     in_flight_flow: Option<FlowId>,
-    /// Shadow of the manager's flow table: normalised client key → `FlowId`.
+    /// Shadow of the manager's flow table: client source address → `FlowId`.
     /// Lets the shell resolve the owning flow for a `SendToBackend` on an
     /// established flow from the in-flight client source. Kept in lockstep with
     /// `OpenUpstream` / `CloseFlow`.
@@ -1293,19 +1293,6 @@ impl UdpListenerSession {
     /// because the buffer holds no live datagram across calls.
     fn resize_recv_buf(&mut self, max_rx: usize) {
         self.recv_buf.resize(max_rx.saturating_add(1).max(1), 0u8);
-    }
-
-    /// Normalise a client source the same way the active manager config keys
-    /// flows (4-tuple when `affinity_with_port`, else source-IP with port 0).
-    fn client_key(&self, src: SocketAddr) -> SocketAddr {
-        let with_port = self.manager.borrow().affinity_with_port();
-        if with_port {
-            src
-        } else {
-            let mut s = src;
-            s.set_port(0);
-            s
-        }
     }
 
     /// Drain every datagram waiting on the listener socket into the manager.
@@ -1528,8 +1515,7 @@ impl UdpListenerSession {
         let client = self.in_flight_client.unwrap_or(self.address);
         self.flow_endpoints.insert(flow, (client, Some(backend)));
         if let Some(src) = self.in_flight_client {
-            let key = self.client_key(src);
-            self.client_key_to_flow.insert(key, flow);
+            self.client_key_to_flow.insert(src, flow);
             // The shadow flow-table only ever holds live flows: the flow we just
             // mapped must have a live upstream token (it is the one we just
             // opened). Pairs the on-close drop in `on_close_flow`.
@@ -1548,11 +1534,10 @@ impl UdpListenerSession {
         // connected socket misroutes that backend's reply to the wrong client).
         //   * new flow:  `OpenUpstream{flow}` set `in_flight_flow` just before.
         //   * established flow: resolve via the in-flight client source through
-        //     the shell-side `client_key -> flow` shadow of the flow table.
+        //     the shell-side `client source -> flow` shadow of the flow table.
         let flow = self.in_flight_flow.or_else(|| {
             self.in_flight_client
-                .map(|src| self.client_key(src))
-                .and_then(|key| self.client_key_to_flow.get(&key).copied())
+                .and_then(|src| self.client_key_to_flow.get(&src).copied())
         });
         let token = flow.and_then(|f| self.flow_to_upstream.get(&f).copied());
         let Some(token) = token else {
@@ -1842,9 +1827,8 @@ impl UdpListenerSession {
             .remove(&flow)
             .unwrap_or((self.address, None));
         // Drop the shadow flow-table entry if it still points at this flow.
-        let key = self.client_key(client);
-        if self.client_key_to_flow.get(&key) == Some(&flow) {
-            self.client_key_to_flow.remove(&key);
+        if self.client_key_to_flow.get(&client) == Some(&flow) {
+            self.client_key_to_flow.remove(&client);
         }
         // The shadow flow-table must no longer map THIS flow id. A surviving
         // entry would misroute a later established-flow `SendToBackend` onto a
