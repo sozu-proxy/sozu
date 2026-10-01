@@ -1017,7 +1017,7 @@ or held move. The key is:
 
 | datapath | client key |
 |---|---|
-| UDP | the flow key, per `[clusters.<id>.udp] affinity_key` (see "UDP clusters") |
+| UDP | the client source IP, or source IP and port, per `[clusters.<id>.udp] affinity_key` (see "UDP clusters") |
 | TCP | the client source IP |
 | HTTP, HTTPS | the value of `affinity_header` or `affinity_cookie` when set and present in the request, else the client source IP |
 
@@ -1295,7 +1295,7 @@ The `[clusters.<id>.udp]` block:
 
 | Key                             | Default      | Description                                                                                                                                   |
 | ------------------------------- | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `affinity_key`                  | `SOURCE_IP`  | Flow affinity key for hash LBs. `SOURCE_IP` pins every port from one client to one backend; `SOURCE_IP_PORT` keys on the full source 2-tuple. |
+| `affinity_key`                  | `SOURCE_IP`  | Backend affinity key for hash LBs. `SOURCE_IP` pins every port from one client to one backend; `SOURCE_IP_PORT` keys on the full source 2-tuple. It only selects the backend: a flow is always one client source IP and port, with its own upstream socket, and replies return to that source. |
 | `responses`                     | `0`          | Expected replies per flow. A DNS flow sets `responses = 1` so the flow closes immediately after its single reply; `0` = unlimited (syslog-style fire-and-forget). |
 | `requests`                      | `0`          | Maximum client datagrams per flow before teardown. `0` = unlimited.                                                                           |
 | `send_proxy_protocol`           | `false`      | Prepend a PROXY protocol **v2** header (carrying the real client `SocketAddr`) to the backend. By default it is sent on the **first** datagram of the flow only. Backend PPv2-over-UDP parse support is not guaranteed by the spec — verify per backend. |

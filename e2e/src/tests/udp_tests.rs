@@ -49,11 +49,12 @@ fn udp_cluster<S: Into<String>>(cluster_id: S, lb: LoadBalancingAlgorithms) -> C
     }
 }
 
-/// A UDP cluster keyed on the 4-tuple (`SOURCE_IP_PORT`). On loopback every
-/// client shares the source IP `127.0.0.1`, so the default `SOURCE_IP` key
-/// would collapse all clients into a single flow. The 4-tuple key makes each
-/// distinct client *port* its own flow — the precondition for any
-/// distribution / per-flow-affinity assertion.
+/// A UDP cluster whose backend affinity is keyed on the source port too
+/// (`SOURCE_IP_PORT`). On loopback every client shares the source IP
+/// `127.0.0.1`, so under the default `SOURCE_IP` key a hash LB sends every
+/// client to one backend. Each client port is its own flow either way; the
+/// port-aware affinity key is what lets distinct ports hash to distinct
+/// backends — the precondition for any distribution assertion.
 fn udp_cluster_per_port<S: Into<String>>(cluster_id: S, lb: LoadBalancingAlgorithms) -> Cluster {
     Cluster {
         udp: Some(UdpClusterConfig {
@@ -82,6 +83,17 @@ fn setup_udp_test(
     cluster: Cluster,
     nb_backends: usize,
 ) -> (Worker, Vec<SocketAddr>, SocketAddr) {
+    setup_udp_test_with_idle_timeout(name, cluster, nb_backends, None)
+}
+
+/// [`setup_udp_test`] with the listener's `front_timeout` / `back_timeout`
+/// (the flow idle timeout, in seconds) set to `idle_timeout` when given.
+fn setup_udp_test_with_idle_timeout(
+    name: &str,
+    cluster: Cluster,
+    nb_backends: usize,
+    idle_timeout: Option<u32>,
+) -> (Worker, Vec<SocketAddr>, SocketAddr) {
     let front_address = create_local_address();
     // An empty config + empty listeners: no SCM descriptor is pre-attached, so
     // the UDP listener binds its own socket on activation. The `from_scm` field
@@ -93,6 +105,8 @@ fn setup_udp_test(
 
     worker.send_proxy_request_type(RequestType::AddUdpListener(
         ListenerBuilder::new_udp(front_address.into())
+            .with_front_timeout(idle_timeout)
+            .with_back_timeout(idle_timeout)
             .to_udp(None)
             .expect("could not build udp listener config"),
     ));
@@ -990,6 +1004,141 @@ fn test_udp_affinity_source_ip_port() {
             5,
             "UDP affinity SOURCE_IP_PORT: same 4-tuple sticks to one backend",
             try_udp_affinity_source_ip_port,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 13: client sockets sharing one source IP are distinct flows (#1732).
+//
+// Under the default `SOURCE_IP` affinity, a first client opens a flow and goes
+// away; two further sockets from the same IP then alternate datagrams. Each
+// one must get its own replies, and both must land on one backend: the
+// affinity key picks the backend, the client source address keys the flow.
+// =========================================================================
+
+fn try_udp_same_ip_clients_are_distinct_flows() -> State {
+    let (mut worker, backends, front) = setup_udp_test(
+        "UDP-SAME-IP",
+        udp_cluster(CLUSTER, LoadBalancingAlgorithms::Hrw),
+        2,
+    );
+    let bk0 = UdpBackend::bind("BK0", backends[0], 1).spawn();
+    let bk1 = UdpBackend::bind("BK1", backends[1], 1).spawn();
+
+    let first = UdpClient::new("C0", front);
+    let first_ok = first.round_trip(b"c0", RT).is_some();
+    drop(first);
+
+    let a = UdpClient::new("A", front);
+    let b = UdpClient::new("B", front);
+    let mut served_by = Vec::new();
+    let mut all_ok = first_ok;
+    for round in 0..3 {
+        for client in [&a, &b] {
+            let payload = format!("{}-{round}", client.name);
+            match client
+                .round_trip(payload.as_bytes(), RT)
+                .as_deref()
+                .and_then(strip_reply_tag)
+            {
+                Some((name, echoed)) if echoed == payload.as_bytes() => served_by.push(name),
+                other => {
+                    println!("{payload}: expected its own reply, got {other:?}");
+                    all_ok = false;
+                }
+            }
+        }
+    }
+    let one_backend = served_by.windows(2).all(|w| w[0] == w[1]);
+    println!("same IP: first_ok={first_ok} served_by={served_by:?}");
+
+    bk0.stop();
+    bk1.stop();
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    if all_ok && one_backend && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_udp_same_ip_clients_are_distinct_flows() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "UDP SOURCE_IP: each socket of one IP gets its own replies, on one backend",
+            try_udp_same_ip_clients_are_distinct_flows,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 14: an idle flow is torn down after the listener's idle timeout.
+//
+// With a 1 s idle timeout, a client that stays silent past it must find its
+// flow gone: its next datagram opens a new flow, which the backend sees as a
+// fresh PPv2 header (sent on the first datagram of a flow only) arriving from
+// a new upstream socket.
+// =========================================================================
+
+fn try_udp_idle_flow_is_torn_down() -> State {
+    let cluster = Cluster {
+        udp: Some(UdpClusterConfig {
+            send_proxy_protocol: Some(true),
+            ..Default::default()
+        }),
+        ..udp_cluster(CLUSTER, LoadBalancingAlgorithms::RoundRobin)
+    };
+    let (mut worker, backends, front) =
+        setup_udp_test_with_idle_timeout("UDP-IDLE", cluster, 1, Some(1));
+    let backend = UdpBackend::bind("BK0", backends[0], 1).spawn();
+
+    let client = UdpClient::new("CLIENT", front);
+    let before_ok = client.round_trip(b"before", RT).is_some();
+    // Stay silent well past the 1 s idle timeout.
+    std::thread::sleep(Duration::from_millis(2500));
+    let after_ok = client.round_trip(b"after", RT).is_some();
+    backend.wait_for_requests(2, RT);
+    let observed = backend.observed();
+
+    backend.stop();
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    let client_src = client.local_addr();
+    let new_flow = match observed.as_slice() {
+        [first, second] => {
+            println!(
+                "idle: peers {} -> {}, second PPv2 client {:?}",
+                first.peer, second.peer, second.proxy_protocol_client
+            );
+            second.proxy_protocol_client == Some(client_src) && first.peer != second.peer
+        }
+        other => {
+            println!("backend observed {} datagrams, expected 2", other.len());
+            false
+        }
+    };
+    println!("idle: before_ok={before_ok} after_ok={after_ok} new_flow={new_flow}");
+    if before_ok && after_ok && new_flow && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_udp_idle_flow_is_torn_down() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "UDP idle timeout: a silent flow is torn down and the next datagram opens a new one",
+            try_udp_idle_flow_is_torn_down,
         ),
         State::Success,
     );

@@ -3836,6 +3836,25 @@
 
 ### 🐛 Fixed
 
+- **`fix(udp)`: key UDP flows on the client source address, not on the affinity key
+  ([#1732](https://github.com/sozu-proxy/sozu/issues/1732)).** Under the default
+  `affinity_key = SOURCE_IP`, `FlowKey::from_src` zeroed the source port, so every socket of one
+  client IP shared one flow and one connected upstream socket, and every backend reply went to the
+  port of the socket that opened the flow; once that socket was gone, no client of that IP got a
+  reply until the flow expired. Behind NAT, one flow served every client of the address. The flow
+  table is now keyed on the client source IP and port whatever the affinity key, as the design of
+  [#1273](https://github.com/sozu-proxy/sozu/issues/1273) states ("virtual 4-tuple flow sessions",
+  one connected socket per flow); `affinity_key` only feeds the backend-selection hash, so the
+  sockets of one IP still land on one backend under `HRW` / `MAGLEV`. Behaviour change: a client
+  IP now holds one flow, one upstream socket and one `max_flows` slot per source port instead of
+  one in total. `FlowKey::from_src` loses its `with_port` argument and
+  `UdpManager::affinity_with_port` is removed. Seen red first:
+  `same_ip_clients_get_distinct_flows_and_their_own_replies` (`manager.rs`) and
+  `test_udp_same_ip_clients_are_distinct_flows` (`e2e/src/tests/udp_tests.rs`). The idle
+  eviction reported in the same issue does not reproduce on this branch: it is the lost wakeup
+  fixed by "an idle UDP flow was never evicted after an early timer-wheel fire" below, which no
+  release carries yet; `test_udp_idle_flow_is_torn_down` is the end-to-end test that fix lacked.
+
 - **`fix(h1)`: forward a final response read together with a 1xx
   ([#1759](https://github.com/sozu-proxy/sozu/issues/1759)).** When an HTTP/1.1 backend wrote an
   interim response and what follows it (another 1xx, the final response) at once, an HTTP/1.1

@@ -29,8 +29,8 @@ use crate::protocol::udp::{
 };
 
 /// Extracts a [`FlowKey`] from an admitted client datagram. The default
-/// [`SourceTupleExtractor`] keys on the real client source address (2-tuple
-/// source-IP or 4-tuple source-IP+port per cluster config). The trait is the
+/// [`SourceTupleExtractor`] keys on the real client source address (source IP
+/// and port, whatever the cluster's affinity key). The trait is the
 /// only seam for alternative keying (e.g. a QUIC-CID extractor, a non-goal);
 /// the 4-tuple impl is the only one in scope.
 pub trait FlowKeyExtractor {
@@ -41,17 +41,18 @@ pub trait FlowKeyExtractor {
 }
 
 /// The in-scope flow-key extractor: keys on the real client source address,
-/// honouring the cluster's `affinity_with_port` knob (4-tuple vs 2-tuple).
+/// IP and port. The cluster's `affinity_with_port` knob is not read here: it
+/// shapes the backend-selection hash only ([`UdpManager`]'s `affinity_hash`).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SourceTupleExtractor;
 
 impl FlowKeyExtractor for SourceTupleExtractor {
-    fn flow_key(&self, src: SocketAddr, payload: &[u8], cfg: &ClusterConfig) -> Option<FlowKey> {
+    fn flow_key(&self, src: SocketAddr, payload: &[u8], _cfg: &ClusterConfig) -> Option<FlowKey> {
         // "Silence is a virtue": an empty datagram is not a valid flow trigger.
         if payload.is_empty() {
             return None;
         }
-        Some(FlowKey::from_src(src, cfg.affinity_with_port))
+        Some(FlowKey::from_src(src))
     }
 }
 
@@ -96,7 +97,7 @@ pub struct UdpManager<E: FlowKeyExtractor = SourceTupleExtractor> {
 }
 
 impl UdpManager<SourceTupleExtractor> {
-    /// Construct a manager with the default 4-tuple/2-tuple source extractor.
+    /// Construct a manager with the default client source-address extractor.
     pub fn new(
         cluster: ClusterConfig,
         max_flows: usize,
@@ -153,13 +154,6 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
     /// Whether the listener is draining.
     pub fn is_draining(&self) -> bool {
         self.draining
-    }
-
-    /// Whether the active cluster config keys flows on the 4-tuple (source
-    /// IP + port) rather than source IP only. The shell needs this to mirror
-    /// the manager's flow keying for its `SendToBackend` socket resolution.
-    pub fn affinity_with_port(&self) -> bool {
-        self.cluster.affinity_with_port
     }
 
     /// Borrow a flow by id (for the shell's access log on close).
@@ -630,18 +624,11 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
             return;
         }
         flow.set_phase(FlowPhase::Closing);
-        let key = FlowKey::from_src(flow.client, self.cluster.affinity_with_port);
+        let key = FlowKey::from_src(flow.client);
         // Remove the table entry only if it still points at this flow; a
         // recreated flow under the same key must not be unmapped.
         if self.table.get(&key) == Some(&flow_id) {
             self.table.remove(&key);
-        } else {
-            // The flow was keyed when admitted; recompute via its own config to
-            // be robust to a mid-flow affinity change.
-            let own_key = FlowKey::from_src(flow.client, flow.config.affinity_with_port);
-            if self.table.get(&own_key) == Some(&flow_id) {
-                self.table.remove(&own_key);
-            }
         }
         self.flows.remove(flow_id);
         self.outputs
@@ -1029,6 +1016,86 @@ mod tests {
             .expect("the admission datagram must be forwarded in the same call");
         assert_eq!(sent.dst, backend_addr(1));
         assert_eq!(sent.payload, b"query");
+    }
+
+    /// A backend source that records the affinity key of every selection, so a
+    /// test can check which client key reached the load balancer.
+    struct KeyRecordingBackends {
+        keys: Vec<Option<u64>>,
+    }
+
+    impl BackendSource for KeyRecordingBackends {
+        fn select(
+            &mut self,
+            _cluster: &str,
+            key: Option<u64>,
+            _now: Instant,
+        ) -> Option<(String, SocketAddr)> {
+            self.keys.push(key);
+            Some(("b1".to_owned(), backend_addr(1)))
+        }
+    }
+
+    /// Two client sockets on one source IP are two flows even under the
+    /// default `SOURCE_IP` affinity (#1732). The affinity key only feeds
+    /// backend selection: both flows present the same key to the load
+    /// balancer, so a hash LB pins them to one backend, but each flow keeps its
+    /// own upstream socket and each backend reply goes back to the client that
+    /// flow belongs to, not to whichever socket of that IP spoke first.
+    #[test]
+    fn same_ip_clients_get_distinct_flows_and_their_own_replies() {
+        let cfg = cluster("udp");
+        assert!(!cfg.affinity_with_port, "the default affinity is SOURCE_IP");
+        let mut mgr = UdpManager::new(cfg, 16, 65535, 7);
+        let now = Instant::now();
+        let mut backends = KeyRecordingBackends { keys: Vec::new() };
+        let a = client(1, 50376);
+        let b = client(1, 50644);
+
+        let mut flows = Vec::new();
+        for src in [a, b] {
+            mgr.handle_input(
+                ManagerInput::ClientDatagram {
+                    src,
+                    payload: b"hi",
+                    backends: &mut backends,
+                },
+                now,
+            );
+            let opened = drain(&mut mgr)
+                .into_iter()
+                .find_map(|o| match o {
+                    Output::OpenUpstream { flow, .. } => Some(flow),
+                    _ => None,
+                })
+                .expect("each client socket must open its own upstream");
+            flows.push(opened);
+        }
+        assert_eq!(mgr.flow_count(), 2, "one flow per client source address");
+        assert_ne!(flows[0], flows[1]);
+        assert_eq!(backends.keys.len(), 2);
+        assert_eq!(
+            backends.keys[0], backends.keys[1],
+            "SOURCE_IP affinity must present one key for every port of an IP"
+        );
+
+        for (flow, src) in [(flows[1], b), (flows[0], a)] {
+            mgr.handle_input(
+                ManagerInput::BackendDatagram {
+                    flow,
+                    payload: b"reply",
+                },
+                now,
+            );
+            let dst = drain(&mut mgr)
+                .into_iter()
+                .find_map(|o| match o {
+                    Output::SendToClient(t) => Some(t.dst),
+                    _ => None,
+                })
+                .expect("a backend reply must be returned");
+            assert_eq!(dst, src, "the reply must go to the flow's own client");
+        }
     }
 
     #[test]

@@ -49,28 +49,23 @@ pub type FlowId = usize;
 pub type BackendId = String;
 
 /// The virtual flow key extracted from a client datagram. The default
-/// [`SourceTupleExtractor`] keys on the real (pre-NAT) client source address;
-/// `with_port` distinguishes the 2-tuple (source IP only) from the 4-tuple
-/// (source IP + port). Other extractors may key differently — the trait is the
-/// only seam — but the 4-tuple impl is the only one in scope.
+/// [`SourceTupleExtractor`] keys on the real (pre-NAT) client source address,
+/// IP **and** port, whatever the cluster's affinity key: one client socket is
+/// one flow with one connected upstream socket, so every backend reply returns
+/// to the socket it answers. `affinity_key` only feeds backend selection (the
+/// affinity hash), where `SOURCE_IP` makes every port of one IP land on the
+/// same backend (#1732). Other extractors may key differently — the trait is
+/// the only seam — but the 4-tuple impl is the only one in scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FlowKey {
-    /// The client source address. When the extractor keys on source IP only,
-    /// the port is normalised to `0`.
+    /// The client source address (IP and port).
     pub src: SocketAddr,
 }
 
 impl FlowKey {
-    /// Build a key from a client source address, keeping the port when
-    /// `with_port` is set, normalising it to `0` otherwise.
-    pub fn from_src(src: SocketAddr, with_port: bool) -> Self {
-        if with_port {
-            FlowKey { src }
-        } else {
-            let mut src = src;
-            src.set_port(0);
-            FlowKey { src }
-        }
+    /// Build a key from a client source address.
+    pub fn from_src(src: SocketAddr) -> Self {
+        FlowKey { src }
     }
 }
 
@@ -263,8 +258,9 @@ pub enum MetricEvent {
 pub struct ClusterConfig {
     /// Cluster the listener routes to.
     pub cluster: ClusterId,
-    /// Key on `src_ip + src_port` (true) vs `src_ip` only (false). Maps the
-    /// `UdpAffinityKey` proto enum.
+    /// Hash `src_ip + src_port` (true) vs `src_ip` only (false) into the
+    /// backend-selection affinity key. Maps the `UdpAffinityKey` proto enum.
+    /// Flows are always keyed on the full source address ([`FlowKey`]).
     pub affinity_with_port: bool,
     /// Expected replies per flow before close. `0` = unlimited (DNS = 1).
     pub responses: u32,
