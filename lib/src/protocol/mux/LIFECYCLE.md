@@ -1460,7 +1460,15 @@ kept in lock-step:
   the id is already present;
   `H2ControlTx::enqueue_rst` short-circuits on that branch so its queue and
   its lifetime counter stay consistent even when a cascading error path
-  re-enters the reset flow for the same stream.
+  re-enters the reset flow for the same stream. When `H2StreamTable::remove`
+  evicts an id from `rst_sent`, it keeps it among the last
+  `RESET_STREAMS_REMEMBERED` reset streams, so `H2StreamTable::reset_by_us`
+  still recognises it and the read side ignores the frames the peer sent
+  before reading the reset (RFC 9113 §5.1) instead of answering
+  GOAWAY(STREAM_CLOSED) or a second RST_STREAM (sozu-proxy/sozu#1783). Pinned
+  by `frames_on_a_backend_stream_sozu_reset_are_ignored` (`h2.rs`) and
+  `reset_by_us_outlives_eviction_for_the_last_streams_only`
+  (`h2_stream_table.rs`).
 - **MadeYouReset queued cap** via `H2ControlTx`'s lifetime counter (capped at
   `MAX_PENDING_RST_STREAMS = 200`, `h2_control_tx.rs`). Each freshly queued RST
   bumps the counter, and neither a drain nor a queue clear ever rewinds it —

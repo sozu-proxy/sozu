@@ -3836,6 +3836,20 @@
 
 ### 🐛 Fixed
 
+- **`fix(mux-h2)`: ignore frames on a stream Sōzu reset instead of closing the connection
+  ([#1783](https://github.com/sozu-proxy/sozu/issues/1783)).** After Sōzu sent RST_STREAM on a
+  stream, a frame the peer had sent before reading the reset was treated as a protocol error: a
+  HEADERS frame was answered GOAWAY(STREAM_CLOSED), ending every other stream of the
+  connection, and a DATA frame a second RST_STREAM(STREAM_CLOSED). RFC 9113 §5.1 requires such
+  frames to be ignored. `H2StreamTable::remove` (`lib/src/protocol/mux/h2_stream_table.rs`) now
+  remembers the last 64 reset streams it evicts, and `ConnectionH2::handle_read`
+  (`lib/src/protocol/mux/h2.rs`) ignores the frames on a stream `H2StreamTable::reset_by_us`
+  recognises: a HEADERS block is still decoded to keep the HPACK dynamic table in sync (§4.3), a
+  DATA payload is only credited to connection flow control (§6.9), and each counts as a glitch.
+  Documented in `lib/src/protocol/mux/LIFECYCLE.md` and `doc/h2_mux_internals.md`. Covered by
+  `frames_on_a_backend_stream_sozu_reset_are_ignored` (`h2.rs`) and
+  `reset_by_us_outlives_eviction_for_the_last_streams_only` (`h2_stream_table.rs`).
+
 - **`fix(h1)`: handle every 1xx other than 101 as an interim response
   ([#1733](https://github.com/sozu-proxy/sozu/issues/1733)).** On an HTTP/1.1 frontend,
   `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`) kept the stream linked after a 100 or a

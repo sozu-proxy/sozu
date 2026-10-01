@@ -1992,6 +1992,36 @@ impl ConnectionH2 {
                     || matches!(header.frame_type, FrameType::Unknown(_))
                 {
                     H2StreamId::Zero
+                } else if self.stream_table.reset_by_us(stream_id)
+                    && !matches!(
+                        header.frame_type,
+                        FrameType::WindowUpdate | FrameType::Priority | FrameType::RstStream
+                    )
+                {
+                    // RFC 9113 §5.1: after sending RST_STREAM, an endpoint
+                    // MUST ignore frames it receives on that stream, which
+                    // the peer may have sent before reading the reset. A
+                    // HEADERS block is still decoded so the HPACK dynamic
+                    // table stays in sync (§4.3); a DATA payload is read
+                    // through stream 0, where `handle_data_frame` credits
+                    // connection flow control (§6.9) and drops it.
+                    debug!(
+                        "{} Ignoring {:?} on stream {} reset by this endpoint",
+                        log_context!(self),
+                        header.frame_type,
+                        stream_id
+                    );
+                    self.flood_detector.record_glitch();
+                    check_flood_or_return!(self);
+                    if header.frame_type == FrameType::Headers {
+                        return self.discard_field_block(
+                            header.payload_len,
+                            DiscardedFieldBlock::New {
+                                flags: header.flags,
+                            },
+                        );
+                    }
+                    H2StreamId::Zero
                 } else if let Some(global_stream_id) = self.stream_table.streams().get(&stream_id) {
                     let allowed_on_half_closed = header.frame_type == FrameType::WindowUpdate
                         || header.frame_type == FrameType::Priority
@@ -5198,11 +5228,24 @@ impl ConnectionH2 {
         if let Some(result) = self.enqueue_rst(stream_id, error) {
             return result;
         }
+        let result = self.discard_field_block(payload_len, discarded);
+        self.record_refusal_for_backpressure();
+        result
+    }
+
+    /// Read the `payload_len` bytes of a HEADERS frame whose stream is
+    /// dropped through `H2State::Discard`, which decodes its field block
+    /// (and any CONTINUATION after it) only to keep the HPACK dynamic table
+    /// in sync (RFC 9113 §4.3), then resumes normal reading.
+    fn discard_field_block(
+        &mut self,
+        payload_len: u32,
+        discarded: DiscardedFieldBlock,
+    ) -> MuxResult {
         self.state = H2State::Discard;
         self.stream_table
             .set_expect_read(Some((H2StreamId::Zero, payload_len as usize)));
         self.discarded_field_block = Some(discarded);
-        self.record_refusal_for_backpressure();
         MuxResult::Continue
     }
 
@@ -6025,9 +6068,18 @@ impl ConnectionH2 {
             self.flood_detector.record_empty_data_frame();
             check_flood_or_return!(self);
         }
-        let Some(global_stream_id) = self.stream_table.get(data.stream_id) else {
+        // A stream this endpoint reset takes the same path as an unknown one:
+        // its DATA is ignored (RFC 9113 §5.1) once connection flow control
+        // is credited.
+        let tracked = if self.stream_table.reset_by_us(data.stream_id) {
+            None
+        } else {
+            self.stream_table.get(data.stream_id)
+        };
+        let Some(global_stream_id) = tracked else {
             // The stream was terminated while data was expected,
-            // probably due to automatic answer for invalid/unauthorized access.
+            // probably due to automatic answer for invalid/unauthorized access,
+            // or reset by this endpoint.
             // RFC 9113 §6.9: we MUST still account for the DATA payload in
             // connection-level flow control using the full wire length
             // (including pad-length byte and padding), otherwise the window
@@ -15772,6 +15824,128 @@ mod tests {
         assert!(
             frames.iter().any(|(kind, _, id, _)| *kind == 1 && *id == 1),
             "the request linked during the handshake must go out, got {frames:?}"
+        );
+    }
+
+    /// RFC 9113 §5.1: after sozu resets a backend stream, the backend may
+    /// still send frames it queued before reading the RST_STREAM, and sozu
+    /// MUST ignore them. Here a response framed by `content-length: 3`
+    /// carries 5 bytes of DATA, so sozu resets stream 1 (§8.1.1); the
+    /// backend then sends a trailer HEADERS frame and another DATA frame on
+    /// it. The trailer block adds `x-dyn: one` to the HPACK dynamic table,
+    /// and the response on stream 3 refers to that entry, so it parses only
+    /// if the ignored block was still decoded (§4.3).
+    ///
+    /// TO SEE THIS RED: in [`ConnectionH2::handle_read`], drop the
+    /// reset-by-us check of the closed-stream branch: the trailer HEADERS is
+    /// answered GOAWAY(STREAM_CLOSED).
+    #[test]
+    fn frames_on_a_backend_stream_sozu_reset_are_ignored() {
+        use std::io::Write;
+
+        let LinkedBackend {
+            _pool,
+            mut connection,
+            mut peer,
+            mut context,
+            mut router,
+            gid,
+        } = backend_with_a_linked_stream(
+            H2State::Header,
+            BackendStatus::Connected,
+            Ready::READABLE | Ready::HUP | Ready::ERROR,
+        );
+        queue_request(&mut context, gid);
+        // Open on the client side, as a stream the router linked; `Link`
+        // carries no frontend token for `reset_stream` to end.
+        context.streams[gid].state = StreamState::Link;
+        let request = drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+        assert!(
+            peer_frames(&request)
+                .expect("whole frames")
+                .iter()
+                .any(|(kind, _, id, _)| *kind == 1 && *id == 1),
+            "premise: the request went out on stream 1, got {request:?}"
+        );
+
+        // :status 200 (static index 8), then `content-length: 3` as a
+        // literal without indexing.
+        let mut head = vec![0x88, 0x00, 14];
+        head.extend_from_slice(b"content-length");
+        head.extend_from_slice(&[1, b'3']);
+        let mut wire = orphan_frame(1, 0x4, 1, head.len() as u32, &head);
+        wire.extend(orphan_frame(0, 0, 1, 5, b"hello"));
+        peer.write_all(&wire).expect("loopback write must complete");
+        let reset = drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+        let reset = peer_frames(&reset).expect("whole frames");
+        assert!(
+            reset
+                .iter()
+                .any(|(kind, _, id, payload)| *kind == 3 && *id == 1 && payload == &[0, 0, 0, 1]),
+            "premise: stream 1 is reset with PROTOCOL_ERROR, got {reset:?}"
+        );
+
+        // A trailer block adding `x-dyn: one` to the dynamic table (literal
+        // with incremental indexing), then more DATA, both on stream 1.
+        let mut trailer = vec![0x40, 5];
+        trailer.extend_from_slice(b"x-dyn");
+        trailer.extend_from_slice(&[3]);
+        trailer.extend_from_slice(b"one");
+        let mut wire = orphan_frame(1, 0x4 | 0x1, 1, trailer.len() as u32, &trailer);
+        wire.extend(orphan_frame(0, 0x1, 1, 2, b"zz"));
+        peer.write_all(&wire).expect("loopback write must complete");
+        let after = drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+        let after = peer_frames(&after).expect("whole frames");
+        assert!(
+            !after.iter().any(|(kind, _, _, _)| *kind == 7 || *kind == 3),
+            "frames on the reset stream are ignored: no GOAWAY, no RST_STREAM, got {after:?}"
+        );
+        assert!(
+            matches!(connection.core.state, H2State::Header),
+            "the shared connection stays up, got {:?}",
+            connection.core.state
+        );
+
+        // A second stream, answered with `:status 200` and the dynamic entry
+        // the ignored trailer block added (index 62).
+        let second = context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("test context must create a stream");
+        assert!(
+            connection.start_stream(second, &mut context),
+            "the backend connection accepts a second stream"
+        );
+        queue_request(&mut context, second);
+        context.streams[second].state = StreamState::Link;
+        let request = drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+        assert!(
+            peer_frames(&request)
+                .expect("whole frames")
+                .iter()
+                .any(|(kind, _, id, _)| *kind == 1 && *id == 3),
+            "premise: the second request went out on stream 3, got {request:?}"
+        );
+        peer.write_all(&orphan_frame(1, 0x4 | 0x1, 3, 2, &[0x88, 0xbe]))
+            .expect("loopback write must complete");
+        let last = drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+        let last = peer_frames(&last).expect("whole frames");
+        assert!(
+            !last.iter().any(|(kind, _, _, _)| *kind == 7),
+            "the second response decodes against the same dynamic table, got {last:?}"
+        );
+        assert!(
+            matches!(connection.core.state, H2State::Header),
+            "the shared connection stays up after the second response, got {:?}",
+            connection.core.state
+        );
+        let buffer = context.streams[second].back.storage.buffer();
+        let has_dynamic_field = context.streams[second].back.blocks.iter().any(|block| {
+            matches!(block, kawa::Block::Header(kawa::Pair { key, val })
+                if key.data(buffer) == b"x-dyn" && val.data(buffer) == b"one")
+        });
+        assert!(
+            has_dynamic_field,
+            "the second response carries the field of the dynamic entry"
         );
     }
 

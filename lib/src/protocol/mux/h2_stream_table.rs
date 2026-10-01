@@ -113,11 +113,17 @@
 //! concern either.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashSet, VecDeque},
     time::{Duration, Instant},
 };
 
 use super::{GlobalStreamId, StreamId, h2::H2StreamId};
+
+/// How many reset streams, once evicted, [`H2StreamTable::reset_by_us`]
+/// still recognises (RFC 9113 §5.1). Frames the peer queued before reading
+/// a RST_STREAM arrive within a round trip, while a connection retires far
+/// fewer streams than this in that time.
+const RESET_STREAMS_REMEMBERED: usize = 64;
 
 /// H2 wire-level stream-slot bookkeeping: see the module doc.
 pub(super) struct H2StreamTable {
@@ -132,6 +138,13 @@ pub(super) struct H2StreamTable {
     /// RFC 9113 §6.8: tracks stream IDs for which RST_STREAM has already been
     /// sent, preventing duplicate RST_STREAM frames on the wire.
     rst_sent: HashSet<StreamId>,
+    /// RFC 9113 §5.1: the most recent streams evicted from `rst_sent`, at
+    /// most [`RESET_STREAMS_REMEMBERED`], oldest first. Frames the peer sent
+    /// before it read our RST_STREAM may still arrive on them and are
+    /// ignored rather than treated as a protocol error; §5.1 lets an
+    /// endpoint limit how long it does so, and the bound keeps a peer that
+    /// provokes resets from growing this set.
+    reset_evicted: VecDeque<StreamId>,
     /// Per-stream wall-clock timestamp of last meaningful activity (DATA or
     /// HEADERS frame receipt) — the bidirectional-silence (slow-multiplex)
     /// reap guard. `BTreeMap` for deterministic reap order — see the module
@@ -187,6 +200,7 @@ impl H2StreamTable {
             expect_read,
             expect_write: None,
             rst_sent: HashSet::new(),
+            reset_evicted: VecDeque::new(),
             stream_last_activity_at: BTreeMap::new(),
             stream_fc_stalled_since: BTreeMap::new(),
             stream_fc_stalled_progress: BTreeMap::new(),
@@ -284,7 +298,12 @@ impl H2StreamTable {
         } else {
             RemoveOutcome::NotPresent
         };
-        self.rst_sent.remove(&stream_id);
+        if self.rst_sent.remove(&stream_id) {
+            if self.reset_evicted.len() == RESET_STREAMS_REMEMBERED {
+                self.reset_evicted.pop_front();
+            }
+            self.reset_evicted.push_back(stream_id);
+        }
         self.stream_last_activity_at.remove(&stream_id);
         self.stream_fc_stalled_since.remove(&stream_id);
         self.stream_fc_stalled_progress.remove(&stream_id);
@@ -360,6 +379,13 @@ impl H2StreamTable {
 
     pub(super) fn rst_sent_contains(&self, stream_id: StreamId) -> bool {
         self.rst_sent.contains(&stream_id)
+    }
+
+    /// Whether this endpoint sent RST_STREAM on `stream_id`, still tracked
+    /// or among the last [`RESET_STREAMS_REMEMBERED`] evicted: RFC 9113 §5.1
+    /// has the frames that then arrive on it ignored.
+    pub(super) fn reset_by_us(&self, stream_id: StreamId) -> bool {
+        self.rst_sent.contains(&stream_id) || self.reset_evicted.contains(&stream_id)
     }
 
     /// Narrow escape hatch for the two sites that need raw `&mut
@@ -548,6 +574,33 @@ mod tests {
         assert!(!table.stream_last_activity_at().contains_key(&1));
         assert_eq!(table.expect_write(), None);
         assert_eq!(table.expect_read(), None);
+    }
+
+    /// RFC 9113 §5.1: a stream reset by this endpoint is still recognised
+    /// once evicted, so the frames the peer sent before reading the reset
+    /// are ignored, but only the last `RESET_STREAMS_REMEMBERED` of them; a
+    /// stream evicted without a reset is not recognised at all.
+    #[test]
+    fn reset_by_us_outlives_eviction_for_the_last_streams_only() {
+        let now = Instant::now();
+        let mut table = H2StreamTable::new(None);
+        table.register(1, 0, now);
+        table.remove(1, 0);
+        assert!(!table.reset_by_us(1), "a stream closed without a reset");
+        let first = 3;
+        let count = RESET_STREAMS_REMEMBERED as u32 + 1;
+        for index in 0..count {
+            let stream_id = first + 2 * index;
+            table.register(stream_id, 0, now);
+            table.rst_sent_mut().insert(stream_id);
+            assert!(table.reset_by_us(stream_id), "a tracked reset stream");
+            table.remove(stream_id, 0);
+        }
+        assert!(!table.reset_by_us(first), "the oldest reset is forgotten");
+        assert!(
+            (1..count).all(|index| table.reset_by_us(first + 2 * index)),
+            "the last RESET_STREAMS_REMEMBERED resets are remembered"
+        );
     }
 
     #[test]
