@@ -1229,6 +1229,10 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
     /// Every value read under the borrow below is re-read on each call for
     /// that reason. The two that are NOT read here — [`Self::protocol`] and
     /// the TLS fields — are connection-scoped by nature and captured once.
+    ///
+    /// `window` seeds [`Stream::front_window`], the stream's send window on
+    /// the frontend connection. The backend leg's window is the backend's to
+    /// size: `ConnectionH2::start_stream` sets [`Stream::back_window`].
     pub fn create_stream(&mut self, request_id: Ulid, window: u32) -> Option<GlobalStreamId> {
         let (http_context, answers) = {
             let listener = self.listener.borrow();
@@ -1302,7 +1306,8 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             // an aggregate that only drifts up never underflows, so nothing
             // logs and nothing saturates.
             stream.request_counted = false;
-            stream.window = i32::try_from(window).unwrap_or(i32::MAX);
+            stream.front_window = i32::try_from(window).unwrap_or(i32::MAX);
+            stream.back_window = i32::try_from(h2::DEFAULT_INITIAL_WINDOW_SIZE).unwrap_or(i32::MAX);
             stream.context = http_context;
             // A recycled slot takes the fresh capture too: the request that
             // released it ran on whatever the listener held then, and the one
