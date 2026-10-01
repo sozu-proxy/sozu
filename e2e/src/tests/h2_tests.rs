@@ -6601,13 +6601,10 @@ fn try_h2_graceful_shutdown_completes_large_transfer() -> State {
     )));
     worker.read_to_last();
 
-    // Backend that delays 1s before responding with a 512KB body
+    // Held, not merely slow: the 512KB response must still be owed when
+    // `soft_stop` is issued, and that is an ordering, not a duration.
     let body_size = 512 * 1024;
-    let mut delayed_backend = DelayedH2Backend::start(
-        back_address,
-        Duration::from_millis(500),
-        "X".repeat(body_size),
-    );
+    let mut delayed_backend = DelayedH2Backend::start_held(back_address, "X".repeat(body_size));
 
     let client = build_h2_client();
     let uri: hyper::Uri = format!("https://localhost:{front_port}/api/large")
@@ -6618,9 +6615,26 @@ fn try_h2_graceful_shutdown_completes_large_transfer() -> State {
     let client_clone = client.clone();
     let request_handle = thread::spawn(move || resolve_request(&client_clone, uri));
 
-    // Give time for the request to reach the backend, then trigger soft_stop
-    thread::sleep(Duration::from_millis(200));
+    // The transfer is only in flight once the request has reached the
+    // backend. A fixed sleep here let `soft_stop` land first on a loaded
+    // machine: sozu then rightly refused the not-yet-opened connection or
+    // stream, and the test failed without ever exercising the drain.
+    let wait_start = Instant::now();
+    while delayed_backend.get_requests_received() == 0 {
+        if wait_start.elapsed() > Duration::from_secs(5) {
+            println!("H2 graceful shutdown - request never reached backend");
+            delayed_backend.release();
+            let _ = request_handle.join();
+            worker.soft_stop();
+            let _ = worker.wait_for_server_stop();
+            delayed_backend.stop();
+            return State::Fail;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
     worker.soft_stop();
+    delayed_backend.release();
 
     // Wait for the request to complete
     let result = request_handle.join().expect("request thread panicked");
