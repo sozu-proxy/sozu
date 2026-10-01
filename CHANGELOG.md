@@ -6924,16 +6924,19 @@
   rows of `e2e/src/tests/h1_security_tests.rs`. Documented in `doc/configure.md` and
   `lib/src/protocol/kawa_h1/LIFECYCLE.md`.
 
-- **`fix(mux-h1)`: H2→H1: write nothing after the head of a response without a body to an H1
-  client ([#1761](https://github.com/sozu-proxy/sozu/issues/1761)).** A response to HEAD, a 204
-  or a 304 ends with its header section on HTTP/1.1 (RFC 9112 §6.3), but when an H2 backend sent
+- **`fix(mux-h1)`: H2→H1: write no last chunk or trailer section after the head of a response
+  without a body to an H1 client ([#1761](https://github.com/sozu-proxy/sozu/issues/1761)).**
+  A response to HEAD, a 204 or a 304 ends with its header section on HTTP/1.1 (RFC 9112 §6.3),
+  but when an H2 backend sent
   its HEADERS without END_STREAM and without `content-length`, the response was framed as
   chunked and the end of its stream, a trailer HEADERS frame or an empty DATA frame, was written
   as a last chunk `0\r\n`, the trailer fields and an empty line after the head, which a
   keep-alive client reads as the start of the next response. `ConnectionH1::writable`
   (`lib/src/protocol/mux/h1.rs`) now clears the end-of-body framing and drops the trailer block
-  of such a response (RFC 9110 §6.5.1) before writing, and counts a dropped block in the new
-  `h2.trailers_dropped_no_body`, documented in `doc/configure.md`. Documented in
+  of such a response (RFC 9110 §6.5.1) before writing, so a stream ended by a trailer HEADERS
+  frame or an empty DATA frame writes nothing after the head, and counts a dropped block in the
+  new `h2.trailers_dropped_no_body`, documented in `doc/configure.md`. DATA carrying a payload
+  on such a response is still written after the head, a known gap. Documented in
   `lib/src/protocol/mux/LIFECYCLE.md` §8.4. Covered by unit tests in `h1.rs` and by
   `test_h2_bodiless_response_trailers_keep_h1_client_framing`
   (`e2e/src/tests/h2_security_header_injection.rs`).
