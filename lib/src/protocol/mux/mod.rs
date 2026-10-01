@@ -3105,12 +3105,22 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             return SessionResult::Upgrade;
                         }
                     }
-                    // Cross-readiness: frontend wrote → wake parked backends.
-                    // If any backend resumes, invalidate the stale readiness
-                    // flag so the inner loop continues instead of breaking.
+                    // Cross-readiness: the frontend write can hand work back to
+                    // a backend — a parked one resumes once its peer drained
+                    // buffer space, and forwarding an interim 1xx re-arms the
+                    // backend read so the response bytes already buffered
+                    // behind it get parsed (`ConnectionH1::writable`'s interim
+                    // arms, `ConnectionH2::handle_1xx_reset`). The
+                    // `all_backends_readiness_are_empty` flag was recorded
+                    // before this write, so it is refreshed from every
+                    // backend's readiness now: a stale `true` would exit the
+                    // loop with a backend armed and no socket event left to
+                    // bring it back.
                     let context = &mut self.context;
                     for backend in self.router.backends.values_mut() {
-                        if backend.try_resume_reading(context) {
+                        if backend.try_resume_reading(context)
+                            || !backend.readiness().filter_interest().is_empty()
+                        {
                             all_backends_readiness_are_empty = false;
                         }
                     }
