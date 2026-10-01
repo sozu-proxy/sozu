@@ -8639,6 +8639,11 @@ impl<Front: SocketHandler> H2Shell<Front> {
         L: ListenerHandler + L7ListenerHandler,
     {
         if self.core.is_lingering() {
+            // Entry point: adopt the mux's snapshot, as `poll_read_target`
+            // would. `graceful_shutdown_deadline_elapsed` reads it, and a
+            // snapshot frozen at the linger's start would keep a soft stop's
+            // budget from ever elapsing.
+            self.core.adopt_now(context.now);
             return self.drain_linger(context.now);
         }
         let result = self.readable_inner(context, endpoint);
@@ -8812,6 +8817,8 @@ impl<Front: SocketHandler> H2Shell<Front> {
         L: ListenerHandler + L7ListenerHandler,
     {
         if self.core.is_lingering() {
+            // Entry point: adopt the mux's snapshot, as `writable_inner` does.
+            self.core.adopt_now(context.now);
             // The write side is shut down: nothing is left to write.
             self.core.readiness.interest.remove(Ready::WRITABLE);
             self.core.readiness.event.remove(Ready::WRITABLE);

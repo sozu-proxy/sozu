@@ -3865,8 +3865,13 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             return true;
         }
         if self.frontend.is_lingering() {
-            // Bounded by its own deadline, which the timer still enforces,
-            // and for H2 by the graceful-shutdown budget just above.
+            // Bounded by its own deadline (`request_timeout` from the
+            // linger's start), which the timer enforces. For H2 also by the
+            // graceful-shutdown budget just above, once that budget is armed:
+            // `graceful_goaway` arms it when this soft stop sends the first
+            // GOAWAY, and the lingering passes keep the connection's clock
+            // fresh so it can elapse. A drain the client's own GOAWAY started
+            // never armed it, so such a linger runs to its own deadline.
             return false;
         }
         if matches!(self.frontend, Connection::H2(_)) && self.frontend.is_draining() {
@@ -4313,6 +4318,68 @@ mod tests {
         assert!(
             matches!(after_client_close, MuxResult::CloseSession),
             "the client's EOF ends the drain, got {after_client_close:?}"
+        );
+    }
+
+    /// A soft stop must still close a lingering H2 session once the H2
+    /// listener's graceful-shutdown budget has elapsed, even when the linger
+    /// began before the budget ran out. The lingering `readable`/`writable`
+    /// passes must adopt the pass's clock: `graceful_shutdown_deadline_elapsed`
+    /// reads the connection's own snapshot, and one frozen at the linger's
+    /// start would only ever see the budget as it stood then.
+    ///
+    /// TO SEE THIS RED: drop the `self.core.adopt_now(context.now)` from the
+    /// lingering early returns of `H2Shell::readable` and `H2Shell::writable`.
+    /// `shutting_down` then keeps the session.
+    #[test]
+    fn a_soft_stop_closes_a_lingering_h2_session_once_its_budget_elapses() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (socket, _peer) = connected_socket();
+
+        let mut h2 = h2::H2Shell::new(
+            Ulid::generate(),
+            socket,
+            Position::Server,
+            &mut PoolBufferSource::new(Rc::downgrade(&pool)),
+            H2FloodConfig::default(),
+            H2ConnectionConfig::default(),
+            Duration::from_secs(30),
+            Some(Duration::from_secs(1)),
+            Duration::from_secs(30),
+            None,
+            Ready::READABLE | Ready::HUP | Ready::ERROR,
+        )
+        .expect("a pool with free buffers must yield an H2 connection");
+
+        // A 1 s budget armed 3 s ago; the linger began 100 ms into it, with a
+        // linger deadline far away.
+        let armed_at = Instant::now() - Duration::from_secs(3);
+        let linger_started = armed_at + Duration::from_millis(100);
+        h2.core.state = H2State::Error;
+        h2.core.drain.__test_arm_draining(armed_at);
+        h2.core.adopt_now(linger_started);
+        h2.core.linger = shared::Linger::Draining {
+            deadline: linger_started + Duration::from_secs(60),
+            remaining: shared::LINGER_MAX_BYTES,
+        };
+        let frontend = Connection::H2(h2);
+        assert!(frontend.is_lingering(), "premise: the session lingers");
+
+        let mut mux = Mux {
+            configured_frontend_timeout: Duration::from_secs(30),
+            frontend_token: Token(0),
+            frontend,
+            router: Router::new(Duration::from_secs(30), Duration::from_secs(30)),
+            context: test_context(&pool),
+            session_ulid: Ulid::generate(),
+            timeouts: MuxTimeouts::new(TimeoutContainer::new_empty(Duration::from_secs(30))),
+            backend_registry: BackendRegistry::default(),
+            backends: Rc::default(),
+        };
+
+        assert!(
+            mux.shutting_down(),
+            "the elapsed graceful-shutdown budget closes the lingering session"
         );
     }
 

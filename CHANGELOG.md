@@ -3863,13 +3863,16 @@
     or the listener's `request_timeout`.
   - `ConnectionH2::arm_timeout` and `set_timeout_duration` leave that deadline in place.
   - A GOAWAY carrying an error code does not linger.
-  - During a soft stop, the H2 graceful-shutdown budget still closes a lingering session when it
-    elapses first.
+  - The linger is bounded by `request_timeout` from its start. During a soft stop, the H2
+    graceful-shutdown budget also closes it when that budget is armed and elapses first: the
+    lingering passes keep the connection's clock fresh. A drain the client's own GOAWAY started
+    does not arm that budget, so its linger runs to `request_timeout`.
 
   Documented in `lib/src/protocol/mux/LIFECYCLE.md` §8.1, `doc/h2_mux_internals.md` and
   `doc/configure.md`. Covered by the unit tests
-  `an_h2_frontend_lingers_after_its_final_goaway_so_the_client_reads_everything` and
-  `a_linger_deferred_behind_close_notify_starts_on_the_next_pass`.
+  `an_h2_frontend_lingers_after_its_final_goaway_so_the_client_reads_everything`,
+  `a_linger_deferred_behind_close_notify_starts_on_the_next_pass` and
+  `a_soft_stop_closes_a_lingering_h2_session_once_its_budget_elapses`.
   `the_final_goaway_and_close_notify_leave_in_one_tls_write` now expects the pass that flushes
   the final GOAWAY to start the lingering close.
 
