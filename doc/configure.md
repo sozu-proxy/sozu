@@ -1108,7 +1108,8 @@ weighted score `HRW` uses, see "Client affinity" — over the cluster's
 - **the same on every worker and across restarts**, since the key and the
   ranking are pure functions of the client and the backend addresses. On HTTP,
   HTTPS and TCP the key hash is Sōzu's own seeded FNV and does not change
-  between builds; on UDP the flow key comes from the standard library's
+  between builds; on UDP the affinity key (the source IP, or source IP and port
+  per `affinity_key`) is hashed with the standard library's
   `DefaultHasher`, whose algorithm Rust does not promise to keep across
   toolchain versions, so a UDP client's shard may move after an upgrade built
   with another Rust version;
@@ -1177,7 +1178,8 @@ How it composes with the rest of selection:
 - **No key, no shard.** A request with no source address (and no configured
   header or cookie) selects over the whole cluster.
 - **Every datapath.** Sharding lives in the cluster's backend list, so a UDP
-  cluster that sets it shards its flows by their flow key too.
+  cluster that sets it shards its flows by their affinity key too (the source
+  IP, or source IP and port per `affinity_key`).
 
 **Before enabling it.** Sharding is off unless `shard_percent` is set, so
 upgrading changes nothing by itself. Before setting it:

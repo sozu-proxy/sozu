@@ -3836,8 +3836,8 @@
 
 ### 🐛 Fixed
 
-- **`fix(udp)`: key UDP flows on the client source address, not on the affinity key
-  ([#1732](https://github.com/sozu-proxy/sozu/issues/1732)).** Under the default
+- **BREAKING (library API) — `fix(udp)`: key UDP flows on the client source address, not on the
+  affinity key ([#1732](https://github.com/sozu-proxy/sozu/issues/1732)).** Under the default
   `affinity_key = SOURCE_IP`, `FlowKey::from_src` zeroed the source port, so every socket of one
   client IP shared one flow and one connected upstream socket, and every backend reply went to the
   port of the socket that opened the flow; once that socket was gone, no client of that IP got a
@@ -3847,8 +3847,9 @@
   one connected socket per flow); `affinity_key` only feeds the backend-selection hash, so the
   sockets of one IP still land on one backend under `HRW` / `MAGLEV`. Behaviour change: a client
   IP now holds one flow, one upstream socket and one `max_flows` slot per source port instead of
-  one in total. `FlowKey::from_src` loses its `with_port` argument and
-  `UdpManager::affinity_with_port` is removed. Seen red first:
+  one in total. Library API: `FlowKey::from_src(SocketAddr, bool)` becomes
+  `FlowKey::from_src(SocketAddr)` and the public `UdpManager::affinity_with_port()` is removed, both
+  public in `sozu-lib` 2.2.1. Seen red first:
   `same_ip_clients_get_distinct_flows_and_their_own_replies` (`manager.rs`) and
   `test_udp_same_ip_clients_are_distinct_flows` (`e2e/src/tests/udp_tests.rs`). The idle
   eviction reported in the same issue does not reproduce on this branch: it is the lost wakeup

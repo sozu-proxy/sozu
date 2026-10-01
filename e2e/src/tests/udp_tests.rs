@@ -1082,8 +1082,7 @@ fn test_udp_same_ip_clients_are_distinct_flows() {
 //
 // With a 1 s idle timeout, a client that stays silent past it must find its
 // flow gone: its next datagram opens a new flow, which the backend sees as a
-// fresh PPv2 header (sent on the first datagram of a flow only) arriving from
-// a new upstream socket.
+// fresh PPv2 header (sent on the first datagram of a flow only).
 // =========================================================================
 
 fn try_udp_idle_flow_is_torn_down() -> State {
@@ -1117,7 +1116,12 @@ fn try_udp_idle_flow_is_torn_down() -> State {
                 "idle: peers {} -> {}, second PPv2 client {:?}",
                 first.peer, second.peer, second.proxy_protocol_client
             );
-            second.proxy_protocol_client == Some(client_src) && first.peer != second.peer
+            // The fresh PPv2 header is the eviction signal: it is sent on the
+            // first datagram of a flow only. The upstream port is logged, not
+            // asserted, since the kernel may hand the new socket the same
+            // ephemeral port.
+            first.proxy_protocol_client == Some(client_src)
+                && second.proxy_protocol_client == Some(client_src)
         }
         other => {
             println!("backend observed {} datagrams, expected 2", other.len());
