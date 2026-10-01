@@ -1518,7 +1518,7 @@ impl SessionMetrics {
     /// Overwrites, exactly like [`Self::backend_stop`] and for the same
     /// reason: a 1xx informational response is forwarded and the back buffer
     /// is then cleared — `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`)
-    /// in its 100-Continue and 103-Early-Hints arms, `ConnectionH2::handle_1xx_reset`
+    /// in its 100-Continue and other-interim (102-199) arms, `ConnectionH2::handle_1xx_reset`
     /// (`lib/src/protocol/mux/h2.rs`) — so the final response re-enters that
     /// transition from the initial parsing phase. Last write wins, which anchors
     /// this on the FINAL response headers — the same response `backend_stop`

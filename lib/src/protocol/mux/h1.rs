@@ -572,7 +572,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         let is_keep_alive_backend = parts.context.keep_alive_backend;
         let is_body_phase_after_parse = kawa.is_main_phase();
 
-        // 1xx informational responses (100 Continue, 103 Early Hints): the H1
+        // 1xx informational responses (every 1xx, RFC 9110 §15.2): the H1
         // parser treats them as complete (Terminated + end_stream=true), but for
         // H2 frontends they must be forwarded WITHOUT END_STREAM so the real
         // response can follow on the same stream. Also keep READABLE interest
@@ -613,8 +613,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 // `backend_header_time`'s H1 arming — nginx's
                 // `$upstream_header_time` (sozu-proxy/sozu#426).
                 //
-                // Unconditional, including on a 1xx: a 100-Continue or a 103
-                // Early Hints clears the back buffer in
+                // Unconditional, including on a 1xx: every interim response
+                // (100-Continue, 102-199) clears the back buffer in
                 // `ConnectionH1::writable`, so the FINAL response re-enters
                 // this edge and overwrites, which is the response
                 // `SessionMetrics::backend_stop` also anchors on. A 101 has no
@@ -956,13 +956,23 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                             }
                             return MuxResult::Continue;
                         }
-                        kawa::StatusLine::Response { code: 103, .. } => {
-                            debug!("{} ============== HANDLE EARLY HINT!", log_context!(self));
-                            // Do NOT call generate_access_log for 103 Early Hints.
+                        // Every other 1xx (102 Processing, 103 Early Hints and
+                        // the unassigned 104-199) is interim too: RFC 9110
+                        // §15.2 has a client accept any number of them before
+                        // the final response, so the stream stays linked and
+                        // the backend stays out of the keep-alive pool until
+                        // that final response has been written.
+                        kawa::StatusLine::Response { code, .. } if (102..200).contains(&code) => {
+                            debug!(
+                                "{} ============== HANDLE INTERIM {}!",
+                                log_context!(self),
+                                code
+                            );
+                            // Do NOT call generate_access_log for an interim response.
                             // The final response will emit the access log.
                             // Calling it here would double-decrement http.active_requests.
                             if let StreamState::Linked(token) = stream.state {
-                                // after a 103 early hints, we expect the backend to send its response
+                                // after an interim response, we expect the backend to send its final response
                                 endpoint
                                     .readiness_mut(token)
                                     .interest
@@ -978,7 +988,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                                 for event in stream
                                     .generate_access_log(
                                         false,
-                                        Some("H1::EarlyHint"),
+                                        Some("H1::Interim"),
                                         context.listener.clone(),
                                         client_rtt,
                                         server_rtt,
@@ -988,7 +998,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                                 {
                                     crate::protocol::mux::h2::record_metric(event);
                                 }
-                                return self.defer_close_for_tls_flush("early-hint");
+                                return self.defer_close_for_tls_flush("interim");
                             }
                         }
                         _ => {}

@@ -3836,6 +3836,18 @@
 
 ### 🐛 Fixed
 
+- **`fix(h1)`: handle every 1xx other than 101 as an interim response
+  ([#1733](https://github.com/sozu-proxy/sozu/issues/1733)).** On an HTTP/1.1 frontend,
+  `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`) kept the stream linked after a 100 or a
+  103 from an HTTP/1.1 backend, but sent any other 1xx (102, or an unassigned 104-199) down the
+  final-response path: access log emitted, stream unlinked and the backend returned to the
+  keep-alive pool while its final response was still due, which the client then never received.
+  RFC 9110 §15.2 makes every 1xx interim; the 103 arm now covers 102-199, so the final response
+  follows on the same backend connection. 100 and 101 keep their own handling. The access-log tag
+  of an interim response on an unlinked stream is now `H1::Interim` (was `H1::EarlyHint`). Covered
+  by `test_h1_interim_102_before_final` and `test_h1_interim_150_before_final`
+  (`e2e/src/tests/tests.rs`), which also send a second exchange on the same connections.
+
 - **`fix(mux)`: release the backend connection reservation of an abandoned dial
   ([#1713](https://github.com/sozu-proxy/sozu/issues/1713)).** Selection reserves a connection on
   the chosen backend (`active_connections += 1`) before the mux dials it, and only a failed
