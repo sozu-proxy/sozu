@@ -2060,12 +2060,16 @@ impl ConnectionH2 {
                         stream_id
                     );
                     // What the peer had in flight when it read the reset is
-                    // no abuse: a header block, or DATA within the stream's
-                    // receive window, which Sōzu credits back as it reads
-                    // DATA, so it stays the initial window it advertised.
-                    // DATA beyond it, and any other frame, count as a glitch.
+                    // no abuse: at most two header blocks (a trailer section,
+                    // or an interim and a final response), or DATA within the
+                    // stream's receive window, which Sōzu credits back as it
+                    // reads DATA, so it stays the initial window it
+                    // advertised. More header blocks, DATA beyond it, and any
+                    // other frame, count as a glitch.
                     let in_flight = match header.frame_type {
-                        FrameType::Headers => true,
+                        FrameType::Headers => self
+                            .stream_table
+                            .charge_reset_stream_header_block(stream_id),
                         FrameType::Data => self.stream_table.charge_reset_stream_data(
                             stream_id,
                             header.payload_len,
@@ -5316,6 +5320,13 @@ impl ConnectionH2 {
         payload_len: u32,
         discarded: DiscardedFieldBlock,
     ) -> MuxResult {
+        // A new block's first frame counts toward the block's size like an
+        // accepted one's (CVE-2024-27316), so its CONTINUATION frames are
+        // held to the same `max_header_list_size`; the whole frame payload
+        // stands in for the fragment, which it bounds.
+        if matches!(discarded, DiscardedFieldBlock::New { .. }) {
+            self.flood_detector.begin_header_block_if_new(payload_len);
+        }
         self.state = H2State::Discard;
         self.stream_table
             .set_expect_read(Some((H2StreamId::Zero, payload_len as usize)));
@@ -16118,6 +16129,83 @@ mod tests {
         );
     }
 
+    /// Header blocks a backend sends on a stream Sōzu reset count no glitch
+    /// for the first two, a trailer section or an interim and a final
+    /// response it may have had in flight (RFC 9113 §8.1), and one glitch
+    /// each beyond: a peer repeating blocks on a reset stream trips the
+    /// glitch limit and the connection ends with GOAWAY(ENHANCE_YOUR_CALM),
+    /// instead of having every block HPACK-decoded for free.
+    ///
+    /// TO SEE THIS RED: in [`ConnectionH2::handle_read`], count every header
+    /// block on a reset stream as in flight: no GOAWAY ever comes.
+    #[test]
+    fn header_blocks_on_a_reset_backend_stream_beyond_two_count_glitches() {
+        use std::io::Write;
+
+        let LinkedBackend {
+            _pool,
+            mut connection,
+            mut peer,
+            mut context,
+            mut router,
+            ..
+        } = backend_stream_reset_for_its_content_length();
+        // Each small write must reach the connection before the next drive,
+        // not wait behind Nagle's algorithm for the previous one's ACK.
+        peer.set_nodelay(true).expect("TCP_NODELAY must apply");
+        let glitches = connection.core.flood_detector.glitch_count();
+        // `:status 200`, alone, in one HEADERS frame ending the block.
+        let block = || orphan_frame(1, 0x4, 1, 1, &[0x88]);
+
+        let mut wire = block();
+        wire.extend(block());
+        peer.write_all(&wire).expect("loopback write must complete");
+        drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+        assert_eq!(
+            connection.core.flood_detector.glitch_count(),
+            glitches,
+            "two header blocks may be in flight"
+        );
+
+        peer.write_all(&block())
+            .expect("loopback write must complete");
+        drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+        assert_eq!(
+            connection.core.flood_detector.glitch_count(),
+            glitches + 1,
+            "a third header block counts a glitch"
+        );
+
+        let mut received = Vec::new();
+        for _ in 0..20 {
+            let mut wire = Vec::new();
+            for _ in 0..100 {
+                wire.extend(block());
+            }
+            if peer.write_all(&wire).is_err() {
+                break;
+            }
+            received.extend(drive_and_read_backend(
+                &mut connection,
+                &mut peer,
+                &mut context,
+                &mut router,
+            ));
+            if peer_frames(&received)
+                .map(|frames| frames.iter().any(|(kind, _, _, _)| *kind == 7))
+                .unwrap_or(false)
+            {
+                break;
+            }
+        }
+        let frames = peer_frames(&received).expect("whole frames");
+        assert!(
+            frames.iter().any(|(kind, _, _, payload)| *kind == 7
+                && payload.get(4..8) == Some(&[0, 0, 0, 0xb][..])),
+            "repeated header blocks end the connection with GOAWAY(ENHANCE_YOUR_CALM), got {frames:?}"
+        );
+    }
+
     /// A backend stream Sōzu reset from its write pass, because its request
     /// failed after its head left, stays tracked until its end: DATA the
     /// backend then sends on it is ignored (RFC 9113 §5.1), never queued for
@@ -16312,6 +16400,62 @@ mod tests {
             matches!(connection.core.state, H2State::Header),
             "the client connection stays up, got {:?}",
             connection.core.state
+        );
+    }
+
+    /// A refused header block is held to `max_header_list_size` like an
+    /// accepted one, its first fragment included: a 16 000-byte HEADERS frame
+    /// and four 12 500-byte CONTINUATION frames exceed the 65 536-byte limit
+    /// only with that first fragment, and end the connection with
+    /// GOAWAY(ENHANCE_YOUR_CALM) (CVE-2024-27316).
+    ///
+    /// TO SEE THIS RED: in [`ConnectionH2::discard_field_block`], drop the
+    /// `begin_header_block_if_new` call: the block is read to its end.
+    #[test]
+    fn a_refused_header_block_counts_its_first_fragment_toward_its_size() {
+        use std::io::Write;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+        let (mut connection, mut peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        connection.core.state = H2State::Header;
+        connection
+            .core
+            .stream_table
+            .set_expect_read(Some((H2StreamId::Zero, 9)));
+        connection
+            .core
+            .local_settings
+            .settings_max_concurrent_streams = 0;
+        let first = vec![0x88; 16_000];
+        let mut wire = orphan_frame(1, 0, 1, first.len() as u32, &first);
+        let rest = vec![0x88; 12_500];
+        for _ in 0..4 {
+            wire.extend(orphan_frame(9, 0, 1, rest.len() as u32, &rest));
+        }
+        // The peer cannot write all of it before the connection reads, so
+        // write it from a thread while the connection is driven.
+        let mut writer = peer.try_clone().expect("the peer socket must clone");
+        let sender = std::thread::spawn(move || {
+            let _ = writer.write_all(&wire);
+        });
+        let mut received = Vec::new();
+        for _ in 0..8 {
+            received.extend(drive_and_read_backend(
+                &mut connection,
+                &mut peer,
+                &mut context,
+                &mut router,
+            ));
+        }
+        let _ = sender.join();
+        let frames = peer_frames(&received).expect("whole frames");
+        assert!(
+            frames.iter().any(|(kind, _, _, payload)| *kind == 7
+                && payload.get(4..8) == Some(&[0, 0, 0, 0xb][..])),
+            "the oversized refused block ends the connection with GOAWAY(ENHANCE_YOUR_CALM), \
+             got {frames:?}"
         );
     }
 

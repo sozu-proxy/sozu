@@ -1467,12 +1467,16 @@ kept in lock-step:
   (with their CONTINUATION frames) the peer sent before reading the reset
   (RFC 9113 §5.1) instead of answering GOAWAY(STREAM_CLOSED) or a second
   RST_STREAM (sozu-proxy/sozu#1783). A header block is still decoded whole
-  for HPACK, and DATA within the stream's receive window counts no glitch.
+  for HPACK. Two header blocks per stream and DATA within the stream's
+  receive window count no glitch; each block beyond two, and DATA beyond
+  the window, count one.
   Pinned by `frames_on_a_backend_stream_sozu_reset_are_ignored`,
   `frames_on_a_client_stream_sozu_reset_are_ignored`,
   `data_on_a_reset_backend_stream_counts_a_glitch_beyond_its_window_only`,
   `data_on_a_tracked_backend_stream_sozu_reset_is_ignored`,
-  `a_continuation_of_a_refused_header_block_is_discarded_with_it` (`h2.rs`)
+  `header_blocks_on_a_reset_backend_stream_beyond_two_count_glitches`,
+  `a_continuation_of_a_refused_header_block_is_discarded_with_it`,
+  `a_refused_header_block_counts_its_first_fragment_toward_its_size` (`h2.rs`)
   and `reset_by_us_outlives_eviction_for_the_last_streams_only`
   (`h2_stream_table.rs`).
 - **MadeYouReset queued cap** via `H2ControlTx`'s lifetime counter (capped at

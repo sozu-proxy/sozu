@@ -3846,18 +3846,22 @@
   (`lib/src/protocol/mux/h2.rs`) ignores DATA and HEADERS on a stream
   `H2StreamTable::reset_by_us` recognises. A header block, with the CONTINUATION frames
   completing it, is still decoded to keep the HPACK dynamic table in sync (§4.3); a DATA payload
-  is only credited to connection flow control (§6.9). Neither counts as a flood glitch while the
-  DATA fits the stream's 65 535-byte receive window; DATA beyond it does. WINDOW_UPDATE,
+  is only credited to connection flow control (§6.9). What the peer may have had in flight counts
+  no flood glitch: two header blocks per stream, and DATA within the stream's 65 535-byte receive
+  window; each further block, and DATA beyond the window, counts one. WINDOW_UPDATE,
   PRIORITY and RST_STREAM keep their handling, and other frame types keep theirs (PUSH_PROMISE
   stays a connection error). The CONTINUATION frames of a header block Sōzu refuses, for
   example at SETTINGS_MAX_CONCURRENT_STREAMS, were taken for standalone frames and answered
-  GOAWAY(PROTOCOL_ERROR); they are now discarded with the block. Documented in
+  GOAWAY(PROTOCOL_ERROR); they are now discarded with the block, and its first fragment counts
+  toward `max_header_list_size`. Documented in
   `lib/src/protocol/mux/LIFECYCLE.md` and `doc/h2_mux_internals.md`. Covered by
   `frames_on_a_backend_stream_sozu_reset_are_ignored`,
   `frames_on_a_client_stream_sozu_reset_are_ignored`,
   `data_on_a_reset_backend_stream_counts_a_glitch_beyond_its_window_only`,
   `data_on_a_tracked_backend_stream_sozu_reset_is_ignored`,
-  `a_continuation_of_a_refused_header_block_is_discarded_with_it` (`h2.rs`) and
+  `header_blocks_on_a_reset_backend_stream_beyond_two_count_glitches`,
+  `a_continuation_of_a_refused_header_block_is_discarded_with_it`,
+  `a_refused_header_block_counts_its_first_fragment_toward_its_size` (`h2.rs`) and
   `reset_by_us_outlives_eviction_for_the_last_streams_only` (`h2_stream_table.rs`).
 
 - **`fix(h1)`: handle every 1xx other than 101 as an interim response

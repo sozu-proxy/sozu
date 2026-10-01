@@ -125,6 +125,11 @@ use super::{GlobalStreamId, StreamId, h2::H2StreamId};
 /// fewer streams than this in that time.
 const RESET_STREAMS_REMEMBERED: usize = 64;
 
+/// How many header blocks a peer may still send on a stream this endpoint
+/// reset without counting a flood glitch (RFC 9113 §8.1): a trailer
+/// section, or an interim and a final response.
+const RESET_STREAM_HEADER_BLOCKS: u8 = 2;
+
 /// H2 wire-level stream-slot bookkeeping: see the module doc.
 pub(super) struct H2StreamTable {
     /// Wire `StreamId -> GlobalStreamId` map.
@@ -153,6 +158,10 @@ pub(super) struct H2StreamTable {
     /// the first ignored DATA frame; dropped with the stream's id from
     /// `reset_order`.
     reset_data_allowance: HashMap<StreamId, u32>,
+    /// Header blocks ignored so far on a stream this endpoint reset, keyed
+    /// by stream: [`RESET_STREAM_HEADER_BLOCKS`] may legitimately still
+    /// arrive. Kept and dropped like `reset_data_allowance`.
+    reset_header_blocks: HashMap<StreamId, u8>,
     /// Per-stream wall-clock timestamp of last meaningful activity (DATA or
     /// HEADERS frame receipt) — the bidirectional-silence (slow-multiplex)
     /// reap guard. `BTreeMap` for deterministic reap order — see the module
@@ -211,6 +220,7 @@ impl H2StreamTable {
             reset_order: VecDeque::new(),
             reset_evicted: HashSet::new(),
             reset_data_allowance: HashMap::new(),
+            reset_header_blocks: HashMap::new(),
             stream_last_activity_at: BTreeMap::new(),
             stream_fc_stalled_since: BTreeMap::new(),
             stream_fc_stalled_progress: BTreeMap::new(),
@@ -314,6 +324,7 @@ impl H2StreamTable {
             {
                 self.reset_evicted.remove(&oldest);
                 self.reset_data_allowance.remove(&oldest);
+                self.reset_header_blocks.remove(&oldest);
             }
             self.reset_order.push_back(stream_id);
         }
@@ -399,6 +410,17 @@ impl H2StreamTable {
     /// has the frames that then arrive on it ignored.
     pub(super) fn reset_by_us(&self, stream_id: StreamId) -> bool {
         self.rst_sent.contains(&stream_id) || self.reset_evicted.contains(&stream_id)
+    }
+
+    /// Count one header block ignored on a stream this endpoint reset, and
+    /// return whether the peer may legitimately still have sent it: at most
+    /// [`RESET_STREAM_HEADER_BLOCKS`] per stream, a trailer section or an
+    /// interim and a final response (RFC 9113 §8.1). Any block beyond is no
+    /// in-flight remainder.
+    pub(super) fn charge_reset_stream_header_block(&mut self, stream_id: StreamId) -> bool {
+        let blocks = self.reset_header_blocks.entry(stream_id).or_insert(0);
+        *blocks = blocks.saturating_add(1);
+        *blocks <= RESET_STREAM_HEADER_BLOCKS
     }
 
     /// Charge `len` bytes of DATA ignored on a stream this endpoint reset
