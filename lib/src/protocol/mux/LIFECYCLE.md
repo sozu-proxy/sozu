@@ -1658,9 +1658,14 @@ response can never follow the close-delimited body; the client retries it on
 a new connection (§9.3.2). Before this, the client waited for more body until
 the frontend timeout and the next pipelined response was appended to the
 body. This is an H1-frontend decision only: `keep_alive_frontend` is not
-cleared, because `ConnectionH2::write_streams` reads it to send GOAWAY, and an
-H2 client neither sees `Connection` (RFC 9113 §8.2.2) nor needs the close to
-end the body, which carries END_STREAM. HAProxy's `h1_set_cli_conn_mode`
+cleared, because an H2 client neither sees `Connection` (RFC 9113 §8.2.2) nor
+needs the close to end the body, which carries END_STREAM. The H2 write pass
+does not read `keep_alive_frontend` at all: a default answer whose template
+carries `Connection: close` clears it, and on an H2 frontend that answer ends
+its own stream and nothing else — no GOAWAY, the other streams continue
+(sozu-proxy/sozu#1740). Pinned by the e2e
+`test_h2_default_answer_terminates_stream` and
+`test_h2_default_answer_502_spares_other_streams`. HAProxy's `h1_set_cli_conn_mode`
 (`src/mux_h1.c`) closes the client on a response without a known length as
 well; sozu does not re-frame such a body as chunked to keep the connection.
 Pinned by the e2e `test_h1_close_delimited_body_closes_client`,

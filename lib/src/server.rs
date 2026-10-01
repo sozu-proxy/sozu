@@ -642,8 +642,8 @@ impl SessionManager {
     /// refactor — it would LOOSEN a connection limit under exactly the
     /// conditions a client can induce.
     ///
-    /// What makes the unpaired claim cheap is that a failed dial ENDS
-    /// the frontend connection, so the slot returns with it:
+    /// What makes the unpaired claim cheap on H1 is that a failed dial
+    /// ENDS the frontend connection, so the slot returns with it:
     ///
     /// - `Mux::ready_inner` joins the plan and the dial into a single
     ///   `Result` with `and_then`, so every post-claim exit from either
@@ -661,13 +661,10 @@ impl SessionManager {
     ///   `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`) takes
     ///   `ConnectionH1::defer_close_for_tls_flush` instead of the
     ///   keep-alive reset, so the session closes after that one flush.
-    /// - H2: the write pass raises its `close_frontend` flag when the
-    ///   answered stream retires, and `ConnectionH2::poll_write_target`
-    ///   (`lib/src/protocol/mux/h2.rs`) then sends `ConnectionH2::goaway`
-    ///   when that stream was the only one, or
-    ///   `ConnectionH2::graceful_goaway` when others are still in flight.
-    ///   A draining connection REFUSES new peer streams, so the window is
-    ///   bounded by the streams already open, not by the client.
+    /// - H2: the answer ends its own stream only (RFC 9113 §8.2.2:
+    ///   `Connection` is not an H2 field, sozu-proxy/sozu#1740). The
+    ///   connection stays open, so the slot is held until the client
+    ///   closes it or it times out.
     /// - TCP never reaches an answer at all: any error out of
     ///   `TcpSession::connect_to_backend` (`lib/src/tcp.rs`) becomes
     ///   `SessionResult::Close` in the same event-loop pass.

@@ -2506,9 +2506,11 @@ literal value that drifted from the body length cannot land on the wire (RFC
 synthesised. Operators who want a Content-Length include one; those who rely on
 `Connection: close` for body framing get a clean header-only response.
 
-When a template carries `Connection: close`, the response will close the
-frontend connection after delivery; a custom template without that header keeps
-frontend keep-alive on. The value is read as a comma-separated list of
+When a template carries `Connection: close`, the response will close an
+HTTP/1.1 frontend connection after delivery; a custom template without that
+header keeps frontend keep-alive on. On an HTTP/2 frontend the header is
+stripped (RFC 9113 §8.2.2) and the answer ends only its own stream; the
+connection and its other streams continue. The value is read as a comma-separated list of
 case-insensitive options, on every `Connection` line of the template, so
 `Connection: keep-alive, close` and `Connection: close, x-custom` close too,
 while `Connection: closed` does not. The HAProxy parallel is `errorfile NNN /path`.
