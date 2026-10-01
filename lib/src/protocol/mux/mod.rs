@@ -1907,6 +1907,26 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         }
     }
 
+    /// Whether a frontend HUP still leaves an exchange to serve.
+    ///
+    /// The frontend HUP is not always a hang-up: `Ready::from(&Event)`
+    /// (`command/src/ready.rs`) also raises it for `is_read_closed()`, the
+    /// `EPOLLRDHUP` a client's half-close (`shutdown(SHUT_WR)`, RFC 9293
+    /// §3.6) produces. Such a client has stopped sending, not receiving, and
+    /// still expects the response to what it sent. A request is therefore in
+    /// flight while a stream is open, from the request head to the end of its
+    /// response, and its bytes may still be unread while the frontend has a
+    /// read to do: the FIN can arrive with the request itself. A real hang-up
+    /// is found by the next write, which fails and closes the session.
+    fn frontend_exchange_in_flight(&self) -> bool {
+        self.frontend.readiness().filter_interest().is_readable()
+            || self
+                .context
+                .streams
+                .iter()
+                .any(|stream| stream.state.is_open())
+    }
+
     fn delay_close_for_frontend_flush(&mut self, reason: &'static str) -> bool {
         let _ = self.frontend.initiate_close_notify();
         // LIFECYCLE §9 invariant 16: consult per-stream back-buffers in
@@ -2635,6 +2655,16 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             // A lingering frontend reads to the client's EOF before it closes:
             // a close with its last bytes unread would still reset.
             self.frontend.readiness_mut().event.insert(Ready::READABLE);
+        } else if self.frontend.readiness().event.is_hup() && self.frontend_exchange_in_flight() {
+            // A half-closed client still gets the response to what it sent:
+            // neither close nor queue `close_notify` while it is in flight.
+            // What is already pending is flushed as a delayed close would.
+            if self
+                .frontend
+                .has_pending_write_including_streams(&self.context)
+            {
+                self.frontend.readiness_mut().arm_writable();
+            }
         } else if self.frontend.readiness().event.is_hup()
             && !self.delay_close_for_frontend_flush("frontend HUP")
         {
@@ -3138,12 +3168,26 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 // it stops when the frontend has nothing to read or write,
                 // and the next readiness event resumes the flush. Counting
                 // the HUP as work spun the loop to `MAX_LOOP_ITERATIONS`
-                // after every client hang-up.
+                // after every client hang-up. A HUP that comes from a
+                // half-close leaves the exchange in flight to be served
+                // (`Mux::frontend_exchange_in_flight`): the session closes
+                // here once its response is complete.
+                //
+                // That exchange keeps READABLE, so a read in this pass may
+                // already have met the client's EOF and consumed the event
+                // before its response started a linger. As on entry, the
+                // drain then reads to that EOF, which the HUP says has
+                // arrived: `ConnectionH1::drain_linger` returns at the EOF,
+                // so this cannot spin.
+                if self.frontend.is_lingering() && self.frontend.readiness().event.is_hup() {
+                    self.frontend.readiness_mut().event.insert(Ready::READABLE);
+                }
                 if self.frontend.readiness().event.is_hup()
                     && !self.frontend.is_lingering()
                     && !self
                         .frontend
                         .has_pending_write_including_streams(&self.context)
+                    && !self.frontend_exchange_in_flight()
                     && !self.delay_close_for_frontend_flush("frontend HUP")
                 {
                     debug!(
@@ -5400,9 +5444,18 @@ mod tests {
     /// leaves the rest of the request unread, and the close resets the
     /// connection.
     ///
-    /// TO SEE THIS RED: drop `!self.frontend.is_lingering()` from the in-loop
-    /// HUP check of `Mux::ready_inner`. The pass then closes the session
-    /// before the drain read anything.
+    /// What is asserted is the socket, not the reader: whichever path
+    /// consumed the client's last bytes, the request reader or the linger
+    /// drain, none may be left unread at the close.
+    ///
+    /// TO SEE THIS RED: before sozu-proxy/sozu#1779, dropping
+    /// `!self.frontend.is_lingering()` from the in-loop HUP check of
+    /// `Mux::ready_inner` closed the session before the drain read anything
+    /// (4 bytes left unread). Since then a half-close keeps the exchange
+    /// readable, so it takes dropping the entry check's
+    /// `Mux::frontend_exchange_in_flight` branch together with both
+    /// `!self.frontend.is_lingering()` and `!self.frontend_exchange_in_flight()`
+    /// from the in-loop check.
     #[test]
     fn a_hup_during_the_flush_that_starts_a_linger_drains_before_closing() {
         use std::io::{Read, Write};
@@ -5463,14 +5516,25 @@ mod tests {
         let Connection::H1(h1) = &mux.frontend else {
             unreachable!("the frontend is H1")
         };
-        let linger = h1.linger;
+        // What the close must not leave behind: a byte the client sent and
+        // sozu never read, which turns the close into a reset. Whichever
+        // reader consumed them, the request reader or the linger drain, a
+        // peek on the socket must meet the client's EOF, not data.
+        let mut probe = [0u8; 16];
+        let unread = match h1.socket.stream.peek(&mut probe) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+            Err(e) => panic!("the frontend socket peek failed: {e}"),
+        };
         assert!(
             matches!(result, SessionResult::Close),
             "the drain meets the client's EOF and closes, got {result:?}"
         );
-        assert!(
-            matches!(linger, h1::Linger::Draining { remaining, .. } if remaining < h1::LINGER_MAX_BYTES),
-            "the session must drain the rest of the request before it closes, got {linger:?}"
+        assert_eq!(
+            unread, 0,
+            "the session must read the rest of the request before it closes, {unread} bytes \
+             left unread, {:?}",
+            h1.linger
         );
         drop(mux);
 

@@ -338,7 +338,19 @@ from `Mux::ready`. Termination may be triggered by:
 
 - Frontend HUP — detected by the `readiness().event.is_hup()` branch of
   `Mux::ready` (`lib/src/protocol/mux/mod.rs`), subject to
-  `delay_close_for_frontend_flush` (`mod.rs`) to avoid truncating TLS.
+  `delay_close_for_frontend_flush` (`mod.rs`) to avoid truncating TLS. The
+  HUP also stands for a client's half-close (`EPOLLRDHUP`, which
+  `Ready::from(&Event)` in `command/src/ready.rs` maps to HUP): while
+  `Mux::frontend_exchange_in_flight` (`mod.rs`) holds — a stream is open, or
+  the frontend still has a read to do — the session serves the exchange and
+  closes once the response is complete
+  ([#1779](https://github.com/sozu-proxy/sozu/issues/1779)). Output already
+  pending is flushed as a delayed close would, without `close_notify`, and a
+  lingering frontend gets READABLE in the inner loop too, since a read in the
+  same pass may have met the EOF before the linger started. The request
+  reader keeps reading an answered stream: `ConnectionH1::readable` never
+  links a request whose stream is already `Unlinked`, such as one
+  `Mux::timeout_inner` answered 408 while its head was incomplete.
 - `MuxResult::CloseSession` from any readable/writable path (the frontend
   readable and writable arms of `Mux::ready_inner`, etc.).
 - A loop-iteration budget overrun (`MAX_LOOP_ITERATIONS = 10_000`, `mod.rs`,
@@ -1096,7 +1108,8 @@ deadlines are compared against `ConnectionH2.now` (§7.5):
    in `Mux::ready_inner`, whose `counter` is declared above BOTH of its loops,
    so the budget is shared across every outer iteration of one `ready()` call.
    A frontend HUP never counts as work against it: the inner loop closes the
-   session on one once no output is left to flush, except on a lingering
+   session on one once no output is left to flush and no exchange is in
+   flight (`Mux::frontend_exchange_in_flight`), except on a lingering
    frontend (§8.4), which it leaves to drain the client's last bytes to the
    EOF, as the entry check does. Its exit check counts only frontend
    READABLE, WRITABLE and ERROR interest.
@@ -2084,7 +2097,10 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
 11. **Frontend HUP defers close when output is pending.**
     `delay_close_for_frontend_flush` (`mod.rs`) must be consulted before
     returning `SessionResult::Close` so that unflushed TLS/GOAWAY records are
-    not lost.
+    not lost. Neither HUP check of `Mux::ready_inner` consults it while
+    `Mux::frontend_exchange_in_flight` holds: it queues `close_notify` on its
+    first line, and a half-closed client (RFC 9293 §3.6) is still owed the
+    whole response ([#1779](https://github.com/sozu-proxy/sozu/issues/1779)).
 12. **Loop budget.** Every inner loop in `Mux::ready` and
     `drive_frontend_shutdown_io` bounds iterations at
     `MAX_LOOP_ITERATIONS = 10_000` (`mod.rs`).

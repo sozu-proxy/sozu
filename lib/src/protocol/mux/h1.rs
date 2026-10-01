@@ -536,6 +536,9 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         if stream.metrics.start.is_none() {
             stream.metrics.mark_request_start();
         }
+        // Read before `split` borrows the stream: the relink guard below
+        // needs it while `parts` is alive.
+        let answered = stream.state == StreamState::Unlinked;
         let parts = stream.split(&self.position);
         let kawa = parts.rbuffer;
 
@@ -792,7 +795,12 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 // successor and correctly keeps its own instant.
                 parts.metrics.backend_headers_received();
             }
-            if !was_main_phase && self.position.is_server() {
+            // A request already answered is never linked. `Mux::timeout_inner`
+            // (`lib/src/protocol/mux/mod.rs`) answers 408 on an `Idle` stream
+            // whose head was incomplete and leaves it `Unlinked`; the rest of
+            // that head may still arrive, and is drained by the linger after
+            // the answer (`ConnectionH1::start_linger`), never forwarded.
+            if !was_main_phase && self.position.is_server() && !answered {
                 if parts.context.method.is_none()
                     || parts.context.authority.is_none()
                     || parts.context.path.is_none()

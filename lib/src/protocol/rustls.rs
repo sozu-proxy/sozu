@@ -538,7 +538,14 @@ impl SessionState for TlsHandshake {
     ) -> SessionResult {
         let mut counter = 0;
 
-        if self.frontend_readiness.event.is_hup() {
+        // A HUP with bytes still to read can be a client's half-close
+        // (`EPOLLRDHUP`, which `Ready::from(&Event)` in `command/src/ready.rs`
+        // reports as HUP): with TLS 1.3 its `Finished`, its request and its
+        // FIN may arrive together. Read them first; `handshake_read` closes
+        // the session on the EOF if they finish no handshake.
+        if self.frontend_readiness.event.is_hup()
+            && !self.frontend_readiness.filter_interest().is_readable()
+        {
             return SessionResult::Close;
         }
 

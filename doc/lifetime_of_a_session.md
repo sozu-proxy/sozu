@@ -250,7 +250,11 @@ handshake completes, `upgraded_frontend_events` (`lib/src/https.rs`) arms the
 mux frontend for WRITABLE, and for READABLE only when the handshake still held
 a READABLE edge or rustls already holds plaintext (an HTTP/2 preface sharing a
 segment with the client `Finished`) or a `close_notify`
-([#1609](https://github.com/sozu-proxy/sozu/issues/1609)).
+([#1609](https://github.com/sozu-proxy/sozu/issues/1609)). A HUP the
+handshake saw survives the upgrade. With TLS 1.3 a client's `Finished`, its
+request and its half-close FIN can arrive together, so `TlsHandshake::ready`
+closes on a HUP only when no read is due, and the mux serves that request
+before it closes ([#1779](https://github.com/sozu-proxy/sozu/issues/1779)).
 
 On the wire a TLS 1.3 handshake costs the server one `writev(2)` for its flight
 (ServerHello, ChangeCipherSpec, encrypted handshake messages) and one for the
@@ -586,7 +590,12 @@ READABLE, WRITABLE or ERROR interest with a matching event and every backend's
 readiness is empty. A frontend HUP is not work the loop can progress: each
 iteration closes the session on one once no output is left to flush, except on
 a lingering frontend, which drains the client's last bytes to the EOF first
-([#1774](https://github.com/sozu-proxy/sozu/issues/1774)).
+([#1774](https://github.com/sozu-proxy/sozu/issues/1774)). The HUP is also how
+a client's half-close arrives (`EPOLLRDHUP`): while a stream is open or the
+frontend still has a read to do (`Mux::frontend_exchange_in_flight`), neither
+the entry check nor the in-loop check closes the session or queues
+`close_notify`, and the session closes once the response is complete
+([#1779](https://github.com/sozu-proxy/sozu/issues/1779)).
 
 ## 9. TCP (pipe) session lifecycle
 
@@ -738,7 +747,7 @@ EOF is read by a later `readable`, in the same pass when the event already
 carried HUP, one `epoll_wait` round later when the FIN landed after that
 `epoll_wait` returned (§2.2). A frontend read does not record HUP: over TLS its
 `Closed` can be a `close_notify` on a TCP stream that is still open, and a
-frontend HUP closes the whole session.
+frontend HUP closes the whole session once no exchange is in flight.
 
 The sockets of an HTTP or HTTPS session are **not** deregistered from epoll
 ([#1567](https://github.com/sozu-proxy/sozu/issues/1567)). Each one closes when

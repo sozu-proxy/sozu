@@ -3859,6 +3859,32 @@
   timeout on some runs, and adding that fix's one-line `armed_deadline` reset to 2.2.1 alone
   makes it pass; `test_udp_idle_flow_is_torn_down` and `test_udp_every_idle_flow_is_torn_down`
   are the end-to-end tests that fix lacked.
+- **`fix(mux)`: deliver the whole response to a client that half-closed its connection
+  ([#1779](https://github.com/sozu-proxy/sozu/issues/1779)).** A client that half-closes after its
+  request (`shutdown(SHUT_WR)`) has stopped sending, not receiving (RFC 9293 §3.6), but its FIN
+  reaches sozu as a frontend HUP: `Ready::from(&Event)` (`command/src/ready.rs`) maps
+  `EPOLLRDHUP` to it. `Mux::ready_inner` (`lib/src/protocol/mux/mod.rs`) treated that HUP as a
+  hang-up: on entry it closed the session, or queued `close_notify` and closed once the queued
+  output was flushed, so a TLS response still arriving from the backend was cut, or never sent when
+  the FIN came with the request. `TlsHandshake::ready` (`lib/src/protocol/rustls.rs`) likewise
+  closed on a HUP that arrived with the client's TLS 1.3 `Finished` and request, and
+  `upgraded_frontend_events` (`lib/src/https.rs`) dropped a HUP seen during the handshake. A
+  frontend HUP now closes the session only once no stream is open and no read is due
+  (`Mux::frontend_exchange_in_flight`), the handshake reads before acting on a HUP, and the HUP
+  survives the upgrade, so the half-closed session closes once its response is complete. A real
+  hang-up is still found by the next write. Pending output is still flushed on that HUP, a
+  lingering frontend reads to the EOF from the inner loop as well as on entry, and
+  `ConnectionH1::readable` (`lib/src/protocol/mux/h1.rs`) no longer links a request whose stream
+  was already answered (`Unlinked`), such as a 408 from `Mux::timeout_inner` sent while the
+  request head was incomplete. Documented in `lib/src/protocol/mux/LIFECYCLE.md` and
+  `doc/lifetime_of_a_session.md`. Covered by `test_tls_client_half_close_after_request_receives_large_response`,
+  `test_tls_client_half_close_mid_response_receives_it_whole` and
+  `test_tls_client_half_close_keep_alive_closes_after_response` (`e2e/src/tests/tls_tests.rs`);
+  `e2e_session_tls_client_fin_not_truncated` (`e2e/src/tests/h2_security_session.rs`) no longer
+  waits 200 ms before half-closing. `a_hup_during_the_flush_that_starts_a_linger_drains_before_closing`
+  (`lib/src/protocol/mux/mod.rs`) now asserts that the frontend socket holds no unread byte at the
+  close, since the request reader, not the linger drain, reads the client's last bytes on a
+  half-close.
 
 - **`fix(mux)`: stop spinning the session loop on a frontend hang-up
   ([#1774](https://github.com/sozu-proxy/sozu/issues/1774)).** `Mux::ready_inner`

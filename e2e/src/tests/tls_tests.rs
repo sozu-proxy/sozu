@@ -9,7 +9,7 @@
 
 use std::{
     io::{ErrorKind, Read, Write},
-    net::{SocketAddr, TcpStream},
+    net::{Shutdown, SocketAddr, TcpStream},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -53,6 +53,12 @@ struct BlockingHttpBackend {
 
 impl BlockingHttpBackend {
     fn start(address: SocketAddr, body: String) -> Self {
+        Self::start_with_connection(address, body, "close")
+    }
+
+    /// `connection` is the response's `Connection` value: `close` ends the
+    /// exchange from the backend, `keep-alive` leaves sozu to end it.
+    fn start_with_connection(address: SocketAddr, body: String, connection: &'static str) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let requests_received = Arc::new(AtomicUsize::new(0));
         let responses_sent = Arc::new(AtomicUsize::new(0));
@@ -78,7 +84,7 @@ impl BlockingHttpBackend {
                         requests_clone.fetch_add(1, Ordering::Relaxed);
 
                         let response = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: {connection}\r\n\r\n{}",
                             body.len(),
                             body
                         );
@@ -1250,6 +1256,214 @@ fn test_tls_connection_close_large_response() {
             5,
             "TLS regression: large Connection: close response is fully delivered before teardown",
             try_tls_connection_close_large_response
+        ),
+        State::Success
+    );
+}
+
+/// When a client half-closes, relative to its exchange.
+#[derive(Clone, Copy, Debug)]
+enum HalfClose {
+    /// Right after the request, so the FIN may reach sozu with it.
+    AfterRequest,
+    /// Once the response head has arrived, with most of the body still to
+    /// come from the backend.
+    AfterResponseHead,
+}
+
+/// A TLS HTTP/1.1 client that sends its whole request and then half-closes
+/// its connection (`shutdown(SHUT_WR)`) still receives the whole response,
+/// and sozu closes the connection with `close_notify` once it is delivered.
+///
+/// The FIN only ends the client's sending side (RFC 9293 §3.6): the kernel
+/// reports it as `EPOLLRDHUP`, which `Ready::from(&mio::event::Event)` maps
+/// to HUP. The response is far larger than the socket buffers, so it is still
+/// arriving from the backend when that HUP is seen, and the frontend has to
+/// keep serving it instead of closing the session. With a `keep-alive`
+/// backend, only that HUP tells sozu to close after the response; a session
+/// left open would make the client wait for its read timeout.
+fn try_tls_client_half_close(
+    name: &str,
+    half_close: HalfClose,
+    backend_connection: &'static str,
+) -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let back_address = create_local_address();
+    let payload = "y".repeat(8 * 1024 * 1024);
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        ListenerBuilder::new_https(front_address.clone())
+            .to_tls(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: "localhost".to_owned(),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: CertificateAndKey {
+            certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+            key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+            certificate_chain: vec![],
+            versions: vec![],
+            names: vec![],
+        },
+        expired_at: None,
+    }));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let mut backend = BlockingHttpBackend::start_with_connection(
+        back_address,
+        payload.clone(),
+        backend_connection,
+    );
+
+    let mut tls_config = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(Verifier))
+        .with_no_client_auth();
+    tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let conn = rustls::ClientConnection::new(Arc::new(tls_config), server_name.to_owned()).unwrap();
+    let addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        .expect("could not connect to sozu");
+    tcp.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    tcp.set_write_timeout(Some(Duration::from_secs(5))).ok();
+    let mut tls_stream = rustls::StreamOwned::new(conn, tcp);
+
+    let request_body = "half-close";
+    let request = format!(
+        "POST /large HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{request_body}",
+        request_body.len()
+    );
+    let sent = tls_stream.write_all(request.as_bytes()).is_ok() && tls_stream.flush().is_ok();
+
+    let mut response_bytes = Vec::new();
+    let mut buf = [0u8; 65536];
+    let mut half_closed = None;
+    let mut ending = String::from("timeout");
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(20) {
+        let head_received = response_bytes.windows(4).any(|w| w == b"\r\n\r\n");
+        if half_closed.is_none()
+            && match half_close {
+                HalfClose::AfterRequest => true,
+                HalfClose::AfterResponseHead => head_received,
+            }
+        {
+            half_closed = Some(tls_stream.sock.shutdown(Shutdown::Write).is_ok());
+        }
+        match tls_stream.read(&mut buf) {
+            Ok(0) => {
+                ending = "close_notify".to_owned();
+                break;
+            }
+            Ok(n) => response_bytes.extend_from_slice(&buf[..n]),
+            Err(ref e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => {
+                ending = format!("error: {e}");
+                break;
+            }
+        }
+    }
+    drop(tls_stream);
+
+    let separator = response_bytes.windows(4).position(|w| w == b"\r\n\r\n");
+    let (status_ok, body_len) = match separator {
+        Some(at) => (
+            response_bytes.starts_with(b"HTTP/1.1 200"),
+            response_bytes.len() - at - 4,
+        ),
+        None => (false, 0),
+    };
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    backend.stop();
+
+    println!(
+        "{name}: {half_close:?} backend={backend_connection} sent={sent} \
+         half_closed={half_closed:?} status_ok={status_ok} body={body_len}/{} \
+         ending={ending} stopped={stopped}",
+        payload.len()
+    );
+    if sent
+        && half_closed == Some(true)
+        && status_ok
+        && body_len == payload.len()
+        && ending == "close_notify"
+        && stopped
+    {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_tls_client_half_close_after_request_receives_large_response() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TLS H1: a client that half-closes after its request receives the whole response",
+            || try_tls_client_half_close(
+                "TLS-HALF-CLOSE-REQUEST",
+                HalfClose::AfterRequest,
+                "close"
+            )
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_tls_client_half_close_mid_response_receives_it_whole() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TLS H1: a client that half-closes mid-response receives it whole, then the close",
+            || try_tls_client_half_close(
+                "TLS-HALF-CLOSE-RESPONSE",
+                HalfClose::AfterResponseHead,
+                "keep-alive"
+            )
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_tls_client_half_close_keep_alive_closes_after_response() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TLS H1: a half-closed keep-alive exchange is closed once its response is delivered",
+            || try_tls_client_half_close(
+                "TLS-HALF-CLOSE-KEEPALIVE",
+                HalfClose::AfterRequest,
+                "keep-alive"
+            )
         ),
         State::Success
     );

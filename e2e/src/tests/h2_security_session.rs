@@ -495,13 +495,10 @@ fn try_e2e_session_tls_client_fin_not_truncated() -> State {
     let headers_frame = H2Frame::headers(1, hdrs, true, true);
     let write_ok = tls.write_all(&headers_frame.encode()).is_ok() && tls.flush().is_ok();
 
-    // Let sozu route and forward the request to the backend *before* we
-    // close the write half — once TCP FIN lands, rustls cannot emit any
-    // further TLS records on this connection.
-    thread::sleep(Duration::from_millis(200));
-
-    // Send FIN on the underlying TCP write half. Sozu must still deliver
-    // the full backend response.
+    // Send FIN on the underlying TCP write half at once, so it may reach
+    // sozu with the request: a half-close only ends the client's sending
+    // side (RFC 9293 §3.6), and sozu must still deliver the full backend
+    // response.
     let _ = tls.sock.shutdown(Shutdown::Write);
 
     // Drain the response for up to 3 s.
