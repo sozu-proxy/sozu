@@ -603,8 +603,8 @@ the response is complete. A request left incomplete at the client's EOF closes
 the session at once. On an H1 frontend a full hang-up closes it whatever is in
 flight; an H2 frontend with output still pending waits for a timeout instead,
 since no H2 write path treats a failed write as fatal
-([#1792](https://github.com/sozu-proxy/sozu/issues/1792)). A hang-up is ERROR or WRITE_CLOSED: `Ready::from(&Event)` raises WRITE_CLOSED
-for mio's `is_write_closed` (`EPOLLHUP` or `EPOLLERR`), which a half-close
+([#1792](https://github.com/sozu-proxy/sozu/issues/1792)). A hang-up is ERROR
+or WRITE_CLOSED: `Ready::from(&Event)` raises WRITE_CLOSED for mio's `is_write_closed` (`EPOLLHUP` or `EPOLLERR`), which a half-close
 (`EPOLLRDHUP` alone) never raises. ERROR alone is not enough, because a reset
 whose error a `read` or `write` consumed first is reported as `EPOLLHUP`
 without `EPOLLERR`. A write to the client that fails closes the session as

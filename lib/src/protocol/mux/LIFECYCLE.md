@@ -356,8 +356,8 @@ from `Mux::ready`. Termination may be triggered by:
   connection then reports nothing left to flush, so an H1 session closes at
   once. An H2 session with output pending still waits for a timeout: the
   delayed close arms WRITABLE and no H2 write path treats a failed write as
-  fatal ([#1792](https://github.com/sozu-proxy/sozu/issues/1792)). Output already pending is
-  flushed as a delayed close would, without `close_notify`. A lingering
+  fatal ([#1792](https://github.com/sozu-proxy/sozu/issues/1792)). Output
+  already pending is flushed as a delayed close would, without `close_notify`. A lingering
   frontend counts as unread input from `ConnectionH1::start_linger`, which
   raises READABLE, until its drain reads the EOF. The request reader keeps
   reading an answered stream: `ConnectionH1::readable` never links a request
@@ -1125,8 +1125,9 @@ deadlines are compared against `ConnectionH2.now` (§7.5):
    is in flight until its drain reads the client's EOF, as unread input, so
    its last bytes are drained first. Its exit check counts only frontend
    READABLE, WRITABLE and ERROR interest; a full hang-up (ERROR or
-   WRITE_CLOSED) is never in flight, and closes an H1 session at once (an H2
-   one with output pending waits, ([#1792](https://github.com/sozu-proxy/sozu/issues/1792))).
+   WRITE_CLOSED) is never in flight, and closes an H1 session at once; an H2
+   one with output pending waits
+   ([#1792](https://github.com/sozu-proxy/sozu/issues/1792)).
 
 Steps 1-4 all run inside one `readable()`/`writable()` call and therefore all
 read the same `ConnectionH2.now` — see §7.5.

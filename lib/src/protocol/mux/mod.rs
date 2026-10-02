@@ -1925,8 +1925,9 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     ///
     /// A full hang-up is never in flight: the client will read nothing more.
     /// (An H1 session then closes at once; an H2 one with output pending
-    /// still waits for a timeout, sozu-proxy/sozu#1792.) It is ERROR (`EPOLLERR`, a reset) or WRITE_CLOSED (mio's
-    /// `is_write_closed`: `EPOLLHUP` or `EPOLLERR`). ERROR alone is not
+    /// still waits for a timeout, sozu-proxy/sozu#1792.) It is ERROR
+    /// (`EPOLLERR`, a reset) or WRITE_CLOSED (mio's `is_write_closed`:
+    /// `EPOLLHUP` or `EPOLLERR`). ERROR alone is not
     /// enough: a reset whose error sozu's own `read` or `write` consumed
     /// first is reported as `EPOLLHUP` without `EPOLLERR`, which only
     /// WRITE_CLOSED tells from a half-close. A lingering frontend is the one
