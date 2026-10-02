@@ -4097,6 +4097,57 @@
   makes it pass; `test_udp_idle_flow_is_torn_down` and `test_udp_every_idle_flow_is_torn_down`
   are the end-to-end tests that fix lacked.
 
+- **`fix(mux)`: deliver the whole response to a client that half-closed its connection
+  ([#1779](https://github.com/sozu-proxy/sozu/issues/1779)).** A client that half-closes after its
+  request (`shutdown(SHUT_WR)`) has stopped sending, not receiving (RFC 9293 §3.6), but its FIN
+  reaches sozu as a frontend HUP: `Ready::from(&Event)` (`command/src/ready.rs`) maps
+  `EPOLLRDHUP` to it. `Mux::ready_inner` (`lib/src/protocol/mux/mod.rs`) treated that HUP as a
+  hang-up: on entry it closed the session, or queued `close_notify` and closed once the queued
+  output was flushed, so a TLS response still arriving from the backend was cut, or never sent when
+  the FIN came with the request. `TlsHandshake::ready` (`lib/src/protocol/rustls.rs`) likewise
+  closed on a HUP that arrived with the client's TLS 1.3 `Finished` and request, and
+  `upgraded_frontend_events` (`lib/src/https.rs`) dropped a HUP seen during the handshake.
+  A frontend HUP now keeps the session only while input is still unread
+  (`Connection::has_unread_input`) or a stream whose request was received whole is open
+  (`Mux::frontend_exchange_in_flight`); the session then closes once that response is complete.
+  A request the client left incomplete is closed at once once its EOF is read, as before, without
+  waiting for the backend. On an H1 frontend a full hang-up closes the session at once whatever is
+  in flight (an H2 frontend with output pending still waits for a timeout,
+  [#1792](https://github.com/sozu-proxy/sozu/issues/1792)): ERROR,
+  or the new `Ready::WRITE_CLOSED` bit (`sozu-command-lib`, `command/src/ready.rs`), which
+  `Ready::from(&Event)` raises for mio's `is_write_closed` (`EPOLLHUP` or `EPOLLERR`) and a
+  half-close never raises. ERROR alone missed a reset whose error sozu's own read or write had
+  consumed, which epoll then reports as `EPOLLHUP` without `EPOLLERR`, and kept that session open
+  until a timeout. A failed write to the client also closes the session
+  (`ConnectionH1::writable`), so a socket that can never be flushed no longer waits. Pending output is still flushed on a half-close, without `close_notify`. The
+  handshake reads past a HUP when a read is due and closes if the handshake is still incomplete
+  afterwards, since such a client can never send its `Finished`; its loop no longer counts HUP
+  alone as work, and a FIN or a reset during the handshake logs at debug, not error. The HUP
+  survives the upgrade, with WRITE_CLOSED. Readiness traces render WRITE_CLOSED as a fifth column,
+  `C` (`display_ready`, `lib/src/lib.rs`), so a hang-up reads `---HC` and a half-close `---H-`.
+  `ConnectionH1::readable` (`lib/src/protocol/mux/h1.rs`) no longer links a
+  request whose stream was already answered (`Unlinked`), such as a 408 from `Mux::timeout_inner`
+  sent while the request head was incomplete. Documented in `lib/src/protocol/mux/LIFECYCLE.md`
+  and `doc/lifetime_of_a_session.md`. Covered by the `test_tls_client_half_close_*`,
+  `test_plain_client_half_close_*`, `test_*_half_close_with_incomplete_request_closes_at_once` and
+  `test_*_client_reset_with_linked_request_closes_without_spinning` and
+  `test_rr_client_reset_mid_download_*` e2e tests (`e2e/src/tests/tls_tests.rs`), by
+  `a_half_close_is_hup_but_not_write_closed`, `a_reset_is_error_and_write_closed` and
+  `a_reset_consumed_by_a_write_is_write_closed_without_error` (`command/src/ready.rs`, on a real
+  epoll), and by the unit tests `a_hang_up_without_error_closes_a_waiting_request`,
+  `a_failed_write_to_the_client_closes_the_session`,
+  `a_partial_client_hello_then_fin_closes_without_spinning`,
+  `a_full_client_hello_then_fin_closes_without_spinning`,
+  `a_full_client_hello_then_fin_with_writable_closes_without_spinning`
+  (`lib/src/protocol/rustls.rs`) and `an_answered_request_is_never_linked`
+  (`lib/src/protocol/mux/mod.rs`). `e2e_session_tls_client_fin_not_truncated`
+  (`e2e/src/tests/h2_security_session.rs`) no longer waits 200 ms before half-closing. The
+  sozu-proxy/sozu#1774 unit test is renamed
+  `a_lingering_frontend_reads_the_clients_last_bytes_before_closing` and asserts that the frontend
+  socket holds no unread byte at the close, whichever reader consumed it; the in-loop
+  `!is_lingering()` guard it pinned is removed, since a lingering frontend now counts as unread
+  input until its drain reads the EOF.
+
 - **`fix(mux)`: stop spinning the session loop on a frontend hang-up
   ([#1774](https://github.com/sozu-proxy/sozu/issues/1774)).** `Mux::ready_inner`
   (`lib/src/protocol/mux/mod.rs`) handled a frontend HUP only on entry. When it delayed the close

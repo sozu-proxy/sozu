@@ -1462,6 +1462,11 @@ LINE_COMMENT = re.compile(r"//.*$", re.MULTILINE)
 # change leaves a trace. The checker holds the forwarding pointer live: the
 # value must itself name a `fn`, or the citation is reported.
 RENAMED_TESTS = {
+    # sozu#1779 retargeted the sozu#1774 test from which reader drains the
+    # client's last bytes to the socket holding none of them at the close;
+    # the sozu#1774 CHANGELOG entry cites the name it shipped with.
+    "a_hup_during_the_flush_that_starts_a_linger_drains_before_closing":
+        "a_lingering_frontend_reads_the_clients_last_bytes_before_closing",
     # sozu#1590 made the frontend RTT sample lazy and removed the carried
     # field the first two pinned; each was rewritten to pin the lazy contract
     # that replaced it. The per-connection sample then rewrote those two
