@@ -3868,6 +3868,36 @@
 
 ### 🐛 Fixed
 
+- **`fix(mux-h2)`: spare in-flight frames on a stream Sōzu reset from the flood glitch count, and
+  discard the CONTINUATION frames of a dropped header block
+  ([#1783](https://github.com/sozu-proxy/sozu/issues/1783)).** The frames a peer sent on a stream
+  before reading Sōzu's RST_STREAM are ignored (RFC 9113 §5.1) through one read-side branch of
+  `ConnectionH2::handle_header_state` (`lib/src/protocol/mux/h2.rs`), for a stream still tracked
+  or among the 256 retired ones `H2StreamTable::was_reset_locally` remembers. Every ignored frame
+  counted a flood glitch, so a backend connection cancelling a few dozen streams a second, each
+  with DATA in flight, tripped GOAWAY(ENHANCE_YOUR_CALM). What the peer may have had in flight now
+  counts none: two header blocks per stream (a trailer section, or an interim and a final
+  response) and DATA within the stream's initial receive window
+  (`lib/src/protocol/mux/h2_stream_table.rs`); each further block, and each DATA frame beyond
+  the window, counts one glitch, and an empty DATA frame without END_STREAM counts toward the
+  empty-DATA flood limit as on a live stream (CVE-2019-9518). The allowances are held for at most
+  512 reset streams at once, and a backend connection's are further bounded by that backend's own
+  stream concurrency. A dropped header block without END_HEADERS, on a reset stream, on a stream reset
+  for a stream error, or refused (for example at SETTINGS_MAX_CONCURRENT_STREAMS), left its
+  CONTINUATION frames to be taken for standalone ones and answered GOAWAY(PROTOCOL_ERROR); they
+  are now discarded with the block, which is decoded whole to keep the HPACK dynamic table in
+  sync (§4.3, §6.10), and its first fragment counts toward `max_header_list_size`. Retired reset
+  streams are now looked up in a set. Documented in `lib/src/protocol/mux/LIFECYCLE.md` and
+  `doc/h2_mux_internals.md`. Covered by `frames_on_a_backend_stream_sozu_reset_are_ignored`,
+  `frames_on_a_client_stream_sozu_reset_are_ignored`,
+  `data_on_a_reset_backend_stream_counts_a_glitch_beyond_its_window_only`,
+  `data_on_a_tracked_backend_stream_sozu_reset_is_ignored`,
+  `header_blocks_on_a_reset_backend_stream_beyond_two_count_glitches`,
+  `a_continuation_of_a_refused_header_block_is_discarded_with_it`,
+  `a_refused_header_block_counts_its_first_fragment_toward_its_size`,
+  `empty_data_frames_on_a_reset_backend_stream_count_toward_the_flood_limit` (`h2.rs`) and
+  `reset_stream_allowances_stay_bounded` (`h2_stream_table.rs`).
+
 - **`fix(mux-h2)`: raise H2 flood-protection defaults that tripped on legitimate traffic; scale
   RST caps with the streams a backend answered; stop counting Sōzu-initiated resets
   ([#1749](https://github.com/sozu-proxy/sozu/issues/1749)).** Ordinary browsers, large downloads,
@@ -4221,11 +4251,14 @@
   streams on the connection, instead of drawing a second RST_STREAM (DATA) or a GOAWAY (HEADERS). A
   self-dependent PRIORITY (RFC 7540 §5.3.1) on an idle stream still closes the connection, since
   RST_STREAM must not name an idle stream (§6.4). Each RST_STREAM still feeds the emitted-RST flood
-  accounting and each ignored frame counts as a glitch; flood thresholds are unchanged. A dropped
-  HEADERS frame that lacks END_HEADERS is not decoded, so its CONTINUATION still ends the
-  connection, as for a refused stream: this covers the HEADERS that triggers a stream error (a
-  trailer block or a half-closed-stream HEADERS split across CONTINUATION) as well as late HEADERS
-  on a stream Sōzu reset. Covered by four `e2e/src/tests/h2_security_tests.rs` tests that check
+  accounting; flood thresholds are unchanged. On a stream Sōzu reset, what the peer may have had
+  in flight counts no flood glitch: two header blocks, and DATA within the stream's initial receive
+  window; each further block, and each DATA frame beyond the window, counts one, and an empty DATA
+  frame without END_STREAM counts toward the empty-DATA flood limit
+  ([#1783](https://github.com/sozu-proxy/sozu/issues/1783)). A dropped header block that lacks
+  END_HEADERS, whether it triggers a stream error (a trailer block or a half-closed-stream HEADERS
+  split across CONTINUATION) or arrives late on a stream Sōzu reset, is discarded with its
+  CONTINUATION frames and decoded whole for HPACK. Covered by four `e2e/src/tests/h2_security_tests.rs` tests that check
   another in-flight stream completes. The h2spec counts in `doc/h2_mux_internals.md` and
   `e2e/README.md` now read 146, the number of cases h2spec 2.6.0 runs.
 

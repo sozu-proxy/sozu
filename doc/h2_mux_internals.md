@@ -401,7 +401,9 @@ call sites — not inside `check_flood`'s chain.
 `glitch_count` is incremented for protocol anomalies that don't fit a specific
 flood pattern but indicate abuse in aggregate:
 
-- Frames on closed streams (RST_STREAM, WINDOW_UPDATE, DATA on already-closed streams)
+- Frames on closed streams (RST_STREAM, WINDOW_UPDATE, DATA on already-closed streams;
+  on a stream this endpoint reset, header blocks beyond two and DATA beyond its
+  receive window)
 - Other minor protocol violations that don't warrant an immediate GOAWAY
 
 Unlike the rate-based counters, `glitch_count` uses the same half-decay window,
@@ -681,7 +683,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:4873-4886
+```rust lib/src/protocol/mux/h2.rs:4937-4950
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -707,7 +709,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:4924-4930
+```rust lib/src/protocol/mux/h2.rs:4988-4994
 let events = stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -739,7 +741,7 @@ taken at the top of `H2WritePhase::Flush`'s post-flush tail
 (`ConnectionH2::poll_write_target`, `lib/src/protocol/mux/h2.rs`) and passes `stream.linked_token()` straight
 out of it:
 
-```rust lib/src/protocol/mux/h2.rs:3629-3630
+```rust lib/src/protocol/mux/h2.rs:3693-3694
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 ```
@@ -1092,7 +1094,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9092-9096
+```rust lib/src/protocol/mux/h2.rs:9175-9179
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1218,11 +1220,28 @@ Key decisions in this method:
   through `reset_stream_and_discard_frame`, and the payload is still minimally
   processed through `Discard` (HPACK decoded, DATA credited to the connection
   window). Every other stream on the connection carries on
-- Frames on a stream this endpoint reset are ignored (§5.1) after the same
-  minimal processing: `H2StreamTable::was_reset_locally` covers `rst_sent` and
-  the last `RECENTLY_RESET_CAPACITY` (256) retired reset streams. A stream
-  closed by END_STREAM in both directions keeps the connection error
-  STREAM_CLOSED for HEADERS, and the stream error for DATA (§6.1)
+- DATA and HEADERS frames on a stream this endpoint reset are ignored (§5.1)
+  after the same minimal processing (`ConnectionH2::discard_frame_payload`),
+  whether the stream is still tracked or retired:
+  `H2StreamTable::was_reset_locally` covers `rst_sent` and the last
+  `RECENTLY_RESET_CAPACITY` (256) retired reset streams. What the peer may
+  have had in flight counts no glitch: two header blocks per stream, a
+  trailer section or an interim and a final response
+  (`H2StreamTable::charge_reset_stream_header_block`), and DATA within the
+  stream's initial receive window
+  (`H2StreamTable::charge_reset_stream_data`); each header block beyond two,
+  and each DATA frame beyond the window, counts one. An empty DATA frame
+  without END_STREAM counts toward the empty-DATA flood limit as on a live
+  stream (CVE-2019-9518). Allowances are dropped with their stream's id from
+  the ring, and held for at most `RESET_ALLOWANCES_CAPACITY` (512) streams,
+  since a stream refused or reset untracked stays in `rst_sent` and never
+  enters the ring. On a backend connection they are bounded by the backend's
+  own stream concurrency too, not by the emitted-RST cap, which the CANCEL
+  `ConnectionH2::end_stream` sends for a client that went away does not feed. WINDOW_UPDATE, PRIORITY and
+  RST_STREAM keep their own handling, and so does every other frame type (a
+  PUSH_PROMISE is still a connection error). A stream closed by END_STREAM in
+  both directions keeps the connection error STREAM_CLOSED for HEADERS, and
+  the stream error for DATA (§6.1)
 - A self-dependent PRIORITY (RFC 7540 §5.3.1) resets an open stream and
   closes the connection on an idle one, since RST_STREAM must not name an
   idle stream (RFC 9113 §6.4). A PRIORITY frame whose length is not 5 is a
@@ -1230,9 +1249,12 @@ Key decisions in this method:
   dropped otherwise; every other frame size error stays a connection error
   (§4.2). Each dropped frame counts as a glitch, and each RST_STREAM sent
   feeds the emitted-RST accounting
-- A dropped HEADERS frame without END_HEADERS is not decoded, so the
-  CONTINUATION that follows is a connection error, whether the HEADERS
-  triggered the stream error or arrived late on a reset stream
+- A dropped header block without END_HEADERS, whether it triggered a stream
+  error, arrived on a reset stream or was refused, keeps its fragment in
+  `ConnectionH2::pending_discarded_block`: only a CONTINUATION frame on the
+  same stream may follow (§6.10), it is discarded with it, and the block is
+  decoded whole for HPACK (§4.3). The first fragment counts toward
+  `max_header_list_size` like an accepted block's
 
 ### handle_continuation_header_state()
 
@@ -1246,7 +1268,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9270-9274
+```rust lib/src/protocol/mux/h2.rs:9353-9357
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1721,7 +1743,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:8593
+```rust lib/src/protocol/mux/h2.rs:8676
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -1955,7 +1977,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:7124-7126
+```rust lib/src/protocol/mux/h2.rs:7207-7209
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1963,7 +1985,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:7138-7144
+```rust lib/src/protocol/mux/h2.rs:7221-7227
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.

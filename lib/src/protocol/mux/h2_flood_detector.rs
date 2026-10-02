@@ -1087,6 +1087,12 @@ impl H2FloodDetector {
         self.debug_assert_invariants();
     }
 
+    /// The glitch counter, for tests that pin what counts as a glitch.
+    #[cfg(test)]
+    pub(super) fn glitch_count(&self) -> u32 {
+        self.glitch_count
+    }
+
     /// Record one general protocol anomaly that does not fit a specific flood
     /// pattern (a frame on a closed stream, an unknown SETTINGS identifier, a
     /// zero-increment WINDOW_UPDATE on an already-closed stream, ...) toward
