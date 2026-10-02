@@ -7261,13 +7261,15 @@
   carry content (RFC 9110 §9.3.2): its payload is dropped from the stream buffer, windows
   credited, and the connection stays usable, however large the payload. Such a stream stays
   linked until the backend's END_STREAM ([#1776](https://github.com/sozu-proxy/sozu/issues/1776)),
-  so its DATA reaches these branches whether it arrives with the head or later. Known
-  limitation: a trailer HEADERS frame the backend sends after the reset of a 204 or a 304 still
-  answers GOAWAY(STREAM_CLOSED) for the whole backend connection until
-  [#1784](https://github.com/sozu-proxy/sozu/pull/1784) lands. Documented in
+  so its DATA reaches these branches whether it arrives with the head or later. A trailer block
+  the backend sends after the reset of a 204 or a 304, in one HEADERS frame or split over
+  CONTINUATION frames, is ignored (RFC 9113 §5.1) and the backend connection keeps its other
+  streams; before [#1784](https://github.com/sozu-proxy/sozu/pull/1784) a split trailer block
+  answered GOAWAY(PROTOCOL_ERROR) for the whole backend connection. Documented in
   `lib/src/protocol/mux/LIFECYCLE.md` §8.4. Covered by
-  `a_backend_response_content_is_forbidden_for_204_and_304_and_discarded_for_head` and
-  `a_204_response_carrying_data_resets_its_backend_stream_and_a_head_response_discards_it`
+  `a_backend_response_content_is_forbidden_for_204_and_304_and_discarded_for_head`,
+  `a_204_response_carrying_data_resets_its_backend_stream_and_a_head_response_discards_it` and
+  `a_trailer_after_the_reset_of_a_204_carrying_data_is_ignored`
   (`h2.rs`), and by `test_h2_bodiless_response_data_never_reaches_h1_client`,
   `test_h2_head_response_with_large_data_completes` and
   `test_h2_head_response_with_large_data_keeps_the_backend_connection`
