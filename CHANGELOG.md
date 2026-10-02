@@ -3970,6 +3970,7 @@
   frontends, H2 backends, refused backends, default budget of 5, per-cluster override and global
   fallback, runtime changes), the `connect_outcome_tests` and `exclusion_tests` unit tests, and the
   `max_connection_attempts` config and state tests.
+
 - **`fix(mux-h2)`: forward a response to HEAD with a non-zero `content-length` and END_STREAM on
   its HEADERS ([#1791](https://github.com/sozu-proxy/sozu/issues/1791)).** `pkawa::handle_header`
   (`lib/src/protocol/mux/pkawa.rs`) refused an H2 backend response whose HEADERS frame carried
