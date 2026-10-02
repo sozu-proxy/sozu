@@ -29,8 +29,8 @@
 //! way to exercise sozu's filter is to build the header block by hand.
 
 use std::{
-    io::Write,
-    net::SocketAddr,
+    io::{Read, Write},
+    net::{SocketAddr, TcpStream},
     thread,
     time::{Duration, Instant},
 };
@@ -50,6 +50,7 @@ use super::h2_utils::{
 };
 use crate::{
     mock::{
+        aggregator::SimpleAggregator, async_backend::BackendHandle as AsyncBackend,
         h2_backend::H2Backend, raw_h2_response_backend::RawH2ResponseBackend,
         sync_backend::Backend as SyncBackend,
     },
@@ -709,6 +710,168 @@ fn test_h2_length_framed_request_trailers_keep_h1_backend_framing() {
         ),
         State::Success
     );
+}
+
+// ============================================================================
+// Trailers of a response without a body towards an H1 client
+// ============================================================================
+
+/// Sōzu HTTP listener (H1 clients) + an `http2` cluster for `localhost`
+/// served by a `RawH2ResponseBackend`, and an H1 cluster for `other`
+/// answering `200` with `pong`. Returns the running `Worker`, the raw
+/// backend, the H1 backend and the front address.
+fn setup_h1_front_with_raw_h2_backend(
+    name: &str,
+) -> (
+    Worker,
+    RawH2ResponseBackend,
+    AsyncBackend<SimpleAggregator>,
+    SocketAddr,
+) {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let (config, listeners, state) = Worker::empty_http_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
+    worker.send_proxy_request_type(RequestType::AddHttpListener(
+        ListenerBuilder::new_http(front_address.clone())
+            .to_http(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
+        address: front_address.clone(),
+        proxy: ListenerType::Http.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Cluster {
+        http2: Some(true),
+        ..Worker::default_cluster("cluster_0")
+    }));
+    worker.send_proxy_request_type(RequestType::AddHttpFrontend(Worker::default_http_frontend(
+        "cluster_0",
+        front_address.clone().into(),
+    )));
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    let backend = RawH2ResponseBackend::new(back_address);
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_1",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpFrontend(RequestHttpFrontend {
+        hostname: String::from("other"),
+        ..Worker::default_http_frontend("cluster_1", front_address.into())
+    }));
+    let h1_back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_1",
+        "cluster_1-0",
+        h1_back_address,
+        None,
+    )));
+    let h1_backend = AsyncBackend::spawn_detached_backend(
+        format!("{name}-H1-BACK"),
+        h1_back_address,
+        SimpleAggregator::default(),
+        AsyncBackend::http_handler("pong".to_owned()),
+    );
+    worker.read_to_last();
+    // Give the backend threads a moment to bind.
+    thread::sleep(Duration::from_millis(100));
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    (worker, backend, h1_backend, front_addr)
+}
+
+/// Read what the client connection holds until a read returns nothing once
+/// something arrived, within about one second.
+fn drain_client(client: &mut TcpStream) -> String {
+    let mut received = Vec::new();
+    let mut buffer = [0u8; 4096];
+    for _ in 0..10 {
+        match client.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => received.extend_from_slice(&buffer[..n]),
+            Err(_) if !received.is_empty() => break,
+            Err(_) => {}
+        }
+    }
+    String::from_utf8_lossy(&received).into_owned()
+}
+
+/// An H2 backend answers a `method` request with `:status` `status` and no
+/// `content-length`, then ends the stream with a trailer HEADERS frame; a
+/// second request on the same keep-alive H1 client connection, routed to an
+/// H1 backend, is answered `200` with a body. The first response has no body
+/// by definition (RFC 9110 §9.3.2, §15.3.5, §15.4.5), so the H1 client reads
+/// it as ending with its header section (RFC 9112 §6.3 rule 1): the next
+/// byte after that head must start the second response, with no last chunk
+/// and no trailer section between them.
+///
+/// TO SEE THIS RED: make `ConnectionH1::drop_bodiless_response_framing`
+/// (`lib/src/protocol/mux/h1.rs`) return `false` without touching the block
+/// queue.
+fn try_h2_bodiless_response_trailers_keep_h1_client_framing(method: &str, status: &str) -> State {
+    let (mut worker, backend, mut h1_backend, front_addr) =
+        setup_h1_front_with_raw_h2_backend(&format!("H2-BODILESS-TRAILERS-H1-{method}-{status}"));
+    backend.set_status(status);
+    backend.set_trailers(Some(vec![(b"grpc-status".to_vec(), b"0".to_vec())]));
+
+    let mut client = TcpStream::connect(front_addr).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    client
+        .write_all(format!("{method} / HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+        .unwrap();
+    let first = drain_client(&mut client);
+    println!("bodiless trailers {method} {status} — first response {first:?}");
+
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: other\r\n\r\n")
+        .unwrap();
+    let second = drain_client(&mut client);
+    println!("bodiless trailers {method} {status} — second response {second:?}");
+
+    drop(client);
+    drop(backend);
+    h1_backend.stop_and_get_aggregator();
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    // Split the connection's bytes by HTTP/1.1 framing: the first response
+    // is its head alone, and whatever follows is the next message.
+    let wire = format!("{first}{second}");
+    let first_ok = wire.starts_with(&format!("HTTP/1.1 {status} "));
+    let next = wire.split_once("\r\n\r\n").map_or("", |(_, rest)| rest);
+    let second_parsed = next.starts_with("HTTP/1.1 200 ") && next.contains("pong");
+    if first_ok && second_parsed && stopped {
+        State::Success
+    } else {
+        println!(
+            "bodiless trailers {method} {status} FAIL — first_ok={first_ok} next={next:?} \
+             second_parsed={second_parsed} stopped={stopped}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_bodiless_response_trailers_keep_h1_client_framing() {
+    for (method, status) in [("GET", "204"), ("GET", "304"), ("HEAD", "200")] {
+        assert_eq!(
+            repeat_until_error_or(
+                3,
+                "H2->H1: no trailer section follows a response without a body (RFC 9112 §6.3)",
+                || try_h2_bodiless_response_trailers_keep_h1_client_framing(method, status)
+            ),
+            State::Success,
+            "{method} answered {status}"
+        );
+    }
 }
 
 // ============================================================================

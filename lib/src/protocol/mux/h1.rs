@@ -436,6 +436,90 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         true
     }
 
+    /// Whether the response on this stream has no body by definition: a
+    /// response to HEAD (RFC 9110 §9.3.2) or a 204 or 304 (RFC 9110 §15.3.5,
+    /// §15.4.5). Its H1 message ends with the header section whatever its
+    /// framing fields say (RFC 9112 §6.3 rule 1).
+    fn response_has_no_body(context: &crate::protocol::kawa_h1::editor::HttpContext) -> bool {
+        context.method == Some(crate::protocol::kawa_h1::parser::Method::Head)
+            || matches!(context.status, Some(204 | 304))
+    }
+
+    /// Strip the end-of-body framing and the trailer block of a response
+    /// that has no body by definition (`response_has_no_body`) before it is
+    /// written to this H1 client, and return whether a trailer block was
+    /// dropped.
+    ///
+    /// An H1 client reads such a response as ending with its header section
+    /// (RFC 9112 §6.3 rule 1), so it carries neither a last chunk nor a
+    /// trailer section, and any byte written after the head is read as the
+    /// start of the next response on a keep-alive connection. An H2 backend
+    /// that sends the header section without END_STREAM and no
+    /// `content-length` gets chunked framing from `pkawa::handle_header`, and
+    /// the end of its stream, an empty DATA frame or a trailer HEADERS
+    /// frame, queues `Flags` that kawa's H1 serializer writes as `0\r\n`,
+    /// the trailer fields and an empty line. Every block after the header
+    /// section is cleared here: its trailer fields are removed (RFC 9110
+    /// §6.5.1 lets a recipient discard trailers) and its `Flags` lose
+    /// `end_body`, `end_chunk` and `end_header`, so for a stream ended by a
+    /// trailer HEADERS frame or an empty DATA frame nothing is written after
+    /// the head. DATA carrying a payload on such a response is not removed
+    /// here and is still written after the head, a known gap. The header section is the last queued `StatusLine` (an
+    /// informational head queued before it is left whole) up to its first
+    /// closing `Flags { end_header }`; when it is no longer queued, kawa's
+    /// H1 serializer already wrote it whole, since it drains every queued
+    /// block in one `prepare`. `drop_length_framed_trailers` runs first and
+    /// keeps counting a `Content-Length`-framed trailer block.
+    fn drop_bodiless_response_framing(kawa: &mut super::GenericHttpStream) -> bool {
+        let after_head = match kawa
+            .blocks
+            .iter()
+            .rposition(|block| matches!(block, kawa::Block::StatusLine))
+        {
+            Some(status_line) => match kawa.blocks.range(status_line..).position(|block| {
+                matches!(
+                    block,
+                    kawa::Block::Flags(kawa::Flags {
+                        end_header: true,
+                        ..
+                    })
+                )
+            }) {
+                Some(closing) => status_line + closing + 1,
+                // The header section is not complete yet.
+                None => return false,
+            },
+            None => 0,
+        };
+        let mut dropped_trailers = false;
+        let mut index = after_head;
+        while index < kawa.blocks.len() {
+            match &mut kawa.blocks[index] {
+                kawa::Block::Header(_) => {
+                    kawa.blocks.remove(index);
+                    continue;
+                }
+                kawa::Block::Flags(flags) => {
+                    dropped_trailers |= flags.end_header && flags.end_stream;
+                    flags.end_body = false;
+                    flags.end_chunk = false;
+                    flags.end_header = false;
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        if dropped_trailers {
+            warn!(
+                "{} trailers of a response without a body dropped towards an H1 client \
+                 (RFC 9112 §6.3)",
+                log_module_context!()
+            );
+            incr!(names::h2::TRAILERS_DROPPED_NO_BODY);
+        }
+        dropped_trailers
+    }
+
     /// End a response body at the backend's EOF.
     ///
     /// Only a body with neither `Content-Length` nor chunked coding
@@ -958,6 +1042,9 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             super::shared::apply_response_header_edits(kawa, &edits);
         }
         Self::drop_length_framed_trailers(kawa);
+        if matches!(self.position, Position::Server) && Self::response_has_no_body(parts.context) {
+            Self::drop_bodiless_response_framing(kawa);
+        }
         kawa.prepare(&mut kawa::h1::BlockConverter);
         // SAFETY: the descriptors `gather` pushes borrow memory `kawa` owns:
         // a `Store::Slice` or `Detached` points into `kawa.storage`, while an
@@ -3972,6 +4059,222 @@ mod tests {
                     fields.len()
                 );
             }
+        }
+    }
+
+    /// What `ConnectionH1::writable` writes to an H1 client for a response
+    /// from an H2 backend whose header section `head` arrived without
+    /// END_STREAM, ended by a trailer HEADERS block of `trailer` fields when
+    /// `trailer` is `Some`, or by an empty DATA frame with END_STREAM
+    /// otherwise. `body_size`, when `Some`, overrides the framing
+    /// `pkawa::handle_header` resolved. Returns the resolved framing and the
+    /// bytes, written in one pass like a backend that sent the whole
+    /// response before the client side became writable.
+    fn h1_bytes_of_a_bodiless_response(
+        head: &[(&[u8], &[u8])],
+        body_size: Option<kawa::BodySize>,
+        trailer: Option<&[(&[u8], &[u8])]>,
+    ) -> (kawa::BodySize, String) {
+        struct NoCallbacks;
+        impl kawa::h1::ParserCallbacks<crate::pool::Checkout> for NoCallbacks {
+            fn on_headers(&mut self, _kawa: &mut super::super::GenericHttpStream) {}
+        }
+        let mut pool = Pool::with_capacity(1, 1, 4096);
+        let checkout = pool
+            .checkout()
+            .expect("the test pool must hand out a buffer");
+        let mut kawa: super::super::GenericHttpStream =
+            kawa::Kawa::new(kawa::Kind::Response, kawa::Buffer::new(checkout));
+        let mut decoder = super::super::hpack::Decoder::new();
+        let mut encoder = super::super::hpack::Encoder::new();
+        let mut encoded = Vec::new();
+        for &(name, value) in head {
+            encoder.encode_header_into((name, value), &mut encoded);
+        }
+        let (_, result) = super::super::pkawa::handle_header(
+            &mut decoder,
+            &mut crate::protocol::mux::h2_scheduler::Prioriser::default(),
+            1,
+            &mut kawa,
+            &encoded,
+            false,
+            &mut NoCallbacks,
+            super::super::h2::MAX_HEADER_LIST_SIZE as u32,
+            u32::MAX,
+            false,
+        );
+        assert!(result.is_ok(), "handle_header failed: {:?}", result.err());
+        if let Some(body_size) = body_size {
+            kawa.body_size = body_size;
+        }
+        match trailer {
+            Some(fields) => {
+                let mut encoded = Vec::new();
+                for &(name, value) in fields {
+                    encoder.encode_header_into((name, value), &mut encoded);
+                }
+                let result = super::super::pkawa::handle_trailer(
+                    &mut kawa,
+                    &encoded,
+                    true,
+                    &mut decoder,
+                    super::super::h2::MAX_HEADER_LIST_SIZE as u32,
+                    u32::MAX,
+                    false,
+                    &mut Vec::new(),
+                );
+                assert!(result.is_ok(), "handle_trailer failed: {:?}", result.err());
+            }
+            // The blocks `handle_data_frame` queues for an empty DATA frame
+            // with END_STREAM.
+            None => {
+                kawa.push_block(kawa::Block::Chunk(kawa::Chunk {
+                    data: kawa::Store::Static(b""),
+                }));
+                let end_chunk = kawa.is_streaming();
+                kawa.push_block(kawa::Block::Flags(kawa::Flags {
+                    end_body: true,
+                    end_chunk,
+                    end_header: false,
+                    end_stream: true,
+                }));
+            }
+        }
+        let body_size = kawa.body_size;
+
+        ConnectionH1::<mio::net::TcpStream>::drop_length_framed_trailers(&mut kawa);
+        ConnectionH1::<mio::net::TcpStream>::drop_bodiless_response_framing(&mut kawa);
+        kawa.prepare(&mut kawa::h1::BlockConverter);
+        let buffer = kawa.storage.buffer();
+        let bytes: Vec<u8> = kawa
+            .out
+            .iter()
+            .flat_map(|block| match block {
+                kawa::OutBlock::Store(store) => store.data(buffer).to_vec(),
+                kawa::OutBlock::Delimiter => Vec::new(),
+            })
+            .collect();
+        (body_size, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// A response to HEAD, a 204 or a 304 ends with its header section on
+    /// HTTP/1.1 (RFC 9112 §6.3 rule 1): whatever its framing, nothing
+    /// follows the head towards an H1 client, neither a last chunk nor a
+    /// trailer section (RFC 9110 §6.5.1), so the next response on a
+    /// keep-alive connection starts right after it. Covers chunked framing
+    /// (no `content-length`), `Content-Length` framing and `BodySize::Empty`,
+    /// each ended by a trailer block with one field or none, or by an empty
+    /// DATA frame. A `:status 200` stands for the response to a HEAD.
+    ///
+    /// TO SEE THIS RED: make `drop_bodiless_response_framing` return `false`
+    /// before touching the block queue.
+    #[test]
+    fn a_bodiless_response_writes_nothing_after_its_head_to_an_h1_client() {
+        let with_field: &[(&[u8], &[u8])] = &[(b"grpc-status", b"0")];
+        for status in [&b"204"[..], b"304", b"200"] {
+            let status_line = String::from_utf8_lossy(status);
+            for (content_length, body_size, expected_size, framing) in [
+                (
+                    None,
+                    None,
+                    kawa::BodySize::Chunked,
+                    "Transfer-Encoding: chunked\r\n",
+                ),
+                (
+                    Some(&b"0"[..]),
+                    None,
+                    kawa::BodySize::Length(0),
+                    "content-length: 0\r\n",
+                ),
+                (
+                    Some(b"5"),
+                    None,
+                    kawa::BodySize::Length(5),
+                    "content-length: 5\r\n",
+                ),
+                (
+                    None,
+                    Some(kawa::BodySize::Empty),
+                    kawa::BodySize::Empty,
+                    "Transfer-Encoding: chunked\r\n",
+                ),
+            ] {
+                let mut head: Vec<(&[u8], &[u8])> = vec![(b":status", status)];
+                if let Some(length) = content_length {
+                    head.push((b"content-length", length));
+                }
+                let expected = format!("HTTP/1.1 {status_line} FromH2\r\n{framing}\r\n");
+                for trailer in [Some(with_field), Some(&[][..]), None] {
+                    assert_eq!(
+                        h1_bytes_of_a_bodiless_response(&head, body_size, trailer),
+                        (expected_size, expected.clone()),
+                        "{status_line} {expected_size:?} ended by {trailer:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The trailer block of a bodiless response queued alone, its header
+    /// section written in an earlier pass, is dropped whole and counted;
+    /// a queue with no trailer block reports none.
+    #[test]
+    fn a_bodiless_response_trailer_block_queued_after_its_head_is_dropped() {
+        let mut pool = Pool::with_capacity(1, 1, 4096);
+        let checkout = pool
+            .checkout()
+            .expect("the test pool must hand out a buffer");
+        let mut kawa: super::super::GenericHttpStream =
+            kawa::Kawa::new(kawa::Kind::Response, kawa::Buffer::new(checkout));
+        kawa.body_size = kawa::BodySize::Chunked;
+        let mut encoded = Vec::new();
+        super::super::hpack::Encoder::new()
+            .encode_header_into((b"grpc-status", b"0"), &mut encoded);
+        let result = super::super::pkawa::handle_trailer(
+            &mut kawa,
+            &encoded,
+            true,
+            &mut super::super::hpack::Decoder::new(),
+            super::super::h2::MAX_HEADER_LIST_SIZE as u32,
+            u32::MAX,
+            false,
+            &mut Vec::new(),
+        );
+        assert!(result.is_ok(), "handle_trailer failed: {:?}", result.err());
+        assert!(ConnectionH1::<mio::net::TcpStream>::drop_bodiless_response_framing(&mut kawa));
+        assert!(
+            !kawa
+                .blocks
+                .iter()
+                .any(|block| matches!(block, kawa::Block::Header(_))),
+            "the trailer fields are removed"
+        );
+        kawa.prepare(&mut kawa::h1::BlockConverter);
+        assert!(kawa.out.is_empty(), "nothing is written after the head");
+        assert!(!ConnectionH1::<mio::net::TcpStream>::drop_bodiless_response_framing(&mut kawa));
+    }
+
+    /// Which responses `response_has_no_body` treats as bodiless.
+    #[test]
+    fn a_response_has_no_body_for_head_204_and_304_only() {
+        use crate::protocol::kawa_h1::parser::Method;
+        let cases = [
+            (Some(Method::Head), Some(200), true),
+            (Some(Method::Get), Some(204), true),
+            (Some(Method::Get), Some(304), true),
+            (Some(Method::Get), Some(200), false),
+            (Some(Method::Post), Some(205), false),
+            (None, None, false),
+        ];
+        for (method, status, expected) in cases {
+            let mut context = test_http_context(Ulid::generate());
+            context.method = method.clone();
+            context.status = status;
+            assert_eq!(
+                ConnectionH1::<mio::net::TcpStream>::response_has_no_body(&context),
+                expected,
+                "{method:?} {status:?}"
+            );
         }
     }
 
