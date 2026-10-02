@@ -27,7 +27,7 @@
 //! `DiscardedFieldBlock::Continuation` unread on a CVE-2024-27316 refusal —
 //! either way returning ownership of the bytes and resetting to idle. Every
 //! early-return path in `ConnectionH2::handle_headers_frame` that could
-//! abandon an in-progress reassembly (e.g. an RFC 9113 §5.3.1 PRIORITY
+//! abandon an in-progress reassembly (e.g. an RFC 7540 §5.3.1 PRIORITY
 //! self-dependency reset) must retire it before returning, or the
 //! `is_in_progress()` flag leaks into the NEXT HEADERS frame processed on
 //! this connection — which may belong to an entirely different stream —
