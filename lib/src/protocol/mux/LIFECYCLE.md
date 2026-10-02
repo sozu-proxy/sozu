@@ -2044,12 +2044,17 @@ line under chunked framing. Pinned by
 `test_h2_head_response_with_large_data_keeps_the_backend_connection`
 (`e2e/src/tests/h2_security_header_injection.rs`).
 
-Known limitation: after the PROTOCOL_ERROR reset of a 204 or a 304, a frame the
-backend had already sent on that stream is not ignored as RFC 9113 §5.1
-requires. A trailer HEADERS frame then hits the closed-stream check of
-`ConnectionH2::handle_read`, which answers GOAWAY(STREAM_CLOSED) and ends
-every stream of the backend connection. This holds until
-sozu-proxy/sozu#1784 (sozu-proxy/sozu#1783) lands.
+After the PROTOCOL_ERROR reset of a 204 or a 304, a frame the backend had
+already sent on that stream is ignored as RFC 9113 §5.1 requires, by the
+`H2StreamTable::was_reset_locally` branch of
+`ConnectionH2::handle_header_state` described in §8.2: a trailer block, in one
+HEADERS frame or split over CONTINUATION frames, is decoded for HPACK and
+discarded, and the backend connection keeps its other streams. Before
+sozu-proxy/sozu#1784 (sozu-proxy/sozu#1783) the CONTINUATION of a split
+trailer block was taken for a standalone frame and answered
+GOAWAY(PROTOCOL_ERROR), ending every stream of the backend connection; a
+trailer in one HEADERS frame was already ignored. Pinned by
+`a_trailer_after_the_reset_of_a_204_carrying_data_is_ignored` (`h2.rs`).
 
 ### 8.5 Stale-upstream replay (`ReplayOnFreshBackend`)
 
