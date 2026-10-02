@@ -882,7 +882,7 @@ impl BackendMap {
 
     /// [`Self::reserve_backend`], preferring a backend whose address is not in
     /// `exclude`: the backends a request already failed to connect to
-    /// (sozu-proxy/sozu#1800). See [`BackendList::select_with_key_excluding`]
+    /// (sozu-proxy/sozu#1800). See `BackendList::select_with_key_excluding`
     /// for what happens when every selectable backend is excluded.
     pub fn reserve_backend_excluding(
         &mut self,
