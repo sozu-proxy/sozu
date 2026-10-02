@@ -15,7 +15,7 @@
 //!
 //! ## Test list
 //! 1. [`test_h2_flood_window_decays_between_bursts`] — the flood detector's
-//!    sliding window really decays: 120 PINGs (threshold is 100) spread over
+//!    sliding window really decays: 2400 PINGs (threshold is 2000) spread over
 //!    three bursts one and a half seconds apart do NOT trip
 //!    `GOAWAY(ENHANCE_YOUR_CALM)`, and the connection still serves a request
 //!    afterwards. This is the negative space of the CVE-2019-9512 tests in
@@ -116,28 +116,28 @@ fn count_ping_acks(frames: &[(u8, u8, u32, Vec<u8>)]) -> usize {
 // Test 1: the flood detector's sliding window decays
 // ============================================================================
 
-/// `DEFAULT_MAX_PING_PER_WINDOW` in `lib/src/protocol/mux/h2.rs`. Not a knob
+/// `DEFAULT_MAX_PING_PER_WINDOW` in `lib/src/protocol/mux/h2_flood_detector.rs`. Not a knob
 /// this test patches — the listener default is what the CVE-2019-9512 test in
 /// `h2_tests.rs` trips, and this test is its negative space.
-const PING_THRESHOLD: usize = 100;
-/// PINGs per burst. Three bursts put 120 PINGs on the connection, 20 above
+const PING_THRESHOLD: usize = 2000;
+/// PINGs per burst. Three bursts put 2400 PINGs on the connection, 400 above
 /// `PING_THRESHOLD`, so a detector whose window never advances trips.
 ///
 /// With the window advancing, the counter half-decays at each window edge:
-/// 40 → (20 + 40) = 60 → (30 + 40) = 70, well under the threshold. Two bursts
-/// landing in ONE window still only reach 80, so the test only false-fails if
-/// all three bursts are ingested in a single window — a three-second stall of
-/// the worker's event loop.
-const PINGS_PER_BURST: usize = 40;
+/// 800 → (400 + 800) = 1200 → (600 + 800) = 1400, well under the threshold.
+/// Two bursts landing in ONE window still only reach 1600, so the test only
+/// false-fails if all three bursts are ingested in a single window — a
+/// three-second stall of the worker's event loop.
+const PINGS_PER_BURST: usize = 800;
 const PING_BURSTS: usize = 3;
 /// Interval between burst *starts*. `FLOOD_WINDOW_DURATION` is one second, so
 /// this leaves half a second of slack before two bursts could share a window.
 const BURST_PERIOD: Duration = Duration::from_millis(1500);
 
-/// To SEE THIS RED: in `lib/src/protocol/mux/h2.rs`, change
+/// To SEE THIS RED: in `lib/src/protocol/mux/h2_flood_detector.rs`, change
 /// `FLOOD_WINDOW_DURATION` from `from_secs(1)` to `from_secs(3600)` — the
-/// sliding window then never advances, the three bursts accumulate to 120
-/// PINGs against a threshold of 100, and the third burst is answered with
+/// sliding window then never advances, the three bursts accumulate to 2400
+/// PINGs against a threshold of 2000, and the third burst is answered with
 /// `GOAWAY(ENHANCE_YOUR_CALM)` instead of PING ACKs. Inverting
 /// `maybe_reset_window`'s comparison, or making its body a no-op, reddens it
 /// the same way.

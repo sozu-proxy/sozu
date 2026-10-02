@@ -3329,7 +3329,18 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 );
                                 set_default_answer(stream, front_readiness, 503, &answers);
                             }
-                            BE::Backend(BackendError::NoBackendForCluster(_)) => {
+                            BE::Backend(BackendError::NoBackendForCluster(ref cluster_id)) => {
+                                // A cluster that has backends, none of them
+                                // selectable, is in an outage: its backends
+                                // failed their health checks or the
+                                // connections Sōzu opened to them. A cluster
+                                // with no backend at all is a routing miss.
+                                stream.context.backends_unavailable = self
+                                    .backends
+                                    .borrow()
+                                    .backends
+                                    .get(cluster_id.as_str())
+                                    .is_some_and(|list| !list.backends.is_empty());
                                 set_default_answer(stream, front_readiness, 503, &answers);
                             }
                             BE::RetrieveClusterError(RetrieveClusterError::RetrieveFrontend(
