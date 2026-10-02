@@ -508,6 +508,30 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   `ConnectionH2::create_stream` (`h2.rs`) via `H2StreamTable::register`
   (`h2_stream_table.rs`) — cited by symbol on both ends because the call site's
   own line, `self.stream_table`, is one of thirteen identical lines in `h2.rs`.
+- **H1 keep-alive reuse.** An H1 frontend keeps its one slot for the next
+  request: the keep-alive branch of `ConnectionH1::writable` (`h1.rs`) resets
+  it in place instead of going through `Context::create_stream`. It resets
+  `HttpContext` (`HttpContext::reset`, with a fresh request id), clears
+  `front`, `back` and the response storage, `front_bound_to_backend`,
+  `attempts`, `Stream::front_received_end_of_stream`,
+  `Stream::back_received_end_of_stream`, `Stream::front_data_received` and
+  `Stream::back_data_received`, forgets the replay capture, and returns the
+  slot to `Idle`. Unlike `Context::create_stream`, it keeps the slot's
+  `answers` (the connection's listener templates), leaves
+  `Stream::front_window` alone (an H1 frontend leg has no window), and does
+  not touch `request_counted`, which `Stream::generate_access_log` already
+  cleared, nor mark a request start, which `ConnectionH1::readable` marks when
+  the next request arrives. `ConnectionH2::start_stream` sizes
+  `Stream::back_window` from the backend's SETTINGS_INITIAL_WINDOW_SIZE each
+  time the slot opens on an H2 backend, and asserts that the backend leg's
+  end-of-stream flag and DATA counter are clear. An H2 backend connection
+  reads `Stream::back_received_end_of_stream` to refuse a frame on a closed
+  stream (RFC 9113 §5.1): before sozu-proxy/sozu#1781 the stale flag of the
+  first response made it refuse the second response's HEADERS with
+  GOAWAY(STREAM_CLOSED), and the client got a 502. Pinned by
+  `test_h1_to_h2_keep_alive_requests` and
+  `test_h1_to_h2_keep_alive_requests_small_backend_window`
+  (`e2e/src/tests/tests.rs`).
 - **Backend attach.** Two call sites, on the two paths a stream can reach a
   backend, both reached from `Mux::ready_inner`'s `pending_links` drain:
   `Router::plan_connect` calls `Context::link_stream` itself on the pool-reuse
@@ -1856,6 +1880,73 @@ empty line were written after the body. Pinned by
 `test_h2_length_framed_request_trailers_keep_h1_backend_framing`
 (`e2e/src/tests/h2_security_header_injection.rs`).
 
+**No end-of-body framing or trailer section follows the head of a response
+without a body towards an H1 client.** A response to HEAD, a 204 or a 304 has no body by definition
+(RFC 9110 §9.3.2, §15.3.5, §15.4.5), and an H1 client reads it as ending with
+its header section whatever its framing fields say (RFC 9112 §6.3 rule 1), so
+any byte after the head is read as the next response on a keep-alive
+connection. The end of an H2 backend stream, an empty DATA frame or a trailer
+HEADERS frame, queues `Flags` that kawa's H1 serializer writes as the last
+chunk `0\r\n` under chunked framing, and as the trailer fields and an empty
+line. For a
+`Position::Server` pass whose `HttpContext` holds a HEAD method or a 204 or
+304 status (`ConnectionH1::response_has_no_body`), `ConnectionH1::writable`
+calls `ConnectionH1::drop_bodiless_response_framing` after
+`drop_length_framed_trailers` and before its `kawa.prepare`: every block
+after the header section (the last queued `StatusLine` up to its first
+closing `Flags { end_header }`, or the whole queue once the head is written) loses
+its `Header` fields and its `Flags` lose `end_body`, `end_chunk` and
+`end_header`, so for a stream ended by a trailer HEADERS frame or an empty
+DATA frame nothing is written after the head. Each dropped trailer
+block logs a `warn!` and increments `h2.trailers_dropped_no_body`; a
+`Content-Length`-framed one is still dropped and counted by
+`drop_length_framed_trailers` first.
+
+`pkawa::handle_header` gives a response with no content by definition no
+framing: a response with a 1xx, 204 or 304 status, or to HEAD (which
+`HttpContext::on_response_headers` has already marked `Terminated`), whose
+header section arrives without END_STREAM gains no `Transfer-Encoding:
+chunked` field and no chunked framing (RFC 9112 §6.1 forbids the field in a
+1xx or 204). A `content-length` the backend sent is removed from a 1xx or a
+204, where a server MUST NOT send it, and passed through on a 304 or a
+response to HEAD (RFC 9110 §8.6). A 1xx is interim: like kawa's H1 parser,
+`handle_header` marks it complete (`ParsingPhase::Terminated`) at its head, and
+the final response follows on the same stream once the frontend has written
+it (`ConnectionH2::handle_1xx_reset` on an H2 frontend). A 204, a 304 or a
+response to HEAD stays open (`ParsingPhase::Body`) until the backend ends its
+stream with an empty DATA frame or a trailer HEADERS frame (RFC 9113 §8.1):
+released at its head, the backend stream would be reset by
+`ConnectionH2::end_stream` while those frames were in flight, and the
+closed-stream check of `ConnectionH2::handle_read` would answer the trailer HEADERS
+with GOAWAY(STREAM_CLOSED), ending every stream of the backend connection; an
+H2 frontend would also have sent the head without END_STREAM and retired the
+stream, so the client never saw it end. The backend's END_STREAM is what ends
+the response for every frontend: an H1 client reads the head alone, as above,
+and an H2 client receives the head without END_STREAM, then an empty DATA
+frame or the trailer HEADERS frame carrying it. A `:status 101` is malformed
+in HTTP/2 (RFC 9113 §8.6): `handle_header` refuses it as a stream error
+(PROTOCOL_ERROR), so the client gets a 502 rather than an upgrade attempt.
+Before sozu-proxy/sozu#1776 such a head gained `Transfer-Encoding: chunked`
+and chunked framing, and a 1xx never completed, so an H1 client read a chunked
+103 and never the final response. Pinned by
+`a_bodiless_h2_response_gains_no_transfer_encoding_towards_an_h1_client`
+(`h1.rs`), `a_101_response_is_a_stream_protocol_error` (`pkawa.rs`),
+`test_h2_bodiless_response_head_has_no_transfer_encoding`,
+`test_h2_bodiless_response_ends_the_h2_client_stream`,
+`test_h2_bodiless_response_end_keeps_the_backend_connection`,
+`test_h2_backend_interim_response_reaches_the_client` and
+`test_h2_backend_101_is_a_bad_gateway`
+(`e2e/src/tests/h2_security_header_injection.rs`). A known gap remains: DATA
+carrying a payload on a 204, a 304 or a response to HEAD is still forwarded,
+written after the head to an H1 client and as DATA to an H2 client, because
+`ConnectionH2::content_length_exempt` (`h2.rs`) skips the `content-length`
+mismatch reset for HEAD, 204 and 304 and the chunks are not removed here. Pinned by
+`a_bodiless_response_writes_nothing_after_its_head_to_an_h1_client`,
+`a_bodiless_response_trailer_block_queued_after_its_head_is_dropped`,
+`a_response_has_no_body_for_head_204_and_304_only` (`h1.rs`) and
+`test_h2_bodiless_response_trailers_keep_h1_client_framing`
+(`e2e/src/tests/h2_security_header_injection.rs`).
+
 ### 8.5 Stale-upstream replay (`ReplayOnFreshBackend`)
 
 `end_stream_decision` splits "the backend closed without answering" in four,
@@ -2111,7 +2202,16 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     not lost.
 12. **Loop budget.** Every inner loop in `Mux::ready` and
     `drive_frontend_shutdown_io` bounds iterations at
-    `MAX_LOOP_ITERATIONS = 10_000` (`mod.rs`).
+    `MAX_LOOP_ITERATIONS = 10_000` (`mod.rs`). In `ConnectionH1::writable`
+    (`h1.rs`), a write that did not answer `SocketResult::Continue` never
+    re-raises its own WRITABLE event: a `WouldBlock` is resumed by the
+    kernel's next edge, and an `Error` or `Closed` leaves nothing to retry.
+    It signals a pending write while the TLS socket still holds records only
+    after a write that answered `Continue`; re-raising it after a blocked one
+    spun the inner loop to the budget when a TLS client stopped reading
+    ([#1780](https://github.com/sozu-proxy/sozu/issues/1780)).
+    `ConnectionH2` still re-raises it after a blocked write
+    ([#1788](https://github.com/sozu-proxy/sozu/issues/1788)).
 13. **`shrink_trailing_recycle` runs only from `create_stream`.** Calling it
     from elsewhere can invalidate cached `GlobalStreamId` values (including
     `expect_write`/`expect_read`) that the caller is not prepared to re-check.
@@ -2897,6 +2997,27 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     `MuxResult::Continue` as well — the result alone cannot tell the two
     apart. That is what sozu-proxy/sozu#1454 asked for. `h2_close`'s tables
     remain the exhaustive statement of the decisions; these are their callers.
+
+    **Keeping the connection open is not re-arming it.** Every site that
+    keeps a connection for its pending records goes through
+    `ConnectionH2::ensure_tls_flushed`, which raises a synthetic WRITABLE
+    event only when the latest socket write of the pass was not refused by
+    the kernel. A write that answered `WouldBlock` met a full socket: the
+    kernel raises the next WRITABLE edge once the peer reads, and that edge
+    flushes the records and lets the close proceed. A synthetic edge would
+    only repeat the refused write, and `Mux::ready_inner` did so on every
+    inner iteration until `MAX_LOOP_ITERATIONS` whenever a TLS client stopped
+    reading ([#1788](https://github.com/sozu-proxy/sozu/issues/1788)). A
+    refused write also consumes the WRITABLE event, including the empty-buffer
+    flushes whose status nothing else reads. The decisions above are
+    unchanged: they still read `tls_wants_write`, and a connection with
+    records pending keeps WRITABLE interest. The two real-rustls tests above
+    assert that the refused pass queues no event and that the pass the kernel
+    edge triggers flushes the records and closes;
+    `a_refused_goaway_flush_waits_for_the_kernel_edge_then_closes` does the
+    same over `BackpressuredTlsSocket`, and
+    `test_tls_h2_stalled_reader_does_not_exhaust_loop_budget`
+    (`e2e/src/tests/h2_tests.rs`) end to end.
 
     **A fourth site shares the shape without deciding a close.** The end of
     every `ConnectionH2::write_streams` pass runs the same

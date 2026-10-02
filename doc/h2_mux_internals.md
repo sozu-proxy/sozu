@@ -529,6 +529,12 @@ client's grant nor a previous request on the slot carries over. A client and a
 backend that both advertise 2^31-1 are each within the §6.9.2 ceiling and must
 not be summed into one window. An H1 leg never reads its window.
 
+A `SETTINGS_INITIAL_WINDOW_SIZE` above 2^31-1 (RFC 9113 §6.5.2), or a change
+that would push one of the connection's stream windows past 2^31-1 (§6.9.2),
+is answered with GOAWAY(FLOW_CONTROL_ERROR). `update_initial_window_size`
+checks every window before it changes any, so a rejected value leaves the
+windows and the recorded setting untouched.
+
 ### Prepared DATA dropped unsent gives its send credit back
 
 The send windows are debited when DATA is **prepared**, not when it is
@@ -675,7 +681,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:4837-4850
+```rust lib/src/protocol/mux/h2.rs:4873-4886
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -701,7 +707,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:4888-4894
+```rust lib/src/protocol/mux/h2.rs:4924-4930
 let events = stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -733,7 +739,7 @@ taken at the top of `H2WritePhase::Flush`'s post-flush tail
 (`ConnectionH2::poll_write_target`, `lib/src/protocol/mux/h2.rs`) and passes `stream.linked_token()` straight
 out of it:
 
-```rust lib/src/protocol/mux/h2.rs:3621-3622
+```rust lib/src/protocol/mux/h2.rs:3629-3630
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 ```
@@ -1086,7 +1092,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8996-9000
+```rust lib/src/protocol/mux/h2.rs:9072-9076
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1240,7 +1246,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9174-9178
+```rust lib/src/protocol/mux/h2.rs:9250-9254
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1715,7 +1721,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:8499
+```rust lib/src/protocol/mux/h2.rs:8575
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -1949,7 +1955,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:7087-7089
+```rust lib/src/protocol/mux/h2.rs:7124-7126
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1957,7 +1963,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:7101-7107
+```rust lib/src/protocol/mux/h2.rs:7138-7144
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.

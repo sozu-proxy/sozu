@@ -5664,6 +5664,131 @@ fn test_h2_to_h1_102_103_and_final_in_one_write() {
     );
 }
 
+// ---- TLS H1 frontend backpressured by a client that stops reading ----
+
+/// A TLS HTTP/1.1 client that stops reading a large response leaves the
+/// frontend socket backpressured while the backend still has bytes to send.
+/// The session must park on that backpressure, waiting for the next
+/// readiness event, without running `Mux::ready_inner` to its iteration
+/// budget, which `http.infinite_loop.error` records, and resume once the
+/// client reads again.
+fn try_tls_h1_stalled_reader_does_not_exhaust_loop_budget() -> State {
+    let (mut worker, _, front_address) = setup_h2_listener_only("TLS-H1-STALLED-READER");
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let body_size = 8 * 1024 * 1024;
+    let handler: Box<
+        dyn Fn(&std::net::TcpStream, &str, SimpleAggregator) -> SimpleAggregator + Send + Sync,
+    > = Box::new(move |mut stream, _backend_name, mut aggregator| {
+        let mut buf = [0u8; 4096];
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => return aggregator,
+            Ok(_) => {}
+        }
+        aggregator.requests_received += 1;
+        stream.set_nonblocking(false).ok();
+        stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {body_size}\r\n\r\n");
+        let body = vec![b'z'; body_size];
+        if stream.write_all(head.as_bytes()).is_ok() && stream.write_all(&body).is_ok() {
+            aggregator.responses_sent += 1;
+        }
+        stream.set_nonblocking(true).ok();
+        aggregator
+    });
+    let mut backend = AsyncBackend::spawn_detached_backend(
+        "STALLED_READER".to_owned(),
+        back_address,
+        SimpleAggregator::default(),
+        handler,
+    );
+
+    let mut tls_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(crate::mock::https_client::Verifier))
+        .with_no_client_auth();
+    tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let conn = rustls::ClientConnection::new(Arc::new(tls_config), server_name.to_owned()).unwrap();
+    let addr: SocketAddr = SocketAddr::from(front_address);
+    let tcp = super::h2_utils::connect_with_small_receive_buffer(addr);
+    tcp.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let mut tls = rustls::StreamOwned::new(conn, tcp);
+    let sent = tls
+        .write_all(b"GET /large HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .is_ok()
+        && tls.flush().is_ok();
+
+    // Read the response head, then stop reading: the rest of the body fills
+    // the socket buffers and backpressures the frontend.
+    let mut head = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+        match tls.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => head.extend_from_slice(&buf[..n]),
+        }
+    }
+    let answered = head.starts_with(b"HTTP/1.1 200");
+    thread::sleep(Duration::from_secs(2));
+
+    let spins = query_proxy_count(
+        &mut worker,
+        sozu_lib::metrics::names::http::INFINITE_LOOP_ERROR,
+    );
+
+    // The client reads again: the kernel's WRITABLE edge, not a synthetic
+    // one, must resume the flush, and the whole body must arrive.
+    let header_len = head
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(head.len(), |at| at + 4);
+    let mut body_received = head.len() - header_len;
+    let mut big = vec![0u8; 65536];
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while body_received < body_size && Instant::now() < deadline {
+        match tls.read(&mut big) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => body_received += n,
+        }
+    }
+    println!(
+        "TLS H1 stalled reader - sent {sent}, answered {answered}, {} {spins}, body {body_received}/{body_size}",
+        sozu_lib::metrics::names::http::INFINITE_LOOP_ERROR
+    );
+    drop(tls);
+
+    worker.soft_stop();
+    let _ = worker.wait_for_server_stop();
+    backend.stop_and_get_aggregator();
+
+    if sent && answered && spins == 0 && body_received == body_size {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_tls_h1_stalled_reader_does_not_exhaust_loop_budget() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TLS H1: a client that stops reading a large response does not exhaust the loop budget",
+            try_tls_h1_stalled_reader_does_not_exhaust_loop_budget
+        ),
+        State::Success
+    );
+}
+
 // ---- H2-to-H1 large headers ----
 
 /// Send an H2 request with many large custom headers through sozu to an H1
@@ -10960,6 +11085,183 @@ fn test_h2_streams_carry_distinct_request_ids() {
             3,
             "H2: each stream of a connection carries its own Sozu-Id",
             try_h2_streams_carry_distinct_request_ids
+        ),
+        State::Success
+    );
+}
+
+// ---- TLS H2 frontend backpressured by a client that stops reading ----
+
+/// A TLS HTTP/2 client that opens its flow-control windows wide, then stops
+/// reading a large response, leaves the frontend socket backpressured while
+/// sozu still has DATA to send. The session must park on that backpressure,
+/// waiting for the kernel's next writable edge, without running
+/// `Mux::ready_inner` to its iteration budget, which
+/// `http.infinite_loop.error` records, and the records rustls holds must
+/// still be flushed once the client reads again (sozu-proxy/sozu#1788).
+fn try_tls_h2_stalled_reader_does_not_exhaust_loop_budget() -> State {
+    use super::h2_utils::{
+        H2_CLIENT_PREFACE, H2_FLAG_ACK, H2_FRAME_DATA, H2_FRAME_HEADERS, H2_FRAME_SETTINGS,
+        advance_one_frame, connect_with_small_receive_buffer,
+    };
+
+    let is_timeout = |e: &std::io::Error| {
+        matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        )
+    };
+    let (mut worker, _, front_address) = setup_h2_listener_only("TLS-H2-STALLED-READER");
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let body_size = 32 * 1024 * 1024;
+    let handler: Box<
+        dyn Fn(&std::net::TcpStream, &str, SimpleAggregator) -> SimpleAggregator + Send + Sync,
+    > = Box::new(move |mut stream, _backend_name, mut aggregator| {
+        let mut buf = [0u8; 4096];
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => return aggregator,
+            Ok(_) => {}
+        }
+        aggregator.requests_received += 1;
+        stream.set_nonblocking(false).ok();
+        stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {body_size}\r\n\r\n");
+        let body = vec![b'z'; body_size];
+        if stream.write_all(head.as_bytes()).is_ok() && stream.write_all(&body).is_ok() {
+            aggregator.responses_sent += 1;
+        }
+        stream.set_nonblocking(true).ok();
+        aggregator
+    });
+    let mut backend = AsyncBackend::spawn_detached_backend(
+        "H2_STALLED_READER".to_owned(),
+        back_address,
+        SimpleAggregator::default(),
+        handler,
+    );
+
+    let mut tls_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(crate::mock::https_client::Verifier))
+        .with_no_client_auth();
+    tls_config.alpn_protocols = vec![b"h2".to_vec()];
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let conn = rustls::ClientConnection::new(Arc::new(tls_config), server_name.to_owned()).unwrap();
+    let tcp = connect_with_small_receive_buffer(SocketAddr::from(front_address));
+    tcp.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    tcp.set_write_timeout(Some(Duration::from_secs(5))).ok();
+    let mut tls = rustls::StreamOwned::new(conn, tcp);
+
+    // Both windows at their RFC 9113 §6.9.1 maximum, so flow control never
+    // holds the response back: only the socket does.
+    const MAX_WINDOW: u32 = 0x7FFF_FFFF;
+    let mut header_block = vec![
+        0x82, // :method GET (static idx 2)
+        0x87, // :scheme https (static idx 7)
+        0x84, // :path / (static idx 4)
+    ];
+    // :authority localhost — name at static idx 1, literal value.
+    header_block.push(0x41);
+    header_block.push(9);
+    header_block.extend_from_slice(b"localhost");
+    let mut opening = H2_CLIENT_PREFACE.to_vec();
+    // SETTINGS_INITIAL_WINDOW_SIZE is id 0x4 (RFC 9113 §6.5.2).
+    opening.extend(H2Frame::settings(&[(0x4, MAX_WINDOW)]).encode());
+    opening.extend(H2Frame::window_update(0, MAX_WINDOW - 65_535).encode());
+    opening.extend(H2Frame::headers(1, header_block, true, true).encode());
+    let sent = tls.write_all(&opening).is_ok() && tls.flush().is_ok();
+
+    // Acknowledge the server's SETTINGS and read up to the response HEADERS,
+    // then stop reading: the rest of the body fills the socket buffers and
+    // backpressures the frontend.
+    let mut carry = Vec::new();
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut answered = false;
+    let mut body_received = 0usize;
+    let mut ended = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while sent && !answered && Instant::now() < deadline {
+        match tls.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => carry.extend_from_slice(&buf[..n]),
+            Err(e) if is_timeout(&e) => continue,
+            Err(_) => break,
+        }
+        while let Some((frame_type, flags, sid, payload)) = advance_one_frame(&mut carry) {
+            if frame_type == H2_FRAME_SETTINGS && flags & H2_FLAG_ACK == 0 {
+                let _ = tls.write_all(&H2Frame::settings_ack().encode());
+                let _ = tls.flush();
+            } else if frame_type == H2_FRAME_HEADERS && sid == 1 {
+                answered = true;
+            } else if frame_type == H2_FRAME_DATA && sid == 1 {
+                body_received += payload.len();
+                ended |= flags & H2_FLAG_END_STREAM != 0;
+            }
+        }
+    }
+    thread::sleep(Duration::from_secs(2));
+
+    let spins = query_proxy_count(
+        &mut worker,
+        sozu_lib::metrics::names::http::INFINITE_LOOP_ERROR,
+    );
+
+    // The client reads again: the kernel's WRITABLE edge, not a synthetic
+    // one, must resume the flush, and the whole body must arrive.
+    let mut big = vec![0u8; 64 * 1024];
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        while let Some((frame_type, flags, sid, payload)) = advance_one_frame(&mut carry) {
+            if frame_type == H2_FRAME_DATA && sid == 1 {
+                body_received += payload.len();
+                ended |= flags & H2_FLAG_END_STREAM != 0;
+            }
+        }
+        if ended || Instant::now() >= deadline {
+            break;
+        }
+        match tls.read(&mut big) {
+            Ok(0) => break,
+            Ok(n) => carry.extend_from_slice(&big[..n]),
+            // A loaded host may pause the transfer past one read timeout:
+            // only the deadline above ends the wait.
+            Err(e) if is_timeout(&e) => continue,
+            Err(_) => break,
+        }
+    }
+    println!(
+        "TLS H2 stalled reader - sent {sent}, answered {answered}, {} {spins}, body {body_received}/{body_size}, ended {ended}",
+        sozu_lib::metrics::names::http::INFINITE_LOOP_ERROR
+    );
+    drop(tls);
+
+    worker.soft_stop();
+    let _ = worker.wait_for_server_stop();
+    backend.stop_and_get_aggregator();
+
+    if sent && answered && spins == 0 && body_received == body_size && ended {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_tls_h2_stalled_reader_does_not_exhaust_loop_budget() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TLS H2: a client that stops reading a large response does not exhaust the loop budget",
+            try_tls_h2_stalled_reader_does_not_exhaust_loop_budget
         ),
         State::Success
     );

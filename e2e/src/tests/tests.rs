@@ -4916,6 +4916,17 @@ fn setup_h2_backend_test(
     nb_backends: usize,
     frontend_h2: bool,
 ) -> (Worker, Vec<H2Backend>, u16) {
+    setup_h2_backend_test_with(name, nb_backends, frontend_h2, H2Backend::start)
+}
+
+/// [`setup_h2_backend_test`] with each backend started by `start_backend`
+/// from its name, address and response body.
+fn setup_h2_backend_test_with(
+    name: &str,
+    nb_backends: usize,
+    frontend_h2: bool,
+    start_backend: fn(String, SocketAddr, String) -> H2Backend,
+) -> (Worker, Vec<H2Backend>, u16) {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
 
@@ -4993,7 +5004,7 @@ fn setup_h2_backend_test(
             back_address,
             None,
         )));
-        backends.push(H2Backend::start(
+        backends.push(start_backend(
             format!("H2_BACKEND_{i}"),
             back_address,
             format!("h2-pong{i}"),
@@ -5122,6 +5133,143 @@ fn test_h1_to_h2_basic_request() {
             10,
             "H1→H2: HTTP/1.1 frontend to H2 backend",
             try_h1_to_h2_basic_request
+        ),
+        State::Success
+    );
+}
+
+/// H1 frontend → H2 backend, several requests on one keep-alive client
+/// connection, served over one backend connection: a GET, POSTs of
+/// `POST_BODY` bytes, then a GET. Each is answered `200` with the backend's
+/// body. Each request is a new H2 stream on the backend connection, so its
+/// response HEADERS must be accepted whatever the previous stream's end left
+/// on the reused client-side stream slot (RFC 9113 §5.1), and its request
+/// DATA must start from the backend's own initial stream window, not from
+/// what the previous request left of it (§6.9). With `small_backend_window`
+/// the backend advertises `SMALL_BACKEND_WINDOW`, below the 65 535 default,
+/// as its SETTINGS_INITIAL_WINDOW_SIZE. Both backends read every request
+/// body to its end before answering.
+///
+/// TO SEE THIS RED: in `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`),
+/// drop the clearing of `back_received_end_of_stream` from the keep-alive
+/// reset: in a debug build the fresh-backend-leg `debug_assert!` of
+/// `ConnectionH2::start_stream` panics on the second request, and in a
+/// release build that response is refused and answered 502. Or, in
+/// `ConnectionH2::start_stream` (`lib/src/protocol/mux/h2.rs`), stop sizing
+/// the backend leg's window: only the small-window variant fails, its fourth
+/// POST stalling.
+fn try_h1_to_h2_keep_alive_requests(small_backend_window: bool) -> State {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    const POST_BODY: usize = 600_000;
+    const POSTS: usize = 4;
+
+    let (mut worker, mut backends, front_port) = if small_backend_window {
+        setup_h2_backend_test_with(
+            "H1-TO-H2-KEEP-ALIVE-SMALL-WINDOW",
+            1,
+            false,
+            |name, address, body| {
+                H2Backend::start_with_stream_window(name, address, body, SMALL_BACKEND_WINDOW)
+            },
+        )
+    } else {
+        setup_h2_backend_test_with("H1-TO-H2-KEEP-ALIVE", 1, false, |name, address, body| {
+            H2Backend::start_recording_trailers(name, address, body)
+        })
+    };
+    let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connect to sozu");
+    client
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    client
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let post_body = vec![b'p'; POST_BODY];
+    let mut requests: Vec<Vec<u8>> = vec![b"GET /api HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec()];
+    for _ in 0..POSTS {
+        let mut post = format!(
+            "POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: {POST_BODY}\r\n\r\n"
+        )
+        .into_bytes();
+        post.extend_from_slice(&post_body);
+        requests.push(post);
+    }
+    requests.push(b"GET /api HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec());
+
+    let mut answers = Vec::new();
+    for request in &requests {
+        if client.write_all(request).is_err() {
+            answers.push(String::from("<request write stalled>"));
+            break;
+        }
+        let mut received = Vec::new();
+        let mut buffer = [0u8; 4096];
+        for _ in 0..25 {
+            match client.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    received.extend_from_slice(&buffer[..n]);
+                    if String::from_utf8_lossy(&received).contains("h2-pong0") {
+                        break;
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        answers.push(String::from_utf8_lossy(&received).into_owned());
+    }
+    let answered: Vec<bool> = answers
+        .iter()
+        .map(|answer| answer.starts_with("HTTP/1.1 200 ") && answer.contains("h2-pong0"))
+        .collect();
+    println!("H1→H2 keep-alive small_window={small_backend_window} answered: {answered:?}");
+    drop(client);
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    let connections = backends[0].get_connections_accepted();
+    let received = backends[0].get_requests_received();
+    backends.iter_mut().for_each(|b| b.stop());
+    println!(
+        "H1→H2 keep-alive small_window={small_backend_window}: {connections} backend connection(s), {received} request(s)"
+    );
+
+    if stopped
+        && answered.len() == requests.len()
+        && answered.iter().all(|ok| *ok)
+        && connections == 1
+        && received == requests.len()
+    {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+/// A backend SETTINGS_INITIAL_WINDOW_SIZE below the 65 535 default.
+const SMALL_BACKEND_WINDOW: u32 = 16_384;
+
+#[test]
+fn test_h1_to_h2_keep_alive_requests() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H1→H2: every request on a keep-alive client connection is answered",
+            || try_h1_to_h2_keep_alive_requests(false)
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_h1_to_h2_keep_alive_requests_small_backend_window() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H1→H2: keep-alive requests respect a backend window below 65 535",
+            || try_h1_to_h2_keep_alive_requests(true)
         ),
         State::Success
     );

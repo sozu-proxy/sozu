@@ -264,6 +264,10 @@ pub mod h2 {
         "h2.signal.writable.rearmed.priority_update";
 
     pub const TRAILERS_DROPPED_CONTENT_LENGTH: &str = "h2.trailers_dropped_content_length";
+    /// H2 trailer blocks of a response to HEAD, a 204 or a 304 dropped by
+    /// `ConnectionH1::writable` towards an H1 client, which reads such a
+    /// response as ending with its header section (RFC 9112 §6.3).
+    pub const TRAILERS_DROPPED_NO_BODY: &str = "h2.trailers_dropped_no_body";
     /// Request trailer fields elided by `pkawa::handle_trailer` because their
     /// name is one of `editor::TRAILER_FORBIDDEN_FIELDS` (sozu-proxy/sozu#1714).
     /// One increment per field; the request is still forwarded. The H1

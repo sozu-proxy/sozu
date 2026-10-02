@@ -876,6 +876,13 @@ pub struct ConnectionH2 {
     discarded_field_block: Option<DiscardedFieldBlock>,
     /// True once we've asked rustls to emit TLS close_notify for this frontend.
     close_notify_sent: bool,
+    /// The last socket write of the current [`H2Shell::writable`] pass
+    /// answered `WouldBlock`: the kernel refused it, so it owes this socket
+    /// its next WRITABLE edge, and [`Self::ensure_tls_flushed`] must not
+    /// synthesize one. Recorded by [`Self::note_write_status`] after every
+    /// write, and cleared when a pass starts, so a pass that wrote nothing
+    /// re-arms as before (sozu-proxy/sozu#1788).
+    kernel_refused_write: bool,
     /// Per-listener H2 connection tuning (window size, max streams, shrink ratio).
     pub connection_config: H2ConnectionConfig,
     /// Maximum pending WINDOW_UPDATE entries before dropping.
@@ -1987,6 +1994,7 @@ impl ConnectionH2 {
             control_tx: h2_control_tx::H2ControlTx::new(connection_config.max_concurrent_streams),
             discarded_field_block: None,
             close_notify_sent: false,
+            kernel_refused_write: false,
             max_pending_window_updates: 1 + connection_config.max_concurrent_streams as usize * 4,
             connection_config,
             ready_incremental_streams: 0,
@@ -3867,6 +3875,7 @@ impl ConnectionH2 {
     ) where
         L: ListenerHandler + L7ListenerHandler,
     {
+        self.note_write_status(status);
         let H2Written {
             size,
             from_output,
@@ -4003,9 +4012,36 @@ impl ConnectionH2 {
     /// The stalled-drain tails of [`Self::flush_pending_control_frames`] used
     /// to read it and re-arm individually; its one output flush now answers
     /// [`H2ControlFlushTarget::Stalled`] and that arm re-arms.
+    ///
+    /// No re-arm follows a write the kernel refused
+    /// (`kernel_refused_write`): the socket is full, the kernel raises
+    /// the next WRITABLE edge once the peer reads, and that edge flushes the
+    /// records. A synthetic edge would only repeat the refused write, and
+    /// `Mux::ready_inner` did so on every inner iteration until
+    /// `MAX_LOOP_ITERATIONS` counted `http.infinite_loop.error` whenever a
+    /// TLS client stopped reading (sozu-proxy/sozu#1788). The close decisions
+    /// still read `tls_wants_write` unchanged: a connection with records
+    /// pending keeps WRITABLE interest and stays open until they are flushed.
     pub fn ensure_tls_flushed(&mut self, tls_wants_write: bool) {
-        if tls_wants_write {
+        if tls_wants_write && !self.kernel_refused_write {
             self.readiness.signal_pending_write();
+        }
+    }
+
+    /// Record what a socket write of this pass answered, for
+    /// [`Self::ensure_tls_flushed`]. Every write the shell makes reports
+    /// here, so the flag always describes the latest one.
+    ///
+    /// A refused write also consumes the WRITABLE event, as
+    /// `update_readiness_after_write` does for the writes whose status it
+    /// reads. The empty-buffer flushes of `H2Shell::flush_tls_records` have
+    /// no other reader of their status, so without this a refused flush left
+    /// the edge it was called on in place, and `Mux::ready_inner` ran the
+    /// pass again on every inner iteration.
+    fn note_write_status(&mut self, status: SocketResult) {
+        self.kernel_refused_write = status == SocketResult::WouldBlock;
+        if self.kernel_refused_write {
+            self.readiness.event.remove(Ready::WRITABLE);
         }
     }
 
@@ -6025,6 +6061,7 @@ impl ConnectionH2 {
     /// the caller must wait for its next writable event; `false` means carry
     /// on until [`Self::output_pending`] is empty.
     pub fn consume_output_flush(&mut self, size: usize, status: SocketResult) -> bool {
+        self.note_write_status(status);
         self.consume_output(size);
         update_readiness_after_write(size, status, &mut self.readiness)
     }
@@ -7114,7 +7151,15 @@ impl ConnectionH2 {
                 },
                 parser::SETTINGS_ENABLE_PUSH       => { self.peer_settings.settings_enable_push = v == 1;             is_error |= v > 1 },
                 parser::SETTINGS_MAX_CONCURRENT_STREAMS => { self.peer_settings.settings_max_concurrent_streams = v },
-                parser::SETTINGS_INITIAL_WINDOW_SIZE    => { is_error |= self.update_initial_window_size(v, context) },
+                parser::SETTINGS_INITIAL_WINDOW_SIZE    => {
+                    // RFC 9113 §6.5.2 / §6.9.2: a value above 2^31-1, or one
+                    // that pushes a stream window past it, is a connection
+                    // error of type FLOW_CONTROL_ERROR, not PROTOCOL_ERROR.
+                    if self.update_initial_window_size(v, context) {
+                        error!("{} INVALID SETTINGS_INITIAL_WINDOW_SIZE {}", log_context!(self), v);
+                        return self.goaway(H2Error::FlowControlError);
+                    }
+                },
                 parser::SETTINGS_MAX_FRAME_SIZE         => { self.peer_settings.settings_max_frame_size = v;           is_error |= !(MIN_MAX_FRAME_SIZE..MAX_MAX_FRAME_SIZE).contains(&v) },
                 parser::SETTINGS_MAX_HEADER_LIST_SIZE   => { self.peer_settings.settings_max_header_list_size = v },
                 parser::SETTINGS_ENABLE_CONNECT_PROTOCOL => { self.peer_settings.settings_enable_connect_protocol = v == 1; is_error |= v > 1 },
@@ -7559,6 +7604,13 @@ impl ConnectionH2 {
         MuxResult::Continue
     }
 
+    /// Apply a peer's `SETTINGS_INITIAL_WINDOW_SIZE` to every stream window
+    /// this connection holds (RFC 9113 §6.9.2). `true` when the value is
+    /// invalid — above 2^31-1, or a change that would push some stream
+    /// window past it — which the caller answers with
+    /// GOAWAY(FLOW_CONTROL_ERROR). Every window is checked before any is
+    /// changed, so a rejected value leaves all of them, and the recorded
+    /// setting, as they were.
     fn update_initial_window_size<L>(&mut self, value: u32, context: &mut Context<L>) -> bool
     where
         L: ListenerHandler + L7ListenerHandler,
@@ -7575,21 +7627,31 @@ impl ConnectionH2 {
                 return true;
             }
         };
+        // RFC 9113 §6.9.2: changes to SETTINGS_INITIAL_WINDOW_SIZE can cause
+        // stream windows to exceed 2^31-1, which is a flow control error.
+        // Checked for every stream first, so a rejection changes nothing.
+        // Only streams owned by this connection, and only this connection's
+        // leg of each (RFC 9113 §6.9): the other connection's window is its
+        // own.
+        let overflows = self
+            .stream_table
+            .streams()
+            .values()
+            .any(|&global_stream_id| {
+                context.streams[global_stream_id]
+                    .send_window_mut(&self.position)
+                    .checked_add(delta)
+                    .is_none()
+            });
+        if overflows {
+            return true;
+        }
         let mut open_window = false;
-        // Only update windows for streams owned by this connection
         for &global_stream_id in self.stream_table.streams().values() {
-            // RFC 9113 §6.9: the peer's setting sizes this connection's leg of
-            // the stream only; the other connection's window is its own.
             let stream_window = context.streams[global_stream_id].send_window_mut(&self.position);
-            // RFC 9113 §6.9.2: changes to SETTINGS_INITIAL_WINDOW_SIZE can cause
-            // stream windows to exceed 2^31-1, which is a flow control error.
-            match stream_window.checked_add(delta) {
-                Some(new_window) => {
-                    open_window |= *stream_window <= 0 && new_window > 0;
-                    *stream_window = new_window;
-                }
-                None => return true,
-            }
+            let new_window = *stream_window + delta;
+            open_window |= *stream_window <= 0 && new_window > 0;
+            *stream_window = new_window;
         }
         trace!(
             "{} UPDATE INIT WINDOW: {} {} {:?}",
@@ -8200,6 +8262,18 @@ impl ConnectionH2 {
         // slot left.
         *context.streams[stream].send_window_mut(&self.position) =
             i32::try_from(self.peer_settings.settings_initial_window_size).unwrap_or(i32::MAX);
+        // Pre: the backend leg of the slot starts fresh, whether it comes
+        // from `Context::create_stream` or from an H1 frontend's keep-alive
+        // reset (sozu-proxy/sozu#1781): nothing has been received on it yet,
+        // or `handle_read` would refuse the response as arriving on a closed
+        // stream. The frontend leg may legitimately be done already: an H2
+        // client's request ends with END_STREAM before the backend is
+        // dialled.
+        debug_assert!(
+            !context.streams[stream].back_received_end_of_stream
+                && context.streams[stream].back_data_received == 0,
+            "a stream must open on a backend with a fresh backend leg"
+        );
         self.stream_table.register(stream_id, stream, self.now);
         // Sōzu opened this stream; the backend peer cannot inflate the count.
         self.flood_detector.record_stream_opened();
@@ -8421,7 +8495,9 @@ impl<Front: SocketHandler> H2Shell<Front> {
     /// records behind — and only [`Self::flush_output_buffer`] consumes the
     /// status, through `update_readiness_after_write`.
     fn flush_tls_records(&mut self) -> (usize, SocketResult) {
-        self.socket.socket_write(&[])
+        let (size, status) = self.socket.socket_write(&[]);
+        self.core.note_write_status(status);
+        (size, status)
     }
 
     /// Start the TLS `close_notify` handshake, generating the records that
@@ -9203,6 +9279,8 @@ impl<Front: SocketHandler> H2Shell<Front> {
     {
         // Entry point: adopt the mux's snapshot for this pass.
         self.core.adopt_now(context.now);
+        // Only this pass's writes may withhold its TLS re-arm.
+        self.core.kernel_refused_write = false;
         self.core.prune_inactive_streams_while_closing(context);
 
         match self.drive_control_flush() {
@@ -10642,6 +10720,11 @@ mod tests {
         pending: std::cell::Cell<usize>,
         drain_per_flush: usize,
         flushes: std::cell::Cell<usize>,
+        /// An empty-buffer flush that leaves records behind answers
+        /// `WouldBlock`, as `FrontRustls` does when the kernel refused them,
+        /// instead of `Continue`. Off by default, so every test written
+        /// before this field is byte-for-byte unaffected.
+        refuse_flush: bool,
         /// Scripted `(size, status)` answers for `socket_write_vectored`,
         /// consumed front to back. An EMPTY script — the default, and what
         /// every test written before this field had — delegates to the real
@@ -10708,6 +10791,7 @@ mod tests {
                 pending: std::cell::Cell::new(pending),
                 drain_per_flush,
                 flushes: std::cell::Cell::new(0),
+                refuse_flush: false,
                 vectored_script: std::collections::VecDeque::new(),
                 write_script: std::collections::VecDeque::new(),
                 vectored_calls: 0,
@@ -10726,6 +10810,9 @@ mod tests {
                 self.flushes.set(self.flushes.get() + 1);
                 let drained = self.drain_per_flush.min(self.pending.get());
                 self.pending.set(self.pending.get() - drained);
+                if self.refuse_flush && self.pending.get() > 0 {
+                    return (0, SocketResult::WouldBlock);
+                }
                 return (0, SocketResult::Continue);
             }
             self.writes += 1;
@@ -10924,6 +11011,62 @@ mod tests {
         );
     }
 
+    /// A GoAway flush the kernel refuses keeps the connection open WITHOUT
+    /// re-raising WRITABLE: the kernel owes the socket its next edge, and a
+    /// synthetic one made `Mux::ready_inner` repeat the refused flush on
+    /// every inner iteration until `MAX_LOOP_ITERATIONS`
+    /// (sozu-proxy/sozu#1788). Once the kernel drains, the next writable
+    /// pass flushes the records and reaches the disconnect, so no record is
+    /// lost on the way to the close.
+    ///
+    /// TO SEE THIS RED: drop `&& !self.kernel_refused_write` from
+    /// `ConnectionH2::ensure_tls_flushed`. The refused pass then re-raises
+    /// the WRITABLE event.
+    #[test]
+    fn a_refused_goaway_flush_waits_for_the_kernel_edge_then_closes() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut connection, _peer) = connection_with_backpressure(&pool, 2, 0, H2State::GoAway);
+        connection.socket.refuse_flush = true;
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        connection.core.readiness.event.insert(Ready::WRITABLE);
+
+        let result = connection.writable(&mut context, EndpointClient(&mut router));
+
+        assert!(
+            matches!(result, MuxResult::Continue),
+            "records still buffered: the session must stay open, got {result:?}"
+        );
+        assert!(
+            matches!(connection.core.state, H2State::GoAway),
+            "the GoAway arm must keep the connection, got {:?}",
+            connection.core.state
+        );
+        assert!(
+            connection.core.readiness.interest.is_writable(),
+            "WRITABLE interest must stay so the kernel edge is delivered"
+        );
+        assert!(
+            !connection.core.readiness.event.is_writable(),
+            "a refused flush must leave WRITABLE to the kernel edge, got {:?}",
+            connection.core.readiness
+        );
+
+        // The peer reads: the kernel takes the records and raises its edge.
+        connection.socket.drain_per_flush = 2;
+        connection.core.readiness.event.insert(Ready::WRITABLE);
+        let result = connection.writable(&mut context, EndpointClient(&mut router));
+
+        assert!(
+            !connection.socket.socket_wants_write(),
+            "the kernel edge must flush the pending records"
+        );
+        assert!(
+            !matches!(result, MuxResult::Continue),
+            "a drained GoAway flush must reach the disconnect, got {result:?}"
+        );
+    }
+
     // ── The write pass's own flush triple (`finalize_write`) ────────────
     //
     // `ConnectionH2::finalize_write` ends every write pass with the same
@@ -11057,7 +11200,12 @@ mod tests {
     // (#1604). When that flush stalls, `update_readiness_after_write`
     // (`mux/mod.rs`) has just REMOVED the WRITABLE event bit, and the
     // `Stalled` answer puts it back when the socket still holds records it
-    // could not hand to the kernel. Before #1604 each of the two stages had a
+    // could not hand to the kernel — unless the kernel refused the write
+    // (`WouldBlock`): it then owes the socket its next edge, and the re-arm
+    // would only repeat the refused write (sozu-proxy/sozu#1788,
+    // `a_refused_goaway_flush_waits_for_the_kernel_edge_then_closes`). The
+    // two tests below therefore stall the flush on a zero-length write the
+    // kernel did NOT refuse, the case the re-arm still exists for. Before #1604 each of the two stages had a
     // stall tail of its own; the two tests below cover the one that remains.
     //
     // Until the two tests below existed, nothing in the suite reached either
@@ -11093,13 +11241,14 @@ mod tests {
         // One record rustls still holds and a kernel that accepts nothing, so
         // `socket_wants_write()` answers true for the whole test.
         let (mut connection, _peer) = connection_with_backpressure(&pool, 1, 0, H2State::Header);
-        // The output flush stalls on its first round. `(0, WouldBlock)`
+        // The output flush stalls on its first round. A zero-length write
         // is what `update_readiness_after_write` reads as a stall, and it
         // removes the WRITABLE event bit before the drain stage can re-arm.
+        // `Continue`, not `WouldBlock`: no kernel edge is owed for it.
         connection
             .socket
             .write_script
-            .push_back((0, SocketResult::WouldBlock));
+            .push_back((0, SocketResult::Continue));
         let mut context = test_context(&pool);
         let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
 
@@ -11154,7 +11303,7 @@ mod tests {
         connection
             .socket
             .write_script
-            .push_back((0, SocketResult::WouldBlock));
+            .push_back((0, SocketResult::Continue));
         let mut context = test_context(&pool);
         let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
 
@@ -12960,6 +13109,100 @@ mod tests {
                 "front window {front_window}: and leaves the frontend leg alone"
             );
         }
+    }
+
+    /// Feed `inbound` to a frontend connection carrying streams 1 and 3,
+    /// flush what it answers, and return the GOAWAY error codes it wrote.
+    fn goaway_codes_after(
+        connection: &mut H2Shell<PacedSocket>,
+        context: &mut Context<TestListener>,
+        router: &mut Router,
+        inbound: &[u8],
+    ) -> Vec<u32> {
+        connection.socket.inbound.extend(inbound);
+        for _ in 0..4 {
+            connection.core.readiness.event.insert(Ready::READABLE);
+            if connection.core.readiness.filter_interest().is_readable() {
+                connection.readable(context, EndpointClient(router));
+            }
+        }
+        connection.core.readiness.event.insert(Ready::WRITABLE);
+        connection.writable(context, EndpointClient(router));
+        peer_frames(&connection.socket.wire)
+            .expect("whole frames on the wire")
+            .iter()
+            .filter(|(kind, ..)| *kind == 7)
+            .map(|(_, _, _, payload)| {
+                u32::from_be_bytes(payload[4..8].try_into().expect("GOAWAY error code"))
+            })
+            .collect()
+    }
+
+    /// A SETTINGS frame carrying only `SETTINGS_INITIAL_WINDOW_SIZE = value`.
+    fn initial_window_settings(value: u32) -> Vec<u8> {
+        let mut payload = vec![0, 4];
+        payload.extend_from_slice(&value.to_be_bytes());
+        orphan_frame(4, 0, 0, 6, &payload)
+    }
+
+    /// RFC 9113 §6.5.2: a `SETTINGS_INITIAL_WINDOW_SIZE` above 2^31-1 "MUST
+    /// be treated as a connection error of type FLOW_CONTROL_ERROR".
+    ///
+    /// TO SEE THIS RED: answer the `SETTINGS_INITIAL_WINDOW_SIZE` arm of
+    /// `ConnectionH2::handle_settings_frame` with `H2Error::ProtocolError`:
+    /// `left: [1], right: [3]`. Verified 2026-10-01 (red on `c8779209`).
+    #[test]
+    fn an_initial_window_above_the_maximum_is_a_flow_control_error() {
+        let (_pool, mut connection, mut context, mut router, _peer) = two_requests_read(usize::MAX);
+        let codes = goaway_codes_after(
+            &mut connection,
+            &mut context,
+            &mut router,
+            &initial_window_settings(FLOW_CONTROL_MAX_WINDOW + 1),
+        );
+        assert_eq!(codes, vec![0x3], "GOAWAY(FLOW_CONTROL_ERROR)");
+    }
+
+    /// RFC 9113 §6.9.2: a SETTINGS change that pushes a stream window past
+    /// 2^31-1 is a connection error of type FLOW_CONTROL_ERROR. Stream 3's
+    /// window already stands at 2^31-1; raising the initial window by one
+    /// overflows it. The rejection is checked before any window moves, so
+    /// stream 1, walked first, keeps its window.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::update_initial_window_size`,
+    /// apply each delta as it is checked, returning on the first overflow:
+    /// `the rejected setting changes no stream window`, `left: 65536, right:
+    /// 65535`. Verified 2026-10-01 (red on `c8779209`).
+    #[test]
+    fn a_settings_change_overflowing_a_stream_window_is_a_flow_control_error() {
+        let (_pool, mut connection, mut context, mut router, _peer) = two_requests_read(usize::MAX);
+        let gid = |connection: &H2Shell<PacedSocket>, id: u32| {
+            *connection
+                .core
+                .stream_table
+                .streams()
+                .get(&id)
+                .expect("the stream is open")
+        };
+        let (first, third) = (gid(&connection, 1), gid(&connection, 3));
+        let mut inbound = orphan_frame(
+            8,
+            0,
+            3,
+            4,
+            &(FLOW_CONTROL_MAX_WINDOW - DEFAULT_INITIAL_WINDOW_SIZE).to_be_bytes(),
+        );
+        inbound.extend(initial_window_settings(DEFAULT_INITIAL_WINDOW_SIZE + 1));
+        let codes = goaway_codes_after(&mut connection, &mut context, &mut router, &inbound);
+        assert_eq!(
+            context.streams[third].front_window, FLOW_CONTROL_MAX_WINDOW as i32,
+            "premise: stream 3's window stands at 2^31-1"
+        );
+        assert_eq!(codes, vec![0x3], "GOAWAY(FLOW_CONTROL_ERROR)");
+        assert_eq!(
+            context.streams[first].front_window, DEFAULT_INITIAL_WINDOW_SIZE as i32,
+            "the rejected setting changes no stream window"
+        );
     }
 
     /// RFC 9113 §6.9 on the frontend leg: the client's WINDOW_UPDATE and
@@ -20170,11 +20413,18 @@ mod tests {
              not close the session: the close destroys plaintext the peer has \
              not received and it reads the response as truncated"
         );
+        // The kernel refused the flush: it owes this socket its next
+        // WRITABLE edge, so no synthetic one is queued (sozu-proxy/sozu#1788).
         assert!(
-            connection.core.readiness.event.is_writable(),
-            "ensure_tls_flushed must re-signal the WRITABLE event, since \
-             nothing else wakes a connection whose bytes are stuck in rustls \
-             rather than in the kernel"
+            connection.core.readiness.interest.is_writable(),
+            "the delayed close must keep WRITABLE interest so the kernel edge \
+             is delivered"
+        );
+        assert!(
+            !connection.core.readiness.event.is_writable(),
+            "a flush the kernel refused must leave WRITABLE to the kernel's \
+             next edge, got {:?}",
+            connection.core.readiness
         );
 
         let mut received = Vec::new();
@@ -20269,10 +20519,13 @@ mod tests {
              reaching Error means the arm fell through to force_disconnect \
              and its own record guard, not this one, kept the session alive"
         );
+        // The kernel refused the flush: it owes this socket its next
+        // WRITABLE edge, so no synthetic one is queued (sozu-proxy/sozu#1788).
         assert!(
-            connection.core.readiness.event.is_writable(),
-            "ensure_tls_flushed must re-signal the WRITABLE event so the loop \
-             comes back and retries the flush"
+            !connection.core.readiness.event.is_writable(),
+            "a flush the kernel refused must leave WRITABLE to the kernel's \
+             next edge, got {:?}",
+            connection.core.readiness
         );
 
         let mut received = Vec::new();
