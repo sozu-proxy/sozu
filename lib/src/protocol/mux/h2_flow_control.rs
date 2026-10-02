@@ -26,11 +26,13 @@
 //!   by [`H2FlowControl::queue_window_update`] and flushed by
 //!   [`H2FlowControl::drain_window_updates_into`].
 //!
-//! Per-stream *send*-window state (`Stream.window` in `stream.rs`) and the
-//! per-stream arm of `handle_window_update_frame` (which resolves a stream
-//! slot via `ConnectionH2::streams` and can RST the stream) stay on
-//! `ConnectionH2` / `Stream` — they need the stream table and endpoint this
-//! module deliberately does not have.
+//! Per-stream *send*-window state (`Stream.front_window` and
+//! `Stream.back_window` in `stream.rs`, one per connection the stream crosses,
+//! because RFC 9113 §6.9 flow control is hop-by-hop) and the per-stream arm of
+//! `handle_window_update_frame` (which resolves a stream slot via
+//! `ConnectionH2::streams` and can RST the stream) stay on `ConnectionH2` /
+//! `Stream` — they need the stream table and endpoint this module deliberately
+//! does not have.
 //!
 //! ## The advertised connection-level receive window is not enforced
 //!
@@ -54,14 +56,15 @@
 //! window — peer-granted credit for our own writes — and
 //! [`H2FlowControl::account_received_bytes`] only accumulates. No state in
 //! this module is decremented by an inbound DATA frame, so none can go
-//! negative, and no connection-level `FLOW_CONTROL_ERROR` is raised: the only
-//! `H2Error::FlowControlError` this connection emits at all comes from
-//! `ConnectionH2::handle_window_update_frame`, when an increment would grow a
-//! SEND window past 2^31-1 — GOAWAY for the connection window, RST_STREAM for
-//! a stream's. Every other flow-control-shaped rejection there is a
-//! `ProtocolError` (a zero increment; a `SETTINGS_INITIAL_WINDOW_SIZE` above
-//! 2^31-1, which `ConnectionH2::update_initial_window_size` reports to
-//! `ConnectionH2::handle_settings_frame`). Measured on
+//! negative, and no `FLOW_CONTROL_ERROR` is raised for inbound DATA: every
+//! `H2Error::FlowControlError` this connection emits is about a SEND window
+//! growing past 2^31-1. `ConnectionH2::handle_window_update_frame` raises it
+//! when an increment would — GOAWAY for the connection window, RST_STREAM for
+//! a stream's — and `ConnectionH2::handle_settings_frame` answers GOAWAY with
+//! it when `ConnectionH2::update_initial_window_size` rejects a
+//! `SETTINGS_INITIAL_WINDOW_SIZE` above 2^31-1 or one that would push a
+//! stream window past it (RFC 9113 §6.5.2, §6.9.2). A zero increment is a
+//! `ProtocolError`. Measured on
 //! sozu-proxy/sozu#1488: against 98303 octets advertised — the 65535 default
 //! plus one 32768 grant — **106496 octets of DATA were accepted, with no
 //! GOAWAY and no `FLOW_CONTROL_ERROR`**.

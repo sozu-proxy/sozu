@@ -2675,7 +2675,8 @@ mod backend_selection_order_tests {
         protocol::{
             http::parser::Method,
             mux::{
-                BackendRegistry, BackendStatus, Connection, Context, Position, StreamState,
+                BackendId, BackendRegistry, BackendStatus, Connection, Context, Position,
+                StreamState,
                 buffer_source::PoolBufferSource,
                 h2::H2ConnectionConfig,
                 h2_flood_detector::H2FloodConfig,
@@ -2914,6 +2915,114 @@ mod backend_selection_order_tests {
         match context.streams[stream_id].state {
             StreamState::Linked(token) => token,
             other => panic!("connect must link the stream to a backend, got {other:?}"),
+        }
+    }
+
+    /// Drive one `Router::plan_connect` against a single staged connection of
+    /// the `staged` arm, whose backend is retired when `retired` is set, and
+    /// return the plan.
+    fn plan_against_one_staged(
+        fixture: &RoutingFixture,
+        staged: &Staged,
+        retired: bool,
+    ) -> (ConnectPlan, StreamState) {
+        let mut context = Context::new(
+            Ulid::generate(),
+            Rc::downgrade(&fixture.pool),
+            fixture.listener.clone(),
+            None,
+            "127.0.0.1:80"
+                .parse()
+                .expect("test public address must parse"),
+        );
+        let stream_id = context
+            .create_stream(Ulid::generate(), 65_535)
+            .expect("the test pool must hand out a stream");
+        {
+            let stream = &mut context.streams[stream_id];
+            stream.state = StreamState::Link;
+            stream.context.authority = Some(staged.authority().to_owned());
+            stream.context.path = Some("/".to_owned());
+            stream.context.method = Some(Method::Get);
+        }
+        let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+        let mut backend_registry = BackendRegistry::default();
+        let (connection, _peer) = staged_backend(&fixture.pool, staged, &mut backend_registry);
+        if retired {
+            // What `BackendList::remove_backend` and `BackendMap::remove_cluster`
+            // do to the handle the session's registry still holds.
+            let Position::Client(_, backend, _) = connection.position() else {
+                unreachable!("a staged backend is a client connection")
+            };
+            backend_registry
+                .handle(backend)
+                .expect("the staged backend was interned")
+                .borrow_mut()
+                .set_closing();
+        }
+        router.backends.insert(Token(LOWEST_TOKEN), connection);
+        let is_retired = |backend: &BackendId| backend_registry.is_retired(backend);
+        let proxy_ref = fixture.proxy.borrow();
+        let view = RoutingView::new(proxy_ref.clusters(), proxy_ref.kind())
+            .with_backend_retired(&is_retired);
+        let plan = router
+            .plan_connect(stream_id, &mut context, &view)
+            .map(decided)
+            .expect("routing must resolve the staged cluster");
+        (plan, context.streams[stream_id].state)
+    }
+
+    /// The pool-reuse scan skips a connection whose backend has left the
+    /// configuration, in each of its three reusable arms: H2 `Connected`, H2
+    /// `Connecting` and H1 `KeepAlive`. The same connection with a live
+    /// backend is reused, so a `Dial` here is the skip and not a scan that
+    /// would have missed anyway.
+    #[test]
+    fn a_retired_backend_connection_is_never_reused() {
+        let fixture = routing_fixture();
+        for (staged, arm) in [
+            (Staged::ConnectedH2, "H2 Connected"),
+            (Staged::ConnectingH2, "H2 Connecting"),
+            (Staged::KeepAliveH1, "H1 KeepAlive"),
+        ] {
+            let (plan, state) = plan_against_one_staged(&fixture, &staged, false);
+            assert!(
+                matches!(plan, ConnectPlan::Attached),
+                "premise, {arm}: a connection to a live backend is reused, got {plan:?}"
+            );
+            assert_eq!(state, StreamState::Linked(Token(LOWEST_TOKEN)));
+
+            let (plan, state) = plan_against_one_staged(&fixture, &staged, true);
+            assert!(
+                matches!(&plan, ConnectPlan::Dial { cluster_id, .. } if &**cluster_id == staged.cluster()),
+                "{arm}: a connection to a retired backend must not be reused, got {plan:?}"
+            );
+            assert_eq!(
+                state,
+                StreamState::Link,
+                "{arm}: the stream must not be linked to the retired connection"
+            );
+        }
+    }
+
+    /// `Mux::ready_inner` closes a retired connection only once it is idle:
+    /// an H1 keep-alive, or a connected H2 connection with no stream. A dial
+    /// still in progress is left to its own connect path.
+    #[test]
+    fn idle_pooled_backend_names_only_streamless_pooled_connections() {
+        let fixture = routing_fixture();
+        for (staged, arm, idle) in [
+            (Staged::ConnectedH2, "H2 Connected", true),
+            (Staged::ConnectingH2, "H2 Connecting", false),
+            (Staged::KeepAliveH1, "H1 KeepAlive", true),
+        ] {
+            let mut backend_registry = BackendRegistry::default();
+            let (connection, _peer) = staged_backend(&fixture.pool, &staged, &mut backend_registry);
+            assert_eq!(
+                connection.idle_pooled_backend().is_some(),
+                idle,
+                "{arm}: idle_pooled_backend must answer {idle}"
+            );
         }
     }
 

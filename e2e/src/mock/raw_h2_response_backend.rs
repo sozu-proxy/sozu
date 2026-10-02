@@ -11,7 +11,12 @@
 //! hand-crafted HEADERS frame whose `:status` field carries caller-
 //! supplied bytes (e.g. `"abc"`, `"20"`, `"+200"`, `"1234"`). Additional
 //! header pairs can be appended verbatim via
-//! [`RawH2ResponseBackend::push_header`].
+//! [`RawH2ResponseBackend::push_header`]. Interim (1xx) heads can precede
+//! it ([`RawH2ResponseBackend::push_interim`]), and a body, a trailer
+//! section or an empty DATA frame can end the stream. In second-stream mode
+//! ([`RawH2ResponseBackend::set_serve_second_stream`]) the end of stream 1
+//! waits for sozu to open another stream on the same connection, which is
+//! answered too.
 //!
 //! The header block is emitted using HPACK's "literal header field without
 //! indexing — new name" form (`0x00` opcode) so the backend does not need a
@@ -57,6 +62,22 @@ struct RawResponse {
     /// Delay between HEADERS and the first DATA frame. Only consulted
     /// when [`Self::body`] is `Some`.
     body_delay: Duration,
+    /// Optional trailer fields. When `Some`, HEADERS is sent without
+    /// END_STREAM, the body DATA frames (if any) keep END_STREAM clear,
+    /// and a trailer HEADERS frame carrying these pairs, possibly none,
+    /// ends the stream.
+    trailers: Option<Vec<(Vec<u8>, Vec<u8>)>>,
+    /// `:status` values of interim (1xx) header sections sent before the
+    /// final one, each in its own HEADERS frame without END_STREAM.
+    interim: Vec<Vec<u8>>,
+    /// When `true` and neither [`Self::body`] nor [`Self::trailers`] is
+    /// set, HEADERS is sent without END_STREAM and an empty DATA frame
+    /// flagged END_STREAM ends the stream.
+    empty_data_end: bool,
+    /// When `true`, the end of stream 1 (its DATA and trailer frames) is
+    /// held back until sozu opens another stream on the same connection;
+    /// that stream is then answered `200` with the body `pong`.
+    serve_second_stream: bool,
 }
 
 impl Default for RawResponse {
@@ -66,6 +87,10 @@ impl Default for RawResponse {
             extra_headers: Vec::new(),
             body: None,
             body_delay: Duration::ZERO,
+            trailers: None,
+            interim: Vec::new(),
+            empty_data_end: false,
+            serve_second_stream: false,
         }
     }
 }
@@ -75,6 +100,11 @@ pub struct RawH2ResponseBackend {
     stop: Arc<AtomicBool>,
     #[allow(dead_code)]
     connections_received: Arc<AtomicUsize>,
+    /// GOAWAY frames read from sozu in [`RawResponse::serve_second_stream`]
+    /// mode.
+    goaways_received: Arc<AtomicUsize>,
+    /// RST_STREAM frames read from sozu in the same mode.
+    resets_received: Arc<AtomicUsize>,
     response: Arc<Mutex<RawResponse>>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -87,10 +117,14 @@ impl RawH2ResponseBackend {
     pub fn new(address: SocketAddr) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let connections_received = Arc::new(AtomicUsize::new(0));
+        let goaways_received = Arc::new(AtomicUsize::new(0));
+        let resets_received = Arc::new(AtomicUsize::new(0));
         let response = Arc::new(Mutex::new(RawResponse::default()));
 
         let stop_thread = stop.clone();
         let conn_thread = connections_received.clone();
+        let goaways_thread = goaways_received.clone();
+        let resets_thread = resets_received.clone();
         let response_thread = response.clone();
 
         let thread = thread::spawn(move || {
@@ -113,8 +147,15 @@ impl RawH2ResponseBackend {
                     // the incoming frames, a bounded read is enough for the
                     // adversarial recipes.
                     let mut buf = vec![0u8; 4096];
-                    let _ = tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buf))
-                        .await;
+                    let read =
+                        tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buf))
+                            .await;
+                    // What follows the client preface, kept to find the
+                    // frames of a second stream.
+                    let mut pending = match read {
+                        Ok(Ok(n)) => buf[..n].get(24..).unwrap_or_default().to_vec(),
+                        _ => Vec::new(),
+                    };
 
                     // Snapshot the configured response and build the reply.
                     let response_snapshot = response_thread.lock().unwrap().clone();
@@ -123,6 +164,13 @@ impl RawH2ResponseBackend {
                     out.extend_from_slice(&[0, 0, 0, 0x04, 0, 0, 0, 0, 0]);
                     // SETTINGS ACK (acknowledges sozu's settings).
                     out.extend_from_slice(&[0, 0, 0, 0x04, 0x01, 0, 0, 0, 0]);
+
+                    // Interim HEADERS frames, END_HEADERS only.
+                    for status in &response_snapshot.interim {
+                        let mut block = Vec::new();
+                        encode_literal(&mut block, b":status", status);
+                        push_frame(&mut out, 0x01, 0x04, 1, &block);
+                    }
 
                     // HEADERS frame carrying the crafted :status + any
                     // extra headers. END_HEADERS always; END_STREAM only
@@ -134,7 +182,12 @@ impl RawH2ResponseBackend {
                         len < (1 << 24),
                         "raw h2 response header block larger than 24-bit payload_len"
                     );
-                    let has_body = response_snapshot.body.is_some();
+                    let has_trailers = response_snapshot.trailers.is_some();
+                    let empty_data_end = response_snapshot.empty_data_end
+                        && response_snapshot.body.is_none()
+                        && !has_trailers;
+                    let has_body =
+                        response_snapshot.body.is_some() || has_trailers || empty_data_end;
                     let headers_flags: u8 = if has_body { 0x04 } else { 0x04 | 0x01 };
                     out.push((len >> 16) as u8);
                     out.push((len >> 8) as u8);
@@ -146,6 +199,21 @@ impl RawH2ResponseBackend {
 
                     let _ = stream.write_all(&out).await;
                     let _ = stream.flush().await;
+
+                    // Hold the end of stream 1 back until sozu opens another
+                    // stream on this connection.
+                    let second_stream = if response_snapshot.serve_second_stream {
+                        read_frames_until(
+                            &mut stream,
+                            &mut pending,
+                            [&goaways_thread, &resets_thread],
+                            Duration::from_secs(2),
+                            true,
+                        )
+                        .await
+                    } else {
+                        None
+                    };
 
                     // HEADERS-then-delay-then-DATA mode: split body into
                     // ≤ 16384-byte DATA frames (default max_frame_size),
@@ -170,13 +238,61 @@ impl RawH2ResponseBackend {
                             frame.push((chunk_len >> 8) as u8);
                             frame.push(chunk_len as u8);
                             frame.push(0x00); // DATA
-                            frame.push(if is_last { 0x01 } else { 0x00 });
+                            frame.push(if is_last && !has_trailers { 0x01 } else { 0x00 });
                             frame.extend_from_slice(&1u32.to_be_bytes());
                             frame.extend_from_slice(chunk);
                             let _ = stream.write_all(&frame).await;
                             let _ = stream.flush().await;
                             emitted = end;
                         }
+                    }
+
+                    // Trailer HEADERS frame: END_HEADERS | END_STREAM.
+                    if let Some(trailers) = response_snapshot.trailers.as_ref() {
+                        let mut block = Vec::new();
+                        for (name, value) in trailers {
+                            encode_literal(&mut block, name, value);
+                        }
+                        let len = block.len();
+                        let mut frame = Vec::with_capacity(9 + len);
+                        frame.push((len >> 16) as u8);
+                        frame.push((len >> 8) as u8);
+                        frame.push(len as u8);
+                        frame.push(0x01); // HEADERS
+                        frame.push(0x04 | 0x01);
+                        frame.extend_from_slice(&1u32.to_be_bytes());
+                        frame.extend_from_slice(&block);
+                        let _ = stream.write_all(&frame).await;
+                        let _ = stream.flush().await;
+                    }
+
+                    if empty_data_end {
+                        let mut frame = Vec::new();
+                        push_frame(&mut frame, 0x00, 0x01, 1, &[]);
+                        let _ = stream.write_all(&frame).await;
+                        let _ = stream.flush().await;
+                    }
+
+                    if let Some(stream_id) = second_stream {
+                        let mut block = Vec::new();
+                        encode_literal(&mut block, b":status", b"200");
+                        encode_literal(&mut block, b"content-length", b"4");
+                        let mut frames = Vec::new();
+                        push_frame(&mut frames, 0x01, 0x04, stream_id, &block);
+                        push_frame(&mut frames, 0x00, 0x01, stream_id, b"pong");
+                        let _ = stream.write_all(&frames).await;
+                        let _ = stream.flush().await;
+                    }
+                    if response_snapshot.serve_second_stream {
+                        // Count what sozu answers to the end of stream 1.
+                        read_frames_until(
+                            &mut stream,
+                            &mut pending,
+                            [&goaways_thread, &resets_thread],
+                            Duration::from_millis(300),
+                            false,
+                        )
+                        .await;
                     }
 
                     // Give sozu time to consume the response before we FIN.
@@ -189,6 +305,8 @@ impl RawH2ResponseBackend {
         Self {
             stop,
             connections_received,
+            goaways_received,
+            resets_received,
             response,
             thread: Some(thread),
         }
@@ -227,6 +345,44 @@ impl RawH2ResponseBackend {
         let mut response = self.response.lock().unwrap();
         response.body = Some(body.into());
         response.body_delay = delay;
+    }
+
+    /// End subsequent responses with a trailer HEADERS frame carrying
+    /// `trailers` (possibly none), or with END_STREAM on the last HEADERS
+    /// or DATA frame when `None`.
+    pub fn set_trailers(&self, trailers: Option<Vec<(Vec<u8>, Vec<u8>)>>) {
+        self.response.lock().unwrap().trailers = trailers;
+    }
+
+    /// Send an interim (1xx) header section with `:status` `status`
+    /// before the final one of subsequent responses.
+    pub fn push_interim(&self, status: impl Into<Vec<u8>>) {
+        self.response.lock().unwrap().interim.push(status.into());
+    }
+
+    /// End subsequent responses that set neither a body nor trailers with
+    /// an empty DATA frame flagged END_STREAM, after a HEADERS frame
+    /// without it, when `true`.
+    pub fn set_empty_data_end(&self, empty_data_end: bool) {
+        self.response.lock().unwrap().empty_data_end = empty_data_end;
+    }
+
+    /// Hold the end of stream 1 back until sozu opens a second stream on
+    /// the same connection, then answer that stream `200` with the body
+    /// `pong`, and count the GOAWAY and RST_STREAM frames sozu sends, when
+    /// `true`.
+    pub fn set_serve_second_stream(&self, serve_second_stream: bool) {
+        self.response.lock().unwrap().serve_second_stream = serve_second_stream;
+    }
+
+    /// GOAWAY frames read from sozu in second-stream mode.
+    pub fn goaways_received(&self) -> usize {
+        self.goaways_received.load(Ordering::Relaxed)
+    }
+
+    /// RST_STREAM frames read from sozu in second-stream mode.
+    pub fn resets_received(&self) -> usize {
+        self.resets_received.load(Ordering::Relaxed)
     }
 
     #[allow(dead_code)]
@@ -268,6 +424,57 @@ fn encode_header_block(response: &RawResponse) -> Vec<u8> {
         encode_literal(&mut out, name, value);
     }
     out
+}
+
+/// Append a frame of type `kind` with `flags` on `stream_id` to `buf`.
+fn push_frame(buf: &mut Vec<u8>, kind: u8, flags: u8, stream_id: u32, payload: &[u8]) {
+    let len = payload.len();
+    buf.extend_from_slice(&[(len >> 16) as u8, (len >> 8) as u8, len as u8, kind, flags]);
+    buf.extend_from_slice(&stream_id.to_be_bytes());
+    buf.extend_from_slice(payload);
+}
+
+/// Read the frames sozu sends, counting each GOAWAY and RST_STREAM in
+/// `counters`, until
+/// `timeout` elapses or, when `stop_at_headers`, a HEADERS frame opens a
+/// stream other than 1, whose id is returned. `pending` holds the bytes
+/// read but not yet parsed, starting on a frame boundary.
+async fn read_frames_until(
+    stream: &mut tokio::net::TcpStream,
+    pending: &mut Vec<u8>,
+    counters: [&AtomicUsize; 2],
+    timeout: Duration,
+    stop_at_headers: bool,
+) -> Option<u32> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut buf = vec![0u8; 4096];
+    loop {
+        while pending.len() >= 9 {
+            let len = (usize::from(pending[0]) << 16)
+                | (usize::from(pending[1]) << 8)
+                | usize::from(pending[2]);
+            if pending.len() < 9 + len {
+                break;
+            }
+            let kind = pending[3];
+            let stream_id =
+                u32::from_be_bytes([pending[5], pending[6], pending[7], pending[8]]) & 0x7fff_ffff;
+            pending.drain(..9 + len);
+            match kind {
+                0x07 => counters[0].fetch_add(1, Ordering::Relaxed),
+                0x03 => counters[1].fetch_add(1, Ordering::Relaxed),
+                _ => 0,
+            };
+            if stop_at_headers && kind == 0x01 && stream_id != 1 {
+                return Some(stream_id);
+            }
+        }
+        let read = tokio::time::timeout_at(deadline, stream.read(&mut buf)).await;
+        match read {
+            Ok(Ok(n)) if n > 0 => pending.extend_from_slice(&buf[..n]),
+            _ => return None,
+        }
+    }
 }
 
 fn encode_literal(buf: &mut Vec<u8>, name: &[u8], value: &[u8]) {

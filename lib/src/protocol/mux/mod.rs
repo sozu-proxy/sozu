@@ -1230,6 +1230,10 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
     /// Every value read under the borrow below is re-read on each call for
     /// that reason. The two that are NOT read here — [`Self::protocol`] and
     /// the TLS fields — are connection-scoped by nature and captured once.
+    ///
+    /// `window` seeds [`Stream::front_window`], the stream's send window on
+    /// the frontend connection. The backend leg's window is the backend's to
+    /// size: `ConnectionH2::start_stream` sets [`Stream::back_window`].
     pub fn create_stream(&mut self, request_id: Ulid, window: u32) -> Option<GlobalStreamId> {
         let (http_context, answers) = {
             let listener = self.listener.borrow();
@@ -1303,7 +1307,8 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             // an aggregate that only drifts up never underflows, so nothing
             // logs and nothing saturates.
             stream.request_counted = false;
-            stream.window = i32::try_from(window).unwrap_or(i32::MAX);
+            stream.front_window = i32::try_from(window).unwrap_or(i32::MAX);
+            stream.back_window = i32::try_from(h2::DEFAULT_INITIAL_WINDOW_SIZE).unwrap_or(i32::MAX);
             stream.context = http_context;
             // A recycled slot takes the fresh capture too: the request that
             // released it ran on whatever the listener held then, and the one
@@ -3175,6 +3180,34 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     }
                 }
 
+                // A pooled connection whose backend left the configuration
+                // is never reused (`Router::decide_after_gate`); once it
+                // carries no stream it has nothing left to do, so drop it
+                // rather than leave it idle until the session ends. The HUP
+                // `force_disconnect` raises sends it through the dead-backend
+                // sweep above on the next iteration, which releases its
+                // connection on the backend and lets a `Closing` backend
+                // reach `Closed`.
+                for (token, backend) in self.router.backends.iter_mut() {
+                    let retired = backend
+                        .idle_pooled_backend()
+                        .is_some_and(|id| self.backend_registry.is_retired(id))
+                        && self
+                            .context
+                            .backend_streams
+                            .get(token)
+                            .is_none_or(|ids| ids.is_empty());
+                    if retired {
+                        debug!(
+                            "{} closing idle backend connection {:?}: its backend was removed",
+                            log_context_lite!(self),
+                            token
+                        );
+                        backend.force_disconnect();
+                        all_backends_readiness_are_empty = false;
+                    }
+                }
+
                 // A frontend HUP is handled here as it is on entry: nothing
                 // else in this loop acts on one. Once no output is left to
                 // flush, this check closes the session, including after a
@@ -3350,7 +3383,18 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 );
                                 set_default_answer(stream, front_readiness, 503, &answers);
                             }
-                            BE::Backend(BackendError::NoBackendForCluster(_)) => {
+                            BE::Backend(BackendError::NoBackendForCluster(ref cluster_id)) => {
+                                // A cluster that has backends, none of them
+                                // selectable, is in an outage: its backends
+                                // failed their health checks or the
+                                // connections Sōzu opened to them. A cluster
+                                // with no backend at all is a routing miss.
+                                stream.context.backends_unavailable = self
+                                    .backends
+                                    .borrow()
+                                    .backends
+                                    .get(cluster_id.as_str())
+                                    .is_some_and(|list| !list.backends.is_empty());
                                 set_default_answer(stream, front_readiness, 503, &answers);
                             }
                             BE::RetrieveClusterError(RetrieveClusterError::RetrieveFrontend(

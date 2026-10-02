@@ -2,7 +2,8 @@
 //!
 //! `UdpManager` owns the flow table (`HashMap<FlowKey, FlowId>` over a
 //! `slab::Slab<UdpFlow>`), admission ("allocate nothing for unknown / over-cap
-//! / invalid datagrams"), the flow-table cap and shedding, pluggable flow-key
+//! / invalid datagrams"), the flow-table cap and shedding, the per-source flow
+//! limits (`max_flows_per_ip` / `max_flows_per_subnet`), pluggable flow-key
 //! extraction ([`FlowKeyExtractor`]), backend selection for new flows (from
 //! the [`BackendSource`] view the embedder supplies), and the
 //! timer scheduling: a **single armed manager-wide deadline** plus per-flow
@@ -15,11 +16,12 @@
 use std::{
     collections::{HashMap, VecDeque},
     hash::{Hash, Hasher},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     time::Instant,
 };
 
 use slab::Slab;
+use sozu_command::state::ClusterId;
 
 use crate::protocol::udp::{
     BackendSource, ClusterConfig, ConfigEvent, DropReason, FlowId, FlowKey, ManagerInput,
@@ -27,6 +29,54 @@ use crate::protocol::udp::{
     flow::{CloseReason, FlowPhase, UdpFlow},
     proxy_protocol::prepend_dgram_header,
 };
+use crate::server::subnet_key;
+
+/// Live flow count per cluster, then per source key (an IP or a masked
+/// subnet). Nested so a lookup borrows the cluster id instead of cloning it,
+/// as `SessionManager` does for the TCP/HTTP connection counters.
+type SourceCounts = HashMap<ClusterId, HashMap<IpAddr, usize>>;
+
+/// The subnet key of `ip` under the prefixes captured in `cfg`.
+fn subnet_of(cfg: &ClusterConfig, ip: IpAddr) -> IpAddr {
+    subnet_key(&ip, cfg.subnet_ipv4_prefix, cfg.subnet_ipv6_prefix)
+}
+
+/// The live flow count recorded for `(cluster, key)`; `0` when absent.
+fn source_count(counts: &SourceCounts, cluster: &str, key: &IpAddr) -> usize {
+    counts
+        .get(cluster)
+        .and_then(|by_key| by_key.get(key))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Count one more flow for `(cluster, key)`.
+fn source_incr(counts: &mut SourceCounts, cluster: &ClusterId, key: IpAddr) {
+    *counts
+        .entry(cluster.clone())
+        .or_default()
+        .entry(key)
+        .or_insert(0) += 1;
+}
+
+/// Count one flow less for `(cluster, key)`, removing entries that reach zero
+/// so the maps never outgrow the live flow set.
+fn source_decr(counts: &mut SourceCounts, cluster: &str, key: &IpAddr) {
+    let Some(by_key) = counts.get_mut(cluster) else {
+        debug_assert!(false, "a closing flow's cluster must have a source count");
+        return;
+    };
+    match by_key.get_mut(key) {
+        Some(count) if *count > 1 => *count -= 1,
+        Some(_) => {
+            by_key.remove(key);
+        }
+        None => debug_assert!(false, "a closing flow's source must have a count"),
+    }
+    if by_key.is_empty() {
+        counts.remove(cluster);
+    }
+}
 
 /// Extracts a [`FlowKey`] from an admitted client datagram. The default
 /// [`SourceTupleExtractor`] keys on the real client source address (source IP
@@ -65,6 +115,15 @@ pub struct UdpManager<E: FlowKeyExtractor = SourceTupleExtractor> {
     flows: Slab<UdpFlow>,
     /// Flow-table cap. New flows beyond this are shed (drop + metric).
     max_flows: usize,
+    /// Live flows per `(cluster, source IP)`, for the cluster's
+    /// `max_flows_per_ip`. Every admitted flow is counted, whatever the
+    /// limit, so a limit raised from `0` at runtime applies to the flows
+    /// already open. Keyed on the cluster each flow captured at admission.
+    flows_per_ip: SourceCounts,
+    /// Live flows per `(cluster, source subnet)`, for `max_flows_per_subnet`.
+    /// The subnet key uses the prefixes the flow captured at admission, so a
+    /// close always decrements the key its admission incremented.
+    flows_per_subnet: SourceCounts,
     /// Maximum accepted rx datagram size; larger datagrams are dropped as
     /// truncated.
     max_rx_datagram_size: usize,
@@ -127,6 +186,8 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
             table: HashMap::new(),
             flows: Slab::new(),
             max_flows,
+            flows_per_ip: HashMap::new(),
+            flows_per_subnet: HashMap::new(),
             max_rx_datagram_size,
             cluster,
             hash_seed,
@@ -149,6 +210,11 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
     /// The configured flow-table cap.
     pub fn max_flows(&self) -> usize {
         self.max_flows
+    }
+
+    /// The cluster routing + per-cluster knobs new flows are admitted under.
+    pub fn cluster_config(&self) -> &ClusterConfig {
+        &self.cluster
     }
 
     /// Whether the listener is draining.
@@ -283,6 +349,17 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
             );
             return;
         }
+        if self.source_at_limit(src.ip()) {
+            self.outputs
+                .push_back(Output::Metric(MetricEvent::FlowShedSourceLimit));
+            self.drop_datagram(DropReason::Shed);
+            debug_assert_eq!(
+                self.flows.len(),
+                flows_before_admit,
+                "per-source shed must allocate no flow"
+            );
+            return;
+        }
         if self.flows.len() >= self.max_flows {
             self.outputs
                 .push_back(Output::Metric(MetricEvent::FlowShed));
@@ -341,6 +418,9 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
         let flow = UdpFlow::new(src, self.cluster.clone(), backend_id, backend_addr, now);
         let flow_id = self.flows.insert(flow);
         self.table.insert(key, flow_id);
+        let subnet = subnet_of(&self.cluster, src.ip());
+        source_incr(&mut self.flows_per_ip, &self.cluster.cluster, src.ip());
+        source_incr(&mut self.flows_per_subnet, &self.cluster.cluster, subnet);
 
         // Post (admission): exactly one slot was added and the key now maps to
         // it. Pairs the pre-conditions above (grew by exactly 1, not 0 or 2).
@@ -630,6 +710,11 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
         if self.table.get(&key) == Some(&flow_id) {
             self.table.remove(&key);
         }
+        let ip = flow.client.ip();
+        let subnet = subnet_of(&flow.config, ip);
+        let cluster = flow.config.cluster.clone();
+        source_decr(&mut self.flows_per_ip, &cluster, &ip);
+        source_decr(&mut self.flows_per_subnet, &cluster, &subnet);
         self.flows.remove(flow_id);
         self.outputs
             .push_back(Output::Metric(MetricEvent::FlowEvicted));
@@ -651,6 +736,22 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
                 "close_flow left a table entry mapping to the removed FlowId {flow_id}"
             );
         }
+    }
+
+    /// Whether a new flow from `ip` would exceed the active cluster's
+    /// per-source limits: `max_flows_per_ip` on the address itself, or
+    /// `max_flows_per_subnet` on its masked subnet. `0` disables a limit, and
+    /// the subnet key is only derived when that limit is set.
+    fn source_at_limit(&self, ip: IpAddr) -> bool {
+        let cfg = &self.cluster;
+        if cfg.max_flows_per_ip > 0
+            && source_count(&self.flows_per_ip, &cfg.cluster, &ip) as u64 >= cfg.max_flows_per_ip
+        {
+            return true;
+        }
+        cfg.max_flows_per_subnet > 0
+            && source_count(&self.flows_per_subnet, &cfg.cluster, &subnet_of(cfg, ip)) as u64
+                >= cfg.max_flows_per_subnet
     }
 
     /// Emit a drop with its by-reason metric. Allocates nothing per the
@@ -781,6 +882,28 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
                 None => flow.idle_deadline,
             });
         }
+
+        // (8) Per-source counters are exact: recounting the slab gives both
+        // maps back, key for key, with no zero entry left behind.
+        let mut per_ip = SourceCounts::new();
+        let mut per_subnet = SourceCounts::new();
+        for (_, flow) in self.flows.iter() {
+            let ip = flow.client.ip();
+            source_incr(&mut per_ip, &flow.config.cluster, ip);
+            source_incr(
+                &mut per_subnet,
+                &flow.config.cluster,
+                subnet_of(&flow.config, ip),
+            );
+        }
+        debug_assert_eq!(
+            self.flows_per_ip, per_ip,
+            "per-IP flow counts must match the live flows"
+        );
+        debug_assert_eq!(
+            self.flows_per_subnet, per_subnet,
+            "per-subnet flow counts must match the live flows"
+        );
 
         // The high-water cap bounds the live population at all times (the live
         // cap itself can be shrunk below flows.len() by SetMaxFlows, so we assert
@@ -1256,6 +1379,135 @@ mod tests {
             outs.iter()
                 .any(|o| matches!(o, Output::Drop(DropReason::Shed)))
         );
+    }
+
+    /// Feed one client datagram and return the outputs it produced.
+    fn send_from(mgr: &mut UdpManager, src: SocketAddr, now: Instant) -> Vec<Output> {
+        mgr.handle_input(
+            ManagerInput::ClientDatagram {
+                src,
+                payload: b"q",
+                backends: &mut TestBackends::one(),
+            },
+            now,
+        );
+        drain(mgr)
+    }
+
+    /// Whether `outs` is a per-source shed: the source-limit metric and a
+    /// `Shed` drop, and no upstream opened.
+    fn source_shed(outs: &[Output]) -> bool {
+        outs.iter()
+            .any(|o| matches!(o, Output::Metric(MetricEvent::FlowShedSourceLimit)))
+            && outs
+                .iter()
+                .any(|o| matches!(o, Output::Drop(DropReason::Shed)))
+            && !outs
+                .iter()
+                .any(|o| matches!(o, Output::OpenUpstream { .. }))
+    }
+
+    fn opened(outs: &[Output]) -> bool {
+        outs.iter()
+            .any(|o| matches!(o, Output::OpenUpstream { .. }))
+    }
+
+    #[test]
+    fn per_ip_limit_sheds_new_ports_of_one_address_only() {
+        let cfg = ClusterConfig {
+            max_flows_per_ip: 2,
+            ..cluster("dns")
+        };
+        let mut mgr = UdpManager::new(cfg, 16, 65535, 7);
+        let now = Instant::now();
+
+        assert!(opened(&send_from(&mut mgr, client(1, 1000), now)));
+        assert!(opened(&send_from(&mut mgr, client(1, 1001), now)));
+        let outs = send_from(&mut mgr, client(1, 1002), now);
+        assert!(
+            source_shed(&outs),
+            "a third port of one address must be shed: {outs:?}"
+        );
+        assert!(
+            !outs
+                .iter()
+                .any(|o| matches!(o, Output::Metric(MetricEvent::FlowShed))),
+            "a per-source shed is not a table-full shed"
+        );
+        assert_eq!(mgr.flow_count(), 2);
+
+        assert!(
+            opened(&send_from(&mut mgr, client(2, 1000), now)),
+            "another address must still be admitted"
+        );
+        let outs = send_from(&mut mgr, client(1, 1000), now);
+        assert!(
+            outs.iter().any(|o| matches!(o, Output::SendToBackend(_))),
+            "an existing flow of the capped address keeps forwarding"
+        );
+        assert_eq!(mgr.flow_count(), 3);
+    }
+
+    #[test]
+    fn closing_a_flow_frees_its_source_slot() {
+        let cfg = ClusterConfig {
+            max_flows_per_ip: 1,
+            front_timeout: Duration::from_secs(1),
+            back_timeout: Duration::from_secs(1),
+            ..cluster("dns")
+        };
+        let mut mgr = UdpManager::new(cfg, 16, 65535, 7);
+        let now = Instant::now();
+        assert!(opened(&send_from(&mut mgr, client(1, 1000), now)));
+        assert!(source_shed(&send_from(&mut mgr, client(1, 1001), now)));
+
+        let later = now + Duration::from_secs(2);
+        mgr.handle_timeout(later);
+        assert_eq!(mgr.flow_count(), 0);
+        drain(&mut mgr);
+        assert!(
+            opened(&send_from(&mut mgr, client(1, 1001), later)),
+            "the closed flow's slot must be free again"
+        );
+    }
+
+    #[test]
+    fn per_subnet_limit_groups_addresses_by_prefix() {
+        let cfg = ClusterConfig {
+            max_flows_per_subnet: 2,
+            subnet_ipv4_prefix: 24,
+            ..cluster("dns")
+        };
+        let mut mgr = UdpManager::new(cfg, 16, 65535, 7);
+        let now = Instant::now();
+        let at = |a, b, c, d| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), 1000);
+
+        assert!(opened(&send_from(&mut mgr, at(192, 0, 2, 1), now)));
+        assert!(opened(&send_from(&mut mgr, at(192, 0, 2, 2), now)));
+        assert!(
+            source_shed(&send_from(&mut mgr, at(192, 0, 2, 3), now)),
+            "a third address of one /24 must be shed"
+        );
+        assert!(
+            opened(&send_from(&mut mgr, at(192, 0, 3, 1), now)),
+            "an address of another /24 must still be admitted"
+        );
+    }
+
+    #[test]
+    fn a_limit_set_at_runtime_counts_flows_already_open() {
+        let mut mgr = UdpManager::new(cluster("dns"), 16, 65535, 7);
+        let now = Instant::now();
+        assert!(opened(&send_from(&mut mgr, client(1, 1000), now)));
+        assert!(opened(&send_from(&mut mgr, client(1, 1001), now)));
+        mgr.handle_input(
+            ManagerInput::Config(ConfigEvent::SetCluster(ClusterConfig {
+                max_flows_per_ip: 2,
+                ..cluster("dns")
+            })),
+            now,
+        );
+        assert!(source_shed(&send_from(&mut mgr, client(1, 1002), now)));
     }
 
     #[test]

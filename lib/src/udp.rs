@@ -413,6 +413,18 @@ pub struct UdpProxy {
     /// neither must clobber the other's contribution to a manager's
     /// `ClusterConfig`.
     cluster_udp_config: HashMap<ClusterId, sozu_command::proto::command::UdpClusterConfig>,
+    /// Last `AddCluster`-supplied `max_connections_per_ip` /
+    /// `max_connections_per_subnet` overrides per cluster, cached for the same
+    /// order-independence as `cluster_udp_config`. They live on the `Cluster`
+    /// message itself, not in its `udp` block. Only these cluster-level values
+    /// apply to UDP: the global defaults are deliberately NOT inherited, so a
+    /// global cap set for HTTP/TCP never starts dropping UDP flows.
+    cluster_flow_limits: HashMap<ClusterId, (Option<u64>, Option<u64>)>,
+    /// The worker's boot-time `subnet_ipv4_prefix` / `subnet_ipv6_prefix`,
+    /// copied from the `SessionManager` at construction. A copy rather than a
+    /// borrow: the server calls into this proxy (`add_listener`) while it
+    /// holds the `SessionManager` mutably.
+    subnet_prefixes: (u32, u32),
     registry: Registry,
     sessions: Rc<RefCell<SessionManager>>,
     #[allow(dead_code)]
@@ -454,6 +466,10 @@ impl UdpProxy {
         // and reshuffle it on every restart. Reuse the LB module's canonical
         // affinity seed so UDP and the HTTP/TCP affinity hashers agree.
         let hash_seed = crate::load_balancing::DEFAULT_HASH_SEED;
+        let subnet_prefixes = {
+            let s = sessions.borrow();
+            (s.subnet_ipv4_prefix, s.subnet_ipv6_prefix)
+        };
         UdpProxy {
             backends,
             listeners: HashMap::new(),
@@ -461,6 +477,8 @@ impl UdpProxy {
             managers: HashMap::new(),
             cluster_for_listener: HashMap::new(),
             cluster_udp_config: HashMap::new(),
+            cluster_flow_limits: HashMap::new(),
+            subnet_prefixes,
             fronts: HashMap::new(),
             registry,
             sessions,
@@ -519,6 +537,8 @@ impl UdpProxy {
                 let cluster_cfg = ClusterConfig {
                     front_timeout: front,
                     back_timeout: back,
+                    subnet_ipv4_prefix: self.subnet_prefixes.0,
+                    subnet_ipv6_prefix: self.subnet_prefixes.1,
                     ..Default::default()
                 };
                 self.managers.insert(
@@ -894,7 +914,25 @@ impl UdpProxy {
         if let Some(udp) = self.cluster_udp_config.get(&cluster) {
             apply_udp_knobs(&mut cfg, udp);
         }
+        // Per-source flow limits: opt-in, from the cluster's own
+        // `max_connections_per_ip` / `max_connections_per_subnet` only. An
+        // absent value is unlimited; the global defaults are NOT inherited.
+        // The subnet prefixes are the worker's boot-time ones.
+        let (per_ip, per_subnet) = self
+            .cluster_flow_limits
+            .get(&cluster)
+            .copied()
+            .unwrap_or_default();
+        cfg.max_flows_per_ip = per_ip.unwrap_or(0);
+        cfg.max_flows_per_subnet = per_subnet.unwrap_or(0);
+        (cfg.subnet_ipv4_prefix, cfg.subnet_ipv6_prefix) = self.subnet_prefixes;
         cfg
+    }
+
+    /// The flow manager of the listener at `token`.
+    #[cfg(test)]
+    pub(crate) fn manager(&self, token: Token) -> Option<Rc<RefCell<UdpManager>>> {
+        self.managers.get(&token).cloned()
     }
 
     /// Apply an `AddCluster` to every listener routing to it: fold the UDP
@@ -944,6 +982,13 @@ impl UdpProxy {
                 self.cluster_udp_config.remove(cluster.cluster_id.as_str());
             }
         }
+        self.cluster_flow_limits.insert(
+            cluster.cluster_id.as_str().into(),
+            (
+                cluster.max_connections_per_ip,
+                cluster.max_connections_per_subnet,
+            ),
+        );
 
         // 2. Per-cluster UDP knobs into the managers routing to this cluster.
         // `cluster_config_for` now folds the cached knobs in, so the rebuild is
@@ -1008,6 +1053,7 @@ impl UdpProxy {
                     }
                 }
                 self.cluster_udp_config.remove(cluster_id.as_str());
+                self.cluster_flow_limits.remove(cluster_id.as_str());
                 self.health.remove_cluster(&cluster_id, &self.registry);
                 WorkerResponse::ok(message.id)
             }
@@ -1852,6 +1898,10 @@ impl UdpListenerSession {
             }
             MetricEvent::FlowShed => {
                 incr!(names::udp::FLOWS_SHED);
+            }
+            MetricEvent::FlowShedSourceLimit => {
+                incr!(names::udp::FLOWS_SHED);
+                incr!(names::udp::FLOWS_SHED_SOURCE_LIMIT);
             }
             MetricEvent::DatagramIn(bytes) => {
                 incr!(names::udp::DATAGRAMS_IN);

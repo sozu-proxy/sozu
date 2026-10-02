@@ -243,7 +243,8 @@ pub mod h2 {
         "h2.rst_stream.received.pre_response_start";
 
     /// A proxy-emitted RST_STREAM that was never queued because
-    /// `pending_rst_streams` was already at `MAX_PENDING_RST_STREAMS`.
+    /// `pending_rst_streams` was already at its bound (`pending_rst_bound`,
+    /// at least `MIN_PENDING_RST_STREAMS`).
     /// Sibling of `WINDOW_UPDATE_DROPPED` below, same "control queue full"
     /// semantics; a non-zero value means the connection is on its way to
     /// `GOAWAY(ENHANCE_YOUR_CALM)`.
@@ -263,6 +264,10 @@ pub mod h2 {
         "h2.signal.writable.rearmed.priority_update";
 
     pub const TRAILERS_DROPPED_CONTENT_LENGTH: &str = "h2.trailers_dropped_content_length";
+    /// H2 trailer blocks of a response to HEAD, a 204 or a 304 dropped by
+    /// `ConnectionH1::writable` towards an H1 client, which reads such a
+    /// response as ending with its header section (RFC 9112 §6.3).
+    pub const TRAILERS_DROPPED_NO_BODY: &str = "h2.trailers_dropped_no_body";
     /// Request trailer fields elided by `pkawa::handle_trailer` because their
     /// name is one of `editor::TRAILER_FORBIDDEN_FIELDS` (sozu-proxy/sozu#1714).
     /// One increment per field; the request is still forwarded. The H1
@@ -580,8 +585,13 @@ pub mod udp {
     pub const FLOWS_CREATED: &str = "udp.flows.created";
     /// Flows torn down (idle / teardown / drain).
     pub const FLOWS_EVICTED: &str = "udp.flows.evicted";
-    /// New flows shed at the `max_flows` cap or under fd pressure.
+    /// New flows shed at the `max_flows` cap, at a per-source limit, or
+    /// under fd pressure.
     pub const FLOWS_SHED: &str = "udp.flows.shed";
+    /// New flows shed because their source IP or subnet held the cluster's
+    /// `max_connections_per_ip` / `max_connections_per_subnet` flows. Also
+    /// counted in [`FLOWS_SHED`].
+    pub const FLOWS_SHED_SOURCE_LIMIT: &str = "udp.flows.shed.source_limit";
     /// Datagrams dropped before allocation (aggregate). Reason-specific
     /// counters below carry the dotted `.<reason>` suffix; both are emitted
     /// so dashboards can chart the total or break it down. The `incr!` macro
