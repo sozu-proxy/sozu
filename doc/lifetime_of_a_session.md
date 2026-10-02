@@ -137,10 +137,18 @@ kernel's next writable edge, and a synthetic one would only repeat it.
 pending write while rustls still holds records only when its write answered
 `SocketResult::Continue`; signalling after a blocked one ran `Mux::ready_inner`
 to `MAX_LOOP_ITERATIONS` whenever a TLS client stopped reading a large response
-([#1780](https://github.com/sozu-proxy/sozu/issues/1780)). A TLS write that
-meets any other socket error marks the transport dead (`FrontRustls::peer_reset`,
-`lib/src/socket.rs`), so the records it still holds no longer count as pending
-and the session closes on the hang-up that follows.
+([#1780](https://github.com/sozu-proxy/sozu/issues/1780)). `ConnectionH2`
+applies the same rule through `ensure_tls_flushed`
+([#1788](https://github.com/sozu-proxy/sozu/issues/1788)). A TLS write that
+answers `SocketResult::Error` — a socket error other than `WouldBlock`, a
+rustls writer failure, or the write loop's budget — marks the transport dead
+(`FrontRustls::peer_reset`, `lib/src/socket.rs`), so the records it still
+holds no longer count as pending and the session closes on the hang-up that
+follows. An interrupted call (`EINTR`) is not an error on any socket path:
+`flush_tls` retries an interrupted TLS write, `rustls_socket_read` an
+interrupted `read_tls`, and `plain_socket_read`, `plain_socket_write` and
+`plain_socket_write_vectored` an interrupted plain TCP read or write
+([#1799](https://github.com/sozu-proxy/sozu/issues/1799)).
 
 ### 2.4 Tokens, the SessionManager, and the slab
 

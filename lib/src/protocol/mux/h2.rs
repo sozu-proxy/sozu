@@ -691,6 +691,20 @@ pub struct H2ByteAccounting {
     pub overhead_bout: usize,
 }
 
+/// What `ConnectionH2::handle_data_frame` does with the payload of a DATA
+/// frame of a backend response (`ConnectionH2::backend_response_content`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendResponseContent {
+    /// The response may carry content: the payload is forwarded.
+    Forwarded,
+    /// A response to HEAD, which SHOULD NOT carry content (RFC 9110
+    /// §9.3.2): the payload is discarded.
+    Discarded,
+    /// A 204 or a 304, which cannot carry content (RFC 9110 §15.3.5,
+    /// §15.4.5): a payload resets the backend stream.
+    Forbidden,
+}
+
 pub struct ConnectionH2 {
     /// Connection/session ULID propagated from the parent [`super::Mux`]. Used to
     /// stamp the session slot of the `[session req cluster backend]` log
@@ -6564,6 +6578,24 @@ impl ConnectionH2 {
         false
     }
 
+    /// What `handle_data_frame` does with the DATA payload of a backend
+    /// response that has no content by definition (RFC 9110 §6.4.1). Only
+    /// meaningful when reading a backend response (`Position::Client`): on
+    /// the server side `context.status` describes the response, not the
+    /// request being read.
+    fn backend_response_content(
+        context: &crate::protocol::kawa_h1::editor::HttpContext,
+    ) -> BackendResponseContent {
+        use crate::protocol::kawa_h1::parser::Method;
+        if matches!(context.status, Some(204 | 304)) {
+            BackendResponseContent::Forbidden
+        } else if context.method == Some(Method::Head) {
+            BackendResponseContent::Discarded
+        } else {
+            BackendResponseContent::Forwarded
+        }
+    }
+
     fn handle_data_frame<E, L>(
         &mut self,
         data: parser::Data,
@@ -6607,6 +6639,11 @@ impl ConnectionH2 {
         // RFC 9113 §5.2: padding counts against flow-control windows.
         let wire_len = wire_payload_len as usize;
         let cl_exempt = self.content_length_exempt(&stream.context);
+        let content = if self.position.is_client() {
+            Self::backend_response_content(&stream.context)
+        } else {
+            BackendResponseContent::Forwarded
+        };
 
         // Extract declared content-length and update position-aware data counter
         let (data_received, declared_length) = {
@@ -6633,6 +6670,36 @@ impl ConnectionH2 {
             .account_received_bytes(wire_payload_len, conn_threshold)
         {
             self.queue_window_update(0, increment);
+        }
+
+        // RFC 9110 §15.3.5, §15.4.5, RFC 9113 §8.1.1: a 204 or a 304 cannot
+        // contain content, so DATA carrying a payload makes it malformed:
+        // reset the backend stream before the payload is queued, so it never
+        // reaches the client (an H1 client would read it as the start of the
+        // next response). `content_length_exempt` skips the length checks
+        // below for these responses, so they would not catch it. A response
+        // to HEAD only SHOULD NOT carry content (RFC 9110 §9.3.2): its payload
+        // is discarded below instead.
+        if content == BackendResponseContent::Forbidden && content_len > 0 {
+            error!(
+                "{} DATA with a {}-byte payload on a {:?} response (RFC 9110 §6.4.1)",
+                log_context!(self),
+                content_len,
+                stream.context.status
+            );
+            incr!(names::h2::BODILESS_RESPONSE_DATA_RESET);
+            if !self.flow_control.pending_window_updates_is_empty() {
+                self.readiness.arm_writable();
+            }
+            let result = self.reset_stream(
+                data.stream_id,
+                global_stream_id,
+                context,
+                endpoint,
+                H2Error::ProtocolError,
+            );
+            self.remove_dead_stream(data.stream_id, global_stream_id);
+            return result;
         }
 
         // RFC 9113 §8.1.1: if Content-Length is present, total DATA payload
@@ -6707,14 +6774,33 @@ impl ConnectionH2 {
                 self.mark_end_of_stream(stream);
             }
         } else {
-            // Advance storage.head by the full wire payload length so the
-            // next frame doesn't read stale pad-length+padding bytes.
-            slice.start = slice.start.saturating_add(kawa.storage.head as u32);
-            kawa.storage.head += wire_len;
-
+            // A response to HEAD has no content (RFC 9110 §9.3.2): its
+            // payload is never queued, as kawa's H1 parser leaves the bytes
+            // an H1 backend sends after such a head unread, and its windows
+            // were credited above.
+            let discarded = content == BackendResponseContent::Discarded && content_len > 0;
+            if discarded {
+                // The frame's wire payload is the tail of the buffer: drop
+                // it there. Kept behind `storage.head`, it would hold space
+                // only the frontend consuming a block frees, and no block
+                // refers to it, so a payload larger than the buffer would
+                // stop the backend connection from being read before its
+                // END_STREAM.
+                debug_assert_eq!(
+                    kawa.storage.end,
+                    kawa.storage.head + wire_len,
+                    "a DATA payload being read is the tail of the stream buffer"
+                );
+                kawa.storage.end = kawa.storage.head;
+            } else {
+                // Advance storage.head by the full wire payload length so the
+                // next frame doesn't read stale pad-length+padding bytes.
+                slice.start = slice.start.saturating_add(kawa.storage.head as u32);
+                kawa.storage.head += wire_len;
+            }
             // Emit chunk framing for chunked transfer encoding (H2→H1 path).
             // H2 converter ignores ChunkHeader and end_chunk Flags, so this is safe for H2→H2.
-            if kawa.body_size == kawa::BodySize::Chunked && content_len > 0 {
+            if kawa.body_size == kawa::BodySize::Chunked && content_len > 0 && !discarded {
                 let hex_len = {
                     let mut buf = Vec::with_capacity(16);
                     let _ = write!(buf, "{content_len:x}");
@@ -6725,11 +6811,19 @@ impl ConnectionH2 {
                 }));
             }
 
-            kawa.push_block(kawa::Block::Chunk(kawa::Chunk {
-                data: kawa::Store::Slice(slice),
-            }));
+            if discarded {
+                debug!(
+                    "{} DATA payload of {} bytes on a response to HEAD discarded",
+                    log_context!(self),
+                    content_len
+                );
+            } else {
+                kawa.push_block(kawa::Block::Chunk(kawa::Chunk {
+                    data: kawa::Store::Slice(slice),
+                }));
+            }
 
-            if kawa.body_size == kawa::BodySize::Chunked && content_len > 0 {
+            if kawa.body_size == kawa::BodySize::Chunked && content_len > 0 && !discarded {
                 kawa.push_block(kawa::Block::Flags(kawa::Flags {
                     end_body: false,
                     end_chunk: true,
@@ -10495,6 +10589,59 @@ mod tests {
         Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)))
     }
 
+    /// What `handle_data_frame` does with the DATA payload of a backend
+    /// response: a 204 or a 304 cannot carry content and is reset, even to
+    /// HEAD; a response to HEAD only SHOULD NOT and its payload is
+    /// discarded (RFC 9110 §6.4.1, §9.3.2, §15.3.5, §15.4.5).
+    #[test]
+    fn a_backend_response_content_is_forbidden_for_204_and_304_and_discarded_for_head() {
+        use crate::protocol::kawa_h1::parser::Method;
+        let pool = make_pool_for_invariant_16();
+        let mut stream = make_stream_for_invariant_16(&pool, Ulid::generate());
+        let cases = [
+            (
+                Some(Method::Head),
+                Some(200),
+                BackendResponseContent::Discarded,
+            ),
+            (
+                Some(Method::Head),
+                Some(204),
+                BackendResponseContent::Forbidden,
+            ),
+            (
+                Some(Method::Get),
+                Some(204),
+                BackendResponseContent::Forbidden,
+            ),
+            (
+                Some(Method::Get),
+                Some(304),
+                BackendResponseContent::Forbidden,
+            ),
+            (
+                Some(Method::Get),
+                Some(200),
+                BackendResponseContent::Forwarded,
+            ),
+            (
+                Some(Method::Post),
+                Some(205),
+                BackendResponseContent::Forwarded,
+            ),
+            (None, None, BackendResponseContent::Forwarded),
+        ];
+        for (method, status, expected) in cases {
+            stream.context.method = method.clone();
+            stream.context.status = status;
+            assert_eq!(
+                ConnectionH2::backend_response_content(&stream.context),
+                expected,
+                "{method:?} {status:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_any_stream_has_pending_back_empty_map_is_false() {
         let pool = make_pool_for_invariant_16();
@@ -11590,6 +11737,107 @@ mod tests {
         );
     }
 
+    /// The kernel-refused sibling of the two drain tests above: the output
+    /// flush stalls on `(0, WouldBlock)`, and the `Stalled` arm must leave
+    /// WRITABLE to the kernel's next edge instead of re-raising it. A
+    /// synthetic edge here made `Mux::ready_inner` repeat the refused flush
+    /// on every inner iteration (sozu-proxy/sozu#1788).
+    ///
+    /// TO SEE THIS RED: drop `self.note_write_status(status);` from
+    /// `ConnectionH2::consume_output_flush`. The refusal is then never
+    /// recorded and `ensure_tls_flushed` re-raises the event for both drains.
+    #[test]
+    fn a_refused_control_frame_drain_leaves_writable_to_the_kernel() {
+        for drain in ["WINDOW_UPDATE", "RST_STREAM"] {
+            let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+            let (mut connection, _peer) =
+                connection_with_backpressure(&pool, 1, 0, H2State::Header);
+            connection
+                .socket
+                .write_script
+                .push_back((0, SocketResult::WouldBlock));
+            let mut context = test_context(&pool);
+            let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+            if drain == "WINDOW_UPDATE" {
+                connection.core.queue_window_update(0, 65_535);
+            } else {
+                assert!(
+                    connection
+                        .core
+                        .enqueue_rst(1, H2Error::Cancel, RstOrigin::Local)
+                        .is_none(),
+                    "premise: a single RST must not trip the flood detector"
+                );
+            }
+            connection.core.readiness.event.insert(Ready::WRITABLE);
+
+            let result = connection.writable(&mut context, EndpointClient(&mut router));
+
+            assert!(
+                matches!(result, MuxResult::Continue),
+                "a refused {drain} drain parks the pass and continues, got {result:?}"
+            );
+            assert!(
+                !connection.core.output.is_empty(),
+                "premise: the {drain} flush must have stalled, leaving the frame queued"
+            );
+            assert!(
+                connection.socket.socket_wants_write(),
+                "premise: rustls must still hold records, or the re-arm is gated off"
+            );
+            assert!(
+                !connection.core.readiness.event.is_writable(),
+                "a {drain} drain the kernel refused must leave WRITABLE to the \
+                 kernel's next edge, got {:?}",
+                connection.core.readiness
+            );
+        }
+    }
+
+    /// A stream write the kernel refuses, while rustls still holds records,
+    /// ends the pass without a synthetic WRITABLE. The pass already wrote
+    /// through `socket_write_vectored`, so `finalize_write` skips its own
+    /// flush and decides on the refusal `handle_write` recorded: the preamble
+    /// flush before it answered `Continue`, so without that record the
+    /// `ReArm` would re-raise the event.
+    ///
+    /// TO SEE THIS RED: drop `self.note_write_status(status);` from
+    /// `ConnectionH2::handle_write`.
+    #[test]
+    fn a_refused_stream_write_leaves_writable_to_the_kernel() {
+        let pool = make_pool_for_invariant_16();
+        let (mut connection, mut context, gid, _peer) = writable_fixture(
+            &pool,
+            &[FIRST_BLOCK, SECOND_BLOCK],
+            &[(0, SocketResult::WouldBlock)],
+        );
+        connection.socket.pending.set(1);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        assert_prepare_gate_is_shut(&context, gid);
+        connection.core.readiness.event.insert(Ready::WRITABLE);
+
+        let result = connection.writable(&mut context, EndpointClient(&mut router));
+
+        assert!(
+            matches!(result, MuxResult::Continue),
+            "a refused stream write continues, got {result:?}"
+        );
+        assert_eq!(
+            connection.socket.vectored_calls, 1,
+            "premise: the pass must have reached the stream write"
+        );
+        assert!(
+            connection.socket.socket_wants_write(),
+            "premise: rustls must still hold records"
+        );
+        assert!(
+            !connection.core.readiness.event.is_writable(),
+            "a stream write the kernel refused must leave WRITABLE to the \
+             kernel's next edge, got {:?}",
+            connection.core.readiness
+        );
+    }
+
     // ── The vectored write loop: a partial write that reports WouldBlock ──
     //
     // First, which shape each neighbour targets, because #1454 asks for that
@@ -11608,7 +11856,7 @@ mod tests {
     //     `dispatch_writable_state`'s `(H2State::Error, Position::Server)`
     //     arm. The preamble half is asserted by the two GoAway tests above,
     //     and #1454's
-    //     `a_rustls_frontend_in_error_state_re_arms_until_its_records_drain`
+    //     `a_rustls_frontend_in_error_state_stays_open_until_its_records_drain`
     //     drives the second query over the production handler — this line
     //     said **Uncovered** until that test existed, and it was already
     //     wrong before this changeset renamed what it points at.
@@ -17007,6 +17255,121 @@ mod tests {
         kawa.parsing_phase = kawa::ParsingPhase::Terminated;
     }
 
+    /// Frame-level pin of `handle_data_frame`'s bodiless branches: a backend
+    /// answers `method` with the HEADERS block `head` (no END_STREAM, so the
+    /// stream stays linked, RFC 9113 §8.1), then DATA carrying `hello`
+    /// flagged END_STREAM. Returns the frames the backend reads after the
+    /// DATA, whether the payload was queued on the response, whether the
+    /// stream is still tracked, and how many bytes the DATA frame left in the
+    /// response buffer.
+    fn bodiless_response_with_data(
+        method: crate::protocol::kawa_h1::parser::Method,
+        head: &[u8],
+    ) -> (Vec<PeerFrame>, bool, bool, usize) {
+        use std::io::Write;
+
+        let LinkedBackend {
+            _pool,
+            mut connection,
+            mut peer,
+            mut context,
+            mut router,
+            gid,
+        } = backend_with_a_linked_stream(
+            H2State::Header,
+            BackendStatus::Connected,
+            Ready::READABLE | Ready::HUP | Ready::ERROR,
+        );
+        queue_request(&mut context, gid);
+        context.streams[gid].context.method = Some(method);
+        // Open on the client side, as a stream the router linked; `Link`
+        // carries no frontend token for `reset_stream` to end.
+        context.streams[gid].state = StreamState::Link;
+        let request = drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+        assert!(
+            peer_frames(&request)
+                .expect("whole frames")
+                .iter()
+                .any(|(kind, _, id, _)| *kind == 1 && *id == 1),
+            "premise: the request went out on stream 1, got {request:?}"
+        );
+
+        peer.write_all(&orphan_frame(1, 0x4, 1, head.len() as u32, head))
+            .expect("loopback write must complete");
+        drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+        let end_before = context.streams[gid].back.storage.end;
+        peer.write_all(&orphan_frame(0, 0x1, 1, 5, b"hello"))
+            .expect("loopback write must complete");
+        let after = drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+        let after = peer_frames(&after).expect("whole frames");
+        assert!(
+            matches!(connection.core.state, H2State::Header),
+            "the shared connection stays up, got {:?}",
+            connection.core.state
+        );
+        let back = &context.streams[gid].back;
+        let buffer = back.storage.buffer();
+        let queued = back.blocks.iter().any(|block| {
+            matches!(block, kawa::Block::Chunk(kawa::Chunk { data })
+                if !data.data(buffer).is_empty())
+        });
+        let tracked = connection.core.stream_table.get(1).is_some();
+        let retained = back.storage.end.saturating_sub(end_before);
+        (after, queued, tracked, retained)
+    }
+
+    /// RFC 9110 §15.3.5, §15.4.5, RFC 9113 §8.1.1: DATA carrying a payload
+    /// on a 204 still linked to its backend stream resets that stream with
+    /// PROTOCOL_ERROR before the payload is queued, without a GOAWAY. RFC 9110
+    /// §9.3.2: the payload of a response to HEAD is dropped from the stream
+    /// buffer and never queued, and its END_STREAM still ends the response,
+    /// with no frame sent. A 200 to GET forwards the payload.
+    ///
+    /// TO SEE THIS RED: make `ConnectionH2::backend_response_content` return
+    /// `BackendResponseContent::Forwarded` for every response, or keep the
+    /// discarded payload behind `storage.head` in `handle_data_frame`.
+    #[test]
+    fn a_204_response_carrying_data_resets_its_backend_stream_and_a_head_response_discards_it() {
+        use crate::protocol::kawa_h1::parser::Method;
+
+        // :status 204 (static index 9).
+        let (frames, queued, tracked, _) = bodiless_response_with_data(Method::Get, &[0x89]);
+        assert_eq!(
+            frames,
+            vec![(3, 0, 1, vec![0, 0, 0, 1])],
+            "a 204 carrying DATA gets RST_STREAM(PROTOCOL_ERROR) alone"
+        );
+        assert!(!queued, "the payload of a 204 is never queued");
+        assert!(!tracked, "the reset stream is retired");
+
+        // :status 200 (static index 8), to HEAD.
+        let (frames, queued, _, retained) = bodiless_response_with_data(Method::Head, &[0x88]);
+        assert!(
+            !frames
+                .iter()
+                .any(|(kind, _, _, _)| *kind == 3 || *kind == 7),
+            "a response to HEAD carrying DATA is not reset, got {frames:?}"
+        );
+        assert!(!queued, "the payload of a response to HEAD is never queued");
+        assert_eq!(
+            retained, 0,
+            "the payload of a response to HEAD leaves no byte in the buffer"
+        );
+
+        let (frames, queued, _, retained) = bodiless_response_with_data(Method::Get, &[0x88]);
+        assert!(
+            !frames
+                .iter()
+                .any(|(kind, _, _, _)| *kind == 3 || *kind == 7),
+            "premise: a 200 to GET is not reset, got {frames:?}"
+        );
+        assert!(queued, "premise: the payload of a 200 to GET is queued");
+        assert_eq!(
+            retained, 5,
+            "premise: a forwarded payload stays in the buffer"
+        );
+    }
+
     /// sozu-proxy/sozu#1631, `Header` row: a backend stream ended before any
     /// write pass sent its HEADERS is idle on the backend, and a RST_STREAM
     /// for it is a connection error there (RFC 9113 §5.1, §6.4) that takes
@@ -21219,11 +21582,15 @@ mod tests {
             "the delayed close must keep WRITABLE interest so the write path \
              can still flush"
         );
+        // The records were written straight to the socket, outside any
+        // writable pass, so no refusal is recorded and the delayed close
+        // re-raises WRITABLE for the write path to run once more. A write the
+        // same pass saw refused would leave it to the kernel's edge instead
+        // (`a_refused_goaway_flush_waits_for_the_kernel_edge_then_closes`).
         assert!(
             connection.core.readiness.event.is_writable(),
-            "ensure_tls_flushed must re-signal the WRITABLE event: nothing \
-             else wakes an edge-triggered connection whose records are stuck \
-             in rustls rather than in the kernel"
+            "with no refused write recorded, ensure_tls_flushed must re-signal \
+             the WRITABLE event so the write path runs again"
         );
 
         let mut received = Vec::new();
@@ -21247,8 +21614,11 @@ mod tests {
 
     /// The `(H2State::Error, Position::Server)` arm of
     /// `ConnectionH2::dispatch_writable_state` reads the real handler's
-    /// POST-flush answer: it re-arms while rustls still holds records and
-    /// closes only once they are gone.
+    /// POST-flush answer: it keeps the session open while rustls still holds
+    /// records — leaving WRITABLE to the kernel's edge, since the flush was
+    /// refused — and closes once they are gone. The test drains the records
+    /// itself between the two passes (`flush_until_drained`); the second pass
+    /// only has to see that nothing is left.
     ///
     /// That arm has no flush of its own — `H2Shell::writable`'s preamble
     /// already issued this pass's `socket_write(&[])` and discarded both the
@@ -21269,7 +21639,7 @@ mod tests {
     /// response as truncated`. Measured: `1116 passed; 1 failed` — it is the
     /// only test in the crate that moves.
     #[test]
-    fn a_rustls_frontend_in_error_state_re_arms_until_its_records_drain() {
+    fn a_rustls_frontend_in_error_state_stays_open_until_its_records_drain() {
         let pool = make_pool_for_invariant_16();
         let (mut connection, mut peer, mut client) = rustls_h2_connection(&pool, H2State::Error);
         let mut context = test_context(&pool);
@@ -21336,13 +21706,15 @@ mod tests {
     /// and the `ConnectionH2::dispatch_writable_state_after_flush` that
     /// settles it — the triple whose own comment calls it the primary
     /// truncation vector under HAProxy chaining — over the production TLS
-    /// handler: it re-arms while rustls still holds records and disconnects
-    /// only once they are gone.
+    /// handler: it keeps the session open while rustls still holds records,
+    /// leaving WRITABLE to the kernel's edge, and disconnects once they are
+    /// gone. As in the Error-arm test, the records are drained by the test
+    /// between the passes, not by the second pass.
     ///
     /// This is the triple #1454 names. Of the three, `finalize_write`'s is
     /// driven by `a_blocked_rustls_frontend_delivers_every_queued_byte_across_passes`
     /// above and the Error arm by
-    /// `a_rustls_frontend_in_error_state_re_arms_until_its_records_drain`; this
+    /// `a_rustls_frontend_in_error_state_stays_open_until_its_records_drain`; this
     /// one completes the set. The fourth `socket_write(&[])` site,
     /// `flush_output_buffer`, is deliberately not targeted here: it keeps the
     /// status its flush returned instead of re-querying, so it is not this
@@ -21351,7 +21723,7 @@ mod tests {
     /// The state assertion is not decoration. Falling through this arm reaches
     /// `force_disconnect`, which has a record guard of its own and answers
     /// `MuxResult::Continue` too — so the result alone cannot tell a correct
-    /// re-arm from a fall-through that only looks correct. `H2State::Error` is
+    /// hold from a fall-through that only looks correct. `H2State::Error` is
     /// what the fall-through leaves behind, and nothing else sets it here.
     ///
     /// TO SEE THIS RED: in `ConnectionH2::dispatch_writable_state_after_flush`,
@@ -21365,7 +21737,7 @@ mod tests {
     /// the same arm with one witness over a modelled handler and one over the
     /// production one.
     #[test]
-    fn a_rustls_frontend_in_goaway_re_arms_until_its_records_drain() {
+    fn a_rustls_frontend_in_goaway_stays_open_until_its_records_drain() {
         let pool = make_pool_for_invariant_16();
         let (mut connection, mut peer, mut client) = rustls_h2_connection(&pool, H2State::GoAway);
         let mut context = test_context(&pool);

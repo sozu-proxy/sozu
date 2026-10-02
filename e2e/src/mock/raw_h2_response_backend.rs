@@ -16,7 +16,9 @@
 //! section or an empty DATA frame can end the stream. In second-stream mode
 //! ([`RawH2ResponseBackend::set_serve_second_stream`]) the end of stream 1
 //! waits for sozu to open another stream on the same connection, which is
-//! answered too.
+//! answered too. Body DATA frames wait for sozu's flow-control windows
+//! (SETTINGS and WINDOW_UPDATE), so a body may exceed the initial 65 535
+//! bytes; a window that stays closed for 2 s panics the backend thread.
 //!
 //! The header block is emitted using HPACK's "literal header field without
 //! indexing — new name" form (`0x00` opcode) so the backend does not need a
@@ -78,6 +80,10 @@ struct RawResponse {
     /// held back until sozu opens another stream on the same connection;
     /// that stream is then answered `200` with the body `pong`.
     serve_second_stream: bool,
+    /// When `true`, the SETTINGS, HEADERS, DATA and trailer frames of a
+    /// response leave in one `write_all`, so sozu reads them together;
+    /// [`Self::body_delay`] is then not consulted.
+    single_write: bool,
 }
 
 impl Default for RawResponse {
@@ -91,6 +97,7 @@ impl Default for RawResponse {
             interim: Vec::new(),
             empty_data_end: false,
             serve_second_stream: false,
+            single_write: false,
         }
     }
 }
@@ -150,12 +157,20 @@ impl RawH2ResponseBackend {
                     let read =
                         tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buf))
                             .await;
-                    // What follows the client preface, kept to find the
-                    // frames of a second stream.
-                    let mut pending = match read {
-                        Ok(Ok(n)) => buf[..n].get(24..).unwrap_or_default().to_vec(),
-                        _ => Vec::new(),
+                    // What follows the client preface: sozu's frames, read
+                    // for its flow-control windows and its second stream.
+                    let mut peer = Peer {
+                        pending: match read {
+                            Ok(Ok(n)) => buf[..n].get(24..).unwrap_or_default().to_vec(),
+                            _ => Vec::new(),
+                        },
+                        counters: [&goaways_thread, &resets_thread],
+                        initial_window: DEFAULT_WINDOW,
+                        connection_window: DEFAULT_WINDOW,
+                        stream_window: DEFAULT_WINDOW,
                     };
+                    peer.read_frames(&mut stream, Duration::ZERO, Until::Timeout)
+                        .await;
 
                     // Snapshot the configured response and build the reply.
                     let response_snapshot = response_thread.lock().unwrap().clone();
@@ -197,20 +212,18 @@ impl RawH2ResponseBackend {
                     out.extend_from_slice(&1u32.to_be_bytes());
                     out.extend_from_slice(&header_block);
 
-                    let _ = stream.write_all(&out).await;
-                    let _ = stream.flush().await;
+                    let single_write = response_snapshot.single_write;
+                    if !single_write {
+                        let _ = stream.write_all(&out).await;
+                        let _ = stream.flush().await;
+                        out.clear();
+                    }
 
                     // Hold the end of stream 1 back until sozu opens another
                     // stream on this connection.
                     let second_stream = if response_snapshot.serve_second_stream {
-                        read_frames_until(
-                            &mut stream,
-                            &mut pending,
-                            [&goaways_thread, &resets_thread],
-                            Duration::from_secs(2),
-                            true,
-                        )
-                        .await
+                        peer.read_frames(&mut stream, Duration::from_secs(2), Until::SecondStream)
+                            .await
                     } else {
                         None
                     };
@@ -223,7 +236,7 @@ impl RawH2ResponseBackend {
                     // woken by `signal_pending_write` after DATA arrives,
                     // not by the initial HEADERS natural-writable).
                     if let Some(body) = response_snapshot.body.as_ref() {
-                        if !response_snapshot.body_delay.is_zero() {
+                        if !single_write && !response_snapshot.body_delay.is_zero() {
                             tokio::time::sleep(response_snapshot.body_delay).await;
                         }
                         const MAX_FRAME: usize = 16384;
@@ -241,8 +254,32 @@ impl RawH2ResponseBackend {
                             frame.push(if is_last && !has_trailers { 0x01 } else { 0x00 });
                             frame.extend_from_slice(&1u32.to_be_bytes());
                             frame.extend_from_slice(chunk);
-                            let _ = stream.write_all(&frame).await;
-                            let _ = stream.flush().await;
+                            if single_write {
+                                out.extend_from_slice(&frame);
+                            } else {
+                                // Respect sozu's flow-control windows (RFC
+                                // 9113 §6.9), waiting for its WINDOW_UPDATE.
+                                // A window sozu never opens is a test
+                                // failure, not a reason to overrun it.
+                                while peer.window() < chunk_len as i64 {
+                                    assert!(
+                                        peer.read_frames(
+                                            &mut stream,
+                                            Duration::from_secs(2),
+                                            Until::WindowUpdate,
+                                        )
+                                        .await
+                                        .is_some(),
+                                        "sozu sent no WINDOW_UPDATE within 2 s for a {chunk_len}-byte \
+                                         DATA frame (window {})",
+                                        peer.window()
+                                    );
+                                }
+                                peer.connection_window -= chunk_len as i64;
+                                peer.stream_window -= chunk_len as i64;
+                                let _ = stream.write_all(&frame).await;
+                                let _ = stream.flush().await;
+                            }
                             emitted = end;
                         }
                     }
@@ -262,7 +299,10 @@ impl RawH2ResponseBackend {
                         frame.push(0x04 | 0x01);
                         frame.extend_from_slice(&1u32.to_be_bytes());
                         frame.extend_from_slice(&block);
-                        let _ = stream.write_all(&frame).await;
+                        out.extend_from_slice(&frame);
+                    }
+                    if !out.is_empty() {
+                        let _ = stream.write_all(&out).await;
                         let _ = stream.flush().await;
                     }
 
@@ -285,14 +325,8 @@ impl RawH2ResponseBackend {
                     }
                     if response_snapshot.serve_second_stream {
                         // Count what sozu answers to the end of stream 1.
-                        read_frames_until(
-                            &mut stream,
-                            &mut pending,
-                            [&goaways_thread, &resets_thread],
-                            Duration::from_millis(300),
-                            false,
-                        )
-                        .await;
+                        peer.read_frames(&mut stream, Duration::from_millis(300), Until::Timeout)
+                            .await;
                     }
 
                     // Give sozu time to consume the response before we FIN.
@@ -385,6 +419,13 @@ impl RawH2ResponseBackend {
         self.resets_received.load(Ordering::Relaxed)
     }
 
+    /// Send every frame of subsequent responses in one `write_all` when
+    /// `true`, so they reach sozu in one read, or frame by frame when
+    /// `false` (the default).
+    pub fn set_single_write(&self, single_write: bool) {
+        self.response.lock().unwrap().single_write = single_write;
+    }
+
     #[allow(dead_code)]
     pub fn connections_received(&self) -> usize {
         self.connections_received.load(Ordering::Relaxed)
@@ -434,45 +475,107 @@ fn push_frame(buf: &mut Vec<u8>, kind: u8, flags: u8, stream_id: u32, payload: &
     buf.extend_from_slice(payload);
 }
 
-/// Read the frames sozu sends, counting each GOAWAY and RST_STREAM in
-/// `counters`, until
-/// `timeout` elapses or, when `stop_at_headers`, a HEADERS frame opens a
-/// stream other than 1, whose id is returned. `pending` holds the bytes
-/// read but not yet parsed, starting on a frame boundary.
-async fn read_frames_until(
-    stream: &mut tokio::net::TcpStream,
-    pending: &mut Vec<u8>,
-    counters: [&AtomicUsize; 2],
-    timeout: Duration,
-    stop_at_headers: bool,
-) -> Option<u32> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut buf = vec![0u8; 4096];
-    loop {
-        while pending.len() >= 9 {
-            let len = (usize::from(pending[0]) << 16)
-                | (usize::from(pending[1]) << 8)
-                | usize::from(pending[2]);
-            if pending.len() < 9 + len {
-                break;
+/// The flow-control window each side starts with (RFC 9113 §6.9.2).
+const DEFAULT_WINDOW: i64 = 65_535;
+
+/// What [`Peer::read_frames`] waits for besides its timeout.
+enum Until {
+    /// Only the timeout.
+    Timeout,
+    /// A HEADERS frame opening a stream other than 1, whose id is returned.
+    SecondStream,
+    /// A WINDOW_UPDATE frame; `Some(0)` is returned.
+    WindowUpdate,
+}
+
+/// What the backend knows of sozu's side of the connection.
+struct Peer<'a> {
+    /// Bytes read but not yet parsed, starting on a frame boundary.
+    pending: Vec<u8>,
+    /// GOAWAY and RST_STREAM frames read.
+    counters: [&'a AtomicUsize; 2],
+    /// `SETTINGS_INITIAL_WINDOW_SIZE` sozu announced.
+    initial_window: i64,
+    /// What the backend may still send on the connection.
+    connection_window: i64,
+    /// What the backend may still send on stream 1.
+    stream_window: i64,
+}
+
+impl Peer<'_> {
+    /// What the backend may still send on stream 1.
+    fn window(&self) -> i64 {
+        self.connection_window.min(self.stream_window)
+    }
+
+    /// Read and account for the frames sozu sends until `timeout` elapses or
+    /// `until` is met.
+    async fn read_frames(
+        &mut self,
+        stream: &mut tokio::net::TcpStream,
+        timeout: Duration,
+        until: Until,
+    ) -> Option<u32> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut buf = vec![0u8; 4096];
+        loop {
+            while self.pending.len() >= 9 {
+                let pending = &self.pending;
+                let len = (usize::from(pending[0]) << 16)
+                    | (usize::from(pending[1]) << 8)
+                    | usize::from(pending[2]);
+                if pending.len() < 9 + len {
+                    break;
+                }
+                let (kind, flags) = (pending[3], pending[4]);
+                let stream_id =
+                    u32::from_be_bytes([pending[5], pending[6], pending[7], pending[8]])
+                        & 0x7fff_ffff;
+                let payload = pending[9..9 + len].to_vec();
+                self.pending.drain(..9 + len);
+                match kind {
+                    0x07 => {
+                        self.counters[0].fetch_add(1, Ordering::Relaxed);
+                    }
+                    0x03 => {
+                        self.counters[1].fetch_add(1, Ordering::Relaxed);
+                    }
+                    0x04 if flags & 0x01 == 0 => {
+                        for setting in payload.chunks_exact(6) {
+                            if u16::from_be_bytes([setting[0], setting[1]]) == 0x4 {
+                                let value = i64::from(u32::from_be_bytes([
+                                    setting[2], setting[3], setting[4], setting[5],
+                                ]));
+                                self.stream_window += value - self.initial_window;
+                                self.initial_window = value;
+                            }
+                        }
+                    }
+                    0x08 if payload.len() == 4 => {
+                        let increment = i64::from(
+                            u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
+                                & 0x7fff_ffff,
+                        );
+                        match stream_id {
+                            0 => self.connection_window += increment,
+                            1 => self.stream_window += increment,
+                            _ => {}
+                        }
+                        if matches!(until, Until::WindowUpdate) {
+                            return Some(0);
+                        }
+                    }
+                    0x01 if matches!(until, Until::SecondStream) && stream_id != 1 => {
+                        return Some(stream_id);
+                    }
+                    _ => {}
+                }
             }
-            let kind = pending[3];
-            let stream_id =
-                u32::from_be_bytes([pending[5], pending[6], pending[7], pending[8]]) & 0x7fff_ffff;
-            pending.drain(..9 + len);
-            match kind {
-                0x07 => counters[0].fetch_add(1, Ordering::Relaxed),
-                0x03 => counters[1].fetch_add(1, Ordering::Relaxed),
-                _ => 0,
-            };
-            if stop_at_headers && kind == 0x01 && stream_id != 1 {
-                return Some(stream_id);
+            let read = tokio::time::timeout_at(deadline, stream.read(&mut buf)).await;
+            match read {
+                Ok(Ok(n)) if n > 0 => self.pending.extend_from_slice(&buf[..n]),
+                _ => return None,
             }
-        }
-        let read = tokio::time::timeout_at(deadline, stream.read(&mut buf)).await;
-        match read {
-            Ok(Ok(n)) if n > 0 => pending.extend_from_slice(&buf[..n]),
-            _ => return None,
         }
     }
 }

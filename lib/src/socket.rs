@@ -263,6 +263,9 @@ fn log_socket_module_prefix(
 ///   signalled comes with no further edge, so a caller that saw HUP must keep
 ///   READABLE to read it: `update_readiness_after_read` in the mux does.
 ///
+/// A read the kernel interrupted (`EINTR`) is retried at once, as
+/// [`flush_tls`] does for writes: it says nothing about the socket.
+///
 /// The returned error, when there is one, is a transport failure the caller
 /// logs with its socket context; the result is then [`SocketResult::Error`].
 fn plain_socket_read<R: Read>(
@@ -274,7 +277,13 @@ fn plain_socket_read<R: Read>(
     if buf.is_empty() {
         return (0, SocketResult::Continue, None);
     }
-    match stream.read(buf) {
+    let read = loop {
+        match stream.read(buf) {
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            read => break read,
+        }
+    };
+    match read {
         Ok(0) => (0, SocketResult::Closed, None),
         Ok(sz) => {
             // `read` cannot report more bytes than the slice it was given.
@@ -355,23 +364,61 @@ fn tcp_socket_read(
     (size, result)
 }
 
-fn tcp_socket_write(
-    stream: &mut TcpStream,
+/// A failure [`plain_socket_write`] or [`plain_socket_write_vectored`] hit,
+/// handed back rather than logged so [`tcp_socket_write`] and
+/// [`tcp_socket_write_vectored`] render it with their socket context, as
+/// [`tcp_socket_read`] does for [`plain_socket_read`]. Its counters are
+/// already bumped.
+#[derive(Debug)]
+enum PlainWriteFault {
+    /// The write loop ran [`MAX_LOOP_ITERATIONS`] times without settling.
+    LoopLimit,
+    /// The socket failed with something other than `WouldBlock`, a reset, a
+    /// broken pipe, a refused connection or an interruption.
+    Io(std::io::Error),
+}
+
+/// Map a failed plain TCP write to its result, bumping its counters. A peer
+/// reset (see [`plain_socket_read`]) keeps counting under `tcp.write.error`
+/// as well, as it did before `tcp.write.reset`.
+fn plain_write_error(e: std::io::Error) -> (SocketResult, Option<PlainWriteFault>) {
+    match e.kind() {
+        ErrorKind::WouldBlock => (SocketResult::WouldBlock, None),
+        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => {
+            incr!(names::tcp::WRITE_RESET);
+            incr!(names::tcp::WRITE_ERROR);
+            (SocketResult::Closed, None)
+        }
+        ErrorKind::BrokenPipe | ErrorKind::ConnectionRefused => {
+            incr!(names::tcp::WRITE_ERROR);
+            (SocketResult::Closed, None)
+        }
+        _ => {
+            incr!(names::tcp::WRITE_ERROR);
+            (SocketResult::Error, Some(PlainWriteFault::Io(e)))
+        }
+    }
+}
+
+/// Body of [`tcp_socket_write`], generic over the transport so tests can
+/// script what each write answers.
+///
+/// A write the kernel interrupted (`EINTR`) is retried at once, as
+/// [`flush_tls`] and std's `write_all` do: it says nothing about the socket,
+/// so it must neither end the write as `WouldBlock`, which no edge would
+/// follow, nor as `Error`, which closes the session. The retry counts against
+/// [`MAX_LOOP_ITERATIONS`] like every other pass of the loop.
+fn plain_socket_write<W: Write>(
+    stream: &mut W,
     buf: &[u8],
-    session_ulid: Option<Ulid>,
-    configured_peer: Option<SocketAddr>,
-) -> (usize, SocketResult) {
+) -> (usize, SocketResult, Option<PlainWriteFault>) {
     let mut size = 0usize;
     let mut counter = 0;
     loop {
         counter += 1;
         if counter > MAX_LOOP_ITERATIONS {
-            error!(
-                "{} MAX_LOOP_ITERATION reached in TcpStream::socket_write",
-                log_socket_module_prefix(stream, session_ulid, configured_peer)
-            );
             incr!(names::socket::WRITE_INFINITE_LOOP_ERROR);
-            return (size, SocketResult::Error);
+            return (size, SocketResult::Error, Some(PlainWriteFault::LoopLimit));
         }
         // Loop invariant: the cursor never overshoots the buffer, so the
         // `&buf[size..]` slice below can never panic on a bad offset.
@@ -381,10 +428,10 @@ fn tcp_socket_write(
             buf.len()
         );
         if size == buf.len() {
-            return (size, SocketResult::Continue);
+            return (size, SocketResult::Continue, None);
         }
         match stream.write(&buf[size..]) {
-            Ok(0) => return (size, SocketResult::Continue),
+            Ok(0) => return (size, SocketResult::Continue, None),
             Ok(sz) => {
                 // `write` cannot report more bytes than the slice it was given.
                 debug_assert!(
@@ -394,48 +441,90 @@ fn tcp_socket_write(
                 );
                 size += sz;
             }
-            Err(e) => match e.kind() {
-                ErrorKind::WouldBlock => return (size, SocketResult::WouldBlock),
-                // A peer reset (see `plain_socket_read`) keeps counting under
-                // `tcp.write.error` as well, as it did before `tcp.write.reset`.
-                ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => {
-                    incr!(names::tcp::WRITE_RESET);
-                    incr!(names::tcp::WRITE_ERROR);
-                    return (size, SocketResult::Closed);
-                }
-                ErrorKind::BrokenPipe | ErrorKind::ConnectionRefused => {
-                    incr!(names::tcp::WRITE_ERROR);
-                    return (size, SocketResult::Closed);
-                }
-                // Noisy-expected transport failures (see `tcp_socket_read`
-                // for rationale). Log at `warn!` and still bump the
-                // `tcp.write.error` counter so rate-based dashboards stay
-                // accurate.
-                ErrorKind::HostUnreachable
-                | ErrorKind::NetworkUnreachable
-                | ErrorKind::TimedOut
-                | ErrorKind::NotConnected => {
-                    warn!(
-                        "{} socket_write error={:?}",
-                        log_socket_module_prefix(stream, session_ulid, configured_peer),
-                        e
-                    );
-                    incr!(names::tcp::WRITE_ERROR);
-                    return (size, SocketResult::Error);
-                }
-                _ => {
-                    //FIXME: timeout and other common errors should be sent up
-                    error!(
-                        "{} socket_write error={:?}",
-                        log_socket_module_prefix(stream, session_ulid, configured_peer),
-                        e
-                    );
-                    incr!(names::tcp::WRITE_ERROR);
-                    return (size, SocketResult::Error);
-                }
-            },
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => {
+                let (result, fault) = plain_write_error(e);
+                return (size, result, fault);
+            }
         }
     }
+}
+
+/// Body of [`tcp_socket_write_vectored`], generic over the transport so tests
+/// can script what each write answers. One `writev(2)`, retried at once when
+/// the kernel interrupts it (`EINTR`), as [`plain_socket_write`] retries.
+fn plain_socket_write_vectored<W: Write>(
+    stream: &mut W,
+    bufs: &[std::io::IoSlice],
+) -> (usize, SocketResult, Option<PlainWriteFault>) {
+    let written = loop {
+        match stream.write_vectored(bufs) {
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            written => break written,
+        }
+    };
+    match written {
+        Ok(sz) => {
+            // `write_vectored` cannot report more bytes than the slices held.
+            debug_assert!(
+                sz <= bufs.iter().map(|b| b.len()).sum::<usize>(),
+                "write_vectored reported {sz} bytes from {}-byte slices",
+                bufs.iter().map(|b| b.len()).sum::<usize>()
+            );
+            (sz, SocketResult::Continue, None)
+        }
+        Err(e) => {
+            let (result, fault) = plain_write_error(e);
+            (0, result, fault)
+        }
+    }
+}
+
+/// Log a [`PlainWriteFault`] with the socket context of [`tcp_socket_read`].
+fn log_plain_write_fault(
+    stream: &TcpStream,
+    session_ulid: Option<Ulid>,
+    configured_peer: Option<SocketAddr>,
+    fault: PlainWriteFault,
+) {
+    match fault {
+        PlainWriteFault::LoopLimit => error!(
+            "{} MAX_LOOP_ITERATION reached in TcpStream::socket_write",
+            log_socket_module_prefix(stream, session_ulid, configured_peer)
+        ),
+        PlainWriteFault::Io(e) => match e.kind() {
+            // Noisy-expected transport failures (see `tcp_socket_read` for
+            // rationale): `warn!`, the `tcp.write.error` counter still bumped
+            // so rate-based dashboards stay accurate.
+            ErrorKind::HostUnreachable
+            | ErrorKind::NetworkUnreachable
+            | ErrorKind::TimedOut
+            | ErrorKind::NotConnected => warn!(
+                "{} socket_write error={:?}",
+                log_socket_module_prefix(stream, session_ulid, configured_peer),
+                e
+            ),
+            //FIXME: timeout and other common errors should be sent up
+            _ => error!(
+                "{} socket_write error={:?}",
+                log_socket_module_prefix(stream, session_ulid, configured_peer),
+                e
+            ),
+        },
+    }
+}
+
+fn tcp_socket_write(
+    stream: &mut TcpStream,
+    buf: &[u8],
+    session_ulid: Option<Ulid>,
+    configured_peer: Option<SocketAddr>,
+) -> (usize, SocketResult) {
+    let (size, result, fault) = plain_socket_write(stream, buf);
+    if let Some(fault) = fault {
+        log_plain_write_fault(stream, session_ulid, configured_peer, fault);
+    }
+    (size, result)
 }
 
 fn tcp_socket_write_vectored(
@@ -444,54 +533,11 @@ fn tcp_socket_write_vectored(
     session_ulid: Option<Ulid>,
     configured_peer: Option<SocketAddr>,
 ) -> (usize, SocketResult) {
-    match stream.write_vectored(bufs) {
-        Ok(sz) => {
-            // `write_vectored` cannot report more bytes than the slices held.
-            debug_assert!(
-                sz <= bufs.iter().map(|b| b.len()).sum::<usize>(),
-                "write_vectored reported {sz} bytes from {}-byte slices",
-                bufs.iter().map(|b| b.len()).sum::<usize>()
-            );
-            (sz, SocketResult::Continue)
-        }
-        Err(e) => match e.kind() {
-            ErrorKind::WouldBlock => (0, SocketResult::WouldBlock),
-            // Same split as the scalar write path.
-            ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => {
-                incr!(names::tcp::WRITE_RESET);
-                incr!(names::tcp::WRITE_ERROR);
-                (0, SocketResult::Closed)
-            }
-            ErrorKind::BrokenPipe | ErrorKind::ConnectionRefused => {
-                incr!(names::tcp::WRITE_ERROR);
-                (0, SocketResult::Closed)
-            }
-            // Noisy-expected transport failures (see `tcp_socket_read` for
-            // rationale). Same tiering as the scalar write path.
-            ErrorKind::HostUnreachable
-            | ErrorKind::NetworkUnreachable
-            | ErrorKind::TimedOut
-            | ErrorKind::NotConnected => {
-                warn!(
-                    "{} socket_write error={:?}",
-                    log_socket_module_prefix(stream, session_ulid, configured_peer),
-                    e
-                );
-                incr!(names::tcp::WRITE_ERROR);
-                (0, SocketResult::Error)
-            }
-            _ => {
-                //FIXME: timeout and other common errors should be sent up
-                error!(
-                    "{} socket_write error={:?}",
-                    log_socket_module_prefix(stream, session_ulid, configured_peer),
-                    e
-                );
-                incr!(names::tcp::WRITE_ERROR);
-                (0, SocketResult::Error)
-            }
-        },
+    let (size, result, fault) = plain_socket_write_vectored(stream, bufs);
+    if let Some(fault) = fault {
+        log_plain_write_fault(stream, session_ulid, configured_peer, fault);
     }
+    (size, result)
 }
 
 impl SocketHandler for TcpStream {
@@ -642,11 +688,14 @@ pub struct FrontRustls {
     /// records to flush on the write side — do NOT abort pending writes.
     pub peer_disconnected: bool,
     /// The TCP channel is dead: the peer reset the connection
-    /// (RST/ConnectionAborted/BrokenPipe), or a write to the socket failed
-    /// with any other error but `WouldBlock`. Further writes are pointless and
-    /// short-circuit, and [`SocketHandler::socket_wants_write`] stops
-    /// reporting the records rustls still holds: no write can deliver them,
-    /// so they must not keep the session open or re-raise WRITABLE.
+    /// (RST/ConnectionAborted/BrokenPipe), or a write answered
+    /// [`SocketResult::Error`] — a socket error other than `WouldBlock`
+    /// (an `Interrupted` write is retried in `flush_tls` and never gets
+    /// here), a rustls writer failure, or the write loop's budget. Further
+    /// writes are pointless and short-circuit, and
+    /// [`SocketHandler::socket_wants_write`] stops reporting the records
+    /// rustls still holds: no write can deliver them, so they must neither
+    /// keep the session open nor wait for a WRITABLE edge that will not come.
     pub peer_reset: bool,
     /// `process_new_packets` failed on this connection: a corrupt record, a
     /// fatal alert, a protocol violation. rustls keeps that error for good,
@@ -752,12 +801,28 @@ impl RecvMemory {
 /// error arm (sozu-proxy/sozu#434); the callers' `peer_reset` then stops
 /// every later write before it reaches the socket, so a reset counts once.
 /// The callers still count it under `rustls.write.error` as well.
-fn flush_tls(session: &mut ServerConnection, stream: &mut TcpStream) -> std::io::Result<usize> {
+///
+/// A write the kernel interrupted (`EINTR`) is retried at once, as the
+/// relay (`lib/src/protocol/proxy_protocol/relay.rs`), the UDP path
+/// (`lib/src/udp.rs`) and the plain TCP paths ([`plain_socket_read`],
+/// [`plain_socket_write`], [`plain_socket_write_vectored`]) do: it says
+/// nothing about the socket, so it must
+/// neither end the write as `WouldBlock`, which no edge would follow, nor
+/// as `Error`, which marks the channel dead.
+fn flush_tls(
+    session: &mut ServerConnection,
+    stream: &mut impl std::io::Write,
+) -> std::io::Result<usize> {
     #[cfg(test)]
     if session.wants_write() {
         TLS_WRITES.with(|writes| writes.set(writes.get() + 1));
     }
-    let written = session.write_tls(stream);
+    let written = loop {
+        match session.write_tls(stream) {
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            written => break written,
+        }
+    };
     if let Err(e) = &written
         && matches!(
             e.kind(),
@@ -797,8 +862,8 @@ impl std::fmt::Debug for FrontRustls {
 enum RustlsReadFault {
     /// The pass ran [`MAX_LOOP_ITERATIONS`] times without settling.
     LoopLimit,
-    /// `read_tls` failed with something other than `WouldBlock`, a reset, or
-    /// rustls's own "plaintext buffer full".
+    /// `read_tls` failed with something other than `WouldBlock`, a reset, an
+    /// interruption (retried), or rustls's own "plaintext buffer full".
     ReadTls(std::io::Error),
     /// `process_new_packets` rejected what `read_tls` delivered.
     ProcessPackets(rustls::Error),
@@ -1006,8 +1071,18 @@ fn rustls_socket_read<R: Read>(
             break;
         }
 
+        // rustls hands an interrupted `recv` (`EINTR`) back from `read_tls`
+        // (only its `complete_io` retries it), and it says nothing about the
+        // socket, so it is retried at once, as [`plain_socket_read`] does. The
+        // probe only records a successful read, so the retry leaves
+        // `was_short` exact.
         let mut probe = ShortReadProbe::new(&mut *stream);
-        let read = session.read_tls(&mut probe);
+        let read = loop {
+            match session.read_tls(&mut probe) {
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                read => break read,
+            }
+        };
         drained |= probe.was_short();
         match read {
             Ok(0) => {
@@ -1246,8 +1321,6 @@ impl SocketHandler for FrontRustls {
                             );
                             incr!(names::rustls::WRITE_ERROR);
                             is_error = true;
-                            // The kernel refused the socket for good: see `peer_reset`.
-                            self.peer_reset = true;
                             break;
                         }
                     },
@@ -1286,8 +1359,6 @@ impl SocketHandler for FrontRustls {
                             );
                             incr!(names::rustls::WRITE_ERROR);
                             is_error = true;
-                            // The kernel refused the socket for good: see `peer_reset`.
-                            self.peer_reset = true;
                             break;
                         }
                     },
@@ -1308,6 +1379,9 @@ impl SocketHandler for FrontRustls {
             "rustls socket_write cannot be both Error and Closed"
         );
         if is_error {
+            // Whatever failed — the socket, rustls, or the loop budget — no
+            // later write can deliver what rustls holds: see `peer_reset`.
+            self.peer_reset = true;
             (buffered_size, SocketResult::Error)
         } else if is_closed {
             (buffered_size, SocketResult::Closed)
@@ -1440,8 +1514,6 @@ impl SocketHandler for FrontRustls {
                                 );
                                 incr!(names::rustls::WRITE_ERROR);
                                 is_error = true;
-                                // The kernel refused the socket for good: see `peer_reset`.
-                                self.peer_reset = true;
                                 break;
                             }
                         },
@@ -1477,8 +1549,6 @@ impl SocketHandler for FrontRustls {
                             );
                             incr!(names::rustls::WRITE_ERROR);
                             is_error = true;
-                            // The kernel refused the socket for good: see `peer_reset`.
-                            self.peer_reset = true;
                             break;
                         }
                     },
@@ -1512,8 +1582,6 @@ impl SocketHandler for FrontRustls {
                             );
                             incr!(names::rustls::WRITE_ERROR);
                             is_error = true;
-                            // The kernel refused the socket for good: see `peer_reset`.
-                            self.peer_reset = true;
                             break;
                         }
                     },
@@ -1533,6 +1601,8 @@ impl SocketHandler for FrontRustls {
             "rustls socket_write_vectored cannot be both Error and Closed"
         );
         if is_error {
+            // Same as `socket_write`: an `Error` always marks the channel dead.
+            self.peer_reset = true;
             (buffered_size, SocketResult::Error)
         } else if is_closed {
             (buffered_size, SocketResult::Closed)
@@ -2874,7 +2944,7 @@ pub(crate) mod rustls_read_tests {
     /// A non-blocking transport: `wire` is what the kernel holds, served by at
     /// most one read, and `eof` is a received FIN once `wire` is drained.
     /// `eagains` counts the reads that found nothing, the ones a short read
-    /// makes unnecessary.
+    /// makes unnecessary. The first `interrupts` reads answer `EINTR`.
     #[derive(Default)]
     pub(crate) struct CountingTransport {
         pub(crate) wire: VecDeque<u8>,
@@ -2882,11 +2952,16 @@ pub(crate) mod rustls_read_tests {
         pub(crate) reset: bool,
         pub(crate) reads: usize,
         pub(crate) eagains: usize,
+        pub(crate) interrupts: usize,
     }
 
     impl Read for CountingTransport {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             self.reads += 1;
+            if self.interrupts > 0 {
+                self.interrupts -= 1;
+                return Err(ErrorKind::Interrupted.into());
+            }
             if self.reset {
                 return Err(ErrorKind::ConnectionReset.into());
             }
@@ -3708,6 +3783,212 @@ pub(crate) mod rustls_read_tests {
             writes,
             "a write after the error must not reach the socket"
         );
+    }
+
+    /// `refused_front` with records already queued in rustls and nothing
+    /// written yet, for the empty-buffer flushes that only drain them.
+    fn refused_front_holding_records() -> FrontRustls {
+        let mut front = refused_front();
+        front
+            .session
+            .writer()
+            .write_all(b"queued before the flush")
+            .expect("rustls must absorb the plaintext");
+        assert!(
+            front.session.wants_write(),
+            "premise: rustls must hold the record the flush will try to write"
+        );
+        front
+    }
+
+    /// The write that met the socket error answered `Error`, and the record
+    /// rustls still holds no longer reads as a pending write.
+    fn assert_error_marks_the_channel_dead(front: &FrontRustls, result: SocketResult) {
+        assert_eq!(result, SocketResult::Error);
+        assert!(
+            front.session.wants_write(),
+            "premise: rustls must still hold the record the kernel refused"
+        );
+        assert!(
+            front.peer_reset && !front.socket_wants_write(),
+            "an Error write must mark the channel dead, or the record keeps the \
+             session waiting for a WRITABLE edge that never comes"
+        );
+    }
+
+    /// The empty-buffer flush of `socket_write` — the one `H2Shell` issues to
+    /// push queued records — marks the channel dead on a socket error.
+    ///
+    /// TO SEE THIS RED: drop the `self.peer_reset = true;` of the `is_error`
+    /// return in `FrontRustls::socket_write`.
+    #[test]
+    fn an_empty_tls_flush_that_meets_a_socket_error_marks_the_channel_dead() {
+        let mut front = refused_front_holding_records();
+        let (_, result) = front.socket_write(&[]);
+        assert_error_marks_the_channel_dead(&front, result);
+    }
+
+    /// A vectored write rustls absorbs whole, then flushes in the main loop.
+    ///
+    /// TO SEE THIS RED: drop the `self.peer_reset = true;` of the `is_error`
+    /// return in `FrontRustls::socket_write_vectored`.
+    #[test]
+    fn a_vectored_tls_write_that_meets_a_socket_error_marks_the_channel_dead() {
+        let mut front = refused_front();
+        let (size, result) = front.socket_write_vectored(&[
+            std::io::IoSlice::new(b"refused "),
+            std::io::IoSlice::new(b"by the kernel"),
+        ]);
+        assert_eq!(size, 21, "premise: rustls must absorb the whole write");
+        assert_error_marks_the_channel_dead(&front, result);
+    }
+
+    /// A vectored write rustls absorbs only in part (its send buffer is
+    /// capped), which takes the partial-write flush before returning.
+    ///
+    /// TO SEE THIS RED: the same edit as the whole-write test above.
+    #[test]
+    fn a_partial_vectored_tls_write_that_meets_a_socket_error_marks_the_channel_dead() {
+        let mut front = refused_front();
+        front.session.set_buffer_limit(Some(64));
+        let payload = vec![b'x'; 4096];
+        let (size, result) = front.socket_write_vectored(&[std::io::IoSlice::new(&payload)]);
+        assert!(
+            size > 0 && size < payload.len(),
+            "premise: rustls must absorb part of the write, got {size}"
+        );
+        assert_error_marks_the_channel_dead(&front, result);
+    }
+
+    /// The empty-buffer flush of `socket_write_vectored`.
+    ///
+    /// TO SEE THIS RED: the same edit as the whole-write test above.
+    #[test]
+    fn an_empty_vectored_tls_flush_that_meets_a_socket_error_marks_the_channel_dead() {
+        let mut front = refused_front_holding_records();
+        let (_, result) = front.socket_write_vectored(&[]);
+        assert_error_marks_the_channel_dead(&front, result);
+    }
+
+    /// A transport whose first write is interrupted (`EINTR`) and whose next
+    /// one takes everything.
+    #[derive(Default)]
+    struct InterruptedOnce {
+        calls: usize,
+        written: Vec<u8>,
+    }
+
+    impl std::io::Write for InterruptedOnce {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            if self.calls == 1 {
+                return Err(std::io::Error::from(ErrorKind::Interrupted));
+            }
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// An interrupted TLS write is retried, not reported: as `WouldBlock` no
+    /// edge would resume it, and as an error it would mark the channel dead.
+    ///
+    /// TO SEE THIS RED: remove the `Interrupted => continue` arm of the retry
+    /// loop in `flush_tls`.
+    #[test]
+    fn an_interrupted_tls_write_is_retried() {
+        let (mut session, _client) = handshaken_pair();
+        session
+            .writer()
+            .write_all(b"interrupted once")
+            .expect("rustls must absorb the plaintext");
+        let mut transport = InterruptedOnce::default();
+
+        let written = flush_tls(&mut session, &mut transport)
+            .expect("an interrupted write must be retried, not reported");
+
+        assert!(written > 0 && transport.written.len() == written);
+        assert_eq!(transport.calls, 2, "one interrupted write, one retry");
+        assert!(!session.wants_write(), "the retry must deliver the record");
+    }
+
+    /// An interrupted plain TCP write is retried, not reported: as an error it
+    /// would close the session (the pipe path closes on a front write error).
+    ///
+    /// TO SEE THIS RED: remove the `Interrupted` arm of the write loop in
+    /// `plain_socket_write`.
+    #[test]
+    fn an_interrupted_plain_write_is_retried() {
+        let mut transport = InterruptedOnce::default();
+
+        let (size, result, fault) = plain_socket_write(&mut transport, b"interrupted once");
+
+        assert!(fault.is_none(), "unexpected write fault: {fault:?}");
+        assert_eq!((size, result), (16, SocketResult::Continue));
+        assert_eq!(transport.calls, 2, "one interrupted write, one retry");
+        assert_eq!(transport.written, b"interrupted once");
+    }
+
+    /// The vectored plain TCP write retries an interruption the same way.
+    ///
+    /// TO SEE THIS RED: remove the `Interrupted` arm of the retry loop in
+    /// `plain_socket_write_vectored`.
+    #[test]
+    fn an_interrupted_plain_vectored_write_is_retried() {
+        let mut transport = InterruptedOnce::default();
+        let bufs = [std::io::IoSlice::new(b"interrupted once")];
+
+        let (size, result, fault) = plain_socket_write_vectored(&mut transport, &bufs);
+
+        assert!(fault.is_none(), "unexpected write fault: {fault:?}");
+        assert_eq!((size, result), (16, SocketResult::Continue));
+        assert_eq!(transport.calls, 2, "one interrupted write, one retry");
+        assert_eq!(transport.written, b"interrupted once");
+    }
+
+    /// An interrupted plain TCP read is retried, not reported as an error.
+    ///
+    /// TO SEE THIS RED: remove the `Interrupted` arm of the retry loop in
+    /// `plain_socket_read`.
+    #[test]
+    fn an_interrupted_plain_read_is_retried() {
+        let mut transport = CountingTransport {
+            wire: b"interrupted once".iter().copied().collect(),
+            interrupts: 1,
+            ..Default::default()
+        };
+        let mut buf = [0u8; 32];
+
+        let (size, result, fault) = plain_socket_read(&mut transport, &mut buf);
+
+        assert!(fault.is_none(), "unexpected read fault: {fault:?}");
+        assert_eq!((size, result), (16, SocketResult::WouldBlock));
+        assert_eq!(&buf[..size], b"interrupted once");
+        assert_eq!(transport.reads, 2, "one interrupted read, one retry");
+    }
+
+    /// An interrupted `recv` under `read_tls` is retried, not reported as a
+    /// `ReadTls` fault.
+    ///
+    /// TO SEE THIS RED: remove the `Interrupted` arm of the `read_tls` retry
+    /// loop in `rustls_socket_read`.
+    #[test]
+    fn an_interrupted_tls_read_is_retried() {
+        let (mut front, mut client) = front_and_client();
+        let mut transport = CountingTransport {
+            wire: seal(&mut client, b"interrupted once").into(),
+            interrupts: 1,
+            ..Default::default()
+        };
+
+        let (read, result) = front.read(&mut transport, 32);
+
+        assert_eq!(read, b"interrupted once");
+        assert_eq!(result, SocketResult::WouldBlock);
+        assert_eq!(transport.reads, 2, "one interrupted read, one retry");
     }
 
     /// Read everything `transport` holds through [`plain_socket_read`] with a

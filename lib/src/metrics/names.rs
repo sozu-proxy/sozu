@@ -268,6 +268,10 @@ pub mod h2 {
     /// `ConnectionH1::writable` towards an H1 client, which reads such a
     /// response as ending with its header section (RFC 9112 §6.3).
     pub const TRAILERS_DROPPED_NO_BODY: &str = "h2.trailers_dropped_no_body";
+    /// Backend streams reset by `ConnectionH2::handle_data_frame` because a
+    /// 204 or a 304 response carried a DATA payload (RFC 9110 §15.3.5,
+    /// §15.4.5; RFC 9113 §8.1.1).
+    pub const BODILESS_RESPONSE_DATA_RESET: &str = "h2.bodiless_response_data_reset";
     /// Request trailer fields elided by `pkawa::handle_trailer` because their
     /// name is one of `editor::TRAILER_FORBIDDEN_FIELDS` (sozu-proxy/sozu#1714).
     /// One increment per field; the request is still forwarded. The H1
