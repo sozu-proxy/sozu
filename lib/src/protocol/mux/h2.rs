@@ -2121,6 +2121,17 @@ impl ConnectionH2 {
                     // reads DATA, so it stays the initial window it
                     // advertised. More header blocks, and DATA beyond it,
                     // count as a glitch.
+                    // CVE-2019-9518: an empty DATA frame without END_STREAM
+                    // counts toward the empty-DATA flood limit here as on a
+                    // live stream (`handle_data_frame`), since it carries no
+                    // payload to charge against the stream's window.
+                    if header.frame_type == FrameType::Data
+                        && header.payload_len == 0
+                        && header.flags & parser::FLAG_END_STREAM == 0
+                    {
+                        self.flood_detector.record_empty_data_frame();
+                        check_flood_or_return!(self);
+                    }
                     let in_flight = if header.frame_type == FrameType::Headers {
                         self.stream_table
                             .charge_reset_stream_header_block(stream_id)
@@ -8154,6 +8165,18 @@ impl ConnectionH2 {
         // slot left.
         *context.streams[stream].send_window_mut(&self.position) =
             i32::try_from(self.peer_settings.settings_initial_window_size).unwrap_or(i32::MAX);
+        // Pre: the backend leg of the slot starts fresh, whether it comes
+        // from `Context::create_stream` or from an H1 frontend's keep-alive
+        // reset (sozu-proxy/sozu#1781): nothing has been received on it yet,
+        // or `handle_read` would refuse the response as arriving on a closed
+        // stream. The frontend leg may legitimately be done already: an H2
+        // client's request ends with END_STREAM before the backend is
+        // dialled.
+        debug_assert!(
+            !context.streams[stream].back_received_end_of_stream
+                && context.streams[stream].back_data_received == 0,
+            "a stream must open on a backend with a fresh backend leg"
+        );
         self.stream_table.register(stream_id, stream, self.now);
         self.readiness.arm_writable();
         true
@@ -16816,6 +16839,59 @@ mod tests {
             frames.iter().any(|(kind, _, _, payload)| *kind == 7
                 && payload.get(4..8) == Some(&[0, 0, 0, 0xb][..])),
             "repeated header blocks end the connection with GOAWAY(ENHANCE_YOUR_CALM), got {frames:?}"
+        );
+    }
+
+    /// Empty DATA frames without END_STREAM on a stream Sōzu reset count
+    /// toward the empty-DATA flood limit as on a live stream
+    /// (CVE-2019-9518): they carry no payload to charge against the stream's
+    /// window, so without it a peer could send them for free. A flood of
+    /// them ends the connection with GOAWAY(ENHANCE_YOUR_CALM).
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::handle_header_state`, drop the
+    /// `record_empty_data_frame` call of the `was_reset_locally` branch: no
+    /// GOAWAY ever comes.
+    #[test]
+    fn empty_data_frames_on_a_reset_backend_stream_count_toward_the_flood_limit() {
+        use std::io::Write;
+
+        let LinkedBackend {
+            _pool,
+            mut connection,
+            mut peer,
+            mut context,
+            mut router,
+            ..
+        } = backend_stream_reset_for_its_content_length();
+        peer.set_nodelay(true).expect("TCP_NODELAY must apply");
+        let mut received = Vec::new();
+        for _ in 0..50 {
+            let mut wire = Vec::new();
+            for _ in 0..100 {
+                wire.extend(orphan_frame(0, 0, 1, 0, b""));
+            }
+            if peer.write_all(&wire).is_err() {
+                break;
+            }
+            received.extend(drive_and_read_backend(
+                &mut connection,
+                &mut peer,
+                &mut context,
+                &mut router,
+            ));
+            if peer_frames(&received)
+                .map(|frames| frames.iter().any(|(kind, _, _, _)| *kind == 7))
+                .unwrap_or(false)
+            {
+                break;
+            }
+        }
+        let frames = peer_frames(&received).expect("whole frames");
+        assert!(
+            frames.iter().any(|(kind, _, _, payload)| *kind == 7
+                && payload.get(4..8) == Some(&[0, 0, 0, 0xb][..])),
+            "a flood of empty DATA frames ends the connection with \
+             GOAWAY(ENHANCE_YOUR_CALM), got {frames:?}"
         );
     }
 

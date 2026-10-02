@@ -49,13 +49,15 @@ pub struct H2Backend {
     stop: Arc<AtomicBool>,
     pub requests_received: Arc<AtomicUsize>,
     pub responses_sent: Arc<AtomicUsize>,
+    /// TCP connections the backend accepted.
+    pub connections_accepted: Arc<AtomicUsize>,
     requests_log: Arc<Mutex<Vec<RecordedH2Request>>>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
 impl H2Backend {
     pub fn start(name: impl Into<String>, address: SocketAddr, body: impl Into<String>) -> Self {
-        Self::start_inner(name, address, body, false)
+        Self::start_inner(name, address, body, false, None)
     }
 
     /// Like [`H2Backend::start`], but read each request body to its end
@@ -67,7 +69,20 @@ impl H2Backend {
         address: SocketAddr,
         body: impl Into<String>,
     ) -> Self {
-        Self::start_inner(name, address, body, true)
+        Self::start_inner(name, address, body, true, None)
+    }
+
+    /// Like [`H2Backend::start_recording_trailers`], reading each request
+    /// body to its end, but advertising `window` as its
+    /// `SETTINGS_INITIAL_WINDOW_SIZE` (RFC 9113 §6.5.2), so a sender that
+    /// ignores it over-runs the stream window.
+    pub fn start_with_stream_window(
+        name: impl Into<String>,
+        address: SocketAddr,
+        body: impl Into<String>,
+        window: u32,
+    ) -> Self {
+        Self::start_inner(name, address, body, true, Some(window))
     }
 
     fn start_inner(
@@ -75,12 +90,15 @@ impl H2Backend {
         address: SocketAddr,
         body: impl Into<String>,
         record_trailers: bool,
+        initial_stream_window: Option<u32>,
     ) -> Self {
         let name = name.into();
         let body: Bytes = Bytes::from(body.into());
         let stop = Arc::new(AtomicBool::new(false));
         let requests_received = Arc::new(AtomicUsize::new(0));
         let responses_sent = Arc::new(AtomicUsize::new(0));
+        let connections_accepted = Arc::new(AtomicUsize::new(0));
+        let accepted = connections_accepted.clone();
         let requests_log: Arc<Mutex<Vec<RecordedH2Request>>> = Arc::new(Mutex::new(Vec::new()));
 
         let stop_clone = stop.clone();
@@ -129,6 +147,7 @@ impl H2Backend {
                         }
                         Err(_) => continue, // timeout, check stop flag
                     };
+                    accepted.fetch_add(1, Ordering::Relaxed);
 
                     let body = body.clone();
                     let req_count = req_count.clone();
@@ -210,7 +229,10 @@ impl H2Backend {
                             }
                         });
 
-                        let builder = ServerBuilder::new(TokioExecutor::new());
+                        let mut builder = ServerBuilder::new(TokioExecutor::new());
+                        if let Some(window) = initial_stream_window {
+                            builder.http2().initial_stream_window_size(window);
+                        }
                         if let Err(e) = builder.serve_connection(io, service).await {
                             eprintln!("h2 backend connection error: {e}");
                         }
@@ -232,6 +254,7 @@ impl H2Backend {
             stop,
             requests_received,
             responses_sent,
+            connections_accepted,
             requests_log,
             thread: Some(thread),
         }
@@ -271,6 +294,10 @@ impl H2Backend {
 
     pub fn get_responses_sent(&self) -> usize {
         self.responses_sent.load(Ordering::Relaxed)
+    }
+
+    pub fn get_connections_accepted(&self) -> usize {
+        self.connections_accepted.load(Ordering::Relaxed)
     }
 }
 

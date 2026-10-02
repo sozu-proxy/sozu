@@ -134,6 +134,13 @@ pub(super) const RECENTLY_RESET_CAPACITY: usize = 256;
 /// section, or an interim and a final response.
 const RESET_STREAM_HEADER_BLOCKS: u8 = 2;
 
+/// At most how many reset streams hold a DATA or header-block allowance at
+/// once. An allowance is dropped with its stream's id when that id leaves
+/// `recently_reset`, but a stream refused or reset without ever being
+/// tracked stays in `rst_sent` and never enters the ring; past this bound
+/// such a stream gets no allowance, so its frames count as glitches.
+const RESET_ALLOWANCES_CAPACITY: usize = 2 * RECENTLY_RESET_CAPACITY;
+
 /// H2 wire-level stream-slot bookkeeping: see the module doc.
 pub(super) struct H2StreamTable {
     /// Wire `StreamId -> GlobalStreamId` map.
@@ -157,12 +164,12 @@ pub(super) struct H2StreamTable {
     /// RFC 9113 §6.9: DATA bytes a peer may still send on a stream this
     /// endpoint reset without abusing it, keyed by stream: the receive
     /// window it was granted, consumed as its DATA is ignored. Created on
-    /// the first ignored DATA frame; dropped with the stream's id from
-    /// `recently_reset`.
+    /// the first ignored DATA frame, for at most [`RESET_ALLOWANCES_CAPACITY`]
+    /// streams; dropped with the stream's id from `recently_reset`.
     reset_data_allowance: HashMap<StreamId, u32>,
     /// Header blocks ignored so far on a stream this endpoint reset, keyed
     /// by stream: [`RESET_STREAM_HEADER_BLOCKS`] may legitimately still
-    /// arrive. Kept and dropped like `reset_data_allowance`.
+    /// arrive. Bounded and dropped like `reset_data_allowance`.
     reset_header_blocks: HashMap<StreamId, u8>,
     /// Per-stream wall-clock timestamp of last meaningful activity (DATA or
     /// HEADERS frame receipt) — the bidirectional-silence (slow-multiplex)
@@ -422,6 +429,11 @@ impl H2StreamTable {
     /// interim and a final response (RFC 9113 §8.1). Any block beyond is no
     /// in-flight remainder.
     pub(super) fn charge_reset_stream_header_block(&mut self, stream_id: StreamId) -> bool {
+        if !self.reset_header_blocks.contains_key(&stream_id)
+            && self.reset_header_blocks.len() >= RESET_ALLOWANCES_CAPACITY
+        {
+            return false;
+        }
         let blocks = self.reset_header_blocks.entry(stream_id).or_insert(0);
         *blocks = blocks.saturating_add(1);
         *blocks <= RESET_STREAM_HEADER_BLOCKS
@@ -437,6 +449,11 @@ impl H2StreamTable {
         len: u32,
         granted: u32,
     ) -> bool {
+        if !self.reset_data_allowance.contains_key(&stream_id)
+            && self.reset_data_allowance.len() >= RESET_ALLOWANCES_CAPACITY
+        {
+            return false;
+        }
         let allowance = self
             .reset_data_allowance
             .entry(stream_id)
@@ -583,6 +600,11 @@ impl H2StreamTable {
             self.recently_reset.len() <= RECENTLY_RESET_CAPACITY
                 && self.recently_reset_ids.len() == self.recently_reset.len(),
             "recently_reset must stay bounded and indexed"
+        );
+        debug_assert!(
+            self.reset_data_allowance.len() <= RESET_ALLOWANCES_CAPACITY
+                && self.reset_header_blocks.len() <= RESET_ALLOWANCES_CAPACITY,
+            "reset-stream allowances must stay bounded"
         );
         debug_assert!(
             self.stream_fc_stalled_since
@@ -859,6 +881,37 @@ mod tests {
             "streams() pairs must agree with its own keys and values: \
              handle_goaway_frame reads both halves of this iterator together"
         );
+    }
+
+    /// Allowances for reset streams that never enter the ring, such as
+    /// refused ones kept in `rst_sent`, stay bounded: past
+    /// `RESET_ALLOWANCES_CAPACITY` streams a new one gets none, while a stream
+    /// that already holds one keeps it.
+    #[test]
+    fn reset_stream_allowances_stay_bounded() {
+        let mut table = H2StreamTable::new(None);
+        let capacity = RESET_ALLOWANCES_CAPACITY as u32;
+        for index in 0..capacity {
+            let stream_id = 1 + 2 * index;
+            table.rst_sent_mut().insert(stream_id);
+            assert!(table.charge_reset_stream_data(stream_id, 1, 10));
+            assert!(table.charge_reset_stream_header_block(stream_id));
+        }
+        let next = 1 + 2 * capacity;
+        table.rst_sent_mut().insert(next);
+        assert!(
+            !table.charge_reset_stream_data(next, 1, 10),
+            "no DATA allowance past the bound"
+        );
+        assert!(
+            !table.charge_reset_stream_header_block(next),
+            "no header-block allowance past the bound"
+        );
+        assert!(
+            table.charge_reset_stream_data(1, 1, 10),
+            "an allowance already held is kept"
+        );
+        assert_eq!(table.reset_data_allowance.len(), RESET_ALLOWANCES_CAPACITY);
     }
 
     /// RFC 9113 §5.1: a retired stream this endpoint reset is still known as

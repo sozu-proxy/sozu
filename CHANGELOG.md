@@ -3877,9 +3877,12 @@
   counted a flood glitch, so a backend connection cancelling a few dozen streams a second, each
   with DATA in flight, tripped GOAWAY(ENHANCE_YOUR_CALM). What the peer may have had in flight now
   counts none: two header blocks per stream (a trailer section, or an interim and a final
-  response) and DATA within the stream's 65 535-byte receive window
-  (`lib/src/protocol/mux/h2_stream_table.rs`); each further block, and DATA beyond the window,
-  counts one. A dropped header block without END_HEADERS, on a reset stream, on a stream reset
+  response) and DATA within the stream's initial receive window
+  (`lib/src/protocol/mux/h2_stream_table.rs`); each further block, and each DATA frame beyond
+  the window, counts one glitch, and an empty DATA frame without END_STREAM counts toward the
+  empty-DATA flood limit as on a live stream (CVE-2019-9518). The allowances are held for at most
+  512 reset streams at once, and a backend connection's are further bounded by that backend's own
+  stream concurrency. A dropped header block without END_HEADERS, on a reset stream, on a stream reset
   for a stream error, or refused (for example at SETTINGS_MAX_CONCURRENT_STREAMS), left its
   CONTINUATION frames to be taken for standalone ones and answered GOAWAY(PROTOCOL_ERROR); they
   are now discarded with the block, which is decoded whole to keep the HPACK dynamic table in
@@ -3890,8 +3893,33 @@
   `data_on_a_reset_backend_stream_counts_a_glitch_beyond_its_window_only`,
   `data_on_a_tracked_backend_stream_sozu_reset_is_ignored`,
   `header_blocks_on_a_reset_backend_stream_beyond_two_count_glitches`,
-  `a_continuation_of_a_refused_header_block_is_discarded_with_it` and
-  `a_refused_header_block_counts_its_first_fragment_toward_its_size` (`h2.rs`).
+  `a_continuation_of_a_refused_header_block_is_discarded_with_it`,
+  `a_refused_header_block_counts_its_first_fragment_toward_its_size`,
+  `empty_data_frames_on_a_reset_backend_stream_count_toward_the_flood_limit` (`h2.rs`) and
+  `reset_stream_allowances_stay_bounded` (`h2_stream_table.rs`).
+- **`fix(mux)`: stop spinning the session loop when a TLS HTTP/1.1 client stops reading
+  ([#1780](https://github.com/sozu-proxy/sozu/issues/1780)).** When a TLS client stopped reading a
+  large response, rustls kept the records the kernel refused, and `ConnectionH1::writable`
+  (`lib/src/protocol/mux/h1.rs`) re-raised its WRITABLE event because `socket_wants_write()` was
+  still true, right after the write had answered `WouldBlock` and cleared it. `Mux::ready_inner`
+  (`lib/src/protocol/mux/mod.rs`) then called that write again on every inner iteration, each
+  answering `WouldBlock`, until `MAX_LOOP_ITERATIONS` counted an `http.infinite_loop.error`. The
+  pending write is now signalled only when the write answered `SocketResult::Continue`, so the
+  session waits for the kernel's next writable edge. The same re-raise kept every
+  `shut_down_sessions()` tick of a draining H1 session in `drive_frontend_shutdown_io`
+  (`lib/src/protocol/mux/mod.rs`) calling the blocked write until `MAX_LOOP_ITERATIONS`; that loop
+  now stops after the first refused write, once no WRITABLE event is left. A TLS write that meets a
+  socket error other than a reset now marks the transport dead (`FrontRustls::peer_reset`,
+  `lib/src/socket.rs`) as a reset does, so the records rustls still holds no longer count as a
+  pending write that holds the session open on the hang-up. Documented in
+  `lib/src/protocol/mux/LIFECYCLE.md` and `doc/lifetime_of_a_session.md`. Covered by
+  `test_tls_h1_stalled_reader_does_not_exhaust_loop_budget` (`e2e/src/tests/h2_tests.rs`), which
+  shrinks the client's receive buffer so the response always overflows it and checks that the
+  whole body arrives once the client reads again,
+  `a_tls_flush_that_did_not_continue_leaves_writable_to_the_kernel`
+  (`lib/src/protocol/mux/h1.rs`) and
+  `a_tls_write_that_meets_a_socket_error_stops_wanting_to_write` (`lib/src/socket.rs`). The same
+  spin on the HTTP/2 path is [#1788](https://github.com/sozu-proxy/sozu/issues/1788).
 
 - **BREAKING (library API) — `fix(udp)`: key UDP flows on the client source address, not on the
   affinity key ([#1732](https://github.com/sozu-proxy/sozu/issues/1732)).** Under the default
@@ -3957,6 +3985,22 @@
   Covered by `test_h1_interim_103_and_final_in_one_write`,
   `test_h1_interim_102_and_final_in_one_write` and
   `test_h1_several_interims_and_final_in_one_write` (`e2e/src/tests/tests.rs`).
+- **`fix(mux-h1)`: answer a second keep-alive request to an H2 backend instead of a 502
+  ([#1781](https://github.com/sozu-proxy/sozu/issues/1781)).** With an H1 client in front of an
+  H2 backend, `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`) reused the client stream
+  slot for the next request without clearing `Stream::back_received_end_of_stream`,
+  `Stream::front_received_end_of_stream` and the per-direction DATA counters, which
+  `Context::create_stream` clears for a recycled slot. The stale end-of-stream flag made the H2
+  backend connection refuse the second response's HEADERS as arriving on a closed stream
+  (RFC 9113 §5.1) and send GOAWAY(STREAM_CLOSED), so the client got a 502. The keep-alive reset
+  now clears them, and `ConnectionH2::start_stream` asserts that the backend leg is fresh; the
+  backend leg's send window is sized from the backend's SETTINGS_INITIAL_WINDOW_SIZE by
+  [#1757](https://github.com/sozu-proxy/sozu/pull/1757), which this builds on, so a keep-alive
+  request no longer starts from what the previous one left of it. Documented in
+  `lib/src/protocol/mux/LIFECYCLE.md` §3.2. Covered by `test_h1_to_h2_keep_alive_requests` and
+  `test_h1_to_h2_keep_alive_requests_small_backend_window` (`e2e/src/tests/tests.rs`): a GET,
+  four 600 000-byte POSTs and a GET on one client connection, over one backend connection,
+  with the default and a 16 384-byte backend window.
 
 - **`fix(h1)`: handle every 1xx other than 101 as an interim response
   ([#1733](https://github.com/sozu-proxy/sozu/issues/1733)).** On an HTTP/1.1 frontend,
@@ -4053,8 +4097,9 @@
   self-dependent PRIORITY (RFC 7540 §5.3.1) on an idle stream still closes the connection, since
   RST_STREAM must not name an idle stream (§6.4). Each RST_STREAM still feeds the emitted-RST flood
   accounting; flood thresholds are unchanged. On a stream Sōzu reset, what the peer may have had
-  in flight counts no flood glitch: two header blocks, and DATA within the stream's receive window;
-  each further block, and DATA beyond the window, counts one
+  in flight counts no flood glitch: two header blocks, and DATA within the stream's initial receive
+  window; each further block, and each DATA frame beyond the window, counts one, and an empty DATA
+  frame without END_STREAM counts toward the empty-DATA flood limit
   ([#1783](https://github.com/sozu-proxy/sozu/issues/1783)). A dropped header block that lacks
   END_HEADERS, whether it triggers a stream error (a trailer block or a half-closed-stream HEADERS
   split across CONTINUATION) or arrives late on a stream Sōzu reset, is discarded with its

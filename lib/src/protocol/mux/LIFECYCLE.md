@@ -508,6 +508,30 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   `ConnectionH2::create_stream` (`h2.rs`) via `H2StreamTable::register`
   (`h2_stream_table.rs`) — cited by symbol on both ends because the call site's
   own line, `self.stream_table`, is one of thirteen identical lines in `h2.rs`.
+- **H1 keep-alive reuse.** An H1 frontend keeps its one slot for the next
+  request: the keep-alive branch of `ConnectionH1::writable` (`h1.rs`) resets
+  it in place instead of going through `Context::create_stream`. It resets
+  `HttpContext` (`HttpContext::reset`, with a fresh request id), clears
+  `front`, `back` and the response storage, `front_bound_to_backend`,
+  `attempts`, `Stream::front_received_end_of_stream`,
+  `Stream::back_received_end_of_stream`, `Stream::front_data_received` and
+  `Stream::back_data_received`, forgets the replay capture, and returns the
+  slot to `Idle`. Unlike `Context::create_stream`, it keeps the slot's
+  `answers` (the connection's listener templates), leaves
+  `Stream::front_window` alone (an H1 frontend leg has no window), and does
+  not touch `request_counted`, which `Stream::generate_access_log` already
+  cleared, nor mark a request start, which `ConnectionH1::readable` marks when
+  the next request arrives. `ConnectionH2::start_stream` sizes
+  `Stream::back_window` from the backend's SETTINGS_INITIAL_WINDOW_SIZE each
+  time the slot opens on an H2 backend, and asserts that the backend leg's
+  end-of-stream flag and DATA counter are clear. An H2 backend connection
+  reads `Stream::back_received_end_of_stream` to refuse a frame on a closed
+  stream (RFC 9113 §5.1): before sozu-proxy/sozu#1781 the stale flag of the
+  first response made it refuse the second response's HEADERS with
+  GOAWAY(STREAM_CLOSED), and the client got a 502. Pinned by
+  `test_h1_to_h2_keep_alive_requests` and
+  `test_h1_to_h2_keep_alive_requests_small_backend_window`
+  (`e2e/src/tests/tests.rs`).
 - **Backend attach.** Two call sites, on the two paths a stream can reach a
   backend, both reached from `Mux::ready_inner`'s `pending_links` drain:
   `Router::plan_connect` calls `Context::link_stream` itself on the pool-reuse
@@ -1526,17 +1550,21 @@ kept in lock-step:
   reset (RFC 9113 §5.1), on a tracked or a retired stream alike
   (sozu-proxy/sozu#1751, sozu-proxy/sozu#1783). A header block is still
   decoded whole for HPACK. Two header blocks per stream and DATA within the
-  stream's receive window count no glitch; each block beyond two, and DATA
-  beyond the window, count one.
+  stream's initial receive window count no glitch; each block beyond two, and
+  each DATA frame beyond the window, count one, and an empty DATA frame
+  without END_STREAM counts toward the empty-DATA flood limit
+  (CVE-2019-9518). The allowances are held for at most
+  `RESET_ALLOWANCES_CAPACITY` streams.
   Pinned by `frames_on_a_backend_stream_sozu_reset_are_ignored`,
   `frames_on_a_client_stream_sozu_reset_are_ignored`,
   `data_on_a_reset_backend_stream_counts_a_glitch_beyond_its_window_only`,
   `data_on_a_tracked_backend_stream_sozu_reset_is_ignored`,
   `header_blocks_on_a_reset_backend_stream_beyond_two_count_glitches`,
   `a_continuation_of_a_refused_header_block_is_discarded_with_it`,
-  `a_refused_header_block_counts_its_first_fragment_toward_its_size` (`h2.rs`)
-  and `was_reset_locally_survives_removal_within_the_bound`
-  (`h2_stream_table.rs`).
+  `a_refused_header_block_counts_its_first_fragment_toward_its_size`,
+  `empty_data_frames_on_a_reset_backend_stream_count_toward_the_flood_limit`
+  (`h2.rs`), `was_reset_locally_survives_removal_within_the_bound` and
+  `reset_stream_allowances_stay_bounded` (`h2_stream_table.rs`).
 - **MadeYouReset queued cap** via `H2ControlTx`'s lifetime counter (capped at
   `MAX_PENDING_RST_STREAMS = 200`, `h2_control_tx.rs`). Each freshly queued RST
   bumps the counter, and neither a drain nor a queue clear ever rewinds it —
@@ -2160,7 +2188,16 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     not lost.
 12. **Loop budget.** Every inner loop in `Mux::ready` and
     `drive_frontend_shutdown_io` bounds iterations at
-    `MAX_LOOP_ITERATIONS = 10_000` (`mod.rs`).
+    `MAX_LOOP_ITERATIONS = 10_000` (`mod.rs`). In `ConnectionH1::writable`
+    (`h1.rs`), a write that did not answer `SocketResult::Continue` never
+    re-raises its own WRITABLE event: a `WouldBlock` is resumed by the
+    kernel's next edge, and an `Error` or `Closed` leaves nothing to retry.
+    It signals a pending write while the TLS socket still holds records only
+    after a write that answered `Continue`; re-raising it after a blocked one
+    spun the inner loop to the budget when a TLS client stopped reading
+    ([#1780](https://github.com/sozu-proxy/sozu/issues/1780)).
+    `ConnectionH2` still re-raises it after a blocked write
+    ([#1788](https://github.com/sozu-proxy/sozu/issues/1788)).
 13. **`shrink_trailing_recycle` runs only from `create_stream`.** Calling it
     from elsewhere can invalidate cached `GlobalStreamId` values (including
     `expect_write`/`expect_read`) that the caller is not prepared to re-check.
