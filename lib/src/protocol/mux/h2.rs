@@ -2312,10 +2312,24 @@ impl ConnectionH2 {
                     {
                         // An id between the last accepted stream and the
                         // highest one the client used was refused or skipped,
-                        // never opened: it is no new stream (§5.1.1), and
-                        // HEADERS on it is a connection error of type
-                        // PROTOCOL_ERROR. Streams still tracked, and streams
-                        // Sōzu reset, were handled above.
+                        // never opened: it is no new stream, and HEADERS on it
+                        // is a connection error of type PROTOCOL_ERROR.
+                        // Streams still tracked, and registered streams Sōzu
+                        // reset (`H2StreamTable::was_reset_locally`), were
+                        // handled above. A refused stream is neither: it is
+                        // never registered, and `Self::enqueue_rst` records
+                        // only registered streams, so the request trailers of
+                        // a refused stream, sent before the client read its
+                        // REFUSED_STREAM, land here and end the connection with
+                        // every stream in flight on it. That holds for every
+                        // refusal below (flood pressure, draining,
+                        // SETTINGS_MAX_CONCURRENT_STREAMS, buffer-pool
+                        // exhaustion). §5.1.1 only covers ids the client
+                        // skipped; for a refused id, §5.1 would have the frame
+                        // ignored. Accepted as a rare case: browsers and
+                        // standard gRPC send no request trailers. Recording
+                        // refused ids in the bounded recently-reset set would
+                        // ignore them instead.
                         error!(
                             "{} HEADERS on stream {} at or below the highest client stream id {}, sending GOAWAY(PROTOCOL_ERROR)",
                             log_context!(self),
@@ -2492,8 +2506,15 @@ impl ConnectionH2 {
                                     // connection for other streams. The payload is
                                     // still routed through stream 0 so handle_frame
                                     // can do connection-level flow control accounting.
-                                    // A stream this endpoint reset never gets here:
-                                    // its late DATA is ignored above.
+                                    // A registered stream this endpoint reset never
+                                    // gets here: its late DATA is ignored above. A
+                                    // refused stream does, since it was never
+                                    // registered: each DATA frame the client sent
+                                    // before reading its REFUSED_STREAM costs one
+                                    // glitch and one RST_STREAM(STREAM_CLOSED) — a
+                                    // refused upload filling a 64 KiB window in
+                                    // 16 KiB frames costs four — and the
+                                    // connection survives.
                                     debug!(
                                         "{} DATA on closed stream {}, sending RST_STREAM(STREAM_CLOSED)",
                                         log_context!(self),

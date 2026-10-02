@@ -18,9 +18,18 @@
   flood counter. A reset of a refused stream (of the latest run) counts as a pre-response reset,
   and one glitch as any reset of a closed stream, and ends the refusals on that connection, so a
   client that ignores them meets the cap exactly as before; a cancel that races a refusal ends
-  them too. HEADERS on a client stream id at or below one already refused, which was never
-  opened, is now a connection error, `GOAWAY(PROTOCOL_ERROR)` (RFC 9113 §5.1.1), instead of
-  being taken for a new stream. New listener key `h2_stream_refusal_percent` (TOML;
+  them too. HEADERS on a client stream id above the last accepted stream and at or below the
+  highest id the client used (refused or skipped, never opened) is now a connection error,
+  `GOAWAY(PROTOCOL_ERROR)` (RFC 9113 §5.1.1), instead of being taken for a new stream; a lower
+  never-opened id keeps getting `GOAWAY(STREAM_CLOSED)`. Known limitation, accepted as rare: a
+  client that sends HEADERS, DATA and request trailers before reading its `REFUSED_STREAM` gets
+  `RST_STREAM(REFUSED_STREAM)`, `RST_STREAM(STREAM_CLOSED)` and `GOAWAY(PROTOCOL_ERROR)`, losing
+  every stream in flight, for every refusal kind (flood pressure,
+  `SETTINGS_MAX_CONCURRENT_STREAMS`, graceful drain, which then ends with `PROTOCOL_ERROR`
+  instead of `NO_ERROR`, and buffer-pool exhaustion); each DATA frame of a refused stream costs a
+  glitch and a `RST_STREAM(STREAM_CLOSED)`. Browsers and standard gRPC send no request trailers;
+  trailer-forwarding clients such as Envoy can. RFC 9113 §5.1 would ignore those frames; recording
+  refused ids in the bounded recently-reset set is left for later. New listener key `h2_stream_refusal_percent` (TOML;
   `command.proto` fields `HttpListenerConfig` 37, `HttpsListenerConfig` 50,
   `UpdateHttpListenerConfig` 43, `UpdateHttpsListenerConfig` 44; `--h2-stream-refusal-percent`
   on `sozu listener http|https update`) and counter `h2.flood.stream_refused`. Library API:
