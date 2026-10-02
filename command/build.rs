@@ -48,6 +48,11 @@ pub fn main() {
         // `Request.request_type` and `ResponseContent.content_type` oneofs
         // can't derive their own Hash/Eq either.
         .message_attribute("MetricDetailStatus", "#[derive(Hash, Eq)]")
+        // `HealthCheckConfig.accepted_statuses` is a repeated message field,
+        // which also strips the auto-derive from the config and from the
+        // `SetHealthCheck` request that carries it.
+        .message_attribute("HealthCheckConfig", "#[derive(Hash, Eq)]")
+        .message_attribute("SetHealthCheck", "#[derive(Hash, Eq)]")
         // JSON state-file forward compat: `SaveState`/`LoadState` files are
         // JSON-encoded `WorkerRequest` records. Without `#[serde(default)]`,
         // serde rejects records that don't carry every `Vec`/`map` field — so
@@ -73,6 +78,11 @@ pub fn main() {
         .field_attribute("TcpListenerConfig.answers", "#[serde(default)]")
         .field_attribute("RequestUdpFrontend.tags", "#[serde(default)]")
         .field_attribute("RequestTcpFrontend.alpn", "#[serde(default)]")
+        .field_attribute("HealthCheckConfig.accepted_statuses", "#[serde(default)]")
+        // `mode` is a required scalar added after the state format shipped:
+        // a record written before it carries no `mode`, which must load as
+        // `HTTP` (0), the only probe those records could describe.
+        .field_attribute("HealthCheckConfig.mode", "#[serde(default)]")
         .skip_debug([
             "CertificateAndKey",
             "CertificateSummary",

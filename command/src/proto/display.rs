@@ -16,12 +16,13 @@ use crate::{
         command::{
             AggregatedMetrics, AvailableMetrics, CertificateAndKey, CertificateSummary,
             CertificatesWithFingerprints, Cluster, ClusterMetrics, CustomHttpAnswers, Event,
-            EventKind, FilteredMetrics, ForwardedHeaders, HealthChecksList, HttpEndpoint,
-            HttpListenerConfig, HttpsListenerConfig, ListOfCertificatesByAddress, ListedFrontends,
-            ListenersList, MetricDetailStatus, ProtobufEndpoint, QueryCertificatesFilters,
-            RequestCounts, Response, ResponseContent, ResponseStatus, RunState, SocketAddress,
-            TlsVersion, WorkerInfos, WorkerMetrics, WorkerResponses, filtered_metrics,
-            protobuf_endpoint, request::RequestType, response_content::ContentType,
+            EventKind, FilteredMetrics, ForwardedHeaders, HealthCheckConfig, HealthCheckMode,
+            HealthChecksList, HttpEndpoint, HttpListenerConfig, HttpStatusRange,
+            HttpsListenerConfig, ListOfCertificatesByAddress, ListedFrontends, ListenersList,
+            MetricDetailStatus, ProtobufEndpoint, QueryCertificatesFilters, RequestCounts,
+            Response, ResponseContent, ResponseStatus, RunState, SocketAddress, TlsVersion,
+            WorkerInfos, WorkerMetrics, WorkerResponses, filtered_metrics, protobuf_endpoint,
+            request::RequestType, response_content::ContentType,
         },
     },
 };
@@ -1138,36 +1139,73 @@ fn print_health_checks(list: &HealthChecksList) -> Result<(), DisplayError> {
     table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
     table.add_row(row![
         "cluster",
+        "mode",
         "uri",
         "interval",
         "timeout",
         "healthy threshold",
         "unhealthy threshold",
-        "expected status"
+        "accepted statuses"
     ]);
 
     let mut entries: Vec<_> = list.map.iter().collect();
     entries.sort_by_key(|(id, _)| id.as_str());
 
     for (cluster_id, config) in entries {
-        let expected = if config.expected_status == 0 {
-            "any 2xx".to_owned()
-        } else {
-            config.expected_status.to_string()
+        let (mode, uri, accepted) = match HealthCheckMode::try_from(config.mode) {
+            Ok(HealthCheckMode::Http) => ("http", config.uri.as_str(), accepted_statuses(config)),
+            Ok(HealthCheckMode::Tcp) => ("tcp", "-", "-".to_owned()),
+            Err(_) => ("unknown", config.uri.as_str(), "-".to_owned()),
         };
 
         table.add_row(row![
             cluster_id,
-            config.uri,
+            mode,
+            uri,
             format!("{}s", config.interval),
             format!("{}s", config.timeout),
             config.healthy_threshold,
             config.unhealthy_threshold,
-            expected
+            accepted
         ]);
     }
     table.printstd();
     Ok(())
+}
+
+/// The statuses an HTTP-mode probe accepts, in the syntax
+/// `sozu cluster health-check set --accepted-statuses` takes back.
+fn accepted_statuses(config: &HealthCheckConfig) -> String {
+    if !config.accepted_statuses.is_empty() {
+        return config
+            .accepted_statuses
+            .iter()
+            .map(HttpStatusRange::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+    }
+    match config.expected_status {
+        0 => "2xx".to_owned(),
+        status => status.to_string(),
+    }
+}
+
+/// Renders the range in the syntax `parse_http_status_range`
+/// (`command/src/config.rs`) parses: `404`, `2xx`, `any` or `200-399`.
+impl Display for HttpStatusRange {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        if self.start == self.end {
+            write!(f, "{}", self.start)
+        } else if self.start == crate::config::HTTP_STATUS_MIN
+            && self.end == crate::config::HTTP_STATUS_MAX
+        {
+            write!(f, "any")
+        } else if self.start.is_multiple_of(100) && self.end == self.start + 99 {
+            write!(f, "{}xx", self.start / 100)
+        } else {
+            write!(f, "{}-{}", self.start, self.end)
+        }
+    }
 }
 
 fn format_tags_to_string(tags: &BTreeMap<String, String>) -> String {

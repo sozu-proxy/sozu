@@ -656,15 +656,20 @@ backends = [
     { address = "127.0.0.1:1026", backend_id = "the-backend-to-my-app" }
 ]
 
-# optional: active HTTP health checks for backends in this cluster
+# optional: active health checks for backends in this cluster
 # see doc/health_checks.md for details
 # [clusters.MyCluster.health_check]
-# uri = "/health"
+# mode = "HTTP"          # "HTTP" (default) probes uri; "TCP" only checks the
+#                        # TCP connection is established, nothing is sent
+# uri = "/health"        # HTTP mode only (default: "/")
 # interval = 10          # seconds between check cycles (default: 10)
 # timeout = 5            # seconds to wait for a response (default: 5)
 # healthy_threshold = 3  # consecutive successes to mark UP (default: 3)
 # unhealthy_threshold = 3 # consecutive failures to mark DOWN (default: 3)
 # expected_status = 0    # 0 = any 2xx, or a specific status code (default: 0)
+# accepted_statuses = ["200-399"] # HTTP mode: codes ("404"), ranges ("200-399"),
+#                        # classes ("2xx") or "any"; replaces expected_status,
+#                        # which must then stay 0
 
 # this is an example of a routing configuration for the TCP proxy
 [clusters.TcpTest]

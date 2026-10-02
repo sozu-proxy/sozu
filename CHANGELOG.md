@@ -4,6 +4,54 @@
 
 ### ✨ Added
 
+- **BREAKING (library API) — `feat(health-check)`: TCP connect probe mode and configurable
+  accepted HTTP statuses ([#1801](https://github.com/sozu-proxy/sozu/issues/1801)).**
+  `HealthCheckConfig` gains a `mode` (proto field 7, `HealthCheckMode`): `HTTP`, the default and
+  the only behaviour so far, or `TCP`, where a backend passes as soon as the TCP connection is
+  established within `timeout`; nothing is sent and the connection is closed once established.
+  It lets a platform enable health checks on every cluster to take blackholed backends out of
+  rotation (the active-probe side of [#1800](https://github.com/sozu-proxy/sozu/issues/1800))
+  without marking down applications that answer 3xx, 401, 404 or 500 on a fixed path. HTTP mode
+  gains `accepted_statuses` (proto field 8, inclusive `HttpStatusRange` entries; TOML and CLI
+  entries `"404"`, `"200-399"`, `"2xx"` or `"any"`, bounds within `100-599`), which replaces
+  `expected_status` when set. `validate_health_check_config` refuses a non-zero
+  `expected_status` beside a list, and either status field with `mode = TCP`, at the CLI, the
+  TOML loader, the master state and the worker. HTTP probes now judge the final status: interim
+  `1xx` responses (except `101`) are skipped on HTTP/1.1 and h2c. `uri` stays a required proto
+  field and may be empty in TCP mode; the TOML key and `--uri` default to `/`. A message or
+  saved state without the new fields decodes as before (HTTP mode, no list), so existing
+  configurations keep their meaning. New `sozu cluster health-check set` flags
+  `--mode http|tcp` and `--accepted-statuses`; `sozu cluster health-check list` shows the mode
+  and an `accepted statuses` column (a legacy `expected_status = 0` now reads `2xx` instead of
+  `any 2xx`). The probe timeout flag of `health-check set` is renamed `--probe-timeout`: its
+  `--timeout` shared the clap id of the global `-t/--timeout` command timeout (`u64` against
+  `u32`), so every `sozu cluster health-check set` invocation panicked before sending anything.
+  `--timeout` on that subcommand now sets the global command timeout, in milliseconds, as
+  everywhere else, and no longer the probe timeout. Library API: `HealthCheckConfig` gains the
+  public fields `mode` and `accepted_statuses`, so a struct literal must name them or use
+  `..Default::default()`; `FileHealthCheckConfig` gains `mode` and `accepted_statuses`, and
+  `FileHealthCheckConfig::to_proto` now returns `Result<HealthCheckConfig, &'static str>`;
+  `ConfigError` gains `InvalidHealthCheck`.
+
+  **Before enabling it.** Nothing changes on upgrade. **Upgrade the main process and every
+  worker, and use the new CLI, before enabling `TCP` mode or `accepted_statuses`**: an older
+  worker (between `sozu upgrade main` and `sozu upgrade worker`) ignores fields 7 and 8 and
+  silently runs `GET <uri>` (`/` when left unset) accepting only 2xx, marking down every
+  backend that answers 3xx, 404 or 500. An older `sozu` CLI that patches a cluster by
+  read-modify-write (`QueryClusterById` → `AddCluster`, as `sozu cluster h2 enable|disable`
+  does) drops both fields and switches the health check back to that probe on every worker.
+  Downgrading while a cluster uses either field is not supported: an older binary loading the
+  saved state does the same. Documented in `doc/health_checks.md` and `doc/configure.md`;
+  covered by `test_health_check_tcp_mode_marks_blackholed_and_refused_backends_down`,
+  `test_health_check_tcp_mode_keeps_500_and_404_backends_up`,
+  `test_health_check_http_mode_accepted_statuses_keep_404_backend_up` and
+  `test_health_check_legacy_config_marks_404_backend_down`
+  (`e2e/src/tests/health_check_mode_tests.rs`),
+  `http1_interim_responses_are_skipped_for_the_final_status` and
+  `h2c_interim_headers_are_skipped_for_the_final_status` (`lib/src/health_check.rs`),
+  `set_health_check_tcp_mode_with_status_field_rejected` (`command/src/state.rs`), plus unit
+  tests in `command/src/config.rs` and `bin/src/cli.rs`.
+
 - **BREAKING (library API) — `feat(mux-h2)`: refuse new streams before the pre-response
   RST_STREAM cap ([#1797](https://github.com/sozu-proxy/sozu/issues/1797)).** The pre-response
   cap (`h2_max_rst_stream_abusive_lifetime`) ends the connection with `GOAWAY(ENHANCE_YOUR_CALM)`
