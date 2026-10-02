@@ -508,6 +508,30 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   `ConnectionH2::create_stream` (`h2.rs`) via `H2StreamTable::register`
   (`h2_stream_table.rs`) — cited by symbol on both ends because the call site's
   own line, `self.stream_table`, is one of thirteen identical lines in `h2.rs`.
+- **H1 keep-alive reuse.** An H1 frontend keeps its one slot for the next
+  request: the keep-alive branch of `ConnectionH1::writable` (`h1.rs`) resets
+  it in place instead of going through `Context::create_stream`. It resets
+  `HttpContext` (`HttpContext::reset`, with a fresh request id), clears
+  `front`, `back` and the response storage, `front_bound_to_backend`,
+  `attempts`, `Stream::front_received_end_of_stream`,
+  `Stream::back_received_end_of_stream`, `Stream::front_data_received` and
+  `Stream::back_data_received`, forgets the replay capture, and returns the
+  slot to `Idle`. Unlike `Context::create_stream`, it keeps the slot's
+  `answers` (the connection's listener templates), leaves
+  `Stream::front_window` alone (an H1 frontend leg has no window), and does
+  not touch `request_counted`, which `Stream::generate_access_log` already
+  cleared, nor mark a request start, which `ConnectionH1::readable` marks when
+  the next request arrives. `ConnectionH2::start_stream` sizes
+  `Stream::back_window` from the backend's SETTINGS_INITIAL_WINDOW_SIZE each
+  time the slot opens on an H2 backend, and asserts that the backend leg's
+  end-of-stream flag and DATA counter are clear. An H2 backend connection
+  reads `Stream::back_received_end_of_stream` to refuse a frame on a closed
+  stream (RFC 9113 §5.1): before sozu-proxy/sozu#1781 the stale flag of the
+  first response made it refuse the second response's HEADERS with
+  GOAWAY(STREAM_CLOSED), and the client got a 502. Pinned by
+  `test_h1_to_h2_keep_alive_requests` and
+  `test_h1_to_h2_keep_alive_requests_small_backend_window`
+  (`e2e/src/tests/tests.rs`).
 - **Backend attach.** Two call sites, on the two paths a stream can reach a
   backend, both reached from `Mux::ready_inner`'s `pending_links` drain:
   `Router::plan_connect` calls `Context::link_stream` itself on the pool-reuse

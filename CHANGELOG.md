@@ -3956,6 +3956,22 @@
   Covered by `test_h1_interim_103_and_final_in_one_write`,
   `test_h1_interim_102_and_final_in_one_write` and
   `test_h1_several_interims_and_final_in_one_write` (`e2e/src/tests/tests.rs`).
+- **`fix(mux-h1)`: answer a second keep-alive request to an H2 backend instead of a 502
+  ([#1781](https://github.com/sozu-proxy/sozu/issues/1781)).** With an H1 client in front of an
+  H2 backend, `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`) reused the client stream
+  slot for the next request without clearing `Stream::back_received_end_of_stream`,
+  `Stream::front_received_end_of_stream` and the per-direction DATA counters, which
+  `Context::create_stream` clears for a recycled slot. The stale end-of-stream flag made the H2
+  backend connection refuse the second response's HEADERS as arriving on a closed stream
+  (RFC 9113 §5.1) and send GOAWAY(STREAM_CLOSED), so the client got a 502. The keep-alive reset
+  now clears them, and `ConnectionH2::start_stream` asserts that the backend leg is fresh; the
+  backend leg's send window is sized from the backend's SETTINGS_INITIAL_WINDOW_SIZE by
+  [#1757](https://github.com/sozu-proxy/sozu/pull/1757), which this builds on, so a keep-alive
+  request no longer starts from what the previous one left of it. Documented in
+  `lib/src/protocol/mux/LIFECYCLE.md` §3.2. Covered by `test_h1_to_h2_keep_alive_requests` and
+  `test_h1_to_h2_keep_alive_requests_small_backend_window` (`e2e/src/tests/tests.rs`): a GET,
+  four 600 000-byte POSTs and a GET on one client connection, over one backend connection,
+  with the default and a 16 384-byte backend window.
 
 - **`fix(h1)`: handle every 1xx other than 101 as an interim response
   ([#1733](https://github.com/sozu-proxy/sozu/issues/1733)).** On an HTTP/1.1 frontend,
