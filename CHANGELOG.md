@@ -3921,6 +3921,16 @@
   (`e2e/src/tests/h2_security_header_injection.rs`): HEAD with and without a `content-length`,
   and the GET rejection, for an H1 and an H2 client.
 
+- **`fix(rustls)`: an interrupted TLS handshake read or write is retried.** `handshake_read` and
+  the write pump of `TlsHandshake::writable` (`lib/src/protocol/rustls.rs`) now retry a `read_tls`
+  or `write_tls` the kernel interrupted (`EINTR`), as `flush_tls` does after the handshake since
+  [#1795](https://github.com/sozu-proxy/sozu/pull/1795); they used to log `Could not perform
+  handshake` and close a healthy session. Only the syscall is retried: the readiness, the
+  short-read probe and the reset counters are unchanged. The handshake write moves into
+  `handshake_write`, generic over the transport like `handshake_read`. Covered by
+  `an_interrupted_handshake_read_is_retried` and `an_interrupted_handshake_write_is_retried`
+  ([#1799](https://github.com/sozu-proxy/sozu/issues/1799)).
+
 - **`fix(socket)`: retry interrupted plain TCP reads and writes and interrupted TLS reads
   ([#1799](https://github.com/sozu-proxy/sozu/issues/1799)).** The plain TCP `socket_read`,
   `socket_write` and `socket_write_vectored` (`lib/src/socket.rs`) and the `read_tls` call of
@@ -3934,7 +3944,7 @@
   `tcp_socket_write_vectored`. Covered by `an_interrupted_plain_write_is_retried`,
   `an_interrupted_plain_vectored_write_is_retried`, `an_interrupted_plain_read_is_retried` and
   `an_interrupted_tls_read_is_retried`. The TLS handshake pump (`lib/src/protocol/rustls.rs`)
-  keeps its mapping.
+  retries the same way since [#1803](https://github.com/sozu-proxy/sozu/pull/1803).
 
 - **`test(mux-h2)`: the refused header block GOAWAY test no longer races its writer thread.**
   `a_refused_header_block_counts_its_first_fragment_toward_its_size` (`lib/src/protocol/mux/h2.rs`)
