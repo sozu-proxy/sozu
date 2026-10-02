@@ -3868,6 +3868,16 @@
 
 ### 🐛 Fixed
 
+- **`fix(rustls)`: an interrupted TLS handshake read or write is retried.** `handshake_read` and
+  the write pump of `TlsHandshake::writable` (`lib/src/protocol/rustls.rs`) now retry a `read_tls`
+  or `write_tls` the kernel interrupted (`EINTR`), as `flush_tls` does after the handshake since
+  [#1795](https://github.com/sozu-proxy/sozu/pull/1795); they used to log `Could not perform
+  handshake` and close a healthy session. Only the syscall is retried: the readiness, the
+  short-read probe and the reset counters are unchanged. The handshake write moves into
+  `handshake_write`, generic over the transport like `handshake_read`. Covered by
+  `an_interrupted_handshake_read_is_retried` and `an_interrupted_handshake_write_is_retried`
+  ([#1799](https://github.com/sozu-proxy/sozu/issues/1799)).
+
 - **`fix(socket)`: an interrupted TLS write is retried, and every TLS write error marks the channel
   dead.** `flush_tls` (`lib/src/socket.rs`) now retries a write the kernel interrupted (`EINTR`),
   as the relay and the UDP path already do; it used to fall into the generic error arm, which

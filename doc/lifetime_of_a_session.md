@@ -261,8 +261,10 @@ stores, ALPN list, SNI binding policy) lives in `lib/src/https.rs` and
 The handshake reads the way the established session does (§2.2):
 `handshake_read` (`lib/src/protocol/rustls.rs`) stops on a `recv` that answers
 fewer bytes than rustls offered, as on `EAGAIN`, and drops READABLE; the next
-segment of a ClientHello split across several raises the next edge. When the
-handshake completes, `upgraded_frontend_events` (`lib/src/https.rs`) arms the
+segment of a ClientHello split across several raises the next edge. A `recv`
+or a write the kernel interrupted (`EINTR`) is retried at once by
+`handshake_read` and `handshake_write`, as `flush_tls` does after the
+handshake, instead of closing the session. When the handshake completes, `upgraded_frontend_events` (`lib/src/https.rs`) arms the
 mux frontend for WRITABLE, and for READABLE only when the handshake still held
 a READABLE edge or rustls already holds plaintext (an HTTP/2 preface sharing a
 segment with the client `Finished`) or a `close_notify`
