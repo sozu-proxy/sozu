@@ -145,6 +145,17 @@ pub(crate) fn start_worker(
     frontend: Frontend,
     front_address: SocketAddr,
 ) -> Worker {
+    start_worker_with_front_timeout(name, config, frontend, front_address, None)
+}
+
+/// [`start_worker`], with the listener's `front_timeout` set when given.
+pub(crate) fn start_worker_with_front_timeout(
+    name: &str,
+    config: ServerConfig,
+    frontend: Frontend,
+    front_address: SocketAddr,
+    front_timeout: Option<u32>,
+) -> Worker {
     let mut listeners = Listeners::default();
     match frontend {
         Frontend::Http1 => attach_reserved_http_listener(&mut listeners, front_address),
@@ -156,6 +167,7 @@ pub(crate) fn start_worker(
             worker.send_proxy_request_type(RequestType::AddHttpListener(
                 ListenerBuilder::new_http(front_address.into())
                     .with_connect_timeout(Some(CONNECT_TIMEOUT))
+                    .with_front_timeout(front_timeout)
                     .to_http(None)
                     .unwrap(),
             ));
@@ -171,6 +183,7 @@ pub(crate) fn start_worker(
             worker.send_proxy_request_type(RequestType::AddHttpsListener(
                 ListenerBuilder::new_https(address.clone())
                     .with_connect_timeout(Some(CONNECT_TIMEOUT))
+                    .with_front_timeout(front_timeout)
                     .to_tls(None)
                     .unwrap(),
             ));
@@ -409,8 +422,13 @@ fn try_connect_timeout_fails_over(frontend: Frontend) -> State {
     // is what keeps the load balancer off it afterwards. Before
     // sozu-proxy/sozu#1800 a connect timeout was never counted, so this stayed
     // at 0 and the blackholed backends kept their full share of requests.
-    if errors == 0 {
-        println!("the connect timeouts were not counted as backend connect failures");
+    // Round robin over six backends sends the first six requests to each of
+    // them once, so each of the three blackholed backends fails at least once.
+    if errors < 3 {
+        println!(
+            "only {errors} connect timeouts were counted as backend connect failures, \
+             expected at least one per blackholed backend"
+        );
         return State::Fail;
     }
     State::Success
@@ -741,5 +759,73 @@ fn test_connection_attempt_budget_changes_at_runtime() {
     assert_eq!(
         global_five, 200,
         "the global budget raised back to five applies"
+    );
+}
+
+// ── Overall deadline ────────────────────────────────────────────────────────
+
+/// Failover is bounded by the listener's `front_timeout`, armed when the
+/// request was first linked to a backend, not by `max_connection_attempts`
+/// times `connect_timeout`: re-linking a request must not push that deadline
+/// out. Six blackholed backends, a budget of 20 attempts and a 3-second
+/// `front_timeout` with a 1-second `connect_timeout`: the client must get an
+/// answer — the frontend timeout's `504` — within about `front_timeout`, not
+/// after six or more connect timeouts.
+fn try_failover_is_bounded_by_front_timeout(frontend: Frontend) -> State {
+    const FRONT_TIMEOUT: u32 = 3;
+    let front_address = create_local_address();
+    let mut worker = start_worker_with_front_timeout(
+        "FAILOVER-DEADLINE",
+        Worker::into_config(FileConfig::default()),
+        frontend,
+        front_address,
+        Some(FRONT_TIMEOUT),
+    );
+    let _backends = add_cluster(
+        &mut worker,
+        frontend,
+        front_address,
+        Cluster {
+            max_connection_attempts: Some(20),
+            ..Worker::default_cluster("cluster_0")
+        },
+        "/",
+        &[Behaviour::Blackholed; 6],
+    );
+
+    let started = Instant::now();
+    let statuses = send_requests(frontend, front_address, "/api", 1);
+    let elapsed = started.elapsed();
+    println!("{frontend:?} statuses: {statuses:?} after {elapsed:?}");
+    stop(worker);
+
+    if elapsed > Duration::from_secs(u64::from(FRONT_TIMEOUT) + 2) {
+        println!("failover outlived front_timeout ({FRONT_TIMEOUT}s): {elapsed:?}");
+        return State::Fail;
+    }
+    if statuses != [504] {
+        println!("expected the frontend timeout's 504, got {statuses:?}");
+        return State::Fail;
+    }
+    State::Success
+}
+
+#[test]
+fn test_failover_is_bounded_by_front_timeout_h1() {
+    assert_eq!(
+        repeat_until_error_or(1, "H1: front_timeout bounds the whole failover", || {
+            try_failover_is_bounded_by_front_timeout(Frontend::Http1)
+        },),
+        State::Success
+    );
+}
+
+#[test]
+fn test_failover_is_bounded_by_front_timeout_h2() {
+    assert_eq!(
+        repeat_until_error_or(1, "H2: front_timeout bounds the whole failover", || {
+            try_failover_is_bounded_by_front_timeout(Frontend::Http2)
+        },),
+        State::Success
     );
 }

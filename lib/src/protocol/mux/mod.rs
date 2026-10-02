@@ -1670,7 +1670,16 @@ enum ConnectOutcome {
 fn connect_outcome(socket: &TcpStream) -> ConnectOutcome {
     match socket.take_error() {
         Ok(None) => {}
-        Ok(Some(_)) | Err(_) => return ConnectOutcome::Failed,
+        Ok(Some(error)) | Err(error) => {
+            // The level of the synchronous refusal the pending-links loop
+            // of `Mux::ready_inner` logs before it retries.
+            debug!(
+                "{} backend connect failed, retrying: {}",
+                log_module_context!(),
+                error
+            );
+            return ConnectOutcome::Failed;
+        }
     }
     match socket.peer_addr() {
         Ok(_) => ConnectOutcome::Connected,
@@ -3439,9 +3448,20 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     continue;
                 }
                 // Before the first request triggers a stream Link, the frontend timeout is set
-                // to a shorter request_timeout, here we switch to the longer nominal timeout
-                self.frontend
-                    .set_timeout_duration(self.configured_frontend_timeout, context.now);
+                // to a shorter request_timeout, here we switch to the longer nominal timeout.
+                //
+                // Only on a request's first link. A re-link — failover after a
+                // failed dial, a stale-upstream replay — keeps the deadline armed
+                // then, so `front_timeout` bounds the whole failover: re-arming it
+                // on every attempt let a request spend `max_connection_attempts`
+                // times `connect_timeout` before any answer. When it expires
+                // during failover, the frontend-timeout branch of
+                // `Mux::timeout_inner` answers as for any request still waiting on
+                // a backend (sozu-proxy/sozu#1800).
+                if stream.attempts == 0 {
+                    self.frontend
+                        .set_timeout_duration(self.configured_frontend_timeout, context.now);
+                }
                 let front_readiness = self.frontend.readiness_mut();
                 dirty = true;
                 // Settle the ledger before the ONLY reader of backend load

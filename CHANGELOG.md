@@ -3941,7 +3941,20 @@
     (`Request.set_max_connection_attempts`, field 62; not saved, like `connection-limit set`).
     Values lie in `1..=255`, validated at config load, on `AddCluster` and on the runtime set.
     The cluster value wins over the global one, for HTTP and TCP clusters. This supersedes the
-    "three connection attempts" of the shuffle-sharding entry above.
+    "three connection attempts" of the shuffle-sharding entry above;
+  - the whole failover is bounded by the listener's `front_timeout`: it is armed when a request is
+    first linked to a backend and no longer re-armed on each re-link, so failover cannot run for
+    `max_connection_attempts × connect_timeout`. When it expires during failover the request is
+    answered `504` (`client_timeout_during_response`). Keep `connect_timeout` well below
+    `front_timeout / max_connection_attempts`.
+
+  **Status change for alerting:** a request whose every attempted backend is unreachable (connect
+  timeout or refused) is now answered `503`; a connect timeout used to answer `504`. A request
+  arriving while every backend is in its back-off window fails fast with `503`. Alerts on the
+  `504` rate should watch `503`, `backend.connections.error` and
+  `backend.connect.retries_exhausted` instead. With the default budget raised from 3 to 5, an
+  idempotent request written to a stale keep-alive connection can be replayed to up to 4 backends
+  (`n - 1`), against 2 before.
 
   Library API: `sozu_lib::server::CONN_RETRIES` is removed (use
   `sozu_command_lib::config::DEFAULT_MAX_CONNECTION_ATTEMPTS` and

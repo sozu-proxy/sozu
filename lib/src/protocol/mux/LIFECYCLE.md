@@ -1151,7 +1151,11 @@ deadlines are compared against `ConnectionH2.now` (§7.5):
   WRITABLE on a socket `getpeername(2)` still reports `ENOTCONN` for is one
   sozu raised itself, and is dropped until the kernel's completion edge.
   `Router::plan_connect` bounds the re-links with the cluster's
-  `max_connection_attempts` and answers 503 once they are spent.
+  `max_connection_attempts` and answers 503 once they are spent. The
+  pending-links loop of `Mux::ready_inner` sets the frontend's nominal timeout
+  only on a request's first link (`stream.attempts == 0`), so the frontend
+  deadline bounds the whole failover; when it fires first, the `Linked` arm of
+  the frontend-token branch answers 504 (`client_timeout_during_response`).
 - Fired by: timer wheel → `Mux::timeout` with the backend token.
 - Action: for each stream linked to that backend, either send 504, or forcefully
   terminate, or keep draining — see the backend-token branch of `Mux::timeout_inner`. The

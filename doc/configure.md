@@ -1045,9 +1045,43 @@ max_connection_attempts = 3       # this cluster only, 1-255
 
 When they are all spent on failed connections the request is answered `503`
 (`backend.connect.retries_exhausted`), as it was with the former hard-coded
-budget of three. A `504` is answered only when the backend accepted the
-connection and then sent no response within `back_timeout`; the request may
-have reached it, so it is not sent elsewhere.
+budget of three. A `504` is answered when the backend accepted the connection
+and then sent no response within `back_timeout` (access-log message
+`backend_timeout`): the request may have reached it, so it is not sent
+elsewhere. A `504` is also answered when the frontend timeout expires while
+the request still waits on a backend, failover included (access-log message
+`client_timeout_during_response`, below).
+
+**Status change for alerting.** A request whose every attempted backend is
+unreachable — connect timeout or refused — is now answered `503`. Before
+[#1800](https://github.com/sozu-proxy/sozu/issues/1800) a connect timeout
+answered `504`. A request arriving while every backend is in its back-off
+window also fails fast with `503`, without dialling. Alerts keyed on the `504`
+rate to detect dead backends should watch `503`,
+`backend.connections.error` and `backend.connect.retries_exhausted` instead.
+
+**The whole failover is bounded by `front_timeout`.** The listener's
+`front_timeout` is armed when the request is first linked to a backend and is
+not pushed out when it is retried on another one. Each failed attempt can take
+up to `connect_timeout`, so the worst case of an attempt budget is
+`max_connection_attempts × connect_timeout`; when `front_timeout` expires
+first, the request is answered `504` (`client_timeout_during_response`).
+Keep `connect_timeout` well below `front_timeout / max_connection_attempts` —
+the defaults, 3 s against 60 s / 5, leave room — so that every attempt can be
+spent before the client is answered. On an HTTP/2 frontend the timer belongs
+to the connection and activity on its other streams re-arms it.
+
+**Back-off and slow failures.** A failed backend's first back-off lasts one
+second and grows with each consecutive failure: after the `n`-th, a random wait
+of at least one second and below `2^(n-1)` seconds, with `n - 1` capped at 6. With a `connect_timeout` longer
+than the current back-off, a blackholed backend is selectable again by the
+next request, which pays one `connect_timeout` before failing over, until its
+back-off has grown or a `health_check` removes it.
+
+**Stale keep-alive replays.** The same budget bounds the replay of an
+idempotent request written to a pooled keep-alive connection the backend had
+already closed ("Stale-upstream retry" below): with the default of 5, one such
+request can be replayed to up to 4 backends (`n - 1`), against 2 before.
 
 **Each retry skips the backends that already failed for the request**,
 whatever the `load_balancing` policy: they are left out of the candidates the
