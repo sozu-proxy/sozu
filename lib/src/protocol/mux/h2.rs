@@ -17370,6 +17370,90 @@ mod tests {
         );
     }
 
+    /// RFC 9113 §5.1: after the PROTOCOL_ERROR reset of a 204 carrying DATA,
+    /// the trailer block the backend had already sent on that stream is
+    /// ignored, in one HEADERS frame or split over a CONTINUATION frame
+    /// (RFC 9113 §6.10). The shared backend connection gets no GOAWAY and no
+    /// further RST_STREAM, and stays up.
+    ///
+    /// TO SEE THIS RED: in the `H2State::Discard` arm of
+    /// `ConnectionH2::handle_read` (`lib/src/protocol/mux/h2.rs`), drop the
+    /// `pending_discarded_block` store: the CONTINUATION is taken for a
+    /// standalone frame and answered GOAWAY(PROTOCOL_ERROR):
+    /// `split=true: ... got [(7, 0, 0, [0, 0, 0, 0, 0, 0, 0, 1])]`, verified
+    /// 2026-10-02. The split row is also red on `2ce07244`
+    /// (sozu-proxy/sozu#1775 before sozu-proxy/sozu#1784 was merged), where
+    /// the unsplit row already passes.
+    #[test]
+    fn a_trailer_after_the_reset_of_a_204_carrying_data_is_ignored() {
+        use std::io::Write;
+
+        for split in [false, true] {
+            let LinkedBackend {
+                _pool,
+                mut connection,
+                mut peer,
+                mut context,
+                mut router,
+                gid,
+            } = backend_with_a_linked_stream(
+                H2State::Header,
+                BackendStatus::Connected,
+                Ready::READABLE | Ready::HUP | Ready::ERROR,
+            );
+            queue_request(&mut context, gid);
+            context.streams[gid].context.method =
+                Some(crate::protocol::kawa_h1::parser::Method::Get);
+            context.streams[gid].state = StreamState::Link;
+            drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+
+            // :status 204 (static index 9), without END_STREAM, then DATA
+            // without END_STREAM: the backend means to end with a trailer.
+            peer.write_all(&orphan_frame(1, 0x4, 1, 1, &[0x89]))
+                .expect("loopback write must complete");
+            drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+            peer.write_all(&orphan_frame(0, 0x0, 1, 5, b"hello"))
+                .expect("loopback write must complete");
+            let reset =
+                drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+            let reset = peer_frames(&reset).expect("whole frames");
+            assert_eq!(
+                reset,
+                vec![(3, 0, 1, vec![0, 0, 0, 1])],
+                "split={split}: premise: a 204 carrying DATA gets RST_STREAM(PROTOCOL_ERROR) alone"
+            );
+
+            // The trailer block `x-trailer: one` (literal without indexing),
+            // ending the stream.
+            let mut trailer = vec![0x00, 9];
+            trailer.extend_from_slice(b"x-trailer");
+            trailer.extend_from_slice(&[3]);
+            trailer.extend_from_slice(b"one");
+            let wire = if split {
+                let (first, rest) = trailer.split_at(4);
+                let mut wire = orphan_frame(1, 0x1, 1, first.len() as u32, first);
+                wire.extend(orphan_frame(9, 0x4, 1, rest.len() as u32, rest));
+                wire
+            } else {
+                orphan_frame(1, 0x4 | 0x1, 1, trailer.len() as u32, &trailer)
+            };
+            peer.write_all(&wire).expect("loopback write must complete");
+            let after =
+                drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+            let after = peer_frames(&after).expect("whole frames");
+            assert!(
+                !after.iter().any(|(kind, _, _, _)| *kind == 7 || *kind == 3),
+                "split={split}: the trailer on the reset stream is ignored: no GOAWAY, no \
+                 RST_STREAM, got {after:?}"
+            );
+            assert!(
+                matches!(connection.core.state, H2State::Header),
+                "split={split}: the shared connection stays up, got {:?}",
+                connection.core.state
+            );
+        }
+    }
+
     /// sozu-proxy/sozu#1631, `Header` row: a backend stream ended before any
     /// write pass sent its HEADERS is idle on the backend, and a RST_STREAM
     /// for it is a connection error there (RFC 9113 §5.1, §6.4) that takes
