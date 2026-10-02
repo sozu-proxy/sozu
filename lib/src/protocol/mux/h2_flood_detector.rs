@@ -72,6 +72,10 @@
 //! - The per-header-block CONTINUATION accounting (`continuation_count`,
 //!   `accumulated_header_size`), reset by [`H2FloodDetector::reset_continuation`]
 //!   once a block completes.
+//! - The soft stream-refusal state ([`H2FloodDetector::refuses_new_streams`]):
+//!   before the pre-response cap trips, the connection refuses new client
+//!   streams with `REFUSED_STREAM` (RFC 9113 §8.7) and keeps serving the open
+//!   ones. It reads the counters above and moves none of them.
 //!
 //! ## Clock: the last self-sampling exception is gone
 //!
@@ -265,6 +269,22 @@ const DEFAULT_MAX_HEADER_TABLE_SIZE: u32 = 65536;
 /// ~2048 fields for a 64 KB list; this explicit count cap is the tighter,
 /// upstream-matching defense (cf. nginx `max_headers`, Apache `LimitRequestFields`).
 const DEFAULT_MAX_HEADER_FIELDS: u32 = 128;
+/// Default share, in percent, of the pre-response RST_STREAM cap's floor
+/// ([`DEFAULT_MAX_RST_STREAM_ABUSIVE_LIFETIME`]) at which a connection starts
+/// refusing new client streams with `REFUSED_STREAM` instead of waiting for
+/// the cap itself, which ends the connection with
+/// `GOAWAY(ENHANCE_YOUR_CALM)` and every stream on it.
+///
+/// A refused stream did no work, so RFC 9113 §8.7 lets the client retry it.
+/// `0` disables the soft state; `100` or more has the same effect, since the
+/// cap itself trips first.
+///
+/// The per-window RST_STREAM rate ([`DEFAULT_MAX_RST_STREAM_PER_WINDOW`]) has
+/// no soft threshold. It counts every reset, answered streams included, and
+/// with its half-decay a client sustaining half the rate never reaches the
+/// limit: a soft threshold there would refuse streams of clients the limit
+/// never cuts off.
+const DEFAULT_STREAM_REFUSAL_PERCENT: u32 = 50;
 /// Duration of the sliding window for rate-based flood counters
 const FLOOD_WINDOW_DURATION: std::time::Duration = std::time::Duration::from_secs(1);
 /// Default maximum general anomaly count before triggering ENHANCE_YOUR_CALM.
@@ -333,6 +353,12 @@ pub struct H2FloodConfig {
     /// header bomb, where many 1-byte indexed references each materialize a
     /// `Pair` of per-entry bookkeeping.
     max_header_fields: u32,
+    /// Share, in percent, of the pre-response cap's floor at which new client
+    /// streams are refused with `REFUSED_STREAM` (see
+    /// [`H2FloodDetector::refuses_new_streams`]). Not clamped: `0`
+    /// disables the soft state, and `100` or more never engages it before
+    /// the limit itself trips.
+    stream_refusal_percent: u32,
 }
 
 impl Default for H2FloodConfig {
@@ -351,6 +377,7 @@ impl Default for H2FloodConfig {
             max_header_list_size: MAX_HEADER_LIST_SIZE as u32,
             max_header_table_size: DEFAULT_MAX_HEADER_TABLE_SIZE,
             max_header_fields: DEFAULT_MAX_HEADER_FIELDS,
+            stream_refusal_percent: DEFAULT_STREAM_REFUSAL_PERCENT,
         }
     }
 }
@@ -378,6 +405,7 @@ impl H2FloodConfig {
         max_header_list_size: u32,
         max_header_table_size: u32,
         max_header_fields: u32,
+        stream_refusal_percent: u32,
     ) -> Self {
         let config = Self {
             max_rst_stream_per_window: max_rst_stream_per_window.max(1),
@@ -393,6 +421,8 @@ impl H2FloodConfig {
             max_header_list_size: max_header_list_size.max(1),
             max_header_table_size: max_header_table_size.max(1),
             max_header_fields: max_header_fields.max(1),
+            // Not clamped: every value has a meaning, `0` included.
+            stream_refusal_percent,
         };
         // Post-condition: every threshold is clamped to at least 1. A zero
         // threshold would make `check_flood`/`record_rst_*` trip on the very
@@ -474,6 +504,7 @@ impl H2FloodConfig {
         max_header_list_size: Option<u32>,
         max_header_table_size: Option<u32>,
         max_header_fields: Option<u32>,
+        stream_refusal_percent: Option<u32>,
     ) -> Self {
         let defaults = Self::default();
         Self::new(
@@ -491,6 +522,7 @@ impl H2FloodConfig {
             max_header_list_size.unwrap_or(defaults.max_header_list_size),
             max_header_table_size.unwrap_or(defaults.max_header_table_size),
             max_header_fields.unwrap_or(defaults.max_header_fields),
+            stream_refusal_percent.unwrap_or(defaults.stream_refusal_percent),
         )
     }
 
@@ -559,6 +591,12 @@ impl H2FloodConfig {
     /// Maximum number of materialized header fields per HEADERS/trailers block.
     pub fn max_header_fields(&self) -> u32 {
         self.max_header_fields
+    }
+
+    /// Share, in percent, of the pre-response cap's floor at which new client
+    /// streams are refused; `0` disables the soft state.
+    pub fn stream_refusal_percent(&self) -> u32 {
+        self.stream_refusal_percent
     }
 }
 
@@ -676,6 +714,14 @@ pub(super) struct H2FloodDetector {
     accumulated_header_size: u32,
     /// General anomaly counter
     glitch_count: u32,
+    /// When the peer last reset a stream before its response — the
+    /// caller's clock, as handed to [`Self::record_rst_received`]. The
+    /// pre-response branch of [`Self::refuses_new_streams`] holds only within
+    /// one [`FLOOD_WINDOW_DURATION`] of it: the pre-response count never
+    /// decays, and the answered streams that would rebalance it cannot grow
+    /// while every new stream is refused, so without this the refusal would
+    /// outlive the resets that caused it.
+    last_pre_response_rst_at: Option<Instant>,
     /// Window start for rate-based counters.
     ///
     /// Private: the detector never samples the clock itself, so this field is
@@ -743,6 +789,7 @@ impl H2FloodDetector {
             continuation_count: 0,
             accumulated_header_size: 0,
             glitch_count: 0,
+            last_pre_response_rst_at: None,
             window_start: now,
             config,
         };
@@ -862,10 +909,14 @@ impl H2FloodDetector {
     /// stream after the check would leave each check one answered stream
     /// short, and a client that cancels every stream after its response
     /// would trip the received-RST cap just past its floor.
+    ///
+    /// `now` is the caller's clock snapshot; a pre-response reset stamps it
+    /// for [`Self::refuses_new_streams`].
     pub(super) fn record_rst_received(
         &mut self,
         response_started: bool,
         answered: bool,
+        now: Instant,
     ) -> Option<H2FloodViolation> {
         debug_assert!(
             response_started || !answered,
@@ -874,7 +925,65 @@ impl H2FloodDetector {
         if answered {
             self.record_stream_opened();
         }
+        if !response_started {
+            self.last_pre_response_rst_at = Some(now);
+        }
+        debug_assert!(
+            response_started || self.last_pre_response_rst_at == Some(now),
+            "a pre-response reset must stamp the soft-refusal clock"
+        );
         self.record_rst_lifetime(response_started)
+    }
+
+    /// Whether a new client stream must be refused with `REFUSED_STREAM`
+    /// instead of opened: the soft state below the pre-response cap
+    /// (CVE-2023-44487).
+    ///
+    /// It holds while all three hold:
+    ///
+    /// - the pre-response reset count is past `stream_refusal_percent` of the
+    ///   cap's floor;
+    /// - pre-response resets already outnumber the answered streams — the
+    ///   cap's own ratio, so a client that would never trip the cap is never
+    ///   refused;
+    /// - the peer reset a stream before its response within the last
+    ///   [`FLOOD_WINDOW_DURATION`]. The count never decays, and the answered
+    ///   streams that would rebalance the ratio cannot grow while every new
+    ///   stream is refused, so this is what ends the refusal once the client
+    ///   stops.
+    ///
+    /// The caller resets the stream as a local decision, which the
+    /// provoked-RST cap does not see. Once the peer acknowledged Sōzu's
+    /// SETTINGS, the refusal counts one glitch, like every other stream
+    /// refusal: the glitch budget bounds a peer that keeps opening streams it
+    /// is refused. A peer that keeps resetting streams still moves toward the
+    /// cap, which ends the connection unchanged. The
+    /// per-window RST_STREAM rate and the PING, SETTINGS, empty DATA,
+    /// CONTINUATION and stream-0 WINDOW_UPDATE floods have no soft state —
+    /// see [`DEFAULT_STREAM_REFUSAL_PERCENT`].
+    pub(super) fn refuses_new_streams(&self, now: Instant) -> bool {
+        let percent = u128::from(self.config.stream_refusal_percent);
+        if percent == 0 {
+            return false;
+        }
+        let recent = self
+            .last_pre_response_rst_at
+            .is_some_and(|at| now.saturating_duration_since(at) < FLOOD_WINDOW_DURATION);
+        // `count > percent% of floor`, in integers.
+        let past_soft_floor = u128::from(self.total_abusive_rst_received_lifetime) * 100
+            > u128::from(self.config.max_rst_stream_abusive_lifetime) * percent;
+        let refuses = recent && past_soft_floor && self.pre_response_resets() > self.streams_opened;
+        // Pair: a refusal needs pre-response resets on record, and the clock
+        // that ends it.
+        debug_assert!(
+            !refuses || self.total_abusive_rst_received_lifetime > 0,
+            "a refusal needs at least one pre-response reset"
+        );
+        debug_assert!(
+            !refuses || self.last_pre_response_rst_at.is_some(),
+            "a refusal needs the time of the last pre-response reset"
+        );
+        refuses
     }
 
     /// Increment the lifetime RST_STREAM counters and return a
@@ -1383,6 +1492,180 @@ mod tests {
     use super::*;
 
     // ── H2FloodDetector ──────────────────────────────────────────────────
+
+    /// Default thresholds except the pre-response floor and the soft-refusal
+    /// percentage.
+    fn soft_refusal_config(abusive_floor: u64, percent: Option<u32>) -> H2FloodConfig {
+        H2FloodConfig::from_optional(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(abusive_floor),
+            None,
+            None,
+            None,
+            None,
+            percent,
+        )
+    }
+
+    /// Past half the pre-response floor, with more pre-response resets than
+    /// answered streams, new streams are refused and no cap trips.
+    #[test]
+    fn test_soft_refusal_engages_past_half_the_pre_response_floor() {
+        let base = Instant::now();
+        let mut detector = H2FloodDetector::new(soft_refusal_config(100, None), base);
+        for n in 1..=50 {
+            assert!(detector.record_rst_received(false, false, base).is_none());
+            assert!(
+                !detector.refuses_new_streams(base),
+                "{n} pre-response resets are not past half the floor"
+            );
+        }
+        assert!(detector.record_rst_received(false, false, base).is_none());
+        assert!(
+            detector.refuses_new_streams(base),
+            "51 pre-response resets are past half the floor of 100"
+        );
+    }
+
+    /// The pre-response count never decays and refused streams cannot raise
+    /// the answered count, so the refusal ends one window after the last
+    /// pre-response reset instead.
+    #[test]
+    fn test_soft_refusal_lifts_once_pre_response_resets_stop() {
+        let base = Instant::now();
+        let mut detector = H2FloodDetector::new(soft_refusal_config(100, None), base);
+        for _ in 0..60 {
+            assert!(detector.record_rst_received(false, false, base).is_none());
+        }
+        assert!(detector.refuses_new_streams(base), "premise: refusing");
+        let later = base + FLOOD_WINDOW_DURATION;
+        assert!(
+            !detector.refuses_new_streams(later),
+            "one window without a pre-response reset ends the refusal"
+        );
+        assert!(detector.record_rst_received(false, false, later).is_none());
+        assert!(
+            detector.refuses_new_streams(later),
+            "a new pre-response reset past the soft threshold refuses again"
+        );
+    }
+
+    /// A client whose pre-response resets stay at or under its answered
+    /// streams never trips the cap, so it is never refused either, however
+    /// many resets it sends.
+    #[test]
+    fn test_soft_refusal_follows_the_pre_response_ratio() {
+        let base = Instant::now();
+        let mut detector = H2FloodDetector::new(soft_refusal_config(100, None), base);
+        for _ in 0..90 {
+            detector.record_stream_opened();
+        }
+        for _ in 0..90 {
+            assert!(detector.record_rst_received(false, false, base).is_none());
+        }
+        assert!(
+            !detector.refuses_new_streams(base),
+            "90 pre-response resets against 90 answered streams are not refused"
+        );
+        assert!(detector.record_rst_received(false, false, base).is_none());
+        assert!(
+            detector.refuses_new_streams(base),
+            "one more pre-response reset than answered streams is"
+        );
+    }
+
+    /// While new streams are refused, a peer that keeps resetting streams
+    /// still reaches the pre-response cap, which ends the connection exactly
+    /// as without the soft state, and the RST_STREAM rate limit, which has no
+    /// soft state, trips as before.
+    #[test]
+    fn test_soft_refusal_leaves_the_hard_limit_unchanged() {
+        let base = Instant::now();
+        let floor = 100;
+        let mut detector = H2FloodDetector::new(soft_refusal_config(floor, None), base);
+        let mut tripped_at = None;
+        for n in 1..=floor + 1 {
+            if let Some(violation) = detector.record_rst_received(false, false, base) {
+                assert_eq!(violation.error, H2Error::EnhanceYourCalm);
+                assert_eq!(
+                    violation.metric_key,
+                    "h2.flood.violation.rst_stream_pre_response_lifetime"
+                );
+                tripped_at = Some(n);
+                break;
+            }
+            if n > floor / 2 {
+                assert!(detector.refuses_new_streams(base), "refusing at {n}");
+            }
+        }
+        assert_eq!(
+            tripped_at,
+            Some(floor + 1),
+            "the pre-response cap trips just past its floor, soft state or not"
+        );
+
+        let config = H2FloodConfig::default();
+        let mut detector = H2FloodDetector::new(config, base);
+        for _ in 0..=config.max_rst_stream_per_window() {
+            detector.record_rst_stream_window();
+        }
+        assert!(
+            matches!(
+                detector.check_flood(base),
+                Some(H2FloodViolation {
+                    error: H2Error::EnhanceYourCalm,
+                    metric_key: "h2.flood.violation.rst_stream_window",
+                    ..
+                })
+            ),
+            "the RST_STREAM rate limit still trips past its threshold"
+        );
+    }
+
+    /// `0` disables the soft state, and `100` never engages it before the
+    /// cap itself: a peer at the very edge of the cap is not refused.
+    #[test]
+    fn test_soft_refusal_disabled_at_zero_and_inert_at_hundred() {
+        let base = Instant::now();
+        for percent in [0, 100, 250] {
+            let mut detector = H2FloodDetector::new(soft_refusal_config(100, Some(percent)), base);
+            for _ in 0..100 {
+                assert!(detector.record_rst_received(false, false, base).is_none());
+            }
+            assert!(
+                !detector.refuses_new_streams(base),
+                "percent {percent} must not refuse below the cap"
+            );
+        }
+    }
+
+    /// The RST_STREAM rate has no soft state: a client at the edge of the rate
+    /// limit, whose resets all follow a response, is not refused.
+    #[test]
+    fn test_soft_refusal_ignores_the_rst_rate() {
+        let base = Instant::now();
+        let config = H2FloodConfig::default();
+        let mut detector = H2FloodDetector::new(config, base);
+        for _ in 0..config.max_rst_stream_per_window() {
+            detector.record_rst_stream_window();
+            assert!(detector.record_rst_received(true, true, base).is_none());
+        }
+        assert!(
+            detector.check_flood(base).is_none(),
+            "premise: at the rate limit"
+        );
+        assert!(
+            !detector.refuses_new_streams(base),
+            "resets after a response, however fast, are not refused"
+        );
+    }
 
     #[test]
     fn test_flood_detector_no_flood_below_threshold() {
@@ -2186,14 +2469,14 @@ mod tests {
     #[test]
     fn test_flood_config_from_optional_all_none_is_default() {
         let config = H2FloodConfig::from_optional(
-            None, None, None, None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None, None, None, None, None,
         );
         assert_eq!(config, H2FloodConfig::default());
     }
 
-    /// `from_optional` takes thirteen same-typed positional arguments, so a
+    /// `from_optional` takes fourteen same-typed positional arguments, so a
     /// transposed pair compiles silently and would quietly apply one operator
-    /// knob's value to a different CVE's threshold. Thirteen distinct values,
+    /// knob's value to a different CVE's threshold. Fourteen distinct values,
     /// each asserted against its own field, is what makes that a test failure
     /// instead of a production surprise.
     #[test]
@@ -2212,6 +2495,7 @@ mod tests {
             Some(21),
             Some(22),
             Some(23),
+            Some(24),
         );
         assert_eq!(config.max_rst_stream_per_window, 11);
         assert_eq!(config.max_ping_per_window, 12);
@@ -2226,6 +2510,7 @@ mod tests {
         assert_eq!(config.max_header_list_size, 21);
         assert_eq!(config.max_header_table_size, 22);
         assert_eq!(config.max_header_fields, 23);
+        assert_eq!(config.stream_refusal_percent, 24);
     }
 
     /// Regression for sozu-proxy/sozu#1418: a zero that reached the runtime
@@ -2235,6 +2520,7 @@ mod tests {
     #[test]
     fn test_flood_config_from_optional_clamps_every_zero_to_one() {
         let config = H2FloodConfig::from_optional(
+            Some(0),
             Some(0),
             Some(0),
             Some(0),
@@ -2262,6 +2548,8 @@ mod tests {
         assert_eq!(config.max_header_list_size, 1);
         assert_eq!(config.max_header_table_size, 1);
         assert_eq!(config.max_header_fields, 1);
+        // The one knob a zero does not clamp: it disables the soft refusal.
+        assert_eq!(config.stream_refusal_percent, 0);
     }
 
     /// Every accessor reads back its own field — the same transposition guard
@@ -2282,6 +2570,7 @@ mod tests {
             Some(21),
             Some(22),
             Some(23),
+            Some(24),
         );
         assert_eq!(config.max_rst_stream_per_window(), 11);
         assert_eq!(config.max_ping_per_window(), 12);
@@ -2296,5 +2585,6 @@ mod tests {
         assert_eq!(config.max_header_list_size(), 21);
         assert_eq!(config.max_header_table_size(), 22);
         assert_eq!(config.max_header_fields(), 23);
+        assert_eq!(config.stream_refusal_percent(), 24);
     }
 }

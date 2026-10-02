@@ -1548,7 +1548,8 @@ a cancelled upload with a full 1 MiB window in flight is about 64 of them),
 `WINDOW_UPDATE` with zero increment on a closed stream, unknown SETTINGS
 identifiers, every stream Sōzu refuses once the client has acknowledged its
 SETTINGS (over its concurrency limit, including the lower limit back-pressure
-sets, or while the connection drains — buffer-pool refusals excepted), every
+sets, while the connection drains, or under flood pressure — buffer-pool
+refusals excepted), every
 reset the client provokes (see `h2_max_rst_stream_emitted_lifetime`), and each
 received `GOAWAY` (a graceful close sends at most two, RFC 9113 §6.8). The
 counter uses a 1-second sliding window with
@@ -1645,7 +1646,7 @@ that cancels its streams after their responses never trips it.
 | ------------------------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `h2_max_rst_stream_lifetime`         | 200000  | Floor of the cap on RST_STREAM frames **received** on this connection; trips once the resets received after a response started or on an already-closed stream also outnumber the streams a backend answered. |
 | `h2_max_rst_stream_abusive_lifetime` | 1000    | Floor of the cap on "abusive" **received** RST_STREAM frames — resets the client sends on a frontend connection before the response starts, the Rapid Reset signature (CVE-2023-44487); trips once these resets plus the resets the client provoked are more than half of the backend-routed streams. Resets a backend sends on a backend connection never count as abusive: Sōzu opened those streams. |
-| `h2_max_rst_stream_emitted_lifetime` | 10000   | Floor of the cap on RST_STREAM frames **emitted by the server** that the peer provoked (CVE-2025-8671 "MadeYouReset"): Content-Length mismatch, header parse error, oversized header block, PRIORITY self-dependency, zero-increment or overflowing `WINDOW_UPDATE` on an open stream. Trips once these resets plus the pre-response resets the client sent are more than half of the backend-routed streams. Each one also counts as a glitch. Resets Sōzu decides on its own are **not** counted: the idle-stream reaper's `CANCEL`, `REFUSED_STREAM` from its concurrency limit, back-pressure or buffer pool, `STREAM_CLOSED` for DATA on a closed stream, and the error a failing backend response produces. `NoError` resets are not counted either. Crossing the cap emits `GOAWAY(EnhanceYourCalm)`. |
+| `h2_max_rst_stream_emitted_lifetime` | 10000   | Floor of the cap on RST_STREAM frames **emitted by the server** that the peer provoked (CVE-2025-8671 "MadeYouReset"): Content-Length mismatch, header parse error, oversized header block, PRIORITY self-dependency, zero-increment or overflowing `WINDOW_UPDATE` on an open stream. Trips once these resets plus the pre-response resets the client sent are more than half of the backend-routed streams. Each one also counts as a glitch. Resets Sōzu decides on its own are **not** counted: the idle-stream reaper's `CANCEL`, `REFUSED_STREAM` from its concurrency limit, back-pressure, buffer pool or `h2_stream_refusal_percent`, `STREAM_CLOSED` for DATA on a closed stream, and the error a failing backend response produces. `NoError` resets are not counted either. Crossing the cap emits `GOAWAY(EnhanceYourCalm)`. |
 
 _Configuration example:_
 
@@ -1657,6 +1658,96 @@ protocol = "https"
 h2_max_rst_stream_lifetime = 200000
 h2_max_rst_stream_abusive_lifetime = 1000
 h2_max_rst_stream_emitted_lifetime = 10000
+```
+
+#### Refusing new streams before the pre-response cap
+
+The pre-response cap (`h2_max_rst_stream_abusive_lifetime`) ends the connection
+with `GOAWAY(ENHANCE_YOUR_CALM)`, and every stream in flight on it with the
+connection. Before that, Sōzu refuses new streams on the connection: each new
+stream gets `RST_STREAM(REFUSED_STREAM)` and the streams already open keep being
+served. A refused stream did no work, so the client may retry it (RFC 9113
+§8.7). The refusal holds while all three hold:
+
+- the client's pre-response resets are past `h2_stream_refusal_percent` of the
+  cap's floor;
+- they already outnumber the backend-routed streams — the cap's own ratio, so a
+  client that would never trip the cap is never refused;
+- the client reset a stream before its response within the last second. The
+  pre-response count never decays, so a client that stops cancelling is served
+  again one second after its last pre-response reset.
+
+The cap and the other flood limits are unchanged. Like a refusal at
+`SETTINGS_MAX_CONCURRENT_STREAMS` or during a graceful shutdown, each refusal
+counts one glitch toward `h2_max_glitch_count` once the client acknowledged
+Sōzu's SETTINGS: that budget is what ends the connection of a client that keeps
+opening streams it is refused. A refusal is not counted as a provoked reset
+and does not trigger the `SETTINGS_MAX_CONCURRENT_STREAMS` back-pressure.
+
+A client that resets a stream Sōzu refused does not honour the refusal: that
+reset counts as a pre-response reset, since the stream never had a response,
+and Sōzu stops refusing streams on that connection, which then meets the cap
+exactly as it would without the soft state. The refused stream is no longer
+tracked, so its reset also counts one glitch, like any RST_STREAM on a closed
+stream. Only the latest run of refused streams is remembered — the streams
+refused since the last one Sōzu accepted; a reset of a stream refused before
+that counts as a reset after a response, as without the soft state. A client
+that does honour refusals can still meet this once: if it cancels a stream at
+the moment Sōzu refuses it, its RST_STREAM crosses the `REFUSED_STREAM` and
+counts as a reset of a refused stream, and the refusals end for the rest of that
+connection, which then behaves as it would without the soft state.
+
+HEADERS on a client stream id that was never opened opens no stream. An id
+above the last stream Sōzu accepted and at or below the highest id the client
+used — refused, or skipped by the client — ends the connection with
+`GOAWAY(PROTOCOL_ERROR)` (RFC 9113 §5.1.1). An id below the last accepted
+stream, skipped or refused, takes the closed-stream path and ends it with
+`GOAWAY(STREAM_CLOSED)`, as before.
+
+This has one cost for a legitimate client, accepted as a rare case: a client
+that sends HEADERS, DATA and request trailers on a stream before it reads that
+stream's `REFUSED_STREAM` loses the connection, with every other stream in
+flight on it. The peer reads `RST_STREAM(REFUSED_STREAM)`, then
+`RST_STREAM(STREAM_CLOSED)` for its DATA, then `GOAWAY(PROTOCOL_ERROR)` for the
+trailers (`GOAWAY(STREAM_CLOSED)` once a later stream was accepted). It applies
+to every refusal, not only this soft state: over
+`SETTINGS_MAX_CONCURRENT_STREAMS`, during a graceful shutdown — whose drain can
+then end with `PROTOCOL_ERROR` instead of `NO_ERROR` — and on buffer-pool
+exhaustion. Browsers and standard gRPC clients send no request trailers (gRPC
+ends a request with END_STREAM on DATA) and are unaffected; a client that
+forwards request trailers, as Envoy can, may meet it. Each DATA frame of a
+refused stream costs one glitch and one `RST_STREAM(STREAM_CLOSED)` — a refused
+browser upload filling a 64 KiB window costs about four — and the connection
+survives that. Strictly, RFC 9113 §5.1 has an endpoint ignore frames on a
+stream it reset; the §5.1.1 reasoning holds only for ids the client skipped.
+Recording refused ids in the bounded list of recently reset streams, so their
+frames are ignored, is left for later.
+
+Clients that retry fast meet the refusals too. A gRPC client whose calls hit
+their deadlines cancels each one before its response — a pre-response reset —
+and a client that retries a refused stream at once opens it again within the
+second, so during such a storm its retries are refused, each costing a glitch,
+until it stops cancelling for a second or its retries exhaust the glitch
+budget and the connection ends with `GOAWAY(ENHANCE_YOUR_CALM)`. The per-window RST_STREAM rate
+(`h2_max_rst_stream_per_window`) has no soft threshold: it counts every reset,
+answered streams included, and with its half-decay a client at half the rate
+never reaches the limit, so refusing there would refuse clients the limit never
+cuts off. PING, SETTINGS, empty DATA, CONTINUATION and stream-0
+`WINDOW_UPDATE` floods open no stream and have no soft threshold either. Each
+refusal is counted in `h2.flood.stream_refused`.
+
+| Parameter                   | Default | Description                                                                                                                                              |
+| --------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `h2_stream_refusal_percent` | 50      | Share, in percent, of the `h2_max_rst_stream_abusive_lifetime` floor at which new streams are refused. `0` disables the refusal; `100` or more never refuses before the cap itself trips. |
+
+_Configuration example:_
+
+```toml
+[[listeners]]
+address = "0.0.0.0:443"
+protocol = "https"
+
+h2_stream_refusal_percent = 50
 ```
 
 #### Security and protocol settings
@@ -2895,6 +2986,7 @@ immediately after the patch is acknowledged.
 | `h2_max_rst_stream_lifetime`              | `u64` (≥ 1)     | per-connection setup | `200000`                | Floor of the received RST_STREAM cap (also needs the resets after a response or on a closed stream to exceed the streams a backend answered) — CVE-2023-44487           |
 | `h2_max_rst_stream_abusive_lifetime`      | `u64` (≥ 1)     | per-connection setup | `1000`                  | Floor of the pre-response RST_STREAM cap (also needs the pre-response resets, received plus provoked, to exceed the streams a backend answered) — Rapid Reset signature |
 | `h2_max_rst_stream_emitted_lifetime`      | `u64` (≥ 1)     | per-connection setup | `10000`                 | Floor of the peer-provoked server-emitted RST_STREAM cap (also needs the pre-response resets, received plus provoked, to exceed the streams a backend answered) — CVE-2025-8671 |
+| `h2_stream_refusal_percent`               | `u32`           | per-connection setup | `50`                    | Share of the pre-response RST_STREAM cap's floor at which new streams get `REFUSED_STREAM`. `0` disables; `100` or more never refuses. |
 | `h2_initial_connection_window`            | `u32`           | per-connection setup | `16777216`              | Connection receive window advertised to the peer (bytes, RFC 9113 §6.9.2); not enforced on inbound DATA                                                      |
 | `h2_max_concurrent_streams`               | `u32` (≥ 1)     | per-connection setup | `100`                   | `SETTINGS_MAX_CONCURRENT_STREAMS`                                                                                                                            |
 | `h2_stream_shrink_ratio`                  | `u32` (≥ 2)     | per-connection setup | `2`                     | Stream-slot Vec shrink threshold                                                                                                                             |
@@ -3846,6 +3938,7 @@ a hot loop regression.
 | `h2.streams.ready_incremental.by_urgency`                | gauge   | proxy | Sum across live connections of each connection's last post-scheduling-pass count of ready incremental streams, itself summed over that connection's urgency buckets (RFC 9218 §4). Emitted as a signed lifecycle delta with `impl Drop for H2Shell` teardown, so a connection's contribution leaves the aggregate when it closes. Debug hint for scheduler fairness — a consistently non-zero value under load means the round-robin is active.  |
 | `h2.trailers_dropped_content_length`                     | counter | proxy | Fired in `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`) when an H2 trailer block of a message framed by `Content-Length` (`BodySize::Length`) is about to be written to an H1 peer, a backend or a client: HTTP/1.1 carries trailers only with chunked coding (RFC 9112 §7.1), so the block is dropped (RFC 9110 §6.5.1) and nothing follows the body. An H2 peer receives these trailers. A `content-length` trailer field is still elided and counted in `h2.trailer.forbidden_field_elided`. Omit `Content-Length` to have trailers forwarded to an H1 peer. |
 | `h2.trailers_dropped_no_body`                            | counter | proxy | Fired in `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`) when an H2 trailer block of a response to HEAD, a 204 or a 304 is about to be written to an H1 client: such a response ends with its header section on HTTP/1.1 (RFC 9112 §6.3), so the block and the last chunk are dropped (RFC 9110 §6.5.1) and, for a stream ended by that trailer HEADERS frame, nothing follows the head. A `Content-Length`-framed block is counted in `h2.trailers_dropped_content_length` instead. |
+| `h2.bodiless_response_data_reset`                        | counter | proxy | Fired in `ConnectionH2::handle_data_frame` (`lib/src/protocol/mux/h2.rs`) when an H2 backend sends DATA carrying a payload on a 204 or a 304 response, which cannot carry content (RFC 9110 §15.3.5, §15.4.5; RFC 9113 §8.1.1): the backend stream is reset with PROTOCOL_ERROR and the payload never reaches the client. The payload of a response to HEAD is discarded without a reset and not counted. |
 | `h2.trailer.forbidden_field_elided`                      | counter | proxy | Request trailer fields elided by `pkawa::handle_trailer` (`lib/src/protocol/mux/pkawa.rs`) because their name is one of `TRAILER_FORBIDDEN_FIELDS`, the list the H1 frontend counts in `http.trailer.forbidden_field_elided` (RFC 9110 §6.5.1; #1714). One increment per field; the request is still forwarded. The connection-specific names of that list are refused earlier as a malformed field block (RFC 9113 §8.2.2) and are not counted here, except `te: trailers`: RFC 9113 §8.2.2 allows that value, so it passes that check and is then elided and counted here like any other forbidden name |
 | `h1.backend_eof_before_message_complete`                 | counter | proxy | Fired in `ConnectionH1::terminate_close_delimited` (`lib/src/protocol/mux/h1.rs`) when a `Connection: close` H1 backend closes the socket before the response body is fully delivered (a chunked body without its terminating zero chunk, or a `Content-Length` body short of its length), and in the close-delimited arm of `ConnectionH2::end_stream` (`lib/src/protocol/mux/h2.rs`) when such a backend goes away without that EOF being read (socket error, backend timeout). Only a body with neither framing ends cleanly at the close. The H2 frontend surfaces it as `RST_STREAM(InternalError)`; the H1 frontend closes the client connection without completing the response. Non-zero rate maps to backend application crashes or restarts mid-response. |
 
@@ -4022,6 +4115,12 @@ emits both the contextual log line and the per-kind counter below.
 | `h2.flood.violation.continuation_per_block`           | counter | proxy | Single header block split across more CONTINUATION frames than the configured cap (CVE-2024-27316).                                                                  |
 | `h2.flood.violation.header_size_per_block`            | counter | proxy | Single header block accumulated more bytes than the configured cap (CVE-2024-27316 sibling — header overflow).                                                       |
 | `h2.flood.violation.glitch_window`                    | counter | proxy | Generic anomaly budget exceeded (unknown SETTINGS, WINDOW_UPDATE on closed stream, other low-severity protocol drift).                                               |
+
+`h2.flood.stream_refused` (counter, proxy) is incremented once per new stream
+refused with `RST_STREAM(REFUSED_STREAM)` because its connection is past
+`h2_stream_refusal_percent` of the pre-response cap's floor. The connection
+stays open; a rising rate is the early warning before
+`h2.flood.violation.rst_stream_pre_response_lifetime`.
 
 #### Protocol upgrade failures
 

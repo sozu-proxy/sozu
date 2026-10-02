@@ -9,7 +9,8 @@
 
 use std::{
     io::{ErrorKind, Read, Write},
-    net::{SocketAddr, TcpStream},
+    net::{Shutdown, SocketAddr, TcpStream},
+    os::fd::AsRawFd,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -53,6 +54,12 @@ struct BlockingHttpBackend {
 
 impl BlockingHttpBackend {
     fn start(address: SocketAddr, body: String) -> Self {
+        Self::start_with_connection(address, body, "close")
+    }
+
+    /// `connection` is the response's `Connection` value: `close` ends the
+    /// exchange from the backend, `keep-alive` leaves sozu to end it.
+    fn start_with_connection(address: SocketAddr, body: String, connection: &'static str) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let requests_received = Arc::new(AtomicUsize::new(0));
         let responses_sent = Arc::new(AtomicUsize::new(0));
@@ -78,7 +85,7 @@ impl BlockingHttpBackend {
                         requests_clone.fetch_add(1, Ordering::Relaxed);
 
                         let response = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: {connection}\r\n\r\n{}",
                             body.len(),
                             body
                         );
@@ -1172,9 +1179,12 @@ fn try_tls_connection_close_large_response() -> State {
 
     worker.soft_stop();
     let success = worker.wait_for_server_stop();
+    // Read the counters once the backend thread is joined: it bumps
+    // `responses_sent` after its `write_all` returns, which can come after
+    // the client has read the whole response.
+    backend.stop();
     let requests_received = backend.requests_received();
     let responses_sent = backend.responses_sent();
-    backend.stop();
 
     // Name every failing conjunct with its values.
     //
@@ -1250,6 +1260,678 @@ fn test_tls_connection_close_large_response() {
             5,
             "TLS regression: large Connection: close response is fully delivered before teardown",
             try_tls_connection_close_large_response
+        ),
+        State::Success
+    );
+}
+
+/// The listener a half-close test runs against.
+#[derive(Clone, Copy, Debug)]
+enum Transport {
+    Plain,
+    Tls,
+}
+
+/// Start a worker with one listener of `transport` routing `localhost` to one
+/// backend at `back_address`. Returns the worker and the frontend address.
+fn start_half_close_worker(
+    name: &str,
+    transport: Transport,
+    back_address: SocketAddr,
+) -> (Worker, SocketAddr) {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let front: SocketAddr = front_address.clone().into();
+    let mut worker = match transport {
+        Transport::Plain => {
+            let (config, listeners, state) = Worker::empty_http_config(front);
+            let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
+            worker.send_proxy_request_type(RequestType::AddHttpListener(
+                ListenerBuilder::new_http(front_address.clone())
+                    .to_http(None)
+                    .unwrap(),
+            ));
+            worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+                interface: None,
+                address: front_address.clone(),
+                proxy: ListenerType::Http.into(),
+                from_scm: false,
+            }));
+            worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+                "cluster_0",
+            )));
+            worker.send_proxy_request_type(RequestType::AddHttpFrontend(
+                Worker::default_http_frontend("cluster_0", front),
+            ));
+            worker
+        }
+        Transport::Tls => {
+            let (config, listeners, state) = Worker::empty_https_config(front);
+            let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
+            worker.send_proxy_request_type(RequestType::AddHttpsListener(
+                ListenerBuilder::new_https(front_address.clone())
+                    .to_tls(None)
+                    .unwrap(),
+            ));
+            worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+                interface: None,
+                address: front_address.clone(),
+                proxy: ListenerType::Https.into(),
+                from_scm: false,
+            }));
+            worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+                "cluster_0",
+            )));
+            worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+                hostname: "localhost".to_owned(),
+                ..Worker::default_http_frontend("cluster_0", front)
+            }));
+            worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+                address: front_address,
+                certificate: CertificateAndKey {
+                    certificate: String::from(include_str!(
+                        "../../../lib/assets/local-certificate.pem"
+                    )),
+                    key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+                    certificate_chain: vec![],
+                    versions: vec![],
+                    names: vec![],
+                },
+                expired_at: None,
+            }));
+            worker
+        }
+    };
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+    (worker, front)
+}
+
+/// A client connection of `transport` to `front`, and a handle on its TCP
+/// socket for `shutdown` and `SO_LINGER`.
+fn half_close_client(transport: Transport, front: SocketAddr) -> (Box<dyn ReadWrite>, TcpStream) {
+    let tcp = TcpStream::connect_timeout(&front, Duration::from_secs(5))
+        .expect("could not connect to sozu");
+    tcp.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    tcp.set_write_timeout(Some(Duration::from_secs(5))).ok();
+    let handle = tcp.try_clone().expect("the client socket must clone");
+    let stream: Box<dyn ReadWrite> = match transport {
+        Transport::Plain => Box::new(tcp),
+        Transport::Tls => {
+            let mut tls_config = ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(Verifier))
+                .with_no_client_auth();
+            tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+            let conn = rustls::ClientConnection::new(Arc::new(tls_config), server_name.to_owned())
+                .unwrap();
+            Box::new(rustls::StreamOwned::new(conn, tcp))
+        }
+    };
+    (stream, handle)
+}
+
+trait ReadWrite: Read + Write {}
+impl<T: Read + Write> ReadWrite for T {}
+
+/// When a client half-closes, relative to its exchange.
+#[derive(Clone, Copy, Debug)]
+enum HalfClose {
+    /// Right after the request, so the FIN may reach sozu with it.
+    AfterRequest,
+    /// Once the response head has arrived, with most of the body still to
+    /// come from the backend.
+    AfterResponseHead,
+}
+
+/// An HTTP/1.1 client that sends its whole request and then half-closes its
+/// connection (`shutdown(SHUT_WR)`) still receives the whole response, and
+/// sozu closes the connection (with `close_notify` over TLS) once it is
+/// delivered.
+///
+/// The FIN only ends the client's sending side (RFC 9293 §3.6): the kernel
+/// reports it as `EPOLLRDHUP`, which `Ready::from(&mio::event::Event)` maps
+/// to HUP. The response is far larger than the socket buffers, so it is still
+/// arriving from the backend when that HUP is seen, and the frontend has to
+/// keep serving it instead of closing the session. With a `keep-alive`
+/// backend, only that HUP tells sozu to close after the response; a session
+/// left open would make the client wait for its read timeout.
+fn try_client_half_close(
+    name: &str,
+    transport: Transport,
+    half_close: HalfClose,
+    backend_connection: &'static str,
+) -> State {
+    let back_address = create_local_address();
+    let payload = "y".repeat(8 * 1024 * 1024);
+    let (mut worker, front) = start_half_close_worker(name, transport, back_address);
+    let mut backend = BlockingHttpBackend::start_with_connection(
+        back_address,
+        payload.clone(),
+        backend_connection,
+    );
+    let (mut stream, handle) = half_close_client(transport, front);
+
+    let request_body = "half-close";
+    let request = format!(
+        "POST /large HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{request_body}",
+        request_body.len()
+    );
+    let sent = stream.write_all(request.as_bytes()).is_ok() && stream.flush().is_ok();
+
+    let mut response_bytes = Vec::new();
+    let mut buf = [0u8; 65536];
+    let mut half_closed = None;
+    let mut ending = String::from("timeout");
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(20) {
+        let head_received = response_bytes.windows(4).any(|w| w == b"\r\n\r\n");
+        if half_closed.is_none()
+            && match half_close {
+                HalfClose::AfterRequest => true,
+                HalfClose::AfterResponseHead => head_received,
+            }
+        {
+            half_closed = Some(handle.shutdown(Shutdown::Write).is_ok());
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => {
+                ending = "closed".to_owned();
+                break;
+            }
+            Ok(n) => response_bytes.extend_from_slice(&buf[..n]),
+            Err(ref e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => {
+                ending = format!("error: {e}");
+                break;
+            }
+        }
+    }
+    drop(stream);
+
+    let separator = response_bytes.windows(4).position(|w| w == b"\r\n\r\n");
+    let (status_ok, body_len) = match separator {
+        Some(at) => (
+            response_bytes.starts_with(b"HTTP/1.1 200"),
+            response_bytes.len() - at - 4,
+        ),
+        None => (false, 0),
+    };
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    backend.stop();
+
+    println!(
+        "{name}: {transport:?} {half_close:?} backend={backend_connection} sent={sent} \
+         half_closed={half_closed:?} status_ok={status_ok} body={body_len}/{} \
+         ending={ending} stopped={stopped}",
+        payload.len()
+    );
+    if sent
+        && half_closed == Some(true)
+        && status_ok
+        && body_len == payload.len()
+        && ending == "closed"
+        && stopped
+    {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_tls_client_half_close_after_request_receives_large_response() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TLS H1: a client that half-closes after its request receives the whole response",
+            || try_client_half_close(
+                "TLS-HALF-CLOSE-REQUEST",
+                Transport::Tls,
+                HalfClose::AfterRequest,
+                "close"
+            )
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_tls_client_half_close_mid_response_receives_it_whole() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TLS H1: a client that half-closes mid-response receives it whole, then the close",
+            || try_client_half_close(
+                "TLS-HALF-CLOSE-RESPONSE",
+                Transport::Tls,
+                HalfClose::AfterResponseHead,
+                "keep-alive"
+            )
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_tls_client_half_close_keep_alive_closes_after_response() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TLS H1: a half-closed keep-alive exchange is closed once its response is delivered",
+            || try_client_half_close(
+                "TLS-HALF-CLOSE-KEEPALIVE",
+                Transport::Tls,
+                HalfClose::AfterRequest,
+                "keep-alive"
+            )
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_plain_client_half_close_after_request_receives_large_response() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H1: a client that half-closes after its request receives the whole response",
+            || try_client_half_close(
+                "PLAIN-HALF-CLOSE-REQUEST",
+                Transport::Plain,
+                HalfClose::AfterRequest,
+                "keep-alive"
+            )
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_plain_client_half_close_mid_response_receives_it_whole() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H1: a client that half-closes mid-response receives it whole, then the close",
+            || try_client_half_close(
+                "PLAIN-HALF-CLOSE-RESPONSE",
+                Transport::Plain,
+                HalfClose::AfterResponseHead,
+                "keep-alive"
+            )
+        ),
+        State::Success
+    );
+}
+
+/// A backend that accepts one connection, reads, never answers, and records
+/// when it has read something and when its connection closed.
+struct SilentBackend {
+    received: Arc<AtomicBool>,
+    closed: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl SilentBackend {
+    fn start(address: SocketAddr) -> Self {
+        let received = Arc::new(AtomicBool::new(false));
+        let closed = Arc::new(AtomicBool::new(false));
+        let (received_clone, closed_clone) = (received.clone(), closed.clone());
+        let listener = bind_std_listener(address, "silent backend");
+        let thread = thread::spawn(move || {
+            listener
+                .set_nonblocking(true)
+                .expect("could not set backend listener nonblocking");
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+                    Err(_) => return,
+                }
+            };
+            stream.set_nonblocking(false).ok();
+            stream.set_read_timeout(Some(Duration::from_secs(15))).ok();
+            let mut buf = [0u8; 65536];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => received_clone.store(true, Ordering::SeqCst),
+                    Err(ref e) if e.kind() == ErrorKind::Interrupted => {}
+                    // A timeout leaves `closed` unset: the connection stayed open.
+                    Err(ref e)
+                        if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
+                    {
+                        return;
+                    }
+                    Err(_) => break,
+                }
+            }
+            closed_clone.store(true, Ordering::SeqCst);
+        });
+        Self {
+            received,
+            closed,
+            thread: Some(thread),
+        }
+    }
+
+    /// Wait up to `within` for `flag`.
+    fn wait(flag: &AtomicBool, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if flag.load(Ordering::SeqCst) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        flag.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for SilentBackend {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// A client that half-closes after a request it left incomplete — its head
+/// announces a body it never sends whole — can never complete it. Once the
+/// client's EOF is read, sozu closes the session at once, as on a hang-up,
+/// instead of waiting for the backend, which waits for the rest of the body
+/// until its own timeout.
+fn try_half_close_with_incomplete_request(name: &str, transport: Transport) -> State {
+    let back_address = create_local_address();
+    let backend = SilentBackend::start(back_address);
+    let (mut worker, front) = start_half_close_worker(name, transport, back_address);
+    let (mut stream, handle) = half_close_client(transport, front);
+
+    let mut request =
+        b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1000000\r\n\r\n".to_vec();
+    request.extend_from_slice(&[b'u'; 1000]);
+    let sent = stream.write_all(&request).is_ok() && stream.flush().is_ok();
+    // The backend has the head before the client gives up on the body.
+    let forwarded = SilentBackend::wait(&backend.received, Duration::from_secs(5));
+    let half_closed = handle.shutdown(Shutdown::Write).is_ok();
+
+    let start = Instant::now();
+    let mut buf = [0u8; 4096];
+    let client_closed = loop {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break start.elapsed(),
+            Ok(_) => {}
+        }
+    };
+    let backend_closed = SilentBackend::wait(&backend.closed, Duration::from_secs(2));
+    drop(stream);
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    drop(backend);
+
+    println!(
+        "{name}: {transport:?} sent={sent} forwarded={forwarded} half_closed={half_closed} \
+         client_closed_after={client_closed:?} backend_closed={backend_closed} stopped={stopped}"
+    );
+    if sent
+        && forwarded
+        && half_closed
+        && client_closed < Duration::from_secs(2)
+        && backend_closed
+        && stopped
+    {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_plain_half_close_with_incomplete_request_closes_at_once() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H1: a half-close that leaves the request incomplete closes the session at once",
+            || try_half_close_with_incomplete_request(
+                "PLAIN-HALF-CLOSE-INCOMPLETE",
+                Transport::Plain
+            )
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_tls_half_close_with_incomplete_request_closes_at_once() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TLS H1: a half-close that leaves the request incomplete closes the session at once",
+            || try_half_close_with_incomplete_request("TLS-HALF-CLOSE-INCOMPLETE", Transport::Tls)
+        ),
+        State::Success
+    );
+}
+
+/// A client that resets its connection while its request is linked to a
+/// backend has hung up: the reset reaches sozu as ERROR and WRITE_CLOSED
+/// beside the HUP, and the session closes at once. Treating it as a half-close kept the session
+/// with an ERROR nothing clears, which spun `Mux::ready_inner` to
+/// `MAX_LOOP_ITERATIONS` (`http.infinite_loop.error`).
+fn try_client_reset_with_linked_request(name: &str, transport: Transport) -> State {
+    let back_address = create_local_address();
+    let backend = SilentBackend::start(back_address);
+    let (mut worker, front) = start_half_close_worker(name, transport, back_address);
+    let (mut stream, handle) = half_close_client(transport, front);
+
+    let sent = stream
+        .write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .is_ok()
+        && stream.flush().is_ok();
+    let linked = SilentBackend::wait(&backend.received, Duration::from_secs(5));
+    super::h2_security_session::set_linger_zero(handle.as_raw_fd());
+    drop(stream);
+    drop(handle);
+
+    let backend_closed = SilentBackend::wait(&backend.closed, Duration::from_secs(5));
+    let spins = super::h2_tests::query_proxy_count(
+        &mut worker,
+        sozu_lib::metrics::names::http::INFINITE_LOOP_ERROR,
+    );
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    drop(backend);
+
+    println!(
+        "{name}: {transport:?} sent={sent} linked={linked} backend_closed={backend_closed} \
+         {}={spins} stopped={stopped}",
+        sozu_lib::metrics::names::http::INFINITE_LOOP_ERROR
+    );
+    if sent && linked && backend_closed && spins == 0 && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_tls_client_reset_with_linked_request_closes_without_spinning() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TLS H1: a client reset with a linked request closes the session without spinning",
+            || try_client_reset_with_linked_request("TLS-RESET-LINKED", Transport::Tls)
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_plain_client_reset_with_linked_request_closes_without_spinning() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H1: a client reset with a linked request closes the session without spinning",
+            || try_client_reset_with_linked_request("PLAIN-RESET-LINKED", Transport::Plain)
+        ),
+        State::Success
+    );
+}
+
+/// A backend that streams an 8 MiB response to one request and records when
+/// a write fails, which happens once sozu closes its connection.
+struct StreamingBackend {
+    closed_at: Arc<std::sync::Mutex<Option<Instant>>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl StreamingBackend {
+    const BODY: usize = 8 * 1024 * 1024;
+
+    fn start(address: SocketAddr) -> Self {
+        let closed_at = Arc::new(std::sync::Mutex::new(None));
+        let closed_clone = closed_at.clone();
+        let listener = bind_std_listener(address, "streaming backend");
+        let thread = thread::spawn(move || {
+            listener
+                .set_nonblocking(true)
+                .expect("could not set backend listener nonblocking");
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+                    Err(_) => return,
+                }
+            };
+            stream.set_nonblocking(false).ok();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            // Longer than any prompt close, shorter than a session held open.
+            stream.set_write_timeout(Some(Duration::from_secs(30))).ok();
+            let mut buf = [0u8; 4096];
+            if !matches!(stream.read(&mut buf), Ok(n) if n > 0) {
+                return;
+            }
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", Self::BODY);
+            let chunk = vec![b'd'; 65536];
+            let mut result = stream.write_all(head.as_bytes());
+            let mut sent = 0;
+            while result.is_ok() && sent < Self::BODY {
+                result = stream.write_all(&chunk);
+                sent += chunk.len();
+            }
+            if result.is_err() {
+                *closed_clone.lock().unwrap() = Some(Instant::now());
+            }
+        });
+        Self {
+            closed_at,
+            thread: Some(thread),
+        }
+    }
+
+    fn closed_at(&self) -> Option<Instant> {
+        *self.closed_at.lock().unwrap()
+    }
+}
+
+impl Drop for StreamingBackend {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// rr_client_reset_mid_download: a client reads part of a large response,
+/// then resets its connection. That is a full hang-up, and the session must
+/// close at once, closing its backend connection with it.
+///
+/// When sozu's own `read` or `write` meets the reset before `epoll` reports
+/// it, the error is consumed and the event is `EPOLLHUP` without `EPOLLERR`:
+/// HUP and WRITE_CLOSED, not ERROR. Read as a half-close, it kept the session
+/// with its response in flight until a timeout. The race depends on timing,
+/// so the test repeats the exchange.
+fn try_rr_client_reset_mid_download(name: &str, transport: Transport) -> State {
+    let back_address = create_local_address();
+    let backend = StreamingBackend::start(back_address);
+    let (mut worker, front) = start_half_close_worker(name, transport, back_address);
+    let (mut stream, handle) = half_close_client(transport, front);
+
+    let sent = stream
+        .write_all(b"GET /download HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .is_ok()
+        && stream.flush().is_ok();
+    let mut received = 0;
+    let mut buf = [0u8; 65536];
+    while received < 280 * 1024 {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => received += n,
+        }
+    }
+    super::h2_security_session::set_linger_zero(handle.as_raw_fd());
+    let reset_at = Instant::now();
+    drop(stream);
+    drop(handle);
+
+    let deadline = reset_at + Duration::from_secs(3);
+    while backend.closed_at().is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    let closed_after = backend
+        .closed_at()
+        .map(|at| at.saturating_duration_since(reset_at));
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    drop(backend);
+
+    println!(
+        "{name}: {transport:?} sent={sent} received={received} \
+         backend_closed_after={closed_after:?} stopped={stopped}"
+    );
+    if sent
+        && received >= 280 * 1024
+        && closed_after.is_some_and(|after| after < Duration::from_secs(2))
+        && stopped
+    {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_rr_client_reset_mid_download_tls() {
+    assert_eq!(
+        repeat_until_error_or(
+            12,
+            "TLS H1: a client that resets mid-download closes its session at once",
+            || try_rr_client_reset_mid_download("TLS-RR-RESET-MID-DOWNLOAD", Transport::Tls)
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_rr_client_reset_mid_download_plain() {
+    assert_eq!(
+        repeat_until_error_or(
+            12,
+            "H1: a client that resets mid-download closes its session at once",
+            || try_rr_client_reset_mid_download("PLAIN-RR-RESET-MID-DOWNLOAD", Transport::Plain)
         ),
         State::Success
     );

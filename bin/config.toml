@@ -524,6 +524,13 @@ cipher_list = [
 # h2_max_rst_stream_abusive_lifetime = 1000   # received pre-response RST (Rapid Reset)
 # h2_max_rst_stream_emitted_lifetime = 10000  # peer-provoked server RST (CVE-2025-8671 MadeYouReset)
 
+# Before the pre-response RST_STREAM cap trips, refuse new streams with
+# RST_STREAM(REFUSED_STREAM) (retryable, RFC 9113 §8.7) once a connection is
+# past this percentage of h2_max_rst_stream_abusive_lifetime; open streams
+# keep being served and the cap still sends GOAWAY(ENHANCE_YOUR_CALM).
+# 0 disables.
+# h2_stream_refusal_percent = 50
+
 # H2 catch-all protocol-drift budget. 1-second sliding window with half-decay,
 # default 2000 (a burst of 2000, or about 1000 per second sustained). See
 # `doc/configure.md` (Tuning h2_max_glitch_count) for the decision matrix;

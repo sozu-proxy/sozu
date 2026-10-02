@@ -287,6 +287,64 @@ Configurable thresholds with safe compile-time defaults:
 | `max_header_table_size` | 65536 (64 KiB) | (HPACK memory) | Peer-advertised dynamic table size cap |
 | `max_header_fields` | 128 | (HPACK memory) | Indexed-reference "header bomb" |
 | `max_glitch_count` | 2000 | (cumulative) | General protocol abuse |
+| `stream_refusal_percent` | 50 | CVE-2023-44487 | Soft state: past this share of the `max_rst_stream_abusive_lifetime` floor, with the cap's ratio crossed, new client streams get `REFUSED_STREAM` and open ones are served; `0` disables |
+
+`H2FloodDetector::refuses_new_streams` is the soft state below the
+pre-response cap. `ConnectionH2::handle_header_state` asks it before opening a
+client stream and refuses with `RstOrigin::Local` and without SETTINGS
+back-pressure. Like the draining and `SETTINGS_MAX_CONCURRENT_STREAMS`
+refusals, each soft refusal counts one glitch once the client acknowledged
+Sōzu's SETTINGS: the glitch budget (`max_glitch_count`) is what bounds a client
+that keeps opening streams it is refused without resetting any. It feeds no
+other counter. The pre-response count never decays, so the soft state holds
+only within one window of the last pre-response reset.
+
+`ConnectionH2::flood_refused_streams` keeps only the latest run of refused ids;
+an accepted stream ends the run, and the next refusal starts a new one. A
+reset of an id in that run counts as pre-response in
+`ConnectionH2::handle_rst_stream_frame` and sets
+`ConnectionH2::flood_refusal_ignored`, which ends the refusals on that
+connection: a client that resets the streams it is refused meets the cap
+exactly as it would without the soft state. Such a reset names a stream that
+is not tracked, so before reaching `handle_rst_stream_frame` it also goes
+through the closed-stream branch of `ConnectionH2::handle_header_state` and
+costs one glitch. A reset of an id from an earlier run is not recognised: it
+takes the untracked-stream arm and counts as a reset after a response, as
+before the soft state. A client that only raced a cancel against a refusal —
+its RST_STREAM for a stream it opened crossed Sōzu's `REFUSED_STREAM` —
+disables the refusals for the rest of its connection just the same, which
+then behaves as it would without the soft state.
+
+A refused stream moves `H2StreamTable::highest_peer_stream_id` but not
+`ConnectionH2::last_stream_id`, which only an accepted stream moves. A HEADERS
+frame on a client id above `last_stream_id` and at or below
+`highest_peer_stream_id` — a refused id, or one the client skipped — opens no
+stream and is a connection error of type `PROTOCOL_ERROR`. An id below
+`last_stream_id` that was never opened takes the closed-stream branch and gets
+`GOAWAY(STREAM_CLOSED)`, as before.
+
+A refused stream is never registered, and `ConnectionH2::enqueue_rst` records
+only registered streams in `rst_sent`, so `H2StreamTable::was_reset_locally`
+does not know it. The frames a client sent on it before reading its
+`REFUSED_STREAM` are therefore not ignored: each DATA frame takes the
+closed-stream DATA branch (one glitch and one `RST_STREAM(STREAM_CLOSED)`; a
+refused browser upload filling a 64 KiB window costs about four, and the
+connection survives), and request trailers take the `PROTOCOL_ERROR` branch
+above (`GOAWAY(STREAM_CLOSED)` once a later stream was accepted). A client
+sending HEADERS, DATA and trailers in one burst thus reads
+`RST_STREAM(REFUSED_STREAM)`, `RST_STREAM(STREAM_CLOSED)`,
+`GOAWAY(PROTOCOL_ERROR)`, and loses every other stream in flight with the
+connection. This holds for every refusal — flood pressure, draining (whose
+drain then ends with `PROTOCOL_ERROR` instead of `NO_ERROR`),
+`SETTINGS_MAX_CONCURRENT_STREAMS` and buffer-pool exhaustion. Browsers and
+standard gRPC send no request trailers and are unaffected; a trailer-forwarding
+client such as Envoy can be. RFC 9113 §5.1 would have these frames ignored, the
+§5.1.1 reasoning holding only for skipped ids; the case is accepted as rare,
+and recording refused ids in the bounded recently-reset set
+(`H2StreamTable::was_reset_locally`) would close it.
+
+The per-window RST_STREAM rate has no soft state: it counts every reset, and
+with its half-decay a client at half the rate never reaches the limit.
 
 The sliding window duration is 1 second (`FLOOD_WINDOW_DURATION`). The three
 `*_lifetime` counters never decay, but each trips only once it also exceeds a
@@ -683,7 +741,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:4937-4950
+```rust lib/src/protocol/mux/h2.rs:5071-5084
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -709,7 +767,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:4988-4994
+```rust lib/src/protocol/mux/h2.rs:5122-5128
 let events = stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -741,7 +799,7 @@ taken at the top of `H2WritePhase::Flush`'s post-flush tail
 (`ConnectionH2::poll_write_target`, `lib/src/protocol/mux/h2.rs`) and passes `stream.linked_token()` straight
 out of it:
 
-```rust lib/src/protocol/mux/h2.rs:3693-3694
+```rust lib/src/protocol/mux/h2.rs:3827-3828
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 ```
@@ -1094,7 +1152,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9155-9159
+```rust lib/src/protocol/mux/h2.rs:9404-9408
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1268,7 +1326,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9333-9337
+```rust lib/src/protocol/mux/h2.rs:9582-9586
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1743,7 +1801,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:8658
+```rust lib/src/protocol/mux/h2.rs:8907
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -1977,7 +2035,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:7207-7209
+```rust lib/src/protocol/mux/h2.rs:7456-7458
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1985,7 +2043,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:7221-7227
+```rust lib/src/protocol/mux/h2.rs:7470-7476
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.

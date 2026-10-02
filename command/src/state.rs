@@ -1198,6 +1198,9 @@ impl ConfigState {
         if let Some(v) = patch.h2_max_header_fields {
             listener.h2_max_header_fields = Some(v);
         }
+        if let Some(v) = patch.h2_stream_refusal_percent {
+            listener.h2_stream_refusal_percent = Some(v);
+        }
         if let Some(v) = patch.h2_stream_idle_timeout_seconds {
             listener.h2_stream_idle_timeout_seconds = Some(v);
         }
@@ -1357,6 +1360,9 @@ impl ConfigState {
         }
         if let Some(v) = patch.h2_max_header_fields {
             listener.h2_max_header_fields = Some(v);
+        }
+        if let Some(v) = patch.h2_stream_refusal_percent {
+            listener.h2_stream_refusal_percent = Some(v);
         }
         if let Some(v) = patch.h2_stream_idle_timeout_seconds {
             listener.h2_stream_idle_timeout_seconds = Some(v);

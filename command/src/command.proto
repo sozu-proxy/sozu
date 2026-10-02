@@ -289,6 +289,9 @@ message UpdateHttpListenerConfig {
     // Which forwarding header family the listener emits — see
     // HttpListenerConfig.
     optional ForwardedHeaders forwarded_headers     = 42;
+    // Soft stream-refusal share of the pre-response RST_STREAM cap, in percent —
+    // see HttpListenerConfig.
+    optional uint32 h2_stream_refusal_percent       = 43;
 }
 
 // Partial-update patch for a running HTTPS listener.
@@ -394,6 +397,9 @@ message UpdateHttpsListenerConfig {
     // Which forwarding header family the listener emits — see
     // HttpsListenerConfig.
     optional ForwardedHeaders forwarded_headers     = 43;
+    // Soft stream-refusal share of the pre-response RST_STREAM cap, in percent —
+    // see HttpsListenerConfig.
+    optional uint32 h2_stream_refusal_percent       = 44;
 }
 
 // Partial-update patch for a running TCP listener.
@@ -568,6 +574,13 @@ message HttpListenerConfig {
     // `X-Forwarded-*`, RFC 7239 `Forwarded`, both, or none. Independent of
     // `elide_x_real_ip` and `send_x_real_ip`. Default: both.
     optional ForwardedHeaders forwarded_headers = 36 [default = FORWARDED_HEADERS_BOTH];
+    // Share, in percent, of the pre-response RST_STREAM cap's floor
+    // (h2_max_rst_stream_abusive_lifetime) at which an H2 connection refuses
+    // new client streams with RST_STREAM(REFUSED_STREAM), retryable per
+    // RFC 9113 §8.7, and keeps serving its open streams. The cap itself still
+    // ends the connection with GOAWAY(ENHANCE_YOUR_CALM). 0 disables the soft
+    // state; 100 or more never engages it before the cap. Default: 50.
+    optional uint32 h2_stream_refusal_percent = 37;
 }
 
 // details of an HTTPS listener
@@ -733,6 +746,13 @@ message HttpsListenerConfig {
     // `X-Forwarded-*`, RFC 7239 `Forwarded`, both, or none. Independent of
     // `elide_x_real_ip` and `send_x_real_ip`. Default: both.
     optional ForwardedHeaders forwarded_headers = 49 [default = FORWARDED_HEADERS_BOTH];
+    // Share, in percent, of the pre-response RST_STREAM cap's floor
+    // (h2_max_rst_stream_abusive_lifetime) at which an H2 connection refuses
+    // new client streams with RST_STREAM(REFUSED_STREAM), retryable per
+    // RFC 9113 §8.7, and keeps serving its open streams. The cap itself still
+    // ends the connection with GOAWAY(ENHANCE_YOUR_CALM). 0 disables the soft
+    // state; 100 or more never engages it before the cap. Default: 50.
+    optional uint32 h2_stream_refusal_percent = 50;
 }
 
 // details of an TCP listener

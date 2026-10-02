@@ -27,18 +27,27 @@
 //!    cancels one request in three before any answer keeps its connection
 //!    past the pre-response floor: a stream routed to a cluster and answered
 //!    by Sōzu counts as answered.
+//! 4. [`test_h2_cancels_past_the_soft_threshold_refuse_new_streams`] — a
+//!    client that cancels past half the pre-response floor but under the
+//!    floor itself gets `RST_STREAM(REFUSED_STREAM)` on its next stream,
+//!    keeps its connection, finishes the upload it had open, and is served
+//!    again once it stops cancelling for a flood window.
 
 use std::{
+    collections::HashMap,
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
+    sync::Mutex,
+    thread,
     time::{Duration, Instant},
 };
 
 use super::h2_utils::{
     CHROME146_CONN_WINDOW_UPDATE_DELTA, CHROME146_INITIAL_WINDOW_SIZE, H2_ERROR_ENHANCE_YOUR_CALM,
-    H2_FLAG_END_STREAM, H2_FRAME_DATA, H2_FRAME_GOAWAY, H2_FRAME_HEADERS, H2_FRAME_RST_STREAM,
-    H2Frame, advance_one_frame, decode_status, h2_handshake, h2_handshake_with_initial_window,
-    raw_h2_connection, setup_h2_listener_only, setup_h2_test, stream_status_matches, teardown,
+    H2_ERROR_REFUSED_STREAM, H2_FLAG_END_STREAM, H2_FRAME_DATA, H2_FRAME_GOAWAY, H2_FRAME_HEADERS,
+    H2_FRAME_RST_STREAM, H2Frame, advance_one_frame, decode_status, h2_handshake,
+    h2_handshake_with_initial_window, raw_h2_connection, setup_h2_listener_only, setup_h2_test,
+    stream_status_matches, teardown,
 };
 use crate::{
     mock::{aggregator::SimpleAggregator, async_backend::BackendHandle as AsyncBackend},
@@ -513,6 +522,262 @@ fn test_h2_cancels_during_a_backend_outage_keep_the_connection() {
             1,
             "H2: client cancels during a backend outage keep the connection",
             try_h2_cancels_during_a_backend_outage_keep_the_connection,
+        ),
+        State::Success
+    );
+}
+
+// ── 4. cancels past the soft threshold ──────────────────────────────────
+
+/// The pre-response floor this test configures. Low, so the test needs few
+/// cancels; the soft threshold sits at half of it (the default
+/// `h2_stream_refusal_percent` of 50).
+const SOFT_PRE_RESPONSE_FLOOR: u64 = 40;
+/// Cancels sent: one past the soft threshold (half the floor), well under the
+/// floor. Not more: every cancel after the threshold would reset a stream
+/// Sōzu already refused, and a client that resets a refused stream is one
+/// that ignores refusals, which ends them for its connection.
+const SOFT_CANCELS: u32 = SOFT_PRE_RESPONSE_FLOOR as u32 / 2 + 1;
+/// The upload the client keeps open while it cancels: its body length.
+const HELD_BODY: &[u8] = b"held";
+
+/// A backend that answers a request only once its whole body arrived —
+/// `Content-Length` bytes, or the last chunk — so the stream carrying it stays
+/// open for as long as the client holds the body back.
+fn whole_body_backend(worker: &mut Worker) -> AsyncBackend<SimpleAggregator> {
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    let pending: Mutex<HashMap<SocketAddr, Vec<u8>>> = Mutex::new(HashMap::new());
+    let handler: Box<dyn Fn(&TcpStream, &str, SimpleAggregator) -> SimpleAggregator + Send + Sync> =
+        Box::new(move |mut stream, backend_name, mut aggregator| {
+            let Ok(peer) = stream.peer_addr() else {
+                return aggregator;
+            };
+            let mut buf = [0u8; 4096];
+            let n = match stream.read(&mut buf) {
+                Ok(0) | Err(_) => return aggregator,
+                Ok(n) => n,
+            };
+            let mut pending = pending.lock().unwrap();
+            let request = pending.entry(peer).or_default();
+            request.extend_from_slice(&buf[..n]);
+            let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                return aggregator;
+            };
+            let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+            let body = &request[end + 4..];
+            let content_length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok());
+            let complete = match content_length {
+                Some(length) => body.len() >= length,
+                None if head.contains("transfer-encoding: chunked") => {
+                    body.windows(5).any(|w| w == b"0\r\n\r\n")
+                }
+                None => true,
+            };
+            if !complete {
+                return aggregator;
+            }
+            pending.remove(&peer);
+            println!("{backend_name} answers a complete request");
+            aggregator.requests_received += 1;
+            if stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .is_ok()
+            {
+                aggregator.responses_sent += 1;
+            }
+            aggregator
+        });
+    AsyncBackend::spawn_detached_backend(
+        "WHOLE_BODY".to_owned(),
+        back_address,
+        SimpleAggregator::default(),
+        handler,
+    )
+}
+
+/// `POST /` announcing a `HELD_BODY`-long body.
+fn post_root_header_block() -> Vec<u8> {
+    let mut block = vec![
+        0x83, // :method POST (static index 3)
+        0x84, // :path / (static index 4)
+        0x86, // :scheme https (static index 6)
+        0x41, 0x09, // :authority, literal value of length 9
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't', 0x0f,
+        0x0d, // content-length (static index 28), literal without indexing
+        0x01,
+    ];
+    block.push(b'0' + HELD_BODY.len() as u8);
+    block
+}
+
+fn rst_stream_code(frames: &[(u8, u8, u32, Vec<u8>)], stream_id: u32) -> Option<u32> {
+    frames.iter().find_map(|(ft, _, sid, payload)| {
+        (*ft == H2_FRAME_RST_STREAM && *sid == stream_id && payload.len() >= 4)
+            .then(|| u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]))
+    })
+}
+
+fn try_h2_cancels_past_the_soft_threshold_refuse_new_streams() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned("H2-SOFT-REFUSAL", config, listeners, state);
+    let mut listener = ListenerBuilder::new_https(front_address.clone())
+        .to_tls(None)
+        .unwrap();
+    listener.h2_max_rst_stream_abusive_lifetime = Some(SOFT_PRE_RESPONSE_FLOOR);
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(listener));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: CertificateAndKey {
+            certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+            key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+            certificate_chain: vec![],
+            versions: vec![],
+            names: vec![],
+        },
+        expired_at: None,
+    }));
+    let backends = vec![whole_body_backend(&mut worker)];
+    worker.read_to_last();
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+    let mut carry = Vec::new();
+    let mut seen = Vec::new();
+
+    // Stream 1: an upload whose body the client holds back, so it stays
+    // open through everything below.
+    let held_id = 1;
+    let mut wire = H2Frame::headers(held_id, post_root_header_block(), true, false).encode();
+    // Each cancelled request is an upload whose body never comes, so the
+    // backend never answers it and its RST_STREAM(CANCEL) is pre-response
+    // however the host schedules the reads. The probe stream rides in the
+    // same write as the cancels, so it reaches Sōzu while the resets are
+    // fresh.
+    let probe_id = 1 + 2 * (SOFT_CANCELS + 1);
+    for i in 0..SOFT_CANCELS {
+        let stream_id = 3 + 2 * i;
+        wire.extend_from_slice(
+            &H2Frame::headers(stream_id, post_root_header_block(), true, false).encode(),
+        );
+        wire.extend_from_slice(&H2Frame::rst_stream(stream_id, 0x8).encode());
+    }
+    wire.extend_from_slice(
+        &H2Frame::headers(probe_id, get_root_header_block(), true, true).encode(),
+    );
+    if tls.write_all(&wire).and_then(|_| tls.flush()).is_err() {
+        let _ = teardown(tls, front_port, worker, backends);
+        return State::Fail;
+    }
+    seen.extend(pump_frames(
+        &mut tls,
+        &mut carry,
+        Duration::from_secs(5),
+        |frames| {
+            rst_stream_code(frames, probe_id).is_some()
+                || stream_status_matches(frames, probe_id, 200)
+                || frames.iter().any(|(ft, _, _, _)| *ft == H2_FRAME_GOAWAY)
+        },
+    ));
+    let probe_code = rst_stream_code(&seen, probe_id);
+
+    // The open upload is still served: finish its body, get its answer.
+    let body_written = tls
+        .write_all(&H2Frame::data(held_id, HELD_BODY.to_vec(), true).encode())
+        .and_then(|_| tls.flush())
+        .is_ok();
+    seen.extend(pump_frames(
+        &mut tls,
+        &mut carry,
+        Duration::from_secs(5),
+        |frames| {
+            stream_status_matches(frames, held_id, 200)
+                || frames.iter().any(|(ft, _, _, _)| *ft == H2_FRAME_GOAWAY)
+        },
+    ));
+    let held_served = stream_status_matches(&seen, held_id, 200);
+
+    // A flood window without a cancel ends the refusal.
+    thread::sleep(Duration::from_millis(1500));
+    let retry_id = probe_id + 2;
+    let retry_written = tls
+        .write_all(&H2Frame::headers(retry_id, get_root_header_block(), true, true).encode())
+        .and_then(|_| tls.flush())
+        .is_ok();
+    seen.extend(pump_frames(
+        &mut tls,
+        &mut carry,
+        Duration::from_secs(5),
+        |frames| {
+            stream_status_matches(frames, retry_id, 200)
+                || rst_stream_code(frames, retry_id).is_some()
+                || frames.iter().any(|(ft, _, _, _)| *ft == H2_FRAME_GOAWAY)
+        },
+    ));
+    let retry_served = stream_status_matches(&seen, retry_id, 200);
+    let goaway = seen.iter().any(|(ft, _, _, _)| *ft == H2_FRAME_GOAWAY);
+
+    println!(
+        "soft refusal: probe RST_STREAM code={probe_code:?} body_written={body_written} \
+         held_served={held_served} retry_written={retry_written} retry_served={retry_served} \
+         goaway={goaway} goaway(ENHANCE_YOUR_CALM)={}",
+        goaway_with_calm(&seen)
+    );
+    let stopped = teardown(tls, front_port, worker, backends);
+    if probe_code == Some(H2_ERROR_REFUSED_STREAM)
+        && body_written
+        && held_served
+        && retry_written
+        && retry_served
+        && !goaway
+        && stopped
+    {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+/// A client cancelling past half the pre-response floor, but under the floor,
+/// has its next stream refused with `RST_STREAM(REFUSED_STREAM)` instead of
+/// losing the connection: its open upload completes, no GOAWAY is sent, and
+/// a stream opened after a quiet flood window is served again.
+///
+/// TO SEE THIS RED: run it without the soft state — set
+/// `DEFAULT_STREAM_REFUSAL_PERCENT` to 0 in
+/// `lib/src/protocol/mux/h2_flood_detector.rs`, or run it against a tree
+/// without `H2FloodDetector::refuses_new_streams`. The probe stream is then
+/// opened and answered 200 instead of refused.
+#[test]
+fn test_h2_cancels_past_the_soft_threshold_refuse_new_streams() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "H2: cancels past the soft threshold refuse new streams and keep the connection",
+            try_h2_cancels_past_the_soft_threshold_refuse_new_streams,
         ),
         State::Success
     );

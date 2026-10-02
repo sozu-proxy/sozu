@@ -268,6 +268,10 @@ pub mod h2 {
     /// `ConnectionH1::writable` towards an H1 client, which reads such a
     /// response as ending with its header section (RFC 9112 §6.3).
     pub const TRAILERS_DROPPED_NO_BODY: &str = "h2.trailers_dropped_no_body";
+    /// Backend streams reset by `ConnectionH2::handle_data_frame` because a
+    /// 204 or a 304 response carried a DATA payload (RFC 9110 §15.3.5,
+    /// §15.4.5; RFC 9113 §8.1.1).
+    pub const BODILESS_RESPONSE_DATA_RESET: &str = "h2.bodiless_response_data_reset";
     /// Request trailer fields elided by `pkawa::handle_trailer` because their
     /// name is one of `editor::TRAILER_FORBIDDEN_FIELDS` (sozu-proxy/sozu#1714).
     /// One increment per field; the request is still forwarded. The H1
@@ -286,6 +290,11 @@ pub mod h2 {
     pub const FLOOD_VIOLATION_PRIORITY: &str = "h2.flood.violation.priority";
     pub const FLOOD_VIOLATION_RAPID_RESET: &str = "h2.flood.violation.rapid_reset";
     pub const FLOOD_VIOLATION_SETTINGS: &str = "h2.flood.violation.settings";
+    /// A new client stream refused with `REFUSED_STREAM` in the soft state
+    /// below the pre-response RST_STREAM cap (`h2_stream_refusal_percent`).
+    /// The connection stays open; a rising rate is the early warning before
+    /// `h2.flood.violation.rst_stream_pre_response_lifetime`.
+    pub const FLOOD_STREAM_REFUSED: &str = "h2.flood.stream_refused";
 }
 
 /// HTTP counters (H1 + H2 share these); see `https` for the HTTPS-specific

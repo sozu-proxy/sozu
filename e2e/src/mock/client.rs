@@ -53,6 +53,32 @@ impl Client {
         self.stream = None;
     }
 
+    /// Reset the connection: `SO_LINGER` zero, then close, so the peer sees
+    /// a client that went away rather than one that half-closed after its
+    /// request (which sozu still answers).
+    pub fn reset(&mut self) {
+        let Some(stream) = self.stream.take() else {
+            return;
+        };
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        // SAFETY: `linger` is a valid `libc::linger` and `stream` owns the
+        // descriptor for the duration of the call.
+        let rc = unsafe {
+            libc::setsockopt(
+                std::os::fd::AsRawFd::as_raw_fd(&stream),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                &linger as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "SO_LINGER zero must set");
+        drop(stream);
+    }
+
     pub fn is_connected(&self) -> bool {
         match &self.stream {
             None => false,
