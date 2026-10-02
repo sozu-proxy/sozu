@@ -290,6 +290,11 @@ pub mod h2 {
     pub const FLOOD_VIOLATION_PRIORITY: &str = "h2.flood.violation.priority";
     pub const FLOOD_VIOLATION_RAPID_RESET: &str = "h2.flood.violation.rapid_reset";
     pub const FLOOD_VIOLATION_SETTINGS: &str = "h2.flood.violation.settings";
+    /// A new client stream refused with `REFUSED_STREAM` in the soft state
+    /// below the pre-response RST_STREAM cap (`h2_stream_refusal_percent`).
+    /// The connection stays open; a rising rate is the early warning before
+    /// `h2.flood.violation.rst_stream_pre_response_lifetime`.
+    pub const FLOOD_STREAM_REFUSED: &str = "h2.flood.stream_refused";
 }
 
 /// HTTP counters (H1 + H2 share these); see `https` for the HTTPS-specific
