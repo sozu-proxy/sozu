@@ -527,6 +527,12 @@ client's grant nor a previous request on the slot carries over. A client and a
 backend that both advertise 2^31-1 are each within the §6.9.2 ceiling and must
 not be summed into one window. An H1 leg never reads its window.
 
+A `SETTINGS_INITIAL_WINDOW_SIZE` above 2^31-1 (RFC 9113 §6.5.2), or a change
+that would push one of the connection's stream windows past 2^31-1 (§6.9.2),
+is answered with GOAWAY(FLOW_CONTROL_ERROR). `update_initial_window_size`
+checks every window before it changes any, so a rejected value leaves the
+windows and the recorded setting untouched.
+
 ### Prepared DATA dropped unsent gives its send credit back
 
 The send windows are debited when DATA is **prepared**, not when it is
@@ -1084,7 +1090,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8927-8931
+```rust lib/src/protocol/mux/h2.rs:8952-8956
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1238,7 +1244,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9105-9109
+```rust lib/src/protocol/mux/h2.rs:9130-9134
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1712,7 +1718,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:8430
+```rust lib/src/protocol/mux/h2.rs:8455
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
