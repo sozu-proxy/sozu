@@ -4781,3 +4781,132 @@ fn test_h2_content_length_with_connection_close_keeps_the_h2_connection() {
         State::Success
     );
 }
+
+// ============================================================================
+// Per-connection stream send windows (RFC 9113 §6.9)
+// ============================================================================
+
+/// RFC 9113 §6.9: flow control is hop-by-hop, so a proxied stream has one
+/// send window on the frontend connection and another on the backend one.
+/// A client and an H2 backend that both advertise
+/// `SETTINGS_INITIAL_WINDOW_SIZE = 2^31-1` are each within the §6.9.2
+/// ceiling; applying both to one shared per-stream window overflows it, and
+/// the backend connection is torn down with a GOAWAY instead of serving the
+/// request.
+#[test]
+fn test_h2_client_and_h2_backend_both_at_max_initial_window() {
+    const MAX_WINDOW: u32 = 0x7fff_ffff;
+    const SETTINGS_INITIAL_WINDOW_SIZE_ID: u16 = 0x4;
+
+    let (mut worker, front_port, _) = setup_h2_listener_only("H2-PER-LEG-WINDOW");
+    let mut h2_cluster = Worker::default_cluster("cluster_0");
+    h2_cluster.http2 = Some(true);
+    worker.send_proxy_request_type(RequestType::AddCluster(h2_cluster));
+    let back_port = crate::tests::provide_unbound_port();
+    let back_address: SocketAddr = format!("127.0.0.1:{back_port}").parse().unwrap();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    // A raw H2 backend: advertise the maximum initial window, answer the
+    // first request with an empty 200, and report every frame Sōzu sent.
+    let listener = std::net::TcpListener::bind(back_address).expect("bind the H2 backend");
+    listener.set_nonblocking(true).unwrap();
+    let backend = thread::spawn(move || -> Vec<(u8, u8, u32, Vec<u8>)> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Vec::new();
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("backend accept failed: {e}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let settings = H2Frame::settings(&[(SETTINGS_INITIAL_WINDOW_SIZE_ID, MAX_WINDOW)]);
+        stream.write_all(&settings.encode()).unwrap();
+        let mut received = Vec::new();
+        let mut buf = [0u8; 16_384];
+        let mut acked = false;
+        let mut answered = false;
+        while Instant::now() < deadline {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => received.extend_from_slice(&buf[..n]),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(_) => break,
+            }
+            let frames = parse_h2_frames(received.get(24..).unwrap_or_default());
+            if !acked
+                && frames
+                    .iter()
+                    .any(|(t, f, _, _)| *t == H2_FRAME_SETTINGS && f & H2_FLAG_ACK == 0)
+            {
+                stream.write_all(&H2Frame::settings_ack().encode()).unwrap();
+                acked = true;
+            }
+            if !answered
+                && frames
+                    .iter()
+                    .any(|(t, _, s, _)| *t == H2_FRAME_HEADERS && *s == 1)
+            {
+                // `:status: 200`, indexed (RFC 7541 Appendix A, index 8).
+                stream
+                    .write_all(&H2Frame::headers(1, vec![0x88], true, true).encode())
+                    .unwrap();
+                answered = true;
+            }
+            if contains_goaway(&frames) {
+                break;
+            }
+        }
+        parse_h2_frames(received.get(24..).unwrap_or_default())
+    });
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, MAX_WINDOW);
+    tls.write_all(&H2Frame::headers(1, build_get_headers_no_priority(), true, true).encode())
+        .unwrap();
+    tls.flush().unwrap();
+
+    let frames = collect_response_frames(&mut tls, 300, 5, 200);
+    log_frames("H2-PER-LEG-WINDOW client", &frames);
+    let backend_frames = backend.join().expect("the backend thread completes");
+    log_frames("H2-PER-LEG-WINDOW backend", &backend_frames);
+    assert!(
+        !backend_frames.is_empty(),
+        "premise: Sōzu dialled the H2 backend"
+    );
+
+    assert!(
+        !contains_goaway(&backend_frames),
+        "Sōzu must not send the backend a GOAWAY for a valid initial window, got {:?}",
+        goaway_error_code(&backend_frames)
+    );
+    assert!(
+        stream_status_matches(&frames, 1, 200),
+        "the client must receive the backend's 200"
+    );
+    assert!(
+        !contains_goaway(&frames),
+        "the client connection must stay up"
+    );
+
+    drop(tls);
+    worker.soft_stop();
+    assert!(worker.wait_for_server_stop());
+}

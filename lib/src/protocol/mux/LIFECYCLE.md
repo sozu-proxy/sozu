@@ -242,9 +242,10 @@ Declared in `h2.rs` (`pub enum H2State`):
   used at an earlier revision — a collision the drift rule cannot tell from
   staleness, because it keys on the citation and not on where it sits. Do not
   convert it back.
-- `Discard` (stream refused, or an orphaned DATA remainder skipped — see §5.4)
-  is set in `refuse_stream_and_discard` or `skip_orphaned_data_payload`
-  (`h2.rs`) and exited by the `H2State::Discard` arm of `ConnectionH2::handle_read`
+- `Discard` (stream refused, a frame dropped for a stream reset by a stream
+  error or earlier by us — RFC 9113 §5.1 —, or an orphaned DATA remainder
+  skipped — see §5.4) is set in `refuse_stream_and_discard`,
+  `discard_field_block` or `skip_orphaned_data_payload` (`h2.rs`) and exited by the `H2State::Discard` arm of `ConnectionH2::handle_read`
   (`lib/src/protocol/mux/h2.rs`). By symbol, not line, for the same reason as
   the bullet above: `self.expect_header();` is one of four identical lines in
   the file, and the line number this bullet would otherwise carry is one the
@@ -260,7 +261,7 @@ Declared in `h2.rs` (`pub enum H2State`):
   `handle_read()` arm clears `zero.storage`, it decodes that field block into
   `ConnectionH2::decoder` (result discarded, callback is a no-op) via the
   free function `decode_discarded_field_block`, using the
-  `ConnectionH2::discarded_field_block` value `refuse_stream_and_discard`
+  `ConnectionH2::discarded_field_block` value `discard_field_block`
   stashed for it (see `DiscardedFieldBlock`, `h2.rs`). A brand-new stream's
   whole HEADERS payload still carries its own PADDED/PRIORITY prefix
   (RFC 9113 §6.2), which is stripped by re-running `parser::headers_frame`
@@ -1037,7 +1038,9 @@ deadlines are compared against `ConnectionH2.now` (§7.5):
   `H2StreamTable.stream_fc_stalled_progress: BTreeMap<StreamId, usize>` (the
   cumulative-stall budget). Armed (in `ConnectionH2::poll_write_target`) whenever a stream holds
   sendable buffered data it cannot send because its effective send window
-  `min(stream.window, connection.window)` is exhausted. This is
+  `min(stream window, connection.window)` is exhausted (the stream window is
+  this connection's leg: `Stream::front_window` on a frontend connection,
+  `Stream::back_window` on a backend one). This is
   **bidirectional**: the buffered data is the **response** on a `Position::Server`
   (frontend) connection and the **request upload** on a `Position::Client`
   (backend) connection — so a slot pinned by a stalled upload to a slow H2 backend
@@ -2595,7 +2598,7 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
 
     - **The accumulator can still leak `is_in_progress() == true` across
       streams if a READ-side early return skips retiring it.**
-      `handle_headers_frame`'s RFC 9113 §5.3.1 PRIORITY self-dependency
+      `handle_headers_frame`'s RFC 7540 §5.3.1 PRIORITY self-dependency
       branch (`reset_stream` + `remove_dead_stream`, then `return`) used to
       do exactly that: when the aborted stream's block had gone through
       CONTINUATION reassembly, the flag stayed `true`, and the NEXT HEADERS

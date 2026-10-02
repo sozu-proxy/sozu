@@ -749,7 +749,7 @@ pub struct ListenerBuilder {
     /// H2 flood detection: max accumulated protocol anomalies before
     /// ENHANCE_YOUR_CALM. Default: 2000.
     pub h2_max_glitch_count: Option<u32>,
-    /// H2 connection-level receive window size in bytes (RFC 9113 §6.9.2). Default: 1048576 (1MB).
+    /// H2 connection-level receive window size in bytes (RFC 9113 §6.9.2). Default: 16777216 (16 MiB).
     pub h2_initial_connection_window: Option<u32>,
     /// Maximum concurrent H2 streams (SETTINGS_MAX_CONCURRENT_STREAMS). Default: 100.
     pub h2_max_concurrent_streams: Option<u32>,
@@ -2712,7 +2712,9 @@ pub struct FileClusterConfig {
     /// `max_connections_per_ip`. `Some(0)` is explicit "unlimited for
     /// this cluster". `Some(n > 0)` overrides with the cluster-specific
     /// limit. The source IP is taken from the parsed proxy-protocol
-    /// header when present, else `peer_addr`.
+    /// header when present, else `peer_addr`. On a UDP cluster it limits
+    /// concurrent flows per datagram source address; UDP never inherits the
+    /// global default.
     pub max_connections_per_ip: Option<u64>,
     /// Override the global per-(cluster, source-SUBNET) connection limit
     /// for this cluster. Same three-state semantics as
@@ -4408,7 +4410,8 @@ pub struct Config {
     /// Default per-(cluster, source-IP) connection limit. `0` means
     /// unlimited. Each cluster may override via its own
     /// `max_connections_per_ip`. Source IP attribution honours the
-    /// proxy-protocol header when present.
+    /// proxy-protocol header when present. UDP listeners ignore it: only a
+    /// cluster's own value limits UDP flows.
     #[serde(default = "default_max_connections_per_ip")]
     pub max_connections_per_ip: u64,
     /// Default per-(cluster, source-SUBNET) connection limit. `0` means

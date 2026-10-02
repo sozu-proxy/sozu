@@ -129,6 +129,8 @@ max_connections = 500
 #   - HTTP/HTTPS clients receive `429 Too Many Requests` (with optional
 #     `Retry-After`).
 #   - TCP clients see a graceful FIN before any backend connect.
+#   - UDP listeners ignore this global default: only a cluster's own
+#     `max_connections_per_ip` limits its UDP flows.
 # Each cluster may override this default via its own `max_connections_per_ip`
 # field. Counts are kept per `(cluster_id, source_ip)`, so two clusters never
 # share a counter even from the same IP.
@@ -155,6 +157,7 @@ max_connections = 500
 # together mean "10 per IP AND 100 per subnet".
 #
 # Each cluster may override via its own `max_connections_per_subnet`.
+# UDP listeners ignore this global default, as for `max_connections_per_ip`.
 # max_connections_per_subnet = 0
 
 # Prefix lengths, in bits, that define a "subnet" for the counter above.
@@ -498,7 +501,7 @@ cipher_list = [
 # alpn_protocols = ["h2"]
 
 # H2 connection tuning (optional, defaults shown)
-# h2_initial_connection_window = 1048576  # 1MB, min 65535, max 2147483647
+# h2_initial_connection_window = 16777216 # 16 MiB, min 65535, max 2147483647
 # h2_max_concurrent_streams = 100         # min 1
 # h2_stream_shrink_ratio = 2              # min 2
 

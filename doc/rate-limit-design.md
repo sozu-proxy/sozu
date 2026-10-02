@@ -243,6 +243,9 @@ means. Two enforcement points:
 - **Raw TCP** (`lib/src/tcp.rs`) — TCP clients see a graceful FIN
   before any backend connect — no SO_LINGER trick, no RST.
 
+UDP has its own enforcement point, described in §3.5.1, because a UDP
+listener counts flows rather than connections.
+
 ### 3.4 Reject behaviour (HTTP / HTTPS)
 
 - Status: `429 Too Many Requests` (RFC 6585).
@@ -263,6 +266,45 @@ custom templates can opt into keep-alive by omitting the
 - Graceful FIN — no `SO_LINGER` reset trick, no `TCP RST`. The client
   sees a normal close before any backend connect attempt.
 - Same counter `connections.rejected_per_cluster_ip` increments.
+
+### 3.5.1 UDP flows
+
+A UDP cluster can apply the same two knobs to **flows**, opt-in. Each client
+source IP and port is its own flow, with its own connected upstream
+socket and `max_flows` slot, so without a per-source cap one address —
+one NAT, or one host cycling source ports — can hold every slot for an
+idle timeout.
+
+- **Counted unit**: one flow, per `(cluster, source IP)` and per
+  `(cluster, masked source subnet)`, with the same prefixes and the
+  same IPv4-mapped canonicalisation as above (`subnet_key`).
+- **Limits**: the cluster's own `max_connections_per_ip` /
+  `max_connections_per_subnet` only, resolved by the UDP shell
+  (`UdpProxy::cluster_config_for`, `lib/src/udp.rs`) into the flow
+  manager's `ClusterConfig`; an absent value is unlimited. The global
+  defaults (and `SetMaxConnectionsPerIp` / `SetMaxConnectionsPerSubnet`)
+  are deliberately **not** inherited: a global cap tuned for HTTP/TCP
+  connections would otherwise start dropping UDP flows on upgrade — a
+  DNS resolver on one address sends from many ports. The subnet
+  prefixes are the worker's boot-time ones.
+- **Enforcement**: `UdpManager::on_client_datagram`
+  (`lib/src/protocol/udp/manager.rs`), for a datagram that would open a
+  new flow, after the drain check and before the `max_flows` check.
+  Datagrams of an existing flow are never refused.
+- **Source address**: the datagram source. Inbound PROXY protocol is
+  not supported on UDP listeners.
+- **Reject**: the datagram is dropped (`DropReason::Shed`), nothing is
+  allocated; `udp.flows.shed` and `udp.flows.shed.source_limit`
+  increment.
+- **Release**: the flow's close (idle timeout, `responses` / `requests`
+  reached, drain, failed upstream connect) decrements both counters.
+- **Scope**: the counters live in the flow manager, one per UDP
+  listener, and are separate from the TCP/HTTP connection counters. Two
+  UDP listeners routed to one cluster each admit the limit.
+- **Counting is unconditional**: every flow is counted whatever the
+  limit, so a limit set at runtime (an `AddCluster` upsert) applies to
+  the flows already open. Skipping the bookkeeping while both limits
+  are `0`, as the TCP subnet counter does, would lose that.
 
 ### 3.6 Source IP selection
 
@@ -395,6 +437,7 @@ in their config to make it durable across restarts.
 | ------------------------------------- | ------- | --------------------------------------------------------- |
 | `connections.rejected_per_cluster_ip` | counter | per-cluster reject count (cluster-labelled)               |
 | `client.connect.per_source.bucket_*`  | counter | per-IP accept-queue admission histogram (already shipped) |
+| `udp.flows.shed.source_limit`         | counter | UDP flows dropped at a per-source limit (§3.5.1)          |
 
 The single counter `connections.rejected_per_cluster_ip` (with the
 `cluster_id` label) is the durable signal. Operators wanting per-IP
@@ -421,6 +464,15 @@ End-to-end tests in `e2e/src/tests/cluster_ip_limit_tests.rs`:
 - **TCP**: a TCP listener with `max_connections_per_ip = 1` accepts
   the first connection but closes the second one gracefully (FIN, no
   RST) without dialling the backend.
+
+UDP flows (§3.5.1): `test_udp_per_ip_flow_limit` in
+`e2e/src/tests/udp_tests.rs` (a third socket of one address is
+dropped, another address is admitted, an idle-closed flow frees its
+slot); the per-IP, per-subnet, runtime-limit and slot-release unit
+tests in `lib/src/protocol/udp/manager.rs`; and
+`udp_flow_limits_come_from_the_cluster_not_the_global_defaults` in
+`lib/src/server.rs` (a global limit does not shed UDP, a cluster one
+does).
 
 H2 frontend cells are not in this test file — they are tracked under
 `e2e/src/tests/protocol_pair_matrix.rs` as a deferred matrix backfill

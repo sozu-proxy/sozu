@@ -41,6 +41,7 @@
 //! - HEADERS flood exceeding MAX_CONCURRENT_STREAMS (RFC 9113 §5.1.2)
 //! - CONTINUATION without preceding HEADERS (RFC 9113 §6.10)
 //! - Padded DATA frame body integrity + flow-control credit accounting (RFC 9113 §6.1, §6.9)
+//! - Stream errors reset one stream and spare the others (RFC 9113 §5.1, §5.4.2, §6.3, §8.1.1)
 
 use std::{
     io::{Read, Write},
@@ -64,12 +65,13 @@ use sozu_command_lib::{
 
 use super::h2_utils::{
     H2_ERROR_ENHANCE_YOUR_CALM, H2_ERROR_FRAME_SIZE_ERROR, H2_ERROR_PROTOCOL_ERROR,
-    H2_ERROR_REFUSED_STREAM, H2_FRAME_DATA, H2_FRAME_HEADERS, H2_FRAME_SETTINGS, H2Frame,
-    collect_response_frames, contains_goaway, contains_goaway_with_error,
-    contains_headers_response, contains_rst_stream, h2_handshake, h2_handshake_with_initial_window,
-    log_frames, parse_h2_frames, raw_h2_connection, read_all_available,
-    rejected_with_goaway_or_rst, setup_h2_listener_only, setup_h2_test, stream_status_matches,
-    teardown, verify_sozu_alive,
+    H2_ERROR_REFUSED_STREAM, H2_FLAG_END_STREAM, H2_FRAME_DATA, H2_FRAME_HEADERS,
+    H2_FRAME_SETTINGS, H2Frame, collect_response_frames, contains_goaway,
+    contains_goaway_with_error, contains_headers_response, contains_rst_stream,
+    contains_rst_stream_with_error, extract_rst_streams, goaway_error_code, h2_handshake,
+    h2_handshake_with_initial_window, log_frames, parse_h2_frames, raw_h2_connection,
+    read_all_available, rejected_with_goaway_or_rst, setup_h2_listener_only, setup_h2_test,
+    stream_status_matches, teardown, verify_sozu_alive,
 };
 use crate::{
     mock::{
@@ -4312,5 +4314,137 @@ fn h2_400_terms_decode_the_status_field_not_the_0x8d_byte() {
     assert!(
         !stream_status_matches(&routed_404, 3, 404),
         "a HEADERS frame on stream 1 must not answer for stream 3"
+    );
+}
+
+// ============================================================================
+// Stream errors reset one stream and spare the others (RFC 9113 §5.4.2)
+// ============================================================================
+
+/// RFC 9113 §7 error code STREAM_CLOSED.
+const H2_ERROR_STREAM_CLOSED: u32 = 0x5;
+
+/// `:method POST`, `:path /`, `:scheme https`, `:authority localhost`.
+const POST_LOCALHOST: [u8; 14] = [
+    0x83, 0x84, 0x87, 0x41, 0x09, b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+];
+/// `:method GET`, `:path /`, `:scheme https`, `:authority localhost`.
+const GET_LOCALHOST: [u8; 14] = [
+    0x82, 0x84, 0x87, 0x41, 0x09, b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+];
+/// A trailer field block: `x-a: b`, literal without indexing.
+const TRAILER_X_A: [u8; 7] = [0x00, 0x03, b'x', b'-', b'a', 0x01, b'b'];
+
+/// Open stream 1 as an in-flight POST, write `offending` on another stream,
+/// then end stream 1's body, all in one write so the frames are processed
+/// while stream 1 is still in flight. Returns the frames Sōzu sent back and
+/// whether the worker stayed healthy.
+fn run_beside_an_in_flight_stream(
+    name: &str,
+    offending: &[u8],
+) -> (Vec<(u8, u8, u32, Vec<u8>)>, bool) {
+    let (worker, backends, front_port) = setup_h2_test(name, 1);
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    let mut bytes = H2Frame::headers(1, POST_LOCALHOST.to_vec(), true, false).encode();
+    bytes.extend(H2Frame::data(1, b"first".to_vec(), false).encode());
+    bytes.extend_from_slice(offending);
+    bytes.extend(H2Frame::data(1, b"last".to_vec(), true).encode());
+    tls.write_all(&bytes).unwrap();
+    tls.flush().unwrap();
+
+    let frames = collect_response_frames(&mut tls, 500, 5, 500);
+    log_frames(name, &frames);
+    let infra_ok = teardown(tls, front_port, worker, backends);
+    (frames, infra_ok)
+}
+
+/// The in-flight stream 1 got its whole response and the connection was
+/// never closed.
+fn assert_stream_1_completed(frames: &[(u8, u8, u32, Vec<u8>)], infra_ok: bool) {
+    assert!(infra_ok, "the worker must stay healthy");
+    assert!(
+        !contains_goaway(frames),
+        "a stream error must not close the connection: {:?}",
+        goaway_error_code(frames)
+    );
+    assert!(
+        stream_status_matches(frames, 1, 200),
+        "the in-flight stream 1 must receive its response"
+    );
+    assert!(
+        frames.iter().any(|(t, fl, sid, _)| *sid == 1
+            && (*t == H2_FRAME_DATA || *t == H2_FRAME_HEADERS)
+            && fl & H2_FLAG_END_STREAM != 0),
+        "the in-flight stream 1 must complete with END_STREAM"
+    );
+}
+
+/// RFC 9113 §5.1: DATA on a half-closed (remote) stream is a stream error
+/// of type STREAM_CLOSED.
+#[test]
+fn test_h2_data_on_half_closed_remote_stream_resets_only_that_stream() {
+    let mut offending = H2Frame::headers(3, GET_LOCALHOST.to_vec(), true, true).encode();
+    offending.extend(H2Frame::data(3, b"late".to_vec(), false).encode());
+    let (frames, infra_ok) = run_beside_an_in_flight_stream("H2-HALF-CLOSED-DATA", &offending);
+    assert_stream_1_completed(&frames, infra_ok);
+    assert!(
+        contains_rst_stream_with_error(&frames, 3, H2_ERROR_STREAM_CLOSED),
+        "stream 3 must be reset with STREAM_CLOSED: {:?}",
+        extract_rst_streams(&frames)
+    );
+}
+
+/// RFC 9113 §8.1, §8.1.1: a HEADERS frame without END_STREAM after the
+/// request header section makes the request malformed, a stream error of
+/// type PROTOCOL_ERROR.
+#[test]
+fn test_h2_trailers_without_end_stream_reset_only_that_stream() {
+    let mut offending = H2Frame::headers(3, POST_LOCALHOST.to_vec(), true, false).encode();
+    offending.extend(H2Frame::data(3, b"body".to_vec(), false).encode());
+    offending.extend(H2Frame::headers(3, TRAILER_X_A.to_vec(), true, false).encode());
+    let (frames, infra_ok) = run_beside_an_in_flight_stream("H2-TRAILERS-NO-ES", &offending);
+    assert_stream_1_completed(&frames, infra_ok);
+    assert!(
+        contains_rst_stream_with_error(&frames, 3, H2_ERROR_PROTOCOL_ERROR),
+        "stream 3 must be reset with PROTOCOL_ERROR: {:?}",
+        extract_rst_streams(&frames)
+    );
+}
+
+/// RFC 9113 §5.1: frames received on a stream after sending RST_STREAM on
+/// it are ignored. Stream 3 declares `content-length: 1`, sends more, is
+/// reset with PROTOCOL_ERROR (§8.1.1), then its trailers arrive.
+#[test]
+fn test_h2_frames_after_our_rst_stream_are_ignored() {
+    let mut request = POST_LOCALHOST.to_vec();
+    // content-length: 1, literal without indexing, static name index 28.
+    request.extend_from_slice(&[0x0f, 0x0d, 0x01, b'1']);
+    let mut offending = H2Frame::headers(3, request, true, false).encode();
+    offending.extend(H2Frame::data(3, b"too long".to_vec(), false).encode());
+    offending.extend(H2Frame::headers(3, TRAILER_X_A.to_vec(), true, true).encode());
+    let (frames, infra_ok) = run_beside_an_in_flight_stream("H2-AFTER-OUR-RST", &offending);
+    assert_stream_1_completed(&frames, infra_ok);
+    assert_eq!(
+        extract_rst_streams(&frames),
+        vec![(3, H2_ERROR_PROTOCOL_ERROR)],
+        "stream 3 must be reset once, and its later frames ignored"
+    );
+}
+
+/// RFC 9113 §6.3: a PRIORITY frame with a length other than 5 octets is a
+/// stream error of type FRAME_SIZE_ERROR.
+#[test]
+fn test_h2_priority_with_bad_length_resets_only_that_stream() {
+    let mut offending = H2Frame::headers(3, POST_LOCALHOST.to_vec(), true, false).encode();
+    offending.extend(H2Frame::new(0x2, 0, 3, vec![0, 0, 0, 0]).encode());
+    let (frames, infra_ok) = run_beside_an_in_flight_stream("H2-PRIORITY-BAD-LEN", &offending);
+    assert_stream_1_completed(&frames, infra_ok);
+    assert!(
+        contains_rst_stream_with_error(&frames, 3, H2_ERROR_FRAME_SIZE_ERROR),
+        "stream 3 must be reset with FRAME_SIZE_ERROR: {:?}",
+        extract_rst_streams(&frames)
     );
 }

@@ -16,7 +16,10 @@ use std::{
 use mio::Token;
 use sozu_command::logging::ansi_palette;
 
-use super::{GenericHttpStream, Position, h2::MetricEvent};
+use super::{
+    GenericHttpStream, Position,
+    h2::{DEFAULT_INITIAL_WINDOW_SIZE, MetricEvent},
+};
 use crate::metrics::names;
 use crate::{
     L7ListenerHandler, ListenerHandler, Protocol, SessionMetrics,
@@ -197,7 +200,20 @@ impl DerefMut for ReplayCapture {
 }
 
 pub struct Stream {
-    pub window: i32,
+    /// RFC 9113 §6.9 send window of this stream on the FRONTEND connection:
+    /// the credit the client granted for the response DATA Sōzu writes to
+    /// it. Sized by the client's `SETTINGS_INITIAL_WINDOW_SIZE` when the
+    /// stream is created and moved only by that connection's SETTINGS and
+    /// WINDOW_UPDATE frames. Unused when the frontend speaks H1.
+    pub front_window: i32,
+    /// RFC 9113 §6.9 send window of this stream on the BACKEND connection:
+    /// the credit the H2 backend granted for the request DATA Sōzu writes
+    /// to it. Flow control is hop-by-hop, so it is independent of
+    /// [`Self::front_window`]: `ConnectionH2::start_stream` sizes it from the
+    /// backend's `SETTINGS_INITIAL_WINDOW_SIZE` each time the stream is
+    /// opened on a backend connection, and only that connection's SETTINGS
+    /// and WINDOW_UPDATE frames move it. Unused when the backend speaks H1.
+    pub back_window: i32,
     pub attempts: u8,
     pub state: StreamState,
     /// True when the frontend connection has received end_of_stream from the client.
@@ -294,7 +310,8 @@ impl Debug for KawaSummary<'_> {
 impl Debug for Stream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Stream")
-            .field("window", &self.window)
+            .field("front_window", &self.front_window)
+            .field("back_window", &self.back_window)
             .field("attempts", &self.attempts)
             .field("state", &self.state)
             .field(
@@ -324,6 +341,8 @@ impl Debug for Stream {
 /// This struct allows to mutably borrow the read and write buffers (dependant on the position)
 /// as well as the context and metrics of a Stream at the same time
 pub struct StreamParts<'a> {
+    /// This connection's send window for the stream: [`Stream::back_window`]
+    /// on a backend connection, [`Stream::front_window`] on a frontend one.
     pub window: &'a mut i32,
     pub rbuffer: &'a mut GenericHttpStream,
     pub wbuffer: &'a mut GenericHttpStream,
@@ -361,7 +380,8 @@ impl Stream {
         let stream = Self {
             state: StreamState::Idle,
             attempts: 0,
-            window: i32::try_from(window).unwrap_or(i32::MAX),
+            front_window: i32::try_from(window).unwrap_or(i32::MAX),
+            back_window: i32::try_from(DEFAULT_INITIAL_WINDOW_SIZE).unwrap_or(i32::MAX),
             front_received_end_of_stream: false,
             back_received_end_of_stream: false,
             front_data_received: 0,
@@ -464,6 +484,18 @@ impl Stream {
         front_done && back_done
     }
 
+    /// The RFC 9113 §6.9 send window the connection at `position` holds for
+    /// this stream: [`Self::back_window`] on a backend connection
+    /// (`Position::Client`), [`Self::front_window`] on a frontend one. The
+    /// same selection as [`Self::split`]'s `window`, for the paths that
+    /// adjust a window without splitting the stream.
+    pub fn send_window_mut(&mut self, position: &Position) -> &mut i32 {
+        match position {
+            Position::Client(..) => &mut self.back_window,
+            Position::Server => &mut self.front_window,
+        }
+    }
+
     pub fn split(&mut self, position: &Position) -> StreamParts<'_> {
         // Pre: the front buffer always parses requests and the back buffer
         // always parses responses. `split` only re-labels them as read/write
@@ -480,7 +512,7 @@ impl Stream {
         );
         match position {
             Position::Client(..) => StreamParts {
-                window: &mut self.window,
+                window: &mut self.back_window,
                 rbuffer: &mut self.back,
                 wbuffer: &mut self.front,
                 received_end_of_stream: &mut self.back_received_end_of_stream,
@@ -491,7 +523,7 @@ impl Stream {
                 front_bound_to_backend: &mut self.front_bound_to_backend,
             },
             Position::Server => StreamParts {
-                window: &mut self.window,
+                window: &mut self.front_window,
                 rbuffer: &mut self.front,
                 wbuffer: &mut self.back,
                 received_end_of_stream: &mut self.front_received_end_of_stream,
