@@ -2234,8 +2234,14 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     after a write that answered `Continue`; re-raising it after a blocked one
     spun the inner loop to the budget when a TLS client stopped reading
     ([#1780](https://github.com/sozu-proxy/sozu/issues/1780)).
-    `ConnectionH2` still re-raises it after a blocked write
-    ([#1788](https://github.com/sozu-proxy/sozu/issues/1788)).
+    `ConnectionH2` follows the same rule through
+    `ConnectionH2::ensure_tls_flushed`: it raises no synthetic WRITABLE when
+    the latest socket write of the pass answered `WouldBlock`, and consumes
+    the event instead ([#1788](https://github.com/sozu-proxy/sozu/issues/1788);
+    see "Keeping the connection open is not re-arming it" below). On a TLS
+    frontend an `Error` write also marks the channel dead
+    (`FrontRustls::peer_reset`, `lib/src/socket.rs`), so the records rustls
+    still holds stop reading as a pending write on both protocols.
 13. **`shrink_trailing_recycle` runs only from `create_stream`.** Calling it
     from elsewhere can invalidate cached `GlobalStreamId` values (including
     `expect_write`/`expect_read`) that the caller is not prepared to re-check.
@@ -3009,11 +3015,11 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     memory and attaches it to a loopback socket whose kernel queues are pinned
     small, so `socket_wants_write()` answers `true` because rustls really is
     holding records it could not push;
-    `a_rustls_frontend_in_error_state_re_arms_until_its_records_drain` drives
+    `a_rustls_frontend_in_error_state_stays_open_until_its_records_drain` drives
     the `(H2State::Error, Position::Server)` arm over it,
     `force_disconnect_over_a_real_rustls_frontend_waits_for_the_records_to_drain`
     drives `force_disconnect`'s server arm, and
-    `a_rustls_frontend_in_goaway_re_arms_until_its_records_drain` drives the
+    `a_rustls_frontend_in_goaway_stays_open_until_its_records_drain` drives the
     `H2State::GoAway` arm, each asserting both answers on one connection whose
     only change between them is whether the peer read. The GoAway one also
     asserts the state is still `GoAway`, because falling through that arm
@@ -3036,10 +3042,13 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     flushes whose status nothing else reads. The decisions above are
     unchanged: they still read `tls_wants_write`, and a connection with
     records pending keeps WRITABLE interest. The two real-rustls tests above
-    assert that the refused pass queues no event and that the pass the kernel
-    edge triggers flushes the records and closes;
-    `a_refused_goaway_flush_waits_for_the_kernel_edge_then_closes` does the
-    same over `BackpressuredTlsSocket`, and
+    assert that the refused pass queues no event and, once the records have
+    drained (the test drains them itself), that the next pass closes;
+    `a_refused_goaway_flush_waits_for_the_kernel_edge_then_closes` checks over
+    `BackpressuredTlsSocket` that the pass the kernel edge triggers flushes
+    the records and disconnects, `a_refused_control_frame_drain_leaves_writable_to_the_kernel`
+    and `a_refused_stream_write_leaves_writable_to_the_kernel` cover the
+    control-frame flush and the stream write, and
     `test_tls_h2_stalled_reader_does_not_exhaust_loop_budget`
     (`e2e/src/tests/h2_tests.rs`) end to end.
 
