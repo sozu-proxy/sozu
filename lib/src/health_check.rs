@@ -1,10 +1,15 @@
-//! Non-blocking HTTP health checks for backends
+//! Non-blocking health checks for backends
 //!
 //! Health checks run within the single-threaded mio event loop using non-blocking TCP
 //! connections. Each check cycle is triggered by a timer. For each backend with a
-//! configured health check, we open a non-blocking TCP connection, send a minimal
-//! HTTP/1.1 GET request, parse the status line from the response, and update the
-//! backend's health state accordingly.
+//! configured health check, we open a non-blocking TCP connection, then either:
+//!
+//! - `HealthCheckMode::Http`: send a minimal HTTP/1.1 (or h2c) GET request, parse the
+//!   response status and judge it against the accepted statuses;
+//! - `HealthCheckMode::Tcp`: send nothing and count the probe as passed once the
+//!   connection is established, then close it.
+//!
+//! The result updates the backend's health state accordingly.
 
 use std::{
     cell::RefCell,
@@ -18,7 +23,7 @@ use std::{
 
 use mio::{Interest, Registry, Token, net::TcpStream};
 use sozu_command::{
-    proto::command::{Event, EventKind, HealthCheckConfig},
+    proto::command::{Event, EventKind, HealthCheckConfig, HealthCheckMode},
     state::ClusterId,
 };
 
@@ -94,6 +99,10 @@ struct InFlightCheck {
     /// record avoids racing the cluster's `http2` flag if the
     /// operator flips it mid-probe.
     h2c: bool,
+    /// `HealthCheckMode::Tcp`: the probe passes once the connection is
+    /// established; nothing is written or read. Captured at probe-creation
+    /// time for the same reason as `h2c`.
+    tcp_connect_only: bool,
 }
 
 /// Manages health checks across all clusters and backends
@@ -292,6 +301,14 @@ impl HealthChecker {
             // here, no defense-in-depth divergence between what the
             // operator typed and what hits the wire.
             let probe_uri = config.uri.as_str();
+            let tcp_connect_only = config.mode == HealthCheckMode::Tcp as i32;
+            // A connect-only probe never writes or reads: it waits for the
+            // writability that signals the end of the handshake.
+            let interest = if tcp_connect_only {
+                Interest::WRITABLE
+            } else {
+                Interest::READABLE | Interest::WRITABLE
+            };
 
             for (backend_id, address) in backends_to_check {
                 match TcpStream::connect(address) {
@@ -310,11 +327,7 @@ impl HealthChecker {
                             );
                             continue;
                         };
-                        if let Err(e) = registry.register(
-                            &mut stream,
-                            token,
-                            Interest::READABLE | Interest::WRITABLE,
-                        ) {
+                        if let Err(e) = registry.register(&mut stream, token, interest) {
                             debug!(
                                 "{} failed to register socket for {} ({}) in cluster {}: {}",
                                 log_context!(),
@@ -340,8 +353,10 @@ impl HealthChecker {
                             address,
                             cluster_id
                         );
-                        let request_bytes = if h2c {
-                            build_h2c_probe_bytes(probe_uri, address)
+                        let request_bytes = if tcp_connect_only {
+                            None
+                        } else if h2c {
+                            Some(build_h2c_probe_bytes(probe_uri, address))
                         } else {
                             // RFC 9110 §7.2: `Host` MUST carry the
                             // authority component, including the port
@@ -356,11 +371,20 @@ impl HealthChecker {
                             // a per-cluster `host` field on
                             // `HealthCheckConfig` is tracked as a
                             // follow-up.
-                            format!(
-                                "GET {probe_uri} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+                            Some(
+                                format!(
+                                    "GET {probe_uri} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+                                )
+                                .into_bytes(),
                             )
-                            .into_bytes()
                         };
+                        // A connect-only probe carries no request; every
+                        // HTTP probe carries one.
+                        debug_assert_eq!(
+                            request_bytes.is_none(),
+                            tcp_connect_only,
+                            "only a TCP-mode probe may skip the HTTP request"
+                        );
                         self.in_flight.push(InFlightCheck {
                             stream,
                             token,
@@ -369,11 +393,12 @@ impl HealthChecker {
                             address,
                             started_at: now,
                             timeout: Duration::from_secs(u64::from(config.timeout)),
-                            request_bytes: Some(request_bytes),
+                            request_bytes,
                             write_offset: 0,
                             response_buf: Vec::with_capacity(256),
                             config: config.to_owned(),
                             h2c,
+                            tcp_connect_only,
                         });
                     }
                     Err(e) => {
@@ -444,6 +469,20 @@ impl HealthChecker {
 
             // Skip I/O if the socket has not been reported ready by mio
             if !ready.contains(&check.token) {
+                continue;
+            }
+
+            if check.tcp_connect_only {
+                // Nothing to send: the probe only waits for the handshake.
+                // Dropping the stream after `deregister` closes it: a FIN
+                // while the receive queue is empty, which is the usual case
+                // since nothing was asked for. A backend that greets first
+                // (an SMTP or SSH banner) and whose bytes already arrived
+                // makes the kernel answer the close with an RST instead;
+                // the probe never reads them, and the verdict is the same.
+                if let Some(success) = tcp_connect_outcome(&check.stream) {
+                    completed.push((idx, success));
+                }
                 continue;
             }
 
@@ -749,35 +788,100 @@ fn parse_probe_response(buf: &[u8], config: &HealthCheckConfig, h2c: bool) -> Op
     }
 }
 
+/// Judge the final HTTP/1.1 response: interim `1xx` responses (RFC 9110
+/// §15.2, e.g. `100 Continue` or `103 Early Hints`) are skipped, header
+/// section included, so the verdict is the status of the response that
+/// follows them. `101 Switching Protocols` is final. `None` means the
+/// final status line has not fully arrived yet.
 fn try_parse_status_line(buf: &[u8], config: &HealthCheckConfig) -> Option<bool> {
-    let response = std::str::from_utf8(buf).ok()?;
-    let first_line_end = response.find("\r\n")?;
-    let status_line = &response[..first_line_end];
-    // The status line is the prefix before the first CRLF, so it can never be
-    // longer than the buffer it was sliced from.
-    debug_assert!(
-        status_line.len() < response.len(),
-        "status line must be a strict prefix ending before the CRLF"
-    );
+    let mut head = buf;
+    loop {
+        let line_end = find_subslice(head, b"\r\n")?;
+        let status_line = std::str::from_utf8(&head[..line_end]).ok()?;
+        // The status line is the prefix before the first CRLF, so it can
+        // never be longer than the buffer it was sliced from.
+        debug_assert!(
+            status_line.len() < head.len(),
+            "status line must be a strict prefix ending before the CRLF"
+        );
 
-    let (_, rest) = status_line.split_once(' ')?;
-    let status_str = rest.split(' ').next()?;
-    let status_code: u32 = status_str.parse().unwrap_or(0);
-    Some(is_status_healthy(status_code, config.expected_status))
+        let (_, rest) = status_line.split_once(' ')?;
+        let status_str = rest.split(' ').next()?;
+        let status_code: u32 = status_str.parse().unwrap_or(0);
+        if !is_interim_status(status_code) {
+            return Some(is_status_healthy(status_code, config));
+        }
+        // An interim response ends with its (possibly empty) header section.
+        let head_end = find_subslice(head, b"\r\n\r\n")? + 4;
+        debug_assert!(
+            head_end > line_end && head_end <= head.len(),
+            "skipping an interim response must consume at least its status line"
+        );
+        head = &head[head_end..];
+    }
 }
 
-fn is_status_healthy(actual: u32, expected: u32) -> bool {
-    let healthy = if expected == 0 {
+/// Interim (informational) statuses precede the final response; `101`
+/// ends the HTTP exchange and is final for the probe.
+fn is_interim_status(status: u32) -> bool {
+    (100..200).contains(&status) && status != 101
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Outcome of a connect-only probe on a readiness event: `Some(true)` once
+/// the handshake completed, `Some(false)` when the socket reports an error
+/// (refused, unreachable, reset), `None` while the connect is still in
+/// progress — mio may report writability before it completes, which
+/// `peer_addr` answers with `NotConnected`.
+fn tcp_connect_outcome(stream: &TcpStream) -> Option<bool> {
+    match stream.take_error() {
+        Ok(None) => {}
+        Ok(Some(_)) | Err(_) => return Some(false),
+    }
+    match stream.peer_addr() {
+        Ok(_) => Some(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotConnected => None,
+        Err(_) => Some(false),
+    }
+}
+
+/// Whether an HTTP probe's response status passes: within one of
+/// `accepted_statuses` when that list is set, otherwise any 2xx for
+/// `expected_status == 0` or exactly `expected_status`. Validation
+/// (`validate_health_check_config` in `command/src/config.rs`) refuses
+/// a config that sets both, so the list never silently overrides a
+/// non-zero `expected_status`.
+fn is_status_healthy(actual: u32, config: &HealthCheckConfig) -> bool {
+    let expected = config.expected_status;
+    let healthy = if !config.accepted_statuses.is_empty() {
+        config
+            .accepted_statuses
+            .iter()
+            .any(|range| (range.start..=range.end).contains(&actual))
+    } else if expected == 0 {
         (200..300).contains(&actual)
     } else {
         actual == expected
     };
-    // When a specific status is required, health is exact equality; the two
-    // branches must never both claim healthy for the same inputs unless the
-    // expected code is itself a 2xx.
+    // Without a list, a specific expected status means exact equality.
     debug_assert!(
-        expected == 0 || healthy == (actual == expected),
+        !config.accepted_statuses.is_empty() || expected == 0 || healthy == (actual == expected),
         "with a specific expected status, health must be exact equality"
+    );
+    // With a list, health is membership in it and nothing else.
+    debug_assert!(
+        config.accepted_statuses.is_empty()
+            || healthy
+                == config
+                    .accepted_statuses
+                    .iter()
+                    .any(|range| range.start <= actual && actual <= range.end),
+        "with accepted statuses, health must be membership in one of the ranges"
     );
     healthy
 }
@@ -847,8 +951,9 @@ fn build_h2c_probe_bytes(uri: &str, address: SocketAddr) -> Vec<u8> {
 ///
 /// Returns:
 ///
-/// * `Some(true)` — `:status` decoded and matches
-///   `config.expected_status` (or any 2xx when `expected_status == 0`).
+/// * `Some(true)` — the final `:status` decoded and passes [`is_status_healthy`]
+///   (`config.accepted_statuses`, else `config.expected_status`); interim
+///   `1xx` HEADERS blocks before it are skipped.
 /// * `Some(false)` — `:status` decoded but does not match, the HPACK
 ///   block was malformed, or a GOAWAY frame arrived.
 /// * `None` — buffer truncated mid-frame; caller should keep reading.
@@ -871,6 +976,9 @@ fn try_parse_h2c_status(buf: &[u8], config: &HealthCheckConfig) -> Option<bool> 
     // connection, but we still tolerate interleaved control frames
     // for robustness — the decoder only fires on END_HEADERS.
     let mut headers_block: Option<Vec<u8>> = None;
+    // One HPACK decoder for the whole walk: an interim HEADERS block may
+    // insert into the dynamic table the final block then references.
+    let mut decoder = crate::protocol::mux::hpack::Decoder::new();
 
     while !remaining.is_empty() {
         // The `mux::parser::frame_header` is built from `nom::number::complete`
@@ -934,9 +1042,16 @@ fn try_parse_h2c_status(buf: &[u8], config: &HealthCheckConfig) -> Option<bool> 
                 let mut accumulator = headers_block.take().unwrap_or_default();
                 accumulator.extend_from_slice(block);
                 if header.flags & FLAG_END_HEADERS != 0 {
-                    return Some(decode_status_from_block(&accumulator, config));
+                    match decode_status_from_block(&mut decoder, &accumulator) {
+                        // RFC 9113 §8.1: interim responses arrive as their
+                        // own HEADERS before the final one; keep walking.
+                        Some(code) if is_interim_status(code) => {}
+                        Some(code) => return Some(is_status_healthy(code, config)),
+                        None => return Some(false),
+                    }
+                } else {
+                    headers_block = Some(accumulator);
                 }
-                headers_block = Some(accumulator);
             }
             FrameType::Continuation if header.stream_id == 1 => {
                 // CONTINUATION carries no padding/priority flags; the
@@ -948,9 +1063,16 @@ fn try_parse_h2c_status(buf: &[u8], config: &HealthCheckConfig) -> Option<bool> 
                 };
                 accumulator.extend_from_slice(payload);
                 if header.flags & FLAG_END_HEADERS != 0 {
-                    return Some(decode_status_from_block(&accumulator, config));
+                    match decode_status_from_block(&mut decoder, &accumulator) {
+                        // RFC 9113 §8.1: interim responses arrive as their
+                        // own HEADERS before the final one; keep walking.
+                        Some(code) if is_interim_status(code) => {}
+                        Some(code) => return Some(is_status_healthy(code, config)),
+                        None => return Some(false),
+                    }
+                } else {
+                    headers_block = Some(accumulator);
                 }
-                headers_block = Some(accumulator);
             }
             FrameType::GoAway => return Some(false),
             // SETTINGS, SETTINGS-ACK, DATA, PING, etc. — keep walking
@@ -965,8 +1087,10 @@ fn try_parse_h2c_status(buf: &[u8], config: &HealthCheckConfig) -> Option<bool> 
 
 /// Trim the optional 1-byte pad-length prefix and the 5-byte priority
 /// dependency (RFC 9113 §6.2). Returns `None` when the flags claim
-/// padding/priority but the payload is too short to satisfy them — the
-/// caller turns that into `Some(false)` (probe unhealthy).
+/// padding/priority but the payload is too short to satisfy them; the
+/// HEADERS arm of `try_parse_h2c_status` propagates it with `?`, so the
+/// probe keeps reading and is judged at EOF (unparsable, unhealthy) or
+/// when its timeout fires.
 fn strip_padded_priority(payload: &[u8], flags: u8) -> Option<&[u8]> {
     let mut start = 0usize;
     let mut end = payload.len();
@@ -1007,13 +1131,15 @@ fn strip_padded_priority(payload: &[u8], flags: u8) -> Option<&[u8]> {
     Some(block)
 }
 
-/// Run `crate::protocol::mux::hpack::Decoder` over the assembled HEADERS block and
-/// return whether `:status` matches `config.expected_status`. Unknown
-/// HPACK encodings, malformed integers, Huffman fallbacks, and
-/// `:status` values that fail UTF-8 / numeric parsing all collapse to
-/// `false` — the probe is recorded as unhealthy, never as a panic.
-fn decode_status_from_block(block: &[u8], config: &HealthCheckConfig) -> bool {
-    let mut decoder = crate::protocol::mux::hpack::Decoder::new();
+/// Run the walk's `crate::protocol::mux::hpack::Decoder` over an assembled
+/// HEADERS block and return its `:status`. Unknown HPACK encodings,
+/// malformed integers, Huffman fallbacks, and `:status` values that fail
+/// UTF-8 / numeric parsing all yield `None` — the caller records the probe
+/// as unhealthy, never panics.
+fn decode_status_from_block(
+    decoder: &mut crate::protocol::mux::hpack::Decoder,
+    block: &[u8],
+) -> Option<u32> {
     let mut status: Option<u32> = None;
     let decode_result = decoder.decode_with_cb(block, |name, value| {
         if status.is_some() {
@@ -1027,34 +1153,209 @@ fn decode_status_from_block(block: &[u8], config: &HealthCheckConfig) -> bool {
         }
     });
     if decode_result.is_err() {
-        return false;
+        return None;
     }
-    match status {
-        Some(code) => is_status_healthy(code, config.expected_status),
-        None => false,
-    }
+    status
 }
 
 #[cfg(test)]
 mod tests {
+    use sozu_command::proto::command::HttpStatusRange;
+
     use super::*;
     use crate::backends::HealthState;
 
+    /// An HTTP-mode config judging statuses by `expected_status` and
+    /// `accepted_statuses` (given as `(start, end)` pairs).
+    fn status_config(expected: u32, accepted: &[(u32, u32)]) -> HealthCheckConfig {
+        HealthCheckConfig {
+            expected_status: expected,
+            accepted_statuses: accepted
+                .iter()
+                .map(|&(start, end)| HttpStatusRange { start, end })
+                .collect(),
+            ..h2c_config(0)
+        }
+    }
+
     #[test]
     fn test_is_status_healthy_any_2xx() {
-        assert!(is_status_healthy(200, 0));
-        assert!(is_status_healthy(204, 0));
-        assert!(is_status_healthy(299, 0));
-        assert!(!is_status_healthy(301, 0));
-        assert!(!is_status_healthy(500, 0));
-        assert!(!is_status_healthy(0, 0));
+        let config = status_config(0, &[]);
+        assert!(is_status_healthy(200, &config));
+        assert!(is_status_healthy(204, &config));
+        assert!(is_status_healthy(299, &config));
+        assert!(!is_status_healthy(301, &config));
+        assert!(!is_status_healthy(500, &config));
+        assert!(!is_status_healthy(0, &config));
     }
 
     #[test]
     fn test_is_status_healthy_specific() {
-        assert!(is_status_healthy(200, 200));
-        assert!(!is_status_healthy(204, 200));
-        assert!(!is_status_healthy(500, 200));
+        let config = status_config(200, &[]);
+        assert!(is_status_healthy(200, &config));
+        assert!(!is_status_healthy(204, &config));
+        assert!(!is_status_healthy(500, &config));
+    }
+
+    #[test]
+    fn accepted_statuses_list_of_codes_accepts_only_those_codes() {
+        let config = status_config(0, &[(200, 200), (404, 404)]);
+        assert!(is_status_healthy(200, &config));
+        assert!(is_status_healthy(404, &config));
+        assert!(
+            !is_status_healthy(204, &config),
+            "a 2xx outside the list fails"
+        );
+        assert!(!is_status_healthy(403, &config));
+        assert!(!is_status_healthy(500, &config));
+    }
+
+    #[test]
+    fn accepted_statuses_ranges_are_inclusive_at_both_bounds() {
+        let config = status_config(0, &[(200, 399), (401, 401)]);
+        assert!(is_status_healthy(200, &config));
+        assert!(is_status_healthy(302, &config));
+        assert!(is_status_healthy(399, &config));
+        assert!(is_status_healthy(401, &config));
+        assert!(!is_status_healthy(199, &config));
+        assert!(!is_status_healthy(400, &config));
+        assert!(!is_status_healthy(404, &config));
+        assert!(!is_status_healthy(500, &config));
+    }
+
+    #[test]
+    fn accepted_statuses_any_accepts_every_valid_status_but_no_garbage() {
+        // `"any"` parses to 100-599 (`parse_http_status_range` in
+        // `command/src/config.rs`).
+        let config = status_config(0, &[(100, 599)]);
+        for status in [100, 200, 301, 401, 404, 500, 503, 599] {
+            assert!(is_status_healthy(status, &config), "{status} must pass");
+        }
+        // An unparsable status line yields 0, never a pass.
+        assert!(!is_status_healthy(0, &config));
+        assert!(!is_status_healthy(600, &config));
+        let buf = b"HTTP/1.1 500 Internal Server Error\r\n\r\n";
+        assert_eq!(try_parse_status_line(buf, &config), Some(true));
+        let buf = b"HTTP/1.1 garbage\r\n\r\n";
+        assert_eq!(try_parse_status_line(buf, &config), Some(false));
+    }
+
+    #[test]
+    fn accepted_statuses_replace_the_default_2xx_when_expected_status_is_zero() {
+        // `expected_status = 0` is the "unset" value: the list alone decides,
+        // so a 2xx outside the list fails and a 404 inside it passes.
+        let config = status_config(0, &[(404, 404)]);
+        assert!(!is_status_healthy(200, &config));
+        assert!(is_status_healthy(404, &config));
+        // The h2c path judges `:status` with the same rule.
+        let block = encode_response_headers(&[(b":status", b"404")]);
+        let buf = frame_with_header(0x01, FLAG_END_HEADERS, 1, &block);
+        assert_eq!(try_parse_h2c_status(&buf, &config), Some(true));
+        let block = encode_response_headers(&[(b":status", b"200")]);
+        let buf = frame_with_header(0x01, FLAG_END_HEADERS, 1, &block);
+        assert_eq!(try_parse_h2c_status(&buf, &config), Some(false));
+    }
+
+    #[test]
+    fn http1_interim_responses_are_skipped_for_the_final_status() {
+        // Default 2xx: a `103 Early Hints` with headers, then the final 200.
+        let default = status_config(0, &[]);
+        let buf = b"HTTP/1.1 103 Early Hints\r\nLink: </a.css>\r\n\r\nHTTP/1.1 200 OK\r\n\r\n";
+        assert_eq!(try_parse_status_line(buf, &default), Some(true));
+        // `1xx` accepted: an interim `100 Continue` must not stand in for a
+        // final 500.
+        let informational = status_config(0, &[(100, 199)]);
+        let buf = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 500 Internal Server Error\r\n\r\n";
+        assert_eq!(try_parse_status_line(buf, &informational), Some(false));
+        // `101 Switching Protocols` is final.
+        let buf = b"HTTP/1.1 101 Switching Protocols\r\n\r\n";
+        assert_eq!(try_parse_status_line(buf, &informational), Some(true));
+        // Until the final status line arrives, keep reading.
+        for partial in [
+            &b"HTTP/1.1 100 Continue\r\n"[..],
+            b"HTTP/1.1 100 Continue\r\n\r\n",
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200",
+        ] {
+            assert_eq!(
+                try_parse_status_line(partial, &default),
+                None,
+                "{partial:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn h2c_interim_headers_are_skipped_for_the_final_status() {
+        // One encoder for both blocks, as a server would use. `x-hint` is
+        // not in the HPACK static table, so the encoder inserts it in the
+        // dynamic table with the interim block and the final block refers
+        // to that entry: a decoder rebuilt per block cannot decode it.
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
+        let mut interim = Vec::new();
+        encoder.encode_into(
+            [(&b":status"[..], &b"103"[..]), (b"x-hint", b"warm")],
+            &mut interim,
+        );
+        let mut last = Vec::new();
+        encoder.encode_into(
+            [(&b":status"[..], &b"200"[..]), (b"x-hint", b"warm")],
+            &mut last,
+        );
+        let mut buf = frame_with_header(0x01, FLAG_END_HEADERS, 1, &interim);
+        assert_eq!(
+            try_parse_h2c_status(&buf, &h2c_config(0)),
+            None,
+            "wait for the final HEADERS"
+        );
+        buf.extend_from_slice(&frame_with_header(0x01, FLAG_END_HEADERS, 1, &last));
+        assert_eq!(try_parse_h2c_status(&buf, &h2c_config(0)), Some(true));
+        // `1xx` accepted: the interim block is still not the verdict.
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
+        let mut interim = Vec::new();
+        encoder.encode_into([(&b":status"[..], &b"100"[..])], &mut interim);
+        let mut last = Vec::new();
+        encoder.encode_into([(&b":status"[..], &b"500"[..])], &mut last);
+        let mut buf = frame_with_header(0x01, FLAG_END_HEADERS, 1, &interim);
+        buf.extend_from_slice(&frame_with_header(0x01, FLAG_END_HEADERS, 1, &last));
+        assert_eq!(
+            try_parse_h2c_status(&buf, &status_config(0, &[(100, 199)])),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn tcp_connect_outcome_reports_established_and_refused() {
+        // Established: a listener completes the handshake in the kernel
+        // without `accept`.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let stream = TcpStream::connect(address).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut outcome = tcp_connect_outcome(&stream);
+        while outcome.is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            outcome = tcp_connect_outcome(&stream);
+        }
+        assert_eq!(outcome, Some(true), "a listening backend must pass");
+
+        // Refused: a socket bound but never listening holds its port, so
+        // no concurrent test can take it while the kernel answers RST.
+        drop(stream);
+        drop(listener);
+        let closed =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        closed
+            .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+            .unwrap();
+        let address = closed.local_addr().unwrap().as_socket().unwrap();
+        let stream = TcpStream::connect(address).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut outcome = tcp_connect_outcome(&stream);
+        while outcome.is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            outcome = tcp_connect_outcome(&stream);
+        }
+        assert_eq!(outcome, Some(false), "a refused connection must fail");
     }
 
     #[test]
@@ -1066,6 +1367,8 @@ mod tests {
             healthy_threshold: 3,
             unhealthy_threshold: 3,
             expected_status: 0,
+            mode: HealthCheckMode::Http as i32,
+            accepted_statuses: Vec::new(),
         };
 
         let buf = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
@@ -1106,6 +1409,8 @@ mod tests {
             healthy_threshold: 3,
             unhealthy_threshold: 3,
             expected_status: expected,
+            mode: HealthCheckMode::Http as i32,
+            accepted_statuses: Vec::new(),
         }
     }
 

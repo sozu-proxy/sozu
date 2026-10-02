@@ -1381,13 +1381,44 @@ enum ShardMode {
     STRICT = 1;
 }
 
+// How a health-check probe decides that a backend is healthy.
+enum HealthCheckMode {
+    // Send an HTTP `GET <uri>` and judge the response status against
+    // `accepted_statuses` (or `expected_status` when that list is empty).
+    HEALTH_CHECK_MODE_HTTP = 0;
+    // Healthy iff a TCP connection to the backend is established within
+    // `timeout`. No byte is sent; the connection is closed as soon as it
+    // is established. `uri` is ignored; a non-zero `expected_status` or a
+    // non-empty `accepted_statuses` is refused. A peer that predates this
+    // field ignores it and runs the HTTP probe instead.
+    HEALTH_CHECK_MODE_TCP = 1;
+}
+
+// An inclusive range of HTTP status codes, `start <= end`, both within
+// 100..=599 (RFC 9110 §15). A single code is `start == end`.
+message HttpStatusRange {
+    required uint32 start = 1;
+    required uint32 end = 2;
+}
+
 message HealthCheckConfig {
+    // Request target of the HTTP probe; must start with `/`. Ignored in
+    // `TCP` mode. Kept `required` on the wire for compatibility with
+    // peers that predate `mode`.
     required string uri = 1;
     required uint32 interval = 2 [default = 10];
     required uint32 timeout = 3 [default = 5];
     required uint32 healthy_threshold = 4 [default = 3];
     required uint32 unhealthy_threshold = 5 [default = 3];
+    // `0` accepts any 2xx, any other value exactly that status. Applies
+    // only while `accepted_statuses` is empty; setting both is rejected.
     required uint32 expected_status = 6 [default = 0];
+    // Probe mode. Absent decodes as `HTTP`, the behaviour of peers that
+    // predate this field.
+    required HealthCheckMode mode = 7 [default = HEALTH_CHECK_MODE_HTTP];
+    // HTTP mode: the response statuses that count as healthy. When
+    // non-empty it replaces `expected_status`, which must then be `0`.
+    repeated HttpStatusRange accepted_statuses = 8;
     // The probe wire format is derived from `Cluster.http2` (the same
     // backend-capability hint the mux router reads). When the cluster
     // sets `http2 = true`, the probe sends the HTTP/2 connection

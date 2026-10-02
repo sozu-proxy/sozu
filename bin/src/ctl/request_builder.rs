@@ -9,19 +9,22 @@ use sozu_command_lib::{
     certificate::{
         decode_fingerprint, get_fingerprint_from_certificate_path, load_full_certificate,
     },
-    config::{ForwardedHeadersMode, ListenerBuilder, validate_health_check_config},
+    config::{
+        ForwardedHeadersMode, ListenerBuilder, parse_http_status_range,
+        validate_health_check_config,
+    },
     proto::command::{
         ActivateListener, AddBackend, AddCertificate, AlpnProtocols, Cluster, CountRequests,
         CustomHttpAnswers, DeactivateListener, ForwardedHeaders, FrontendFilters, HardStop,
-        HealthCheckConfig, ListListeners, ListedFrontends, ListenerType, LoadBalancingParams,
-        MetricsConfiguration, PathRule, ProxyProtocolConfig, QueryCertificatesFilters,
-        QueryClusterByDomain, QueryClustersHashes, QueryHealthChecks, QueryMaxConnectionsPerIp,
-        QueryMaxConnectionsPerSubnet, RemoveBackend, RemoveCertificate, RemoveListener,
-        ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend, RequestUdpFrontend,
-        ResponseContent, RulePosition, SetHealthCheck, ShardMode, SocketAddress, SoftStop, Status,
-        SubscribeEvents, TlsVersion, UpdateHttpListenerConfig, UpdateHttpsListenerConfig,
-        UpdateTcpListenerConfig, UpdateUdpListenerConfig, request::RequestType,
-        response_content::ContentType,
+        HealthCheckConfig, HealthCheckMode, ListListeners, ListedFrontends, ListenerType,
+        LoadBalancingParams, MetricsConfiguration, PathRule, ProxyProtocolConfig,
+        QueryCertificatesFilters, QueryClusterByDomain, QueryClustersHashes, QueryHealthChecks,
+        QueryMaxConnectionsPerIp, QueryMaxConnectionsPerSubnet, RemoveBackend, RemoveCertificate,
+        RemoveListener, ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend,
+        RequestUdpFrontend, ResponseContent, RulePosition, SetHealthCheck, ShardMode,
+        SocketAddress, SoftStop, Status, SubscribeEvents, TlsVersion, UpdateHttpListenerConfig,
+        UpdateHttpsListenerConfig, UpdateTcpListenerConfig, UpdateUdpListenerConfig,
+        request::RequestType, response_content::ContentType,
     },
     proto::display::print_json_response,
 };
@@ -505,13 +508,20 @@ impl CommandManager {
         match cmd {
             HealthCheckCmd::Set {
                 id,
+                mode,
                 uri,
                 interval,
                 timeout,
                 healthy_threshold,
                 unhealthy_threshold,
                 expected_status,
+                accepted_statuses,
             } => {
+                let accepted_statuses = accepted_statuses
+                    .iter()
+                    .map(|spec| parse_http_status_range(spec))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|reason| CtlError::Failure(reason.to_owned()))?;
                 let config = HealthCheckConfig {
                     uri,
                     interval,
@@ -519,6 +529,8 @@ impl CommandManager {
                     healthy_threshold,
                     unhealthy_threshold,
                     expected_status,
+                    mode: HealthCheckMode::from(mode) as i32,
+                    accepted_statuses,
                 };
                 if let Err(reason) = validate_health_check_config(&config) {
                     return Err(CtlError::Failure(reason.to_owned()));

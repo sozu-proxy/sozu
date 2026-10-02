@@ -64,14 +64,14 @@ use crate::{
     logging::AccessLogFormat,
     proto::command::{
         ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
-        CustomHttpAnswers, ForwardedHeaders, Header, HeaderPosition, HealthCheckConfig, HstsConfig,
-        HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
-        LoadBalancingParams, LoadMetric, MetricDetail, MetricsConfiguration, PathRule,
-        ProtobufAccessLogFormat, ProxyProtocolConfig, RedirectPolicy, RedirectScheme, Request,
-        RequestHttpFrontend, RequestTcpFrontend, RequestUdpFrontend, RulePosition, ServerConfig,
-        ServerMetricsConfig, ShardMode, SocketAddress, TcpListenerConfig, TlsVersion,
-        UdpAffinityKey, UdpClusterConfig, UdpHealthConfig, UdpHealthMode, UdpListenerConfig,
-        WorkerRequest, request::RequestType,
+        CustomHttpAnswers, ForwardedHeaders, Header, HeaderPosition, HealthCheckConfig,
+        HealthCheckMode, HstsConfig, HttpListenerConfig, HttpStatusRange, HttpsListenerConfig,
+        ListenerType, LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, MetricDetail,
+        MetricsConfiguration, PathRule, ProtobufAccessLogFormat, ProxyProtocolConfig,
+        RedirectPolicy, RedirectScheme, Request, RequestHttpFrontend, RequestTcpFrontend,
+        RequestUdpFrontend, RulePosition, ServerConfig, ServerMetricsConfig, ShardMode,
+        SocketAddress, TcpListenerConfig, TlsVersion, UdpAffinityKey, UdpClusterConfig,
+        UdpHealthConfig, UdpHealthMode, UdpListenerConfig, WorkerRequest, request::RequestType,
     },
 };
 
@@ -401,6 +401,13 @@ pub enum ConfigError {
     InvalidMaxConnectionAttempts {
         cluster_id: Option<String>,
         value: u32,
+        reason: &'static str,
+    },
+    /// A cluster's `health_check` block has an unparsable `accepted_statuses`
+    /// entry or breaks [`validate_health_check_config`].
+    #[error("cluster {cluster_id}: {reason}")]
+    InvalidHealthCheck {
+        cluster_id: String,
         reason: &'static str,
     },
     /// `subnet_ipv4_prefix` / `subnet_ipv6_prefix` is outside the bit
@@ -2532,10 +2539,16 @@ fn default_health_check_timeout() -> u32 {
 fn default_health_check_threshold() -> u32 {
     3
 }
+fn default_health_check_uri() -> String {
+    "/".to_owned()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileHealthCheckConfig {
+    /// Request target of the HTTP probe. Defaults to `/`; ignored in `TCP`
+    /// mode.
+    #[serde(default = "default_health_check_uri")]
     pub uri: String,
     #[serde(default = "default_health_check_interval")]
     pub interval: u32,
@@ -2547,10 +2560,26 @@ pub struct FileHealthCheckConfig {
     pub unhealthy_threshold: u32,
     #[serde(default)]
     pub expected_status: u32,
+    /// Probe mode, parsed in SCREAMING_SNAKE_CASE: `"HTTP"` (the default)
+    /// or `"TCP"`.
+    #[serde(default)]
+    pub mode: Option<HealthCheckMode>,
+    /// HTTP mode: statuses that count as healthy, each one of `"200"`,
+    /// `"200-399"`, `"2xx"` or `"any"` (see [`parse_http_status_range`]).
+    #[serde(default)]
+    pub accepted_statuses: Vec<String>,
 }
 
 impl FileHealthCheckConfig {
-    pub fn to_proto(&self) -> HealthCheckConfig {
+    /// Build the proto config, parsing `accepted_statuses` and running
+    /// [`validate_health_check_config`] so a bad block is refused at load
+    /// time with the cluster it belongs to.
+    pub fn to_proto(&self) -> Result<HealthCheckConfig, &'static str> {
+        let accepted_statuses = self
+            .accepted_statuses
+            .iter()
+            .map(|spec| parse_http_status_range(spec))
+            .collect::<Result<Vec<_>, _>>()?;
         let proto = HealthCheckConfig {
             uri: self.uri.to_owned(),
             interval: self.interval,
@@ -2558,6 +2587,8 @@ impl FileHealthCheckConfig {
             healthy_threshold: self.healthy_threshold,
             unhealthy_threshold: self.unhealthy_threshold,
             expected_status: self.expected_status,
+            mode: self.mode.unwrap_or(HealthCheckMode::Http) as i32,
+            accepted_statuses,
         };
         // POST: the proto mirrors the file config exactly — the URI and all
         // timing knobs are carried through verbatim (no clamping or defaulting
@@ -2570,8 +2601,86 @@ impl FileHealthCheckConfig {
                 && proto.unhealthy_threshold == self.unhealthy_threshold,
             "proto timing knobs must mirror the file config"
         );
-        proto
+        debug_assert_eq!(
+            proto.accepted_statuses.len(),
+            self.accepted_statuses.len(),
+            "every accepted status spec must map to exactly one range"
+        );
+        validate_health_check_config(&proto)?;
+        Ok(proto)
     }
+}
+
+/// Lowest and highest valid HTTP status codes: RFC 9110 §15 calls values
+/// outside `100..=599` invalid.
+pub const HTTP_STATUS_MIN: u32 = 100;
+pub const HTTP_STATUS_MAX: u32 = 599;
+
+/// Parse one `accepted_statuses` entry of the TOML file or the CLI:
+///
+/// - `"any"`: every valid status, `100-599` — any well-formed HTTP response;
+/// - `"Nxx"` with `N` in `1..=5`: the class `N00-N99`;
+/// - `"A-B"`: the inclusive range `A..=B`;
+/// - `"A"`: the single status `A`.
+///
+/// Bounds must lie in `100..=599` and `A <= B`.
+pub fn parse_http_status_range(spec: &str) -> Result<HttpStatusRange, &'static str> {
+    const INVALID: &str = "health check accepted status must be a code (\"404\"), a range \
+                           (\"200-399\"), a class (\"2xx\") or \"any\"";
+    let spec = spec.trim();
+    let range = if spec.eq_ignore_ascii_case("any") {
+        HttpStatusRange {
+            start: HTTP_STATUS_MIN,
+            end: HTTP_STATUS_MAX,
+        }
+    } else if let [class @ b'1'..=b'5', x1, x2] = spec.as_bytes()
+        && x1.eq_ignore_ascii_case(&b'x')
+        && x2.eq_ignore_ascii_case(&b'x')
+    {
+        let start = u32::from(class - b'0') * 100;
+        HttpStatusRange {
+            start,
+            end: start + 99,
+        }
+    } else if let Some((start, end)) = spec.split_once('-') {
+        HttpStatusRange {
+            start: parse_status_code(start).ok_or(INVALID)?,
+            end: parse_status_code(end).ok_or(INVALID)?,
+        }
+    } else {
+        let code = parse_status_code(spec).ok_or(INVALID)?;
+        HttpStatusRange {
+            start: code,
+            end: code,
+        }
+    };
+    validate_http_status_range(&range)?;
+    Ok(range)
+}
+
+/// A status code is ASCII digits only: `u32::from_str` alone would also take
+/// a leading `+`.
+fn parse_status_code(code: &str) -> Option<u32> {
+    let code = code.trim();
+    if code.is_empty() || !code.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    code.parse().ok()
+}
+
+fn validate_http_status_range(range: &HttpStatusRange) -> Result<(), &'static str> {
+    if range.start < HTTP_STATUS_MIN || range.end > HTTP_STATUS_MAX {
+        return Err("health check accepted statuses must lie within 100-599");
+    }
+    if range.start > range.end {
+        return Err("health check accepted status range must not end before it starts");
+    }
+    debug_assert!(
+        (HTTP_STATUS_MIN..=HTTP_STATUS_MAX).contains(&range.start)
+            && (HTTP_STATUS_MIN..=HTTP_STATUS_MAX).contains(&range.end),
+        "a validated range must lie within the valid status codes"
+    );
+    Ok(())
 }
 
 /// Validate a cluster's client affinity key source, `affinity_header` or
@@ -2654,8 +2763,12 @@ pub fn validate_shuffle_sharding(
 }
 
 /// Validate a [`HealthCheckConfig`] for the rules every layer relies on:
-/// strict positive thresholds and a URI that cannot smuggle a second
-/// HTTP message on the wire (RFC 9110 §5.1 — request-target). Used by
+/// a known probe mode, strict positive thresholds, a URI that cannot
+/// smuggle a second HTTP message on the wire (RFC 9110 §5.1 —
+/// request-target; the leading `/` is only required in HTTP mode, the
+/// only one that sends it), accepted status ranges within `100..=599`,
+/// at most one of `expected_status` / `accepted_statuses`, and neither in
+/// TCP mode, which judges no status. Used by
 /// the CLI request builder and the worker `SetHealthCheck` handler so
 /// off-channel inputs (TOML reload, third-party clients) are
 /// constrained the same way as `sozu cluster health-check set`.
@@ -2664,6 +2777,9 @@ pub fn validate_shuffle_sharding(
 /// than carrying a structured error: the diagnostics only flow into
 /// CLI output / worker error responses where the message is the value.
 pub fn validate_health_check_config(cfg: &HealthCheckConfig) -> Result<(), &'static str> {
+    let Ok(mode) = HealthCheckMode::try_from(cfg.mode) else {
+        return Err("health check mode must be HTTP or TCP");
+    };
     if cfg.interval == 0 {
         return Err("health check interval must be > 0");
     }
@@ -2676,7 +2792,11 @@ pub fn validate_health_check_config(cfg: &HealthCheckConfig) -> Result<(), &'sta
     if cfg.unhealthy_threshold == 0 {
         return Err("health check unhealthy_threshold must be > 0");
     }
-    if !cfg.uri.starts_with('/') {
+    // The URI only reaches the wire in HTTP mode; TCP mode ignores it and
+    // may leave it empty. The control-byte check below still applies, so a
+    // stored config never carries a URI that would smuggle a second message
+    // if displayed or later reused.
+    if mode == HealthCheckMode::Http && !cfg.uri.starts_with('/') {
         return Err("health check URI must start with '/'");
     }
     if cfg
@@ -2685,6 +2805,25 @@ pub fn validate_health_check_config(cfg: &HealthCheckConfig) -> Result<(), &'sta
         .any(|b| b == b'\r' || b == b'\n' || b == 0 || (b < 0x20 && b != b'\t'))
     {
         return Err("health check URI must not contain CR, LF, NUL, or other C0 control bytes");
+    }
+    for range in &cfg.accepted_statuses {
+        validate_http_status_range(range)?;
+    }
+    if cfg.expected_status != 0 && !cfg.accepted_statuses.is_empty() {
+        return Err(
+            "health check expected_status and accepted_statuses are mutually exclusive: \
+             set at most one",
+        );
+    }
+    // A TCP probe judges no status: a status field set beside it would read
+    // as a constraint the probe silently does not apply.
+    if mode == HealthCheckMode::Tcp
+        && (cfg.expected_status != 0 || !cfg.accepted_statuses.is_empty())
+    {
+        return Err(
+            "health check expected_status and accepted_statuses apply to HTTP mode only: \
+             leave them unset with mode TCP",
+        );
     }
     // POST: a validated config has strictly-positive timing knobs (a zero
     // interval/timeout/threshold would make the health-check loop spin or
@@ -2699,8 +2838,17 @@ pub fn validate_health_check_config(cfg: &HealthCheckConfig) -> Result<(), &'sta
         "validated health-check thresholds must all be strictly positive"
     );
     debug_assert!(
-        cfg.uri.starts_with('/'),
-        "validated health-check URI must be an absolute path"
+        mode == HealthCheckMode::Tcp || cfg.uri.starts_with('/'),
+        "a validated HTTP health-check URI must be an absolute path"
+    );
+    debug_assert!(
+        cfg.expected_status == 0 || cfg.accepted_statuses.is_empty(),
+        "a validated health check sets at most one of expected_status and accepted_statuses"
+    );
+    debug_assert!(
+        mode == HealthCheckMode::Http
+            || (cfg.expected_status == 0 && cfg.accepted_statuses.is_empty()),
+        "a validated TCP health check sets no status field"
     );
     Ok(())
 }
@@ -2927,6 +3075,15 @@ impl FileClusterConfig {
                 }
             })?;
         }
+        let health_check = self
+            .health_check
+            .as_ref()
+            .map(FileHealthCheckConfig::to_proto)
+            .transpose()
+            .map_err(|reason| ConfigError::InvalidHealthCheck {
+                cluster_id: cluster_id.to_owned(),
+                reason,
+            })?;
         match self.protocol {
             FileClusterProtocolConfig::Tcp => {
                 // A TCP cluster has no request to read a header or a cookie
@@ -3021,7 +3178,7 @@ impl FileClusterConfig {
                     max_connections_per_ip: self.max_connections_per_ip,
                     max_connections_per_subnet: self.max_connections_per_subnet,
                     retry_after: self.retry_after,
-                    health_check: self.health_check.as_ref().map(|hc| hc.to_proto()),
+                    health_check,
                     udp,
                     shard_percent: self.shard_percent,
                     shard_min_backends: self.shard_min_backends,
@@ -3076,7 +3233,7 @@ impl FileClusterConfig {
                     max_connections_per_ip: self.max_connections_per_ip,
                     max_connections_per_subnet: self.max_connections_per_subnet,
                     retry_after: self.retry_after,
-                    health_check: self.health_check.as_ref().map(|hc| hc.to_proto()),
+                    health_check,
                     udp,
                     affinity_header: self.affinity_header,
                     affinity_cookie: self.affinity_cookie,
@@ -5657,6 +5814,209 @@ mod tests {
                 matches!(
                     parse(bad).to_cluster_config("sharded", &HashSet::new()),
                     Err(ConfigError::InvalidShuffleSharding { .. })
+                ),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// #1801: `accepted_statuses` entries parse to inclusive ranges, and
+    /// everything outside the documented syntax or `100..=599` is refused.
+    #[test]
+    fn http_status_range_parses_codes_ranges_classes_and_any() {
+        let range = |start, end| HttpStatusRange { start, end };
+        for (spec, expected) in [
+            ("404", range(404, 404)),
+            ("200-399", range(200, 399)),
+            (" 200 - 399 ", range(200, 399)),
+            ("2xx", range(200, 299)),
+            ("5XX", range(500, 599)),
+            ("any", range(100, 599)),
+            ("ANY", range(100, 599)),
+            ("100-599", range(100, 599)),
+        ] {
+            assert_eq!(parse_http_status_range(spec), Ok(expected), "{spec:?}");
+        }
+        for spec in [
+            "", "abc", "99", "600", "0", "6xx", "0xx", "2x", "2xxx", "399-200", "200-", "-200",
+            "+200", "200-600", "1-2-3", "2xx-3xx",
+        ] {
+            assert!(
+                parse_http_status_range(spec).is_err(),
+                "{spec:?} must be refused"
+            );
+        }
+    }
+
+    /// #1801: the rendering used by `sozu cluster health-check list` parses
+    /// back to the same range.
+    #[test]
+    fn http_status_range_display_round_trips_through_the_parser() {
+        for spec in ["404", "200-399", "2xx", "any", "101-102"] {
+            let range = parse_http_status_range(spec).unwrap();
+            assert_eq!(range.to_string(), spec);
+            assert_eq!(parse_http_status_range(&range.to_string()), Ok(range));
+        }
+    }
+
+    /// #1801: validation of the probe mode, the TCP-mode URI exemption, the
+    /// range bounds and the `expected_status` / `accepted_statuses`
+    /// exclusion — the rules shared by the CLI, the TOML loader, the master
+    /// state and the worker.
+    #[test]
+    fn health_check_validation_covers_mode_uri_and_accepted_statuses() {
+        let http = HealthCheckConfig {
+            uri: "/health".to_owned(),
+            interval: 10,
+            timeout: 5,
+            healthy_threshold: 3,
+            unhealthy_threshold: 3,
+            expected_status: 0,
+            mode: HealthCheckMode::Http as i32,
+            accepted_statuses: Vec::new(),
+        };
+        assert_eq!(validate_health_check_config(&http), Ok(()));
+
+        // TCP mode ignores the URI, so an empty one is fine; HTTP mode is not.
+        let tcp_no_uri = HealthCheckConfig {
+            uri: String::new(),
+            mode: HealthCheckMode::Tcp as i32,
+            ..http.clone()
+        };
+        assert_eq!(validate_health_check_config(&tcp_no_uri), Ok(()));
+        let http_no_uri = HealthCheckConfig {
+            uri: String::new(),
+            ..http.clone()
+        };
+        assert!(validate_health_check_config(&http_no_uri).is_err());
+        // Control bytes are refused in every mode.
+        let tcp_crlf = HealthCheckConfig {
+            uri: "/a\r\nGET /b".to_owned(),
+            ..tcp_no_uri.clone()
+        };
+        assert!(validate_health_check_config(&tcp_crlf).is_err());
+
+        // TCP mode judges no status, so status fields beside it are refused.
+        let tcp_expected = HealthCheckConfig {
+            expected_status: 200,
+            ..tcp_no_uri.clone()
+        };
+        assert!(validate_health_check_config(&tcp_expected).is_err());
+        let tcp_accepted = HealthCheckConfig {
+            accepted_statuses: vec![HttpStatusRange {
+                start: 100,
+                end: 599,
+            }],
+            ..tcp_no_uri.clone()
+        };
+        assert!(validate_health_check_config(&tcp_accepted).is_err());
+
+        let unknown_mode = HealthCheckConfig {
+            mode: 7,
+            ..http.clone()
+        };
+        assert!(validate_health_check_config(&unknown_mode).is_err());
+
+        let accepted = HealthCheckConfig {
+            accepted_statuses: vec![HttpStatusRange {
+                start: 200,
+                end: 499,
+            }],
+            ..http.clone()
+        };
+        assert_eq!(validate_health_check_config(&accepted), Ok(()));
+        let both = HealthCheckConfig {
+            expected_status: 200,
+            ..accepted.clone()
+        };
+        assert!(
+            validate_health_check_config(&both).is_err(),
+            "expected_status and accepted_statuses must not both be set"
+        );
+        for (start, end) in [(99, 200), (200, 600), (300, 200)] {
+            let bad_range = HealthCheckConfig {
+                accepted_statuses: vec![HttpStatusRange { start, end }],
+                ..http.clone()
+            };
+            assert!(
+                validate_health_check_config(&bad_range).is_err(),
+                "{start}-{end} must be refused"
+            );
+        }
+    }
+
+    /// #1801: the TOML block defaults to HTTP mode on `/`, accepts
+    /// `mode = "TCP"` without a `uri`, carries `accepted_statuses` to the
+    /// `AddCluster` order, and refuses a bad block at load.
+    #[test]
+    fn health_check_toml_mode_and_accepted_statuses_reach_the_add_cluster_order() {
+        let parse = |block: &str| -> FileClusterConfig {
+            toml::from_str(&format!(
+                "protocol = \"http\"\nfrontends = []\nbackends = []\n[health_check]\n{block}"
+            ))
+            .expect("the cluster must parse")
+        };
+        let health_check = |block: &str| -> HealthCheckConfig {
+            let ClusterConfig::Http(http) = parse(block)
+                .to_cluster_config("checked", &HashSet::new())
+                .expect("a valid health check builds")
+            else {
+                panic!("an http cluster must build as one");
+            };
+            let orders = http.generate_requests().expect("the orders must build");
+            let Some(RequestType::AddCluster(cluster)) =
+                orders.first().and_then(|order| order.request_type.as_ref())
+            else {
+                panic!("the orders must lead with an AddCluster");
+            };
+            cluster
+                .health_check
+                .clone()
+                .expect("the health check must travel")
+        };
+
+        // A legacy block keeps its meaning: HTTP mode, no list.
+        let legacy = health_check("uri = \"/health\"\nexpected_status = 204\n");
+        assert_eq!(legacy.mode, HealthCheckMode::Http as i32);
+        assert_eq!(
+            (legacy.uri.as_str(), legacy.expected_status),
+            ("/health", 204)
+        );
+        assert!(legacy.accepted_statuses.is_empty());
+
+        let defaulted = health_check("");
+        assert_eq!(defaulted.mode, HealthCheckMode::Http as i32);
+        assert_eq!(defaulted.uri, "/");
+
+        let tcp = health_check("mode = \"TCP\"\n");
+        assert_eq!(tcp.mode, HealthCheckMode::Tcp as i32);
+
+        let accepted = health_check("uri = \"/livez\"\naccepted_statuses = [\"2xx\", \"404\"]\n");
+        assert_eq!(
+            accepted.accepted_statuses,
+            vec![
+                HttpStatusRange {
+                    start: 200,
+                    end: 299
+                },
+                HttpStatusRange {
+                    start: 404,
+                    end: 404
+                },
+            ]
+        );
+
+        for bad in [
+            "accepted_statuses = [\"6xx\"]\n",
+            "expected_status = 200\naccepted_statuses = [\"any\"]\n",
+            "uri = \"health\"\n",
+            "mode = \"TCP\"\nexpected_status = 200\n",
+            "mode = \"TCP\"\naccepted_statuses = [\"any\"]\n",
+        ] {
+            assert!(
+                matches!(
+                    parse(bad).to_cluster_config("checked", &HashSet::new()),
+                    Err(ConfigError::InvalidHealthCheck { .. })
                 ),
                 "{bad:?} must be refused"
             );
