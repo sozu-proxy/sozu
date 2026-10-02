@@ -1937,6 +1937,78 @@ fn test_rr_client_reset_mid_download_plain() {
     );
 }
 
+/// rr_client_reset_mid_download over HTTP/2: the client opens one stream
+/// with a large window, reads part of the response, then resets its
+/// connection. The session must close at once, closing its backend
+/// connection with it, instead of waiting for a timeout while the delayed
+/// close tries to flush output to a socket that can take none.
+fn try_rr_h2_client_reset_mid_download(name: &str) -> State {
+    use super::h2_utils::{
+        H2Frame, build_chrome146_get_headers, h2_handshake_chromium_146, raw_h2_connection,
+    };
+
+    let back_address = create_local_address();
+    let backend = StreamingBackend::start(back_address);
+    let (mut worker, front) = start_half_close_worker(name, Transport::Tls, back_address);
+
+    let mut tls = raw_h2_connection(front);
+    h2_handshake_chromium_146(&mut tls);
+    let headers = build_chrome146_get_headers("localhost", "/download", None);
+    let sent = tls
+        .write_all(&H2Frame::headers(1, headers, true, true).encode())
+        .is_ok()
+        && tls.flush().is_ok();
+    let mut received = 0;
+    let mut buf = [0u8; 65536];
+    while received < 280 * 1024 {
+        match tls.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => received += n,
+        }
+    }
+    super::h2_security_session::set_linger_zero(tls.sock.as_raw_fd());
+    let reset_at = Instant::now();
+    drop(tls);
+
+    let deadline = reset_at + Duration::from_secs(3);
+    while backend.closed_at().is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    let closed_after = backend
+        .closed_at()
+        .map(|at| at.saturating_duration_since(reset_at));
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    drop(backend);
+
+    println!(
+        "{name}: sent={sent} received={received} backend_closed_after={closed_after:?} \
+         stopped={stopped}"
+    );
+    if sent
+        && received >= 280 * 1024
+        && closed_after.is_some_and(|after| after < Duration::from_secs(2))
+        && stopped
+    {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_rr_h2_client_reset_mid_download() {
+    assert_eq!(
+        repeat_until_error_or(
+            12,
+            "H2: a client that resets mid-download closes its session at once",
+            || try_rr_h2_client_reset_mid_download("H2-RR-RESET-MID-DOWNLOAD")
+        ),
+        State::Success
+    );
+}
+
 fn try_wss_server_speaks_first_after_upgrade() -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
