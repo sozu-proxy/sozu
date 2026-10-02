@@ -3868,6 +3868,30 @@
 
 ### 🐛 Fixed
 
+- **`fix(mux)`: stop spinning the session loop when a TLS HTTP/1.1 client stops reading
+  ([#1780](https://github.com/sozu-proxy/sozu/issues/1780)).** When a TLS client stopped reading a
+  large response, rustls kept the records the kernel refused, and `ConnectionH1::writable`
+  (`lib/src/protocol/mux/h1.rs`) re-raised its WRITABLE event because `socket_wants_write()` was
+  still true, right after the write had answered `WouldBlock` and cleared it. `Mux::ready_inner`
+  (`lib/src/protocol/mux/mod.rs`) then called that write again on every inner iteration, each
+  answering `WouldBlock`, until `MAX_LOOP_ITERATIONS` counted an `http.infinite_loop.error`. The
+  pending write is now signalled only when the write answered `SocketResult::Continue`, so the
+  session waits for the kernel's next writable edge. The same re-raise kept every
+  `shut_down_sessions()` tick of a draining H1 session in `drive_frontend_shutdown_io`
+  (`lib/src/protocol/mux/mod.rs`) calling the blocked write until `MAX_LOOP_ITERATIONS`; that loop
+  now stops after the first refused write, once no WRITABLE event is left. A TLS write that meets a
+  socket error other than a reset now marks the transport dead (`FrontRustls::peer_reset`,
+  `lib/src/socket.rs`) as a reset does, so the records rustls still holds no longer count as a
+  pending write that holds the session open on the hang-up. Documented in
+  `lib/src/protocol/mux/LIFECYCLE.md` and `doc/lifetime_of_a_session.md`. Covered by
+  `test_tls_h1_stalled_reader_does_not_exhaust_loop_budget` (`e2e/src/tests/h2_tests.rs`), which
+  shrinks the client's receive buffer so the response always overflows it and checks that the
+  whole body arrives once the client reads again,
+  `a_tls_flush_that_did_not_continue_leaves_writable_to_the_kernel`
+  (`lib/src/protocol/mux/h1.rs`) and
+  `a_tls_write_that_meets_a_socket_error_stops_wanting_to_write` (`lib/src/socket.rs`). The same
+  spin on the HTTP/2 path is [#1788](https://github.com/sozu-proxy/sozu/issues/1788).
+
 - **BREAKING (library API) — `fix(udp)`: key UDP flows on the client source address, not on the
   affinity key ([#1732](https://github.com/sozu-proxy/sozu/issues/1732)).** Under the default
   `affinity_key = SOURCE_IP`, `FlowKey::from_src` zeroed the source port, so every socket of one
