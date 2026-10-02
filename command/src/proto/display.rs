@@ -15,7 +15,7 @@ use crate::{
         DisplayError,
         command::{
             AggregatedMetrics, AvailableMetrics, CertificateAndKey, CertificateSummary,
-            CertificatesWithFingerprints, Cluster, ClusterMetrics, CustomHttpAnswers, Event,
+            CertificatesWithFingerprints, ClientAuthMode, Cluster, ClusterMetrics, CustomHttpAnswers, Event,
             EventKind, FilteredMetrics, ForwardedHeaders, HealthCheckConfig, HealthCheckMode,
             HealthChecksList, HttpEndpoint, HttpListenerConfig, HttpStatusRange,
             HttpsListenerConfig, ListOfCertificatesByAddress, ListedFrontends, ListenersList,
@@ -1223,6 +1223,35 @@ fn format_tags_to_string(tags: &BTreeMap<String, String>) -> String {
         .join(", ")
 }
 
+/// Render an HTTPS listener's mTLS client-authentication policy.
+///
+/// An operator reading `sozu listeners` must be able to tell a listener that
+/// requires a client certificate from one that does not: the two are otherwise
+/// indistinguishable in this table, which is exactly the confusion that turns a
+/// misapplied policy into silent unauthenticated access. The row is therefore
+/// always emitted, including for the `none` default.
+///
+/// CA and CRL entries are PEM bodies. They are summarised as counts only —
+/// never rendered — matching the redaction the hand-written `Debug` impl in
+/// `proto/mod.rs` applies to `certificate` / `key`.
+fn add_client_auth_rows(
+    table: &mut Table,
+    client_auth: &Option<i32>,
+    client_ca_certificates: &[String],
+    client_ca_crls: &[String],
+) {
+    let raw = client_auth.unwrap_or(ClientAuthMode::ClientAuthNone as i32);
+    // An unknown value must not be folded to `none`: the worker rejects it at
+    // listener build time, and displaying it as "none" here would hide why.
+    let mode = match ClientAuthMode::try_from(raw) {
+        Ok(mode) => mode.as_str_name().to_string(),
+        Err(_) => format!("UNKNOWN ({raw})"),
+    };
+    table.add_row(row!["client auth", mode]);
+    table.add_row(row!["client CA certificates", client_ca_certificates.len()]);
+    table.add_row(row!["client CA CRLs", client_ca_crls.len()]);
+}
+
 fn list_string_vec(vec: &[String]) -> String {
     let mut output = String::new();
     for item in vec.iter() {
@@ -1440,6 +1469,12 @@ impl Display for HttpsListenerConfig {
         if let Some(v) = self.forwarded_headers {
             table.add_row(row!["forwarded headers", forwarded_headers_label(v)]);
         }
+        add_client_auth_rows(
+            &mut table,
+            &self.client_auth,
+            &self.client_ca_certificates,
+            &self.client_ca_crls,
+        );
         write!(f, "{table}")
     }
 }
@@ -1625,5 +1660,101 @@ impl Display for Event {
             self.cluster_id(),
             address,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::proto::command::{ClientAuthMode, HttpsListenerConfig, SocketAddress};
+
+    const CA_PEM_SENTINEL: &str = "CLIENT_CA_PEM_BODY_SENTINEL";
+    const CRL_PEM_SENTINEL: &str = "CLIENT_CRL_PEM_BODY_SENTINEL";
+
+    fn https_config(client_auth: Option<i32>, cas: &[&str], crls: &[&str]) -> HttpsListenerConfig {
+        HttpsListenerConfig {
+            address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
+            client_auth,
+            client_ca_certificates: cas.iter().map(|s| s.to_string()).collect(),
+            client_ca_crls: crls.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn listener_display_distinguishes_client_auth_modes() {
+        // The regression this guards: `ListListeners` output for a listener
+        // with `required` client auth used to be byte-identical to one with
+        // client auth disabled, so an operator could not verify an applied
+        // mTLS policy from the CLI.
+        let none = format!("{}", https_config(None, &[], &[]));
+        let required = format!(
+            "{}",
+            https_config(
+                Some(ClientAuthMode::ClientAuthRequired as i32),
+                &[CA_PEM_SENTINEL],
+                &[],
+            )
+        );
+
+        assert!(
+            none.contains(ClientAuthMode::ClientAuthNone.as_str_name()),
+            "an absent client_auth must render as the none default: {none}"
+        );
+        assert!(
+            required.contains(ClientAuthMode::ClientAuthRequired.as_str_name()),
+            "required client auth must be visible: {required}"
+        );
+        assert_ne!(
+            none, required,
+            "listeners with and without client auth must not render identically"
+        );
+    }
+
+    #[test]
+    fn listener_display_summarises_ca_and_crl_without_rendering_pem() {
+        // CA and CRL entries are PEM bodies: counts are operator-useful,
+        // contents are not, and dumping them into a terminal table would be a
+        // regression against the redaction applied elsewhere.
+        let output = format!(
+            "{}",
+            https_config(
+                Some(ClientAuthMode::ClientAuthOptional as i32),
+                &[CA_PEM_SENTINEL, CA_PEM_SENTINEL],
+                &[CRL_PEM_SENTINEL],
+            )
+        );
+
+        assert!(
+            !output.contains(CA_PEM_SENTINEL),
+            "listener display leaked a client CA PEM body: {output}"
+        );
+        assert!(
+            !output.contains(CRL_PEM_SENTINEL),
+            "listener display leaked a client CRL PEM body: {output}"
+        );
+        assert!(
+            output.contains("client CA certificates"),
+            "missing client CA count row: {output}"
+        );
+        assert!(
+            output.contains("client CA CRLs"),
+            "missing client CRL count row: {output}"
+        );
+    }
+
+    #[test]
+    fn listener_display_does_not_fold_an_unknown_mode_to_none() {
+        // A value the master does not recognise must stand out rather than
+        // masquerade as the unauthenticated default.
+        let output = format!("{}", https_config(Some(999), &[], &[]));
+
+        assert!(
+            output.contains("UNKNOWN"),
+            "an unknown client_auth value must render as unknown: {output}"
+        );
+        assert!(
+            !output.contains(ClientAuthMode::ClientAuthNone.as_str_name()),
+            "an unknown client_auth value must not render as none: {output}"
+        );
     }
 }
