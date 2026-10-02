@@ -474,10 +474,12 @@ impl HealthChecker {
 
             if check.tcp_connect_only {
                 // Nothing to send: the probe only waits for the handshake.
-                // The verdict lands on the first readiness after it,
-                // normally before the backend has accepted and could greet,
-                // so dropping the stream after `deregister` closes it with a
-                // FIN on an empty receive queue.
+                // Dropping the stream after `deregister` closes it: a FIN
+                // while the receive queue is empty, which is the usual case
+                // since nothing was asked for. A backend that greets first
+                // (an SMTP or SSH banner) and whose bytes already arrived
+                // makes the kernel answer the close with an RST instead;
+                // the probe never reads them, and the verdict is the same.
                 if let Some(success) = tcp_connect_outcome(&check.stream) {
                     completed.push((idx, success));
                 }
@@ -786,21 +788,49 @@ fn parse_probe_response(buf: &[u8], config: &HealthCheckConfig, h2c: bool) -> Op
     }
 }
 
+/// Judge the final HTTP/1.1 response: interim `1xx` responses (RFC 9110
+/// §15.2, e.g. `100 Continue` or `103 Early Hints`) are skipped, header
+/// section included, so the verdict is the status of the response that
+/// follows them. `101 Switching Protocols` is final. `None` means the
+/// final status line has not fully arrived yet.
 fn try_parse_status_line(buf: &[u8], config: &HealthCheckConfig) -> Option<bool> {
-    let response = std::str::from_utf8(buf).ok()?;
-    let first_line_end = response.find("\r\n")?;
-    let status_line = &response[..first_line_end];
-    // The status line is the prefix before the first CRLF, so it can never be
-    // longer than the buffer it was sliced from.
-    debug_assert!(
-        status_line.len() < response.len(),
-        "status line must be a strict prefix ending before the CRLF"
-    );
+    let mut head = buf;
+    loop {
+        let line_end = find_subslice(head, b"\r\n")?;
+        let status_line = std::str::from_utf8(&head[..line_end]).ok()?;
+        // The status line is the prefix before the first CRLF, so it can
+        // never be longer than the buffer it was sliced from.
+        debug_assert!(
+            status_line.len() < head.len(),
+            "status line must be a strict prefix ending before the CRLF"
+        );
 
-    let (_, rest) = status_line.split_once(' ')?;
-    let status_str = rest.split(' ').next()?;
-    let status_code: u32 = status_str.parse().unwrap_or(0);
-    Some(is_status_healthy(status_code, config))
+        let (_, rest) = status_line.split_once(' ')?;
+        let status_str = rest.split(' ').next()?;
+        let status_code: u32 = status_str.parse().unwrap_or(0);
+        if !is_interim_status(status_code) {
+            return Some(is_status_healthy(status_code, config));
+        }
+        // An interim response ends with its (possibly empty) header section.
+        let head_end = find_subslice(head, b"\r\n\r\n")? + 4;
+        debug_assert!(
+            head_end > line_end && head_end <= head.len(),
+            "skipping an interim response must consume at least its status line"
+        );
+        head = &head[head_end..];
+    }
+}
+
+/// Interim (informational) statuses precede the final response; `101`
+/// ends the HTTP exchange and is final for the probe.
+fn is_interim_status(status: u32) -> bool {
+    (100..200).contains(&status) && status != 101
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 /// Outcome of a connect-only probe on a readiness event: `Some(true)` once
@@ -921,8 +951,9 @@ fn build_h2c_probe_bytes(uri: &str, address: SocketAddr) -> Vec<u8> {
 ///
 /// Returns:
 ///
-/// * `Some(true)` — `:status` decoded and passes [`is_status_healthy`]
-///   (`config.accepted_statuses`, else `config.expected_status`).
+/// * `Some(true)` — the final `:status` decoded and passes [`is_status_healthy`]
+///   (`config.accepted_statuses`, else `config.expected_status`); interim
+///   `1xx` HEADERS blocks before it are skipped.
 /// * `Some(false)` — `:status` decoded but does not match, the HPACK
 ///   block was malformed, or a GOAWAY frame arrived.
 /// * `None` — buffer truncated mid-frame; caller should keep reading.
@@ -945,6 +976,9 @@ fn try_parse_h2c_status(buf: &[u8], config: &HealthCheckConfig) -> Option<bool> 
     // connection, but we still tolerate interleaved control frames
     // for robustness — the decoder only fires on END_HEADERS.
     let mut headers_block: Option<Vec<u8>> = None;
+    // One HPACK decoder for the whole walk: an interim HEADERS block may
+    // insert into the dynamic table the final block then references.
+    let mut decoder = crate::protocol::mux::hpack::Decoder::new();
 
     while !remaining.is_empty() {
         // The `mux::parser::frame_header` is built from `nom::number::complete`
@@ -1008,9 +1042,16 @@ fn try_parse_h2c_status(buf: &[u8], config: &HealthCheckConfig) -> Option<bool> 
                 let mut accumulator = headers_block.take().unwrap_or_default();
                 accumulator.extend_from_slice(block);
                 if header.flags & FLAG_END_HEADERS != 0 {
-                    return Some(decode_status_from_block(&accumulator, config));
+                    match decode_status_from_block(&mut decoder, &accumulator) {
+                        // RFC 9113 §8.1: interim responses arrive as their
+                        // own HEADERS before the final one; keep walking.
+                        Some(code) if is_interim_status(code) => {}
+                        Some(code) => return Some(is_status_healthy(code, config)),
+                        None => return Some(false),
+                    }
+                } else {
+                    headers_block = Some(accumulator);
                 }
-                headers_block = Some(accumulator);
             }
             FrameType::Continuation if header.stream_id == 1 => {
                 // CONTINUATION carries no padding/priority flags; the
@@ -1022,9 +1063,16 @@ fn try_parse_h2c_status(buf: &[u8], config: &HealthCheckConfig) -> Option<bool> 
                 };
                 accumulator.extend_from_slice(payload);
                 if header.flags & FLAG_END_HEADERS != 0 {
-                    return Some(decode_status_from_block(&accumulator, config));
+                    match decode_status_from_block(&mut decoder, &accumulator) {
+                        // RFC 9113 §8.1: interim responses arrive as their
+                        // own HEADERS before the final one; keep walking.
+                        Some(code) if is_interim_status(code) => {}
+                        Some(code) => return Some(is_status_healthy(code, config)),
+                        None => return Some(false),
+                    }
+                } else {
+                    headers_block = Some(accumulator);
                 }
-                headers_block = Some(accumulator);
             }
             FrameType::GoAway => return Some(false),
             // SETTINGS, SETTINGS-ACK, DATA, PING, etc. — keep walking
@@ -1081,13 +1129,15 @@ fn strip_padded_priority(payload: &[u8], flags: u8) -> Option<&[u8]> {
     Some(block)
 }
 
-/// Run `crate::protocol::mux::hpack::Decoder` over the assembled HEADERS block and
-/// return whether `:status` passes [`is_status_healthy`]. Unknown
-/// HPACK encodings, malformed integers, Huffman fallbacks, and
-/// `:status` values that fail UTF-8 / numeric parsing all collapse to
-/// `false` — the probe is recorded as unhealthy, never as a panic.
-fn decode_status_from_block(block: &[u8], config: &HealthCheckConfig) -> bool {
-    let mut decoder = crate::protocol::mux::hpack::Decoder::new();
+/// Run the walk's `crate::protocol::mux::hpack::Decoder` over an assembled
+/// HEADERS block and return its `:status`. Unknown HPACK encodings,
+/// malformed integers, Huffman fallbacks, and `:status` values that fail
+/// UTF-8 / numeric parsing all yield `None` — the caller records the probe
+/// as unhealthy, never panics.
+fn decode_status_from_block(
+    decoder: &mut crate::protocol::mux::hpack::Decoder,
+    block: &[u8],
+) -> Option<u32> {
     let mut status: Option<u32> = None;
     let decode_result = decoder.decode_with_cb(block, |name, value| {
         if status.is_some() {
@@ -1101,12 +1151,9 @@ fn decode_status_from_block(block: &[u8], config: &HealthCheckConfig) -> bool {
         }
     });
     if decode_result.is_err() {
-        return false;
+        return None;
     }
-    match status {
-        Some(code) => is_status_healthy(code, config),
-        None => false,
-    }
+    status
 }
 
 #[cfg(test)]
@@ -1205,6 +1252,71 @@ mod tests {
         let block = encode_response_headers(&[(b":status", b"200")]);
         let buf = frame_with_header(0x01, FLAG_END_HEADERS, 1, &block);
         assert_eq!(try_parse_h2c_status(&buf, &config), Some(false));
+    }
+
+    #[test]
+    fn http1_interim_responses_are_skipped_for_the_final_status() {
+        // Default 2xx: a `103 Early Hints` with headers, then the final 200.
+        let default = status_config(0, &[]);
+        let buf = b"HTTP/1.1 103 Early Hints\r\nLink: </a.css>\r\n\r\nHTTP/1.1 200 OK\r\n\r\n";
+        assert_eq!(try_parse_status_line(buf, &default), Some(true));
+        // `1xx` accepted: an interim `100 Continue` must not stand in for a
+        // final 500.
+        let informational = status_config(0, &[(100, 199)]);
+        let buf = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 500 Internal Server Error\r\n\r\n";
+        assert_eq!(try_parse_status_line(buf, &informational), Some(false));
+        // `101 Switching Protocols` is final.
+        let buf = b"HTTP/1.1 101 Switching Protocols\r\n\r\n";
+        assert_eq!(try_parse_status_line(buf, &informational), Some(true));
+        // Until the final status line arrives, keep reading.
+        for partial in [
+            &b"HTTP/1.1 100 Continue\r\n"[..],
+            b"HTTP/1.1 100 Continue\r\n\r\n",
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200",
+        ] {
+            assert_eq!(
+                try_parse_status_line(partial, &default),
+                None,
+                "{partial:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn h2c_interim_headers_are_skipped_for_the_final_status() {
+        // One encoder for both blocks, as a server would use: the final
+        // block may reference dynamic-table entries the interim one added.
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
+        let mut interim = Vec::new();
+        encoder.encode_into(
+            [(&b":status"[..], &b"103"[..]), (b"link", b"</a.css>")],
+            &mut interim,
+        );
+        let mut last = Vec::new();
+        encoder.encode_into(
+            [(&b":status"[..], &b"200"[..]), (b"link", b"</a.css>")],
+            &mut last,
+        );
+        let mut buf = frame_with_header(0x01, FLAG_END_HEADERS, 1, &interim);
+        assert_eq!(
+            try_parse_h2c_status(&buf, &h2c_config(0)),
+            None,
+            "wait for the final HEADERS"
+        );
+        buf.extend_from_slice(&frame_with_header(0x01, FLAG_END_HEADERS, 1, &last));
+        assert_eq!(try_parse_h2c_status(&buf, &h2c_config(0)), Some(true));
+        // `1xx` accepted: the interim block is still not the verdict.
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
+        let mut interim = Vec::new();
+        encoder.encode_into([(&b":status"[..], &b"100"[..])], &mut interim);
+        let mut last = Vec::new();
+        encoder.encode_into([(&b":status"[..], &b"500"[..])], &mut last);
+        let mut buf = frame_with_header(0x01, FLAG_END_HEADERS, 1, &interim);
+        buf.extend_from_slice(&frame_with_header(0x01, FLAG_END_HEADERS, 1, &last));
+        assert_eq!(
+            try_parse_h2c_status(&buf, &status_config(0, &[(100, 199)])),
+            Some(false)
+        );
     }
 
     #[test]

@@ -3048,7 +3048,10 @@ also unaffected.
 
 You can optionally configure active health checks for backends: an HTTP
 probe (the default) or a TCP connect probe. See
-[health_checks.md](./health_checks.md) for full details.
+[health_checks.md](./health_checks.md) for full details. Upgrade the main
+process and every worker, and use the new `sozu` CLI, before setting
+`mode = "TCP"` or `accepted_statuses`: an older Sōzu ignores both and probes
+`GET <uri>` accepting only 2xx.
 
 ```toml
 [clusters.NameOfYourCluster.health_check]

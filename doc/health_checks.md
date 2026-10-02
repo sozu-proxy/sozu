@@ -12,12 +12,26 @@ Two probe modes exist (`mode`):
   response status is accepted (`accepted_statuses`, or `expected_status` when
   that list is empty).
 - **`TCP`**: a TCP connect; the backend passes when the TCP connection is
-  established within `timeout`. Nothing is sent, the connection is closed as
-  soon as it is established, and `uri`, `expected_status` and
-  `accepted_statuses` are ignored. Use it when the only question is whether the
+  established within `timeout`. Nothing is sent and the connection is closed as
+  soon as it is established. `uri` is ignored; a non-zero `expected_status` or
+  a non-empty `accepted_statuses` is refused, since a TCP probe judges no
+  status. Use it when the only question is whether the
   backend accepts connections — for example to take blackholed backends out of
   rotation on a platform where an application answering 3xx, 401, 404 or even
   500 on a fixed path is still serving.
+
+> **Before enabling `TCP` mode or `accepted_statuses`, upgrade the main process
+> and every worker, and use the new `sozu` CLI.** Both are new protocol fields
+> (`HealthCheckConfig` fields 7 and 8) that an older Sōzu ignores, so it
+> silently runs the default probe instead — `GET <uri>` (`/` when the TOML or
+> CLI left `uri` unset) accepting only 2xx — and marks down every backend that
+> answers 3xx, 404 or 500. That happens with an older worker still running
+> between `sozu upgrade main` and `sozu upgrade worker`; with an older `sozu`
+> CLI that patches a cluster by read-modify-write (`QueryClusterById` →
+> `AddCluster`, as `sozu cluster h2 enable|disable` does), which re-sends the
+> health check without the two fields and so switches it back to that default
+> on every worker; and with an older binary loading a saved state written by a
+> newer one. Downgrading while a cluster uses either field is not supported.
 
 ## How it works
 
@@ -60,6 +74,11 @@ is accepted:
 - when `accepted_statuses` is set, the status must fall in one of its entries;
 - otherwise, if `expected_status` is `0` (the default), any 2xx status code
   (200–299) is accepted, and any other value accepts exactly that status.
+
+The status judged is the final one: interim `1xx` responses (`100 Continue`,
+`103 Early Hints`, RFC 9110 §15.2) are skipped, on HTTP/1.1 and h2c alike, so
+accepting `1xx` or `any` never lets an interim response stand in for a final
+500. `101 Switching Protocols` is final.
 
 Setting both a non-zero `expected_status` and `accepted_statuses` is refused
 when the configuration is loaded or sent, so one never silently overrides the
@@ -132,8 +151,8 @@ accepted_statuses = ["200-499"]
 | `timeout`             | u32      | `5`      | Seconds to wait for the connection (`TCP`) or the response (`HTTP`) before marking the check as failed.         |
 | `healthy_threshold`   | u32      | `3`      | Consecutive successes required to transition from unhealthy to healthy.                                         |
 | `unhealthy_threshold` | u32      | `3`      | Consecutive failures required to transition from healthy to unhealthy.                                          |
-| `expected_status`     | u32      | `0`      | `HTTP` mode, when `accepted_statuses` is empty: `0` accepts any 2xx, any other value exactly that status.       |
-| `accepted_statuses`   | [string] | `[]`     | `HTTP` mode: the accepted statuses (see below). Exclusive with a non-zero `expected_status`.                    |
+| `expected_status`     | u32      | `0`      | `HTTP` mode, when `accepted_statuses` is empty: `0` accepts any 2xx, any other value exactly that status. Must stay `0` in `TCP` mode. |
+| `accepted_statuses`   | [string] | `[]`     | `HTTP` mode: the accepted statuses (see below). Exclusive with a non-zero `expected_status`; refused in `TCP` mode. |
 
 Each `accepted_statuses` entry is one of:
 
@@ -150,6 +169,12 @@ Every bound must lie in `100-599` (RFC 9110 §15). In the protocol
 `uri` stays a required field on the wire and may be empty in `TCP` mode. A
 message without field 7 decodes as `HTTP`, so configurations written before
 the modes existed keep their meaning.
+
+In TOML, `mode` is written in upper case, `"HTTP"` or `"TCP"`, and the
+spelling is case-sensitive like every other protocol enum key (`shard_mode`,
+`udp.health.mode`); the CLI takes `--mode http|tcp`. Do not confuse it with the
+UDP cluster health check, whose `[clusters.<id>.udp.health] mode` takes
+`"TCP_PROBE"`, `"UDP_PROBE"` or `"HEALTH_OFF"`.
 
 In `HTTP` mode the probe wire format follows the cluster's `http2` flag. Setting
 `[clusters.<id>] http2 = true` switches both the data-plane backend connection
@@ -181,6 +206,12 @@ sozu cluster health-check set --id my-cluster --uri /livez --accepted-statuses 2
 
 Creates or replaces the health check configuration for the given cluster. Only
 `--id` is required — all other flags have sensible defaults (shown above).
+
+The probe timeout is `--probe-timeout`, in seconds. `--timeout` (`-t`) is the
+global `sozu` command timeout, in milliseconds, on this subcommand as on every
+other: `sozu cluster health-check set --timeout 5 …` waits 5 ms for the answer
+and leaves the probe timeout at its default. Before `--probe-timeout` existed
+the two flags collided and every `health-check set` invocation panicked.
 
 | Flag                    | Required | Default | Description                                                                                |
 | ----------------------- | -------- | ------- | ------------------------------------------------------------------------------------------ |

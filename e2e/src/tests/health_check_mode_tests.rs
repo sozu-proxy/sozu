@@ -10,6 +10,13 @@
 //! - A legacy configuration (no mode, no list) keeps its meaning: any 2xx,
 //!   so the same 404 backend is marked down.
 //!
+//! The mode switch itself is guarded by
+//! `test_health_check_tcp_mode_keeps_500_and_404_backends_up`: an HTTP probe
+//! marks those backends down, so it fails if `TCP` ever falls back to HTTP.
+//! The blackholed/refused test passes under either mode — both fail an HTTP
+//! probe too — and guards the connect verdict instead: a refused connection
+//! reported as established makes it fail.
+//!
 //! The verdicts are read from the worker's `health_check.*` counters
 //! (`HealthChecker::record_check_result`, `lib/src/health_check.rs`), which
 //! count every probe result and every UP/DOWN transition. The counters are

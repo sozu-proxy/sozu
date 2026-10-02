@@ -7168,6 +7168,64 @@ mod tests {
         );
     }
 
+    /// #1801: `SetHealthCheck` refuses a TCP-mode probe carrying a status
+    /// field, and keeps the previous config; the same probe without one is
+    /// stored.
+    #[test]
+    fn set_health_check_tcp_mode_with_status_field_rejected() {
+        use crate::proto::command::{HealthCheckConfig, HealthCheckMode, SetHealthCheck};
+
+        let mut state = ConfigState::new();
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("app"),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("the cluster is added");
+        let tcp = HealthCheckConfig {
+            uri: String::new(),
+            interval: 10,
+            timeout: 5,
+            healthy_threshold: 3,
+            unhealthy_threshold: 3,
+            mode: HealthCheckMode::Tcp as i32,
+            ..Default::default()
+        };
+        let set = |config: HealthCheckConfig| {
+            RequestType::SetHealthCheck(SetHealthCheck {
+                cluster_id: String::from("app"),
+                config,
+            })
+            .into()
+        };
+
+        let err = state
+            .dispatch(&set(HealthCheckConfig {
+                expected_status: 200,
+                ..tcp.clone()
+            }))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StateError::InvalidValue {
+                    field: "health_check",
+                    ..
+                }
+            ),
+            "expected InvalidValue for a TCP probe with expected_status, got: {err}"
+        );
+        assert_eq!(state.clusters["app"].health_check, None);
+
+        state
+            .dispatch(&set(tcp.clone()))
+            .expect("a bare TCP probe is accepted");
+        assert_eq!(state.clusters["app"].health_check, Some(tcp));
+    }
+
     /// ALPN validation: reject unknown ALPN values.
     #[test]
     fn update_https_listener_alpn_unknown_value_rejected() {

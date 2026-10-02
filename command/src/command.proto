@@ -1375,8 +1375,9 @@ enum HealthCheckMode {
     HEALTH_CHECK_MODE_HTTP = 0;
     // Healthy iff a TCP connection to the backend is established within
     // `timeout`. No byte is sent; the connection is closed as soon as it
-    // is established. `uri`, `expected_status` and `accepted_statuses`
-    // are ignored.
+    // is established. `uri` is ignored; a non-zero `expected_status` or a
+    // non-empty `accepted_statuses` is refused. A peer that predates this
+    // field ignores it and runs the HTTP probe instead.
     HEALTH_CHECK_MODE_TCP = 1;
 }
 

@@ -2736,7 +2736,8 @@ pub fn validate_shuffle_sharding(
 /// smuggle a second HTTP message on the wire (RFC 9110 §5.1 —
 /// request-target; the leading `/` is only required in HTTP mode, the
 /// only one that sends it), accepted status ranges within `100..=599`,
-/// and at most one of `expected_status` / `accepted_statuses`. Used by
+/// at most one of `expected_status` / `accepted_statuses`, and neither in
+/// TCP mode, which judges no status. Used by
 /// the CLI request builder and the worker `SetHealthCheck` handler so
 /// off-channel inputs (TOML reload, third-party clients) are
 /// constrained the same way as `sozu cluster health-check set`.
@@ -2783,6 +2784,16 @@ pub fn validate_health_check_config(cfg: &HealthCheckConfig) -> Result<(), &'sta
              set at most one",
         );
     }
+    // A TCP probe judges no status: a status field set beside it would read
+    // as a constraint the probe silently does not apply.
+    if mode == HealthCheckMode::Tcp
+        && (cfg.expected_status != 0 || !cfg.accepted_statuses.is_empty())
+    {
+        return Err(
+            "health check expected_status and accepted_statuses apply to HTTP mode only: \
+             leave them unset with mode TCP",
+        );
+    }
     // POST: a validated config has strictly-positive timing knobs (a zero
     // interval/timeout/threshold would make the health-check loop spin or
     // never converge) and a request-target the worker can splice into an HTTP
@@ -2802,6 +2813,11 @@ pub fn validate_health_check_config(cfg: &HealthCheckConfig) -> Result<(), &'sta
     debug_assert!(
         cfg.expected_status == 0 || cfg.accepted_statuses.is_empty(),
         "a validated health check sets at most one of expected_status and accepted_statuses"
+    );
+    debug_assert!(
+        mode == HealthCheckMode::Http
+            || (cfg.expected_status == 0 && cfg.accepted_statuses.is_empty()),
+        "a validated TCP health check sets no status field"
     );
     Ok(())
 }
@@ -5797,6 +5813,21 @@ mod tests {
         };
         assert!(validate_health_check_config(&tcp_crlf).is_err());
 
+        // TCP mode judges no status, so status fields beside it are refused.
+        let tcp_expected = HealthCheckConfig {
+            expected_status: 200,
+            ..tcp_no_uri.clone()
+        };
+        assert!(validate_health_check_config(&tcp_expected).is_err());
+        let tcp_accepted = HealthCheckConfig {
+            accepted_statuses: vec![HttpStatusRange {
+                start: 100,
+                end: 599,
+            }],
+            ..tcp_no_uri.clone()
+        };
+        assert!(validate_health_check_config(&tcp_accepted).is_err());
+
         let unknown_mode = HealthCheckConfig {
             mode: 7,
             ..http.clone()
@@ -5896,6 +5927,8 @@ mod tests {
             "accepted_statuses = [\"6xx\"]\n",
             "expected_status = 200\naccepted_statuses = [\"any\"]\n",
             "uri = \"health\"\n",
+            "mode = \"TCP\"\nexpected_status = 200\n",
+            "mode = \"TCP\"\naccepted_statuses = [\"any\"]\n",
         ] {
             assert!(
                 matches!(
