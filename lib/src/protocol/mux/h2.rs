@@ -946,6 +946,24 @@ pub struct ConnectionH2 {
     /// on sustained abuse — a single halving per connection is sufficient to
     /// signal back-pressure; further bursts trigger `EnhanceYourCalm`.
     mcs_backpressure_applied: bool,
+    /// First and last client stream ids of the latest run of streams refused
+    /// under flood pressure (`H2FloodDetector::refuses_new_streams`,
+    /// `lib/src/protocol/mux/h2_flood_detector.rs`). Every new client stream
+    /// is refused while the soft state holds, so one run is a contiguous
+    /// range; the next accepted stream ends it.
+    ///
+    /// A RST_STREAM the client sends for one of these ids resets a stream
+    /// that never got a response, so `Self::handle_rst_stream_frame` counts
+    /// it as a pre-response reset. Without that, a client that ignores the
+    /// refusals and keeps opening and resetting streams would stop moving
+    /// toward the pre-response cap as soon as the soft state engages.
+    flood_refused_streams: Option<(StreamId, StreamId)>,
+    /// Set once the client resets a stream of [`Self::flood_refused_streams`]:
+    /// it does not honour `REFUSED_STREAM`, so no further stream is refused
+    /// under flood pressure on this connection and it meets the flood limits
+    /// unchanged. Refusing it further would only add one RST_STREAM per
+    /// stream it opens ahead of the pre-response cap's GOAWAY.
+    flood_refusal_ignored: bool,
     /// Clock snapshot for the pass currently executing — this connection's
     /// mirror of [`Context::now`](super::Context::now).
     ///
@@ -1130,6 +1148,9 @@ pub(super) enum MetricEvent {
     RstStreamReceived(u32),
     /// The peer reset a stream before the backend had begun answering it.
     RstStreamReceivedBeforeResponse,
+    /// A new client stream was refused with `REFUSED_STREAM` because the
+    /// connection is in the soft state below the pre-response RST_STREAM cap.
+    StreamRefusedUnderFlood,
     /// A GOAWAY arrived carrying this raw wire error code.
     GoAwayReceived(u32),
 
@@ -1277,6 +1298,9 @@ pub(super) fn record_metric(event: MetricEvent) {
         }
         MetricEvent::RstStreamReceivedBeforeResponse => {
             count!(names::h2::RST_STREAM_RECEIVED_PRE_RESPONSE_START, 1)
+        }
+        MetricEvent::StreamRefusedUnderFlood => {
+            count!(names::h2::FLOOD_STREAM_REFUSED, 1)
         }
         MetricEvent::GoAwayReceived(error_code) => {
             count!(metric_for_goaway_received(error_code), 1)
@@ -2004,6 +2028,8 @@ impl ConnectionH2 {
             refuse_count_window: 0,
             refuse_window_start: now,
             mcs_backpressure_applied: false,
+            flood_refused_streams: None,
+            flood_refusal_ignored: false,
             now,
             pending_force_disconnect: None,
         })
@@ -2210,6 +2236,42 @@ impl ConnectionH2 {
                                     flags: header.flags,
                                 },
                             );
+                        }
+                        // Soft state below the pre-response RST_STREAM cap:
+                        // refuse the new stream, keep serving the open ones.
+                        // The refusal is retryable (RFC 9113 §8.7) and counted
+                        // by no flood counter — no glitch, `RstOrigin::Local`,
+                        // and no SETTINGS back-pressure, which would halve
+                        // MAX_CONCURRENT_STREAMS for the rest of the
+                        // connection over a state that decays. A client that
+                        // reset a refused stream gets no more refusals
+                        // (`Self::flood_refusal_ignored`).
+                        if !self.flood_refusal_ignored
+                            && self.flood_detector.refuses_new_streams(self.now)
+                        {
+                            debug!(
+                                "{} refusing stream {} under flood pressure",
+                                log_context!(self),
+                                stream_id
+                            );
+                            self.metric_events
+                                .push(MetricEvent::StreamRefusedUnderFlood);
+                            self.stream_table.observe_peer_stream_id(stream_id);
+                            self.note_flood_refused_stream(stream_id);
+                            if let Some(result) = self.enqueue_rst(
+                                stream_id,
+                                H2Error::RefusedStream,
+                                RstOrigin::Local,
+                            ) {
+                                return result;
+                            }
+                            self.discard_field_block(
+                                header.payload_len,
+                                DiscardedFieldBlock::New {
+                                    flags: header.flags,
+                                },
+                            );
+                            return MuxResult::Continue;
                         }
                         if self.stream_table.len()
                             >= self.local_settings.settings_max_concurrent_streams as usize
@@ -5431,6 +5493,26 @@ impl ConnectionH2 {
         MuxResult::Continue
     }
 
+    /// Extend [`Self::flood_refused_streams`] with `stream_id`, refused under
+    /// flood pressure, or start a new run when a stream was accepted since
+    /// the last refusal (the even watermark `last_stream_id` moved past the
+    /// run's first id).
+    fn note_flood_refused_stream(&mut self, stream_id: StreamId) {
+        let run = match self.flood_refused_streams {
+            Some((first, _)) if self.last_stream_id < first => (first, stream_id),
+            _ => (stream_id, stream_id),
+        };
+        debug_assert!(
+            run.0 <= run.1 && run.1 == stream_id,
+            "the refused run ends at the stream just refused"
+        );
+        debug_assert!(
+            self.last_stream_id < run.0,
+            "no accepted stream lies inside the refused run"
+        );
+        self.flood_refused_streams = Some(run);
+    }
+
     /// Read and drop a HEADERS payload of `payload_len` bytes through
     /// `H2State::Discard`, decoding its field block on the way so the HPACK
     /// decoder stays in sync (RFC 9113 §4.3). Queues nothing.
@@ -5586,7 +5668,7 @@ fn routed_to_a_backend(stream: &crate::protocol::mux::Stream) -> bool {
 /// MadeYouReset cap (`H2FloodDetector::record_rst_emitted`,
 /// `lib/src/protocol/mux/h2_flood_detector.rs`). A reset Sōzu decides on its
 /// own — the idle reaper's `CANCEL`, a `REFUSED_STREAM` from its own
-/// concurrency limit, back-pressure or buffer pool, `STREAM_CLOSED` for DATA
+/// concurrency limit, back-pressure, buffer pool or flood soft state, `STREAM_CLOSED` for DATA
 /// on a stream it already closed, the converter's error on a backend failure —
 /// says nothing about the peer, and counting it would end healthy connections
 /// for Sōzu's own decisions.
@@ -7015,6 +7097,20 @@ impl ConnectionH2 {
         // (`routed_to_a_backend`) before the caps are checked, so a client
         // that cancels every stream after its response never has one more
         // reset than answered streams.
+        // A stream refused under flood pressure never got a response:
+        // resetting it is a pre-response reset, whatever the refusal did to
+        // the stream table. It also shows the peer does not honour
+        // REFUSED_STREAM, so the soft refusal ends for this connection: more
+        // refusals would only multiply the RST_STREAM frames Sōzu sends ahead
+        // of the cap's GOAWAY.
+        let refused_stream_reset = self.position.is_server()
+            && self.stream_table.get(rst_stream.stream_id).is_none()
+            && self
+                .flood_refused_streams
+                .is_some_and(|(first, last)| (first..=last).contains(&rst_stream.stream_id));
+        if refused_stream_reset {
+            self.flood_refusal_ignored = true;
+        }
         let (response_started, answered) =
             match self.stream_table.streams().get(&rst_stream.stream_id) {
                 Some(global_stream_id) => {
@@ -7025,14 +7121,15 @@ impl ConnectionH2 {
                         self.position.is_server() && started && routed_to_a_backend(stream),
                     )
                 }
+                None if refused_stream_reset => (false, false),
                 // Stream already gone (e.g. closed, not yet registered) —
                 // treat as response-started to avoid over-counting benign
                 // races as abusive.
                 None => (true, false),
             };
-        if let Some(violation) = self
-            .flood_detector
-            .record_rst_received(response_started, answered)
+        if let Some(violation) =
+            self.flood_detector
+                .record_rst_received(response_started, answered, self.now)
         {
             return self.handle_flood_violation(violation);
         }
@@ -15420,6 +15517,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             ),
             connection.core.now,
         );
@@ -15434,7 +15532,7 @@ mod tests {
             if connection
                 .core
                 .flood_detector
-                .record_rst_received(false, false)
+                .record_rst_received(false, false, connection.core.now)
                 .is_some()
             {
                 tripped_at = Some(n);
@@ -21608,6 +21706,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         connection.core.flood_detector =
             h2_flood_detector::H2FloodDetector::new(config, connection.core.now);
@@ -21677,6 +21776,120 @@ mod tests {
                 n + 1
             );
         }
+    }
+
+    /// A frontend connection whose pre-response cap has the floor `floor`,
+    /// every other threshold at its default (soft refusal at 50 %).
+    fn frontend_pre_response_fixture(
+        floor: u64,
+    ) -> (
+        Rc<RefCell<Pool>>,
+        H2Shell<mio::net::TcpStream>,
+        std::net::TcpStream,
+        Context<TestListener>,
+        Router,
+    ) {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(8, 512, 16_384)));
+        let (mut connection, peer) = test_h2_connection(&pool, None);
+        let config = H2FloodConfig::from_optional(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(floor),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        connection.core.flood_detector =
+            h2_flood_detector::H2FloodDetector::new(config, connection.core.now);
+        let context = test_context(&pool);
+        let router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        (pool, connection, peer, context, router)
+    }
+
+    /// A client that ignores `REFUSED_STREAM` and resets the streams Sōzu
+    /// refused under flood pressure still reaches the pre-response cap: a
+    /// refused stream never got a response, so its reset is a pre-response
+    /// one even though the stream was never registered. A reset of a stream
+    /// that is simply gone keeps counting as response-started.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::handle_rst_stream_frame`, delete
+    /// the `flood_refused_streams` arm. The resets then count as
+    /// response-started, the pre-response count stops at the soft threshold,
+    /// and no GOAWAY is ever sent.
+    #[test]
+    fn resets_of_streams_refused_under_flood_count_as_pre_response() {
+        const FLOOR: u64 = 10;
+        let (_pool, mut connection, _peer, mut context, mut router) =
+            frontend_pre_response_fixture(FLOOR);
+        let refused = (FLOOR as u32 + 1) * 2;
+        for n in 0..refused {
+            let stream_id = 2 * n + 1;
+            connection
+                .core
+                .stream_table
+                .observe_peer_stream_id(stream_id);
+            connection.core.note_flood_refused_stream(stream_id);
+        }
+        assert_eq!(
+            connection.core.flood_refused_streams,
+            Some((1, 2 * refused - 1)),
+            "consecutive refusals form one run"
+        );
+        // Resets of ids past the run: gone, not refused, never pre-response,
+        // and no reason to stop refusing.
+        for n in 0..=FLOOR as u32 {
+            let stream_id = 2 * (refused + n) + 1;
+            assert!(
+                !client_cancels(&mut connection, &mut context, &mut router, stream_id),
+                "a reset of a stream outside the refused run must not count as pre-response"
+            );
+        }
+        assert!(!connection.core.flood_refusal_ignored);
+        let mut tripped_at = None;
+        for n in 0..refused {
+            if client_cancels(&mut connection, &mut context, &mut router, 2 * n + 1) {
+                tripped_at = Some(u64::from(n) + 1);
+                break;
+            }
+        }
+        assert_eq!(
+            tripped_at,
+            Some(FLOOR + 1),
+            "resets of refused streams must reach the pre-response cap just past its floor"
+        );
+        assert!(
+            connection.core.flood_refusal_ignored,
+            "a client that resets a refused stream gets no more refusals"
+        );
+    }
+
+    /// An accepted stream ends the refused run; the next refusal starts a new
+    /// one, so a stream that was served never counts as refused.
+    #[test]
+    fn an_accepted_stream_ends_the_flood_refused_run() {
+        let (_pool, mut connection, _peer, mut context, _router) =
+            frontend_pre_response_fixture(10);
+        connection.core.note_flood_refused_stream(1);
+        connection.core.note_flood_refused_stream(3);
+        assert_eq!(connection.core.flood_refused_streams, Some((1, 3)));
+        connection
+            .core
+            .create_stream(5, &mut context)
+            .expect("the pool must hand out stream buffers");
+        connection.core.note_flood_refused_stream(7);
+        assert_eq!(
+            connection.core.flood_refused_streams,
+            Some((7, 7)),
+            "a refusal after an accepted stream starts a new run"
+        );
     }
 
     /// A mix of cancels: one stream in ten reset before its response,

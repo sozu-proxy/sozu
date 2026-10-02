@@ -1388,6 +1388,7 @@ impl L7ListenerHandler for HttpsListener {
             self.config.h2_max_header_list_size,
             self.config.h2_max_header_table_size,
             self.config.h2_max_header_fields,
+            self.config.h2_stream_refusal_percent,
         )
     }
 
@@ -1875,6 +1876,9 @@ impl HttpsListener {
         }
         if let Some(v) = patch.h2_max_header_fields {
             config.h2_max_header_fields = Some(v);
+        }
+        if let Some(v) = patch.h2_stream_refusal_percent {
+            config.h2_stream_refusal_percent = Some(v);
         }
         if let Some(v) = patch.h2_stream_idle_timeout_seconds {
             config.h2_stream_idle_timeout_seconds = Some(v);
@@ -3660,6 +3664,7 @@ mod tests {
         cfg.h2_max_header_list_size = Some(111);
         cfg.h2_max_header_table_size = Some(112);
         cfg.h2_max_header_fields = Some(113);
+        cfg.h2_stream_refusal_percent = Some(114);
 
         let listener = HttpsListener::try_new(cfg, Token(0)).expect("build listener");
         let flood = listener.get_h2_flood_config();
@@ -3677,6 +3682,7 @@ mod tests {
         assert_eq!(flood.max_header_list_size(), 111);
         assert_eq!(flood.max_header_table_size(), 112);
         assert_eq!(flood.max_header_fields(), 113);
+        assert_eq!(flood.stream_refusal_percent(), 114);
     }
 
     #[test]

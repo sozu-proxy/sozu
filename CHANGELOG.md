@@ -4,6 +4,25 @@
 
 ### ✨ Added
 
+- **BREAKING (library API) — `feat(mux-h2)`: refuse new streams before the pre-response
+  RST_STREAM cap ([#1797](https://github.com/sozu-proxy/sozu/issues/1797)).** The pre-response
+  cap (`h2_max_rst_stream_abusive_lifetime`) ends the connection with `GOAWAY(ENHANCE_YOUR_CALM)`
+  and every stream in flight on it. A connection past `h2_stream_refusal_percent` (default 50,
+  `0` disables) of the cap's floor, whose pre-response resets already outnumber its
+  backend-routed streams, now refuses new client streams with `RST_STREAM(REFUSED_STREAM)`,
+  retryable per RFC 9113 §8.7, and keeps serving its open streams. The refusal ends one second
+  after the last pre-response reset. The cap and the other flood limits are unchanged; a refusal
+  feeds no flood counter. A reset of a refused stream counts as a pre-response reset and ends
+  the refusals on that connection, so a client that ignores them meets the cap exactly as
+  before. New listener key `h2_stream_refusal_percent` (TOML; `command.proto` fields
+  `HttpListenerConfig` 37, `HttpsListenerConfig` 50, `UpdateHttpListenerConfig` 43,
+  `UpdateHttpsListenerConfig` 44; `--h2-stream-refusal-percent` on
+  `sozu listener http|https update`) and counter `h2.flood.stream_refused`. Library API:
+  `H2FloodConfig::new` and `H2FloodConfig::from_optional` take a fourteenth argument.
+  Documented in `doc/configure.md` ("Refusing new streams before the pre-response cap");
+  covered by `test_h2_cancels_past_the_soft_threshold_refuse_new_streams`
+  (`e2e/src/tests/h2_flood_threshold_tests.rs`) and the `refuses_new_streams` unit tests.
+
 - **BREAKING (library API) — `feat(udp)`: opt-in per-source flow limit on UDP clusters.** Each
   client source IP and port is its own UDP flow, with its own upstream socket and `max_flows` slot,
   and nothing bounded the flows one source address held. A cluster's own `max_connections_per_ip`

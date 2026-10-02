@@ -287,6 +287,21 @@ Configurable thresholds with safe compile-time defaults:
 | `max_header_table_size` | 65536 (64 KiB) | (HPACK memory) | Peer-advertised dynamic table size cap |
 | `max_header_fields` | 128 | (HPACK memory) | Indexed-reference "header bomb" |
 | `max_glitch_count` | 2000 | (cumulative) | General protocol abuse |
+| `stream_refusal_percent` | 50 | CVE-2023-44487 | Soft state: past this share of the `max_rst_stream_abusive_lifetime` floor, with the cap's ratio crossed, new client streams get `REFUSED_STREAM` and open ones are served; `0` disables |
+
+`H2FloodDetector::refuses_new_streams` is the soft state below the
+pre-response cap. `ConnectionH2::handle_header_state` asks it before opening a
+client stream and refuses with `RstOrigin::Local`, without a glitch and without
+SETTINGS back-pressure, so the refusal feeds no counter. The pre-response count
+never decays, so the soft state holds only within one window of the last
+pre-response reset. `ConnectionH2::flood_refused_streams` keeps the latest run
+of refused ids. A reset of one of them counts as pre-response in
+`ConnectionH2::handle_rst_stream_frame` and sets
+`ConnectionH2::flood_refusal_ignored`, which ends the refusals on that
+connection: a client that resets the streams it is refused meets the cap
+exactly as it would without the soft state. The per-window RST_STREAM rate has
+no soft state: it counts every reset, and with its half-decay a client at half
+the rate never reaches the limit.
 
 The sliding window duration is 1 second (`FLOOD_WINDOW_DURATION`). The three
 `*_lifetime` counters never decay, but each trips only once it also exceeds a
@@ -681,7 +696,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:4873-4886
+```rust lib/src/protocol/mux/h2.rs:4935-4948
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -707,7 +722,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:4924-4930
+```rust lib/src/protocol/mux/h2.rs:4986-4992
 let events = stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -739,7 +754,7 @@ taken at the top of `H2WritePhase::Flush`'s post-flush tail
 (`ConnectionH2::poll_write_target`, `lib/src/protocol/mux/h2.rs`) and passes `stream.linked_token()` straight
 out of it:
 
-```rust lib/src/protocol/mux/h2.rs:3629-3630
+```rust lib/src/protocol/mux/h2.rs:3691-3692
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 ```
@@ -1092,7 +1107,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9072-9076
+```rust lib/src/protocol/mux/h2.rs:9169-9173
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1246,7 +1261,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9250-9254
+```rust lib/src/protocol/mux/h2.rs:9347-9351
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1721,7 +1736,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:8575
+```rust lib/src/protocol/mux/h2.rs:8672
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -1955,7 +1970,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:7124-7126
+```rust lib/src/protocol/mux/h2.rs:7221-7223
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1963,7 +1978,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:7138-7144
+```rust lib/src/protocol/mux/h2.rs:7235-7241
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.
