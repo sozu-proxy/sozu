@@ -537,6 +537,7 @@ impl std::fmt::Debug for command::HttpsListenerConfig {
             .field("forwarded_headers", &self.forwarded_headers)
             .field("hsts", &self.hsts)
             .field("h2_max_header_fields", &self.h2_max_header_fields)
+            .field("h2_stream_refusal_percent", &self.h2_stream_refusal_percent)
             .finish()
     }
 }

@@ -1301,6 +1301,11 @@ pub enum HttpListenerCmd {
             help = "Maximum materialized header fields per request, incl. cookie crumbs (HTTP/2 header-bomb mitigation)"
         )]
         h2_max_header_fields: Option<u32>,
+        #[clap(
+            long,
+            help = "Percent of the pre-response RST_STREAM cap floor at which new streams are refused with REFUSED_STREAM; 0 disables"
+        )]
+        h2_stream_refusal_percent: Option<u32>,
         #[clap(long, help = "Per-stream idle timeout in seconds")]
         h2_stream_idle_timeout_seconds: Option<u32>,
         #[clap(
@@ -1605,6 +1610,11 @@ pub enum HttpsListenerCmd {
             help = "Maximum materialized header fields per request, incl. cookie crumbs (HTTP/2 header-bomb mitigation)"
         )]
         h2_max_header_fields: Option<u32>,
+        #[clap(
+            long,
+            help = "Percent of the pre-response RST_STREAM cap floor at which new streams are refused with REFUSED_STREAM; 0 disables"
+        )]
+        h2_stream_refusal_percent: Option<u32>,
         #[clap(long, help = "Per-stream idle timeout in seconds")]
         h2_stream_idle_timeout_seconds: Option<u32>,
         #[clap(
