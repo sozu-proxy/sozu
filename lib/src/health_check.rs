@@ -1,10 +1,15 @@
-//! Non-blocking HTTP health checks for backends
+//! Non-blocking health checks for backends
 //!
 //! Health checks run within the single-threaded mio event loop using non-blocking TCP
 //! connections. Each check cycle is triggered by a timer. For each backend with a
-//! configured health check, we open a non-blocking TCP connection, send a minimal
-//! HTTP/1.1 GET request, parse the status line from the response, and update the
-//! backend's health state accordingly.
+//! configured health check, we open a non-blocking TCP connection, then either:
+//!
+//! - `HealthCheckMode::Http`: send a minimal HTTP/1.1 (or h2c) GET request, parse the
+//!   response status and judge it against the accepted statuses;
+//! - `HealthCheckMode::Tcp`: send nothing and count the probe as passed once the
+//!   connection is established, then close it.
+//!
+//! The result updates the backend's health state accordingly.
 
 use std::{
     cell::RefCell,
@@ -18,7 +23,7 @@ use std::{
 
 use mio::{Interest, Registry, Token, net::TcpStream};
 use sozu_command::{
-    proto::command::{Event, EventKind, HealthCheckConfig},
+    proto::command::{Event, EventKind, HealthCheckConfig, HealthCheckMode},
     state::ClusterId,
 };
 
@@ -94,6 +99,10 @@ struct InFlightCheck {
     /// record avoids racing the cluster's `http2` flag if the
     /// operator flips it mid-probe.
     h2c: bool,
+    /// `HealthCheckMode::Tcp`: the probe passes once the connection is
+    /// established; nothing is written or read. Captured at probe-creation
+    /// time for the same reason as `h2c`.
+    tcp_connect_only: bool,
 }
 
 /// Manages health checks across all clusters and backends
@@ -292,6 +301,14 @@ impl HealthChecker {
             // here, no defense-in-depth divergence between what the
             // operator typed and what hits the wire.
             let probe_uri = config.uri.as_str();
+            let tcp_connect_only = config.mode == HealthCheckMode::Tcp as i32;
+            // A connect-only probe never writes or reads: it waits for the
+            // writability that signals the end of the handshake.
+            let interest = if tcp_connect_only {
+                Interest::WRITABLE
+            } else {
+                Interest::READABLE | Interest::WRITABLE
+            };
 
             for (backend_id, address) in backends_to_check {
                 match TcpStream::connect(address) {
@@ -310,11 +327,7 @@ impl HealthChecker {
                             );
                             continue;
                         };
-                        if let Err(e) = registry.register(
-                            &mut stream,
-                            token,
-                            Interest::READABLE | Interest::WRITABLE,
-                        ) {
+                        if let Err(e) = registry.register(&mut stream, token, interest) {
                             debug!(
                                 "{} failed to register socket for {} ({}) in cluster {}: {}",
                                 log_context!(),
@@ -340,8 +353,10 @@ impl HealthChecker {
                             address,
                             cluster_id
                         );
-                        let request_bytes = if h2c {
-                            build_h2c_probe_bytes(probe_uri, address)
+                        let request_bytes = if tcp_connect_only {
+                            None
+                        } else if h2c {
+                            Some(build_h2c_probe_bytes(probe_uri, address))
                         } else {
                             // RFC 9110 §7.2: `Host` MUST carry the
                             // authority component, including the port
@@ -356,11 +371,20 @@ impl HealthChecker {
                             // a per-cluster `host` field on
                             // `HealthCheckConfig` is tracked as a
                             // follow-up.
-                            format!(
-                                "GET {probe_uri} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+                            Some(
+                                format!(
+                                    "GET {probe_uri} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+                                )
+                                .into_bytes(),
                             )
-                            .into_bytes()
                         };
+                        // A connect-only probe carries no request; every
+                        // HTTP probe carries one.
+                        debug_assert_eq!(
+                            request_bytes.is_none(),
+                            tcp_connect_only,
+                            "only a TCP-mode probe may skip the HTTP request"
+                        );
                         self.in_flight.push(InFlightCheck {
                             stream,
                             token,
@@ -369,11 +393,12 @@ impl HealthChecker {
                             address,
                             started_at: now,
                             timeout: Duration::from_secs(u64::from(config.timeout)),
-                            request_bytes: Some(request_bytes),
+                            request_bytes,
                             write_offset: 0,
                             response_buf: Vec::with_capacity(256),
                             config: config.to_owned(),
                             h2c,
+                            tcp_connect_only,
                         });
                     }
                     Err(e) => {
@@ -444,6 +469,18 @@ impl HealthChecker {
 
             // Skip I/O if the socket has not been reported ready by mio
             if !ready.contains(&check.token) {
+                continue;
+            }
+
+            if check.tcp_connect_only {
+                // Nothing to send: the probe only waits for the handshake.
+                // The verdict lands on the first readiness after it,
+                // normally before the backend has accepted and could greet,
+                // so dropping the stream after `deregister` closes it with a
+                // FIN on an empty receive queue.
+                if let Some(success) = tcp_connect_outcome(&check.stream) {
+                    completed.push((idx, success));
+                }
                 continue;
             }
 
@@ -763,21 +800,58 @@ fn try_parse_status_line(buf: &[u8], config: &HealthCheckConfig) -> Option<bool>
     let (_, rest) = status_line.split_once(' ')?;
     let status_str = rest.split(' ').next()?;
     let status_code: u32 = status_str.parse().unwrap_or(0);
-    Some(is_status_healthy(status_code, config.expected_status))
+    Some(is_status_healthy(status_code, config))
 }
 
-fn is_status_healthy(actual: u32, expected: u32) -> bool {
-    let healthy = if expected == 0 {
+/// Outcome of a connect-only probe on a readiness event: `Some(true)` once
+/// the handshake completed, `Some(false)` when the socket reports an error
+/// (refused, unreachable, reset), `None` while the connect is still in
+/// progress — mio may report writability before it completes, which
+/// `peer_addr` answers with `NotConnected`.
+fn tcp_connect_outcome(stream: &TcpStream) -> Option<bool> {
+    match stream.take_error() {
+        Ok(None) => {}
+        Ok(Some(_)) | Err(_) => return Some(false),
+    }
+    match stream.peer_addr() {
+        Ok(_) => Some(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotConnected => None,
+        Err(_) => Some(false),
+    }
+}
+
+/// Whether an HTTP probe's response status passes: within one of
+/// `accepted_statuses` when that list is set, otherwise any 2xx for
+/// `expected_status == 0` or exactly `expected_status`. Validation
+/// (`validate_health_check_config` in `command/src/config.rs`) refuses
+/// a config that sets both, so the list never silently overrides a
+/// non-zero `expected_status`.
+fn is_status_healthy(actual: u32, config: &HealthCheckConfig) -> bool {
+    let expected = config.expected_status;
+    let healthy = if !config.accepted_statuses.is_empty() {
+        config
+            .accepted_statuses
+            .iter()
+            .any(|range| (range.start..=range.end).contains(&actual))
+    } else if expected == 0 {
         (200..300).contains(&actual)
     } else {
         actual == expected
     };
-    // When a specific status is required, health is exact equality; the two
-    // branches must never both claim healthy for the same inputs unless the
-    // expected code is itself a 2xx.
+    // Without a list, a specific expected status means exact equality.
     debug_assert!(
-        expected == 0 || healthy == (actual == expected),
+        !config.accepted_statuses.is_empty() || expected == 0 || healthy == (actual == expected),
         "with a specific expected status, health must be exact equality"
+    );
+    // With a list, health is membership in it and nothing else.
+    debug_assert!(
+        config.accepted_statuses.is_empty()
+            || healthy
+                == config
+                    .accepted_statuses
+                    .iter()
+                    .any(|range| range.start <= actual && actual <= range.end),
+        "with accepted statuses, health must be membership in one of the ranges"
     );
     healthy
 }
@@ -847,8 +921,8 @@ fn build_h2c_probe_bytes(uri: &str, address: SocketAddr) -> Vec<u8> {
 ///
 /// Returns:
 ///
-/// * `Some(true)` — `:status` decoded and matches
-///   `config.expected_status` (or any 2xx when `expected_status == 0`).
+/// * `Some(true)` — `:status` decoded and passes [`is_status_healthy`]
+///   (`config.accepted_statuses`, else `config.expected_status`).
 /// * `Some(false)` — `:status` decoded but does not match, the HPACK
 ///   block was malformed, or a GOAWAY frame arrived.
 /// * `None` — buffer truncated mid-frame; caller should keep reading.
@@ -1008,7 +1082,7 @@ fn strip_padded_priority(payload: &[u8], flags: u8) -> Option<&[u8]> {
 }
 
 /// Run `crate::protocol::mux::hpack::Decoder` over the assembled HEADERS block and
-/// return whether `:status` matches `config.expected_status`. Unknown
+/// return whether `:status` passes [`is_status_healthy`]. Unknown
 /// HPACK encodings, malformed integers, Huffman fallbacks, and
 /// `:status` values that fail UTF-8 / numeric parsing all collapse to
 /// `false` — the probe is recorded as unhealthy, never as a panic.
@@ -1030,31 +1104,142 @@ fn decode_status_from_block(block: &[u8], config: &HealthCheckConfig) -> bool {
         return false;
     }
     match status {
-        Some(code) => is_status_healthy(code, config.expected_status),
+        Some(code) => is_status_healthy(code, config),
         None => false,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use sozu_command::proto::command::HttpStatusRange;
+
     use super::*;
     use crate::backends::HealthState;
 
+    /// An HTTP-mode config judging statuses by `expected_status` and
+    /// `accepted_statuses` (given as `(start, end)` pairs).
+    fn status_config(expected: u32, accepted: &[(u32, u32)]) -> HealthCheckConfig {
+        HealthCheckConfig {
+            expected_status: expected,
+            accepted_statuses: accepted
+                .iter()
+                .map(|&(start, end)| HttpStatusRange { start, end })
+                .collect(),
+            ..h2c_config(0)
+        }
+    }
+
     #[test]
     fn test_is_status_healthy_any_2xx() {
-        assert!(is_status_healthy(200, 0));
-        assert!(is_status_healthy(204, 0));
-        assert!(is_status_healthy(299, 0));
-        assert!(!is_status_healthy(301, 0));
-        assert!(!is_status_healthy(500, 0));
-        assert!(!is_status_healthy(0, 0));
+        let config = status_config(0, &[]);
+        assert!(is_status_healthy(200, &config));
+        assert!(is_status_healthy(204, &config));
+        assert!(is_status_healthy(299, &config));
+        assert!(!is_status_healthy(301, &config));
+        assert!(!is_status_healthy(500, &config));
+        assert!(!is_status_healthy(0, &config));
     }
 
     #[test]
     fn test_is_status_healthy_specific() {
-        assert!(is_status_healthy(200, 200));
-        assert!(!is_status_healthy(204, 200));
-        assert!(!is_status_healthy(500, 200));
+        let config = status_config(200, &[]);
+        assert!(is_status_healthy(200, &config));
+        assert!(!is_status_healthy(204, &config));
+        assert!(!is_status_healthy(500, &config));
+    }
+
+    #[test]
+    fn accepted_statuses_list_of_codes_accepts_only_those_codes() {
+        let config = status_config(0, &[(200, 200), (404, 404)]);
+        assert!(is_status_healthy(200, &config));
+        assert!(is_status_healthy(404, &config));
+        assert!(
+            !is_status_healthy(204, &config),
+            "a 2xx outside the list fails"
+        );
+        assert!(!is_status_healthy(403, &config));
+        assert!(!is_status_healthy(500, &config));
+    }
+
+    #[test]
+    fn accepted_statuses_ranges_are_inclusive_at_both_bounds() {
+        let config = status_config(0, &[(200, 399), (401, 401)]);
+        assert!(is_status_healthy(200, &config));
+        assert!(is_status_healthy(302, &config));
+        assert!(is_status_healthy(399, &config));
+        assert!(is_status_healthy(401, &config));
+        assert!(!is_status_healthy(199, &config));
+        assert!(!is_status_healthy(400, &config));
+        assert!(!is_status_healthy(404, &config));
+        assert!(!is_status_healthy(500, &config));
+    }
+
+    #[test]
+    fn accepted_statuses_any_accepts_every_valid_status_but_no_garbage() {
+        // `"any"` parses to 100-599 (`parse_http_status_range` in
+        // `command/src/config.rs`).
+        let config = status_config(0, &[(100, 599)]);
+        for status in [100, 200, 301, 401, 404, 500, 503, 599] {
+            assert!(is_status_healthy(status, &config), "{status} must pass");
+        }
+        // An unparsable status line yields 0, never a pass.
+        assert!(!is_status_healthy(0, &config));
+        assert!(!is_status_healthy(600, &config));
+        let buf = b"HTTP/1.1 500 Internal Server Error\r\n\r\n";
+        assert_eq!(try_parse_status_line(buf, &config), Some(true));
+        let buf = b"HTTP/1.1 garbage\r\n\r\n";
+        assert_eq!(try_parse_status_line(buf, &config), Some(false));
+    }
+
+    #[test]
+    fn accepted_statuses_replace_the_default_2xx_when_expected_status_is_zero() {
+        // `expected_status = 0` is the "unset" value: the list alone decides,
+        // so a 2xx outside the list fails and a 404 inside it passes.
+        let config = status_config(0, &[(404, 404)]);
+        assert!(!is_status_healthy(200, &config));
+        assert!(is_status_healthy(404, &config));
+        // The h2c path judges `:status` with the same rule.
+        let block = encode_response_headers(&[(b":status", b"404")]);
+        let buf = frame_with_header(0x01, FLAG_END_HEADERS, 1, &block);
+        assert_eq!(try_parse_h2c_status(&buf, &config), Some(true));
+        let block = encode_response_headers(&[(b":status", b"200")]);
+        let buf = frame_with_header(0x01, FLAG_END_HEADERS, 1, &block);
+        assert_eq!(try_parse_h2c_status(&buf, &config), Some(false));
+    }
+
+    #[test]
+    fn tcp_connect_outcome_reports_established_and_refused() {
+        // Established: a listener completes the handshake in the kernel
+        // without `accept`.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let stream = TcpStream::connect(address).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut outcome = tcp_connect_outcome(&stream);
+        while outcome.is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            outcome = tcp_connect_outcome(&stream);
+        }
+        assert_eq!(outcome, Some(true), "a listening backend must pass");
+
+        // Refused: a socket bound but never listening holds its port, so
+        // no concurrent test can take it while the kernel answers RST.
+        drop(stream);
+        drop(listener);
+        let closed =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        closed
+            .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+            .unwrap();
+        let address = closed.local_addr().unwrap().as_socket().unwrap();
+        let stream = TcpStream::connect(address).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut outcome = tcp_connect_outcome(&stream);
+        while outcome.is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            outcome = tcp_connect_outcome(&stream);
+        }
+        assert_eq!(outcome, Some(false), "a refused connection must fail");
     }
 
     #[test]
@@ -1066,6 +1251,8 @@ mod tests {
             healthy_threshold: 3,
             unhealthy_threshold: 3,
             expected_status: 0,
+            mode: HealthCheckMode::Http as i32,
+            accepted_statuses: Vec::new(),
         };
 
         let buf = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
@@ -1106,6 +1293,8 @@ mod tests {
             healthy_threshold: 3,
             unhealthy_threshold: 3,
             expected_status: expected,
+            mode: HealthCheckMode::Http as i32,
+            accepted_statuses: Vec::new(),
         }
     }
 

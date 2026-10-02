@@ -11,9 +11,10 @@ use sozu_command_lib::{
     logging::setup_default_logging,
     proto::command::{
         ActivateListener, AddCertificate, CertificateAndKey, Cluster, CustomHttpAnswers,
-        HealthCheckConfig, ListenerType, QueryMetricsOptions, RemoveBackend, RequestHttpFrontend,
-        ResponseStatus, SetHealthCheck, SocketAddress, TlsVersion, UpdateHttpListenerConfig,
-        filtered_metrics, request::RequestType, response_content::ContentType,
+        HealthCheckConfig, HealthCheckMode, ListenerType, QueryMetricsOptions, RemoveBackend,
+        RequestHttpFrontend, ResponseStatus, SetHealthCheck, SocketAddress, TlsVersion,
+        UpdateHttpListenerConfig, filtered_metrics, request::RequestType,
+        response_content::ContentType,
     },
     scm_socket::Listeners,
     state::ConfigState,
@@ -55,6 +56,8 @@ fn default_health_check_config() -> HealthCheckConfig {
         healthy_threshold: 2,
         unhealthy_threshold: 2,
         expected_status: 0,
+        mode: HealthCheckMode::Http as i32,
+        accepted_statuses: Vec::new(),
     }
 }
 

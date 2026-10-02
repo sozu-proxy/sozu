@@ -4,6 +4,35 @@
 
 ### ✨ Added
 
+- **`feat(health-check)`: TCP connect probe mode and configurable accepted HTTP statuses
+  ([#1801](https://github.com/sozu-proxy/sozu/issues/1801)).** `HealthCheckConfig` gains a
+  `mode` (proto field 7, `HealthCheckMode`): `HTTP`, the default and the only behaviour so far,
+  or `TCP`, where a backend passes as soon as the TCP connection is established within `timeout`;
+  nothing is sent, the connection is closed once established, and `uri` and the status fields are
+  ignored. It lets a platform enable health checks on every cluster to take blackholed backends
+  out of rotation (the active-probe side of
+  [#1800](https://github.com/sozu-proxy/sozu/issues/1800)) without marking down applications
+  that answer 3xx, 401, 404 or 500 on a fixed path. HTTP mode gains `accepted_statuses` (proto
+  field 8, inclusive `HttpStatusRange` entries; TOML and CLI entries `"404"`, `"200-399"`,
+  `"2xx"` or `"any"`, bounds within `100-599`), which replaces `expected_status` when set;
+  setting both a non-zero `expected_status` and a list is refused by
+  `validate_health_check_config`, at the CLI, the TOML loader, the master state and the worker.
+  `uri` stays a required proto field and may be empty in TCP mode; the TOML key and `--uri`
+  default to `/`. A message or saved state without the new fields decodes as before (HTTP mode,
+  no list), so existing configurations keep their meaning. New `sozu cluster health-check set`
+  flags `--mode http|tcp` and `--accepted-statuses`; `sozu cluster health-check list` shows the
+  mode and an `accepted statuses` column (a legacy `expected_status = 0` now reads `2xx` instead
+  of `any 2xx`). The probe timeout flag of `health-check set` is renamed `--probe-timeout`: its
+  `--timeout` shared the clap id of the global `-t/--timeout` command timeout (`u64` against
+  `u32`), so every `sozu cluster health-check set` invocation panicked before sending anything.
+  Documented in `doc/health_checks.md` and `doc/configure.md`; covered by
+  `test_health_check_tcp_mode_marks_blackholed_and_refused_backends_down`,
+  `test_health_check_tcp_mode_keeps_500_and_404_backends_up`,
+  `test_health_check_http_mode_accepted_statuses_keep_404_backend_up` and
+  `test_health_check_legacy_config_marks_404_backend_down`
+  (`e2e/src/tests/health_check_mode_tests.rs`), plus unit tests in `lib/src/health_check.rs`,
+  `command/src/config.rs` and `bin/src/cli.rs`.
+
 - **BREAKING (library API) — `feat(udp)`: opt-in per-source flow limit on UDP clusters.** Each
   client source IP and port is its own UDP flow, with its own upstream socket and `max_flows` slot,
   and nothing bounded the flows one source address held. A cluster's own `max_connections_per_ip`

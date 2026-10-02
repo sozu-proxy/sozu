@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, io::IsTerminal, net::SocketAddr, path::PathBuf}
 use clap::{ArgAction, CommandFactory, FromArgMatches, Parser, Subcommand};
 use sozu_command_lib::{
     config::ForwardedHeadersMode,
-    proto::command::{LoadBalancingAlgorithms, TlsVersion},
+    proto::command::{HealthCheckMode, LoadBalancingAlgorithms, TlsVersion},
 };
 
 #[derive(Parser, PartialEq, Eq, Clone, Debug)]
@@ -335,6 +335,25 @@ impl From<ForwardedHeadersArg> for ForwardedHeadersMode {
     }
 }
 
+/// `--mode` clap value enum for `sozu cluster health-check set`. Mirrors
+/// the proto `HealthCheckMode` with lowercase spellings.
+#[derive(clap::ValueEnum, PartialEq, Eq, Clone, Copy, Debug)]
+pub enum HealthCheckModeArg {
+    /// HTTP `GET <uri>`; healthy iff the response status is accepted.
+    Http,
+    /// Healthy iff the TCP connection is established within the timeout.
+    Tcp,
+}
+
+impl From<HealthCheckModeArg> for HealthCheckMode {
+    fn from(arg: HealthCheckModeArg) -> Self {
+        match arg {
+            HealthCheckModeArg::Http => HealthCheckMode::Http,
+            HealthCheckModeArg::Tcp => HealthCheckMode::Tcp,
+        }
+    }
+}
+
 /// `--glyphs` clap value enum for `sozu top`. Three modes mirroring btop:
 /// Braille (highest density), Block (compatible Unicode), TTY-ASCII fallback.
 #[cfg(feature = "tui")]
@@ -618,9 +637,17 @@ pub enum HealthCheckCmd {
         #[clap(short = 'i', long = "id", help = "cluster id")]
         id: String,
         #[clap(
+            long = "mode",
+            value_enum,
+            default_value = "http",
+            help = "probe mode: http (GET <uri>, judge the status) or tcp (healthy iff the TCP connection is established)"
+        )]
+        mode: HealthCheckModeArg,
+        #[clap(
             short = 'u',
             long = "uri",
-            help = "health check URI path (e.g. /health)"
+            help = "HTTP probe URI path (e.g. /health); ignored in tcp mode",
+            default_value = "/"
         )]
         uri: String,
         #[clap(
@@ -629,8 +656,12 @@ pub enum HealthCheckCmd {
             default_value = "10"
         )]
         interval: u32,
+        // Not `--timeout`: the global `-t/--timeout` (command timeout, u64)
+        // shares the clap id `timeout`, and the clash panicked every
+        // `health-check set` invocation on the u32/u64 downcast.
         #[clap(
-            long = "timeout",
+            id = "probe_timeout",
+            long = "probe-timeout",
             help = "check timeout in seconds",
             default_value = "5"
         )]
@@ -649,10 +680,16 @@ pub enum HealthCheckCmd {
         unhealthy_threshold: u32,
         #[clap(
             long = "expected-status",
-            help = "expected HTTP status code (0 = any 2xx)",
+            help = "expected HTTP status code (0 = any 2xx); exclusive with --accepted-statuses",
             default_value = "0"
         )]
         expected_status: u32,
+        #[clap(
+            long = "accepted-statuses",
+            value_delimiter = ',',
+            help = "HTTP statuses counted as healthy, comma-separated codes, ranges, classes or any (e.g. 200-399,404 or 2xx or any)"
+        )]
+        accepted_statuses: Vec<String>,
     },
     #[clap(name = "remove", about = "Remove the health check from a cluster")]
     Remove {
@@ -2162,6 +2199,82 @@ mod tests {
             parse("x-forwarded").is_err(),
             "an unknown --forwarded-headers spelling must be refused"
         );
+    }
+
+    /// #1801: `sozu cluster health-check set` takes `--mode` and
+    /// `--accepted-statuses`, and no longer requires `--uri`.
+    #[test]
+    fn cluster_health_check_set_parses_mode_and_accepted_statuses() {
+        use super::*;
+
+        let parse = |extra: &[&str]| -> HealthCheckCmd {
+            let mut argv = vec!["sozu", "cluster", "health-check", "set", "--id", "app"];
+            argv.extend_from_slice(extra);
+            match Args::try_parse_from(argv)
+                .expect("clap should accept the health-check flags")
+                .cmd
+            {
+                SubCmd::Cluster {
+                    cmd: ClusterCmd::HealthCheck { cmd },
+                } => cmd,
+                other => panic!("expected cluster health-check, got {other:?}"),
+            }
+        };
+
+        let HealthCheckCmd::Set {
+            mode,
+            uri,
+            timeout,
+            expected_status,
+            accepted_statuses,
+            ..
+        } = parse(&[])
+        else {
+            panic!("expected HealthCheckCmd::Set");
+        };
+        assert_eq!(mode, HealthCheckModeArg::Http, "http stays the default");
+        assert_eq!((uri.as_str(), timeout, expected_status), ("/", 5, 0));
+        assert!(accepted_statuses.is_empty());
+
+        // The probe timeout has its own flag; the global `-t/--timeout`
+        // (command timeout) still parses beside it.
+        let args = Args::try_parse_from([
+            "sozu",
+            "--timeout",
+            "1000",
+            "cluster",
+            "health-check",
+            "set",
+            "--id",
+            "app",
+            "--probe-timeout",
+            "2",
+        ])
+        .expect("clap should accept both timeouts");
+        assert_eq!(args.timeout, Some(1000));
+        let SubCmd::Cluster {
+            cmd:
+                ClusterCmd::HealthCheck {
+                    cmd: HealthCheckCmd::Set { timeout, .. },
+                },
+        } = args.cmd
+        else {
+            panic!("expected cluster health-check set");
+        };
+        assert_eq!(timeout, 2);
+
+        let HealthCheckCmd::Set { mode, .. } = parse(&["--mode", "tcp"]) else {
+            panic!("expected HealthCheckCmd::Set");
+        };
+        assert_eq!(HealthCheckMode::from(mode), HealthCheckMode::Tcp);
+
+        let HealthCheckCmd::Set {
+            accepted_statuses, ..
+        } = parse(&["--uri", "/livez", "--accepted-statuses", "200-399,404"])
+        else {
+            panic!("expected HealthCheckCmd::Set");
+        };
+        assert_eq!(accepted_statuses, vec!["200-399", "404"]);
     }
 
     #[test]
