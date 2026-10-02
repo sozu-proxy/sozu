@@ -203,14 +203,15 @@ frontend connection**, so the slot comes back with it:
 A registered, healthy-status backend that is down may not fail on the
 dial at all. The dial — `Mux::dial_backend` (`lib/src/protocol/mux/mod.rs`)
 for HTTP, `Backend::try_connect` (`lib/src/backends.rs`) for TCP — is
-non-blocking: a refusal the kernel reports synchronously — the common
-case for a closed port on loopback — surfaces as
-`BackendError::ConnectionFailures` and takes the answer path above,
-while an `EINPROGRESS` connect returns `Ok` and its refusal, or a
-blackholed SYN, arrives later as a backend HUP and the stream retries
-instead. The re-increment is idempotent within the session, so **one**
-slot — not one per attempt — is held for at most `CONN_RETRIES`
-attempts, each bounded by `connect_timeout`.
+non-blocking: a refusal the kernel reports synchronously surfaces as
+`BackendError::ConnectionFailures`, which the mux re-queues for another
+backend, while an `EINPROGRESS` connect returns `Ok` and its refusal
+arrives later as a backend HUP, and a blackholed SYN as the expiry of
+`connect_timeout`; either way the stream retries
+([#1800](https://github.com/sozu-proxy/sozu/issues/1800)). The
+re-increment is idempotent within the session, so **one** slot — not one
+per attempt — is held for at most `max_connection_attempts` attempts
+(5 by default), each bounded by `connect_timeout`.
 
 The slot is held for the connection's whole lifetime on an HTTP/2
 frontend, and on HTTP/1.1 with a custom answer template that omits

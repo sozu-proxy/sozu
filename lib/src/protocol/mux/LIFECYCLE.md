@@ -1110,8 +1110,24 @@ deadlines are compared against `ConnectionH2.now` (§7.5):
 
 - Tracker: the backend connection's own `timeout_deadline`, reflected onto the
   wheel by the handle under `back_token` in `Mux.timeouts.backends` (§7.7).
-- Set to `configured_backend_timeout` after successful connect
+- Armed with `configured_connect_timeout` when the connection is built
+  (`Connection::new_h1_client`, `Connection::new_h2_client`), and set to
+  `configured_backend_timeout` after successful connect
   (`Connection::set_timeout_duration`, called from `Mux::ready_inner`).
+- A connection still `BackendStatus::Connecting` when it fires timed out on
+  `connect_timeout`: no byte of any request reached the backend. The
+  backend-token branch of `Mux::timeout_inner` flags its readiness `ERROR`, as
+  the kernel flags a refused dial, and returns; `Mux::has_pending_backend_failure`
+  makes `Server::timeout` run `ready` (`ProxySession::needs_ready_pass`), whose
+  dead-backend branch counts the failure (`failures`, `retry_policy`,
+  `backend.down`), records the address in each stream's
+  `Stream::tried_backends`, and closes the connection, so its streams are
+  re-linked through `EndStreamAction::Reconnect` (sozu-proxy/sozu#1800). The
+  same branch takes a dial whose WRITABLE edge carries an `SO_ERROR`; a
+  WRITABLE on a socket `getpeername(2)` still reports `ENOTCONN` for is one
+  sozu raised itself, and is dropped until the kernel's completion edge.
+  `Router::plan_connect` bounds the re-links with the cluster's
+  `max_connection_attempts` and answers 503 once they are spent.
 - Fired by: timer wheel → `Mux::timeout` with the backend token.
 - Action: for each stream linked to that backend, either send 504, or forcefully
   terminate, or keep draining — see the backend-token branch of `Mux::timeout_inner`. The
@@ -2088,7 +2104,8 @@ memory bound:
   wherever the capture is, including the `Stream` simply being dropped.
   `doc/configure.md`'s "Capture budget" carries the operator-facing version.
 
-`CONN_RETRIES` is what bounds how many times a replay may be RE-ISSUED, but it
+The cluster's `max_connection_attempts` is what bounds how many times a replay
+may be RE-ISSUED, but it
 is no longer the only thing that decides whether a replay happens at all —
 the capture budget above can decline the capture before any of this is
 reached. Given a capture, the capture is *taken*, not cloned, so it does not
@@ -2097,8 +2114,8 @@ survive its own replay — but that does not make one request one replay:
 transition and `reused_from_pool` is never cleared, so a replay that lands on
 another pooled connection may itself be replayed, budget permitting. The bound
 on that is the re-link going back through `Router::plan_connect`, whose
-`stream.attempts >= CONN_RETRIES` gate (3, `server.rs`) answers 503 once the
-budget is spent. `backend.retry.stale_upstream` can therefore increment more
+gate of `stream.attempts` against `max_connection_attempts` (5 by default,
+`command/src/config.rs`) answers 503 once the budget is spent. `backend.retry.stale_upstream` can therefore increment more
 than once for one client request.
 
 `Router::plan_connect` skips `route_from_request` on a replay — `front.consumed` is
@@ -2117,7 +2134,7 @@ empty: a partial `socket_write_vectored` leaves the refused remainder queued
 and appending behind it would put `[tail][head]` on the wire. Once queued they
 live in `front.out` as an owned `kawa::Store::Alloc` — still off-pool, and no
 longer charged to the capture budget, which `queue_upstream_replay` releases
-as it takes the capture. That window is bounded by `CONN_RETRIES` and by the
+as it takes the capture. That window is bounded by `max_connection_attempts` and by the
 same one-front-buffer limit the bytes were captured under, and it is not
 separately accounted.
 

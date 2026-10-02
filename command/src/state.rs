@@ -337,6 +337,7 @@ impl ConfigState {
             | RequestType::QueryMaxConnectionsPerIp(_)
             | RequestType::SetMaxConnectionsPerSubnet(_)
             | RequestType::QueryMaxConnectionsPerSubnet(_)
+            | RequestType::SetMaxConnectionAttempts(_)
             | RequestType::HardStop(_) => Ok(()),
 
             _other_request => Err(StateError::UndispatchableRequest),
@@ -589,6 +590,15 @@ impl ConfigState {
         ) {
             return Err(StateError::InvalidValue {
                 field: "shuffle_sharding",
+                reason,
+            });
+        }
+        if let Some(Err(reason)) = cluster
+            .max_connection_attempts
+            .map(crate::config::validate_max_connection_attempts)
+        {
+            return Err(StateError::InvalidValue {
+                field: "max_connection_attempts",
                 reason,
             });
         }
@@ -7041,6 +7051,49 @@ mod tests {
             "unexpected error: {err:?}"
         );
         assert_eq!(state.clusters["tcp"].affinity_header, None);
+    }
+
+    /// A cluster budget allowing no attempt, or more than the attempt
+    /// counters hold, is refused; an accepted one is stored with the cluster,
+    /// so it is saved and replayed with it (sozu-proxy/sozu#1800).
+    #[test]
+    fn add_cluster_with_out_of_range_max_connection_attempts_rejected() {
+        for attempts in [0, 256] {
+            let mut state = ConfigState::new();
+            let err = state
+                .dispatch(
+                    &RequestType::AddCluster(Cluster {
+                        cluster_id: String::from("budget"),
+                        max_connection_attempts: Some(attempts),
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect_err("an out-of-range budget must be refused");
+            assert!(
+                matches!(
+                    err,
+                    StateError::InvalidValue {
+                        field: "max_connection_attempts",
+                        ..
+                    }
+                ),
+                "{attempts}: unexpected error {err:?}"
+            );
+            assert!(state.clusters.is_empty());
+        }
+        let mut state = ConfigState::new();
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("budget"),
+                    max_connection_attempts: Some(7),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("a budget in range is accepted");
+        assert_eq!(state.clusters["budget"].max_connection_attempts, Some(7));
     }
 
     #[test]

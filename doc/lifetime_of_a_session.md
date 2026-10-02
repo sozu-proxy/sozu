@@ -425,6 +425,19 @@ stamps the stream with a reference count, not a copy
 ([#1565](https://github.com/sozu-proxy/sozu/pull/1565),
 [#1581](https://github.com/sozu-proxy/sozu/pull/1581)).
 
+A dial that fails — refused, still unanswered when the listener's
+`connect_timeout` expires, or reporting `SO_ERROR` when the socket turns
+writable (a WRITABLE edge alone does not prove the connection; `getpeername(2)`
+tells an established socket from one still connecting) — is counted against
+its backend (`backend.connections.error`, the retry policy's back-off) and
+closed, and the request, of which no byte was sent, is linked again through
+`EndStreamAction::Reconnect`. The next selection skips the backends that
+already failed for that request (`Stream::tried_backends`), and the cluster's
+`max_connection_attempts` (5 by default) bounds the attempts before a `503`
+([#1800](https://github.com/sozu-proxy/sozu/issues/1800)). A connect timeout
+reaches the session through the timer alone, so `Server::timeout` runs the
+`ready` pass that does this (`ProxySession::needs_ready_pass`).
+
 ### 6.4 Forward the request, read the response
 
 `ConnectionH1::writable` on the backend position gathers the request's kawa
@@ -627,7 +640,8 @@ A WebSocket upgrade on an H1 connection ends in the same `Pipe`.
    socket: `TcpSession::fail_backend_connection` bumps `Backend::failures`,
    arms `Backend::retry_policy` (which keeps the backend out of selection for
    its back-off window) and counts `backend.connections.error`, then the
-   connect is retried, up to `CONN_RETRIES` times. A connect that completes
+   connect is retried while the cluster's `max_connection_attempts` (5 by
+   default) lasts. A connect that completes
    resets the retry policy (`TcpSession::set_back_connected`).
 3. **Relay.** On Linux with the `splice` feature, a `Protocol::TCP` pipe
    takes a `SplicePipe` (`lib/src/splice.rs`) when it is created: an idle pair

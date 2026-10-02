@@ -26,6 +26,7 @@
 #![allow(clippy::useless_vec)]
 
 mod affinity_key_tests;
+mod backend_failover_tests;
 mod cluster_ip_limit_tests;
 mod command_channel_security_tests;
 mod eviction_tests;

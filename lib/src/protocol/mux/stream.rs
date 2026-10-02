@@ -215,6 +215,13 @@ pub struct Stream {
     /// and WINDOW_UPDATE frames move it. Unused when the backend speaks H1.
     pub back_window: i32,
     pub attempts: u8,
+    /// Addresses of the backends this request failed to connect to: refused,
+    /// timed out, or reporting a socket error once the dial completed. A
+    /// retry prefers any other backend (`BackendMap::reserve_backend_excluding`
+    /// in `lib/src/backends.rs`, sozu-proxy/sozu#1800). Cleared with
+    /// [`Self::attempts`] for each request; empty, and unallocated, on every
+    /// request whose first dial succeeds.
+    pub tried_backends: Vec<std::net::SocketAddr>,
     pub state: StreamState,
     /// True when the frontend connection has received end_of_stream from the client.
     pub front_received_end_of_stream: bool,
@@ -313,6 +320,7 @@ impl Debug for Stream {
             .field("front_window", &self.front_window)
             .field("back_window", &self.back_window)
             .field("attempts", &self.attempts)
+            .field("tried_backends", &self.tried_backends)
             .field("state", &self.state)
             .field(
                 "front_received_end_of_stream",
@@ -380,6 +388,7 @@ impl Stream {
         let stream = Self {
             state: StreamState::Idle,
             attempts: 0,
+            tried_backends: Vec::new(),
             front_window: i32::try_from(window).unwrap_or(i32::MAX),
             back_window: i32::try_from(DEFAULT_INITIAL_WINDOW_SIZE).unwrap_or(i32::MAX),
             front_received_end_of_stream: false,
@@ -545,8 +554,9 @@ impl Stream {
     /// calls this on every `KeepAlive -> Connected` transition and
     /// `reused_from_pool` is never cleared, so a replay that lands on
     /// another pooled connection re-arms a fresh capture and may itself be
-    /// replayed. `Router::plan_connect`'s `stream.attempts >= CONN_RETRIES` gate
-    /// is the only bound on how many times one request is re-issued.
+    /// replayed. `Router::plan_connect`'s gate of `stream.attempts` against the
+    /// cluster's `max_connection_attempts` is the only bound on how many times
+    /// one request is re-issued.
     ///
     /// Arming is BEST EFFORT. Past [`MAX_ARMED_REPLAY_CAPTURES`] no buffer is
     /// installed, `backend.retry.captures_declined` is incremented, and the

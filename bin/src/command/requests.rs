@@ -279,6 +279,7 @@ fn is_mutating_verb(req: &RequestType) -> bool {
             | RequestType::Logging(_)
             | RequestType::SetMaxConnectionsPerIp(_)
             | RequestType::SetMaxConnectionsPerSubnet(_)
+            | RequestType::SetMaxConnectionAttempts(_)
     )
 }
 
@@ -453,7 +454,10 @@ impl Server {
             // live counter and the prefixes both live in `SessionManager`,
             // not in the master's `ConfigState`.
             | RequestType::SetMaxConnectionsPerSubnet(_)
-            | RequestType::QueryMaxConnectionsPerSubnet(_) => {
+            | RequestType::QueryMaxConnectionsPerSubnet(_)
+            // The global backend connection attempt budget lives in each
+            // worker's `SessionManager` too.
+            | RequestType::SetMaxConnectionAttempts(_) => {
                 worker_request(self, client, request_type);
             }
             // `sozu top`'s runtime cardinality lease verb. Each worker maintains

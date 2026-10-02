@@ -50,6 +50,7 @@ by the main process and workers (like the log level):
 | `front_timeout`               | maximum time of inactivity for a front socket                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |                                           |
 | `back_timeout`                | maximum time of inactivity for a backend socket (seconds). Defaults to `30`. Can be overridden per listener.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | seconds                                   |
 | `connect_timeout`             | maximum time of inactivity for a request to connect                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |                                           |
+| `max_connection_attempts`     | how many backend connections a request may try, the first included, before it is answered `503` (HTTP) or closed (TCP). A failed connection — refused, timed out on `connect_timeout`, or reporting a socket error — is counted against its backend and the request goes to another backend while attempts remain. Defaults to `5` (the hard-coded `CONN_RETRIES` of earlier versions allowed `3`). Must lie in `1`-`255`; a value outside it is rejected at config-load time. Each cluster may override it, and `sozu connection-attempts set` changes it on running workers. See "Backend connection failover". | integer (1-255, default 5)                |
 | `accept_queue_timeout`        | maximum time (in seconds) a TCP connection stays in sozu's accept queue before being dropped. Defaults to `60`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | seconds                                   |
 | `request_timeout`             | maximum time of inactivity for a request                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |                                           |
 | `zombie_check_interval`       | duration between checks for zombie sessions                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |                                           |
@@ -1011,6 +1012,73 @@ stops being read. Every datapath supplies a key (below), so that fallback is
 reached only by a request with no source address.
 An unset `weight` defaults to 100 wherever one is read.
 
+#### Backend connection failover
+
+A backend connection that fails to establish is retried on another backend
+of the cluster ([#1800](https://github.com/sozu-proxy/sozu/issues/1800)).
+Three outcomes count as a failed connection:
+
+- the backend refuses it;
+- it is still not established when the listener's `connect_timeout` expires —
+  the backend accepts nothing, its SYN is dropped or its accept queue is full;
+- the socket reports an error (`SO_ERROR`) when the dial completes.
+
+Each failure is counted against the backend as the refused case always was:
+`backend.connections.error` is incremented and the backend's retry policy
+puts it in its back-off window, which is what keeps the load balancer off it
+for the next requests (`backend.down` once it keeps failing). No byte of the
+request has reached that backend, so the request goes back through backend
+selection, on an HTTP/1.1 or an HTTP/2 frontend, and for a cluster with
+`http2 = true` as well: a request is encoded for an HTTP/2 backend only once
+that connection is established.
+
+**Attempts.** A request may try `max_connection_attempts` backend
+connections, the first included: `5` by default, set globally and overridable
+per cluster:
+
+```toml
+max_connection_attempts = 5       # global, 1-255
+
+[clusters.NameOfYourCluster]
+max_connection_attempts = 3       # this cluster only, 1-255
+```
+
+When they are all spent on failed connections the request is answered `503`
+(`backend.connect.retries_exhausted`), as it was with the former hard-coded
+budget of three. A `504` is answered only when the backend accepted the
+connection and then sent no response within `back_timeout`; the request may
+have reached it, so it is not sent elsewhere.
+
+**Each retry skips the backends that already failed for the request**,
+whatever the `load_balancing` policy: they are left out of the candidates the
+policy picks from. A failed backend is normally out of them already, held by
+its back-off; the exclusion matters when the back-off ends while the request
+is still retrying, which a `connect_timeout` as long as the back-off makes
+routine. When every backend that can take a connection has already failed for
+this request, the selection runs as if nothing had been tried, fail-open
+regime included (see [health_checks.md](./health_checks.md)), so the request
+retries one of them rather than being refused while attempts remain. A
+sticky-session cookie naming a backend that failed for the request is not
+followed.
+
+**At runtime.** The cluster budget is part of the cluster's configuration:
+set it with `sozu cluster add --max-connection-attempts <n>`, or on a running
+cluster with `sozu cluster connection-attempts set --id <id> <n>` (and
+`unset --id <id>` to inherit the global value again), which re-sends the
+cluster with that field changed; it is saved with the state like the rest of
+the cluster. `sozu connection-attempts set <n>` changes the global budget on
+every running worker. Like `connection-limit set`, that change is not saved:
+a worker started later reads `max_connection_attempts` from the configuration
+file, so mirror the change there to make it durable.
+
+TCP clusters apply the same budget, global or per cluster, to the refused
+connections they retry; a TCP backend whose connect times out still closes the
+client connection.
+
+A per-cluster `health_check` remains the way to take a dead backend out of
+rotation before any request pays a connect timeout on it; see
+[health_checks.md](./health_checks.md).
+
 #### Client affinity
 
 `HRW` and `MAGLEV` pin each client to one backend: whenever Sōzu dials a new
@@ -1160,12 +1228,13 @@ How it composes with the rest of selection:
   `MAGLEV`.
 - **Retries stay in the shard.** A failed connection puts the backend in its
   back-off window, and the next attempt selects again inside the same shard.
-  Each request has three connection attempts (`CONN_RETRIES`): with a shard of
-  2, a request whose two shard members both refuse spills over (`FALLBACK`) or
-  is answered 503 (`STRICT`) on its third attempt; with a shard of 3 or more,
-  that request exhausts its attempts inside the shard and is answered 503, and
-  the next request, finding the members in back-off, spills over or is
-  refused at once.
+  Each request has `max_connection_attempts` connection attempts (5 by
+  default, see "Backend connection failover"): with a shard of `k` members
+  where `k` is below that budget, a request whose `k` shard members all refuse
+  spills over (`FALLBACK`) or is answered 503 (`STRICT`) on attempt `k + 1`;
+  with a shard at least as large as the budget, that request exhausts its
+  attempts inside the shard and is answered 503, and the next request, finding
+  the members in back-off, spills over or is refused at once.
 - **A sticky session wins.** On a frontend with `sticky_session`, a cookie
   naming a live backend is honoured even outside the client's shard; a client
   without a usable cookie selects inside its shard.
@@ -3382,8 +3451,8 @@ Incremented when Sōzu generates a default error response instead of proxying:
 | `connections_per_backend`           | gauge   | cluster, backend | Per-backend connection count                                                                                                                                                                                                                                                                                                           |
 | `backend.up`                        | counter | proxy            | Backend marked as healthy (after successful connection)                                                                                                                                                                                                                                                                                |
 | `backend.down`                      | counter | proxy            | Backend marked as unhealthy (retry policy triggered)                                                                                                                                                                                                                                                                                   |
-| `backend.connections.error`         | counter | proxy            | Backend connection failures                                                                                                                                                                                                                                                                                                            |
-| `backend.connect.retries_exhausted` | counter | cluster, backend | Per-session backend-connect retry budget (`CONN_RETRIES = 3`) was exhausted. Emitted once per event at the TCP, HTTP/1, and HTTP/2-mux gates. Alert on this counter's rate instead of grepping `WARN` / `ERROR` logs — the underlying log line is `warn!` since the condition is peer-driven backpressure, not a Sōzu invariant break. |
+| `backend.connections.error`         | counter | proxy            | Backend connections that failed to establish: refused, timed out on `connect_timeout`, or reporting a socket error once dialled. Each one feeds the backend's retry policy. See "Backend connection failover".                                                                                                                         |
+| `backend.connect.retries_exhausted` | counter | cluster, backend | Per-request backend connection attempt budget (`max_connection_attempts`, 5 by default, overridable per cluster) was exhausted. Emitted once per event at the TCP, HTTP/1, and HTTP/2-mux gates. Alert on this counter's rate instead of grepping `WARN` / `ERROR` logs — the underlying log line is `warn!` since the condition is peer-driven backpressure, not a Sōzu invariant break. |
 | `backend.shard.spillover`           | counter | cluster          | Shuffle sharding `FALLBACK`: a selection found no backend of the client's shard able to take a connection and chose one outside the shard (a fail-open pick that lands back inside the shard is not counted). See "Shuffle sharding". |
 | `backend.shard.exhausted`           | counter | cluster          | Shuffle sharding `STRICT`: a selection found no backend of the client's shard able to take a connection and chose none (HTTP 503, TCP close, UDP flow not admitted). See "Shuffle sharding". |
 | `backend.retry.stale_upstream`      | counter | cluster, backend | A request written onto a POOLED H1 keep-alive backend connection that then closed without answering was re-issued on a fresh backend instead of being answered `502 Bad Gateway`. Labelled with the **stale** backend — the one that did not answer. One client request can increment this more than once. See "Stale-upstream retry" below, which covers how to read a rate that tracks the request rate. |
@@ -3426,18 +3495,18 @@ re-issuing is unobservable — and only when all of the following hold:
 
 The re-issued request is byte-identical to the first attempt, `Sozu-Id`
 included, so one client request still produces one access-log line. Retries
-consume the same per-session budget as connection attempts
-(`CONN_RETRIES = 3`); exhausting it answers `503` and increments
+consume the same per-request budget as connection attempts
+(`max_connection_attempts`, 5 by default); exhausting it answers `503` and increments
 `backend.connect.retries_exhausted`. That budget is the only bound: a re-issued
 request that again lands on a pooled connection may be re-issued again, so
 `backend.retry.stale_upstream` can increment more than once for one client
 request, and the counter is not the number of replays that reached a backend.
 It is incremented in `ConnectionH1::end_stream` / `ConnectionH2::end_stream`
 *before* the stream is pushed back onto `pending_links`, so `Router::plan_connect`
-has not yet had the chance to refuse it. With `CONN_RETRIES = 3` that is at
-most three increments for one client request, of which at most two replays are
-actually written to a backend: the third increment is immediately followed by
-the exhausted-budget `503`.
+has not yet had the chance to refuse it. With a budget of `n` attempts that is
+at most `n` increments for one client request, of which at most `n - 1`
+replays are actually written to a backend: the last increment is immediately
+followed by the exhausted-budget `503`.
 
 **Reading the counter.** It says "an upstream went away before answering", not
 "the pool held a closed socket". If its rate tracks the request rate, check the
@@ -3480,7 +3549,7 @@ not a configuration key: the value it wants is "high enough not to bite at the
 stock defaults", the ceiling is a memory-safety bound rather than a tuning
 knob, and `backend.retry.captures_declined` is the operational signal for the
 case where it does bite. Sōzu states this class of bound as a constant
-elsewhere too — `CONN_RETRIES`, `MIN_PENDING_RST_STREAMS`.
+elsewhere too — `MIN_PENDING_RST_STREAMS`.
 
 512 is chosen against the arithmetic above. The defaults can produce at most
 500 concurrent captures, which fits under it, so a stock deployment replays

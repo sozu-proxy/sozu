@@ -809,7 +809,7 @@ impl BackendMap {
         key: Option<u64>,
         now: Instant,
     ) -> Result<(Rc<RefCell<Backend>>, TcpStream), BackendError> {
-        let next_backend = self.select_backend(cluster_id, key, now)?;
+        let next_backend = self.select_backend(cluster_id, key, now, &[])?;
 
         let tcp_stream = {
             let mut borrowed_backend = next_backend.borrow_mut();
@@ -877,7 +877,21 @@ impl BackendMap {
         key: Option<u64>,
         now: Instant,
     ) -> Result<Rc<RefCell<Backend>>, BackendError> {
-        let backend = self.select_backend(cluster_id, key, now)?;
+        self.reserve_backend_excluding(cluster_id, key, now, &[])
+    }
+
+    /// [`Self::reserve_backend`], preferring a backend whose address is not in
+    /// `exclude`: the backends a request already failed to connect to
+    /// (sozu-proxy/sozu#1800). See [`BackendList::select_with_key_excluding`]
+    /// for what happens when every selectable backend is excluded.
+    pub fn reserve_backend_excluding(
+        &mut self,
+        cluster_id: &str,
+        key: Option<u64>,
+        now: Instant,
+        exclude: &[SocketAddr],
+    ) -> Result<Rc<RefCell<Backend>>, BackendError> {
+        let backend = self.select_backend(cluster_id, key, now, exclude)?;
         backend.borrow_mut().reserve_connection()?;
         // Re-evaluate on a successful selection, as the connecting path does
         // on a successful connect, so an AllDown -> Available recovery is
@@ -899,10 +913,26 @@ impl BackendMap {
         key: Option<u64>,
         now: Instant,
     ) -> Result<Rc<RefCell<Backend>>, BackendError> {
+        self.reserve_sticky_backend_excluding(cluster_id, sticky_session, key, now, &[])
+    }
+
+    /// [`Self::reserve_sticky_backend`], except that a cookie naming a backend
+    /// in `exclude` is not followed: the request already failed to connect to
+    /// it, so it goes to [`Self::reserve_backend_excluding`] instead
+    /// (sozu-proxy/sozu#1800).
+    pub fn reserve_sticky_backend_excluding(
+        &mut self,
+        cluster_id: &str,
+        sticky_session: &str,
+        key: Option<u64>,
+        now: Instant,
+        exclude: &[SocketAddr],
+    ) -> Result<Rc<RefCell<Backend>>, BackendError> {
         let sticky = self
             .backends
             .get_mut(cluster_id)
             .and_then(|cluster_backends| cluster_backends.find_sticky(sticky_session, now))
+            .filter(|backend| !exclude.contains(&backend.borrow().address))
             .cloned();
         match sticky {
             Some(backend) => {
@@ -914,7 +944,7 @@ impl BackendMap {
                     "Couldn't find a backend corresponding to sticky_session {} for cluster {}",
                     sticky_session, cluster_id
                 );
-                self.reserve_backend(cluster_id, key, now)
+                self.reserve_backend_excluding(cluster_id, key, now, exclude)
             }
         }
     }
@@ -926,6 +956,7 @@ impl BackendMap {
         cluster_id: &str,
         key: Option<u64>,
         now: Instant,
+        exclude: &[SocketAddr],
     ) -> Result<Rc<RefCell<Backend>>, BackendError> {
         let cluster_backends = self
             .backends
@@ -947,7 +978,7 @@ impl BackendMap {
             "selection runs only on a non-empty backend list"
         );
 
-        let (picked, outcome) = cluster_backends.select_with_key(key, now);
+        let (picked, outcome) = cluster_backends.select_with_key_excluding(key, now, exclude);
         record_shard_outcome(cluster_id, outcome, picked.is_some());
         match picked {
             Some(backend) => Ok(backend),
@@ -1504,6 +1535,61 @@ impl BackendList {
         key: Option<u64>,
         now: Instant,
     ) -> (Option<Rc<RefCell<Backend>>>, ShardOutcome) {
+        self.select_tiers(key, now, &[])
+    }
+
+    /// [`Self::select_with_key`] for a request that already failed to connect
+    /// to the backends at the addresses in `exclude` (sozu-proxy/sozu#1800).
+    ///
+    /// Every policy picks from the candidate set this list builds, so leaving
+    /// those backends out of it is what makes a retry skip them under round
+    /// robin, random, least loaded, power of two, HRW and Maglev alike.
+    ///
+    /// The exclusion only narrows the healthy tiers, primary then backup. When
+    /// it leaves both empty — every backend that can take a connection was
+    /// already tried by this request — the selection runs again without it,
+    /// exactly as [`Self::select_with_key`] would: the request retries a
+    /// backend it already tried rather than failing, and the fail-open regime
+    /// still decides when no backend can take a connection at all. A backend
+    /// that failed is usually out of the healthy tiers already, its retry
+    /// policy holding it in back-off; the exclusion matters when that back-off
+    /// expires while the request is still retrying, which a connect timeout as
+    /// long as the back-off makes routine.
+    pub(crate) fn select_with_key_excluding(
+        &mut self,
+        key: Option<u64>,
+        now: Instant,
+        exclude: &[SocketAddr],
+    ) -> (Option<Rc<RefCell<Backend>>>, ShardOutcome) {
+        if !exclude.is_empty() {
+            let selection = self.select_tiers(key, now, exclude);
+            if selection.0.is_some() {
+                debug_assert!(
+                    selection
+                        .0
+                        .as_ref()
+                        .is_some_and(|backend| !exclude.contains(&backend.borrow().address)),
+                    "an excluding selection must not return an excluded backend"
+                );
+                return selection;
+            }
+        }
+        self.select_tiers(key, now, &[])
+    }
+
+    /// The selection itself. A non-empty `exclude` removes those addresses
+    /// from the healthy tiers and skips the fail-open regime, which
+    /// [`Self::select_with_key_excluding`] reaches through a second call
+    /// without exclusion.
+    fn select_tiers(
+        &mut self,
+        key: Option<u64>,
+        now: Instant,
+        exclude: &[SocketAddr],
+    ) -> (Option<Rc<RefCell<Backend>>>, ShardOutcome) {
+        let candidate = |backend: &Backend, backup: bool| {
+            is_tier_candidate(backend, backup, now) && !exclude.contains(&backend.address)
+        };
         let sharded = self.compute_shard(key);
         let strict = sharded
             && self
@@ -1515,8 +1601,7 @@ impl BackendList {
             ShardOutcome::Unsharded
         };
 
-        let mut available =
-            self.collect_candidates(|backend| is_tier_candidate(backend, false, now));
+        let mut available = self.collect_candidates(|backend| candidate(backend, false));
         if sharded {
             // Primary backends able to take a connection, inside the shard
             // or not: under `STRICT` they, and only they, decide between
@@ -1539,13 +1624,12 @@ impl BackendList {
                 available = 0;
             } else {
                 outcome = ShardOutcome::SpilledOver;
-                available =
-                    self.collect_candidates(|backend| is_tier_candidate(backend, false, now));
+                available = self.collect_candidates(|backend| candidate(backend, false));
             }
         }
 
         if available == 0 && !strict {
-            available = self.collect_candidates(|backend| is_tier_candidate(backend, true, now));
+            available = self.collect_candidates(|backend| candidate(backend, true));
         }
 
         if available != 0 {
@@ -1590,6 +1674,12 @@ impl BackendList {
         // still respecting the per-backend back-off window — hammering a
         // backend at line rate during its back-off would defeat the back-off
         // itself. Ref: Amazon "Implementing Health Checks".
+        //
+        // An excluding selection stops before this regime: it is decided by
+        // the second, unexcluding call `select_with_key_excluding` makes.
+        if !exclude.is_empty() {
+            return (None, outcome);
+        }
         let mut available = self.collect_candidates(|backend| {
             backend.status == BackendStatus::Normal
                 && matches!(
@@ -3038,6 +3128,128 @@ mod backends_test {
         assert_eq!(
             allocated, 0,
             "256 sharded selections made {allocated} allocations"
+        );
+    }
+}
+
+/// A retry skips the backends its request already failed to connect to,
+/// under every load-balancing policy (sozu-proxy/sozu#1800).
+#[cfg(test)]
+mod exclusion_tests {
+    use super::*;
+
+    const POLICIES: [LoadBalancingAlgorithms; 6] = [
+        LoadBalancingAlgorithms::RoundRobin,
+        LoadBalancingAlgorithms::Random,
+        LoadBalancingAlgorithms::LeastLoaded,
+        LoadBalancingAlgorithms::PowerOfTwo,
+        LoadBalancingAlgorithms::Hrw,
+        LoadBalancingAlgorithms::Maglev,
+    ];
+
+    fn address(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// A list of `count` healthy backends on ports 9100.. under `policy`.
+    fn list(policy: LoadBalancingAlgorithms, count: u16) -> BackendList {
+        let mut list = BackendList::with_seed(7);
+        for index in 0..count {
+            list.add_backend(Backend::new(
+                &format!("b{index}"),
+                address(9100 + index),
+                None,
+                None,
+                None,
+            ));
+        }
+        list.set_load_balancing_policy(policy, None, 11);
+        list
+    }
+
+    #[test]
+    fn a_selection_never_returns_an_excluded_backend_under_any_policy() {
+        let now = Instant::now();
+        let exclude = [address(9100), address(9101), address(9102)];
+        for policy in POLICIES {
+            let mut list = list(policy, 4);
+            for key in 0..32 {
+                // HRW and Maglev pin on the key; the others ignore it.
+                let (picked, _) = list.select_with_key_excluding(Some(key), now, &exclude);
+                let picked = picked
+                    .expect("one backend is not excluded")
+                    .borrow()
+                    .address;
+                assert_eq!(
+                    picked,
+                    address(9103),
+                    "{policy:?} picked {picked}, which the request already tried"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_exclusion_selects_exactly_as_before() {
+        let now = Instant::now();
+        for policy in POLICIES {
+            let mut excluding = list(policy, 4);
+            let mut plain = list(policy, 4);
+            for key in 0..16 {
+                let left = excluding
+                    .select_with_key_excluding(Some(key), now, &[])
+                    .0
+                    .map(|backend| backend.borrow().address);
+                let right = plain
+                    .select_with_key(Some(key), now)
+                    .0
+                    .map(|backend| backend.borrow().address);
+                assert_eq!(left, right, "{policy:?} diverged on key {key}");
+            }
+        }
+    }
+
+    #[test]
+    fn excluding_every_backend_falls_back_to_the_plain_selection() {
+        let now = Instant::now();
+        let exclude = [address(9100), address(9101)];
+        for policy in POLICIES {
+            let mut list = list(policy, 2);
+            let (picked, _) = list.select_with_key_excluding(Some(3), now, &exclude);
+            assert!(
+                picked.is_some(),
+                "{policy:?}: a request that tried every backend retries one of them"
+            );
+        }
+    }
+
+    #[test]
+    fn an_excluded_sticky_backend_is_not_followed() {
+        let now = Instant::now();
+        let mut map = BackendMap::with_seed(5);
+        for index in 0..2u16 {
+            map.add_backend(
+                "cluster",
+                Backend::new(
+                    &format!("b{index}"),
+                    address(9200 + index),
+                    Some(format!("sticky{index}")),
+                    None,
+                    None,
+                ),
+            );
+        }
+        let followed = map
+            .reserve_sticky_backend_excluding("cluster", "sticky0", None, now, &[])
+            .expect("a backend is selectable");
+        assert_eq!(followed.borrow().address, address(9200));
+        let skipped = map
+            .reserve_sticky_backend_excluding("cluster", "sticky0", None, now, &[address(9200)])
+            .expect("a backend is selectable");
+        assert_eq!(
+            skipped.borrow().address,
+            address(9201),
+            "the cookie names a backend the request already failed to reach"
         );
     }
 }

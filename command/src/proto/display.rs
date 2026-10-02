@@ -123,6 +123,7 @@ pub fn format_request_type(request_type: &RequestType) -> &str {
         RequestType::SetMaxConnectionsPerIp(_) => "SetMaxConnectionsPerIp",
         RequestType::QueryMaxConnectionsPerIp(_) => "QueryMaxConnectionsPerIp",
         RequestType::SetMaxConnectionsPerSubnet(_) => "SetMaxConnectionsPerSubnet",
+        RequestType::SetMaxConnectionAttempts(_) => "SetMaxConnectionAttempts",
         RequestType::QueryMaxConnectionsPerSubnet(_) => "QueryMaxConnectionsPerSubnet",
         RequestType::SetHealthCheck(_) => "SetHealthCheck",
         RequestType::RemoveHealthCheck(_) => "RemoveHealthCheck",
@@ -760,6 +761,7 @@ fn print_cluster_infos(worker_responses: &WorkerResponses) -> Result<(), Display
             "https_redirect",
             "affinity_key",
             "shuffle_sharding",
+            "max_connection_attempts",
         ],
         &worker_responses.map,
     );
@@ -850,6 +852,12 @@ fn print_cluster_infos(worker_responses: &WorkerResponses) -> Result<(), Display
                 configuration
                     .map(shuffle_sharding_label)
                     .unwrap_or_else(|| String::from("-"))
+            ),
+            // `global` when the cluster inherits the worker's value.
+            cell!(
+                configuration
+                    .and_then(|conf| conf.max_connection_attempts)
+                    .map_or_else(|| String::from("global"), |attempts| attempts.to_string())
             ),
         ];
 

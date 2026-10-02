@@ -267,6 +267,29 @@ pub const DEFAULT_RETRY_AFTER: u32 = 60;
 /// (sozu-proxy/sozu#1270). Both gates are consulted and both must admit.
 pub const DEFAULT_MAX_CONNECTIONS_PER_SUBNET: u64 = 0;
 
+/// Default backend connection attempt budget of a request: how many backend
+/// connections it may try, the first included, before it is answered `503`
+/// (HTTP) or closed (TCP). Every failed connection counts — refused, timed
+/// out on `connect_timeout`, or reporting a socket error. Replaces the
+/// hard-coded `CONN_RETRIES = 3` of `sozu-lib`; the default rose to 5 with
+/// sozu-proxy/sozu#1800, so a request survives more dead backends in a row.
+pub const DEFAULT_MAX_CONNECTION_ATTEMPTS: u32 = 5;
+
+/// Inclusive upper bound of `max_connection_attempts`, global or per
+/// cluster: the attempt counters are `u8`.
+pub const MAX_CONNECTION_ATTEMPTS_UPPER_BOUND: u32 = u8::MAX as u32;
+
+/// Validate a `max_connection_attempts` value, global or per cluster: at least
+/// one attempt, at most [`MAX_CONNECTION_ATTEMPTS_UPPER_BOUND`]. Called at
+/// config load, on every `AddCluster` and on `SetMaxConnectionAttempts`.
+pub fn validate_max_connection_attempts(attempts: u32) -> Result<(), &'static str> {
+    if (1..=MAX_CONNECTION_ATTEMPTS_UPPER_BOUND).contains(&attempts) {
+        Ok(())
+    } else {
+        Err("max_connection_attempts must lie in 1..=255")
+    }
+}
+
 /// Default IPv4 prefix length (bits) used to derive the subnet key. 32
 /// masks nothing, so enabling only `max_connections_per_subnet` yields a
 /// per-address counter rather than a surprising aggregation. `/24` is the
@@ -370,6 +393,14 @@ pub enum ConfigError {
     #[error("cluster {cluster_id}: {reason}")]
     InvalidShuffleSharding {
         cluster_id: String,
+        reason: &'static str,
+    },
+    /// A `max_connection_attempts`, global (`cluster_id` is `None`) or of a
+    /// cluster, breaks [`validate_max_connection_attempts`].
+    #[error("max_connection_attempts = {value}{}: {reason}", cluster_id.as_deref().map(|id| format!(" in cluster {id}")).unwrap_or_default())]
+    InvalidMaxConnectionAttempts {
+        cluster_id: Option<String>,
+        value: u32,
         reason: &'static str,
     },
     /// `subnet_ipv4_prefix` / `subnet_ipv6_prefix` is outside the bit
@@ -2764,6 +2795,12 @@ pub struct FileClusterConfig {
     /// cluster; `STRICT` refuses.
     #[serde(default)]
     pub shard_mode: Option<ShardMode>,
+    /// Override the global `max_connection_attempts` for this cluster: how
+    /// many backend connections a request may try, the first included,
+    /// before it is answered `503` (HTTP) or closed (TCP). `None` inherits
+    /// the global value. See [`validate_max_connection_attempts`].
+    #[serde(default)]
+    pub max_connection_attempts: Option<u32>,
 }
 
 /// UDP backend health-check configuration, parsed from
@@ -2871,6 +2908,15 @@ impl FileClusterConfig {
             cluster_id: cluster_id.to_owned(),
             reason,
         })?;
+        if let Some(attempts) = self.max_connection_attempts {
+            validate_max_connection_attempts(attempts).map_err(|reason| {
+                ConfigError::InvalidMaxConnectionAttempts {
+                    cluster_id: Some(cluster_id.to_owned()),
+                    value: attempts,
+                    reason,
+                }
+            })?;
+        }
         match self.protocol {
             FileClusterProtocolConfig::Tcp => {
                 // A TCP cluster has no request to read a header or a cookie
@@ -2970,6 +3016,7 @@ impl FileClusterConfig {
                     shard_percent: self.shard_percent,
                     shard_min_backends: self.shard_min_backends,
                     shard_mode: self.shard_mode,
+                    max_connection_attempts: self.max_connection_attempts,
                 }))
             }
             FileClusterProtocolConfig::Http => {
@@ -3026,6 +3073,7 @@ impl FileClusterConfig {
                     shard_percent: self.shard_percent,
                     shard_min_backends: self.shard_min_backends,
                     shard_mode: self.shard_mode,
+                    max_connection_attempts: self.max_connection_attempts,
                 }))
             }
         }
@@ -3263,6 +3311,9 @@ pub struct HttpClusterConfig {
     /// See [`FileClusterConfig::shard_mode`].
     #[serde(default)]
     pub shard_mode: Option<ShardMode>,
+    /// See [`FileClusterConfig::max_connection_attempts`].
+    #[serde(default)]
+    pub max_connection_attempts: Option<u32>,
 }
 
 impl HttpClusterConfig {
@@ -3291,6 +3342,7 @@ impl HttpClusterConfig {
                 shard_percent: self.shard_percent,
                 shard_min_backends: self.shard_min_backends,
                 shard_mode: self.shard_mode.map(|mode| mode as i32),
+                max_connection_attempts: self.max_connection_attempts,
             })
             .into(),
         ];
@@ -3419,6 +3471,9 @@ pub struct TcpClusterConfig {
     /// See [`FileClusterConfig::shard_mode`].
     #[serde(default)]
     pub shard_mode: Option<ShardMode>,
+    /// See [`FileClusterConfig::max_connection_attempts`].
+    #[serde(default)]
+    pub max_connection_attempts: Option<u32>,
 }
 
 impl TcpClusterConfig {
@@ -3448,6 +3503,7 @@ impl TcpClusterConfig {
                 shard_percent: self.shard_percent,
                 shard_min_backends: self.shard_min_backends,
                 shard_mode: self.shard_mode.map(|mode| mode as i32),
+                max_connection_attempts: self.max_connection_attempts,
             })
             .into(),
         ];
@@ -3612,6 +3668,14 @@ pub struct FileConfig {
     /// only. TCP listeners ignore this value (no HTTP envelope).
     #[serde(default)]
     pub retry_after: Option<u32>,
+    /// Backend connection attempt budget of every request: how many backend
+    /// connections a request may try, the first included, before it is
+    /// answered `503` (HTTP) or closed (TCP). `None` keeps
+    /// [`DEFAULT_MAX_CONNECTION_ATTEMPTS`]. Each cluster may override it with
+    /// its own `max_connection_attempts`. Out-of-range values (see
+    /// [`validate_max_connection_attempts`]) are rejected at config load.
+    #[serde(default)]
+    pub max_connection_attempts: Option<u32>,
     /// Requested kernel-pipe capacity, in bytes, for each `splice(2)`
     /// zero-copy direction (Linux only, `splice` feature). `None` keeps
     /// the kernel default (64 KiB). Applied via `fcntl(F_SETPIPE_SZ)`;
@@ -3837,6 +3901,9 @@ impl ConfigBuilder {
                 .subnet_ipv6_prefix
                 .unwrap_or(DEFAULT_SUBNET_IPV6_PREFIX),
             retry_after: file_config.retry_after.unwrap_or(DEFAULT_RETRY_AFTER),
+            max_connection_attempts: file_config
+                .max_connection_attempts
+                .unwrap_or(DEFAULT_MAX_CONNECTION_ATTEMPTS),
             splice_pipe_capacity_bytes: file_config.splice_pipe_capacity_bytes,
             ..Default::default()
         };
@@ -4078,6 +4145,13 @@ impl ConfigBuilder {
                 maximum: MAX_SUBNET_IPV6_PREFIX,
             });
         }
+        validate_max_connection_attempts(self.built.max_connection_attempts).map_err(|reason| {
+            ConfigError::InvalidMaxConnectionAttempts {
+                cluster_id: None,
+                value: self.built.max_connection_attempts,
+                reason,
+            }
+        })?;
 
         if let Some(listeners) = &self.file.listeners {
             self.populate_listeners(listeners.clone())?;
@@ -4433,6 +4507,10 @@ pub struct Config {
     /// responses. `0` omits the header.
     #[serde(default = "default_retry_after")]
     pub retry_after: u32,
+    /// Backend connection attempt budget of every request, the first attempt
+    /// included. Each cluster may override it.
+    #[serde(default = "default_max_connection_attempts")]
+    pub max_connection_attempts: u32,
     /// Requested kernel-pipe capacity, in bytes, for each `splice(2)`
     /// zero-copy direction. `None` keeps the kernel default of 64 KiB.
     /// Applied via `fcntl(F_SETPIPE_SZ)` per pipe at `SplicePipe::new`;
@@ -4497,6 +4575,10 @@ fn default_subnet_ipv6_prefix() -> u32 {
 
 fn default_retry_after() -> u32 {
     DEFAULT_RETRY_AFTER
+}
+
+fn default_max_connection_attempts() -> u32 {
+    DEFAULT_MAX_CONNECTION_ATTEMPTS
 }
 
 impl Config {
@@ -4900,6 +4982,7 @@ impl From<&Config> for ServerConfig {
             subnet_ipv6_prefix: Some(config.subnet_ipv6_prefix),
             retry_after: Some(config.retry_after),
             splice_pipe_capacity_bytes: config.splice_pipe_capacity_bytes,
+            max_connection_attempts: Some(config.max_connection_attempts),
         };
 
         // POST: the worker-facing config preserves the buffer-pool invariant
@@ -7122,6 +7205,137 @@ mod tests {
             Some(7),
             "the per-cluster subnet override must reach the cluster config"
         );
+    }
+
+    /// The backend connection attempt budget (sozu-proxy/sozu#1800): five by
+    /// default, set globally and per cluster from TOML, carried to the worker
+    /// in `ServerConfig` and to the cluster in its `AddCluster`.
+    #[test]
+    fn max_connection_attempts_defaults_to_five_and_round_trips_from_toml() {
+        let config_with = |global: &str, cluster: &str| -> Config {
+            let toml_content = format!(
+                r#"
+            command_socket = "/tmp/sozu.sock"
+            saved_state    = "./state.json"
+            worker_count   = 1
+            {global}
+
+            [[listeners]]
+            protocol = "http"
+            address  = "127.0.0.1:8080"
+
+            [clusters.api]
+            protocol       = "http"
+            load_balancing = "ROUND_ROBIN"
+            {cluster}
+            frontends = [
+              {{ address = "127.0.0.1:8080", hostname = "example.com" }}
+            ]
+            backends = [ {{ address = "10.0.0.1:8080" }} ]
+        "#
+            );
+            let file_config: FileConfig =
+                toml::from_str(&toml_content).expect("Could not parse TOML config");
+            ConfigBuilder::new(file_config, "/tmp/test_config.toml")
+                .into_config()
+                .expect("a valid attempt budget must load")
+        };
+        let cluster_attempts = |config: &Config| match config.clusters.get("api") {
+            Some(ClusterConfig::Http(http)) => http.max_connection_attempts,
+            other => panic!("expected the HTTP cluster, got {other:?}"),
+        };
+        let add_cluster_attempts = |config: &Config| {
+            config
+                .generate_config_messages()
+                .expect("Could not generate config messages")
+                .into_iter()
+                .find_map(|message| match message.content.request_type {
+                    Some(RequestType::AddCluster(cluster)) => Some(cluster.max_connection_attempts),
+                    _ => None,
+                })
+                .expect("the cluster is added")
+        };
+
+        let defaults = config_with("", "");
+        assert_eq!(DEFAULT_MAX_CONNECTION_ATTEMPTS, 5);
+        assert_eq!(defaults.max_connection_attempts, 5);
+        assert_eq!(
+            ServerConfig::from(&defaults).max_connection_attempts,
+            Some(5),
+            "the worker receives the default"
+        );
+        assert_eq!(
+            cluster_attempts(&defaults),
+            None,
+            "a cluster inherits by default"
+        );
+        assert_eq!(add_cluster_attempts(&defaults), None);
+
+        let set = config_with("max_connection_attempts = 2", "max_connection_attempts = 7");
+        assert_eq!(set.max_connection_attempts, 2);
+        assert_eq!(ServerConfig::from(&set).max_connection_attempts, Some(2));
+        assert_eq!(cluster_attempts(&set), Some(7));
+        assert_eq!(add_cluster_attempts(&set), Some(7));
+    }
+
+    /// A budget allowing no attempt, or more than the attempt counters hold,
+    /// is rejected at load, globally and per cluster; both bounds are
+    /// inclusive.
+    #[test]
+    fn an_out_of_range_max_connection_attempts_is_rejected() {
+        let load = |global: &str, cluster: &str| {
+            let toml_content = format!(
+                r#"
+            command_socket = "/tmp/sozu.sock"
+            saved_state    = "./state.json"
+            worker_count   = 1
+            {global}
+
+            [[listeners]]
+            protocol = "http"
+            address  = "127.0.0.1:8080"
+
+            [clusters.api]
+            protocol       = "http"
+            load_balancing = "ROUND_ROBIN"
+            {cluster}
+            frontends = [
+              {{ address = "127.0.0.1:8080", hostname = "example.com" }}
+            ]
+            backends = [ {{ address = "10.0.0.1:8080" }} ]
+        "#
+            );
+            let file_config: FileConfig =
+                toml::from_str(&toml_content).expect("Could not parse TOML config");
+            ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config()
+        };
+        for value in ["0", "256"] {
+            let global = format!("max_connection_attempts = {value}");
+            assert!(
+                matches!(
+                    load(&global, ""),
+                    Err(ConfigError::InvalidMaxConnectionAttempts {
+                        cluster_id: None,
+                        ..
+                    })
+                ),
+                "a global budget of {value} must be rejected"
+            );
+            assert!(
+                matches!(
+                    load("", &global),
+                    Err(ConfigError::InvalidMaxConnectionAttempts {
+                        cluster_id: Some(_),
+                        ..
+                    })
+                ),
+                "a cluster budget of {value} must be rejected"
+            );
+        }
+        for value in ["1", "255"] {
+            let budget = format!("max_connection_attempts = {value}");
+            assert!(load(&budget, &budget).is_ok(), "{value} is in range");
+        }
     }
 
     /// An out-of-range prefix is REJECTED, never silently clamped. A

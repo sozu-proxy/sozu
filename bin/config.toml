@@ -237,6 +237,14 @@ buffer_size = 16393
 # defaults to 3 seconds, can be specified at the listener level
 # connect_timeout = 3
 
+# how many backend connections a request may try, the first included, before
+# it is answered 503 (HTTP) or closed (TCP). A connection that is refused,
+# times out on connect_timeout or reports a socket error counts against its
+# backend, and the request goes to another backend while attempts remain.
+# 1 to 255, defaults to 5 (earlier versions hard-coded 3). Each cluster may
+# override it; `sozu connection-attempts set` changes it at runtime.
+# max_connection_attempts = 5
+
 # maximum time to receive a request since the connection started
 # defaults to 10 seconds, can be specified at the listener level
 # request_timeout = 10
@@ -598,6 +606,9 @@ load_balancing = "ROUND_ROBIN"
 # on its source IP. At most one of the two; refused on a TCP cluster.
 # affinity_header = "X-Tenant"
 # affinity_cookie = "tenant"
+# backend connection attempts of a request to this cluster, overriding the
+# global max_connection_attempts (1 to 255)
+# max_connection_attempts = 5
 # Shuffle sharding (off when unset): serve each client from a shard of
 # max(2, ceil(shard_percent x N / 100)) of the N primary backends, the top of
 # the HRW ranking of its key (source IP, or the header/cookie above). The

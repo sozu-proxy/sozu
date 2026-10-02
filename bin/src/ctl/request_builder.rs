@@ -29,9 +29,10 @@ use sozu_command_lib::{
 use super::CtlError;
 use crate::{
     cli::{
-        BackendCmd, ClusterCmd, ClusterH2Cmd, ConnectionLimitCmd, ForwardedHeadersArg,
-        HealthCheckCmd, HttpFrontendCmd, HttpListenerCmd, HttpsListenerCmd, MetricsCmd,
-        SubnetConnectionLimitCmd, TcpFrontendCmd, TcpListenerCmd, UdpFrontendCmd, UdpListenerCmd,
+        BackendCmd, ClusterCmd, ClusterConnectionAttemptsCmd, ClusterH2Cmd, ConnectionAttemptsCmd,
+        ConnectionLimitCmd, ForwardedHeadersArg, HealthCheckCmd, HttpFrontendCmd, HttpListenerCmd,
+        HttpsListenerCmd, MetricsCmd, SubnetConnectionLimitCmd, TcpFrontendCmd, TcpListenerCmd,
+        UdpFrontendCmd, UdpListenerCmd,
     },
     ctl::CommandManager,
 };
@@ -188,6 +189,7 @@ impl CommandManager {
                 shard_percent,
                 shard_min_backends,
                 shard_strict,
+                max_connection_attempts,
             } => {
                 let proxy_protocol = match (send_proxy, expect_proxy) {
                     (true, true) => Some(ProxyProtocolConfig::RelayHeader),
@@ -238,6 +240,10 @@ impl CommandManager {
                         reason.to_owned(),
                     )
                 })?;
+
+                if let Some(attempts) = max_connection_attempts {
+                    validate_attempts_flag(attempts)?;
+                }
 
                 let shard_mode = shard_strict.then_some(ShardMode::Strict as i32);
                 sozu_command_lib::config::validate_shuffle_sharding(
@@ -301,12 +307,14 @@ impl CommandManager {
                         shard_percent,
                         shard_min_backends,
                         shard_mode,
+                        max_connection_attempts,
                         ..Default::default()
                     })
                     .into(),
                 )
             }
             ClusterCmd::Remove { id } => self.send_request(RequestType::RemoveCluster(id).into()),
+            ClusterCmd::ConnectionAttempts { cmd } => self.cluster_connection_attempts_command(cmd),
             ClusterCmd::Tags { id } => self.cluster_tags(id),
             ClusterCmd::H2 { cmd } => self.cluster_h2_command(cmd),
             ClusterCmd::HealthCheck { cmd } => self.health_check_command(cmd),
@@ -439,6 +447,58 @@ impl CommandManager {
         };
 
         self.send_request(RequestType::AddCluster(updated).into())
+    }
+
+    /// Drives `sozu cluster connection-attempts {set|unset}`: the cluster's
+    /// configuration is read back and re-sent with only
+    /// `max_connection_attempts` changed, as `sozu cluster h2` does for
+    /// `http2`. The change is part of the cluster's state, so it is saved
+    /// with it and reaches workers started later.
+    pub fn cluster_connection_attempts_command(
+        &mut self,
+        cmd: ClusterConnectionAttemptsCmd,
+    ) -> Result<(), CtlError> {
+        let (cluster_id, attempts) = match cmd {
+            ClusterConnectionAttemptsCmd::Set { id, attempts } => {
+                validate_attempts_flag(attempts)?;
+                (id, Some(attempts))
+            }
+            ClusterConnectionAttemptsCmd::Unset { id } => (id, None),
+        };
+
+        let request = RequestType::QueryClusterById(cluster_id.clone()).into();
+        let response = self.send_request_get_response(request, true)?;
+
+        let cluster = response
+            .content
+            .and_then(|content| content.content_type)
+            .and_then(|content_type| find_cluster_configuration(content_type, &cluster_id))
+            .ok_or_else(|| {
+                CtlError::ArgsNeeded("cluster not found".to_owned(), cluster_id.clone())
+            })?;
+
+        let updated = Cluster {
+            max_connection_attempts: attempts,
+            ..cluster
+        };
+
+        self.send_request(RequestType::AddCluster(updated).into())
+    }
+
+    /// Drives `sozu connection-attempts set`: changes the global backend
+    /// connection attempt budget on every worker. Non-sticky, like
+    /// `connection_limit_command`: a worker started later reads the
+    /// configuration file.
+    pub fn connection_attempts_command(
+        &mut self,
+        cmd: ConnectionAttemptsCmd,
+    ) -> Result<(), CtlError> {
+        match cmd {
+            ConnectionAttemptsCmd::Set { attempts } => {
+                validate_attempts_flag(attempts)?;
+                self.send_request(RequestType::SetMaxConnectionAttempts(attempts).into())
+            }
+        }
     }
 
     pub fn health_check_command(&mut self, cmd: HealthCheckCmd) -> Result<(), CtlError> {
@@ -1528,6 +1588,17 @@ impl CommandManager {
             ),
         }
     }
+}
+
+/// Refuse a backend connection attempt budget outside `1..=255` before it is
+/// sent, naming the flag rather than the proto field the worker would cite.
+fn validate_attempts_flag(attempts: u32) -> Result<(), CtlError> {
+    sozu_command_lib::config::validate_max_connection_attempts(attempts).map_err(|reason| {
+        CtlError::ArgsNeeded(
+            "a backend connection attempt count in 1..=255".to_string(),
+            format!("got {attempts}: {reason}"),
+        )
+    })
 }
 
 /// JSON shape of `sozu -j cluster tags -i <id>`: the union of the access-log

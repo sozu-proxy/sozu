@@ -246,6 +246,14 @@ pub enum SubCmd {
         #[clap(subcommand)]
         cmd: SubnetConnectionLimitCmd,
     },
+    #[clap(
+        name = "connection-attempts",
+        about = "manage the global backend connection attempt budget of a request at runtime"
+    )]
+    ConnectionAttempts {
+        #[clap(subcommand)]
+        cmd: ConnectionAttemptsCmd,
+    },
     /// Live operator TUI: btop/htop-style overview of clusters, backends,
     /// listeners, and H2 health. Built behind the `tui` Cargo feature so
     /// production binaries stay lean. v1 is read-only; the cardinality lease
@@ -403,6 +411,49 @@ pub enum SubnetConnectionLimitCmd {
         about = "show the current global per-(cluster, source-subnet) connection limit and the subnet prefixes in force"
     )]
     Show,
+}
+
+/// Runtime surface for the global backend connection attempt budget
+/// (`max_connection_attempts`, sozu-proxy/sozu#1800).
+///
+/// Non-sticky, like `connection-limit`: a worker started later reads the
+/// value from the configuration file, so mirror the change there to make it
+/// durable. A cluster's own budget (`sozu cluster connection-attempts`)
+/// takes precedence over this one.
+#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
+pub enum ConnectionAttemptsCmd {
+    #[clap(
+        name = "set",
+        about = "set how many backend connections a request may try, the first included, before it is answered 503 (1..=255)"
+    )]
+    Set {
+        #[clap(help = "backend connection attempts per request, the first included (1..=255)")]
+        attempts: u32,
+    },
+}
+
+/// Per-cluster override of the backend connection attempt budget, set on a
+/// running cluster by re-sending its configuration with the field changed.
+#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
+pub enum ClusterConnectionAttemptsCmd {
+    #[clap(
+        name = "set",
+        about = "set the backend connection attempt budget of this cluster's requests (1..=255)"
+    )]
+    Set {
+        #[clap(short = 'i', long = "id", help = "cluster id")]
+        id: String,
+        #[clap(help = "backend connection attempts per request, the first included (1..=255)")]
+        attempts: u32,
+    },
+    #[clap(
+        name = "unset",
+        about = "remove this cluster's budget, so its requests use the global one"
+    )]
+    Unset {
+        #[clap(short = 'i', long = "id", help = "cluster id")]
+        id: String,
+    },
 }
 
 #[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
@@ -581,6 +632,11 @@ pub enum ClusterCmd {
             help = "When no backend of a client's shard can take a connection, refuse (503) instead of spilling over to the rest of the cluster."
         )]
         shard_strict: bool,
+        #[clap(
+            long = "max-connection-attempts",
+            help = "How many backend connections a request to this cluster may try, the first included, before it is answered 503 (1..=255). Defaults to the global max_connection_attempts."
+        )]
+        max_connection_attempts: Option<u32>,
     },
     #[clap(
         name = "h2",
@@ -594,6 +650,14 @@ pub enum ClusterCmd {
     HealthCheck {
         #[clap(subcommand)]
         cmd: HealthCheckCmd,
+    },
+    #[clap(
+        name = "connection-attempts",
+        about = "Set or unset the backend connection attempt budget of a running cluster"
+    )]
+    ConnectionAttempts {
+        #[clap(subcommand)]
+        cmd: ClusterConnectionAttemptsCmd,
     },
 }
 

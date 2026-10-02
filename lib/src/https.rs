@@ -1145,6 +1145,10 @@ impl ProxySession for HttpsSession {
         session_result == StateResult::CloseSession
     }
 
+    fn needs_ready_pass(&self) -> bool {
+        matches!(&self.state, HttpsStateMachine::Mux(mux) if mux.has_pending_backend_failure())
+    }
+
     fn protocol(&self) -> Protocol {
         Protocol::HTTPS
     }

@@ -1374,6 +1374,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         // backend yet (sozu-proxy/sozu#1632).
                         stream.front_bound_to_backend = false;
                         stream.attempts = 0;
+                        stream.tried_backends.clear();
                         // The next request is a new H2 stream on an H2
                         // backend connection, which reads these to refuse a
                         // frame on a closed stream (RFC 9113 §5.1) and to
@@ -1801,7 +1802,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         stream.state = StreamState::Link;
                         context.pending_links.push_back(stream_id);
                         // `Router::plan_connect` still gates on `stream.attempts`
-                        // against `CONN_RETRIES`, so a cluster whose backends
+                        // against `max_connection_attempts`, so a cluster whose backends
                         // are all stale cannot loop: the budget runs out and
                         // the caller answers 503.
                     }
