@@ -1087,8 +1087,10 @@ fn try_parse_h2c_status(buf: &[u8], config: &HealthCheckConfig) -> Option<bool> 
 
 /// Trim the optional 1-byte pad-length prefix and the 5-byte priority
 /// dependency (RFC 9113 §6.2). Returns `None` when the flags claim
-/// padding/priority but the payload is too short to satisfy them — the
-/// caller turns that into `Some(false)` (probe unhealthy).
+/// padding/priority but the payload is too short to satisfy them; the
+/// HEADERS arm of `try_parse_h2c_status` propagates it with `?`, so the
+/// probe keeps reading and is judged at EOF (unparsable, unhealthy) or
+/// when its timeout fires.
 fn strip_padded_priority(payload: &[u8], flags: u8) -> Option<&[u8]> {
     let mut start = 0usize;
     let mut end = payload.len();
@@ -1284,17 +1286,19 @@ mod tests {
 
     #[test]
     fn h2c_interim_headers_are_skipped_for_the_final_status() {
-        // One encoder for both blocks, as a server would use: the final
-        // block may reference dynamic-table entries the interim one added.
+        // One encoder for both blocks, as a server would use. `x-hint` is
+        // not in the HPACK static table, so the encoder inserts it in the
+        // dynamic table with the interim block and the final block refers
+        // to that entry: a decoder rebuilt per block cannot decode it.
         let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut interim = Vec::new();
         encoder.encode_into(
-            [(&b":status"[..], &b"103"[..]), (b"link", b"</a.css>")],
+            [(&b":status"[..], &b"103"[..]), (b"x-hint", b"warm")],
             &mut interim,
         );
         let mut last = Vec::new();
         encoder.encode_into(
-            [(&b":status"[..], &b"200"[..]), (b"link", b"</a.css>")],
+            [(&b":status"[..], &b"200"[..]), (b"x-hint", b"warm")],
             &mut last,
         );
         let mut buf = frame_with_header(0x01, FLAG_END_HEADERS, 1, &interim);

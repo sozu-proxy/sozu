@@ -78,7 +78,10 @@ is accepted:
 The status judged is the final one: interim `1xx` responses (`100 Continue`,
 `103 Early Hints`, RFC 9110 §15.2) are skipped, on HTTP/1.1 and h2c alike, so
 accepting `1xx` or `any` never lets an interim response stand in for a final
-500. `101 Switching Protocols` is final.
+500. `101 Switching Protocols` is final. The probe buffers at most 4096 bytes
+of response before reaching its verdict, interim responses included: a backend
+that sends, say, a `103 Early Hints` with more than about 4 KB of headers
+before its final status fails the probe.
 
 Setting both a non-zero `expected_status` and `accepted_statuses` is refused
 when the configuration is loaded or sent, so one never silently overrides the
