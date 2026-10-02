@@ -1573,6 +1573,30 @@ kept in lock-step:
   `ConnectionH2::enqueue_rst` passes no set for a refused stream or a closed
   one, because only the stream table's eviction removes an id again, and an
   unregistered id would stay for the connection's lifetime.
+  When `H2StreamTable::remove`
+  evicts an id from `rst_sent`, it keeps it among the last
+  `RECENTLY_RESET_CAPACITY` reset streams, so
+  `H2StreamTable::was_reset_locally` still recognises it, and one read-side
+  branch of `ConnectionH2::handle_header_state` ignores the DATA and HEADERS
+  frames (with their CONTINUATION frames) the peer sent before reading the
+  reset (RFC 9113 §5.1), on a tracked or a retired stream alike
+  (sozu-proxy/sozu#1751, sozu-proxy/sozu#1783). A header block is still
+  decoded whole for HPACK. Two header blocks per stream and DATA within the
+  stream's initial receive window count no glitch; each block beyond two, and
+  each DATA frame beyond the window, count one, and an empty DATA frame
+  without END_STREAM counts toward the empty-DATA flood limit
+  (CVE-2019-9518). The allowances are held for at most
+  `RESET_ALLOWANCES_CAPACITY` streams.
+  Pinned by `frames_on_a_backend_stream_sozu_reset_are_ignored`,
+  `frames_on_a_client_stream_sozu_reset_are_ignored`,
+  `data_on_a_reset_backend_stream_counts_a_glitch_beyond_its_window_only`,
+  `data_on_a_tracked_backend_stream_sozu_reset_is_ignored`,
+  `header_blocks_on_a_reset_backend_stream_beyond_two_count_glitches`,
+  `a_continuation_of_a_refused_header_block_is_discarded_with_it`,
+  `a_refused_header_block_counts_its_first_fragment_toward_its_size`,
+  `empty_data_frames_on_a_reset_backend_stream_count_toward_the_flood_limit`
+  (`h2.rs`), `was_reset_locally_survives_removal_within_the_bound` and
+  `reset_stream_allowances_stay_bounded` (`h2_stream_table.rs`).
 - **Lifetime count** via `H2ControlTx`'s `total_rst_streams_queued`: each
   freshly queued RST bumps it and nothing rewinds it. It is reported by the
   session log line and bounds nothing. The CVE-2025-8671 MadeYouReset cap is
