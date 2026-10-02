@@ -29,7 +29,9 @@
 //!   `H2Shell::flush_tls_records` and then asks again with
 //!   [`TlsFlushPhase::AfterFlush`].
 //! - **`Readiness`.** [`CloseAction::ReArmAndContinue`] says to re-arm;
-//!   the caller owns the bits.
+//!   the caller owns the bits. Its `ConnectionH2::ensure_tls_flushed`
+//!   raises no synthetic WRITABLE event after a write the kernel refused,
+//!   since the kernel owes that socket its next edge (sozu-proxy/sozu#1788).
 //! - **Reading whether TLS still holds records.** That is a live-socket query
 //!   and the caller makes it, through its own `H2Shell::tls_wants_write`
 //!   seam. This module receives the answer as a `bool` — a one-bit projection,
@@ -160,7 +162,9 @@ pub(super) enum CloseAction {
     /// [`TlsFlushPhase::AfterFlush`]. Only ever returned for
     /// [`TlsFlushPhase::BeforeFlush`].
     Flush,
-    /// Records are still buffered: re-arm WRITABLE and keep the session.
+    /// Records are still buffered: re-arm WRITABLE and keep the session. The
+    /// re-arm is `ConnectionH2::ensure_tls_flushed`'s, which leaves a write
+    /// the kernel refused to the kernel's next edge.
     ReArmAndContinue,
     /// Nothing is buffered: proceed to the connection's disconnect path.
     Disconnect,
@@ -268,7 +272,9 @@ pub(super) enum FinalizeAction {
     /// `Ready::WRITABLE` interest and wait for an external wake-up
     /// (`WINDOW_UPDATE`, backend readable, a new request).
     Quiesce,
-    /// Records survived the flush: re-arm the edge-triggered WRITABLE event.
+    /// Records survived the flush: re-arm the edge-triggered WRITABLE event,
+    /// through `ConnectionH2::ensure_tls_flushed`, which leaves a flush the
+    /// kernel refused to the kernel's next edge.
     ReArm,
     /// The kernel took everything this site had to give. Nothing left to do —
     /// and deliberately NOT a fall-through into the readiness policy: once

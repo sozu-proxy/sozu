@@ -181,7 +181,9 @@ impl Model {
             match out {
                 Output::Metric(MetricEvent::FlowCreated) => self.created_seen += 1,
                 Output::Metric(MetricEvent::FlowEvicted) => self.evicted_seen += 1,
-                Output::Metric(MetricEvent::FlowShed) => self.shed_seen += 1,
+                Output::Metric(MetricEvent::FlowShed | MetricEvent::FlowShedSourceLimit) => {
+                    self.shed_seen += 1
+                }
                 Output::OpenUpstream { flow, .. } => {
                     self.established.push(flow);
                     if self.established.len() > 256 {
@@ -445,6 +447,20 @@ fn random_cluster(ctx: &SimContext, allow_empty: bool) -> ClusterConfig {
         back_timeout: Duration::from_millis(ctx.random().random_range(500..5000)),
         send_proxy_protocol: ctx.random().random_bool(0.3),
         proxy_protocol_every_datagram: ctx.random().random_bool(0.5),
+        // 0 = unlimited; otherwise a small per-source cap so the per-source
+        // shed and the flow-count bookkeeping are exercised.
+        max_flows_per_ip: if ctx.random().random_bool(0.6) {
+            0
+        } else {
+            ctx.random().random_range(1..4u64)
+        },
+        max_flows_per_subnet: if ctx.random().random_bool(0.6) {
+            0
+        } else {
+            ctx.random().random_range(1..6u64)
+        },
+        subnet_ipv4_prefix: ctx.random().random_range(24..33u32),
+        subnet_ipv6_prefix: 128,
     }
 }
 

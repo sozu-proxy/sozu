@@ -641,8 +641,12 @@ pub struct FrontRustls {
     /// We can no longer receive plaintext, but may still have rustls-buffered
     /// records to flush on the write side — do NOT abort pending writes.
     pub peer_disconnected: bool,
-    /// Peer reset the connection (RST/ConnectionAborted/BrokenPipe). The TCP
-    /// channel is dead; further writes are pointless and should short-circuit.
+    /// The TCP channel is dead: the peer reset the connection
+    /// (RST/ConnectionAborted/BrokenPipe), or a write to the socket failed
+    /// with any other error but `WouldBlock`. Further writes are pointless and
+    /// short-circuit, and [`SocketHandler::socket_wants_write`] stops
+    /// reporting the records rustls still holds: no write can deliver them,
+    /// so they must not keep the session open or re-raise WRITABLE.
     pub peer_reset: bool,
     /// `process_new_packets` failed on this connection: a corrupt record, a
     /// fatal alert, a protocol violation. rustls keeps that error for good,
@@ -1242,6 +1246,8 @@ impl SocketHandler for FrontRustls {
                             );
                             incr!(names::rustls::WRITE_ERROR);
                             is_error = true;
+                            // The kernel refused the socket for good: see `peer_reset`.
+                            self.peer_reset = true;
                             break;
                         }
                     },
@@ -1280,6 +1286,8 @@ impl SocketHandler for FrontRustls {
                             );
                             incr!(names::rustls::WRITE_ERROR);
                             is_error = true;
+                            // The kernel refused the socket for good: see `peer_reset`.
+                            self.peer_reset = true;
                             break;
                         }
                     },
@@ -1432,6 +1440,8 @@ impl SocketHandler for FrontRustls {
                                 );
                                 incr!(names::rustls::WRITE_ERROR);
                                 is_error = true;
+                                // The kernel refused the socket for good: see `peer_reset`.
+                                self.peer_reset = true;
                                 break;
                             }
                         },
@@ -1467,6 +1477,8 @@ impl SocketHandler for FrontRustls {
                             );
                             incr!(names::rustls::WRITE_ERROR);
                             is_error = true;
+                            // The kernel refused the socket for good: see `peer_reset`.
+                            self.peer_reset = true;
                             break;
                         }
                     },
@@ -1500,6 +1512,8 @@ impl SocketHandler for FrontRustls {
                             );
                             incr!(names::rustls::WRITE_ERROR);
                             is_error = true;
+                            // The kernel refused the socket for good: see `peer_reset`.
+                            self.peer_reset = true;
                             break;
                         }
                     },
@@ -1564,8 +1578,9 @@ impl SocketHandler for FrontRustls {
     }
 
     fn socket_wants_write(&self) -> bool {
-        // Only a true RST stops us wanting to write — a peer FIN still
-        // allows flushing TLS plaintext buffered in rustls (half-close).
+        // Only a dead channel (a RST, or a failed socket write) stops us
+        // wanting to write — a peer FIN still allows flushing TLS plaintext
+        // buffered in rustls (half-close).
         !self.peer_reset && self.session.wants_write()
     }
 
@@ -3605,6 +3620,93 @@ pub(crate) mod rustls_read_tests {
             super::tests::proxy_count(names::rustls::WRITE_RESET) - resets,
             1,
             "the reset is counted once"
+        );
+    }
+
+    /// A settled TLS frontend over a socket whose connection the kernel
+    /// refused: its first write answers `ECONNREFUSED`, which no arm but the
+    /// generic one names.
+    fn refused_front() -> FrontRustls {
+        let address = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("test listener must bind to a loopback port")
+            .local_addr()
+            .expect("test listener must report its local address");
+        // The listener is gone: the connect below meets a RST.
+        let socket =
+            Socket::new(Domain::IPV4, Type::STREAM, None).expect("a TCP socket must be created");
+        socket
+            .set_nonblocking(true)
+            .expect("mio requires a nonblocking stream");
+        if let Err(e) = socket.connect(&address.into()) {
+            assert_eq!(
+                e.raw_os_error(),
+                Some(libc::EINPROGRESS),
+                "a nonblocking connect must be in progress, got {e}"
+            );
+        }
+        let mut pollfd = libc::pollfd {
+            fd: std::os::unix::io::AsRawFd::as_raw_fd(&socket),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: one valid `pollfd` borrowed for the duration of the call.
+        let ready = unsafe { libc::poll(&mut pollfd, 1, 5_000) };
+        assert_eq!(ready, 1, "the refusal must arrive within 5 s");
+        assert_ne!(
+            pollfd.revents & libc::POLLERR,
+            0,
+            "premise: the kernel must have refused the connection"
+        );
+        let (session, _client) = handshaken_pair();
+        FrontRustls {
+            stream: TcpStream::from_std(std::net::TcpStream::from(socket)),
+            session,
+            peer_disconnected: false,
+            peer_reset: false,
+            tls_fatal: false,
+            session_ulid: Ulid::generate(),
+            configured_peer: None,
+            recv_memory: RecvMemory::default(),
+        }
+    }
+
+    /// A TLS write that meets a socket error no other arm names answers
+    /// `Error` and marks the channel dead: the record rustls still holds can
+    /// never be delivered, so `socket_wants_write` stops reporting it, and the
+    /// next write short-circuits without reaching the socket. Otherwise the
+    /// record kept the H1 session's flush pending, which delays its close on
+    /// the hang-up, and a mux pass that re-raised WRITABLE for it retried the
+    /// failing write (sozu-proxy/sozu#1780).
+    ///
+    /// To SEE THIS RED: drop `self.peer_reset = true;` from the generic arm
+    /// of the `flush_tls` loop in `FrontRustls::socket_write`.
+    #[test]
+    fn a_tls_write_that_meets_a_socket_error_stops_wanting_to_write() {
+        let mut front = refused_front();
+        let errors = super::tests::proxy_count(names::rustls::WRITE_ERROR);
+
+        let (_, result) = front.socket_write(b"refused by the kernel");
+        assert_eq!(result, SocketResult::Error);
+        assert_eq!(
+            super::tests::proxy_count(names::rustls::WRITE_ERROR) - errors,
+            1
+        );
+        assert!(
+            front.session.wants_write(),
+            "premise: rustls must still hold the record the kernel refused"
+        );
+        assert!(
+            !front.socket_wants_write(),
+            "a record no write can deliver must not read as a pending write"
+        );
+
+        let writes = tls_writes();
+        let (_, result) = front.socket_write_vectored(&[std::io::IoSlice::new(b"after the error")]);
+        assert_eq!(result, SocketResult::Closed);
+        assert_eq!(
+            tls_writes(),
+            writes,
+            "a write after the error must not reach the socket"
         );
     }
 

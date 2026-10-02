@@ -4,6 +4,24 @@
 
 ### ✨ Added
 
+- **BREAKING (library API) — `feat(udp)`: opt-in per-source flow limit on UDP clusters.** Each
+  client source IP and port is its own UDP flow, with its own upstream socket and `max_flows` slot,
+  and nothing bounded the flows one source address held. A cluster's own `max_connections_per_ip`
+  and `max_connections_per_subnet` (with the worker's `subnet_ipv4_prefix` /
+  `subnet_ipv6_prefix`) now also cap the concurrent UDP flows per `(cluster, source IP)` and
+  `(cluster, masked source subnet)`. A datagram that would open a flow over either limit is
+  dropped (`DropReason::Shed`), counted in `udp.flows.shed` and the new
+  `udp.flows.shed.source_limit`; datagrams of existing flows are not affected, and a closed flow
+  frees its slot. The counters are per UDP listener and separate from the TCP/HTTP connection
+  counters. The global `max_connections_per_ip` / `max_connections_per_subnet` defaults do not
+  apply to UDP, so an existing configuration admits exactly the UDP flows it admitted before;
+  the limit is opt-in per cluster. Library API: `udp::ClusterConfig` gains `max_flows_per_ip`,
+  `max_flows_per_subnet`, `subnet_ipv4_prefix` and `subnet_ipv6_prefix`, and `udp::MetricEvent`
+  gains `FlowShedSourceLimit`. Documented in `doc/configure.md` ("UDP clusters") and
+  `doc/rate-limit-design.md` §3.5.1; covered by `test_udp_per_ip_flow_limit`
+  (`e2e/src/tests/udp_tests.rs`), the `manager.rs` unit tests and
+  `udp_flow_limits_come_from_the_cluster_not_the_global_defaults` (`server.rs`).
+
 - **`feat(lb)`: shuffle sharding over the HRW ranking
   ([#524](https://github.com/sozu-proxy/sozu/issues/524)).** A cluster can now serve each client
   from a shard of its backends instead of all of them, so a client that overloads or poisons its
@@ -3850,6 +3868,53 @@
 
 ### 🐛 Fixed
 
+- **`fix(mux)`: stop spinning the session loop when a TLS HTTP/2 client stops reading
+  ([#1788](https://github.com/sozu-proxy/sozu/issues/1788)).** `ConnectionH2::ensure_tls_flushed`
+  (`lib/src/protocol/mux/h2.rs`) re-raised the WRITABLE event whenever rustls still held records,
+  whatever the last socket write answered. After a write the kernel refused with `WouldBlock` —
+  the stalled control-frame flush, `ConnectionH2::finalize_write_after_flush`, the `GoAway` and
+  `Error` close arms — `Mux::ready_inner` (`lib/src/protocol/mux/mod.rs`) ran the write pass again
+  on every inner iteration, each refused, until `MAX_LOOP_ITERATIONS` counted an
+  `http.infinite_loop.error`. The connection now records whether the latest write of a pass was
+  refused and then leaves WRITABLE to the kernel's next edge, consuming the event as
+  `update_readiness_after_write` does, including on the empty-buffer TLS flushes whose status
+  nothing read. Close decisions still read whether rustls holds records, so a connection keeps
+  WRITABLE interest and stays open until they are flushed. The same re-raise kept every
+  `shut_down_sessions()` tick of a backpressured TLS H2 session in `drive_frontend_shutdown_io`
+  (`lib/src/protocol/mux/mod.rs`) calling the refused flush until `MAX_LOOP_ITERATIONS`; that loop
+  now stops once the refused write leaves no WRITABLE event. Behaviour change in the tests: the
+  stalled control-frame drain tests now stall on a write the kernel did not refuse, and the
+  real-rustls `GoAway`/`Error` tests assert that the refused pass queues no event and that the pass
+  the kernel edge triggers flushes and closes. Documented in `lib/src/protocol/mux/LIFECYCLE.md`.
+  Covered by `test_tls_h2_stalled_reader_does_not_exhaust_loop_budget`
+  (`e2e/src/tests/h2_tests.rs`), which checks the whole 32 MiB body arrives once the client reads
+  again, and `a_refused_goaway_flush_waits_for_the_kernel_edge_then_closes`
+  (`lib/src/protocol/mux/h2.rs`).
+
+- **`fix(mux)`: stop spinning the session loop when a TLS HTTP/1.1 client stops reading
+  ([#1780](https://github.com/sozu-proxy/sozu/issues/1780)).** When a TLS client stopped reading a
+  large response, rustls kept the records the kernel refused, and `ConnectionH1::writable`
+  (`lib/src/protocol/mux/h1.rs`) re-raised its WRITABLE event because `socket_wants_write()` was
+  still true, right after the write had answered `WouldBlock` and cleared it. `Mux::ready_inner`
+  (`lib/src/protocol/mux/mod.rs`) then called that write again on every inner iteration, each
+  answering `WouldBlock`, until `MAX_LOOP_ITERATIONS` counted an `http.infinite_loop.error`. The
+  pending write is now signalled only when the write answered `SocketResult::Continue`, so the
+  session waits for the kernel's next writable edge. The same re-raise kept every
+  `shut_down_sessions()` tick of a draining H1 session in `drive_frontend_shutdown_io`
+  (`lib/src/protocol/mux/mod.rs`) calling the blocked write until `MAX_LOOP_ITERATIONS`; that loop
+  now stops after the first refused write, once no WRITABLE event is left. A TLS write that meets a
+  socket error other than a reset now marks the transport dead (`FrontRustls::peer_reset`,
+  `lib/src/socket.rs`) as a reset does, so the records rustls still holds no longer count as a
+  pending write that holds the session open on the hang-up. Documented in
+  `lib/src/protocol/mux/LIFECYCLE.md` and `doc/lifetime_of_a_session.md`. Covered by
+  `test_tls_h1_stalled_reader_does_not_exhaust_loop_budget` (`e2e/src/tests/h2_tests.rs`), which
+  shrinks the client's receive buffer so the response always overflows it and checks that the
+  whole body arrives once the client reads again,
+  `a_tls_flush_that_did_not_continue_leaves_writable_to_the_kernel`
+  (`lib/src/protocol/mux/h1.rs`) and
+  `a_tls_write_that_meets_a_socket_error_stops_wanting_to_write` (`lib/src/socket.rs`). The same
+  spin on the HTTP/2 path is [#1788](https://github.com/sozu-proxy/sozu/issues/1788).
+
 - **BREAKING (library API) — `fix(udp)`: key UDP flows on the client source address, not on the
   affinity key ([#1732](https://github.com/sozu-proxy/sozu/issues/1732)).** Under the default
   `affinity_key = SOURCE_IP`, `FlowKey::from_src` zeroed the source port, so every socket of one
@@ -3914,6 +3979,22 @@
   Covered by `test_h1_interim_103_and_final_in_one_write`,
   `test_h1_interim_102_and_final_in_one_write` and
   `test_h1_several_interims_and_final_in_one_write` (`e2e/src/tests/tests.rs`).
+- **`fix(mux-h1)`: answer a second keep-alive request to an H2 backend instead of a 502
+  ([#1781](https://github.com/sozu-proxy/sozu/issues/1781)).** With an H1 client in front of an
+  H2 backend, `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`) reused the client stream
+  slot for the next request without clearing `Stream::back_received_end_of_stream`,
+  `Stream::front_received_end_of_stream` and the per-direction DATA counters, which
+  `Context::create_stream` clears for a recycled slot. The stale end-of-stream flag made the H2
+  backend connection refuse the second response's HEADERS as arriving on a closed stream
+  (RFC 9113 §5.1) and send GOAWAY(STREAM_CLOSED), so the client got a 502. The keep-alive reset
+  now clears them, and `ConnectionH2::start_stream` asserts that the backend leg is fresh; the
+  backend leg's send window is sized from the backend's SETTINGS_INITIAL_WINDOW_SIZE by
+  [#1757](https://github.com/sozu-proxy/sozu/pull/1757), which this builds on, so a keep-alive
+  request no longer starts from what the previous one left of it. Documented in
+  `lib/src/protocol/mux/LIFECYCLE.md` §3.2. Covered by `test_h1_to_h2_keep_alive_requests` and
+  `test_h1_to_h2_keep_alive_requests_small_backend_window` (`e2e/src/tests/tests.rs`): a GET,
+  four 600 000-byte POSTs and a GET on one client connection, over one backend connection,
+  with the default and a 16 384-byte backend window.
 
 - **`fix(h1)`: handle every 1xx other than 101 as an interim response
   ([#1733](https://github.com/sozu-proxy/sozu/issues/1733)).** On an HTTP/1.1 frontend,
@@ -7032,6 +7113,47 @@
   `test_h1_trailer_spoof_headers_dropped*` and `test_h1_pipelined_trailer_spoof_headers_dropped`
   rows of `e2e/src/tests/h1_security_tests.rs`. Documented in `doc/configure.md` and
   `lib/src/protocol/kawa_h1/LIFECYCLE.md`.
+
+- **`fix(mux-h2)`: add no `Transfer-Encoding` to a response without a body from an H2 backend,
+  and forward its 1xx ([#1776](https://github.com/sozu-proxy/sozu/issues/1776)).** When an H2
+  backend sent a header section without END_STREAM and without `content-length`,
+  `pkawa::handle_header` (`lib/src/protocol/mux/pkawa.rs`) added `Transfer-Encoding: chunked`
+  and framed the response chunked for an H1 client, including for a 1xx, a 204, a 304 and a
+  response to HEAD, which have no content by definition (RFC 9110 §6.4.1); RFC 9112 §6.1 forbids
+  the field in a 1xx or 204. A 1xx never completed either, so an H1 client read a chunked 103
+  and never the final response. Such a response now gains no framing. A 1xx is complete at its
+  head and the final response follows it. A 204, a 304 or a response to HEAD stays open until
+  the backend's END_STREAM, which reaches an H2 client; a response to HEAD marked complete at
+  its head used to leave an H2 client stream without END_STREAM and to reset the backend stream
+  with frames in flight, whose trailer HEADERS then cost the whole backend connection a
+  GOAWAY(STREAM_CLOSED). A `content-length` is removed from a 1xx or a 204, where a server MUST
+  NOT send it, and kept on a 304 or a response to HEAD (RFC 9110 §8.6). A `:status 101`, which
+  HTTP/2 does not support (RFC 9113 §8.6), is a stream error (PROTOCOL_ERROR) answered 502.
+  Documented in `lib/src/protocol/mux/LIFECYCLE.md` §8.4. Covered by
+  `a_bodiless_h2_response_gains_no_transfer_encoding_towards_an_h1_client` (`h1.rs`),
+  `a_101_response_is_a_stream_protocol_error` (`pkawa.rs`),
+  `test_h2_bodiless_response_head_has_no_transfer_encoding`,
+  `test_h2_bodiless_response_ends_the_h2_client_stream`,
+  `test_h2_bodiless_response_end_keeps_the_backend_connection`,
+  `test_h2_backend_interim_response_reaches_the_client` and
+  `test_h2_backend_101_is_a_bad_gateway` (`e2e/src/tests/h2_security_header_injection.rs`).
+
+- **`fix(mux-h1)`: H2→H1: write no last chunk or trailer section after the head of a response
+  without a body to an H1 client ([#1761](https://github.com/sozu-proxy/sozu/issues/1761)).**
+  A response to HEAD, a 204 or a 304 ends with its header section on HTTP/1.1 (RFC 9112 §6.3),
+  but when an H2 backend sent
+  its HEADERS without END_STREAM and without `content-length`, the response was framed as
+  chunked and the end of its stream, a trailer HEADERS frame or an empty DATA frame, was written
+  as a last chunk `0\r\n`, the trailer fields and an empty line after the head, which a
+  keep-alive client reads as the start of the next response. `ConnectionH1::writable`
+  (`lib/src/protocol/mux/h1.rs`) now clears the end-of-body framing and drops the trailer block
+  of such a response (RFC 9110 §6.5.1) before writing, so a stream ended by a trailer HEADERS
+  frame or an empty DATA frame writes nothing after the head, and counts a dropped block in the
+  new `h2.trailers_dropped_no_body`, documented in `doc/configure.md`. DATA carrying a payload
+  on such a response is still written after the head, a known gap. Documented in
+  `lib/src/protocol/mux/LIFECYCLE.md` §8.4. Covered by unit tests in `h1.rs` and by
+  `test_h2_bodiless_response_trailers_keep_h1_client_framing`
+  (`e2e/src/tests/h2_security_header_injection.rs`).
 
 - **`fix(mux-h1)`: H2→H1: drop the trailer fields of a `Content-Length`-framed message instead of
   writing them after the body ([#1730](https://github.com/sozu-proxy/sozu/issues/1730)).**
