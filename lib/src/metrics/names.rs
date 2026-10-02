@@ -580,8 +580,13 @@ pub mod udp {
     pub const FLOWS_CREATED: &str = "udp.flows.created";
     /// Flows torn down (idle / teardown / drain).
     pub const FLOWS_EVICTED: &str = "udp.flows.evicted";
-    /// New flows shed at the `max_flows` cap or under fd pressure.
+    /// New flows shed at the `max_flows` cap, at a per-source limit, or
+    /// under fd pressure.
     pub const FLOWS_SHED: &str = "udp.flows.shed";
+    /// New flows shed because their source IP or subnet held the cluster's
+    /// `max_connections_per_ip` / `max_connections_per_subnet` flows. Also
+    /// counted in [`FLOWS_SHED`].
+    pub const FLOWS_SHED_SOURCE_LIMIT: &str = "udp.flows.shed.source_limit";
     /// Datagrams dropped before allocation (aggregate). Reason-specific
     /// counters below carry the dotted `.<reason>` suffix; both are emitted
     /// so dashboards can chart the total or break it down. The `incr!` macro
