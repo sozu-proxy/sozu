@@ -22,7 +22,7 @@ use sozu_command_lib::{
     proto::command::{
         ActivateListener, AddCertificate, CertificateAndKey, Cluster, ListenerType,
         QueryMetricsOptions, RequestHttpFrontend, ResponseStatus, ServerConfig, SocketAddress,
-        filtered_metrics, request::RequestType, response_content::ContentType,
+        WorkerResponse, filtered_metrics, request::RequestType, response_content::ContentType,
     },
     scm_socket::Listeners,
     state::ConfigState,
@@ -355,6 +355,25 @@ pub(crate) fn send_requests(
     }
 }
 
+/// The worker's answer to the request just sent. A worker also writes the
+/// events it emits to the command channel — a backend these tests make fail
+/// is reported `BACKEND_DOWN` once its retry policy gives up on it — and one
+/// can arrive before the answer, so they are skipped.
+pub(crate) fn read_answer(worker: &mut Worker) -> WorkerResponse {
+    loop {
+        let response = worker.read_proxy_response().expect("the worker answers");
+        if !matches!(
+            response
+                .content
+                .as_ref()
+                .and_then(|content| content.content_type.as_ref()),
+            Some(ContentType::Event(_))
+        ) {
+            return response;
+        }
+    }
+}
+
 /// The `backend.connections.error` count of `cluster_id`: the backend
 /// connections that failed to establish, refused or timed out.
 pub(crate) fn cluster_connection_errors(worker: &mut Worker, cluster_id: &str) -> i64 {
@@ -366,9 +385,7 @@ pub(crate) fn cluster_connection_errors(worker: &mut Worker, cluster_id: &str) -
         no_clusters: false,
         workers: false,
     }));
-    let response = worker
-        .read_proxy_response()
-        .expect("the worker answers a metrics query");
+    let response = read_answer(worker);
     assert_eq!(response.status, ResponseStatus::Ok as i32, "{response:?}");
     let Some(ContentType::WorkerMetrics(metrics)) =
         response.content.and_then(|content| content.content_type)
@@ -722,7 +739,7 @@ fn test_connection_attempt_budget_changes_at_runtime() {
 
     // A budget no request could use is refused, and changes nothing.
     worker.send_proxy_request_type(RequestType::SetMaxConnectionAttempts(0));
-    let refused = worker.read_proxy_response().expect("the worker answers");
+    let refused = read_answer(&mut worker);
     assert_eq!(
         refused.status,
         ResponseStatus::Failure as i32,
@@ -730,13 +747,13 @@ fn test_connection_attempt_budget_changes_at_runtime() {
     );
 
     worker.send_proxy_request_type(RequestType::SetMaxConnectionAttempts(4));
-    let lowered = worker.read_proxy_response().expect("the worker answers");
+    let lowered = read_answer(&mut worker);
     assert_eq!(lowered.status, ResponseStatus::Ok as i32);
     let (global_four, _a) =
         first_request_of_fifth_attempt_cluster(&mut worker, front_address, "global-four", None);
 
     worker.send_proxy_request_type(RequestType::SetMaxConnectionAttempts(5));
-    let raised = worker.read_proxy_response().expect("the worker answers");
+    let raised = read_answer(&mut worker);
     assert_eq!(raised.status, ResponseStatus::Ok as i32);
 
     // A running cluster, first added without a budget of its own, then given
@@ -754,7 +771,7 @@ fn test_connection_attempt_budget_changes_at_runtime() {
         max_connection_attempts: Some(4),
         ..Worker::default_cluster("updated")
     }));
-    let updated = worker.read_proxy_response().expect("the worker answers");
+    let updated = read_answer(&mut worker);
     assert_eq!(updated.status, ResponseStatus::Ok as i32);
     let cluster_four = h1_get(front_address, path).unwrap_or(0);
 
