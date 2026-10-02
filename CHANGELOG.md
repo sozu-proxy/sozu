@@ -3953,6 +3953,32 @@
 
 ### 🐛 Fixed
 
+- **`fix(mux-h2)`: forward a response to HEAD with a non-zero `content-length` and END_STREAM on
+  its HEADERS ([#1791](https://github.com/sozu-proxy/sozu/issues/1791)).** `pkawa::handle_header`
+  (`lib/src/protocol/mux/pkawa.rs`) refused an H2 backend response whose HEADERS frame carried
+  END_STREAM and a non-zero `content-length` as a stream error (PROTOCOL_ERROR), exempting only a
+  1xx, a 204 and a 304, so a response to HEAD reached the client as a 502. RFC 9113 §8.1.1 lets a
+  response with no content carry a non-zero `content-length`, and a response to HEAD has none
+  (RFC 9110 §9.3.2). Only that END_STREAM check changes: it now exempts a response to HEAD,
+  whose `content-length` was already forwarded otherwise. A response to HEAD with END_STREAM and
+  no `content-length` also no longer gains an injected `Content-Length: 0`, which on HEAD, as on a
+  304, would state that the selected representation is empty (RFC 9110 §8.6). A response to GET
+  with END_STREAM and a non-zero `content-length` is still refused. Documented in
+  `lib/src/protocol/mux/LIFECYCLE.md` §8.4. Covered by
+  `test_h2_head_response_with_end_stream_keeps_the_backend_content_length`
+  (`e2e/src/tests/h2_security_header_injection.rs`): HEAD with and without a `content-length`,
+  and the GET rejection, for an H1 and an H2 client.
+
+- **`fix(rustls)`: an interrupted TLS handshake read or write is retried.** `handshake_read` and
+  the write pump of `TlsHandshake::writable` (`lib/src/protocol/rustls.rs`) now retry a `read_tls`
+  or `write_tls` the kernel interrupted (`EINTR`), as `flush_tls` does after the handshake since
+  [#1795](https://github.com/sozu-proxy/sozu/pull/1795); they used to log `Could not perform
+  handshake` and close a healthy session. Only the syscall is retried: the readiness, the
+  short-read probe and the reset counters are unchanged. The handshake write moves into
+  `handshake_write`, generic over the transport like `handshake_read`. Covered by
+  `an_interrupted_handshake_read_is_retried` and `an_interrupted_handshake_write_is_retried`
+  ([#1799](https://github.com/sozu-proxy/sozu/issues/1799)).
+
 - **`fix(socket)`: retry interrupted plain TCP reads and writes and interrupted TLS reads
   ([#1799](https://github.com/sozu-proxy/sozu/issues/1799)).** The plain TCP `socket_read`,
   `socket_write` and `socket_write_vectored` (`lib/src/socket.rs`) and the `read_tls` call of
@@ -3966,7 +3992,16 @@
   `tcp_socket_write_vectored`. Covered by `an_interrupted_plain_write_is_retried`,
   `an_interrupted_plain_vectored_write_is_retried`, `an_interrupted_plain_read_is_retried` and
   `an_interrupted_tls_read_is_retried`. The TLS handshake pump (`lib/src/protocol/rustls.rs`)
-  keeps its mapping.
+  retries the same way since [#1803](https://github.com/sozu-proxy/sozu/pull/1803).
+
+- **`test(mux-h2)`: the refused header block GOAWAY test no longer races its writer thread.**
+  `a_refused_header_block_counts_its_first_fragment_toward_its_size` (`lib/src/protocol/mux/h2.rs`)
+  wrote its 66 000-byte block from a spawned thread and drove the connection for a fixed eight
+  passes without waiting for it, so a writer descheduled for the whole window left nothing to read
+  (`got []`), and a GOAWAY queued by the read of the last fragment in the final pass was never
+  flushed. It now drives until the GOAWAY reaches the peer, under a 30-second deadline, and joins
+  the writer, requiring its write to succeed, before the unchanged assertion. Measured with 24
+  busy loops on a 20-CPU host: 2 failures in 200 runs before, 0 in 200 after.
 
 - **`fix(socket)`: an interrupted TLS write is retried, and every TLS write error marks the channel
   dead.** `flush_tls` (`lib/src/socket.rs`) now retries a write the kernel interrupted (`EINTR`),
@@ -7412,13 +7447,15 @@
   carry content (RFC 9110 §9.3.2): its payload is dropped from the stream buffer, windows
   credited, and the connection stays usable, however large the payload. Such a stream stays
   linked until the backend's END_STREAM ([#1776](https://github.com/sozu-proxy/sozu/issues/1776)),
-  so its DATA reaches these branches whether it arrives with the head or later. Known
-  limitation: a trailer HEADERS frame the backend sends after the reset of a 204 or a 304 still
-  answers GOAWAY(STREAM_CLOSED) for the whole backend connection until
-  [#1784](https://github.com/sozu-proxy/sozu/pull/1784) lands. Documented in
+  so its DATA reaches these branches whether it arrives with the head or later. A trailer block
+  the backend sends after the reset of a 204 or a 304, in one HEADERS frame or split over
+  CONTINUATION frames, is ignored (RFC 9113 §5.1) and the backend connection keeps its other
+  streams; before [#1784](https://github.com/sozu-proxy/sozu/pull/1784) a split trailer block
+  answered GOAWAY(PROTOCOL_ERROR) for the whole backend connection. Documented in
   `lib/src/protocol/mux/LIFECYCLE.md` §8.4. Covered by
-  `a_backend_response_content_is_forbidden_for_204_and_304_and_discarded_for_head` and
-  `a_204_response_carrying_data_resets_its_backend_stream_and_a_head_response_discards_it`
+  `a_backend_response_content_is_forbidden_for_204_and_304_and_discarded_for_head`,
+  `a_204_response_carrying_data_resets_its_backend_stream_and_a_head_response_discards_it` and
+  `a_trailer_after_the_reset_of_a_204_carrying_data_is_ignored`
   (`h2.rs`), and by `test_h2_bodiless_response_data_never_reaches_h1_client`,
   `test_h2_head_response_with_large_data_completes` and
   `test_h2_head_response_with_large_data_keeps_the_backend_connection`
