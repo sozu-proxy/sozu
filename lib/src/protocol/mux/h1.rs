@@ -1374,6 +1374,17 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         // backend yet (sozu-proxy/sozu#1632).
                         stream.front_bound_to_backend = false;
                         stream.attempts = 0;
+                        // The next request is a new H2 stream on an H2
+                        // backend connection, which reads these to refuse a
+                        // frame on a closed stream (RFC 9113 §5.1) and to
+                        // check `content-length` (§8.1.1): clear them as
+                        // `Context::create_stream` does for a recycled slot,
+                        // or the backend's response HEADERS is refused as
+                        // arriving after END_STREAM (sozu-proxy/sozu#1781).
+                        stream.front_received_end_of_stream = false;
+                        stream.back_received_end_of_stream = false;
+                        stream.front_data_received = 0;
+                        stream.back_data_received = 0;
                         // The next pipelined request gets its own replay
                         // decision: `start_stream` re-arms capture only if it
                         // again picks a connection out of the keep-alive pool.
