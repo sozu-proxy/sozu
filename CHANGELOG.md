@@ -3982,6 +3982,23 @@
   `a_408_to_a_silent_client_closes_without_lingering` and
   `a_silent_client_is_closed_at_the_linger_deadline`.
 
+- **`fix(mux-h2)`: keep one stream send window per connection
+  ([#1755](https://github.com/sozu-proxy/sozu/issues/1755)).** A stream relayed from an H2
+  frontend to an H2 backend kept a single send window for both connections, although RFC 9113
+  §6.9 flow control is per hop. A client and a backend that both advertised
+  `SETTINGS_INITIAL_WINDOW_SIZE = 2^31-1` overflowed it and the backend connection was closed with
+  GOAWAY(PROTOCOL_ERROR); the backend leg also started at the frontend's window instead of the
+  backend's, and each peer's WINDOW_UPDATE credited the other leg too. `Stream::window` is
+  replaced by `Stream::front_window` and `Stream::back_window`; `Stream::split` and the new
+  `Stream::send_window_mut` pick the connection's own leg from its `Position`, and
+  `ConnectionH2::start_stream` sizes the backend leg from the backend's initial window
+  (`lib/src/protocol/mux/stream.rs`, `lib/src/protocol/mux/h2.rs`). H1 legs are unchanged.
+  Covered by `a_backend_max_initial_window_is_independent_of_the_frontend_window`,
+  `a_backend_stream_window_is_sized_and_credited_by_the_backend_only`,
+  `a_frontend_window_update_credits_the_frontend_leg_only` and the e2e
+  `test_h2_client_and_h2_backend_both_at_max_initial_window`; documented in
+  `doc/h2_mux_internals.md` and `doc/architecture.md`.
+
 - **`fix(mux-h2)`: answer stream-scoped errors with RST_STREAM instead of GOAWAY.** Several
   errors that RFC 9113 scopes to one stream closed the whole connection, ending every in-flight
   stream on it. Now only the offending stream is reset, and its frame is still minimally processed

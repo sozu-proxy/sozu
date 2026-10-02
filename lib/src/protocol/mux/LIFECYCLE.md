@@ -1038,7 +1038,9 @@ deadlines are compared against `ConnectionH2.now` (§7.5):
   `H2StreamTable.stream_fc_stalled_progress: BTreeMap<StreamId, usize>` (the
   cumulative-stall budget). Armed (in `ConnectionH2::poll_write_target`) whenever a stream holds
   sendable buffered data it cannot send because its effective send window
-  `min(stream.window, connection.window)` is exhausted. This is
+  `min(stream window, connection.window)` is exhausted (the stream window is
+  this connection's leg: `Stream::front_window` on a frontend connection,
+  `Stream::back_window` on a backend one). This is
   **bidirectional**: the buffered data is the **response** on a `Position::Server`
   (frontend) connection and the **request upload** on a `Position::Client`
   (backend) connection — so a slot pinned by a stalled upload to a slow H2 backend
