@@ -1356,6 +1356,341 @@ fn test_h2_backend_101_is_a_bad_gateway() {
     );
 }
 
+/// One row of `test_h2_bodiless_response_data_never_reaches_h1_client`.
+struct BodilessDataCase {
+    method: &'static str,
+    status: &'static str,
+    head: &'static [(&'static [u8], &'static [u8])],
+    trailers: bool,
+    /// HEADERS and DATA leave the backend in one write instead of 200 ms
+    /// apart.
+    single_write: bool,
+    /// Whether the client connection stays open for a second request.
+    keep_alive: bool,
+}
+
+/// An H2 backend answers with `:status` `status`, the extra `head` fields,
+/// a DATA frame carrying `hello` and, when `trailers`, a trailer HEADERS
+/// frame, with HEADERS and DATA in one write or 200 ms apart. The payload
+/// never reaches the H1 client.
+///
+/// A 204 or a 304 cannot carry content (RFC 9110 §15.3.5, §15.4.5), so the
+/// DATA payload makes it malformed (RFC 9113 §8.1.1) and the backend stream
+/// is reset. In both orderings the H1 client has already been written the
+/// head when sozu reads the DATA frame, so it reads that head, then the
+/// connection closes, signalling an incomplete message (RFC 9112 §8). Had
+/// the head not left yet, `forcefully_terminate_answer` would answer 502
+/// instead (RFC 9110 §15.6.3); this test does not reach that ordering.
+///
+/// A response to HEAD only SHOULD NOT carry content (RFC 9110 §9.3.2): the
+/// client reads its head, and the next request on the connection is
+/// answered. The backend stream stays linked until its END_STREAM, carried
+/// here by the DATA frame, so the payload reaches the
+/// `BackendResponseContent::Discarded` branch in both orderings and is
+/// dropped there.
+///
+/// TO SEE THIS RED: make `ConnectionH2::backend_response_content`
+/// (`lib/src/protocol/mux/h2.rs`) return `BackendResponseContent::Forwarded`
+/// for a 204 and a 304 (their rows) or for a response to HEAD (its rows):
+/// `hello` then reaches the client before the next response.
+fn try_h2_bodiless_response_data_never_reaches_h1_client(case: &BodilessDataCase) -> State {
+    let BodilessDataCase {
+        method,
+        status,
+        head,
+        trailers,
+        single_write,
+        keep_alive,
+    } = *case;
+    let (mut worker, backend, mut h1_backend, front_addr) =
+        setup_h1_front_with_raw_h2_backend(&format!(
+            "H2-BODILESS-DATA-H1-{method}-{status}-{}",
+            if single_write { "ONE" } else { "SPLIT" }
+        ));
+    backend.set_status(status);
+    for &(name, value) in head {
+        backend.push_header(name, value);
+    }
+    backend.set_body_with_delay(b"hello".to_vec(), Duration::from_millis(200));
+    backend.set_single_write(single_write);
+    if trailers {
+        backend.set_trailers(Some(vec![(b"grpc-status".to_vec(), b"0".to_vec())]));
+    }
+
+    let mut client = TcpStream::connect(front_addr).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    client
+        .write_all(format!("{method} / HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+        .unwrap();
+    let first = drain_client(&mut client);
+    println!("bodiless data {method} {status} — first response {first:?}");
+    // On a closed connection the write or the read fails or returns
+    // nothing, which `keep_alive` then requires.
+    let _ = client.write_all(b"GET / HTTP/1.1\r\nHost: other\r\n\r\n");
+    let second = drain_client(&mut client);
+    println!("bodiless data {method} {status} — second response {second:?}");
+
+    drop(client);
+    drop(backend);
+    h1_backend.stop_and_get_aggregator();
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    let wire = format!("{first}{second}");
+    let leaked = wire.contains("hello");
+    let first_ok = wire.starts_with(&format!("HTTP/1.1 {status} "));
+    let next = wire.split_once("\r\n\r\n").map_or("", |(_, rest)| rest);
+    let next_ok = if keep_alive {
+        next.starts_with("HTTP/1.1 200 ") && next.contains("pong")
+    } else {
+        next.is_empty()
+    };
+    if first_ok && !leaked && next_ok && stopped {
+        State::Success
+    } else {
+        println!(
+            "bodiless data {method} {status} FAIL — first_ok={first_ok} leaked={leaked} \
+             next={next:?} stopped={stopped}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_bodiless_response_data_never_reaches_h1_client() {
+    const CONTENT_LENGTH_5: &[(&[u8], &[u8])] = &[(b"content-length", b"5")];
+    let mut cases = Vec::new();
+    for single_write in [true, false] {
+        cases.extend([
+            BodilessDataCase {
+                method: "GET",
+                status: "204",
+                head: &[],
+                trailers: false,
+                single_write,
+                keep_alive: false,
+            },
+            BodilessDataCase {
+                method: "GET",
+                status: "304",
+                head: &[],
+                trailers: true,
+                single_write,
+                keep_alive: false,
+            },
+            BodilessDataCase {
+                method: "HEAD",
+                status: "200",
+                head: CONTENT_LENGTH_5,
+                trailers: false,
+                single_write,
+                keep_alive: true,
+            },
+        ]);
+    }
+    for case in &cases {
+        assert_eq!(
+            repeat_until_error_or(
+                3,
+                "H2->H1: a DATA payload on a response without a body never reaches the client \
+                 (RFC 9110 §6.4.1)",
+                || try_h2_bodiless_response_data_never_reaches_h1_client(case)
+            ),
+            State::Success,
+            "{} answered {}, single write {}",
+            case.method,
+            case.status,
+            case.single_write
+        );
+    }
+}
+
+/// Sizes of the DATA an H2 backend sends on a response to HEAD: more than one
+/// stream buffer (16 393 bytes), several of them, and many.
+const HEAD_DATA_SIZES: [usize; 3] = [20_000, 60_000, 200_000];
+
+/// An H2 backend answers HEAD with `200`, `content-length: size` and `size`
+/// bytes of DATA, the last frame flagged END_STREAM. A response to HEAD only
+/// SHOULD NOT carry content (RFC 9110 §9.3.2): the payload is discarded
+/// without occupying the stream buffer, so the backend connection keeps
+/// being read up to END_STREAM, however large the payload. An H1 client
+/// reads the head alone and its next request on the connection is answered;
+/// an H2 client sees stream 1 end without DATA.
+///
+/// TO SEE THIS RED: in the HEAD discard of `ConnectionH2::handle_data_frame`
+/// (`lib/src/protocol/mux/h2.rs`), advance `kawa.storage.head` past the
+/// payload instead of dropping it: the stream buffer fills, READABLE is
+/// removed from the backend connection, and END_STREAM is never read.
+fn try_h2_head_response_with_large_data(size: usize, h2_client: bool) -> State {
+    let name = format!(
+        "H2-HEAD-DATA-{size}-{}",
+        if h2_client { "H2" } else { "H1" }
+    );
+    let length = size.to_string();
+    if h2_client {
+        let (mut worker, backend, front_port) = setup_h2_front_with_raw_h2_backend(&name);
+        backend.push_header("content-length", length.as_bytes());
+        backend.set_body_with_delay(vec![b'x'; size], Duration::ZERO);
+        let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+        let mut tls = raw_h2_connection(front_addr);
+        h2_handshake(&mut tls);
+        tls.write_all(&H2Frame::headers(1, request_for(b"HEAD"), true, true).encode())
+            .unwrap();
+        tls.flush().unwrap();
+        let frames = read_h2_frames_until(&mut tls, Duration::from_secs(3), |frames| {
+            ends_stream(frames, 1)
+        });
+        log_frames(&format!("HEAD {size} H2 client"), &frames);
+        drop(tls);
+        drop(backend);
+        worker.soft_stop();
+        let stopped = worker.wait_for_server_stop();
+        let status_ok = stream_status_matches(&frames, 1, 200);
+        let ended = ends_stream(&frames, 1);
+        let no_content = stream_data(&frames, 1).is_empty();
+        let no_reset = !contains_rst_stream(&frames) && !contains_goaway(&frames);
+        if status_ok && ended && no_content && no_reset && stopped {
+            State::Success
+        } else {
+            println!(
+                "HEAD {size} H2 client FAIL — status_ok={status_ok} ended={ended} \
+                 no_content={no_content} no_reset={no_reset} stopped={stopped}"
+            );
+            State::Fail
+        }
+    } else {
+        let (mut worker, backend, mut h1_backend, front_addr) =
+            setup_h1_front_with_raw_h2_backend(&name);
+        backend.push_header("content-length", length.as_bytes());
+        backend.set_body_with_delay(vec![b'x'; size], Duration::ZERO);
+        let mut client = TcpStream::connect(front_addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        client
+            .write_all(b"HEAD / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let first = drain_client(&mut client);
+        let _ = client.write_all(b"GET / HTTP/1.1\r\nHost: other\r\n\r\n");
+        let second = drain_client(&mut client);
+        println!("HEAD {size} H1 client — {first:?} then {second:?}");
+        drop(client);
+        drop(backend);
+        h1_backend.stop_and_get_aggregator();
+        worker.soft_stop();
+        let stopped = worker.wait_for_server_stop();
+        let wire = format!("{first}{second}");
+        let (head, next) = wire.split_once("\r\n\r\n").unwrap_or(("", ""));
+        let head_ok = head.starts_with("HTTP/1.1 200 ");
+        let next_ok = next.starts_with("HTTP/1.1 200 ") && next.ends_with("pong");
+        let leaked = wire.contains('x');
+        if head_ok && next_ok && !leaked && stopped {
+            State::Success
+        } else {
+            println!(
+                "HEAD {size} H1 client FAIL — head_ok={head_ok} next={next:?} leaked={leaked} \
+                 stopped={stopped}"
+            );
+            State::Fail
+        }
+    }
+}
+
+#[test]
+fn test_h2_head_response_with_large_data_completes() {
+    // Every row runs, so a failure report names all the rows that failed.
+    let mut failed = Vec::new();
+    for h2_client in [false, true] {
+        for size in HEAD_DATA_SIZES {
+            if repeat_until_error_or(
+                2,
+                "H2 backend: the DATA of a response to HEAD never fills the stream buffer",
+                || try_h2_head_response_with_large_data(size, h2_client),
+            ) != State::Success
+            {
+                failed.push((size, h2_client));
+            }
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "failed rows (size, h2_client): {failed:?}"
+    );
+}
+
+/// An H2 backend answers HEAD on stream 1 with `200` and 20 000 bytes of
+/// DATA, sent once a GET of the same H2 client opened stream 3 on the same
+/// backend connection, then answers stream 3 `200` with `pong`. Discarding
+/// the HEAD payload must not stop that connection from being read: both
+/// streams end, over one backend connection, without GOAWAY or RST_STREAM.
+///
+/// TO SEE THIS RED: as for `try_h2_head_response_with_large_data`; the
+/// response on stream 3 is never read.
+fn try_h2_head_response_with_large_data_keeps_the_backend_connection() -> State {
+    let (mut worker, backend, front_port) =
+        setup_h2_front_with_raw_h2_backend("H2-HEAD-DATA-SECOND-STREAM");
+    backend.push_header("content-length", "20000");
+    backend.set_body_with_delay(vec![b'x'; 20_000], Duration::ZERO);
+    backend.set_serve_second_stream(true);
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+    tls.write_all(&H2Frame::headers(1, request_for(b"HEAD"), true, true).encode())
+        .unwrap();
+    tls.flush().unwrap();
+    let first = read_h2_frames_until(&mut tls, Duration::from_secs(1), |frames| {
+        frames
+            .iter()
+            .any(|(kind, _, id, _)| *kind == H2_FRAME_HEADERS && *id == 1)
+    });
+    tls.write_all(&H2Frame::headers(3, request_for(b"GET"), true, true).encode())
+        .unwrap();
+    tls.flush().unwrap();
+    let rest = read_h2_frames_until(&mut tls, Duration::from_secs(3), |frames| {
+        ends_stream(frames, 3) && ends_stream(frames, 1)
+    });
+    let frames = [first, rest].concat();
+    log_frames("HEAD 20000 and a second stream", &frames);
+    drop(tls);
+    thread::sleep(Duration::from_millis(400));
+    let goaways = backend.goaways_received();
+    let resets = backend.resets_received();
+    let connections = backend.connections_received();
+    drop(backend);
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    let first_ok = stream_status_matches(&frames, 1, 200)
+        && ends_stream(&frames, 1)
+        && stream_data(&frames, 1).is_empty();
+    let second_ok = stream_status_matches(&frames, 3, 200)
+        && ends_stream(&frames, 3)
+        && stream_data(&frames, 3) == b"pong";
+    if first_ok && second_ok && goaways == 0 && resets == 0 && connections == 1 && stopped {
+        State::Success
+    } else {
+        println!(
+            "HEAD 20000 second stream FAIL — first_ok={first_ok} second_ok={second_ok} \
+             backend_goaways={goaways} backend_resets={resets} \
+             backend_connections={connections} stopped={stopped}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_head_response_with_large_data_keeps_the_backend_connection() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "H2 backend: discarding HEAD DATA keeps a shared backend connection read",
+            try_h2_head_response_with_large_data_keeps_the_backend_connection
+        ),
+        State::Success
+    );
+}
+
 // ============================================================================
 // FIX-3 — `:path` syntax (starts with `/`, or `*` only for OPTIONS)
 // ============================================================================
