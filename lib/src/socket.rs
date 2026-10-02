@@ -642,11 +642,14 @@ pub struct FrontRustls {
     /// records to flush on the write side — do NOT abort pending writes.
     pub peer_disconnected: bool,
     /// The TCP channel is dead: the peer reset the connection
-    /// (RST/ConnectionAborted/BrokenPipe), or a write to the socket failed
-    /// with any other error but `WouldBlock`. Further writes are pointless and
-    /// short-circuit, and [`SocketHandler::socket_wants_write`] stops
-    /// reporting the records rustls still holds: no write can deliver them,
-    /// so they must not keep the session open or re-raise WRITABLE.
+    /// (RST/ConnectionAborted/BrokenPipe), or a write answered
+    /// [`SocketResult::Error`] — a socket error other than `WouldBlock`
+    /// (an `Interrupted` write is retried in `flush_tls` and never gets
+    /// here), a rustls writer failure, or the write loop's budget. Further
+    /// writes are pointless and short-circuit, and
+    /// [`SocketHandler::socket_wants_write`] stops reporting the records
+    /// rustls still holds: no write can deliver them, so they must neither
+    /// keep the session open nor wait for a WRITABLE edge that will not come.
     pub peer_reset: bool,
     /// `process_new_packets` failed on this connection: a corrupt record, a
     /// fatal alert, a protocol violation. rustls keeps that error for good,
@@ -752,12 +755,26 @@ impl RecvMemory {
 /// error arm (sozu-proxy/sozu#434); the callers' `peer_reset` then stops
 /// every later write before it reaches the socket, so a reset counts once.
 /// The callers still count it under `rustls.write.error` as well.
-fn flush_tls(session: &mut ServerConnection, stream: &mut TcpStream) -> std::io::Result<usize> {
+///
+/// A write the kernel interrupted (`EINTR`) is retried at once, as the
+/// relay (`lib/src/protocol/proxy_protocol/relay.rs`) and the UDP path
+/// (`lib/src/udp.rs`) do: it says nothing about the socket, so it must
+/// neither end the write as `WouldBlock`, which no edge would follow, nor
+/// as `Error`, which marks the channel dead.
+fn flush_tls(
+    session: &mut ServerConnection,
+    stream: &mut impl std::io::Write,
+) -> std::io::Result<usize> {
     #[cfg(test)]
     if session.wants_write() {
         TLS_WRITES.with(|writes| writes.set(writes.get() + 1));
     }
-    let written = session.write_tls(stream);
+    let written = loop {
+        match session.write_tls(stream) {
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            written => break written,
+        }
+    };
     if let Err(e) = &written
         && matches!(
             e.kind(),
@@ -1246,8 +1263,6 @@ impl SocketHandler for FrontRustls {
                             );
                             incr!(names::rustls::WRITE_ERROR);
                             is_error = true;
-                            // The kernel refused the socket for good: see `peer_reset`.
-                            self.peer_reset = true;
                             break;
                         }
                     },
@@ -1286,8 +1301,6 @@ impl SocketHandler for FrontRustls {
                             );
                             incr!(names::rustls::WRITE_ERROR);
                             is_error = true;
-                            // The kernel refused the socket for good: see `peer_reset`.
-                            self.peer_reset = true;
                             break;
                         }
                     },
@@ -1308,6 +1321,9 @@ impl SocketHandler for FrontRustls {
             "rustls socket_write cannot be both Error and Closed"
         );
         if is_error {
+            // Whatever failed — the socket, rustls, or the loop budget — no
+            // later write can deliver what rustls holds: see `peer_reset`.
+            self.peer_reset = true;
             (buffered_size, SocketResult::Error)
         } else if is_closed {
             (buffered_size, SocketResult::Closed)
@@ -1440,8 +1456,6 @@ impl SocketHandler for FrontRustls {
                                 );
                                 incr!(names::rustls::WRITE_ERROR);
                                 is_error = true;
-                                // The kernel refused the socket for good: see `peer_reset`.
-                                self.peer_reset = true;
                                 break;
                             }
                         },
@@ -1477,8 +1491,6 @@ impl SocketHandler for FrontRustls {
                             );
                             incr!(names::rustls::WRITE_ERROR);
                             is_error = true;
-                            // The kernel refused the socket for good: see `peer_reset`.
-                            self.peer_reset = true;
                             break;
                         }
                     },
@@ -1512,8 +1524,6 @@ impl SocketHandler for FrontRustls {
                             );
                             incr!(names::rustls::WRITE_ERROR);
                             is_error = true;
-                            // The kernel refused the socket for good: see `peer_reset`.
-                            self.peer_reset = true;
                             break;
                         }
                     },
@@ -1533,6 +1543,8 @@ impl SocketHandler for FrontRustls {
             "rustls socket_write_vectored cannot be both Error and Closed"
         );
         if is_error {
+            // Same as `socket_write`: an `Error` always marks the channel dead.
+            self.peer_reset = true;
             (buffered_size, SocketResult::Error)
         } else if is_closed {
             (buffered_size, SocketResult::Closed)
@@ -3708,6 +3720,136 @@ pub(crate) mod rustls_read_tests {
             writes,
             "a write after the error must not reach the socket"
         );
+    }
+
+    /// `refused_front` with records already queued in rustls and nothing
+    /// written yet, for the empty-buffer flushes that only drain them.
+    fn refused_front_holding_records() -> FrontRustls {
+        let mut front = refused_front();
+        front
+            .session
+            .writer()
+            .write_all(b"queued before the flush")
+            .expect("rustls must absorb the plaintext");
+        assert!(
+            front.session.wants_write(),
+            "premise: rustls must hold the record the flush will try to write"
+        );
+        front
+    }
+
+    /// The write that met the socket error answered `Error`, and the record
+    /// rustls still holds no longer reads as a pending write.
+    fn assert_error_marks_the_channel_dead(front: &FrontRustls, result: SocketResult) {
+        assert_eq!(result, SocketResult::Error);
+        assert!(
+            front.session.wants_write(),
+            "premise: rustls must still hold the record the kernel refused"
+        );
+        assert!(
+            front.peer_reset && !front.socket_wants_write(),
+            "an Error write must mark the channel dead, or the record keeps the \
+             session waiting for a WRITABLE edge that never comes"
+        );
+    }
+
+    /// The empty-buffer flush of `socket_write` — the one `H2Shell` issues to
+    /// push queued records — marks the channel dead on a socket error.
+    ///
+    /// TO SEE THIS RED: drop the `self.peer_reset = true;` of the `is_error`
+    /// return in `FrontRustls::socket_write`.
+    #[test]
+    fn an_empty_tls_flush_that_meets_a_socket_error_marks_the_channel_dead() {
+        let mut front = refused_front_holding_records();
+        let (_, result) = front.socket_write(&[]);
+        assert_error_marks_the_channel_dead(&front, result);
+    }
+
+    /// A vectored write rustls absorbs whole, then flushes in the main loop.
+    ///
+    /// TO SEE THIS RED: drop the `self.peer_reset = true;` of the `is_error`
+    /// return in `FrontRustls::socket_write_vectored`.
+    #[test]
+    fn a_vectored_tls_write_that_meets_a_socket_error_marks_the_channel_dead() {
+        let mut front = refused_front();
+        let (size, result) = front.socket_write_vectored(&[
+            std::io::IoSlice::new(b"refused "),
+            std::io::IoSlice::new(b"by the kernel"),
+        ]);
+        assert_eq!(size, 21, "premise: rustls must absorb the whole write");
+        assert_error_marks_the_channel_dead(&front, result);
+    }
+
+    /// A vectored write rustls absorbs only in part (its send buffer is
+    /// capped), which takes the partial-write flush before returning.
+    ///
+    /// TO SEE THIS RED: the same edit as the whole-write test above.
+    #[test]
+    fn a_partial_vectored_tls_write_that_meets_a_socket_error_marks_the_channel_dead() {
+        let mut front = refused_front();
+        front.session.set_buffer_limit(Some(64));
+        let payload = vec![b'x'; 4096];
+        let (size, result) = front.socket_write_vectored(&[std::io::IoSlice::new(&payload)]);
+        assert!(
+            size > 0 && size < payload.len(),
+            "premise: rustls must absorb part of the write, got {size}"
+        );
+        assert_error_marks_the_channel_dead(&front, result);
+    }
+
+    /// The empty-buffer flush of `socket_write_vectored`.
+    ///
+    /// TO SEE THIS RED: the same edit as the whole-write test above.
+    #[test]
+    fn an_empty_vectored_tls_flush_that_meets_a_socket_error_marks_the_channel_dead() {
+        let mut front = refused_front_holding_records();
+        let (_, result) = front.socket_write_vectored(&[]);
+        assert_error_marks_the_channel_dead(&front, result);
+    }
+
+    /// A transport whose first write is interrupted (`EINTR`) and whose next
+    /// one takes everything.
+    #[derive(Default)]
+    struct InterruptedOnce {
+        calls: usize,
+        written: Vec<u8>,
+    }
+
+    impl std::io::Write for InterruptedOnce {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            if self.calls == 1 {
+                return Err(std::io::Error::from(ErrorKind::Interrupted));
+            }
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// An interrupted TLS write is retried, not reported: as `WouldBlock` no
+    /// edge would resume it, and as an error it would mark the channel dead.
+    ///
+    /// TO SEE THIS RED: remove the `Interrupted => continue` arm of the retry
+    /// loop in `flush_tls`.
+    #[test]
+    fn an_interrupted_tls_write_is_retried() {
+        let (mut session, _client) = handshaken_pair();
+        session
+            .writer()
+            .write_all(b"interrupted once")
+            .expect("rustls must absorb the plaintext");
+        let mut transport = InterruptedOnce::default();
+
+        let written = flush_tls(&mut session, &mut transport)
+            .expect("an interrupted write must be retried, not reported");
+
+        assert!(written > 0 && transport.written.len() == written);
+        assert_eq!(transport.calls, 2, "one interrupted write, one retry");
+        assert!(!session.wants_write(), "the retry must deliver the record");
     }
 
     /// Read everything `transport` holds through [`plain_socket_read`] with a
