@@ -83,7 +83,7 @@ fn pump_worker(_worker: &mut Worker) {
 /// Enable `SO_LINGER(0)` on a raw TCP file descriptor so that closing the
 /// socket sends a RST instead of a graceful FIN. `TcpStream::set_linger` is
 /// still nightly-only, so we reach for `libc::setsockopt` directly.
-fn set_linger_zero(fd: libc::c_int) {
+pub(crate) fn set_linger_zero(fd: libc::c_int) {
     let linger = libc::linger {
         l_onoff: 1,
         l_linger: 0,

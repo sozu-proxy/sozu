@@ -1913,18 +1913,31 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     /// (`command/src/ready.rs`) also raises it for `is_read_closed()`, the
     /// `EPOLLRDHUP` a client's half-close (`shutdown(SHUT_WR)`, RFC 9293
     /// §3.6) produces. Such a client has stopped sending, not receiving, and
-    /// still expects the response to what it sent. A request is therefore in
-    /// flight while a stream is open, from the request head to the end of its
-    /// response, and its bytes may still be unread while the frontend has a
-    /// read to do: the FIN can arrive with the request itself. A real hang-up
-    /// is found by the next write, which fails and closes the session.
+    /// still expects the response to what it sent:
+    ///
+    /// - input not read yet may hold a request, or the rest of one: the FIN
+    ///   can arrive with the request itself (`Connection::has_unread_input`);
+    /// - a stream whose request was received whole is answered.
+    ///
+    /// Nothing else is: once the client's EOF is read, a request it left
+    /// incomplete can never complete, and the session closes as on a hang-up
+    /// instead of waiting for its backend.
+    ///
+    /// A reset is a hang-up whatever is in flight: mio reports it with
+    /// `is_error()` (`EPOLLERR`), as ERROR beside the HUP, and the client
+    /// will read nothing more. Linux raises `EPOLLHUP` without `EPOLLERR`
+    /// only once both directions are shut down, which on a frontend sozu has
+    /// not shut down for writing means a reset as well.
     fn frontend_exchange_in_flight(&self) -> bool {
-        self.frontend.readiness().filter_interest().is_readable()
+        if self.frontend.readiness().event.is_error() {
+            return false;
+        }
+        self.frontend.has_unread_input()
             || self
                 .context
                 .streams
                 .iter()
-                .any(|stream| stream.state.is_open())
+                .any(|stream| stream.state.is_open() && stream.front.is_terminated())
     }
 
     fn delay_close_for_frontend_flush(&mut self, reason: &'static str) -> bool {
@@ -3161,9 +3174,11 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 // flush, this check closes the session, including after a
                 // flush the entry check delayed the close for and the
                 // writable arm above completed. A lingering frontend is left
-                // to its drain, as on entry: it reads the client's last bytes
-                // to the EOF before it closes, and closing it here would leave
-                // them unread and reset the connection. While output is
+                // to its drain: `ConnectionH1::start_linger` raises READABLE,
+                // which `Mux::frontend_exchange_in_flight` counts as unread
+                // input until the drain reads the client's EOF, so the
+                // client's last bytes are never left unread to reset the
+                // connection. While output is
                 // pending, the HUP alone is not work this loop can progress:
                 // it stops when the frontend has nothing to read or write,
                 // and the next readiness event resumes the flush. Counting
@@ -3172,18 +3187,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 // half-close leaves the exchange in flight to be served
                 // (`Mux::frontend_exchange_in_flight`): the session closes
                 // here once its response is complete.
-                //
-                // That exchange keeps READABLE, so a read in this pass may
-                // already have met the client's EOF and consumed the event
-                // before its response started a linger. As on entry, the
-                // drain then reads to that EOF, which the HUP says has
-                // arrived: `ConnectionH1::drain_linger` returns at the EOF,
-                // so this cannot spin.
-                if self.frontend.is_lingering() && self.frontend.readiness().event.is_hup() {
-                    self.frontend.readiness_mut().event.insert(Ready::READABLE);
-                }
                 if self.frontend.readiness().event.is_hup()
-                    && !self.frontend.is_lingering()
                     && !self
                         .frontend
                         .has_pending_write_including_streams(&self.context)
@@ -5435,29 +5439,24 @@ mod tests {
         fn write_error(&self) {}
     }
 
-    /// A TLS client hangs up while the answer to its partly received request
-    /// is still buffered: the entry check of `Mux::ready_inner` delays the
-    /// close for that flush, and the flush, then the `close_notify`, start
-    /// the lingering close inside the loop (RFC 9112 §9.6,
-    /// `ConnectionH1::start_linger`). The in-loop HUP check must leave that
-    /// frontend to its drain, as the entry check does: closing it there
-    /// leaves the rest of the request unread, and the close resets the
-    /// connection.
+    /// A TLS client half-closes while the answer to its partly received
+    /// request is still buffered (a 408 from `Mux::timeout_inner`): the
+    /// answer is flushed, then the `close_notify`, and the lingering close
+    /// starts inside the loop (RFC 9112 §9.6, `ConnectionH1::start_linger`).
+    /// The in-loop HUP check must leave that frontend to its drain: closing it
+    /// with the client's last bytes unread resets the connection.
     ///
     /// What is asserted is the socket, not the reader: whichever path
     /// consumed the client's last bytes, the request reader or the linger
     /// drain, none may be left unread at the close.
     ///
-    /// TO SEE THIS RED: before sozu-proxy/sozu#1779, dropping
-    /// `!self.frontend.is_lingering()` from the in-loop HUP check of
-    /// `Mux::ready_inner` closed the session before the drain read anything
-    /// (4 bytes left unread). Since then a half-close keeps the exchange
-    /// readable, so it takes dropping the entry check's
-    /// `Mux::frontend_exchange_in_flight` branch together with both
-    /// `!self.frontend.is_lingering()` and `!self.frontend_exchange_in_flight()`
-    /// from the in-loop check.
+    /// TO SEE THIS RED: drop `c.readiness.filter_interest().is_readable() ||`
+    /// from `Connection::has_unread_input`, which is what keeps a lingering
+    /// frontend (READABLE raised by `ConnectionH1::start_linger`) from the
+    /// in-loop close: 4 bytes are left unread. Before sozu-proxy/sozu#1779 the
+    /// `!self.frontend.is_lingering()` guard of that check did this.
     #[test]
-    fn a_hup_during_the_flush_that_starts_a_linger_drains_before_closing() {
+    fn a_lingering_frontend_reads_the_clients_last_bytes_before_closing() {
         use std::io::{Read, Write};
 
         let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
@@ -5552,6 +5551,67 @@ mod tests {
         assert!(
             outcome.is_ok(),
             "the response ends with the FIN, not a reset: {outcome:?}"
+        );
+    }
+
+    /// A request answered before its head was whole (a 408 from
+    /// `Mux::timeout_inner` on an `Idle` stream) is never linked to a backend
+    /// when the rest of its head arrives afterwards: the answer is final, and
+    /// the bytes behind it are drained after it, never forwarded.
+    ///
+    /// TO SEE THIS RED: drop `&& !answered` from the first-seen-request branch
+    /// of `ConnectionH1::readable`.
+    #[test]
+    fn an_answered_request_is_never_linked() {
+        use std::io::Write;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (socket, mut peer) = connected_socket();
+        let frontend_timeout = Duration::from_secs(60);
+        let mut frontend = Connection::new_h1_server(Ulid::generate(), socket, frontend_timeout);
+        let mut context = test_context(&pool);
+        context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("test context must create a stream");
+        let head_start = b"GET /slow HTTP/1.1\r\nHost: loc";
+        {
+            let Connection::H1(h1) = &mut frontend else {
+                unreachable!("new_h1_server builds an H1 connection")
+            };
+            h1.stream = Some(0);
+            let stream = &mut context.streams[0];
+            let storage = &mut stream.front.storage;
+            storage.space()[..head_start.len()].copy_from_slice(head_start);
+            storage.fill(head_start.len());
+            let answers_rc = stream.answers.clone();
+            let answers = answers_rc.borrow();
+            set_default_answer(stream, &mut h1.readiness, 408, &answers);
+        }
+        assert_eq!(
+            context.streams[0].state,
+            StreamState::Unlinked,
+            "premise: the 408 leaves the stream answered"
+        );
+
+        peer.write_all(b"alhost\r\n\r\n")
+            .expect("the client peer writes the rest of its head");
+        std::thread::sleep(Duration::from_millis(20));
+        frontend.readiness_mut().event.insert(Ready::READABLE);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        let _ = frontend.readable(&mut context, EndpointClient(&mut router));
+
+        assert!(
+            context.streams[0].front.is_main_phase(),
+            "premise: the rest of the head was read and parsed"
+        );
+        assert_eq!(
+            context.streams[0].state,
+            StreamState::Unlinked,
+            "an answered request must stay answered"
+        );
+        assert!(
+            context.pending_links.is_empty(),
+            "an answered request must not be queued for a backend"
         );
     }
 

@@ -255,6 +255,10 @@ handshake saw survives the upgrade. With TLS 1.3 a client's `Finished`, its
 request and its half-close FIN can arrive together, so `TlsHandshake::ready`
 closes on a HUP only when no read is due, and the mux serves that request
 before it closes ([#1779](https://github.com/sozu-proxy/sozu/issues/1779)).
+A HUP still set after a read that left the handshake incomplete closes it
+(`TlsHandshake::readable`): that client can never send its `Finished`. The
+handshake loop counts only READABLE, WRITABLE and ERROR as work, so a HUP
+alone never spins it.
 
 On the wire a TLS 1.3 handshake costs the server one `writev(2)` for its flight
 (ServerHello, ChangeCipherSpec, encrypted handshake messages) and one for the
@@ -591,10 +595,13 @@ readiness is empty. A frontend HUP is not work the loop can progress: each
 iteration closes the session on one once no output is left to flush, except on
 a lingering frontend, which drains the client's last bytes to the EOF first
 ([#1774](https://github.com/sozu-proxy/sozu/issues/1774)). The HUP is also how
-a client's half-close arrives (`EPOLLRDHUP`): while a stream is open or the
-frontend still has a read to do (`Mux::frontend_exchange_in_flight`), neither
-the entry check nor the in-loop check closes the session or queues
-`close_notify`, and the session closes once the response is complete
+a client's half-close arrives (`EPOLLRDHUP`): while input is still unread or a
+stream whose request was received whole is open
+(`Mux::frontend_exchange_in_flight`), neither the entry check nor the in-loop
+check closes the session or queues `close_notify`, and the session closes once
+the response is complete. A request left incomplete at the client's EOF closes
+the session at once, and a reset, which mio reports as ERROR beside the HUP,
+closes it whatever is in flight
 ([#1779](https://github.com/sozu-proxy/sozu/issues/1779)).
 
 ## 9. TCP (pipe) session lifecycle

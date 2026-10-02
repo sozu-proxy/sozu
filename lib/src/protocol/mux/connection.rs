@@ -510,6 +510,20 @@ impl<Front: SocketHandler> Connection<Front> {
         }
     }
 
+    /// Whether the client may have sent bytes this connection has not read:
+    /// a read is due, or the read stopped on buffer pressure with the rest
+    /// still in the kernel. An H1 connection parks with its READABLE event
+    /// cleared (`ConnectionH1::readable`), an H2 one with its READABLE
+    /// interest cleared and the event kept (`ConnectionH2::try_resume_reading`).
+    pub(super) fn has_unread_input(&self) -> bool {
+        match self {
+            Connection::H1(c) => {
+                c.readiness.filter_interest().is_readable() || c.parked_on_buffer_pressure
+            }
+            Connection::H2(_) => self.readiness().event.is_readable(),
+        }
+    }
+
     pub(super) fn is_draining(&self) -> bool {
         match self {
             Connection::H1(_) => false,

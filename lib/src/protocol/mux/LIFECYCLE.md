@@ -341,16 +341,19 @@ from `Mux::ready`. Termination may be triggered by:
   `delay_close_for_frontend_flush` (`mod.rs`) to avoid truncating TLS. The
   HUP also stands for a client's half-close (`EPOLLRDHUP`, which
   `Ready::from(&Event)` in `command/src/ready.rs` maps to HUP): while
-  `Mux::frontend_exchange_in_flight` (`mod.rs`) holds — a stream is open, or
-  the frontend still has a read to do — the session serves the exchange and
-  closes once the response is complete
-  ([#1779](https://github.com/sozu-proxy/sozu/issues/1779)). Output already
-  pending is flushed as a delayed close would, without `close_notify`, and a
-  lingering frontend gets READABLE in the inner loop too, since a read in the
-  same pass may have met the EOF before the linger started. The request
-  reader keeps reading an answered stream: `ConnectionH1::readable` never
-  links a request whose stream is already `Unlinked`, such as one
-  `Mux::timeout_inner` answered 408 while its head was incomplete.
+  `Mux::frontend_exchange_in_flight` (`mod.rs`) holds — input is still
+  unread (`Connection::has_unread_input`), or a stream whose request was
+  received whole is open — the session serves the exchange and closes once
+  the response is complete
+  ([#1779](https://github.com/sozu-proxy/sozu/issues/1779)). A request left
+  incomplete at the client's EOF holds nothing, and a reset (ERROR beside the
+  HUP) closes the session whatever is in flight. Output already pending is
+  flushed as a delayed close would, without `close_notify`. A lingering
+  frontend counts as unread input from `ConnectionH1::start_linger`, which
+  raises READABLE, until its drain reads the EOF. The request reader keeps
+  reading an answered stream: `ConnectionH1::readable` never links a request
+  whose stream is already `Unlinked`, such as one `Mux::timeout_inner`
+  answered 408 while its head was incomplete.
 - `MuxResult::CloseSession` from any readable/writable path (the frontend
   readable and writable arms of `Mux::ready_inner`, etc.).
 - A loop-iteration budget overrun (`MAX_LOOP_ITERATIONS = 10_000`, `mod.rs`,
@@ -1109,10 +1112,11 @@ deadlines are compared against `ConnectionH2.now` (§7.5):
    so the budget is shared across every outer iteration of one `ready()` call.
    A frontend HUP never counts as work against it: the inner loop closes the
    session on one once no output is left to flush and no exchange is in
-   flight (`Mux::frontend_exchange_in_flight`), except on a lingering
-   frontend (§8.4), which it leaves to drain the client's last bytes to the
-   EOF, as the entry check does. Its exit check counts only frontend
-   READABLE, WRITABLE and ERROR interest.
+   flight (`Mux::frontend_exchange_in_flight`). A lingering frontend (§8.4)
+   is in flight until its drain reads the client's EOF, as unread input, so
+   its last bytes are drained first. Its exit check counts only frontend
+   READABLE, WRITABLE and ERROR interest; a reset's ERROR closes the session
+   instead of keeping it in flight.
 
 Steps 1-4 all run inside one `readable()`/`writable()` call and therefore all
 read the same `ConnectionH2.now` — see §7.5.

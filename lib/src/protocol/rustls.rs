@@ -103,8 +103,10 @@ enum HandshakeReadFault {
 /// - a read that fills what rustls offered is not a short read: the loop
 ///   reads again;
 /// - HUP needs no exception here, unlike the mux (`update_readiness_after_read`
-///   in `lib/src/protocol/mux/mod.rs`): `TlsHandshake::ready` closes the
-///   session on HUP before reading anything;
+///   in `lib/src/protocol/mux/mod.rs`): a client whose FIN arrived before its
+///   handshake completed can never send its `Finished`, so
+///   `TlsHandshake::readable` closes such a handshake instead of reading to
+///   the EOF;
 /// - TCP urgent data is the exception to "a short read empties the queue":
 ///   `recv` stops before an urgent mark with bytes queued behind it (see
 ///   `plain_socket_read` in `lib/src/socket.rs`), so a peer that sends OOB
@@ -265,8 +267,23 @@ impl TlsHandshake {
             &mut self.frontend_readiness.event,
         ) {
             Ok(()) => {}
+            // A FIN or a reset before the handshake completes is routine
+            // (health checks, scanners): not an error.
             Err(HandshakeReadFault::Closed) => {
-                error!("{} Connection closed during handshake", log_context!(self));
+                debug!("{} Connection closed during handshake", log_context!(self));
+                return SessionResult::Close;
+            }
+            Err(HandshakeReadFault::ReadTls(e))
+                if matches!(
+                    e.kind(),
+                    ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+                ) =>
+            {
+                debug!(
+                    "{} Connection reset during handshake: {:?}",
+                    log_context!(self),
+                    e
+                );
                 return SessionResult::Close;
             }
             Err(HandshakeReadFault::ReadTls(e)) => {
@@ -289,6 +306,19 @@ impl TlsHandshake {
             was_handshaking || !self.session.is_handshaking(),
             "rustls handshake must not regress from finished back to handshaking"
         );
+
+        // The client sent its FIN before its handshake completed: it can
+        // never send its `Finished`, so nothing it sent can be answered. A
+        // FIN after the `Finished` is a half-close the mux serves (the HUP
+        // survives the upgrade, `upgraded_frontend_events` in
+        // `lib/src/https.rs`).
+        if self.frontend_readiness.event.is_hup() && self.session.is_handshaking() {
+            debug!(
+                "{} Connection closed before the handshake completed",
+                log_context!(self)
+            );
+            return SessionResult::Close;
+        }
 
         // Readiness must mirror rustls's own wants: we only drop READABLE
         // interest when the session no longer wants to read.
@@ -529,20 +559,25 @@ fn handshake_failure_reason(err: &RustlsError) -> &'static str {
     }
 }
 
-impl SessionState for TlsHandshake {
-    fn ready(
-        &mut self,
-        _session: Rc<RefCell<dyn crate::ProxySession>>,
-        _proxy: Rc<RefCell<dyn crate::L7Proxy>>,
-        _metrics: &mut SessionMetrics,
-    ) -> SessionResult {
+#[cfg(test)]
+thread_local! {
+    /// Passes of `TlsHandshake::drive`'s loop, so a test can prove one event
+    /// settles in a few passes rather than at `MAX_LOOP_ITERATIONS`.
+    static HANDSHAKE_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl TlsHandshake {
+    /// One readiness event's worth of handshake work; `SessionState::ready`
+    /// is this with arguments the handshake does not use.
+    fn drive(&mut self) -> SessionResult {
         let mut counter = 0;
 
-        // A HUP with bytes still to read can be a client's half-close
-        // (`EPOLLRDHUP`, which `Ready::from(&Event)` in `command/src/ready.rs`
-        // reports as HUP): with TLS 1.3 its `Finished`, its request and its
-        // FIN may arrive together. Read them first; `handshake_read` closes
-        // the session on the EOF if they finish no handshake.
+        // A HUP with no read due closes the handshake. With a read due it may
+        // be a client's half-close (`EPOLLRDHUP`, which `Ready::from(&Event)`
+        // in `command/src/ready.rs` reports as HUP): with TLS 1.3 its
+        // `Finished`, its request and its FIN may arrive together. Read them
+        // first: `TlsHandshake::readable` closes the handshake if they did not
+        // complete it.
         if self.frontend_readiness.event.is_hup()
             && !self.frontend_readiness.filter_interest().is_readable()
         {
@@ -550,10 +585,16 @@ impl SessionState for TlsHandshake {
         }
 
         while counter < MAX_LOOP_ITERATIONS {
+            #[cfg(test)]
+            HANDSHAKE_PASSES.with(|passes| passes.set(passes.get() + 1));
             let frontend_interest = self.frontend_readiness.filter_interest();
 
             trace!("{} Interest({:?})", log_context!(self), frontend_interest);
-            if frontend_interest.is_empty() {
+            // HUP alone is no work this loop can do: nothing here acts on it.
+            if !frontend_interest.is_readable()
+                && !frontend_interest.is_writable()
+                && !frontend_interest.is_error()
+            {
                 break;
             }
 
@@ -594,6 +635,17 @@ impl SessionState for TlsHandshake {
         }
 
         SessionResult::Continue
+    }
+}
+
+impl SessionState for TlsHandshake {
+    fn ready(
+        &mut self,
+        _session: Rc<RefCell<dyn crate::ProxySession>>,
+        _proxy: Rc<RefCell<dyn crate::L7Proxy>>,
+        _metrics: &mut SessionMetrics,
+    ) -> SessionResult {
+        self.drive()
     }
 
     fn update_readiness(&mut self, token: Token, events: Ready) {
@@ -859,6 +911,91 @@ mod tests {
         );
         assert!(!event.is_readable());
         assert!(server.wants_write(), "the whole ClientHello was processed");
+    }
+
+    /// A client sends `hello_len` bytes of its ClientHello, then its FIN, and
+    /// the handshake gets one event carrying `event`. Returns what the pass
+    /// decided and how many loop passes it took.
+    fn hello_then_fin(hello_part: impl Fn(usize) -> usize, event: Ready) -> (SessionResult, usize) {
+        use std::io::Write as _;
+
+        use crate::socket::rustls_read_tests::fresh_pair;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("test listener must bind to a loopback port");
+        let mut peer = std::net::TcpStream::connect(
+            listener
+                .local_addr()
+                .expect("test listener must report its local address"),
+        )
+        .expect("loopback connect must complete");
+        let (accepted, _) = listener.accept().expect("the connection must be accepted");
+        accepted
+            .set_nonblocking(true)
+            .expect("mio requires a nonblocking stream");
+        let (server, mut client) = fresh_pair(Vec::new());
+        let hello = flight(&mut client);
+        peer.write_all(&hello[..hello_part(hello.len())])
+            .expect("the client must send");
+        peer.shutdown(std::net::Shutdown::Write)
+            .expect("the client must send its FIN");
+
+        let token = Token(7);
+        let mut handshake = TlsHandshake::new(
+            TimeoutContainer::new_empty(std::time::Duration::from_secs(10)),
+            server,
+            TcpStream::from_std(accepted),
+            token,
+            Ulid::generate(),
+            None,
+        );
+        handshake.update_readiness(token, event);
+        super::HANDSHAKE_PASSES.with(|passes| passes.set(0));
+        let result = handshake.drive();
+        (result, super::HANDSHAKE_PASSES.with(|passes| passes.get()))
+    }
+
+    /// A ClientHello cut short by the client's FIN: the short read stops
+    /// before the EOF, and the client can never complete the handshake, so
+    /// the handshake closes. Waiting for a read that never comes left the HUP
+    /// spinning the loop to `MAX_LOOP_ITERATIONS`.
+    ///
+    /// TO SEE THIS RED, for this test and the two below: drop the
+    /// `is_hup() && is_handshaking()` close from `TlsHandshake::readable` and
+    /// the HUP-alone break from `TlsHandshake::drive`.
+    #[test]
+    fn a_partial_client_hello_then_fin_closes_without_spinning() {
+        let (result, passes) = hello_then_fin(|len| len / 2, Ready::READABLE | Ready::HUP);
+        assert_eq!(result, SessionResult::Close, "the EOF closes the handshake");
+        assert!(
+            passes < 4,
+            "one event settles in a few passes, took {passes}"
+        );
+    }
+
+    /// A whole ClientHello then the FIN: rustls wants to answer, but the
+    /// client can never finish the handshake, and its EOF closes it.
+    #[test]
+    fn a_full_client_hello_then_fin_closes_without_spinning() {
+        let (result, passes) = hello_then_fin(|len| len, Ready::READABLE | Ready::HUP);
+        assert_eq!(result, SessionResult::Close, "the EOF closes the handshake");
+        assert!(
+            passes < 4,
+            "one event settles in a few passes, took {passes}"
+        );
+    }
+
+    /// The same with WRITABLE in the event, as the first edge of a fresh
+    /// socket reports it.
+    #[test]
+    fn a_full_client_hello_then_fin_with_writable_closes_without_spinning() {
+        let (result, passes) =
+            hello_then_fin(|len| len, Ready::READABLE | Ready::WRITABLE | Ready::HUP);
+        assert_eq!(result, SessionResult::Close, "the EOF closes the handshake");
+        assert!(
+            passes < 4,
+            "one event settles in a few passes, took {passes}"
+        );
     }
 
     /// Drive a handshake the way `TlsHandshake::ready` does, for one event.
