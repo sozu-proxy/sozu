@@ -1356,6 +1356,185 @@ fn test_h2_backend_101_is_a_bad_gateway() {
     );
 }
 
+/// An H2 backend answers HEAD with `200` and END_STREAM on its HEADERS frame,
+/// with `content-length: 5` when `length`, without any `content-length`
+/// otherwise. A response to HEAD has no content (RFC 9110 §9.3.2), and RFC
+/// 9113 §8.1.1 lets a response with no content carry a non-zero
+/// `content-length` with no DATA frame, so the response is forwarded with
+/// the field the backend sent, and with none when it sent none: on HEAD the
+/// field states the length of the selected representation (RFC 9110 §8.6),
+/// so an injected `0` would be false. An H1 client reads the head alone,
+/// followed on the same connection by the answer to its next request; an H2
+/// client receives HEADERS with END_STREAM on stream 1.
+///
+/// A response to GET with `content-length: 5` and END_STREAM on HEADERS has
+/// content by definition yet no DATA, which RFC 9113 §8.1.1 makes malformed:
+/// it stays a stream error and the client gets a 502 (`get` row). The
+/// exemption keys on `ParsingPhase::Terminated`, which another callback sets
+/// for HEAD, so this row pins that it does not reach other responses.
+///
+/// TO SEE THIS RED: drop the HEAD case from the END_STREAM `content-length`
+/// exemption of `pkawa::handle_header` (`lib/src/protocol/mux/pkawa.rs`), and
+/// the client gets a 502 (`length` rows); or from the exclusions of its
+/// `Content-Length: 0` injection, and `content-length: 0` is added (other
+/// rows); or exempt every response from that check, and the `get` row
+/// forwards a `200`.
+fn try_h2_head_response_with_end_stream(h2_client: bool, length: bool, get: bool) -> State {
+    let name = format!(
+        "H2-{}-END-STREAM-{}-{}",
+        if get { "GET" } else { "HEAD" },
+        if h2_client { "H2" } else { "H1" },
+        if length { "CL5" } else { "NOCL" }
+    );
+    let method: &[u8] = if get { b"GET" } else { b"HEAD" };
+    // `content-length: <value>`, as Kawa's encoder writes it in a field
+    // block: a literal over the static name index 28 (`0f 0d`).
+    let encoded_length = |value: u8| [0x0f, 0x0d, 0x01, value];
+    if h2_client {
+        let (mut worker, backend, front_port) = setup_h2_front_with_raw_h2_backend(&name);
+        if length {
+            backend.push_header("content-length", "5");
+        }
+        let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+        let mut tls = raw_h2_connection(front_addr);
+        h2_handshake(&mut tls);
+        tls.write_all(&H2Frame::headers(1, request_for(method), true, true).encode())
+            .unwrap();
+        tls.flush().unwrap();
+        let frames = read_h2_frames_until(&mut tls, Duration::from_secs(1), |frames| {
+            ends_stream(frames, 1)
+        });
+        log_frames(
+            &format!("END_STREAM get={get} length={length} H2 client"),
+            &frames,
+        );
+        drop(tls);
+        drop(backend);
+        worker.soft_stop();
+        let stopped = worker.wait_for_server_stop();
+        let head_carries = |value: u8| {
+            frames.iter().any(|(kind, _, id, payload)| {
+                *kind == H2_FRAME_HEADERS
+                    && *id == 1
+                    && payload
+                        .windows(4)
+                        .any(|field| field == encoded_length(value))
+            })
+        };
+        let length_ok = if length {
+            head_carries(b'5')
+        } else {
+            !head_carries(b'0')
+        };
+        if get {
+            let bad_gateway = stream_status_matches(&frames, 1, 502);
+            let no_200 = !stream_status_matches(&frames, 1, 200);
+            return if bad_gateway && no_200 && stopped {
+                State::Success
+            } else {
+                println!(
+                    "GET END_STREAM H2 client FAIL — bad_gateway={bad_gateway} \
+                     no_200={no_200} stopped={stopped}"
+                );
+                State::Fail
+            };
+        }
+        let status_ok = stream_status_matches(&frames, 1, 200);
+        let ended = ends_stream(&frames, 1);
+        let no_content = stream_data(&frames, 1).is_empty();
+        let no_reset = !contains_rst_stream(&frames) && !contains_goaway(&frames);
+        if status_ok && length_ok && ended && no_content && no_reset && stopped {
+            State::Success
+        } else {
+            println!(
+                "HEAD END_STREAM length={length} H2 client FAIL — status_ok={status_ok} \
+                 length_ok={length_ok} ended={ended} no_content={no_content} \
+                 no_reset={no_reset} stopped={stopped}"
+            );
+            State::Fail
+        }
+    } else {
+        let (mut worker, backend, mut h1_backend, front_addr) =
+            setup_h1_front_with_raw_h2_backend(&name);
+        if length {
+            backend.push_header("content-length", "5");
+        }
+        let mut client = TcpStream::connect(front_addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        client
+            .write_all(
+                format!(
+                    "{} / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                    String::from_utf8_lossy(method)
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let first = drain_client(&mut client);
+        let _ = client.write_all(b"GET / HTTP/1.1\r\nHost: other\r\n\r\n");
+        let second = drain_client(&mut client);
+        println!("END_STREAM get={get} length={length} H1 client — {first:?} then {second:?}");
+        drop(client);
+        drop(backend);
+        h1_backend.stop_and_get_aggregator();
+        worker.soft_stop();
+        let stopped = worker.wait_for_server_stop();
+        let wire = format!("{first}{second}");
+        if get {
+            return if wire.starts_with("HTTP/1.1 502 ") && stopped {
+                State::Success
+            } else {
+                println!("GET END_STREAM H1 client FAIL — wire={wire:?} stopped={stopped}");
+                State::Fail
+            };
+        }
+        let (head, next) = wire.split_once("\r\n\r\n").unwrap_or(("", ""));
+        let head_lower = head.to_ascii_lowercase();
+        let length_ok = if length {
+            head_lower.contains("\r\ncontent-length: 5")
+        } else {
+            !head_lower.contains("content-length")
+        };
+        let head_ok = head.starts_with("HTTP/1.1 200 ") && length_ok;
+        let next_ok = next.starts_with("HTTP/1.1 200 ") && next.ends_with("pong");
+        if head_ok && next_ok && stopped {
+            State::Success
+        } else {
+            println!(
+                "HEAD END_STREAM length={length} H1 client FAIL — head={head:?} next={next:?} \
+                 stopped={stopped}"
+            );
+            State::Fail
+        }
+    }
+}
+
+#[test]
+fn test_h2_head_response_with_end_stream_keeps_the_backend_content_length() {
+    // Every row runs, so a failure report names each one that failed.
+    let mut failed = Vec::new();
+    for h2_client in [false, true] {
+        for (length, get) in [(true, false), (false, false), (true, true)] {
+            if repeat_until_error_or(
+                2,
+                "H2 backend: a HEAD response with END_STREAM keeps the backend's \
+                 content-length, or none, and a GET one is refused (RFC 9113 §8.1.1, \
+                 RFC 9110 §8.6)",
+                || try_h2_head_response_with_end_stream(h2_client, length, get),
+            ) != State::Success
+            {
+                failed.push((h2_client, length, get));
+            }
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "failed rows (h2_client, length, get): {failed:?}"
+    );
+}
+
 /// One row of `test_h2_bodiless_response_data_never_reaches_h1_client`.
 struct BodilessDataCase {
     method: &'static str,
