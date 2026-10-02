@@ -1179,9 +1179,12 @@ fn try_tls_connection_close_large_response() -> State {
 
     worker.soft_stop();
     let success = worker.wait_for_server_stop();
+    // Read the counters once the backend thread is joined: it bumps
+    // `responses_sent` after its `write_all` returns, which can come after
+    // the client has read the whole response.
+    backend.stop();
     let requests_received = backend.requests_received();
     let responses_sent = backend.responses_sent();
-    backend.stop();
 
     // Name every failing conjunct with its values.
     //
