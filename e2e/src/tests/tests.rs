@@ -3366,6 +3366,12 @@ fn try_max_connections() -> State {
         new_client.set_request(format!(
             "GET /api-{i} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
         ));
+        // The connection this client opened over the limit still waits in
+        // the accept queue with its whole request. Reset it: a client that
+        // merely closes after a complete request has half-closed, and sozu
+        // serves that request (sozu-proxy/sozu#1779), which would open one
+        // backend connection more than the limit check below accounts for.
+        new_client.reset();
         new_client.connect();
         new_client.send();
 
