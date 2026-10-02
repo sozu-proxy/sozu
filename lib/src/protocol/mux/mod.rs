@@ -1923,13 +1923,17 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     /// incomplete can never complete, and the session closes as on a hang-up
     /// instead of waiting for its backend.
     ///
-    /// A reset is a hang-up whatever is in flight: mio reports it with
-    /// `is_error()` (`EPOLLERR`), as ERROR beside the HUP, and the client
-    /// will read nothing more. Linux raises `EPOLLHUP` without `EPOLLERR`
-    /// only once both directions are shut down, which on a frontend sozu has
-    /// not shut down for writing means a reset as well.
+    /// A full hang-up closes whatever is in flight: the client will read
+    /// nothing more. It is ERROR (`EPOLLERR`, a reset) or WRITE_CLOSED (mio's
+    /// `is_write_closed`: `EPOLLHUP` or `EPOLLERR`). ERROR alone is not
+    /// enough: a reset whose error sozu's own `read` or `write` consumed
+    /// first is reported as `EPOLLHUP` without `EPOLLERR`, which only
+    /// WRITE_CLOSED tells from a half-close. A lingering frontend is the one
+    /// exception: sozu shut its write side itself, so `EPOLLHUP` follows the
+    /// client's FIN, and its drain still reads to that EOF.
     fn frontend_exchange_in_flight(&self) -> bool {
-        if self.frontend.readiness().event.is_error() {
+        let event = self.frontend.readiness().event;
+        if event.is_error() || (event.is_write_closed() && !self.frontend.is_lingering()) {
             return false;
         }
         self.frontend.has_unread_input()
@@ -5612,6 +5616,117 @@ mod tests {
         assert!(
             context.pending_links.is_empty(),
             "an answered request must not be queued for a backend"
+        );
+    }
+
+    /// An H1 frontend whose request was received whole and whose response
+    /// has not started, as one waiting for its backend, with nothing queued
+    /// for the client. `event` is the readiness the next pass sees.
+    fn waiting_request_pass(event: Ready) -> SessionResult {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut mux, _peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));
+        {
+            let stream = &mut mux.context.streams[0];
+            let request = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+            let storage = &mut stream.front.storage;
+            storage.space()[..request.len()].copy_from_slice(request);
+            storage.fill(request.len());
+            kawa::h1::parse(&mut stream.front, &mut stream.context);
+            assert!(
+                stream.front.is_terminated(),
+                "premise: the request is whole"
+            );
+            stream.state = StreamState::Unlinked;
+        }
+        let readiness = mux.frontend.readiness_mut();
+        readiness.interest.remove(Ready::READABLE);
+        readiness.event = event;
+        let session: Rc<RefCell<dyn ProxySession>> = Rc::new(RefCell::new(NoDialSession));
+        let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(RemoveOnlyProxy));
+        let mut metrics = SessionMetrics::new(None);
+        mux.ready(session, proxy, &mut metrics)
+    }
+
+    /// A full hang-up whose reset a `read` or `write` already consumed comes
+    /// as `EPOLLHUP` without `EPOLLERR`: HUP and WRITE_CLOSED, no ERROR. It
+    /// closes the session at once, even with a request in flight and no write
+    /// pending to fail; a half-close (HUP alone) keeps it for the response.
+    ///
+    /// TO SEE THIS RED: drop the `event.is_write_closed()` clause from
+    /// `Mux::frontend_exchange_in_flight`.
+    #[test]
+    fn a_hang_up_without_error_closes_a_waiting_request() {
+        assert!(
+            matches!(
+                waiting_request_pass(Ready::READABLE | Ready::HUP | Ready::WRITE_CLOSED),
+                SessionResult::Close
+            ),
+            "a hang-up must close the session at once"
+        );
+        assert!(
+            matches!(
+                waiting_request_pass(Ready::READABLE | Ready::HUP),
+                SessionResult::Continue
+            ),
+            "a half-close keeps the session for the response"
+        );
+    }
+
+    /// A write that meets the client's reset before `epoll` reports it fails
+    /// (`ECONNRESET`/`EPIPE`): the session closes at once, instead of
+    /// waiting for an event that only says what the write already learned.
+    /// Any failed write closes it, since nothing more can be flushed.
+    ///
+    /// TO SEE THIS RED: make `ConnectionH1::client_write_failed` return
+    /// `None`.
+    #[test]
+    fn a_failed_write_to_the_client_closes_the_session() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut mux, peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));
+        {
+            let Connection::H1(h1) = &mut mux.frontend else {
+                unreachable!("the helper builds an H1 frontend")
+            };
+            let stream = &mut mux.context.streams[0];
+            let request = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+            let storage = &mut stream.front.storage;
+            storage.space()[..request.len()].copy_from_slice(request);
+            storage.fill(request.len());
+            kawa::h1::parse(&mut stream.front, &mut stream.context);
+            let answers_rc = stream.answers.clone();
+            let answers = answers_rc.borrow();
+            set_default_answer(stream, &mut h1.readiness, 503, &answers);
+        }
+        // The client resets: `SO_LINGER` zero, then close.
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        // SAFETY: `linger` is a valid `libc::linger` and `peer` owns the
+        // descriptor for the duration of the call.
+        let rc = unsafe {
+            libc::setsockopt(
+                std::os::fd::AsRawFd::as_raw_fd(&peer),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                &linger as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "SO_LINGER zero must set");
+        drop(peer);
+        std::thread::sleep(Duration::from_millis(20));
+        // The pass runs on a WRITABLE edge only: the reset is learned by the
+        // write, not from the event.
+        mux.frontend.readiness_mut().event = Ready::WRITABLE;
+
+        let session: Rc<RefCell<dyn ProxySession>> = Rc::new(RefCell::new(NoDialSession));
+        let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(RemoveOnlyProxy));
+        let mut metrics = SessionMetrics::new(None);
+        let result = mux.ready(session, proxy, &mut metrics);
+        assert!(
+            matches!(result, SessionResult::Close),
+            "a failed write to the client must close the session, got {result:?}"
         );
     }
 

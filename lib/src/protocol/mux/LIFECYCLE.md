@@ -346,8 +346,14 @@ from `Mux::ready`. Termination may be triggered by:
   received whole is open — the session serves the exchange and closes once
   the response is complete
   ([#1779](https://github.com/sozu-proxy/sozu/issues/1779)). A request left
-  incomplete at the client's EOF holds nothing, and a reset (ERROR beside the
-  HUP) closes the session whatever is in flight. Output already pending is
+  incomplete at the client's EOF holds nothing, and a full hang-up closes the
+  session whatever is in flight: ERROR, or WRITE_CLOSED (mio's
+  `is_write_closed`, `EPOLLHUP` or `EPOLLERR`, which a half-close never
+  raises), except on a lingering frontend whose write side sozu shut itself.
+  ERROR alone is not enough: a reset whose error sozu's own `read` or `write`
+  consumed first is reported as `EPOLLHUP` without `EPOLLERR`. A write to the
+  client that fails closes the session too (`ConnectionH1::writable`), and the
+  connection then reports nothing left to flush. Output already pending is
   flushed as a delayed close would, without `close_notify`. A lingering
   frontend counts as unread input from `ConnectionH1::start_linger`, which
   raises READABLE, until its drain reads the EOF. The request reader keeps
@@ -1115,8 +1121,8 @@ deadlines are compared against `ConnectionH2.now` (§7.5):
    flight (`Mux::frontend_exchange_in_flight`). A lingering frontend (§8.4)
    is in flight until its drain reads the client's EOF, as unread input, so
    its last bytes are drained first. Its exit check counts only frontend
-   READABLE, WRITABLE and ERROR interest; a reset's ERROR closes the session
-   instead of keeping it in flight.
+   READABLE, WRITABLE and ERROR interest; a full hang-up (ERROR or
+   WRITE_CLOSED) closes the session instead of keeping it in flight.
 
 Steps 1-4 all run inside one `readable()`/`writable()` call and therefore all
 read the same `ConnectionH2.now` — see §7.5.

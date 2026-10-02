@@ -170,6 +170,10 @@ pub struct ConnectionH1<Front: SocketHandler> {
     /// kernel socket buffer, so the cross-readiness mechanism must re-arm it
     /// via `try_resume_reading` once the peer drains the buffer.
     pub parked_on_buffer_pressure: bool,
+    /// A write to the client failed (reset, broken pipe or another socket
+    /// error): nothing more can be flushed to it, so the connection reports
+    /// no pending write and the session closes instead of waiting to flush.
+    pub write_failed: bool,
     /// True once we've asked rustls to emit TLS close_notify for this frontend.
     pub close_notify_sent: bool,
     /// Connection/session ULID propagated from the parent [`super::Mux`]. Used to
@@ -933,6 +937,9 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             if self.socket.socket_wants_write() {
                 let (size, status) = self.socket.socket_write_vectored(&[]);
                 let _ = update_readiness_after_write(size, status, &mut self.readiness);
+                if let Some(result) = self.client_write_failed(status) {
+                    return result;
+                }
                 if self.socket.socket_wants_write() {
                     self.readiness.signal_pending_write();
                 }
@@ -1060,6 +1067,9 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         crate::protocol::mux::h2::record_metric(self.position.bytes_out_event(size));
         self.position.count_bytes_out(parts.metrics, size);
         let should_yield = update_readiness_after_write(size, status, &mut self.readiness);
+        if let Some(result) = self.client_write_failed(status) {
+            return result;
+        }
         if self.socket.socket_wants_write() {
             self.readiness.signal_pending_write();
             // Pair the queued-write signal with the socket's own report: we
@@ -1442,7 +1452,26 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
     }
 
     pub fn has_pending_write(&self) -> bool {
-        self.socket.socket_wants_write()
+        !self.write_failed && self.socket.socket_wants_write()
+    }
+
+    /// A write to the client failed: the client is gone, or its socket can
+    /// never be flushed. Close at once; `Self::has_pending_write` stops
+    /// reporting output, so no delayed close waits for a flush that cannot
+    /// happen.
+    fn client_write_failed(&mut self, status: SocketResult) -> Option<MuxResult> {
+        if self.position.is_server() && matches!(status, SocketResult::Error | SocketResult::Closed)
+        {
+            debug!(
+                "{} H1 closing the frontend after a failed write: {:?}",
+                log_context!(self),
+                status
+            );
+            self.write_failed = true;
+            Some(MuxResult::CloseSession)
+        } else {
+            None
+        }
     }
 
     pub fn initiate_close_notify(&mut self) -> bool {

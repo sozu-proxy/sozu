@@ -1724,8 +1724,8 @@ fn test_tls_half_close_with_incomplete_request_closes_at_once() {
 }
 
 /// A client that resets its connection while its request is linked to a
-/// backend has hung up: the reset reaches sozu as ERROR beside the HUP, and
-/// the session closes at once. Treating it as a half-close kept the session
+/// backend has hung up: the reset reaches sozu as ERROR and WRITE_CLOSED
+/// beside the HUP, and the session closes at once. Treating it as a half-close kept the session
 /// with an ERROR nothing clears, which spun `Mux::ready_inner` to
 /// `MAX_LOOP_ITERATIONS` (`http.infinite_loop.error`).
 fn try_client_reset_with_linked_request(name: &str, transport: Transport) -> State {
@@ -1784,6 +1784,154 @@ fn test_plain_client_reset_with_linked_request_closes_without_spinning() {
             3,
             "H1: a client reset with a linked request closes the session without spinning",
             || try_client_reset_with_linked_request("PLAIN-RESET-LINKED", Transport::Plain)
+        ),
+        State::Success
+    );
+}
+
+/// A backend that streams an 8 MiB response to one request and records when
+/// a write fails, which happens once sozu closes its connection.
+struct StreamingBackend {
+    closed_at: Arc<std::sync::Mutex<Option<Instant>>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl StreamingBackend {
+    const BODY: usize = 8 * 1024 * 1024;
+
+    fn start(address: SocketAddr) -> Self {
+        let closed_at = Arc::new(std::sync::Mutex::new(None));
+        let closed_clone = closed_at.clone();
+        let listener = bind_std_listener(address, "streaming backend");
+        let thread = thread::spawn(move || {
+            listener
+                .set_nonblocking(true)
+                .expect("could not set backend listener nonblocking");
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+                    Err(_) => return,
+                }
+            };
+            stream.set_nonblocking(false).ok();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            // Longer than any prompt close, shorter than a session held open.
+            stream.set_write_timeout(Some(Duration::from_secs(30))).ok();
+            let mut buf = [0u8; 4096];
+            if !matches!(stream.read(&mut buf), Ok(n) if n > 0) {
+                return;
+            }
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", Self::BODY);
+            let chunk = vec![b'd'; 65536];
+            let mut result = stream.write_all(head.as_bytes());
+            let mut sent = 0;
+            while result.is_ok() && sent < Self::BODY {
+                result = stream.write_all(&chunk);
+                sent += chunk.len();
+            }
+            if result.is_err() {
+                *closed_clone.lock().unwrap() = Some(Instant::now());
+            }
+        });
+        Self {
+            closed_at,
+            thread: Some(thread),
+        }
+    }
+
+    fn closed_at(&self) -> Option<Instant> {
+        *self.closed_at.lock().unwrap()
+    }
+}
+
+impl Drop for StreamingBackend {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// rr_client_reset_mid_download: a client reads part of a large response,
+/// then resets its connection. That is a full hang-up, and the session must
+/// close at once, closing its backend connection with it.
+///
+/// When sozu's own `read` or `write` meets the reset before `epoll` reports
+/// it, the error is consumed and the event is `EPOLLHUP` without `EPOLLERR`:
+/// HUP and WRITE_CLOSED, not ERROR. Read as a half-close, it kept the session
+/// with its response in flight until a timeout. The race depends on timing,
+/// so the test repeats the exchange.
+fn try_rr_client_reset_mid_download(name: &str, transport: Transport) -> State {
+    let back_address = create_local_address();
+    let backend = StreamingBackend::start(back_address);
+    let (mut worker, front) = start_half_close_worker(name, transport, back_address);
+    let (mut stream, handle) = half_close_client(transport, front);
+
+    let sent = stream
+        .write_all(b"GET /download HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .is_ok()
+        && stream.flush().is_ok();
+    let mut received = 0;
+    let mut buf = [0u8; 65536];
+    while received < 280 * 1024 {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => received += n,
+        }
+    }
+    super::h2_security_session::set_linger_zero(handle.as_raw_fd());
+    let reset_at = Instant::now();
+    drop(stream);
+    drop(handle);
+
+    let deadline = reset_at + Duration::from_secs(3);
+    while backend.closed_at().is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    let closed_after = backend
+        .closed_at()
+        .map(|at| at.saturating_duration_since(reset_at));
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    drop(backend);
+
+    println!(
+        "{name}: {transport:?} sent={sent} received={received} \
+         backend_closed_after={closed_after:?} stopped={stopped}"
+    );
+    if sent
+        && received >= 280 * 1024
+        && closed_after.is_some_and(|after| after < Duration::from_secs(2))
+        && stopped
+    {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_rr_client_reset_mid_download_tls() {
+    assert_eq!(
+        repeat_until_error_or(
+            12,
+            "TLS H1: a client that resets mid-download closes its session at once",
+            || try_rr_client_reset_mid_download("TLS-RR-RESET-MID-DOWNLOAD", Transport::Tls)
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_rr_client_reset_mid_download_plain() {
+    assert_eq!(
+        repeat_until_error_or(
+            12,
+            "H1: a client that resets mid-download closes its session at once",
+            || try_rr_client_reset_mid_download("PLAIN-RR-RESET-MID-DOWNLOAD", Transport::Plain)
         ),
         State::Success
     );

@@ -3873,8 +3873,13 @@
   (`Connection::has_unread_input`) or a stream whose request was received whole is open
   (`Mux::frontend_exchange_in_flight`); the session then closes once that response is complete.
   A request the client left incomplete is closed at once once its EOF is read, as before, without
-  waiting for the backend, and a reset (ERROR beside the HUP) closes the session at once whatever
-  is in flight. Pending output is still flushed on a half-close, without `close_notify`. The
+  waiting for the backend. A full hang-up closes the session at once whatever is in flight: ERROR,
+  or the new `Ready::WRITE_CLOSED` bit (`sozu-command-lib`, `command/src/ready.rs`), which
+  `Ready::from(&Event)` raises for mio's `is_write_closed` (`EPOLLHUP` or `EPOLLERR`) and a
+  half-close never raises. ERROR alone missed a reset whose error sozu's own read or write had
+  consumed, which epoll then reports as `EPOLLHUP` without `EPOLLERR`, and kept that session open
+  until a timeout. A failed write to the client also closes the session
+  (`ConnectionH1::writable`), so a socket that can never be flushed no longer waits. Pending output is still flushed on a half-close, without `close_notify`. The
   handshake reads past a HUP when a read is due and closes if the handshake is still incomplete
   afterwards, since such a client can never send its `Finished`; its loop no longer counts HUP
   alone as work, and a FIN or a reset during the handshake logs at debug, not error. The HUP
@@ -3883,8 +3888,12 @@
   sent while the request head was incomplete. Documented in `lib/src/protocol/mux/LIFECYCLE.md`
   and `doc/lifetime_of_a_session.md`. Covered by the `test_tls_client_half_close_*`,
   `test_plain_client_half_close_*`, `test_*_half_close_with_incomplete_request_closes_at_once` and
-  `test_*_client_reset_with_linked_request_closes_without_spinning` e2e tests
-  (`e2e/src/tests/tls_tests.rs`), and by the unit tests
+  `test_*_client_reset_with_linked_request_closes_without_spinning` and
+  `test_rr_client_reset_mid_download_*` e2e tests (`e2e/src/tests/tls_tests.rs`), by
+  `a_half_close_is_hup_but_not_write_closed`, `a_reset_is_error_and_write_closed` and
+  `a_reset_consumed_by_a_write_is_write_closed_without_error` (`command/src/ready.rs`, on a real
+  epoll), and by the unit tests `a_hang_up_without_error_closes_a_waiting_request`,
+  `a_failed_write_to_the_client_closes_the_session`,
   `a_partial_client_hello_then_fin_closes_without_spinning`,
   `a_full_client_hello_then_fin_closes_without_spinning`,
   `a_full_client_hello_then_fin_with_writable_closes_without_spinning`

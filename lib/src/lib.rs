@@ -1169,13 +1169,19 @@ impl Default for Readiness {
 }
 
 impl Readiness {
-    /// Mask of every bit `Ready` defines (READABLE | WRITABLE | ERROR | HUP).
+    /// Mask of every bit `Ready` defines (READABLE | WRITABLE | ERROR | HUP |
+    /// WRITE_CLOSED).
     /// Any bit outside this set in `event` or `interest` is a corrupted
     /// readiness word — checked by [`Self::check_invariants`]. Not
     /// `#[cfg(debug_assertions)]`-gated: it is read from inside `debug_assert!`s
     /// whose arguments must still compile in release (HARD RULE 2 / E0425).
-    const KNOWN_BITS: Ready =
-        Ready(Ready::READABLE.0 | Ready::WRITABLE.0 | Ready::ERROR.0 | Ready::HUP.0);
+    const KNOWN_BITS: Ready = Ready(
+        Ready::READABLE.0
+            | Ready::WRITABLE.0
+            | Ready::ERROR.0
+            | Ready::HUP.0
+            | Ready::WRITE_CLOSED.0,
+    );
 
     pub const fn new() -> Readiness {
         Readiness {
@@ -1193,12 +1199,12 @@ impl Readiness {
         debug_assert_eq!(
             self.event & Self::KNOWN_BITS,
             self.event,
-            "Readiness.event carries a bit outside READABLE|WRITABLE|ERROR|HUP"
+            "Readiness.event carries a bit outside READABLE|WRITABLE|ERROR|HUP|WRITE_CLOSED"
         );
         debug_assert_eq!(
             self.interest & Self::KNOWN_BITS,
             self.interest,
-            "Readiness.interest carries a bit outside READABLE|WRITABLE|ERROR|HUP"
+            "Readiness.interest carries a bit outside READABLE|WRITABLE|ERROR|HUP|WRITE_CLOSED"
         );
     }
 

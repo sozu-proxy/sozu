@@ -600,8 +600,13 @@ stream whose request was received whole is open
 (`Mux::frontend_exchange_in_flight`), neither the entry check nor the in-loop
 check closes the session or queues `close_notify`, and the session closes once
 the response is complete. A request left incomplete at the client's EOF closes
-the session at once, and a reset, which mio reports as ERROR beside the HUP,
-closes it whatever is in flight
+the session at once, and a full hang-up closes it whatever is in flight. A
+hang-up is ERROR or WRITE_CLOSED: `Ready::from(&Event)` raises WRITE_CLOSED
+for mio's `is_write_closed` (`EPOLLHUP` or `EPOLLERR`), which a half-close
+(`EPOLLRDHUP` alone) never raises. ERROR alone is not enough, because a reset
+whose error a `read` or `write` consumed first is reported as `EPOLLHUP`
+without `EPOLLERR`. A write to the client that fails closes the session as
+well (`ConnectionH1::writable`)
 ([#1779](https://github.com/sozu-proxy/sozu/issues/1779)).
 
 ## 9. TCP (pipe) session lifecycle
