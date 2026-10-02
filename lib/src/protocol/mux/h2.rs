@@ -11435,6 +11435,107 @@ mod tests {
         );
     }
 
+    /// The kernel-refused sibling of the two drain tests above: the output
+    /// flush stalls on `(0, WouldBlock)`, and the `Stalled` arm must leave
+    /// WRITABLE to the kernel's next edge instead of re-raising it. A
+    /// synthetic edge here made `Mux::ready_inner` repeat the refused flush
+    /// on every inner iteration (sozu-proxy/sozu#1788).
+    ///
+    /// TO SEE THIS RED: drop `self.note_write_status(status);` from
+    /// `ConnectionH2::consume_output_flush`. The refusal is then never
+    /// recorded and `ensure_tls_flushed` re-raises the event for both drains.
+    #[test]
+    fn a_refused_control_frame_drain_leaves_writable_to_the_kernel() {
+        for drain in ["WINDOW_UPDATE", "RST_STREAM"] {
+            let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+            let (mut connection, _peer) =
+                connection_with_backpressure(&pool, 1, 0, H2State::Header);
+            connection
+                .socket
+                .write_script
+                .push_back((0, SocketResult::WouldBlock));
+            let mut context = test_context(&pool);
+            let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+            if drain == "WINDOW_UPDATE" {
+                connection.core.queue_window_update(0, 65_535);
+            } else {
+                assert!(
+                    connection
+                        .core
+                        .enqueue_rst(1, H2Error::Cancel, RstOrigin::Local)
+                        .is_none(),
+                    "premise: a single RST must not trip the flood detector"
+                );
+            }
+            connection.core.readiness.event.insert(Ready::WRITABLE);
+
+            let result = connection.writable(&mut context, EndpointClient(&mut router));
+
+            assert!(
+                matches!(result, MuxResult::Continue),
+                "a refused {drain} drain parks the pass and continues, got {result:?}"
+            );
+            assert!(
+                !connection.core.output.is_empty(),
+                "premise: the {drain} flush must have stalled, leaving the frame queued"
+            );
+            assert!(
+                connection.socket.socket_wants_write(),
+                "premise: rustls must still hold records, or the re-arm is gated off"
+            );
+            assert!(
+                !connection.core.readiness.event.is_writable(),
+                "a {drain} drain the kernel refused must leave WRITABLE to the \
+                 kernel's next edge, got {:?}",
+                connection.core.readiness
+            );
+        }
+    }
+
+    /// A stream write the kernel refuses, while rustls still holds records,
+    /// ends the pass without a synthetic WRITABLE. The pass already wrote
+    /// through `socket_write_vectored`, so `finalize_write` skips its own
+    /// flush and decides on the refusal `handle_write` recorded: the preamble
+    /// flush before it answered `Continue`, so without that record the
+    /// `ReArm` would re-raise the event.
+    ///
+    /// TO SEE THIS RED: drop `self.note_write_status(status);` from
+    /// `ConnectionH2::handle_write`.
+    #[test]
+    fn a_refused_stream_write_leaves_writable_to_the_kernel() {
+        let pool = make_pool_for_invariant_16();
+        let (mut connection, mut context, gid, _peer) = writable_fixture(
+            &pool,
+            &[FIRST_BLOCK, SECOND_BLOCK],
+            &[(0, SocketResult::WouldBlock)],
+        );
+        connection.socket.pending.set(1);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        assert_prepare_gate_is_shut(&context, gid);
+        connection.core.readiness.event.insert(Ready::WRITABLE);
+
+        let result = connection.writable(&mut context, EndpointClient(&mut router));
+
+        assert!(
+            matches!(result, MuxResult::Continue),
+            "a refused stream write continues, got {result:?}"
+        );
+        assert_eq!(
+            connection.socket.vectored_calls, 1,
+            "premise: the pass must have reached the stream write"
+        );
+        assert!(
+            connection.socket.socket_wants_write(),
+            "premise: rustls must still hold records"
+        );
+        assert!(
+            !connection.core.readiness.event.is_writable(),
+            "a stream write the kernel refused must leave WRITABLE to the \
+             kernel's next edge, got {:?}",
+            connection.core.readiness
+        );
+    }
+
     // ── The vectored write loop: a partial write that reports WouldBlock ──
     //
     // First, which shape each neighbour targets, because #1454 asks for that
@@ -11453,7 +11554,7 @@ mod tests {
     //     `dispatch_writable_state`'s `(H2State::Error, Position::Server)`
     //     arm. The preamble half is asserted by the two GoAway tests above,
     //     and #1454's
-    //     `a_rustls_frontend_in_error_state_re_arms_until_its_records_drain`
+    //     `a_rustls_frontend_in_error_state_stays_open_until_its_records_drain`
     //     drives the second query over the production handler — this line
     //     said **Uncovered** until that test existed, and it was already
     //     wrong before this changeset renamed what it points at.
@@ -21061,11 +21162,15 @@ mod tests {
             "the delayed close must keep WRITABLE interest so the write path \
              can still flush"
         );
+        // The records were written straight to the socket, outside any
+        // writable pass, so no refusal is recorded and the delayed close
+        // re-raises WRITABLE for the write path to run once more. A write the
+        // same pass saw refused would leave it to the kernel's edge instead
+        // (`a_refused_goaway_flush_waits_for_the_kernel_edge_then_closes`).
         assert!(
             connection.core.readiness.event.is_writable(),
-            "ensure_tls_flushed must re-signal the WRITABLE event: nothing \
-             else wakes an edge-triggered connection whose records are stuck \
-             in rustls rather than in the kernel"
+            "with no refused write recorded, ensure_tls_flushed must re-signal \
+             the WRITABLE event so the write path runs again"
         );
 
         let mut received = Vec::new();
@@ -21089,8 +21194,11 @@ mod tests {
 
     /// The `(H2State::Error, Position::Server)` arm of
     /// `ConnectionH2::dispatch_writable_state` reads the real handler's
-    /// POST-flush answer: it re-arms while rustls still holds records and
-    /// closes only once they are gone.
+    /// POST-flush answer: it keeps the session open while rustls still holds
+    /// records — leaving WRITABLE to the kernel's edge, since the flush was
+    /// refused — and closes once they are gone. The test drains the records
+    /// itself between the two passes (`flush_until_drained`); the second pass
+    /// only has to see that nothing is left.
     ///
     /// That arm has no flush of its own — `H2Shell::writable`'s preamble
     /// already issued this pass's `socket_write(&[])` and discarded both the
@@ -21111,7 +21219,7 @@ mod tests {
     /// response as truncated`. Measured: `1116 passed; 1 failed` — it is the
     /// only test in the crate that moves.
     #[test]
-    fn a_rustls_frontend_in_error_state_re_arms_until_its_records_drain() {
+    fn a_rustls_frontend_in_error_state_stays_open_until_its_records_drain() {
         let pool = make_pool_for_invariant_16();
         let (mut connection, mut peer, mut client) = rustls_h2_connection(&pool, H2State::Error);
         let mut context = test_context(&pool);
@@ -21178,13 +21286,15 @@ mod tests {
     /// and the `ConnectionH2::dispatch_writable_state_after_flush` that
     /// settles it — the triple whose own comment calls it the primary
     /// truncation vector under HAProxy chaining — over the production TLS
-    /// handler: it re-arms while rustls still holds records and disconnects
-    /// only once they are gone.
+    /// handler: it keeps the session open while rustls still holds records,
+    /// leaving WRITABLE to the kernel's edge, and disconnects once they are
+    /// gone. As in the Error-arm test, the records are drained by the test
+    /// between the passes, not by the second pass.
     ///
     /// This is the triple #1454 names. Of the three, `finalize_write`'s is
     /// driven by `a_blocked_rustls_frontend_delivers_every_queued_byte_across_passes`
     /// above and the Error arm by
-    /// `a_rustls_frontend_in_error_state_re_arms_until_its_records_drain`; this
+    /// `a_rustls_frontend_in_error_state_stays_open_until_its_records_drain`; this
     /// one completes the set. The fourth `socket_write(&[])` site,
     /// `flush_output_buffer`, is deliberately not targeted here: it keeps the
     /// status its flush returned instead of re-querying, so it is not this
@@ -21193,7 +21303,7 @@ mod tests {
     /// The state assertion is not decoration. Falling through this arm reaches
     /// `force_disconnect`, which has a record guard of its own and answers
     /// `MuxResult::Continue` too — so the result alone cannot tell a correct
-    /// re-arm from a fall-through that only looks correct. `H2State::Error` is
+    /// hold from a fall-through that only looks correct. `H2State::Error` is
     /// what the fall-through leaves behind, and nothing else sets it here.
     ///
     /// TO SEE THIS RED: in `ConnectionH2::dispatch_writable_state_after_flush`,
@@ -21207,7 +21317,7 @@ mod tests {
     /// the same arm with one witness over a modelled handler and one over the
     /// production one.
     #[test]
-    fn a_rustls_frontend_in_goaway_re_arms_until_its_records_drain() {
+    fn a_rustls_frontend_in_goaway_stays_open_until_its_records_drain() {
         let pool = make_pool_for_invariant_16();
         let (mut connection, mut peer, mut client) = rustls_h2_connection(&pool, H2State::GoAway);
         let mut context = test_context(&pool);
