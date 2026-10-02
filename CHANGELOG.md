@@ -3905,6 +3905,14 @@
 
 ### 🐛 Fixed
 
+- **`chore(clippy)`: `cargo clippy --all-targets --all-features -- -D warnings` passes on Rust
+  1.98 and newer.** Their `clippy::chunks_exact_to_as_chunks` lint rejects `chunks_exact` with a
+  constant size. The three hits, the `drain_window_updates_into` unit test in
+  `lib/src/protocol/mux/h2.rs` and the SETTINGS parsers of the `RawH2ResponseBackend` e2e mock and
+  the `h2_window_update_tests` peer, now use `as_chunks::<N>()` (stable since 1.88, below the
+  1.93.1 MSRV) and ignore the remainder exactly as `chunks_exact` did. Test and mock code only, no
+  behaviour change.
+
 - **`fix(socket)`: retry interrupted plain TCP reads and writes and interrupted TLS reads
   ([#1799](https://github.com/sozu-proxy/sozu/issues/1799)).** The plain TCP `socket_read`,
   `socket_write` and `socket_write_vectored` (`lib/src/socket.rs`) and the `read_tls` call of
