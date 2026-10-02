@@ -43,6 +43,7 @@ mod h2_security_sni;
 mod h2_security_tests;
 mod h2_tests;
 pub(crate) mod h2_utils;
+mod h2_window_update_tests;
 mod hsts_tests;
 mod listener_reactivation_tests;
 mod listener_update_tests;

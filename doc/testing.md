@@ -926,7 +926,7 @@ skipping it produced a real flaky-test or papered-over-bug commit.
   (`lib/src/protocol/mux/converter.rs:123`, armed in
   `ConnectionH2::handle_settings_frame`, `lib/src/protocol/mux/h2.rs`) prepends a `001xxxxx` HPACK dynamic table
   size update when a peer changes `SETTINGS_HEADER_TABLE_SIZE`, and three e2e
-  call sites send one: `h2_security_tests.rs:2445` (value 0) and
+  call sites send one: `h2_security_tests.rs:2447` (value 0) and
   `h2_handshake_chromium_146` (`h2_utils.rs:721`, value 65 536) from
   `try_h2_large_gzipped_chunked_drains_fully` and
   `try_h2_large_chunked_7mb_drains_fully`

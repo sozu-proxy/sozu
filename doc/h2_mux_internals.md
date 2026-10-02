@@ -400,8 +400,8 @@ call sites — not inside `check_flood`'s chain.
 flood pattern but indicate abuse in aggregate:
 
 - Frames on closed streams (RST_STREAM, WINDOW_UPDATE, DATA on already-closed streams;
-  on a stream this endpoint reset, header blocks beyond two, DATA beyond its receive
-  window, and frame types other than DATA, HEADERS and CONTINUATION)
+  on a stream this endpoint reset, header blocks beyond two and DATA beyond its
+  receive window)
 - Other minor protocol violations that don't warrant an immediate GOAWAY
 
 Unlike the rate-based counters, `glitch_count` uses the same half-decay window,
@@ -457,7 +457,7 @@ When absent (`None`), the built-in defaults apply:
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `initial_connection_window` | 1048576 (1MB) | Connection receive window **advertised** to the peer (RFC 9113 §6.9.2), clamped to [65535, 2^31-1]. Not enforced on inbound DATA — see below |
+| `initial_connection_window` | 16777216 (16 MiB) | Connection receive window **advertised** to the peer (RFC 9113 §6.9.2), clamped to [65535, 2^31-1]. Credit is returned in one stream-0 `WINDOW_UPDATE` per half window received. Not enforced on inbound DATA — see below. A connection Sōzu stops reading can hold up to min(window, `max_concurrent_streams` × 65535) octets, ~6.25 MiB by default, in its kernel receive buffer (no `SO_RCVBUF` is set; autotuning caps it at `net.ipv4.tcp_rmem[2]`) |
 | `max_concurrent_streams` | 100 | `SETTINGS_MAX_CONCURRENT_STREAMS`, also sizes the pending WINDOW_UPDATE cap |
 | `stream_shrink_ratio` | 2 | Stream Vec shrink threshold: `total > active * ratio`, minimum 2 |
 
@@ -513,6 +513,21 @@ connection window is never overcommitted: `doc/testing.md` records why the H2
 simulator deliberately carries no such property.
 `lib/src/protocol/mux/h2_flow_control.rs`'s module doc carries the same
 statement beside the code.
+
+### One stream send window per connection
+
+RFC 9113 §6.9 flow control applies to each hop, so a stream relayed from an
+H2 client to an H2 backend has two send windows: `Stream::front_window`, the
+credit the client grants for response DATA, and `Stream::back_window`, the
+credit the backend grants for request DATA. Each connection's SETTINGS
+(`ConnectionH2::update_initial_window_size`) and WINDOW_UPDATE frames move only
+its own leg, selected by `Stream::send_window_mut` / `Stream::split` from the
+connection's `Position`. `Context::create_stream` seeds `front_window` from the
+client's `SETTINGS_INITIAL_WINDOW_SIZE`; `ConnectionH2::start_stream` sets
+`back_window` from the backend's each time it opens the stream, so neither the
+client's grant nor a previous request on the slot carries over. A client and a
+backend that both advertise 2^31-1 are each within the §6.9.2 ceiling and must
+not be summed into one window. An H1 leg never reads its window.
 
 ### Prepared DATA dropped unsent gives its send credit back
 
@@ -660,7 +675,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:4803-4816
+```rust lib/src/protocol/mux/h2.rs:4851-4864
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -686,7 +701,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:4851-4857
+```rust lib/src/protocol/mux/h2.rs:4899-4905
 let events = stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -718,7 +733,7 @@ taken at the top of `H2WritePhase::Flush`'s post-flush tail
 (`ConnectionH2::poll_write_target`, `lib/src/protocol/mux/h2.rs`) and passes `stream.linked_token()` straight
 out of it:
 
-```rust lib/src/protocol/mux/h2.rs:3589-3590
+```rust lib/src/protocol/mux/h2.rs:3637-3638
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 ```
@@ -1071,7 +1086,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8798-8802
+```rust lib/src/protocol/mux/h2.rs:8948-8952
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1191,25 +1206,40 @@ Key decisions in this method:
   rather than a convention
 - Closed vs idle stream detection: frames on closed streams get RST_STREAM or
   GOAWAY depending on frame type; frames on idle streams get GOAWAY(PROTOCOL_ERROR)
-- On a stream this endpoint reset, as long as `H2StreamTable::reset_by_us`
-  recognises it (still in `rst_sent`, or among the last
-  `RESET_STREAMS_REMEMBERED` (64) reset streams evicted from it), DATA and
-  HEADERS frames are ignored instead (RFC 9113 §5.1). A HEADERS block and
-  the CONTINUATION frames completing it are still decoded through
-  `H2State::Discard` (`ConnectionH2::discard_field_block`,
-  `ConnectionH2::pending_discarded_block`) to keep the HPACK dynamic table in
-  sync (§4.3); a refused stream's block is completed the same way. A DATA
-  payload is read through stream 0 and only credited to connection flow
-  control (§6.9). What the peer may have had in flight counts no glitch: two
-  header blocks per stream, a trailer section or an interim and a final
-  response (`H2StreamTable::charge_reset_stream_header_block`), and DATA
-  within the stream's 65 535-byte receive window
-  (`H2StreamTable::charge_reset_stream_data`). Each header block beyond two,
-  and DATA beyond the window, counts one. The first fragment of a discarded
-  block counts toward `max_header_list_size` like an accepted one's.
-  WINDOW_UPDATE, PRIORITY and RST_STREAM keep their own handling, and any
-  other frame type keeps its own (a PUSH_PROMISE is still a connection
-  error) and counts as a glitch
+- Stream errors stay stream-scoped (RFC 9113 §5.4.2): DATA or HEADERS on a
+  half-closed (remote) stream (§5.1, STREAM_CLOSED) and a HEADERS frame without
+  END_STREAM in the body phase (§8.1.1, PROTOCOL_ERROR) reset that one stream
+  through `reset_stream_and_discard_frame`, and the payload is still minimally
+  processed through `Discard` (HPACK decoded, DATA credited to the connection
+  window). Every other stream on the connection carries on
+- DATA and HEADERS frames on a stream this endpoint reset are ignored (§5.1)
+  after the same minimal processing (`ConnectionH2::discard_frame_payload`),
+  whether the stream is still tracked or retired:
+  `H2StreamTable::was_reset_locally` covers `rst_sent` and the last
+  `RECENTLY_RESET_CAPACITY` (256) retired reset streams. What the peer may
+  have had in flight counts no glitch: two header blocks per stream, a
+  trailer section or an interim and a final response
+  (`H2StreamTable::charge_reset_stream_header_block`), and DATA within the
+  stream's 65 535-byte receive window
+  (`H2StreamTable::charge_reset_stream_data`); each header block beyond two,
+  and DATA beyond the window, counts one. WINDOW_UPDATE, PRIORITY and
+  RST_STREAM keep their own handling, and so does every other frame type (a
+  PUSH_PROMISE is still a connection error). A stream closed by END_STREAM in
+  both directions keeps the connection error STREAM_CLOSED for HEADERS, and
+  the stream error for DATA (§6.1)
+- A self-dependent PRIORITY (RFC 7540 §5.3.1) resets an open stream and
+  closes the connection on an idle one, since RST_STREAM must not name an
+  idle stream (RFC 9113 §6.4). A PRIORITY frame whose length is not 5 is a
+  stream error FRAME_SIZE_ERROR (§6.3) that resets an open stream and is
+  dropped otherwise; every other frame size error stays a connection error
+  (§4.2). Each dropped frame counts as a glitch, and each RST_STREAM sent
+  feeds the emitted-RST accounting
+- A dropped header block without END_HEADERS, whether it triggered a stream
+  error, arrived on a reset stream or was refused, keeps its fragment in
+  `ConnectionH2::pending_discarded_block`: only a CONTINUATION frame on the
+  same stream may follow (§6.10), it is discarded with it, and the block is
+  decoded whole for HPACK (§4.3). The first fragment counts toward
+  `max_header_list_size` like an accepted block's
 
 ### handle_continuation_header_state()
 
@@ -1223,7 +1253,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8976-8980
+```rust lib/src/protocol/mux/h2.rs:9126-9130
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1697,7 +1727,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:8301
+```rust lib/src/protocol/mux/h2.rs:8451
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -1859,7 +1889,7 @@ and `tracestate` headers are extracted from inbound requests:
 At access log emission time (`Stream::generate_access_log`, in
 `lib/src/protocol/mux/stream.rs`):
 
-```rust lib/src/protocol/mux/stream.rs:882-885
+```rust lib/src/protocol/mux/stream.rs:914-917
 #[cfg(feature = "opentelemetry")]
 otel: context.otel.as_ref(),
 #[cfg(not(feature = "opentelemetry"))]
@@ -1931,7 +1961,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:6904-6906
+```rust lib/src/protocol/mux/h2.rs:7043-7045
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1939,7 +1969,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:6918-6924
+```rust lib/src/protocol/mux/h2.rs:7057-7063
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.
@@ -2263,7 +2293,7 @@ Tests use the `e2e` crate which provides:
 
 ### h2spec conformance
 
-The implementation targets 145/145 h2spec test cases for RFC 9113 conformance.
+The implementation targets 146/146 h2spec 2.6.0 test cases for RFC 9113 conformance.
 h2spec is an external conformance testing tool (https://github.com/summerwind/h2spec)
 that validates frame-level protocol correctness.
 

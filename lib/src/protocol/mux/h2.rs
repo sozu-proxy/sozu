@@ -244,11 +244,11 @@ pub(super) fn next_stream_id(
     Some((issued, next))
 }
 
-/// Enlarged connection-level receive window (1 MB).
-/// The RFC 9113 default is 65 535 bytes, which is too small for high-throughput
-/// proxying and causes excessive WINDOW_UPDATE round-trips. 1 MB matches the
-/// initial window used by HAProxy, the h2 crate, and other production proxies.
-const ENLARGED_CONNECTION_WINDOW: u32 = 1_048_576;
+/// Connection receive window (16 MiB), advertised and not enforced (see
+/// `lib/src/protocol/mux/h2_flow_control.rs`). Credit returns in one stream-0 WINDOW_UPDATE per
+/// half window received, one per 8 MiB, well under peers' stream-0 flood limits (Chromium uses
+/// 15 MB, Envoy 24 MiB). The buffer pool bounds memory: DATA is read only when its buffer has room.
+const ENLARGED_CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
 
 /// H2 client connection preface size: 24-byte magic + 9-byte SETTINGS frame header
 pub const CLIENT_PREFACE_SIZE: usize = 24 + parser::FRAME_HEADER_SIZE;
@@ -815,6 +815,12 @@ pub struct ConnectionH2 {
     /// `H2WritePhase::Start`. Set with `parked_header_block`, taken by
     /// whichever comes first.
     parked_data: i32,
+    /// Whether the one-shot stream-0 WINDOW_UPDATE that enlarges the
+    /// connection receive window to `H2ConnectionConfig::initial_connection_window`
+    /// was sent. A backend may send SETTINGS more than once; granting the
+    /// surplus again each time would push its send window past 2^31-1
+    /// (RFC 9113 §6.9.1).
+    connection_window_enlarged: bool,
     /// RFC 9113 §6.8 double-GOAWAY drain bookkeeping, encapsulated so
     /// nothing outside `h2_drain.rs` can reach the raw fields — see
     /// [`h2_drain::H2DrainState`].
@@ -1970,6 +1976,7 @@ impl ConnectionH2 {
             pending_table_size_update: None,
             parked_header_block: false,
             parked_data: 0,
+            connection_window_enlarged: false,
             drain: h2_drain::H2DrainState::new(graceful_shutdown_deadline),
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
             output: h2_output::H2Output::default(),
@@ -2011,8 +2018,9 @@ impl ConnectionH2 {
     /// transition to `H2State::Frame` for the payload.
     ///
     /// Returns `MuxResult` — the caller should propagate the result directly.
-    fn handle_header_state<L>(&mut self, context: &mut Context<L>) -> MuxResult
+    fn handle_header_state<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
     where
+        E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
         let i = self.zero.storage.data();
@@ -2086,22 +2094,22 @@ impl ConnectionH2 {
                     || matches!(header.frame_type, FrameType::Unknown(_))
                 {
                     H2StreamId::Zero
-                } else if self.stream_table.reset_by_us(stream_id)
-                    && !matches!(
-                        header.frame_type,
-                        FrameType::WindowUpdate | FrameType::Priority | FrameType::RstStream
-                    )
+                } else if (header.frame_type == FrameType::Data
+                    || header.frame_type == FrameType::Headers)
+                    && self.stream_table.was_reset_locally(stream_id)
                 {
                     // RFC 9113 §5.1: after sending RST_STREAM, an endpoint
                     // MUST ignore frames it receives on that stream, which
-                    // the peer may have sent before reading the reset. A
-                    // HEADERS block, and the CONTINUATION frames completing
-                    // it, are still decoded so the HPACK dynamic table stays
-                    // in sync (§4.3); a DATA payload is read through stream
-                    // 0, where `handle_data_frame` credits connection flow
-                    // control (§6.9) and drops it.
+                    // the peer may have sent before reading the reset,
+                    // whether the stream is still tracked or already retired.
+                    // `discard_frame_payload` still processes them minimally:
+                    // a HEADERS block, and the CONTINUATION frames completing
+                    // it, are decoded so the HPACK dynamic table stays in
+                    // sync (§4.3); a DATA payload is credited to connection
+                    // flow control (§6.9). Every other frame type on such a
+                    // stream keeps its own handling.
                     debug!(
-                        "{} Ignoring {:?} on stream {} reset by this endpoint",
+                        "{} Ignoring {:?} on stream {} after sending RST_STREAM",
                         log_context!(self),
                         header.frame_type,
                         stream_id
@@ -2111,38 +2119,32 @@ impl ConnectionH2 {
                     // or an interim and a final response), or DATA within the
                     // stream's receive window, which Sōzu credits back as it
                     // reads DATA, so it stays the initial window it
-                    // advertised. More header blocks, DATA beyond it, and any
-                    // other frame, count as a glitch.
-                    let in_flight = match header.frame_type {
-                        FrameType::Headers => self
-                            .stream_table
-                            .charge_reset_stream_header_block(stream_id),
-                        FrameType::Data => self.stream_table.charge_reset_stream_data(
+                    // advertised. More header blocks, and DATA beyond it,
+                    // count as a glitch.
+                    let in_flight = if header.frame_type == FrameType::Headers {
+                        self.stream_table
+                            .charge_reset_stream_header_block(stream_id)
+                    } else {
+                        self.stream_table.charge_reset_stream_data(
                             stream_id,
                             header.payload_len,
                             self.local_settings.settings_initial_window_size,
-                        ),
-                        _ => false,
+                        )
                     };
                     if !in_flight {
                         self.flood_detector.record_glitch();
                         check_flood_or_return!(self);
                     }
-                    if header.frame_type == FrameType::Headers {
-                        return self.discard_field_block(
-                            stream_id,
-                            header.payload_len,
-                            DiscardedFieldBlock::New {
-                                flags: header.flags,
-                            },
-                        );
-                    }
-                    H2StreamId::Zero
-                } else if let Some(global_stream_id) = self.stream_table.streams().get(&stream_id) {
+                    return self.discard_frame_payload(&header);
+                } else if let Some(global_stream_id) =
+                    self.stream_table.streams().get(&stream_id).copied()
+                {
                     let allowed_on_half_closed = header.frame_type == FrameType::WindowUpdate
                         || header.frame_type == FrameType::Priority
                         || header.frame_type == FrameType::RstStream;
-                    let stream = &context.streams[*global_stream_id];
+                    let carries_message = header.frame_type == FrameType::Data
+                        || header.frame_type == FrameType::Headers;
+                    let stream = &context.streams[global_stream_id];
                     // Use the position-aware end_of_stream flag:
                     // - Server reads from front (client requests)
                     // - Client reads from back (backend responses)
@@ -2158,6 +2160,24 @@ impl ConnectionH2 {
                         received_eos,
                         stream.state
                     );
+                    // RFC 9113 §5.1: DATA or HEADERS on a half-closed (remote)
+                    // stream is a stream error of type STREAM_CLOSED. Only that
+                    // stream is reset; the frame is still minimally processed.
+                    if carries_message && received_eos && stream.state.is_open() {
+                        debug!(
+                            "{} {:?} on half-closed (remote) stream {}, sending RST_STREAM(STREAM_CLOSED)",
+                            log_context!(self),
+                            header.frame_type,
+                            stream_id
+                        );
+                        return self.reset_stream_and_discard_frame(
+                            &header,
+                            global_stream_id,
+                            H2Error::StreamClosed,
+                            context,
+                            endpoint,
+                        );
+                    }
                     if !allowed_on_half_closed && (received_eos || !stream.state.is_open()) {
                         error!(
                             "{} CANNOT RECEIVE {:?} ON THIS STREAM {:?}",
@@ -2189,21 +2209,30 @@ impl ConnectionH2 {
                     } else {
                         stream.back.is_main_phase()
                     };
+                    //
+                    // RFC 9113 §8.1.1: such a message is malformed, a stream
+                    // error of type PROTOCOL_ERROR: only this stream is reset.
                     if header.frame_type == FrameType::Headers
                         && read_in_body
                         && header.flags & parser::FLAG_END_STREAM == 0
                     {
-                        error!(
+                        debug!(
                             "{} HEADERS without END_STREAM on open stream {} in body phase: trailers MUST carry END_STREAM",
                             log_context!(self),
                             stream_id
                         );
-                        return self.goaway(H2Error::ProtocolError);
+                        return self.reset_stream_and_discard_frame(
+                            &header,
+                            global_stream_id,
+                            H2Error::ProtocolError,
+                            context,
+                            endpoint,
+                        );
                     }
                     if header.frame_type == FrameType::Data {
                         H2StreamId::Other {
                             id: stream_id,
-                            gid: *global_stream_id,
+                            gid: global_stream_id,
                         }
                     } else {
                         H2StreamId::Zero
@@ -2323,6 +2352,8 @@ impl ConnectionH2 {
                                     // connection for other streams. The payload is
                                     // still routed through stream 0 so handle_frame
                                     // can do connection-level flow control accounting.
+                                    // A stream this endpoint reset never gets here:
+                                    // its late DATA is ignored above.
                                     debug!(
                                         "{} DATA on closed stream {}, sending RST_STREAM(STREAM_CLOSED)",
                                         log_context!(self),
@@ -2338,7 +2369,8 @@ impl ConnectionH2 {
                                 }
                                 _ => {
                                     // RFC 9113 §5.1: HEADERS or other frames on a
-                                    // closed stream → connection error STREAM_CLOSED.
+                                    // closed stream we did not reset → connection
+                                    // error STREAM_CLOSED, which §5.1 permits.
                                     error!(
                                         "{} Received {:?} on closed stream {}, sending GOAWAY(STREAM_CLOSED)",
                                         log_context!(self),
@@ -2843,6 +2875,7 @@ impl ConnectionH2 {
                     .connection_config
                     .initial_connection_window
                     .saturating_sub(DEFAULT_INITIAL_WINDOW_SIZE);
+                self.connection_window_enlarged = true;
                 if increment > 0 {
                     match self.output.push_frames(WINDOW_UPDATE_FRAME_SIZE, |buf| {
                         serializer::gen_window_update(buf, 0, increment).map(|(_, size)| size)
@@ -2887,7 +2920,7 @@ impl ConnectionH2 {
                 };
             }
             (H2State::Header, _) => {
-                return self.handle_header_state(context);
+                return self.handle_header_state(context, endpoint);
             }
             (H2State::ContinuationHeader(headers), _) => {
                 let headers = headers.clone();
@@ -2901,6 +2934,21 @@ impl ConnectionH2 {
                     Ok((_, frame)) => frame,
                     Err(error) => {
                         let error = error_nom_to_h2(error);
+                        // RFC 9113 §6.3: a PRIORITY frame of the wrong length
+                        // is a stream error, unlike every other frame size
+                        // error (§4.2). PRIORITY is read through stream 0.
+                        if header.frame_type == FrameType::Priority
+                            && error == H2Error::FrameSizeError
+                        {
+                            let priority_stream_id = header.stream_id;
+                            kawa.storage.end = kawa.storage.head;
+                            self.expect_header();
+                            return self.handle_priority_frame_size_error(
+                                priority_stream_id,
+                                context,
+                                endpoint,
+                            );
+                        }
                         error!("{} COULD NOT PARSE FRAME BODY", log_context!(self));
                         return self.goaway(error);
                     }
@@ -5342,8 +5390,8 @@ impl ConnectionH2 {
     /// Read the `payload_len` bytes of a HEADERS or CONTINUATION frame of
     /// `stream_id` that is dropped through `H2State::Discard`, which decodes
     /// its field block only to keep the HPACK dynamic table in sync (RFC
-    /// 9113 §4.3), then resumes normal reading. A frame without
-    /// END_HEADERS leaves its fragment in
+    /// 9113 §4.3), then resumes normal reading. Queues nothing. A frame
+    /// without END_HEADERS leaves its fragment in
     /// [`Self::pending_discarded_block`], so the CONTINUATION frames that
     /// complete the block are discarded and decoded with it.
     fn discard_field_block(
@@ -5364,6 +5412,56 @@ impl ConnectionH2 {
             .set_expect_read(Some((H2StreamId::Zero, payload_len as usize)));
         self.discarded_field_block = Some((stream_id, discarded));
         MuxResult::Continue
+    }
+
+    /// Minimally process and drop the payload of the DATA or HEADERS frame
+    /// whose `header` was just parsed, for a stream that is reset or being
+    /// reset (RFC 9113 §5.1): a field block, with the CONTINUATION frames
+    /// completing it, still updates the HPACK decoder, DATA still counts
+    /// toward the connection flow-control window.
+    fn discard_frame_payload(&mut self, header: &FrameHeader) -> MuxResult {
+        debug_assert!(
+            matches!(header.frame_type, FrameType::Data | FrameType::Headers),
+            "only DATA and HEADERS payloads are discarded per stream"
+        );
+        if header.frame_type == FrameType::Headers {
+            self.discard_field_block(
+                header.stream_id,
+                header.payload_len,
+                DiscardedFieldBlock::New {
+                    flags: header.flags,
+                },
+            )
+        } else {
+            self.skip_orphaned_data_payload(header.payload_len as usize, header.payload_len);
+            MuxResult::Continue
+        }
+    }
+
+    /// RFC 9113 §5.4.2: answer a stream error on the open stream `header`
+    /// names with RST_STREAM(`error`), tear the stream down, and discard the
+    /// frame's payload ([`Self::discard_frame_payload`]). Every other stream
+    /// on the connection carries on. The RST_STREAM goes through
+    /// [`Self::reset_stream`], so it feeds the emitted-RST flood accounting.
+    fn reset_stream_and_discard_frame<E, L>(
+        &mut self,
+        header: &FrameHeader,
+        global_stream_id: GlobalStreamId,
+        error: H2Error,
+        context: &mut Context<L>,
+        endpoint: E,
+    ) -> MuxResult
+    where
+        E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        let result =
+            self.reset_stream(header.stream_id, global_stream_id, context, endpoint, error);
+        self.remove_dead_stream(header.stream_id, global_stream_id);
+        if !matches!(result, MuxResult::Continue) {
+            return result;
+        }
+        self.discard_frame_payload(header)
     }
 
     /// RFC 9113 §5.1.2 SETTINGS back-pressure bookkeeping.
@@ -6194,18 +6292,9 @@ impl ConnectionH2 {
             self.flood_detector.record_empty_data_frame();
             check_flood_or_return!(self);
         }
-        // A stream this endpoint reset takes the same path as an unknown one:
-        // its DATA is ignored (RFC 9113 §5.1) once connection flow control
-        // is credited.
-        let tracked = if self.stream_table.reset_by_us(data.stream_id) {
-            None
-        } else {
-            self.stream_table.get(data.stream_id)
-        };
-        let Some(global_stream_id) = tracked else {
+        let Some(global_stream_id) = self.stream_table.get(data.stream_id) else {
             // The stream was terminated while data was expected,
-            // probably due to automatic answer for invalid/unauthorized access,
-            // or reset by this endpoint.
+            // probably due to automatic answer for invalid/unauthorized access.
             // RFC 9113 §6.9: we MUST still account for the DATA payload in
             // connection-level flow control using the full wire length
             // (including pad-length byte and padding), otherwise the window
@@ -6709,6 +6798,9 @@ impl ConnectionH2 {
                 self.remove_dead_stream(priority.stream_id, global_stream_id);
                 return result;
             } else {
+                // RFC 7540 §5.3.1 makes a self-dependency a stream error, but
+                // this stream is idle and RFC 9113 §6.4 forbids RST_STREAM on
+                // an idle stream: the connection error is the only reply.
                 error!(
                     "{} INVALID PRIORITY RECEIVED ON INVALID STREAM",
                     log_context!(self)
@@ -6716,6 +6808,53 @@ impl ConnectionH2 {
                 return self.goaway(H2Error::ProtocolError);
             }
         }
+        MuxResult::Continue
+    }
+
+    /// RFC 9113 §6.3: a PRIORITY frame with a length other than 5 octets is a
+    /// stream error of type FRAME_SIZE_ERROR. An open stream is reset; on an
+    /// idle, closed or already reset stream the frame is dropped, since
+    /// RST_STREAM must not name an idle stream (§6.4) and PRIORITY changes no
+    /// stream state. The frame's payload was already consumed.
+    fn handle_priority_frame_size_error<E, L>(
+        &mut self,
+        stream_id: StreamId,
+        context: &mut Context<L>,
+        endpoint: E,
+    ) -> MuxResult
+    where
+        E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        self.metric_events
+            .push(MetricEvent::FrameReceived(FrameType::Priority));
+        self.attribute_bytes_to_overhead();
+        if let Some(global_stream_id) = self.stream_table.get(stream_id)
+            && context.streams[global_stream_id].state.is_open()
+            && !self.stream_table.rst_sent_contains(stream_id)
+        {
+            debug!(
+                "{} PRIORITY frame of invalid length on stream {}, sending RST_STREAM(FRAME_SIZE_ERROR)",
+                log_context!(self),
+                stream_id
+            );
+            let result = self.reset_stream(
+                stream_id,
+                global_stream_id,
+                context,
+                endpoint,
+                H2Error::FrameSizeError,
+            );
+            self.remove_dead_stream(stream_id, global_stream_id);
+            return result;
+        }
+        debug!(
+            "{} Ignoring PRIORITY frame of invalid length on stream {}",
+            log_context!(self),
+            stream_id
+        );
+        self.flood_detector.record_glitch();
+        check_flood_or_return!(self);
         MuxResult::Continue
     }
 
@@ -6950,10 +7089,10 @@ impl ConnectionH2 {
         // connections (Position::Client). The server side serialises it
         // beside its own SETTINGS in the `(ClientSettings, Server)` readable
         // arm, but the client needs to do it here after receiving the
-        // server's initial SETTINGS.
-        if self.position.is_client()
-            && self.flow_control.window() <= DEFAULT_INITIAL_WINDOW_SIZE as i32
-        {
+        // server's initial SETTINGS. Once only: a later SETTINGS frame must
+        // not grant the surplus again (RFC 9113 §6.9.1).
+        if self.position.is_client() && !self.connection_window_enlarged {
+            self.connection_window_enlarged = true;
             let increment = self
                 .connection_config
                 .initial_connection_window
@@ -7318,23 +7457,25 @@ impl ConnectionH2 {
         } else if let Some(global_stream_id) = self.stream_table.get(stream_id) {
             let stream = &mut context.streams[global_stream_id];
             self.attribute_bytes_to_stream(&mut stream.metrics);
-            let stream_window_before = stream.window;
-            if let Some(window) = stream.window.checked_add(increment) {
-                if stream.window <= 0 && window > 0 {
+            // RFC 9113 §6.9: only this connection's leg of the stream.
+            let stream_window = stream.send_window_mut(&self.position);
+            let stream_window_before = *stream_window;
+            if let Some(window) = stream_window.checked_add(increment) {
+                if *stream_window <= 0 && window > 0 {
                     self.readiness.arm_writable();
                 }
-                stream.window = window;
+                *stream_window = window;
                 // Same replenish invariant as the connection window, applied to
                 // the per-stream send window (RFC 9113 §6.9.1). Overflow past
                 // 2^31-1 is rejected by `checked_add` and handled as a
                 // FLOW_CONTROL_ERROR RST_STREAM below.
                 debug_assert_eq!(
-                    stream.window,
+                    window,
                     stream_window_before + increment,
                     "stream window must increase by exactly the increment"
                 );
                 debug_assert!(
-                    stream.window > stream_window_before,
+                    window > stream_window_before,
                     "a positive WINDOW_UPDATE must strictly grow the stream window"
                 );
                 debug!(
@@ -7342,7 +7483,7 @@ impl ConnectionH2 {
                     log_context!(self),
                     stream_id,
                     increment,
-                    stream.window
+                    window
                 );
             } else {
                 let result = self.reset_stream(
@@ -7393,13 +7534,15 @@ impl ConnectionH2 {
         let mut open_window = false;
         // Only update windows for streams owned by this connection
         for &global_stream_id in self.stream_table.streams().values() {
-            let stream = &mut context.streams[global_stream_id];
+            // RFC 9113 §6.9: the peer's setting sizes this connection's leg of
+            // the stream only; the other connection's window is its own.
+            let stream_window = context.streams[global_stream_id].send_window_mut(&self.position);
             // RFC 9113 §6.9.2: changes to SETTINGS_INITIAL_WINDOW_SIZE can cause
             // stream windows to exceed 2^31-1, which is a flow control error.
-            match stream.window.checked_add(delta) {
+            match stream_window.checked_add(delta) {
                 Some(new_window) => {
-                    open_window |= stream.window <= 0 && new_window > 0;
-                    stream.window = new_window;
+                    open_window |= *stream_window <= 0 && new_window > 0;
+                    *stream_window = new_window;
                 }
                 None => return true,
             }
@@ -8004,6 +8147,13 @@ impl ConnectionH2 {
             self.graceful_goaway(self.now);
             return false;
         };
+        // RFC 9113 §6.9: the stream's send window on this connection starts
+        // at the backend's own SETTINGS_INITIAL_WINDOW_SIZE (the 65535
+        // default until its SETTINGS arrive), whatever the client granted on
+        // the frontend connection and whatever a previous request on the
+        // slot left.
+        *context.streams[stream].send_window_mut(&self.position) =
+            i32::try_from(self.peer_settings.settings_initial_window_size).unwrap_or(i32::MAX);
         self.stream_table.register(stream_id, stream, self.now);
         self.readiness.arm_writable();
         true
@@ -12633,6 +12783,170 @@ mod tests {
         (gid, encoded)
     }
 
+    /// RFC 9113 §6.9: a proxied stream has an independent send window on each
+    /// connection. The client granted the maximum initial window on the
+    /// frontend connection; the H2 backend then advertises
+    /// `SETTINGS_INITIAL_WINDOW_SIZE = 2^31-1` too. Each value is within the
+    /// §6.9.2 ceiling, so the backend connection must acknowledge it and send
+    /// the request, not overflow a window it shares with the frontend leg and
+    /// answer GOAWAY.
+    ///
+    /// TO SEE THIS RED: make `Stream::send_window_mut` and `Stream::split`
+    /// answer `front_window` for `Position::Client` too. The backend then
+    /// adds its delta to the client's 2^31-1: `the backend connection must
+    /// not answer a valid initial window with GOAWAY`. Verified 2026-10-01
+    /// (red on `3d3f077b`).
+    #[test]
+    fn a_backend_max_initial_window_is_independent_of_the_frontend_window() {
+        let pool = make_pool_for_invariant_16();
+        let mut backend = paced_backend(&pool, usize::MAX);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        // What a frontend connection whose client advertised 2^31-1 creates.
+        let gid = context
+            .create_stream(Ulid::generate(), FLOW_CONTROL_MAX_WINDOW)
+            .expect("test context must create a stream");
+        queue_backend_request(&mut context, gid, b"key");
+        context.streams[gid].state = StreamState::Linked(mio::Token(1));
+        assert!(backend.start_stream(gid, &mut context), "premise: stream 1");
+
+        let mut max_initial_window = vec![0, 4];
+        max_initial_window.extend_from_slice(&FLOW_CONTROL_MAX_WINDOW.to_be_bytes());
+        backend
+            .socket
+            .inbound
+            .extend(orphan_frame(4, 0, 0, 6, &max_initial_window));
+        for _ in 0..4 {
+            backend.core.readiness.event.insert(Ready::READABLE);
+            if backend.core.readiness.filter_interest().is_readable() {
+                backend.readable(&mut context, EndpointClient(&mut router));
+            }
+        }
+        backend.core.readiness.event.insert(Ready::WRITABLE);
+        backend.writable(&mut context, EndpointClient(&mut router));
+
+        let frames = peer_frames(&backend.socket.wire).expect("whole frames on the wire");
+        assert!(
+            !frames.iter().any(|(kind, ..)| *kind == 7),
+            "the backend connection must not answer a valid initial window with GOAWAY"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|(kind, flags, ..)| *kind == 4 && *flags == 1),
+            "the backend's SETTINGS are acknowledged"
+        );
+        assert!(
+            frames.iter().any(|(kind, _, id, _)| *kind == 1 && *id == 1),
+            "and the request leaves on stream 1"
+        );
+    }
+
+    /// A 4-octet WINDOW_UPDATE frame for `stream_id`.
+    fn window_update_frame(stream_id: u32, increment: u32) -> Vec<u8> {
+        orphan_frame(8, 0, stream_id, 4, &increment.to_be_bytes())
+    }
+
+    /// RFC 9113 §6.9 on the backend leg: `start_stream` sizes the stream's
+    /// send window from the initial window the BACKEND advertised (here
+    /// 1000, already received on a pooled connection), whatever the frontend
+    /// granted: larger (an H2 client at 2^31-1), the `1 << 16` an H1
+    /// frontend seeds, or nothing. Taking the frontend's value would let a
+    /// request body overrun the backend's window. The backend's WINDOW_UPDATE
+    /// credits that leg only.
+    ///
+    /// TO SEE THIS RED: delete the `send_window_mut` assignment in
+    /// `ConnectionH2::start_stream`: `the backend leg starts at the
+    /// backend's window`, `left: 65535, right: 1000`. Verified 2026-10-01.
+    #[test]
+    fn a_backend_stream_window_is_sized_and_credited_by_the_backend_only() {
+        const BACKEND_WINDOW: u32 = 1000;
+        for front_window in [FLOW_CONTROL_MAX_WINDOW, 1 << 16, 0] {
+            let pool = make_pool_for_invariant_16();
+            let mut backend = paced_backend(&pool, usize::MAX);
+            let mut context = test_context(&pool);
+            let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+            let read = |backend: &mut H2Shell<PacedSocket>,
+                        context: &mut Context<TestListener>,
+                        router: &mut Router| {
+                for _ in 0..4 {
+                    backend.core.readiness.event.insert(Ready::READABLE);
+                    if backend.core.readiness.filter_interest().is_readable() {
+                        backend.readable(context, EndpointClient(router));
+                    }
+                }
+            };
+            let mut initial_window = vec![0, 4];
+            initial_window.extend_from_slice(&BACKEND_WINDOW.to_be_bytes());
+            backend
+                .socket
+                .inbound
+                .extend(orphan_frame(4, 0, 0, 6, &initial_window));
+            read(&mut backend, &mut context, &mut router);
+            let gid = context
+                .create_stream(Ulid::generate(), front_window)
+                .expect("test context must create a stream");
+            queue_backend_request(&mut context, gid, b"key");
+            context.streams[gid].state = StreamState::Linked(mio::Token(1));
+            assert!(backend.start_stream(gid, &mut context), "premise: stream 1");
+            assert_eq!(
+                context.streams[gid].back_window, BACKEND_WINDOW as i32,
+                "front window {front_window}: the backend leg starts at the backend's window"
+            );
+
+            backend.socket.inbound.extend(window_update_frame(1, 500));
+            read(&mut backend, &mut context, &mut router);
+            let stream = &context.streams[gid];
+            assert_eq!(
+                stream.back_window,
+                BACKEND_WINDOW as i32 + 500,
+                "front window {front_window}: the backend's WINDOW_UPDATE credits its leg"
+            );
+            assert_eq!(
+                stream.front_window,
+                i32::try_from(front_window).unwrap(),
+                "front window {front_window}: and leaves the frontend leg alone"
+            );
+        }
+    }
+
+    /// RFC 9113 §6.9 on the frontend leg: the client's WINDOW_UPDATE and
+    /// SETTINGS_INITIAL_WINDOW_SIZE move the stream's frontend window only.
+    #[test]
+    fn a_frontend_window_update_credits_the_frontend_leg_only() {
+        let (_pool, mut connection, mut context, mut router, _peer) = two_requests_read(usize::MAX);
+        let first = *connection
+            .core
+            .stream_table
+            .streams()
+            .get(&1)
+            .expect("the stream is open");
+        context.streams[first].back_window = 1234;
+        let mut initial_window = vec![0, 4];
+        initial_window.extend_from_slice(&100_000u32.to_be_bytes());
+        connection
+            .socket
+            .inbound
+            .extend(window_update_frame(1, 1000));
+        connection
+            .socket
+            .inbound
+            .extend(orphan_frame(4, 0, 0, 6, &initial_window));
+        for _ in 0..4 {
+            connection.core.readiness.event.insert(Ready::READABLE);
+            if connection.core.readiness.filter_interest().is_readable() {
+                connection.readable(&mut context, EndpointClient(&mut router));
+            }
+        }
+        let stream = &context.streams[first];
+        assert_eq!(
+            stream.front_window,
+            100_000 + 1000,
+            "the client's WINDOW_UPDATE and initial window move the frontend leg"
+        );
+        assert_eq!(stream.back_window, 1234, "and not the backend leg");
+    }
+
     /// sozu-proxy/sozu#1632, GOAWAY form: the backend refuses the stream
     /// (`last_stream_id` below it) after its HEADERS were encoded but not
     /// sent. It was not processed, but its request cannot be sent anywhere
@@ -13096,7 +13410,7 @@ mod tests {
         connection.core.readiness.event.insert(Ready::WRITABLE);
         connection.writable(&mut context, EndpointClient(&mut router));
         assert_eq!(
-            context.streams[first].window, DEFAULT_INITIAL_WINDOW_SIZE as i32,
+            context.streams[first].front_window, DEFAULT_INITIAL_WINDOW_SIZE as i32,
             "the stream's window is back where it was before the prepare"
         );
         drive_both_ways(&mut connection, &mut context, &mut router);
@@ -13185,7 +13499,10 @@ mod tests {
             0,
             "the connection window still owes every queued DATA octet"
         );
-        assert_eq!(context.streams[first].window, 0, "and so does the stream's");
+        assert_eq!(
+            context.streams[first].front_window, 0,
+            "and so does the stream's"
+        );
     }
 
     /// A write that cuts stream 1's first DATA frame hands the rest of that
@@ -16117,7 +16434,7 @@ mod tests {
         kawa.parsing_phase = kawa::ParsingPhase::Terminated;
         // The backend grants the stream no send window: its HEADERS leave,
         // its body waits.
-        context.streams[gid].window = 0;
+        context.streams[gid].back_window = 0;
         let sent = drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
         let frames = peer_frames(&sent).expect("whole frames");
         assert!(
@@ -16287,9 +16604,9 @@ mod tests {
     /// entry, so it parses only if the ignored block was decoded whole
     /// (§4.3). What the backend had in flight counts no glitch.
     ///
-    /// TO SEE THIS RED: in [`ConnectionH2::handle_read`], drop the
-    /// reset-by-us check of the closed-stream branch: the trailer HEADERS is
-    /// answered GOAWAY(STREAM_CLOSED); or, in the `H2State::Discard` arm,
+    /// TO SEE THIS RED: in `ConnectionH2::handle_header_state`, drop the
+    /// `was_reset_locally` branch: the trailer HEADERS is answered
+    /// GOAWAY(STREAM_CLOSED); or, in the `H2State::Discard` arm,
     /// drop the `pending_discarded_block` store: the CONTINUATION is
     /// answered GOAWAY(PROTOCOL_ERROR) as standalone.
     #[test]
@@ -16377,7 +16694,7 @@ mod tests {
     /// flight when it read the reset (RFC 9113 §6.9). DATA beyond it counts
     /// one glitch per frame.
     ///
-    /// TO SEE THIS RED: in [`ConnectionH2::handle_read`], count a glitch for
+    /// TO SEE THIS RED: in `ConnectionH2::handle_header_state`, count a glitch for
     /// every frame ignored on a reset stream: `in-flight DATA counts no
     /// glitch`.
     #[test]
@@ -16432,7 +16749,7 @@ mod tests {
     /// glitch limit and the connection ends with GOAWAY(ENHANCE_YOUR_CALM),
     /// instead of having every block HPACK-decoded for free.
     ///
-    /// TO SEE THIS RED: in [`ConnectionH2::handle_read`], count every header
+    /// TO SEE THIS RED: in `ConnectionH2::handle_header_state`, count every header
     /// block on a reset stream as in flight: no GOAWAY ever comes.
     #[test]
     fn header_blocks_on_a_reset_backend_stream_beyond_two_count_glitches() {
@@ -16507,9 +16824,9 @@ mod tests {
     /// backend then sends on it is ignored (RFC 9113 §5.1), never queued for
     /// the client nor counted against the response.
     ///
-    /// TO SEE THIS RED: in [`ConnectionH2::handle_data_frame`], drop the
-    /// reset-by-us check that routes such DATA to the unknown-stream path:
-    /// the payload is counted in `back_data_received`.
+    /// TO SEE THIS RED: in `ConnectionH2::handle_header_state`, drop the
+    /// `was_reset_locally` branch: the DATA reaches the stream and is counted
+    /// in `back_data_received`.
     #[test]
     fn data_on_a_tracked_backend_stream_sozu_reset_is_ignored() {
         use std::io::Write;
@@ -16587,9 +16904,9 @@ mod tests {
     /// (§8.1.1); the DATA and the trailer block the client had already sent
     /// on that stream are ignored, and the connection stays up.
     ///
-    /// TO SEE THIS RED: in [`ConnectionH2::handle_read`], drop the
-    /// reset-by-us check of the closed-stream branch: the trailer HEADERS is
-    /// answered GOAWAY(STREAM_CLOSED).
+    /// TO SEE THIS RED: in `ConnectionH2::handle_header_state`, drop the
+    /// `was_reset_locally` branch: the trailer HEADERS is answered
+    /// GOAWAY(STREAM_CLOSED).
     #[test]
     fn frames_on_a_client_stream_sozu_reset_are_ignored() {
         use std::io::Write;
@@ -17936,7 +18253,7 @@ mod tests {
     }
 
     /// Regression test for B1 (review of `e1c3c2fb`): `handle_headers_frame`'s
-    /// RFC 9113 §5.3.1 self-dependency early return — `reset_stream` +
+    /// RFC 7540 §5.3.1 self-dependency early return — `reset_stream` +
     /// `remove_dead_stream` when a stream's own PRIORITY depends on itself —
     /// used to skip retiring `self.header_reassembly` before returning. When
     /// the aborted stream's block had gone through CONTINUATION reassembly
@@ -17975,7 +18292,7 @@ mod tests {
         // Stream 1: a legitimate multi-frame header block — split across
         // HEADERS + CONTINUATION, exactly like the sibling reassembly tests
         // — but the FIRST frame also carries an RFC 7540 PRIORITY field
-        // whose stream dependency is stream 1 itself (RFC 9113 §5.3.1: a
+        // whose stream dependency is stream 1 itself (RFC 7540 §5.3.1: a
         // stream cannot depend on itself).
         let mut peer_encoder = crate::protocol::mux::hpack::Encoder::new();
         let field_block = peer_encoder.encode([
@@ -21586,6 +21903,70 @@ mod tests {
             &wire[settings_len + 13..],
             &serializer::SETTINGS_ACKNOWLEDGEMENT,
             "the ACK of the client's SETTINGS must close the preface"
+        );
+    }
+
+    /// A backend that sends SETTINGS again, without granting any connection
+    /// credit, must not get the one-shot connection-window enlargement again:
+    /// each repeat would add `initial_connection_window - 65535` to its send
+    /// window until it passed 2^31-1 (RFC 9113 §6.9.1).
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::handle_settings_frame`, gate the
+    /// enlargement on `self.flow_control.window() <= DEFAULT_INITIAL_WINDOW_SIZE`
+    /// (our send window) instead of `connection_window_enlarged`. The three
+    /// SETTINGS then queue three grants, coalesced into one stream-0 frame
+    /// of three times the surplus. Verified 2026-10-01 against `3d3f077b`.
+    #[test]
+    fn repeated_backend_settings_enlarge_the_connection_window_once() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut connection, _peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        connection.core.position = Position::Client(
+            "settings-cluster".into(),
+            super::super::BackendId {
+                slot: super::super::BackendSlot(0),
+                backend_id: Rc::from("settings-backend"),
+                address: "127.0.0.1:1".parse().expect("a literal socket address"),
+            },
+            BackendStatus::Connected,
+        );
+        for _ in 0..3 {
+            let result = connection.core.handle_settings_frame(
+                parser::Settings {
+                    settings: vec![],
+                    ack: false,
+                },
+                &mut context,
+            );
+            assert!(
+                matches!(result, MuxResult::Continue),
+                "an empty SETTINGS must be accepted"
+            );
+        }
+
+        let mut buf = vec![0u8; 13 * 8];
+        let (written, frames) = connection
+            .core
+            .flow_control
+            .drain_window_updates_into(&mut buf);
+        let grants: Vec<(u32, u32)> = buf[..written]
+            .chunks_exact(13)
+            .map(|frame| {
+                (
+                    u32::from_be_bytes(frame[5..9].try_into().unwrap()),
+                    u32::from_be_bytes(frame[9..13].try_into().unwrap()),
+                )
+            })
+            .collect();
+        assert_eq!(frames, grants.len());
+        assert_eq!(
+            grants,
+            vec![(
+                0,
+                H2ConnectionConfig::default().initial_connection_window
+                    - DEFAULT_INITIAL_WINDOW_SIZE
+            )],
+            "three SETTINGS must enlarge the connection window exactly once"
         );
     }
 }

@@ -148,7 +148,8 @@ returns a `StreamParts` struct with direction-appropriate aliases:
              ┌─────────────────────────┐
              │  front: Kawa (Request)  │
              │  back:  Kawa (Response) │
-             │  window: i32            │
+             │  front_window: i32      │
+             │  back_window: i32       │
              │  context: HttpContext    │
              └────────┬────────────────┘
                       │
@@ -161,7 +162,8 @@ returns a `StreamParts` struct with direction-appropriate aliases:
    StreamParts {             StreamParts {
      rbuffer: &front,          rbuffer: &back,
      wbuffer: &back,           wbuffer: &front,
-     window, context           window, context
+     window: &front_window,    window: &back_window,
+     context                   context
    }                         }
 ```
 
@@ -248,11 +250,11 @@ Flow control operates at two levels per RFC 9113 §6.9:
 ```
     ConnectionH2                          Stream
   ┌──────────────┐                    ┌──────────────┐
-  │ window: i32  │  ◄── connection    │ window: i32  │  ◄── stream
-  │              │      level         │              │      level
+  │ window: i32  │  ◄── connection    │ front_window │  ◄── stream level,
+  │              │      level         │ back_window  │      one per leg
   └──────┬───────┘                    └──────┬───────┘
          │                                   │
-         │  effective window = min(connection.window, stream.window)
+         │  effective window = min(connection.window, this leg's stream window)
          │
          ▼
   Sending DATA: decrement both windows by bytes sent.
@@ -266,6 +268,13 @@ Flow control operates at two levels per RFC 9113 §6.9:
 
 WINDOW_UPDATE frames are coalesced per stream ID in `pending_window_updates` and flushed
 inline at the start of `writable()`, avoiding extra event loop iterations.
+
+Flow control is hop-by-hop (RFC 9113 §6.9): a stream proxied from an H2 client to an H2
+backend has one send window on each connection. `Stream::front_window` is sized by the
+client's `SETTINGS_INITIAL_WINDOW_SIZE` and moved only by the frontend connection;
+`Stream::back_window` is sized by the backend's when `ConnectionH2::start_stream` opens the
+stream there, and moved only by the backend connection. `Stream::split` and
+`Stream::send_window_mut` pick the leg from the connection's `Position`.
 
 #### H2 frame processing pipeline
 

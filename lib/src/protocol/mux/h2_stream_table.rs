@@ -23,6 +23,8 @@
 //!   `streams` is a private field of this module, so `self.streams.remove`
 //!   cannot even be written outside `h2_stream_table.rs`.
 //! - `rst_sent` — RFC 9113 §6.8 duplicate-RST_STREAM dedupe.
+//! - `recently_reset` — the bounded memory of retired streams this endpoint
+//!   reset, whose late frames RFC 9113 §5.1 says to ignore.
 //! - The per-stream liveness/stall caches `stream_last_activity_at`,
 //!   `stream_fc_stalled_since`, `stream_fc_stalled_progress` (LIFECYCLE.md
 //!   §7.2), and [`H2StreamTable::collect_timed_out`], the pure reap-candidate
@@ -119,11 +121,13 @@ use std::{
 
 use super::{GlobalStreamId, StreamId, h2::H2StreamId};
 
-/// How many reset streams, once evicted, [`H2StreamTable::reset_by_us`]
-/// still recognises (RFC 9113 §5.1). Frames the peer queued before reading
-/// a RST_STREAM arrive within a round trip, while a connection retires far
-/// fewer streams than this in that time.
-const RESET_STREAMS_REMEMBERED: usize = 64;
+/// How many retired streams [`H2StreamTable::was_reset_locally`] remembers
+/// after they leave `rst_sent`. RFC 9113 §5.1 lets an endpoint limit the
+/// period over which it ignores frames on a stream it reset; this bounds it
+/// by count instead of by timer (which §5.1 discourages), and covers more
+/// than twice the default `SETTINGS_MAX_CONCURRENT_STREAMS` (100) reset in
+/// one burst. Older ids fall back to the closed-stream rules.
+pub(super) const RECENTLY_RESET_CAPACITY: usize = 256;
 
 /// How many header blocks a peer may still send on a stream this endpoint
 /// reset without counting a flood glitch (RFC 9113 §8.1): a trailer
@@ -143,20 +147,18 @@ pub(super) struct H2StreamTable {
     /// RFC 9113 §6.8: tracks stream IDs for which RST_STREAM has already been
     /// sent, preventing duplicate RST_STREAM frames on the wire.
     rst_sent: HashSet<StreamId>,
-    /// RFC 9113 §5.1: the most recent streams evicted from `rst_sent`, at
-    /// most [`RESET_STREAMS_REMEMBERED`], oldest first, with
-    /// `reset_evicted` holding the same ids for lookup. Frames the peer sent
-    /// before it read our RST_STREAM may still arrive on them and are
-    /// ignored rather than treated as a protocol error; §5.1 lets an
-    /// endpoint limit how long it does so, and the bound keeps a peer that
-    /// provokes resets from growing these.
-    reset_order: VecDeque<StreamId>,
-    reset_evicted: HashSet<StreamId>,
+    /// RFC 9113 §5.1: ids of retired streams this endpoint sent RST_STREAM
+    /// on, oldest first, at most [`RECENTLY_RESET_CAPACITY`]. [`Self::remove`]
+    /// moves an id here from `rst_sent`, which must stay exact for dedupe.
+    recently_reset: VecDeque<StreamId>,
+    /// The ids of `recently_reset`, for [`Self::was_reset_locally`] to look
+    /// up without scanning the ring.
+    recently_reset_ids: HashSet<StreamId>,
     /// RFC 9113 §6.9: DATA bytes a peer may still send on a stream this
     /// endpoint reset without abusing it, keyed by stream: the receive
     /// window it was granted, consumed as its DATA is ignored. Created on
     /// the first ignored DATA frame; dropped with the stream's id from
-    /// `reset_order`.
+    /// `recently_reset`.
     reset_data_allowance: HashMap<StreamId, u32>,
     /// Header blocks ignored so far on a stream this endpoint reset, keyed
     /// by stream: [`RESET_STREAM_HEADER_BLOCKS`] may legitimately still
@@ -217,8 +219,8 @@ impl H2StreamTable {
             expect_read,
             expect_write: None,
             rst_sent: HashSet::new(),
-            reset_order: VecDeque::new(),
-            reset_evicted: HashSet::new(),
+            recently_reset: VecDeque::new(),
+            recently_reset_ids: HashSet::new(),
             reset_data_allowance: HashMap::new(),
             reset_header_blocks: HashMap::new(),
             stream_last_activity_at: BTreeMap::new(),
@@ -318,15 +320,15 @@ impl H2StreamTable {
         } else {
             RemoveOutcome::NotPresent
         };
-        if self.rst_sent.remove(&stream_id) && self.reset_evicted.insert(stream_id) {
-            if self.reset_order.len() == RESET_STREAMS_REMEMBERED
-                && let Some(oldest) = self.reset_order.pop_front()
+        if self.rst_sent.remove(&stream_id) && self.recently_reset_ids.insert(stream_id) {
+            if self.recently_reset.len() == RECENTLY_RESET_CAPACITY
+                && let Some(oldest) = self.recently_reset.pop_front()
             {
-                self.reset_evicted.remove(&oldest);
+                self.recently_reset_ids.remove(&oldest);
                 self.reset_data_allowance.remove(&oldest);
                 self.reset_header_blocks.remove(&oldest);
             }
-            self.reset_order.push_back(stream_id);
+            self.recently_reset.push_back(stream_id);
         }
         self.stream_last_activity_at.remove(&stream_id);
         self.stream_fc_stalled_since.remove(&stream_id);
@@ -405,11 +407,13 @@ impl H2StreamTable {
         self.rst_sent.contains(&stream_id)
     }
 
-    /// Whether this endpoint sent RST_STREAM on `stream_id`, still tracked
-    /// or among the last [`RESET_STREAMS_REMEMBERED`] evicted: RFC 9113 §5.1
-    /// has the frames that then arrive on it ignored.
-    pub(super) fn reset_by_us(&self, stream_id: StreamId) -> bool {
-        self.rst_sent.contains(&stream_id) || self.reset_evicted.contains(&stream_id)
+    /// RFC 9113 §5.1: whether this endpoint sent RST_STREAM on `stream_id`,
+    /// either still tracked in `rst_sent` or among the last
+    /// [`RECENTLY_RESET_CAPACITY`] retired streams. Frames the peer sent
+    /// before it processed that RST_STREAM are ignored, not treated as an
+    /// error.
+    pub(super) fn was_reset_locally(&self, stream_id: StreamId) -> bool {
+        self.rst_sent.contains(&stream_id) || self.recently_reset_ids.contains(&stream_id)
     }
 
     /// Count one header block ignored on a stream this endpoint reset, and
@@ -576,6 +580,11 @@ impl H2StreamTable {
         // other. Both are BTreeMap, so comparing sorted key sequences is a
         // cheap, order-correct equality check.
         debug_assert!(
+            self.recently_reset.len() <= RECENTLY_RESET_CAPACITY
+                && self.recently_reset_ids.len() == self.recently_reset.len(),
+            "recently_reset must stay bounded and indexed"
+        );
+        debug_assert!(
             self.stream_fc_stalled_since
                 .keys()
                 .eq(self.stream_fc_stalled_progress.keys()),
@@ -635,33 +644,6 @@ mod tests {
         assert!(!table.stream_last_activity_at().contains_key(&1));
         assert_eq!(table.expect_write(), None);
         assert_eq!(table.expect_read(), None);
-    }
-
-    /// RFC 9113 §5.1: a stream reset by this endpoint is still recognised
-    /// once evicted, so the frames the peer sent before reading the reset
-    /// are ignored, but only the last `RESET_STREAMS_REMEMBERED` of them; a
-    /// stream evicted without a reset is not recognised at all.
-    #[test]
-    fn reset_by_us_outlives_eviction_for_the_last_streams_only() {
-        let now = Instant::now();
-        let mut table = H2StreamTable::new(None);
-        table.register(1, 0, now);
-        table.remove(1, 0);
-        assert!(!table.reset_by_us(1), "a stream closed without a reset");
-        let first = 3;
-        let count = RESET_STREAMS_REMEMBERED as u32 + 1;
-        for index in 0..count {
-            let stream_id = first + 2 * index;
-            table.register(stream_id, 0, now);
-            table.rst_sent_mut().insert(stream_id);
-            assert!(table.reset_by_us(stream_id), "a tracked reset stream");
-            table.remove(stream_id, 0);
-        }
-        assert!(!table.reset_by_us(first), "the oldest reset is forgotten");
-        assert!(
-            (1..count).all(|index| table.reset_by_us(first + 2 * index)),
-            "the last RESET_STREAMS_REMEMBERED resets are remembered"
-        );
     }
 
     #[test]
@@ -877,5 +859,34 @@ mod tests {
             "streams() pairs must agree with its own keys and values: \
              handle_goaway_frame reads both halves of this iterator together"
         );
+    }
+
+    /// RFC 9113 §5.1: a retired stream this endpoint reset is still known as
+    /// reset, a stream retired without a reset is not, and the memory keeps
+    /// only the newest [`RECENTLY_RESET_CAPACITY`] ids.
+    #[test]
+    fn was_reset_locally_survives_removal_within_the_bound() {
+        let mut table = H2StreamTable::new(None);
+        let now = Instant::now();
+        table.register(1, 0, now);
+        table.register(3, 1, now);
+        table.rst_sent_mut().insert(1);
+        table.remove(1, 0);
+        table.remove(3, 1);
+        assert!(!table.rst_sent_contains(1), "rst_sent is still evicted");
+        assert!(table.was_reset_locally(1), "a reset stream stays known");
+        assert!(!table.was_reset_locally(3), "a stream never reset is not");
+
+        let capacity = RECENTLY_RESET_CAPACITY as u32;
+        for id in 0..capacity {
+            let stream_id = 5 + 2 * id;
+            table.register(stream_id, 0, now);
+            table.rst_sent_mut().insert(stream_id);
+            table.remove(stream_id, 0);
+        }
+        assert!(!table.was_reset_locally(1), "the oldest id is forgotten");
+        assert!(table.was_reset_locally(5), "every newer id is kept");
+        assert!(table.was_reset_locally(5 + 2 * (capacity - 1)));
+        assert_eq!(table.recently_reset.len(), RECENTLY_RESET_CAPACITY);
     }
 }

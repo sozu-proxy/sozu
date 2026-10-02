@@ -242,9 +242,10 @@ Declared in `h2.rs` (`pub enum H2State`):
   used at an earlier revision — a collision the drift rule cannot tell from
   staleness, because it keys on the citation and not on where it sits. Do not
   convert it back.
-- `Discard` (stream refused, or an orphaned DATA remainder skipped — see §5.4)
-  is set in `refuse_stream_and_discard` or `skip_orphaned_data_payload`
-  (`h2.rs`) and exited by the `H2State::Discard` arm of `ConnectionH2::handle_read`
+- `Discard` (stream refused, a frame dropped for a stream reset by a stream
+  error or earlier by us — RFC 9113 §5.1 —, or an orphaned DATA remainder
+  skipped — see §5.4) is set in `refuse_stream_and_discard`,
+  `discard_field_block` or `skip_orphaned_data_payload` (`h2.rs`) and exited by the `H2State::Discard` arm of `ConnectionH2::handle_read`
   (`lib/src/protocol/mux/h2.rs`). By symbol, not line, for the same reason as
   the bullet above: `self.expect_header();` is one of four identical lines in
   the file, and the line number this bullet would otherwise carry is one the
@@ -260,7 +261,7 @@ Declared in `h2.rs` (`pub enum H2State`):
   `handle_read()` arm clears `zero.storage`, it decodes that field block into
   `ConnectionH2::decoder` (result discarded, callback is a no-op) via the
   free function `decode_discarded_field_block`, using the
-  `ConnectionH2::discarded_field_block` value `refuse_stream_and_discard`
+  `ConnectionH2::discarded_field_block` value `discard_field_block`
   stashed for it (see `DiscardedFieldBlock`, `h2.rs`). A brand-new stream's
   whole HEADERS payload still carries its own PADDED/PRIORITY prefix
   (RFC 9113 §6.2), which is stripped by re-running `parser::headers_frame`
@@ -1037,7 +1038,9 @@ deadlines are compared against `ConnectionH2.now` (§7.5):
   `H2StreamTable.stream_fc_stalled_progress: BTreeMap<StreamId, usize>` (the
   cumulative-stall budget). Armed (in `ConnectionH2::poll_write_target`) whenever a stream holds
   sendable buffered data it cannot send because its effective send window
-  `min(stream.window, connection.window)` is exhausted. This is
+  `min(stream window, connection.window)` is exhausted (the stream window is
+  this connection's leg: `Stream::front_window` on a frontend connection,
+  `Stream::back_window` on a backend one). This is
   **bidirectional**: the buffered data is the **response** on a `Position::Server`
   (frontend) connection and the **request upload** on a `Position::Client`
   (backend) connection — so a slot pinned by a stalled upload to a slow H2 backend
@@ -1516,14 +1519,15 @@ kept in lock-step:
   its lifetime counter stay consistent even when a cascading error path
   re-enters the reset flow for the same stream. When `H2StreamTable::remove`
   evicts an id from `rst_sent`, it keeps it among the last
-  `RESET_STREAMS_REMEMBERED` reset streams, so `H2StreamTable::reset_by_us`
-  still recognises it and the read side ignores the DATA and HEADERS frames
-  (with their CONTINUATION frames) the peer sent before reading the reset
-  (RFC 9113 §5.1) instead of answering GOAWAY(STREAM_CLOSED) or a second
-  RST_STREAM (sozu-proxy/sozu#1783). A header block is still decoded whole
-  for HPACK. Two header blocks per stream and DATA within the stream's
-  receive window count no glitch; each block beyond two, and DATA beyond
-  the window, count one.
+  `RECENTLY_RESET_CAPACITY` reset streams, so
+  `H2StreamTable::was_reset_locally` still recognises it, and one read-side
+  branch of `ConnectionH2::handle_header_state` ignores the DATA and HEADERS
+  frames (with their CONTINUATION frames) the peer sent before reading the
+  reset (RFC 9113 §5.1), on a tracked or a retired stream alike
+  (sozu-proxy/sozu#1751, sozu-proxy/sozu#1783). A header block is still
+  decoded whole for HPACK. Two header blocks per stream and DATA within the
+  stream's receive window count no glitch; each block beyond two, and DATA
+  beyond the window, count one.
   Pinned by `frames_on_a_backend_stream_sozu_reset_are_ignored`,
   `frames_on_a_client_stream_sozu_reset_are_ignored`,
   `data_on_a_reset_backend_stream_counts_a_glitch_beyond_its_window_only`,
@@ -1531,7 +1535,7 @@ kept in lock-step:
   `header_blocks_on_a_reset_backend_stream_beyond_two_count_glitches`,
   `a_continuation_of_a_refused_header_block_is_discarded_with_it`,
   `a_refused_header_block_counts_its_first_fragment_toward_its_size` (`h2.rs`)
-  and `reset_by_us_outlives_eviction_for_the_last_streams_only`
+  and `was_reset_locally_survives_removal_within_the_bound`
   (`h2_stream_table.rs`).
 - **MadeYouReset queued cap** via `H2ControlTx`'s lifetime counter (capped at
   `MAX_PENDING_RST_STREAMS = 200`, `h2_control_tx.rs`). Each freshly queued RST
@@ -1866,6 +1870,39 @@ empty line were written after the body. Pinned by
 `a_length_framed_trailer_block_reaches_an_h2_peer` (`converter.rs`),
 `handle_trailer_filters_and_keeps_a_length_framed_block` (`pkawa.rs`) and
 `test_h2_length_framed_request_trailers_keep_h1_backend_framing`
+(`e2e/src/tests/h2_security_header_injection.rs`).
+
+**No end-of-body framing or trailer section follows the head of a response
+without a body towards an H1 client.** A response to HEAD, a 204 or a 304 has no body by definition
+(RFC 9110 §9.3.2, §15.3.5, §15.4.5), and an H1 client reads it as ending with
+its header section whatever its framing fields say (RFC 9112 §6.3 rule 1), so
+any byte after the head is read as the next response on a keep-alive
+connection. An H2 backend that sends such a header section without
+END_STREAM and without `content-length` gets chunked framing from
+`pkawa::handle_header`, and the end of its stream, an empty DATA frame or a
+trailer HEADERS frame, queues `Flags` that kawa's H1 serializer writes as the
+last chunk `0\r\n`, the trailer fields and an empty line. For a
+`Position::Server` pass whose `HttpContext` holds a HEAD method or a 204 or
+304 status (`ConnectionH1::response_has_no_body`), `ConnectionH1::writable`
+calls `ConnectionH1::drop_bodiless_response_framing` after
+`drop_length_framed_trailers` and before its `kawa.prepare`: every block
+after the header section (the last queued `StatusLine` up to its first
+closing `Flags { end_header }`, or the whole queue once the head is written) loses
+its `Header` fields and its `Flags` lose `end_body`, `end_chunk` and
+`end_header`, so for a stream ended by a trailer HEADERS frame or an empty
+DATA frame nothing is written after the head. Each dropped trailer
+block logs a `warn!` and increments `h2.trailers_dropped_no_body`; a
+`Content-Length`-framed one is still dropped and counted by
+`drop_length_framed_trailers` first. The `Transfer-Encoding: chunked` field
+`pkawa::handle_header` adds to such a head is still written. A known gap
+remains: DATA carrying a payload on such a response is still written after the
+head (with a chunk-size line under chunked framing), because
+`ConnectionH2::content_length_exempt` (`h2.rs`) skips the `content-length`
+mismatch reset for HEAD, 204 and 304 and the chunks are not removed here. Pinned by
+`a_bodiless_response_writes_nothing_after_its_head_to_an_h1_client`,
+`a_bodiless_response_trailer_block_queued_after_its_head_is_dropped`,
+`a_response_has_no_body_for_head_204_and_304_only` (`h1.rs`) and
+`test_h2_bodiless_response_trailers_keep_h1_client_framing`
 (`e2e/src/tests/h2_security_header_injection.rs`).
 
 ### 8.5 Stale-upstream replay (`ReplayOnFreshBackend`)
@@ -2610,7 +2647,7 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
 
     - **The accumulator can still leak `is_in_progress() == true` across
       streams if a READ-side early return skips retiring it.**
-      `handle_headers_frame`'s RFC 9113 §5.3.1 PRIORITY self-dependency
+      `handle_headers_frame`'s RFC 7540 §5.3.1 PRIORITY self-dependency
       branch (`reset_stream` + `remove_dead_stream`, then `return`) used to
       do exactly that: when the aborted stream's block had gone through
       CONTINUATION reassembly, the flag stayed `true`, and the NEXT HEADERS

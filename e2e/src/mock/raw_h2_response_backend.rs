@@ -57,6 +57,11 @@ struct RawResponse {
     /// Delay between HEADERS and the first DATA frame. Only consulted
     /// when [`Self::body`] is `Some`.
     body_delay: Duration,
+    /// Optional trailer fields. When `Some`, HEADERS is sent without
+    /// END_STREAM, the body DATA frames (if any) keep END_STREAM clear,
+    /// and a trailer HEADERS frame carrying these pairs, possibly none,
+    /// ends the stream.
+    trailers: Option<Vec<(Vec<u8>, Vec<u8>)>>,
 }
 
 impl Default for RawResponse {
@@ -66,6 +71,7 @@ impl Default for RawResponse {
             extra_headers: Vec::new(),
             body: None,
             body_delay: Duration::ZERO,
+            trailers: None,
         }
     }
 }
@@ -134,7 +140,8 @@ impl RawH2ResponseBackend {
                         len < (1 << 24),
                         "raw h2 response header block larger than 24-bit payload_len"
                     );
-                    let has_body = response_snapshot.body.is_some();
+                    let has_trailers = response_snapshot.trailers.is_some();
+                    let has_body = response_snapshot.body.is_some() || has_trailers;
                     let headers_flags: u8 = if has_body { 0x04 } else { 0x04 | 0x01 };
                     out.push((len >> 16) as u8);
                     out.push((len >> 8) as u8);
@@ -170,13 +177,32 @@ impl RawH2ResponseBackend {
                             frame.push((chunk_len >> 8) as u8);
                             frame.push(chunk_len as u8);
                             frame.push(0x00); // DATA
-                            frame.push(if is_last { 0x01 } else { 0x00 });
+                            frame.push(if is_last && !has_trailers { 0x01 } else { 0x00 });
                             frame.extend_from_slice(&1u32.to_be_bytes());
                             frame.extend_from_slice(chunk);
                             let _ = stream.write_all(&frame).await;
                             let _ = stream.flush().await;
                             emitted = end;
                         }
+                    }
+
+                    // Trailer HEADERS frame: END_HEADERS | END_STREAM.
+                    if let Some(trailers) = response_snapshot.trailers.as_ref() {
+                        let mut block = Vec::new();
+                        for (name, value) in trailers {
+                            encode_literal(&mut block, name, value);
+                        }
+                        let len = block.len();
+                        let mut frame = Vec::with_capacity(9 + len);
+                        frame.push((len >> 16) as u8);
+                        frame.push((len >> 8) as u8);
+                        frame.push(len as u8);
+                        frame.push(0x01); // HEADERS
+                        frame.push(0x04 | 0x01);
+                        frame.extend_from_slice(&1u32.to_be_bytes());
+                        frame.extend_from_slice(&block);
+                        let _ = stream.write_all(&frame).await;
+                        let _ = stream.flush().await;
                     }
 
                     // Give sozu time to consume the response before we FIN.
@@ -227,6 +253,13 @@ impl RawH2ResponseBackend {
         let mut response = self.response.lock().unwrap();
         response.body = Some(body.into());
         response.body_delay = delay;
+    }
+
+    /// End subsequent responses with a trailer HEADERS frame carrying
+    /// `trailers` (possibly none), or with END_STREAM on the last HEADERS
+    /// or DATA frame when `None`.
+    pub fn set_trailers(&self, trailers: Option<Vec<(Vec<u8>, Vec<u8>)>>) {
+        self.response.lock().unwrap().trailers = trailers;
     }
 
     #[allow(dead_code)]
