@@ -358,8 +358,8 @@
   KiB on a registered stream and drives `writable()` until the client has decrypted all of it,
   asserting byte equality rather than a call count.
   `force_disconnect_over_a_real_rustls_frontend_waits_for_the_records_to_drain`,
-  `a_rustls_frontend_in_error_state_re_arms_until_its_records_drain` and
-  `a_rustls_frontend_in_goaway_re_arms_until_its_records_drain` drive `force_disconnect`'s server
+  `a_rustls_frontend_in_error_state_stays_open_until_its_records_drain` and
+  `a_rustls_frontend_in_goaway_stays_open_until_its_records_drain` drive `force_disconnect`'s server
   arm, `writable`'s `(H2State::Error, Position::Server)` arm and `writable`'s `H2State::GoAway` arm
   over that handler, each asserting both outcomes on ONE connection whose only change between them
   is whether the peer read. The GoAway one also asserts the connection is still in `H2State::GoAway`:
@@ -1977,7 +1977,7 @@
   (`a_flush_that_does_not_drain_keeps_the_connection_open`); returning `Continue` right after the
   `flush_tls_records()` in `writable`'s `H2WritableStateTarget::Flush` arm gives
   `1115 passed; 2 failed`; `error_close_action(false)` gives `1116 passed; 1 failed`
-  (`a_rustls_frontend_in_error_state_re_arms_until_its_records_drain`); and pinning
+  (`a_rustls_frontend_in_error_state_stays_open_until_its_records_drain`); and pinning
   `goaway_close_action(AfterFlush, false, …)`'s third argument to `false` gives
   `1115 passed; 2 failed`. Each failed on the assertion message its recipe names. The three stale
   `1113`/`1114` counts they carried were measured against a 1115-test suite and are corrected.
@@ -1990,7 +1990,7 @@
   line, and it now reads `12`. One comment in `h2.rs` said the
   `(H2State::Error, Position::Server)` arm's post-flush query was **Uncovered**; that was already
   wrong before this changeset renamed what it points at —
-  `a_rustls_frontend_in_error_state_re_arms_until_its_records_drain` has driven it since
+  `a_rustls_frontend_in_error_state_stays_open_until_its_records_drain` has driven it since
   sozu-proxy/sozu#1454 — and it is corrected in place.
 
 - **`refactor(mux-h2)`: lift the two H2 byte movers out of the core, widen the poll/handle seam to
@@ -3868,6 +3868,25 @@
 
 ### 🐛 Fixed
 
+- **`fix(socket)`: an interrupted TLS write is retried, and every TLS write error marks the channel
+  dead.** `flush_tls` (`lib/src/socket.rs`) now retries a write the kernel interrupted (`EINTR`),
+  as the relay and the UDP path already do; it used to fall into the generic error arm, which
+  answered `Error` and, since [#1787](https://github.com/sozu-proxy/sozu/pull/1787), marked the
+  channel dead. `FrontRustls::socket_write` and `socket_write_vectored` now set `peer_reset` on
+  every `SocketResult::Error` they return, instead of only in the socket-error arms: a rustls
+  writer failure and the write loop's budget returned `Error` with the records still reading as
+  pending, so a session could only close on its timeout. Covered by `an_interrupted_tls_write_is_retried`
+  and one test per write path (`an_empty_tls_flush_that_meets_a_socket_error_marks_the_channel_dead`,
+  `a_vectored_tls_write_that_meets_a_socket_error_marks_the_channel_dead`,
+  `a_partial_vectored_tls_write_that_meets_a_socket_error_marks_the_channel_dead`,
+  `an_empty_vectored_tls_flush_that_meets_a_socket_error_marks_the_channel_dead`). The H2 refused-write
+  rule of [#1788](https://github.com/sozu-proxy/sozu/issues/1788) gains
+  `a_refused_control_frame_drain_leaves_writable_to_the_kernel` and
+  `a_refused_stream_write_leaves_writable_to_the_kernel` (`lib/src/protocol/mux/h2.rs`), which pin
+  the refusal records of `consume_output_flush` and `handle_write`; the real-rustls `GoAway`/`Error`
+  tests are renamed `a_rustls_frontend_in_error_state_stays_open_until_its_records_drain` and
+  `a_rustls_frontend_in_goaway_stays_open_until_its_records_drain`.
+
 - **`fix(mux)`: stop spinning the session loop when a TLS HTTP/2 client stops reading
   ([#1788](https://github.com/sozu-proxy/sozu/issues/1788)).** `ConnectionH2::ensure_tls_flushed`
   (`lib/src/protocol/mux/h2.rs`) re-raised the WRITABLE event whenever rustls still held records,
@@ -3884,8 +3903,8 @@
   (`lib/src/protocol/mux/mod.rs`) calling the refused flush until `MAX_LOOP_ITERATIONS`; that loop
   now stops once the refused write leaves no WRITABLE event. Behaviour change in the tests: the
   stalled control-frame drain tests now stall on a write the kernel did not refuse, and the
-  real-rustls `GoAway`/`Error` tests assert that the refused pass queues no event and that the pass
-  the kernel edge triggers flushes and closes. Documented in `lib/src/protocol/mux/LIFECYCLE.md`.
+  real-rustls `GoAway`/`Error` tests assert that the refused pass queues no event and, once the
+  records have drained, that the next pass closes. Documented in `lib/src/protocol/mux/LIFECYCLE.md`.
   Covered by `test_tls_h2_stalled_reader_does_not_exhaust_loop_budget`
   (`e2e/src/tests/h2_tests.rs`), which checks the whole 32 MiB body arrives once the client reads
   again, and `a_refused_goaway_flush_waits_for_the_kernel_edge_then_closes`
