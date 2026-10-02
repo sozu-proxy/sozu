@@ -118,7 +118,6 @@ use crate::{
         parser::compare_no_case,
     },
     router::{HeaderEdit, RouteResult},
-    server::CONN_RETRIES,
     socket::SessionTcpStream,
 };
 
@@ -235,6 +234,9 @@ pub(super) struct RoutingView<'a> {
     /// Whether the backend a pooled connection was dialled to has left the
     /// configuration. `None` treats every backend as current.
     backend_retired: Option<&'a dyn Fn(&BackendId) -> bool>,
+    /// The worker's backend connection attempt budget, for a cluster that
+    /// sets no `max_connection_attempts` of its own.
+    max_connection_attempts: u32,
 }
 
 impl<'a> RoutingView<'a> {
@@ -246,7 +248,26 @@ impl<'a> RoutingView<'a> {
             clusters,
             listener_kind,
             backend_retired: None,
+            max_connection_attempts: sozu_command::config::DEFAULT_MAX_CONNECTION_ATTEMPTS,
         }
+    }
+
+    /// Use `attempts` as the backend connection attempt budget of a request
+    /// whose cluster sets none: the worker's global value,
+    /// `SessionManager::max_connection_attempts` (`lib/src/server.rs`).
+    pub(super) fn with_max_connection_attempts(mut self, attempts: u32) -> Self {
+        self.max_connection_attempts = attempts;
+        self
+    }
+
+    /// The backend connection attempt budget of a request routed to
+    /// `cluster_id`: the cluster's own `max_connection_attempts` when it sets
+    /// one, the worker's otherwise (sozu-proxy/sozu#1800).
+    fn max_connection_attempts(&self, cluster_id: Option<&str>) -> u32 {
+        cluster_id
+            .and_then(|cluster_id| self.cluster(cluster_id))
+            .and_then(|cluster| cluster.max_connection_attempts)
+            .unwrap_or(self.max_connection_attempts)
     }
 
     /// Answer the pool-reuse scan's question "is this connection's backend
@@ -621,7 +642,11 @@ impl Router {
         context
             .debug
             .push(DebugEvent::Str(stream.context.get_route()));
-        if stream.attempts >= CONN_RETRIES {
+        // The budget is resolved from the cluster the previous attempt routed
+        // to. The first attempt has none yet, and needs none: every budget
+        // allows at least one attempt.
+        let max_attempts = view.max_connection_attempts(stream.context.cluster_id.as_deref());
+        if u32::from(stream.attempts) >= max_attempts {
             incr!(
                 names::backend::CONNECT_RETRIES_EXHAUSTED,
                 stream.context.cluster_id.as_deref(),
@@ -4551,6 +4576,7 @@ mod backend_selector_tests {
                 backends: &mut backends,
                 registry: &mut self.registry,
                 now: self.now,
+                exclude: &[],
             };
             let backend = self
                 .router

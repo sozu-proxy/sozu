@@ -1289,6 +1289,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             trace!("{} Reuse stream: {}", log_module_context!(), stream_id);
             stream.state = StreamState::Idle;
             stream.attempts = 0;
+            stream.tried_backends.clear();
             stream.front_received_end_of_stream = false;
             stream.back_received_end_of_stream = false;
             stream.front_data_received = 0;
@@ -1570,6 +1571,123 @@ impl MuxTimeouts {
 /// itself, in the dead-backend sweep of `Mux::ready_inner`, and `Mux::close`
 /// clears the whole index, so the index stays bounded by the session's live
 /// backend connections.
+/// [`connect_outcome`] against the three states a dialled socket can be in
+/// when sozu sees WRITABLE on it (sozu-proxy/sozu#1800).
+#[cfg(test)]
+mod connect_outcome_tests {
+    use std::{
+        net::{SocketAddr, TcpListener},
+        os::fd::AsRawFd,
+        time::{Duration, Instant},
+    };
+
+    use super::{ConnectOutcome, connect_outcome};
+
+    /// Poll `connect_outcome` until it leaves `Pending` or `deadline` passes.
+    fn settle(socket: &mio::net::TcpStream, deadline: Duration) -> ConnectOutcome {
+        let started = Instant::now();
+        loop {
+            let outcome = connect_outcome(socket);
+            if outcome != ConnectOutcome::Pending || started.elapsed() >= deadline {
+                return outcome;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn an_accepted_dial_is_connected() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = mio::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        assert_eq!(
+            settle(&socket, Duration::from_secs(2)),
+            ConnectOutcome::Connected
+        );
+    }
+
+    #[test]
+    fn a_refused_dial_failed() {
+        let address: SocketAddr = {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        // A loopback refusal may also be reported by `connect(2)` itself, in
+        // which case there is no socket to read the outcome from.
+        let Ok(socket) = mio::net::TcpStream::connect(address) else {
+            return;
+        };
+        assert_eq!(
+            settle(&socket, Duration::from_secs(2)),
+            ConnectOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn a_dial_nobody_answers_is_pending() {
+        // A full accept queue drops the SYN, so the dial stays in flight.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        // SAFETY: shrinks the backlog of a socket this test owns.
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        let address = listener.local_addr().unwrap();
+        let mut queued = Vec::new();
+        while let Ok(stream) =
+            std::net::TcpStream::connect_timeout(&address, Duration::from_millis(300))
+        {
+            queued.push(stream);
+            assert!(queued.len() < 16, "the accept queue never filled");
+        }
+        let socket = mio::net::TcpStream::connect(address).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(connect_outcome(&socket), ConnectOutcome::Pending);
+    }
+}
+
+/// Where the non-blocking `connect(2)` behind a connecting backend socket
+/// stands when its readiness carries WRITABLE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectOutcome {
+    /// The connection is established.
+    Connected,
+    /// The connect is still in progress: the WRITABLE was not the kernel's
+    /// completion edge but one sozu raised itself (`Readiness::
+    /// signal_pending_write` to flush queued output). The completion edge is
+    /// still to come.
+    Pending,
+    /// The connect failed.
+    Failed,
+}
+
+/// Read the outcome of the non-blocking `connect(2)` behind `socket`.
+///
+/// The kernel reports it through the socket's pending error (`SO_ERROR`,
+/// POSIX `connect(2)`): a WRITABLE edge means the attempt finished, not that
+/// it succeeded, and reading the error clears it. An empty error proves
+/// nothing alone, because the WRITABLE may be one sozu signalled itself while
+/// the dial is still in flight, so `getpeername(2)` then tells an
+/// established connection from a pending one (`ENOTCONN`). An error reading
+/// either is a failed connect: nothing past it could use the socket
+/// (sozu-proxy/sozu#1800).
+fn connect_outcome(socket: &TcpStream) -> ConnectOutcome {
+    match socket.take_error() {
+        Ok(None) => {}
+        Ok(Some(error)) | Err(error) => {
+            // The level of the synchronous refusal the pending-links loop
+            // of `Mux::ready_inner` logs before it retries.
+            debug!(
+                "{} backend connect failed, retrying: {}",
+                log_module_context!(),
+                error
+            );
+            return ConnectOutcome::Failed;
+        }
+    }
+    match socket.peer_addr() {
+        Ok(_) => ConnectOutcome::Connected,
+        Err(error) if error.kind() == ErrorKind::NotConnected => ConnectOutcome::Pending,
+        Err(_) => ConnectOutcome::Failed,
+    }
+}
+
 pub(super) fn remove_backend_stream(
     index: &mut InlineTokenMap<LinkedStreams>,
     token: Token,
@@ -1692,6 +1810,19 @@ fn consult_ip_gate(
 impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Mux<Front, L> {
     pub fn front_socket(&self) -> &TcpStream {
         self.frontend.socket()
+    }
+
+    /// Whether a backend connection carries a HUP or ERROR event that no
+    /// socket readiness will deliver again: the flag `Mux::timeout_inner`
+    /// sets on a dial whose connect timed out. The session answers
+    /// `ProxySession::needs_ready_pass` with this, so `Server::timeout` runs
+    /// the `ready` pass that counts the failure and fails the request over
+    /// (sozu-proxy/sozu#1800).
+    pub fn has_pending_backend_failure(&self) -> bool {
+        self.router.backends.iter().any(|(_, backend)| {
+            let event = backend.readiness().event;
+            event.is_error() || event.is_hup()
+        })
     }
 
     /// Whether the client has closed its side of the frontend connection, the
@@ -2428,15 +2559,17 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         // before `add_session` and `register_socket` borrow the proxy below.
         let backend = {
             let mut backends = backends.borrow_mut();
+            let stream = &mut context.streams[stream_id];
             let mut selector = RegistrySelector {
                 backends: &mut backends,
                 registry: backend_registry,
                 now: context.now,
+                exclude: &stream.tried_backends,
             };
             router.backend_from_request(
                 &cluster_id,
                 frontend_should_stick,
-                &mut context.streams[stream_id].context,
+                &mut stream.context,
                 &mut selector,
             )?
         };
@@ -2453,6 +2586,9 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     slot: backend.slot(),
                     change: BackendChange::DialFailed(context.now),
                 });
+                context.streams[stream_id]
+                    .tried_backends
+                    .push(backend.address);
                 // The count the backend will hold once the delta is applied,
                 // as `Backend::try_connect`'s error reported it.
                 let failures = backend_registry
@@ -2774,6 +2910,32 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 self.router.dead_backends.clear();
                 let mut backend_close: Option<(&'static str, Token)> = None;
                 for (token, client) in self.router.backends.iter_mut() {
+                    // A WRITABLE on a connecting socket is not proof it
+                    // connected: a dial that failed can surface as WRITABLE
+                    // alone, its error in `SO_ERROR`, and sozu raises
+                    // WRITABLE itself to flush queued output, as an HTTP/2
+                    // backend's preface, while the dial is still in flight.
+                    // Read the outcome before the WRITABLE arm below would
+                    // mark the connection established: a failure takes the
+                    // same connect-failure branch as a refused dial, a dial
+                    // still in flight waits for the kernel's completion edge
+                    // (sozu-proxy/sozu#1800).
+                    if client.readiness().event.is_writable()
+                        && matches!(
+                            client.position(),
+                            Position::Client(_, _, BackendStatus::Connecting(_))
+                        )
+                    {
+                        match connect_outcome(client.socket()) {
+                            ConnectOutcome::Connected => {}
+                            ConnectOutcome::Pending => {
+                                client.readiness_mut().event.remove(Ready::WRITABLE);
+                            }
+                            ConnectOutcome::Failed => {
+                                client.readiness_mut().event.insert(Ready::ERROR);
+                            }
+                        }
+                    }
                     let readiness = client.readiness_mut();
                     // Check the raw event for HUP/ERROR — not filter_interest(),
                     // because interest only contains READABLE|WRITABLE and would
@@ -3011,6 +3173,16 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                     });
                                 }
                                 drop(backend_borrow);
+                                // Every stream this dial carried failed to
+                                // reach `backend`: a retry of any of them
+                                // prefers another one (sozu-proxy/sozu#1800).
+                                if let Some(ids) = self.context.backend_streams.get(token) {
+                                    for &stream_id in ids.iter() {
+                                        self.context.streams[stream_id]
+                                            .tried_backends
+                                            .push(backend.address);
+                                    }
+                                }
                                 trace!(
                                     "{} connection fail: {:?}",
                                     log_context_lite!(self),
@@ -3274,9 +3446,20 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     continue;
                 }
                 // Before the first request triggers a stream Link, the frontend timeout is set
-                // to a shorter request_timeout, here we switch to the longer nominal timeout
-                self.frontend
-                    .set_timeout_duration(self.configured_frontend_timeout, context.now);
+                // to a shorter request_timeout, here we switch to the longer nominal timeout.
+                //
+                // Only on a request's first link. A re-link — failover after a
+                // failed dial, a stale-upstream replay — keeps the deadline armed
+                // then, so `front_timeout` bounds the whole failover: re-arming it
+                // on every attempt let a request spend `max_connection_attempts`
+                // times `connect_timeout` before any answer. When it expires
+                // during failover, the frontend-timeout branch of
+                // `Mux::timeout_inner` answers as for any request still waiting on
+                // a backend (sozu-proxy/sozu#1800).
+                if stream.attempts == 0 {
+                    self.frontend
+                        .set_timeout_duration(self.configured_frontend_timeout, context.now);
+                }
                 let front_readiness = self.frontend.readiness_mut();
                 dirty = true;
                 // Settle the ledger before the ONLY reader of backend load
@@ -3303,8 +3486,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 let proxy_ref = proxy.borrow();
                 let backend_registry = &self.backend_registry;
                 let retired = |backend: &BackendId| backend_registry.is_retired(backend);
+                let max_connection_attempts = proxy_ref.sessions().borrow().max_connection_attempts;
                 let view = router::RoutingView::new(proxy_ref.clusters(), proxy_ref.kind())
-                    .with_backend_retired(&retired);
+                    .with_backend_retired(&retired)
+                    .with_max_connection_attempts(max_connection_attempts);
                 match self
                     .router
                     .plan_connect(stream_id, context, &view)
@@ -3433,6 +3618,23 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 set_default_answer(stream, front_readiness, code, &answers);
                             }
 
+                            // `connect(2)` itself failed: the dial was refused
+                            // before it could be registered. `Mux::dial_backend`
+                            // recorded the failure and the address; like a dial
+                            // refused later, the request goes to another
+                            // backend while its attempts last, and
+                            // `Router::plan_connect` answers 503 once they are
+                            // spent (sozu-proxy/sozu#1800). The stream is still
+                            // `Link`.
+                            BE::Backend(BackendError::ConnectionFailures { ref error, .. }) => {
+                                debug!(
+                                    "{} backend connect failed, retrying: {}",
+                                    log_module_context!(stream.context),
+                                    error
+                                );
+                                debug_assert_eq!(stream.state, StreamState::Link);
+                                context.pending_links.push_back(stream_id);
+                            }
                             BE::Backend(ref e) => {
                                 error!("{} backend connection error: {}", log_module_context!(), e);
                                 set_default_answer(stream, front_readiness, 503, &answers);
@@ -3497,8 +3699,9 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         context.debug.push(DebugEvent::CCF(stream_id, error));
                     }
                 }
-                // All routing error arms now set a default answer, transitioning
-                // the stream out of Link state. No re-enqueue needed.
+                // Every routing error arm sets a default answer, moving the
+                // stream out of Link state, except a failed `connect(2)`,
+                // which re-queues it above for another backend.
             }
             if !dirty {
                 break;
@@ -3740,6 +3943,35 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 log_context_lite!(self),
                 backend
             );
+            // A dial still `Connecting` when its timer fires is the
+            // `connect_timeout` armed by `Mux::dial_backend`: the backend
+            // accepted nothing, so no byte of any request reached it. That is
+            // a backend connect failure exactly like a refused dial, and it
+            // takes the same path: flag the connection dead as the kernel
+            // flags a refused one, and let `ready_inner`'s dead-backend branch
+            // count the failure (`failures`, `retry_policy`, `backend.down`),
+            // close the connection and re-queue its streams for another
+            // backend through `end_stream_decision`'s `Reconnect`. Answering
+            // 504 here left the failure uncounted, so the load balancer kept
+            // choosing the dead backend (sozu-proxy/sozu#1800).
+            //
+            // The pass that does this runs right after this timeout:
+            // `Mux::has_pending_backend_failure` reports the flag and
+            // `Server::timeout` calls `ready` on it (`ProxySession::
+            // needs_ready_pass`). Nothing is re-armed for this backend: that
+            // pass removes it.
+            if matches!(
+                backend.position(),
+                Position::Client(_, _, BackendStatus::Connecting(_))
+            ) {
+                debug!(
+                    "{} backend connect timeout on {:?}, failing over",
+                    log_context_lite!(self),
+                    token
+                );
+                backend.readiness_mut().event.insert(Ready::ERROR);
+                return StateResult::Continue;
+            }
             let front_readiness = self.frontend.readiness_mut();
             let linked_ids: Vec<GlobalStreamId> = self
                 .context
@@ -4139,6 +4371,10 @@ struct RegistrySelector<'a> {
     /// windows and connection-time decay against it rather than reading a
     /// clock (#1684).
     now: Instant,
+    /// The backends the stream being linked already failed to connect to,
+    /// [`Stream::tried_backends`]: selection prefers any other one
+    /// (sozu-proxy/sozu#1800).
+    exclude: &'a [std::net::SocketAddr],
 }
 
 impl router::BackendSelector for RegistrySelector<'_> {
@@ -4149,12 +4385,18 @@ impl router::BackendSelector for RegistrySelector<'_> {
         key: Option<u64>,
     ) -> Result<router::SelectedBackend, BackendError> {
         let handle = match affinity {
-            router::Affinity::Sticky(Some(cookie)) => self
-                .backends
-                .reserve_sticky_backend(cluster_id, cookie, key, self.now)?,
-            router::Affinity::Sticky(None) | router::Affinity::Unpinned => {
-                self.backends.reserve_backend(cluster_id, key, self.now)?
+            router::Affinity::Sticky(Some(cookie)) => {
+                self.backends.reserve_sticky_backend_excluding(
+                    cluster_id,
+                    cookie,
+                    key,
+                    self.now,
+                    self.exclude,
+                )?
             }
+            router::Affinity::Sticky(None) | router::Affinity::Unpinned => self
+                .backends
+                .reserve_backend_excluding(cluster_id, key, self.now, self.exclude)?,
         };
         let sticky_session = match affinity {
             router::Affinity::Sticky(_) => {
@@ -5262,7 +5504,8 @@ mod tests {
     /// `kawa::Kawa::prepare` contributes nothing, and the buffer is taken so
     /// one capture cannot be replayed twice. That is not a per-REQUEST bound:
     /// `ConnectionH1::start_stream` arms a fresh capture on the next pooled
-    /// attempt, and `CONN_RETRIES` is what bounds the request as a whole.
+    /// attempt, and `max_connection_attempts` is what bounds the request as a
+    /// whole.
     ///
     /// To SEE THIS RED: make `Stream::queue_upstream_replay` clone the buffer
     /// instead of taking it.
@@ -6496,6 +6739,73 @@ mod tests {
         );
     }
 
+    /// Move a client connection built `Connecting` to `Connected`, as the
+    /// WRITABLE edge of an established dial does in `Mux::ready_inner`.
+    fn mark_connected(h1: &mut ConnectionH1<SessionTcpStream>) {
+        let Position::Client(_, _, status) = &mut h1.position else {
+            unreachable!("a backend connection is in client position")
+        };
+        *status = BackendStatus::Connected;
+    }
+
+    /// A backend timer that fires while the dial is still `Connecting` is a
+    /// connect timeout (sozu-proxy/sozu#1800): no byte reached the backend,
+    /// so the request is neither answered 504 nor unlinked here. The
+    /// connection is flagged dead as a refused dial is, its streams stay
+    /// linked for the `ready` pass that counts the failure and re-links them,
+    /// and the session asks for that pass.
+    ///
+    /// To SEE THIS RED: delete the `Connecting` early return from the
+    /// backend-token branch of `Mux::timeout_inner`.
+    #[test]
+    fn a_connect_timeout_flags_the_dial_dead_instead_of_answering_504() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut mux, _peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));
+        let mut metrics = SessionMetrics::new(None);
+        let backend_token = Token(1);
+
+        let (mut connection, _backend_peer) =
+            test_backend_connection(&mut mux, Duration::from_secs(3));
+        let Connection::H1(h1) = &mut connection else {
+            unreachable!("new_h1_client builds an H1 connection")
+        };
+        h1.stream = Some(0);
+        assert!(
+            matches!(
+                h1.position,
+                Position::Client(_, _, BackendStatus::Connecting(_))
+            ),
+            "precondition: the dial has not completed"
+        );
+        park_backend_deadline(&mut connection, Instant::now() - Duration::from_secs(1));
+        mux.router.backends.insert(backend_token, connection);
+        mux.reschedule();
+        mux.context.link_stream(0, backend_token);
+        assert!(!mux.has_pending_backend_failure());
+
+        let result = mux.timeout(backend_token, &mut metrics);
+
+        assert_eq!(result, StateResult::Continue, "the session stays open");
+        assert!(
+            mux.has_pending_backend_failure(),
+            "the dial is flagged dead for the ready pass"
+        );
+        assert_eq!(
+            mux.context.streams[0].state,
+            StreamState::Linked(backend_token),
+            "the stream stays linked until the ready pass re-links it"
+        );
+        assert_eq!(
+            mux.context.streams[0].context.access_log_message, None,
+            "no backend_timeout answer"
+        );
+        assert!(
+            mux.context.streams[0].back.blocks.is_empty()
+                && mux.context.streams[0].back.out.is_empty(),
+            "no default answer was written"
+        );
+    }
+
     /// An H1 backend connection on a live loopback socket, plus the peer the
     /// caller must keep alive.
     fn test_backend_connection(
@@ -6567,6 +6877,11 @@ mod tests {
             unreachable!("new_h1_client builds an H1 connection")
         };
         h1.stream = Some(0);
+        // A backend that has sent part of a response is connected. Left
+        // `Connecting`, as `new_h1_client` builds it, the timer would be a
+        // connect timeout, which fails the request over instead
+        // (sozu-proxy/sozu#1800).
+        mark_connected(h1);
         // Due, not early: the entry really elapsed.
         park_backend_deadline(&mut connection, Instant::now() - Duration::from_secs(1));
         mux.router.backends.insert(backend_token, connection);
@@ -6630,6 +6945,9 @@ mod tests {
             unreachable!("new_h1_client builds an H1 connection")
         };
         h1.stream = Some(0);
+        // A backend whose response was fully proxied is connected; see
+        // `a_backend_timeout_leaves_no_linked_stream_behind_on_the_close_path`.
+        mark_connected(h1);
         park_backend_deadline(&mut connection, Instant::now() - Duration::from_secs(1));
         mux.router.backends.insert(backend_token, connection);
         mux.reschedule();

@@ -93,7 +93,8 @@ impl Request {
             | RequestType::SetMaxConnectionsPerIp(_)
             | RequestType::QueryMaxConnectionsPerIp(_)
             | RequestType::SetMaxConnectionsPerSubnet(_)
-            | RequestType::QueryMaxConnectionsPerSubnet(_) => {}
+            | RequestType::QueryMaxConnectionsPerSubnet(_)
+            | RequestType::SetMaxConnectionAttempts(_) => {}
 
             // the Add***Listener / Update***Listener and other Listener orders will be
             // handled separately by the notify_proxys function, so we don't give them

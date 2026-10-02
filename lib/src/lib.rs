@@ -432,6 +432,17 @@ pub trait ProxySession {
     fn session_address(&self) -> Option<SocketAddr> {
         None
     }
+    /// Whether the session has work that only a [`Self::ready`] pass can do
+    /// although no socket event will arrive to trigger one.
+    ///
+    /// Asked by `Server::timeout` after a timeout that left the session open.
+    /// A backend whose connect timed out is the case: the timer is the only
+    /// signal a blackholed dial ever produces, and failing it over to another
+    /// backend (dialling, registering the new socket) needs the `ready` path
+    /// (sozu-proxy/sozu#1800).
+    fn needs_ready_pass(&self) -> bool {
+        false
+    }
 }
 
 #[macro_export]

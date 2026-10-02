@@ -78,8 +78,8 @@ pub mod backend {
     /// with the cluster and the STALE backend — the one that did not answer.
     ///
     /// One request can increment this more than once: the replay goes back
-    /// through `Router::plan_connect`, so `CONN_RETRIES` bounds the total, not
-    /// this counter.
+    /// through `Router::plan_connect`, so the cluster's
+    /// `max_connection_attempts` bounds the total, not this counter.
     ///
     /// Read it as "an upstream went away before answering", NOT as "the pool
     /// held a closed socket". sozu cannot tell those apart: a backend that

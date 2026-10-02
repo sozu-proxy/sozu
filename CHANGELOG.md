@@ -3953,6 +3953,75 @@
 
 ### 🐛 Fixed
 
+- **BREAKING (library API, default change) — `fix(mux)`: a backend connect timeout fails over to
+  another backend instead of answering 504
+  ([#1800](https://github.com/sozu-proxy/sozu/issues/1800)).** A backend that accepted no
+  connection (blackholed: SYN dropped, accept queue full) hit `connect_timeout` and the request was
+  answered `504`; the timeout path marked the connection `Disconnecting`, so the dead-backend
+  branch that counts a connect failure never saw it, `can_open()` stayed true and the load
+  balancer kept choosing the dead backend (3 healthy and 3 blackholed backends, round robin: half
+  the requests answered `504`, forever). A connect timeout is now a backend connect failure like a
+  refused dial: `Mux::timeout_inner` flags the connecting connection's readiness `ERROR`,
+  `Server::timeout` runs the `ready` pass that only it can trigger (new
+  `ProxySession::needs_ready_pass`), and the existing dead-backend branch counts the failure
+  (`failures`, `retry_policy`, `backend.connections.error`, `backend.down`), closes the
+  connection and re-links the request, which sent no byte, through `EndStreamAction::Reconnect`.
+  The same holds for HTTP/1.1 and HTTP/2 frontends and for `http2 = true` clusters. `504` stays
+  the answer to a response timeout after the connection was established. Related fixes on the
+  same path:
+  - a WRITABLE event on a connecting socket no longer marks it connected unconditionally: its
+    `SO_ERROR` (`take_error`) is read first, an error is a connect failure, and a socket
+    `getpeername(2)` still reports as connecting (a WRITABLE Sōzu raised itself, as for an
+    HTTP/2 backend's preface) waits for the kernel's completion edge — an HTTP/2 backend dial to
+    a blackholed backend used to be marked connected and hang until `back_timeout`;
+  - a synchronous `connect(2)` failure is retried on another backend instead of answered `503`
+    at once;
+  - each retry skips the backends that already failed for the request
+    (`Stream::tried_backends`), under every load-balancing policy, by narrowing the candidate set
+    (`BackendList::select_with_key_excluding`, `BackendMap::reserve_backend_excluding`,
+    `BackendMap::reserve_sticky_backend_excluding`); when every selectable backend was already
+    tried, the selection runs as before, so the request retries one of them;
+  - the retry budget is configurable: global `max_connection_attempts` (TOML, `ServerConfig`
+    field 29, **default 5, was the hard-coded 3**), per-cluster `max_connection_attempts`
+    (`Cluster` field 23, TOML, `sozu cluster add --max-connection-attempts`,
+    `sozu cluster connection-attempts set|unset`, a `max_connection_attempts` column in the
+    cluster table), and at runtime on every worker with `sozu connection-attempts set`
+    (`Request.set_max_connection_attempts`, field 62; not saved, like `connection-limit set`).
+    Values lie in `1..=255`, validated at config load, on `AddCluster` and on the runtime set.
+    The cluster value wins over the global one, for HTTP and TCP clusters. This supersedes the
+    "three connection attempts" of the shuffle-sharding entry above;
+  - the whole failover is bounded by the listener's `front_timeout`: it is armed when a request is
+    first linked to a backend and no longer re-armed on each re-link, so failover cannot run for
+    `max_connection_attempts × connect_timeout`. When it expires during failover the request is
+    answered `504` (`client_timeout_during_response`). Keep `connect_timeout` well below
+    `front_timeout / max_connection_attempts`. On an HTTP/2 frontend the timer is per connection:
+    the first link of every new stream and ordinary frame activity re-arm it, so on a busy HTTP/2
+    connection failover is bounded only by `max_connection_attempts × connect_timeout` (15 s with
+    the defaults), not by `front_timeout`.
+
+  **Status change for alerting:** a request whose every attempted backend is unreachable (connect
+  timeout or refused) is now answered `503`; a connect timeout used to answer `504`. A request
+  arriving while every backend is in its back-off window fails fast with `503`. Alerts on the
+  `504` rate should watch `503`, `backend.connections.error` and
+  `backend.connect.retries_exhausted` instead. With the default budget raised from 3 to 5, an
+  idempotent request written to a stale keep-alive connection can be replayed to up to 4 backends
+  (`n - 1`), against 2 before.
+
+  Library API: `sozu_lib::server::CONN_RETRIES` is removed (use
+  `sozu_command_lib::config::DEFAULT_MAX_CONNECTION_ATTEMPTS` and
+  `SessionManager::max_connection_attempts`); `ProxySession` gains `needs_ready_pass` (default
+  `false`), `Stream` gains `tried_backends`, `SessionManager` gains `max_connection_attempts`, and
+  `Cluster`, `ServerConfig`, `RequestType`, `FileConfig`, `FileClusterConfig`,
+  `HttpClusterConfig` and `TcpClusterConfig` gain the new fields. Upgrade the main process, the
+  workers and the CLI together before setting a per-cluster budget: an older CLI that patches a
+  cluster by read-modify-write drops the field. Documented in `doc/configure.md` ("Backend
+  connection failover"), `doc/configure_cli.md`, `doc/health_checks.md`,
+  `doc/lifetime_of_a_session.md`, `doc/rate-limit-design.md` and `lib/src/protocol/mux/LIFECYCLE.md`
+  §7.3. Covered by `e2e/src/tests/backend_failover_tests.rs` (connect-timeout failover on H1 and H2
+  frontends, H2 backends, refused backends, default budget of 5, per-cluster override and global
+  fallback, runtime changes), the `connect_outcome_tests` and `exclusion_tests` unit tests, and the
+  `max_connection_attempts` config and state tests.
+
 - **`chore(clippy)`: `cargo clippy --all-targets --all-features -- -D warnings` passes on Rust
   1.98 and newer.** Their `clippy::chunks_exact_to_as_chunks` lint rejects `chunks_exact` with a
   constant size. The three hits, the `drain_window_updates_into` unit test in

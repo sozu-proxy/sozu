@@ -332,6 +332,16 @@ identity is moot — the event is about the cluster as a whole).
   when fail-open kicks in, and the `health_check.healthy_backends` gauge drops
   to 0. Use conservative thresholds and the `health_check.down` counter to alert
   on sustained outages.
+- **Health checks and request failover are complementary**: without a health
+  check, a backend is taken out of rotation only by the requests that fail to
+  connect to it — refused, timed out on `connect_timeout`, or reporting a
+  socket error. Each such request is retried on another backend within its
+  `max_connection_attempts` (5 by default), and the failure puts the backend
+  in its retry policy's back-off, but every return from back-off costs one
+  request a connect attempt, and a blackholed backend a full `connect_timeout`.
+  A health check finds it without spending requests. See "Backend connection
+  failover" in [configure.md](./configure.md)
+  ([#1800](https://github.com/sozu-proxy/sozu/issues/1800)).
 - **`TCP` mode sends nothing**: the connect-only probe never writes or reads,
   so it works for any TCP backend, HTTP or not, and cannot be confused by the
   application's answer. It proves only that the backend accepts connections:

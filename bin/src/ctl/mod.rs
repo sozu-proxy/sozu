@@ -233,6 +233,7 @@ impl CommandManager {
             SubCmd::Events => self.events(),
             SubCmd::ConnectionLimit { cmd } => self.connection_limit_command(cmd),
             SubCmd::SubnetConnectionLimit { cmd } => self.subnet_connection_limit_command(cmd),
+            SubCmd::ConnectionAttempts { cmd } => self.connection_attempts_command(cmd),
             #[cfg(feature = "tui")]
             SubCmd::Top {
                 refresh_ms,

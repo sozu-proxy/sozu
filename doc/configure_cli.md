@@ -104,6 +104,34 @@ sozu --config /etc/sozu/config.toml cluster h2 disable --id <my_cluster_id>
 This queries the current cluster configuration, updates the `http2` flag, and re-applies it
 to all workers without affecting other cluster settings.
 
+## Set the backend connection attempt budget
+
+A request may try `max_connection_attempts` backend connections, the first included, before it
+is answered `503`; a connection that is refused, times out on `connect_timeout` or reports a
+socket error is retried on another backend while attempts remain (5 by default, 1 to 255). See
+"Backend connection failover" in `doc/configure.md`.
+
+Per cluster, when the cluster is added or on an existing cluster:
+
+```bash
+sozu --config /etc/sozu/config.toml cluster add --id <my_cluster_id> --load-balancing-policy round_robin --max-connection-attempts 3
+sozu --config /etc/sozu/config.toml cluster connection-attempts set --id <my_cluster_id> 3
+sozu --config /etc/sozu/config.toml cluster connection-attempts unset --id <my_cluster_id>
+```
+
+`set` and `unset` query the current cluster configuration and re-apply it with only
+`max_connection_attempts` changed, as `cluster h2` does for `http2`; `unset` makes the cluster use
+the global budget again. The value is part of the cluster's state and is saved with it.
+
+Globally, on every running worker:
+
+```bash
+sozu --config /etc/sozu/config.toml connection-attempts set 5
+```
+
+A cluster's own budget takes precedence. The global change is not saved: a worker started later
+reads `max_connection_attempts` from the configuration file, so mirror the change there.
+
 ## Remove a cluster
 
 ```bash

@@ -52,9 +52,6 @@ use crate::{
     udp,
 };
 
-// Number of retries to perform on a server after a connection failure
-pub const CONN_RETRIES: u8 = 3;
-
 /// Number of bounded buckets for the per-source connect-rate counter.
 ///
 /// `incr!` requires a `&'static str`, so per-IP labelling would either need
@@ -430,6 +427,13 @@ pub struct SessionManager {
     /// Reverse index for `connections_per_cluster_subnet`, mirroring
     /// `cluster_ip_tracks`. Also empty while the limiter is disabled.
     cluster_subnet_tracks: HashMap<Token, HashMap<ClusterId, HashSet<IpAddr>>>,
+    /// Default backend connection attempt budget of a request, the first
+    /// attempt included: `ServerConfig::max_connection_attempts`, changed at
+    /// runtime by `SetMaxConnectionAttempts`. A cluster's own
+    /// `max_connection_attempts` takes precedence
+    /// ([`Self::effective_max_connection_attempts`]). Validated, so between
+    /// 1 and 255.
+    pub max_connection_attempts: u32,
 }
 
 impl SessionManager {
@@ -456,7 +460,15 @@ impl SessionManager {
             subnet_ipv6_prefix,
             connections_per_cluster_subnet: HashMap::new(),
             cluster_subnet_tracks: HashMap::new(),
+            max_connection_attempts: sozu_command::config::DEFAULT_MAX_CONNECTION_ATTEMPTS,
         }))
+    }
+
+    /// Resolve the backend connection attempt budget of a request routed to
+    /// a cluster whose own setting is `override_value`: the cluster's value
+    /// when it sets one, the global default otherwise (sozu-proxy/sozu#1800).
+    pub fn effective_max_connection_attempts(&self, override_value: Option<u32>) -> u32 {
+        override_value.unwrap_or(self.max_connection_attempts)
     }
 
     /// Resolve the effective per-(cluster, source-IP) limit. `override_value`
@@ -671,14 +683,15 @@ impl SessionManager {
     /// - A registered, `Normal` backend that is down may not fail on the
     ///   dial at all. The dial — `Mux::dial_backend`
     ///   (`lib/src/protocol/mux/mod.rs`) for HTTP, `Backend::try_connect`
-    ///   (`lib/src/backends.rs`) for TCP — is non-blocking: a refusal the kernel reports synchronously —
-    ///   the common case for a closed port on loopback — surfaces as
-    ///   `BackendError::ConnectionFailures` and takes the answer path
-    ///   above, while an `EINPROGRESS` connect returns `Ok` and its
-    ///   refusal arrives later as a backend HUP, so the stream retries
-    ///   through `EndStreamAction::Reconnect` instead. The re-track is
-    ///   the no-op above, so one slot — not one per attempt — is held
-    ///   for at most `CONN_RETRIES` attempts.
+    ///   (`lib/src/backends.rs`) for TCP — is non-blocking: a refusal the
+    ///   kernel reports synchronously surfaces as
+    ///   `BackendError::ConnectionFailures`, which the mux re-queues for
+    ///   another backend, while an `EINPROGRESS` connect returns `Ok` and
+    ///   its refusal (or its `connect_timeout`) arrives later as a backend
+    ///   failure, so the stream retries through `EndStreamAction::Reconnect`.
+    ///   The re-track is the no-op above, so one slot — not one per
+    ///   attempt — is held for at most `max_connection_attempts` attempts
+    ///   (sozu-proxy/sozu#1800).
     ///
     /// The window IS the connection's whole lifetime in two cases: any
     /// H2 connection, and an H1 connection answered by an operator
@@ -1296,6 +1309,25 @@ impl Server {
                 .subnet_ipv6_prefix
                 .unwrap_or(sozu_command::config::DEFAULT_SUBNET_IPV6_PREFIX),
         );
+        // Newer field, so an older main may omit it. The main validates it at
+        // config load; a value that still breaks the bounds keeps the default
+        // rather than disabling retries or overflowing the attempt counters.
+        sessions.borrow_mut().max_connection_attempts = match config.max_connection_attempts {
+            Some(attempts)
+                if sozu_command::config::validate_max_connection_attempts(attempts).is_ok() =>
+            {
+                attempts
+            }
+            Some(attempts) => {
+                error!(
+                    "max_connection_attempts = {} is out of 1..=255, keeping {}",
+                    attempts,
+                    sozu_command::config::DEFAULT_MAX_CONNECTION_ATTEMPTS
+                );
+                sozu_command::config::DEFAULT_MAX_CONNECTION_ATTEMPTS
+            }
+            None => sozu_command::config::DEFAULT_MAX_CONNECTION_ATTEMPTS,
+        };
         {
             let mut s = sessions.borrow_mut();
             let entry = s.slab.vacant_entry();
@@ -2505,6 +2537,23 @@ impl Server {
                 push_queue(WorkerResponse::ok(message.id));
                 return;
             }
+            Some(RequestType::SetMaxConnectionAttempts(attempts)) => {
+                if let Err(reason) =
+                    sozu_command::config::validate_max_connection_attempts(*attempts)
+                {
+                    push_queue(WorkerResponse::error(message.id, reason));
+                    return;
+                }
+                let mut sessions = self.sessions.borrow_mut();
+                let previous = sessions.max_connection_attempts;
+                sessions.max_connection_attempts = *attempts;
+                info!(
+                    "{} updated global max_connection_attempts from {} to {}",
+                    message.id, previous, attempts
+                );
+                push_queue(WorkerResponse::ok(message.id));
+                return;
+            }
             Some(RequestType::QueryMaxConnectionsPerSubnet(_)) => {
                 let sessions = self.sessions.borrow();
                 let limit = sessions.max_connections_per_subnet;
@@ -2650,6 +2699,13 @@ impl Server {
                     cluster.shard_min_backends,
                     cluster.shard_mode,
                 ) {
+                    push_queue(worker_response_error(req_id, reason));
+                    return;
+                }
+                if let Some(Err(reason)) = cluster
+                    .max_connection_attempts
+                    .map(sozu_command::config::validate_max_connection_attempts)
+                {
                     push_queue(worker_response_error(req_id, reason));
                     return;
                 }
@@ -4092,6 +4148,19 @@ impl Server {
                     session.borrow().protocol()
                 );
                 self.kill_session(session);
+            } else if session.borrow().needs_ready_pass() {
+                // The timeout left work only `ready` can do, and no socket
+                // event will come to trigger it: a backend whose connect timed
+                // out must be counted as failed and its requests sent to
+                // another backend (sozu-proxy/sozu#1800).
+                if session.borrow_mut().ready(session.clone()) {
+                    debug!(
+                        "Server killing session from ready after timeout: token={:?}, protocol={:?}",
+                        token,
+                        session.borrow().protocol()
+                    );
+                    self.kill_session(session);
+                }
             }
         }
     }

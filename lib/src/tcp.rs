@@ -43,7 +43,7 @@ use crate::{
         tcp_preread::{AlpnMatcher, PrereadConfig, shell::SniPreread},
     },
     retry::RetryPolicy,
-    server::{CONN_RETRIES, ListenToken, SessionManager, push_event},
+    server::{ListenToken, SessionManager, push_event},
     socket::{server_bind, stats::socket_rtt},
     sozu_command::{
         proto::command::{
@@ -1237,13 +1237,16 @@ impl TcpSession {
     fn check_invariants(&self) {
         // Connection-attempt budget: every retry path increments
         // `connection_attempt` and `connect_to_backend` refuses once the
-        // counter reaches `CONN_RETRIES`, so the value can touch but never
-        // exceed the configured ceiling (and resets to 0 on success).
+        // counter reaches the cluster's `max_connection_attempts`, so the
+        // value never exceeds the largest budget that can be configured (and
+        // resets to 0 on success). The live budget itself is no bound here:
+        // `SetMaxConnectionAttempts` or an `AddCluster` may lower it while a
+        // session is retrying.
         debug_assert!(
-            self.connection_attempt <= CONN_RETRIES,
-            "connection_attempt ({}) must never exceed CONN_RETRIES ({})",
+            u32::from(self.connection_attempt)
+                <= sozu_command::config::MAX_CONNECTION_ATTEMPTS_UPPER_BOUND,
+            "connection_attempt ({}) must never exceed the largest attempt budget",
             self.connection_attempt,
-            CONN_RETRIES
         );
 
         // Token ownership: a fully-connected backend always owns a backend
@@ -1643,12 +1646,13 @@ impl TcpSession {
     ) -> Result<BackendConnectAction, BackendConnectionError> {
         // Precondition: the retry budget can sit AT the ceiling (the gate
         // below converts that into `MaxConnectionRetries`) but the increment
-        // in `ready_inner` must never have pushed it past `CONN_RETRIES`.
+        // in `ready_inner` must never have pushed it past the largest budget
+        // that can be configured.
         debug_assert!(
-            self.connection_attempt <= CONN_RETRIES,
-            "connection_attempt ({}) overflowed CONN_RETRIES ({}) before the retry gate",
+            u32::from(self.connection_attempt)
+                <= sozu_command::config::MAX_CONNECTION_ATTEMPTS_UPPER_BOUND,
+            "connection_attempt ({}) overflowed the largest attempt budget before the retry gate",
             self.connection_attempt,
-            CONN_RETRIES
         );
 
         // Prefer the SNI-routed cluster (set by `TcpSession::readable` once
@@ -1664,7 +1668,20 @@ impl TcpSession {
 
         self.cluster_id = Some(cluster_id.clone());
 
-        if self.connection_attempt >= CONN_RETRIES {
+        // The cluster's own budget when it sets one, the worker's otherwise
+        // (sozu-proxy/sozu#1800).
+        let max_attempts = {
+            let proxy = self.proxy.borrow();
+            let cluster_attempts = proxy
+                .configs
+                .get(&cluster_id)
+                .and_then(|c| c.max_connection_attempts);
+            proxy
+                .sessions
+                .borrow()
+                .effective_max_connection_attempts(cluster_attempts)
+        };
+        if u32::from(self.connection_attempt) >= max_attempts {
             incr!(
                 names::backend::CONNECT_RETRIES_EXHAUSTED,
                 self.cluster_id.as_deref(),
@@ -2763,6 +2780,11 @@ pub struct ClusterConfiguration {
     /// `SessionManager::effective_max_connections_per_subnet` at admit
     /// time. An independent second cap: both must admit.
     pub max_connections_per_subnet: Option<u64>,
+    /// Per-cluster override of the global backend connection attempt
+    /// budget, resolved against
+    /// `SessionManager::effective_max_connection_attempts` in
+    /// `connect_to_backend`. `None` inherits the global value.
+    pub max_connection_attempts: Option<u32>,
 }
 
 pub struct TcpProxy {
@@ -3118,6 +3140,7 @@ impl ProxyConfiguration for TcpProxy {
                     reads_affinity_key: cluster_reads_affinity_key(&cluster),
                     max_connections_per_ip: cluster.max_connections_per_ip,
                     max_connections_per_subnet: cluster.max_connections_per_subnet,
+                    max_connection_attempts: cluster.max_connection_attempts,
                 };
                 self.configs.insert(cluster.cluster_id.into(), config);
                 WorkerResponse::ok(message.id)

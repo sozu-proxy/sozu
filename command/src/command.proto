@@ -167,6 +167,12 @@ message Request {
     // limit AND the two prefix lengths in force. Workers reply with
     // `MaxConnectionsPerSubnetLimit`.
     QueryMaxConnectionsPerSubnet query_max_connections_per_subnet = 61;
+    // set the global backend connection attempt budget of every request
+    // at runtime: how many backend connections a request may try, the
+    // first included, before it is answered `503`. Between 1 and 255.
+    // A cluster's own `Cluster.max_connection_attempts` takes precedence.
+    // Not persisted: a worker started later reads `ServerConfig`.
+    uint32 set_max_connection_attempts = 62;
   }
 }
 
@@ -1356,6 +1362,13 @@ message Cluster {
     // What happens when no backend of a client's shard can take a
     // connection. Requires `shard_percent`.
     optional ShardMode shard_mode = 22;
+    // Per-cluster override for the global `max_connection_attempts`: how
+    // many backend connections a request routed to this cluster may try,
+    // the first included, before it is answered `503` (HTTP) or closed
+    // (TCP). Every failed connection counts: refused, timed out on
+    // `connect_timeout`, or reporting a socket error. Between 1 and 255.
+    // `None` (field absent) inherits the global value.
+    optional uint32 max_connection_attempts = 23;
 }
 
 // See `Cluster.shard_mode`.
@@ -2162,6 +2175,15 @@ message ServerConfig {
     // transfer workloads at the cost of per-session pinned memory.
     // Linux-only; ignored on builds without the `splice` feature.
     optional uint64 splice_pipe_capacity_bytes = 25;
+    // Backend connection attempt budget of every request: how many backend
+    // connections a request may try, the first included, before it is
+    // answered `503` (HTTP) or closed (TCP). A failed connection — refused,
+    // timed out on `connect_timeout`, or reporting a socket error — is
+    // retried on another backend while the budget lasts. Between 1 and 255.
+    // Each cluster may override it with `Cluster.max_connection_attempts`,
+    // and `Request.set_max_connection_attempts` changes it at runtime.
+    // Replaces the library constant `CONN_RETRIES = 3`.
+    optional uint32 max_connection_attempts = 29 [default = 5];
 }
 
 enum ProtobufAccessLogFormat {
