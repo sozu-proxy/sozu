@@ -1069,7 +1069,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8661-8665
+```rust lib/src/protocol/mux/h2.rs:8682-8686
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1202,7 +1202,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8839-8843
+```rust lib/src/protocol/mux/h2.rs:8860-8864
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1676,7 +1676,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:8164
+```rust lib/src/protocol/mux/h2.rs:8183
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 

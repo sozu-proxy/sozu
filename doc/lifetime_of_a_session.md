@@ -600,16 +600,17 @@ stream whose request was received whole is open
 (`Mux::frontend_exchange_in_flight`), neither the entry check nor the in-loop
 check closes the session or queues `close_notify`, and the session closes once
 the response is complete. A request left incomplete at the client's EOF closes
-the session at once. On an H1 frontend a full hang-up closes it whatever is in
-flight; an H2 frontend with output still pending waits for a timeout instead,
-since no H2 write path treats a failed write as fatal
-([#1792](https://github.com/sozu-proxy/sozu/issues/1792)). A hang-up is ERROR
-or WRITE_CLOSED: `Ready::from(&Event)` raises WRITE_CLOSED for mio's `is_write_closed` (`EPOLLHUP` or `EPOLLERR`), which a half-close
+the session at once, and a full hang-up closes it whatever is in flight. A
+hang-up is ERROR or WRITE_CLOSED: `Ready::from(&Event)` raises WRITE_CLOSED
+for mio's `is_write_closed` (`EPOLLHUP` or `EPOLLERR`), which a half-close
 (`EPOLLRDHUP` alone) never raises. ERROR alone is not enough, because a reset
 whose error a `read` or `write` consumed first is reported as `EPOLLHUP`
 without `EPOLLERR`. A write to the client that fails closes the session as
-well (`ConnectionH1::writable`)
-([#1779](https://github.com/sozu-proxy/sozu/issues/1779)).
+well, on H1 (`ConnectionH1::writable`) and on H2 (`H2Shell::writable`), and
+the connection then reports nothing left to flush, so the delayed close does
+not wait for a flush that cannot happen
+([#1779](https://github.com/sozu-proxy/sozu/issues/1779),
+[#1792](https://github.com/sozu-proxy/sozu/issues/1792)).
 
 ## 9. TCP (pipe) session lifecycle
 
