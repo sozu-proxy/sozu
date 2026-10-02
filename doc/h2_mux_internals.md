@@ -658,7 +658,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:4707-4720
+```rust lib/src/protocol/mux/h2.rs:4798-4811
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -684,7 +684,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:4755-4761
+```rust lib/src/protocol/mux/h2.rs:4846-4852
 let events = stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -716,7 +716,7 @@ taken at the top of `H2WritePhase::Flush`'s post-flush tail
 (`ConnectionH2::poll_write_target`, `lib/src/protocol/mux/h2.rs`) and passes `stream.linked_token()` straight
 out of it:
 
-```rust lib/src/protocol/mux/h2.rs:3493-3494
+```rust lib/src/protocol/mux/h2.rs:3584-3585
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 ```
@@ -1069,7 +1069,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8669-8673
+```rust lib/src/protocol/mux/h2.rs:8865-8869
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1189,6 +1189,27 @@ Key decisions in this method:
   rather than a convention
 - Closed vs idle stream detection: frames on closed streams get RST_STREAM or
   GOAWAY depending on frame type; frames on idle streams get GOAWAY(PROTOCOL_ERROR)
+- Stream errors stay stream-scoped (RFC 9113 §5.4.2): DATA or HEADERS on a
+  half-closed (remote) stream (§5.1, STREAM_CLOSED) and a HEADERS frame without
+  END_STREAM in the body phase (§8.1.1, PROTOCOL_ERROR) reset that one stream
+  through `reset_stream_and_discard_frame`, and the payload is still minimally
+  processed through `Discard` (HPACK decoded, DATA credited to the connection
+  window). Every other stream on the connection carries on
+- Frames on a stream this endpoint reset are ignored (§5.1) after the same
+  minimal processing: `H2StreamTable::was_reset_locally` covers `rst_sent` and
+  the last `RECENTLY_RESET_CAPACITY` (256) retired reset streams. A stream
+  closed by END_STREAM in both directions keeps the connection error
+  STREAM_CLOSED for HEADERS, and the stream error for DATA (§6.1)
+- A self-dependent PRIORITY (RFC 7540 §5.3.1) resets an open stream and
+  closes the connection on an idle one, since RST_STREAM must not name an
+  idle stream (RFC 9113 §6.4). A PRIORITY frame whose length is not 5 is a
+  stream error FRAME_SIZE_ERROR (§6.3) that resets an open stream and is
+  dropped otherwise; every other frame size error stays a connection error
+  (§4.2). Each dropped frame counts as a glitch, and each RST_STREAM sent
+  feeds the emitted-RST accounting
+- A dropped HEADERS frame without END_HEADERS is not decoded, so the
+  CONTINUATION that follows is a connection error, whether the HEADERS
+  triggered the stream error or arrived late on a reset stream
 
 ### handle_continuation_header_state()
 
@@ -1202,7 +1223,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8847-8851
+```rust lib/src/protocol/mux/h2.rs:9043-9047
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1676,7 +1697,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:8172
+```rust lib/src/protocol/mux/h2.rs:8368
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -1910,7 +1931,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:6775-6777
+```rust lib/src/protocol/mux/h2.rs:6971-6973
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1918,7 +1939,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:6789-6795
+```rust lib/src/protocol/mux/h2.rs:6985-6991
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.
@@ -2242,7 +2263,7 @@ Tests use the `e2e` crate which provides:
 
 ### h2spec conformance
 
-The implementation targets 145/145 h2spec test cases for RFC 9113 conformance.
+The implementation targets 146/146 h2spec 2.6.0 test cases for RFC 9113 conformance.
 h2spec is an external conformance testing tool (https://github.com/summerwind/h2spec)
 that validates frame-level protocol correctness.
 
