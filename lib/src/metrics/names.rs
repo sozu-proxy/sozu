@@ -243,7 +243,8 @@ pub mod h2 {
         "h2.rst_stream.received.pre_response_start";
 
     /// A proxy-emitted RST_STREAM that was never queued because
-    /// `pending_rst_streams` was already at `MAX_PENDING_RST_STREAMS`.
+    /// `pending_rst_streams` was already at its bound (`pending_rst_bound`,
+    /// at least `MIN_PENDING_RST_STREAMS`).
     /// Sibling of `WINDOW_UPDATE_DROPPED` below, same "control queue full"
     /// semantics; a non-zero value means the connection is on its way to
     /// `GOAWAY(ENHANCE_YOUR_CALM)`.

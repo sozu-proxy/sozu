@@ -2447,14 +2447,14 @@ fn test_h2_te_header_filtering() {
 /// HEADERS+RST_STREAM pairs in a single batched write. Sozu must detect the
 /// flood and respond with GOAWAY(ENHANCE_YOUR_CALM).
 ///
-/// Batched-write pattern (2026-04-25): RST_STREAM threshold
-/// (`H2FloodConfig::max_rst_stream_per_window`) defaults to 100. Previously
-/// this test wrote 200 pairs one-by-one with a 500 ms blanket sleep before
-/// reading — a classic race where the server could send GOAWAY+FIN mid-loop
-/// and the client's next write hit `Broken pipe`. The batched variant
-/// writes exactly threshold + 5 = 105 pairs in one TLS record and then
-/// reads deterministically; the detector has the full evidence by the time
-/// we switch modes.
+/// Batched-write pattern (2026-04-25): the pairs go out in one write and the
+/// test then reads deterministically; the detector has the full evidence by
+/// the time we switch modes. Writing them one-by-one with a blanket sleep
+/// raced the server's GOAWAY+FIN against the client's next write (`Broken
+/// pipe`). Every pair is a pre-response reset, so the cap that trips is the
+/// Rapid Reset one (`h2_max_rst_stream_abusive_lifetime`, 1000, with more
+/// than half of the opened streams reset), well before the per-window
+/// counter (`H2FloodConfig::max_rst_stream_per_window`, 2000).
 fn try_h2_rapid_reset_triggers_goaway() -> State {
     let (mut worker, mut backends, front_port) = setup_h2_test("H2-RAPID-RESET", 1);
 
@@ -2463,11 +2463,18 @@ fn try_h2_rapid_reset_triggers_goaway() -> State {
     let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
-    // Send threshold + 5 pairs (HEADERS + RST_STREAM(CANCEL)) on odd stream
-    // IDs. Each HEADERS must include all 4 pseudo-headers (RFC 9113 §8.3.1)
-    // so sozu parses them as valid requests — otherwise they would be
-    // rejected as INVALID HEADERS and never reach the flood detector.
-    const PAIRS_TO_SEND: u32 = 105;
+    // Send pairs (HEADERS + RST_STREAM(CANCEL)) on odd stream IDs, every
+    // stream reset before its response: past the pre-response floor
+    // (`h2_max_rst_stream_abusive_lifetime`, 1000) with every opened stream
+    // reset, so more than half of them, the Rapid Reset cap trips. Each
+    // HEADERS must include all 4 pseudo-headers (RFC 9113 §8.3.1) so sozu
+    // parses them as valid requests — otherwise they would be rejected as
+    // INVALID HEADERS and never reach the flood detector.
+    // Floor + 5, as the per-window version of this test sent threshold + 5:
+    // the cap trips at the 1001st pair, so almost nothing is left unread
+    // when Sōzu closes, and the close cannot turn into a TCP reset that
+    // discards the GOAWAY before the client reads it.
+    const PAIRS_TO_SEND: u32 = 1005;
     let mut batch = Vec::with_capacity((PAIRS_TO_SEND as usize) * 45);
     for i in 0..PAIRS_TO_SEND {
         let stream_id = 1 + i * 2; // 1, 3, 5, 7, ...
@@ -2658,11 +2665,10 @@ fn try_h2_ping_flood_triggers_goaway() -> State {
     let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
-    // PING threshold (`H2FloodConfig::max_ping_per_window`) defaults to 100.
-    // We send threshold + 5 = 105 frames so the 101st trips the counter
-    // while the batch stays small enough to fit comfortably in one TLS
-    // write.
-    const PINGS_TO_SEND: u32 = 105;
+    // PING threshold (`H2FloodConfig::max_ping_per_window`) defaults to 2000.
+    // We send threshold + 100 = 2100 frames so the 2001st trips the counter;
+    // the batch (~36 KB) is written in one call.
+    const PINGS_TO_SEND: u32 = 2100;
     let mut batch = Vec::with_capacity((PINGS_TO_SEND as usize) * 17); // 9-byte header + 8-byte payload
     for i in 0..PINGS_TO_SEND {
         let mut payload = [0u8; 8];
@@ -2728,7 +2734,7 @@ fn test_h2_ping_flood_triggers_goaway() {
 /// GOAWAY(ENHANCE_YOUR_CALM).
 ///
 /// Batched-write pattern (2026-04-25): SETTINGS threshold
-/// (`H2FloodConfig::max_settings_per_window`) defaults to 50. Previously
+/// (`H2FloodConfig::max_settings_per_window`) defaults to 1000. Previously
 /// this test wrote 100 SETTINGS frames one-by-one and then tried to read;
 /// the per-frame loop raced sozu's detector and the silent `break` after
 /// `Broken pipe` swallowed the real signal on slow runners. Batching the
@@ -2741,10 +2747,10 @@ fn try_h2_settings_flood_triggers_goaway() -> State {
     let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
-    // threshold + 5 = 55 SETTINGS frames, each with a valid setting
-    // (SETTINGS_MAX_CONCURRENT_STREAMS = 100). The batch is ~825 bytes of
-    // plaintext — well below any TLS record boundary.
-    const SETTINGS_TO_SEND: usize = 55;
+    // threshold + 100 = 1100 SETTINGS frames, each with a valid setting
+    // (SETTINGS_MAX_CONCURRENT_STREAMS = 100). The batch is ~16 KB of
+    // plaintext, written in one call.
+    const SETTINGS_TO_SEND: usize = 1100;
     let settings_frame = H2Frame::settings(&[(0x3, 100)]).encode();
     let mut batch = Vec::with_capacity(SETTINGS_TO_SEND * settings_frame.len());
     for _ in 0..SETTINGS_TO_SEND {
@@ -4668,12 +4674,13 @@ fn try_h2_empty_data_flood() -> State {
         b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
     ];
 
-    // Send HEADERS + 200 empty DATA frames in a single batch to ensure
-    // sozu processes them in a tight loop within one flood window.
+    // Send HEADERS + 2100 empty DATA frames (threshold 2000) in a single
+    // batch to ensure sozu processes them in a tight loop within one flood
+    // window.
     let mut batch = Vec::new();
     let headers = H2Frame::headers(1, header_block, true, false);
     batch.extend_from_slice(&headers.encode());
-    for _ in 0..200 {
+    for _ in 0..2100 {
         let empty_data = H2Frame::data(1, Vec::new(), false);
         batch.extend_from_slice(&empty_data.encode());
     }
@@ -7539,7 +7546,7 @@ fn test_h2_client_goaway_then_soft_stop_honors_deadline() {
 }
 
 /// Each received GOAWAY counts toward the glitch budget
-/// (`h2_max_glitch_count`, default 100), so a client repeating GOAWAY on a
+/// (`h2_max_glitch_count`, default 2000), so a client repeating GOAWAY on a
 /// connection its in-flight stream keeps open gets GOAWAY(ENHANCE_YOUR_CALM).
 fn try_h2_repeated_client_goaway_is_bounded() -> State {
     let (worker, front_port, request_seen, release_response, mut backend) =
@@ -7554,8 +7561,9 @@ fn try_h2_repeated_client_goaway_is_bounded() -> State {
         let _ = backend.stop_and_get_aggregator();
         return State::Fail;
     };
+    // 2100 frames, past the default glitch budget of 2000.
     let mut burst = Vec::new();
-    for _ in 0..150 {
+    for _ in 0..2100 {
         burst.extend(H2Frame::goaway(0, H2_ERROR_NO_ERROR).encode());
     }
     let _ = tls.write_all(&burst);
@@ -9335,8 +9343,8 @@ fn try_h2_upstream_ping_flood_detection() -> State {
     )));
     worker.read_to_last();
 
-    // Start the flooding backend (200 PINGs, threshold is 100)
-    let mut flooding_backend = FloodingH2Backend::start(back_address, FloodFrameType::Ping, 200);
+    // Start the flooding backend (4000 PINGs, threshold is 2000)
+    let mut flooding_backend = FloodingH2Backend::start(back_address, FloodFrameType::Ping, 4000);
 
     let client = build_h2_client();
     let uri: hyper::Uri = format!("https://localhost:{front_port}/api")
@@ -9437,9 +9445,9 @@ fn try_h2_upstream_settings_flood_detection() -> State {
     )));
     worker.read_to_last();
 
-    // Start the flooding backend (100 SETTINGS, threshold is 50)
+    // Start the flooding backend (2000 SETTINGS, threshold is 1000)
     let mut flooding_backend =
-        FloodingH2Backend::start(back_address, FloodFrameType::Settings, 100);
+        FloodingH2Backend::start(back_address, FloodFrameType::Settings, 2000);
 
     let client = build_h2_client();
     let uri: hyper::Uri = format!("https://localhost:{front_port}/api")
@@ -9538,10 +9546,10 @@ fn try_h2_upstream_window_update_flood() -> State {
     )));
     worker.read_to_last();
 
-    // 500 WINDOW_UPDATE frames -- should trigger flow control error or
+    // 10000 WINDOW_UPDATE frames -- should trigger flow control error or
     // glitch-based flood detection
     let mut flooding_backend =
-        FloodingH2Backend::start(back_address, FloodFrameType::WindowUpdate, 500);
+        FloodingH2Backend::start(back_address, FloodFrameType::WindowUpdate, 10_000);
 
     let client = build_h2_client();
     let uri: hyper::Uri = format!("https://localhost:{front_port}/api")
@@ -9677,9 +9685,11 @@ fn test_h2_outbound_flood_from_goaway() {
 // ============================================================================
 
 /// Open many streams that exceed MAX_CONCURRENT_STREAMS, causing sozu to
-/// queue RST_STREAM(REFUSED_STREAM) for each. Sozu's pending_rst_streams
-/// cap (MAX_PENDING_RST_STREAMS=200) must trigger GOAWAY(ENHANCE_YOUR_CALM)
-/// instead of sending an unbounded number of RST_STREAM frames.
+/// queue RST_STREAM(REFUSED_STREAM) for each. A refusal is Sōzu's own
+/// decision and is not charged to the peer, but a stream beyond the limit
+/// Sōzu advertised breaks RFC 9113 §5.1.2 and counts as a glitch: past
+/// `h2_max_glitch_count` (2000) the connection gets GOAWAY(ENHANCE_YOUR_CALM)
+/// instead of an unbounded number of RST_STREAM frames.
 fn try_h2_outbound_flood_from_rst_stream() -> State {
     let (mut worker, mut backends, front_port) = setup_h2_test("H2-OUTBOUND-RST", 1);
 
@@ -9687,12 +9697,13 @@ fn try_h2_outbound_flood_from_rst_stream() -> State {
     let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
-    // Send 300 HEADERS frames rapidly on odd stream IDs (1, 3, 5, ...).
+    // Send 2300 HEADERS frames rapidly on odd stream IDs (1, 3, 5, ...).
     // MAX_CONCURRENT_STREAMS is 100, so streams beyond that should get
-    // RST_STREAM(REFUSED_STREAM). With 300 streams, sozu accumulates >200
-    // pending RST_STREAMs and triggers the cap.
+    // RST_STREAM(REFUSED_STREAM). With 2200 streams over the advertised
+    // limit, the glitch budget of 2000 trips first.
+    const HEADERS_TO_SEND: u32 = 2300;
     let mut batch = Vec::new();
-    for i in 0..300u32 {
+    for i in 0..HEADERS_TO_SEND {
         let stream_id = i * 2 + 1; // odd: 1, 3, 5, ...
         let header_block = vec![
             0x82, // :method GET
@@ -9700,8 +9711,11 @@ fn try_h2_outbound_flood_from_rst_stream() -> State {
             0x84, // :path /
             0x41, 0x09, b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
         ];
-        // END_HEADERS + END_STREAM to keep it simple
-        let frame = H2Frame::headers(stream_id, header_block, true, true);
+        // END_HEADERS without END_STREAM: each accepted request then waits
+        // for a body that never comes, so the first 100 streams stay open
+        // and every later one is over the advertised limit, however fast the
+        // backend answers.
+        let frame = H2Frame::headers(stream_id, header_block, true, false);
         batch.extend_from_slice(&frame.encode());
     }
 
@@ -9729,14 +9743,14 @@ fn try_h2_outbound_flood_from_rst_stream() -> State {
         goaway_count
     );
 
-    // The RST_STREAM output should be bounded. Sozu flushes some RST_STREAMs
-    // (up to ~200) and then triggers GOAWAY. It should NOT send 300 RST_STREAMs.
-    let rst_bounded = rst_count < 250;
-    // We expect sozu to eventually send a GOAWAY (either from the pending cap
-    // or from the rapid-reset flood detector).
+    // The RST_STREAM output should be bounded. Sozu refuses streams up to
+    // the glitch budget (2000) and then triggers GOAWAY. It should NOT send
+    // one RST_STREAM for each of the 2200 streams over the limit.
+    let rst_bounded = rst_count < 2200;
+    // We expect sozu to eventually send a GOAWAY (from the glitch budget).
     let got_goaway = goaway_count > 0;
 
-    println!("H2 outbound RST flood - RST_STREAM bounded (<250): {rst_bounded}");
+    println!("H2 outbound RST flood - RST_STREAM bounded (<2200): {rst_bounded}");
     println!("H2 outbound RST flood - got GOAWAY: {got_goaway}");
 
     drop(tls);
@@ -9763,7 +9777,7 @@ fn test_h2_outbound_flood_from_rst_stream() {
     assert_eq!(
         repeat_until_error_or(
             5,
-            "H2 outbound: RST_STREAM count bounded via pending_rst_streams cap",
+            "H2 outbound: RST_STREAM count bounded by the glitch budget",
             try_h2_outbound_flood_from_rst_stream
         ),
         State::Success
