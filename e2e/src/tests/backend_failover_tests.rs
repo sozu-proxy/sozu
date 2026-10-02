@@ -128,6 +128,20 @@ pub(crate) struct Backends {
     _blackholes: Vec<Blackhole>,
 }
 
+/// Stop the HTTP/1.1 backends with the cluster. Their thread polls a
+/// non-blocking listener in a loop that only a stop message ends: a dropped
+/// handle leaves it spinning for the rest of the test process, and two dozen
+/// of them starved every timing-sensitive test that ran after this module on
+/// a small CI runner (`test_h2_rapid_reset_triggers_goaway`). `H2Backend`
+/// stops itself on drop; a `Blackhole` owns no thread.
+impl Drop for Backends {
+    fn drop(&mut self) {
+        for backend in &mut self._healthy {
+            backend.stop_and_get_aggregator();
+        }
+    }
+}
+
 /// Which frontend a test talks to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Frontend {
