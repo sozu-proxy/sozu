@@ -455,7 +455,7 @@ When absent (`None`), the built-in defaults apply:
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `initial_connection_window` | 1048576 (1MB) | Connection receive window **advertised** to the peer (RFC 9113 §6.9.2), clamped to [65535, 2^31-1]. Not enforced on inbound DATA — see below |
+| `initial_connection_window` | 16777216 (16 MiB) | Connection receive window **advertised** to the peer (RFC 9113 §6.9.2), clamped to [65535, 2^31-1]. Credit is returned in one stream-0 `WINDOW_UPDATE` per half window received. Not enforced on inbound DATA — see below. A connection Sōzu stops reading can hold up to min(window, `max_concurrent_streams` × 65535) octets, ~6.25 MiB by default, in its kernel receive buffer (no `SO_RCVBUF` is set; autotuning caps it at `net.ipv4.tcp_rmem[2]`) |
 | `max_concurrent_streams` | 100 | `SETTINGS_MAX_CONCURRENT_STREAMS`, also sizes the pending WINDOW_UPDATE cap |
 | `stream_shrink_ratio` | 2 | Stream Vec shrink threshold: `total > active * ratio`, minimum 2 |
 
@@ -658,7 +658,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:4699-4712
+```rust lib/src/protocol/mux/h2.rs:4707-4720
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -684,7 +684,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:4747-4753
+```rust lib/src/protocol/mux/h2.rs:4755-4761
 let events = stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -716,7 +716,7 @@ taken at the top of `H2WritePhase::Flush`'s post-flush tail
 (`ConnectionH2::poll_write_target`, `lib/src/protocol/mux/h2.rs`) and passes `stream.linked_token()` straight
 out of it:
 
-```rust lib/src/protocol/mux/h2.rs:3485-3486
+```rust lib/src/protocol/mux/h2.rs:3493-3494
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 ```
@@ -1069,7 +1069,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8661-8665
+```rust lib/src/protocol/mux/h2.rs:8669-8673
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1202,7 +1202,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8839-8843
+```rust lib/src/protocol/mux/h2.rs:8847-8851
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1676,7 +1676,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:8164
+```rust lib/src/protocol/mux/h2.rs:8172
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -1910,7 +1910,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:6767-6769
+```rust lib/src/protocol/mux/h2.rs:6775-6777
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1918,7 +1918,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:6781-6787
+```rust lib/src/protocol/mux/h2.rs:6789-6795
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.

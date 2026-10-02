@@ -498,7 +498,7 @@ cipher_list = [
 # alpn_protocols = ["h2"]
 
 # H2 connection tuning (optional, defaults shown)
-# h2_initial_connection_window = 1048576  # 1MB, min 65535, max 2147483647
+# h2_initial_connection_window = 16777216 # 16 MiB, min 65535, max 2147483647
 # h2_max_concurrent_streams = 100         # min 1
 # h2_stream_shrink_ratio = 2              # min 2
 

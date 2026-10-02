@@ -545,6 +545,20 @@
 
 ### 🔄 Changed
 
+- **`fix(mux-h2)`: emit fewer connection-level `WINDOW_UPDATE` frames when receiving DATA
+  ([#1744](https://github.com/sozu-proxy/sozu/issues/1744)).** The default
+  `h2_initial_connection_window` is now 16777216 (16 MiB) instead of 1048576 (1 MiB). Sōzu returns
+  connection credit in one stream-0 `WINDOW_UPDATE` per half window received (RFC 9113 §6.9), so a
+  64 MiB transfer now costs 8 such frames instead of 125, as H2 server receiving a request body and
+  as H2 client receiving a backend response; at LAN speed the former rate could trip a peer's
+  stream-0 `WINDOW_UPDATE` flood detection, Sōzu's own included. The window is advertised, not
+  enforced, and user-space memory stays bounded by the buffer pool. The kernel cost grows: a
+  connection Sōzu stops reading may now hold up to min(connection window,
+  `h2_max_concurrent_streams` × 65535) octets, about 6.25 MiB at the default 100 streams instead of
+  about 1 MiB, in its socket receive buffer (Sōzu sets no `SO_RCVBUF`; autotuning caps it at
+  `net.ipv4.tcp_rmem[2]`). Stream-level credit is still returned per DATA frame. Listeners that set `h2_initial_connection_window` explicitly keep their value.
+  Covered by `e2e/src/tests/h2_window_update_tests.rs`.
+
 - **BEHAVIOUR CHANGE — `feat(state)`: removing a cluster removes its frontends and backends
   ([#1723](https://github.com/sozu-proxy/sozu/issues/1723)).** `RemoveCluster` (`sozu cluster
   remove`) used to remove the cluster definition alone: its HTTP, HTTPS, TCP and UDP frontends and
@@ -3967,6 +3981,14 @@
   `a_linger_started_by_a_timeout_write_keeps_its_own_deadline`,
   `a_408_to_a_silent_client_closes_without_lingering` and
   `a_silent_client_is_closed_at_the_linger_deadline`.
+
+- **`fix(mux-h2)`: enlarge a backend connection's receive window once
+  ([#1744](https://github.com/sozu-proxy/sozu/issues/1744)).** On a backend H2 connection, Sōzu
+  granted the connection-window surplus (`h2_initial_connection_window` − 65535) on every SETTINGS
+  frame received while its own send window was at most 65535, not only on the first. A backend
+  re-sending SETTINGS got a new grant each time and could be pushed past 2^31-1, a
+  `FLOW_CONTROL_ERROR` (RFC 9113 §6.9.1). The grant is now sent once per connection. Covered by
+  `repeated_backend_settings_enlarge_the_connection_window_once`.
 
 - **`fix(mux)`: close a pooled connection to a removed backend once it is idle
   ([#1760](https://github.com/sozu-proxy/sozu/issues/1760)).** A connection whose backend left the
