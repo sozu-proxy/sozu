@@ -641,7 +641,7 @@ impl CommandManager {
                     .to_tls(Some(&self.config))
                     .map_err(CtlError::CreateListener)?;
 
-                self.send_request(RequestType::AddHttpsListener(https_listener).into())
+                self.send_request(RequestType::add_https_listener(https_listener).into())
             }
             HttpsListenerCmd::Remove { address, interface } => {
                 self.remove_listener(address.into(), interface, ListenerType::Https)
