@@ -3920,6 +3920,15 @@
   `an_interrupted_tls_read_is_retried`. The TLS handshake pump (`lib/src/protocol/rustls.rs`)
   keeps its mapping.
 
+- **`test(mux-h2)`: the refused header block GOAWAY test no longer races its writer thread.**
+  `a_refused_header_block_counts_its_first_fragment_toward_its_size` (`lib/src/protocol/mux/h2.rs`)
+  wrote its 66 000-byte block from a spawned thread and drove the connection for a fixed eight
+  passes without waiting for it, so a writer descheduled for the whole window left nothing to read
+  (`got []`), and a GOAWAY queued by the read of the last fragment in the final pass was never
+  flushed. It now drives until the GOAWAY reaches the peer, under a 30-second deadline, and joins
+  the writer, requiring its write to succeed, before the unchanged assertion. Measured with 24
+  busy loops on a 20-CPU host: 2 failures in 200 runs before, 0 in 200 after.
+
 - **`fix(socket)`: an interrupted TLS write is retried, and every TLS write error marks the channel
   dead.** `flush_tls` (`lib/src/socket.rs`) now retries a write the kernel interrupted (`EINTR`),
   as the relay and the UDP path already do; it used to fall into the generic error arm, which
