@@ -11377,7 +11377,10 @@ mod tests {
                 connection.core.queue_window_update(0, 65_535);
             } else {
                 assert!(
-                    connection.core.enqueue_rst(1, H2Error::Cancel).is_none(),
+                    connection
+                        .core
+                        .enqueue_rst(1, H2Error::Cancel, RstOrigin::Local)
+                        .is_none(),
                     "premise: a single RST must not trip the flood detector"
                 );
             }
