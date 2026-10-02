@@ -99,6 +99,7 @@ pub fn format_request_type(request_type: &RequestType) -> &str {
         RequestType::RemoveBackend(_) => "RemoveBackend",
         RequestType::AddHttpListener(_) => "AddHttpListener",
         RequestType::AddHttpsListener(_) => "AddHttpsListener",
+        RequestType::AddHttpsListenerWithClientAuth(_) => "AddHttpsListenerWithClientAuth",
         RequestType::AddTcpListener(_) => "AddTcpListener",
         RequestType::AddUdpListener(_) => "AddUdpListener",
         RequestType::UpdateUdpListener(_) => "UpdateUdpListener",

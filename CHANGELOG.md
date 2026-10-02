@@ -61,6 +61,11 @@
   never blocks the configuration from loading. `HttpsListenerConfig` gains the
   `ClientAuthMode` enum and the three fields; `ListenerError::ClientAuth` and
   `ConfigError::ClientAuthOnNonHttps` report misconfigured input.
+  A listener that asks for a client certificate travels on a new
+  `AddHttpsListenerWithClientAuth` request (`RequestType::add_https_listener`
+  picks the verb, and the main process rewrites every fan-out to it), so a
+  worker or main process that predates mutual TLS fails the request instead of
+  building the listener without client authentication.
 
 - **BREAKING (library API) — `feat(udp)`: opt-in per-source flow limit on UDP clusters.** Each
   client source IP and port is its own UDP flow, with its own upstream socket and `max_flows` slot,

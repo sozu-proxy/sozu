@@ -2559,7 +2559,7 @@ fn run_mtls_handshake(
     https_listener.client_auth = Some(mode as i32);
     https_listener.client_ca_certificates =
         vec![String::from_utf8(MTLS_CA_CERT.to_vec()).expect("CA PEM is valid UTF-8")];
-    worker.send_proxy_request_type(RequestType::AddHttpsListener(https_listener));
+    worker.send_proxy_request_type(RequestType::add_https_listener(https_listener));
 
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
         address: front_address.clone(),

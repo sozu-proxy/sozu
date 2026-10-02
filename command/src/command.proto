@@ -167,6 +167,25 @@ message Request {
     // limit AND the two prefix lengths in force. Workers reply with
     // `MaxConnectionsPerSubnetLimit`.
     QueryMaxConnectionsPerSubnet query_max_connections_per_subnet = 61;
+    // add an HTTPS listener that authenticates clients with a certificate
+    // (`client_auth` set to anything other than CLIENT_AUTH_NONE).
+    //
+    // Same payload as `add_https_listener`, distinct verb on purpose. A
+    // worker or main process that predates mutual TLS decodes
+    // `add_https_listener` but skips the unknown `client_auth` /
+    // `client_ca_*` tags, so it would build the listener without client
+    // authentication and acknowledge it. It cannot decode this verb at all,
+    // so it never builds the listener: the request fails instead of
+    // degrading to unauthenticated access. This matters while the fleet is
+    // mixed, between `UpgradeMain` and the replacement of every worker.
+    //
+    // Emitters pick the verb from the config with
+    // `RequestType::add_https_listener`, and the main process rewrites every
+    // request it fans out to workers to that canonical verb, so an
+    // `add_https_listener` that carries client authentication never reaches
+    // a worker. A listener without client authentication keeps
+    // `add_https_listener`, which every worker version understands.
+    HttpsListenerConfig add_https_listener_with_client_auth = 62;
   }
 }
 

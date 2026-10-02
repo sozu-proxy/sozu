@@ -94,6 +94,10 @@ impl std::fmt::Debug for command::request::RequestType {
             RequestType::AddHttpsListener(value) => {
                 f.debug_tuple("AddHttpsListener").field(value).finish()
             }
+            RequestType::AddHttpsListenerWithClientAuth(value) => f
+                .debug_tuple("AddHttpsListenerWithClientAuth")
+                .field(value)
+                .finish(),
             RequestType::UpdateHttpListener(value) => {
                 f.debug_tuple("UpdateHttpListener").field(value).finish()
             }
