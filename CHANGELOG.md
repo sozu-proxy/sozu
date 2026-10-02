@@ -3878,6 +3878,21 @@
   `an_interrupted_handshake_read_is_retried` and `an_interrupted_handshake_write_is_retried`
   ([#1799](https://github.com/sozu-proxy/sozu/issues/1799)).
 
+- **`fix(socket)`: retry interrupted plain TCP reads and writes and interrupted TLS reads
+  ([#1799](https://github.com/sozu-proxy/sozu/issues/1799)).** The plain TCP `socket_read`,
+  `socket_write` and `socket_write_vectored` (`lib/src/socket.rs`) and the `read_tls` call of
+  `FrontRustls::socket_read` now retry a call the kernel interrupted (`EINTR`), as `flush_tls`
+  does since [#1795](https://github.com/sozu-proxy/sozu/pull/1795); they used to answer
+  `SocketResult::Error`, which closes a healthy session on the pipe path, and on the H1 and h2c
+  mux paths once they close a session whose client write failed
+  ([#1793](https://github.com/sozu-proxy/sozu/pull/1793)). The plain write bodies move into
+  `plain_socket_write` and `plain_socket_write_vectored`, generic over the transport like
+  `plain_socket_read`, with the logging left in `tcp_socket_write` and
+  `tcp_socket_write_vectored`. Covered by `an_interrupted_plain_write_is_retried`,
+  `an_interrupted_plain_vectored_write_is_retried`, `an_interrupted_plain_read_is_retried` and
+  `an_interrupted_tls_read_is_retried`. The TLS handshake pump (`lib/src/protocol/rustls.rs`)
+  retries the same way since [#1803](https://github.com/sozu-proxy/sozu/pull/1803).
+
 - **`fix(socket)`: an interrupted TLS write is retried, and every TLS write error marks the channel
   dead.** `flush_tls` (`lib/src/socket.rs`) now retries a write the kernel interrupted (`EINTR`),
   as the relay and the UDP path already do; it used to fall into the generic error arm, which
@@ -7257,6 +7272,32 @@
   `test_h2_backend_interim_response_reaches_the_client` and
   `test_h2_backend_101_is_a_bad_gateway` (`e2e/src/tests/h2_security_header_injection.rs`).
 
+- **`fix(mux-h2)`: reset an H2 backend stream whose 204 or 304 response carries DATA, and
+  discard the DATA of a response to HEAD
+  ([#1772](https://github.com/sozu-proxy/sozu/issues/1772)).** A response to HEAD, a 204 or a 304
+  has no content (RFC 9110 §6.4.1), but `ConnectionH2::handle_data_frame`
+  (`lib/src/protocol/mux/h2.rs`) forwarded a DATA payload on it, so an H1 client read it after
+  the head as the start of the next response, and an H2 client received it as DATA;
+  `ConnectionH2::content_length_exempt` skips the `content-length` checks for these responses.
+  A 204 or a 304 cannot carry content (RFC 9110 §15.3.5, §15.4.5): its backend stream is now
+  reset with PROTOCOL_ERROR before the payload is queued, counted in the new
+  `h2.bodiless_response_data_reset` (`doc/configure.md`); an H1 client already written the head
+  sees the connection close, one that was not gets a 502. A response to HEAD only SHOULD NOT
+  carry content (RFC 9110 §9.3.2): its payload is dropped from the stream buffer, windows
+  credited, and the connection stays usable, however large the payload. Such a stream stays
+  linked until the backend's END_STREAM ([#1776](https://github.com/sozu-proxy/sozu/issues/1776)),
+  so its DATA reaches these branches whether it arrives with the head or later. Known
+  limitation: a trailer HEADERS frame the backend sends after the reset of a 204 or a 304 still
+  answers GOAWAY(STREAM_CLOSED) for the whole backend connection until
+  [#1784](https://github.com/sozu-proxy/sozu/pull/1784) lands. Documented in
+  `lib/src/protocol/mux/LIFECYCLE.md` §8.4. Covered by
+  `a_backend_response_content_is_forbidden_for_204_and_304_and_discarded_for_head` and
+  `a_204_response_carrying_data_resets_its_backend_stream_and_a_head_response_discards_it`
+  (`h2.rs`), and by `test_h2_bodiless_response_data_never_reaches_h1_client`,
+  `test_h2_head_response_with_large_data_completes` and
+  `test_h2_head_response_with_large_data_keeps_the_backend_connection`
+  (`e2e/src/tests/h2_security_header_injection.rs`).
+
 - **`fix(mux-h1)`: H2→H1: write no last chunk or trailer section after the head of a response
   without a body to an H1 client ([#1761](https://github.com/sozu-proxy/sozu/issues/1761)).**
   A response to HEAD, a 204 or a 304 ends with its header section on HTTP/1.1 (RFC 9112 §6.3),
@@ -7269,7 +7310,8 @@
   of such a response (RFC 9110 §6.5.1) before writing, so a stream ended by a trailer HEADERS
   frame or an empty DATA frame writes nothing after the head, and counts a dropped block in the
   new `h2.trailers_dropped_no_body`, documented in `doc/configure.md`. DATA carrying a payload
-  on such a response is still written after the head, a known gap. Documented in
+  on such a response was still written after the head until
+  [#1772](https://github.com/sozu-proxy/sozu/issues/1772). Documented in
   `lib/src/protocol/mux/LIFECYCLE.md` §8.4. Covered by unit tests in `h1.rs` and by
   `test_h2_bodiless_response_trailers_keep_h1_client_framing`
   (`e2e/src/tests/h2_security_header_injection.rs`).
