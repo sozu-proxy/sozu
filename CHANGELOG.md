@@ -3905,6 +3905,14 @@
 
 ### 🐛 Fixed
 
+- **`chore(clippy)`: `cargo clippy --all-targets --all-features -- -D warnings` passes on Rust
+  1.98 and newer.** Their `clippy::chunks_exact_to_as_chunks` lint rejects `chunks_exact` with a
+  constant size. The three hits, the `drain_window_updates_into` unit test in
+  `lib/src/protocol/mux/h2.rs` and the SETTINGS parsers of the `RawH2ResponseBackend` e2e mock and
+  the `h2_window_update_tests` peer, now use `as_chunks::<N>()` (stable since 1.88, below the
+  1.93.1 MSRV) and ignore the remainder exactly as `chunks_exact` did. Test and mock code only, no
+  behaviour change.
+
 - **`fix(mux-h2)`: forward a response to HEAD with a non-zero `content-length` and END_STREAM on
   its HEADERS ([#1791](https://github.com/sozu-proxy/sozu/issues/1791)).** `pkawa::handle_header`
   (`lib/src/protocol/mux/pkawa.rs`) refused an H2 backend response whose HEADERS frame carried

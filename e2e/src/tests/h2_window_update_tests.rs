@@ -139,7 +139,7 @@ impl<S: Read + Write> Peer<S> {
                     );
                 }
                 H2_FRAME_SETTINGS if flags & H2_FLAG_ACK == 0 => {
-                    for entry in payload.chunks_exact(6) {
+                    for entry in payload.as_chunks::<6>().0 {
                         if u16::from_be_bytes([entry[0], entry[1]]) == 0x4 {
                             let value =
                                 u32::from_be_bytes([entry[2], entry[3], entry[4], entry[5]]);
