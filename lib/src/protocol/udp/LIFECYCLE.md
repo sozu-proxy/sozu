@@ -116,7 +116,15 @@ which also enforces "an empty datagram is not a valid flow trigger" (`SourceTupl
    (`UdpManager::forward_on_existing_flow`). This is what makes affinity
    sticky: the same client always reaches the same backend for the life of the
    flow.
-5. **New key**, draining or at cap → shed, allocate nothing.
+5. **New key**, draining, at the per-source limit or at cap → shed,
+   allocate nothing. The per-source limit is the cluster's
+   `max_flows_per_ip` / `max_flows_per_subnet` (`ClusterConfig`, resolved by
+   the shell from the cluster's own `max_connections_per_ip` /
+   `max_connections_per_subnet`, never from the global defaults),
+   checked against the manager's live flow counts per `(cluster, source IP)`
+   and `(cluster, masked subnet)`; a shed there emits
+   `MetricEvent::FlowShedSourceLimit`. Admission increments both counts and
+   `close_flow` decrements them.
 6. Otherwise **select and admit**, in that order. `UdpManager` picks the
    backend itself, from the `BackendSource` view the embedder handed in with
    this datagram (`mod.rs`). No backend available → `Drop(NoBackend)`,
@@ -490,7 +498,9 @@ model.
    cannot starve HTTP/TCP. Beyond the cap, new flows are **shed**
    (`MetricEvent::FlowShed`, emitted by `UdpManager::on_client_datagram`);
    existing flows are protected. This is the bounded
-   analog of kernel conntrack-table exhaustion.
+   analog of kernel conntrack-table exhaustion. A per-source limit
+   (`max_connections_per_ip` / `max_connections_per_subnet`, step 5 of §3)
+   keeps one source address or subnet from taking every slot.
 3. **Bounded rx.** `max_rx_datagram_size` is clamped to `buffer_size`
    (`clamp_max_rx`, `udp.rs`); the `recv_buf` is sized `max_rx + 1`
    (`UdpListenerSession::new`'s `recv_buf` sizing, `udp.rs`) so an over-size datagram is detected (read longer than

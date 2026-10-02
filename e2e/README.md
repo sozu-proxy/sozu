@@ -36,7 +36,7 @@ shown up on `feat/h2-mux`:
 - Fuzz wrappers: `fuzz_tests.rs` defines `#[ignore]` shims around the
   `cargo-fuzz` targets — exercise with
   `cargo test -p sozu-e2e -- --ignored fuzz`.
-- h2spec acceptance: `test_h2spec_conformance` (currently 145/145/0/0).
+- h2spec acceptance: `test_h2spec_conformance` (currently 146/146/0/0 with h2spec 2.6.0).
 
 Mock backends live in `e2e/src/mock/`: `sync_backend.rs`,
 `async_backend.rs`, `h2_backend.rs`, `raw_h2_response_backend.rs`,

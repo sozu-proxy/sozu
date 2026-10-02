@@ -2447,14 +2447,14 @@ fn test_h2_te_header_filtering() {
 /// HEADERS+RST_STREAM pairs in a single batched write. Sozu must detect the
 /// flood and respond with GOAWAY(ENHANCE_YOUR_CALM).
 ///
-/// Batched-write pattern (2026-04-25): RST_STREAM threshold
-/// (`H2FloodConfig::max_rst_stream_per_window`) defaults to 100. Previously
-/// this test wrote 200 pairs one-by-one with a 500 ms blanket sleep before
-/// reading — a classic race where the server could send GOAWAY+FIN mid-loop
-/// and the client's next write hit `Broken pipe`. The batched variant
-/// writes exactly threshold + 5 = 105 pairs in one TLS record and then
-/// reads deterministically; the detector has the full evidence by the time
-/// we switch modes.
+/// Batched-write pattern (2026-04-25): the pairs go out in one write and the
+/// test then reads deterministically; the detector has the full evidence by
+/// the time we switch modes. Writing them one-by-one with a blanket sleep
+/// raced the server's GOAWAY+FIN against the client's next write (`Broken
+/// pipe`). Every pair is a pre-response reset, so the cap that trips is the
+/// Rapid Reset one (`h2_max_rst_stream_abusive_lifetime`, 1000, with more
+/// than half of the opened streams reset), well before the per-window
+/// counter (`H2FloodConfig::max_rst_stream_per_window`, 2000).
 fn try_h2_rapid_reset_triggers_goaway() -> State {
     let (mut worker, mut backends, front_port) = setup_h2_test("H2-RAPID-RESET", 1);
 
@@ -2463,11 +2463,18 @@ fn try_h2_rapid_reset_triggers_goaway() -> State {
     let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
-    // Send threshold + 5 pairs (HEADERS + RST_STREAM(CANCEL)) on odd stream
-    // IDs. Each HEADERS must include all 4 pseudo-headers (RFC 9113 §8.3.1)
-    // so sozu parses them as valid requests — otherwise they would be
-    // rejected as INVALID HEADERS and never reach the flood detector.
-    const PAIRS_TO_SEND: u32 = 105;
+    // Send pairs (HEADERS + RST_STREAM(CANCEL)) on odd stream IDs, every
+    // stream reset before its response: past the pre-response floor
+    // (`h2_max_rst_stream_abusive_lifetime`, 1000) with every opened stream
+    // reset, so more than half of them, the Rapid Reset cap trips. Each
+    // HEADERS must include all 4 pseudo-headers (RFC 9113 §8.3.1) so sozu
+    // parses them as valid requests — otherwise they would be rejected as
+    // INVALID HEADERS and never reach the flood detector.
+    // Floor + 5, as the per-window version of this test sent threshold + 5:
+    // the cap trips at the 1001st pair, so almost nothing is left unread
+    // when Sōzu closes, and the close cannot turn into a TCP reset that
+    // discards the GOAWAY before the client reads it.
+    const PAIRS_TO_SEND: u32 = 1005;
     let mut batch = Vec::with_capacity((PAIRS_TO_SEND as usize) * 45);
     for i in 0..PAIRS_TO_SEND {
         let stream_id = 1 + i * 2; // 1, 3, 5, 7, ...
@@ -2658,11 +2665,10 @@ fn try_h2_ping_flood_triggers_goaway() -> State {
     let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
-    // PING threshold (`H2FloodConfig::max_ping_per_window`) defaults to 100.
-    // We send threshold + 5 = 105 frames so the 101st trips the counter
-    // while the batch stays small enough to fit comfortably in one TLS
-    // write.
-    const PINGS_TO_SEND: u32 = 105;
+    // PING threshold (`H2FloodConfig::max_ping_per_window`) defaults to 2000.
+    // We send threshold + 100 = 2100 frames so the 2001st trips the counter;
+    // the batch (~36 KB) is written in one call.
+    const PINGS_TO_SEND: u32 = 2100;
     let mut batch = Vec::with_capacity((PINGS_TO_SEND as usize) * 17); // 9-byte header + 8-byte payload
     for i in 0..PINGS_TO_SEND {
         let mut payload = [0u8; 8];
@@ -2728,7 +2734,7 @@ fn test_h2_ping_flood_triggers_goaway() {
 /// GOAWAY(ENHANCE_YOUR_CALM).
 ///
 /// Batched-write pattern (2026-04-25): SETTINGS threshold
-/// (`H2FloodConfig::max_settings_per_window`) defaults to 50. Previously
+/// (`H2FloodConfig::max_settings_per_window`) defaults to 1000. Previously
 /// this test wrote 100 SETTINGS frames one-by-one and then tried to read;
 /// the per-frame loop raced sozu's detector and the silent `break` after
 /// `Broken pipe` swallowed the real signal on slow runners. Batching the
@@ -2741,10 +2747,10 @@ fn try_h2_settings_flood_triggers_goaway() -> State {
     let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
-    // threshold + 5 = 55 SETTINGS frames, each with a valid setting
-    // (SETTINGS_MAX_CONCURRENT_STREAMS = 100). The batch is ~825 bytes of
-    // plaintext — well below any TLS record boundary.
-    const SETTINGS_TO_SEND: usize = 55;
+    // threshold + 100 = 1100 SETTINGS frames, each with a valid setting
+    // (SETTINGS_MAX_CONCURRENT_STREAMS = 100). The batch is ~16 KB of
+    // plaintext, written in one call.
+    const SETTINGS_TO_SEND: usize = 1100;
     let settings_frame = H2Frame::settings(&[(0x3, 100)]).encode();
     let mut batch = Vec::with_capacity(SETTINGS_TO_SEND * settings_frame.len());
     for _ in 0..SETTINGS_TO_SEND {
@@ -4668,12 +4674,13 @@ fn try_h2_empty_data_flood() -> State {
         b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
     ];
 
-    // Send HEADERS + 200 empty DATA frames in a single batch to ensure
-    // sozu processes them in a tight loop within one flood window.
+    // Send HEADERS + 2100 empty DATA frames (threshold 2000) in a single
+    // batch to ensure sozu processes them in a tight loop within one flood
+    // window.
     let mut batch = Vec::new();
     let headers = H2Frame::headers(1, header_block, true, false);
     batch.extend_from_slice(&headers.encode());
-    for _ in 0..200 {
+    for _ in 0..2100 {
         let empty_data = H2Frame::data(1, Vec::new(), false);
         batch.extend_from_slice(&empty_data.encode());
     }
@@ -5652,6 +5659,131 @@ fn test_h2_to_h1_102_103_and_final_in_one_write() {
             3,
             "H2-to-H1: a 102, a 103 and the final 200 written at once all reach the client",
             || try_h2_to_h1_interims_and_final_in_one_write(&[102, 103])
+        ),
+        State::Success
+    );
+}
+
+// ---- TLS H1 frontend backpressured by a client that stops reading ----
+
+/// A TLS HTTP/1.1 client that stops reading a large response leaves the
+/// frontend socket backpressured while the backend still has bytes to send.
+/// The session must park on that backpressure, waiting for the next
+/// readiness event, without running `Mux::ready_inner` to its iteration
+/// budget, which `http.infinite_loop.error` records, and resume once the
+/// client reads again.
+fn try_tls_h1_stalled_reader_does_not_exhaust_loop_budget() -> State {
+    let (mut worker, _, front_address) = setup_h2_listener_only("TLS-H1-STALLED-READER");
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let body_size = 8 * 1024 * 1024;
+    let handler: Box<
+        dyn Fn(&std::net::TcpStream, &str, SimpleAggregator) -> SimpleAggregator + Send + Sync,
+    > = Box::new(move |mut stream, _backend_name, mut aggregator| {
+        let mut buf = [0u8; 4096];
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => return aggregator,
+            Ok(_) => {}
+        }
+        aggregator.requests_received += 1;
+        stream.set_nonblocking(false).ok();
+        stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {body_size}\r\n\r\n");
+        let body = vec![b'z'; body_size];
+        if stream.write_all(head.as_bytes()).is_ok() && stream.write_all(&body).is_ok() {
+            aggregator.responses_sent += 1;
+        }
+        stream.set_nonblocking(true).ok();
+        aggregator
+    });
+    let mut backend = AsyncBackend::spawn_detached_backend(
+        "STALLED_READER".to_owned(),
+        back_address,
+        SimpleAggregator::default(),
+        handler,
+    );
+
+    let mut tls_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(crate::mock::https_client::Verifier))
+        .with_no_client_auth();
+    tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let conn = rustls::ClientConnection::new(Arc::new(tls_config), server_name.to_owned()).unwrap();
+    let addr: SocketAddr = SocketAddr::from(front_address);
+    let tcp = super::h2_utils::connect_with_small_receive_buffer(addr);
+    tcp.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let mut tls = rustls::StreamOwned::new(conn, tcp);
+    let sent = tls
+        .write_all(b"GET /large HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .is_ok()
+        && tls.flush().is_ok();
+
+    // Read the response head, then stop reading: the rest of the body fills
+    // the socket buffers and backpressures the frontend.
+    let mut head = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+        match tls.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => head.extend_from_slice(&buf[..n]),
+        }
+    }
+    let answered = head.starts_with(b"HTTP/1.1 200");
+    thread::sleep(Duration::from_secs(2));
+
+    let spins = query_proxy_count(
+        &mut worker,
+        sozu_lib::metrics::names::http::INFINITE_LOOP_ERROR,
+    );
+
+    // The client reads again: the kernel's WRITABLE edge, not a synthetic
+    // one, must resume the flush, and the whole body must arrive.
+    let header_len = head
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(head.len(), |at| at + 4);
+    let mut body_received = head.len() - header_len;
+    let mut big = vec![0u8; 65536];
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while body_received < body_size && Instant::now() < deadline {
+        match tls.read(&mut big) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => body_received += n,
+        }
+    }
+    println!(
+        "TLS H1 stalled reader - sent {sent}, answered {answered}, {} {spins}, body {body_received}/{body_size}",
+        sozu_lib::metrics::names::http::INFINITE_LOOP_ERROR
+    );
+    drop(tls);
+
+    worker.soft_stop();
+    let _ = worker.wait_for_server_stop();
+    backend.stop_and_get_aggregator();
+
+    if sent && answered && spins == 0 && body_received == body_size {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_tls_h1_stalled_reader_does_not_exhaust_loop_budget() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TLS H1: a client that stops reading a large response does not exhaust the loop budget",
+            try_tls_h1_stalled_reader_does_not_exhaust_loop_budget
         ),
         State::Success
     );
@@ -7414,7 +7546,7 @@ fn test_h2_client_goaway_then_soft_stop_honors_deadline() {
 }
 
 /// Each received GOAWAY counts toward the glitch budget
-/// (`h2_max_glitch_count`, default 100), so a client repeating GOAWAY on a
+/// (`h2_max_glitch_count`, default 2000), so a client repeating GOAWAY on a
 /// connection its in-flight stream keeps open gets GOAWAY(ENHANCE_YOUR_CALM).
 fn try_h2_repeated_client_goaway_is_bounded() -> State {
     let (worker, front_port, request_seen, release_response, mut backend) =
@@ -7429,8 +7561,9 @@ fn try_h2_repeated_client_goaway_is_bounded() -> State {
         let _ = backend.stop_and_get_aggregator();
         return State::Fail;
     };
+    // 2100 frames, past the default glitch budget of 2000.
     let mut burst = Vec::new();
-    for _ in 0..150 {
+    for _ in 0..2100 {
         burst.extend(H2Frame::goaway(0, H2_ERROR_NO_ERROR).encode());
     }
     let _ = tls.write_all(&burst);
@@ -9210,8 +9343,8 @@ fn try_h2_upstream_ping_flood_detection() -> State {
     )));
     worker.read_to_last();
 
-    // Start the flooding backend (200 PINGs, threshold is 100)
-    let mut flooding_backend = FloodingH2Backend::start(back_address, FloodFrameType::Ping, 200);
+    // Start the flooding backend (4000 PINGs, threshold is 2000)
+    let mut flooding_backend = FloodingH2Backend::start(back_address, FloodFrameType::Ping, 4000);
 
     let client = build_h2_client();
     let uri: hyper::Uri = format!("https://localhost:{front_port}/api")
@@ -9312,9 +9445,9 @@ fn try_h2_upstream_settings_flood_detection() -> State {
     )));
     worker.read_to_last();
 
-    // Start the flooding backend (100 SETTINGS, threshold is 50)
+    // Start the flooding backend (2000 SETTINGS, threshold is 1000)
     let mut flooding_backend =
-        FloodingH2Backend::start(back_address, FloodFrameType::Settings, 100);
+        FloodingH2Backend::start(back_address, FloodFrameType::Settings, 2000);
 
     let client = build_h2_client();
     let uri: hyper::Uri = format!("https://localhost:{front_port}/api")
@@ -9413,10 +9546,10 @@ fn try_h2_upstream_window_update_flood() -> State {
     )));
     worker.read_to_last();
 
-    // 500 WINDOW_UPDATE frames -- should trigger flow control error or
+    // 10000 WINDOW_UPDATE frames -- should trigger flow control error or
     // glitch-based flood detection
     let mut flooding_backend =
-        FloodingH2Backend::start(back_address, FloodFrameType::WindowUpdate, 500);
+        FloodingH2Backend::start(back_address, FloodFrameType::WindowUpdate, 10_000);
 
     let client = build_h2_client();
     let uri: hyper::Uri = format!("https://localhost:{front_port}/api")
@@ -9552,9 +9685,11 @@ fn test_h2_outbound_flood_from_goaway() {
 // ============================================================================
 
 /// Open many streams that exceed MAX_CONCURRENT_STREAMS, causing sozu to
-/// queue RST_STREAM(REFUSED_STREAM) for each. Sozu's pending_rst_streams
-/// cap (MAX_PENDING_RST_STREAMS=200) must trigger GOAWAY(ENHANCE_YOUR_CALM)
-/// instead of sending an unbounded number of RST_STREAM frames.
+/// queue RST_STREAM(REFUSED_STREAM) for each. A refusal is Sōzu's own
+/// decision and is not charged to the peer, but a stream beyond the limit
+/// Sōzu advertised breaks RFC 9113 §5.1.2 and counts as a glitch: past
+/// `h2_max_glitch_count` (2000) the connection gets GOAWAY(ENHANCE_YOUR_CALM)
+/// instead of an unbounded number of RST_STREAM frames.
 fn try_h2_outbound_flood_from_rst_stream() -> State {
     let (mut worker, mut backends, front_port) = setup_h2_test("H2-OUTBOUND-RST", 1);
 
@@ -9562,12 +9697,13 @@ fn try_h2_outbound_flood_from_rst_stream() -> State {
     let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
-    // Send 300 HEADERS frames rapidly on odd stream IDs (1, 3, 5, ...).
+    // Send 2300 HEADERS frames rapidly on odd stream IDs (1, 3, 5, ...).
     // MAX_CONCURRENT_STREAMS is 100, so streams beyond that should get
-    // RST_STREAM(REFUSED_STREAM). With 300 streams, sozu accumulates >200
-    // pending RST_STREAMs and triggers the cap.
+    // RST_STREAM(REFUSED_STREAM). With 2200 streams over the advertised
+    // limit, the glitch budget of 2000 trips first.
+    const HEADERS_TO_SEND: u32 = 2300;
     let mut batch = Vec::new();
-    for i in 0..300u32 {
+    for i in 0..HEADERS_TO_SEND {
         let stream_id = i * 2 + 1; // odd: 1, 3, 5, ...
         let header_block = vec![
             0x82, // :method GET
@@ -9575,8 +9711,11 @@ fn try_h2_outbound_flood_from_rst_stream() -> State {
             0x84, // :path /
             0x41, 0x09, b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
         ];
-        // END_HEADERS + END_STREAM to keep it simple
-        let frame = H2Frame::headers(stream_id, header_block, true, true);
+        // END_HEADERS without END_STREAM: each accepted request then waits
+        // for a body that never comes, so the first 100 streams stay open
+        // and every later one is over the advertised limit, however fast the
+        // backend answers.
+        let frame = H2Frame::headers(stream_id, header_block, true, false);
         batch.extend_from_slice(&frame.encode());
     }
 
@@ -9604,14 +9743,14 @@ fn try_h2_outbound_flood_from_rst_stream() -> State {
         goaway_count
     );
 
-    // The RST_STREAM output should be bounded. Sozu flushes some RST_STREAMs
-    // (up to ~200) and then triggers GOAWAY. It should NOT send 300 RST_STREAMs.
-    let rst_bounded = rst_count < 250;
-    // We expect sozu to eventually send a GOAWAY (either from the pending cap
-    // or from the rapid-reset flood detector).
+    // The RST_STREAM output should be bounded. Sozu refuses streams up to
+    // the glitch budget (2000) and then triggers GOAWAY. It should NOT send
+    // one RST_STREAM for each of the 2200 streams over the limit.
+    let rst_bounded = rst_count < 2200;
+    // We expect sozu to eventually send a GOAWAY (from the glitch budget).
     let got_goaway = goaway_count > 0;
 
-    println!("H2 outbound RST flood - RST_STREAM bounded (<250): {rst_bounded}");
+    println!("H2 outbound RST flood - RST_STREAM bounded (<2200): {rst_bounded}");
     println!("H2 outbound RST flood - got GOAWAY: {got_goaway}");
 
     drop(tls);
@@ -9638,7 +9777,7 @@ fn test_h2_outbound_flood_from_rst_stream() {
     assert_eq!(
         repeat_until_error_or(
             5,
-            "H2 outbound: RST_STREAM count bounded via pending_rst_streams cap",
+            "H2 outbound: RST_STREAM count bounded by the glitch budget",
             try_h2_outbound_flood_from_rst_stream
         ),
         State::Success
@@ -10946,6 +11085,183 @@ fn test_h2_streams_carry_distinct_request_ids() {
             3,
             "H2: each stream of a connection carries its own Sozu-Id",
             try_h2_streams_carry_distinct_request_ids
+        ),
+        State::Success
+    );
+}
+
+// ---- TLS H2 frontend backpressured by a client that stops reading ----
+
+/// A TLS HTTP/2 client that opens its flow-control windows wide, then stops
+/// reading a large response, leaves the frontend socket backpressured while
+/// sozu still has DATA to send. The session must park on that backpressure,
+/// waiting for the kernel's next writable edge, without running
+/// `Mux::ready_inner` to its iteration budget, which
+/// `http.infinite_loop.error` records, and the records rustls holds must
+/// still be flushed once the client reads again (sozu-proxy/sozu#1788).
+fn try_tls_h2_stalled_reader_does_not_exhaust_loop_budget() -> State {
+    use super::h2_utils::{
+        H2_CLIENT_PREFACE, H2_FLAG_ACK, H2_FRAME_DATA, H2_FRAME_HEADERS, H2_FRAME_SETTINGS,
+        advance_one_frame, connect_with_small_receive_buffer,
+    };
+
+    let is_timeout = |e: &std::io::Error| {
+        matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        )
+    };
+    let (mut worker, _, front_address) = setup_h2_listener_only("TLS-H2-STALLED-READER");
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let body_size = 32 * 1024 * 1024;
+    let handler: Box<
+        dyn Fn(&std::net::TcpStream, &str, SimpleAggregator) -> SimpleAggregator + Send + Sync,
+    > = Box::new(move |mut stream, _backend_name, mut aggregator| {
+        let mut buf = [0u8; 4096];
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => return aggregator,
+            Ok(_) => {}
+        }
+        aggregator.requests_received += 1;
+        stream.set_nonblocking(false).ok();
+        stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {body_size}\r\n\r\n");
+        let body = vec![b'z'; body_size];
+        if stream.write_all(head.as_bytes()).is_ok() && stream.write_all(&body).is_ok() {
+            aggregator.responses_sent += 1;
+        }
+        stream.set_nonblocking(true).ok();
+        aggregator
+    });
+    let mut backend = AsyncBackend::spawn_detached_backend(
+        "H2_STALLED_READER".to_owned(),
+        back_address,
+        SimpleAggregator::default(),
+        handler,
+    );
+
+    let mut tls_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(crate::mock::https_client::Verifier))
+        .with_no_client_auth();
+    tls_config.alpn_protocols = vec![b"h2".to_vec()];
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let conn = rustls::ClientConnection::new(Arc::new(tls_config), server_name.to_owned()).unwrap();
+    let tcp = connect_with_small_receive_buffer(SocketAddr::from(front_address));
+    tcp.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    tcp.set_write_timeout(Some(Duration::from_secs(5))).ok();
+    let mut tls = rustls::StreamOwned::new(conn, tcp);
+
+    // Both windows at their RFC 9113 §6.9.1 maximum, so flow control never
+    // holds the response back: only the socket does.
+    const MAX_WINDOW: u32 = 0x7FFF_FFFF;
+    let mut header_block = vec![
+        0x82, // :method GET (static idx 2)
+        0x87, // :scheme https (static idx 7)
+        0x84, // :path / (static idx 4)
+    ];
+    // :authority localhost — name at static idx 1, literal value.
+    header_block.push(0x41);
+    header_block.push(9);
+    header_block.extend_from_slice(b"localhost");
+    let mut opening = H2_CLIENT_PREFACE.to_vec();
+    // SETTINGS_INITIAL_WINDOW_SIZE is id 0x4 (RFC 9113 §6.5.2).
+    opening.extend(H2Frame::settings(&[(0x4, MAX_WINDOW)]).encode());
+    opening.extend(H2Frame::window_update(0, MAX_WINDOW - 65_535).encode());
+    opening.extend(H2Frame::headers(1, header_block, true, true).encode());
+    let sent = tls.write_all(&opening).is_ok() && tls.flush().is_ok();
+
+    // Acknowledge the server's SETTINGS and read up to the response HEADERS,
+    // then stop reading: the rest of the body fills the socket buffers and
+    // backpressures the frontend.
+    let mut carry = Vec::new();
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut answered = false;
+    let mut body_received = 0usize;
+    let mut ended = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while sent && !answered && Instant::now() < deadline {
+        match tls.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => carry.extend_from_slice(&buf[..n]),
+            Err(e) if is_timeout(&e) => continue,
+            Err(_) => break,
+        }
+        while let Some((frame_type, flags, sid, payload)) = advance_one_frame(&mut carry) {
+            if frame_type == H2_FRAME_SETTINGS && flags & H2_FLAG_ACK == 0 {
+                let _ = tls.write_all(&H2Frame::settings_ack().encode());
+                let _ = tls.flush();
+            } else if frame_type == H2_FRAME_HEADERS && sid == 1 {
+                answered = true;
+            } else if frame_type == H2_FRAME_DATA && sid == 1 {
+                body_received += payload.len();
+                ended |= flags & H2_FLAG_END_STREAM != 0;
+            }
+        }
+    }
+    thread::sleep(Duration::from_secs(2));
+
+    let spins = query_proxy_count(
+        &mut worker,
+        sozu_lib::metrics::names::http::INFINITE_LOOP_ERROR,
+    );
+
+    // The client reads again: the kernel's WRITABLE edge, not a synthetic
+    // one, must resume the flush, and the whole body must arrive.
+    let mut big = vec![0u8; 64 * 1024];
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        while let Some((frame_type, flags, sid, payload)) = advance_one_frame(&mut carry) {
+            if frame_type == H2_FRAME_DATA && sid == 1 {
+                body_received += payload.len();
+                ended |= flags & H2_FLAG_END_STREAM != 0;
+            }
+        }
+        if ended || Instant::now() >= deadline {
+            break;
+        }
+        match tls.read(&mut big) {
+            Ok(0) => break,
+            Ok(n) => carry.extend_from_slice(&big[..n]),
+            // A loaded host may pause the transfer past one read timeout:
+            // only the deadline above ends the wait.
+            Err(e) if is_timeout(&e) => continue,
+            Err(_) => break,
+        }
+    }
+    println!(
+        "TLS H2 stalled reader - sent {sent}, answered {answered}, {} {spins}, body {body_received}/{body_size}, ended {ended}",
+        sozu_lib::metrics::names::http::INFINITE_LOOP_ERROR
+    );
+    drop(tls);
+
+    worker.soft_stop();
+    let _ = worker.wait_for_server_stop();
+    backend.stop_and_get_aggregator();
+
+    if sent && answered && spins == 0 && body_received == body_size && ended {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_tls_h2_stalled_reader_does_not_exhaust_loop_budget() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TLS H2: a client that stops reading a large response does not exhaust the loop budget",
+            try_tls_h2_stalled_reader_does_not_exhaust_loop_budget
         ),
         State::Success
     );

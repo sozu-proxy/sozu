@@ -129,6 +129,8 @@ max_connections = 500
 #   - HTTP/HTTPS clients receive `429 Too Many Requests` (with optional
 #     `Retry-After`).
 #   - TCP clients see a graceful FIN before any backend connect.
+#   - UDP listeners ignore this global default: only a cluster's own
+#     `max_connections_per_ip` limits its UDP flows.
 # Each cluster may override this default via its own `max_connections_per_ip`
 # field. Counts are kept per `(cluster_id, source_ip)`, so two clusters never
 # share a counter even from the same IP.
@@ -155,6 +157,7 @@ max_connections = 500
 # together mean "10 per IP AND 100 per subnet".
 #
 # Each cluster may override via its own `max_connections_per_subnet`.
+# UDP listeners ignore this global default, as for `max_connections_per_ip`.
 # max_connections_per_subnet = 0
 
 # Prefix lengths, in bits, that define a "subnet" for the counter above.
@@ -498,24 +501,26 @@ cipher_list = [
 # alpn_protocols = ["h2"]
 
 # H2 connection tuning (optional, defaults shown)
-# h2_initial_connection_window = 1048576  # 1MB, min 65535, max 2147483647
+# h2_initial_connection_window = 16777216 # 16 MiB, min 65535, max 2147483647
 # h2_max_concurrent_streams = 100         # min 1
 # h2_stream_shrink_ratio = 2              # min 2
 
-# H2 RST_STREAM lifetime caps. See `doc/configure.md` for the full flood-detection
+# H2 RST_STREAM caps. See `doc/configure.md` for the full flood-detection
 # surface; these three catch patient-attacker patterns that stay under the
-# per-window counters.
-# h2_max_rst_stream_lifetime = 10000          # received RST ceiling (CVE-2023-44487)
-# h2_max_rst_stream_abusive_lifetime = 50     # received pre-response RST (Rapid Reset)
-# h2_max_rst_stream_emitted_lifetime = 500    # server-emitted RST (CVE-2025-8671 MadeYouReset)
+# per-window counters. Each value is a floor: past it, the received cap trips
+# once the resets after a response or on a closed stream exceed the streams a
+# backend answered, the other two once the pre-response resets (received plus
+# provoked) exceed them, so benign cancels on a long-lived connection never
+# add up to a cap.
+# h2_max_rst_stream_lifetime = 200000         # received RST (CVE-2023-44487)
+# h2_max_rst_stream_abusive_lifetime = 1000   # received pre-response RST (Rapid Reset)
+# h2_max_rst_stream_emitted_lifetime = 10000  # peer-provoked server RST (CVE-2025-8671 MadeYouReset)
 
 # H2 catch-all protocol-drift budget. 1-second sliding window with half-decay,
-# default 100. Raise on busy edges that terminate high-cancellation traffic
-# (gRPC, mobile, browser prefetch) — the default trips on legitimate
-# stream-close races. See `doc/configure.md` (Tuning h2_max_glitch_count) for
-# the decision matrix; 500 is a reasonable public-edge value, 1000–2000 for
-# heavy cancellation, never raise to u32::MAX.
-# h2_max_glitch_count = 500
+# default 2000 (a burst of 2000, or about 1000 per second sustained). See
+# `doc/configure.md` (Tuning h2_max_glitch_count) for the decision matrix;
+# never raise to u32::MAX.
+# h2_max_glitch_count = 2000
 
 # Number of TLS 1.3 tickets to send to a client when establishing a connection.
 # The tickets allow the client to resume a session. This protects the client

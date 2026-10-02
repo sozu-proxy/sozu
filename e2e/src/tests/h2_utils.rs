@@ -750,11 +750,8 @@ pub(crate) fn h2_handshake_chromium_146(
 
     stream.write_all(&H2Frame::settings_ack().encode()).unwrap();
     // One-shot conn-level WINDOW_UPDATE, mirroring Chromium's
-    // post-SETTINGS behaviour. No further stream-0 WINDOW_UPDATE is
-    // emitted during drain — `H2FloodDetector` caps stream-0 WUs at
-    // DEFAULT_MAX_WINDOW_UPDATE_STREAM0_PER_WINDOW (100) per sliding
-    // window; a per-stream refresh cadence on stream 0 would trip the
-    // detector and GOAWAY the connection.
+    // post-SETTINGS behaviour. The drain helper refreshes stream windows
+    // only, never this one.
     stream
         .write_all(&H2Frame::window_update(0, CHROME146_CONN_WINDOW_UPDATE_DELTA).encode())
         .unwrap();
@@ -901,10 +898,9 @@ pub(crate) struct StreamingDrainOutcome {
 ///
 /// Flow-control credit is refreshed only on the **prioritised stream**
 /// `sid`; the one-shot connection-level WINDOW_UPDATE emitted by
-/// [`h2_handshake_chromium_146`] covers the whole session. This
-/// intentionally mirrors Sōzu's `H2FloodDetector` constraint that caps
-/// stream-0 WUs at 100 per sliding window — refreshing the conn window
-/// frame-by-frame would GOAWAY the connection.
+/// [`h2_handshake_chromium_146`] covers the whole session. (A client
+/// refreshing the connection window frame by frame is legitimate too;
+/// `h2_flood_threshold_tests.rs` covers it.)
 ///
 /// For PADDED DATA (RFC 9113 §6.1): the first payload byte is pad-length,
 /// and the trailing pad-length bytes are padding. App-visible bytes
@@ -1568,4 +1564,89 @@ pub(crate) fn stream_status_matches(
 #[allow(dead_code)]
 pub(crate) fn contains_data_frame(frames: &[(u8, u8, u32, Vec<u8>)]) -> bool {
     frames.iter().any(|(t, _, _, _)| *t == H2_FRAME_DATA)
+}
+
+/// Connect to `addr` with a receive buffer shrunk BEFORE the handshake, so
+/// the window it advertises stays small whatever the host's
+/// `net.ipv4.tcp_rmem` lets autotuning grow it to: a client that stops
+/// reading then backpressures sozu after a few kilobytes, instead of after
+/// as many megabytes as the host's buffers hold.
+pub(crate) fn connect_with_small_receive_buffer(addr: SocketAddr) -> std::net::TcpStream {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    let family = if addr.is_ipv4() {
+        libc::AF_INET
+    } else {
+        libc::AF_INET6
+    };
+    // SAFETY: plain socket creation; the descriptor is owned right below.
+    let raw = unsafe { libc::socket(family, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    assert!(
+        raw >= 0,
+        "could not create the client socket: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: `raw` is a fresh descriptor nothing else owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let size: libc::c_int = 4096;
+    // SAFETY: `size` is a valid `c_int` for `SO_RCVBUF`, and `fd` outlives the call.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &size as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "could not shrink SO_RCVBUF: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: each arm passes a fully initialized address of the length it
+    // names, and `fd` outlives the call.
+    let rc = unsafe {
+        match addr {
+            SocketAddr::V4(v4) => {
+                let sin = libc::sockaddr_in {
+                    sin_family: libc::AF_INET as libc::sa_family_t,
+                    sin_port: v4.port().to_be(),
+                    sin_addr: libc::in_addr {
+                        s_addr: u32::from_ne_bytes(v4.ip().octets()),
+                    },
+                    sin_zero: [0; 8],
+                };
+                libc::connect(
+                    fd.as_raw_fd(),
+                    &sin as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            }
+            SocketAddr::V6(v6) => {
+                let sin6 = libc::sockaddr_in6 {
+                    sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                    sin6_port: v6.port().to_be(),
+                    sin6_flowinfo: v6.flowinfo(),
+                    sin6_addr: libc::in6_addr {
+                        s6_addr: v6.ip().octets(),
+                    },
+                    sin6_scope_id: v6.scope_id(),
+                };
+                libc::connect(
+                    fd.as_raw_fd(),
+                    &sin6 as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            }
+        }
+    };
+    assert_eq!(
+        rc,
+        0,
+        "could not connect to sozu: {}",
+        std::io::Error::last_os_error()
+    );
+    std::net::TcpStream::from(fd)
 }
