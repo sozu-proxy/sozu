@@ -3850,6 +3850,29 @@
 
 ### 🐛 Fixed
 
+- **`fix(mux)`: stop spinning the session loop when a TLS HTTP/2 client stops reading
+  ([#1788](https://github.com/sozu-proxy/sozu/issues/1788)).** `ConnectionH2::ensure_tls_flushed`
+  (`lib/src/protocol/mux/h2.rs`) re-raised the WRITABLE event whenever rustls still held records,
+  whatever the last socket write answered. After a write the kernel refused with `WouldBlock` —
+  the stalled control-frame flush, `ConnectionH2::finalize_write_after_flush`, the `GoAway` and
+  `Error` close arms — `Mux::ready_inner` (`lib/src/protocol/mux/mod.rs`) ran the write pass again
+  on every inner iteration, each refused, until `MAX_LOOP_ITERATIONS` counted an
+  `http.infinite_loop.error`. The connection now records whether the latest write of a pass was
+  refused and then leaves WRITABLE to the kernel's next edge, consuming the event as
+  `update_readiness_after_write` does, including on the empty-buffer TLS flushes whose status
+  nothing read. Close decisions still read whether rustls holds records, so a connection keeps
+  WRITABLE interest and stays open until they are flushed. The same re-raise kept every
+  `shut_down_sessions()` tick of a backpressured TLS H2 session in `drive_frontend_shutdown_io`
+  (`lib/src/protocol/mux/mod.rs`) calling the refused flush until `MAX_LOOP_ITERATIONS`; that loop
+  now stops once the refused write leaves no WRITABLE event. Behaviour change in the tests: the
+  stalled control-frame drain tests now stall on a write the kernel did not refuse, and the
+  real-rustls `GoAway`/`Error` tests assert that the refused pass queues no event and that the pass
+  the kernel edge triggers flushes and closes. Documented in `lib/src/protocol/mux/LIFECYCLE.md`.
+  Covered by `test_tls_h2_stalled_reader_does_not_exhaust_loop_budget`
+  (`e2e/src/tests/h2_tests.rs`), which checks the whole 32 MiB body arrives once the client reads
+  again, and `a_refused_goaway_flush_waits_for_the_kernel_edge_then_closes`
+  (`lib/src/protocol/mux/h2.rs`).
+
 - **BREAKING (library API) — `fix(udp)`: key UDP flows on the client source address, not on the
   affinity key ([#1732](https://github.com/sozu-proxy/sozu/issues/1732)).** Under the default
   `affinity_key = SOURCE_IP`, `FlowKey::from_src` zeroed the source port, so every socket of one

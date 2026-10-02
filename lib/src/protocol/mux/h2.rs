@@ -876,6 +876,13 @@ pub struct ConnectionH2 {
     discarded_field_block: Option<DiscardedFieldBlock>,
     /// True once we've asked rustls to emit TLS close_notify for this frontend.
     close_notify_sent: bool,
+    /// The last socket write of the current [`H2Shell::writable`] pass
+    /// answered `WouldBlock`: the kernel refused it, so it owes this socket
+    /// its next WRITABLE edge, and [`Self::ensure_tls_flushed`] must not
+    /// synthesize one. Recorded by [`Self::note_write_status`] after every
+    /// write, and cleared when a pass starts, so a pass that wrote nothing
+    /// re-arms as before (sozu-proxy/sozu#1788).
+    kernel_refused_write: bool,
     /// Per-listener H2 connection tuning (window size, max streams, shrink ratio).
     pub connection_config: H2ConnectionConfig,
     /// Maximum pending WINDOW_UPDATE entries before dropping.
@@ -1987,6 +1994,7 @@ impl ConnectionH2 {
             control_tx: h2_control_tx::H2ControlTx::new(),
             discarded_field_block: None,
             close_notify_sent: false,
+            kernel_refused_write: false,
             max_pending_window_updates: 1 + connection_config.max_concurrent_streams as usize * 4,
             connection_config,
             ready_incremental_streams: 0,
@@ -3827,6 +3835,7 @@ impl ConnectionH2 {
     ) where
         L: ListenerHandler + L7ListenerHandler,
     {
+        self.note_write_status(status);
         let H2Written {
             size,
             from_output,
@@ -3963,9 +3972,36 @@ impl ConnectionH2 {
     /// The stalled-drain tails of [`Self::flush_pending_control_frames`] used
     /// to read it and re-arm individually; its one output flush now answers
     /// [`H2ControlFlushTarget::Stalled`] and that arm re-arms.
+    ///
+    /// No re-arm follows a write the kernel refused
+    /// (`kernel_refused_write`): the socket is full, the kernel raises
+    /// the next WRITABLE edge once the peer reads, and that edge flushes the
+    /// records. A synthetic edge would only repeat the refused write, and
+    /// `Mux::ready_inner` did so on every inner iteration until
+    /// `MAX_LOOP_ITERATIONS` counted `http.infinite_loop.error` whenever a
+    /// TLS client stopped reading (sozu-proxy/sozu#1788). The close decisions
+    /// still read `tls_wants_write` unchanged: a connection with records
+    /// pending keeps WRITABLE interest and stays open until they are flushed.
     pub fn ensure_tls_flushed(&mut self, tls_wants_write: bool) {
-        if tls_wants_write {
+        if tls_wants_write && !self.kernel_refused_write {
             self.readiness.signal_pending_write();
+        }
+    }
+
+    /// Record what a socket write of this pass answered, for
+    /// [`Self::ensure_tls_flushed`]. Every write the shell makes reports
+    /// here, so the flag always describes the latest one.
+    ///
+    /// A refused write also consumes the WRITABLE event, as
+    /// `update_readiness_after_write` does for the writes whose status it
+    /// reads. The empty-buffer flushes of `H2Shell::flush_tls_records` have
+    /// no other reader of their status, so without this a refused flush left
+    /// the edge it was called on in place, and `Mux::ready_inner` ran the
+    /// pass again on every inner iteration.
+    fn note_write_status(&mut self, status: SocketResult) {
+        self.kernel_refused_write = status == SocketResult::WouldBlock;
+        if self.kernel_refused_write {
+            self.readiness.event.remove(Ready::WRITABLE);
         }
     }
 
@@ -5925,6 +5961,7 @@ impl ConnectionH2 {
     /// the caller must wait for its next writable event; `false` means carry
     /// on until [`Self::output_pending`] is empty.
     pub fn consume_output_flush(&mut self, size: usize, status: SocketResult) -> bool {
+        self.note_write_status(status);
         self.consume_output(size);
         update_readiness_after_write(size, status, &mut self.readiness)
     }
@@ -8290,7 +8327,9 @@ impl<Front: SocketHandler> H2Shell<Front> {
     /// records behind — and only [`Self::flush_output_buffer`] consumes the
     /// status, through `update_readiness_after_write`.
     fn flush_tls_records(&mut self) -> (usize, SocketResult) {
-        self.socket.socket_write(&[])
+        let (size, status) = self.socket.socket_write(&[]);
+        self.core.note_write_status(status);
+        (size, status)
     }
 
     /// Start the TLS `close_notify` handshake, generating the records that
@@ -9072,6 +9111,8 @@ impl<Front: SocketHandler> H2Shell<Front> {
     {
         // Entry point: adopt the mux's snapshot for this pass.
         self.core.adopt_now(context.now);
+        // Only this pass's writes may withhold its TLS re-arm.
+        self.core.kernel_refused_write = false;
         self.core.prune_inactive_streams_while_closing(context);
 
         match self.drive_control_flush() {
@@ -10510,6 +10551,11 @@ mod tests {
         pending: std::cell::Cell<usize>,
         drain_per_flush: usize,
         flushes: std::cell::Cell<usize>,
+        /// An empty-buffer flush that leaves records behind answers
+        /// `WouldBlock`, as `FrontRustls` does when the kernel refused them,
+        /// instead of `Continue`. Off by default, so every test written
+        /// before this field is byte-for-byte unaffected.
+        refuse_flush: bool,
         /// Scripted `(size, status)` answers for `socket_write_vectored`,
         /// consumed front to back. An EMPTY script — the default, and what
         /// every test written before this field had — delegates to the real
@@ -10576,6 +10622,7 @@ mod tests {
                 pending: std::cell::Cell::new(pending),
                 drain_per_flush,
                 flushes: std::cell::Cell::new(0),
+                refuse_flush: false,
                 vectored_script: std::collections::VecDeque::new(),
                 write_script: std::collections::VecDeque::new(),
                 vectored_calls: 0,
@@ -10594,6 +10641,9 @@ mod tests {
                 self.flushes.set(self.flushes.get() + 1);
                 let drained = self.drain_per_flush.min(self.pending.get());
                 self.pending.set(self.pending.get() - drained);
+                if self.refuse_flush && self.pending.get() > 0 {
+                    return (0, SocketResult::WouldBlock);
+                }
                 return (0, SocketResult::Continue);
             }
             self.writes += 1;
@@ -10792,6 +10842,62 @@ mod tests {
         );
     }
 
+    /// A GoAway flush the kernel refuses keeps the connection open WITHOUT
+    /// re-raising WRITABLE: the kernel owes the socket its next edge, and a
+    /// synthetic one made `Mux::ready_inner` repeat the refused flush on
+    /// every inner iteration until `MAX_LOOP_ITERATIONS`
+    /// (sozu-proxy/sozu#1788). Once the kernel drains, the next writable
+    /// pass flushes the records and reaches the disconnect, so no record is
+    /// lost on the way to the close.
+    ///
+    /// TO SEE THIS RED: drop `&& !self.kernel_refused_write` from
+    /// `ConnectionH2::ensure_tls_flushed`. The refused pass then re-raises
+    /// the WRITABLE event.
+    #[test]
+    fn a_refused_goaway_flush_waits_for_the_kernel_edge_then_closes() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut connection, _peer) = connection_with_backpressure(&pool, 2, 0, H2State::GoAway);
+        connection.socket.refuse_flush = true;
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        connection.core.readiness.event.insert(Ready::WRITABLE);
+
+        let result = connection.writable(&mut context, EndpointClient(&mut router));
+
+        assert!(
+            matches!(result, MuxResult::Continue),
+            "records still buffered: the session must stay open, got {result:?}"
+        );
+        assert!(
+            matches!(connection.core.state, H2State::GoAway),
+            "the GoAway arm must keep the connection, got {:?}",
+            connection.core.state
+        );
+        assert!(
+            connection.core.readiness.interest.is_writable(),
+            "WRITABLE interest must stay so the kernel edge is delivered"
+        );
+        assert!(
+            !connection.core.readiness.event.is_writable(),
+            "a refused flush must leave WRITABLE to the kernel edge, got {:?}",
+            connection.core.readiness
+        );
+
+        // The peer reads: the kernel takes the records and raises its edge.
+        connection.socket.drain_per_flush = 2;
+        connection.core.readiness.event.insert(Ready::WRITABLE);
+        let result = connection.writable(&mut context, EndpointClient(&mut router));
+
+        assert!(
+            !connection.socket.socket_wants_write(),
+            "the kernel edge must flush the pending records"
+        );
+        assert!(
+            !matches!(result, MuxResult::Continue),
+            "a drained GoAway flush must reach the disconnect, got {result:?}"
+        );
+    }
+
     // ── The write pass's own flush triple (`finalize_write`) ────────────
     //
     // `ConnectionH2::finalize_write` ends every write pass with the same
@@ -10925,7 +11031,12 @@ mod tests {
     // (#1604). When that flush stalls, `update_readiness_after_write`
     // (`mux/mod.rs`) has just REMOVED the WRITABLE event bit, and the
     // `Stalled` answer puts it back when the socket still holds records it
-    // could not hand to the kernel. Before #1604 each of the two stages had a
+    // could not hand to the kernel — unless the kernel refused the write
+    // (`WouldBlock`): it then owes the socket its next edge, and the re-arm
+    // would only repeat the refused write (sozu-proxy/sozu#1788,
+    // `a_refused_goaway_flush_waits_for_the_kernel_edge_then_closes`). The
+    // two tests below therefore stall the flush on a zero-length write the
+    // kernel did NOT refuse, the case the re-arm still exists for. Before #1604 each of the two stages had a
     // stall tail of its own; the two tests below cover the one that remains.
     //
     // Until the two tests below existed, nothing in the suite reached either
@@ -10961,13 +11072,14 @@ mod tests {
         // One record rustls still holds and a kernel that accepts nothing, so
         // `socket_wants_write()` answers true for the whole test.
         let (mut connection, _peer) = connection_with_backpressure(&pool, 1, 0, H2State::Header);
-        // The output flush stalls on its first round. `(0, WouldBlock)`
+        // The output flush stalls on its first round. A zero-length write
         // is what `update_readiness_after_write` reads as a stall, and it
         // removes the WRITABLE event bit before the drain stage can re-arm.
+        // `Continue`, not `WouldBlock`: no kernel edge is owed for it.
         connection
             .socket
             .write_script
-            .push_back((0, SocketResult::WouldBlock));
+            .push_back((0, SocketResult::Continue));
         let mut context = test_context(&pool);
         let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
 
@@ -11022,7 +11134,7 @@ mod tests {
         connection
             .socket
             .write_script
-            .push_back((0, SocketResult::WouldBlock));
+            .push_back((0, SocketResult::Continue));
         let mut context = test_context(&pool);
         let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
 
@@ -19638,11 +19750,18 @@ mod tests {
              not close the session: the close destroys plaintext the peer has \
              not received and it reads the response as truncated"
         );
+        // The kernel refused the flush: it owes this socket its next
+        // WRITABLE edge, so no synthetic one is queued (sozu-proxy/sozu#1788).
         assert!(
-            connection.core.readiness.event.is_writable(),
-            "ensure_tls_flushed must re-signal the WRITABLE event, since \
-             nothing else wakes a connection whose bytes are stuck in rustls \
-             rather than in the kernel"
+            connection.core.readiness.interest.is_writable(),
+            "the delayed close must keep WRITABLE interest so the kernel edge \
+             is delivered"
+        );
+        assert!(
+            !connection.core.readiness.event.is_writable(),
+            "a flush the kernel refused must leave WRITABLE to the kernel's \
+             next edge, got {:?}",
+            connection.core.readiness
         );
 
         let mut received = Vec::new();
@@ -19737,10 +19856,13 @@ mod tests {
              reaching Error means the arm fell through to force_disconnect \
              and its own record guard, not this one, kept the session alive"
         );
+        // The kernel refused the flush: it owes this socket its next
+        // WRITABLE edge, so no synthetic one is queued (sozu-proxy/sozu#1788).
         assert!(
-            connection.core.readiness.event.is_writable(),
-            "ensure_tls_flushed must re-signal the WRITABLE event so the loop \
-             comes back and retries the flush"
+            !connection.core.readiness.event.is_writable(),
+            "a flush the kernel refused must leave WRITABLE to the kernel's \
+             next edge, got {:?}",
+            connection.core.readiness
         );
 
         let mut received = Vec::new();

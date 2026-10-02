@@ -2893,6 +2893,27 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     apart. That is what sozu-proxy/sozu#1454 asked for. `h2_close`'s tables
     remain the exhaustive statement of the decisions; these are their callers.
 
+    **Keeping the connection open is not re-arming it.** Every site that
+    keeps a connection for its pending records goes through
+    `ConnectionH2::ensure_tls_flushed`, which raises a synthetic WRITABLE
+    event only when the latest socket write of the pass was not refused by
+    the kernel. A write that answered `WouldBlock` met a full socket: the
+    kernel raises the next WRITABLE edge once the peer reads, and that edge
+    flushes the records and lets the close proceed. A synthetic edge would
+    only repeat the refused write, and `Mux::ready_inner` did so on every
+    inner iteration until `MAX_LOOP_ITERATIONS` whenever a TLS client stopped
+    reading ([#1788](https://github.com/sozu-proxy/sozu/issues/1788)). A
+    refused write also consumes the WRITABLE event, including the empty-buffer
+    flushes whose status nothing else reads. The decisions above are
+    unchanged: they still read `tls_wants_write`, and a connection with
+    records pending keeps WRITABLE interest. The two real-rustls tests above
+    assert that the refused pass queues no event and that the pass the kernel
+    edge triggers flushes the records and closes;
+    `a_refused_goaway_flush_waits_for_the_kernel_edge_then_closes` does the
+    same over `BackpressuredTlsSocket`, and
+    `test_tls_h2_stalled_reader_does_not_exhaust_loop_budget`
+    (`e2e/src/tests/h2_tests.rs`) end to end.
+
     **A fourth site shares the shape without deciding a close.** The end of
     every `ConnectionH2::write_streams` pass runs the same
     query / flush / query triple — the shell performs the three steps and
