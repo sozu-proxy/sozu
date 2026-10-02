@@ -44,7 +44,8 @@ use sozu_command_lib::{
 };
 
 use super::h2_utils::{
-    H2_FRAME_HEADERS, H2Frame, collect_response_frames, h2_handshake, log_frames,
+    H2_FLAG_END_STREAM, H2_FRAME_DATA, H2_FRAME_HEADERS, H2Frame, collect_response_frames,
+    contains_goaway, contains_rst_stream, decode_status, h2_handshake, log_frames, parse_h2_frames,
     raw_h2_connection, rejected_with_goaway_or_rst, setup_h2_listener_only, setup_h2_test,
     stream_status_matches, teardown, verify_sozu_alive,
 };
@@ -872,6 +873,487 @@ fn test_h2_bodiless_response_trailers_keep_h1_client_framing() {
             "{method} answered {status}"
         );
     }
+}
+
+/// An H2 backend answers a `method` request with `:status` `status` and no
+/// `content-length`, its HEADERS without END_STREAM, then ends the stream
+/// with an empty trailer HEADERS frame; a second request on the same
+/// keep-alive H1 client connection, routed to an H1 backend, is answered
+/// `200`. The first response has no body by definition (RFC 9110 §6.4.1), so
+/// its head carries no `Transfer-Encoding` (RFC 9112 §6.1) and the next
+/// response starts right after it.
+///
+/// TO SEE THIS RED: drop the `no_body` guard of the chunked upgrade in
+/// `pkawa::handle_header` (`lib/src/protocol/mux/pkawa.rs`).
+fn try_h2_bodiless_response_head_has_no_transfer_encoding(method: &str, status: &str) -> State {
+    let (mut worker, backend, mut h1_backend, front_addr) =
+        setup_h1_front_with_raw_h2_backend(&format!("H2-BODILESS-NO-TE-H1-{method}-{status}"));
+    backend.set_status(status);
+    backend.set_trailers(Some(Vec::new()));
+
+    let mut client = TcpStream::connect(front_addr).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    client
+        .write_all(format!("{method} / HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+        .unwrap();
+    let first = drain_client(&mut client);
+    println!("bodiless no-TE {method} {status} — first response {first:?}");
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: other\r\n\r\n")
+        .unwrap();
+    let second = drain_client(&mut client);
+    println!("bodiless no-TE {method} {status} — second response {second:?}");
+
+    drop(client);
+    drop(backend);
+    h1_backend.stop_and_get_aggregator();
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    let wire = format!("{first}{second}");
+    let (head, next) = wire.split_once("\r\n\r\n").unwrap_or(("", ""));
+    let head_ok = head.starts_with(&format!("HTTP/1.1 {status} "))
+        && !head.to_ascii_lowercase().contains("transfer-encoding");
+    let second_parsed = next.starts_with("HTTP/1.1 200 ") && next.contains("pong");
+    if head_ok && second_parsed && stopped {
+        State::Success
+    } else {
+        println!(
+            "bodiless no-TE {method} {status} FAIL — head={head:?} next={next:?} \
+             stopped={stopped}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_bodiless_response_head_has_no_transfer_encoding() {
+    for (method, status) in [("GET", "204"), ("GET", "304"), ("HEAD", "200")] {
+        assert_eq!(
+            repeat_until_error_or(
+                3,
+                "H2->H1: no Transfer-Encoding on a response without a body (RFC 9112 §6.1)",
+                || try_h2_bodiless_response_head_has_no_transfer_encoding(method, status)
+            ),
+            State::Success,
+            "{method} answered {status}"
+        );
+    }
+}
+
+// ============================================================================
+// Responses without a body, interim and 101 responses from an H2 backend
+// ============================================================================
+
+/// Sōzu HTTPS listener (H2 clients) + an `http2` cluster for `localhost`
+/// served by a `RawH2ResponseBackend`. Returns the running `Worker`, the
+/// raw backend and the front port.
+fn setup_h2_front_with_raw_h2_backend(name: &str) -> (Worker, RawH2ResponseBackend, u16) {
+    let (mut worker, front_port, _) = setup_h2_listener_only(name);
+    worker.send_proxy_request_type(RequestType::AddCluster(Cluster {
+        http2: Some(true),
+        ..Worker::default_cluster("cluster_0")
+    }));
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+    let backend = RawH2ResponseBackend::new(back_address);
+    // Give the backend thread a moment to bind.
+    thread::sleep(Duration::from_millis(100));
+    (worker, backend, front_port)
+}
+
+/// The header block of a `method` request for `/` on `localhost`.
+fn request_for(method: &[u8]) -> Vec<u8> {
+    let mut block = request_prefix_localhost();
+    if method != b"GET" {
+        block.remove(0);
+        let mut literal = Vec::new();
+        push_literal_indexed_name(&mut literal, 2, method);
+        block.splice(0..0, literal);
+    }
+    block
+}
+
+/// Read the frames sozu sends on `tls` until `done` holds for them or
+/// `timeout` elapses.
+fn read_h2_frames_until(
+    tls: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+    timeout: Duration,
+    done: impl Fn(&[(u8, u8, u32, Vec<u8>)]) -> bool,
+) -> Vec<(u8, u8, u32, Vec<u8>)> {
+    tls.sock
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let start = Instant::now();
+    let mut raw = Vec::new();
+    let mut buffer = vec![0u8; 16_384];
+    loop {
+        let frames = parse_h2_frames(&raw);
+        if done(&frames) || start.elapsed() >= timeout {
+            return frames;
+        }
+        match tls.read(&mut buffer) {
+            Ok(0) => return parse_h2_frames(&raw),
+            Ok(n) => raw.extend_from_slice(&buffer[..n]),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => return parse_h2_frames(&raw),
+        }
+    }
+}
+
+/// Whether a frame of `frames` ends `stream_id`.
+fn ends_stream(frames: &[(u8, u8, u32, Vec<u8>)], stream_id: u32) -> bool {
+    frames.iter().any(|(kind, flags, id, _)| {
+        *id == stream_id
+            && (*kind == H2_FRAME_HEADERS || *kind == H2_FRAME_DATA)
+            && flags & H2_FLAG_END_STREAM != 0
+    })
+}
+
+/// The DATA payload of `stream_id` in `frames`.
+fn stream_data(frames: &[(u8, u8, u32, Vec<u8>)], stream_id: u32) -> Vec<u8> {
+    frames
+        .iter()
+        .filter(|(kind, _, id, _)| *kind == H2_FRAME_DATA && *id == stream_id)
+        .flat_map(|(_, _, _, payload)| payload.clone())
+        .collect()
+}
+
+/// How the H2 backend ends a response whose HEADERS frame lacks END_STREAM.
+#[derive(Clone, Copy, Debug)]
+enum BodilessEnd {
+    /// A trailer HEADERS frame flagged END_STREAM.
+    Trailers,
+    /// An empty DATA frame flagged END_STREAM.
+    EmptyData,
+}
+
+fn end_bodiless_response_with(backend: &RawH2ResponseBackend, end: BodilessEnd) {
+    match end {
+        BodilessEnd::Trailers => {
+            backend.set_trailers(Some(vec![(b"grpc-status".to_vec(), b"0".to_vec())]))
+        }
+        BodilessEnd::EmptyData => backend.set_empty_data_end(true),
+    }
+}
+
+/// The requests and statuses of a response without a body (RFC 9110
+/// §6.4.1), crossed with the two ways an H2 backend ends its stream.
+const BODILESS_CASES: [(&str, &str, BodilessEnd); 6] = [
+    ("GET", "204", BodilessEnd::Trailers),
+    ("GET", "204", BodilessEnd::EmptyData),
+    ("GET", "304", BodilessEnd::Trailers),
+    ("GET", "304", BodilessEnd::EmptyData),
+    ("HEAD", "200", BodilessEnd::Trailers),
+    ("HEAD", "200", BodilessEnd::EmptyData),
+];
+
+/// An H2 backend answers a `method` request with `:status` `status`, its
+/// HEADERS frame without END_STREAM, then ends the stream as `end` says. A
+/// response without a body (RFC 9110 §6.4.1) still ends with the END_STREAM
+/// of its stream (RFC 9113 §8.1), so the H2 client must receive END_STREAM
+/// on stream 1, and no content, reset or GOAWAY.
+///
+/// TO SEE THIS RED: have `pkawa::handle_header`
+/// (`lib/src/protocol/mux/pkawa.rs`) mark every response without a body
+/// `ParsingPhase::Terminated` at its head, not only a 1xx: the client
+/// stream is released after HEADERS and never ends.
+fn try_h2_bodiless_response_ends_the_h2_client_stream(
+    method: &str,
+    status: &str,
+    end: BodilessEnd,
+) -> State {
+    let (mut worker, backend, front_port) = setup_h2_front_with_raw_h2_backend(&format!(
+        "H2-BODILESS-END-H2-{method}-{status}-{end:?}"
+    ));
+    backend.set_status(status);
+    end_bodiless_response_with(&backend, end);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+    tls.write_all(&H2Frame::headers(1, request_for(method.as_bytes()), true, true).encode())
+        .unwrap();
+    tls.flush().unwrap();
+    let frames = read_h2_frames_until(&mut tls, Duration::from_secs(1), |frames| {
+        ends_stream(frames, 1)
+    });
+    log_frames(&format!("bodiless end {method} {status} {end:?}"), &frames);
+
+    drop(tls);
+    drop(backend);
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    let status_ok = stream_status_matches(&frames, 1, status.parse().unwrap());
+    let ended = ends_stream(&frames, 1);
+    let no_content = stream_data(&frames, 1).is_empty();
+    let no_reset = !contains_rst_stream(&frames) && !contains_goaway(&frames);
+    if status_ok && ended && no_content && no_reset && stopped {
+        State::Success
+    } else {
+        println!(
+            "bodiless end {method} {status} {end:?} FAIL — status_ok={status_ok} \
+             ended={ended} no_content={no_content} no_reset={no_reset} stopped={stopped}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_bodiless_response_ends_the_h2_client_stream() {
+    for (method, status, end) in BODILESS_CASES {
+        assert_eq!(
+            repeat_until_error_or(
+                2,
+                "H2->H2: a response without a body ends with END_STREAM (RFC 9113 §8.1)",
+                || try_h2_bodiless_response_ends_the_h2_client_stream(method, status, end)
+            ),
+            State::Success,
+            "{method} answered {status}, ended by {end:?}"
+        );
+    }
+}
+
+/// As `try_h2_bodiless_response_ends_the_h2_client_stream`, but the backend
+/// holds the end of stream 1 back until sozu opens a second stream on the
+/// same backend connection, for a second request of the H2 client. The end
+/// of stream 1 must not cost the backend connection (RFC 9113 §5.1: the
+/// stream is open until END_STREAM): no GOAWAY and no RST_STREAM towards
+/// the backend, both client streams end,
+/// the second one with its `200` and `pong`, over one backend connection.
+///
+/// TO SEE THIS RED: as for `try_h2_bodiless_response_ends_the_h2_client_stream`;
+/// the backend's trailer HEADERS then hits the closed-stream check of
+/// `ConnectionH2::handle_read` (`lib/src/protocol/mux/h2.rs`), which sends
+/// GOAWAY(STREAM_CLOSED).
+fn try_h2_bodiless_response_end_keeps_the_backend_connection(
+    method: &str,
+    status: &str,
+    end: BodilessEnd,
+) -> State {
+    let (mut worker, backend, front_port) = setup_h2_front_with_raw_h2_backend(&format!(
+        "H2-BODILESS-SECOND-{method}-{status}-{end:?}"
+    ));
+    backend.set_status(status);
+    end_bodiless_response_with(&backend, end);
+    backend.set_serve_second_stream(true);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+    tls.write_all(&H2Frame::headers(1, request_for(method.as_bytes()), true, true).encode())
+        .unwrap();
+    tls.flush().unwrap();
+    let first = read_h2_frames_until(&mut tls, Duration::from_secs(1), |frames| {
+        frames
+            .iter()
+            .any(|(kind, _, id, _)| *kind == H2_FRAME_HEADERS && *id == 1)
+    });
+    tls.write_all(&H2Frame::headers(3, request_for(b"GET"), true, true).encode())
+        .unwrap();
+    tls.flush().unwrap();
+    let rest = read_h2_frames_until(&mut tls, Duration::from_secs(2), |frames| {
+        ends_stream(frames, 3) && ends_stream(frames, 1)
+    });
+    let frames = [first, rest].concat();
+    log_frames(
+        &format!("bodiless second {method} {status} {end:?}"),
+        &frames,
+    );
+
+    drop(tls);
+    thread::sleep(Duration::from_millis(400));
+    let goaways = backend.goaways_received();
+    let resets = backend.resets_received();
+    let connections = backend.connections_received();
+    drop(backend);
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    let first_ok = stream_status_matches(&frames, 1, status.parse().unwrap())
+        && ends_stream(&frames, 1)
+        && stream_data(&frames, 1).is_empty();
+    let second_ok = stream_status_matches(&frames, 3, 200)
+        && ends_stream(&frames, 3)
+        && stream_data(&frames, 3) == b"pong";
+    let no_reset = !contains_rst_stream(&frames) && !contains_goaway(&frames);
+    if first_ok
+        && second_ok
+        && no_reset
+        && goaways == 0
+        && resets == 0
+        && connections == 1
+        && stopped
+    {
+        State::Success
+    } else {
+        println!(
+            "bodiless second {method} {status} {end:?} FAIL — first_ok={first_ok} \
+             second_ok={second_ok} no_reset={no_reset} backend_goaways={goaways} \
+             backend_resets={resets} backend_connections={connections} stopped={stopped}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_bodiless_response_end_keeps_the_backend_connection() {
+    for (method, status, end) in BODILESS_CASES {
+        assert_eq!(
+            repeat_until_error_or(
+                2,
+                "H2->H2: the end of a response without a body keeps the backend connection",
+                || try_h2_bodiless_response_end_keeps_the_backend_connection(method, status, end)
+            ),
+            State::Success,
+            "{method} answered {status}, ended by {end:?}"
+        );
+    }
+}
+
+/// An H2 backend answers `103` then `200` with the body `hello`. The
+/// interim response is forwarded on its own (RFC 9110 §15.2), then the
+/// final one: to an H1 client as two heads, the `103` without any framing
+/// field, and to an H2 client as two HEADERS frames on stream 1 before the
+/// DATA ending it, with no reset.
+///
+/// TO SEE THIS RED: drop the 1xx from the statuses
+/// `pkawa::handle_header` (`lib/src/protocol/mux/pkawa.rs`) marks complete
+/// at their head: the `103` is framed chunked, the H1 client never reads the
+/// `200` and the H2 client stream is reset.
+fn try_h2_backend_interim_response_reaches_the_client(h2_client: bool) -> State {
+    let name = format!("H2-INTERIM-{}", if h2_client { "H2" } else { "H1" });
+    let (worker, backend, received, extra) = if h2_client {
+        let (worker, backend, front_port) = setup_h2_front_with_raw_h2_backend(&name);
+        backend.push_interim("103");
+        backend.set_body_with_delay(b"hello".to_vec(), Duration::ZERO);
+        let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+        let mut tls = raw_h2_connection(front_addr);
+        h2_handshake(&mut tls);
+        tls.write_all(&H2Frame::headers(1, request_for(b"GET"), true, true).encode())
+            .unwrap();
+        tls.flush().unwrap();
+        let frames = read_h2_frames_until(&mut tls, Duration::from_secs(1), |frames| {
+            ends_stream(frames, 1)
+        });
+        log_frames("interim H2 client", &frames);
+        let heads: Vec<_> = frames
+            .iter()
+            .filter(|(kind, _, id, _)| *kind == H2_FRAME_HEADERS && *id == 1)
+            .map(|(_, flags, _, payload)| (decode_status(payload), flags & H2_FLAG_END_STREAM))
+            .collect();
+        let ok = heads == [(Some(103), 0), (Some(200), 0)]
+            && stream_data(&frames, 1) == b"hello"
+            && ends_stream(&frames, 1)
+            && !contains_rst_stream(&frames)
+            && !contains_goaway(&frames);
+        drop(tls);
+        (worker, backend, ok, None)
+    } else {
+        let (worker, backend, h1_backend, front_addr) = setup_h1_front_with_raw_h2_backend(&name);
+        backend.push_interim("103");
+        backend.set_body_with_delay(b"hello".to_vec(), Duration::ZERO);
+        let mut client = TcpStream::connect(front_addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let wire = drain_client(&mut client);
+        println!("interim H1 client — {wire:?}");
+        let (interim, rest) = wire.split_once("\r\n\r\n").unwrap_or(("", ""));
+        let ok = interim.starts_with("HTTP/1.1 103 ")
+            && !interim.to_ascii_lowercase().contains("transfer-encoding")
+            && rest.starts_with("HTTP/1.1 200 ")
+            && rest.contains("hello");
+        drop(client);
+        (worker, backend, ok, Some(h1_backend))
+    };
+    let mut worker = worker;
+    drop(backend);
+    if let Some(mut h1_backend) = extra {
+        h1_backend.stop_and_get_aggregator();
+    }
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    if received && stopped {
+        State::Success
+    } else {
+        println!("interim h2_client={h2_client} FAIL — received={received} stopped={stopped}");
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_backend_interim_response_reaches_the_client() {
+    for h2_client in [false, true] {
+        assert_eq!(
+            repeat_until_error_or(
+                2,
+                "H2 backend: a 103 then the final response reach the client (RFC 9110 §15.2)",
+                || try_h2_backend_interim_response_reaches_the_client(h2_client)
+            ),
+            State::Success,
+            "h2_client={h2_client}"
+        );
+    }
+}
+
+/// An H2 backend answers `:status 101`, which HTTP/2 does not support (RFC
+/// 9113 §8.6): the response is malformed, the backend stream is reset and
+/// the H1 client gets a 502, on a session that stays open.
+///
+/// TO SEE THIS RED: drop the `101` check of `pkawa::handle_header`
+/// (`lib/src/protocol/mux/pkawa.rs`): the response reaches the upgrade
+/// branch of `ConnectionH1::readable`, which closes the session.
+fn try_h2_backend_101_is_a_bad_gateway() -> State {
+    let (mut worker, backend, mut h1_backend, front_addr) =
+        setup_h1_front_with_raw_h2_backend("H2-101-BAD-GATEWAY");
+    backend.set_status("101");
+    let mut client = TcpStream::connect(front_addr).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let wire = drain_client(&mut client);
+    println!("101 from an H2 backend — {wire:?}");
+    drop(client);
+    drop(backend);
+    h1_backend.stop_and_get_aggregator();
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    if wire.starts_with("HTTP/1.1 502 ") && stopped {
+        State::Success
+    } else {
+        println!("101 FAIL — stopped={stopped}");
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_backend_101_is_a_bad_gateway() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "H2 backend: :status 101 is a malformed response (RFC 9113 §8.6)",
+            try_h2_backend_101_is_a_bad_gateway
+        ),
+        State::Success
+    );
 }
 
 // ============================================================================

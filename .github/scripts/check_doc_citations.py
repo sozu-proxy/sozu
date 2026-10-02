@@ -1473,6 +1473,13 @@ RENAMED_TESTS = {
         "a_mux_pass_keeps_the_connection_sample_and_reads_none_without_a_log",
     "snapshot_rtts_samples_the_frontend_once_per_pass":
         "snapshot_rtts_samples_the_frontend_once_per_connection",
+    # sozu#1749 turned the pending RST_STREAM queue's lifetime cap into a
+    # bound on what is pending; the two lifetime-cap tests were rewritten to
+    # pin the bound that replaced it. The CHANGELOG cites the old names.
+    "the_lifetime_cap_tracks_the_instance_bound_not_the_constant":
+        "overflow_is_set_by_a_refused_insert_and_survives_the_drain",
+    "draining_does_not_rewind_the_lifetime_cap":
+        "draining_keeps_any_number_of_resets_within_the_bound",
     "a_mux_pass_forgets_the_previous_sample_and_reads_none_without_a_log":
         "a_mux_pass_keeps_the_connection_sample_and_reads_none_without_a_log",
     # Renamed because the old name claimed an ordering the body could not
@@ -1530,6 +1537,8 @@ RENAMED_TESTS = {
 NOT_A_TEST = {
     "h2_graceful_shutdown_deadline_seconds": "listener configuration key",
     "h2_max_rst_stream_per_window": "listener configuration key",
+    "h2_max_rst_stream_abusive_lifetime": "listener configuration key",
+    "h2_max_window_update_stream0_per_window": "listener configuration key",
     "h2_max_header_list_size": "listener configuration key",
     "h2_max_header_table_size": "listener configuration key",
     "select_nth_unstable_by_key": "std library method",

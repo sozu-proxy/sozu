@@ -81,15 +81,16 @@
 //! argued each loop BODY was order-independent, but per-element
 //! commutativity does not cover EARLY TERMINATION.
 //!
-//! `update_initial_window_size` is the counter-example. Its body does read
+//! `update_initial_window_size` was the counter-example. Its body did read
 //! as commutative — an additive delta to each stream's own `window`, a
-//! `bool` OR-combined — but the loop also carries the `None => return true`
-//! arm RFC 9113 §6.9.2 requires on `checked_add`, and it returns from
-//! INSIDE the loop. So when a SETTINGS_INITIAL_WINDOW_SIZE change overflows
-//! one stream, which PREFIX of the others was already mutated before the
-//! abort is precisely the iteration order. `handle_settings_frame` turns
-//! that `true` into a GOAWAY, and the half-updated window set stays in
-//! `context.streams` for `close`'s teardown walk and any pass still to run.
+//! `bool` OR-combined — but the loop also carried the `None => return true`
+//! arm RFC 9113 §6.9.2 requires on `checked_add`, and it returned from
+//! INSIDE the loop. So when a SETTINGS_INITIAL_WINDOW_SIZE change
+//! overflowed one stream, which PREFIX of the others was already mutated
+//! before the abort was precisely the iteration order, and the half-updated
+//! window set stayed in `context.streams` for `close`'s teardown walk. It
+//! now checks every window before changing any (sozu-proxy/sozu#1758), so
+//! a rejection mutates nothing and the order no longer shows.
 //!
 //! Two further sites order observable work rather than arithmetic.
 //! `handle_goaway_frame` walks the map into `retry_streams` and pushes each

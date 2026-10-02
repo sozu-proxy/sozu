@@ -834,6 +834,13 @@ pub struct HttpContext {
     /// `backend_response_timeout`). `None` for non-timeout sessions, in
     /// which case the access log emits `message: None` as before.
     pub access_log_message: Option<&'static str>,
+    /// The routed cluster has backends, but none could be selected for this
+    /// request — every one failing its health check or backing off after
+    /// connection failures — so Sōzu answered 503 without contacting one.
+    /// That is a backend outage, not a routing miss: the H2 RST caps count
+    /// such a stream as routed to a backend (`routed_to_a_backend`,
+    /// `lib/src/protocol/mux/h2.rs`). Request-scoped: `reset` clears it.
+    pub backends_unavailable: bool,
 }
 
 /// How `apply_response_header_edits` should interpret a per-edit value.
@@ -1217,6 +1224,7 @@ impl HttpContext {
             tags: None,
             forwarding_hop: None,
             access_log_message: None,
+            backends_unavailable: false,
         }
     }
 
@@ -2298,6 +2306,7 @@ impl HttpContext {
         self.original_authority = None;
         self.headers_response.clear();
         self.trailer_fields = 0;
+        self.backends_unavailable = false;
         // Note: tls_server_name, tls_version, tls_cipher, tls_alpn,
         // strict_sni_binding, elide_x_real_ip, send_x_real_ip,
         // forwarded_headers and max_trailer_fields are
@@ -2315,7 +2324,8 @@ impl HttpContext {
                 && self.status.is_none()
                 && self.x_request_id.is_none()
                 && self.headers_response.is_empty()
-                && self.trailer_fields == 0,
+                && self.trailer_fields == 0
+                && !self.backends_unavailable,
             "reset() must clear all request-scoped state"
         );
         debug_assert!(

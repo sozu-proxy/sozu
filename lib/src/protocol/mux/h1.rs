@@ -453,13 +453,13 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
     /// An H1 client reads such a response as ending with its header section
     /// (RFC 9112 §6.3 rule 1), so it carries neither a last chunk nor a
     /// trailer section, and any byte written after the head is read as the
-    /// start of the next response on a keep-alive connection. An H2 backend
-    /// that sends the header section without END_STREAM and no
-    /// `content-length` gets chunked framing from `pkawa::handle_header`, and
-    /// the end of its stream, an empty DATA frame or a trailer HEADERS
-    /// frame, queues `Flags` that kawa's H1 serializer writes as `0\r\n`,
-    /// the trailer fields and an empty line. Every block after the header
-    /// section is cleared here: its trailer fields are removed (RFC 9110
+    /// start of the next response on a keep-alive connection. The end of an
+    /// H2 backend stream, an empty DATA frame or a trailer HEADERS frame,
+    /// queues `Flags` that kawa's H1 serializer writes as `0\r\n` under
+    /// chunked framing, and as the trailer fields and an empty line;
+    /// `pkawa::handle_header` gives such a response no chunked framing, and
+    /// leaves it open until that end. Every block after the header section
+    /// is cleared here: its trailer fields are removed (RFC 9110
     /// §6.5.1 lets a recipient discard trailers) and its `Flags` lose
     /// `end_body`, `end_chunk` and `end_header`, so for a stream ended by a
     /// trailer HEADERS frame or an empty DATA frame nothing is written after
@@ -2348,6 +2348,7 @@ mod tests {
             tags: None,
             forwarding_hop: None,
             access_log_message: None,
+            backends_unavailable: false,
         }
     }
 
@@ -4297,10 +4298,13 @@ mod tests {
     /// HTTP/1.1 (RFC 9112 §6.3 rule 1): whatever its framing, nothing
     /// follows the head towards an H1 client, neither a last chunk nor a
     /// trailer section (RFC 9110 §6.5.1), so the next response on a
-    /// keep-alive connection starts right after it. Covers chunked framing
-    /// (no `content-length`), `Content-Length` framing and `BodySize::Empty`,
-    /// each ended by a trailer block with one field or none, or by an empty
-    /// DATA frame. A `:status 200` stands for the response to a HEAD.
+    /// keep-alive connection starts right after it. Covers chunked framing,
+    /// `Content-Length` framing and `BodySize::Empty`, each ended by a
+    /// trailer block with one field or none, or by an empty DATA frame. A
+    /// `:status 200` stands for the response to a HEAD: with no callbacks,
+    /// `pkawa::handle_header` does not know the method and frames it chunked,
+    /// with `Transfer-Encoding`, while it gives a 204 or a 304 no framing and
+    /// removes a 204's `content-length` (RFC 9110 §8.6).
     ///
     /// TO SEE THIS RED: make `drop_bodiless_response_framing` return `false`
     /// before touching the block queue.
@@ -4309,30 +4313,35 @@ mod tests {
         let with_field: &[(&[u8], &[u8])] = &[(b"grpc-status", b"0")];
         for status in [&b"204"[..], b"304", b"200"] {
             let status_line = String::from_utf8_lossy(status);
+            let (unframed_size, unframed) = if status == b"200" {
+                (kawa::BodySize::Chunked, "Transfer-Encoding: chunked\r\n")
+            } else {
+                (kawa::BodySize::Empty, "")
+            };
+            let length_framed = |length: usize, field: &'static str| {
+                if status == b"204" {
+                    (kawa::BodySize::Empty, "")
+                } else {
+                    (kawa::BodySize::Length(length), field)
+                }
+            };
+            let (zero_size, zero) = length_framed(0, "content-length: 0\r\n");
+            let (five_size, five) = length_framed(5, "content-length: 5\r\n");
             for (content_length, body_size, expected_size, framing) in [
+                (None, None, unframed_size, unframed),
                 (
                     None,
-                    None,
+                    Some(kawa::BodySize::Chunked),
                     kawa::BodySize::Chunked,
-                    "Transfer-Encoding: chunked\r\n",
+                    unframed,
                 ),
-                (
-                    Some(&b"0"[..]),
-                    None,
-                    kawa::BodySize::Length(0),
-                    "content-length: 0\r\n",
-                ),
-                (
-                    Some(b"5"),
-                    None,
-                    kawa::BodySize::Length(5),
-                    "content-length: 5\r\n",
-                ),
+                (Some(&b"0"[..]), None, zero_size, zero),
+                (Some(b"5"), None, five_size, five),
                 (
                     None,
                     Some(kawa::BodySize::Empty),
                     kawa::BodySize::Empty,
-                    "Transfer-Encoding: chunked\r\n",
+                    unframed,
                 ),
             ] {
                 let mut head: Vec<(&[u8], &[u8])> = vec![(b":status", status)];
@@ -4388,6 +4397,154 @@ mod tests {
         kawa.prepare(&mut kawa::h1::BlockConverter);
         assert!(kawa.out.is_empty(), "nothing is written after the head");
         assert!(!ConnectionH1::<mio::net::TcpStream>::drop_bodiless_response_framing(&mut kawa));
+    }
+
+    /// What kawa's H1 serializer writes to an H1 client for the header
+    /// section `head` of an H2 backend response that arrived without
+    /// END_STREAM, to a `method` request, and whether the response was then
+    /// complete (`ParsingPhase::Terminated`).
+    fn h1_head_of_an_h2_response(
+        method: crate::protocol::kawa_h1::parser::Method,
+        head: &[(&[u8], &[u8])],
+    ) -> (String, bool) {
+        let mut pool = Pool::with_capacity(1, 1, 4096);
+        let checkout = pool
+            .checkout()
+            .expect("the test pool must hand out a buffer");
+        let mut kawa: super::super::GenericHttpStream =
+            kawa::Kawa::new(kawa::Kind::Response, kawa::Buffer::new(checkout));
+        let mut context = test_http_context(Ulid::generate());
+        context.method = Some(method);
+        let mut encoded = Vec::new();
+        let mut encoder = super::super::hpack::Encoder::new();
+        for &(name, value) in head {
+            encoder.encode_header_into((name, value), &mut encoded);
+        }
+        let (_, result) = super::super::pkawa::handle_header(
+            &mut super::super::hpack::Decoder::new(),
+            &mut crate::protocol::mux::h2_scheduler::Prioriser::default(),
+            1,
+            &mut kawa,
+            &encoded,
+            false,
+            &mut context,
+            super::super::h2::MAX_HEADER_LIST_SIZE as u32,
+            u32::MAX,
+            false,
+        );
+        assert!(result.is_ok(), "handle_header failed: {:?}", result.err());
+        let terminated = kawa.is_terminated();
+        kawa.prepare(&mut kawa::h1::BlockConverter);
+        let buffer = kawa.storage.buffer();
+        let bytes: Vec<u8> = kawa
+            .out
+            .iter()
+            .flat_map(|block| match block {
+                kawa::OutBlock::Store(store) => store.data(buffer).to_vec(),
+                kawa::OutBlock::Delimiter => Vec::new(),
+            })
+            .collect();
+        (String::from_utf8_lossy(&bytes).into_owned(), terminated)
+    }
+
+    /// An H2 response whose header section arrives without END_STREAM gains
+    /// no `Transfer-Encoding` towards an H1 client when it has no content by
+    /// definition (RFC 9110 §6.4.1): a 1xx or a 204 (RFC 9112 §6.1 MUST NOT),
+    /// a 304 or a response to HEAD. A 1xx or a 204 also loses the
+    /// `content-length` the backend sent, which a server MUST NOT send in
+    /// them (RFC 9110 §8.6), while a 304 or a response to HEAD keeps it. A
+    /// 1xx is complete at its head (`ParsingPhase::Terminated`), the final
+    /// response following on the same stream; any other response waits for
+    /// the END_STREAM of its stream (RFC 9113 §8.1). A `200` to GET still
+    /// gains chunked framing.
+    ///
+    /// TO SEE THIS RED: drop the `no_content` guard of the chunked upgrade in
+    /// `pkawa::handle_header`, or its removal of a 1xx or 204
+    /// `content-length`.
+    #[test]
+    fn a_bodiless_h2_response_gains_no_transfer_encoding_towards_an_h1_client() {
+        use crate::protocol::kawa_h1::parser::Method;
+        /// The header fields of a response, `:status` first.
+        type Head = &'static [(&'static [u8], &'static [u8])];
+        let cases: [(Method, Head, &str, bool); 10] = [
+            (
+                Method::Get,
+                &[(b":status", b"204")],
+                "HTTP/1.1 204 FromH2\r\n",
+                false,
+            ),
+            (
+                Method::Get,
+                &[(b":status", b"204"), (b"content-length", b"0")],
+                "HTTP/1.1 204 FromH2\r\n",
+                false,
+            ),
+            (
+                Method::Get,
+                &[(b":status", b"304")],
+                "HTTP/1.1 304 FromH2\r\n",
+                false,
+            ),
+            (
+                Method::Get,
+                &[(b":status", b"304"), (b"content-length", b"5")],
+                "HTTP/1.1 304 FromH2\r\ncontent-length: 5\r\n",
+                false,
+            ),
+            (
+                Method::Get,
+                &[(b":status", b"103"), (b"link", b"</a.css>")],
+                "HTTP/1.1 103 FromH2\r\nlink: </a.css>\r\n",
+                true,
+            ),
+            (
+                Method::Get,
+                &[
+                    (b":status", b"103"),
+                    (b"content-length", b"5"),
+                    (b"link", b"</a.css>"),
+                ],
+                "HTTP/1.1 103 FromH2\r\nlink: </a.css>\r\n",
+                true,
+            ),
+            (
+                Method::Head,
+                &[(b":status", b"200")],
+                "HTTP/1.1 200 FromH2\r\n",
+                false,
+            ),
+            (
+                Method::Head,
+                &[(b":status", b"200"), (b"content-length", b"5")],
+                "HTTP/1.1 200 FromH2\r\ncontent-length: 5\r\n",
+                false,
+            ),
+            (
+                Method::Head,
+                &[(b":status", b"200"), (b"content-length", b"0")],
+                "HTTP/1.1 200 FromH2\r\ncontent-length: 0\r\n",
+                false,
+            ),
+            (
+                Method::Get,
+                &[(b":status", b"200")],
+                "HTTP/1.1 200 FromH2\r\nTransfer-Encoding: chunked\r\n",
+                false,
+            ),
+        ];
+        for (method, head, status_and_fields, terminated) in cases {
+            let (bytes, complete) = h1_head_of_an_h2_response(method.clone(), head);
+            let bytes = bytes
+                .split("\r\n")
+                .filter(|line| !line.starts_with("Sozu-Id: "))
+                .collect::<Vec<_>>()
+                .join("\r\n");
+            assert_eq!(
+                (bytes, complete),
+                (format!("{status_and_fields}\r\n"), terminated),
+                "{method:?} {head:?}"
+            );
+        }
     }
 
     /// Which responses `response_has_no_body` treats as bodiless.

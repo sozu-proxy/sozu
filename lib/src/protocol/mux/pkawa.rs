@@ -1255,6 +1255,18 @@ where
                 error!("{} INVALID HEADERS", log_module_context!());
                 return (events, Err((H2Error::ProtocolError, false)));
             }
+            // RFC 9113 §8.6: HTTP/2 removes support for the 101 (Switching
+            // Protocols) status code, so a response carrying it is malformed
+            // (§8.1.1): a stream error, answered 502 to the client, rather
+            // than an upgrade the H1 frontend would attempt.
+            if code == 101 {
+                error!(
+                    "{} :status 101 in an H2 response (RFC 9113 §8.6)",
+                    log_module_context!()
+                );
+                metric_reject(RejectReason::InvalidStatus, &mut events);
+                return (events, Err((H2Error::ProtocolError, false)));
+            }
             // Past the validity gate, :status was exactly three ASCII digits
             // (the in-loop guard rejected anything else), so the decimal `code`
             // is in 100..=999 and `status` is a stored, non-empty slice.
@@ -1287,11 +1299,53 @@ where
 
     callbacks.on_headers(kawa);
 
+    // A response with no content by definition (RFC 9110 §6.4.1): a 1xx, a
+    // 204, a 304, or a response to HEAD, which
+    // `HttpContext::on_response_headers` has already marked `Terminated`.
+    let (interim, no_content_length_allowed) = match kawa.detached.status_line {
+        StatusLine::Response { code, .. } if matches!(kawa.kind, Kind::Response) => (
+            (100..200).contains(&code),
+            (100..200).contains(&code) || code == 204,
+        ),
+        _ => (false, false),
+    };
+    let no_content = matches!(kawa.kind, Kind::Response)
+        && (no_content_length_allowed
+            || kawa.parsing_phase == ParsingPhase::Terminated
+            || matches!(
+                kawa.detached.status_line,
+                StatusLine::Response { code: 304, .. }
+            ));
+    // RFC 9110 §8.6: a server MUST NOT send Content-Length in a 1xx or a 204
+    // response, so a backend's is removed; a 304 or a response to HEAD keeps
+    // it, as it states the length of the selected representation.
+    if no_content_length_allowed {
+        let buffer = kawa.storage.buffer();
+        let mut elided = false;
+        for block in kawa.blocks.iter_mut() {
+            if let Block::Header(pair) = block
+                && compare_no_case(pair.key.data(buffer), b"content-length")
+            {
+                pair.elide();
+                elided = true;
+            }
+        }
+        if elided {
+            debug!(
+                "{} content-length removed from a 1xx or 204 response (RFC 9110 §8.6)",
+                log_module_context!()
+            );
+        }
+        kawa.body_size = BodySize::Empty;
+    }
+
     if end_stream {
         // RFC 9113 §8.1.1: when END_STREAM is set on HEADERS, no DATA frames
         // follow, so the payload length is 0. A non-zero Content-Length is a
-        // stream error (PROTOCOL_ERROR). Body-exempt responses (1xx, 204, 304)
-        // are excluded — they may carry Content-Length per RFC 9110 §8.6.
+        // stream error (PROTOCOL_ERROR). A 304 is excluded: its Content-Length
+        // states the length of the selected representation (RFC 9110 §8.6),
+        // and RFC 9113 §8.1.1 lets a response with no content carry a
+        // non-zero one. A 1xx or a 204 has none left (removed above).
         if let BodySize::Length(n) = kawa.body_size {
             let body_exempt = matches!(kawa.kind, Kind::Response)
                 && matches!(
@@ -1308,9 +1362,10 @@ where
             }
         }
         if let BodySize::Empty = kawa.body_size {
-            // RFC 9110 §8.6: Do not inject Content-Length: 0 for responses where
-            // message body is forbidden (1xx, 204, 304). Only inject for requests
-            // and other response codes.
+            // RFC 9110 §8.6: Do not inject Content-Length: 0 into a 1xx or a
+            // 204, which MUST NOT carry the field, nor into a 304, where it
+            // would state the length of the selected representation. Only
+            // inject for requests and other response codes.
             let skip_content_length = matches!(kawa.kind, Kind::Response)
                 && matches!(
                     kawa.detached.status_line,
@@ -1340,7 +1395,11 @@ where
     // trailer delivery should omit Content-Length; the branch below then
     // upgrades the framing to chunked and H2BlockConverter on the back side
     // passes the trailer block through intact.
-    if !end_stream && kawa.body_size == BodySize::Empty {
+    //
+    // A response with no content gains no framing at all: its head is the
+    // whole H1 message (RFC 9112 §6.3 rule 1), and a server MUST NOT send
+    // Transfer-Encoding in a 1xx or a 204 (RFC 9112 §6.1).
+    if !end_stream && kawa.body_size == BodySize::Empty && !no_content {
         kawa.body_size = BodySize::Chunked;
         kawa.push_block(Block::Header(Pair {
             key: Store::Static(b"Transfer-Encoding"),
@@ -1354,6 +1413,26 @@ where
         end_header: true,
         end_stream,
     }));
+
+    if !end_stream && no_content {
+        // A 1xx is interim: like kawa's H1 parser, it is complete at its
+        // head, and the final response follows on the same stream
+        // (RFC 9113 §8.1), which `ConnectionH2::handle_1xx_reset` reopens.
+        //
+        // A 204, a 304 or a response to HEAD whose HEADERS frame lacks
+        // END_STREAM is not complete yet: the stream stays open until the
+        // backend ends it, with an empty DATA frame or a trailer section
+        // (RFC 9113 §5.1, §8.1), and its END_STREAM is what the client
+        // receives. Released at its head, the backend stream would be reset
+        // with frames still in flight on it, and an H2 client stream would
+        // never see END_STREAM.
+        kawa.parsing_phase = if interim {
+            ParsingPhase::Terminated
+        } else {
+            ParsingPhase::Body
+        };
+        return (events, Ok(()));
+    }
 
     if kawa.parsing_phase == ParsingPhase::Terminated {
         return (events, Ok(()));
@@ -2710,6 +2789,27 @@ mod tests {
             kawa.body_size,
             kawa::BodySize::Length(42),
             "body_size must be Length(42) after parsing '42'",
+        );
+    }
+
+    /// RFC 9113 §8.6: HTTP/2 has no 101 (Switching Protocols), so a backend
+    /// response carrying it is malformed, a stream error (PROTOCOL_ERROR),
+    /// with or without END_STREAM; another 1xx stays an interim response.
+    ///
+    /// TO SEE THIS RED: drop the `code == 101` check of `handle_header`.
+    #[test]
+    fn a_101_response_is_a_stream_protocol_error() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        for end_stream in [false, true] {
+            assert_eq!(
+                try_decode_response_headers(&mut pool, &[(b":status", b"101")], end_stream),
+                Err((H2Error::ProtocolError, false)),
+                "end_stream={end_stream}"
+            );
+        }
+        assert_eq!(
+            try_decode_response_headers(&mut pool, &[(b":status", b"103")], false),
+            Ok(())
         );
     }
 

@@ -750,11 +750,8 @@ pub(crate) fn h2_handshake_chromium_146(
 
     stream.write_all(&H2Frame::settings_ack().encode()).unwrap();
     // One-shot conn-level WINDOW_UPDATE, mirroring Chromium's
-    // post-SETTINGS behaviour. No further stream-0 WINDOW_UPDATE is
-    // emitted during drain — `H2FloodDetector` caps stream-0 WUs at
-    // DEFAULT_MAX_WINDOW_UPDATE_STREAM0_PER_WINDOW (100) per sliding
-    // window; a per-stream refresh cadence on stream 0 would trip the
-    // detector and GOAWAY the connection.
+    // post-SETTINGS behaviour. The drain helper refreshes stream windows
+    // only, never this one.
     stream
         .write_all(&H2Frame::window_update(0, CHROME146_CONN_WINDOW_UPDATE_DELTA).encode())
         .unwrap();
@@ -901,10 +898,9 @@ pub(crate) struct StreamingDrainOutcome {
 ///
 /// Flow-control credit is refreshed only on the **prioritised stream**
 /// `sid`; the one-shot connection-level WINDOW_UPDATE emitted by
-/// [`h2_handshake_chromium_146`] covers the whole session. This
-/// intentionally mirrors Sōzu's `H2FloodDetector` constraint that caps
-/// stream-0 WUs at 100 per sliding window — refreshing the conn window
-/// frame-by-frame would GOAWAY the connection.
+/// [`h2_handshake_chromium_146`] covers the whole session. (A client
+/// refreshing the connection window frame by frame is legitimate too;
+/// `h2_flood_threshold_tests.rs` covers it.)
 ///
 /// For PADDED DATA (RFC 9113 §6.1): the first payload byte is pad-length,
 /// and the trailing pad-length bytes are padding. App-visible bytes

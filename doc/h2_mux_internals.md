@@ -90,8 +90,8 @@ ConnectionH2
  |-- pending_table_size_update: Option<u32> // RFC 7541 s6.3 directive owed to the peer
  |-- control_tx: H2ControlTx                // Closed API (h2_control_tx.rs, private fields):
  |                                         // pending_rst_streams: Vec<(StreamId, H2Error)>,
- |                                         // total_rst_streams_queued (never-decaying, behind the
- |                                         // CVE-2025-8671 cap) and max_pending
+ |                                         // total_rst_streams_queued (log only), max_pending
+ |                                         // (bound on what is pending) and overflowed
  |-- settings_sent_at: Option<Instant>      // SETTINGS ACK timeout tracking
  |-- zero: GenericHttpStream                // Per-frame read landing zone: frame headers and
  |                                         // stream-0 payloads. Input only since #1604, and
@@ -274,23 +274,25 @@ Configurable thresholds with safe compile-time defaults:
 
 | Field | Default | CVE | Attack |
 |-------|---------|-----|--------|
-| `max_rst_stream_per_window` | 100 | CVE-2023-44487, CVE-2019-9514 | Rapid Reset / Reset Flood (per-window) |
-| `max_rst_stream_lifetime` | 10 000 | CVE-2023-44487 | Rapid Reset, never-decaying lifetime ceiling |
-| `max_rst_stream_abusive_lifetime` | 50 | CVE-2023-44487 | Rapid Reset signature (pre-response-start RST) |
-| `max_rst_stream_emitted_lifetime` | 500 | CVE-2025-8671 | MadeYouReset (server-emitted RST_STREAM) |
-| `max_ping_per_window` | 100 | CVE-2019-9512 | Ping Flood |
-| `max_settings_per_window` | 50 | CVE-2019-9515 | Settings Flood |
-| `max_empty_data_per_window` | 100 | CVE-2019-9518 | Empty Frames Attack |
-| `max_window_update_stream0_per_window` | 100 | (rate cap) | Stream-0 WINDOW_UPDATE CPU-burn |
+| `max_rst_stream_per_window` | 2000 | CVE-2023-44487, CVE-2019-9514 | Rapid Reset / Reset Flood (per-window) |
+| `max_rst_stream_lifetime` | 200 000 | CVE-2023-44487 | Floor; trips past it once the resets received after a response started or on a closed stream exceed the streams a backend answered |
+| `max_rst_stream_abusive_lifetime` | 1000 | CVE-2023-44487 | Floor; Rapid Reset signature (pre-response-start RST), trips past it once pre-response and provoked resets are more than half of the backend-routed streams |
+| `max_rst_stream_emitted_lifetime` | 10 000 | CVE-2025-8671 | Floor; MadeYouReset (peer-provoked server-emitted RST_STREAM), same shared ratio |
+| `max_ping_per_window` | 2000 | CVE-2019-9512 | Ping Flood |
+| `max_settings_per_window` | 1000 | CVE-2019-9515 | Settings Flood |
+| `max_empty_data_per_window` | 2000 | CVE-2019-9518 | Empty Frames Attack |
+| `max_window_update_stream0_per_window` | 2000 | (rate cap) | Unsolicited stream-0 WINDOW_UPDATE CPU-burn (two per DATA frame sent are credited) |
 | `max_continuation_frames` | 20 | CVE-2024-27316 | CONTINUATION Flood (per-block frame count) |
 | `max_header_list_size` | 65536 (64 KiB) | CVE-2024-27316 | CONTINUATION Flood (per-block accumulated size) |
 | `max_header_table_size` | 65536 (64 KiB) | (HPACK memory) | Peer-advertised dynamic table size cap |
 | `max_header_fields` | 128 | (HPACK memory) | Indexed-reference "header bomb" |
-| `max_glitch_count` | 100 | (cumulative) | General protocol abuse |
+| `max_glitch_count` | 2000 | (cumulative) | General protocol abuse |
 
 The sliding window duration is 1 second (`FLOOD_WINDOW_DURATION`). The three
-`*_lifetime` counters deliberately never decay: a half-decaying window counter
-cannot see a patient attacker who stays under the per-second ceiling forever.
+`*_lifetime` counters never decay, but each trips only once it also exceeds a
+share of the streams a backend answered (`H2FloodDetector`'s `streams_opened`):
+benign resets on a long connection do not accumulate toward a fixed ceiling,
+while a client resetting every stream it opens trips just past the floor.
 The fields are private: `H2FloodConfig::new` and `H2FloodConfig::from_optional` are the
 only ways to build one, and both clamp every threshold to at least 1 — a zero
 threshold does not disable a check, it makes the first event that counter sees
@@ -529,6 +531,12 @@ client's grant nor a previous request on the slot carries over. A client and a
 backend that both advertise 2^31-1 are each within the §6.9.2 ceiling and must
 not be summed into one window. An H1 leg never reads its window.
 
+A `SETTINGS_INITIAL_WINDOW_SIZE` above 2^31-1 (RFC 9113 §6.5.2), or a change
+that would push one of the connection's stream windows past 2^31-1 (§6.9.2),
+is answered with GOAWAY(FLOW_CONTROL_ERROR). `update_initial_window_size`
+checks every window before it changes any, so a rejected value leaves the
+windows and the recorded setting untouched.
+
 ### Prepared DATA dropped unsent gives its send credit back
 
 The send windows are debited when DATA is **prepared**, not when it is
@@ -675,7 +683,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:4862-4875
+```rust lib/src/protocol/mux/h2.rs:4937-4950
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -701,7 +709,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:4910-4916
+```rust lib/src/protocol/mux/h2.rs:4988-4994
 let events = stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -733,7 +741,7 @@ taken at the top of `H2WritePhase::Flush`'s post-flush tail
 (`ConnectionH2::poll_write_target`, `lib/src/protocol/mux/h2.rs`) and passes `stream.linked_token()` straight
 out of it:
 
-```rust lib/src/protocol/mux/h2.rs:3648-3649
+```rust lib/src/protocol/mux/h2.rs:3693-3694
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 ```
@@ -1086,7 +1094,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8971-8975
+```rust lib/src/protocol/mux/h2.rs:9155-9159
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1260,7 +1268,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9149-9153
+```rust lib/src/protocol/mux/h2.rs:9333-9337
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1355,21 +1363,22 @@ application frames, in order:
    order, deterministic across processes — see that module's doc comment
 4. **Pending RST_STREAM frames**: Asks `H2ControlTx::drain_rst_streams_into`
    (`h2_control_tx.rs`) to serialize every queued frame into room reserved at
-   the end of the output queue, with flood detection (`MAX_PENDING_RST_STREAMS`
-   cap). Proxy-emitted RSTs (DATA-on-closed, `refuse_stream_and_discard`,
-   `reset_stream`, `cancel_timed_out_streams`) are queued via the canonical
-   `ConnectionH2::enqueue_rst` helper, which delegates to
-   `H2ControlTx::enqueue_rst` — dedupes through the wire-map's `rst_sent` set
-   (`H2StreamTable`, `h2_stream_table.rs`), bumps the lifetime counter, and
-   arms WRITABLE. The same `MAX_PENDING_RST_STREAMS` bounds the queue at the
-   insert: once that queue holds 200 entries a further
-   `enqueue_rst` queues nothing and returns `h2.rst_stream_dropped` plus an
-   `error!` line, because the connection has by then already met the
-   `total_rst_streams_queued >= MAX_PENDING_RST_STREAMS` half of the condition
-   this stage escalates to `GOAWAY(ENHANCE_YOUR_CALM)` before it drains
-   anything. The other half is the state gate
-   `!matches!(self.state, H2State::GoAway | H2State::Error)`, which the drain
-   below it does not share: after the first GOAWAY the queue can stay full
+   the end of the output queue. Proxy-emitted RSTs (DATA-on-closed,
+   `refuse_stream_and_discard`, `reset_stream`, `cancel_timed_out_streams`)
+   are queued via the canonical `ConnectionH2::enqueue_rst` helper, which
+   delegates to `H2ControlTx::enqueue_rst` — dedupes through the wire-map's
+   `rst_sent` set (`H2StreamTable`, `h2_stream_table.rs`), bumps the lifetime
+   count the session log reports, and arms WRITABLE — and then charges the
+   reset to the peer's CVE-2025-8671 MadeYouReset count only when its
+   `RstOrigin` is `PeerProvoked`. `pending_rst_bound` (at least
+   `MIN_PENDING_RST_STREAMS`, 4000) bounds what is pending at the insert:
+   once the queue is full a further `enqueue_rst` queues nothing, sets
+   `H2ControlTx::overflowed` and returns `h2.rst_stream_dropped` plus an
+   `error!` line, and this stage escalates to `GOAWAY(ENHANCE_YOUR_CALM)`
+   before it drains anything. Resets drained as they come never overflow it,
+   however many a connection emits over its lifetime. The escalation carries
+   a state gate, `!matches!(self.state, H2State::GoAway | H2State::Error)`,
+   which the drain below it does not share: after the first GOAWAY the queue can stay full
    without re-escalating, and a reap arriving then is dropped while the drain
    still serialises what is queued — bounded by `writable()`'s `GoAway` arm
    force-disconnecting on the same pass. The
@@ -1734,7 +1743,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:8474
+```rust lib/src/protocol/mux/h2.rs:8658
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -1968,7 +1977,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:7054-7056
+```rust lib/src/protocol/mux/h2.rs:7207-7209
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1976,7 +1985,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:7068-7074
+```rust lib/src/protocol/mux/h2.rs:7221-7227
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.
@@ -2350,8 +2359,9 @@ locks those fixes in:
   request shape + per-stream `WINDOW_UPDATE` cadence from content-encoding
   interactions.
 
-`H2FloodDetector` caps stream-0 `WINDOW_UPDATE` frames at
-`DEFAULT_MAX_WINDOW_UPDATE_STREAM0_PER_WINDOW = 100` per sliding window
+`H2FloodDetector` caps unsolicited stream-0 `WINDOW_UPDATE` frames at
+`DEFAULT_MAX_WINDOW_UPDATE_STREAM0_PER_WINDOW = 2000` per sliding window, two
+per DATA frame sent being credited
 (`lib/src/protocol/mux/h2_flood_detector.rs`, enforced by
 `H2FloodDetector::check_flood`). The
 drain helper refreshes per-stream windows only; the one-shot conn-level bump
