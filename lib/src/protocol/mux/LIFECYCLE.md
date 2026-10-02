@@ -1614,11 +1614,30 @@ kept in lock-step:
   pairs `Ready::WRITABLE` interest with the matching event bit so `writable()`
   is scheduled on the next epoll tick.
 
-The three RST push sites retrofit to `enqueue_rst`:
+The four RST push sites retrofit to `enqueue_rst`:
 
 - DATA-on-closed-stream (the closed-stream DATA branch of
   `ConnectionH2::handle_header_state`, `h2.rs` — `H2Error::StreamClosed`).
 - `refuse_stream_and_discard` (`h2.rs` — MCS / pool exhaustion).
+- the flood-pressure refusal branch of `ConnectionH2::handle_header_state`
+  (`h2.rs` — `H2Error::RefusedStream` while
+  `H2FloodDetector::refuses_new_streams` holds; `RstOrigin::Local`, one
+  glitch once the client acknowledged Sōzu's SETTINGS as for the MCS refusal,
+  and, unlike `refuse_stream_and_discard`, no SETTINGS back-pressure).
+
+A refused stream, from either refusal site, is never registered, so
+`enqueue_rst` keeps its id out of `rst_sent` and
+`H2StreamTable::was_reset_locally` does not know it. Frames the client sent on
+it before reading `REFUSED_STREAM` are not ignored: each DATA frame takes the
+DATA-on-closed-stream site (one glitch, one `RST_STREAM(STREAM_CLOSED)`), and a
+request-trailer HEADERS ends the connection — `GOAWAY(PROTOCOL_ERROR)` while
+its id is above `last_stream_id`, `GOAWAY(STREAM_CLOSED)` once a later stream
+was accepted — with every other stream in flight. This covers flood-pressure,
+draining (a drain then ends with `PROTOCOL_ERROR` instead of `NO_ERROR`), MCS
+and pool-exhaustion refusals. Browsers and standard gRPC send no request
+trailers; trailer-forwarding clients (Envoy) can. RFC 9113 §5.1 would ignore
+these frames; the case is accepted as rare, and recording refused ids in the
+bounded recently-reset set would close it.
 - `reset_stream` (`h2.rs` — per-stream error paths: malformed HEADERS,
   content-length mismatch, WINDOW_UPDATE zero-increment or overflow,
   unauthorised priority updates, self-dependent HEADERS).

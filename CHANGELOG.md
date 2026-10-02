@@ -4,6 +4,43 @@
 
 ### ✨ Added
 
+- **BREAKING (library API) — `feat(mux-h2)`: refuse new streams before the pre-response
+  RST_STREAM cap ([#1797](https://github.com/sozu-proxy/sozu/issues/1797)).** The pre-response
+  cap (`h2_max_rst_stream_abusive_lifetime`) ends the connection with `GOAWAY(ENHANCE_YOUR_CALM)`
+  and every stream in flight on it. A connection past `h2_stream_refusal_percent` (default 50,
+  `0` disables) of the cap's floor, whose pre-response resets already outnumber its
+  backend-routed streams, now refuses new client streams with `RST_STREAM(REFUSED_STREAM)`,
+  retryable per RFC 9113 §8.7, and keeps serving its open streams. The refusal ends one second
+  after the last pre-response reset. The cap and the other flood limits are unchanged. Like the
+  `SETTINGS_MAX_CONCURRENT_STREAMS` and graceful-shutdown refusals, each refusal counts one
+  glitch toward `h2_max_glitch_count` once the client acknowledged Sōzu's SETTINGS, so a client
+  that keeps opening refused streams ends with `GOAWAY(ENHANCE_YOUR_CALM)`; it feeds no other
+  flood counter. A reset of a refused stream (of the latest run) counts as a pre-response reset,
+  and one glitch as any reset of a closed stream, and ends the refusals on that connection, so a
+  client that ignores them meets the cap exactly as before; a cancel that races a refusal ends
+  them too. HEADERS on a client stream id above the last accepted stream and at or below the
+  highest id the client used (refused or skipped, never opened) is now a connection error,
+  `GOAWAY(PROTOCOL_ERROR)` (RFC 9113 §5.1.1), instead of being taken for a new stream; a lower
+  never-opened id keeps getting `GOAWAY(STREAM_CLOSED)`. Known limitation, accepted as rare: a
+  client that sends HEADERS, DATA and request trailers before reading its `REFUSED_STREAM` gets
+  `RST_STREAM(REFUSED_STREAM)`, `RST_STREAM(STREAM_CLOSED)` and `GOAWAY(PROTOCOL_ERROR)`, losing
+  every stream in flight, for every refusal kind (flood pressure,
+  `SETTINGS_MAX_CONCURRENT_STREAMS`, graceful drain, which then ends with `PROTOCOL_ERROR`
+  instead of `NO_ERROR`, and buffer-pool exhaustion); each DATA frame of a refused stream costs a
+  glitch and a `RST_STREAM(STREAM_CLOSED)`. Browsers and standard gRPC send no request trailers;
+  trailer-forwarding clients such as Envoy can. RFC 9113 §5.1 would ignore those frames; recording
+  refused ids in the bounded recently-reset set is left for later. New listener key `h2_stream_refusal_percent` (TOML;
+  `command.proto` fields `HttpListenerConfig` 37, `HttpsListenerConfig` 50,
+  `UpdateHttpListenerConfig` 43, `UpdateHttpsListenerConfig` 44; `--h2-stream-refusal-percent`
+  on `sozu listener http|https update`) and counter `h2.flood.stream_refused`. Library API:
+  `H2FloodConfig::new` and `H2FloodConfig::from_optional` take a fourteenth argument.
+  Documented in `doc/configure.md` ("Refusing new streams before the pre-response cap");
+  covered by `test_h2_cancels_past_the_soft_threshold_refuse_new_streams`
+  (`e2e/src/tests/h2_flood_threshold_tests.rs`), the `refuses_new_streams` unit tests,
+  `headers_below_a_refused_stream_id_is_a_protocol_error`,
+  `soft_refusals_count_toward_the_glitch_budget` and
+  `a_client_reset_of_a_refused_stream_on_the_wire_ends_the_refusals` (`h2.rs`).
+
 - **BREAKING (library API) — `feat(udp)`: opt-in per-source flow limit on UDP clusters.** Each
   client source IP and port is its own UDP flow, with its own upstream socket and `max_flows` slot,
   and nothing bounded the flows one source address held. A cluster's own `max_connections_per_ip`
