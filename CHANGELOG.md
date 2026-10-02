@@ -3868,6 +3868,21 @@
 
 ### 🐛 Fixed
 
+- **`fix(socket)`: retry interrupted plain TCP reads and writes and interrupted TLS reads
+  ([#1799](https://github.com/sozu-proxy/sozu/issues/1799)).** The plain TCP `socket_read`,
+  `socket_write` and `socket_write_vectored` (`lib/src/socket.rs`) and the `read_tls` call of
+  `FrontRustls::socket_read` now retry a call the kernel interrupted (`EINTR`), as `flush_tls`
+  does since [#1795](https://github.com/sozu-proxy/sozu/pull/1795); they used to answer
+  `SocketResult::Error`, which closes a healthy session on the pipe path, and on the H1 and h2c
+  mux paths once they close a session whose client write failed
+  ([#1793](https://github.com/sozu-proxy/sozu/pull/1793)). The plain write bodies move into
+  `plain_socket_write` and `plain_socket_write_vectored`, generic over the transport like
+  `plain_socket_read`, with the logging left in `tcp_socket_write` and
+  `tcp_socket_write_vectored`. Covered by `an_interrupted_plain_write_is_retried`,
+  `an_interrupted_plain_vectored_write_is_retried`, `an_interrupted_plain_read_is_retried` and
+  `an_interrupted_tls_read_is_retried`. The TLS handshake pump (`lib/src/protocol/rustls.rs`)
+  keeps its mapping.
+
 - **`fix(socket)`: an interrupted TLS write is retried, and every TLS write error marks the channel
   dead.** `flush_tls` (`lib/src/socket.rs`) now retries a write the kernel interrupted (`EINTR`),
   as the relay and the UDP path already do; it used to fall into the generic error arm, which
