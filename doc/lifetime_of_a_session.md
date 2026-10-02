@@ -144,8 +144,11 @@ answers `SocketResult::Error` — a socket error other than `WouldBlock`, a
 rustls writer failure, or the write loop's budget — marks the transport dead
 (`FrontRustls::peer_reset`, `lib/src/socket.rs`), so the records it still
 holds no longer count as pending and the session closes on the hang-up that
-follows. An interrupted write (`EINTR`) is not an error: `flush_tls` retries
-it.
+follows. An interrupted call (`EINTR`) is not an error on any socket path:
+`flush_tls` retries an interrupted TLS write, `rustls_socket_read` an
+interrupted `read_tls`, and `plain_socket_read`, `plain_socket_write` and
+`plain_socket_write_vectored` an interrupted plain TCP read or write
+([#1799](https://github.com/sozu-proxy/sozu/issues/1799)).
 
 ### 2.4 Tokens, the SessionManager, and the slab
 

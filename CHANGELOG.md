@@ -4,6 +4,43 @@
 
 ### ✨ Added
 
+- **BREAKING (library API) — `feat(mux-h2)`: refuse new streams before the pre-response
+  RST_STREAM cap ([#1797](https://github.com/sozu-proxy/sozu/issues/1797)).** The pre-response
+  cap (`h2_max_rst_stream_abusive_lifetime`) ends the connection with `GOAWAY(ENHANCE_YOUR_CALM)`
+  and every stream in flight on it. A connection past `h2_stream_refusal_percent` (default 50,
+  `0` disables) of the cap's floor, whose pre-response resets already outnumber its
+  backend-routed streams, now refuses new client streams with `RST_STREAM(REFUSED_STREAM)`,
+  retryable per RFC 9113 §8.7, and keeps serving its open streams. The refusal ends one second
+  after the last pre-response reset. The cap and the other flood limits are unchanged. Like the
+  `SETTINGS_MAX_CONCURRENT_STREAMS` and graceful-shutdown refusals, each refusal counts one
+  glitch toward `h2_max_glitch_count` once the client acknowledged Sōzu's SETTINGS, so a client
+  that keeps opening refused streams ends with `GOAWAY(ENHANCE_YOUR_CALM)`; it feeds no other
+  flood counter. A reset of a refused stream (of the latest run) counts as a pre-response reset,
+  and one glitch as any reset of a closed stream, and ends the refusals on that connection, so a
+  client that ignores them meets the cap exactly as before; a cancel that races a refusal ends
+  them too. HEADERS on a client stream id above the last accepted stream and at or below the
+  highest id the client used (refused or skipped, never opened) is now a connection error,
+  `GOAWAY(PROTOCOL_ERROR)` (RFC 9113 §5.1.1), instead of being taken for a new stream; a lower
+  never-opened id keeps getting `GOAWAY(STREAM_CLOSED)`. Known limitation, accepted as rare: a
+  client that sends HEADERS, DATA and request trailers before reading its `REFUSED_STREAM` gets
+  `RST_STREAM(REFUSED_STREAM)`, `RST_STREAM(STREAM_CLOSED)` and `GOAWAY(PROTOCOL_ERROR)`, losing
+  every stream in flight, for every refusal kind (flood pressure,
+  `SETTINGS_MAX_CONCURRENT_STREAMS`, graceful drain, which then ends with `PROTOCOL_ERROR`
+  instead of `NO_ERROR`, and buffer-pool exhaustion); each DATA frame of a refused stream costs a
+  glitch and a `RST_STREAM(STREAM_CLOSED)`. Browsers and standard gRPC send no request trailers;
+  trailer-forwarding clients such as Envoy can. RFC 9113 §5.1 would ignore those frames; recording
+  refused ids in the bounded recently-reset set is left for later. New listener key `h2_stream_refusal_percent` (TOML;
+  `command.proto` fields `HttpListenerConfig` 37, `HttpsListenerConfig` 50,
+  `UpdateHttpListenerConfig` 43, `UpdateHttpsListenerConfig` 44; `--h2-stream-refusal-percent`
+  on `sozu listener http|https update`) and counter `h2.flood.stream_refused`. Library API:
+  `H2FloodConfig::new` and `H2FloodConfig::from_optional` take a fourteenth argument.
+  Documented in `doc/configure.md` ("Refusing new streams before the pre-response cap");
+  covered by `test_h2_cancels_past_the_soft_threshold_refuse_new_streams`
+  (`e2e/src/tests/h2_flood_threshold_tests.rs`), the `refuses_new_streams` unit tests,
+  `headers_below_a_refused_stream_id_is_a_protocol_error`,
+  `soft_refusals_count_toward_the_glitch_budget` and
+  `a_client_reset_of_a_refused_stream_on_the_wire_ends_the_refusals` (`h2.rs`).
+
 - **BREAKING (library API) — `feat(udp)`: opt-in per-source flow limit on UDP clusters.** Each
   client source IP and port is its own UDP flow, with its own upstream socket and `max_flows` slot,
   and nothing bounded the flows one source address held. A cluster's own `max_connections_per_ip`
@@ -3868,6 +3905,21 @@
 
 ### 🐛 Fixed
 
+- **`fix(socket)`: retry interrupted plain TCP reads and writes and interrupted TLS reads
+  ([#1799](https://github.com/sozu-proxy/sozu/issues/1799)).** The plain TCP `socket_read`,
+  `socket_write` and `socket_write_vectored` (`lib/src/socket.rs`) and the `read_tls` call of
+  `FrontRustls::socket_read` now retry a call the kernel interrupted (`EINTR`), as `flush_tls`
+  does since [#1795](https://github.com/sozu-proxy/sozu/pull/1795); they used to answer
+  `SocketResult::Error`, which closes a healthy session on the pipe path, and on the H1 and h2c
+  mux paths once they close a session whose client write failed
+  ([#1793](https://github.com/sozu-proxy/sozu/pull/1793)). The plain write bodies move into
+  `plain_socket_write` and `plain_socket_write_vectored`, generic over the transport like
+  `plain_socket_read`, with the logging left in `tcp_socket_write` and
+  `tcp_socket_write_vectored`. Covered by `an_interrupted_plain_write_is_retried`,
+  `an_interrupted_plain_vectored_write_is_retried`, `an_interrupted_plain_read_is_retried` and
+  `an_interrupted_tls_read_is_retried`. The TLS handshake pump (`lib/src/protocol/rustls.rs`)
+  keeps its mapping.
+
 - **`fix(socket)`: an interrupted TLS write is retried, and every TLS write error marks the channel
   dead.** `flush_tls` (`lib/src/socket.rs`) now retries a write the kernel interrupted (`EINTR`),
   as the relay and the UDP path already do; it used to fall into the generic error arm, which
@@ -7309,6 +7361,32 @@
   `test_h2_backend_interim_response_reaches_the_client` and
   `test_h2_backend_101_is_a_bad_gateway` (`e2e/src/tests/h2_security_header_injection.rs`).
 
+- **`fix(mux-h2)`: reset an H2 backend stream whose 204 or 304 response carries DATA, and
+  discard the DATA of a response to HEAD
+  ([#1772](https://github.com/sozu-proxy/sozu/issues/1772)).** A response to HEAD, a 204 or a 304
+  has no content (RFC 9110 §6.4.1), but `ConnectionH2::handle_data_frame`
+  (`lib/src/protocol/mux/h2.rs`) forwarded a DATA payload on it, so an H1 client read it after
+  the head as the start of the next response, and an H2 client received it as DATA;
+  `ConnectionH2::content_length_exempt` skips the `content-length` checks for these responses.
+  A 204 or a 304 cannot carry content (RFC 9110 §15.3.5, §15.4.5): its backend stream is now
+  reset with PROTOCOL_ERROR before the payload is queued, counted in the new
+  `h2.bodiless_response_data_reset` (`doc/configure.md`); an H1 client already written the head
+  sees the connection close, one that was not gets a 502. A response to HEAD only SHOULD NOT
+  carry content (RFC 9110 §9.3.2): its payload is dropped from the stream buffer, windows
+  credited, and the connection stays usable, however large the payload. Such a stream stays
+  linked until the backend's END_STREAM ([#1776](https://github.com/sozu-proxy/sozu/issues/1776)),
+  so its DATA reaches these branches whether it arrives with the head or later. Known
+  limitation: a trailer HEADERS frame the backend sends after the reset of a 204 or a 304 still
+  answers GOAWAY(STREAM_CLOSED) for the whole backend connection until
+  [#1784](https://github.com/sozu-proxy/sozu/pull/1784) lands. Documented in
+  `lib/src/protocol/mux/LIFECYCLE.md` §8.4. Covered by
+  `a_backend_response_content_is_forbidden_for_204_and_304_and_discarded_for_head` and
+  `a_204_response_carrying_data_resets_its_backend_stream_and_a_head_response_discards_it`
+  (`h2.rs`), and by `test_h2_bodiless_response_data_never_reaches_h1_client`,
+  `test_h2_head_response_with_large_data_completes` and
+  `test_h2_head_response_with_large_data_keeps_the_backend_connection`
+  (`e2e/src/tests/h2_security_header_injection.rs`).
+
 - **`fix(mux-h1)`: H2→H1: write no last chunk or trailer section after the head of a response
   without a body to an H1 client ([#1761](https://github.com/sozu-proxy/sozu/issues/1761)).**
   A response to HEAD, a 204 or a 304 ends with its header section on HTTP/1.1 (RFC 9112 §6.3),
@@ -7321,7 +7399,8 @@
   of such a response (RFC 9110 §6.5.1) before writing, so a stream ended by a trailer HEADERS
   frame or an empty DATA frame writes nothing after the head, and counts a dropped block in the
   new `h2.trailers_dropped_no_body`, documented in `doc/configure.md`. DATA carrying a payload
-  on such a response is still written after the head, a known gap. Documented in
+  on such a response was still written after the head until
+  [#1772](https://github.com/sozu-proxy/sozu/issues/1772). Documented in
   `lib/src/protocol/mux/LIFECYCLE.md` §8.4. Covered by unit tests in `h1.rs` and by
   `test_h2_bodiless_response_trailers_keep_h1_client_framing`
   (`e2e/src/tests/h2_security_header_injection.rs`).

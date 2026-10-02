@@ -1639,11 +1639,30 @@ kept in lock-step:
   pairs `Ready::WRITABLE` interest with the matching event bit so `writable()`
   is scheduled on the next epoll tick.
 
-The three RST push sites retrofit to `enqueue_rst`:
+The four RST push sites retrofit to `enqueue_rst`:
 
 - DATA-on-closed-stream (the closed-stream DATA branch of
   `ConnectionH2::handle_header_state`, `h2.rs` — `H2Error::StreamClosed`).
 - `refuse_stream_and_discard` (`h2.rs` — MCS / pool exhaustion).
+- the flood-pressure refusal branch of `ConnectionH2::handle_header_state`
+  (`h2.rs` — `H2Error::RefusedStream` while
+  `H2FloodDetector::refuses_new_streams` holds; `RstOrigin::Local`, one
+  glitch once the client acknowledged Sōzu's SETTINGS as for the MCS refusal,
+  and, unlike `refuse_stream_and_discard`, no SETTINGS back-pressure).
+
+A refused stream, from either refusal site, is never registered, so
+`enqueue_rst` keeps its id out of `rst_sent` and
+`H2StreamTable::was_reset_locally` does not know it. Frames the client sent on
+it before reading `REFUSED_STREAM` are not ignored: each DATA frame takes the
+DATA-on-closed-stream site (one glitch, one `RST_STREAM(STREAM_CLOSED)`), and a
+request-trailer HEADERS ends the connection — `GOAWAY(PROTOCOL_ERROR)` while
+its id is above `last_stream_id`, `GOAWAY(STREAM_CLOSED)` once a later stream
+was accepted — with every other stream in flight. This covers flood-pressure,
+draining (a drain then ends with `PROTOCOL_ERROR` instead of `NO_ERROR`), MCS
+and pool-exhaustion refusals. Browsers and standard gRPC send no request
+trailers; trailer-forwarding clients (Envoy) can. RFC 9113 §5.1 would ignore
+these frames; the case is accepted as rare, and recording refused ids in the
+bounded recently-reset set would close it.
 - `reset_stream` (`h2.rs` — per-stream error paths: malformed HEADERS,
   content-length mismatch, WINDOW_UPDATE zero-increment or overflow,
   unauthorised priority updates, self-dependent HEADERS).
@@ -1985,16 +2004,49 @@ and chunked framing, and a 1xx never completed, so an H1 client read a chunked
 `test_h2_bodiless_response_end_keeps_the_backend_connection`,
 `test_h2_backend_interim_response_reaches_the_client` and
 `test_h2_backend_101_is_a_bad_gateway`
-(`e2e/src/tests/h2_security_header_injection.rs`). A known gap remains: DATA
-carrying a payload on a 204, a 304 or a response to HEAD is still forwarded,
-written after the head to an H1 client and as DATA to an H2 client, because
-`ConnectionH2::content_length_exempt` (`h2.rs`) skips the `content-length`
-mismatch reset for HEAD, 204 and 304 and the chunks are not removed here. Pinned by
+(`e2e/src/tests/h2_security_header_injection.rs`).
+
+DATA carrying a payload on a 204, a 304 or a response to HEAD therefore
+reaches `ConnectionH2::handle_data_frame` (`h2.rs`) while the backend stream is
+still linked, whether it arrives in the read of the head or later.
+`handle_data_frame` classifies the backend response
+(`ConnectionH2::backend_response_content`), where
+`ConnectionH2::content_length_exempt` skips the `content-length` checks for
+these responses. A 204 or a 304 cannot carry content (RFC 9110 §15.3.5,
+§15.4.5), so a payload makes it malformed (RFC 9113 §8.1.1): the backend
+stream is reset with PROTOCOL_ERROR before the payload is queued, and
+`h2.bodiless_response_data_reset` is incremented. An H1 client that was
+already written the head then sees the connection close (RFC 9112 §8); one
+that was not gets a 502 from `forcefully_terminate_answer`. A response to HEAD
+only SHOULD NOT carry content (RFC 9110 §9.3.2): its windows are credited, the
+payload is never queued, as kawa's H1 parser leaves the bytes an H1 backend
+sends after such a head unread, and it is dropped from the end of the stream
+buffer (`storage.end` moves back by the frame's wire length) rather than kept
+behind `storage.head`. Only the frontend consuming a queued block frees that
+space, and no block refers to a discarded payload, so a payload larger than the
+buffer would otherwise remove READABLE from the whole backend connection
+before the stream's END_STREAM, stalling every stream it carries. The stream
+then ends with the backend's END_STREAM like any other. Before
+sozu-proxy/sozu#1772 the payload was written after the head, with a chunk-size
+line under chunked framing. Pinned by
+`a_backend_response_content_is_forbidden_for_204_and_304_and_discarded_for_head`,
+`a_204_response_carrying_data_resets_its_backend_stream_and_a_head_response_discards_it`
+(`h2.rs`),
 `a_bodiless_response_writes_nothing_after_its_head_to_an_h1_client`,
 `a_bodiless_response_trailer_block_queued_after_its_head_is_dropped`,
-`a_response_has_no_body_for_head_204_and_304_only` (`h1.rs`) and
-`test_h2_bodiless_response_trailers_keep_h1_client_framing`
+`a_response_has_no_body_for_head_204_and_304_only` (`h1.rs`),
+`test_h2_bodiless_response_trailers_keep_h1_client_framing`,
+`test_h2_bodiless_response_data_never_reaches_h1_client`,
+`test_h2_head_response_with_large_data_completes` and
+`test_h2_head_response_with_large_data_keeps_the_backend_connection`
 (`e2e/src/tests/h2_security_header_injection.rs`).
+
+Known limitation: after the PROTOCOL_ERROR reset of a 204 or a 304, a frame the
+backend had already sent on that stream is not ignored as RFC 9113 §5.1
+requires. A trailer HEADERS frame then hits the closed-stream check of
+`ConnectionH2::handle_read`, which answers GOAWAY(STREAM_CLOSED) and ends
+every stream of the backend connection. This holds until
+sozu-proxy/sozu#1784 (sozu-proxy/sozu#1783) lands.
 
 ### 8.5 Stale-upstream replay (`ReplayOnFreshBackend`)
 
