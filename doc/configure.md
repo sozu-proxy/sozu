@@ -1479,7 +1479,8 @@ a cancelled upload with a full 1 MiB window in flight is about 64 of them),
 `WINDOW_UPDATE` with zero increment on a closed stream, unknown SETTINGS
 identifiers, every stream Sōzu refuses once the client has acknowledged its
 SETTINGS (over its concurrency limit, including the lower limit back-pressure
-sets, or while the connection drains — buffer-pool refusals excepted), every
+sets, while the connection drains, or under flood pressure — buffer-pool
+refusals excepted), every
 reset the client provokes (see `h2_max_rst_stream_emitted_lifetime`), and each
 received `GOAWAY` (a graceful close sends at most two, RFC 9113 §6.8). The
 counter uses a 1-second sliding window with
@@ -1607,13 +1608,34 @@ served. A refused stream did no work, so the client may retry it (RFC 9113
   pre-response count never decays, so a client that stops cancelling is served
   again one second after its last pre-response reset.
 
-The cap and the other flood limits are unchanged. A refusal is counted by no
-flood counter — not as a provoked reset, not as a glitch — and does not trigger
-the `SETTINGS_MAX_CONCURRENT_STREAMS` back-pressure. A client that resets a
-stream Sōzu refused does not honour the refusal: that reset counts as a
-pre-response reset, since the stream never had a response, and Sōzu stops
-refusing streams on that connection, which then meets the cap exactly as it
-would without the soft state. The per-window RST_STREAM rate
+The cap and the other flood limits are unchanged. Like a refusal at
+`SETTINGS_MAX_CONCURRENT_STREAMS` or during a graceful shutdown, each refusal
+counts one glitch toward `h2_max_glitch_count` once the client acknowledged
+Sōzu's SETTINGS: that budget is what ends the connection of a client that keeps
+opening streams it is refused. A refusal is not counted as a provoked reset
+and does not trigger the `SETTINGS_MAX_CONCURRENT_STREAMS` back-pressure.
+
+A client that resets a stream Sōzu refused does not honour the refusal: that
+reset counts as a pre-response reset, since the stream never had a response,
+and Sōzu stops refusing streams on that connection, which then meets the cap
+exactly as it would without the soft state. The refused stream is no longer
+tracked, so its reset also counts one glitch, like any RST_STREAM on a closed
+stream. Only the latest run of refused streams is remembered — the streams
+refused since the last one Sōzu accepted; a reset of a stream refused before
+that counts as a reset after a response, as without the soft state. A client
+that does honour refusals can still meet this once: if it cancels a stream at
+the moment Sōzu refuses it, its RST_STREAM crosses the `REFUSED_STREAM` and
+counts as a reset of a refused stream, and the refusals end for the rest of that
+connection, which then behaves as it would without the soft state. HEADERS on a
+stream id at or below one already refused opens no stream: the id was used, so
+it is a connection error, `GOAWAY(PROTOCOL_ERROR)` (RFC 9113 §5.1.1).
+
+Clients that retry fast meet the refusals too. A gRPC client whose calls hit
+their deadlines cancels each one before its response — a pre-response reset —
+and a client that retries a refused stream at once opens it again within the
+second, so during such a storm its retries are refused, each costing a glitch,
+until it stops cancelling for a second or its retries exhaust the glitch
+budget and the connection ends with `GOAWAY(ENHANCE_YOUR_CALM)`. The per-window RST_STREAM rate
 (`h2_max_rst_stream_per_window`) has no soft threshold: it counts every reset,
 answered streams included, and with its half-decay a client at half the rate
 never reaches the limit, so refusing there would refuse clients the limit never

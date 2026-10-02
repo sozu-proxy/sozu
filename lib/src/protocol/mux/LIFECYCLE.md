@@ -1621,8 +1621,9 @@ The four RST push sites retrofit to `enqueue_rst`:
 - `refuse_stream_and_discard` (`h2.rs` — MCS / pool exhaustion).
 - the flood-pressure refusal branch of `ConnectionH2::handle_header_state`
   (`h2.rs` — `H2Error::RefusedStream` while
-  `H2FloodDetector::refuses_new_streams` holds; `RstOrigin::Local`, and,
-  unlike `refuse_stream_and_discard`, no SETTINGS back-pressure).
+  `H2FloodDetector::refuses_new_streams` holds; `RstOrigin::Local`, one
+  glitch once the client acknowledged Sōzu's SETTINGS as for the MCS refusal,
+  and, unlike `refuse_stream_and_discard`, no SETTINGS back-pressure).
 - `reset_stream` (`h2.rs` — per-stream error paths: malformed HEADERS,
   content-length mismatch, WINDOW_UPDATE zero-increment or overflow,
   unauthorised priority updates, self-dependent HEADERS).

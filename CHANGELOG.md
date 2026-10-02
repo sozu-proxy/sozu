@@ -11,17 +11,26 @@
   `0` disables) of the cap's floor, whose pre-response resets already outnumber its
   backend-routed streams, now refuses new client streams with `RST_STREAM(REFUSED_STREAM)`,
   retryable per RFC 9113 §8.7, and keeps serving its open streams. The refusal ends one second
-  after the last pre-response reset. The cap and the other flood limits are unchanged; a refusal
-  feeds no flood counter. A reset of a refused stream counts as a pre-response reset and ends
-  the refusals on that connection, so a client that ignores them meets the cap exactly as
-  before. New listener key `h2_stream_refusal_percent` (TOML; `command.proto` fields
-  `HttpListenerConfig` 37, `HttpsListenerConfig` 50, `UpdateHttpListenerConfig` 43,
-  `UpdateHttpsListenerConfig` 44; `--h2-stream-refusal-percent` on
-  `sozu listener http|https update`) and counter `h2.flood.stream_refused`. Library API:
+  after the last pre-response reset. The cap and the other flood limits are unchanged. Like the
+  `SETTINGS_MAX_CONCURRENT_STREAMS` and graceful-shutdown refusals, each refusal counts one
+  glitch toward `h2_max_glitch_count` once the client acknowledged Sōzu's SETTINGS, so a client
+  that keeps opening refused streams ends with `GOAWAY(ENHANCE_YOUR_CALM)`; it feeds no other
+  flood counter. A reset of a refused stream (of the latest run) counts as a pre-response reset,
+  and one glitch as any reset of a closed stream, and ends the refusals on that connection, so a
+  client that ignores them meets the cap exactly as before; a cancel that races a refusal ends
+  them too. HEADERS on a client stream id at or below one already refused, which was never
+  opened, is now a connection error, `GOAWAY(PROTOCOL_ERROR)` (RFC 9113 §5.1.1), instead of
+  being taken for a new stream. New listener key `h2_stream_refusal_percent` (TOML;
+  `command.proto` fields `HttpListenerConfig` 37, `HttpsListenerConfig` 50,
+  `UpdateHttpListenerConfig` 43, `UpdateHttpsListenerConfig` 44; `--h2-stream-refusal-percent`
+  on `sozu listener http|https update`) and counter `h2.flood.stream_refused`. Library API:
   `H2FloodConfig::new` and `H2FloodConfig::from_optional` take a fourteenth argument.
   Documented in `doc/configure.md` ("Refusing new streams before the pre-response cap");
   covered by `test_h2_cancels_past_the_soft_threshold_refuse_new_streams`
-  (`e2e/src/tests/h2_flood_threshold_tests.rs`) and the `refuses_new_streams` unit tests.
+  (`e2e/src/tests/h2_flood_threshold_tests.rs`), the `refuses_new_streams` unit tests,
+  `headers_below_a_refused_stream_id_is_a_protocol_error`,
+  `soft_refusals_count_toward_the_glitch_budget` and
+  `a_client_reset_of_a_refused_stream_on_the_wire_ends_the_refusals` (`h2.rs`).
 
 - **BREAKING (library API) — `feat(udp)`: opt-in per-source flow limit on UDP clusters.** Each
   client source IP and port is its own UDP flow, with its own upstream socket and `max_flows` slot,

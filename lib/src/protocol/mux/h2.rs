@@ -956,19 +956,29 @@ pub struct ConnectionH2 {
     /// under flood pressure (`H2FloodDetector::refuses_new_streams`,
     /// `lib/src/protocol/mux/h2_flood_detector.rs`). Every new client stream
     /// is refused while the soft state holds, so one run is a contiguous
-    /// range; the next accepted stream ends it.
+    /// range; the next accepted stream ends it, and the next refusal starts
+    /// a new run. Only that latest run is tracked: ids refused in an earlier
+    /// run are forgotten.
     ///
     /// A RST_STREAM the client sends for one of these ids resets a stream
     /// that never got a response, so `Self::handle_rst_stream_frame` counts
     /// it as a pre-response reset. Without that, a client that ignores the
     /// refusals and keeps opening and resetting streams would stop moving
-    /// toward the pre-response cap as soon as the soft state engages.
+    /// toward the pre-response cap as soon as the soft state engages. A
+    /// reset of an id from an earlier run takes the untracked-stream arm
+    /// there instead and counts as a reset after a response, as it would
+    /// without the soft state.
     flood_refused_streams: Option<(StreamId, StreamId)>,
     /// Set once the client resets a stream of [`Self::flood_refused_streams`]:
     /// it does not honour `REFUSED_STREAM`, so no further stream is refused
     /// under flood pressure on this connection and it meets the flood limits
     /// unchanged. Refusing it further would only add one RST_STREAM per
     /// stream it opens ahead of the pre-response cap's GOAWAY.
+    ///
+    /// A benign race sets it too: a client that cancels a stream just as
+    /// Sōzu refuses it sends a RST_STREAM that crosses the `REFUSED_STREAM`.
+    /// The flag is never cleared, so such a connection behaves for the rest
+    /// of its life as it would without the soft state.
     flood_refusal_ignored: bool,
     /// Clock snapshot for the pass currently executing — this connection's
     /// mirror of [`Context::now`](super::Context::now).
@@ -2290,11 +2300,31 @@ impl ConnectionH2 {
                     // ever enable push in the future). For the first
                     // request on a fresh connection `last_stream_id == 0`
                     // and any client-initiated odd stream still passes.
-                    if header.frame_type == FrameType::Headers
+                    // A refused stream moves `highest_peer_stream_id` but
+                    // not `last_stream_id`, which only an accepted stream
+                    // moves, so a new stream must be past both.
+                    let opens_new_client_stream = header.frame_type == FrameType::Headers
                         && self.position.is_server()
                         && stream_id & 1 == 1
-                        && stream_id > self.last_stream_id
+                        && stream_id > self.last_stream_id;
+                    if opens_new_client_stream
+                        && stream_id <= self.stream_table.highest_peer_stream_id()
                     {
+                        // An id between the last accepted stream and the
+                        // highest one the client used was refused or skipped,
+                        // never opened: it is no new stream (§5.1.1), and
+                        // HEADERS on it is a connection error of type
+                        // PROTOCOL_ERROR. Streams still tracked, and streams
+                        // Sōzu reset, were handled above.
+                        error!(
+                            "{} HEADERS on stream {} at or below the highest client stream id {}, sending GOAWAY(PROTOCOL_ERROR)",
+                            log_context!(self),
+                            stream_id,
+                            self.stream_table.highest_peer_stream_id()
+                        );
+                        return self.goaway(H2Error::ProtocolError);
+                    }
+                    if opens_new_client_stream {
                         // RFC 9113 §6.8: after sending a GOAWAY, the proxy
                         // MUST NOT accept new streams.
                         // `graceful_goaway` marks the connection draining
@@ -2324,16 +2354,23 @@ impl ConnectionH2 {
                         }
                         // Soft state below the pre-response RST_STREAM cap:
                         // refuse the new stream, keep serving the open ones.
-                        // The refusal is retryable (RFC 9113 §8.7) and counted
-                        // by no flood counter — no glitch, `RstOrigin::Local`,
-                        // and no SETTINGS back-pressure, which would halve
-                        // MAX_CONCURRENT_STREAMS for the rest of the
-                        // connection over a state that decays. A client that
-                        // reset a refused stream gets no more refusals
-                        // (`Self::flood_refusal_ignored`).
+                        // The refusal is retryable (RFC 9113 §8.7). Like the
+                        // refusals here and below, it costs a glitch once the
+                        // peer acknowledged our SETTINGS: the glitch budget is
+                        // what bounds a peer that keeps opening streams it is
+                        // refused. It feeds no other flood counter —
+                        // `RstOrigin::Local`, and no SETTINGS back-pressure,
+                        // which would halve MAX_CONCURRENT_STREAMS for the
+                        // rest of the connection over a state that decays. A
+                        // client that reset a refused stream gets no more
+                        // refusals (`Self::flood_refusal_ignored`).
                         if !self.flood_refusal_ignored
                             && self.flood_detector.refuses_new_streams(self.now)
                         {
+                            if self.settings_sent_at.is_none() {
+                                self.flood_detector.record_glitch();
+                                check_flood_or_return!(self);
+                            }
                             debug!(
                                 "{} refusing stream {} under flood pressure",
                                 log_context!(self),
@@ -22615,6 +22652,256 @@ mod tests {
             connection.core.flood_refused_streams,
             Some((7, 7)),
             "a refusal after an accepted stream starts a new run"
+        );
+    }
+
+    /// A frontend connection over a [`PacedSocket`] with streams 1 and 3
+    /// open, a pre-response floor of 10 and a glitch limit of `glitch_limit`,
+    /// its SETTINGS acknowledged, and `pre_response_resets` pre-response
+    /// resets on record. Six or more put it in the soft state: past half the
+    /// floor, more than the streams it got answered (none).
+    fn soft_refusal_connection(
+        glitch_limit: Option<u32>,
+        pre_response_resets: u32,
+    ) -> (
+        Rc<RefCell<Pool>>,
+        H2Shell<PacedSocket>,
+        Context<TestListener>,
+        Router,
+        std::net::TcpStream,
+    ) {
+        let (pool, mut connection, context, router, peer) = two_requests_read(usize::MAX);
+        connection.core.flood_detector = h2_flood_detector::H2FloodDetector::new(
+            H2FloodConfig::from_optional(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                glitch_limit,
+                None,
+                Some(10),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            connection.core.now,
+        );
+        connection.core.settings_sent_at = None;
+        for _ in 0..pre_response_resets {
+            assert!(
+                connection
+                    .core
+                    .flood_detector
+                    .record_rst_received(false, false, connection.core.now)
+                    .is_none(),
+                "premise: the resets on record stay under the cap"
+            );
+        }
+        (pool, connection, context, router, peer)
+    }
+
+    /// A complete `GET /` HEADERS frame on `stream_id`, from the static
+    /// table and literals without indexing, so it decodes whatever the
+    /// peer's dynamic table holds.
+    fn static_get_headers(stream_id: StreamId) -> Vec<u8> {
+        let mut block = vec![0x82, 0x84, 0x87, 0x01, 11];
+        block.extend_from_slice(b"example.com");
+        orphan_frame(
+            1,
+            parser::FLAG_END_STREAM | parser::FLAG_END_HEADERS,
+            stream_id,
+            block.len() as u32,
+            &block,
+        )
+    }
+
+    /// Feed `inbound` to `connection`, flush what it answers, and return
+    /// every frame on the wire so far.
+    fn frames_after(
+        connection: &mut H2Shell<PacedSocket>,
+        context: &mut Context<TestListener>,
+        router: &mut Router,
+        inbound: &[u8],
+    ) -> Vec<PeerFrame> {
+        connection.socket.inbound.extend(inbound);
+        // A pass may stop after a frame that queued output, so drive more
+        // passes than there are frames.
+        for _ in 0..256 {
+            connection.core.readiness.event.insert(Ready::READABLE);
+            if connection.core.readiness.filter_interest().is_readable() {
+                connection.readable(context, EndpointClient(router));
+            }
+            connection.core.readiness.event.insert(Ready::WRITABLE);
+            if connection.core.readiness.filter_interest().is_writable() {
+                connection.writable(context, EndpointClient(router));
+            }
+        }
+        peer_frames(&connection.socket.wire).expect("whole frames on the wire")
+    }
+
+    /// The error code of the first frame of type `kind` (3 RST_STREAM, 7
+    /// GOAWAY) on `stream_id` (0 for GOAWAY) in `frames`.
+    fn error_code_of(frames: &[PeerFrame], kind: u8, stream_id: StreamId) -> Option<u32> {
+        let at = if kind == 7 { 4 } else { 0 };
+        frames
+            .iter()
+            .find(|(k, _, sid, _)| *k == kind && *sid == stream_id)
+            .map(|(_, _, _, payload)| {
+                u32::from_be_bytes(payload[at..at + 4].try_into().expect("an error code"))
+            })
+    }
+
+    /// RFC 9113 §5.1.1: a new stream's id must be greater than every id the
+    /// client already used, refused ones included. After stream 65 is refused
+    /// under flood pressure, HEADERS on 55 opens no stream: it is a
+    /// connection error of type PROTOCOL_ERROR, and the refused run stays
+    /// `(65, 65)`.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::handle_header_state`, compare a new
+    /// client stream's id with `last_stream_id` only, as before the fix. Stream
+    /// 55 is then taken for a new stream and refused too, and the debug build
+    /// panics with `the refused run ends at the stream just refused`.
+    #[test]
+    fn headers_below_a_refused_stream_id_is_a_protocol_error() {
+        let (_pool, mut connection, mut context, mut router, _peer) =
+            soft_refusal_connection(None, 6);
+        let mut wire = static_get_headers(65);
+        wire.extend(static_get_headers(55));
+        let frames = frames_after(&mut connection, &mut context, &mut router, &wire);
+        assert_eq!(
+            error_code_of(&frames, 3, 65),
+            Some(H2Error::RefusedStream as u32),
+            "premise: stream 65 is refused under flood pressure, got {frames:?}"
+        );
+        assert_eq!(
+            error_code_of(&frames, 7, 0),
+            Some(H2Error::ProtocolError as u32),
+            "HEADERS on an id below a refused one must end the connection with \
+             GOAWAY(PROTOCOL_ERROR), got {frames:?}"
+        );
+        assert_eq!(
+            error_code_of(&frames, 3, 55),
+            None,
+            "stream 55 must not be refused as a new stream"
+        );
+        assert_eq!(connection.core.flood_refused_streams, Some((65, 65)));
+    }
+
+    /// Soft refusals count toward the glitch budget once the client
+    /// acknowledged Sōzu's SETTINGS, like the draining and
+    /// SETTINGS_MAX_CONCURRENT_STREAMS refusals: a client that keeps opening
+    /// streams it is refused, without resetting any, ends with
+    /// GOAWAY(ENHANCE_YOUR_CALM).
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::handle_header_state`, drop the
+    /// `record_glitch` call of the soft-refusal branch. Every stream is then
+    /// refused and no GOAWAY ever comes.
+    #[test]
+    fn soft_refusals_count_toward_the_glitch_budget() {
+        const GLITCH_LIMIT: u32 = 20;
+        let (_pool, mut connection, mut context, mut router, _peer) =
+            soft_refusal_connection(Some(GLITCH_LIMIT), 6);
+        let mut wire = Vec::new();
+        for n in 0..2 * GLITCH_LIMIT {
+            wire.extend(static_get_headers(5 + 2 * n));
+        }
+        let frames = frames_after(&mut connection, &mut context, &mut router, &wire);
+        assert_eq!(
+            error_code_of(&frames, 3, 5),
+            Some(H2Error::RefusedStream as u32),
+            "premise: the first new stream is refused under flood pressure"
+        );
+        assert_eq!(
+            error_code_of(&frames, 7, 0),
+            Some(H2Error::EnhanceYourCalm as u32),
+            "a client that keeps opening refused streams must exhaust the glitch \
+             budget, got {} RST_STREAM frames and no GOAWAY",
+            frames.iter().filter(|(kind, ..)| *kind == 3).count()
+        );
+        assert!(
+            frames.iter().filter(|(kind, ..)| *kind == 3).count() <= GLITCH_LIMIT as usize + 1,
+            "the glitch budget bounds the refusals"
+        );
+    }
+
+    /// A RST_STREAM the client sends on the wire for a stream refused under
+    /// flood pressure goes through the closed-stream branch of
+    /// `ConnectionH2::handle_header_state`, which counts one glitch, and then
+    /// reaches `ConnectionH2::handle_rst_stream_frame`: refusals stop for the
+    /// connection, so its next stream is opened, and the reset counts as a
+    /// pre-response one, so with ten pre-response resets on record it
+    /// trips the cap's floor of 10.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::handle_rst_stream_frame`, delete
+    /// the `flood_refused_streams` arm: `a client that resets a refused
+    /// stream gets no more refusals` fails, stream 7 is refused, and the
+    /// reset counts as response-started, so no GOAWAY comes.
+    #[test]
+    fn a_client_reset_of_a_refused_stream_on_the_wire_ends_the_refusals() {
+        let rst = |stream_id: StreamId| {
+            orphan_frame(3, 0, stream_id, 4, &(H2Error::Cancel as u32).to_be_bytes())
+        };
+
+        let (_pool, mut connection, mut context, mut router, _peer) =
+            soft_refusal_connection(None, 6);
+        let frames = frames_after(
+            &mut connection,
+            &mut context,
+            &mut router,
+            &static_get_headers(5),
+        );
+        assert_eq!(
+            error_code_of(&frames, 3, 5),
+            Some(H2Error::RefusedStream as u32),
+            "premise: stream 5 is refused under flood pressure"
+        );
+        let glitches = connection.core.flood_detector.glitch_count();
+        frames_after(&mut connection, &mut context, &mut router, &rst(5));
+        assert_eq!(
+            connection.core.flood_detector.glitch_count(),
+            glitches + 1,
+            "the reset of a refused stream costs one glitch"
+        );
+        assert!(
+            connection.core.flood_refusal_ignored,
+            "a client that resets a refused stream gets no more refusals"
+        );
+        let frames = frames_after(
+            &mut connection,
+            &mut context,
+            &mut router,
+            &static_get_headers(7),
+        );
+        assert_eq!(
+            error_code_of(&frames, 3, 7),
+            None,
+            "no stream is refused after the client reset a refused one"
+        );
+        assert!(
+            connection.core.stream_table.get(7).is_some(),
+            "stream 7 is opened"
+        );
+
+        // Ten pre-response resets on record: the reset of a refused stream is
+        // the eleventh, past the floor.
+        let (_pool, mut connection, mut context, mut router, _peer) =
+            soft_refusal_connection(None, 10);
+        let mut wire = static_get_headers(5);
+        wire.extend(rst(5));
+        let frames = frames_after(&mut connection, &mut context, &mut router, &wire);
+        assert_eq!(
+            error_code_of(&frames, 3, 5),
+            Some(H2Error::RefusedStream as u32),
+            "premise: stream 5 is refused under flood pressure"
+        );
+        assert_eq!(
+            error_code_of(&frames, 7, 0),
+            Some(H2Error::EnhanceYourCalm as u32),
+            "the reset of a refused stream must count as pre-response, got {frames:?}"
         );
     }
 

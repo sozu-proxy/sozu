@@ -952,10 +952,12 @@ impl H2FloodDetector {
     ///   stream is refused, so this is what ends the refusal once the client
     ///   stops.
     ///
-    /// A refusal is not counted by any flood counter: the caller resets the
-    /// stream as a local decision, which neither the provoked-RST cap nor the
-    /// glitch counter sees. Only a peer that keeps resetting streams still
-    /// moves toward the cap, which ends the connection unchanged. The
+    /// The caller resets the stream as a local decision, which the
+    /// provoked-RST cap does not see. Once the peer acknowledged Sōzu's
+    /// SETTINGS, the refusal counts one glitch, like every other stream
+    /// refusal: the glitch budget bounds a peer that keeps opening streams it
+    /// is refused. A peer that keeps resetting streams still moves toward the
+    /// cap, which ends the connection unchanged. The
     /// per-window RST_STREAM rate and the PING, SETTINGS, empty DATA,
     /// CONTINUATION and stream-0 WINDOW_UPDATE floods have no soft state —
     /// see [`DEFAULT_STREAM_REFUSAL_PERCENT`].
