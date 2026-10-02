@@ -546,7 +546,7 @@ fn query_proxy_metric(worker: &mut Worker, metric_name: &str) -> Option<filtered
 /// [`query_proxy_metric`] for a `count!` metric. An absent key reads as 0:
 /// a counter that has never been touched and a counter at zero are the same
 /// observation, and both are "no progress yet" to a poll.
-fn query_proxy_count(worker: &mut Worker, metric_name: &str) -> i64 {
+pub(crate) fn query_proxy_count(worker: &mut Worker, metric_name: &str) -> i64 {
     match query_proxy_metric(worker, metric_name) {
         Some(filtered_metrics::Inner::Count(value)) => value,
         _ => 0,

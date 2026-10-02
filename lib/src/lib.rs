@@ -1144,9 +1144,9 @@ pub struct Readiness {
 
 impl Display for Readiness {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        let i = &mut [b'-'; 4];
-        let r = &mut [b'-'; 4];
-        let mixed = &mut [b'-'; 4];
+        let i = &mut [b'-'; 5];
+        let r = &mut [b'-'; 5];
+        let mixed = &mut [b'-'; 5];
 
         display_ready(i, self.interest);
         display_ready(r, self.event);
@@ -1169,13 +1169,19 @@ impl Default for Readiness {
 }
 
 impl Readiness {
-    /// Mask of every bit `Ready` defines (READABLE | WRITABLE | ERROR | HUP).
+    /// Mask of every bit `Ready` defines (READABLE | WRITABLE | ERROR | HUP |
+    /// WRITE_CLOSED).
     /// Any bit outside this set in `event` or `interest` is a corrupted
     /// readiness word — checked by [`Self::check_invariants`]. Not
     /// `#[cfg(debug_assertions)]`-gated: it is read from inside `debug_assert!`s
     /// whose arguments must still compile in release (HARD RULE 2 / E0425).
-    const KNOWN_BITS: Ready =
-        Ready(Ready::READABLE.0 | Ready::WRITABLE.0 | Ready::ERROR.0 | Ready::HUP.0);
+    const KNOWN_BITS: Ready = Ready(
+        Ready::READABLE.0
+            | Ready::WRITABLE.0
+            | Ready::ERROR.0
+            | Ready::HUP.0
+            | Ready::WRITE_CLOSED.0,
+    );
 
     pub const fn new() -> Readiness {
         Readiness {
@@ -1193,12 +1199,12 @@ impl Readiness {
         debug_assert_eq!(
             self.event & Self::KNOWN_BITS,
             self.event,
-            "Readiness.event carries a bit outside READABLE|WRITABLE|ERROR|HUP"
+            "Readiness.event carries a bit outside READABLE|WRITABLE|ERROR|HUP|WRITE_CLOSED"
         );
         debug_assert_eq!(
             self.interest & Self::KNOWN_BITS,
             self.interest,
-            "Readiness.interest carries a bit outside READABLE|WRITABLE|ERROR|HUP"
+            "Readiness.interest carries a bit outside READABLE|WRITABLE|ERROR|HUP|WRITE_CLOSED"
         );
     }
 
@@ -1326,6 +1332,32 @@ mod readiness_tests {
         assert_eq!(r.interest, Ready::WRITABLE);
         assert_eq!(r.event, Ready::WRITABLE);
     }
+
+    /// A trace line tells a half-close from a hang-up: WRITE_CLOSED renders
+    /// as `C` beside HUP's `H`.
+    #[test]
+    fn readiness_rendering_tells_a_hang_up_from_a_half_close() {
+        assert_eq!(
+            super::ready_to_string(Ready::READABLE | Ready::HUP),
+            "R--H-"
+        );
+        assert_eq!(
+            super::ready_to_string(Ready::READABLE | Ready::HUP | Ready::WRITE_CLOSED),
+            "R--HC"
+        );
+        let readiness = Readiness {
+            event: Ready::HUP | Ready::WRITE_CLOSED,
+            interest: Ready::READABLE | Ready::HUP,
+        };
+        assert_eq!(
+            readiness.to_string(),
+            "I(\"R--H-\")&R(\"---HC\")=M(\"---H-\")"
+        );
+        assert_eq!(
+            format!("{readiness:?}"),
+            "Readiness { interest: R--H-, readiness: ---HC, mixed: ---H- }"
+        );
+    }
 }
 
 pub fn display_ready(s: &mut [u8], readiness: Ready) {
@@ -1341,19 +1373,24 @@ pub fn display_ready(s: &mut [u8], readiness: Ready) {
     if readiness.is_hup() {
         s[3] = b'H';
     }
+    // `H` alone is a half-close or a hang-up; `C` says the peer can receive
+    // nothing more (WRITE_CLOSED), which only a hang-up raises.
+    if readiness.is_write_closed() {
+        s[4] = b'C';
+    }
 }
 
 pub fn ready_to_string(readiness: Ready) -> String {
-    let s = &mut [b'-'; 4];
+    let s = &mut [b'-'; 5];
     display_ready(s, readiness);
     String::from_utf8(s.to_vec()).unwrap()
 }
 
 impl fmt::Debug for Readiness {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let i = &mut [b'-'; 4];
-        let r = &mut [b'-'; 4];
-        let mixed = &mut [b'-'; 4];
+        let i = &mut [b'-'; 5];
+        let r = &mut [b'-'; 5];
+        let mixed = &mut [b'-'; 5];
 
         display_ready(i, self.interest);
         display_ready(r, self.event);
