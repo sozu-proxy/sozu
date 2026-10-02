@@ -1144,9 +1144,9 @@ pub struct Readiness {
 
 impl Display for Readiness {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        let i = &mut [b'-'; 4];
-        let r = &mut [b'-'; 4];
-        let mixed = &mut [b'-'; 4];
+        let i = &mut [b'-'; 5];
+        let r = &mut [b'-'; 5];
+        let mixed = &mut [b'-'; 5];
 
         display_ready(i, self.interest);
         display_ready(r, self.event);
@@ -1332,6 +1332,32 @@ mod readiness_tests {
         assert_eq!(r.interest, Ready::WRITABLE);
         assert_eq!(r.event, Ready::WRITABLE);
     }
+
+    /// A trace line tells a half-close from a hang-up: WRITE_CLOSED renders
+    /// as `C` beside HUP's `H`.
+    #[test]
+    fn readiness_rendering_tells_a_hang_up_from_a_half_close() {
+        assert_eq!(
+            super::ready_to_string(Ready::READABLE | Ready::HUP),
+            "R--H-"
+        );
+        assert_eq!(
+            super::ready_to_string(Ready::READABLE | Ready::HUP | Ready::WRITE_CLOSED),
+            "R--HC"
+        );
+        let readiness = Readiness {
+            event: Ready::HUP | Ready::WRITE_CLOSED,
+            interest: Ready::READABLE | Ready::HUP,
+        };
+        assert_eq!(
+            readiness.to_string(),
+            "I(\"R--H-\")&R(\"---HC\")=M(\"---H-\")"
+        );
+        assert_eq!(
+            format!("{readiness:?}"),
+            "Readiness { interest: R--H-, readiness: ---HC, mixed: ---H- }"
+        );
+    }
 }
 
 pub fn display_ready(s: &mut [u8], readiness: Ready) {
@@ -1347,19 +1373,24 @@ pub fn display_ready(s: &mut [u8], readiness: Ready) {
     if readiness.is_hup() {
         s[3] = b'H';
     }
+    // `H` alone is a half-close or a hang-up; `C` says the peer can receive
+    // nothing more (WRITE_CLOSED), which only a hang-up raises.
+    if readiness.is_write_closed() {
+        s[4] = b'C';
+    }
 }
 
 pub fn ready_to_string(readiness: Ready) -> String {
-    let s = &mut [b'-'; 4];
+    let s = &mut [b'-'; 5];
     display_ready(s, readiness);
     String::from_utf8(s.to_vec()).unwrap()
 }
 
 impl fmt::Debug for Readiness {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let i = &mut [b'-'; 4];
-        let r = &mut [b'-'; 4];
-        let mixed = &mut [b'-'; 4];
+        let i = &mut [b'-'; 5];
+        let r = &mut [b'-'; 5];
+        let mixed = &mut [b'-'; 5];
 
         display_ready(i, self.interest);
         display_ready(r, self.event);

@@ -3873,7 +3873,9 @@
   (`Connection::has_unread_input`) or a stream whose request was received whole is open
   (`Mux::frontend_exchange_in_flight`); the session then closes once that response is complete.
   A request the client left incomplete is closed at once once its EOF is read, as before, without
-  waiting for the backend. A full hang-up closes the session at once whatever is in flight: ERROR,
+  waiting for the backend. On an H1 frontend a full hang-up closes the session at once whatever is
+  in flight (an H2 frontend with output pending still waits for a timeout,
+  [#1792](https://github.com/sozu-proxy/sozu/issues/1792)): ERROR,
   or the new `Ready::WRITE_CLOSED` bit (`sozu-command-lib`, `command/src/ready.rs`), which
   `Ready::from(&Event)` raises for mio's `is_write_closed` (`EPOLLHUP` or `EPOLLERR`) and a
   half-close never raises. ERROR alone missed a reset whose error sozu's own read or write had
@@ -3883,7 +3885,9 @@
   handshake reads past a HUP when a read is due and closes if the handshake is still incomplete
   afterwards, since such a client can never send its `Finished`; its loop no longer counts HUP
   alone as work, and a FIN or a reset during the handshake logs at debug, not error. The HUP
-  survives the upgrade. `ConnectionH1::readable` (`lib/src/protocol/mux/h1.rs`) no longer links a
+  survives the upgrade, with WRITE_CLOSED. Readiness traces render WRITE_CLOSED as a fifth column,
+  `C` (`display_ready`, `lib/src/lib.rs`), so a hang-up reads `---HC` and a half-close `---H-`.
+  `ConnectionH1::readable` (`lib/src/protocol/mux/h1.rs`) no longer links a
   request whose stream was already answered (`Unlinked`), such as a 408 from `Mux::timeout_inner`
   sent while the request head was incomplete. Documented in `lib/src/protocol/mux/LIFECYCLE.md`
   and `doc/lifetime_of_a_session.md`. Covered by the `test_tls_client_half_close_*`,

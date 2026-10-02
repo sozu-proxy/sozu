@@ -251,7 +251,7 @@ mux frontend for WRITABLE, and for READABLE only when the handshake still held
 a READABLE edge or rustls already holds plaintext (an HTTP/2 preface sharing a
 segment with the client `Finished`) or a `close_notify`
 ([#1609](https://github.com/sozu-proxy/sozu/issues/1609)). A HUP the
-handshake saw survives the upgrade. With TLS 1.3 a client's `Finished`, its
+handshake saw survives the upgrade, with WRITE_CLOSED when it was a hang-up. With TLS 1.3 a client's `Finished`, its
 request and its half-close FIN can arrive together, so `TlsHandshake::ready`
 closes on a HUP only when no read is due, and the mux serves that request
 before it closes ([#1779](https://github.com/sozu-proxy/sozu/issues/1779)).
@@ -600,8 +600,10 @@ stream whose request was received whole is open
 (`Mux::frontend_exchange_in_flight`), neither the entry check nor the in-loop
 check closes the session or queues `close_notify`, and the session closes once
 the response is complete. A request left incomplete at the client's EOF closes
-the session at once, and a full hang-up closes it whatever is in flight. A
-hang-up is ERROR or WRITE_CLOSED: `Ready::from(&Event)` raises WRITE_CLOSED
+the session at once. On an H1 frontend a full hang-up closes it whatever is in
+flight; an H2 frontend with output still pending waits for a timeout instead,
+since no H2 write path treats a failed write as fatal
+([#1792](https://github.com/sozu-proxy/sozu/issues/1792)). A hang-up is ERROR or WRITE_CLOSED: `Ready::from(&Event)` raises WRITE_CLOSED
 for mio's `is_write_closed` (`EPOLLHUP` or `EPOLLERR`), which a half-close
 (`EPOLLRDHUP` alone) never raises. ERROR alone is not enough, because a reset
 whose error a `read` or `write` consumed first is reported as `EPOLLHUP`

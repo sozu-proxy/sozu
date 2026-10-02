@@ -1923,8 +1923,9 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     /// incomplete can never complete, and the session closes as on a hang-up
     /// instead of waiting for its backend.
     ///
-    /// A full hang-up closes whatever is in flight: the client will read
-    /// nothing more. It is ERROR (`EPOLLERR`, a reset) or WRITE_CLOSED (mio's
+    /// A full hang-up is never in flight: the client will read nothing more.
+    /// (An H1 session then closes at once; an H2 one with output pending
+    /// still waits for a timeout, sozu-proxy/sozu#1792.) It is ERROR (`EPOLLERR`, a reset) or WRITE_CLOSED (mio's
     /// `is_write_closed`: `EPOLLHUP` or `EPOLLERR`). ERROR alone is not
     /// enough: a reset whose error sozu's own `read` or `write` consumed
     /// first is reported as `EPOLLHUP` without `EPOLLERR`, which only
@@ -5680,6 +5681,7 @@ mod tests {
     /// TO SEE THIS RED: make `ConnectionH1::client_write_failed` return
     /// `None`.
     #[test]
+    #[cfg(target_os = "linux")]
     fn a_failed_write_to_the_client_closes_the_session() {
         let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
         let (mut mux, peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));

@@ -161,7 +161,8 @@ impl std::convert::From<&mio::event::Event> for Ready {
     }
 }
 
-#[cfg(test)]
+// Real-epoll probes: the readiness words they check are Linux's.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::{
         io::{ErrorKind, Write},

@@ -171,14 +171,16 @@ fn successful_tls_handshake_summary(sni: Option<&str>, alpn: Option<&str>) -> St
 /// `plain_socket_read` in `lib/src/socket.rs`), so an unconditional READABLE
 /// only bought a `recv` that answered EAGAIN on every TLS connection.
 ///
-/// HUP survives the upgrade: its edge does not fire again. A client that
+/// HUP and WRITE_CLOSED survive the upgrade: their edge does not fire again,
+/// and WRITE_CLOSED is what tells the mux a hang-up from a half-close. A client that
 /// half-closed with its request (`TlsHandshake::ready` in
 /// `lib/src/protocol/rustls.rs` reads past that HUP) is served by the mux,
 /// which closes the session on the HUP once the response is complete
 /// (`Mux::ready_inner`). Dropping it left that session open after its
 /// response until the frontend timeout.
 fn upgraded_frontend_events(handshake_event: Ready, rustls_holds_input: bool) -> Ready {
-    let hup = handshake_event & Ready::HUP;
+    // WRITE_CLOSED too: it is what tells a hang-up from a half-close.
+    let hup = handshake_event & (Ready::HUP | Ready::WRITE_CLOSED);
     if handshake_event.is_readable() || rustls_holds_input {
         Ready::READABLE | Ready::WRITABLE | hup
     } else {
@@ -3206,6 +3208,11 @@ mod tests {
             upgraded_frontend_events(Ready::HUP, false),
             Ready::WRITABLE | Ready::HUP,
             "HUP survives even when no read is due"
+        );
+        assert_eq!(
+            upgraded_frontend_events(Ready::READABLE | Ready::HUP | Ready::WRITE_CLOSED, true),
+            Ready::READABLE | Ready::WRITABLE | Ready::HUP | Ready::WRITE_CLOSED,
+            "a hang-up seen during the handshake must reach the mux as one"
         );
     }
 
