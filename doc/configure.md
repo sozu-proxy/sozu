@@ -449,8 +449,9 @@ client_auth = "required"
 # concatenated PEM chain; several files may be listed.
 client_ca_certificates = ["/etc/sozu/client-ca.pem"]
 
-# Optional: filesystem paths to PEM-encoded CRLs. When present, a client
-# certificate listed as revoked is rejected.
+# Optional: filesystem paths to PEM-encoded CRLs. When present, revocation is
+# checked across the whole client chain and fails closed — see "Revocation"
+# below before supplying a partial CRL set.
 client_ca_crls = ["/etc/sozu/client-ca.crl.pem"]
 ```
 
@@ -484,6 +485,37 @@ The configuration is rejected rather than silently degraded in every case below.
 | A configured CRL past its `nextUpdate`                               | **Rejected at handshake.** Sōzu enables `enforce_revocation_expiration()`; rustls defaults to ignoring expiration, which would keep trusting a stale CRL. |
 
 The rejections above happen at two distinct stages. Reading the CA/CRL files and refusing mTLS keys on a non-HTTPS listener happen at config-load, in the master. Parsing the PEM bodies and building the verifier happen worker-side, when the listener is created. In both cases the listener is never activated: `create_rustls_context` returns an error, so there is no fallback to an unauthenticated listener.
+
+##### Revocation
+
+`client_ca_crls` is not a best-effort filter. Sōzu passes the configured CRLs to
+rustls with `with_crls(...).enforce_revocation_expiration()` and keeps rustls's
+defaults for the other two revocation knobs, so as soon as at least one CRL is
+configured a handshake is rejected in **three** distinct cases, not just one:
+
+| Situation                                                                 | Outcome                                                                                                                     |
+|---------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------|
+| A certificate in the chain is listed as revoked                            | **Rejected.** The expected case.                                                                                            |
+| Revocation status cannot be established for a certificate in the chain     | **Rejected.** rustls defaults to `UnknownStatusPolicy::Deny`; "no CRL covers this issuer" is treated as revoked, not as OK.  |
+| A CRL that does cover the chain is past its `nextUpdate`                   | **Rejected.** `enforce_revocation_expiration()` is enabled; rustls would otherwise keep trusting a stale CRL.                |
+
+Revocation is checked over the **whole chain** (rustls's default
+`RevocationCheckDepth::Chain`), not only the end-entity certificate. The
+practical consequence is that supplying CRLs is an all-or-nothing commitment:
+
+- Every issuing CA in every accepted chain — intermediates included — must be
+  covered by a configured CRL. A CRL set that covers the leaf issuer but not an
+  intermediate's issuer locks out otherwise valid clients.
+- Every configured CRL must be refreshed before its `nextUpdate`. An expired
+  CRL rejects the clients it covers, even those it never listed as revoked.
+- CRL contents are inlined at config-load and never re-read (see above), so
+  refreshing a CRL file on disk requires reloading the configuration.
+
+This is a deliberate fail-closed posture: a revocation check that silently
+degrades to "allow" is indistinguishable from having no revocation at all. If
+maintaining complete, current CRL coverage for the full chain is not
+operationally feasible, leave `client_ca_crls` empty rather than configuring a
+partial set — chain validation against `client_ca_certificates` still applies.
 
 ##### Notes
 
