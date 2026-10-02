@@ -107,6 +107,7 @@ impl<Front: SocketHandler> Connection<Front> {
             timeout_duration,
             timeout_deadline: Instant::now().checked_add(timeout_duration),
             parked_on_buffer_pressure: false,
+            write_failed: false,
             close_notify_sent: false,
             session_ulid,
             reused_from_pool: false,
@@ -146,6 +147,7 @@ impl<Front: SocketHandler> Connection<Front> {
             timeout_duration,
             timeout_deadline: Instant::now().checked_add(timeout_duration),
             parked_on_buffer_pressure: false,
+            write_failed: false,
             close_notify_sent: false,
             session_ulid,
             reused_from_pool: false,
@@ -538,6 +540,20 @@ impl<Front: SocketHandler> Connection<Front> {
         match self {
             Connection::H1(c) => c.is_lingering(),
             Connection::H2(c) => c.core.is_lingering(),
+        }
+    }
+
+    /// Whether the client may have sent bytes this connection has not read:
+    /// a read is due, or the read stopped on buffer pressure with the rest
+    /// still in the kernel. An H1 connection parks with its READABLE event
+    /// cleared (`ConnectionH1::readable`), an H2 one with its READABLE
+    /// interest cleared and the event kept (`ConnectionH2::try_resume_reading`).
+    pub(super) fn has_unread_input(&self) -> bool {
+        match self {
+            Connection::H1(c) => {
+                c.readiness.filter_interest().is_readable() || c.parked_on_buffer_pressure
+            }
+            Connection::H2(_) => self.readiness().event.is_readable(),
         }
     }
 

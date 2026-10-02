@@ -267,11 +267,20 @@ fewer bytes than rustls offered, as on `EAGAIN`, and drops READABLE; the next
 segment of a ClientHello split across several raises the next edge. A `recv`
 or a write the kernel interrupted (`EINTR`) is retried at once by
 `handshake_read` and `handshake_write`, as `flush_tls` does after the
-handshake, instead of closing the session. When the handshake completes, `upgraded_frontend_events` (`lib/src/https.rs`) arms the
+handshake, instead of closing the session. When the handshake completes,
+`upgraded_frontend_events` (`lib/src/https.rs`) arms the
 mux frontend for WRITABLE, and for READABLE only when the handshake still held
 a READABLE edge or rustls already holds plaintext (an HTTP/2 preface sharing a
 segment with the client `Finished`) or a `close_notify`
-([#1609](https://github.com/sozu-proxy/sozu/issues/1609)).
+([#1609](https://github.com/sozu-proxy/sozu/issues/1609)). A HUP the
+handshake saw survives the upgrade, with WRITE_CLOSED when it was a hang-up. With TLS 1.3 a client's `Finished`, its
+request and its half-close FIN can arrive together, so `TlsHandshake::ready`
+closes on a HUP only when no read is due, and the mux serves that request
+before it closes ([#1779](https://github.com/sozu-proxy/sozu/issues/1779)).
+A HUP still set after a read that left the handshake incomplete closes it
+(`TlsHandshake::readable`): that client can never send its `Finished`. The
+handshake loop counts only READABLE, WRITABLE and ERROR as work, so a HUP
+alone never spins it.
 
 On the wire a TLS 1.3 handshake costs the server one `writev(2)` for its flight
 (ServerHello, ChangeCipherSpec, encrypted handshake messages) and one for the
@@ -607,7 +616,22 @@ READABLE, WRITABLE or ERROR interest with a matching event and every backend's
 readiness is empty. A frontend HUP is not work the loop can progress: each
 iteration closes the session on one once no output is left to flush, except on
 a lingering frontend, which drains the client's last bytes to the EOF first
-([#1774](https://github.com/sozu-proxy/sozu/issues/1774)).
+([#1774](https://github.com/sozu-proxy/sozu/issues/1774)). The HUP is also how
+a client's half-close arrives (`EPOLLRDHUP`): while input is still unread or a
+stream whose request was received whole is open
+(`Mux::frontend_exchange_in_flight`), neither the entry check nor the in-loop
+check closes the session or queues `close_notify`, and the session closes once
+the response is complete. A request left incomplete at the client's EOF closes
+the session at once. On an H1 frontend a full hang-up closes it whatever is in
+flight; an H2 frontend with output still pending waits for a timeout instead,
+since no H2 write path treats a failed write as fatal
+([#1792](https://github.com/sozu-proxy/sozu/issues/1792)). A hang-up is ERROR
+or WRITE_CLOSED: `Ready::from(&Event)` raises WRITE_CLOSED for mio's `is_write_closed` (`EPOLLHUP` or `EPOLLERR`), which a half-close
+(`EPOLLRDHUP` alone) never raises. ERROR alone is not enough, because a reset
+whose error a `read` or `write` consumed first is reported as `EPOLLHUP`
+without `EPOLLERR`. A write to the client that fails closes the session as
+well (`ConnectionH1::writable`)
+([#1779](https://github.com/sozu-proxy/sozu/issues/1779)).
 
 ## 9. TCP (pipe) session lifecycle
 
@@ -759,7 +783,7 @@ EOF is read by a later `readable`, in the same pass when the event already
 carried HUP, one `epoll_wait` round later when the FIN landed after that
 `epoll_wait` returned (§2.2). A frontend read does not record HUP: over TLS its
 `Closed` can be a `close_notify` on a TCP stream that is still open, and a
-frontend HUP closes the whole session.
+frontend HUP closes the whole session once no exchange is in flight.
 
 The sockets of an HTTP or HTTPS session are **not** deregistered from epoll
 ([#1567](https://github.com/sozu-proxy/sozu/issues/1567)). Each one closes when

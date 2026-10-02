@@ -170,6 +170,10 @@ pub struct ConnectionH1<Front: SocketHandler> {
     /// kernel socket buffer, so the cross-readiness mechanism must re-arm it
     /// via `try_resume_reading` once the peer drains the buffer.
     pub parked_on_buffer_pressure: bool,
+    /// A write to the client failed (reset, broken pipe or another socket
+    /// error): nothing more can be flushed to it, so the connection reports
+    /// no pending write and the session closes instead of waiting to flush.
+    pub write_failed: bool,
     /// True once we've asked rustls to emit TLS close_notify for this frontend.
     pub close_notify_sent: bool,
     /// Connection/session ULID propagated from the parent [`super::Mux`]. Used to
@@ -622,6 +626,9 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         if stream.metrics.start.is_none() {
             stream.metrics.mark_request_start();
         }
+        // Read before `split` borrows the stream: the relink guard below
+        // needs it while `parts` is alive.
+        let answered = stream.state == StreamState::Unlinked;
         let parts = stream.split(&self.position);
         let kawa = parts.rbuffer;
 
@@ -878,7 +885,12 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 // successor and correctly keeps its own instant.
                 parts.metrics.backend_headers_received();
             }
-            if !was_main_phase && self.position.is_server() {
+            // A request already answered is never linked. `Mux::timeout_inner`
+            // (`lib/src/protocol/mux/mod.rs`) answers 408 on an `Idle` stream
+            // whose head was incomplete and leaves it `Unlinked`; the rest of
+            // that head may still arrive, and is drained by the linger after
+            // the answer (`ConnectionH1::start_linger`), never forwarded.
+            if !was_main_phase && self.position.is_server() && !answered {
                 if parts.context.method.is_none()
                     || parts.context.authority.is_none()
                     || parts.context.path.is_none()
@@ -1011,6 +1023,9 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             if self.socket.socket_wants_write() {
                 let (size, status) = self.socket.socket_write_vectored(&[]);
                 let _ = update_readiness_after_write(size, status, &mut self.readiness);
+                if let Some(result) = self.client_write_failed(status) {
+                    return result;
+                }
                 // Only after `Continue`: see the same check below.
                 if self.socket.socket_wants_write() && status == SocketResult::Continue {
                     self.readiness.signal_pending_write();
@@ -1142,6 +1157,9 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         crate::protocol::mux::h2::record_metric(self.position.bytes_out_event(size));
         self.position.count_bytes_out(parts.metrics, size);
         let should_yield = update_readiness_after_write(size, status, &mut self.readiness);
+        if let Some(result) = self.client_write_failed(status) {
+            return result;
+        }
         if self.socket.socket_wants_write() {
             // Only a write that answered `Continue` queues a synthetic
             // event. A socket that answered `WouldBlock` is full: the kernel
@@ -1151,8 +1169,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             // iteration, each answering `WouldBlock`, until
             // `MAX_LOOP_ITERATIONS` counted `http.infinite_loop.error`
             // (sozu-proxy/sozu#1780). An `Error` or `Closed` write has nothing
-            // to retry either: the TLS socket marks its transport dead, and
-            // the hang-up that follows closes the session.
+            // to retry either: on the frontend `client_write_failed` closed the
+            // session above; on a backend the hang-up that follows closes it.
             if status == SocketResult::Continue {
                 self.readiness.signal_pending_write();
                 // Pair the queued-write signal with the socket's own report: we
@@ -1552,7 +1570,26 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
     }
 
     pub fn has_pending_write(&self) -> bool {
-        self.socket.socket_wants_write()
+        !self.write_failed && self.socket.socket_wants_write()
+    }
+
+    /// A write to the client failed: the client is gone, or its socket can
+    /// never be flushed. Close at once; `Self::has_pending_write` stops
+    /// reporting output, so no delayed close waits for a flush that cannot
+    /// happen.
+    fn client_write_failed(&mut self, status: SocketResult) -> Option<MuxResult> {
+        if self.position.is_server() && matches!(status, SocketResult::Error | SocketResult::Closed)
+        {
+            debug!(
+                "{} H1 closing the frontend after a failed write: {:?}",
+                log_context!(self),
+                status
+            );
+            self.write_failed = true;
+            Some(MuxResult::CloseSession)
+        } else {
+            None
+        }
     }
 
     pub fn initiate_close_notify(&mut self) -> bool {
@@ -3400,10 +3437,14 @@ mod tests {
     /// Both flushes are covered: the one with no stream, and the TLS-only
     /// flush of a stream with nothing left to write.
     ///
-    /// TO SEE THIS RED: in either flush of `ConnectionH1::writable`, compare
-    /// `status != SocketResult::WouldBlock` instead of
-    /// `status == SocketResult::Continue`. The `Error` case then re-raises
-    /// WRITABLE.
+    /// On this server-side connection an `Error` flush instead closes the
+    /// session through `ConnectionH1::client_write_failed`, before that check
+    /// (sozu-proxy/sozu#1779): it stops reporting pending output, and leaves
+    /// WRITABLE unraised too.
+    ///
+    /// TO SEE THIS RED: in either flush of `ConnectionH1::writable`, drop the
+    /// `status == SocketResult::Continue` condition. The `WouldBlock` case
+    /// then re-raises WRITABLE.
     #[test]
     fn a_tls_flush_that_did_not_continue_leaves_writable_to_the_kernel() {
         for (status, with_stream) in [
@@ -3437,11 +3478,22 @@ mod tests {
 
             let result = frontend.writable(&mut context, EndpointClient(&mut router));
 
-            assert!(matches!(result, MuxResult::Continue));
-            assert!(
-                frontend.has_pending_write(),
-                "premise: the socket must still report records"
-            );
+            if status == SocketResult::Error {
+                assert!(
+                    matches!(result, MuxResult::CloseSession),
+                    "a failed flush (stream: {with_stream}) must close the session"
+                );
+                assert!(
+                    !frontend.has_pending_write(),
+                    "a failed flush (stream: {with_stream}) must stop reporting output"
+                );
+            } else {
+                assert!(matches!(result, MuxResult::Continue));
+                assert!(
+                    frontend.has_pending_write(),
+                    "premise: the socket must still report records"
+                );
+            }
             assert!(
                 !frontend.readiness().event.is_writable(),
                 "a flush that answered {status:?} (stream: {with_stream}) must not re-raise \
