@@ -1342,36 +1342,29 @@ where
     if end_stream {
         // RFC 9113 §8.1.1: when END_STREAM is set on HEADERS, no DATA frames
         // follow, so the payload length is 0. A non-zero Content-Length is a
-        // stream error (PROTOCOL_ERROR). A 304 is excluded: its Content-Length
-        // states the length of the selected representation (RFC 9110 §8.6),
-        // and RFC 9113 §8.1.1 lets a response with no content carry a
-        // non-zero one. A 1xx or a 204 has none left (removed above).
-        if let BodySize::Length(n) = kawa.body_size {
-            let body_exempt = matches!(kawa.kind, Kind::Response)
-                && matches!(
-                    kawa.detached.status_line,
-                    StatusLine::Response { code, .. } if (100..200).contains(&code) || code == 204 || code == 304
-                );
-            if n > 0 && !body_exempt {
-                error!(
-                    "{} END_STREAM with non-zero Content-Length: {} (RFC 9113 §8.1.1)",
-                    log_module_context!(),
-                    n
-                );
-                return (events, Err((H2Error::ProtocolError, false)));
-            }
+        // stream error (PROTOCOL_ERROR). A response with no content is
+        // excluded, as RFC 9113 §8.1.1 lets it carry a non-zero one: on a 304
+        // or a response to HEAD, Content-Length states the length of the
+        // selected representation (RFC 9110 §8.6) and is forwarded. A 1xx or a
+        // 204 has none left (removed above).
+        if let BodySize::Length(n) = kawa.body_size
+            && n > 0
+            && !no_content
+        {
+            error!(
+                "{} END_STREAM with non-zero Content-Length: {} (RFC 9113 §8.1.1)",
+                log_module_context!(),
+                n
+            );
+            return (events, Err((H2Error::ProtocolError, false)));
         }
         if let BodySize::Empty = kawa.body_size {
-            // RFC 9110 §8.6: Do not inject Content-Length: 0 into a 1xx or a
-            // 204, which MUST NOT carry the field, nor into a 304, where it
-            // would state the length of the selected representation. Only
-            // inject for requests and other response codes.
-            let skip_content_length = matches!(kawa.kind, Kind::Response)
-                && matches!(
-                    kawa.detached.status_line,
-                    StatusLine::Response { code, .. } if (100..200).contains(&code) || code == 204 || code == 304
-                );
-            if !skip_content_length {
+            // RFC 9110 §8.6: Do not inject Content-Length: 0 into a response
+            // with no content: a 1xx or a 204 MUST NOT carry the field, and on
+            // a 304 or a response to HEAD it would state that the selected
+            // representation is empty. Only inject for requests and other
+            // responses.
+            if !no_content {
                 kawa.body_size = BodySize::Length(0);
                 kawa.push_block(Block::Header(Pair {
                     key: Store::Static(b"Content-Length"),

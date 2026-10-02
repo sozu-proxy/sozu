@@ -3868,6 +3868,22 @@
 
 ### 🐛 Fixed
 
+- **`fix(mux-h2)`: forward a response to HEAD with a non-zero `content-length` and END_STREAM on
+  its HEADERS ([#1791](https://github.com/sozu-proxy/sozu/issues/1791)).** `pkawa::handle_header`
+  (`lib/src/protocol/mux/pkawa.rs`) refused an H2 backend response whose HEADERS frame carried
+  END_STREAM and a non-zero `content-length` as a stream error (PROTOCOL_ERROR), exempting only a
+  1xx, a 204 and a 304, so a response to HEAD reached the client as a 502. RFC 9113 §8.1.1 lets a
+  response with no content carry a non-zero `content-length`, and a response to HEAD has none
+  (RFC 9110 §9.3.2). Only that END_STREAM check changes: it now exempts a response to HEAD,
+  whose `content-length` was already forwarded otherwise. A response to HEAD with END_STREAM and
+  no `content-length` also no longer gains an injected `Content-Length: 0`, which on HEAD, as on a
+  304, would state that the selected representation is empty (RFC 9110 §8.6). A response to GET
+  with END_STREAM and a non-zero `content-length` is still refused. Documented in
+  `lib/src/protocol/mux/LIFECYCLE.md` §8.4. Covered by
+  `test_h2_head_response_with_end_stream_keeps_the_backend_content_length`
+  (`e2e/src/tests/h2_security_header_injection.rs`): HEAD with and without a `content-length`,
+  and the GET rejection, for an H1 and an H2 client.
+
 - **`fix(mux)`: stop spinning the session loop when a TLS HTTP/1.1 client stops reading
   ([#1780](https://github.com/sozu-proxy/sozu/issues/1780)).** When a TLS client stopped reading a
   large response, rustls kept the records the kernel refused, and `ConnectionH1::writable`

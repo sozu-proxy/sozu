@@ -1906,7 +1906,14 @@ header section arrives without END_STREAM gains no `Transfer-Encoding:
 chunked` field and no chunked framing (RFC 9112 §6.1 forbids the field in a
 1xx or 204). A `content-length` the backend sent is removed from a 1xx or a
 204, where a server MUST NOT send it, and passed through on a 304 or a
-response to HEAD (RFC 9110 §8.6). A 1xx is interim: like kawa's H1 parser,
+response to HEAD (RFC 9110 §8.6), also when the HEADERS frame carries
+END_STREAM: the END_STREAM check that refuses a non-zero `content-length` as
+PROTOCOL_ERROR exempts every response with no content, as RFC 9113 §8.1.1
+allows, and a response with no content that arrives with neither gains no
+`Content-Length: 0`, which on a 304 or a response to HEAD would state that the
+selected representation is empty. Before sozu-proxy/sozu#1791 a response to
+HEAD was not exempt, so the client got a 502, or a `Content-Length: 0` when the
+backend sent no `content-length`. A 1xx is interim: like kawa's H1 parser,
 `handle_header` marks it complete (`ParsingPhase::Terminated`) at its head, and
 the final response follows on the same stream once the frontend has written
 it (`ConnectionH2::handle_1xx_reset` on an H2 frontend). A 204, a 304 or a
@@ -1931,8 +1938,9 @@ and chunked framing, and a 1xx never completed, so an H1 client read a chunked
 `test_h2_bodiless_response_head_has_no_transfer_encoding`,
 `test_h2_bodiless_response_ends_the_h2_client_stream`,
 `test_h2_bodiless_response_end_keeps_the_backend_connection`,
-`test_h2_backend_interim_response_reaches_the_client` and
-`test_h2_backend_101_is_a_bad_gateway`
+`test_h2_backend_interim_response_reaches_the_client`,
+`test_h2_backend_101_is_a_bad_gateway` and
+`test_h2_head_response_with_end_stream_keeps_the_backend_content_length`
 (`e2e/src/tests/h2_security_header_injection.rs`). A known gap remains: DATA
 carrying a payload on a 204, a 304 or a response to HEAD is still forwarded,
 written after the head to an H1 client and as DATA to an H2 client, because
