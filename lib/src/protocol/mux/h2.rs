@@ -8648,6 +8648,11 @@ pub struct H2Shell<Front: SocketHandler> {
     /// [`memoized_rtt`](super::memoized_rtt). A `Cell` because
     /// `Endpoint::local_rtt` takes `&self`.
     pub(super) local_rtt: Cell<Option<Option<Duration>>>,
+    /// A write to the client failed (reset, broken pipe or another socket
+    /// error): nothing more can be flushed to it, so the connection reports
+    /// no pending write and `Self::writable` closes the session instead of
+    /// waiting for a flush that cannot happen (sozu-proxy/sozu#1792).
+    write_failed: bool,
 }
 
 /// Renders the core and nothing else.
@@ -8829,7 +8834,19 @@ impl<Front: SocketHandler> H2Shell<Front> {
     fn flush_tls_records(&mut self) -> (usize, SocketResult) {
         let (size, status) = self.socket.socket_write(&[]);
         self.core.note_write_status(status);
+        self.record_write(status);
         (size, status)
+    }
+
+    /// Remember a failed write to the client: an H2 frontend whose socket
+    /// answered `Error` or `Closed` can flush nothing more. A backend keeps
+    /// its own failure handling.
+    fn record_write(&mut self, status: SocketResult) {
+        if self.core.position.is_server()
+            && matches!(status, SocketResult::Error | SocketResult::Closed)
+        {
+            self.write_failed = true;
+        }
     }
 
     /// Start the TLS `close_notify` handshake, generating the records that
@@ -8882,7 +8899,7 @@ impl<Front: SocketHandler> H2Shell<Front> {
     /// [`Self::has_pending_write_full`] on paths that must honour
     /// LIFECYCLE invariant 16 (e.g. shutdown-drain).
     pub fn has_pending_write(&self) -> bool {
-        self.core.has_pending_write_with(self.tls_wants_write())
+        !self.write_failed && self.core.has_pending_write_with(self.tls_wants_write())
     }
 
     /// Connection-level [`Self::has_pending_write`] extended with a per-stream
@@ -8894,8 +8911,9 @@ impl<Front: SocketHandler> H2Shell<Front> {
     where
         L: ListenerHandler + L7ListenerHandler,
     {
-        self.has_pending_write()
-            || any_stream_has_pending_back(self.core.stream_table.streams(), &context.streams)
+        !self.write_failed
+            && (self.has_pending_write()
+                || any_stream_has_pending_back(self.core.stream_table.streams(), &context.streams))
     }
 
     /// Flush the ordered output queue to the socket, counting its own bytes
@@ -8920,6 +8938,7 @@ impl<Front: SocketHandler> H2Shell<Front> {
             } else {
                 self.socket.socket_write(self.core.output_pending())
             };
+            self.record_write(status);
             #[cfg(debug_assertions)]
             trace!(
                 "{} flush_output_to_socket: written={}, status={:?}, wants_write={}",
@@ -9127,6 +9146,7 @@ impl<Front: SocketHandler> H2Shell<Front> {
             socket,
             io_slices: Vec::new(),
             local_rtt: Cell::new(None),
+            write_failed: false,
         })
     }
 }
@@ -9596,6 +9616,15 @@ impl<Front: SocketHandler> H2Shell<Front> {
         // `GoAway` to `Error` (`ConnectionH2::force_disconnect`).
         let after_final_goaway = self.core.lingers_instead_of_closing();
         let result = self.writable_inner(context, endpoint);
+        if self.write_failed {
+            // The client is gone or its socket can never be flushed: close
+            // at once, as an H1 frontend does (`ConnectionH1::writable`).
+            debug!(
+                "{} H2 closing the frontend after a failed write",
+                log_context!(self.core)
+            );
+            return MuxResult::CloseSession;
+        }
         let result = self.settled(result);
         if after_final_goaway {
             self.linger_instead_of_closing(result)
@@ -9787,6 +9816,7 @@ impl<Front: SocketHandler> H2Shell<Front> {
                             .gather_transmit(context, stream_id, &mut self.io_slices)
                     };
                     let (size, status) = self.socket.socket_write_vectored(&self.io_slices);
+                    self.record_write(status);
                     debug_assert!(
                         size <= offered,
                         "the socket reported {size} bytes written for an offer of {offered}"

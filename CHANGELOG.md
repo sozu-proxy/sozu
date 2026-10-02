@@ -4209,6 +4209,17 @@
   makes it pass; `test_udp_idle_flow_is_torn_down` and `test_udp_every_idle_flow_is_torn_down`
   are the end-to-end tests that fix lacked.
 
+- **`fix(mux)`: close an HTTP/2 session whose client write failed
+  ([#1792](https://github.com/sozu-proxy/sozu/issues/1792)).** An HTTP/2 frontend whose client
+  reset its connection while a response was being sent kept its session until a timeout:
+  `Mux::delay_close_for_frontend_flush` (`lib/src/protocol/mux/mod.rs`) waited for the pending
+  output, and no `H2Shell` write path (`lib/src/protocol/mux/h2.rs`) treated a write answering
+  `Error` or `Closed` as fatal. A failed write to an H2 client now marks the connection
+  (`H2Shell::record_write`), which then reports no pending write, and `H2Shell::writable` closes
+  the session, as an H1 frontend does since #1779. Documented in
+  `lib/src/protocol/mux/LIFECYCLE.md` and `doc/lifetime_of_a_session.md`. Covered by
+  `test_rr_h2_client_reset_mid_download` (`e2e/src/tests/tls_tests.rs`).
+
 - **`fix(mux)`: deliver the whole response to a client that half-closed its connection
   ([#1779](https://github.com/sozu-proxy/sozu/issues/1779)).** A client that half-closes after its
   request (`shutdown(SHUT_WR)`) has stopped sending, not receiving (RFC 9293 §3.6), but its FIN
@@ -4224,8 +4235,8 @@
   (`Mux::frontend_exchange_in_flight`); the session then closes once that response is complete.
   A request the client left incomplete is closed at once once its EOF is read, as before, without
   waiting for the backend. On an H1 frontend a full hang-up closes the session at once whatever is
-  in flight (an H2 frontend with output pending still waits for a timeout,
-  [#1792](https://github.com/sozu-proxy/sozu/issues/1792)): ERROR,
+  in flight (an H2 frontend is covered by the
+  [#1792](https://github.com/sozu-proxy/sozu/issues/1792) entry): ERROR,
   or the new `Ready::WRITE_CLOSED` bit (`sozu-command-lib`, `command/src/ready.rs`), which
   `Ready::from(&Event)` raises for mio's `is_write_closed` (`EPOLLHUP` or `EPOLLERR`) and a
   half-close never raises. ERROR alone missed a reset whose error sozu's own read or write had
