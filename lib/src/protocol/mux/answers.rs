@@ -411,6 +411,7 @@ mod tests {
             tags: None,
             forwarding_hop: None,
             access_log_message: None,
+            backends_unavailable: false,
         };
         let stream = Stream::new(
             &mut PoolBufferSource::new(Rc::downgrade(&pool)),

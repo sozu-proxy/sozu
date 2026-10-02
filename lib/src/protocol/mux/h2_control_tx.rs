@@ -6,13 +6,22 @@
 //! established. Every field here is private to this module; `ConnectionH2`
 //! reaches them only through the accessor methods declared below.
 //!
-//! **This module owns**: the pending `(StreamId, H2Error)` queue, the
-//! never-decaying `total_rst_streams_queued` lifetime counter behind the
-//! CVE-2025-8671 MadeYouReset cap, that cap's value
-//! ([`MAX_PENDING_RST_STREAMS`]) and the test for whether it has been
-//! reached, the per-insert bound that refuses to grow the queue past that cap
-//! (sozu-proxy/sozu#1413), and the serialization of queued frames into a
-//! caller-supplied buffer.
+//! **This module owns**: the pending `(StreamId, H2Error)` queue, its bound
+//! ([`pending_rst_bound`], at least [`MIN_PENDING_RST_STREAMS`]) and the
+//! per-insert refusal that keeps the queue within it (sozu-proxy/sozu#1413),
+//! the overflow flag that records such a refusal, the
+//! `total_rst_streams_queued` lifetime count the session log reports, and the
+//! serialization of queued frames into a caller-supplied buffer.
+//!
+//! The bound limits what is *pending* — queued and not yet serialized — not
+//! how many resets a connection may emit over its lifetime: the queue drains
+//! on every `writable()`, so only a burst inside one pass can fill it. The
+//! peer-provoked resets that make up CVE-2025-8671 MadeYouReset are capped by
+//! the flood detector (`H2FloodDetector::record_rst_emitted`,
+//! `lib/src/protocol/mux/h2_flood_detector.rs`), which never sees the resets
+//! Sōzu decides on its own. Go bounds its queued control frames the same way
+//! (`maxQueuedControlFrames`, `http2/server.go`), as do Envoy
+//! (`max_outbound_control_frames`) and nghttp2 (`NGHTTP2_DEFAULT_MAX_OBQ_FLOOD_ITEM`).
 //!
 //! **It deliberately does NOT own, and why**:
 //!
@@ -35,7 +44,8 @@
 //!   return. [`H2ControlTx::enqueue_rst`] therefore reports an
 //!   [`EnqueueRstOutcome`] and leaves the caller to account exactly the
 //!   freshly-queued case; draining emits no metric at all, or every frame
-//!   would be counted twice.
+//!   would be counted twice. Whether a reset counts against the peer at all
+//!   is the caller's call too (`RstOrigin` in `lib/src/protocol/mux/h2.rs`).
 //!   Same boundary `h2_flow_control` and `h2_stream_table` draw — this module
 //!   stays log- and metrics-free.
 //! - **The buffer.** [`H2ControlTx::drain_rst_streams_into`] writes into a
@@ -64,13 +74,25 @@ use crate::{
     },
 };
 
-/// Hard cap on the lifetime count of queued RST_STREAM frames before the
-/// connection escalates to `GOAWAY(ENHANCE_YOUR_CALM)` (CVE-2025-8671,
-/// MadeYouReset). Checked against the never-decaying lifetime counter rather
-/// than the pending queue length, because `writable()` drains the queue
-/// between `readable()` calls, so the pending count alone may never reach the
-/// cap even under sustained abuse.
-pub(super) const MAX_PENDING_RST_STREAMS: usize = 200;
+/// Floor of the bound on RST_STREAM frames queued and not yet serialized.
+///
+/// Above the outbound control-frame queue bounds of Envoy
+/// (`max_outbound_control_frames`, 1000) and nghttp2
+/// (`NGHTTP2_DEFAULT_MAX_OBQ_FLOOD_ITEM`, 1000), below Go's
+/// (`maxQueuedControlFrames`, 10 000). A connection whose queue overflows
+/// within one pass escalates to `GOAWAY(ENHANCE_YOUR_CALM)` — see
+/// [`EnqueueRstOutcome::Dropped`].
+pub(super) const MIN_PENDING_RST_STREAMS: usize = 4000;
+
+/// The pending-queue bound for a connection advertising
+/// `max_concurrent_streams`: [`MIN_PENDING_RST_STREAMS`], raised to four
+/// resets per concurrent stream so the largest single caller — one idle
+/// reaper sweep, at most one `CANCEL` per open stream — can never fill it on
+/// its own however far an operator raises `h2_max_concurrent_streams`. That
+/// knob is how the bound is configured.
+pub(super) fn pending_rst_bound(max_concurrent_streams: u32) -> usize {
+    MIN_PENDING_RST_STREAMS.max((max_concurrent_streams as usize).saturating_mul(4))
+}
 
 /// Outcome of [`H2ControlTx::enqueue_rst`]. Mirrors
 /// [`super::h2_flow_control::QueueWindowUpdateOutcome`]: this module stays log-
@@ -86,17 +108,14 @@ pub(super) enum EnqueueRstOutcome {
     /// is accounted.
     Deduped,
     /// The pending queue was already at its per-insert cap: not queued, not
-    /// accounted.
+    /// accounted, and [`H2ControlTx::overflowed`] now reports `true`.
     ///
     /// Nothing that would have reached the wire is lost here, and — as long as
     /// the connection has not already entered `H2State::GoAway`/`H2State::Error`
-    /// — the drop is not silent to the peer. [`H2ControlTx::check_invariants`]
-    /// holds `total_rst_streams_queued >= pending_rst_streams.len()`, so a full
-    /// queue implies `total_rst_streams_queued >= MAX_PENDING_RST_STREAMS`,
-    /// which is the counter half — [`H2ControlTx::lifetime_cap_reached`] — of
+    /// — the drop is not silent to the peer. [`H2ControlTx::overflowed`] is
     /// the condition `ConnectionH2::flush_pending_control_frames` tests
     /// *before* its drain loop, returning `goaway(EnhanceYourCalm)` instead of
-    /// serialising anything. The 200 enqueues that filled the queue each armed
+    /// serialising anything. The enqueues that filled the queue each armed
     /// `Ready::WRITABLE`, so that escalation runs on the next writable tick on
     /// both `cancel_timed_out_streams` call paths, including `Mux::timeout`
     /// against a silent peer. The peer is told to back off with
@@ -122,31 +141,38 @@ pub(super) struct H2ControlTx {
     /// Frames queued but not yet written to the wire, in queue order.
     pending_rst_streams: Vec<(StreamId, H2Error)>,
     /// Lifetime count of frames that ever entered `pending_rst_streams`.
-    /// Never decremented: the MadeYouReset cap relies on it not
-    /// under-counting across drains.
+    /// Never decremented. Reported by the session log line; it bounds
+    /// nothing.
     total_rst_streams_queued: usize,
-    /// Per-insert bound on `pending_rst_streams`. Always
-    /// [`MAX_PENDING_RST_STREAMS`] in production; a field rather than the
-    /// constant so the bound's own tests can reach it in a handful of inserts
-    /// instead of two hundred.
+    /// Per-insert bound on `pending_rst_streams`:
+    /// [`pending_rst_bound`] of the connection's `max_concurrent_streams` in
+    /// production; a field so the bound's own tests can reach it in a handful
+    /// of inserts.
     max_pending: usize,
+    /// Set once an insert was refused because the queue was at
+    /// `max_pending` ([`EnqueueRstOutcome::Dropped`]). Never cleared: the
+    /// connection escalates to GOAWAY on the next flush.
+    overflowed: bool,
 }
 
 impl H2ControlTx {
-    pub(super) fn new() -> Self {
-        Self::with_cap(MAX_PENDING_RST_STREAMS)
+    /// A queue bounded by [`pending_rst_bound`] of the connection's
+    /// advertised `max_concurrent_streams`.
+    pub(super) fn new(max_concurrent_streams: u32) -> Self {
+        Self::with_cap(pending_rst_bound(max_concurrent_streams))
     }
 
     /// [`Self::new`] with an explicit per-insert bound.
     ///
-    /// Production always uses [`MAX_PENDING_RST_STREAMS`]; this exists so the
+    /// Production always uses [`pending_rst_bound`]; this exists so the
     /// bound's own tests reach capacity in a handful of inserts and so the
     /// quickcheck property below reaches it on almost every generated run.
-    fn with_cap(max_pending: usize) -> Self {
+    pub(super) fn with_cap(max_pending: usize) -> Self {
         Self {
             pending_rst_streams: Vec::new(),
             total_rst_streams_queued: 0,
             max_pending,
+            overflowed: false,
         }
     }
 
@@ -161,30 +187,34 @@ impl H2ControlTx {
     /// - **Dedupe** via `rst_sent`: at most one queued RST per wire stream
     ///   id. `HashSet::insert` returns `false` when the id is already
     ///   present; the short-circuit on that branch keeps the queue, the
-    ///   lifetime counter and the wire counts consistent.
-    /// - **MadeYouReset queued cap**: each freshly queued RST bumps the
-    ///   lifetime counter that [`Self::lifetime_cap_reached`] polices.
+    ///   lifetime counter and the wire counts consistent. The caller passes
+    ///   `None` for a stream that was never registered (a refused stream, DATA
+    ///   on a closed one): only `H2StreamTable`'s eviction removes an id from
+    ///   `rst_sent`, so recording such an id would keep it there for the
+    ///   connection's lifetime, one entry per refused stream. Refused ids are
+    ///   fresh by construction, so they need no dedupe.
+    /// - **Lifetime count**: each freshly queued RST bumps
+    ///   `total_rst_streams_queued`, for the session log.
     /// - **Per-insert queue bound** (`max_pending`): the queue itself refuses
-    ///   to grow past the cap, so the bound holds however many RSTs ONE caller
+    ///   to grow past the bound, so it holds however many RSTs ONE caller
     ///   queues between two `ConnectionH2::flush_pending_control_frames`
-    ///   passes. `cancel_timed_out_streams` is the largest such caller: it
-    ///   walks the whole timed-out set in a single sweep, and a reap of more
-    ///   than [`MAX_PENDING_RST_STREAMS`] streams — which needs an
-    ///   operator-raised `max_concurrent_streams`, because that is what bounds
-    ///   the live set the reaper walks — used to push `pending_rst_streams`
-    ///   past the bound [`Self::check_invariants`] asserts, panicking on the
-    ///   next inbound frame in a debug build or growing unbounded in release
-    ///   (sozu-proxy/sozu#1413). `max_concurrent_streams` bounds one sweep, not
-    ///   the queue: the queue holds what every caller queued since the last
-    ///   successful drain, and the DATA-on-closed-stream enqueue is a second
-    ///   caller `ConnectionH2::check_invariants` never inspects — see
-    ///   `ConnectionH2::enqueue_rst`.
+    ///   passes, and a refusal sets [`Self::overflowed`].
+    ///   `cancel_timed_out_streams` is the largest such caller: it walks the
+    ///   whole timed-out set in a single sweep, and a reap larger than the
+    ///   bound used to push `pending_rst_streams` past the bound
+    ///   [`Self::check_invariants`] asserts, panicking on the next inbound
+    ///   frame in a debug build or growing unbounded in release
+    ///   (sozu-proxy/sozu#1413). [`pending_rst_bound`] keeps one sweep below
+    ///   the bound, but the queue holds what every caller queued since the
+    ///   last successful drain, and the DATA-on-closed-stream and refusal
+    ///   enqueues are callers `ConnectionH2::check_invariants` never
+    ///   inspects — see `ConnectionH2::enqueue_rst`.
     /// - **LIFECYCLE invariant 15** (edge-triggered epoll): pair
     ///   `Ready::WRITABLE` interest with the event bit so `writable()` is
     ///   scheduled on the next tick.
     pub(super) fn enqueue_rst(
         &mut self,
-        rst_sent: &mut HashSet<StreamId>,
+        rst_sent: Option<&mut HashSet<StreamId>>,
         readiness: &mut Readiness,
         wire_stream_id: StreamId,
         error: H2Error,
@@ -196,9 +226,18 @@ impl H2ControlTx {
         // `enqueue_rst` for that same stream dedupe against a frame that does
         // not exist.
         if pending_before >= self.max_pending {
+            self.overflowed = true;
+            debug_assert_eq!(
+                self.pending_rst_streams.len(),
+                pending_before,
+                "an at-capacity refusal must not enqueue"
+            );
+            self.debug_assert_invariants();
             return EnqueueRstOutcome::Dropped;
         }
-        if !rst_sent.insert(wire_stream_id) {
+        if let Some(rst_sent) = rst_sent
+            && !rst_sent.insert(wire_stream_id)
+        {
             // Dedupe short-circuit: the id was already queued/flushed. We must
             // NOT touch any of the wire-count state, otherwise duplicate calls
             // inflate the MadeYouReset (CVE-2025-8671) lifetime cap with frames
@@ -223,12 +262,8 @@ impl H2ControlTx {
         self.total_rst_streams_queued += 1;
         readiness.arm_writable();
         // Post-condition: a freshly-queued RST advances both the pending Vec
-        // and the lifetime counter by exactly one, and the id is now tracked
-        // for dedupe.
-        debug_assert!(
-            rst_sent.contains(&wire_stream_id),
-            "freshly-queued RST must be recorded in rst_sent for future dedupe"
-        );
+        // and the lifetime counter by exactly one; a tracked id was recorded
+        // for dedupe by the `insert` above.
         debug_assert_eq!(
             self.pending_rst_streams.len(),
             pending_before + 1,
@@ -330,23 +365,24 @@ impl H2ControlTx {
         self.total_rst_streams_queued
     }
 
-    /// True once the CVE-2025-8671 MadeYouReset lifetime cap has been reached
-    /// and the connection must escalate to `GOAWAY(ENHANCE_YOUR_CALM)`.
+    /// The per-insert bound on the pending queue.
+    pub(super) fn max_pending(&self) -> usize {
+        self.max_pending
+    }
+
+    /// True once an RST could not be queued because the pending queue was at
+    /// its bound; the connection must then escalate to
+    /// `GOAWAY(ENHANCE_YOUR_CALM)` rather than leave the peer believing the
+    /// dropped stream is live.
     ///
-    /// Reads `self.max_pending`, the same bound [`Self::enqueue_rst`] tests at
-    /// the insert and [`Self::check_invariants`] asserts as a post-condition.
-    /// One instance carries one cap; a predicate that read the constant
-    /// instead would answer for a bound this instance does not have.
-    pub(super) fn lifetime_cap_reached(&self) -> bool {
-        self.total_rst_streams_queued >= self.max_pending
+    /// This is a bound on what is pending, not a lifetime cap: a connection
+    /// that emits any number of resets, drained as they come, never sets it.
+    pub(super) fn overflowed(&self) -> bool {
+        self.overflowed
     }
 
     /// Drop every queued frame without serializing it, leaving the lifetime
-    /// counter untouched.
-    ///
-    /// The counter deliberately survives: it is the MadeYouReset evidence,
-    /// and a peer that provoked 200 RSTs has done so whether or not the
-    /// connection got to write them.
+    /// counter and the overflow flag untouched.
     pub(super) fn clear_pending(&mut self) {
         let total_before = self.total_rst_streams_queued;
         self.pending_rst_streams.clear();
@@ -360,13 +396,13 @@ impl H2ControlTx {
     /// Full invariant sweep, run as a post-condition of every mutating method.
     ///
     /// 1. The never-decaying lifetime counter is always `>=` the currently
-    ///    pending queue length. The MadeYouReset cap relies on the lifetime
-    ///    counter never under-counting.
-    /// 2. The pending queue stays within its hard cap + 1 — the escalation
-    ///    tripwire fires *at* the cap, so one entry may sit above it for the
-    ///    single call between queueing and the caller's check. The per-insert
+    ///    pending queue length.
+    /// 2. The pending queue stays within its hard cap + 1. The per-insert
     ///    bound in [`Self::enqueue_rst`] is what holds this; the assertion is
     ///    the tripwire that fires when it is removed.
+    /// 3. An overflow is only ever recorded against a queue that reached its
+    ///    bound — the flag cannot be set while `max_pending` was never hit,
+    ///    which `total_rst_streams_queued >= max_pending` witnesses.
     #[cfg(debug_assertions)]
     fn check_invariants(&self) {
         debug_assert!(
@@ -378,6 +414,10 @@ impl H2ControlTx {
         debug_assert!(
             self.pending_rst_streams.len() <= self.max_pending + 1,
             "pending RST queue must stay within its hard cap (escalates at the cap)"
+        );
+        debug_assert!(
+            !self.overflowed || self.total_rst_streams_queued >= self.max_pending,
+            "an overflow requires the queue to have reached its bound"
         );
     }
 
@@ -412,11 +452,11 @@ mod tests {
 
     #[test]
     fn test_enqueue_rst_into_populates_queue_and_dedupe() {
-        let mut tx = H2ControlTx::new();
+        let mut tx = H2ControlTx::new(100);
         let mut sent: HashSet<StreamId> = HashSet::new();
         let mut readiness = Readiness::new();
 
-        let first = tx.enqueue_rst(&mut sent, &mut readiness, 5, H2Error::ProtocolError);
+        let first = tx.enqueue_rst(Some(&mut sent), &mut readiness, 5, H2Error::ProtocolError);
         assert_eq!(
             first,
             EnqueueRstOutcome::Queued,
@@ -424,7 +464,7 @@ mod tests {
         );
         // Second call for the same stream must be a no-op AND report
         // `Deduped` so accounting in `ConnectionH2::enqueue_rst` skips this case.
-        let second = tx.enqueue_rst(&mut sent, &mut readiness, 5, H2Error::InternalError);
+        let second = tx.enqueue_rst(Some(&mut sent), &mut readiness, 5, H2Error::InternalError);
         assert_eq!(
             second,
             EnqueueRstOutcome::Deduped,
@@ -451,12 +491,12 @@ mod tests {
 
     #[test]
     fn test_enqueue_rst_into_bumps_total_for_distinct_ids() {
-        let mut tx = H2ControlTx::new();
+        let mut tx = H2ControlTx::new(100);
         let mut sent: HashSet<StreamId> = HashSet::new();
         let mut readiness = Readiness::new();
 
         for sid in [1u32, 3, 5, 7] {
-            tx.enqueue_rst(&mut sent, &mut readiness, sid, H2Error::ProtocolError);
+            tx.enqueue_rst(Some(&mut sent), &mut readiness, sid, H2Error::ProtocolError);
         }
 
         assert_eq!(tx.pending().len(), 4);
@@ -466,7 +506,7 @@ mod tests {
 
     #[test]
     fn test_enqueue_rst_into_arms_writable_in_invariant_15_form() {
-        let mut tx = H2ControlTx::new();
+        let mut tx = H2ControlTx::new(100);
         let mut sent: HashSet<StreamId> = HashSet::new();
         let mut readiness = Readiness::new();
 
@@ -474,7 +514,12 @@ mod tests {
         assert!(!readiness.interest.is_writable());
         assert!(!readiness.event.is_writable());
 
-        tx.enqueue_rst(&mut sent, &mut readiness, 9, H2Error::FlowControlError);
+        tx.enqueue_rst(
+            Some(&mut sent),
+            &mut readiness,
+            9,
+            H2Error::FlowControlError,
+        );
 
         // Postcondition: invariant-15 — both `interest` and `event` WRITABLE
         // are raised so the next tick runs `writable()` under edge-triggered
@@ -496,12 +541,12 @@ mod tests {
         // a re-entrant reset_stream call during a cascading error path
         // would otherwise re-raise WRITABLE unnecessarily — harmless but
         // noisy in metrics.
-        let mut tx = H2ControlTx::new();
+        let mut tx = H2ControlTx::new(100);
         let mut sent: HashSet<StreamId> = HashSet::new();
         sent.insert(11);
         let mut readiness = Readiness::new();
 
-        tx.enqueue_rst(&mut sent, &mut readiness, 11, H2Error::ProtocolError);
+        tx.enqueue_rst(Some(&mut sent), &mut readiness, 11, H2Error::ProtocolError);
 
         assert!(
             tx.pending().is_empty(),
@@ -543,7 +588,7 @@ mod tests {
 
         for sid in [1u32, 3, 5, 7] {
             assert_eq!(
-                tx.enqueue_rst(&mut sent, &mut readiness, sid, H2Error::Cancel),
+                tx.enqueue_rst(Some(&mut sent), &mut readiness, sid, H2Error::Cancel),
                 EnqueueRstOutcome::Queued,
                 "every insert below the cap must be queued"
             );
@@ -556,7 +601,7 @@ mod tests {
 
         let mut at_capacity = Readiness::new();
         assert_eq!(
-            tx.enqueue_rst(&mut sent, &mut at_capacity, 9, H2Error::Cancel),
+            tx.enqueue_rst(Some(&mut sent), &mut at_capacity, 9, H2Error::Cancel),
             EnqueueRstOutcome::Dropped,
             "an insert at the cap must be refused"
         );
@@ -614,7 +659,7 @@ mod tests {
     /// exactly once — the four facts `ConnectionH2::check_invariants`
     /// invariant 3 and the dedupe invariant assert on the live connection.
     ///
-    /// `MAX` is 16 rather than the production [`MAX_PENDING_RST_STREAMS`] so a
+    /// `MAX` is 16 rather than the production [`MIN_PENDING_RST_STREAMS`] so a
     /// generated `Reap` reaches the cap on almost every run; reachability
     /// itself is pinned deterministically by
     /// [`test_enqueue_rst_into_refuses_at_capacity_without_side_effects`] and,
@@ -647,7 +692,7 @@ mod tests {
                 match step {
                     RstStep::Enqueue(id) => {
                         tx.enqueue_rst(
-                            &mut sent,
+                            Some(&mut sent),
                             &mut readiness,
                             2 * (id as StreamId % 64) + 1,
                             H2Error::ProtocolError,
@@ -655,7 +700,12 @@ mod tests {
                     }
                     RstStep::Reap(n) => {
                         for _ in 0..=(n % 96) {
-                            tx.enqueue_rst(&mut sent, &mut readiness, next_reaped, H2Error::Cancel);
+                            tx.enqueue_rst(
+                                Some(&mut sent),
+                                &mut readiness,
+                                next_reaped,
+                                H2Error::Cancel,
+                            );
                             next_reaped += 2;
                         }
                     }
@@ -688,11 +738,11 @@ mod tests {
 
     #[test]
     fn the_drain_serializes_every_queued_frame_when_the_buffer_is_large_enough() {
-        let mut tx = H2ControlTx::new();
+        let mut tx = H2ControlTx::new(100);
         let mut rst_sent = HashSet::new();
         let mut readiness = readiness();
         for id in [1, 3, 5] {
-            tx.enqueue_rst(&mut rst_sent, &mut readiness, id, H2Error::Cancel);
+            tx.enqueue_rst(Some(&mut rst_sent), &mut readiness, id, H2Error::Cancel);
         }
         let mut buf = vec![0u8; RST_FRAME_SIZE * 8];
 
@@ -710,11 +760,11 @@ mod tests {
 
     #[test]
     fn a_short_buffer_writes_whole_frames_only_and_leaves_the_rest_queued() {
-        let mut tx = H2ControlTx::new();
+        let mut tx = H2ControlTx::new(100);
         let mut rst_sent = HashSet::new();
         let mut readiness = readiness();
         for id in [1, 3, 5, 7] {
-            tx.enqueue_rst(&mut rst_sent, &mut readiness, id, H2Error::Cancel);
+            tx.enqueue_rst(Some(&mut rst_sent), &mut readiness, id, H2Error::Cancel);
         }
         // Room for two whole frames and one byte of a third.
         let mut buf = vec![0u8; RST_FRAME_SIZE * 2 + 1];
@@ -732,10 +782,10 @@ mod tests {
 
     #[test]
     fn a_buffer_too_small_for_one_frame_writes_nothing_and_drops_nothing() {
-        let mut tx = H2ControlTx::new();
+        let mut tx = H2ControlTx::new(100);
         let mut rst_sent = HashSet::new();
         let mut readiness = readiness();
-        tx.enqueue_rst(&mut rst_sent, &mut readiness, 1, H2Error::Cancel);
+        tx.enqueue_rst(Some(&mut rst_sent), &mut readiness, 1, H2Error::Cancel);
         let mut buf = vec![0u8; RST_FRAME_SIZE - 1];
 
         let (bytes, frames) = tx.drain_rst_streams_into(&mut buf);
@@ -746,10 +796,10 @@ mod tests {
 
     #[test]
     fn an_exactly_sized_buffer_writes_the_frame() {
-        let mut tx = H2ControlTx::new();
+        let mut tx = H2ControlTx::new(100);
         let mut rst_sent = HashSet::new();
         let mut readiness = readiness();
-        tx.enqueue_rst(&mut rst_sent, &mut readiness, 1, H2Error::Cancel);
+        tx.enqueue_rst(Some(&mut rst_sent), &mut readiness, 1, H2Error::Cancel);
         let mut buf = vec![0u8; RST_FRAME_SIZE];
 
         let (bytes, frames) = tx.drain_rst_streams_into(&mut buf);
@@ -760,111 +810,100 @@ mod tests {
 
     #[test]
     fn draining_an_empty_queue_is_a_no_op() {
-        let mut tx = H2ControlTx::new();
+        let mut tx = H2ControlTx::new(100);
         let mut buf = vec![0u8; RST_FRAME_SIZE * 4];
 
         assert_eq!(tx.drain_rst_streams_into(&mut buf), (0, 0));
     }
 
-    // ── the MadeYouReset lifetime cap ───────────────────────────────────
+    // ── the queue bound is a bound on what is pending ───────────────────
 
+    /// The bound limits the pending queue, not the connection's lifetime:
+    /// any number of resets, drained as they come, never overflow it.
+    ///
+    /// TO SEE THIS RED: make [`H2ControlTx::overflowed`] return
+    /// `self.total_rst_streams_queued >= self.max_pending`, the lifetime
+    /// reading the bound had before. The second fill then reports an
+    /// overflow that never happened.
     #[test]
-    fn the_lifetime_cap_is_reached_at_the_cap_not_above_it() {
-        let mut tx = H2ControlTx::new();
+    fn draining_keeps_any_number_of_resets_within_the_bound() {
+        let mut tx = H2ControlTx::new(100);
+        let bound = tx.max_pending();
         let mut rst_sent = HashSet::new();
         let mut readiness = readiness();
-
-        for id in 0..MAX_PENDING_RST_STREAMS as u32 - 1 {
-            tx.enqueue_rst(&mut rst_sent, &mut readiness, id * 2 + 1, H2Error::Cancel);
+        let mut buf = vec![0u8; RST_FRAME_SIZE * bound];
+        let mut next: StreamId = 1;
+        for _ in 0..5 {
+            for _ in 0..bound {
+                assert_eq!(
+                    tx.enqueue_rst(Some(&mut rst_sent), &mut readiness, next, H2Error::Cancel),
+                    EnqueueRstOutcome::Queued
+                );
+                next += 2;
+            }
+            let (_, frames) = tx.drain_rst_streams_into(&mut buf);
+            assert_eq!(frames, bound);
+            assert!(
+                !tx.overflowed(),
+                "a queue drained before it overflows must never report an overflow"
+            );
         }
-        assert!(
-            !tx.lifetime_cap_reached(),
-            "one below the cap must not trip it"
-        );
-
-        tx.enqueue_rst(&mut rst_sent, &mut readiness, 100_001, H2Error::Cancel);
-        assert!(tx.lifetime_cap_reached(), "the cap trips AT the cap");
+        assert_eq!(tx.lifetime_queued(), 5 * bound);
     }
 
-    /// Draining does not rewind the cap: the counter is the MadeYouReset
-    /// evidence, and a peer that provoked the cap has done so whether or not
-    /// the frames were written.
-    ///
-    /// TO SEE THIS RED: in [`H2ControlTx::drain_rst_streams_into`], add
-    /// `self.total_rst_streams_queued -= written_count;` after the
-    /// `self.pending_rst_streams.drain(..written_count);` line. The final
-    /// assertion then fails with
-    /// `the cap must stay tripped after the queue drains`, and
-    /// [`the_drain_serializes_every_queued_frame_when_the_buffer_is_large_enough`]
-    /// fails alongside it on `draining must not rewind the lifetime counter` —
-    /// two tests, because the counter is the CVE-2025-8671 evidence and
-    /// rewinding it is exactly how a peer would evade the cap: drain, re-queue,
-    /// repeat.
+    /// The overflow is recorded by the refused insert itself, and only by it,
+    /// and survives the drain that follows.
     #[test]
-    fn draining_does_not_rewind_the_lifetime_cap() {
-        let mut tx = H2ControlTx::new();
-        let mut rst_sent = HashSet::new();
-        let mut readiness = readiness();
-        for id in 0..MAX_PENDING_RST_STREAMS as u32 {
-            tx.enqueue_rst(&mut rst_sent, &mut readiness, id * 2 + 1, H2Error::Cancel);
-        }
-        assert!(tx.lifetime_cap_reached());
-
-        let mut buf = vec![0u8; RST_FRAME_SIZE * (MAX_PENDING_RST_STREAMS + 1)];
-        let (_, frames) = tx.drain_rst_streams_into(&mut buf);
-
-        assert_eq!(frames, MAX_PENDING_RST_STREAMS);
-        assert!(!tx.has_pending());
-        assert!(
-            tx.lifetime_cap_reached(),
-            "the cap must stay tripped after the queue drains"
-        );
-    }
-
-    /// The three cap predicates — the per-insert bound in [`H2ControlTx::enqueue_rst`],
-    /// the escalation tripwire in [`H2ControlTx::lifetime_cap_reached`] and the
-    /// post-condition in `H2ControlTx::check_invariants` — must all read the
-    /// SAME bound. Under [`H2ControlTx::new`] they are indistinguishable,
-    /// because `max_pending` IS `MAX_PENDING_RST_STREAMS` there; only a
-    /// `with_cap` instance can separate them, which is why this test exists
-    /// beside the four that drive `new()`.
-    ///
-    /// TO SEE THIS RED: in [`H2ControlTx::lifetime_cap_reached`], compare
-    /// against `MAX_PENDING_RST_STREAMS` instead of `self.max_pending`, then
-    /// run `cargo test -p sozu-lib --locked
-    /// the_lifetime_cap_tracks_the_instance_bound`. The queue fills to its own
-    /// cap of 4 while the tripwire still waits for 200, and the final
-    /// assertion fails with `a queue at its own cap must have reached its own
-    /// lifetime cap`.
-    #[test]
-    fn the_lifetime_cap_tracks_the_instance_bound_not_the_constant() {
+    fn overflow_is_set_by_a_refused_insert_and_survives_the_drain() {
         const MAX: usize = 4;
         let mut tx = H2ControlTx::with_cap(MAX);
         let mut sent: HashSet<StreamId> = HashSet::new();
         let mut readiness = readiness();
 
-        for sid in [1u32, 3, 5] {
-            tx.enqueue_rst(&mut sent, &mut readiness, sid, H2Error::Cancel);
+        for sid in [1u32, 3, 5, 7] {
+            tx.enqueue_rst(Some(&mut sent), &mut readiness, sid, H2Error::Cancel);
         }
         assert!(
-            !tx.lifetime_cap_reached(),
-            "one below the instance cap must not trip it"
+            !tx.overflowed(),
+            "a queue exactly at its bound has not overflowed"
         );
 
-        tx.enqueue_rst(&mut sent, &mut readiness, 7, H2Error::Cancel);
-        assert!(
-            tx.lifetime_cap_reached(),
-            "a queue at its own cap must have reached its own lifetime cap"
+        assert_eq!(
+            tx.enqueue_rst(Some(&mut sent), &mut readiness, 9, H2Error::Cancel),
+            EnqueueRstOutcome::Dropped
         );
+        assert!(tx.overflowed(), "the refused insert records the overflow");
+
+        let mut buf = vec![0u8; RST_FRAME_SIZE * MAX];
+        tx.drain_rst_streams_into(&mut buf);
+        assert!(!tx.has_pending());
+        assert!(
+            tx.overflowed(),
+            "the overflow survives the drain: the dropped RST never reached the wire"
+        );
+    }
+
+    /// The bound follows the advertised concurrency: one reaper sweep, at
+    /// most one CANCEL per open stream, never fills it on its own.
+    #[test]
+    fn the_bound_follows_max_concurrent_streams() {
+        assert_eq!(pending_rst_bound(1), MIN_PENDING_RST_STREAMS);
+        assert_eq!(pending_rst_bound(100), MIN_PENDING_RST_STREAMS);
+        assert_eq!(pending_rst_bound(1000), MIN_PENDING_RST_STREAMS);
+        assert_eq!(pending_rst_bound(10_000), 40_000);
+        assert_eq!(H2ControlTx::new(10_000).max_pending(), 40_000);
+        for mcs in [1u32, 100, 250, 251, 1000, 10_000] {
+            assert!(pending_rst_bound(mcs) >= mcs as usize);
+        }
     }
 
     #[test]
     fn clearing_the_queue_does_not_rewind_the_lifetime_counter() {
-        let mut tx = H2ControlTx::new();
+        let mut tx = H2ControlTx::new(100);
         let mut rst_sent = HashSet::new();
         let mut readiness = readiness();
         for id in [1, 3, 5] {
-            tx.enqueue_rst(&mut rst_sent, &mut readiness, id, H2Error::Cancel);
+            tx.enqueue_rst(Some(&mut rst_sent), &mut readiness, id, H2Error::Cancel);
         }
 
         tx.clear_pending();
@@ -873,7 +912,7 @@ mod tests {
         assert_eq!(
             tx.lifetime_queued(),
             3,
-            "the MadeYouReset evidence survives a queue clear"
+            "the lifetime count survives a queue clear"
         );
     }
 }

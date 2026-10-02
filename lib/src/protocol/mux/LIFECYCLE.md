@@ -1093,11 +1093,11 @@ deadlines are compared against `ConnectionH2.now` (§7.5):
   `ConnectionH2::has_pending_control_write` and sets `should_write` so the queued
   `RST_STREAM(CANCEL)` is flushed to the peer before close (`has_pending_write`
   intentionally ignores `pending_rst_streams` because it gates connection close).
-- **Does** feed `total_rst_streams_queued` and the MadeYouReset emitted-lifetime
-  cap (via `enqueue_rst` → `account_emitted_rst`, since `Cancel != NoError`):
-  proxy-emitted reaps deliberately count against the caps so an attacker cannot
-  use proxy-forced resets to bypass the ceiling (security review LISA-001; see
-  §8.2).
+- **Does** go through `enqueue_rst` (dedupe, pending-queue bound, `WRITABLE`
+  arming — security review LISA-001; see §8.2) and feeds
+  `total_rst_streams_queued`, but as `RstOrigin::Local`: the reap is Sōzu's
+  decision, so `account_emitted_rst` does not charge it to the peer's
+  MadeYouReset count.
 - All three per-stream maps (`stream_last_activity_at`, `stream_fc_stalled_since`,
   `stream_fc_stalled_progress`) are evicted in `remove_dead_stream` (with
   `debug_assert`s guarding against a leaked entry on a new per-stream cache).
@@ -1541,43 +1541,46 @@ kept in lock-step:
   the id is already present;
   `H2ControlTx::enqueue_rst` short-circuits on that branch so its queue and
   its lifetime counter stay consistent even when a cascading error path
-  re-enters the reset flow for the same stream.
-- **MadeYouReset queued cap** via `H2ControlTx`'s lifetime counter (capped at
-  `MAX_PENDING_RST_STREAMS = 200`, `h2_control_tx.rs`). Each freshly queued RST
-  bumps the counter, and neither a drain nor a queue clear ever rewinds it —
-  rewinding is how a peer would evade the cap by draining and re-queueing;
-  `flush_pending_control_frames` escalates to `GOAWAY(ENHANCE_YOUR_CALM)` when
-  the cap is exceeded. Orthogonal to `record_rst_emitted` (the 500-emitted
-  MadeYouReset lifetime cap) — a RST can be queued-but-not-yet-emitted.
-- **Per-insert queue bound**, the same `MAX_PENDING_RST_STREAMS`, applied by
-  `H2ControlTx::enqueue_rst` to its own queue length at the insert rather than
-  at the drain. An insert at the cap returns `EnqueueRstOutcome::Dropped`:
-  nothing is queued, nothing is recorded in `rst_sent`, `WRITABLE` is not
-  re-armed, and `ConnectionH2::enqueue_rst` answers with a
-  `h2.rst_stream_dropped` counter plus a session-context `error!` line. The
-  order is load-bearing and is what
+  re-enters the reset flow for the same stream. Only a registered stream's id is recorded:
+  `ConnectionH2::enqueue_rst` passes no set for a refused stream or a closed
+  one, because only the stream table's eviction removes an id again, and an
+  unregistered id would stay for the connection's lifetime.
+- **Lifetime count** via `H2ControlTx`'s `total_rst_streams_queued`: each
+  freshly queued RST bumps it and nothing rewinds it. It is reported by the
+  session log line and bounds nothing. The CVE-2025-8671 MadeYouReset cap is
+  `H2FloodDetector::record_rst_emitted`
+  (`lib/src/protocol/mux/h2_flood_detector.rs`), reached from
+  `ConnectionH2::account_emitted_rst` only for a reset whose `RstOrigin` is
+  `PeerProvoked`.
+- **Per-insert queue bound**, `max_pending` — `pending_rst_bound` of the
+  connection's `max_concurrent_streams`: `MIN_PENDING_RST_STREAMS` (4000), or
+  four resets per advertised concurrent stream when that is larger
+  (`h2_control_tx.rs`). It bounds what is *pending*, not the connection's
+  lifetime: the queue drains on every `writable()`. `H2ControlTx::enqueue_rst`
+  applies it to its own queue length at the insert rather than at the drain.
+  An insert at the bound returns `EnqueueRstOutcome::Dropped` and sets
+  `H2ControlTx::overflowed`: nothing is queued, nothing is recorded in
+  `rst_sent`, `WRITABLE` is not re-armed, and `ConnectionH2::enqueue_rst`
+  answers with a `h2.rst_stream_dropped` counter plus a session-context
+  `error!` line. The order is load-bearing and is what
   `test_enqueue_rst_into_refuses_at_capacity_without_side_effects` pins: the
-  cap is tested BEFORE `rst_sent.insert`, because recording an id whose frame
+  bound is tested BEFORE `rst_sent.insert`, because recording an id whose frame
   was never queued would make a later, legitimate reset for that stream dedupe
-  against a frame that does not exist. The drain-side counter check bounds only
-  what is *written*, and `cancel_timed_out_streams` queues one RST per
-  timed-out stream in a single sweep with no flush in between — so with an
-  operator-raised `max_concurrent_streams` a mass idle-timeout reap used to
-  push the queue past the bound invariant 3 asserts (sozu-proxy/sozu#1413).
-  That setting bounds the live set one sweep walks, not the queue, which
-  holds what every caller queued since the last successful drain; the
-  DATA-on-closed-stream reset in `handle_header_state` is a second insert
-  path `ConnectionH2::check_invariants` never inspects, rate-limited by
-  `record_glitch` + `check_flood_or_return!` rather than by the queue bound.
-  Nothing that would have reached the wire is lost: invariant 3 keeps
-  `total_rst_streams_queued >= pending_rst_streams.len()`, so a full queue
-  implies `total_rst_streams_queued >= MAX_PENDING_RST_STREAMS`, the counter
-  half of what `flush_pending_control_frames` tests *before* its drain loop —
-  it emits `GOAWAY(ENHANCE_YOUR_CALM)` instead of serialising anything. The
-  other half is a state gate,
+  against a frame that does not exist. `cancel_timed_out_streams` queues one
+  RST per timed-out stream in a single sweep with no flush in between; a mass
+  idle-timeout reap used to push the queue past the bound invariant 3 asserts
+  (sozu-proxy/sozu#1413). Four per concurrent stream keeps one sweep below the
+  bound, but the queue holds what every caller queued since the last
+  successful drain; the DATA-on-closed-stream reset in `handle_header_state`
+  and the refusals are insert paths `ConnectionH2::check_invariants` never
+  inspects, rate-limited by `record_glitch` + `check_flood_or_return!`
+  rather than by the queue bound. Nothing that would have reached the wire is
+  lost: `flush_pending_control_frames` tests `H2ControlTx::overflowed`
+  *before* its drain loop and emits `GOAWAY(ENHANCE_YOUR_CALM)` instead of
+  serialising anything. That test also carries a state gate,
   `!matches!(self.state, H2State::GoAway | H2State::Error)`, which the drain
-  below it does not share, so the implication holds only until the first
-  GOAWAY: `goaway()` enters `H2State::GoAway` without calling
+  below it does not share, so after the first GOAWAY an overflow does not
+  re-escalate: `goaway()` enters `H2State::GoAway` without calling
   `H2ControlTx::clear_pending`, and a `Mux::timeout` reap landing in that window is
   dropped with no second escalation. That window is bounded — the peer
   already holds the GOAWAY and `writable()`'s `GoAway` arm force-disconnects
@@ -3002,6 +3005,27 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     `MuxResult::Continue` as well — the result alone cannot tell the two
     apart. That is what sozu-proxy/sozu#1454 asked for. `h2_close`'s tables
     remain the exhaustive statement of the decisions; these are their callers.
+
+    **Keeping the connection open is not re-arming it.** Every site that
+    keeps a connection for its pending records goes through
+    `ConnectionH2::ensure_tls_flushed`, which raises a synthetic WRITABLE
+    event only when the latest socket write of the pass was not refused by
+    the kernel. A write that answered `WouldBlock` met a full socket: the
+    kernel raises the next WRITABLE edge once the peer reads, and that edge
+    flushes the records and lets the close proceed. A synthetic edge would
+    only repeat the refused write, and `Mux::ready_inner` did so on every
+    inner iteration until `MAX_LOOP_ITERATIONS` whenever a TLS client stopped
+    reading ([#1788](https://github.com/sozu-proxy/sozu/issues/1788)). A
+    refused write also consumes the WRITABLE event, including the empty-buffer
+    flushes whose status nothing else reads. The decisions above are
+    unchanged: they still read `tls_wants_write`, and a connection with
+    records pending keeps WRITABLE interest. The two real-rustls tests above
+    assert that the refused pass queues no event and that the pass the kernel
+    edge triggers flushes the records and closes;
+    `a_refused_goaway_flush_waits_for_the_kernel_edge_then_closes` does the
+    same over `BackpressuredTlsSocket`, and
+    `test_tls_h2_stalled_reader_does_not_exhaust_loop_budget`
+    (`e2e/src/tests/h2_tests.rs`) end to end.
 
     **A fourth site shares the shape without deciding a close.** The end of
     every `ConnectionH2::write_streams` pass runs the same

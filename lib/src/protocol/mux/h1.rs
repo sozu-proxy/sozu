@@ -2348,6 +2348,7 @@ mod tests {
             tags: None,
             forwarding_hop: None,
             access_log_message: None,
+            backends_unavailable: false,
         }
     }
 

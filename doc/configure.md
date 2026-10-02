@@ -1434,13 +1434,13 @@ The seven thresholds:
 
 | Parameter                                 | Default | Protects against                                                                                                                                                                                                                             | CVE            |
 | ----------------------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------- |
-| `h2_max_rst_stream_per_window`            | 100     | Rapid Reset attack: client opens and immediately resets streams in a tight loop                                                                                                                                                              | CVE-2023-44487 |
-| `h2_max_ping_per_window`                  | 100     | Ping flood: client sends PING frames faster than the server can respond                                                                                                                                                                      | CVE-2019-9512  |
-| `h2_max_settings_per_window`              | 50      | Settings flood: client sends SETTINGS frames requiring ACKs, exhausting server resources                                                                                                                                                     | CVE-2019-9515  |
-| `h2_max_empty_data_per_window`            | 100     | Empty DATA flood: client sends zero-length DATA frames to consume processing time                                                                                                                                                            | CVE-2019-9518  |
-| `h2_max_window_update_stream0_per_window` | 100     | Connection-level (stream 0) WINDOW_UPDATE flood: client sends a torrent of non-zero stream-0 WINDOW_UPDATE frames to burn server CPU parsing each one (zero-increment frames short-circuit into `GOAWAY(PROTOCOL_ERROR)` per RFC 9113 §6.9). |                |
+| `h2_max_rst_stream_per_window`            | 2000    | RST_STREAM storm: client resets streams in a tight loop. A browser tab closing cancels up to `h2_max_concurrent_streams` streams at once; the Rapid Reset signature itself (resets before the response) is capped by `h2_max_rst_stream_abusive_lifetime` | CVE-2023-44487 |
+| `h2_max_ping_per_window`                  | 2000    | Ping flood: client sends PING frames faster than the server can respond                                                                                                                                                                      | CVE-2019-9512  |
+| `h2_max_settings_per_window`              | 1000    | Settings flood: client sends SETTINGS frames requiring ACKs, exhausting server resources                                                                                                                                                     | CVE-2019-9515  |
+| `h2_max_empty_data_per_window`            | 2000    | Empty DATA flood: client sends zero-length DATA frames to consume processing time                                                                                                                                                            | CVE-2019-9518  |
+| `h2_max_window_update_stream0_per_window` | 2000    | Connection-level (stream 0) WINDOW_UPDATE flood: client sends a torrent of non-zero stream-0 WINDOW_UPDATE frames to burn server CPU parsing each one (zero-increment frames short-circuit into `GOAWAY(PROTOCOL_ERROR)` per RFC 9113 §6.9). Only **unsolicited** updates count: each DATA frame Sōzu sends entitles the peer to two stream-0 WINDOW_UPDATEs that are not counted, so a client returning credit as it downloads — one update per DATA frame, per half window, … — never reaches it. |                |
 | `h2_max_continuation_frames`              | 20      | CONTINUATION flood: client sends many small CONTINUATION frames to exhaust header memory                                                                                                                                                     | CVE-2024-27316 |
-| `h2_max_glitch_count`                     | 100     | Cumulative protocol violations: total number of minor protocol errors before disconnection                                                                                                                                                   |                |
+| `h2_max_glitch_count`                     | 2000    | Cumulative protocol violations: minor protocol errors (see [below](#tuning-h2_max_glitch_count-in-production)) before disconnection                                                                                                          |                |
 
 _Configuration example:_
 
@@ -1450,14 +1450,20 @@ address = "0.0.0.0:443"
 protocol = "https"
 
 # H2 flood detection thresholds (optional, defaults shown)
-h2_max_rst_stream_per_window = 100    # Rapid Reset (CVE-2023-44487)
-h2_max_ping_per_window = 100          # Ping flood (CVE-2019-9512)
-h2_max_settings_per_window = 50       # Settings flood (CVE-2019-9515)
-h2_max_empty_data_per_window = 100    # Empty DATA flood (CVE-2019-9518)
-h2_max_window_update_stream0_per_window = 100  # Connection-level WINDOW_UPDATE flood (stream 0)
-h2_max_continuation_frames = 20       # CONTINUATION flood (CVE-2024-27316)
-h2_max_glitch_count = 100             # Cumulative protocol violations
+h2_max_rst_stream_per_window = 2000   # RST_STREAM storm (CVE-2023-44487)
+h2_max_ping_per_window = 2000         # Ping flood (CVE-2019-9512)
+h2_max_settings_per_window = 1000     # Settings flood (CVE-2019-9515)
+h2_max_empty_data_per_window = 2000   # Empty DATA flood (CVE-2019-9518)
+h2_max_window_update_stream0_per_window = 2000  # Unsolicited connection-level WINDOW_UPDATE flood (stream 0)
+h2_max_continuation_frames = 20       # CONTINUATION flood (CVE-2024-27316) — a memory bound
+h2_max_glitch_count = 2000            # Cumulative protocol violations
 ```
+
+The rate defaults are deliberately generous: they stop floods, which run at
+thousands of frames per second, without tripping on ordinary browsers,
+large downloads or a Sōzu in front of another Sōzu. `h2_max_continuation_frames`,
+`h2_max_header_list_size`, `h2_max_header_fields` and `h2_max_header_table_size`
+bound memory rather than a rate, and keep their tighter defaults.
 
 > **Note:** When any threshold is exceeded, the connection is terminated with a
 > `GOAWAY` frame using the `ENHANCE_YOUR_CALM` error code (HTTP/2 error code
@@ -1468,25 +1474,29 @@ h2_max_glitch_count = 100             # Cumulative protocol violations
 
 `h2_max_glitch_count` is a catch-all counter for _low-severity_ protocol drift
 that no other flood counter covers. It is incremented on stream-close races
-(`RST_STREAM` / `WINDOW_UPDATE` / `DATA` on a closed stream), `WINDOW_UPDATE`
-with zero increment on a closed stream, unknown SETTINGS identifiers, and each
+(`RST_STREAM` / `WINDOW_UPDATE` / `DATA` on a closed stream, one per frame —
+a cancelled upload with a full 1 MiB window in flight is about 64 of them),
+`WINDOW_UPDATE` with zero increment on a closed stream, unknown SETTINGS
+identifiers, every stream Sōzu refuses once the client has acknowledged its
+SETTINGS (over its concurrency limit, including the lower limit back-pressure
+sets, or while the connection drains — buffer-pool refusals excepted), every
+reset the client provokes (see `h2_max_rst_stream_emitted_lifetime`), and each
 received `GOAWAY` (a graceful close sends at most two, RFC 9113 §6.8). The
-counter uses a 1-second sliding window with _half-decay_ (it halves at each
-window roll rather than resetting), so a threshold of `N` tolerates a one-shot
-burst of `N` glitches or a sustained rate of roughly `N/2` glitches per second.
+counter uses a 1-second sliding window with
+_half-decay_ (it halves at each window roll rather than resetting), so a
+threshold of `N` tolerates a one-shot burst of `N` glitches or a sustained rate
+of roughly `N/2` glitches per second.
 
-The default of `100` is conservative and protects a lightly-loaded edge well,
-but busy proxies that terminate aggressive-cancellation traffic (mobile clients,
-gRPC with deadlines, browser prefetch, fuzz harnesses) routinely trip it on
-legitimate races. If `h2.flood.violation.glitch_window` fires on traffic you
-know is benign, raise the threshold per-listener:
+The default of `2000` absorbs the races of busy browser, mobile and gRPC
+traffic; nghttp2 budgets the same class at a burst of 10 000 and 330 per
+second. If `h2.flood.violation.glitch_window` fires on traffic you know is
+benign, raise the threshold per-listener:
 
 | Traffic profile                   | Suggested `h2_max_glitch_count` |
 | --------------------------------- | ------------------------------- |
-| Default / low traffic             | 100                             |
-| Busy public edge, mixed clients   | 500                             |
-| gRPC / mobile / high cancellation | 1000 – 2000                     |
-| Load-test absorption only         | 5000                            |
+| Default / mixed public traffic    | 2000                            |
+| gRPC / mobile / high cancellation | 4000                            |
+| Load-test absorption only         | 10000                           |
 
 Before raising blindly, drop the relevant module to `debug` level and check
 which branch dominates — a single misbehaving backend or client emitting
@@ -1532,16 +1542,41 @@ h2_graceful_shutdown_deadline_seconds = 5         # soft-stop forced-close deadl
 #### H2 RST_STREAM lifetime caps
 
 In addition to the per-window `h2_max_rst_stream_per_window` threshold, three
-lifetime counters limit the total number of RST_STREAM frames associated with a
+connection-lifetime counters limit the RST_STREAM frames associated with a
 single connection — two on the **received** side (Rapid Reset, CVE-2023-44487)
 and one on the **emitted** side (MadeYouReset, CVE-2025-8671). Together they
 catch patient-attacker patterns that stay just below the per-window threshold.
 
+Each configured value is a **floor**, not a fixed ceiling: a cap trips only once
+its count exceeds the floor and the ratio below is crossed. The ratio is taken
+over the **backend-routed** streams of the connection: those a backend
+answered, those Sōzu answered 502, 503 or 504 after selecting a backend that
+then refused the connection, failed or timed out, and those it answered 503
+because every backend of the cluster was failing its health check or backing
+off after connection failures. A stream answered before any backend was
+selected for another reason does not count, whatever its status: no route,
+redirect, 401, 421, 429, a refusal, a 503 for a cluster with no backend, or a
+session or buffer limit hit before selection. The two pre-response caps share
+one count — resets the client sent before a response plus resets it provoked —
+and trip once more than half of the backend-routed streams were reset before
+their response. A connection whose client cancels a minority of its requests
+therefore never accumulates toward a cap, however long it lives, while a client
+that resets (or makes Sōzu reset) every stream it opens trips just past the
+floor. This is the shape of Envoy's premature-reset guard, which closes a
+connection once at least half of its streams, and at least 250 of them, were
+reset before a response; Sōzu's floors are higher.
+
+`h2_max_rst_stream_lifetime` leaves pre-response resets to the caps above: past
+its floor, it trips once the resets received after a response started or on a
+stream already closed outnumber the streams a backend answered. A stream reset
+after its response started counts as answered before the check, so a client
+that cancels its streams after their responses never trips it.
+
 | Parameter                            | Default | Description                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | ------------------------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `h2_max_rst_stream_lifetime`         | 10000   | Absolute lifetime cap on RST_STREAM frames **received** on this connection.                                                                                                                                                                                                                                                                                                                                                                       |
-| `h2_max_rst_stream_abusive_lifetime` | 50      | Lifetime cap on "abusive" **received** RST_STREAM frames — resets sent by the peer before a response starts, the Rapid Reset signature (CVE-2023-44487).                                                                                                                                                                                                                                                                                          |
-| `h2_max_rst_stream_emitted_lifetime` | 500     | Absolute lifetime cap on RST_STREAM frames **emitted by the server** (CVE-2025-8671 "MadeYouReset"). Increments on every non-`NoError` reset triggered by an attacker-crafted frame (Content-Length mismatch, header parse error, rejected priority, zero-increment `WINDOW_UPDATE` on an open stream). Graceful `NoError` cancels (stream recycle, propagated client cancel) are exempt. Crossing the threshold emits `GOAWAY(EnhanceYourCalm)`. |
+| `h2_max_rst_stream_lifetime`         | 200000  | Floor of the cap on RST_STREAM frames **received** on this connection; trips once the resets received after a response started or on an already-closed stream also outnumber the streams a backend answered. |
+| `h2_max_rst_stream_abusive_lifetime` | 1000    | Floor of the cap on "abusive" **received** RST_STREAM frames — resets the client sends on a frontend connection before the response starts, the Rapid Reset signature (CVE-2023-44487); trips once these resets plus the resets the client provoked are more than half of the backend-routed streams. Resets a backend sends on a backend connection never count as abusive: Sōzu opened those streams. |
+| `h2_max_rst_stream_emitted_lifetime` | 10000   | Floor of the cap on RST_STREAM frames **emitted by the server** that the peer provoked (CVE-2025-8671 "MadeYouReset"): Content-Length mismatch, header parse error, oversized header block, PRIORITY self-dependency, zero-increment or overflowing `WINDOW_UPDATE` on an open stream. Trips once these resets plus the pre-response resets the client sent are more than half of the backend-routed streams. Each one also counts as a glitch. Resets Sōzu decides on its own are **not** counted: the idle-stream reaper's `CANCEL`, `REFUSED_STREAM` from its concurrency limit, back-pressure or buffer pool, `STREAM_CLOSED` for DATA on a closed stream, and the error a failing backend response produces. `NoError` resets are not counted either. Crossing the cap emits `GOAWAY(EnhanceYourCalm)`. |
 
 _Configuration example:_
 
@@ -1550,9 +1585,9 @@ _Configuration example:_
 address = "0.0.0.0:443"
 protocol = "https"
 
-h2_max_rst_stream_lifetime = 10000
-h2_max_rst_stream_abusive_lifetime = 50
-h2_max_rst_stream_emitted_lifetime = 500
+h2_max_rst_stream_lifetime = 200000
+h2_max_rst_stream_abusive_lifetime = 1000
+h2_max_rst_stream_emitted_lifetime = 10000
 ```
 
 #### Security and protocol settings
@@ -2781,16 +2816,16 @@ immediately after the patch is acknowledged.
 | `http_answers`                            | file paths      | session-at-accept    | built-in defaults       | Listener-default HTTP error bodies (301/401/404/408/413/421/502/503/504/507). Per-cluster `answer_503` overrides are preserved.                              |
 | `sozu_id_header`                          | `string`        | session-at-accept    | `"Sozu-Id"`             | Correlation header name (RFC 9110 §5.1 token; reject empty or containing CR/LF/colon/space)                                                                  |
 | `forwarded_headers`                       | enum            | session-at-accept    | `both`                  | `both` \| `x_forwarded` \| `rfc7239` \| `none` — forwarding header family added to requests (see "Forwarding headers")                                       |
-| `h2_max_rst_stream_per_window`            | `u32` (≥ 1)     | per-connection setup | `100`                   | RST_STREAM flood cap — CVE-2023-44487, CVE-2019-9514                                                                                                         |
-| `h2_max_ping_per_window`                  | `u32` (≥ 1)     | per-connection setup | `100`                   | PING flood cap — CVE-2019-9512                                                                                                                               |
-| `h2_max_settings_per_window`              | `u32` (≥ 1)     | per-connection setup | `50`                    | SETTINGS flood cap — CVE-2019-9515                                                                                                                           |
-| `h2_max_empty_data_per_window`            | `u32` (≥ 1)     | per-connection setup | `100`                   | Empty DATA flood cap — CVE-2019-9518                                                                                                                         |
+| `h2_max_rst_stream_per_window`            | `u32` (≥ 1)     | per-connection setup | `2000`                  | RST_STREAM flood cap — CVE-2023-44487, CVE-2019-9514                                                                                                         |
+| `h2_max_ping_per_window`                  | `u32` (≥ 1)     | per-connection setup | `2000`                  | PING flood cap — CVE-2019-9512                                                                                                                               |
+| `h2_max_settings_per_window`              | `u32` (≥ 1)     | per-connection setup | `1000`                  | SETTINGS flood cap — CVE-2019-9515                                                                                                                           |
+| `h2_max_empty_data_per_window`            | `u32` (≥ 1)     | per-connection setup | `2000`                  | Empty DATA flood cap — CVE-2019-9518                                                                                                                         |
 | `h2_max_continuation_frames`              | `u32` (≥ 1)     | per-connection setup | `20`                    | CONTINUATION flood cap — CVE-2024-27316                                                                                                                      |
-| `h2_max_glitch_count`                     | `u32` (≥ 1)     | per-connection setup | `100`                   | Cumulative protocol-anomaly budget                                                                                                                           |
-| `h2_max_window_update_stream0_per_window` | `u32` (≥ 1)     | per-connection setup | `100`                   | Stream-0 WINDOW_UPDATE flood cap                                                                                                                             |
-| `h2_max_rst_stream_lifetime`              | `u64` (≥ 1)     | per-connection setup | `10000`                 | Lifetime RST_STREAM received cap — CVE-2023-44487                                                                                                            |
-| `h2_max_rst_stream_abusive_lifetime`      | `u64` (≥ 1)     | per-connection setup | `50`                    | Lifetime abusive RST_STREAM cap (Rapid Reset signature)                                                                                                      |
-| `h2_max_rst_stream_emitted_lifetime`      | `u64` (≥ 1)     | per-connection setup | `500`                   | Lifetime server-emitted RST_STREAM cap — CVE-2025-8671                                                                                                       |
+| `h2_max_glitch_count`                     | `u32` (≥ 1)     | per-connection setup | `2000`                  | Cumulative protocol-anomaly budget                                                                                                                           |
+| `h2_max_window_update_stream0_per_window` | `u32` (≥ 1)     | per-connection setup | `2000`                  | Unsolicited stream-0 WINDOW_UPDATE flood cap (two per DATA frame sent are not counted)                                                                       |
+| `h2_max_rst_stream_lifetime`              | `u64` (≥ 1)     | per-connection setup | `200000`                | Floor of the received RST_STREAM cap (also needs the resets after a response or on a closed stream to exceed the streams a backend answered) — CVE-2023-44487           |
+| `h2_max_rst_stream_abusive_lifetime`      | `u64` (≥ 1)     | per-connection setup | `1000`                  | Floor of the pre-response RST_STREAM cap (also needs the pre-response resets, received plus provoked, to exceed the streams a backend answered) — Rapid Reset signature |
+| `h2_max_rst_stream_emitted_lifetime`      | `u64` (≥ 1)     | per-connection setup | `10000`                 | Floor of the peer-provoked server-emitted RST_STREAM cap (also needs the pre-response resets, received plus provoked, to exceed the streams a backend answered) — CVE-2025-8671 |
 | `h2_initial_connection_window`            | `u32`           | per-connection setup | `16777216`              | Connection receive window advertised to the peer (bytes, RFC 9113 §6.9.2); not enforced on inbound DATA                                                      |
 | `h2_max_concurrent_streams`               | `u32` (≥ 1)     | per-connection setup | `100`                   | `SETTINGS_MAX_CONCURRENT_STREAMS`                                                                                                                            |
 | `h2_stream_shrink_ratio`                  | `u32` (≥ 2)     | per-connection setup | `2`                     | Stream-slot Vec shrink threshold                                                                                                                             |
@@ -2840,10 +2875,10 @@ captured value. `address` and `active` are bind-only — change them with
 # Inspect current values first
 sozu listener list
 
-# Halve the Rapid Reset budget on the HTTPS listener
+# Tighten the Rapid Reset budget on the HTTPS listener
 sozu listener https update -a 0.0.0.0:8443 \
-    --h2-max-rst-stream-per-window 50 \
-    --h2-max-rst-stream-abusive-lifetime 25
+    --h2-max-rst-stream-per-window 500 \
+    --h2-max-rst-stream-abusive-lifetime 250
 
 # Confirm the new values are live
 sozu listener list
@@ -3445,7 +3480,7 @@ not a configuration key: the value it wants is "high enough not to bite at the
 stock defaults", the ceiling is a memory-safety bound rather than a tuning
 knob, and `backend.retry.captures_declined` is the operational signal for the
 case where it does bite. Sōzu states this class of bound as a constant
-elsewhere too — `CONN_RETRIES`, `MAX_PENDING_RST_STREAMS`.
+elsewhere too — `CONN_RETRIES`, `MIN_PENDING_RST_STREAMS`.
 
 512 is chosen against the arithmetic above. The defaults can produce at most
 500 concurrent captures, which fits under it, so a stock deployment replays
@@ -3664,8 +3699,9 @@ closed while streams were still active | | `h2.window_update_dropped` | counter
 | proxy | WINDOW_UPDATE frame dropped because the per-connection pending-update
 queue was already at capacity | | `h2.rst_stream_dropped` | counter | proxy |
 Proxy-emitted RST_STREAM never queued because `pending_rst_streams` was already
-at `MAX_PENDING_RST_STREAMS` (200). A non-zero value means the connection has
-already met the queued-RST cap, so it is either on its way to
+at its bound — `MIN_PENDING_RST_STREAMS` (4000), or four per advertised
+`h2_max_concurrent_streams` when that is larger — within one pass. A non-zero
+value means the pending queue overflowed, so the connection is either on its way to
 `GOAWAY(ENHANCE_YOUR_CALM)` — the escalation only fires while the connection is
 not yet in `GoAway`/`Error` — or already past it and about to be
 force-disconnected. In the first case no dropped frame would have been
@@ -3910,9 +3946,9 @@ emits both the contextual log line and the per-kind counter below.
 | `h2.flood.violation.rst_stream_pre_response_lifetime` | counter | proxy | Lifetime received-RST ceiling exceeded for streams that the backend had not yet started answering. The canonical Rapid Reset signature (CVE-2023-44487).             |
 | `h2.flood.violation.rst_stream_emitted_lifetime`      | counter | proxy | Lifetime server-emitted RST ceiling exceeded. MadeYouReset mitigation (CVE-2025-8671) — peer kept feeding the server crafted frames that forced it to reset streams. |
 | `h2.flood.violation.ping_window`                      | counter | proxy | Per-window PING flood (CVE-2019-9512).                                                                                                                               |
-| `h2.flood.violation.ping_lifetime`                    | counter | proxy | Lifetime PING ceiling exceeded — catches sustained low-rate PING abuse that stays under the windowed cap.                                                            |
+| `h2.flood.violation.ping_lifetime`                    | counter | proxy | Lifetime PING ceiling (200 000, not configurable) exceeded — catches sustained low-rate PING abuse that stays under the windowed cap.                                |
 | `h2.flood.violation.settings_window`                  | counter | proxy | Per-window SETTINGS flood (CVE-2019-9515).                                                                                                                           |
-| `h2.flood.violation.settings_lifetime`                | counter | proxy | Lifetime SETTINGS ceiling exceeded.                                                                                                                                  |
+| `h2.flood.violation.settings_lifetime`                | counter | proxy | Lifetime SETTINGS ceiling (200 000, not configurable) exceeded.                                                                                                      |
 | `h2.flood.violation.empty_data_window`                | counter | proxy | Per-window flood of empty DATA frames (CVE-2019-9518).                                                                                                               |
 | `h2.flood.violation.continuation_per_block`           | counter | proxy | Single header block split across more CONTINUATION frames than the configured cap (CVE-2024-27316).                                                                  |
 | `h2.flood.violation.header_size_per_block`            | counter | proxy | Single header block accumulated more bytes than the configured cap (CVE-2024-27316 sibling — header overflow).                                                       |
