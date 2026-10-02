@@ -554,6 +554,7 @@ fn is_mutating_verb(req: &RequestType) -> bool {
             | RequestType::AddHttpListener(_)
             | RequestType::AddHttpsFrontend(_)
             | RequestType::AddHttpsListener(_)
+            | RequestType::AddHttpsListenerWithClientAuth(_)
             | RequestType::AddTcpFrontend(_)
             | RequestType::AddTcpListener(_)
             | RequestType::AddUdpFrontend(_)
@@ -711,6 +712,7 @@ impl Server {
             | RequestType::AddHttpListener(_)
             | RequestType::AddHttpsFrontend(_)
             | RequestType::AddHttpsListener(_)
+            | RequestType::AddHttpsListenerWithClientAuth(_)
             | RequestType::AddTcpFrontend(_)
             | RequestType::AddTcpListener(_)
             | RequestType::AddUdpFrontend(_)
@@ -2068,7 +2070,8 @@ fn audit_entry_for(
                 extras: AuditExtras::default(),
             })
         }
-        RequestType::AddHttpsListener(listener) => {
+        RequestType::AddHttpsListener(listener)
+        | RequestType::AddHttpsListenerWithClientAuth(listener) => {
             let (verb, counter) = audit_verb!("https_listener_added");
             Some(AuditEntry {
                 kind: EventKind::ListenerAdded,
@@ -2620,7 +2623,8 @@ fn validate_listener_request(request: &RequestType) -> Result<(), String> {
         RequestType::AddHttpListener(config) => {
             sozu_lib::http::HttpListener::validate_config(config)
         }
-        RequestType::AddHttpsListener(config) => {
+        RequestType::AddHttpsListener(config)
+        | RequestType::AddHttpsListenerWithClientAuth(config) => {
             sozu_lib::https::HttpsListener::validate_config(config)
         }
         RequestType::AddTcpListener(config) => sozu_lib::tcp::TcpListener::validate_config(config),
@@ -2705,7 +2709,8 @@ fn validate_h2_knob_floors(request: &RequestType) -> Result<(), String> {
         RequestType::AddHttpListener(config) => {
             sozu_command_lib::state::validate_h2_flood_knobs_http_listener(config)
         }
-        RequestType::AddHttpsListener(config) => {
+        RequestType::AddHttpsListener(config)
+        | RequestType::AddHttpsListenerWithClientAuth(config) => {
             sozu_command_lib::state::validate_h2_flood_knobs_https_listener(config)
         }
         _ => return Ok(()),
@@ -2806,11 +2811,14 @@ fn compute_rollback(request: &RequestType) -> Option<Request> {
             address: config.address,
             proxy: ListenerType::Http.into(),
         }),
-        RequestType::AddHttpsListener(config) => RequestType::RemoveListener(RemoveListener {
-            interface: config.interface.clone(),
-            address: config.address,
-            proxy: ListenerType::Https.into(),
-        }),
+        RequestType::AddHttpsListener(config)
+        | RequestType::AddHttpsListenerWithClientAuth(config) => {
+            RequestType::RemoveListener(RemoveListener {
+                interface: config.interface.clone(),
+                address: config.address,
+                proxy: ListenerType::Https.into(),
+            })
+        }
         RequestType::AddTcpListener(config) => RequestType::RemoveListener(RemoveListener {
             interface: config.interface.clone(),
             address: config.address,

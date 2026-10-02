@@ -2810,7 +2810,10 @@ impl Server {
             Some(RequestType::AddHttpListener(listener)) => {
                 push_queue(self.notify_add_http_listener(&req_id, listener));
             }
-            Some(RequestType::AddHttpsListener(listener)) => {
+            Some(
+                RequestType::AddHttpsListener(listener)
+                | RequestType::AddHttpsListenerWithClientAuth(listener),
+            ) => {
                 push_queue(self.notify_add_https_listener(&req_id, listener));
             }
             Some(RequestType::AddTcpListener(listener)) => {

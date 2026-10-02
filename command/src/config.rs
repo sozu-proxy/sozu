@@ -4943,7 +4943,7 @@ impl Config {
         for listener in &self.https_listeners {
             v.push(WorkerRequest {
                 id: format!("CONFIG-{count}"),
-                content: RequestType::AddHttpsListener(listener.clone()).into(),
+                content: RequestType::add_https_listener(listener.clone()).into(),
             });
             count += 1;
         }

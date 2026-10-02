@@ -289,7 +289,10 @@ impl ConfigState {
             RequestType::AddCluster(cluster) => self.add_cluster(cluster),
             RequestType::RemoveCluster(cluster_id) => self.remove_cluster(cluster_id),
             RequestType::AddHttpListener(listener) => self.add_http_listener(listener),
-            RequestType::AddHttpsListener(listener) => self.add_https_listener(listener),
+            RequestType::AddHttpsListener(listener)
+            | RequestType::AddHttpsListenerWithClientAuth(listener) => {
+                self.add_https_listener(listener)
+            }
             RequestType::AddTcpListener(listener) => self.add_tcp_listener(listener),
             RequestType::AddUdpListener(listener) => self.add_udp_listener(listener),
             RequestType::RemoveListener(remove) => self.remove_listener(remove),
@@ -2290,7 +2293,7 @@ impl ConfigState {
         }
 
         for listener in self.https_listeners.values() {
-            v.push(RequestType::AddHttpsListener(listener.clone()).into());
+            v.push(RequestType::add_https_listener(listener.clone()).into());
             if listener.active {
                 v.push(
                     RequestType::ActivateListener(ActivateListener {
@@ -2663,7 +2666,7 @@ impl ConfigState {
         }
 
         for address in added_https_listeners.clone() {
-            v.push(RequestType::AddHttpsListener(other.https_listeners[*address].clone()).into());
+            v.push(RequestType::add_https_listener(other.https_listeners[*address].clone()).into());
 
             if other.https_listeners[*address].active {
                 v.push(
@@ -2844,7 +2847,7 @@ impl ConfigState {
                 // any added listener should be unactive
                 let mut listener_to_add = their_listener.clone();
                 listener_to_add.active = false;
-                v.push(RequestType::AddHttpsListener(listener_to_add).into());
+                v.push(RequestType::add_https_listener(listener_to_add).into());
 
                 // The Remove + Add(active=false) above wipes the listener's
                 // active state. Re-emit an ActivateListener whenever the target
@@ -3879,8 +3882,8 @@ mod tests {
 
     use super::*;
     use crate::proto::command::{
-        CustomHttpAnswers, Header, HeaderPosition, HstsConfig, LoadBalancingParams, PathRuleKind,
-        RedirectPolicy, RedirectScheme, RequestHttpFrontend, RequestTcpFrontend,
+        ClientAuthMode, CustomHttpAnswers, Header, HeaderPosition, HstsConfig, LoadBalancingParams,
+        PathRuleKind, RedirectPolicy, RedirectScheme, RequestHttpFrontend, RequestTcpFrontend,
         RequestUdpFrontend, RulePosition, UdpListenerConfig, UpdateUdpListenerConfig,
     };
 
@@ -5897,6 +5900,63 @@ mod tests {
             )
             .expect("Could not execute request");
         assert_eq!(state.count_frontends(), 3);
+    }
+
+    /// A state that holds an HTTPS listener requiring a client certificate
+    /// must rebuild it on `AddHttpsListenerWithClientAuth`: those requests
+    /// are the initial state of every new worker, the saved state file and
+    /// the reload diff, and a peer that predates mutual TLS would build the
+    /// listener without client auth from `AddHttpsListener`.
+    #[test]
+    fn https_listener_requests_carry_client_auth_on_their_own_verb() {
+        let mtls_address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let plain_address = SocketAddress::new_v4(127, 0, 0, 1, 8444);
+        let mtls = HttpsListenerConfig {
+            client_auth: Some(ClientAuthMode::ClientAuthRequired as i32),
+            client_ca_certificates: vec!["CLIENT CA PEM".to_owned()],
+            ..make_https_listener(mtls_address)
+        };
+
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpsListenerWithClientAuth(mtls.clone()).into())
+            .expect("the mTLS verb must add the listener to the state");
+        state
+            .dispatch(&RequestType::AddHttpsListener(make_https_listener(plain_address)).into())
+            .expect("the historical verb must keep adding listeners without client auth");
+        assert_eq!(
+            state.https_listeners.len(),
+            2,
+            "both verbs add a listener to the same state"
+        );
+
+        let https_adds = |requests: Vec<Request>| -> Vec<(SocketAddress, bool)> {
+            requests
+                .into_iter()
+                .filter_map(|request| match request.request_type {
+                    Some(RequestType::AddHttpsListener(listener)) => {
+                        Some((listener.address, false))
+                    }
+                    Some(RequestType::AddHttpsListenerWithClientAuth(listener)) => {
+                        Some((listener.address, true))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut generated = https_adds(state.generate_requests());
+        generated.sort_by_key(|(address, _)| address.port);
+        assert_eq!(
+            generated,
+            vec![(mtls_address, true), (plain_address, false)],
+            "generate_requests must put only the listener asking for a client certificate on the mTLS verb"
+        );
+
+        let diff = https_adds(ConfigState::new().diff(&state));
+        assert!(
+            diff.contains(&(mtls_address, true)) && !diff.contains(&(mtls_address, false)),
+            "the reload diff must add the mTLS listener on the mTLS verb: {diff:?}"
+        );
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────

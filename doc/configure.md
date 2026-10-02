@@ -524,6 +524,7 @@ partial set — chain validation against `client_ca_certificates` still applies.
 - The policy is per-listener, not per-frontend. Every frontend served by an HTTPS listener with `client_auth = "required"` requires a client certificate.
 - `UpdateHttpsListenerConfig` carries no mTLS fields, so a hot-reconfig partial update cannot downgrade a running listener's client-auth policy. Changing it means recreating the listener.
 - The verifier is built with the same explicitly selected `CryptoProvider` as the server config, so it works in single-provider builds (`crypto-openssl` only) and in multi-provider builds where no process-default provider is installed.
+- A listener with `client_auth` other than `none` is sent to the workers as `AddHttpsListenerWithClientAuth`, not `AddHttpsListener`. A worker that predates mutual TLS cannot decode that request, so it never builds the listener rather than building it without client authentication. Between `sozu upgrade` and the replacement of the last old worker, such a listener is therefore served only by the upgraded workers, and adding it counts each old worker as failed once `worker_timeout` expires, since such a worker does not answer a request it cannot decode. The same holds for a saved state file loaded by a version that predates mutual TLS: it rejects the listener instead of loading it unauthenticated. Listeners without client authentication keep `AddHttpsListener` and work across versions as before.
 
 #### Options specific to Rustls based HTTPS listeners
 
