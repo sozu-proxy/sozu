@@ -4052,11 +4052,13 @@
   streams on the connection, instead of drawing a second RST_STREAM (DATA) or a GOAWAY (HEADERS). A
   self-dependent PRIORITY (RFC 7540 §5.3.1) on an idle stream still closes the connection, since
   RST_STREAM must not name an idle stream (§6.4). Each RST_STREAM still feeds the emitted-RST flood
-  accounting and each ignored frame counts as a glitch; flood thresholds are unchanged. A dropped
-  HEADERS frame that lacks END_HEADERS is not decoded, so its CONTINUATION still ends the
-  connection, as for a refused stream: this covers the HEADERS that triggers a stream error (a
-  trailer block or a half-closed-stream HEADERS split across CONTINUATION) as well as late HEADERS
-  on a stream Sōzu reset. Covered by four `e2e/src/tests/h2_security_tests.rs` tests that check
+  accounting; flood thresholds are unchanged. On a stream Sōzu reset, what the peer may have had
+  in flight counts no flood glitch: two header blocks, and DATA within the stream's receive window;
+  each further block, and DATA beyond the window, counts one
+  ([#1783](https://github.com/sozu-proxy/sozu/issues/1783)). A dropped header block that lacks
+  END_HEADERS, whether it triggers a stream error (a trailer block or a half-closed-stream HEADERS
+  split across CONTINUATION) or arrives late on a stream Sōzu reset, is discarded with its
+  CONTINUATION frames and decoded whole for HPACK. Covered by four `e2e/src/tests/h2_security_tests.rs` tests that check
   another in-flight stream completes. The h2spec counts in `doc/h2_mux_internals.md` and
   `e2e/README.md` now read 146, the number of cases h2spec 2.6.0 runs.
 
