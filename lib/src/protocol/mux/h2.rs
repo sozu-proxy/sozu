@@ -17374,6 +17374,26 @@ mod tests {
         // Each small write must reach the connection before the next drive,
         // not wait behind Nagle's algorithm for the previous one's ACK.
         peer.set_nodelay(true).expect("TCP_NODELAY must apply");
+        // An explicit glitch limit, so the flood below trips it whatever the
+        // default (`DEFAULT_MAX_GLITCH_COUNT`) is.
+        connection.core.flood_detector = h2_flood_detector::H2FloodDetector::new(
+            H2FloodConfig::from_optional(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(100),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            connection.core.now,
+        );
         let glitches = connection.core.flood_detector.glitch_count();
         // `:status 200`, alone, in one HEADERS frame ending the block.
         let block = || orphan_frame(1, 0x4, 1, 1, &[0x88]);
@@ -17449,6 +17469,27 @@ mod tests {
             ..
         } = backend_stream_reset_for_its_content_length();
         peer.set_nodelay(true).expect("TCP_NODELAY must apply");
+        // An explicit empty-DATA limit, so the flood below trips it whatever the
+        // default (`DEFAULT_MAX_EMPTY_DATA_PER_WINDOW`) is. The glitch limit
+        // stays the default: the GOAWAY must come from the empty-DATA count.
+        connection.core.flood_detector = h2_flood_detector::H2FloodDetector::new(
+            H2FloodConfig::from_optional(
+                None,
+                None,
+                None,
+                Some(100),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            connection.core.now,
+        );
         let mut received = Vec::new();
         for _ in 0..50 {
             let mut wire = Vec::new();
