@@ -7422,23 +7422,25 @@ impl ConnectionH2 {
         } else if let Some(global_stream_id) = self.stream_table.get(stream_id) {
             let stream = &mut context.streams[global_stream_id];
             self.attribute_bytes_to_stream(&mut stream.metrics);
-            let stream_window_before = stream.window;
-            if let Some(window) = stream.window.checked_add(increment) {
-                if stream.window <= 0 && window > 0 {
+            // RFC 9113 §6.9: only this connection's leg of the stream.
+            let stream_window = stream.send_window_mut(&self.position);
+            let stream_window_before = *stream_window;
+            if let Some(window) = stream_window.checked_add(increment) {
+                if *stream_window <= 0 && window > 0 {
                     self.readiness.arm_writable();
                 }
-                stream.window = window;
+                *stream_window = window;
                 // Same replenish invariant as the connection window, applied to
                 // the per-stream send window (RFC 9113 §6.9.1). Overflow past
                 // 2^31-1 is rejected by `checked_add` and handled as a
                 // FLOW_CONTROL_ERROR RST_STREAM below.
                 debug_assert_eq!(
-                    stream.window,
+                    window,
                     stream_window_before + increment,
                     "stream window must increase by exactly the increment"
                 );
                 debug_assert!(
-                    stream.window > stream_window_before,
+                    window > stream_window_before,
                     "a positive WINDOW_UPDATE must strictly grow the stream window"
                 );
                 debug!(
@@ -7446,7 +7448,7 @@ impl ConnectionH2 {
                     log_context!(self),
                     stream_id,
                     increment,
-                    stream.window
+                    window
                 );
             } else {
                 let result = self.reset_stream(
@@ -7497,13 +7499,15 @@ impl ConnectionH2 {
         let mut open_window = false;
         // Only update windows for streams owned by this connection
         for &global_stream_id in self.stream_table.streams().values() {
-            let stream = &mut context.streams[global_stream_id];
+            // RFC 9113 §6.9: the peer's setting sizes this connection's leg of
+            // the stream only; the other connection's window is its own.
+            let stream_window = context.streams[global_stream_id].send_window_mut(&self.position);
             // RFC 9113 §6.9.2: changes to SETTINGS_INITIAL_WINDOW_SIZE can cause
             // stream windows to exceed 2^31-1, which is a flow control error.
-            match stream.window.checked_add(delta) {
+            match stream_window.checked_add(delta) {
                 Some(new_window) => {
-                    open_window |= stream.window <= 0 && new_window > 0;
-                    stream.window = new_window;
+                    open_window |= *stream_window <= 0 && new_window > 0;
+                    *stream_window = new_window;
                 }
                 None => return true,
             }
@@ -8108,6 +8112,13 @@ impl ConnectionH2 {
             self.graceful_goaway(self.now);
             return false;
         };
+        // RFC 9113 §6.9: the stream's send window on this connection starts
+        // at the backend's own SETTINGS_INITIAL_WINDOW_SIZE (the 65535
+        // default until its SETTINGS arrive), whatever the client granted on
+        // the frontend connection and whatever a previous request on the
+        // slot left.
+        *context.streams[stream].send_window_mut(&self.position) =
+            i32::try_from(self.peer_settings.settings_initial_window_size).unwrap_or(i32::MAX);
         self.stream_table.register(stream_id, stream, self.now);
         self.readiness.arm_writable();
         true
@@ -12812,6 +12823,170 @@ mod tests {
         (gid, encoded)
     }
 
+    /// RFC 9113 §6.9: a proxied stream has an independent send window on each
+    /// connection. The client granted the maximum initial window on the
+    /// frontend connection; the H2 backend then advertises
+    /// `SETTINGS_INITIAL_WINDOW_SIZE = 2^31-1` too. Each value is within the
+    /// §6.9.2 ceiling, so the backend connection must acknowledge it and send
+    /// the request, not overflow a window it shares with the frontend leg and
+    /// answer GOAWAY.
+    ///
+    /// TO SEE THIS RED: make `Stream::send_window_mut` and `Stream::split`
+    /// answer `front_window` for `Position::Client` too. The backend then
+    /// adds its delta to the client's 2^31-1: `the backend connection must
+    /// not answer a valid initial window with GOAWAY`. Verified 2026-10-01
+    /// (red on `3d3f077b`).
+    #[test]
+    fn a_backend_max_initial_window_is_independent_of_the_frontend_window() {
+        let pool = make_pool_for_invariant_16();
+        let mut backend = paced_backend(&pool, usize::MAX);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        // What a frontend connection whose client advertised 2^31-1 creates.
+        let gid = context
+            .create_stream(Ulid::generate(), FLOW_CONTROL_MAX_WINDOW)
+            .expect("test context must create a stream");
+        queue_backend_request(&mut context, gid, b"key");
+        context.streams[gid].state = StreamState::Linked(mio::Token(1));
+        assert!(backend.start_stream(gid, &mut context), "premise: stream 1");
+
+        let mut max_initial_window = vec![0, 4];
+        max_initial_window.extend_from_slice(&FLOW_CONTROL_MAX_WINDOW.to_be_bytes());
+        backend
+            .socket
+            .inbound
+            .extend(orphan_frame(4, 0, 0, 6, &max_initial_window));
+        for _ in 0..4 {
+            backend.core.readiness.event.insert(Ready::READABLE);
+            if backend.core.readiness.filter_interest().is_readable() {
+                backend.readable(&mut context, EndpointClient(&mut router));
+            }
+        }
+        backend.core.readiness.event.insert(Ready::WRITABLE);
+        backend.writable(&mut context, EndpointClient(&mut router));
+
+        let frames = peer_frames(&backend.socket.wire).expect("whole frames on the wire");
+        assert!(
+            !frames.iter().any(|(kind, ..)| *kind == 7),
+            "the backend connection must not answer a valid initial window with GOAWAY"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|(kind, flags, ..)| *kind == 4 && *flags == 1),
+            "the backend's SETTINGS are acknowledged"
+        );
+        assert!(
+            frames.iter().any(|(kind, _, id, _)| *kind == 1 && *id == 1),
+            "and the request leaves on stream 1"
+        );
+    }
+
+    /// A 4-octet WINDOW_UPDATE frame for `stream_id`.
+    fn window_update_frame(stream_id: u32, increment: u32) -> Vec<u8> {
+        orphan_frame(8, 0, stream_id, 4, &increment.to_be_bytes())
+    }
+
+    /// RFC 9113 §6.9 on the backend leg: `start_stream` sizes the stream's
+    /// send window from the initial window the BACKEND advertised (here
+    /// 1000, already received on a pooled connection), whatever the frontend
+    /// granted: larger (an H2 client at 2^31-1), the `1 << 16` an H1
+    /// frontend seeds, or nothing. Taking the frontend's value would let a
+    /// request body overrun the backend's window. The backend's WINDOW_UPDATE
+    /// credits that leg only.
+    ///
+    /// TO SEE THIS RED: delete the `send_window_mut` assignment in
+    /// `ConnectionH2::start_stream`: `the backend leg starts at the
+    /// backend's window`, `left: 65535, right: 1000`. Verified 2026-10-01.
+    #[test]
+    fn a_backend_stream_window_is_sized_and_credited_by_the_backend_only() {
+        const BACKEND_WINDOW: u32 = 1000;
+        for front_window in [FLOW_CONTROL_MAX_WINDOW, 1 << 16, 0] {
+            let pool = make_pool_for_invariant_16();
+            let mut backend = paced_backend(&pool, usize::MAX);
+            let mut context = test_context(&pool);
+            let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+            let read = |backend: &mut H2Shell<PacedSocket>,
+                        context: &mut Context<TestListener>,
+                        router: &mut Router| {
+                for _ in 0..4 {
+                    backend.core.readiness.event.insert(Ready::READABLE);
+                    if backend.core.readiness.filter_interest().is_readable() {
+                        backend.readable(context, EndpointClient(router));
+                    }
+                }
+            };
+            let mut initial_window = vec![0, 4];
+            initial_window.extend_from_slice(&BACKEND_WINDOW.to_be_bytes());
+            backend
+                .socket
+                .inbound
+                .extend(orphan_frame(4, 0, 0, 6, &initial_window));
+            read(&mut backend, &mut context, &mut router);
+            let gid = context
+                .create_stream(Ulid::generate(), front_window)
+                .expect("test context must create a stream");
+            queue_backend_request(&mut context, gid, b"key");
+            context.streams[gid].state = StreamState::Linked(mio::Token(1));
+            assert!(backend.start_stream(gid, &mut context), "premise: stream 1");
+            assert_eq!(
+                context.streams[gid].back_window, BACKEND_WINDOW as i32,
+                "front window {front_window}: the backend leg starts at the backend's window"
+            );
+
+            backend.socket.inbound.extend(window_update_frame(1, 500));
+            read(&mut backend, &mut context, &mut router);
+            let stream = &context.streams[gid];
+            assert_eq!(
+                stream.back_window,
+                BACKEND_WINDOW as i32 + 500,
+                "front window {front_window}: the backend's WINDOW_UPDATE credits its leg"
+            );
+            assert_eq!(
+                stream.front_window,
+                i32::try_from(front_window).unwrap(),
+                "front window {front_window}: and leaves the frontend leg alone"
+            );
+        }
+    }
+
+    /// RFC 9113 §6.9 on the frontend leg: the client's WINDOW_UPDATE and
+    /// SETTINGS_INITIAL_WINDOW_SIZE move the stream's frontend window only.
+    #[test]
+    fn a_frontend_window_update_credits_the_frontend_leg_only() {
+        let (_pool, mut connection, mut context, mut router, _peer) = two_requests_read(usize::MAX);
+        let first = *connection
+            .core
+            .stream_table
+            .streams()
+            .get(&1)
+            .expect("the stream is open");
+        context.streams[first].back_window = 1234;
+        let mut initial_window = vec![0, 4];
+        initial_window.extend_from_slice(&100_000u32.to_be_bytes());
+        connection
+            .socket
+            .inbound
+            .extend(window_update_frame(1, 1000));
+        connection
+            .socket
+            .inbound
+            .extend(orphan_frame(4, 0, 0, 6, &initial_window));
+        for _ in 0..4 {
+            connection.core.readiness.event.insert(Ready::READABLE);
+            if connection.core.readiness.filter_interest().is_readable() {
+                connection.readable(&mut context, EndpointClient(&mut router));
+            }
+        }
+        let stream = &context.streams[first];
+        assert_eq!(
+            stream.front_window,
+            100_000 + 1000,
+            "the client's WINDOW_UPDATE and initial window move the frontend leg"
+        );
+        assert_eq!(stream.back_window, 1234, "and not the backend leg");
+    }
+
     /// sozu-proxy/sozu#1632, GOAWAY form: the backend refuses the stream
     /// (`last_stream_id` below it) after its HEADERS were encoded but not
     /// sent. It was not processed, but its request cannot be sent anywhere
@@ -13275,7 +13450,7 @@ mod tests {
         connection.core.readiness.event.insert(Ready::WRITABLE);
         connection.writable(&mut context, EndpointClient(&mut router));
         assert_eq!(
-            context.streams[first].window, DEFAULT_INITIAL_WINDOW_SIZE as i32,
+            context.streams[first].front_window, DEFAULT_INITIAL_WINDOW_SIZE as i32,
             "the stream's window is back where it was before the prepare"
         );
         drive_both_ways(&mut connection, &mut context, &mut router);
@@ -13364,7 +13539,10 @@ mod tests {
             0,
             "the connection window still owes every queued DATA octet"
         );
-        assert_eq!(context.streams[first].window, 0, "and so does the stream's");
+        assert_eq!(
+            context.streams[first].front_window, 0,
+            "and so does the stream's"
+        );
     }
 
     /// A write that cuts stream 1's first DATA frame hands the rest of that
@@ -16296,7 +16474,7 @@ mod tests {
         kawa.parsing_phase = kawa::ParsingPhase::Terminated;
         // The backend grants the stream no send window: its HEADERS leave,
         // its body waits.
-        context.streams[gid].window = 0;
+        context.streams[gid].back_window = 0;
         let sent = drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
         let frames = peer_frames(&sent).expect("whole frames");
         assert!(

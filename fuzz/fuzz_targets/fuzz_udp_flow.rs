@@ -169,6 +169,12 @@ fn cluster_config(r: &mut Reader) -> ClusterConfig {
         back_timeout: back,
         send_proxy_protocol: flags & 0b0000_0100 != 0,
         proxy_protocol_every_datagram: flags & 0b0000_1000 != 0,
+        // 0 = unlimited; otherwise a small per-source cap so the per-source
+        // shed and its counter bookkeeping are reached.
+        max_flows_per_ip: (r.u8() % 4) as u64,
+        max_flows_per_subnet: (r.u8() % 4) as u64,
+        subnet_ipv4_prefix: 24 + (r.u8() as u32 % 9),
+        subnet_ipv6_prefix: 128,
     }
 }
 

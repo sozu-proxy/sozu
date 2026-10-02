@@ -26,11 +26,13 @@
 //!   by [`H2FlowControl::queue_window_update`] and flushed by
 //!   [`H2FlowControl::drain_window_updates_into`].
 //!
-//! Per-stream *send*-window state (`Stream.window` in `stream.rs`) and the
-//! per-stream arm of `handle_window_update_frame` (which resolves a stream
-//! slot via `ConnectionH2::streams` and can RST the stream) stay on
-//! `ConnectionH2` / `Stream` — they need the stream table and endpoint this
-//! module deliberately does not have.
+//! Per-stream *send*-window state (`Stream.front_window` and
+//! `Stream.back_window` in `stream.rs`, one per connection the stream crosses,
+//! because RFC 9113 §6.9 flow control is hop-by-hop) and the per-stream arm of
+//! `handle_window_update_frame` (which resolves a stream slot via
+//! `ConnectionH2::streams` and can RST the stream) stay on `ConnectionH2` /
+//! `Stream` — they need the stream table and endpoint this module deliberately
+//! does not have.
 //!
 //! ## The advertised connection-level receive window is not enforced
 //!

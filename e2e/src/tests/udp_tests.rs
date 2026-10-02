@@ -1374,3 +1374,77 @@ fn test_udp_every_idle_flow_is_torn_down() {
         State::Success,
     );
 }
+
+// =========================================================================
+// Test 16: per-source flow limit.
+//
+// With `max_connections_per_ip = 2` on the cluster, a third socket of one
+// source address is shed while another address is still admitted, and once
+// the address's flows go idle and close, a new socket of it is admitted.
+// =========================================================================
+
+/// A [`UdpClient`] on an ephemeral port of the local address `ip`. Linux
+/// routes all of `127.0.0.0/8` to the loopback interface, so a test can speak
+/// from several source addresses without any setup.
+fn udp_client_at(name: &str, ip: std::net::Ipv4Addr, front: SocketAddr) -> UdpClient {
+    let socket = std::net::UdpSocket::bind((ip, 0)).expect("udp client: bind");
+    socket
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("udp client: set read timeout");
+    UdpClient {
+        name: name.to_owned(),
+        socket,
+        front,
+    }
+}
+
+fn try_udp_per_ip_flow_limit() -> State {
+    const IDLE_TIMEOUT_SECS: u32 = 1;
+    let cluster = Cluster {
+        max_connections_per_ip: Some(2),
+        ..udp_cluster(CLUSTER, LoadBalancingAlgorithms::RoundRobin)
+    };
+    let (mut worker, backends, front) =
+        setup_udp_test_with_idle_timeout("UDP-PER-IP", cluster, 1, Some(IDLE_TIMEOUT_SECS));
+    let backend = UdpBackend::bind("BK0", backends[0], 1).spawn();
+
+    let capped = std::net::Ipv4Addr::new(127, 0, 0, 1);
+    let other = std::net::Ipv4Addr::new(127, 0, 0, 2);
+    let a = udp_client_at("A", capped, front);
+    let b = udp_client_at("B", capped, front);
+    let c = udp_client_at("C", capped, front);
+    let d = udp_client_at("D", other, front);
+
+    let a_ok = a.round_trip(b"a", RT).is_some();
+    let b_ok = b.round_trip(b"b", RT).is_some();
+    let c_shed = c.round_trip(b"c", RT).is_none();
+    let d_ok = d.round_trip(b"d", RT).is_some();
+
+    // Let every flow go idle and close, then a new socket of the capped
+    // address must be admitted again.
+    std::thread::sleep(Duration::from_secs(u64::from(IDLE_TIMEOUT_SECS) * 3));
+    let e = udp_client_at("E", capped, front);
+    let e_ok = e.round_trip(b"e", RT).is_some();
+    println!("per-ip: a_ok={a_ok} b_ok={b_ok} c_shed={c_shed} d_ok={d_ok} after_idle_ok={e_ok}");
+
+    backend.stop();
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    if a_ok && b_ok && c_shed && d_ok && e_ok && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_udp_per_ip_flow_limit() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "UDP max_connections_per_ip: one address is capped, another is admitted, idle flows free slots",
+            try_udp_per_ip_flow_limit,
+        ),
+        State::Success,
+    );
+}

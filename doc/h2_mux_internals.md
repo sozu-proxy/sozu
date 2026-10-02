@@ -512,6 +512,21 @@ simulator deliberately carries no such property.
 `lib/src/protocol/mux/h2_flow_control.rs`'s module doc carries the same
 statement beside the code.
 
+### One stream send window per connection
+
+RFC 9113 §6.9 flow control applies to each hop, so a stream relayed from an
+H2 client to an H2 backend has two send windows: `Stream::front_window`, the
+credit the client grants for response DATA, and `Stream::back_window`, the
+credit the backend grants for request DATA. Each connection's SETTINGS
+(`ConnectionH2::update_initial_window_size`) and WINDOW_UPDATE frames move only
+its own leg, selected by `Stream::send_window_mut` / `Stream::split` from the
+connection's `Position`. `Context::create_stream` seeds `front_window` from the
+client's `SETTINGS_INITIAL_WINDOW_SIZE`; `ConnectionH2::start_stream` sets
+`back_window` from the backend's each time it opens the stream, so neither the
+client's grant nor a previous request on the slot carries over. A client and a
+backend that both advertise 2^31-1 are each within the §6.9.2 ceiling and must
+not be summed into one window. An H1 leg never reads its window.
+
 ### Prepared DATA dropped unsent gives its send credit back
 
 The send windows are debited when DATA is **prepared**, not when it is
@@ -1069,7 +1084,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8904-8908
+```rust lib/src/protocol/mux/h2.rs:8915-8919
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1223,7 +1238,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9082-9086
+```rust lib/src/protocol/mux/h2.rs:9093-9097
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1697,7 +1712,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:8407
+```rust lib/src/protocol/mux/h2.rs:8418
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -1859,7 +1874,7 @@ and `tracestate` headers are extracted from inbound requests:
 At access log emission time (`Stream::generate_access_log`, in
 `lib/src/protocol/mux/stream.rs`):
 
-```rust lib/src/protocol/mux/stream.rs:882-885
+```rust lib/src/protocol/mux/stream.rs:914-917
 #[cfg(feature = "opentelemetry")]
 otel: context.otel.as_ref(),
 #[cfg(not(feature = "opentelemetry"))]
