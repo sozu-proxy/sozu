@@ -17826,7 +17826,8 @@ mod tests {
     /// GOAWAY(ENHANCE_YOUR_CALM) (CVE-2024-27316).
     ///
     /// TO SEE THIS RED: in [`ConnectionH2::discard_field_block`], drop the
-    /// `begin_header_block_if_new` call: the block is read to its end.
+    /// `begin_header_block_if_new` call: the block is read to its end, and
+    /// the test fails once its 30-second deadline passes without a GOAWAY.
     #[test]
     fn a_refused_header_block_counts_its_first_fragment_toward_its_size() {
         use std::io::Write;
@@ -17853,23 +17854,36 @@ mod tests {
         // The peer cannot write all of it before the connection reads, so
         // write it from a thread while the connection is driven.
         let mut writer = peer.try_clone().expect("the peer socket must clone");
-        let sender = std::thread::spawn(move || {
-            let _ = writer.write_all(&wire);
-        });
+        let sender = std::thread::spawn(move || writer.write_all(&wire));
+        let enhance_your_calm = |frames: &[PeerFrame]| {
+            frames.iter().any(|(kind, _, _, payload)| {
+                *kind == 7 && payload.get(4..8) == Some(&[0, 0, 0, 0xb][..])
+            })
+        };
+        // Drive until the GOAWAY reaches the peer, not for a fixed number of
+        // passes: on a loaded host the writer thread can be descheduled for
+        // all of them, and the GOAWAY the read of the last fragment queues is
+        // only flushed by the next pass's `writable()`.
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut received = Vec::new();
-        for _ in 0..8 {
+        while Instant::now() < deadline {
             received.extend(drive_and_read_backend(
                 &mut connection,
                 &mut peer,
                 &mut context,
                 &mut router,
             ));
+            if peer_frames(&received).is_ok_and(|frames| enhance_your_calm(&frames)) {
+                break;
+            }
         }
-        let _ = sender.join();
+        sender
+            .join()
+            .expect("the writer thread must not panic")
+            .expect("the peer must write the whole block");
         let frames = peer_frames(&received).expect("whole frames");
         assert!(
-            frames.iter().any(|(kind, _, _, payload)| *kind == 7
-                && payload.get(4..8) == Some(&[0, 0, 0, 0xb][..])),
+            enhance_your_calm(&frames),
             "the oversized refused block ends the connection with GOAWAY(ENHANCE_YOUR_CALM), \
              got {frames:?}"
         );
