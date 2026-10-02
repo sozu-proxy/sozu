@@ -873,7 +873,13 @@ pub struct ConnectionH2 {
     /// decoder a complete field block before its bytes are dropped — RFC
     /// 9113 §4.3: field-compression state is scoped to the connection, not
     /// the stream. See `LIFECYCLE.md`'s Discard section.
-    discarded_field_block: Option<DiscardedFieldBlock>,
+    discarded_field_block: Option<(StreamId, DiscardedFieldBlock)>,
+    /// The stream and field-block bytes of a discarded header block whose
+    /// frame did not carry END_HEADERS: set by the `H2State::Discard` arm,
+    /// consumed by `handle_header_state`, where only a CONTINUATION frame
+    /// on that stream may come next (RFC 9113 §6.10). The block is decoded
+    /// once whole, to keep the HPACK dynamic table in sync (§4.3).
+    pending_discarded_block: Option<(StreamId, Vec<u8>)>,
     /// True once we've asked rustls to emit TLS close_notify for this frontend.
     close_notify_sent: bool,
     /// The last socket write of the current [`H2Shell::writable`] pass
@@ -1796,7 +1802,7 @@ fn decode_discarded_field_block(
     decoder: &mut crate::protocol::mux::hpack::Decoder,
     payload: &[u8],
     discarded: DiscardedFieldBlock,
-) -> Result<(), H2Error> {
+) -> Result<Option<Vec<u8>>, H2Error> {
     match discarded {
         DiscardedFieldBlock::New { flags } => {
             // Reparse using the same grammar as an accepted HEADERS frame
@@ -1817,23 +1823,21 @@ fn decode_discarded_field_block(
             let Frame::Headers(headers) = frame else {
                 unreachable!("parser::headers_frame always yields Frame::Headers")
             };
-            // Correction: when END_HEADERS is not set, the block continues
-            // on a CONTINUATION frame that (per `handle_header_state`) can
-            // now only arrive as a standalone frame and is therefore
-            // rejected as a connection error of type PROTOCOL_ERROR before
-            // any further bytes of this block are read. There is nothing
-            // to decode yet, and decoding a fragment that ends mid-integer
-            // or mid-Huffman-string would misreport COMPRESSION_ERROR in
-            // place of that PROTOCOL_ERROR.
-            if !headers.end_headers {
-                return Ok(());
-            }
             let fragment = headers
                 .header_block_fragment
                 .data_opt(payload)
                 .ok_or(H2Error::InternalError)?;
+            // Without END_HEADERS the block continues on CONTINUATION frames
+            // (RFC 9113 §6.10): hand its fragment back, to be completed by
+            // them (`ConnectionH2::pending_discarded_block`) and decoded
+            // whole, since a fragment may end mid-integer or
+            // mid-Huffman-string.
+            if !headers.end_headers {
+                return Ok(Some(fragment.to_vec()));
+            }
             decoder
                 .decode_with_cb(fragment, |_, _| {})
+                .map(|_| None)
                 .map_err(|_| H2Error::CompressionError)
         }
         DiscardedFieldBlock::Continuation {
@@ -1843,12 +1847,13 @@ fn decode_discarded_field_block(
             // Same END_HEADERS gate as above, evaluated on this trailing
             // CONTINUATION frame's own flags rather than the (still false)
             // flag the originating HEADERS frame carried.
-            if !end_headers {
-                return Ok(());
-            }
             prior_fragment.extend_from_slice(payload);
+            if !end_headers {
+                return Ok(Some(prior_fragment));
+            }
             decoder
                 .decode_with_cb(&prior_fragment, |_, _| {})
+                .map(|_| None)
                 .map_err(|_| H2Error::CompressionError)
         }
     }
@@ -2017,6 +2022,7 @@ impl ConnectionH2 {
             settings_sent_at: None,
             control_tx: h2_control_tx::H2ControlTx::new(connection_config.max_concurrent_streams),
             discarded_field_block: None,
+            pending_discarded_block: None,
             close_notify_sent: false,
             kernel_refused_write: false,
             max_pending_window_updates: 1 + connection_config.max_concurrent_streams as usize * 4,
@@ -2058,6 +2064,47 @@ impl ConnectionH2 {
                 trace!("{} {:#?}", log_context!(self), header);
                 self.zero.storage.clear();
                 let stream_id = header.stream_id;
+                // A discarded header block without END_HEADERS continues
+                // here: only a CONTINUATION frame on its stream may follow
+                // (RFC 9113 §6.10), and it is discarded the same way, its
+                // fragment completing the block for HPACK (§4.3).
+                if let Some((block_stream_id, fragment)) = self.pending_discarded_block.take() {
+                    if header.frame_type != FrameType::Continuation || stream_id != block_stream_id
+                    {
+                        error!(
+                            "{} {:?} on stream {} interrupts the header block of stream {}",
+                            log_context!(self),
+                            header.frame_type,
+                            stream_id,
+                            block_stream_id
+                        );
+                        return self.goaway(H2Error::ProtocolError);
+                    }
+                    // CVE-2024-27316: the same per-block CONTINUATION count and
+                    // size limits as an accepted block.
+                    self.flood_detector
+                        .record_continuation_frame(header.payload_len);
+                    check_flood_or_return!(self);
+                    if self.flood_detector.accumulated_header_size()
+                        > self.flood_detector.config().max_header_list_size()
+                        || (header.payload_len as usize) > self.zero.storage.available_space()
+                    {
+                        error!(
+                            "{} discarded header block of stream {} exceeds its limits",
+                            log_context!(self),
+                            stream_id
+                        );
+                        return self.goaway(H2Error::EnhanceYourCalm);
+                    }
+                    return self.discard_field_block(
+                        stream_id,
+                        header.payload_len,
+                        DiscardedFieldBlock::Continuation {
+                            prior_fragment: fragment,
+                            end_headers: header.flags & parser::FLAG_END_HEADERS != 0,
+                        },
+                    );
+                }
                 // RFC 9113 §6.10: CONTINUATION frames MUST be preceded by a
                 // HEADERS or PUSH_PROMISE frame without END_HEADERS. When we
                 // reach `handle_header_state`, we are between frames and no
@@ -2081,6 +2128,59 @@ impl ConnectionH2 {
                     || matches!(header.frame_type, FrameType::Unknown(_))
                 {
                     H2StreamId::Zero
+                } else if (header.frame_type == FrameType::Data
+                    || header.frame_type == FrameType::Headers)
+                    && self.stream_table.was_reset_locally(stream_id)
+                {
+                    // RFC 9113 §5.1: after sending RST_STREAM, an endpoint
+                    // MUST ignore frames it receives on that stream, which
+                    // the peer may have sent before reading the reset,
+                    // whether the stream is still tracked or already retired.
+                    // `discard_frame_payload` still processes them minimally:
+                    // a HEADERS block, and the CONTINUATION frames completing
+                    // it, are decoded so the HPACK dynamic table stays in
+                    // sync (§4.3); a DATA payload is credited to connection
+                    // flow control (§6.9). Every other frame type on such a
+                    // stream keeps its own handling.
+                    debug!(
+                        "{} Ignoring {:?} on stream {} after sending RST_STREAM",
+                        log_context!(self),
+                        header.frame_type,
+                        stream_id
+                    );
+                    // What the peer had in flight when it read the reset is
+                    // no abuse: at most two header blocks (a trailer section,
+                    // or an interim and a final response), or DATA within the
+                    // stream's receive window, which Sōzu credits back as it
+                    // reads DATA, so it stays the initial window it
+                    // advertised. More header blocks, and DATA beyond it,
+                    // count as a glitch.
+                    // CVE-2019-9518: an empty DATA frame without END_STREAM
+                    // counts toward the empty-DATA flood limit here as on a
+                    // live stream (`handle_data_frame`), since it carries no
+                    // payload to charge against the stream's window.
+                    if header.frame_type == FrameType::Data
+                        && header.payload_len == 0
+                        && header.flags & parser::FLAG_END_STREAM == 0
+                    {
+                        self.flood_detector.record_empty_data_frame();
+                        check_flood_or_return!(self);
+                    }
+                    let in_flight = if header.frame_type == FrameType::Headers {
+                        self.stream_table
+                            .charge_reset_stream_header_block(stream_id)
+                    } else {
+                        self.stream_table.charge_reset_stream_data(
+                            stream_id,
+                            header.payload_len,
+                            self.local_settings.settings_initial_window_size,
+                        )
+                    };
+                    if !in_flight {
+                        self.flood_detector.record_glitch();
+                        check_flood_or_return!(self);
+                    }
+                    return self.discard_frame_payload(&header);
                 } else if let Some(global_stream_id) =
                     self.stream_table.streams().get(&stream_id).copied()
                 {
@@ -2089,21 +2189,6 @@ impl ConnectionH2 {
                         || header.frame_type == FrameType::RstStream;
                     let carries_message = header.frame_type == FrameType::Data
                         || header.frame_type == FrameType::Headers;
-                    // RFC 9113 §5.1: frames the peer sent before it processed
-                    // our RST_STREAM are ignored, after the minimal
-                    // processing (HPACK, connection flow control).
-                    if carries_message && self.stream_table.rst_sent_contains(stream_id) {
-                        debug!(
-                            "{} Ignoring {:?} on stream {} after sending RST_STREAM",
-                            log_context!(self),
-                            header.frame_type,
-                            stream_id
-                        );
-                        self.flood_detector.record_glitch();
-                        check_flood_or_return!(self);
-                        self.discard_frame_payload(&header);
-                        return MuxResult::Continue;
-                    }
                     let stream = &context.streams[global_stream_id];
                     // Use the position-aware end_of_stream flag:
                     // - Server reads from front (client requests)
@@ -2265,13 +2350,13 @@ impl ConnectionH2 {
                             ) {
                                 return result;
                             }
-                            self.discard_field_block(
+                            return self.discard_field_block(
+                                stream_id,
                                 header.payload_len,
                                 DiscardedFieldBlock::New {
                                     flags: header.flags,
                                 },
                             );
-                            return MuxResult::Continue;
                         }
                         if self.stream_table.len()
                             >= self.local_settings.settings_max_concurrent_streams as usize
@@ -2370,52 +2455,26 @@ impl ConnectionH2 {
                                     // connection for other streams. The payload is
                                     // still routed through stream 0 so handle_frame
                                     // can do connection-level flow control accounting.
-                                    //
-                                    // A stream we reset is the exception: its
-                                    // late DATA is ignored (RFC 9113 §5.1), no
-                                    // second RST_STREAM.
-                                    self.flood_detector.record_glitch();
-                                    check_flood_or_return!(self);
-                                    if self.stream_table.was_reset_locally(header.stream_id) {
-                                        debug!(
-                                            "{} Ignoring DATA on stream {} after sending RST_STREAM",
-                                            log_context!(self),
-                                            header.stream_id
-                                        );
-                                    } else {
-                                        debug!(
-                                            "{} DATA on closed stream {}, sending RST_STREAM(STREAM_CLOSED)",
-                                            log_context!(self),
-                                            header.stream_id
-                                        );
-                                        // Local: this DATA is already counted as
-                                        // a glitch above, which is what bounds
-                                        // it; charging it to the provoked-RST
-                                        // cap too would count it twice.
-                                        if let Some(result) = self.enqueue_rst(
-                                            header.stream_id,
-                                            H2Error::StreamClosed,
-                                            RstOrigin::Local,
-                                        ) {
-                                            return result;
-                                        }
-                                    }
-                                }
-                                FrameType::Headers
-                                    if self.stream_table.was_reset_locally(header.stream_id) =>
-                                {
-                                    // RFC 9113 §5.1: frames received after we
-                                    // sent RST_STREAM are ignored, after the
-                                    // field block updates the HPACK decoder.
+                                    // A stream this endpoint reset never gets here:
+                                    // its late DATA is ignored above.
                                     debug!(
-                                        "{} Ignoring HEADERS on stream {} after sending RST_STREAM",
+                                        "{} DATA on closed stream {}, sending RST_STREAM(STREAM_CLOSED)",
                                         log_context!(self),
                                         header.stream_id
                                     );
                                     self.flood_detector.record_glitch();
                                     check_flood_or_return!(self);
-                                    self.discard_frame_payload(&header);
-                                    return MuxResult::Continue;
+                                    // Local: this DATA is already counted as a
+                                    // glitch above, which is what bounds it;
+                                    // charging it to the provoked-RST cap too
+                                    // would count it twice.
+                                    if let Some(result) = self.enqueue_rst(
+                                        header.stream_id,
+                                        H2Error::StreamClosed,
+                                        RstOrigin::Local,
+                                    ) {
+                                        return result;
+                                    }
                                 }
                                 _ => {
                                     // RFC 9113 §5.1: HEADERS or other frames on a
@@ -2833,16 +2892,21 @@ impl ConnectionH2 {
                 // Without a field block this is an orphaned DATA remainder
                 // (`Self::skip_orphaned_data_payload`): its bytes were never
                 // kept, and `zero` may still hold unflushed output.
-                if let Some(discarded) = self.discarded_field_block.take() {
-                    if let Err(error) =
-                        decode_discarded_field_block(self.hpack.decoder_mut(), i, discarded)
-                    {
-                        error!(
-                            "{} discarded stream's HPACK field block failed to decode: {:?}",
-                            log_context!(self),
-                            error
-                        );
-                        return self.goaway(error);
+                if let Some((stream_id, discarded)) = self.discarded_field_block.take() {
+                    match decode_discarded_field_block(self.hpack.decoder_mut(), i, discarded) {
+                        // The block continues on CONTINUATION frames.
+                        Ok(Some(fragment)) => {
+                            self.pending_discarded_block = Some((stream_id, fragment));
+                        }
+                        Ok(None) => self.flood_detector.reset_continuation(),
+                        Err(error) => {
+                            error!(
+                                "{} discarded stream's HPACK field block failed to decode: {:?}",
+                                log_context!(self),
+                                error
+                            );
+                            return self.goaway(error);
+                        }
                     }
                     kawa.storage.clear();
                 }
@@ -5488,9 +5552,9 @@ impl ConnectionH2 {
         if let Some(result) = self.enqueue_rst(stream_id, error, origin) {
             return result;
         }
-        self.discard_field_block(payload_len, discarded);
+        let result = self.discard_field_block(stream_id, payload_len, discarded);
         self.record_refusal_for_backpressure();
-        MuxResult::Continue
+        result
     }
 
     /// Extend [`Self::flood_refused_streams`] with `stream_id`, refused under
@@ -5513,34 +5577,54 @@ impl ConnectionH2 {
         self.flood_refused_streams = Some(run);
     }
 
-    /// Read and drop a HEADERS payload of `payload_len` bytes through
-    /// `H2State::Discard`, decoding its field block on the way so the HPACK
-    /// decoder stays in sync (RFC 9113 §4.3). Queues nothing.
-    fn discard_field_block(&mut self, payload_len: u32, discarded: DiscardedFieldBlock) {
+    /// Read the `payload_len` bytes of a HEADERS or CONTINUATION frame of
+    /// `stream_id` that is dropped through `H2State::Discard`, which decodes
+    /// its field block only to keep the HPACK dynamic table in sync (RFC
+    /// 9113 §4.3), then resumes normal reading. Queues nothing. A frame
+    /// without END_HEADERS leaves its fragment in
+    /// [`Self::pending_discarded_block`], so the CONTINUATION frames that
+    /// complete the block are discarded and decoded with it.
+    fn discard_field_block(
+        &mut self,
+        stream_id: StreamId,
+        payload_len: u32,
+        discarded: DiscardedFieldBlock,
+    ) -> MuxResult {
+        // A new block's first frame counts toward the block's size like an
+        // accepted one's (CVE-2024-27316), so its CONTINUATION frames are
+        // held to the same `max_header_list_size`; the whole frame payload
+        // stands in for the fragment, which it bounds.
+        if matches!(discarded, DiscardedFieldBlock::New { .. }) {
+            self.flood_detector.begin_header_block_if_new(payload_len);
+        }
         self.state = H2State::Discard;
         self.stream_table
             .set_expect_read(Some((H2StreamId::Zero, payload_len as usize)));
-        self.discarded_field_block = Some(discarded);
+        self.discarded_field_block = Some((stream_id, discarded));
+        MuxResult::Continue
     }
 
     /// Minimally process and drop the payload of the DATA or HEADERS frame
     /// whose `header` was just parsed, for a stream that is reset or being
-    /// reset (RFC 9113 §5.1): a field block still updates the HPACK decoder,
-    /// DATA still counts toward the connection flow-control window.
-    fn discard_frame_payload(&mut self, header: &FrameHeader) {
+    /// reset (RFC 9113 §5.1): a field block, with the CONTINUATION frames
+    /// completing it, still updates the HPACK decoder, DATA still counts
+    /// toward the connection flow-control window.
+    fn discard_frame_payload(&mut self, header: &FrameHeader) -> MuxResult {
         debug_assert!(
             matches!(header.frame_type, FrameType::Data | FrameType::Headers),
             "only DATA and HEADERS payloads are discarded per stream"
         );
         if header.frame_type == FrameType::Headers {
             self.discard_field_block(
+                header.stream_id,
                 header.payload_len,
                 DiscardedFieldBlock::New {
                     flags: header.flags,
                 },
-            );
+            )
         } else {
             self.skip_orphaned_data_payload(header.payload_len as usize, header.payload_len);
+            MuxResult::Continue
         }
     }
 
@@ -5567,8 +5651,7 @@ impl ConnectionH2 {
         if !matches!(result, MuxResult::Continue) {
             return result;
         }
-        self.discard_frame_payload(header);
-        MuxResult::Continue
+        self.discard_frame_payload(header)
     }
 
     /// RFC 9113 §5.1.2 SETTINGS back-pressure bookkeeping.
@@ -17145,6 +17228,649 @@ mod tests {
         assert!(
             frames.iter().any(|(kind, _, id, _)| *kind == 1 && *id == 1),
             "the request linked during the handshake must go out, got {frames:?}"
+        );
+    }
+
+    /// A backend stream 1 whose response is framed by `content-length: 3`,
+    /// its request sent and its response carrying 5 bytes of DATA, which
+    /// makes Sōzu reset it with PROTOCOL_ERROR (RFC 9113 §8.1.1). Returns the
+    /// fixture, ready for the frames the backend sends after the reset.
+    fn backend_stream_reset_for_its_content_length() -> LinkedBackend {
+        use std::io::Write;
+
+        let mut linked = backend_with_a_linked_stream(
+            H2State::Header,
+            BackendStatus::Connected,
+            Ready::READABLE | Ready::HUP | Ready::ERROR,
+        );
+        let LinkedBackend {
+            connection,
+            peer,
+            context,
+            router,
+            gid,
+            ..
+        } = &mut linked;
+        queue_request(context, *gid);
+        // Open on the client side, as a stream the router linked; `Link`
+        // carries no frontend token for `reset_stream` to end.
+        context.streams[*gid].state = StreamState::Link;
+        let request = drive_and_read_backend(connection, peer, context, router);
+        assert!(
+            peer_frames(&request)
+                .expect("whole frames")
+                .iter()
+                .any(|(kind, _, id, _)| *kind == 1 && *id == 1),
+            "premise: the request went out on stream 1, got {request:?}"
+        );
+        // :status 200 (static index 8), then `content-length: 3` as a
+        // literal without indexing.
+        let mut head = vec![0x88, 0x00, 14];
+        head.extend_from_slice(b"content-length");
+        head.extend_from_slice(&[1, b'3']);
+        let mut wire = orphan_frame(1, 0x4, 1, head.len() as u32, &head);
+        wire.extend(orphan_frame(0, 0, 1, 5, b"hello"));
+        peer.write_all(&wire).expect("loopback write must complete");
+        let reset = drive_and_read_backend(connection, peer, context, router);
+        let reset = peer_frames(&reset).expect("whole frames");
+        assert!(
+            reset
+                .iter()
+                .any(|(kind, _, id, payload)| *kind == 3 && *id == 1 && payload == &[0, 0, 0, 1]),
+            "premise: stream 1 is reset with PROTOCOL_ERROR, got {reset:?}"
+        );
+        linked
+    }
+
+    /// The trailer block adding `x-dyn: one` to the HPACK dynamic table
+    /// (literal with incremental indexing) on stream 1, in one HEADERS frame
+    /// or, with `split`, a HEADERS frame without END_HEADERS and a
+    /// CONTINUATION frame (RFC 9113 §6.10).
+    fn dynamic_trailer_block(split: bool) -> Vec<u8> {
+        let mut trailer = vec![0x40, 5];
+        trailer.extend_from_slice(b"x-dyn");
+        trailer.extend_from_slice(&[3]);
+        trailer.extend_from_slice(b"one");
+        if split {
+            let (first, rest) = trailer.split_at(4);
+            let mut wire = orphan_frame(1, 0x1, 1, first.len() as u32, first);
+            wire.extend(orphan_frame(9, 0x4, 1, rest.len() as u32, rest));
+            wire
+        } else {
+            orphan_frame(1, 0x4 | 0x1, 1, trailer.len() as u32, &trailer)
+        }
+    }
+
+    /// RFC 9113 §5.1: after sozu resets a backend stream, the backend may
+    /// still send frames it queued before reading the RST_STREAM, and sozu
+    /// MUST ignore them. Here the backend sends a trailer block, in one
+    /// HEADERS frame or split over a CONTINUATION frame, and another DATA
+    /// frame on the reset stream. The trailer block adds `x-dyn: one` to the
+    /// HPACK dynamic table, and the response on stream 3 refers to that
+    /// entry, so it parses only if the ignored block was decoded whole
+    /// (§4.3). What the backend had in flight counts no glitch.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::handle_header_state`, drop the
+    /// `was_reset_locally` branch: the trailer HEADERS is answered
+    /// GOAWAY(STREAM_CLOSED); or, in the `H2State::Discard` arm,
+    /// drop the `pending_discarded_block` store: the CONTINUATION is
+    /// answered GOAWAY(PROTOCOL_ERROR) as standalone.
+    #[test]
+    fn frames_on_a_backend_stream_sozu_reset_are_ignored() {
+        use std::io::Write;
+
+        for split in [true, false] {
+            let LinkedBackend {
+                _pool,
+                mut connection,
+                mut peer,
+                mut context,
+                mut router,
+                ..
+            } = backend_stream_reset_for_its_content_length();
+            let glitches = connection.core.flood_detector.glitch_count();
+
+            let mut wire = dynamic_trailer_block(split);
+            wire.extend(orphan_frame(0, 0x1, 1, 2, b"zz"));
+            peer.write_all(&wire).expect("loopback write must complete");
+            let after =
+                drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+            let after = peer_frames(&after).expect("whole frames");
+            assert!(
+                !after.iter().any(|(kind, _, _, _)| *kind == 7 || *kind == 3),
+                "split={split}: frames on the reset stream are ignored: no GOAWAY, no \
+                 RST_STREAM, got {after:?}"
+            );
+            assert!(
+                matches!(connection.core.state, H2State::Header),
+                "split={split}: the shared connection stays up, got {:?}",
+                connection.core.state
+            );
+            assert_eq!(
+                connection.core.flood_detector.glitch_count(),
+                glitches,
+                "split={split}: what the backend had in flight counts no glitch"
+            );
+
+            // A second stream, answered with `:status 200` and the dynamic
+            // entry the ignored trailer block added (index 62).
+            let second = context
+                .create_stream(Ulid::generate(), 1 << 16)
+                .expect("test context must create a stream");
+            assert!(
+                connection.start_stream(second, &mut context),
+                "the backend connection accepts a second stream"
+            );
+            queue_request(&mut context, second);
+            context.streams[second].state = StreamState::Link;
+            let request =
+                drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+            assert!(
+                peer_frames(&request)
+                    .expect("whole frames")
+                    .iter()
+                    .any(|(kind, _, id, _)| *kind == 1 && *id == 3),
+                "premise: the second request went out on stream 3, got {request:?}"
+            );
+            peer.write_all(&orphan_frame(1, 0x4 | 0x1, 3, 2, &[0x88, 0xbe]))
+                .expect("loopback write must complete");
+            let last =
+                drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+            let last = peer_frames(&last).expect("whole frames");
+            assert!(
+                !last.iter().any(|(kind, _, _, _)| *kind == 7),
+                "split={split}: the second response decodes against the same dynamic table, \
+                 got {last:?}"
+            );
+            let buffer = context.streams[second].back.storage.buffer();
+            let has_dynamic_field = context.streams[second].back.blocks.iter().any(|block| {
+                matches!(block, kawa::Block::Header(kawa::Pair { key, val })
+                    if key.data(buffer) == b"x-dyn" && val.data(buffer) == b"one")
+            });
+            assert!(
+                has_dynamic_field,
+                "split={split}: the second response carries the field of the dynamic entry"
+            );
+        }
+    }
+
+    /// DATA a backend sends on a stream Sōzu reset counts no glitch while it
+    /// fits the stream's receive window, the 65 535 bytes Sōzu advertised
+    /// and keeps crediting back: the backend may have had that much in
+    /// flight when it read the reset (RFC 9113 §6.9). DATA beyond it counts
+    /// one glitch per frame.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::handle_header_state`, count a glitch for
+    /// every frame ignored on a reset stream: `in-flight DATA counts no
+    /// glitch`.
+    #[test]
+    fn data_on_a_reset_backend_stream_counts_a_glitch_beyond_its_window_only() {
+        use std::io::Write;
+
+        let LinkedBackend {
+            _pool,
+            mut connection,
+            mut peer,
+            mut context,
+            mut router,
+            ..
+        } = backend_stream_reset_for_its_content_length();
+        let glitches = connection.core.flood_detector.glitch_count();
+        // 5 bytes already arrived before the reset; four 16 000-byte frames
+        // still fit in the 65 535-byte window.
+        let chunk = vec![b'd'; 16_000];
+        let mut wire = Vec::new();
+        for _ in 0..4 {
+            wire.extend(orphan_frame(0, 0, 1, chunk.len() as u32, &chunk));
+        }
+        peer.write_all(&wire).expect("loopback write must complete");
+        drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+        assert_eq!(
+            connection.core.flood_detector.glitch_count(),
+            glitches,
+            "in-flight DATA counts no glitch"
+        );
+
+        peer.write_all(&orphan_frame(0, 0, 1, chunk.len() as u32, &chunk))
+            .expect("loopback write must complete");
+        let after = drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+        assert_eq!(
+            connection.core.flood_detector.glitch_count(),
+            glitches + 1,
+            "DATA beyond the stream's window counts a glitch"
+        );
+        assert!(
+            !peer_frames(&after)
+                .expect("whole frames")
+                .iter()
+                .any(|(kind, _, _, _)| *kind == 7 || *kind == 3),
+            "it is still ignored, not answered"
+        );
+    }
+
+    /// Header blocks a backend sends on a stream Sōzu reset count no glitch
+    /// for the first two, a trailer section or an interim and a final
+    /// response it may have had in flight (RFC 9113 §8.1), and one glitch
+    /// each beyond: a peer repeating blocks on a reset stream trips the
+    /// glitch limit and the connection ends with GOAWAY(ENHANCE_YOUR_CALM),
+    /// instead of having every block HPACK-decoded for free.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::handle_header_state`, count every header
+    /// block on a reset stream as in flight: no GOAWAY ever comes.
+    #[test]
+    fn header_blocks_on_a_reset_backend_stream_beyond_two_count_glitches() {
+        use std::io::Write;
+
+        let LinkedBackend {
+            _pool,
+            mut connection,
+            mut peer,
+            mut context,
+            mut router,
+            ..
+        } = backend_stream_reset_for_its_content_length();
+        // Each small write must reach the connection before the next drive,
+        // not wait behind Nagle's algorithm for the previous one's ACK.
+        peer.set_nodelay(true).expect("TCP_NODELAY must apply");
+        // An explicit glitch limit, so the flood below trips it whatever the
+        // default (`DEFAULT_MAX_GLITCH_COUNT`) is.
+        connection.core.flood_detector = h2_flood_detector::H2FloodDetector::new(
+            H2FloodConfig::from_optional(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(100),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            connection.core.now,
+        );
+        let glitches = connection.core.flood_detector.glitch_count();
+        // `:status 200`, alone, in one HEADERS frame ending the block.
+        let block = || orphan_frame(1, 0x4, 1, 1, &[0x88]);
+
+        let mut wire = block();
+        wire.extend(block());
+        peer.write_all(&wire).expect("loopback write must complete");
+        drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+        assert_eq!(
+            connection.core.flood_detector.glitch_count(),
+            glitches,
+            "two header blocks may be in flight"
+        );
+
+        peer.write_all(&block())
+            .expect("loopback write must complete");
+        drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+        assert_eq!(
+            connection.core.flood_detector.glitch_count(),
+            glitches + 1,
+            "a third header block counts a glitch"
+        );
+
+        let mut received = Vec::new();
+        for _ in 0..20 {
+            let mut wire = Vec::new();
+            for _ in 0..100 {
+                wire.extend(block());
+            }
+            if peer.write_all(&wire).is_err() {
+                break;
+            }
+            received.extend(drive_and_read_backend(
+                &mut connection,
+                &mut peer,
+                &mut context,
+                &mut router,
+            ));
+            if peer_frames(&received)
+                .map(|frames| frames.iter().any(|(kind, _, _, _)| *kind == 7))
+                .unwrap_or(false)
+            {
+                break;
+            }
+        }
+        let frames = peer_frames(&received).expect("whole frames");
+        assert!(
+            frames.iter().any(|(kind, _, _, payload)| *kind == 7
+                && payload.get(4..8) == Some(&[0, 0, 0, 0xb][..])),
+            "repeated header blocks end the connection with GOAWAY(ENHANCE_YOUR_CALM), got {frames:?}"
+        );
+    }
+
+    /// Empty DATA frames without END_STREAM on a stream Sōzu reset count
+    /// toward the empty-DATA flood limit as on a live stream
+    /// (CVE-2019-9518): they carry no payload to charge against the stream's
+    /// window, so without it a peer could send them for free. A flood of
+    /// them ends the connection with GOAWAY(ENHANCE_YOUR_CALM).
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::handle_header_state`, drop the
+    /// `record_empty_data_frame` call of the `was_reset_locally` branch: no
+    /// GOAWAY ever comes.
+    #[test]
+    fn empty_data_frames_on_a_reset_backend_stream_count_toward_the_flood_limit() {
+        use std::io::Write;
+
+        let LinkedBackend {
+            _pool,
+            mut connection,
+            mut peer,
+            mut context,
+            mut router,
+            ..
+        } = backend_stream_reset_for_its_content_length();
+        peer.set_nodelay(true).expect("TCP_NODELAY must apply");
+        // An explicit empty-DATA limit, so the flood below trips it whatever the
+        // default (`DEFAULT_MAX_EMPTY_DATA_PER_WINDOW`) is. The glitch limit
+        // stays the default: the GOAWAY must come from the empty-DATA count.
+        connection.core.flood_detector = h2_flood_detector::H2FloodDetector::new(
+            H2FloodConfig::from_optional(
+                None,
+                None,
+                None,
+                Some(100),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            connection.core.now,
+        );
+        let mut received = Vec::new();
+        for _ in 0..50 {
+            let mut wire = Vec::new();
+            for _ in 0..100 {
+                wire.extend(orphan_frame(0, 0, 1, 0, b""));
+            }
+            if peer.write_all(&wire).is_err() {
+                break;
+            }
+            received.extend(drive_and_read_backend(
+                &mut connection,
+                &mut peer,
+                &mut context,
+                &mut router,
+            ));
+            if peer_frames(&received)
+                .map(|frames| frames.iter().any(|(kind, _, _, _)| *kind == 7))
+                .unwrap_or(false)
+            {
+                break;
+            }
+        }
+        let frames = peer_frames(&received).expect("whole frames");
+        assert!(
+            frames.iter().any(|(kind, _, _, payload)| *kind == 7
+                && payload.get(4..8) == Some(&[0, 0, 0, 0xb][..])),
+            "a flood of empty DATA frames ends the connection with \
+             GOAWAY(ENHANCE_YOUR_CALM), got {frames:?}"
+        );
+    }
+
+    /// A backend stream Sōzu reset from its write pass, because its request
+    /// failed after its head left, stays tracked until its end: DATA the
+    /// backend then sends on it is ignored (RFC 9113 §5.1), never queued for
+    /// the client nor counted against the response.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::handle_header_state`, drop the
+    /// `was_reset_locally` branch: the DATA reaches the stream and is counted
+    /// in `back_data_received`.
+    #[test]
+    fn data_on_a_tracked_backend_stream_sozu_reset_is_ignored() {
+        use std::io::Write;
+
+        let LinkedBackend {
+            _pool,
+            mut connection,
+            mut peer,
+            mut context,
+            mut router,
+            gid,
+        } = backend_with_a_linked_stream(
+            H2State::Header,
+            BackendStatus::Connected,
+            Ready::READABLE | Ready::HUP | Ready::ERROR,
+        );
+        // A request whose body is still to come: its head leaves, the
+        // stream stays open on the request side.
+        queue_request(&mut context, gid);
+        let front = &mut context.streams[gid].front;
+        if let Some(kawa::Block::Flags(flags)) = front.blocks.back_mut() {
+            flags.end_stream = false;
+        }
+        front.body_size = kawa::BodySize::Chunked;
+        front.parsing_phase = kawa::ParsingPhase::Chunks { first: true };
+        context.streams[gid].state = StreamState::Link;
+        drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+        // The request side then fails: the write pass resets the stream and
+        // keeps it tracked.
+        context.streams[gid]
+            .front
+            .parsing_phase
+            .error("request failed".into());
+        connection.core.readiness.arm_writable();
+        let reset = drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+        assert!(
+            peer_frames(&reset)
+                .expect("whole frames")
+                .iter()
+                .any(|(kind, _, id, _)| *kind == 3 && *id == 1),
+            "premise: the write pass resets stream 1, got {reset:?}"
+        );
+        assert!(
+            connection.core.stream_table.get(1).is_some()
+                && connection.core.stream_table.rst_sent_contains(1),
+            "premise: the reset stream is still tracked"
+        );
+
+        peer.write_all(&orphan_frame(0, 0, 1, 5, b"hello"))
+            .expect("loopback write must complete");
+        let after = drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+        assert_eq!(
+            context.streams[gid].back_data_received, 0,
+            "the DATA is not counted against the response"
+        );
+        assert!(
+            !context.streams[gid]
+                .back
+                .blocks
+                .iter()
+                .any(|block| matches!(block, kawa::Block::Chunk(_))),
+            "the DATA is not queued for the client"
+        );
+        assert!(
+            !peer_frames(&after)
+                .expect("whole frames")
+                .iter()
+                .any(|(kind, _, _, _)| *kind == 7),
+            "the connection stays up"
+        );
+    }
+
+    /// The client-facing side of RFC 9113 §5.1: a request framed by
+    /// `content-length: 3` whose DATA carries 5 bytes is reset by Sōzu
+    /// (§8.1.1); the DATA and the trailer block the client had already sent
+    /// on that stream are ignored, and the connection stays up.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::handle_header_state`, drop the
+    /// `was_reset_locally` branch: the trailer HEADERS is answered
+    /// GOAWAY(STREAM_CLOSED).
+    #[test]
+    fn frames_on_a_client_stream_sozu_reset_are_ignored() {
+        use std::io::Write;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+        let (mut connection, mut peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        connection.core.state = H2State::Header;
+        connection
+            .core
+            .stream_table
+            .set_expect_read(Some((H2StreamId::Zero, 9)));
+        let block = crate::protocol::mux::hpack::Encoder::new().encode([
+            (&b":method"[..], &b"POST"[..]),
+            (&b":scheme"[..], &b"https"[..]),
+            (&b":authority"[..], &b"example.com"[..]),
+            (&b":path"[..], &b"/upload"[..]),
+            (&b"content-length"[..], &b"3"[..]),
+        ]);
+        let mut wire = orphan_frame(1, parser::FLAG_END_HEADERS, 1, block.len() as u32, &block);
+        wire.extend(orphan_frame(0, 0, 1, 5, b"hello"));
+        peer.write_all(&wire).expect("loopback write must complete");
+        let reset = drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+        let reset = peer_frames(&reset).expect("whole frames");
+        assert!(
+            reset
+                .iter()
+                .any(|(kind, _, id, payload)| *kind == 3 && *id == 1 && payload == &[0, 0, 0, 1]),
+            "premise: stream 1 is reset with PROTOCOL_ERROR, got {reset:?}"
+        );
+
+        let mut wire = orphan_frame(0, 0, 1, 2, b"zz");
+        wire.extend(dynamic_trailer_block(false));
+        peer.write_all(&wire).expect("loopback write must complete");
+        let after = drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+        let after = peer_frames(&after).expect("whole frames");
+        assert!(
+            !after.iter().any(|(kind, _, _, _)| *kind == 7 || *kind == 3),
+            "frames on the reset stream are ignored: no GOAWAY, no RST_STREAM, got {after:?}"
+        );
+        assert!(
+            matches!(connection.core.state, H2State::Header),
+            "the client connection stays up, got {:?}",
+            connection.core.state
+        );
+    }
+
+    /// A stream Sōzu refuses at its HEADERS frame (here because
+    /// SETTINGS_MAX_CONCURRENT_STREAMS is reached) is answered
+    /// RST_STREAM(REFUSED_STREAM) and its field block discarded, and the
+    /// CONTINUATION frame completing that block (RFC 9113 §6.10) is
+    /// discarded with it, not taken for a standalone CONTINUATION.
+    ///
+    /// TO SEE THIS RED: in the `H2State::Discard` arm of
+    /// [`ConnectionH2::handle_read`], drop the `pending_discarded_block`
+    /// store: the CONTINUATION is answered GOAWAY(PROTOCOL_ERROR).
+    #[test]
+    fn a_continuation_of_a_refused_header_block_is_discarded_with_it() {
+        use std::io::Write;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+        let (mut connection, mut peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        connection.core.state = H2State::Header;
+        connection
+            .core
+            .stream_table
+            .set_expect_read(Some((H2StreamId::Zero, 9)));
+        connection
+            .core
+            .local_settings
+            .settings_max_concurrent_streams = 0;
+        let block = crate::protocol::mux::hpack::Encoder::new().encode([
+            (&b":method"[..], &b"GET"[..]),
+            (&b":scheme"[..], &b"https"[..]),
+            (&b":authority"[..], &b"example.com"[..]),
+            (&b":path"[..], &b"/"[..]),
+        ]);
+        let (first, rest) = block.split_at(block.len() / 2);
+        let mut wire = orphan_frame(1, parser::FLAG_END_STREAM, 1, first.len() as u32, first);
+        wire.extend(orphan_frame(
+            9,
+            parser::FLAG_END_HEADERS,
+            1,
+            rest.len() as u32,
+            rest,
+        ));
+        peer.write_all(&wire).expect("loopback write must complete");
+        let answer = drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+        let answer = peer_frames(&answer).expect("whole frames");
+        assert!(
+            answer
+                .iter()
+                .any(|(kind, _, id, payload)| *kind == 3 && *id == 1 && payload == &[0, 0, 0, 7]),
+            "the stream is refused, got {answer:?}"
+        );
+        assert!(
+            !answer.iter().any(|(kind, _, _, _)| *kind == 7),
+            "the CONTINUATION is discarded with its block, got {answer:?}"
+        );
+        assert!(
+            matches!(connection.core.state, H2State::Header),
+            "the client connection stays up, got {:?}",
+            connection.core.state
+        );
+    }
+
+    /// A refused header block is held to `max_header_list_size` like an
+    /// accepted one, its first fragment included: a 16 000-byte HEADERS frame
+    /// and four 12 500-byte CONTINUATION frames exceed the 65 536-byte limit
+    /// only with that first fragment, and end the connection with
+    /// GOAWAY(ENHANCE_YOUR_CALM) (CVE-2024-27316).
+    ///
+    /// TO SEE THIS RED: in [`ConnectionH2::discard_field_block`], drop the
+    /// `begin_header_block_if_new` call: the block is read to its end.
+    #[test]
+    fn a_refused_header_block_counts_its_first_fragment_toward_its_size() {
+        use std::io::Write;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+        let (mut connection, mut peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        connection.core.state = H2State::Header;
+        connection
+            .core
+            .stream_table
+            .set_expect_read(Some((H2StreamId::Zero, 9)));
+        connection
+            .core
+            .local_settings
+            .settings_max_concurrent_streams = 0;
+        let first = vec![0x88; 16_000];
+        let mut wire = orphan_frame(1, 0, 1, first.len() as u32, &first);
+        let rest = vec![0x88; 12_500];
+        for _ in 0..4 {
+            wire.extend(orphan_frame(9, 0, 1, rest.len() as u32, &rest));
+        }
+        // The peer cannot write all of it before the connection reads, so
+        // write it from a thread while the connection is driven.
+        let mut writer = peer.try_clone().expect("the peer socket must clone");
+        let sender = std::thread::spawn(move || {
+            let _ = writer.write_all(&wire);
+        });
+        let mut received = Vec::new();
+        for _ in 0..8 {
+            received.extend(drive_and_read_backend(
+                &mut connection,
+                &mut peer,
+                &mut context,
+                &mut router,
+            ));
+        }
+        let _ = sender.join();
+        let frames = peer_frames(&received).expect("whole frames");
+        assert!(
+            frames.iter().any(|(kind, _, _, payload)| *kind == 7
+                && payload.get(4..8) == Some(&[0, 0, 0, 0xb][..])),
+            "the oversized refused block ends the connection with GOAWAY(ENHANCE_YOUR_CALM), \
+             got {frames:?}"
         );
     }
 

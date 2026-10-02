@@ -416,7 +416,9 @@ call sites — not inside `check_flood`'s chain.
 `glitch_count` is incremented for protocol anomalies that don't fit a specific
 flood pattern but indicate abuse in aggregate:
 
-- Frames on closed streams (RST_STREAM, WINDOW_UPDATE, DATA on already-closed streams)
+- Frames on closed streams (RST_STREAM, WINDOW_UPDATE, DATA on already-closed streams;
+  on a stream this endpoint reset, header blocks beyond two and DATA beyond its
+  receive window)
 - Other minor protocol violations that don't warrant an immediate GOAWAY
 
 Unlike the rate-based counters, `glitch_count` uses the same half-decay window,
@@ -1233,11 +1235,28 @@ Key decisions in this method:
   through `reset_stream_and_discard_frame`, and the payload is still minimally
   processed through `Discard` (HPACK decoded, DATA credited to the connection
   window). Every other stream on the connection carries on
-- Frames on a stream this endpoint reset are ignored (§5.1) after the same
-  minimal processing: `H2StreamTable::was_reset_locally` covers `rst_sent` and
-  the last `RECENTLY_RESET_CAPACITY` (256) retired reset streams. A stream
-  closed by END_STREAM in both directions keeps the connection error
-  STREAM_CLOSED for HEADERS, and the stream error for DATA (§6.1)
+- DATA and HEADERS frames on a stream this endpoint reset are ignored (§5.1)
+  after the same minimal processing (`ConnectionH2::discard_frame_payload`),
+  whether the stream is still tracked or retired:
+  `H2StreamTable::was_reset_locally` covers `rst_sent` and the last
+  `RECENTLY_RESET_CAPACITY` (256) retired reset streams. What the peer may
+  have had in flight counts no glitch: two header blocks per stream, a
+  trailer section or an interim and a final response
+  (`H2StreamTable::charge_reset_stream_header_block`), and DATA within the
+  stream's initial receive window
+  (`H2StreamTable::charge_reset_stream_data`); each header block beyond two,
+  and each DATA frame beyond the window, counts one. An empty DATA frame
+  without END_STREAM counts toward the empty-DATA flood limit as on a live
+  stream (CVE-2019-9518). Allowances are dropped with their stream's id from
+  the ring, and held for at most `RESET_ALLOWANCES_CAPACITY` (512) streams,
+  since a stream refused or reset untracked stays in `rst_sent` and never
+  enters the ring. On a backend connection they are bounded by the backend's
+  own stream concurrency too, not by the emitted-RST cap, which the CANCEL
+  `ConnectionH2::end_stream` sends for a client that went away does not feed. WINDOW_UPDATE, PRIORITY and
+  RST_STREAM keep their own handling, and so does every other frame type (a
+  PUSH_PROMISE is still a connection error). A stream closed by END_STREAM in
+  both directions keeps the connection error STREAM_CLOSED for HEADERS, and
+  the stream error for DATA (§6.1)
 - A self-dependent PRIORITY (RFC 7540 §5.3.1) resets an open stream and
   closes the connection on an idle one, since RST_STREAM must not name an
   idle stream (RFC 9113 §6.4). A PRIORITY frame whose length is not 5 is a
@@ -1245,9 +1264,12 @@ Key decisions in this method:
   dropped otherwise; every other frame size error stays a connection error
   (§4.2). Each dropped frame counts as a glitch, and each RST_STREAM sent
   feeds the emitted-RST accounting
-- A dropped HEADERS frame without END_HEADERS is not decoded, so the
-  CONTINUATION that follows is a connection error, whether the HEADERS
-  triggered the stream error or arrived late on a reset stream
+- A dropped header block without END_HEADERS, whether it triggered a stream
+  error, arrived on a reset stream or was refused, keeps its fragment in
+  `ConnectionH2::pending_discarded_block`: only a CONTINUATION frame on the
+  same stream may follow (§6.10), it is discarded with it, and the block is
+  decoded whole for HPACK (§4.3). The first fragment counts toward
+  `max_header_list_size` like an accepted block's
 
 ### handle_continuation_header_state()
 
