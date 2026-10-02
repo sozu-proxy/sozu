@@ -541,7 +541,7 @@ impl Peer<'_> {
                         self.counters[1].fetch_add(1, Ordering::Relaxed);
                     }
                     0x04 if flags & 0x01 == 0 => {
-                        for setting in payload.chunks_exact(6) {
+                        for setting in payload.as_chunks::<6>().0 {
                             if u16::from_be_bytes([setting[0], setting[1]]) == 0x4 {
                                 let value = i64::from(u32::from_be_bytes([
                                     setting[2], setting[3], setting[4], setting[5],

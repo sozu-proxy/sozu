@@ -8,7 +8,7 @@
 
 use std::{
     cell::RefCell,
-    io::{ErrorKind, Read},
+    io::{ErrorKind, Read, Write},
     net::SocketAddr,
     rc::Rc,
     time::Instant,
@@ -65,7 +65,8 @@ macro_rules! log_context {
 enum HandshakeReadFault {
     /// `read_tls` answered `Ok(0)`: the peer closed during the handshake.
     Closed,
-    /// `read_tls` failed with something other than `WouldBlock`.
+    /// `read_tls` failed with something other than `WouldBlock` or
+    /// `Interrupted`.
     ReadTls(std::io::Error),
     /// `process_new_packets` rejected what `read_tls` delivered.
     ProcessPackets(RustlsError),
@@ -85,6 +86,12 @@ enum HandshakeReadFault {
 ///   delivered is still processed;
 /// - `wants_read()` turning false: rustls holds plaintext, or has a flight to
 ///   send first (`rustls-0.23.45/src/common_state.rs:674-684`).
+///
+/// A `recv` the kernel interrupted (`EINTR`) is none of these: rustls hands
+/// it back from `read_tls`, and it says nothing about the socket, so it is
+/// retried at once, as `flush_tls` (`lib/src/socket.rs`) retries an
+/// interrupted write. The probe only records a successful read, so the retry
+/// leaves `was_short` exact.
 ///
 /// A TLS 1.3 server `wants_read()` again as soon as its own flight is queued,
 /// because it may already send application data; without the stop on a short
@@ -129,7 +136,13 @@ fn handshake_read<R: Read>(
     let mut can_read = true;
     while can_read && session.wants_read() {
         let mut probe = ShortReadProbe::new(&mut *stream);
-        match session.read_tls(&mut probe) {
+        let read = loop {
+            match session.read_tls(&mut probe) {
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                read => break read,
+            }
+        };
+        match read {
             Ok(0) => return Err(HandshakeReadFault::Closed),
             Ok(_) => {
                 if probe.was_short() {
@@ -164,6 +177,25 @@ fn handshake_read<R: Read>(
         "the handshake stopped reading on an empty queue but kept READABLE"
     );
     Ok(())
+}
+
+/// One `write_tls` of [`TlsHandshake::writable`], generic over the transport
+/// so tests can interrupt it.
+///
+/// A write the kernel interrupted (`EINTR`) is retried at once, as
+/// `flush_tls` (`lib/src/socket.rs`) does after the handshake: it says nothing
+/// about the socket, so it must neither stop the pump as `WouldBlock`, which
+/// no edge would follow, nor close the session as an error.
+fn handshake_write<W: Write>(
+    session: &mut ServerConnection,
+    stream: &mut W,
+) -> std::io::Result<usize> {
+    loop {
+        match session.write_tls(stream) {
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            written => break written,
+        }
+    }
 }
 
 pub enum TlsState {
@@ -383,7 +415,7 @@ impl TlsHandshake {
             if self.session.wants_write() && can_write {
                 can_work = true;
 
-                match self.session.write_tls(&mut self.stream) {
+                match handshake_write(&mut self.session, &mut self.stream) {
                     Ok(_) => {}
                     Err(e) => match e.kind() {
                         ErrorKind::WouldBlock => {
@@ -696,7 +728,9 @@ mod tests {
     use mio::{Token, net::TcpStream};
     use rusty_ulid::Ulid;
 
-    use super::{HandshakeReadFault, TlsHandshake, handshake_failure_reason, handshake_read};
+    use super::{
+        HandshakeReadFault, TlsHandshake, handshake_failure_reason, handshake_read, handshake_write,
+    };
     use crate::{
         Ready, SessionResult, metrics::names, protocol::SessionState, timer::TimeoutContainer,
     };
@@ -911,6 +945,117 @@ mod tests {
         );
         assert!(!event.is_readable());
         assert!(server.wants_write(), "the whole ClientHello was processed");
+    }
+
+    /// A transport whose first call, read or write, is interrupted (`EINTR`)
+    /// and whose later calls reach `inner`.
+    struct InterruptedOnce<T> {
+        inner: T,
+        calls: usize,
+    }
+
+    impl<T> InterruptedOnce<T> {
+        fn new(inner: T) -> Self {
+            InterruptedOnce { inner, calls: 0 }
+        }
+
+        fn interrupt_first(&mut self) -> std::io::Result<()> {
+            self.calls += 1;
+            if self.calls == 1 {
+                return Err(ErrorKind::Interrupted.into());
+            }
+            Ok(())
+        }
+    }
+
+    impl<T: std::io::Read> std::io::Read for InterruptedOnce<T> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.interrupt_first()?;
+            self.inner.read(buf)
+        }
+    }
+
+    impl<T: std::io::Write> std::io::Write for InterruptedOnce<T> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.interrupt_first()?;
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    /// An interrupted `recv` during the handshake is retried, not reported as
+    /// a `ReadTls` fault that closes the session: it says nothing about the
+    /// socket. The retry reads the ClientHello short, which still drops
+    /// READABLE.
+    ///
+    /// TO SEE THIS RED: remove the `Interrupted` arm of the `read_tls` retry
+    /// loop in `handshake_read`.
+    #[test]
+    fn an_interrupted_handshake_read_is_retried() {
+        use crate::socket::rustls_read_tests::{CountingTransport, fresh_pair};
+
+        let (mut server, mut client) = fresh_pair(Vec::new());
+        let mut transport = InterruptedOnce::new(CountingTransport {
+            wire: flight(&mut client).into_iter().collect(),
+            ..Default::default()
+        });
+
+        let mut event = Ready::READABLE;
+        handshake_read(&mut server, &mut transport, &mut event)
+            .expect("an interrupted read must be retried, not reported");
+
+        assert_eq!(transport.calls, 2, "one interrupted read, one retry");
+        assert_eq!(
+            (transport.inner.reads, transport.inner.eagains),
+            (1, 0),
+            "the retry is the only recv to reach the socket"
+        );
+        assert!(
+            transport.inner.wire.is_empty(),
+            "the retry read the ClientHello"
+        );
+        assert!(
+            !event.is_readable(),
+            "the retried read was short: READABLE must go"
+        );
+        assert!(server.wants_write(), "the whole ClientHello was processed");
+    }
+
+    /// An interrupted handshake write is retried, not reported as an error
+    /// that closes the session.
+    ///
+    /// TO SEE THIS RED: remove the `Interrupted` arm of the retry loop in
+    /// `handshake_write`.
+    #[test]
+    fn an_interrupted_handshake_write_is_retried() {
+        use crate::socket::rustls_read_tests::fresh_pair;
+
+        let (mut server, mut client) = fresh_pair(Vec::new());
+        let hello = flight(&mut client);
+        server
+            .read_tls(&mut std::io::Cursor::new(hello))
+            .expect("the ClientHello must be readable from memory");
+        server
+            .process_new_packets()
+            .expect("the ClientHello must process cleanly");
+        assert!(server.wants_write(), "premise: the server flight is queued");
+        let mut transport = InterruptedOnce::new(Vec::new());
+
+        let written = handshake_write(&mut server, &mut transport)
+            .expect("an interrupted write must be retried, not reported");
+
+        assert_eq!(transport.calls, 2, "one interrupted write, one retry");
+        assert!(written > 0 && transport.inner.len() == written);
+        let mut wire = transport.inner;
+        wire.extend(flight(&mut server));
+        deliver(&mut client, &wire);
+        assert!(
+            client.wants_write(),
+            "the client got the whole server flight and answers it"
+        );
     }
 
     /// A client sends `hello_len` bytes of its ClientHello, then its FIN, and

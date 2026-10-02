@@ -23959,7 +23959,9 @@ mod tests {
             .flow_control
             .drain_window_updates_into(&mut buf);
         let grants: Vec<(u32, u32)> = buf[..written]
-            .chunks_exact(13)
+            .as_chunks::<13>()
+            .0
+            .iter()
             .map(|frame| {
                 (
                     u32::from_be_bytes(frame[5..9].try_into().unwrap()),

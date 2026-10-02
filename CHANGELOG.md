@@ -3946,7 +3946,10 @@
     first linked to a backend and no longer re-armed on each re-link, so failover cannot run for
     `max_connection_attempts × connect_timeout`. When it expires during failover the request is
     answered `504` (`client_timeout_during_response`). Keep `connect_timeout` well below
-    `front_timeout / max_connection_attempts`.
+    `front_timeout / max_connection_attempts`. On an HTTP/2 frontend the timer is per connection:
+    the first link of every new stream and ordinary frame activity re-arm it, so on a busy HTTP/2
+    connection failover is bounded only by `max_connection_attempts × connect_timeout` (15 s with
+    the defaults), not by `front_timeout`.
 
   **Status change for alerting:** a request whose every attempted backend is unreachable (connect
   timeout or refused) is now answered `503`; a connect timeout used to answer `504`. A request
@@ -3971,6 +3974,14 @@
   fallback, runtime changes), the `connect_outcome_tests` and `exclusion_tests` unit tests, and the
   `max_connection_attempts` config and state tests.
 
+- **`chore(clippy)`: `cargo clippy --all-targets --all-features -- -D warnings` passes on Rust
+  1.98 and newer.** Their `clippy::chunks_exact_to_as_chunks` lint rejects `chunks_exact` with a
+  constant size. The three hits, the `drain_window_updates_into` unit test in
+  `lib/src/protocol/mux/h2.rs` and the SETTINGS parsers of the `RawH2ResponseBackend` e2e mock and
+  the `h2_window_update_tests` peer, now use `as_chunks::<N>()` (stable since 1.88, below the
+  1.93.1 MSRV) and ignore the remainder exactly as `chunks_exact` did. Test and mock code only, no
+  behaviour change.
+
 - **`fix(mux-h2)`: forward a response to HEAD with a non-zero `content-length` and END_STREAM on
   its HEADERS ([#1791](https://github.com/sozu-proxy/sozu/issues/1791)).** `pkawa::handle_header`
   (`lib/src/protocol/mux/pkawa.rs`) refused an H2 backend response whose HEADERS frame carried
@@ -3987,6 +3998,16 @@
   (`e2e/src/tests/h2_security_header_injection.rs`): HEAD with and without a `content-length`,
   and the GET rejection, for an H1 and an H2 client.
 
+- **`fix(rustls)`: an interrupted TLS handshake read or write is retried.** `handshake_read` and
+  the write pump of `TlsHandshake::writable` (`lib/src/protocol/rustls.rs`) now retry a `read_tls`
+  or `write_tls` the kernel interrupted (`EINTR`), as `flush_tls` does after the handshake since
+  [#1795](https://github.com/sozu-proxy/sozu/pull/1795); they used to log `Could not perform
+  handshake` and close a healthy session. Only the syscall is retried: the readiness, the
+  short-read probe and the reset counters are unchanged. The handshake write moves into
+  `handshake_write`, generic over the transport like `handshake_read`. Covered by
+  `an_interrupted_handshake_read_is_retried` and `an_interrupted_handshake_write_is_retried`
+  ([#1799](https://github.com/sozu-proxy/sozu/issues/1799)).
+
 - **`fix(socket)`: retry interrupted plain TCP reads and writes and interrupted TLS reads
   ([#1799](https://github.com/sozu-proxy/sozu/issues/1799)).** The plain TCP `socket_read`,
   `socket_write` and `socket_write_vectored` (`lib/src/socket.rs`) and the `read_tls` call of
@@ -4000,7 +4021,7 @@
   `tcp_socket_write_vectored`. Covered by `an_interrupted_plain_write_is_retried`,
   `an_interrupted_plain_vectored_write_is_retried`, `an_interrupted_plain_read_is_retried` and
   `an_interrupted_tls_read_is_retried`. The TLS handshake pump (`lib/src/protocol/rustls.rs`)
-  keeps its mapping.
+  retries the same way since [#1803](https://github.com/sozu-proxy/sozu/pull/1803).
 
 - **`test(mux-h2)`: the refused header block GOAWAY test no longer races its writer thread.**
   `a_refused_header_block_counts_its_first_fragment_toward_its_size` (`lib/src/protocol/mux/h2.rs`)

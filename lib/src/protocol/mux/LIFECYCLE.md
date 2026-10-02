@@ -1155,7 +1155,13 @@ deadlines are compared against `ConnectionH2.now` (§7.5):
   pending-links loop of `Mux::ready_inner` sets the frontend's nominal timeout
   only on a request's first link (`stream.attempts == 0`), so the frontend
   deadline bounds the whole failover; when it fires first, the `Linked` arm of
-  the frontend-token branch answers 504 (`client_timeout_during_response`).
+  the frontend-token branch answers 504 (`client_timeout_during_response`), and
+  a stream still `Link` gets the `Link` arm's 503. That bound holds for an H1
+  frontend only. An H2 frontend's timer is the connection's: the first link of
+  any new stream (a fresh or recycled `Stream` has `attempts == 0`) and the
+  connection's ordinary frame activity (`ConnectionH2::arm_timeout`) re-arm it,
+  so on a busy H2 connection a failover is bounded only by
+  `max_connection_attempts × connect_timeout`.
 - Fired by: timer wheel → `Mux::timeout` with the backend token.
 - Action: for each stream linked to that backend, either send 504, or forcefully
   terminate, or keep draining — see the backend-token branch of `Mux::timeout_inner`. The

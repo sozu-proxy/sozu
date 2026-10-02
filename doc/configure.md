@@ -1060,16 +1060,25 @@ window also fails fast with `503`, without dialling. Alerts keyed on the `504`
 rate to detect dead backends should watch `503`,
 `backend.connections.error` and `backend.connect.retries_exhausted` instead.
 
-**The whole failover is bounded by `front_timeout`.** The listener's
-`front_timeout` is armed when the request is first linked to a backend and is
-not pushed out when it is retried on another one. Each failed attempt can take
-up to `connect_timeout`, so the worst case of an attempt budget is
-`max_connection_attempts × connect_timeout`; when `front_timeout` expires
-first, the request is answered `504` (`client_timeout_during_response`).
-Keep `connect_timeout` well below `front_timeout / max_connection_attempts` —
-the defaults, 3 s against 60 s / 5, leave room — so that every attempt can be
-spent before the client is answered. On an HTTP/2 frontend the timer belongs
-to the connection and activity on its other streams re-arms it.
+**On an HTTP/1.1 frontend the whole failover is bounded by `front_timeout`.**
+The listener's `front_timeout` is armed when the request is first linked to a
+backend and is not pushed out when it is retried on another one. Each failed
+attempt can take up to `connect_timeout`, so the worst case of an attempt
+budget is `max_connection_attempts × connect_timeout`; when `front_timeout`
+expires first, the request is answered `504`
+(`client_timeout_during_response`). Keep `connect_timeout` well below
+`front_timeout / max_connection_attempts` — the defaults, 3 s against 60 s /
+5, leave room — so that every attempt can be spent before the client is
+answered. On an HTTP/2 frontend the timer belongs to the connection, not to
+the stream: the first link of every new stream (its `attempts` is 0) and
+ordinary frame activity on the connection re-arm it, so on a busy HTTP/2
+connection a failover is bounded only by `max_connection_attempts ×
+connect_timeout` (15 s with the defaults), not by `front_timeout`.
+
+A failing-over request is normally `Linked` to the backend being dialled when
+the frontend timer fires, so it gets the `504` above. One still in `Link` state
+— waiting to be linked, not yet dialled — gets `503` instead, with no
+access-log message (the `Link` arm of the frontend timeout).
 
 **Back-off and slow failures.** A failed backend's first back-off lasts one
 second and grows with each consecutive failure: after the `n`-th, a random wait
