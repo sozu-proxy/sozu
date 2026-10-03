@@ -174,10 +174,6 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
 
             count!(names::backend::BYTES_IN, sz as i64);
             metrics.bin += sz;
-
-            if self.index == self.frontend_buffer.len() {
-                self.frontend_readiness.interest.remove(Ready::READABLE);
-            }
         } else {
             debug_assert_eq!(
                 self.index, index_before,

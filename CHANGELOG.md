@@ -4033,7 +4033,10 @@
   232-byte capacity, and then reads exactly the declared `16 + len` bytes. Coalesced payload
   stays in the socket for the downstream protocol, while the accepted 232-byte boundary and
   malformed-header rejection remain unchanged. `expect_proxy` and its error metric are also
-  documented as v2-only; Sōzu does not ingest PROXY v1.
+  documented as v2-only; Sōzu does not ingest PROXY v1. The expect stage also no longer drops
+  READABLE interest once a header fills all 232 bytes: the HTTPS upgrade copied that interest into
+  the TLS handshake, which then never read the ClientHello behind a maximum-size header; pinned by
+  `test_ppv2_https_expect_keeps_the_client_hello_behind_the_header`.
 
 - **`fix(metrics)`: metric-detail leases expire without another worker command
   ([#1831](https://github.com/sozu-proxy/sozu/issues/1831)).** The lease janitor

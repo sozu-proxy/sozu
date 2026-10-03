@@ -116,6 +116,10 @@ PROXY phase and the downstream protocol.
     another read. If the parser is still `Incomplete` at the declared target,
     the header is malformed. Both cases increment `proxy_protocol.errors` and
     close.
+  - `readable` never removes READABLE from the frontend interest, not even
+    when a 232-byte header fills the buffer: `HttpsSession::upgrade_expect`
+    (`lib/src/https.rs`) copies the whole readiness, interest included, into
+    the TLS handshake, which would otherwise never read the ClientHello.
   - A successful parse stores the `ProxyAddr` into `self.addresses` and returns
     `SessionResult::Upgrade`; the proxy then swaps the session for a `Pipe` via
     `ExpectProxyProtocol::into_pipe` (`expect.rs`), which prefers
@@ -171,7 +175,7 @@ PROXY phase and the downstream protocol.
     dispatch loop, so the worker burns 100% CPU with its event loop
     starved.
   - A zero-length **read** in `readable` drops the frontend READABLE event,
-    as `expect.rs:186` does. `tcp_socket_read` returns
+    as `expect.rs:182` does. `tcp_socket_read` returns
     `(0, SocketResult::Continue)` for an empty slice, which is what
     `space()` yields once the buffer is full, so without the guard a client
     that declares a large `len` and stalls has `ready_inner` re-enter until
@@ -265,11 +269,13 @@ which makes it an attractive target. These rules are load-bearing.
 1. **Bounded buffers, no growth.** `ExpectProxyProtocol::frontend_buffer`
    is a stack-sized `[u8; 232]` (`expect.rs:35/90`) — Sōzu's accepted v2-header
    capacity. There is no growable backing — a peer that floods bytes
-   without a valid header trips the oversized-header branch
-   (`expect.rs:249-260`) and is closed.
+   without a valid header fails the v2 signature parse
+   (`expect.rs:283-292`) and is closed, and a prelude declaring more than
+   232 bytes trips the oversized-header branch (`expect.rs:247-257`) before
+   any further read.
 2. **TCP healthchecks bypass the protocol.** Upstream LBs probe backends
    with bare TCP (SYN/ACK/FIN) and never send `send-proxy`. The fast-close
-   branch in `expect.rs:204-216` handles that gracefully — without it,
+   branch in `expect.rs:200-212` handles that gracefully — without it,
    every healthcheck would idle for the full `request_timeout`. Do not
    "fix" that branch without measuring against an HAProxy mesh.
 3. **`MAX_LOOP_ITERATIONS` ceiling.** All three modules import
@@ -283,7 +289,7 @@ which makes it an attractive target. These rules are load-bearing.
    security-sensitive areas list, the proxy-protocol path must convert
    parse errors / partial reads / oversized headers into
    `SessionResult::Close` plus a metric and a contextual log line. New
-   error paths follow the existing pattern (see `expect.rs:287-295`).
+   error paths follow the existing pattern (see `expect.rs:283-292`).
 6. **`HeaderV1` is dead weight.** Per the `header.rs:47` comment the v1
    variant is never produced or consumed; tests are commented out
    (`header.rs:110-141`). Removing it is a documented follow-up — until
