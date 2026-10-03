@@ -23,6 +23,7 @@ updates:
       # moved to the new toolchain, and the release build, whose own comment
       # promises it "must match the MSRV pinned in `rust-toolchain`", would no
       # longer have said what it means. Raise the MSRV by editing
-      # `rust-toolchain` and every workflow pin together.
+      # `rust-toolchain`, every workflow pin and the `Dockerfile` builder image
+      # together.
       - dependency-name: dtolnay/rust-toolchain
     open-pull-requests-limit: 5
