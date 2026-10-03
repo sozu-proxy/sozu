@@ -3953,6 +3953,17 @@
 
 ### 🐛 Fixed
 
+- **`fix(health-check)`: `sozu cluster health-check remove` resets the backends a probe marked
+  DOWN ([#1811](https://github.com/sozu-proxy/sozu/issues/1811)).** The worker's
+  `RemoveHealthCheck` handler (`Server::remove_health_check_state`) only forgot the cluster's
+  configuration: a backend a probe had marked DOWN stayed out of rotation with nothing left to
+  probe it UP again, until the cluster was added again without a health check. It now clears the
+  health check through `BackendMap::set_health_check_config(cluster_id, None)`, as `AddCluster`
+  does, which resets every backend of the cluster to healthy and re-emits the availability
+  gauges. An `AddCluster` upsert without a health check now also drops the cluster's in-flight
+  probes, as `RemoveHealthCheck` and `RemoveCluster` already did, so a probe launched before the
+  upsert can no longer mark a backend DOWN after the reset.
+
 - **BREAKING (library API, default change) — `fix(mux)`: a backend connect timeout fails over to
   another backend instead of answering 504
   ([#1800](https://github.com/sozu-proxy/sozu/issues/1800)).** A backend that accepted no

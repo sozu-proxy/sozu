@@ -268,7 +268,10 @@ sozu cluster health-check remove --id my-cluster
 ```
 
 Stops health checking for the given cluster. All backends in the cluster are
-reset to healthy and resume receiving traffic immediately.
+reset to healthy and resume receiving traffic immediately, including those a
+probe had marked DOWN; probes still in flight are dropped, so none can mark a
+backend DOWN after the reset. Adding the cluster again without a health check
+(`sozu cluster add` on the existing id) has the same effect.
 
 ## Metrics
 
