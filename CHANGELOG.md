@@ -648,6 +648,17 @@
 
 ### 🔄 Changed
 
+- **`docs`: fix stale flood-window, idle-timeout and rejected-per-IP statements.** The
+  `h2_flood_detector.rs` comments still sized the connection window at 1 MiB: a chained Sōzu acks
+  every 8 MiB of its 16 MiB window, and a cancelled upload's in-flight DATA is bounded by the
+  64 KiB stream window, about four glitches in 16 KiB frames, not 64. `command.proto` and
+  `command/src/config.rs` said `h2_stream_idle_timeout_seconds` defaults to 30; unset, it inherits
+  `back_timeout` floored at 30, and an explicit `0` means 1. `doc/configure.md`,
+  `doc/rate-limit-design.md` and the e2e `cluster_ip_limit_tests.rs` header said
+  `connections.rejected_per_cluster_ip` also counts TCP sessions closed by the per-(cluster,
+  source-IP) limit, or that the e2e suite asserts it: only the HTTP/HTTPS 429 answer increments
+  it, and the suite never reads it. No behaviour change.
+
 - **`docs`: align the example configuration and the docs with the changes merged from 2026-10-01
   to 2026-10-03.** `bin/config.toml` and `os-build/config.toml` now say that a `503` also answers a
   request whose every backend connection attempt failed and that a `504` no longer comes from a
