@@ -4162,6 +4162,7 @@ emits both the contextual log line and the per-kind counter below.
 | `h2.flood.violation.settings_lifetime`                | counter | proxy | Lifetime SETTINGS ceiling (200 000, not configurable) exceeded.                                                                                                      |
 | `h2.flood.violation.empty_data_window`                | counter | proxy | Per-window flood of empty DATA frames (CVE-2019-9518).                                                                                                               |
 | `h2.flood.violation.continuation_per_block`           | counter | proxy | Single header block split across more CONTINUATION frames than the configured cap (CVE-2024-27316).                                                                  |
+| `h2.flood.violation.window_update_stream0_window`     | counter | proxy | Per-window flood of unsolicited connection-level (stream 0) WINDOW_UPDATE frames (`h2_max_window_update_stream0_per_window`).                                        |
 | `h2.flood.violation.header_size_per_block`            | counter | proxy | Single header block accumulated more bytes than the configured cap (CVE-2024-27316 sibling — header overflow).                                                       |
 | `h2.flood.violation.glitch_window`                    | counter | proxy | Generic anomaly budget exceeded (unknown SETTINGS, WINDOW_UPDATE on closed stream, other low-severity protocol drift).                                               |
 

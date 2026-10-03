@@ -19,23 +19,23 @@ expression: out
 │frames.tx.goaway                                   0                ▁▁                                                │
 │╭ flood mitigations · CVE-2023-44487 / CVE-2024-27316 / CVE-2025-8671 ───────────────────────────────────────────────╮│
 ││counter                                           value            trend (60 s)                                     ││
+││rst_stream_pre_response_lifetime                  0                ▁▁                                               ││
+││rst_stream_lifetime                               0                ▁▁                                               ││
+││rst_stream_emitted_lifetime                       0                ▁▁                                               ││
+││rst_stream_window                                 0                ▁▁                                               ││
+││stream_refused                                    0                ▁▁                                               ││
+││continuation_per_block                            0                ▁▁                                               ││
+││header_size_per_block                             0                ▁▁                                               ││
+││ping_window                                       0                ▁▁                                               ││
+││ping_lifetime                                     0                ▁▁                                               ││
+││settings_window                                   0                ▁▁                                               ││
+││settings_lifetime                                 0                ▁▁                                               ││
+││empty_data_window                                 0                ▁▁                                               ││
+││window_update_stream0_window                      0                ▁▁                                               ││
 ││glitch_window                                     0                ▁▁                                               ││
-││rapid_reset                                       0                ▁▁                                               ││
-││continuation_flood                                0                ▁▁                                               ││
-││made_you_reset                                    0                ▁▁                                               ││
-││ping_flood                                        0                ▁▁                                               ││
-││settings_flood                                    0                ▁▁                                               ││
-││priority_flood                                    0                ▁▁                                               ││
 ││window_update_dropped                             0                ▁▁                                               ││
 ││rst_stream_dropped                                0                ▁▁                                               ││
 ││close_with_active_streams                         0                ▁▁                                               ││
-││                                                                                                                    ││
-││                                                                                                                    ││
-││                                                                                                                    ││
-││                                                                                                                    ││
-││                                                                                                                    ││
-││                                                                                                                    ││
-││                                                                                                                    ││
 ││                                                                                                                    ││
 ││                                                                                                                    ││
 ││                                                                                                                    ││

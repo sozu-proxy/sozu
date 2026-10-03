@@ -3953,6 +3953,18 @@
 
 ### 🐛 Fixed
 
+- **BREAKING (library API) — `fix(top)`: the `sozu top` H2 pane reads the flood metrics the H2
+  flood detector emits ([#1810](https://github.com/sozu-proxy/sozu/issues/1810)).** The pane read
+  `h2.flood.violation.{rapid_reset,made_you_reset,continuation,ping,settings,priority}`, names
+  nothing emits, so only `glitch_window` could ever leave zero. It now shows the thirteen
+  `h2.flood.violation.*` keys `H2FloodDetector` emits, most severe first, plus
+  `h2.flood.stream_refused` from [#1798](https://github.com/sozu-proxy/sozu/issues/1798), with
+  their trend sparklines. `sozu_lib::metrics::names::h2` drops the six unused constants for the
+  phantom names and gains one constant per emitted key plus `FLOOD_VIOLATION_KEYS`; the detector's
+  metric-key test now requires that list to match the emitted keys exactly, and a `sozu top` test
+  requires the pane to read only and all of them. `doc/configure.md` lists the missing
+  `h2.flood.violation.window_update_stream0_window`.
+
 - **BREAKING (library API, default change) — `fix(mux)`: a backend connect timeout fails over to
   another backend instead of answering 504
   ([#1800](https://github.com/sozu-proxy/sozu/issues/1800)).** A backend that accepted no
