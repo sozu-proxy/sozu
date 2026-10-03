@@ -1480,6 +1480,59 @@ mod tests {
         );
     }
 
+    /// #1821: duplicate-probe detection is per backend incarnation. A probe
+    /// still in flight for a removed incarnation must not delay the first
+    /// probe of a replacement re-added with the same id and address.
+    #[test]
+    fn in_flight_probe_for_removed_incarnation_does_not_block_replacement_probe() {
+        const CLUSTER: &str = "in-flight-incarnation-cluster";
+        const BACKEND: &str = "in-flight-incarnation-backend";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let poll = mio::Poll::new().unwrap();
+        let mut backend_map = BackendMap::new();
+        backend_map.add_backend(CLUSTER, Backend::new(BACKEND, address, None, None, None));
+        backend_map
+            .health_check_configs
+            .insert(CLUSTER.into(), h2c_config(0));
+        let backends = Rc::new(RefCell::new(backend_map));
+        let mut checker = HealthChecker::new();
+
+        checker.initiate_checks(&backends, poll.registry());
+        assert_eq!(
+            checker.in_flight.len(),
+            1,
+            "the first cycle probes the backend"
+        );
+
+        assert!(
+            backends
+                .borrow_mut()
+                .remove_backend(CLUSTER, BACKEND, &address)
+        );
+        backends
+            .borrow_mut()
+            .add_backend(CLUSTER, Backend::new(BACKEND, address, None, None, None));
+        let replacement = Rc::clone(&backends.borrow().backends[CLUSTER].backends[0]);
+
+        // Make the cluster due again while the removed incarnation's probe
+        // is still in flight.
+        checker.last_check_time.clear();
+        checker.initiate_checks(&backends, poll.registry());
+        assert_eq!(
+            checker.in_flight.len(),
+            2,
+            "the replacement must be probed without waiting for the removed incarnation's probe"
+        );
+        assert!(
+            std::ptr::eq(
+                checker.in_flight[1].backend.as_ptr(),
+                Rc::as_ptr(&replacement)
+            ),
+            "the new probe targets the replacement incarnation"
+        );
+    }
+
     /// #1821: two ids may share an address; a probe result updates the id
     /// that was probed, never the first sibling at that address.
     #[test]

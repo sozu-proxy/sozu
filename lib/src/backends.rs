@@ -750,7 +750,14 @@ impl BackendMap {
         backend_address: &SocketAddr,
     ) -> bool {
         let removed = if let Some(backends) = self.backends.get_mut(cluster_id) {
-            backends.remove_backend(backend_id, backend_address)
+            let removed = backends.remove_backend(backend_id, backend_address);
+            if !removed {
+                warn!(
+                    "No backend matches id {} at address {:?} in cluster {}: nothing removed",
+                    backend_id, backend_address, cluster_id
+                );
+            }
+            removed
         } else {
             error!(
                 "Backend was already removed: cluster id {}, backend id {}, address {:?}",

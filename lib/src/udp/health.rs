@@ -749,4 +749,70 @@ mod tests {
             "a result for the live incarnation must mark it DOWN"
         );
     }
+
+    /// #1821: duplicate-probe detection is per backend incarnation. A probe
+    /// still in flight for a removed incarnation (kept alive by a session)
+    /// must not delay the first probe of a replacement re-added with the
+    /// same id and address.
+    #[test]
+    fn in_flight_probe_for_removed_incarnation_does_not_block_replacement_probe() {
+        use crate::backends::{Backend, BackendMap};
+
+        let cluster = "dns";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let poll = mio::Poll::new().unwrap();
+        let backend_map = Rc::new(RefCell::new(BackendMap::new()));
+        backend_map
+            .borrow_mut()
+            .add_backend(cluster, Backend::new("b1", address, None, None, None));
+        let settings = UdpHealthSettings::from_proto(&UdpHealthConfig {
+            mode: None,
+            tcp_port: None,
+            rise: Some(1),
+            fall: Some(1),
+            fail_open: None,
+            udp_probe_payload: None,
+            probe_interval_seconds: Some(10),
+            probe_timeout_seconds: Some(5),
+        });
+        let mut checker = UdpHealthChecker::new();
+        checker.set_cluster(cluster, Some(settings), poll.registry());
+
+        checker.initiate(&backend_map, poll.registry());
+        assert_eq!(
+            checker.in_flight.len(),
+            1,
+            "the first cycle probes the backend"
+        );
+
+        // A session still holding the removed backend keeps it alive.
+        let _held = Rc::clone(&backend_map.borrow().backends[cluster].backends[0]);
+        assert!(
+            backend_map
+                .borrow_mut()
+                .remove_backend(cluster, "b1", &address)
+        );
+        backend_map
+            .borrow_mut()
+            .add_backend(cluster, Backend::new("b1", address, None, None, None));
+        let replacement = Rc::clone(&backend_map.borrow().backends[cluster].backends[0]);
+
+        // Make the cluster due again while the removed incarnation's probe
+        // is still in flight.
+        checker.last_check.clear();
+        checker.initiate(&backend_map, poll.registry());
+        assert_eq!(
+            checker.in_flight.len(),
+            2,
+            "the replacement must be probed without waiting for the removed incarnation's probe"
+        );
+        assert!(
+            std::ptr::eq(
+                checker.in_flight[1].backend.as_ptr(),
+                Rc::as_ptr(&replacement)
+            ),
+            "the new probe targets the replacement incarnation"
+        );
+    }
 }

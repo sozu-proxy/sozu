@@ -4013,7 +4013,9 @@
   is still in the cluster: a result for a removed backend is discarded, the re-added backend
   starts healthy, and it is probed on the next cycle without waiting for the old probe. One probe
   is in flight per incarnation rather than per backend id. `RemoveCluster` still removes the
-  whole cluster. Library API: `BackendList::remove_backend(backend_id, address)` and
+  whole cluster. A `RemoveBackend` sent directly to a worker whose id matches no backend at the
+  address now removes nothing and logs a warning (it previously removed every backend at that
+  address). Library API: `BackendList::remove_backend(backend_id, address)` and
   `BackendMap::remove_backend(cluster_id, backend_id, address)` take the backend id and return
   whether the backend was present instead of the list of removed ids; new
   `BackendList::find_backend_by_identity` and `BackendList::find_incarnation`.
