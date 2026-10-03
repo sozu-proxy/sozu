@@ -732,6 +732,14 @@ a wedged session, or a security regression.
    requests of one connection. A client-supplied `X-Request-Id` is still
    forwarded verbatim. Pinned by `header_editing_output_is_byte_exact_across_keep_alive_requests`
    (`editor.rs`) and `test_keep_alive_rotates_request_id`
+   (`e2e/src/tests/tests.rs`). The sticky-session answer
+   (`HttpContext::sticky_session`) is request-scoped too: the router writes
+   it only for a frontend that sticks and `on_response_headers` answers any
+   value left there with a `Set-Cookie`, so `reset` clears it and a request
+   to a frontend that does not stick never carries the previous request's
+   cookie ([#1822](https://github.com/sozu-proxy/sozu/issues/1822)). Pinned by
+   `reset_clears_the_sticky_session_answer_of_the_previous_request`
+   (`editor.rs`) and `test_keep_alive_does_not_carry_a_sticky_cookie_over`
    (`e2e/src/tests/tests.rs`).
 
 5. **`impl kawa::AsBuffer for Checkout` is unique to this module.** It lives at
