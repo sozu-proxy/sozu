@@ -5730,6 +5730,88 @@ mod remove_cluster_cascade_tests {
         }
     }
 
+    /// Admission leases belong to live frontend-session tokens, not to the
+    /// current cluster configuration object. Removing a cluster therefore
+    /// leaves the old session's contribution in both counters; re-adding the
+    /// same id lets a new session contribute alongside it; closing either
+    /// session releases exactly that token's contribution.
+    ///
+    /// To SEE THIS RED: change `untrack_all_cluster_ip`'s per-IP decrement from
+    /// `saturating_sub(1)` to `saturating_sub(0)`. The old lease then remains at
+    /// two and the post-close assertion fails, proving this observes release
+    /// rather than only reconfiguration.
+    #[test]
+    fn remove_then_readd_same_cluster_id_preserves_and_releases_live_admission_leases() {
+        let mut server = bare_server();
+        let cluster_id = ClusterId::from(REMOVED);
+        let source: IpAddr = "203.0.113.9".parse().expect("test address must parse");
+        let subnet = server.sessions.borrow().subnet_key(&source);
+        let old_token = Token(60_001);
+        let new_token = Token(60_002);
+
+        for response in send(
+            &mut server,
+            "add-old-incarnation",
+            RequestType::AddCluster(Cluster {
+                cluster_id: REMOVED.to_owned(),
+                max_connections_per_ip: Some(2),
+                max_connections_per_subnet: Some(2),
+                ..Default::default()
+            }),
+        ) {
+            assert_eq!(response.status, ResponseStatus::Ok as i32);
+        }
+        server.sessions.borrow_mut().track_cluster_connection(
+            old_token,
+            cluster_id.clone(),
+            source,
+            Some(2),
+        );
+
+        for response in send(
+            &mut server,
+            "remove-old-incarnation",
+            RequestType::RemoveCluster(REMOVED.to_owned()),
+        ) {
+            assert_eq!(response.status, ResponseStatus::Ok as i32);
+        }
+        for response in send(
+            &mut server,
+            "add-new-incarnation",
+            RequestType::AddCluster(Cluster {
+                cluster_id: REMOVED.to_owned(),
+                max_connections_per_ip: Some(2),
+                max_connections_per_subnet: Some(2),
+                ..Default::default()
+            }),
+        ) {
+            assert_eq!(response.status, ResponseStatus::Ok as i32);
+        }
+
+        {
+            let mut sessions = server.sessions.borrow_mut();
+            assert_eq!(sessions.connections_per_cluster_ip[REMOVED][&source], 1);
+            assert_eq!(sessions.connections_per_cluster_subnet[REMOVED][&subnet], 1);
+            sessions.track_cluster_connection(new_token, cluster_id, source, Some(2));
+            assert_eq!(sessions.connections_per_cluster_ip[REMOVED][&source], 2);
+            assert_eq!(sessions.connections_per_cluster_subnet[REMOVED][&subnet], 2);
+
+            sessions.untrack_all_cluster_ip(old_token);
+            assert_eq!(sessions.connections_per_cluster_ip[REMOVED][&source], 1);
+            assert_eq!(sessions.connections_per_cluster_subnet[REMOVED][&subnet], 1);
+            assert!(sessions.cluster_ip_tracks.contains_key(&new_token));
+            assert!(sessions.cluster_subnet_tracks.contains_key(&new_token));
+
+            sessions.untrack_all_cluster_ip(new_token);
+            assert!(!sessions.connections_per_cluster_ip.contains_key(REMOVED));
+            assert!(
+                !sessions
+                    .connections_per_cluster_subnet
+                    .contains_key(REMOVED)
+            );
+        }
+    }
+
     /// The route an HTTP request to `hostname` + `path` resolves to on the
     /// worker's only HTTP listener, as a cluster id (`Some(None)` for a route
     /// that names no cluster), or `None` when nothing routes it.

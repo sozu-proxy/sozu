@@ -785,6 +785,191 @@ fn real_http_session_without_add_cluster_records_labelled_metrics() {
     assert!(worker_stopped);
 }
 
+// Additional H1 coverage: recreate the cluster ID with a distinct backend
+// identity and address, then prove late teardown cannot recreate the retired row.
+
+fn try_old_http_session_does_not_contaminate_readded_cluster() -> State {
+    let front_address = create_local_address();
+    let old_back_address = create_local_address();
+    let new_back_address = create_local_address();
+    let cluster_id = "lifecycle_cluster_incarnation";
+    let old_backend_id = "lifecycle_backend_old";
+    let new_backend_id = "lifecycle_backend_new";
+
+    let mut worker = setup_worker_with_cluster(
+        "METRICS-LIFECYCLE-INCARNATION",
+        cluster_id,
+        old_backend_id,
+        front_address,
+        old_back_address,
+    );
+    let metric_detail_ack = lease_backend_metric_detail(&mut worker);
+    let mut old_backend = SyncBackend::new(
+        "METRICS-LIFECYCLE-OLD",
+        old_back_address,
+        http_ok_response("old-incarnation"),
+    );
+    let mut new_backend = SyncBackend::new(
+        "METRICS-LIFECYCLE-NEW",
+        new_back_address,
+        http_ok_response("new-incarnation"),
+    );
+    old_backend.connect();
+    new_backend.connect();
+
+    // The old response is held by construction: the backend receives the
+    // request but sends nothing until after the same-id replacement exists.
+    let mut old_client = Client::new(
+        "METRICS-LIFECYCLE-OLD-CLIENT",
+        front_address,
+        http_request("GET", "/old", "", "localhost"),
+    );
+    old_client.connect();
+    old_client.send();
+    let old_session_held = wait_for_backend_request(&mut old_backend, 0);
+
+    let mut remove_ack = false;
+    let mut add_cluster_ack = false;
+    let mut add_frontend_ack = false;
+    let mut add_backend_ack = false;
+    let mut new_session_reached_backend = false;
+    let mut new_gauge = None;
+    let mut proxy_gauge_before_old_close = None;
+    let mut proxy_gauge_after_old_close = None;
+    let mut new_session_progressed = false;
+    let mut new_response_metric = None;
+    let mut old_session_terminated = false;
+    let mut old_gauge = None;
+    let mut new_client = None;
+
+    if metric_detail_ack && old_session_held {
+        remove_ack = request_acknowledged(
+            &mut worker,
+            RequestType::RemoveCluster(cluster_id.to_owned()),
+        );
+        add_cluster_ack = request_acknowledged(
+            &mut worker,
+            RequestType::AddCluster(Worker::default_cluster(cluster_id)),
+        );
+        add_frontend_ack = request_acknowledged(
+            &mut worker,
+            RequestType::AddHttpFrontend(RequestHttpFrontend {
+                ..Worker::default_http_frontend(cluster_id, front_address)
+            }),
+        );
+        add_backend_ack = request_acknowledged(
+            &mut worker,
+            RequestType::AddBackend(Worker::default_backend(
+                cluster_id,
+                new_backend_id,
+                new_back_address,
+                None,
+            )),
+        );
+
+        if remove_ack && add_cluster_ack && add_frontend_ack && add_backend_ack {
+            let mut current = Client::new(
+                "METRICS-LIFECYCLE-NEW-CLIENT",
+                front_address,
+                http_request("GET", "/new", "", "localhost"),
+            );
+            current.connect();
+            current.send();
+            new_session_reached_backend = wait_for_backend_request(&mut new_backend, 0);
+            if new_session_reached_backend {
+                // Positive witness: the new incarnation has its own live
+                // backend connection before the old one is released.
+                new_gauge = backend_connection_gauge(&mut worker, cluster_id, new_backend_id);
+                proxy_gauge_before_old_close = proxy_backend_connection_gauge(&mut worker);
+            }
+
+            // This is the real late-emission trigger. Closing the backend held
+            // by the pre-remove Mux reaches its backend-close bookkeeping and
+            // emits GaugeAdd(-1) with the old cluster/backend labels.
+            let _ = old_backend.close(0);
+            old_session_terminated = wait_for_client_termination(&mut old_client);
+            if old_session_terminated
+                && let Some(before) = proxy_gauge_before_old_close
+                && before > 0
+            {
+                proxy_gauge_after_old_close =
+                    wait_for_proxy_backend_connections(&mut worker, before - 1);
+            }
+
+            // Phase two supplies a metric whose source is causally later than
+            // the old connection's labelled decrement: the new backend stays
+            // held until the proxy-gauge terminal witness above has returned.
+            let sent = new_backend.send(0).is_some();
+            let response = current.receive_response(SESSION_BARRIER_BUDGET);
+            new_session_progressed = sent
+                && response
+                    .as_deref()
+                    .is_some_and(|value| value.ends_with("new-incarnation"));
+            if new_session_progressed {
+                new_response_metric = wait_for_backend_2xx(&mut worker, cluster_id, new_backend_id);
+            }
+            if new_response_metric.is_some() {
+                // Only evaluate incarnation isolation after the later 2xx
+                // metric has traversed the same synchronous LocalDrain.
+                old_gauge = backend_connection_gauge(&mut worker, cluster_id, old_backend_id);
+            }
+            new_client = Some(current);
+        }
+    }
+
+    old_client.disconnect();
+    if let Some(client) = new_client.as_mut() {
+        client.disconnect();
+    }
+    let _ = new_backend.close(0);
+    old_backend.disconnect();
+    new_backend.disconnect();
+    let worker_stopped = stop_worker_within(worker);
+
+    println!(
+        "incarnation metrics: detail_ack={metric_detail_ack} old_held={old_session_held} \
+         remove_ack={remove_ack} \
+         add_cluster_ack={add_cluster_ack} add_frontend_ack={add_frontend_ack} \
+         add_backend_ack={add_backend_ack} new_reached={new_session_reached_backend} \
+         new_gauge={new_gauge:?} proxy_before={proxy_gauge_before_old_close:?} \
+         proxy_after={proxy_gauge_after_old_close:?} new_progressed={new_session_progressed} \
+         new_response_metric={new_response_metric:?} \
+         old_terminated={old_session_terminated} old_gauge={old_gauge:?} \
+         worker_stopped={worker_stopped}"
+    );
+
+    if !old_session_held {
+        return State::Undecided;
+    }
+    if metric_detail_ack
+        && remove_ack
+        && add_cluster_ack
+        && add_frontend_ack
+        && add_backend_ack
+        && new_session_reached_backend
+        && new_gauge == Some(1)
+        && proxy_gauge_before_old_close == Some(2)
+        && proxy_gauge_after_old_close == Some(1)
+        && new_session_progressed
+        && new_response_metric.is_some_and(|count| count > 0)
+        && old_session_terminated
+        && old_gauge.is_none()
+        && worker_stopped
+    {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_old_http_session_metrics_do_not_contaminate_readded_cluster() {
+    assert_eq!(
+        try_old_http_session_does_not_contaminate_readded_cluster(),
+        State::Success,
+    );
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // Test 4: RemoveBackend drops the backend row but keeps the cluster row
 // ══════════════════════════════════════════════════════════════════════
@@ -853,14 +1038,11 @@ fn test_remove_backend_keeps_cluster_row_when_others_remain() {
 // Test 5: an abandoned metric-detail lease expires with no later command
 // ══════════════════════════════════════════════════════════════════════
 //
-// sozu-proxy/sozu#1831: the lease janitor (`Aggregator::lease_tick`) only
-// ran at the top of `Server::notify`, so an expired lease outlived its TTL
-// until the next worker command arrived. A `sozu top` that crashes leaves
-// exactly that situation: no renewal, no clear, no further request. The
-// owner here applies a one-second lease and then goes silent; only data
-// plane traffic flows, and the expiry must surface on its own as the
-// worker-pushed `lease_tick_expired` event. Reading the channel is passive,
-// so the observation cannot be what triggers the cleanup.
+// Contract (sozu-proxy/sozu#1831): once its owner goes silent, a short
+// metric-detail lease expires within its TTL plus the five-second janitor
+// cadence without another worker command. The refuting observation is a real
+// worker that continues serving data-plane traffic but emits no passive
+// `lease_tick_expired` transition before that bound.
 
 fn try_abandoned_lease_expires_without_a_command() -> State {
     let front_address = create_local_address();
@@ -892,18 +1074,41 @@ fn try_abandoned_lease_expires_without_a_command() -> State {
         peer_pid: None,
         peer_session_ulid: None,
     }));
-    worker.read_to_last();
+    let mut lease_applied = false;
+    loop {
+        let Some(response) = worker.read_proxy_response() else {
+            break;
+        };
+        let terminal = response.id == worker.command_id.last;
+        if let Some(ContentType::WorkerMetricDetailStatus(status)) =
+            response.content.and_then(|content| content.content_type)
+        {
+            lease_applied = status.effective == MetricDetail::DetailBackend as i32
+                && status.active_lease_count == 1;
+        }
+        if terminal {
+            break;
+        }
+    }
 
-    // The bound the janitor promises: TTL plus its five-second cadence, plus
-    // one second for the event loop's poll timeout and a little scheduling
-    // slack. Nothing is written on the command channel from here on.
-    let deadline = Instant::now() + ttl + Duration::from_secs(8);
+    // Reading the worker channel is passive. From this point until the
+    // observation deadline, only HTTP traffic enters the worker; no command can
+    // accidentally invoke `Server::notify` and become the janitor trigger.
+    let deadline = Instant::now() + ttl + Duration::from_secs(5);
+    let observation_started = Instant::now();
     let mut expired = None;
+    let mut traffic_responses = 0usize;
     while expired.is_none() && Instant::now() < deadline {
-        serve_one_request(&mut backend, front_address);
+        if serve_one_request(&mut backend, front_address) {
+            traffic_responses += 1;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
         let Ok(response) = worker
             .command_channel
-            .read_message_blocking_timeout(Some(Duration::from_millis(500)))
+            .read_message_blocking_timeout(Some(remaining.min(Duration::from_millis(500))))
         else {
             continue;
         };
@@ -915,12 +1120,25 @@ fn try_abandoned_lease_expires_without_a_command() -> State {
         }
     }
 
+    // Cleanup begins only after the passive observation is complete. SoftStop
+    // is intentionally the first later worker command and cannot retroactively
+    // satisfy the oracle above.
     worker.soft_stop();
-    worker.wait_for_server_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    println!(
+        "metric lease evidence: lease_applied={lease_applied}, \
+         traffic_responses={traffic_responses}, expired={expired:?}, \
+         observation_elapsed={:?}, worker_stopped={stopped}",
+        observation_started.elapsed(),
+    );
 
     match expired {
         Some(transition)
-            if transition.previous_effective == MetricDetail::DetailBackend as i32
+            if lease_applied
+                && traffic_responses > 0
+                && stopped
+                && transition.previous_effective == MetricDetail::DetailBackend as i32
                 && transition.effective == MetricDetail::DetailCluster as i32 =>
         {
             State::Success
@@ -934,8 +1152,8 @@ fn test_abandoned_lease_expires_without_a_command() {
     assert_eq!(
         repeat_until_error_or(
             3,
-            "an abandoned metric-detail lease expires within TTL + the janitor cadence \
-             with no later worker command",
+            "an abandoned metric-detail lease expires within TTL + five seconds with no later \
+             worker command",
             try_abandoned_lease_expires_without_a_command,
         ),
         State::Success,

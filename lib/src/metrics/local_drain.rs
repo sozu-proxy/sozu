@@ -1447,6 +1447,36 @@ mod tests {
     }
 
     #[test]
+    fn readded_cluster_rejects_late_emission_from_previous_incarnation() {
+        // Removing a cluster does not close its established H2 / WebSocket /
+        // TCP sessions. Re-adding the same id therefore creates two live
+        // incarnations: the fresh cluster and draining sessions from the old
+        // one. A late metric from the old incarnation must not populate the
+        // fresh cluster's row.
+        let mut local_drain = LocalDrain::new("prefix".to_string());
+
+        local_drain.remove_cluster("cluster-a");
+        local_drain.add_cluster("cluster-a");
+
+        // This emission represents a draining session created before the
+        // remove. The current API carries only the reused textual ids, so the
+        // drain cannot distinguish it from the new incarnation.
+        local_drain.receive_metric(
+            "backend.connections.error",
+            Some("cluster-a"),
+            Some("old-backend"),
+            MetricValue::Count(7),
+        );
+
+        assert!(
+            local_drain
+                .metrics_of_one_cluster("cluster-a", &[])
+                .is_err(),
+            "a late emission from the retired incarnation must not contaminate the re-added cluster",
+        );
+    }
+
+    #[test]
     fn clear_wipes_tombstones() {
         // Operator-issued clear must wipe tombstones too so previously-
         // removed cluster ids can resume emitting without going through
