@@ -38,7 +38,7 @@ implementation depending on what the frontend negotiated.
 | `converter.rs` / `pkawa.rs`   | idem                                 | HPACK ↔ kawa block conversion                     |
 | `h2_scheduler.rs`             | `lib/src/protocol/mux/h2_scheduler.rs` | RFC 9218 priorities + the write-pass order/yield decision |
 | `h2_close.rs`                 | `lib/src/protocol/mux/h2_close.rs` | Close and write-pass finalization decisions under TLS backpressure |
-| `h2_control_tx.rs`            | `lib/src/protocol/mux/h2_control_tx.rs` | Proxy-emitted `RST_STREAM` queue and its lifetime cap |
+| `h2_control_tx.rs`            | `lib/src/protocol/mux/h2_control_tx.rs` | Proxy-emitted `RST_STREAM` queue and its pending bound |
 | `h2_drain.rs`                 | `lib/src/protocol/mux/h2_drain.rs` | RFC 9113 §6.8 double-GOAWAY drain state and its transitions |
 | `h2_flood_detector.rs`        | `lib/src/protocol/mux/h2_flood_detector.rs` | CVE-2023-44487 / CVE-2024-27316 / CVE-2025-8671 mitigations, frame rate limits |
 | `h2_flow_control.rs`          | `lib/src/protocol/mux/h2_flow_control.rs` | Connection-level send window, queued `WINDOW_UPDATE`s; the advertised receive window is not enforced |
@@ -1162,7 +1162,7 @@ deadlines are compared against `ConnectionH2.now` (§7.5):
   so on a busy H2 connection a failover is bounded only by
   `max_connection_attempts × connect_timeout`.
 - Fired by: timer wheel → `Mux::timeout` with the backend token.
-- Action: for each stream linked to that backend, either send 504, or forcefully
+- Action: on an established connection, for each stream linked to that backend, either send 504, or forcefully
   terminate, or keep draining — see the backend-token branch of `Mux::timeout_inner`. The
   timeout is re-armed there if the session stays alive to avoid the "immortal zombie"
   state.

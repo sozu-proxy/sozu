@@ -240,7 +240,8 @@ buffer_size = 16393
 # how many backend connections a request may try, the first included, before
 # it is answered 503 (HTTP) or closed (TCP). A connection that is refused,
 # times out on connect_timeout or reports a socket error counts against its
-# backend, and the request goes to another backend while attempts remain.
+# backend, and the request goes to another backend while attempts remain
+# (a TCP session whose connect times out is closed instead).
 # 1 to 255, defaults to 5 (earlier versions hard-coded 3). Each cluster may
 # override it; `sozu connection-attempts set` changes it at runtime.
 # max_connection_attempts = 5
@@ -313,9 +314,12 @@ address = "0.0.0.0:8080"
 # answer_413 = "/absolute/path/to/custom_413.http"
 # a 502 response means the response sent by a backend could not be parsed by Sōzu
 # answer_502 = "/absolute/path/to/custom_502.http"
-# a 503 response is sent if there are no backend servers available
+# a 503 response is sent if there are no backend servers available, or if
+# every backend connection attempt of the request failed
 # answer_503 = "/absolute/path/to/custom_503.http"
-# a 504 response means the backend timed out
+# a 504 response means a connected backend sent no response in time, or the
+# frontend timed out while waiting on a backend (a connect timeout fails over
+# to another backend and ends in 503 once attempts are spent)
 # answer_504 = "/absolute/path/to/custom_504.http"
 # a 507 response occurs when the response sent by a backend is too big
 # answer_507 = "/absolute/path/to/custom_507.http"
@@ -371,9 +375,12 @@ address = "0.0.0.0:8443"
 # answer_413 = "/absolute/path/to/custom_413.http"
 # a 502 response means the response sent by a backend could not be parsed by Sōzu
 # answer_502 = "/absolute/path/to/custom_502.http"
-# a 503 response is sent if there are no backend servers available
+# a 503 response is sent if there are no backend servers available, or if
+# every backend connection attempt of the request failed
 # answer_503 = "/absolute/path/to/custom_503.http"
-# a 504 response means the backend timed out
+# a 504 response means a connected backend sent no response in time, or the
+# frontend timed out while waiting on a backend (a connect timeout fails over
+# to another backend and ends in 503 once attempts are spent)
 # answer_504 = "/absolute/path/to/custom_504.http"
 # a 507 response occurs when the response sent by a backend is too big
 # answer_507 = "/absolute/path/to/custom_507.http"
@@ -584,9 +591,10 @@ protocol = "http"
 #                  independently seeded workers from converging on the same
 #                  "least loaded" backend.
 #   HRW, MAGLEV  - client-affine policies: each pins a client to one backend
-#                  on a key — the flow key on UDP; on HTTP, HTTPS and TCP the
-#                  client source IP (the PROXY-protocol source when the
-#                  listener expects one), or `affinity_header` /
+#                  on a key — on UDP the source IP, or source IP and port
+#                  per `[clusters.<id>.udp] affinity_key`; on HTTP, HTTPS
+#                  and TCP the client source IP (the PROXY-protocol source
+#                  when the listener expects one), or `affinity_header` /
 #                  `affinity_cookie` below. Both read `weight` — HRW scales
 #                  its rendezvous score by it, MAGLEV gives each backend a
 #                  proportional share of lookup-table slots. A request with
@@ -674,7 +682,8 @@ backends = [
 #                        # TCP connection is established, nothing is sent
 # uri = "/health"        # HTTP mode only (default: "/")
 # interval = 10          # seconds between check cycles (default: 10)
-# timeout = 5            # seconds to wait for a response (default: 5)
+# timeout = 5            # seconds to wait for a response, or for the TCP
+#                        # connection in TCP mode (default: 5)
 # healthy_threshold = 3  # consecutive successes to mark UP (default: 3)
 # unhealthy_threshold = 3 # consecutive failures to mark DOWN (default: 3)
 # expected_status = 0    # 0 = any 2xx, or a specific status code (default: 0)

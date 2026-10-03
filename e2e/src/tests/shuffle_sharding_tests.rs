@@ -191,8 +191,8 @@ fn test_a_client_stays_in_its_shard() {
 
 /// `FALLBACK`: with both members of the client's shard down, the request
 /// spills over to a backend outside the shard and succeeds. The two failed
-/// connects consume two of the request's three connection attempts; the
-/// third leaves the exhausted shard.
+/// connects consume two of the request's `max_connection_attempts` (5 by
+/// default); the third leaves the exhausted shard.
 ///
 /// TO SEE THIS RED: make `FALLBACK` refuse like `STRICT` in
 /// `BackendList::select_with_key`; the request is then answered 503.
