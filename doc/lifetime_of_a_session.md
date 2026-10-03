@@ -490,7 +490,10 @@ request, and repeated on every later line of the connection (`memoized_rtt`,
 `keep_alive_frontend` and `keep_alive_backend` hold, so a backend's
 `Connection: close` also closes the client connection once the response is
 flushed ([#1648](https://github.com/sozu-proxy/sozu/pull/1648)). On keep-alive,
-`HttpContext::reset` clears the request-scoped fields and installs the next
+`HttpContext::reset` clears the request-scoped fields — the sticky-session
+answer among them, so a request to a frontend that does not stick never
+carries the previous request's `Set-Cookie`
+([#1822](https://github.com/sozu-proxy/sozu/issues/1822)) — and installs the next
 request's id, minted by `Context::next_request_id` from the pass's wall-clock
 snapshot and the session's seeded RNG — no system call, no allocation
 ([#1635](https://github.com/sozu-proxy/sozu/pull/1635)) — while the session id,
