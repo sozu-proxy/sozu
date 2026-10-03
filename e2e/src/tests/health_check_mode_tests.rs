@@ -27,15 +27,16 @@
 
 use std::{
     io::{ErrorKind, Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     os::fd::AsRawFd,
     thread,
     time::{Duration, Instant},
 };
 
 use sozu_command_lib::proto::command::{
-    HealthCheckConfig, HealthCheckMode, HttpStatusRange, QueryMetricsOptions, SetHealthCheck,
-    filtered_metrics, request::RequestType, response_content::ContentType,
+    HealthCheckConfig, HealthCheckMode, HttpStatusRange, QueryMetricsOptions, ResponseStatus,
+    SetHealthCheck, WorkerResponse, filtered_metrics, request::RequestType,
+    response_content::ContentType,
 };
 use sozu_lib::metrics::names::health_check::{DOWN, FAILURE, SUCCESS};
 
@@ -156,6 +157,50 @@ fn spawn_status_backend(
     )
 }
 
+/// Accept one probe connection within the suite's health-check budget.
+fn accept_probe(listener: &TcpListener) -> TcpStream {
+    let deadline = Instant::now() + VERDICT_BUDGET;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("could not bound probe reads");
+                return stream;
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                panic!("no health-check connection arrived within {VERDICT_BUDGET:?}");
+            }
+            Err(error) => panic!("could not accept health-check connection: {error}"),
+        }
+    }
+}
+
+/// Read one complete HTTP probe request, bounded by the stream timeout.
+fn read_probe_request(stream: &mut TcpStream) -> Vec<u8> {
+    let mut request = Vec::new();
+    let mut buf = [0u8; 512];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => panic!("health-check connection closed before its HTTP request completed"),
+            Ok(n) => {
+                request.extend_from_slice(&buf[..n]);
+                assert!(
+                    request.len() <= 4096,
+                    "health-check request exceeded the test's 4096-byte bound"
+                );
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    return request;
+                }
+            }
+            Err(error) => panic!("could not read health-check request: {error}"),
+        }
+    }
+}
+
 /// Read the worker's `health_check.*` counters as `(success, failure, down)`;
 /// an absent counter reads as 0.
 ///
@@ -208,12 +253,19 @@ fn wait_for_counters(
     }
 }
 
-fn set_health_check(worker: &mut Worker, config: HealthCheckConfig) {
+fn set_health_check(worker: &mut Worker, config: HealthCheckConfig) -> WorkerResponse {
     worker.send_proxy_request_type(RequestType::SetHealthCheck(SetHealthCheck {
         cluster_id: "cluster_0".to_owned(),
         config,
     }));
-    worker.read_to_last();
+    loop {
+        let response = worker
+            .read_proxy_response()
+            .expect("the worker answers SetHealthCheck");
+        if response.id == worker.command_id.last {
+            return response;
+        }
+    }
 }
 
 fn add_backend(worker: &mut Worker, backend_id: &str, address: SocketAddr) {
@@ -431,6 +483,140 @@ fn test_health_check_legacy_config_marks_404_backend_down() {
         ),
         State::Success
     );
+}
+
+/// A probe snapshots the policy at launch. A later `SetHealthCheck` is
+/// acknowledged without cancelling or rewriting that probe; only probes
+/// launched after the update use the replacement policy.
+#[test]
+fn in_flight_probe_finishes_with_old_policy_then_future_probe_uses_new_policy() {
+    let front_address = create_local_address();
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, _) = setup_async_test(
+        "HC-POLICY-CUTOVER",
+        config,
+        listeners,
+        state,
+        front_address,
+        0,
+        false,
+    );
+
+    let accepted_listener =
+        TcpListener::bind("127.0.0.1:0").expect("could not bind the accepted-status backend");
+    let rejected_listener =
+        TcpListener::bind("127.0.0.1:0").expect("could not bind the threshold backend");
+    accepted_listener
+        .set_nonblocking(true)
+        .expect("could not make the accepted-status listener nonblocking");
+    rejected_listener
+        .set_nonblocking(true)
+        .expect("could not make the threshold listener nonblocking");
+    let accepted_address = accepted_listener
+        .local_addr()
+        .expect("accepted-status listener must have an address");
+    let rejected_address = rejected_listener
+        .local_addr()
+        .expect("threshold listener must have an address");
+    add_backend(&mut worker, "cluster_0-accepted", accepted_address);
+    add_backend(&mut worker, "cluster_0-rejected", rejected_address);
+
+    let old_policy = HealthCheckConfig {
+        uri: "/old-policy".to_owned(),
+        interval: 30,
+        timeout: 10,
+        healthy_threshold: 2,
+        unhealthy_threshold: 2,
+        accepted_statuses: vec![HttpStatusRange {
+            start: 404,
+            end: 404,
+        }],
+        ..fast_health_check(HealthCheckMode::Http)
+    };
+    assert_eq!(
+        set_health_check(&mut worker, old_policy).status,
+        ResponseStatus::Ok as i32,
+        "the initial health-check policy must be acknowledged"
+    );
+
+    let mut accepted_probe = accept_probe(&accepted_listener);
+    let mut rejected_probe = accept_probe(&rejected_listener);
+    for request in [
+        read_probe_request(&mut accepted_probe),
+        read_probe_request(&mut rejected_probe),
+    ] {
+        assert!(
+            request.starts_with(b"GET /old-policy HTTP/1.1\r\n"),
+            "the in-flight probe must have launched in the old HTTP mode with the old URI: {request:?}"
+        );
+    }
+
+    let mut new_policy = HealthCheckConfig {
+        uri: String::new(),
+        interval: 30,
+        timeout: 5,
+        ..fast_health_check(HealthCheckMode::Tcp)
+    };
+    let update = set_health_check(&mut worker, new_policy.to_owned());
+    assert_eq!(
+        update.status,
+        ResponseStatus::Ok as i32,
+        "SetHealthCheck must acknowledge the new policy while old probes are in flight"
+    );
+    assert_eq!(
+        query_counters(&mut worker),
+        (0, 0, 0),
+        "acknowledging the TCP policy must not complete the old HTTP probes"
+    );
+
+    accepted_probe
+        .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+        .expect("could not finish the old accepted-status probe");
+    rejected_probe
+        .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
+        .expect("could not finish the old threshold probe");
+    accepted_probe
+        .shutdown(Shutdown::Write)
+        .expect("could not close the accepted-status response");
+    rejected_probe
+        .shutdown(Shutdown::Write)
+        .expect("could not close the threshold response");
+
+    let old_results = wait_for_counters(&mut worker, |success, failure, _| {
+        success >= 1 && failure >= 1
+    });
+    assert_eq!(
+        old_results,
+        (1, 1, 0),
+        "the old policy must accept 404 and require two failures before marking a backend DOWN"
+    );
+
+    drop(rejected_probe);
+    drop(rejected_listener);
+    new_policy.interval = 1;
+    assert_eq!(
+        set_health_check(&mut worker, new_policy).status,
+        ResponseStatus::Ok as i32,
+        "the next TCP probe must be made immediately eligible"
+    );
+    let mut future_probe = accept_probe(&accepted_listener);
+    let future_results = wait_for_counters(&mut worker, |success, failure, down| {
+        success >= 2 && failure >= 2 && down >= 1
+    });
+    assert_eq!(
+        future_results.2, 1,
+        "the refused future probe must use the new threshold of one failure"
+    );
+    let mut application_byte = [0u8; 1];
+    let application_bytes = future_probe
+        .read(&mut application_byte)
+        .expect("could not observe the completed TCP-mode probe");
+    assert_eq!(
+        application_bytes, 0,
+        "a future TCP-mode probe must close without sending HTTP bytes"
+    );
+
+    stop(worker);
 }
 
 // ---------------------------------------------------------------------------

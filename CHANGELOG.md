@@ -642,6 +642,21 @@
 
 ### 🔄 Changed
 
+- **`docs(health-check)`: document and test `SetHealthCheck`'s draining policy boundary
+  ([#1824](https://github.com/sozu-proxy/sozu/issues/1824)).** `SetHealthCheck` validates and
+  stores the replacement policy and acknowledges it without cancelling the probes already in
+  flight. Each of them captured its mode and request, timeout, accepted statuses and thresholds
+  at launch and completes under that old policy, so its result can still change a backend's
+  health after the acknowledgement; only probes launched afterwards use the new policy.
+  Updating a policy launches no probe and keeps the last launch time, so the new interval counts
+  from it. `doc/health_checks.md` now states this boundary, and the real-socket e2e test
+  `in_flight_probe_finishes_with_old_policy_then_future_probe_uses_new_policy`
+  (`e2e/src/tests/health_check_mode_tests.rs`) pins it: two HTTP probes in flight finish with the
+  old accepted status and failure threshold after the TCP policy is acknowledged, then a later
+  probe uses TCP mode and the new threshold. The file's `set_health_check` helper now returns the
+  worker's answer to the request it sent instead of draining every pending answer. No behaviour
+  change.
+
 - **`docs(udp)`: describe stale idle-expiry handling as deadline revalidation
   ([#1825](https://github.com/sozu-proxy/sozu/issues/1825)).** The UDP lifecycle documentation,
   the `flow.rs`/`manager.rs`/`mod.rs` comments and two test names attributed the survival of a
@@ -4048,6 +4063,27 @@
   all three failed on `main`. Two end-to-end tests have an idle HTTP/2 backend send DATA on
   stream 0 or HEADERS on a stream sozu never opened, and require the client's 5xx within 3 s. `mux/LIFECYCLE.md` and `doc/lifetime_of_a_session.md` describe the
   loop's exit condition and the budget.
+
+- **BREAKING (library API) — `fix(backends)`: preserve backend identity and incarnation across
+  removal and health-check completion ([#1821](https://github.com/sozu-proxy/sozu/issues/1821)).**
+  `AddBackend` and `ConfigState` identify a backend by `(backend_id, address)` and admit two ids
+  at one address, but the worker dropped that identity in three places. `RemoveBackend` removed
+  every backend at the address, so removing id A answered ok while its sibling B, still listed
+  by `ConfigState` and its queries, stopped receiving traffic. HTTP/TCP and UDP health results
+  were applied to the first backend at the probed address, so a failed UDP probe of B marked A
+  DOWN. A probe still in flight when its backend was removed could complete after the same id
+  and address were added again and mark the new backend DOWN. Removal now drops only the backend
+  with the requested id at that address, and each probe captures the backend incarnation it was
+  launched for (a `Weak` handle on the live entry) and applies its result only while that entry
+  is still in the cluster: a result for a removed backend is discarded, the re-added backend
+  starts healthy, and it is probed on the next cycle without waiting for the old probe. One probe
+  is in flight per incarnation rather than per backend id. `RemoveCluster` still removes the
+  whole cluster. A `RemoveBackend` sent directly to a worker whose id matches no backend at the
+  address now removes nothing and logs a warning (it previously removed every backend at that
+  address). Library API: `BackendList::remove_backend(backend_id, address)` and
+  `BackendMap::remove_backend(cluster_id, backend_id, address)` take the backend id and return
+  whether the backend was present instead of the list of removed ids; new
+  `BackendList::find_backend_by_identity` and `BackendList::find_incarnation`.
 
 - **`fix(metrics)`: metric-detail leases expire without another worker command
   ([#1831](https://github.com/sozu-proxy/sozu/issues/1831)).** The lease janitor

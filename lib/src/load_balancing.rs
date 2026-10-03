@@ -47,12 +47,13 @@ fn backend_weight(backend: &Backend) -> u32 {
 /// Deterministic, seedable 64-bit hash over the backend's STABLE identifier.
 ///
 /// We hash the backend **socket address** (`SocketAddr`) rather than the
-/// `backend_id` string: the address is the routing-stable identity (it is the
-/// key used by `BackendList::remove_backend` / `has_backend` and survives a
-/// reconfiguration that merely re-emits the same backend), whereas `backend_id`
-/// is a human label that the control plane may rename without changing where
-/// traffic actually goes. Hashing the address keeps HRW/Maglev placement stable
-/// across such cosmetic reconfigurations.
+/// `backend_id` string: the address is where traffic actually goes, so it is
+/// the routing-stable part of a backend and survives a reconfiguration that
+/// merely re-emits the same backend. Backend lifecycle identity is the
+/// `(backend_id, address)` pair (`BackendList::remove_backend` removes only
+/// the backend matching both, so two ids may share an address), but placement
+/// deliberately keys on the address alone: HRW/Maglev then stay stable when
+/// the control plane renames a backend without moving it.
 ///
 /// Uses `std::hash::SipHasher13` indirectly via a tiny FNV-1a construction with
 /// an injected seed — fully reproducible, never `RandomState`.

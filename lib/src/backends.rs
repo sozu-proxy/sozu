@@ -2,7 +2,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     net::SocketAddr,
-    rc::Rc,
+    rc::{Rc, Weak},
     time::{Duration, Instant},
 };
 
@@ -740,33 +740,36 @@ impl BackendMap {
     }
 
     // TODO: return <Result, BackendError>, log the error downstream
-    /// Remove every backend at `backend_address` from `cluster_id` and
-    /// return the list of `backend_id`s that were dropped. Callers (e.g.
-    /// `Server::remove_backend`) iterate over the returned ids to tear
-    /// down per-backend metrics so the identity used by the runtime
-    /// (address-keyed) matches the identity used by the metrics layer
-    /// (id-keyed) — see PR #1252 follow-up review MEDIUM-3.
+    /// Remove the backend identified by `(backend_id, backend_address)` from
+    /// `cluster_id` and return whether it was present. A backend of another
+    /// id at the same address stays (#1821).
     pub fn remove_backend(
         &mut self,
         cluster_id: &str,
+        backend_id: &str,
         backend_address: &SocketAddr,
-    ) -> Vec<String> {
+    ) -> bool {
         let removed = if let Some(backends) = self.backends.get_mut(cluster_id) {
-            backends.remove_backend(backend_address)
+            let removed = backends.remove_backend(backend_id, backend_address);
+            if !removed {
+                warn!(
+                    "No backend matches id {} at address {:?} in cluster {}: nothing removed",
+                    backend_id, backend_address, cluster_id
+                );
+            }
+            removed
         } else {
             error!(
-                "Backend was already removed: cluster id {}, address {:?}",
-                cluster_id, backend_address
+                "Backend was already removed: cluster id {}, backend id {}, address {:?}",
+                cluster_id, backend_id, backend_address
             );
-            return Vec::new();
+            return false;
         };
-        // Whatever ids came back, the address is now gone from the cluster's
-        // live set (remove_backend evicts every backend at that address).
         debug_assert!(
-            self.backends
-                .get(cluster_id)
-                .is_none_or(|list| !list.has_backend(backend_address)),
-            "remove_backend must evict every backend at the address"
+            self.backends.get(cluster_id).is_none_or(|list| list
+                .find_backend_by_identity(backend_id, backend_address)
+                .is_none()),
+            "remove_backend must evict the backend it names"
         );
         // Re-evaluate so removing the last backend logs an explicit
         // `AllDown` transition (or, with `total == 0`, drops back to
@@ -1223,10 +1226,10 @@ impl BackendList {
             self.next_id,
             self.backends.len()
         );
-        // Addresses are the routing-stable identity used by `has_backend` /
-        // `remove_backend`; two live backends may legitimately share an address
-        // (A/B variant) but must then differ by `backend_id`. The (address,
-        // backend_id) pair is therefore unique across the live set.
+        // `(backend_id, address)` is the identity `remove_backend` keys on; two
+        // live backends may legitimately share an address (A/B variant) but
+        // must then differ by `backend_id`. The pair is therefore unique
+        // across the live set.
         for (i, a) in self.backends.iter().enumerate() {
             let a = a.borrow();
             for b in self.backends.iter().skip(i + 1) {
@@ -1388,20 +1391,17 @@ impl BackendList {
         self.candidates.len()
     }
 
-    /// Remove every backend at `backend_address` and return the list of
-    /// `backend_id`s that were dropped. Two backends with the same address
-    /// but distinct ids (A/B test, weighted variant, dedup race) are both
-    /// removed here; the caller relies on the returned ids to tear down
-    /// matching per-backend state (metrics, health-check). Returning the
-    /// ids closes the identity drift between runtime-removal-by-address
-    /// and metrics-removal-by-id.
-    pub fn remove_backend(&mut self, backend_address: &SocketAddr) -> Vec<String> {
+    /// Remove the backend identified by `(backend_id, backend_address)`, the
+    /// identity `AddBackend` and `ConfigState` key backends on, and return
+    /// whether it was present. Another id at the same address (A/B test,
+    /// weighted variant) is a distinct backend and stays (#1821).
+    pub fn remove_backend(&mut self, backend_id: &str, backend_address: &SocketAddr) -> bool {
         let len_before = self.backends.len();
-        let mut removed = Vec::new();
+        let mut removed = false;
         self.backends.retain(|backend| {
             let mut b = backend.borrow_mut();
-            if &b.address == backend_address {
-                removed.push(b.backend_id.clone());
+            if b.backend_id == backend_id && &b.address == backend_address {
+                removed = true;
                 // A session may still hold this backend: retire it so none
                 // of its pooled connections takes a new request.
                 b.set_closing();
@@ -1410,26 +1410,53 @@ impl BackendList {
                 true
             }
         });
-        // The list shrinks by exactly the number of ids reported removed, and
-        // the address is fully evicted (no straggler left behind).
+        // The list holds each `(backend_id, address)` at most once, so it
+        // shrinks by exactly one entry when the identity was present.
         debug_assert_eq!(
             self.backends.len(),
-            len_before - removed.len(),
-            "remove_backend must drop exactly the backends it reports"
+            len_before - removed as usize,
+            "remove_backend must drop exactly the backend it reports"
         );
         debug_assert!(
-            !self.has_backend(backend_address),
-            "remove_backend must evict every backend at the address"
+            self.find_backend_by_identity(backend_id, backend_address)
+                .is_none(),
+            "remove_backend must evict the backend it names"
         );
         // Rebuild table-based policies (Maglev) off the datapath after the set
         // shrinks, only when something was actually removed. No-op for the
         // stateless policies.
-        if !removed.is_empty() {
+        if removed {
             self.load_balancing.rebuild(&self.backends);
         }
         #[cfg(debug_assertions)]
         self.check_invariants();
         removed
+    }
+
+    /// The live backend identified by `(backend_id, backend_address)`.
+    pub fn find_backend_by_identity(
+        &self,
+        backend_id: &str,
+        backend_address: &SocketAddr,
+    ) -> Option<&Rc<RefCell<Backend>>> {
+        self.backends.iter().find(|backend| {
+            let b = backend.borrow();
+            b.backend_id == backend_id && b.address == *backend_address
+        })
+    }
+
+    /// The live entry that is the `incarnation` a health probe captured when
+    /// it launched, or `None` once that backend left the list: removed, or
+    /// replaced by a backend re-added under the same id and address, which is
+    /// a new incarnation. Comparing allocations is sound because the `Weak`
+    /// keeps its allocation alive, so no later backend can reuse it (#1821).
+    pub fn find_incarnation(
+        &self,
+        incarnation: &Weak<RefCell<Backend>>,
+    ) -> Option<&Rc<RefCell<Backend>>> {
+        self.backends
+            .iter()
+            .find(|backend| std::ptr::eq(Rc::as_ptr(backend), incarnation.as_ptr()))
     }
 
     pub fn has_backend(&self, backend_address: &SocketAddr) -> bool {
@@ -1865,7 +1892,7 @@ mod backends_test {
         backend_map.add_backend("foo", Backend::new("foo-2", second, None, None, None));
         let held: Vec<Rc<RefCell<Backend>>> = backend_map.backends["foo"].backends.clone();
 
-        backend_map.remove_backend("foo", &first);
+        assert!(backend_map.remove_backend("foo", "foo-1", &first));
         assert_eq!(held[0].borrow().status, BackendStatus::Closing);
         assert_eq!(held[1].borrow().status, BackendStatus::Normal);
 
@@ -1877,6 +1904,33 @@ mod backends_test {
         let readded = &backend_map.backends["foo"].backends[0];
         assert!(!Rc::ptr_eq(readded, &held[1]));
         assert_eq!(readded.borrow().status, BackendStatus::Normal);
+    }
+
+    /// `AddBackend` admits two ids at one address; removing one of them must
+    /// keep the other routable (#1821).
+    #[test]
+    fn removing_one_backend_id_keeps_its_same_address_sibling() {
+        let mut backend_map = BackendMap::new();
+        let shared: SocketAddr = "127.0.0.1:9003".parse().unwrap();
+        backend_map.add_backend("foo", Backend::new("foo-a", shared, None, None, None));
+        backend_map.add_backend("foo", Backend::new("foo-b", shared, None, None, None));
+        let held: Vec<Rc<RefCell<Backend>>> = backend_map.backends["foo"].backends.clone();
+
+        assert!(backend_map.remove_backend("foo", "foo-a", &shared));
+        assert_eq!(held[0].borrow().status, BackendStatus::Closing);
+        assert_eq!(held[1].borrow().status, BackendStatus::Normal);
+        let list = &backend_map.backends["foo"];
+        assert_eq!(list.backends.len(), 1);
+        assert!(Rc::ptr_eq(
+            list.find_backend_by_identity("foo-b", &shared).unwrap(),
+            &held[1]
+        ));
+        assert!(list.find_backend_by_identity("foo-a", &shared).is_none());
+
+        // Removing it again, or an id never added, removes nothing.
+        assert!(!backend_map.remove_backend("foo", "foo-a", &shared));
+        assert!(!backend_map.remove_backend("foo", "foo-c", &shared));
+        assert_eq!(backend_map.backends["foo"].backends.len(), 1);
     }
 
     #[test]
@@ -2807,9 +2861,11 @@ mod backends_test {
                 .map(|b| b.borrow().address)
                 .find(|a| !before.contains(a))
                 .expect("a shard of 2 among 10 leaves outsiders");
-            list.remove_backend(&outsider);
+            // `sharded_list` names each backend after its port.
+            let id_of = |address: &SocketAddr| format!("shard-{}", address.port() - 20_000);
+            assert!(list.remove_backend(&id_of(&outsider), &outsider));
             assert_eq!(shard_of(&mut list, key), before, "key {key}");
-            list.remove_backend(&before[0]);
+            assert!(list.remove_backend(&id_of(&before[0]), &before[0]));
             assert!(
                 shard_of(&mut list, key).contains(&before[1]),
                 "key {key}: removing one member keeps the other"

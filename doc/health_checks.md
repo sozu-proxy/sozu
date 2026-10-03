@@ -56,6 +56,14 @@ every check cycle:
 4. Compares the HTTP status code against the accepted statuses
 5. Updates the backend's health state based on success or failure
 
+A probe is bound to the backend it was launched for, identified by its backend
+id and address: two backends of a cluster may share an address under distinct
+ids, and each probe updates only its own. When `RemoveBackend` removes a
+backend while one of its probes is in flight, the probe's result is discarded
+on completion, even if a backend with the same id and address was added in the
+meantime: the re-added backend is a new one, starts healthy, and is probed on
+the next check cycle without waiting for the old probe to end.
+
 ### Health state machine
 
 Each backend maintains a `HealthState` with counters for consecutive successes
@@ -209,6 +217,22 @@ sozu cluster health-check set --id my-cluster --uri /livez --accepted-statuses 2
 
 Creates or replaces the health check configuration for the given cluster. Only
 `--id` is required — all other flags have sensible defaults (shown above).
+
+Each probe snapshots its policy when it is launched. `SetHealthCheck` validates
+and stores the replacement policy, then acknowledges the command without
+cancelling or rewriting probes already in flight. Those probes keep their old
+mode and request, timeout, accepted-status rule, and healthy/unhealthy thresholds
+through completion; their result can still update the backend's health after the
+new policy has been acknowledged. Only probes launched afterwards use the new
+policy. The acknowledgement is therefore a draining policy boundary, not an
+atomic cutover of work already in flight.
+
+Updating a policy does not itself launch a probe or reset the last launch time.
+The new interval controls when the next probe becomes eligible relative to that
+existing launch time. Removing a health check has the stronger cancellation and
+reset semantics described in [Remove a health check](#remove-a-health-check).
+Removing a backend discards the result of its probes still in flight, as
+described in [How it works](#how-it-works).
 
 The probe timeout is `--probe-timeout`, in seconds. `--timeout` (`-t`) is the
 global `sozu` command timeout, in milliseconds, on this subcommand as on every

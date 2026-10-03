@@ -17,7 +17,7 @@ use std::{
     hash::{Hash, Hasher},
     io::{Read, Write},
     net::SocketAddr,
-    rc::Rc,
+    rc::{Rc, Weak},
     time::{Duration, Instant},
 };
 
@@ -29,7 +29,7 @@ use sozu_command::{
 
 use crate::metrics::names;
 use crate::{
-    backends::BackendMap,
+    backends::{Backend, BackendMap},
     protocol::mux::{
         parser::{
             FLAG_END_HEADERS, FLAG_PADDED, FLAG_PRIORITY, FRAME_HEADER_SIZE, FrameType,
@@ -71,12 +71,13 @@ const HEALTH_CHECK_TOKEN_CAPACITY: usize = 1 << 16;
 /// Each pending entry is `(cluster_id, config, h2c, backends_to_check)`.
 /// `h2c` mirrors `cluster.http2` (the same backend-capability hint the
 /// mux router uses) so the probe wire format matches what the proxy
-/// will actually use to reach those backends.
+/// will actually use to reach those backends. Each backend to check is
+/// `(backend_id, address, incarnation)`.
 type PendingChecks = Vec<(
     ClusterId,
     HealthCheckConfig,
     bool,
-    Vec<(String, SocketAddr)>,
+    Vec<(String, SocketAddr, Weak<RefCell<Backend>>)>,
 )>;
 
 /// Tracks an in-flight health check connection
@@ -87,6 +88,11 @@ struct InFlightCheck {
     cluster_id: ClusterId,
     backend_id: String,
     address: SocketAddr,
+    /// The backend incarnation this probe was launched for. The result
+    /// applies to it only while it is still in the cluster's list, so a
+    /// probe that outlives a `RemoveBackend` (and a re-add of the same id
+    /// and address) never mutates the replacement (#1821).
+    backend: Weak<RefCell<Backend>>,
     started_at: Instant,
     timeout: Duration,
     request_bytes: Option<Vec<u8>>,
@@ -257,21 +263,29 @@ impl HealthChecker {
             }
 
             if let Some(backend_list) = backend_map.backends.get(cluster_id) {
-                let backends_to_check: Vec<(String, SocketAddr)> = backend_list
-                    .backends
-                    .iter()
-                    .filter(|b| {
-                        let b = b.borrow();
-                        b.status == crate::backends::BackendStatus::Normal
-                            && !self.in_flight.iter().any(|f| {
-                                f.cluster_id == *cluster_id && f.backend_id == b.backend_id
-                            })
-                    })
-                    .map(|b| {
-                        let b = b.borrow();
-                        (b.backend_id.to_owned(), b.address)
-                    })
-                    .collect();
+                // One probe in flight per backend incarnation: a probe still
+                // draining for a removed incarnation does not delay the
+                // first probe of its replacement.
+                let backends_to_check: Vec<(String, SocketAddr, Weak<RefCell<Backend>>)> =
+                    backend_list
+                        .backends
+                        .iter()
+                        .filter(|b| {
+                            b.borrow().status == crate::backends::BackendStatus::Normal
+                                && !self
+                                    .in_flight
+                                    .iter()
+                                    .any(|f| std::ptr::eq(f.backend.as_ptr(), Rc::as_ptr(b)))
+                        })
+                        .map(|b| {
+                            let backend = b.borrow();
+                            (
+                                backend.backend_id.to_owned(),
+                                backend.address,
+                                Rc::downgrade(b),
+                            )
+                        })
+                        .collect();
 
                 if !backends_to_check.is_empty() {
                     let h2c = backend_map
@@ -310,7 +324,7 @@ impl HealthChecker {
                 Interest::READABLE | Interest::WRITABLE
             };
 
-            for (backend_id, address) in backends_to_check {
+            for (backend_id, address, incarnation) in backends_to_check {
                 match TcpStream::connect(address) {
                     Ok(mut stream) => {
                         let Some(token) = self.allocate_token() else {
@@ -320,8 +334,7 @@ impl HealthChecker {
                             Self::record_check_result(
                                 backends,
                                 &cluster_id,
-                                &backend_id,
-                                address,
+                                &incarnation,
                                 false,
                                 &config,
                             );
@@ -339,8 +352,7 @@ impl HealthChecker {
                             Self::record_check_result(
                                 backends,
                                 &cluster_id,
-                                &backend_id,
-                                address,
+                                &incarnation,
                                 false,
                                 &config,
                             );
@@ -391,6 +403,7 @@ impl HealthChecker {
                             cluster_id: cluster_id.to_owned(),
                             backend_id,
                             address,
+                            backend: incarnation,
                             started_at: now,
                             timeout: Duration::from_secs(u64::from(config.timeout)),
                             request_bytes,
@@ -413,8 +426,7 @@ impl HealthChecker {
                         Self::record_check_result(
                             backends,
                             &cluster_id,
-                            &backend_id,
-                            address,
+                            &incarnation,
                             false,
                             &config,
                         );
@@ -574,19 +586,21 @@ impl HealthChecker {
             Self::record_check_result(
                 backends,
                 &check.cluster_id,
-                &check.backend_id,
-                check.address,
+                &check.backend,
                 success,
                 &check.config,
             );
         }
     }
 
+    /// Apply a probe result to the backend `incarnation` it was launched
+    /// for. A result whose incarnation left the cluster (removed, or
+    /// replaced by a re-add of the same id and address) is dropped; it never
+    /// lands on a sibling at the same address nor on the replacement (#1821).
     fn record_check_result(
         backends: &Rc<RefCell<BackendMap>>,
         cluster_id: &str,
-        backend_id: &str,
-        address: SocketAddr,
+        incarnation: &Weak<RefCell<Backend>>,
         success: bool,
         config: &HealthCheckConfig,
     ) {
@@ -595,11 +609,19 @@ impl HealthChecker {
             return;
         };
 
-        let Some(backend_ref) = backend_list.find_backend(&address) else {
+        let Some(backend_ref) = backend_list.find_incarnation(incarnation) else {
+            debug!(
+                "{} dropping a result for a backend no longer in cluster {}",
+                log_context!(),
+                cluster_id
+            );
             return;
         };
 
         let mut backend = backend_ref.borrow_mut();
+        let backend_id = backend.backend_id.to_owned();
+        let backend_id = backend_id.as_str();
+        let address = backend.address;
 
         if success {
             // Snapshot the hysteresis status before the counter mutation so we
@@ -1163,7 +1185,7 @@ mod tests {
     use sozu_command::proto::command::HttpStatusRange;
 
     use super::*;
-    use crate::backends::HealthState;
+    use crate::backends::{Backend, HealthState};
 
     /// An HTTP-mode config judging statuses by `expected_status` and
     /// `accepted_statuses` (given as `(start, end)` pairs).
@@ -1399,6 +1421,145 @@ mod tests {
 
         assert!(state.record_success(3));
         assert!(state.is_healthy());
+    }
+
+    /// The health of the backend `backend_id` at `address` in `cluster`.
+    fn is_healthy_by_id(
+        backends: &Rc<RefCell<BackendMap>>,
+        cluster: &str,
+        backend_id: &str,
+        address: SocketAddr,
+    ) -> bool {
+        backends.borrow().backends[cluster]
+            .find_backend_by_identity(backend_id, &address)
+            .expect("the backend is in the cluster")
+            .borrow()
+            .health
+            .is_healthy()
+    }
+
+    /// #1821: a probe launched before `RemoveBackend` can complete after the
+    /// same id and address are added again; its result belongs to the
+    /// removed incarnation and must not mark the replacement DOWN.
+    #[test]
+    fn late_result_after_remove_and_readd_same_identity_does_not_mutate_replacement() {
+        const CLUSTER: &str = "late-result-cluster";
+        const BACKEND: &str = "late-result-backend";
+        let address: SocketAddr = "127.0.0.1:23110".parse().unwrap();
+        let mut backend_map = BackendMap::new();
+        backend_map.add_backend(CLUSTER, Backend::new(BACKEND, address, None, None, None));
+        let backends = Rc::new(RefCell::new(backend_map));
+        // What `initiate_checks` captures when it launches the probe, and a
+        // session still holding the removed backend, which keeps it alive.
+        let held = Rc::clone(&backends.borrow().backends[CLUSTER].backends[0]);
+        let stale = Rc::downgrade(&held);
+
+        assert!(
+            backends
+                .borrow_mut()
+                .remove_backend(CLUSTER, BACKEND, &address)
+        );
+        backends
+            .borrow_mut()
+            .add_backend(CLUSTER, Backend::new(BACKEND, address, None, None, None));
+
+        let mut config = h2c_config(0);
+        config.unhealthy_threshold = 1;
+        HealthChecker::record_check_result(&backends, CLUSTER, &stale, false, &config);
+        assert!(
+            is_healthy_by_id(&backends, CLUSTER, BACKEND, address),
+            "a late result from the removed incarnation must not mark its replacement DOWN"
+        );
+
+        // Positive control: a result for the replacement does apply.
+        let current = Rc::downgrade(&backends.borrow().backends[CLUSTER].backends[0]);
+        HealthChecker::record_check_result(&backends, CLUSTER, &current, false, &config);
+        assert!(
+            !is_healthy_by_id(&backends, CLUSTER, BACKEND, address),
+            "a result for the live incarnation must mark it DOWN"
+        );
+    }
+
+    /// #1821: duplicate-probe detection is per backend incarnation. A probe
+    /// still in flight for a removed incarnation must not delay the first
+    /// probe of a replacement re-added with the same id and address.
+    #[test]
+    fn in_flight_probe_for_removed_incarnation_does_not_block_replacement_probe() {
+        const CLUSTER: &str = "in-flight-incarnation-cluster";
+        const BACKEND: &str = "in-flight-incarnation-backend";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let poll = mio::Poll::new().unwrap();
+        let mut backend_map = BackendMap::new();
+        backend_map.add_backend(CLUSTER, Backend::new(BACKEND, address, None, None, None));
+        backend_map
+            .health_check_configs
+            .insert(CLUSTER.into(), h2c_config(0));
+        let backends = Rc::new(RefCell::new(backend_map));
+        let mut checker = HealthChecker::new();
+
+        checker.initiate_checks(&backends, poll.registry());
+        assert_eq!(
+            checker.in_flight.len(),
+            1,
+            "the first cycle probes the backend"
+        );
+
+        assert!(
+            backends
+                .borrow_mut()
+                .remove_backend(CLUSTER, BACKEND, &address)
+        );
+        backends
+            .borrow_mut()
+            .add_backend(CLUSTER, Backend::new(BACKEND, address, None, None, None));
+        let replacement = Rc::clone(&backends.borrow().backends[CLUSTER].backends[0]);
+
+        // Make the cluster due again while the removed incarnation's probe
+        // is still in flight.
+        checker.last_check_time.clear();
+        checker.initiate_checks(&backends, poll.registry());
+        assert_eq!(
+            checker.in_flight.len(),
+            2,
+            "the replacement must be probed without waiting for the removed incarnation's probe"
+        );
+        assert!(
+            std::ptr::eq(
+                checker.in_flight[1].backend.as_ptr(),
+                Rc::as_ptr(&replacement)
+            ),
+            "the new probe targets the replacement incarnation"
+        );
+    }
+
+    /// #1821: two ids may share an address; a probe result updates the id
+    /// that was probed, never the first sibling at that address.
+    #[test]
+    fn probe_result_updates_the_backend_id_that_was_probed() {
+        const CLUSTER: &str = "sibling-cluster";
+        let address: SocketAddr = "127.0.0.1:23111".parse().unwrap();
+        let mut backend_map = BackendMap::new();
+        backend_map.add_backend(CLUSTER, Backend::new("a", address, None, None, None));
+        backend_map.add_backend(CLUSTER, Backend::new("b", address, None, None, None));
+        let backends = Rc::new(RefCell::new(backend_map));
+        let probed = Rc::downgrade(
+            backends.borrow().backends[CLUSTER]
+                .find_backend_by_identity("b", &address)
+                .unwrap(),
+        );
+
+        let mut config = h2c_config(0);
+        config.unhealthy_threshold = 1;
+        HealthChecker::record_check_result(&backends, CLUSTER, &probed, false, &config);
+        assert_eq!(
+            (
+                is_healthy_by_id(&backends, CLUSTER, "a", address),
+                is_healthy_by_id(&backends, CLUSTER, "b", address),
+            ),
+            (true, false),
+            "a failed probe for backend b must mutate b, not the first backend at its address"
+        );
     }
 
     fn h2c_config(expected: u32) -> HealthCheckConfig {
