@@ -345,7 +345,24 @@ fn restore_cloexec_after_failed_upgrade(server: &mut Server) {
     }
 }
 
-pub fn upgrade_main(server: &mut Server, client: &mut ClientSession) {
+/// Hand the main process over to a freshly executed binary.
+///
+/// sozu#1832: refused while `pending_tasks` (`CommandHub::pending_task_count`)
+/// is non-zero. `UpgradeData` carries no client, task or worker-response
+/// route, and the old main stops reading worker answers once the handoff is
+/// confirmed, so a command admitted before the upgrade would never be
+/// answered. The refusal comes before any side effect: no generation bump, no
+/// audit success, no fork. The requesting client retries once the pending
+/// commands have completed or reached their deadline.
+pub fn upgrade_main(server: &mut Server, client: &mut ClientSession, pending_tasks: usize) {
+    if pending_tasks > 0 {
+        client.finish_failure(format!(
+            "Cannot upgrade the main process: {pending_tasks} control command(s) still pending, \
+             which the new main process would not inherit. Retry once they complete"
+        ));
+        return;
+    }
+
     // Bump the boot generation BEFORE serialising upgrade_data so the
     // re-execed main starts at the new value. The audit line below
     // already reflects the bumped value.

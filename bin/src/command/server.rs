@@ -829,13 +829,14 @@ impl CommandHub {
                     SIGTERM_TOKEN => self.on_sigterm(),
                     token => {
                         trace!("{:?} got event: {:?}", token, event);
+                        let pending_tasks = self.pending_task_count();
                         if let Some((server, client)) = self.get_client_mut(&token) {
                             client.update_readiness(ready);
                             match client.ready() {
                                 ClientResult::NothingToDo => {}
                                 ClientResult::NewRequest(request) => {
                                     debug!("Received new request: {:?}", request);
-                                    server.handle_client_request(client, request);
+                                    server.handle_client_request(client, request, pending_tasks);
                                     self.flush_pending_audit_events();
                                 }
                                 ClientResult::CloseSession => {
@@ -880,6 +881,14 @@ impl CommandHub {
                 }
             }
         }
+    }
+
+    /// Control tasks the main process still owes a terminal answer: the ones
+    /// migrated into [`Self::tasks`] and the ones queued during the current
+    /// event-loop iteration. `upgrade_main` refuses to hand off while any is
+    /// pending (sozu#1832).
+    fn pending_task_count(&self) -> usize {
+        self.tasks.len() + self.server.queued_tasks.len()
     }
 
     /// How long the event loop may block in `poll` before a task deadline
@@ -2739,5 +2748,99 @@ mod tests {
             (0, 0, 0),
             "a cancelled task never finishes"
         );
+    }
+
+    /// Regression (sozu#1832): `upgrade-main` is refused, explicitly and at
+    /// once, while another control command is still pending.
+    ///
+    /// `UpgradeData` carries no client, task or in-flight route, and once the
+    /// handoff is confirmed the old main stops reading worker answers: a
+    /// command admitted before the upgrade had no continuation and its client
+    /// was never answered. The contract is that the upgrade waits for no one
+    /// and loses no one: it fails before any side effect (no generation bump,
+    /// no fork, no `Stopping`) and the pending command completes normally.
+    ///
+    /// The hub runs `/bin/false` as its "new binary", so a regression that
+    /// lets the upgrade proceed forks a child that exits at once instead of
+    /// re-running the test harness.
+    ///
+    /// To SEE THIS RED: drop the `pending_tasks` refusal at the top of
+    /// `upgrade_main` — the upgrade forks, bumps `boot_generation`, and fails
+    /// with "no feedback from the new main" instead.
+    #[test]
+    fn upgrade_main_is_refused_while_a_control_command_is_pending() {
+        use crate::command::requests::load_state_rollback_tests::{queued_responses, test_client};
+        use sozu_command_lib::proto::command::UpgradeMain;
+
+        let dir = tempfile::tempdir().expect("Could not create temp dir");
+        let unix_listener =
+            UnixListener::bind(dir.path().join("test.sock")).expect("Could not bind socket");
+        let mut hub = CommandHub::new(unix_listener, Config::default(), "/bin/false".to_owned())
+            .expect("Could not create command hub");
+        let (_silent_worker, _scm) = register_test_worker(&mut hub.server, 0, 4096, 65536);
+
+        // Client A's command: held by a worker that has not answered yet.
+        let seen = std::rc::Rc::new(std::cell::Cell::new((0, 0, 0)));
+        let pending = hub.server.new_task(
+            Box::new(TallyTask {
+                gatherer: DefaultGatherer::default(),
+                seen: seen.clone(),
+            }),
+            Timeout::Default,
+        );
+        hub.server
+            .scatter_on(RequestType::Status(Status {}).into(), pending, 1, None);
+        let queued = std::mem::take(&mut hub.server.queued_tasks);
+        hub.tasks.extend(queued);
+        assert_eq!(hub.pending_task_count(), 1);
+
+        // Client B asks for the upgrade meanwhile.
+        let (mut client_b, _peer) = test_client();
+        let pending_tasks = hub.pending_task_count();
+        hub.server.handle_client_request(
+            &mut client_b,
+            RequestType::UpgradeMain(UpgradeMain {}).into(),
+            pending_tasks,
+        );
+
+        let responses = queued_responses(&client_b);
+        let last = responses.last().expect("client B must be answered");
+        assert_eq!(
+            last.status,
+            ResponseStatus::Failure as i32,
+            "the upgrade must be refused: {responses:?}"
+        );
+        assert!(
+            last.message.contains("1 control command"),
+            "the refusal must name what the upgrade waits for: {:?}",
+            last.message
+        );
+        assert_eq!(
+            hub.server.boot_generation, 0,
+            "a refused upgrade is not a new generation"
+        );
+        assert_eq!(hub.server.run_state, ServerState::Running);
+        assert!(!hub.server.upgrading);
+
+        // Client A's command is untouched and completes as usual.
+        hub.handle_worker_response(
+            0,
+            WorkerResponse {
+                id: format!("0-{pending}-1"),
+                status: ResponseStatus::Ok.into(),
+                message: String::new(),
+                content: None,
+            },
+        );
+        let mut container = hub.tasks.remove(&pending).expect("the task must survive");
+        assert!(container.job.get_gatherer().has_finished());
+        hub.handle_finishing_task(pending, container, false);
+        assert_eq!(
+            seen.get(),
+            (1, 0, 1),
+            "the pending command must complete with its answer"
+        );
+        assert!(hub.server.in_flight.is_empty());
+        assert_eq!(hub.pending_task_count(), 0);
     }
 }

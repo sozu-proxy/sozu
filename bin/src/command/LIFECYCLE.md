@@ -301,6 +301,18 @@ live in `WorkerSession` (`bin/src/command/sessions.rs`).
    surviving channel endpoints which are forwarded through the FD-handoff
    protocol.
 
+`UpgradeData` carries no client, task or `in_flight` route, and once the
+handoff is confirmed the old master stops reading worker answers. A control
+command still pending at that point would never be answered, so
+`upgrade_main` refuses the upgrade while `CommandHub::pending_task_count` is
+non-zero (sozu#1832): the requesting client receives an immediate `Failure`
+naming the number of pending commands, before any side effect (no
+`boot_generation` bump, no `MainUpgraded` audit success, no fork), and the
+pending commands complete normally. The operator retries once they are done.
+A command with no deadline, such as an `UpgradeWorker` waiting for the old
+worker's soft stop or a soft `shutdown` draining the fleet, keeps the upgrade
+refused until it completes.
+
 `UpgradeWorker` follows the analogous pattern through `upgrade_worker`
 (`bin/src/command/upgrade.rs`) and re-exec of an individual worker.
 

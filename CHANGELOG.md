@@ -3984,6 +3984,22 @@
 
 ### 🐛 Fixed
 
+- **`fix(command)`: `sozu upgrade` refuses to upgrade the main process while another control
+  command is pending
+  ([#1832](https://github.com/sozu-proxy/sozu/issues/1832)).** `UpgradeData` carries no client,
+  task or worker-response route, and the old main process stops reading worker answers once the
+  handoff is confirmed, so a command admitted before the upgrade (a `state load`, an
+  `upgrade --worker`, a soft `shutdown`, or any command a silent worker still holds) was never
+  answered. `upgrade_main` (`bin/src/command/upgrade.rs`) now refuses while
+  `CommandHub::pending_task_count` is non-zero: the requesting client receives an immediate
+  `Failure` (`Cannot upgrade the main process: N control command(s) still pending, which the new
+  main process would not inherit. Retry once they complete`) before any side effect, with no
+  `boot_generation` bump, no `MainUpgraded` audit success and no fork, and the pending commands
+  complete normally. A command with no deadline, such as an `upgrade --worker` waiting for the old
+  worker's soft stop, keeps the main-process upgrade refused until it completes. Documented in
+  `doc/configure_cli.md` and `bin/src/command/LIFECYCLE.md`; pinned by
+  `upgrade_main_is_refused_while_a_control_command_is_pending`.
+
 - **`fix(command)`: cancelling a control task retires its worker-response routes
   ([#1827](https://github.com/sozu-proxy/sozu/issues/1827)).** `Server::cancel_task`
   (`bin/src/command/server.rs`) dropped the queued task but left its `in_flight` routes. A late
