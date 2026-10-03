@@ -3984,6 +3984,21 @@
 
 ### 🐛 Fixed
 
+- **`fix(kawa-h1)`: clear the sticky-session answer when reusing an HTTP/1 keep-alive slot
+  ([#1822](https://github.com/sozu-proxy/sozu/issues/1822)).** `HttpContext::reset`
+  (`lib/src/protocol/kawa_h1/editor.rs`) kept `sticky_session` across the requests of one
+  keep-alive connection. `backend_from_request` (`lib/src/protocol/mux/router.rs`) writes it only
+  when the request's frontend sticks, and `on_response_headers` answers any value left there with a
+  `Set-Cookie`, so a request to a frontend that does not stick, sent after one to a sticky
+  frontend on the same connection, reached its own backend but was answered with the previous
+  request's `SOZUBALANCEID` cookie, naming a backend of another cluster that this frontend never
+  asked for and cannot use. `reset` now clears it. HTTP/2 was not affected: `Context::create_stream`
+  (`lib/src/protocol/mux/mod.rs`) builds a fresh `HttpContext` for every stream, recycled slots
+  included. Pinned by `reset_clears_the_sticky_session_answer_of_the_previous_request` and the
+  e2e `test_keep_alive_does_not_carry_a_sticky_cookie_over`; the assertion of
+  `test_reset_preserves_connection_state` that `reset` keeps `sticky_session` encoded the defect
+  and is removed.
+
 - **`test(e2e)`: `test_issue_806` no longer times the host's scheduler against its reconnect
   budget.** `try_backend_stop` (`e2e/src/tests/tests.rs`) compared the wall-clock round trip of the
   request that follows the backend stop with a 100 ms budget. On a loaded host the round trip of a
