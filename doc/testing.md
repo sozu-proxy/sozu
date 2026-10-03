@@ -511,9 +511,11 @@ Per-method, `flow.rs` adds the monotonic-counter guards (`requests_seen` /
 `set_phase` (one edge remains, `Established → Closing`; the two edges out of
 the retired `AwaitingBackend` were deleted so they fall through to the guard's
 existing `false` rather than being listed as permitted — a dead allow turned
-into a live check), and the generation-token guard in
-`touch` (a touch *must* advance `timer_gen`, defeating the stale-close
-busy-loop).
+into a live check), and the refresh-counter guard in
+`touch` (a touch *must* advance `timer_gen`). That counter is bookkeeping: a
+stale expiry is defeated by deadline revalidation in
+`UdpManager::handle_timeout`, which `prop_deadline_revalidation_defeats_stale_close`
+(`manager.rs`) exercises.
 
 ---
 
