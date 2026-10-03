@@ -2292,6 +2292,12 @@ impl HttpContext {
         self.keep_alive_backend = true;
         self.keep_alive_frontend = true;
         self.sticky_session_found = None;
+        // The sticky-session answer is request-scoped (#1822):
+        // `backend_from_request` writes it only when the request's frontend
+        // sticks, and `on_response_headers` answers with a `Set-Cookie` for
+        // any value left here, so keeping it would hand a request to a
+        // frontend that does not stick the previous request's cookie.
+        self.sticky_session = None;
         self.affinity_key = None;
         self.method = None;
         self.authority = None;
@@ -2319,6 +2325,7 @@ impl HttpContext {
         // would leak across pipelined requests on the same connection).
         debug_assert!(
             self.method.is_none()
+                && self.sticky_session.is_none()
                 && self.authority.is_none()
                 && self.path.is_none()
                 && self.status.is_none()
@@ -2630,7 +2637,9 @@ mod tests {
         ctx.closing = true;
         ctx.cluster_id = Some("cluster-1".into());
         ctx.backend_id = Some("backend-1".into());
-        ctx.sticky_session = Some("session-abc".to_owned());
+        // `sticky_session` is request-scoped, not connection state (#1822):
+        // `reset_clears_the_sticky_session_answer_of_the_previous_request`
+        // pins that it is cleared.
 
         let original_id = ctx.id;
         let original_protocol = ctx.protocol;
@@ -2643,13 +2652,66 @@ mod tests {
         assert!(ctx.closing);
         assert_eq!(ctx.cluster_id.as_deref(), Some("cluster-1"));
         assert_eq!(ctx.backend_id.as_deref(), Some("backend-1"));
-        assert_eq!(ctx.sticky_session.as_deref(), Some("session-abc"));
         // The request id is request-scoped: a keep-alive connection's next
         // request must not inherit the previous one's.
         assert_ne!(ctx.id, original_id);
         assert_eq!(ctx.id, next_id);
         assert_eq!(ctx.protocol, original_protocol);
         assert_eq!(ctx.public_address, original_public_address);
+    }
+
+    /// The response a context's editor builds for `bytes`, serialised.
+    fn edited_response(ctx: &mut HttpContext, bytes: &[u8]) -> String {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let mut kawa: GenericHttpStream = kawa::Kawa::new(
+            kawa::Kind::Response,
+            kawa::Buffer::new(
+                pool.checkout()
+                    .expect("the test pool must hand out a buffer"),
+            ),
+        );
+        kawa.storage.space()[..bytes.len()].copy_from_slice(bytes);
+        kawa.storage.fill(bytes.len());
+        kawa::h1::parse(&mut kawa, ctx);
+        assert!(!kawa.is_error(), "premise: the response must parse");
+        serialized_request(&mut kawa)
+    }
+
+    /// #1822: the sticky-session cookie `backend_from_request` chose for one
+    /// request of a keep-alive connection is not the next request's. That
+    /// call writes `sticky_session` only when the request's frontend sticks,
+    /// so a request to a frontend that does not stick, following one to a
+    /// frontend that does, used to answer with the previous request's
+    /// `Set-Cookie`, pinning the client to a backend of another cluster.
+    ///
+    /// TO SEE THIS RED: drop `self.sticky_session = None;` from
+    /// `HttpContext::reset`.
+    #[test]
+    fn reset_clears_the_sticky_session_answer_of_the_previous_request() {
+        const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nb";
+        let mut ctx = make_context();
+        // Request A, to a sticky frontend whose client sent no cookie: the
+        // router answers with the chosen backend's sticky id.
+        ctx.sticky_session = Some("sticky-a".to_owned());
+        let first = edited_response(&mut ctx, RESPONSE);
+        assert!(
+            first.contains("Set-Cookie: SERVERID=sticky-a; Path=/\r\n"),
+            "premise: the sticky request is answered with its cookie, got {first:?}"
+        );
+
+        // Request B, on the same connection, to a frontend that does not
+        // stick: the router leaves `sticky_session` as `reset` left it.
+        ctx.reset(Ulid::generate());
+        assert_eq!(
+            ctx.sticky_session, None,
+            "reset must clear the previous request's sticky-session answer"
+        );
+        let second = edited_response(&mut ctx, RESPONSE);
+        assert!(
+            !second.to_ascii_lowercase().contains("set-cookie"),
+            "a request to a frontend that does not stick must not carry the \
+             previous request's cookie, got {second:?}"
+        );
     }
 
     // ── write_forwarded_for_by (RFC 7239 §6 IP-literal bracketing) ──────
