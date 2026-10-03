@@ -1691,18 +1691,14 @@ The four RST push sites retrofit to `enqueue_rst`:
   and, unlike `refuse_stream_and_discard`, no SETTINGS back-pressure).
 
 A refused stream, from either refusal site, is never registered, so
-`enqueue_rst` keeps its id out of `rst_sent` and
-`H2StreamTable::was_reset_locally` does not know it. Frames the client sent on
-it before reading `REFUSED_STREAM` are not ignored: each DATA frame takes the
-DATA-on-closed-stream site (one glitch, one `RST_STREAM(STREAM_CLOSED)`), and a
-request-trailer HEADERS ends the connection — `GOAWAY(PROTOCOL_ERROR)` while
-its id is above `last_stream_id`, `GOAWAY(STREAM_CLOSED)` once a later stream
-was accepted — with every other stream in flight. This covers flood-pressure,
-draining (a drain then ends with `PROTOCOL_ERROR` instead of `NO_ERROR`), MCS
-and pool-exhaustion refusals. Browsers and standard gRPC send no request
-trailers; trailer-forwarding clients (Envoy) can. RFC 9113 §5.1 would ignore
-these frames; the case is accepted as rare, and recording refused ids in the
-bounded recently-reset set would close it.
+`enqueue_rst` keeps its id out of `rst_sent`; both sites record it in the
+bounded recently-reset ring instead (`H2StreamTable::remember_refused`), so
+`H2StreamTable::was_reset_locally` knows it. Frames the client sent on it
+before reading `REFUSED_STREAM` are ignored as on a stream Sōzu reset (RFC 9113
+§5.1): DATA, credited to the connection window, and request trailers, within
+the reset-stream allowances, past which each frame counts one glitch. This
+covers flood-pressure, draining (a drain still ends with `NO_ERROR`), MCS and
+pool-exhaustion refusals (sozu-proxy/sozu#1815).
 - `reset_stream` (`h2.rs` — per-stream error paths: malformed HEADERS,
   content-length mismatch, WINDOW_UPDATE zero-increment or overflow,
   unauthorised priority updates, self-dependent HEADERS).

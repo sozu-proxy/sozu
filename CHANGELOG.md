@@ -69,15 +69,9 @@
   them too. HEADERS on a client stream id above the last accepted stream and at or below the
   highest id the client used (refused or skipped, never opened) is now a connection error,
   `GOAWAY(PROTOCOL_ERROR)` (RFC 9113 §5.1.1), instead of being taken for a new stream; a lower
-  never-opened id keeps getting `GOAWAY(STREAM_CLOSED)`. Known limitation, accepted as rare: a
-  client that sends HEADERS, DATA and request trailers before reading its `REFUSED_STREAM` gets
-  `RST_STREAM(REFUSED_STREAM)`, `RST_STREAM(STREAM_CLOSED)` and `GOAWAY(PROTOCOL_ERROR)`, losing
-  every stream in flight, for every refusal kind (flood pressure,
-  `SETTINGS_MAX_CONCURRENT_STREAMS`, graceful drain, which then ends with `PROTOCOL_ERROR`
-  instead of `NO_ERROR`, and buffer-pool exhaustion); each DATA frame of a refused stream costs a
-  glitch and a `RST_STREAM(STREAM_CLOSED)`. Browsers and standard gRPC send no request trailers;
-  trailer-forwarding clients such as Envoy can. RFC 9113 §5.1 would ignore those frames; recording
-  refused ids in the bounded recently-reset set is left for later. New listener key `h2_stream_refusal_percent` (TOML;
+  never-opened id keeps getting `GOAWAY(STREAM_CLOSED)`. Frames a client sent on a refused stream
+  before reading its `REFUSED_STREAM` are ignored since
+  [#1815](https://github.com/sozu-proxy/sozu/issues/1815) (see 🐛 Fixed). New listener key `h2_stream_refusal_percent` (TOML;
   `command.proto` fields `HttpListenerConfig` 37, `HttpsListenerConfig` 50,
   `UpdateHttpListenerConfig` 43, `UpdateHttpsListenerConfig` 44; `--h2-stream-refusal-percent`
   on `sozu listener http|https update`) and counter `h2.flood.stream_refused`. Library API:
@@ -647,6 +641,17 @@
   `doc/configure.md` gains the key in both metric inventories.
 
 ### 🔄 Changed
+
+- **`docs`: fix stale flood-window, idle-timeout and rejected-per-IP statements.** The
+  `h2_flood_detector.rs` comments still sized the connection window at 1 MiB: a chained Sōzu acks
+  every 8 MiB of its 16 MiB window, and a cancelled upload's in-flight DATA is bounded by the
+  64 KiB stream window, about four glitches in 16 KiB frames, not 64. `command.proto` and
+  `command/src/config.rs` said `h2_stream_idle_timeout_seconds` defaults to 30; unset, it inherits
+  `back_timeout` floored at 30, and an explicit `0` means 1. `doc/configure.md`,
+  `doc/rate-limit-design.md` and the e2e `cluster_ip_limit_tests.rs` header said
+  `connections.rejected_per_cluster_ip` also counts TCP sessions closed by the per-(cluster,
+  source-IP) limit, or that the e2e suite asserts it: only the HTTP/HTTPS 429 answer increments
+  it, and the suite never reads it. No behaviour change.
 
 - **`docs`: align the example configuration and the docs with the changes merged from 2026-10-01
   to 2026-10-03.** `bin/config.toml` and `os-build/config.toml` now say that a `503` also answers a
@@ -3996,6 +4001,47 @@
   client half-close, and an end-to-end test stalls an HTTP/2 client on its flow-control window;
   all three failed on `main`. `mux/LIFECYCLE.md` and `doc/lifetime_of_a_session.md` describe the
   loop's exit condition and the budget.
+- **`test(e2e)`: `test_issue_806` no longer times the host's scheduler against its reconnect
+  budget.** `try_backend_stop` (`e2e/src/tests/tests.rs`) compared the wall-clock round trip of the
+  request that follows the backend stop with a 100 ms budget. On a loaded host the round trip of a
+  correct re-route (status 200, the surviving backend serving one request) reached 117-365 ms,
+  most of it spent with the client, worker or backend thread runnable but waiting for a CPU. The
+  budget now applies to the round trip less that run-queue wait, read per thread from
+  `/proc/self/task/<tid>/schedstat` (new `e2e/src/sched.rs`; `Worker::server_tid` and
+  `BackendHandle::tid` name the threads). A blocked wait is not run-queue time, so the documented
+  red check (a 150 ms sleep before the backend connect in `Mux::dial_backend`) still fails on the
+  first iteration, idle or loaded. The mock `AsyncBackend` thread now blocks in `poll` on its
+  listener, its clients and a stop waker instead of spinning on non-blocking `accept`/`read`, so
+  it is woken by a request rather than noticing it at its next time slice, and no longer holds a
+  CPU for the whole test. Measured with 60 busy loops on a 20-CPU host (load average 80-110): 17
+  failures in 20 runs before, 0 in 20 after (in each of two batches); over their 4 000
+  trials the raw round trip exceeded the budget 88 times while the compared value stayed under 4 ms.
+
+- **`fix(mux-h2)`: ignore frames on refused streams like on reset streams
+  ([#1815](https://github.com/sozu-proxy/sozu/issues/1815)).** A stream Sōzu refuses with
+  `RST_STREAM(REFUSED_STREAM)` (the soft flood refusal of
+  [#1797](https://github.com/sozu-proxy/sozu/issues/1797), `SETTINGS_MAX_CONCURRENT_STREAMS`, a
+  graceful drain, buffer-pool exhaustion) is never registered, so the bounded set of recently
+  reset streams did not know it, and the frames the client sent on it before reading the refusal
+  were not ignored. Request trailers ended the connection: the client read
+  `RST_STREAM(REFUSED_STREAM)`, `RST_STREAM(STREAM_CLOSED)` and `GOAWAY(PROTOCOL_ERROR)`
+  (`GOAWAY(STREAM_CLOSED)` once a later stream was accepted) and lost every stream in flight, and
+  a drain could end with `PROTOCOL_ERROR` instead of `NO_ERROR`. Each DATA frame cost a glitch and
+  a `RST_STREAM(STREAM_CLOSED)`, about four for a refused 64 KiB upload. Every refusal now records
+  the stream id in that set, with its bound (256 ids) and eviction, so those frames are ignored
+  as RFC 9113 §5.1 requires, within the existing reset-stream allowances: two header blocks, and
+  DATA within the stream's initial window, still credited to the connection window. Each frame
+  beyond them counts one glitch. The refusals keep their own accounting: the flood-pressure,
+  drain and `SETTINGS_MAX_CONCURRENT_STREAMS` refusals count a glitch once the client
+  acknowledged Sōzu's SETTINGS (unacknowledged SETTINGS end the connection after 5 s), the
+  oversized-CONTINUATION refusal counts as a provoked reset, and a buffer-pool refusal counts
+  nothing, so frames on refused ids cost at most a fixed multiple of the refused HEADERS that
+  opened them. HEADERS on an id the
+  client skipped keeps getting `GOAWAY(PROTOCOL_ERROR)` (§5.1.1), and a reset of a refused stream
+  still ends the soft refusal. Tests: `trailers_on_a_refused_stream_are_ignored`,
+  `data_on_a_refused_stream_is_ignored_and_credited`,
+  `a_drain_with_a_refused_upload_carrying_trailers_ends_with_no_error` (`h2.rs`, red on
+  `6c3b8e89`), `refused_streams_share_the_recently_reset_bound` (`h2_stream_table.rs`).
 
 - **`ci(docker)`: build the Docker image with a pinned Rust image instead of Alpine edge's
   rolling `rust` package.** On 2026-10-02 Alpine edge shipped `rust 1.99.0-r0` with a broken

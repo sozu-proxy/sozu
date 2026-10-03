@@ -34,6 +34,7 @@ use crate::{
         },
         sync_backend::Backend as SyncBackend,
     },
+    sched::{current_tid, run_queue_delay},
     sozu::worker::Worker,
     tests::{
         State, provide_port, provide_unbound_port, repeat_until_error_or, setup_async_test,
@@ -468,6 +469,18 @@ pub fn try_sync(nb_clients: usize, nb_requests: usize) -> State {
 /// millisecond, so this is ~100x headroom and a breach means sozu waited on
 /// something rather than that the machine was busy.
 ///
+/// That last claim holds only for what is compared against the budget: the
+/// round trip less the time the client, worker and `backend2` threads spent
+/// runnable but waiting for a CPU (`crate::sched::run_queue_delay`). On a
+/// host at load average 80 on 20 CPUs, measured 2026-10-03, the raw round
+/// trip of a correct re-route (status 200, `backend2` serving `(1, 1)`)
+/// reached 117-365 ms and failed 17 of 20 runs; in 8 instrumented failing
+/// runs the thread identified as the worker by spawn order had waited
+/// 12-167 ms of it in the run queue, and the then-spinning mock backend most
+/// of the rest: the budget was timing the scheduler. The wait is not time sozu spent, and a blocked wait — a
+/// `sleep`, a timer, a pending connect — is not run-queue time, so it stays
+/// in the comparison.
+///
 /// Measured 2026-09-22, pooled over 25 runs = 401 trials, counting only the
 /// 376 that actually re-routed: min 0.242 ms, median 0.636 ms, p99 1.043 ms,
 /// max 1.462 ms — 68x under the bound at its worst. The 25 trials that did
@@ -489,6 +502,17 @@ pub fn try_sync(nb_clients: usize, nb_requests: usize) -> State {
 /// branch is reached and red on its own and not through the status check
 /// above it. The same break leaves the pre-#1427 shape of this test GREEN,
 /// which is what it was reported for.
+///
+/// Re-measured 2026-10-03 with the run-queue wait taken out, at the
+/// `Mux::dial_backend` site: `151.909271ms (152.047532ms less 138.261µs of
+/// run-queue wait)` on the first iteration, and still red on the first
+/// iteration in 10 of 10 runs beside 60 busy loops on 20 CPUs, at 109-151 ms.
+/// The spread is the subtraction's one known error: summing three threads'
+/// waits counts twice a wait that overlaps another's (which overlap, is
+/// inferred, not measured). Beside the same load the sum exceeded the raw
+/// round trip by up to 252 ms in one of 2 000 trials. That lowers what is
+/// compared and never raises it, and only on a loaded host; on an idle one
+/// the wait is well under a millisecond.
 const RECONNECT_BUDGET_MS: u64 = 100;
 const RECONNECT_BUDGET: Duration = Duration::from_millis(RECONNECT_BUDGET_MS);
 
@@ -570,11 +594,18 @@ pub fn try_backend_stop(nb_requests: usize, zombie: Option<u32>) -> State {
     // rig. The reconnect is the first round trip issued once `backend1` is
     // gone: its back connection is dead, so sozu has to notice and route
     // the request to `backend2` instead.
+    //
+    // The round trip crosses three threads: this one (the client), the
+    // worker, and `backend2`'s. The time any of them spent runnable but
+    // waiting for a CPU is the host's, not sozu's, and is taken out of the
+    // budget comparison below (`crate::sched`).
+    let path_threads = [current_tid(), worker.server_tid, backend2.tid];
     let mut backend1_stopped = false;
     let mut reconnect = None;
     let mut client_completed_requests = true;
     for i in 0..nb_requests {
         let times_the_reconnect = backend1_stopped && reconnect.is_none();
+        let run_queue_before = run_queue_delay(&path_threads);
         let round_trip_start = Instant::now();
         if client.send().is_none() {
             client_completed_requests = false;
@@ -585,6 +616,7 @@ pub fn try_backend_stop(nb_requests: usize, zombie: Option<u32>) -> State {
         // has no business inside a budget written for sozu.
         let received = client.receive();
         let round_trip = round_trip_start.elapsed();
+        let host_delay = run_queue_delay(&path_threads).saturating_sub(run_queue_before);
         let Some(response) = received else {
             client_completed_requests = false;
             break;
@@ -593,7 +625,7 @@ pub fn try_backend_stop(nb_requests: usize, zombie: Option<u32>) -> State {
         if times_the_reconnect {
             // Duration and response travel together so the two can never
             // disagree about which round trip was the reconnect.
-            reconnect = Some((round_trip, response));
+            reconnect = Some((round_trip, host_delay, response));
         }
         if i == 0 {
             backend1_aggregator = backend1.stop_and_get_aggregator();
@@ -642,9 +674,13 @@ pub fn try_backend_stop(nb_requests: usize, zombie: Option<u32>) -> State {
     // recorded the round trip that followed the backend stop or left through
     // the `client_completed_requests` branch. A caller passing less than 2
     // asks for a reconnect test without a reconnect.
-    let (reconnect_duration, reconnect_response) =
+    let (reconnect_duration, host_delay, reconnect_response) =
         reconnect.expect("nb_requests must be at least 2 for a request to follow the backend stop");
-    println!("reconnect: {reconnect_duration:?}");
+    // What sozu took: the round trip less the time its threads waited for a
+    // CPU. Saturating, because two threads queued at the same moment are
+    // both counted while the round trip only lasted once.
+    let sozu_duration = reconnect_duration.saturating_sub(host_delay);
+    println!("reconnect: {reconnect_duration:?}, of which run-queue wait: {host_delay:?}");
 
     if backend1_served != Some((1, 1)) {
         // The warm-up request has to have been served by the backend that is
@@ -692,13 +728,14 @@ pub fn try_backend_stop(nb_requests: usize, zombie: Option<u32>) -> State {
         return State::Fail;
     }
 
-    if reconnect_duration > RECONNECT_BUDGET {
+    if sozu_duration > RECONNECT_BUDGET {
         // The property issue 806 is about. `Fail`, not `Undecided`: the
         // reconnect was measured and it was too slow. Elsewhere in this
         // suite `Undecided` means a trial could not set up its
         // measurement, never that the measured property was violated.
         println!(
-            "reconnecting to another backend took {reconnect_duration:?}, \
+            "reconnecting to another backend took {sozu_duration:?} \
+             ({reconnect_duration:?} less {host_delay:?} of run-queue wait), \
              over the {RECONNECT_BUDGET:?} budget"
         );
         return State::Fail;
