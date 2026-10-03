@@ -262,20 +262,21 @@ A flow is reaped on the **first** of these (`CloseReason`, `flow.rs`):
 `UdpFlow::teardown_reason` (`flow.rs`), whose `debug_assert` proves the boundary
 (a reason is returned **iff** a cap is truly exhausted).
 
-**Idle is a single armed deadline + generation tokens, not a per-flow timer.**
+**Idle is a single armed deadline + deadline revalidation, not a per-flow timer.**
 The manager only ever asks the shell to arm **one** deadline (`armed_deadline`,
 `ArmTimer`, `UdpManager::reschedule`, `manager.rs`); the shell owns the actual `TIMER`
 wheel (`arm_timer`, `udp.rs`; `server::TIMER`), counting the delay from the
 drain's own `now` so the entry lands on the grid point the deadline maps to.
-Each flow carries a
-`timer_gen` token (`flow.rs`) bumped on every `UdpFlow::touch` (`flow.rs`).
-A wheel expiry only closes a flow whose deadline is still `<= now`
-(`UdpManager::handle_timeout`, `manager.rs`); a flow that saw traffic has been
-rescheduled, so it survives the expiry. A debug **strict-advance guard**
+Each `UdpFlow::touch` (`flow.rs`) pushes the flow's `idle_deadline` back. A
+wheel expiry carries no per-flow token: it only closes a flow whose deadline is
+still `<= now` when the expiry is handled (`UdpManager::handle_timeout`,
+`manager.rs`), so a flow that saw traffic has a later deadline and survives
+the expiry. The `timer_gen` counter `touch` also advances (`flow.rs`) is never
+read on that path. A debug **strict-advance guard**
 (at the end of `UdpManager::handle_timeout`) asserts the next armed deadline is strictly `> now` after
-a firing — this is the canonical sans-io busy-loop defence and the real reason
-the generation tokens exist. (`prop_generation_token_defeats_stale_close`,
-`manager.rs`, fuzzes this.)
+a firing — this is the canonical sans-io busy-loop defence, upheld by deadline
+revalidation plus the consume-then-reschedule rule below.
+(`prop_deadline_revalidation_defeats_stale_close`, `manager.rs`, fuzzes this.)
 
 **Consume-then-reschedule: an expiry that closes nothing is NOT a no-op.**
 `crate::timer` rounds a requested delay to the *nearest* tick
@@ -295,7 +296,7 @@ was due:
   `reschedule`, so a recomputed deadline equal to the old one is still emitted
   as a fresh `ArmTimer` instead of being memoized away — this is the
   load-bearing half;
-- the shell drops its `timer_handle` (`UdpListenerSession::close`, `udp.rs`), which is hygiene rather
+- the shell drops its `timer_handle` (`UdpListenerSession::timeout_at`, `udp.rs`), which is hygiene rather
   than a fix: a delivered handle is already inert, because `set_timeout_at`
   clamps every new entry past `self.tick` while a delivered one sat at or below
   it, so `cancel_timeout`'s tick guard can never match the successor that reuses

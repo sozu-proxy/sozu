@@ -12,13 +12,17 @@
 //! silently regressed (10-min idle GC lingering after a `RemoveCluster`)
 //! lives here.
 
-use std::{net::SocketAddr, thread, time::Duration};
+use std::{
+    net::SocketAddr,
+    thread,
+    time::{Duration, Instant},
+};
 
 use sozu_command_lib::{
     config::FileConfig,
     proto::command::{
-        ActivateListener, ListenerType, QueryMetricsOptions, RemoveBackend, Request,
-        RequestHttpFrontend, ResponseStatus, ServerConfig, request::RequestType,
+        ActivateListener, ListenerType, MetricDetail, QueryMetricsOptions, RemoveBackend, Request,
+        RequestHttpFrontend, ResponseStatus, ServerConfig, SetMetricDetail, request::RequestType,
         response_content::ContentType,
     },
     scm_socket::Listeners,
@@ -103,7 +107,12 @@ fn prime_with_one_request(front_address: SocketAddr, back_address: SocketAddr) {
         "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\npong",
     );
     backend.connect();
+    serve_one_request(&mut backend, front_address);
+}
 
+/// Send one `Connection: close` request through the worker and let
+/// `backend` (already bound) answer it.
+fn serve_one_request(backend: &mut SyncBackend, front_address: SocketAddr) {
     let mut client = crate::mock::client::Client::new(
         "metrics_lifecycle_client",
         front_address,
@@ -332,6 +341,99 @@ fn test_remove_backend_keeps_cluster_row_when_others_remain() {
             3,
             "RemoveBackend drops per-backend row but keeps cluster row when others remain",
             try_remove_backend_keeps_cluster_row_when_others_remain,
+        ),
+        State::Success,
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Test 4: an abandoned metric-detail lease expires with no later command
+// ══════════════════════════════════════════════════════════════════════
+//
+// sozu-proxy/sozu#1831: the lease janitor (`Aggregator::lease_tick`) only
+// ran at the top of `Server::notify`, so an expired lease outlived its TTL
+// until the next worker command arrived. A `sozu top` that crashes leaves
+// exactly that situation: no renewal, no clear, no further request. The
+// owner here applies a one-second lease and then goes silent; only data
+// plane traffic flows, and the expiry must surface on its own as the
+// worker-pushed `lease_tick_expired` event. Reading the channel is passive,
+// so the observation cannot be what triggers the cleanup.
+
+fn try_abandoned_lease_expires_without_a_command() -> State {
+    let front_address = create_local_address();
+    let back_address = create_local_address();
+    let cluster_id = "lifecycle_cluster_lease";
+
+    let mut worker = setup_worker_with_cluster(
+        "METRICS-LIFECYCLE-LEASE",
+        cluster_id,
+        "lifecycle_back_lease",
+        front_address,
+        back_address,
+    );
+
+    let mut backend = SyncBackend::new(
+        "metrics_lifecycle_lease_backend",
+        back_address,
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\npong",
+    );
+    backend.connect();
+
+    let ttl = Duration::from_secs(1);
+    worker.send_proxy_request_type(RequestType::SetMetricDetail(SetMetricDetail {
+        client_id: "top:1831:abandoned".to_owned(),
+        detail: Some(MetricDetail::DetailBackend as i32),
+        ttl_seconds: Some(ttl.as_secs() as u32),
+        clear: None,
+        reason: None,
+        peer_pid: None,
+        peer_session_ulid: None,
+    }));
+    worker.read_to_last();
+
+    // The bound the janitor promises: TTL plus its five-second cadence, plus
+    // one second for the event loop's poll timeout and a little scheduling
+    // slack. Nothing is written on the command channel from here on.
+    let deadline = Instant::now() + ttl + Duration::from_secs(8);
+    let mut expired = None;
+    while expired.is_none() && Instant::now() < deadline {
+        serve_one_request(&mut backend, front_address);
+        let Ok(response) = worker
+            .command_channel
+            .read_message_blocking_timeout(Some(Duration::from_millis(500)))
+        else {
+            continue;
+        };
+        if let Some(ContentType::Event(event)) = response.content.and_then(|c| c.content_type)
+            && let Some(transition) = event.metric_detail
+            && transition.transition_kind == "lease_tick_expired"
+        {
+            expired = Some(transition);
+        }
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    match expired {
+        Some(transition)
+            if transition.previous_effective == MetricDetail::DetailBackend as i32
+                && transition.effective == MetricDetail::DetailCluster as i32 =>
+        {
+            State::Success
+        }
+        _ => State::Fail,
+    }
+}
+
+#[test]
+fn test_abandoned_lease_expires_without_a_command() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "an abandoned metric-detail lease expires within TTL + the janitor cadence \
+             with no later worker command",
+            try_abandoned_lease_expires_without_a_command,
         ),
         State::Success,
     );
