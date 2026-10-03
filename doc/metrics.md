@@ -11,7 +11,7 @@ Sōzu exposes the following metrics for monitoring:
 | `sozu.buffer.number` | gauge | Active buffers from the buffer pool |
 | `sozu.slab.entries` | gauge | Slab allocator usage (session slots) |
 | `sozu.zombies` | gauge | Zombie sessions detected (indicates bugs — should be 0) |
-| `health_check.success` | counter | Passed health-check probes: an accepted HTTP status, or an established connection in `TCP` mode (per cluster, when emitted with labels). |
+| `health_check.success` | counter | Passed health-check probes: an accepted HTTP status, or an established connection in `TCP` mode. Not labelled by cluster or backend. |
 | `health_check.failure` | counter | Failed health-check probes (connect error, timeout, HTTP status not accepted). |
 | `health_check.up` | counter | Backend transitions to healthy after `healthy_threshold` consecutive successes. |
 | `health_check.down` | counter | Backend transitions to unhealthy after `unhealthy_threshold` consecutive failures. |

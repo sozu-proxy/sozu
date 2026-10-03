@@ -252,7 +252,7 @@ message UpdateHttpListenerConfig {
     optional uint32 h2_initial_connection_window     = 26;
     // Maximum concurrent H2 streams (SETTINGS_MAX_CONCURRENT_STREAMS); >= 1
     optional uint32 h2_max_concurrent_streams        = 27;
-    // Shrink threshold ratio for recycled stream slots; >= 1
+    // Shrink threshold ratio for recycled stream slots; >= 2
     optional uint32 h2_stream_shrink_ratio           = 28;
     // Floor of the lifetime cap on RST_STREAM frames received (CVE-2023-44487)
     optional uint64 h2_max_rst_stream_lifetime       = 29;
@@ -352,7 +352,7 @@ message UpdateHttpsListenerConfig {
     optional uint32 h2_initial_connection_window     = 26;
     // Maximum concurrent H2 streams (SETTINGS_MAX_CONCURRENT_STREAMS); >= 1
     optional uint32 h2_max_concurrent_streams        = 27;
-    // Shrink threshold ratio for recycled stream slots; >= 1
+    // Shrink threshold ratio for recycled stream slots; >= 2
     optional uint32 h2_stream_shrink_ratio           = 28;
     // Floor of the lifetime cap on RST_STREAM frames received (CVE-2023-44487)
     optional uint64 h2_max_rst_stream_lifetime       = 29;
@@ -1434,7 +1434,8 @@ enum LoadBalancingAlgorithms {
     LEAST_LOADED = 2;
     POWER_OF_TWO = 3;
     // Highest-Random-Weight / rendezvous hashing — client-affine backend
-    // selection. Maps a client key (the UDP flow key; the source IP, or the
+    // selection. Maps a client key (on UDP the source IP, or source IP and
+    // port per `UdpAffinityKey`; the source IP, or the
     // cluster's `affinity_header` / `affinity_cookie`, on HTTP, HTTPS and
     // TCP) to a backend that survives minimal disruption on backend
     // add/remove.

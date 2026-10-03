@@ -648,6 +648,33 @@
 
 ### 🔄 Changed
 
+- **`docs`: align the example configuration and the docs with the changes merged from 2026-10-01
+  to 2026-10-03.** `bin/config.toml` and `os-build/config.toml` now say that a `503` also answers a
+  request whose every backend connection attempt failed and that a `504` no longer comes from a
+  connect timeout; `bin/config.toml` also notes that a TCP session whose connect times out is closed
+  rather than failed over, names the UDP affinity key, not the flow key, as the HRW/MAGLEV key, and
+  says what the health check `timeout` waits for in `TCP` mode. `doc/debugging_strategies.md` drops
+  the hard-coded three-attempt circuit breaker and its stale log lines for `max_connection_attempts`
+  and `backend.connect.retries_exhausted`. `doc/configure.md` fixes the `front_timeout` and
+  `connect_timeout` rows, the `client_timeout_during_response`, `backend_timeout` and
+  `http.503.errors` descriptions, the floor-and-ratio semantics of the RST_STREAM lifetime
+  violation metrics, the missing `h2.flood.violation.window_update_stream0_window` row, the
+  `udp.flows.evicted` reasons and the UDP soft-stop behaviour. `doc/architecture.md` and
+  `doc/h2_mux_internals.md` count the fourteen `H2FloodConfig` thresholds, including
+  `h2_stream_refusal_percent`. `doc/configure_admin_ops.md` halves the current flood defaults in its
+  worked example, lists the H2 knobs for HTTP listeners too and names `h2.flood.stream_refused`.
+  `doc/health_checks.md` corrects `health-check remove` (backends keep the health state the last
+  probes left them in), the DOWN log level and the fail-open citation; `doc/metrics.md` no longer
+  calls the health-check counters per cluster. `doc/configure_cli.md` gains a health-check section
+  and the UDP affinity key. `doc/lifetime_of_a_session.md` notes that a pooled connection to a
+  removed backend is not reused, `doc/udp_simulation.md` lists the per-source flow limits and their
+  invariant, and `lib/src/protocol/mux/LIFECYCLE.md` limits the backend-timeout `504` to an
+  established connection and calls the `h2_control_tx.rs` bound a pending bound, not a lifetime
+  cap. The `--max-connection-attempts` and `connection-attempts set` help texts
+  mention the TCP close, the `--load-balancing-policy` help names the UDP affinity key, and the
+  `UpdateHttp(s)ListenerConfig` comments give the `h2_stream_shrink_ratio` floor of 2. Documentation
+  only, no behaviour change.
+
 - **`fix(mux-h2)`: emit fewer connection-level `WINDOW_UPDATE` frames when receiving DATA
   ([#1744](https://github.com/sozu-proxy/sozu/issues/1744)).** The default
   `h2_initial_connection_window` is now 16777216 (16 MiB) instead of 1048576 (1 MiB). Sōzu returns

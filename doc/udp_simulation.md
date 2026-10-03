@@ -54,7 +54,7 @@ Each step draws one weighted-random action:
 |   16   | `ChangeBackendSet`| the backend set the core selects from, changed between admissions (an empty set included) |
 |   14   | `BackendDatagram` | NAT return path (valid + unknown / closed id)       |
 |   14   | `AdvanceClock`    | idle reaper (small jumps + occasional mass-reap)    |
-|    6   | `ReconfigCluster` | reconfig storms (affinity / caps / PPv2 / timeouts) |
+|    6   | `ReconfigCluster` | reconfig storms (affinity / caps / per-source flow limits / PPv2 / timeouts) |
 |    5   | `SetMaxFlows`     | cap shrink **below** live count + grow              |
 |    4   | `AbortFlow`       | on-demand teardown of a random id                   |
 |    3   | `SetMaxRx`        | max-rx change → truncation boundary                 |
@@ -100,8 +100,8 @@ its fault as well (the arm is skipped, never redrawn).
 
 The core's own `debug_assert` invariants fire for free during each `handle_*`
 call (table↔slab consistency, table injectivity, `Closing` never persists,
-phase↔backend coherence, cap high-water bound, timer coherence, and the
-strict-advance "next deadline > now after a firing" busy-loop guard). The
+phase↔backend coherence, cap high-water bound, timer coherence, exact
+per-source flow counters, and the strict-advance "next deadline > now after a firing" busy-loop guard). The
 harness adds, after every fully-drained step:
 
 - `flow_count() <= high-water mark of every cap ever set`.

@@ -18,7 +18,8 @@ First you need to create a new cluster with an id and a load balancing policy (`
 sozu --config /etc/sozu/config.toml cluster add --id <my_cluster_id> --load-balancing-policy round_robin
 ```
 
-`hrw` and `maglev` pin each client to one backend, keyed on its source IP. On an
+`hrw` and `maglev` pin each client to one backend, keyed on its source IP (on a
+UDP cluster, the source IP or source IP and port, per its `affinity_key`). On an
 HTTP/HTTPS cluster, `--affinity-header <name>` or `--affinity-cookie <name>` keys
 it on that request header or cookie instead, falling back to the source IP when a
 request does not carry it:
@@ -107,7 +108,7 @@ to all workers without affecting other cluster settings.
 ## Set the backend connection attempt budget
 
 A request may try `max_connection_attempts` backend connections, the first included, before it
-is answered `503`; a connection that is refused, times out on `connect_timeout` or reports a
+is answered `503` (a TCP session is closed instead); a connection that is refused, times out on `connect_timeout` or reports a
 socket error is retried on another backend while attempts remain (5 by default, 1 to 255). See
 "Backend connection failover" in `doc/configure.md`.
 
@@ -131,6 +132,19 @@ sozu --config /etc/sozu/config.toml connection-attempts set 5
 
 A cluster's own budget takes precedence. The global change is not saved: a worker started later
 reads `max_connection_attempts` from the configuration file, so mirror the change there.
+
+## Configure active health checks
+
+```bash
+sozu --config /etc/sozu/config.toml cluster health-check set --id <my_cluster_id> --uri /health --accepted-statuses 200-399,404
+sozu --config /etc/sozu/config.toml cluster health-check set --id <my_cluster_id> --mode tcp
+sozu --config /etc/sozu/config.toml cluster health-check list
+sozu --config /etc/sozu/config.toml cluster health-check remove --id <my_cluster_id>
+```
+
+`--mode` is `http` (the default) or `tcp`, which only checks that a TCP connection is
+established. The probe timeout is `--probe-timeout` (seconds); `--timeout` is the global
+command timeout in milliseconds. See `doc/health_checks.md` for every flag and default.
 
 ## Remove a cluster
 
