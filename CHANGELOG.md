@@ -3984,6 +3984,18 @@
 
 ### 🐛 Fixed
 
+- **`fix(top)`: `sozu top` exits without waiting out its collectors' polling interval
+  ([#1829](https://github.com/sozu-proxy/sozu/issues/1829)).** After the render loop returned,
+  `run_top` (`bin/src/ctl/top/mod.rs`) joined the snapshot, listeners and certs threads, but
+  `poll_loop` (`bin/src/ctl/top/transport.rs`) waited between polls in `thread::sleep`, which
+  nothing could interrupt: exit took up to the 30 s certs cadence (29.85 s measured after a
+  `--snapshot 1` frame). `poll_loop` now waits in `recv_timeout` on a wake channel `run_top` owns,
+  and `run_top` drops its sender before the joins, so the three threads return at once. The
+  longest wait left is the events thread's 1 s bounded read. Test:
+  `sozu_top_tick_once_against_real_master` (`bin/tests/sozu_top_e2e.rs`) now asserts the gap
+  between the last frame byte and process exit is under 2 s, twice that read (red on `bd19a78e`:
+  29.85 s).
+
 - **`test(e2e)`: `test_issue_806` no longer times the host's scheduler against its reconnect
   budget.** `try_backend_stop` (`e2e/src/tests/tests.rs`) compared the wall-clock round trip of the
   request that follows the backend stop with a 100 ms budget. On a loaded host the round trip of a
