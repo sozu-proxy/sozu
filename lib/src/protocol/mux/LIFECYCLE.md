@@ -366,7 +366,12 @@ from `Mux::ready`. Termination may be triggered by:
 - `MuxResult::CloseSession` from any readable/writable path (the frontend
   readable and writable arms of `Mux::ready_inner`, etc.).
 - A loop-iteration budget overrun (`MAX_LOOP_ITERATIONS = 10_000`, `mod.rs`,
-  checked in the inner loop of `Mux::ready_inner`).
+  checked in the inner loop of `Mux::ready_inner`) with nothing queued for
+  the client, or reached again with no byte written to the client since the
+  last time. Otherwise, with output still queued in the connection or in an
+  open stream's response buffer, `Mux::wait_for_client_at_loop_limit` keeps
+  the session and waits for its next writable event
+  ([#1819](https://github.com/sozu-proxy/sozu/issues/1819)).
 - Timeout (`Mux::timeout`, `mod.rs`).
 - Graceful shutdown initiated by the server (`Mux::shutting_down`,
   `mod.rs`).
@@ -1195,7 +1200,26 @@ deadlines are compared against `ConnectionH2.now` (§7.5):
    is in flight until its drain reads the client's EOF, as unread input, so
    its last bytes are drained first. Its exit check counts only frontend
    READABLE, WRITABLE and ERROR interest; a full hang-up (ERROR or
-   WRITE_CLOSED) is never in flight, and closes the session at once.
+   WRITE_CLOSED) is never in flight, and closes the session at once. A
+   backend is work (`Connection::has_loop_work`) for READABLE or WRITABLE,
+   and for a HUP or ERROR the dead-backend check has yet to act on: sozu
+   raises HUP itself during an iteration (`force_disconnect`, after an H2
+   backend protocol error), after that iteration's check, and no socket
+   event would bring the loop back to close the connection and answer the
+   client. A dead backend the check keeps for the bytes it still has to
+   deliver (`Connection::has_buffer_pressure`) is not work: it waits for the
+   client to drain the stream buffer, which `Connection::try_resume_reading`
+   signals. Counting its HUP spun the loop to the budget whenever a slow
+   client downloaded a response its backend had already sent whole and
+   closed ([#1819](https://github.com/sozu-proxy/sozu/issues/1819)). Reaching
+   the budget is a bug: `Mux::wait_for_client_at_loop_limit` increments
+   `http.infinite_loop.error` and logs a warning, then waits for the
+   client's next writable event while output is queued for it. A second
+   time with no byte written to the client since (`Context::client_bytes_out`,
+   a session-wide count the per-stream metric resets do not touch) closes
+   the session, as does nothing queued. Once the budget is spent, the outer
+   loop re-enters the inner one at most once, for a stream that sweep just
+   linked, and that iteration stops without counting the limit again.
 
 Steps 1-4 all run inside one `readable()`/`writable()` call and therefore all
 read the same `ConnectionH2.now` — see §7.5.
@@ -2342,7 +2366,11 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     whole response ([#1779](https://github.com/sozu-proxy/sozu/issues/1779)).
 12. **Loop budget.** Every inner loop in `Mux::ready` and
     `drive_frontend_shutdown_io` bounds iterations at
-    `MAX_LOOP_ITERATIONS = 10_000` (`mod.rs`). In `ConnectionH1::writable`
+    `MAX_LOOP_ITERATIONS = 10_000` (`mod.rs`). Reaching it in `Mux::ready`
+    does not drop output queued for a client that is still draining it: the
+    session then waits for its next writable event, and closes on a second
+    time with no byte written since (§7.4, step 6;
+    [#1819](https://github.com/sozu-proxy/sozu/issues/1819)). In `ConnectionH1::writable`
     (`h1.rs`), a write that did not answer `SocketResult::Continue` never
     re-raises its own WRITABLE event: a `WouldBlock` is resumed by the
     kernel's next edge, and an `Error` or `Closed` leaves nothing to retry.
