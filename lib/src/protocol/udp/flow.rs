@@ -3,9 +3,11 @@
 //! A [`UdpFlow`] is the per-admitted-flow half of the two-level split. It owns
 //! the three-knob teardown counters (`responses` / `requests` / idle), the idle
 //! and lifetime deadlines, PPv2-first-datagram bookkeeping, the real (pre-NAT)
-//! client address, the chosen backend, and the forward/return decisions. It
-//! carries a `timer_gen` generation token so a stale wheel expiry cannot close
-//! a flow that has since seen traffic.
+//! client address, the chosen backend, and the forward/return decisions. A
+//! stale wheel expiry cannot close a flow that has since seen traffic because
+//! [`UdpManager::handle_timeout`](crate::protocol::udp::manager::UdpManager::handle_timeout)
+//! revalidates each flow's `idle_deadline` against `now`; the `timer_gen`
+//! counter every `touch` advances takes no part in that decision.
 //!
 //! No socket, no clock, no rand: every time-dependent method takes `now:
 //! Instant`. The manager owns the slab; this type is the slot payload.
@@ -68,9 +70,11 @@ pub struct UdpFlow {
 
     /// Absolute idle deadline; reset on every datagram in either direction.
     pub idle_deadline: Instant,
-    /// Generation token. Incremented every time the idle deadline is pushed
-    /// back. A wheel expiry only closes the flow when its captured generation
-    /// still matches — defeating the stale-close busy-loop bug.
+    /// Refresh counter. Incremented every time the idle deadline is pushed
+    /// back. No expiry path reads it: a wheel expiry closes the flow only when
+    /// `idle_deadline` is still `<= now` (deadline revalidation in
+    /// `UdpManager::handle_timeout`), which is what keeps a stale expiry from
+    /// closing a refreshed flow.
     pub timer_gen: u64,
 
     /// True until the first upstream datagram is sent; gates PPv2 prefixing
@@ -106,13 +110,12 @@ impl UdpFlow {
         }
     }
 
-    /// Push the idle deadline back to `now + timeout` and bump the generation
-    /// token so any in-flight wheel expiry for the old deadline is invalidated.
-    /// Returns the *new* generation so the manager can re-arm the wheel.
+    /// Push the idle deadline back to `now + timeout` and advance `timer_gen`.
+    /// The later deadline is what invalidates an in-flight wheel expiry for the
+    /// old one: `UdpManager::handle_timeout` revalidates `idle_deadline <= now`
+    /// before closing. Returns the new `timer_gen`; no caller consumes it.
     pub fn touch(&mut self, timeout: std::time::Duration, now: Instant) -> u64 {
-        // Generation token: a `touch` MUST advance `timer_gen` so any in-flight
-        // wheel expiry captured against the old generation no longer matches and
-        // cannot close a flow that has since seen traffic. Snapshot the old
+        // A `touch` advances `timer_gen` as a refresh counter. Snapshot the old
         // value and pair-assert (positive: the new value is returned; negative:
         // it differs from the old, even across the wrapping boundary).
         // Not `#[cfg(debug_assertions)]`-gated: `debug_assert_ne!` compiles its
@@ -124,14 +127,14 @@ impl UdpFlow {
         self.timer_gen = self.timer_gen.wrapping_add(1);
         debug_assert_ne!(
             self.timer_gen, old_gen,
-            "touch must advance the generation token (stale expiry would still match)"
+            "touch must advance the timer_gen refresh counter"
         );
         self.timer_gen
     }
 
     /// Record that one client datagram was actually *forwarded* upstream: bump
     /// the `requests` counter and refresh the front idle deadline. Returns the
-    /// new generation token. Call this only at a real forward site, so
+    /// new `timer_gen`. Call this only at a real forward site, so
     /// `requests` measures datagrams that actually reached a backend. Use
     /// [`touch`](Self::touch) for an idle refresh that is not a forward.
     pub fn on_client_datagram(&mut self, now: Instant) -> u64 {
@@ -158,7 +161,7 @@ impl UdpFlow {
     }
 
     /// Record that one backend reply was returned; refresh the back idle
-    /// deadline. Returns the new generation token.
+    /// deadline. Returns the new `timer_gen`.
     pub fn on_backend_datagram(&mut self, now: Instant) -> u64 {
         // A backend reply can only arrive on an Established flow: the upstream
         // socket is opened from the admitting call, and a reply on a flow

@@ -32,8 +32,9 @@ sozu --version       # reports `+tui` when the subcommand is linked
 - The TUI auto-elevates the worker's metric cardinality to `Backend`
   by leasing it through a `SetMetricDetail` runtime verb. The lease
   is `client_id`-keyed, TTL-bounded (default 60 s, clamp 300 s), and
-  self-expires server-side if the TUI crashes — so a dead `sozu top`
-  cannot permanently elevate cardinality. Renewal runs at half-TTL.
+  self-expires server-side if the TUI crashes — within TTL plus the
+  worker's 5 s janitor cadence and 1 s poll timeout, without any further
+  command — so a dead `sozu top` cannot permanently elevate cardinality. Renewal runs at half-TTL.
 
 ## Panes
 
