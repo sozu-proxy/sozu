@@ -3987,7 +3987,12 @@
   the stream id in that set, with its bound (256 ids) and eviction, so those frames are ignored
   as RFC 9113 §5.1 requires, within the existing reset-stream allowances: two header blocks, and
   DATA within the stream's initial window, still credited to the connection window. Each frame
-  beyond them counts one glitch, and each refusal keeps its own glitch. HEADERS on an id the
+  beyond them counts one glitch. The refusals keep their own accounting: the flood-pressure,
+  drain and `SETTINGS_MAX_CONCURRENT_STREAMS` refusals count a glitch once the client
+  acknowledged Sōzu's SETTINGS (unacknowledged SETTINGS end the connection after 5 s), the
+  oversized-CONTINUATION refusal counts as a provoked reset, and a buffer-pool refusal counts
+  nothing, so frames on refused ids cost at most a fixed multiple of the refused HEADERS that
+  opened them. HEADERS on an id the
   client skipped keeps getting `GOAWAY(PROTOCOL_ERROR)` (§5.1.1), and a reset of a refused stream
   still ends the soft refusal. Tests: `trailers_on_a_refused_stream_are_ignored`,
   `data_on_a_refused_stream_is_ignored_and_credited`,

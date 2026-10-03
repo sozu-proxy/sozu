@@ -327,9 +327,17 @@ frame counts one glitch. This holds for every refusal — flood pressure,
 draining (whose drain still ends with `NO_ERROR`),
 `SETTINGS_MAX_CONCURRENT_STREAMS`, buffer-pool exhaustion, and the oversized
 CONTINUATION block refused after its stream was removed. Refused ids share the
-ring's bound and eviction with reset streams; a refusal still costs its own
-glitch, so a client opening refused streams to spend their allowances meets
-the glitch budget first.
+ring's bound and eviction with reset streams. The refusals keep their own
+accounting: the flood-pressure, draining and `SETTINGS_MAX_CONCURRENT_STREAMS`
+refusals each count one glitch once the client acknowledged Sōzu's SETTINGS,
+and none before (bounded by `SETTINGS_ACK_TIMEOUT`, 5 s, past which the
+connection ends); the oversized CONTINUATION refusal is a provoked reset
+(`RstOrigin::PeerProvoked`, one glitch and the emitted-RST cap); a buffer-pool
+refusal counts nothing. Where a refusal counts a glitch, a client opening
+refused streams to spend their allowances meets the glitch budget first;
+where it does not, each refused HEADERS buys at most two more header blocks
+and one initial window of DATA, which is credited back like DATA on an open
+stream.
 
 A refused stream moves `H2StreamTable::highest_peer_stream_id` but not
 `ConnectionH2::last_stream_id`, which only an accepted stream moves. A HEADERS
@@ -1292,8 +1300,10 @@ Key decisions in this method:
   ring. On a backend connection they are bounded by the backend's
   own stream concurrency too, not by the emitted-RST cap, which the CANCEL
   `ConnectionH2::end_stream` sends for a client that went away does not feed.
-  The ring also holds the ids of the streams a frontend connection refused
-  (`H2StreamTable::remember_refused`), which are never tracked. WINDOW_UPDATE, PRIORITY and
+  The ring also holds the ids of refused streams
+  (`H2StreamTable::remember_refused`), which are never tracked: on a frontend
+  connection every refusal records them, and on either side the oversized
+  CONTINUATION refusal does. WINDOW_UPDATE, PRIORITY and
   RST_STREAM keep their own handling, and so does every other frame type (a
   PUSH_PROMISE is still a connection error). A stream closed by END_STREAM in
   both directions keeps the connection error STREAM_CLOSED for HEADERS, and

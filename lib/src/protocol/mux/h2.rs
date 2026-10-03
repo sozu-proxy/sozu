@@ -23433,8 +23433,9 @@ mod tests {
             &block,
         );
         wire.extend(refused_stream_data(stream_id, len, 0));
-        // `x-t: 1`, a literal without indexing with a new name.
-        let trailers = [0x00, 3, b'x', b'-', b't', 1, b'1'];
+        // `x-t: 1`, a literal with incremental indexing and a new name: it
+        // becomes the newest dynamic table entry, index 62 (RFC 7541 §6.2.1).
+        let trailers = [0x40, 3, b'x', b'-', b't', 1, b'1'];
         wire.extend(orphan_frame(
             1,
             parser::FLAG_END_HEADERS | parser::FLAG_END_STREAM,
@@ -23520,8 +23521,23 @@ mod tests {
             "the connection survives, got {:?}",
             connection.core.state
         );
-        // The connection reads on: the HPACK decoder kept in step with the
-        // ignored blocks, so a later PING is answered.
+        // The ignored trailer block was still decoded (RFC 9113 §4.3): the
+        // entry it indexed is the newest in the connection's dynamic table.
+        let mut decoded = Vec::new();
+        let status = connection
+            .core
+            .hpack
+            .decoder_mut()
+            .decode_with_cb(&[0x80 | 62], |k, v| {
+                decoded.push((k.into_owned(), v.into_owned()));
+            });
+        assert!(status.is_ok(), "index 62 must resolve, got {status:?}");
+        assert_eq!(
+            decoded,
+            vec![(b"x-t".to_vec(), b"1".to_vec())],
+            "the ignored trailers must keep the HPACK decoder in step with the peer"
+        );
+        // The connection reads on: a later PING is answered.
         let frames = frames_after(&mut connection, &mut context, &mut router, &orphan_ping());
         assert!(
             frames.iter().any(|(kind, flags, _, payload)| *kind == 6
@@ -23579,9 +23595,9 @@ mod tests {
                 u32::from_be_bytes(payload[..4].try_into().expect("an increment")) & 0x7fff_ffff
             })
             .sum();
-        assert!(
-            credited >= 65_535 / 2,
-            "the ignored DATA must count toward the connection window, credited {credited}"
+        assert_eq!(
+            credited as usize, window,
+            "the ignored DATA must be credited to the connection window exactly once"
         );
         assert_eq!(
             error_code_of(&frames, 7, 0),

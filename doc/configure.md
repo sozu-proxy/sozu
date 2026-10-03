@@ -1751,7 +1751,10 @@ buffer-pool exhaustion. Sōzu remembers refused ids in the same bounded list as
 the streams it reset (the last 256), and holds them to the same allowance: two
 header blocks per stream and DATA within the stream's initial window, still
 credited to the connection window. Each frame beyond that counts one glitch
-(`h2_max_glitch_count`), and each refusal still counts one as described above
+(`h2_max_glitch_count`). The flood-pressure, graceful-shutdown and
+`SETTINGS_MAX_CONCURRENT_STREAMS` refusals themselves count one glitch each once
+the client acknowledged Sōzu's SETTINGS (a client that never acknowledges them
+is disconnected after 5 s); a buffer-pool refusal counts none
 ([#1815](https://github.com/sozu-proxy/sozu/issues/1815)).
 
 HEADERS on a client stream id that was never opened opens no stream. An id
