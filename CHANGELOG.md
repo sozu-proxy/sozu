@@ -3984,6 +3984,21 @@
 
 ### 🐛 Fixed
 
+- **`fix(proxy-protocol)`: an expect-proxy session parses a PROXY-v2 header that arrives with the
+  client's half-close ([#1823](https://github.com/sozu-proxy/sozu/issues/1823)).** On Linux a
+  client that sends its header and payload and then calls `shutdown(SHUT_WR)` can be reported in
+  one `READABLE | HUP` epoll event. `TcpSession::ready_inner` (`lib/src/tcp.rs`) handled the
+  frontend HUP before the readable bytes, and `TcpSession::front_hup` closes the expect state,
+  so the complete header was never parsed and the session closed before dialing the backend;
+  `SessionState::ready` for `ExpectProxyProtocol`
+  (`lib/src/protocol/proxy_protocol/expect.rs`), the HTTP and HTTPS listeners' expect stage,
+  closed on HUP the same way. Both now drain the readable bytes first: a complete header upgrades
+  and hands HUP on to the next stage (on TCP, `Pipe::frontend_hup` forwards the payload still
+  queued behind the header to the backend), while a zero-byte bare-TCP healthcheck or a truncated
+  header still closes without dialing a backend. A coalesced zero-byte close now takes the expect
+  stage's own zero-byte branch, which emits no access log, as the same close already did when the
+  FIN arrived in its own event. Relay sessions (`RelayProxyProtocol`) are unchanged.
+
 - **`test(e2e)`: `test_issue_806` no longer times the host's scheduler against its reconnect
   budget.** `try_backend_stop` (`e2e/src/tests/tests.rs`) compared the wall-clock round trip of the
   request that follows the backend stop with a 100 ms budget. On a loaded host the round trip of a

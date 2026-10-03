@@ -119,6 +119,19 @@ PROXY phase and the downstream protocol.
     prefers `ProxyAddr::source()` and falls back to the front socket's
     `peer_addr` when it is `AfUnspec` — including for every `LOCAL` header
     (§1).
+- HUP is honoured only after the readable bytes are drained. A client
+  that half-closes right behind its header and payload can deliver all of
+  it as ONE `READABLE | HUP` event (Linux coalesces `EPOLLIN |
+  EPOLLRDHUP`), so closing on HUP first would discard a complete header
+  ([#1823](https://github.com/sozu-proxy/sozu/issues/1823)). On TCP,
+  `TcpSession::ready_inner` (`lib/src/tcp.rs`) calls `readable` while
+  READABLE and HUP are both set, before its frontend-HUP check; on HTTP and
+  HTTPS, `SessionState::ready` for `ExpectProxyProtocol` (`expect.rs`)
+  closes on HUP only once READABLE is gone. A parsed header still
+  upgrades and hands HUP on to the next stage (`Pipe::frontend_hup` keeps
+  the session while request bytes remain); an empty or truncated header
+  ends with READABLE cleared by the zero-byte read and closes, so a
+  bare-TCP healthcheck or a dead client never dials a backend.
 
 ### 2.2 `RelayProxyProtocol`
 

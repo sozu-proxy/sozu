@@ -1413,6 +1413,31 @@ impl TcpSession {
             return state_result;
         }
 
+        // A client that half-closes right behind its PROXY-v2 header and
+        // payload can deliver both as ONE `READABLE | HUP` event (Linux
+        // coalesces `EPOLLIN | EPOLLRDHUP`). `front_hup` closes every
+        // pre-`Pipe` state but `SniPreread`, so honouring HUP first would
+        // drop a complete, already-queued header (sozu-proxy/sozu#1823).
+        // Drain the expect state's readable bytes first: a parsed header
+        // returns `Upgrade` and the recursive `ready()` hands the still-set
+        // HUP to `Pipe::frontend_hup`, which keeps the session alive while
+        // request bytes remain to forward. An empty or truncated header
+        // ends with READABLE cleared (`readable` removes it on every
+        // zero-byte read) or a `Close`, so a dead client still closes,
+        // through `readable`'s own zero-byte arm or the HUP check below.
+        if let TcpStateMachine::ExpectProxyProtocol(_) = self.state {
+            while (self.front_readiness().interest & self.front_readiness().event).is_readable()
+                && self.front_readiness().event.is_hup()
+                && counter < MAX_LOOP_ITERATIONS
+            {
+                let session_result = self.readable();
+                if session_result != SessionResult::Continue {
+                    return session_result;
+                }
+                counter += 1;
+            }
+        }
+
         if self.front_readiness().event.is_hup() {
             let session_result = self.front_hup();
             if session_result != SessionResult::Continue {
@@ -5513,6 +5538,214 @@ mod sni_routing_tests {
                 "a dialed backend must own its backend token"
             );
         }
+    }
+
+    /// Queue `wire` on the fixture's client, half-close its write side, then
+    /// observe the accepted frontend socket through a real epoll instance
+    /// registered only AFTER both the bytes and the FIN are queued.
+    ///
+    /// On Linux a `shutdown(SHUT_WR)` behind pending bytes is reported as one
+    /// event carrying `EPOLLIN | EPOLLRDHUP`, which `Ready::from(&Event)`
+    /// maps to `READABLE | HUP` without `WRITE_CLOSED`: the peer ended its
+    /// request stream but still owns a usable response stream. The asserts
+    /// pin that coalesced shape, so the tests that call this exercise the
+    /// real kernel event rather than a synthetic readiness word.
+    #[cfg(target_os = "linux")]
+    fn half_close_and_observe_frontend(fixture: &mut ExpectProxyFixture, wire: &[u8]) -> Ready {
+        use std::{io::Write as _, net::Shutdown, os::fd::AsRawFd, time::Duration};
+
+        use mio::{Events, Interest, Poll, Token, unix::SourceFd};
+
+        fixture
+            .client
+            .write_all(wire)
+            .expect("write the request stream");
+        fixture
+            .client
+            .shutdown(Shutdown::Write)
+            .expect("half-close the client write side");
+
+        let frontend_fd = fixture.session.borrow().state.front_socket().as_raw_fd();
+        let mut source = SourceFd(&frontend_fd);
+        let mut poll = Poll::new().expect("create frontend poll");
+        let observed_token = Token(7);
+        poll.registry()
+            .register(
+                &mut source,
+                observed_token,
+                Interest::READABLE | Interest::WRITABLE,
+            )
+            .expect("register accepted frontend socket");
+        let mut events = Events::with_capacity(4);
+        poll.poll(&mut events, Some(Duration::from_secs(2)))
+            .expect("poll accepted frontend socket");
+        let ready = events
+            .iter()
+            .find(|event| event.token() == observed_token)
+            .map(Ready::from)
+            .expect("the queued request and FIN produce an epoll event");
+        assert!(
+            ready.is_readable(),
+            "the queued FIN must be reported readable: {ready:?}"
+        );
+        assert!(
+            ready.is_hup(),
+            "the peer FIN must be reported as HUP: {ready:?}"
+        );
+        assert!(
+            !ready.is_write_closed(),
+            "EPOLLRDHUP leaves the response direction open: {ready:?}"
+        );
+        ready
+    }
+
+    /// A real Linux `shutdown(SHUT_WR)` can report the final request bytes
+    /// and `EPOLLRDHUP` in the same epoll event (`READABLE | HUP`, see
+    /// `half_close_and_observe_frontend`). An `ExpectProxyProtocol` session
+    /// must consume the complete PROXY-v2 header before acting on HUP,
+    /// upgrade to `Pipe`, drain the payload already queued behind the
+    /// header, and forward it to the backend (sozu-proxy/sozu#1823).
+    ///
+    /// To SEE THIS RED: delete the `ExpectProxyProtocol` drain that
+    /// `TcpSession::ready_inner` runs before its frontend-HUP check. HUP is
+    /// then handled first, `front_hup`'s wildcard arm closes the expect state
+    /// before the already-buffered header is parsed, and the `!closed`
+    /// assertion fails.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn expect_proxy_half_close_drains_payload_to_the_backend() {
+        use std::{io::Read as _, time::Duration};
+
+        let mut fixture = expect_proxy_fixture();
+
+        let payload = b"request-after-proxy-header";
+        let mut wire = proxy_protocol_v2_ipv4_header().to_vec();
+        wire.extend_from_slice(payload);
+        let ready = half_close_and_observe_frontend(&mut fixture, &wire);
+
+        fixture
+            .session
+            .borrow_mut()
+            .update_readiness(fixture.frontend_token, ready);
+        let closed = fixture
+            .session
+            .borrow_mut()
+            .ready(fixture.proxy_session.clone());
+        assert!(
+            !closed,
+            "READABLE|HUP must parse the header and retain the response direction"
+        );
+        assert!(
+            !matches!(
+                fixture.session.borrow().state,
+                TcpStateMachine::ExpectProxyProtocol(_)
+            ),
+            "the complete header must upgrade the expect state"
+        );
+
+        let (mut backend, _) = fixture
+            ._backend_listener
+            .accept()
+            .expect("the parsed header triggers the backend dial");
+        backend
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set backend read timeout");
+        backend
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .expect("set backend write timeout");
+
+        let backend_token = fixture
+            .session
+            .borrow()
+            .backend_token
+            .expect("the upgraded session owns a backend token");
+        // The backend connects and the payload drained behind the header is
+        // flushed to it. Whether the pipe then stays open for a response is
+        // `Pipe::check_connections`' half-close policy (it keeps a
+        // frontend-closed pipe only while request bytes are in flight), the
+        // same for every TCP session with or without a PROXY header, so it is
+        // deliberately not asserted here.
+        fixture
+            .session
+            .borrow_mut()
+            .update_readiness(backend_token, Ready::WRITABLE);
+        let _ = fixture
+            .session
+            .borrow_mut()
+            .ready(fixture.proxy_session.clone());
+
+        let mut backend_received = vec![0; payload.len()];
+        backend
+            .read_exact(&mut backend_received)
+            .expect("backend receives the payload queued before FIN");
+        assert_eq!(backend_received, payload);
+    }
+
+    /// The negative space of the drain above: a bare TCP health check
+    /// (connect, zero bytes, FIN) observed as `READABLE | HUP` must still
+    /// close at once and never dial the backend. The drain reads EOF with
+    /// nothing accumulated, and `ExpectProxyProtocol::readable`'s zero-byte
+    /// `SocketResult::Closed` arm closes the session -- the same outcome as
+    /// when the FIN arrives in its own event.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn expect_proxy_zero_byte_half_close_closes_without_dialing() {
+        let mut fixture = expect_proxy_fixture();
+        let ready = half_close_and_observe_frontend(&mut fixture, &[]);
+
+        fixture
+            .session
+            .borrow_mut()
+            .update_readiness(fixture.frontend_token, ready);
+        let closed = fixture
+            .session
+            .borrow_mut()
+            .ready(fixture.proxy_session.clone());
+        assert!(
+            closed,
+            "a zero-byte client half-close must close the session"
+        );
+        let session = fixture.session.borrow();
+        assert_eq!(
+            session.back_connected(),
+            BackendConnectionStatus::NotConnected,
+            "a zero-byte health check must never dial the backend"
+        );
+        assert!(
+            session.backend_token.is_none(),
+            "a zero-byte health check must never wire a backend token"
+        );
+    }
+
+    /// A client that sends only part of a PROXY-v2 header and then FIN can
+    /// never complete it: once the drain has consumed every readable byte,
+    /// the frontend HUP must still close the session instead of leaving it
+    /// to the frontend timeout, and no backend may be dialed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn expect_proxy_partial_header_half_close_closes_without_dialing() {
+        let mut fixture = expect_proxy_fixture();
+        let header = proxy_protocol_v2_ipv4_header();
+        let ready = half_close_and_observe_frontend(&mut fixture, &header[..10]);
+
+        fixture
+            .session
+            .borrow_mut()
+            .update_readiness(fixture.frontend_token, ready);
+        let closed = fixture
+            .session
+            .borrow_mut()
+            .ready(fixture.proxy_session.clone());
+        assert!(
+            closed,
+            "an incomplete PROXY header followed by FIN must close the session"
+        );
+        let session = fixture.session.borrow();
+        assert_eq!(
+            session.back_connected(),
+            BackendConnectionStatus::NotConnected,
+            "an incomplete PROXY header must never dial the backend"
+        );
     }
 
     /// Structural safety for `ready_inner`'s `Connecting` branch: it reads
