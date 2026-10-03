@@ -6,8 +6,11 @@
 //!    connection count by ALPN class.)
 //! 2. Is anything backed up? (`flow_control_stall` rate,
 //!    `pending_window_updates` gauge, RST_STREAM/GOAWAY rates.)
-//! 3. Has a flood detector tripped? (CVE-2023-44487 / CVE-2024-27316 /
-//!    CVE-2025-8671 mitigations are surfaced as critical-tier counters.)
+//! 3. Has a flood detector tripped? (every `h2.flood.violation.*` key the
+//!    H2 flood detector emits — CVE-2023-44487 / CVE-2024-27316 /
+//!    CVE-2025-8671 / CVE-2019-9512 / CVE-2019-9515 / CVE-2019-9518
+//!    mitigations — plus `h2.flood.stream_refused`, surfaced as
+//!    critical-tier counters.)
 //!
 //! All metric keys are pulled from the freshest `AggregatedMetrics`
 //! snapshot's `proxying` map (the per-cluster `clusters[*].cluster` map
@@ -223,6 +226,61 @@ fn render_flow(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin, m: &Aggreg
     );
 }
 
+/// Counters of the flood-mitigation block, as `(metric key, label)`.
+/// Most severe first: a short terminal drops the bottom rows.
+const FLOOD_ROWS: &[(&str, &str)] = &[
+    (
+        names::h2::FLOOD_VIOLATION_RST_STREAM_PRE_RESPONSE_LIFETIME,
+        "rst_stream_pre_response_lifetime",
+    ),
+    (
+        names::h2::FLOOD_VIOLATION_RST_STREAM_LIFETIME,
+        "rst_stream_lifetime",
+    ),
+    (
+        names::h2::FLOOD_VIOLATION_RST_STREAM_EMITTED_LIFETIME,
+        "rst_stream_emitted_lifetime",
+    ),
+    (
+        names::h2::FLOOD_VIOLATION_RST_STREAM_WINDOW,
+        "rst_stream_window",
+    ),
+    (names::h2::FLOOD_STREAM_REFUSED, "stream_refused"),
+    (
+        names::h2::FLOOD_VIOLATION_CONTINUATION_PER_BLOCK,
+        "continuation_per_block",
+    ),
+    (
+        names::h2::FLOOD_VIOLATION_HEADER_SIZE_PER_BLOCK,
+        "header_size_per_block",
+    ),
+    (names::h2::FLOOD_VIOLATION_PING_WINDOW, "ping_window"),
+    (names::h2::FLOOD_VIOLATION_PING_LIFETIME, "ping_lifetime"),
+    (
+        names::h2::FLOOD_VIOLATION_SETTINGS_WINDOW,
+        "settings_window",
+    ),
+    (
+        names::h2::FLOOD_VIOLATION_SETTINGS_LIFETIME,
+        "settings_lifetime",
+    ),
+    (
+        names::h2::FLOOD_VIOLATION_EMPTY_DATA_WINDOW,
+        "empty_data_window",
+    ),
+    (
+        names::h2::FLOOD_VIOLATION_WINDOW_UPDATE_STREAM0_WINDOW,
+        "window_update_stream0_window",
+    ),
+    (names::h2::FLOOD_VIOLATION_GLITCH_WINDOW, "glitch_window"),
+    (names::h2::WINDOW_UPDATE_DROPPED, "window_update_dropped"),
+    (names::h2::RST_STREAM_DROPPED, "rst_stream_dropped"),
+    (
+        names::h2::CLOSE_WITH_ACTIVE_STREAMS,
+        "close_with_active_streams",
+    ),
+];
+
 fn render_floods(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin, m: &AggregatedMetrics) {
     // Critical-tier counters: any non-zero value is a documented attack
     // mitigation firing. Keep them in their own block with a hot-tier title
@@ -241,26 +299,7 @@ fn render_floods(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin, m: &Aggr
             .add_modifier(Modifier::BOLD),
     );
 
-    let candidates = [
-        (names::h2::FLOOD_VIOLATION_GLITCH_WINDOW, "glitch_window"),
-        (names::h2::FLOOD_VIOLATION_RAPID_RESET, "rapid_reset"),
-        (
-            names::h2::FLOOD_VIOLATION_CONTINUATION,
-            "continuation_flood",
-        ),
-        (names::h2::FLOOD_VIOLATION_MADE_YOU_RESET, "made_you_reset"),
-        (names::h2::FLOOD_VIOLATION_PING, "ping_flood"),
-        (names::h2::FLOOD_VIOLATION_SETTINGS, "settings_flood"),
-        (names::h2::FLOOD_VIOLATION_PRIORITY, "priority_flood"),
-        (names::h2::WINDOW_UPDATE_DROPPED, "window_update_dropped"),
-        (names::h2::RST_STREAM_DROPPED, "rst_stream_dropped"),
-        (
-            names::h2::CLOSE_WITH_ACTIVE_STREAMS,
-            "close_with_active_streams",
-        ),
-    ];
-
-    let rows: Vec<Row<'_>> = candidates
+    let rows: Vec<Row<'_>> = FLOOD_ROWS
         .iter()
         .map(|(key, label)| {
             let v = count(m.proxying.get(*key)).unwrap_or(0);
@@ -327,3 +366,37 @@ fn row_style(skin: &Skin, warn: bool) -> Style {
 // import time) so the H2 pane and the App-side rate calculators share
 // one source of truth for `FilteredMetrics -> Option<{i64,u64}>`
 // extraction.
+
+#[cfg(test)]
+mod tests {
+    use sozu_lib::metrics::names;
+
+    use super::FLOOD_ROWS;
+    use crate::ctl::top::app::H2_TRACKED_KEYS;
+
+    /// Every flood counter the pane reads is one the H2 flood detector
+    /// emits, every one it emits has a row, and every row has a trend.
+    #[test]
+    fn flood_rows_read_the_emitted_flood_metric_names() {
+        let row_keys: Vec<&str> = FLOOD_ROWS.iter().map(|(key, _)| *key).collect();
+        for key in row_keys.iter().filter(|k| k.starts_with("h2.flood.")) {
+            assert!(
+                names::h2::FLOOD_VIOLATION_KEYS.contains(key)
+                    || *key == names::h2::FLOOD_STREAM_REFUSED,
+                "the H2 pane reads {key}, which the flood detector never emits",
+            );
+        }
+        for key in names::h2::FLOOD_VIOLATION_KEYS
+            .iter()
+            .chain([&names::h2::FLOOD_STREAM_REFUSED])
+        {
+            assert!(row_keys.contains(key), "the H2 pane has no row for {key}");
+        }
+        for key in &row_keys {
+            assert!(
+                H2_TRACKED_KEYS.contains(key),
+                "{key} has a row but no trend in H2_TRACKED_KEYS",
+            );
+        }
+    }
+}

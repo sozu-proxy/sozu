@@ -46,7 +46,7 @@ Numbered tabs at the top of the screen; key digits map directly.
 | `3` | BACKENDS | Sortable per-backend table (cluster, backend, bw down/up, connections, p50, p99, requests). Default sort: bandwidth desc. |
 | `4` | LISTENERS | HTTP / HTTPS / TCP listener inventory; refreshed every 5 s. |
 | `5` | CERTS | Certificate inventory by listener address + fingerprint + names; refreshed every 30 s. |
-| `6` | H2 | Active streams, ALPN H2 share, flow-control gauges, frame counters, and CVE flood-mitigation counters (`h2.flood.violation.*`). |
+| `6` | H2 | Active streams, ALPN H2 share, flow-control gauges, frame counters, and CVE flood-mitigation counters: every `h2.flood.violation.*` key the H2 flood detector emits (see [HTTP/2 flood mitigations](configure.md#http2-flood-mitigations)), plus `h2.flood.stream_refused`. |
 | `7` | EVENTS | Colour-coded tail of `SubscribeEvents`. BACKEND_DOWN / NO_AVAILABLE_BACKENDS / WORKER_KILLED in hot, BACKEND_UP / CLUSTER_RECOVERED in cool, METRIC_DETAIL_CHANGED in accent. |
 
 Threshold-driven row tinting is consistent across all panes:

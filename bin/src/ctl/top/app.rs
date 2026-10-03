@@ -436,7 +436,7 @@ fn backend_rate_key(cluster_id: &str, backend_id: &str, suffix: &str) -> String 
 /// Proxy-level metric keys the H2 pane plots in its trend column.
 /// Kept in one place so a key rename in `lib::metrics::names` cannot
 /// silently drop a sparkline from the pane.
-const H2_TRACKED_KEYS: &[&str] = &[
+pub(crate) const H2_TRACKED_KEYS: &[&str] = &[
     names::h2::CONNECTION_ACTIVE_STREAMS,
     names::http::ALPN_H2,
     names::http::ALPN_HTTP11,
@@ -448,13 +448,20 @@ const H2_TRACKED_KEYS: &[&str] = &[
     names::h2::FRAMES_TX_RST_STREAM,
     names::h2::FRAMES_TX_GOAWAY,
     names::h2::HEADERS_REJECTED_BUDGET_OVERRUN,
+    names::h2::FLOOD_VIOLATION_RST_STREAM_PRE_RESPONSE_LIFETIME,
+    names::h2::FLOOD_VIOLATION_RST_STREAM_LIFETIME,
+    names::h2::FLOOD_VIOLATION_RST_STREAM_EMITTED_LIFETIME,
+    names::h2::FLOOD_VIOLATION_RST_STREAM_WINDOW,
+    names::h2::FLOOD_STREAM_REFUSED,
+    names::h2::FLOOD_VIOLATION_CONTINUATION_PER_BLOCK,
+    names::h2::FLOOD_VIOLATION_HEADER_SIZE_PER_BLOCK,
+    names::h2::FLOOD_VIOLATION_PING_WINDOW,
+    names::h2::FLOOD_VIOLATION_PING_LIFETIME,
+    names::h2::FLOOD_VIOLATION_SETTINGS_WINDOW,
+    names::h2::FLOOD_VIOLATION_SETTINGS_LIFETIME,
+    names::h2::FLOOD_VIOLATION_EMPTY_DATA_WINDOW,
+    names::h2::FLOOD_VIOLATION_WINDOW_UPDATE_STREAM0_WINDOW,
     names::h2::FLOOD_VIOLATION_GLITCH_WINDOW,
-    names::h2::FLOOD_VIOLATION_RAPID_RESET,
-    names::h2::FLOOD_VIOLATION_CONTINUATION,
-    names::h2::FLOOD_VIOLATION_MADE_YOU_RESET,
-    names::h2::FLOOD_VIOLATION_PING,
-    names::h2::FLOOD_VIOLATION_SETTINGS,
-    names::h2::FLOOD_VIOLATION_PRIORITY,
     names::h2::WINDOW_UPDATE_DROPPED,
     names::h2::RST_STREAM_DROPPED,
     names::h2::CLOSE_WITH_ACTIVE_STREAMS,

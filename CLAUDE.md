@@ -161,4 +161,4 @@ cargo build -p sozu --release --locked
 target/release/sozu start -c /path/to/config.toml
 ```
 
-Container: `docker build -t sozu:local .` (Dockerfile installs `protobuf`, `protobuf-dev`, `pkgconfig`, `llvm-libunwind`; uses `cargo build --release --frozen`). Release images push as `clevercloud/sozu:${GITHUB_SHA}`. OS packaging in `os-build/` (systemd, RPM, Arch). Upgrade + release guidance: `RELEASE.md` + `doc/upgrade_e2e_tests.md`.
+Container: `docker build -t sozu:local .` (builder is the digest-pinned official `rust:1.93.1-alpine3.23` image — bump it with `rust-toolchain`; it installs `build-base`, `cmake`, `pkgconf`, `protobuf`, `protobuf-dev`, plus static OpenSSL for `CRYPTO_PROVIDER=crypto-openssl` or Go and Perl for `fips`, and uses `cargo build --release --frozen`; runtime is `alpine:${ALPINE_VERSION}`, default `3.24`, never edge). Release images push as `clevercloud/sozu:${GITHUB_SHA}`. OS packaging in `os-build/` (systemd, RPM, Arch). Upgrade + release guidance: `RELEASE.md` + `doc/upgrade_e2e_tests.md`.
