@@ -3979,6 +3979,24 @@
 
 ### 🐛 Fixed
 
+- **`fix(mux)`: a slow client receives the whole response of a backend that already closed
+  ([#1819](https://github.com/sozu-proxy/sozu/issues/1819)).** When a backend had written its
+  whole response and closed before a slow client drained it, the backend connection was kept for
+  its buffered bytes, but its HUP, always in its interest, counted as work for the inner loop of
+  `Mux::ready_inner`. With the client's socket full (or an HTTP/2 stream window exhausted), the
+  loop spun to `MAX_LOOP_ITERATIONS` in one pass, and the budget branch, which only consulted the
+  connection-level `has_pending_write()`, closed the session with the rest of the body still in
+  the stream's buffer: the client saw a clean close after a truncated body, with only
+  `http.infinite_loop.error` recording it. A backend now counts as work only for READABLE or
+  WRITABLE (`backend_has_work`); a dead one kept for its bytes waits for the client to drain them.
+  Reaching the budget logs a warning, and `Mux::wait_for_client_at_loop_limit` keeps a session
+  whose output is still queued, in the connection or in an open stream's response buffer, waiting for
+  its next writable event; only a session with nothing queued is closed. The budget stays as a
+  safety bound. Unit tests drive an HTTP/1.1 frontend whose socket would block, with and without a
+  client half-close, and an end-to-end test stalls an HTTP/2 client on its flow-control window;
+  all three failed on `main`. `mux/LIFECYCLE.md` and `doc/lifetime_of_a_session.md` describe the
+  loop's exit condition and the budget.
+
 - **`ci(docker)`: build the Docker image with a pinned Rust image instead of Alpine edge's
   rolling `rust` package.** On 2026-10-02 Alpine edge shipped `rust 1.99.0-r0` with a broken
   standard library (``only metadata stub found for `rlib` dependency `std` ``, then ``requires
