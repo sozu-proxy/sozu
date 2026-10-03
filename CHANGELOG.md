@@ -642,6 +642,21 @@
 
 ### 🔄 Changed
 
+- **`docs(health-check)`: document and test `SetHealthCheck`'s draining policy boundary
+  ([#1824](https://github.com/sozu-proxy/sozu/issues/1824)).** `SetHealthCheck` validates and
+  stores the replacement policy and acknowledges it without cancelling the probes already in
+  flight. Each of them captured its mode and request, timeout, accepted statuses and thresholds
+  at launch and completes under that old policy, so its result can still change a backend's
+  health after the acknowledgement; only probes launched afterwards use the new policy.
+  Updating a policy launches no probe and keeps the last launch time, so the new interval counts
+  from it. `doc/health_checks.md` now states this boundary, and the real-socket e2e test
+  `in_flight_probe_finishes_with_old_policy_then_future_probe_uses_new_policy`
+  (`e2e/src/tests/health_check_mode_tests.rs`) pins it: two HTTP probes in flight finish with the
+  old accepted status and failure threshold after the TCP policy is acknowledged, then a later
+  probe uses TCP mode and the new threshold. The file's `set_health_check` helper now returns the
+  worker's answer to the request it sent instead of draining every pending answer. No behaviour
+  change.
+
 - **`docs`: fix stale flood-window, idle-timeout and rejected-per-IP statements.** The
   `h2_flood_detector.rs` comments still sized the connection window at 1 MiB: a chained Sōzu acks
   every 8 MiB of its 16 MiB window, and a cancelled upload's in-flight DATA is bounded by the
