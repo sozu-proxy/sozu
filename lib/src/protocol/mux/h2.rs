@@ -2326,24 +2326,16 @@ impl ConnectionH2 {
                     {
                         // An id between the last accepted stream and the
                         // highest one the client used was refused or skipped,
-                        // never opened: it is no new stream, and HEADERS on it
-                        // is a connection error of type PROTOCOL_ERROR.
-                        // Streams still tracked, and registered streams Sōzu
-                        // reset (`H2StreamTable::was_reset_locally`), were
-                        // handled above. A refused stream is neither: it is
-                        // never registered, and `Self::enqueue_rst` records
-                        // only registered streams, so the request trailers of
-                        // a refused stream, sent before the client read its
-                        // REFUSED_STREAM, land here and end the connection with
-                        // every stream in flight on it. That holds for every
-                        // refusal below (flood pressure, draining,
-                        // SETTINGS_MAX_CONCURRENT_STREAMS, buffer-pool
-                        // exhaustion). §5.1.1 only covers ids the client
-                        // skipped; for a refused id, §5.1 would have the frame
-                        // ignored. Accepted as a rare case: browsers and
-                        // standard gRPC send no request trailers. Recording
-                        // refused ids in the bounded recently-reset set would
-                        // ignore them instead.
+                        // never opened: it is no new stream. Streams still
+                        // tracked, and streams Sōzu reset or refused
+                        // (`H2StreamTable::was_reset_locally`), were handled
+                        // above: the request trailers of a refused stream,
+                        // sent before the client read its REFUSED_STREAM, are
+                        // ignored there (RFC 9113 §5.1). What lands here is an
+                        // id the client skipped, or a refused one the bounded
+                        // recently-reset set already forgot, and HEADERS on it
+                        // is a connection error of type PROTOCOL_ERROR
+                        // (§5.1.1).
                         error!(
                             "{} HEADERS on stream {} at or below the highest client stream id {}, sending GOAWAY(PROTOCOL_ERROR)",
                             log_context!(self),
@@ -2415,6 +2407,7 @@ impl ConnectionH2 {
                             ) {
                                 return result;
                             }
+                            self.stream_table.remember_refused(stream_id);
                             return self.discard_field_block(
                                 stream_id,
                                 header.payload_len,
@@ -2520,15 +2513,9 @@ impl ConnectionH2 {
                                     // connection for other streams. The payload is
                                     // still routed through stream 0 so handle_frame
                                     // can do connection-level flow control accounting.
-                                    // A registered stream this endpoint reset never
-                                    // gets here: its late DATA is ignored above. A
-                                    // refused stream does, since it was never
-                                    // registered: each DATA frame the client sent
-                                    // before reading its REFUSED_STREAM costs one
-                                    // glitch and one RST_STREAM(STREAM_CLOSED) — a
-                                    // refused upload filling a 64 KiB window in
-                                    // 16 KiB frames costs four — and the
-                                    // connection survives.
+                                    // A stream this endpoint reset or refused never
+                                    // gets here while the bounded recently-reset set
+                                    // remembers it: its late DATA is ignored above.
                                     debug!(
                                         "{} DATA on closed stream {}, sending RST_STREAM(STREAM_CLOSED)",
                                         log_context!(self),
@@ -5503,7 +5490,9 @@ impl ConnectionH2 {
         // Only a registered stream's id goes into `rst_sent`: eviction from
         // the stream table is what removes it again. A refused stream or a
         // closed one was never (or is no longer) registered, and its id would
-        // otherwise stay in the set for the connection's lifetime.
+        // otherwise stay in the set for the connection's lifetime. A refusal
+        // records its id in the bounded recently-reset set instead
+        // (`H2StreamTable::remember_refused`).
         let registered = self.stream_table.get(wire_stream_id).is_some();
         let rst_sent = registered.then(|| self.stream_table.rst_sent_mut());
         let outcome =
@@ -5624,6 +5613,9 @@ impl ConnectionH2 {
         if let Some(result) = self.enqueue_rst(stream_id, error, origin) {
             return result;
         }
+        // RFC 9113 §5.1: the frames the peer sent on this stream before it
+        // read the refusal are ignored, as on any stream Sōzu reset.
+        self.stream_table.remember_refused(stream_id);
         let result = self.discard_field_block(stream_id, payload_len, discarded);
         self.record_refusal_for_backpressure();
         result
@@ -23423,6 +23415,226 @@ mod tests {
             error_code_of(&frames, 7, 0),
             Some(H2Error::EnhanceYourCalm as u32),
             "the reset of a refused stream must count as pre-response, got {frames:?}"
+        );
+    }
+
+    /// HEADERS without END_STREAM, `len` bytes of DATA split in frames of at
+    /// most 16 KiB, and a trailer section with END_STREAM on `stream_id`:
+    /// what a client streaming an upload with request trailers sends before
+    /// it reads anything back.
+    fn upload_with_trailers(stream_id: StreamId, len: usize) -> Vec<u8> {
+        let mut block = vec![0x83, 0x84, 0x87, 0x01, 11];
+        block.extend_from_slice(b"example.com");
+        let mut wire = orphan_frame(
+            1,
+            parser::FLAG_END_HEADERS,
+            stream_id,
+            block.len() as u32,
+            &block,
+        );
+        wire.extend(refused_stream_data(stream_id, len, 0));
+        // `x-t: 1`, a literal with incremental indexing and a new name: it
+        // becomes the newest dynamic table entry, index 62 (RFC 7541 §6.2.1).
+        let trailers = [0x40, 3, b'x', b'-', b't', 1, b'1'];
+        wire.extend(orphan_frame(
+            1,
+            parser::FLAG_END_HEADERS | parser::FLAG_END_STREAM,
+            stream_id,
+            trailers.len() as u32,
+            &trailers,
+        ));
+        wire
+    }
+
+    /// `len` bytes of DATA on `stream_id` in frames of at most 16 KiB, the
+    /// last one carrying `last_flags`.
+    fn refused_stream_data(stream_id: StreamId, len: usize, last_flags: u8) -> Vec<u8> {
+        let mut wire = Vec::new();
+        let mut left = len;
+        while left > 0 {
+            let size = left.min(16_384);
+            left -= size;
+            let flags = if left == 0 { last_flags } else { 0 };
+            wire.extend(orphan_frame(
+                0,
+                flags,
+                stream_id,
+                size as u32,
+                &vec![b'x'; size],
+            ));
+        }
+        wire
+    }
+
+    /// RFC 9113 §5.1: the frames a client sent on a stream before it read
+    /// Sōzu's `REFUSED_STREAM` are ignored, like those on a stream Sōzu
+    /// reset. A refused upload carrying request trailers costs the client
+    /// that stream only: no `RST_STREAM(STREAM_CLOSED)` for its DATA, no
+    /// GOAWAY for its trailers, and the streams already open, and the
+    /// connection, carry on.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::handle_header_state`, drop the
+    /// `remember_refused` call of the soft-refusal branch. The DATA
+    /// frame then takes the closed-stream branch, and the trailers end the
+    /// connection with GOAWAY(PROTOCOL_ERROR).
+    #[test]
+    fn trailers_on_a_refused_stream_are_ignored() {
+        let (_pool, mut connection, mut context, mut router, _peer) =
+            soft_refusal_connection(None, 6);
+        let glitches = connection.core.flood_detector.glitch_count();
+        let frames = frames_after(
+            &mut connection,
+            &mut context,
+            &mut router,
+            &upload_with_trailers(5, 1000),
+        );
+        assert_eq!(
+            error_code_of(&frames, 3, 5),
+            Some(H2Error::RefusedStream as u32),
+            "premise: stream 5 is refused under flood pressure, got {frames:?}"
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|(kind, _, sid, _)| *kind == 3 && *sid == 5)
+                .count(),
+            1,
+            "the refused stream gets its REFUSED_STREAM and nothing more, got {frames:?}"
+        );
+        assert_eq!(
+            error_code_of(&frames, 7, 0),
+            None,
+            "frames on a refused stream must not end the connection, got {frames:?}"
+        );
+        assert_eq!(
+            connection.core.flood_detector.glitch_count(),
+            glitches + 1,
+            "only the refusal itself costs a glitch"
+        );
+        assert!(
+            connection.core.stream_table.get(1).is_some()
+                && connection.core.stream_table.get(3).is_some(),
+            "the streams already open survive"
+        );
+        assert!(
+            !matches!(connection.core.state, H2State::GoAway | H2State::Error),
+            "the connection survives, got {:?}",
+            connection.core.state
+        );
+        // The ignored trailer block was still decoded (RFC 9113 §4.3): the
+        // entry it indexed is the newest in the connection's dynamic table.
+        let mut decoded = Vec::new();
+        let status = connection
+            .core
+            .hpack
+            .decoder_mut()
+            .decode_with_cb(&[0x80 | 62], |k, v| {
+                decoded.push((k.into_owned(), v.into_owned()));
+            });
+        assert!(status.is_ok(), "index 62 must resolve, got {status:?}");
+        assert_eq!(
+            decoded,
+            vec![(b"x-t".to_vec(), b"1".to_vec())],
+            "the ignored trailers must keep the HPACK decoder in step with the peer"
+        );
+        // The connection reads on: a later PING is answered.
+        let frames = frames_after(&mut connection, &mut context, &mut router, &orphan_ping());
+        assert!(
+            frames.iter().any(|(kind, flags, _, payload)| *kind == 6
+                && *flags & 1 == 1
+                && payload == b"pingpong"),
+            "the connection must keep reading after the ignored frames, got {frames:?}"
+        );
+    }
+
+    /// RFC 9113 §5.1 and §6.9: DATA a client sent on a refused stream within
+    /// the stream's initial window — a browser upload filling it in 16 KiB
+    /// frames — is ignored without a glitch or a `RST_STREAM(STREAM_CLOSED)`
+    /// per frame, and still counts toward the connection's receive window,
+    /// which Sōzu credits back.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::handle_header_state`, drop the
+    /// `remember_refused` call of the soft-refusal branch. Each of
+    /// the four DATA frames then costs a glitch and a RST_STREAM.
+    #[test]
+    fn data_on_a_refused_stream_is_ignored_and_credited() {
+        let (_pool, mut connection, mut context, mut router, _peer) =
+            soft_refusal_connection(None, 6);
+        // Half of this is the threshold at which a stream-0 WINDOW_UPDATE
+        // credits the received bytes back.
+        connection.core.connection_config.initial_connection_window = 65_535;
+        let mut block = vec![0x83, 0x84, 0x87, 0x01, 11];
+        block.extend_from_slice(b"example.com");
+        let mut wire = orphan_frame(1, parser::FLAG_END_HEADERS, 5, block.len() as u32, &block);
+        let window = connection.core.local_settings.settings_initial_window_size as usize;
+        wire.extend(refused_stream_data(5, window, parser::FLAG_END_STREAM));
+        let glitches = connection.core.flood_detector.glitch_count();
+        let frames = frames_after(&mut connection, &mut context, &mut router, &wire);
+        assert_eq!(
+            error_code_of(&frames, 3, 5),
+            Some(H2Error::RefusedStream as u32),
+            "premise: stream 5 is refused under flood pressure, got {frames:?}"
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|(kind, _, sid, _)| *kind == 3 && *sid == 5)
+                .count(),
+            1,
+            "DATA on a refused stream must not be answered with RST_STREAM, got {frames:?}"
+        );
+        assert_eq!(
+            connection.core.flood_detector.glitch_count(),
+            glitches + 1,
+            "DATA within the stream's window on a refused stream costs no glitch"
+        );
+        let credited: u32 = frames
+            .iter()
+            .filter(|(kind, _, sid, _)| *kind == 8 && *sid == 0)
+            .map(|(_, _, _, payload)| {
+                u32::from_be_bytes(payload[..4].try_into().expect("an increment")) & 0x7fff_ffff
+            })
+            .sum();
+        assert_eq!(
+            credited as usize, window,
+            "the ignored DATA must be credited to the connection window exactly once"
+        );
+        assert_eq!(
+            error_code_of(&frames, 7, 0),
+            None,
+            "no GOAWAY, got {frames:?}"
+        );
+    }
+
+    /// A drain refuses new streams; a client that sent a whole upload with
+    /// request trailers on one of them before it read the GOAWAY sees its
+    /// stream refused, and the drain still ends with GOAWAY(NO_ERROR).
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::refuse_stream_and_discard`, drop
+    /// the `remember_refused` call. The trailers then end the
+    /// connection with GOAWAY(PROTOCOL_ERROR) before the drain completes.
+    #[test]
+    fn a_drain_with_a_refused_upload_carrying_trailers_ends_with_no_error() {
+        let (_pool, mut connection, mut context, mut router, _peer) = two_requests_read(usize::MAX);
+        connection.core.drain.__test_set_draining();
+        let frames = frames_after(
+            &mut connection,
+            &mut context,
+            &mut router,
+            &upload_with_trailers(5, 1000),
+        );
+        assert_eq!(
+            error_code_of(&frames, 3, 5),
+            Some(H2Error::RefusedStream as u32),
+            "premise: the drain refuses stream 5, got {frames:?}"
+        );
+        let now = connection.core.now;
+        let _ = connection.core.graceful_goaway(now);
+        let frames = frames_after(&mut connection, &mut context, &mut router, &[]);
+        assert_eq!(
+            error_code_of(&frames, 7, 0),
+            Some(H2Error::NoError as u32),
+            "the drain must end with GOAWAY(NO_ERROR), got {frames:?}"
         );
     }
 

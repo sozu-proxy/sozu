@@ -24,7 +24,8 @@
 //!   cannot even be written outside `h2_stream_table.rs`.
 //! - `rst_sent` — RFC 9113 §6.8 duplicate-RST_STREAM dedupe.
 //! - `recently_reset` — the bounded memory of retired streams this endpoint
-//!   reset, whose late frames RFC 9113 §5.1 says to ignore.
+//!   reset, and of peer streams it refused, whose late frames RFC 9113 §5.1
+//!   says to ignore.
 //! - The per-stream liveness/stall caches `stream_last_activity_at`,
 //!   `stream_fc_stalled_since`, `stream_fc_stalled_progress` (LIFECYCLE.md
 //!   §7.2), and [`H2StreamTable::collect_timed_out`], the pure reap-candidate
@@ -123,7 +124,7 @@ use std::{
 use super::{GlobalStreamId, StreamId, h2::H2StreamId};
 
 /// How many retired streams [`H2StreamTable::was_reset_locally`] remembers
-/// after they leave `rst_sent`. RFC 9113 §5.1 lets an endpoint limit the
+/// after they leave `rst_sent`, refused streams included. RFC 9113 §5.1 lets an endpoint limit the
 /// period over which it ignores frames on a stream it reset; this bounds it
 /// by count instead of by timer (which §5.1 discourages), and covers more
 /// than twice the default `SETTINGS_MAX_CONCURRENT_STREAMS` (100) reset in
@@ -137,9 +138,9 @@ const RESET_STREAM_HEADER_BLOCKS: u8 = 2;
 
 /// At most how many reset streams hold a DATA or header-block allowance at
 /// once. An allowance is dropped with its stream's id when that id leaves
-/// `recently_reset`, but a stream refused or reset without ever being
-/// tracked stays in `rst_sent` and never enters the ring; past this bound
-/// such a stream gets no allowance, so its frames count as glitches.
+/// `recently_reset`, but a stream still tracked in `rst_sent` holds one
+/// before it enters the ring; past this bound a stream gets no allowance,
+/// so its frames count as glitches.
 const RESET_ALLOWANCES_CAPACITY: usize = 2 * RECENTLY_RESET_CAPACITY;
 
 /// H2 wire-level stream-slot bookkeeping: see the module doc.
@@ -156,8 +157,10 @@ pub(super) struct H2StreamTable {
     /// sent, preventing duplicate RST_STREAM frames on the wire.
     rst_sent: HashSet<StreamId>,
     /// RFC 9113 §5.1: ids of retired streams this endpoint sent RST_STREAM
-    /// on, oldest first, at most [`RECENTLY_RESET_CAPACITY`]. [`Self::remove`]
-    /// moves an id here from `rst_sent`, which must stay exact for dedupe.
+    /// on, and of peer streams it refused without registering them, oldest
+    /// first, at most [`RECENTLY_RESET_CAPACITY`]. [`Self::remove`] moves an
+    /// id here from `rst_sent`, which must stay exact for dedupe;
+    /// [`Self::remember_refused`] adds a refused one.
     recently_reset: VecDeque<StreamId>,
     /// The ids of `recently_reset`, for [`Self::was_reset_locally`] to look
     /// up without scanning the ring.
@@ -328,15 +331,8 @@ impl H2StreamTable {
         } else {
             RemoveOutcome::NotPresent
         };
-        if self.rst_sent.remove(&stream_id) && self.recently_reset_ids.insert(stream_id) {
-            if self.recently_reset.len() == RECENTLY_RESET_CAPACITY
-                && let Some(oldest) = self.recently_reset.pop_front()
-            {
-                self.recently_reset_ids.remove(&oldest);
-                self.reset_data_allowance.remove(&oldest);
-                self.reset_header_blocks.remove(&oldest);
-            }
-            self.recently_reset.push_back(stream_id);
+        if self.rst_sent.remove(&stream_id) {
+            self.remember_reset(stream_id);
         }
         self.stream_last_activity_at.remove(&stream_id);
         self.stream_fc_stalled_since.remove(&stream_id);
@@ -369,6 +365,38 @@ impl H2StreamTable {
         );
         self.debug_assert_invariants();
         outcome
+    }
+
+    /// RFC 9113 §5.1: remember `stream_id`, a peer stream this endpoint
+    /// refused with `REFUSED_STREAM` without ever registering it, among the
+    /// recently reset ones, so [`Self::was_reset_locally`] knows it and the
+    /// frames the peer sent on it before reading the refusal are ignored like
+    /// those on any stream this endpoint reset. It shares the ring's bound
+    /// and eviction with the retired streams [`Self::remove`] moves there.
+    pub(super) fn remember_refused(&mut self, stream_id: StreamId) {
+        debug_assert!(
+            !self.streams.contains_key(&stream_id),
+            "a refused stream is never registered"
+        );
+        self.remember_reset(stream_id);
+        self.debug_assert_invariants();
+    }
+
+    /// Push `stream_id` onto `recently_reset`, evicting the oldest id, and
+    /// the allowances held for it, once the ring holds
+    /// [`RECENTLY_RESET_CAPACITY`] ids. A no-op for an id already there.
+    fn remember_reset(&mut self, stream_id: StreamId) {
+        if !self.recently_reset_ids.insert(stream_id) {
+            return;
+        }
+        if self.recently_reset.len() == RECENTLY_RESET_CAPACITY
+            && let Some(oldest) = self.recently_reset.pop_front()
+        {
+            self.recently_reset_ids.remove(&oldest);
+            self.reset_data_allowance.remove(&oldest);
+            self.reset_header_blocks.remove(&oldest);
+        }
+        self.recently_reset.push_back(stream_id);
     }
 
     // ---- highest_peer_stream_id ---------------------------------------------
@@ -941,6 +969,43 @@ mod tests {
         assert!(!table.was_reset_locally(1), "the oldest id is forgotten");
         assert!(table.was_reset_locally(5), "every newer id is kept");
         assert!(table.was_reset_locally(5 + 2 * (capacity - 1)));
+        assert_eq!(table.recently_reset.len(), RECENTLY_RESET_CAPACITY);
+    }
+
+    /// RFC 9113 §5.1: a stream refused without being registered is known as
+    /// reset, and refused ids share the ring's bound and eviction, allowances
+    /// included, with retired reset streams.
+    #[test]
+    fn refused_streams_share_the_recently_reset_bound() {
+        let mut table = H2StreamTable::new(None);
+        table.remember_refused(1);
+        assert!(
+            table.was_reset_locally(1),
+            "a refused stream is known as reset"
+        );
+        assert!(
+            !table.rst_sent_contains(1),
+            "a refused id stays out of rst_sent"
+        );
+        assert!(table.charge_reset_stream_header_block(1));
+        assert!(table.charge_reset_stream_data(1, 10, 10));
+        table.remember_refused(1);
+        assert_eq!(table.recently_reset.len(), 1, "an id is remembered once");
+
+        let capacity = RECENTLY_RESET_CAPACITY as u32;
+        for id in 1..=capacity {
+            table.remember_refused(1 + 2 * id);
+        }
+        assert!(
+            !table.was_reset_locally(1),
+            "the oldest refused id is forgotten"
+        );
+        assert!(
+            !table.reset_header_blocks.contains_key(&1)
+                && !table.reset_data_allowance.contains_key(&1),
+            "its allowances go with it"
+        );
+        assert!(table.was_reset_locally(3) && table.was_reset_locally(1 + 2 * capacity));
         assert_eq!(table.recently_reset.len(), RECENTLY_RESET_CAPACITY);
     }
 }
