@@ -415,6 +415,32 @@ impl<Front: SocketHandler> Connection<Front> {
         }
     }
 
+    /// Whether this backend connection is work for the inner loop of
+    /// `Mux::ready_inner`: an event it asked for that a `readable` or
+    /// `writable` pass can act on, or a HUP or ERROR the dead-backend check
+    /// has yet to act on. That check runs at the top of each iteration, so a
+    /// HUP sozu raises itself during the iteration (`force_disconnect`, after
+    /// a protocol error) must bring the loop back to close the connection:
+    /// no socket event will.
+    ///
+    /// A dead backend the check keeps for the bytes it has left to deliver
+    /// ([`Self::has_buffer_pressure`]) is not work: it waits for the client
+    /// to drain the stream buffer, which [`Self::try_resume_reading`]
+    /// signals with READABLE. `HUP` and `ERROR` are always in a backend's
+    /// interest, and counting them there spun the loop to
+    /// `MAX_LOOP_ITERATIONS` with nothing to progress (sozu-proxy/sozu#1819).
+    pub(super) fn has_loop_work<L>(&self, context: &Context<L>) -> bool
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        let readiness = self.readiness();
+        let work = readiness.filter_interest();
+        work.is_readable()
+            || work.is_writable()
+            || ((readiness.event.is_hup() || readiness.event.is_error())
+                && !self.has_buffer_pressure(context))
+    }
+
     /// Re-enable READABLE if this connection is parked waiting for buffer space
     /// and the target stream's buffer now has enough room.
     ///
@@ -591,9 +617,11 @@ impl<Front: SocketHandler> Connection<Front> {
     }
 
     /// Connection-level [`Self::has_pending_write`] extended with a per-stream
-    /// back-buffer probe (LIFECYCLE §9 invariant 16). Only H2 multiplexes
-    /// multiple streams — H1 falls back to [`Self::has_pending_write`] since
-    /// its single-response pipeline already accounts for pending bytes.
+    /// back-buffer probe (LIFECYCLE §9 invariant 16), for H2 only. H1 falls
+    /// back to [`Self::has_pending_write`], which checks the socket alone
+    /// (TLS records not yet flushed) and NOT the bytes still queued in its
+    /// stream's response buffer; `Mux::wait_for_client_at_loop_limit` probes
+    /// those itself.
     pub(super) fn has_pending_write_including_streams<L>(&self, context: &super::Context<L>) -> bool
     where
         L: ListenerHandler + L7ListenerHandler,

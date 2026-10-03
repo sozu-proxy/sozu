@@ -1572,6 +1572,341 @@ fn test_plain_client_half_close_mid_response_receives_it_whole() {
     );
 }
 
+/// An HTTP/2 client whose stream window is exhausted receives the whole
+/// response of a backend that wrote all of it and closed in the meantime
+/// (sozu-proxy/sozu#1819).
+///
+/// The client keeps the default 65 535-octet windows and sends no
+/// WINDOW_UPDATE until the backend has written its last byte and closed.
+/// sozu cannot send more DATA, so the stream's response buffer stays full
+/// and the backend's FIN arrives with bytes still in its socket: the dead
+/// backend connection is kept for them. Nothing can progress until the
+/// client opens its window, so the session must wait instead of spinning
+/// `Mux::ready_inner` to its iteration budget, which
+/// `http.infinite_loop.error` records and which used to close the session
+/// with the rest of the body unsent. Flow control stands in for a slow
+/// client's full socket here: it stalls the frontend whatever the kernel's
+/// buffer sizes, which a socket that only reads slowly does not. The
+/// `Mux::ready_inner` unit tests cover an HTTP/1.1 frontend whose socket
+/// would block, with and without a client half-close.
+fn try_h2_window_stalled_client_after_backend_close() -> State {
+    use super::h2_utils::{
+        H2_CLIENT_PREFACE, H2_FLAG_ACK, H2_FLAG_END_STREAM, H2_FRAME_DATA, H2_FRAME_HEADERS,
+        H2_FRAME_SETTINGS, H2Frame, advance_one_frame,
+    };
+
+    let name = "H2-WINDOW-STALLED-CLIENT";
+    let back_address = create_local_address();
+    // Twice the initial window: the rest fits in the kernel's socket
+    // buffers, so the backend finishes writing and closes while the window
+    // is still exhausted.
+    let body_size = 128 * 1024;
+    let (mut worker, front) = start_half_close_worker(name, Transport::Tls, back_address);
+    let mut backend =
+        BlockingHttpBackend::start_with_connection(back_address, "w".repeat(body_size), "close");
+
+    let mut tls_config = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(Verifier))
+        .with_no_client_auth();
+    tls_config.alpn_protocols = vec![b"h2".to_vec()];
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let conn = rustls::ClientConnection::new(Arc::new(tls_config), server_name.to_owned()).unwrap();
+    let tcp = TcpStream::connect_timeout(&front, Duration::from_secs(5))
+        .expect("could not connect to sozu");
+    tcp.set_read_timeout(Some(Duration::from_millis(250))).ok();
+    tcp.set_write_timeout(Some(Duration::from_secs(5))).ok();
+    let mut stream = rustls::StreamOwned::new(conn, tcp);
+    let is_timeout =
+        |e: &std::io::Error| matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut);
+
+    let mut header_block = vec![
+        0x82, // :method GET (static idx 2)
+        0x87, // :scheme https (static idx 7)
+        0x84, // :path / (static idx 4)
+    ];
+    // :authority localhost — name at static idx 1, literal value.
+    header_block.push(0x41);
+    header_block.push(9);
+    header_block.extend_from_slice(b"localhost");
+    let mut opening = H2_CLIENT_PREFACE.to_vec();
+    opening.extend(H2Frame::settings(&[]).encode());
+    opening.extend(H2Frame::headers(1, header_block, true, true).encode());
+    let mut sent = stream.write_all(&opening).is_ok() && stream.flush().is_ok();
+
+    let mut carry = Vec::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut answered = false;
+    let mut body_received = 0;
+    let mut ended = false;
+    let mut read_frames = |stream: &mut rustls::StreamOwned<_, TcpStream>,
+                           carry: &mut Vec<u8>,
+                           sent: &mut bool,
+                           answered: &mut bool,
+                           body_received: &mut usize,
+                           ended: &mut bool|
+     -> bool {
+        match stream.read(&mut buf) {
+            Ok(0) => return false,
+            Ok(n) => carry.extend_from_slice(&buf[..n]),
+            Err(e) if is_timeout(&e) => {}
+            Err(_) => return false,
+        }
+        while let Some((frame_type, flags, sid, payload)) = advance_one_frame(carry) {
+            if frame_type == H2_FRAME_SETTINGS && flags & H2_FLAG_ACK == 0 {
+                *sent &= stream.write_all(&H2Frame::settings_ack().encode()).is_ok()
+                    && stream.flush().is_ok();
+            } else if frame_type == H2_FRAME_HEADERS && sid == 1 {
+                *answered = true;
+            } else if frame_type == H2_FRAME_DATA && sid == 1 {
+                *body_received += payload.len();
+                *ended |= flags & H2_FLAG_END_STREAM != 0;
+            }
+        }
+        true
+    };
+
+    // Read what the initial window lets through, until the backend has
+    // written everything and closed; then sozu gets a moment to see the
+    // backend's FIN.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut open = true;
+    while sent && open && backend.responses_sent() == 0 && Instant::now() < deadline {
+        open = read_frames(
+            &mut stream,
+            &mut carry,
+            &mut sent,
+            &mut answered,
+            &mut body_received,
+            &mut ended,
+        );
+    }
+    let backend_done = backend.responses_sent() == 1;
+    let settle = Instant::now() + Duration::from_millis(300);
+    while open && Instant::now() < settle {
+        open = read_frames(
+            &mut stream,
+            &mut carry,
+            &mut sent,
+            &mut answered,
+            &mut body_received,
+            &mut ended,
+        );
+    }
+    let stalled_at = body_received;
+    let spins = super::h2_tests::query_proxy_count(
+        &mut worker,
+        sozu_lib::metrics::names::http::INFINITE_LOOP_ERROR,
+    );
+
+    // The client opens both windows, then reads to the end of the stream.
+    let increment = u32::try_from(body_size).expect("the body size fits a window increment");
+    let mut window = H2Frame::window_update(0, increment).encode();
+    window.extend(H2Frame::window_update(1, increment).encode());
+    let reopened = open && stream.write_all(&window).is_ok() && stream.flush().is_ok();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while open && !ended && Instant::now() < deadline {
+        open = read_frames(
+            &mut stream,
+            &mut carry,
+            &mut sent,
+            &mut answered,
+            &mut body_received,
+            &mut ended,
+        );
+    }
+    drop(stream);
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    backend.stop();
+
+    println!(
+        "{name}: sent={sent} answered={answered} backend_done={backend_done} \
+         stalled_at={stalled_at} {}={spins} reopened={reopened} \
+         body={body_received}/{body_size} ended={ended} stopped={stopped}",
+        sozu_lib::metrics::names::http::INFINITE_LOOP_ERROR
+    );
+    if sent
+        && answered
+        && backend_done
+        && stalled_at < body_size
+        && spins == 0
+        && reopened
+        && body_received == body_size
+        && ended
+        && stopped
+    {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_window_stalled_client_receives_the_whole_response_of_a_closed_backend() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TLS H2: a client with an exhausted window receives the whole response of a \
+             backend that closed",
+            try_h2_window_stalled_client_after_backend_close
+        ),
+        State::Success
+    );
+}
+
+/// A frame an HTTP/2 backend sends to break the protocol.
+#[derive(Clone, Copy, Debug)]
+enum BackendProtocolError {
+    /// A DATA frame on stream 0 (RFC 9113 §6.1: a connection error).
+    DataOnStreamZero,
+    /// A HEADERS frame on a stream sozu never opened (RFC 9113 §5.1).
+    HeadersOnIdleStream,
+}
+
+/// An HTTP/2 backend that completes the connection preface, stays silent
+/// long enough for sozu to go idle, then sends `error` and keeps its socket
+/// open, so no socket event follows.
+fn spawn_protocol_violating_h2_backend(
+    address: SocketAddr,
+    error: BackendProtocolError,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    let listener = bind_std_listener(address, "protocol-violating h2 backend");
+    thread::spawn(move || {
+        listener
+            .set_nonblocking(true)
+            .expect("could not set backend listener nonblocking");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(_) if Instant::now() < deadline && !stop.load(Ordering::SeqCst) => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => return,
+            }
+        };
+        stream.set_nonblocking(false).ok();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .ok();
+        let mut buf = [0u8; 65536];
+        let _ = stream.read(&mut buf);
+        // An empty SETTINGS, then the ACK of sozu's.
+        let _ = stream.write_all(&[0, 0, 0, 0x4, 0, 0, 0, 0, 0, 0, 0, 0, 0x4, 0x1, 0, 0, 0, 0]);
+        let _ = stream.read(&mut buf);
+        // sozu has nothing left to do: it waits for the response.
+        thread::sleep(Duration::from_millis(500));
+        let frame: &[u8] = match error {
+            BackendProtocolError::DataOnStreamZero => &[0, 0, 4, 0x0, 0, 0, 0, 0, 0, 1, 2, 3, 4],
+            // `:status 200` (static index 8), END_HEADERS, on stream 3.
+            BackendProtocolError::HeadersOnIdleStream => &[0, 0, 1, 0x1, 0x4, 0, 0, 0, 3, 0x88],
+        };
+        let _ = stream.write_all(frame);
+        // The socket stays open: only sozu can end this connection.
+        while !stop.load(Ordering::SeqCst) {
+            let _ = stream.read(&mut buf);
+        }
+    })
+}
+
+/// When an idle HTTP/2 backend breaks the protocol, sozu answers the client
+/// at once and drops the backend connection.
+///
+/// sozu flushes its GOAWAY and raises HUP on the backend itself
+/// (`ConnectionH2::force_disconnect`), after the dead-backend check of that
+/// iteration of `Mux::ready_inner` already ran. The backend keeps its socket
+/// open, so no socket event will bring the session back: that HUP has to
+/// count as work for the loop to iterate once more, close the backend and
+/// answer the client. Ignoring it left the client waiting for a timeout.
+fn try_idle_h2_backend_protocol_error_answers_at_once(error: BackendProtocolError) -> State {
+    let name = "H2-BACKEND-PROTOCOL-ERROR";
+    let back_address = create_local_address();
+    let (mut worker, front) = start_half_close_worker(name, Transport::Tls, back_address);
+    let mut h2_cluster = Worker::default_cluster("cluster_0");
+    h2_cluster.http2 = Some(true);
+    worker.send_proxy_request_type(RequestType::AddCluster(h2_cluster));
+    worker.read_to_last();
+    let stop = Arc::new(AtomicBool::new(false));
+    let backend = spawn_protocol_violating_h2_backend(back_address, error, stop.clone());
+
+    let (mut stream, handle) = half_close_client(Transport::Tls, front);
+    handle
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .ok();
+    let start = Instant::now();
+    let sent = stream
+        .write_all(b"GET /api HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .is_ok()
+        && stream.flush().is_ok();
+    let mut received = Vec::new();
+    let mut buf = [0u8; 4096];
+    let ending = loop {
+        if start.elapsed() > Duration::from_secs(12) {
+            break "timeout";
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => break "closed",
+            Ok(n) => {
+                received.extend_from_slice(&buf[..n]);
+                if received.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break "answered";
+                }
+            }
+            Err(ref e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(_) => break "error",
+        }
+    };
+    let elapsed = start.elapsed();
+    let answered = received.starts_with(b"HTTP/1.1 5");
+    drop(stream);
+    stop.store(true, Ordering::SeqCst);
+    let _ = backend.join();
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    println!(
+        "{name}: {error:?} sent={sent} answered={answered} ending={ending} elapsed={elapsed:?} \
+         stopped={stopped}"
+    );
+    if sent && answered && elapsed < Duration::from_secs(3) && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_idle_h2_backend_sending_data_on_stream_zero_is_answered_at_once() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 backend: DATA on stream 0 from an idle backend is answered at once",
+            || try_idle_h2_backend_protocol_error_answers_at_once(
+                BackendProtocolError::DataOnStreamZero
+            )
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_idle_h2_backend_sending_headers_on_an_idle_stream_is_answered_at_once() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 backend: HEADERS on an idle stream from an idle backend is answered at once",
+            || try_idle_h2_backend_protocol_error_answers_at_once(
+                BackendProtocolError::HeadersOnIdleStream
+            )
+        ),
+        State::Success
+    );
+}
+
 /// A backend that accepts one connection, reads, never answers, and records
 /// when it has read something and when its connection closed.
 struct SilentBackend {

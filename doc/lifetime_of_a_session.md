@@ -625,8 +625,16 @@ collect in `Router::dead_backends`, reused across passes) and settles the
 per-backend accounting through `BackendRegistry::apply_all`, whose ledger keeps
 its capacity. The loop repeats while any connection still has interest and an
 event, bounded by `MAX_LOOP_ITERATIONS`: it stops once the frontend has no
-READABLE, WRITABLE or ERROR interest with a matching event and every backend's
-readiness is empty. A frontend HUP is not work the loop can progress: each
+READABLE, WRITABLE or ERROR interest with a matching event and no backend has
+work: READABLE or WRITABLE interest with a matching event, or a HUP or ERROR
+the dead-backend sweep has yet to act on, such as the HUP sozu raises itself
+when it drops a backend that broke the protocol. A dead backend kept for the
+bytes it still has to deliver is not work: it waits for the client to drain
+them ([#1819](https://github.com/sozu-proxy/sozu/issues/1819)). Reaching the
+bound is a bug, counted in `http.infinite_loop.error` and logged as a warning:
+the session waits for its next writable event while output is queued for the
+client, and is closed otherwise, or when the bound is reached again with no
+byte written to the client since. A frontend HUP is not work the loop can progress: each
 iteration closes the session on one once no output is left to flush, except on
 a lingering frontend, which drains the client's last bytes to the EOF first
 ([#1774](https://github.com/sozu-proxy/sozu/issues/1774)). The HUP is also how
