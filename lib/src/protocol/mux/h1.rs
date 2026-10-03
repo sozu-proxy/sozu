@@ -1156,6 +1156,9 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         super::h2_transmit::confirm(kawa, &mut self.io_slices, size);
         crate::protocol::mux::h2::record_metric(self.position.bytes_out_event(size));
         self.position.count_bytes_out(parts.metrics, size);
+        if self.position.is_server() {
+            context.client_bytes_out = context.client_bytes_out.wrapping_add(size);
+        }
         let should_yield = update_readiness_after_write(size, status, &mut self.readiness);
         if let Some(result) = self.client_write_failed(status) {
             return result;

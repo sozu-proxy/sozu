@@ -4025,6 +4025,30 @@
   at most until the earliest outstanding deadline (`CommandHub::next_poll_timeout`,
   `bin/src/command/server.rs`); pinned by `poll_wakes_up_for_the_earliest_task_deadline`.
 
+- **`fix(mux)`: a slow client receives the whole response of a backend that already closed
+  ([#1819](https://github.com/sozu-proxy/sozu/issues/1819)).** When a backend had written its
+  whole response and closed before a slow client drained it, the backend connection was kept for
+  its buffered bytes, but its HUP, always in its interest, counted as work for the inner loop of
+  `Mux::ready_inner`. With the client's socket full (or an HTTP/2 stream window exhausted), the
+  loop spun to `MAX_LOOP_ITERATIONS` in one pass, and the budget branch, which only consulted the
+  connection-level `has_pending_write()`, closed the session with the rest of the body still in
+  the stream's buffer: the client saw a clean close after a truncated body, with only
+  `http.infinite_loop.error` recording it. A dead backend kept for its bytes is no longer work
+  for the loop (`Connection::has_loop_work`) and waits for the client to drain them; any other
+  HUP or ERROR still is, so a backend sozu drops itself mid-pass, after an HTTP/2 protocol error,
+  is closed and the client answered at once. Reaching the budget logs a warning, and
+  `Mux::wait_for_client_at_loop_limit` keeps a session whose output is still queued, in the
+  connection or in an open stream's response buffer, waiting for its next writable event; a
+  session with nothing queued, or reaching the budget again with no byte written to the client
+  since (a session-wide count of bytes written to the client), is closed; past a spent budget the
+  outer loop runs one more inner iteration only for a freshly linked stream, and does not count
+  or log the limit twice. The budget stays as a
+  safety bound. Unit tests drive an HTTP/1.1 frontend whose socket would block, with and without a
+  client half-close, and an end-to-end test stalls an HTTP/2 client on its flow-control window;
+  all three failed on `main`. Two end-to-end tests have an idle HTTP/2 backend send DATA on
+  stream 0 or HEADERS on a stream sozu never opened, and require the client's 5xx within 3 s. `mux/LIFECYCLE.md` and `doc/lifetime_of_a_session.md` describe the
+  loop's exit condition and the budget.
+
 - **`fix(metrics)`: metric-detail leases expire without another worker command
   ([#1831](https://github.com/sozu-proxy/sozu/issues/1831)).** The lease janitor
   (`Aggregator::lease_tick`) ran only at the top of `Server::notify`, which only a worker command
