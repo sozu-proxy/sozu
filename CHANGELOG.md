@@ -3999,7 +3999,9 @@
   `Mux::wait_for_client_at_loop_limit` keeps a session whose output is still queued, in the
   connection or in an open stream's response buffer, waiting for its next writable event; a
   session with nothing queued, or reaching the budget again with no byte written to the client
-  since, is closed, and the outer loop no longer re-enters a spent budget. The budget stays as a
+  since (a session-wide count of bytes written to the client), is closed; past a spent budget the
+  outer loop runs one more inner iteration only for a freshly linked stream, and does not count
+  or log the limit twice. The budget stays as a
   safety bound. Unit tests drive an HTTP/1.1 frontend whose socket would block, with and without a
   client half-close, and an end-to-end test stalls an HTTP/2 client on its flow-control window;
   all three failed on `main`. Two end-to-end tests have an idle HTTP/2 backend send DATA on

@@ -1614,7 +1614,9 @@ fn try_h2_window_stalled_client_after_backend_close() -> State {
     let conn = rustls::ClientConnection::new(Arc::new(tls_config), server_name.to_owned()).unwrap();
     let tcp = TcpStream::connect_timeout(&front, Duration::from_secs(5))
         .expect("could not connect to sozu");
-    tcp.set_read_timeout(Some(Duration::from_millis(250))).ok();
+    // The TLS handshake runs inside the first write: a generous read timeout
+    // until it is done, so a loaded host does not fail the setup.
+    tcp.set_read_timeout(Some(Duration::from_secs(5))).ok();
     tcp.set_write_timeout(Some(Duration::from_secs(5))).ok();
     let mut stream = rustls::StreamOwned::new(conn, tcp);
     let is_timeout =
@@ -1633,6 +1635,10 @@ fn try_h2_window_stalled_client_after_backend_close() -> State {
     opening.extend(H2Frame::settings(&[]).encode());
     opening.extend(H2Frame::headers(1, header_block, true, true).encode());
     let mut sent = stream.write_all(&opening).is_ok() && stream.flush().is_ok();
+    stream
+        .sock
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .ok();
 
     let mut carry = Vec::new();
     let mut buf = vec![0u8; 64 * 1024];
@@ -1833,14 +1839,16 @@ fn try_idle_h2_backend_protocol_error_answers_at_once(error: BackendProtocolErro
     let backend = spawn_protocol_violating_h2_backend(back_address, error, stop.clone());
 
     let (mut stream, handle) = half_close_client(Transport::Tls, front);
-    handle
-        .set_read_timeout(Some(Duration::from_millis(250)))
-        .ok();
     let start = Instant::now();
+    // The TLS handshake runs inside this write, under the client's
+    // generous read timeout; the short one only paces the reads below.
     let sent = stream
         .write_all(b"GET /api HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .is_ok()
         && stream.flush().is_ok();
+    handle
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .ok();
     let mut received = Vec::new();
     let mut buf = [0u8; 4096];
     let ending = loop {

@@ -1215,9 +1215,11 @@ deadlines are compared against `ConnectionH2.now` (§7.5):
    the budget is a bug: `Mux::wait_for_client_at_loop_limit` increments
    `http.infinite_loop.error` and logs a warning, then waits for the
    client's next writable event while output is queued for it. A second
-   time with no byte written to the client since closes the session, as
-   does nothing queued; the outer loop does not re-enter the inner one
-   once its budget is spent.
+   time with no byte written to the client since (`Context::client_bytes_out`,
+   a session-wide count the per-stream metric resets do not touch) closes
+   the session, as does nothing queued. Once the budget is spent, the outer
+   loop re-enters the inner one at most once, for a stream that sweep just
+   linked, and that iteration stops without counting the limit again.
 
 Steps 1-4 all run inside one `readable()`/`writable()` call and therefore all
 read the same `ConnectionH2.now` — see §7.5.

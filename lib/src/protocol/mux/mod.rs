@@ -1087,11 +1087,18 @@ pub struct Context<L: ListenerHandler + L7ListenerHandler> {
     /// drain-before-read leaves the counters at every read point exactly
     /// where mutating in place left them, saturation included.
     pub backend_deltas: Vec<BackendDelta>,
-    /// The bytes the session's streams had written to the client when the
-    /// inner loop of `Mux::ready_inner` last reached `MAX_LOOP_ITERATIONS`
-    /// and waited for the client instead of closing. A second time with no
-    /// byte written since closes the session: waiting is only worth it while
-    /// the client drains (`Mux::wait_for_client_at_loop_limit`).
+    /// Response bytes this session's frontend has handed to its socket, over
+    /// the whole session. Only ever grows (wrapping), unlike the per-stream
+    /// `SessionMetrics::bout`, which `SessionMetrics::reset` zeroes when a
+    /// stream ends and its slot is reused. `ConnectionH1::writable` and
+    /// `H2Shell::write_streams` add every stream byte a server-position
+    /// write accepted.
+    pub(super) client_bytes_out: usize,
+    /// [`Self::client_bytes_out`] when the inner loop of `Mux::ready_inner`
+    /// last reached `MAX_LOOP_ITERATIONS` and waited for the client instead
+    /// of closing. A second time with no byte written to the client since
+    /// closes the session: waiting is only worth it while the client drains
+    /// (`Mux::wait_for_client_at_loop_limit`).
     pub(super) loop_limit_bytes_out: Option<usize>,
 }
 
@@ -1141,6 +1148,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             now_wall_ms: unix_epoch_ms(),
             request_id_rng: StdRng::from_rng(&mut rand::rng()),
             backend_deltas: Vec::new(),
+            client_bytes_out: 0,
             loop_limit_bytes_out: None,
         }
     }
@@ -2127,19 +2135,14 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     /// writable event, with the frontend timeout as the bound if none comes.
     ///
     /// Waiting stays bounded: reaching the limit again with no byte written
-    /// to the client since the last time (`Context::loop_limit_bytes_out`)
+    /// to the client since the last time (`Context::client_bytes_out`)
     /// closes the session, so a loop that spins on every wake-up without
     /// progress costs at most two budgets.
     fn wait_for_client_at_loop_limit(&mut self) -> bool {
         incr!(names::http::INFINITE_LOOP_ERROR);
         #[cfg(test)]
         LOOP_LIMIT_HITS.with(|hits| hits.set(hits.get() + 1));
-        let bytes_out = self
-            .context
-            .streams
-            .iter()
-            .map(|stream| stream.metrics.bout)
-            .sum::<usize>();
+        let bytes_out = self.context.client_bytes_out;
         let progressed = self.context.loop_limit_bytes_out != Some(bytes_out);
         let output_queued = progressed
             && (self
@@ -2924,10 +2927,13 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         ));
         trace!("{} {:?}", log_context!(self), start);
         // Set once the inner loop has spent its budget and waits for the
-        // client: the outer loop then stops after this sweep instead of
-        // re-entering with an exhausted `counter`, which would count and log
-        // the same limit again.
+        // client. The outer loop then re-enters the inner one at most once
+        // more, for a stream this sweep just linked (an attached pooled
+        // backend is armed by a synthetic event no epoll edge repeats), and
+        // that iteration stops at the spent budget without counting or
+        // logging the same limit again.
         let mut budget_spent = false;
+        let mut budget_extra_pass = false;
         loop {
             // The mux's clock sample for this pass. Everything time-based
             // below — flood and back-pressure windows, the SETTINGS-ACK
@@ -3496,6 +3502,9 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
 
                 counter += 1;
                 if counter >= MAX_LOOP_ITERATIONS {
+                    if budget_spent {
+                        break;
+                    }
                     if self.wait_for_client_at_loop_limit() {
                         budget_spent = true;
                         break;
@@ -3771,9 +3780,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 // stream out of Link state, except a failed `connect(2)`,
                 // which re-queues it above for another backend.
             }
-            if !dirty || budget_spent {
+            if !dirty || budget_extra_pass {
                 break;
             }
+            budget_extra_pass = budget_spent;
         }
 
         // Stop service timers before yielding to epoll, so idle wait time is excluded
@@ -7936,6 +7946,12 @@ mod tests {
             received.extend_from_slice(&rest);
         }
         let hits = LOOP_LIMIT_HITS.with(|hits| hits.get());
+        assert!(
+            mux.context.client_bytes_out >= received.len(),
+            "every byte the client received was counted as written to it: {} < {}",
+            mux.context.client_bytes_out,
+            received.len()
+        );
         (body_received(&received), BODY, first, hits)
     }
 
@@ -8037,7 +8053,7 @@ mod tests {
             mux.wait_for_client_at_loop_limit(),
             "the first hit with output queued waits for the client"
         );
-        mux.context.streams[0].metrics.bout += 100;
+        mux.context.client_bytes_out += 100;
         assert!(
             mux.wait_for_client_at_loop_limit(),
             "the client drained bytes since: the session waits again"
@@ -8045,6 +8061,57 @@ mod tests {
         assert!(
             !mux.wait_for_client_at_loop_limit(),
             "no byte reached the client since the last hit: the session must close"
+        );
+    }
+
+    /// Progress at the loop limit is read from the session's own count of
+    /// bytes written to the client, not from the per-stream metrics, which
+    /// `SessionMetrics::reset` zeroes when a stream ends and its slot is
+    /// reused.
+    ///
+    /// TO SEE THIS RED: compute `bytes_out` in
+    /// `Mux::wait_for_client_at_loop_limit` as the sum of every stream's
+    /// `metrics.bout` again. A slot reused between two hits then reads as
+    /// progress when nothing was written, and as no progress when the new
+    /// stream wrote exactly what the old one had.
+    #[test]
+    fn a_stream_slot_reused_between_two_loop_limits_does_not_fake_progress() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut mux, _frontend_peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));
+        mux.context.streams[0].state = StreamState::Linked(Token(1));
+        mux.context.streams[0]
+            .back
+            .push_out(kawa::Store::Static(b"the end of the body"));
+        mux.context.streams[0].metrics.bout = 100;
+        mux.context.client_bytes_out = 100;
+        assert!(
+            mux.wait_for_client_at_loop_limit(),
+            "the first hit with output queued waits for the client"
+        );
+
+        // The stream ends and its slot is reused before anything is written.
+        mux.context.streams[0].metrics.reset();
+        assert!(
+            !mux.wait_for_client_at_loop_limit(),
+            "a reset metric is not progress: the session must close"
+        );
+
+        // A fresh session state: the new stream writes as much as the old one
+        // had, which is progress.
+        let (mut mux, _frontend_peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));
+        mux.context.streams[0].state = StreamState::Linked(Token(1));
+        mux.context.streams[0]
+            .back
+            .push_out(kawa::Store::Static(b"the end of the body"));
+        mux.context.streams[0].metrics.bout = 100;
+        mux.context.client_bytes_out = 100;
+        assert!(mux.wait_for_client_at_loop_limit(), "the first hit waits");
+        mux.context.streams[0].metrics.reset();
+        mux.context.streams[0].metrics.bout = 100;
+        mux.context.client_bytes_out += 100;
+        assert!(
+            mux.wait_for_client_at_loop_limit(),
+            "the reused slot wrote 100 bytes since: the session waits again"
         );
     }
 
