@@ -13,6 +13,7 @@
 //! lives here.
 
 use std::{
+    io::{ErrorKind, Read},
     net::SocketAddr,
     thread,
     time::{Duration, Instant},
@@ -22,15 +23,16 @@ use sozu_command_lib::{
     config::FileConfig,
     proto::command::{
         ActivateListener, ListenerType, MetricDetail, QueryMetricsOptions, RemoveBackend, Request,
-        RequestHttpFrontend, ResponseStatus, ServerConfig, SetMetricDetail, request::RequestType,
-        response_content::ContentType,
+        RequestHttpFrontend, ResponseStatus, ServerConfig, SetMetricDetail, WorkerMetrics,
+        filtered_metrics, request::RequestType, response_content::ContentType,
     },
     scm_socket::Listeners,
     state::ConfigState,
 };
 
 use crate::{
-    mock::sync_backend::Backend as SyncBackend,
+    http_utils::{http_ok_response, http_request},
+    mock::{client::Client, sync_backend::Backend as SyncBackend},
     port_registry::attach_reserved_http_listener,
     sozu::worker::Worker,
     tests::{State, repeat_until_error_or},
@@ -167,6 +169,226 @@ fn cluster_row_present(worker: &mut Worker, cluster_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+const SESSION_BARRIER_BUDGET: Duration = Duration::from_secs(3);
+
+/// Send one lifecycle request and consume intervening worker events until its
+/// own acknowledgement arrives.
+fn request_acknowledged(worker: &mut Worker, request: RequestType) -> bool {
+    worker.send_proxy_request_type(request);
+    let expected_id = worker.command_id.last.clone();
+    loop {
+        let Some(response) = worker.read_proxy_response() else {
+            return false;
+        };
+        if response.id == expected_id {
+            return response.status == ResponseStatus::Ok as i32;
+        }
+    }
+}
+
+/// Observable backend barrier: the proxy has both connected and forwarded the
+/// complete request before the lifecycle command is allowed to proceed.
+fn wait_for_backend_request(backend: &mut SyncBackend, client_id: usize) -> bool {
+    let deadline = Instant::now() + SESSION_BARRIER_BUDGET;
+    while Instant::now() < deadline {
+        if !backend.clients.contains_key(&client_id) {
+            let _ = backend.accept(client_id);
+        }
+        if backend.clients.contains_key(&client_id) && backend.receive(client_id).is_some() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
+/// Observe frontend-session resource termination after the held backend
+/// connection is released. EOF or reset is not a metrics-ordering barrier;
+/// the test establishes that separately through `QueryMetrics` below.
+fn wait_for_client_termination(client: &mut Client) -> bool {
+    let Some(stream) = client.stream.as_mut() else {
+        return true;
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .expect("client termination barrier must set a read timeout");
+    let deadline = Instant::now() + SESSION_BARRIER_BUDGET;
+    let mut buf = [0_u8; 1024];
+    while Instant::now() < deadline {
+        match stream.read(&mut buf) {
+            Ok(0) => return true,
+            Ok(_) => {}
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
+/// Query metrics and consume unrelated asynchronous worker events until the
+/// response carrying this query's command id arrives.
+fn query_worker_metrics(
+    worker: &mut Worker,
+    options: QueryMetricsOptions,
+) -> Option<WorkerMetrics> {
+    worker.send_proxy_request_type(RequestType::QueryMetrics(options));
+    let expected_id = worker.command_id.last.clone();
+    loop {
+        let response = worker.read_proxy_response()?;
+        if response.id != expected_id {
+            continue;
+        }
+        if response.status != ResponseStatus::Ok as i32 {
+            return None;
+        }
+        let ContentType::WorkerMetrics(metrics) = response.content?.content_type? else {
+            return None;
+        };
+        return Some(metrics);
+    }
+}
+
+fn backend_connection_gauge(
+    worker: &mut Worker,
+    cluster_id: &str,
+    backend_id: &str,
+) -> Option<u64> {
+    let metrics = query_worker_metrics(
+        worker,
+        QueryMetricsOptions {
+            list: false,
+            cluster_ids: vec![cluster_id.to_owned()],
+            backend_ids: vec![],
+            metric_names: vec!["connections_per_backend".to_owned()],
+            no_clusters: false,
+            workers: false,
+        },
+    )?;
+    metrics
+        .clusters
+        .get(cluster_id)?
+        .backends
+        .iter()
+        .find(|backend| backend.backend_id == backend_id)?
+        .metrics
+        .get("connections_per_backend")?
+        .inner
+        .as_ref()
+        .and_then(|inner| match inner {
+            filtered_metrics::Inner::Gauge(value) => Some(*value),
+            _ => None,
+        })
+}
+
+/// Incarnation-independent connection gauge. Its 2 -> 1 transition proves
+/// that the old close reached the metrics pipeline without weakening global
+/// accounting while the labelled decrement is fenced off.
+fn proxy_backend_connection_gauge(worker: &mut Worker) -> Option<u64> {
+    let metrics = query_worker_metrics(
+        worker,
+        QueryMetricsOptions {
+            list: false,
+            cluster_ids: vec![],
+            backend_ids: vec![],
+            metric_names: vec!["backend.connections".to_owned()],
+            no_clusters: true,
+            workers: false,
+        },
+    )?;
+    metrics
+        .proxy
+        .get("backend.connections")?
+        .inner
+        .as_ref()
+        .and_then(|inner| match inner {
+            filtered_metrics::Inner::Gauge(value) => Some(*value),
+            _ => None,
+        })
+}
+
+/// This new-incarnation response is released only after the proxy gauge has
+/// observed the old close. Seeing it proves a causally later event traversed
+/// the same synchronous LocalDrain before the final labelled-gauge oracle.
+fn backend_2xx_count(worker: &mut Worker, cluster_id: &str, backend_id: &str) -> Option<i64> {
+    let metrics = query_worker_metrics(
+        worker,
+        QueryMetricsOptions {
+            list: false,
+            cluster_ids: vec![cluster_id.to_owned()],
+            backend_ids: vec![],
+            metric_names: vec!["http.status.2xx".to_owned()],
+            no_clusters: false,
+            workers: false,
+        },
+    )?;
+    metrics
+        .clusters
+        .get(cluster_id)?
+        .backends
+        .iter()
+        .find(|backend| backend.backend_id == backend_id)?
+        .metrics
+        .get("http.status.2xx")?
+        .inner
+        .as_ref()
+        .and_then(|inner| match inner {
+            filtered_metrics::Inner::Count(value) => Some(*value),
+            _ => None,
+        })
+}
+
+fn lease_backend_metric_detail(worker: &mut Worker) -> bool {
+    request_acknowledged(
+        worker,
+        RequestType::SetMetricDetail(SetMetricDetail {
+            client_id: "metrics-lifecycle-incarnation-test".to_owned(),
+            detail: Some(MetricDetail::DetailBackend as i32),
+            ttl_seconds: Some(60),
+            clear: Some(false),
+            reason: Some("same-identity cluster-incarnation regression".to_owned()),
+            peer_pid: None,
+            peer_session_ulid: None,
+        }),
+    )
+}
+
+fn wait_for_proxy_backend_connections(worker: &mut Worker, expected: u64) -> Option<u64> {
+    let deadline = Instant::now() + SESSION_BARRIER_BUDGET;
+    while Instant::now() < deadline {
+        let actual = proxy_backend_connection_gauge(worker);
+        if actual == Some(expected) {
+            return actual;
+        }
+        thread::yield_now();
+    }
+    None
+}
+
+fn wait_for_backend_2xx(worker: &mut Worker, cluster_id: &str, backend_id: &str) -> Option<i64> {
+    let deadline = Instant::now() + SESSION_BARRIER_BUDGET;
+    while Instant::now() < deadline {
+        let actual = backend_2xx_count(worker, cluster_id, backend_id);
+        if actual.is_some_and(|count| count > 0) {
+            return actual;
+        }
+        thread::yield_now();
+    }
+    None
+}
+
+fn stop_worker_within(mut worker: Worker) -> bool {
+    worker.hard_stop();
+    let deadline = Instant::now() + SESSION_BARRIER_BUDGET;
+    while !worker.server_job.is_finished() {
+        if Instant::now() >= deadline {
+            println!("worker did not stop within {SESSION_BARRIER_BUDGET:?}");
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    worker.wait_for_server_stop()
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // Test 1: RemoveCluster IPC drops the cluster row from the worker drain
 // ══════════════════════════════════════════════════════════════════════
@@ -283,7 +505,182 @@ fn test_remove_then_add_cluster_re_arms_metrics() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// Test 3: RemoveBackend drops the backend row but keeps the cluster row
+// Test 3: a real old HTTP session cannot decrement its same-identity replacement
+// ══════════════════════════════════════════════════════════════════════
+
+fn try_old_http_session_does_not_decrement_same_identity_replacement() -> State {
+    let front_address = create_local_address();
+    let back_address = create_local_address();
+    let cluster_id = "lifecycle_cluster_incarnation";
+    let backend_id = "lifecycle_backend_incarnation";
+
+    let mut worker = setup_worker_with_cluster(
+        "METRICS-LIFECYCLE-INCARNATION",
+        cluster_id,
+        backend_id,
+        front_address,
+        back_address,
+    );
+    let metric_detail_ack = lease_backend_metric_detail(&mut worker);
+    // Both incarnations deliberately use this one listener. Client 0 is the
+    // old connection; client 1 is the replacement at the exact same address.
+    let mut backend = SyncBackend::new(
+        "METRICS-LIFECYCLE-SAME-BACKEND",
+        back_address,
+        http_ok_response("replacement-incarnation"),
+    );
+    backend.connect();
+
+    let mut old_client = Client::new(
+        "METRICS-LIFECYCLE-OLD-CLIENT",
+        front_address,
+        http_request("GET", "/old", "", "localhost"),
+    );
+    old_client.connect();
+    old_client.send();
+    let old_session_held = wait_for_backend_request(&mut backend, 0);
+
+    let mut remove_ack = false;
+    let mut add_cluster_ack = false;
+    let mut add_frontend_ack = false;
+    let mut add_backend_ack = false;
+    let mut new_session_reached_backend = false;
+    let mut replacement_gauge_before_old_close = None;
+    let mut proxy_gauge_before_old_close = None;
+    let mut proxy_gauge_after_old_close = None;
+    let mut old_session_terminated = false;
+    let mut new_session_progressed = false;
+    let mut new_response_metric = None;
+    let mut replacement_gauge_after_old_close = None;
+    let mut new_client = None;
+
+    if metric_detail_ack && old_session_held {
+        remove_ack = request_acknowledged(
+            &mut worker,
+            RequestType::RemoveCluster(cluster_id.to_owned()),
+        );
+        add_cluster_ack = request_acknowledged(
+            &mut worker,
+            RequestType::AddCluster(Worker::default_cluster(cluster_id)),
+        );
+        add_frontend_ack = request_acknowledged(
+            &mut worker,
+            RequestType::AddHttpFrontend(RequestHttpFrontend {
+                ..Worker::default_http_frontend(cluster_id, front_address)
+            }),
+        );
+        add_backend_ack = request_acknowledged(
+            &mut worker,
+            RequestType::AddBackend(Worker::default_backend(
+                cluster_id,
+                backend_id,
+                back_address,
+                None,
+            )),
+        );
+
+        if remove_ack && add_cluster_ack && add_frontend_ack && add_backend_ack {
+            let mut current = Client::new(
+                "METRICS-LIFECYCLE-NEW-CLIENT",
+                front_address,
+                http_request("GET", "/new", "", "localhost"),
+            );
+            current.connect();
+            current.send();
+            new_session_reached_backend = wait_for_backend_request(&mut backend, 1);
+            if new_session_reached_backend {
+                replacement_gauge_before_old_close =
+                    backend_connection_gauge(&mut worker, cluster_id, backend_id);
+                proxy_gauge_before_old_close = proxy_backend_connection_gauge(&mut worker);
+            }
+
+            // Source order in the old Mux is proxy-wide decrement first, then
+            // the labelled decrement. The global 2 -> 1 witness proves this
+            // close ran while the replacement connection remained active.
+            let _ = backend.close(0);
+            old_session_terminated = wait_for_client_termination(&mut old_client);
+            if old_session_terminated
+                && let Some(before) = proxy_gauge_before_old_close
+                && before > 0
+            {
+                proxy_gauge_after_old_close =
+                    wait_for_proxy_backend_connections(&mut worker, before - 1);
+            }
+
+            // Emit and consume one replacement metric only after the old-close
+            // witness. This is the same LocalDrain pipeline barrier used by the
+            // final incarnation-sensitive query.
+            let sent = backend.send(1).is_some();
+            let response = current.receive_response(SESSION_BARRIER_BUDGET);
+            new_session_progressed = sent
+                && response
+                    .as_deref()
+                    .is_some_and(|value| value.ends_with("replacement-incarnation"));
+            if new_session_progressed {
+                new_response_metric = wait_for_backend_2xx(&mut worker, cluster_id, backend_id);
+            }
+            if new_response_metric.is_some() {
+                replacement_gauge_after_old_close =
+                    backend_connection_gauge(&mut worker, cluster_id, backend_id);
+            }
+            new_client = Some(current);
+        }
+    }
+
+    old_client.disconnect();
+    if let Some(client) = new_client.as_mut() {
+        client.disconnect();
+    }
+    let _ = backend.close(1);
+    backend.disconnect();
+    let worker_stopped = stop_worker_within(worker);
+
+    println!(
+        "incarnation metrics same identity: detail_ack={metric_detail_ack} \
+         old_held={old_session_held} remove_ack={remove_ack} add_cluster_ack={add_cluster_ack} \
+         add_frontend_ack={add_frontend_ack} add_backend_ack={add_backend_ack} \
+         new_reached={new_session_reached_backend} \
+         replacement_before={replacement_gauge_before_old_close:?} \
+         proxy_before={proxy_gauge_before_old_close:?} proxy_after={proxy_gauge_after_old_close:?} \
+         old_terminated={old_session_terminated} new_progressed={new_session_progressed} \
+         new_response_metric={new_response_metric:?} \
+         replacement_after={replacement_gauge_after_old_close:?} worker_stopped={worker_stopped}"
+    );
+
+    if !old_session_held {
+        return State::Undecided;
+    }
+    if metric_detail_ack
+        && remove_ack
+        && add_cluster_ack
+        && add_frontend_ack
+        && add_backend_ack
+        && new_session_reached_backend
+        && replacement_gauge_before_old_close == Some(1)
+        && proxy_gauge_before_old_close == Some(2)
+        && proxy_gauge_after_old_close == Some(1)
+        && old_session_terminated
+        && new_session_progressed
+        && new_response_metric.is_some_and(|count| count > 0)
+        && replacement_gauge_after_old_close == Some(1)
+        && worker_stopped
+    {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_old_http_session_metrics_do_not_decrement_same_identity_replacement() {
+    assert_eq!(
+        try_old_http_session_does_not_decrement_same_identity_replacement(),
+        State::Success,
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Test 4: RemoveBackend drops the backend row but keeps the cluster row
 // ══════════════════════════════════════════════════════════════════════
 
 fn try_remove_backend_keeps_cluster_row_when_others_remain() -> State {
@@ -347,7 +744,7 @@ fn test_remove_backend_keeps_cluster_row_when_others_remain() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// Test 4: an abandoned metric-detail lease expires with no later command
+// Test 5: an abandoned metric-detail lease expires with no later command
 // ══════════════════════════════════════════════════════════════════════
 //
 // sozu-proxy/sozu#1831: the lease janitor (`Aggregator::lease_tick`) only

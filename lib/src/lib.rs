@@ -1657,6 +1657,54 @@ impl SessionMetrics {
             context.backend_id
         );
     }
+
+    pub(crate) fn register_end_of_session_for_incarnation(
+        &self,
+        context: &LogContext,
+        incarnation: Option<metrics::ClusterMetricsIncarnation>,
+    ) {
+        let request_time = self.request_time();
+        let service_time = self.service_time();
+
+        if let Some(cluster_id) = context.cluster_id {
+            time!(
+                names::event_loop::REQUEST_TIME,
+                cluster_id,
+                request_time.as_millis(),
+                incarnation
+            );
+            time!(
+                names::event_loop::SERVICE_TIME,
+                cluster_id,
+                service_time.as_millis(),
+                incarnation
+            );
+        }
+        time!(names::event_loop::REQUEST_TIME, request_time.as_millis());
+        time!(names::event_loop::SERVICE_TIME, service_time.as_millis());
+
+        if let Some(backend_id) = self.backend_id.as_ref()
+            && let Some(backend_response_time) = self.backend_response_time()
+        {
+            record_backend_metrics!(
+                context.cluster_id.as_str_or("-"),
+                backend_id,
+                backend_response_time.as_millis(),
+                self.backend_connection_time(),
+                self.backend_header_time(),
+                self.backend_bin,
+                self.backend_bout,
+                incarnation
+            );
+        }
+
+        incr!(
+            names::access_logs::COUNT,
+            context.cluster_id,
+            context.backend_id,
+            incarnation
+        );
+    }
 }
 
 /// exponentially weighted moving average with high sensibility to latency bursts

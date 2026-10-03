@@ -323,6 +323,10 @@ pub struct BackendId {
     pub backend_id: Rc<str>,
     /// `Backend::address`, for log lines and `push_event` payloads.
     pub address: SocketAddr,
+    /// Metrics lifetime captured by the request that opened this connection.
+    /// It stays with the connection through draining so its close cannot
+    /// mutate a replacement cluster with the same labels.
+    metric_incarnation: Option<crate::metrics::ClusterMetricsIncarnation>,
 }
 
 impl BackendId {
@@ -340,7 +344,19 @@ impl BackendId {
             slot: BackendSlot(slot),
             backend_id,
             address,
+            metric_incarnation: None,
         }
+    }
+
+    pub(crate) fn metric_incarnation(&self) -> Option<crate::metrics::ClusterMetricsIncarnation> {
+        self.metric_incarnation
+    }
+
+    fn set_metric_incarnation(
+        &mut self,
+        incarnation: Option<crate::metrics::ClusterMetricsIncarnation>,
+    ) {
+        self.metric_incarnation = incarnation;
     }
 
     /// The slot this id names. Module-private on purpose — see [`Mux::backend`]
@@ -471,6 +487,7 @@ impl BackendRegistry {
             slot,
             backend_id: entry.backend_id.clone(),
             address: entry.address,
+            metric_incarnation: None,
         }
     }
 
@@ -2526,7 +2543,11 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         .backend_streams
                         .get(token)
                         .map_or(0, |ids| ids.len());
-                    let (slot, backend_id) = (backend.slot(), backend.backend_id.clone());
+                    let (slot, backend_id, metric_incarnation) = (
+                        backend.slot(),
+                        backend.backend_id.clone(),
+                        backend.metric_incarnation(),
+                    );
                     self.context.backend_deltas.push(BackendDelta {
                         slot,
                         change: BackendChange::StreamsEnded(count),
@@ -2550,7 +2571,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         names::backend::CONNECTIONS_PER_BACKEND,
                         -1,
                         Some(cluster_id),
-                        Some(&backend_id)
+                        Some(&backend_id),
+                        metric_incarnation
                     );
                     trace!(
                         "{} connection (session) closed: {:?}",
@@ -2632,7 +2654,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         // selection and its reservation, and no longer: nothing else on this
         // path borrows the map, and the `RefMut` drops before the dial and
         // before `add_session` and `register_socket` borrow the proxy below.
-        let backend = {
+        let mut backend = {
             let mut backends = backends.borrow_mut();
             let stream = &mut context.streams[stream_id];
             let mut selector = RegistrySelector {
@@ -2648,6 +2670,11 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 &mut selector,
             )?
         };
+        backend.set_metric_incarnation(
+            context.streams[stream_id]
+                .context
+                .cluster_metrics_incarnation(),
+        );
 
         // Selection reserved a connection on `backend`; the dial is ours
         // (#1684). A `connect(2)` that fails releases that reservation and
@@ -2761,6 +2788,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             .borrow()
             .get_h2_graceful_shutdown_deadline();
         let backend_id_for_gauge = Rc::clone(&backend.backend_id);
+        let metric_incarnation = backend.metric_incarnation();
         let mut connection = if h2 {
             match Connection::new_h2_client(
                 context.session_ulid,
@@ -2821,7 +2849,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             names::backend::CONNECTIONS_PER_BACKEND,
             1,
             stream.context.cluster_id.as_deref(),
-            Some(&backend_id_for_gauge)
+            Some(&backend_id_for_gauge),
+            metric_incarnation
         );
 
         let token = proxy.borrow().add_session(session.clone());
@@ -2852,7 +2881,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     names::backend::CONNECTIONS_PER_BACKEND,
                     -1,
                     context.http_context(stream_id).cluster_id.as_deref(),
-                    Some(&backend_id_for_gauge)
+                    Some(&backend_id_for_gauge),
+                    metric_incarnation
                 );
                 // Release the `active_requests` charge `start_stream` took.
                 //
@@ -3071,13 +3101,15 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                     incr!(
                                         names::backend::UP,
                                         Some(cluster_id),
-                                        Some(&backend.backend_id)
+                                        Some(&backend.backend_id),
+                                        backend.metric_incarnation()
                                     );
                                     gauge!(
                                         names::backend::AVAILABLE,
                                         1,
                                         Some(cluster_id),
-                                        Some(&backend.backend_id)
+                                        Some(&backend.backend_id),
+                                        backend.metric_incarnation()
                                     );
                                     push_event(Event {
                                         kind: EventKind::BackendUp as i32,
@@ -3227,7 +3259,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 incr!(
                                     names::backend::CONNECTIONS_ERROR,
                                     Some(cluster_id),
-                                    Some(&backend.backend_id)
+                                    Some(&backend.backend_id),
+                                    backend.metric_incarnation()
                                 );
                                 if !already_unavailable && backend_borrow.retry_policy.is_down() {
                                     error!(
@@ -3239,13 +3272,15 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                     incr!(
                                         names::backend::DOWN,
                                         Some(cluster_id),
-                                        Some(&backend.backend_id)
+                                        Some(&backend.backend_id),
+                                        backend.metric_incarnation()
                                     );
                                     gauge!(
                                         names::backend::AVAILABLE,
                                         0,
                                         Some(cluster_id),
-                                        Some(&backend.backend_id)
+                                        Some(&backend.backend_id),
+                                        backend.metric_incarnation()
                                     );
                                     push_event(Event {
                                         kind: EventKind::BackendDown as i32,

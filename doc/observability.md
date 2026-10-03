@@ -145,7 +145,7 @@ cluster is discarded — bounded by the one-second network-drain cadence
 hard-coded in `NetworkDrain::send_metrics`).
 
 `RemoveCluster` also arms a per-drain tombstone (`removed_clusters:
-HashSet<String>`) so subsequent emissions for the same cluster id are
+HashSet<String>`) so subsequent emissions for the removed cluster are
 dropped on the floor rather than resurrecting the row via
 `entry().or_default()`. This matters in production: the per-proxy
 `remove_cluster` paths in `lib/src/http.rs` / `https.rs` / `tcp.rs`
@@ -159,8 +159,50 @@ The tombstone is cleared on `AddCluster` for the same id (a cluster can
 come back after a remove) and on `sozu metrics clear` (operator-initiated
 full reset).
 
+The tombstone alone cannot distinguish that replacement from the removed
+cluster. Each effective cluster lifetime therefore has an opaque metrics
+incarnation. HTTP streams capture it when their request is routed, TCP
+sessions when their static or SNI route resolves, and backend connections
+retain it until close. At `cluster` or `backend` detail, the aggregator rejects
+a labelled emission whose captured incarnation is no longer current before
+either drain sees it. A late close from the old cluster therefore cannot
+decrement the replacement's identically labelled `connections_per_backend`
+gauge, even when the backend id and address are unchanged.
+
+At `process` and today's `frontend` detail, removing those labels deliberately
+forms a worker-wide aggregate. A stale-incarnation event remains part of that
+aggregate: while detail remains at that level, an old connection's late
+decrement balances the increment it contributed before removal. Metrics
+emitted directly without cluster labels,
+including `backend.connections`, also continue to record the physical close;
+they are a separate emission from the label-stripped aggregate.
+
+The effective detail is evaluated independently for every emission. Changing
+it, including when a runtime lease starts or expires, does not migrate or
+clear values already stored under the previous label shape. By inspection of
+that emission-time policy, a gauge whose increment and decrement straddle the
+transition can be split between shapes; this change does not add a migration
+layer or claim a separately reproduced defect there. The
+cluster-incarnation gate follows the effective detail at the time of the late
+emission.
+
+An `AddCluster` update while the cluster remains configured preserves its
+incarnation; only remove then add creates the next one. Disabling and
+re-enabling cluster metric collection, changing `metrics.detail`, and
+`sozu metrics clear` do not alter that identity. This keeps old emissions
+obsolete across collection controls even though a clear resets the drain
+storage and its tombstones.
+
+The public `SessionMetrics` shape and
+`SessionMetrics::register_end_of_session(&LogContext)` API retain their
+current-configuration semantics for embedders. Sōzu's delayed HTTP, WebSocket,
+and TCP owners use a separate internal registration path with the incarnation
+captured by their request, session, pipe, or backend handle. A missing internal
+capture is rejected for a cluster-labelled event rather than being treated as
+the current incarnation.
+
 Every request ends with a burst of emissions into the local drain
-(`SessionMetrics::register_end_of_session`: two cluster-labelled times and,
+(`SessionMetrics` end-of-session registration: two cluster-labelled times and,
 under `metrics.detail = "backend"`, up to seven backend-labelled metrics —
 the connection and header times are absent when not measured), so its
 lookup path is held to **zero heap allocation in steady state**. Each level is
