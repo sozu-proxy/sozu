@@ -207,6 +207,38 @@ fn push_metric_detail_transition(
     });
 }
 
+/// Polled lease-expiry janitor: `SetMetricDetail` leases self-expire after
+/// their TTL so a crashed `sozu top` cannot permanently elevate metrics
+/// cardinality. Called once per event-loop iteration from [`Server::run`],
+/// which wakes at least once per `poll_timeout` (1 s) even with no traffic
+/// and no command, and from [`Server::notify`]. `lease_tick_due` gates the
+/// HashMap walk to once per `LEASE_TICK_INTERVAL` (5 s), so an abandoned
+/// lease is retired within TTL + 5 s + one poll timeout (#1831).
+fn tick_metric_detail_leases(now: Instant) {
+    // Capture (previous, effective) before releasing the borrow so we can
+    // emit an Event afterwards. Holding `METRICS.borrow_mut` across
+    // `push_event` would re-enter the same thread-local from inside
+    // `QUEUE.with` (safe but conceptually noisy); the two-step split keeps
+    // the borrow scopes minimal. Single-threaded worker, so `borrow_mut` is
+    // safe here.
+    let lease_tick_transition = METRICS.with(|metrics| {
+        let mut m = metrics.borrow_mut();
+        if !m.lease_tick_due(now) {
+            return None;
+        }
+        let previous = m.lease_tick(now)?;
+        let effective = m.detail_effective();
+        Some((previous, effective))
+    });
+    if let Some((previous, effective)) = lease_tick_transition {
+        // The janitor retired one or more leases AND the effective level
+        // moved. Surface the worker-local transition as an Event so the
+        // master folds it into the audit log. `client_id` is `None` because
+        // the janitor may have retired multiple leases at once.
+        push_metric_detail_transition(previous, effective, "lease_tick_expired", None);
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ListenToken(pub usize);
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1617,6 +1649,9 @@ impl Server {
             );
             self.loop_start = after_epoll;
 
+            // Before `send_queue`, so an expiry event leaves on this turn.
+            tick_metric_detail_leases(after_epoll);
+
             self.send_queue();
 
             for event in events.iter() {
@@ -2132,38 +2167,13 @@ impl Server {
     }
 
     fn notify(&mut self, message: WorkerRequest) {
-        // Polled lease-expiry janitor: SetMetricDetail leases self-expire after
-        // their TTL so a crashed `sozu top` cannot permanently elevate metrics
-        // cardinality. The janitor runs at most every LEASE_TICK_INTERVAL,
-        // gated by `lease_tick_due` so the hot path of `notify` doesn't pay
-        // the HashMap walk on every iteration. Single-threaded worker, so
-        // `borrow_mut` is safe here. The same `now` reading is also threaded
-        // into `lease_apply` below (`SetMetricDetail` arm) so the whole lease
-        // lifecycle for this `notify` call is anchored to one clock read.
+        // Run the lease janitor here too, not only from the run loop: the
+        // same `now` reading is threaded into `lease_apply` below
+        // (`SetMetricDetail` arm) so the whole lease lifecycle for this
+        // `notify` call is anchored to one clock read, and a query never
+        // reports a lease the janitor is already due to retire.
         let now = std::time::Instant::now();
-        // Capture (previous, effective) before releasing the borrow so we
-        // can emit an Event afterwards. Holding `METRICS.borrow_mut`
-        // across `push_event` would re-enter the same thread-local from
-        // inside `QUEUE.with` (safe but conceptually noisy); the
-        // two-step split keeps the borrow scopes minimal.
-        let lease_tick_transition = METRICS.with(|metrics| {
-            let mut m = metrics.borrow_mut();
-            if !m.lease_tick_due(now) {
-                return None;
-            }
-            let previous = m.lease_tick(now)?;
-            let effective = m.detail_effective();
-            Some((previous, effective))
-        });
-        if let Some((previous, effective)) = lease_tick_transition {
-            // The janitor retired one or more leases AND the effective
-            // level moved. Surface the worker-local transition as an
-            // Event so the master folds it into the audit log (closes
-            // the gap where TUI-crashed lease expiry was previously
-            // silent). `client_id` is `None` because the janitor may
-            // have retired multiple leases at once.
-            push_metric_detail_transition(previous, effective, "lease_tick_expired", None);
-        }
+        tick_metric_detail_leases(now);
         match &message.content.request_type {
             Some(RequestType::ConfigureMetrics(configuration)) => {
                 match MetricsConfiguration::try_from(*configuration) {
@@ -2195,9 +2205,10 @@ impl Server {
             // Runtime cardinality lease verb — apply, renew, or clear a lease
             // on this worker's `Aggregator`. The lease bumps `effective` to
             // `max(configured, max(active leases))`; expiry runs on the polled
-            // janitor below. Master-side aggregation into `MetricDetailStatus`
-            // lands in a follow-up; for now the worker acks with a bare OK so
-            // the existing `worker_request` fan-out path can collect.
+            // janitor, `tick_metric_detail_leases`. Master-side aggregation
+            // into `MetricDetailStatus` lands in a follow-up; for now the
+            // worker acks with a bare OK so the existing `worker_request`
+            // fan-out path can collect.
             Some(RequestType::SetMetricDetail(req)) => {
                 // Master populates the peer binding from the connecting
                 // `ClientSession` before fan-out (`bin/src/command/
