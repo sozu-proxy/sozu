@@ -214,20 +214,6 @@ pub use crate::protocol::mux::{
 const MAX_LOOP_ITERATIONS: i32 = 10_000;
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Whether a backend's readiness is work for the inner loop of
-/// `Mux::ready_inner`: an event it asked for that a `readable` or `writable`
-/// pass can act on. `HUP` and `ERROR` are always in a backend's interest, so
-/// they would make `filter_interest()` non-empty forever once the backend
-/// closed. The dead-backend check acts on them, and a dead backend it keeps
-/// for the bytes it has left to deliver (`Connection::has_buffer_pressure`)
-/// waits for the client to drain the stream buffer, which
-/// `Connection::try_resume_reading` signals with READABLE. Counting those
-/// bits spun the loop to `MAX_LOOP_ITERATIONS` (sozu-proxy/sozu#1819).
-fn backend_has_work(readiness: &Readiness) -> bool {
-    let work = readiness.filter_interest();
-    work.is_readable() || work.is_writable()
-}
-
 /// Debug tripwire for the one-active-stream invariant that
 /// `ConnectionH1::end_stream`'s early-return guard rests on.
 ///
@@ -1101,6 +1087,12 @@ pub struct Context<L: ListenerHandler + L7ListenerHandler> {
     /// drain-before-read leaves the counters at every read point exactly
     /// where mutating in place left them, saturation included.
     pub backend_deltas: Vec<BackendDelta>,
+    /// The bytes the session's streams had written to the client when the
+    /// inner loop of `Mux::ready_inner` last reached `MAX_LOOP_ITERATIONS`
+    /// and waited for the client instead of closing. A second time with no
+    /// byte written since closes the session: waiting is only worth it while
+    /// the client drains (`Mux::wait_for_client_at_loop_limit`).
+    pub(super) loop_limit_bytes_out: Option<usize>,
 }
 
 /// Unix milliseconds for the wall clock, saturating to 0 before the epoch.
@@ -1149,6 +1141,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             now_wall_ms: unix_epoch_ms(),
             request_id_rng: StdRng::from_rng(&mut rand::rng()),
             backend_deltas: Vec::new(),
+            loop_limit_bytes_out: None,
         }
     }
 
@@ -2127,28 +2120,45 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     /// (`true`) or close the session (`false`).
     ///
     /// Output still queued for the client, in the connection or in an open
-    /// stream's response buffer, is never dropped. An H1 frontend's
-    /// `has_pending_write_including_streams` does not see its stream's
-    /// buffer, so the open streams are probed here (sozu-proxy/sozu#1819).
-    /// The session then waits for the frontend's next writable event, with
-    /// the frontend timeout as the bound if none comes.
+    /// stream's response buffer, is not dropped while the client drains it.
+    /// An H1 frontend's `has_pending_write_including_streams` does not see
+    /// its stream's buffer, so the open streams are probed here
+    /// (sozu-proxy/sozu#1819). The session then waits for the frontend's next
+    /// writable event, with the frontend timeout as the bound if none comes.
+    ///
+    /// Waiting stays bounded: reaching the limit again with no byte written
+    /// to the client since the last time (`Context::loop_limit_bytes_out`)
+    /// closes the session, so a loop that spins on every wake-up without
+    /// progress costs at most two budgets.
     fn wait_for_client_at_loop_limit(&mut self) -> bool {
         incr!(names::http::INFINITE_LOOP_ERROR);
-        let output_queued = self
-            .frontend
-            .has_pending_write_including_streams(&self.context)
-            || self.context.streams.iter().any(|stream| {
-                stream.state.is_open()
-                    && (!stream.back.out.is_empty() || !stream.back.blocks.is_empty())
-            });
+        #[cfg(test)]
+        LOOP_LIMIT_HITS.with(|hits| hits.set(hits.get() + 1));
+        let bytes_out = self
+            .context
+            .streams
+            .iter()
+            .map(|stream| stream.metrics.bout)
+            .sum::<usize>();
+        let progressed = self.context.loop_limit_bytes_out != Some(bytes_out);
+        let output_queued = progressed
+            && (self
+                .frontend
+                .has_pending_write_including_streams(&self.context)
+                || self.context.streams.iter().any(|stream| {
+                    stream.state.is_open()
+                        && (!stream.back.out.is_empty() || !stream.back.blocks.is_empty())
+                }));
         warn!(
             "{} Mux loop reached {} iterations, {}: frontend={:?} backends={:?}",
             log_context!(self),
             MAX_LOOP_ITERATIONS,
             if output_queued {
                 "waiting for the client to drain the queued output"
-            } else {
+            } else if progressed {
                 "closing"
+            } else {
+                "closing: no byte reached the client since the last time"
             },
             self.frontend.readiness(),
             self.router
@@ -2158,6 +2168,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 .collect::<Vec<_>>()
         );
         if output_queued {
+            self.context.loop_limit_bytes_out = Some(bytes_out);
             let readiness = self.frontend.readiness_mut();
             readiness.interest.insert(Ready::WRITABLE);
             readiness.event.remove(Ready::WRITABLE);
@@ -2912,6 +2923,11 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 .as_millis() as usize,
         ));
         trace!("{} {:?}", log_context!(self), start);
+        // Set once the inner loop has spent its budget and waits for the
+        // client: the outer loop then stops after this sweep instead of
+        // re-entering with an exhausted `counter`, which would count and log
+        // the same limit again.
+        let mut budget_spent = false;
         loop {
             // The mux's clock sample for this pass. Everything time-based
             // below — flood and back-pressure windows, the SETTINGS-ACK
@@ -3276,7 +3292,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         self.router.dead_backends.push(*token);
                     }
 
-                    if backend_has_work(client.readiness()) {
+                    if client.has_loop_work(&self.context) {
                         all_backends_readiness_are_empty = false;
                     }
                 }
@@ -3403,9 +3419,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     // bring it back.
                     let context = &mut self.context;
                     for backend in self.router.backends.values_mut() {
-                        if backend.try_resume_reading(context)
-                            || backend_has_work(backend.readiness())
-                        {
+                        if backend.try_resume_reading(context) || backend.has_loop_work(context) {
                             all_backends_readiness_are_empty = false;
                         }
                     }
@@ -3483,6 +3497,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 counter += 1;
                 if counter >= MAX_LOOP_ITERATIONS {
                     if self.wait_for_client_at_loop_limit() {
+                        budget_spent = true;
                         break;
                     }
                     return SessionResult::Close;
@@ -3756,7 +3771,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 // stream out of Link state, except a failed `connect(2)`,
                 // which re-queues it above for another backend.
             }
-            if !dirty {
+            if !dirty || budget_spent {
                 break;
             }
         }
@@ -4638,6 +4653,9 @@ pub(crate) mod test_support {
 #[cfg(test)]
 thread_local! {
     static SHUTDOWN_WRITABLE_PASSES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Times `Mux::wait_for_client_at_loop_limit` ran on this thread, in
+    /// every build (the debug history is empty in release builds).
+    static LOOP_LIMIT_HITS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -7792,8 +7810,8 @@ mod tests {
     /// Drive one H1 exchange whose backend wrote its whole response and
     /// closed before a slow client read it, and return the number of body
     /// bytes the client received, the body length, the `SessionResult` of
-    /// the first `Mux::ready` pass, and the inner-loop iterations that pass
-    /// ran (debug builds record them in `Context::debug`; zero otherwise).
+    /// the first `Mux::ready` pass, and how many times the exchange reached
+    /// the loop limit (`LOOP_LIMIT_HITS`).
     ///
     /// The backend's last bytes and its FIN wait in the kernel while the
     /// stream's response buffer is full and the client's socket would block:
@@ -7804,7 +7822,7 @@ mod tests {
     /// does.
     fn slow_client_after_backend_close(
         client_half_closed: bool,
-    ) -> (usize, usize, SessionResult, i32) {
+    ) -> (usize, usize, SessionResult, u32) {
         use std::io::{Read, Write};
 
         const BODY: usize = 160 * 1024;
@@ -7878,18 +7896,8 @@ mod tests {
         let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(RemoveOnlyProxy));
         let mut metrics = SessionMetrics::new(None);
 
+        LOOP_LIMIT_HITS.with(|hits| hits.set(0));
         let first = mux.ready(session.clone(), proxy.clone(), &mut metrics);
-        let iterations = mux
-            .context
-            .debug
-            .events
-            .iter()
-            .filter_map(|event| match event {
-                DebugEvent::LoopIteration(counter) => Some(*counter),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0);
         let mut result = first;
         let mut received = Vec::new();
         let mut chunk = [0u8; 4096];
@@ -7927,7 +7935,8 @@ mod tests {
             let (rest, _) = drain_peer(&mut frontend_peer, &[]);
             received.extend_from_slice(&rest);
         }
-        (body_received(&received), BODY, first, iterations)
+        let hits = LOOP_LIMIT_HITS.with(|hits| hits.get());
+        (body_received(&received), BODY, first, hits)
     }
 
     /// A slow client downloading a response whose backend has already
@@ -7939,17 +7948,17 @@ mod tests {
     /// `MAX_LOOP_ITERATIONS` with nothing to progress, and close the session
     /// with the end of the body still in the stream's buffer.
     ///
-    /// TO SEE THIS RED: make `backend_has_work` return
+    /// TO SEE THIS RED: make `Connection::has_loop_work` return
     /// `!readiness.filter_interest().is_empty()` again. The first pass then
     /// runs to `MAX_LOOP_ITERATIONS`. With `Mux::wait_for_client_at_loop_limit`
     /// also back to checking `frontend.has_pending_write()` alone, that pass
     /// returns `SessionResult::Close` and the client is short of bytes.
     #[test]
     fn a_slow_client_receives_the_whole_response_of_a_backend_that_closed() {
-        let (received, expected, first, iterations) = slow_client_after_backend_close(false);
-        assert!(
-            iterations < MAX_LOOP_ITERATIONS - 1,
-            "the first pass must stop once nothing can progress, ran {iterations} iterations"
+        let (received, expected, first, hits) = slow_client_after_backend_close(false);
+        assert_eq!(
+            hits, 0,
+            "every pass must stop once nothing can progress, not at the loop limit"
         );
         assert_ne!(
             first,
@@ -7963,10 +7972,10 @@ mod tests {
     /// request.
     #[test]
     fn a_half_closed_slow_client_receives_the_whole_response_of_a_backend_that_closed() {
-        let (received, expected, first, iterations) = slow_client_after_backend_close(true);
-        assert!(
-            iterations < MAX_LOOP_ITERATIONS - 1,
-            "the first pass must stop once nothing can progress, ran {iterations} iterations"
+        let (received, expected, first, hits) = slow_client_after_backend_close(true);
+        assert_eq!(
+            hits, 0,
+            "every pass must stop once nothing can progress, not at the loop limit"
         );
         assert_ne!(
             first,
@@ -8006,6 +8015,36 @@ mod tests {
         assert!(
             readiness.interest.is_writable() && !readiness.event.is_writable(),
             "the session waits for the next writable event, got {readiness:?}"
+        );
+    }
+
+    /// Waiting at the loop limit is bounded: reaching it again with no byte
+    /// written to the client since closes the session, while a client that
+    /// drained some of the response in between is waited for again.
+    ///
+    /// TO SEE THIS RED: drop `progressed &&` from `output_queued` in
+    /// `Mux::wait_for_client_at_loop_limit`. The second hit then waits again.
+    #[test]
+    fn a_second_loop_limit_without_progress_closes_the_session() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut mux, _frontend_peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));
+        mux.context.streams[0].state = StreamState::Linked(Token(1));
+        mux.context.streams[0]
+            .back
+            .push_out(kawa::Store::Static(b"the end of the body"));
+
+        assert!(
+            mux.wait_for_client_at_loop_limit(),
+            "the first hit with output queued waits for the client"
+        );
+        mux.context.streams[0].metrics.bout += 100;
+        assert!(
+            mux.wait_for_client_at_loop_limit(),
+            "the client drained bytes since: the session waits again"
+        );
+        assert!(
+            !mux.wait_for_client_at_loop_limit(),
+            "no byte reached the client since the last hit: the session must close"
         );
     }
 

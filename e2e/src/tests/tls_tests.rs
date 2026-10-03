@@ -1756,6 +1756,157 @@ fn test_h2_window_stalled_client_receives_the_whole_response_of_a_closed_backend
     );
 }
 
+/// A frame an HTTP/2 backend sends to break the protocol.
+#[derive(Clone, Copy, Debug)]
+enum BackendProtocolError {
+    /// A DATA frame on stream 0 (RFC 9113 §6.1: a connection error).
+    DataOnStreamZero,
+    /// A HEADERS frame on a stream sozu never opened (RFC 9113 §5.1).
+    HeadersOnIdleStream,
+}
+
+/// An HTTP/2 backend that completes the connection preface, stays silent
+/// long enough for sozu to go idle, then sends `error` and keeps its socket
+/// open, so no socket event follows.
+fn spawn_protocol_violating_h2_backend(
+    address: SocketAddr,
+    error: BackendProtocolError,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    let listener = bind_std_listener(address, "protocol-violating h2 backend");
+    thread::spawn(move || {
+        listener
+            .set_nonblocking(true)
+            .expect("could not set backend listener nonblocking");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(_) if Instant::now() < deadline && !stop.load(Ordering::SeqCst) => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => return,
+            }
+        };
+        stream.set_nonblocking(false).ok();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .ok();
+        let mut buf = [0u8; 65536];
+        let _ = stream.read(&mut buf);
+        // An empty SETTINGS, then the ACK of sozu's.
+        let _ = stream.write_all(&[0, 0, 0, 0x4, 0, 0, 0, 0, 0, 0, 0, 0, 0x4, 0x1, 0, 0, 0, 0]);
+        let _ = stream.read(&mut buf);
+        // sozu has nothing left to do: it waits for the response.
+        thread::sleep(Duration::from_millis(500));
+        let frame: &[u8] = match error {
+            BackendProtocolError::DataOnStreamZero => &[0, 0, 4, 0x0, 0, 0, 0, 0, 0, 1, 2, 3, 4],
+            // `:status 200` (static index 8), END_HEADERS, on stream 3.
+            BackendProtocolError::HeadersOnIdleStream => &[0, 0, 1, 0x1, 0x4, 0, 0, 0, 3, 0x88],
+        };
+        let _ = stream.write_all(frame);
+        // The socket stays open: only sozu can end this connection.
+        while !stop.load(Ordering::SeqCst) {
+            let _ = stream.read(&mut buf);
+        }
+    })
+}
+
+/// When an idle HTTP/2 backend breaks the protocol, sozu answers the client
+/// at once and drops the backend connection.
+///
+/// sozu flushes its GOAWAY and raises HUP on the backend itself
+/// (`ConnectionH2::force_disconnect`), after the dead-backend check of that
+/// iteration of `Mux::ready_inner` already ran. The backend keeps its socket
+/// open, so no socket event will bring the session back: that HUP has to
+/// count as work for the loop to iterate once more, close the backend and
+/// answer the client. Ignoring it left the client waiting for a timeout.
+fn try_idle_h2_backend_protocol_error_answers_at_once(error: BackendProtocolError) -> State {
+    let name = "H2-BACKEND-PROTOCOL-ERROR";
+    let back_address = create_local_address();
+    let (mut worker, front) = start_half_close_worker(name, Transport::Tls, back_address);
+    let mut h2_cluster = Worker::default_cluster("cluster_0");
+    h2_cluster.http2 = Some(true);
+    worker.send_proxy_request_type(RequestType::AddCluster(h2_cluster));
+    worker.read_to_last();
+    let stop = Arc::new(AtomicBool::new(false));
+    let backend = spawn_protocol_violating_h2_backend(back_address, error, stop.clone());
+
+    let (mut stream, handle) = half_close_client(Transport::Tls, front);
+    handle
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .ok();
+    let start = Instant::now();
+    let sent = stream
+        .write_all(b"GET /api HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .is_ok()
+        && stream.flush().is_ok();
+    let mut received = Vec::new();
+    let mut buf = [0u8; 4096];
+    let ending = loop {
+        if start.elapsed() > Duration::from_secs(12) {
+            break "timeout";
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => break "closed",
+            Ok(n) => {
+                received.extend_from_slice(&buf[..n]);
+                if received.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break "answered";
+                }
+            }
+            Err(ref e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(_) => break "error",
+        }
+    };
+    let elapsed = start.elapsed();
+    let answered = received.starts_with(b"HTTP/1.1 5");
+    drop(stream);
+    stop.store(true, Ordering::SeqCst);
+    let _ = backend.join();
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    println!(
+        "{name}: {error:?} sent={sent} answered={answered} ending={ending} elapsed={elapsed:?} \
+         stopped={stopped}"
+    );
+    if sent && answered && elapsed < Duration::from_secs(3) && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_idle_h2_backend_sending_data_on_stream_zero_is_answered_at_once() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 backend: DATA on stream 0 from an idle backend is answered at once",
+            || try_idle_h2_backend_protocol_error_answers_at_once(
+                BackendProtocolError::DataOnStreamZero
+            )
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_idle_h2_backend_sending_headers_on_an_idle_stream_is_answered_at_once() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 backend: HEADERS on an idle stream from an idle backend is answered at once",
+            || try_idle_h2_backend_protocol_error_answers_at_once(
+                BackendProtocolError::HeadersOnIdleStream
+            )
+        ),
+        State::Success
+    );
+}
+
 /// A backend that accepts one connection, reads, never answers, and records
 /// when it has read something and when its connection closed.
 struct SilentBackend {
