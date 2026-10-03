@@ -3984,6 +3984,26 @@
 
 ### 🐛 Fixed
 
+- **`fix(proxy-protocol)`: an expect-proxy session parses a PROXY-v2 header that arrives with the
+  client's half-close ([#1823](https://github.com/sozu-proxy/sozu/issues/1823)).** On Linux a
+  client that sends its header and payload and then calls `shutdown(SHUT_WR)` can be reported in
+  one `READABLE | HUP` epoll event. `TcpSession::ready_inner` (`lib/src/tcp.rs`) handled the
+  frontend HUP before the readable bytes, and `TcpSession::front_hup` closes the expect state,
+  so the complete header was never parsed and the session closed before dialing the backend;
+  `SessionState::ready` for `ExpectProxyProtocol`
+  (`lib/src/protocol/proxy_protocol/expect.rs`), the HTTP and HTTPS listeners' expect stage,
+  closed on HUP the same way. Both now drain the readable bytes first: a complete header upgrades
+  and hands HUP on to the next stage (on TCP, `Pipe::frontend_hup` keeps the session while request
+  bytes the expect stage did not read remain to forward), while a zero-byte bare-TCP healthcheck
+  or a truncated header still closes without dialing a backend. On TCP, a zero-byte healthcheck
+  (connect then FIN, which Linux always reports as `READABLE | HUP`) now closes through the expect
+  stage's zero-byte branch instead of `TcpSession::front_hup`, so it no longer emits a TCP access-log
+  line or the end-of-session request/service timers; a truncated header followed by FIN still
+  logs one. The client still receives no backend response after its half-close: the TCP pipe
+  closes once the request is flushed, for every TCP session
+  ([#1840](https://github.com/sozu-proxy/sozu/issues/1840)). Relay sessions
+  (`RelayProxyProtocol`) are unchanged.
+
 - **`test(e2e)`: `test_issue_806` no longer times the host's scheduler against its reconnect
   budget.** `try_backend_stop` (`e2e/src/tests/tests.rs`) compared the wall-clock round trip of the
   request that follows the backend stop with a 100 ms budget. On a loaded host the round trip of a

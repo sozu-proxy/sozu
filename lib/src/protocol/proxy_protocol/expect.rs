@@ -349,10 +349,6 @@ impl<Front: SocketHandler> SessionState for ExpectProxyProtocol<Front> {
     ) -> SessionResult {
         let mut counter = 0;
 
-        if self.frontend_readiness.event.is_hup() {
-            return SessionResult::Close;
-        }
-
         while counter < MAX_LOOP_ITERATIONS {
             let frontend_interest = self.frontend_readiness.filter_interest();
 
@@ -361,6 +357,17 @@ impl<Front: SocketHandler> SessionState for ExpectProxyProtocol<Front> {
                 log_context!(self),
                 self.frontend_readiness
             );
+
+            // A client half-close can arrive in the same `READABLE | HUP`
+            // event as the header it follows (Linux coalesces
+            // `EPOLLIN | EPOLLRDHUP`), so HUP closes only once every readable
+            // byte has been consumed: a complete header still upgrades and
+            // hands HUP on to the next stage (sozu-proxy/sozu#1823).
+            // `readable` clears READABLE on every zero-byte read, so an empty
+            // or truncated header reaches this close on the next turn.
+            if self.frontend_readiness.event.is_hup() && !frontend_interest.is_readable() {
+                return SessionResult::Close;
+            }
 
             if frontend_interest.is_empty() {
                 break;
@@ -588,5 +595,183 @@ mod expect_test {
                 Err(e) => panic!("could not connect to the next middleware: {e}"),
             };
         })
+    }
+
+    /// `SessionState::ready` (the HTTP and HTTPS listeners' expect stage)
+    /// never dials nor registers anything, so the session and proxy handles
+    /// it is given are never touched.
+    struct UnusedSession;
+
+    impl crate::ProxySession for UnusedSession {
+        fn protocol(&self) -> Protocol {
+            unreachable!("the expect stage never asks the session")
+        }
+        fn ready(
+            &mut self,
+            _session: Rc<RefCell<dyn crate::ProxySession>>,
+        ) -> crate::SessionIsToBeClosed {
+            unreachable!("the expect stage never asks the session")
+        }
+        fn update_readiness(&mut self, _token: Token, _events: Ready) {
+            unreachable!("the expect stage never asks the session")
+        }
+        fn close(&mut self) {
+            unreachable!("the expect stage never asks the session")
+        }
+        fn timeout(&mut self, _t: Token) -> crate::SessionIsToBeClosed {
+            unreachable!("the expect stage never asks the session")
+        }
+        fn last_event(&self) -> std::time::Instant {
+            unreachable!("the expect stage never asks the session")
+        }
+        fn print_session(&self) {
+            unreachable!("the expect stage never asks the session")
+        }
+        fn frontend_token(&self) -> Token {
+            unreachable!("the expect stage never asks the session")
+        }
+        fn shutting_down(&mut self) -> crate::SessionIsToBeClosed {
+            unreachable!("the expect stage never asks the session")
+        }
+    }
+
+    struct UnusedProxy;
+
+    impl crate::L7Proxy for UnusedProxy {
+        fn kind(&self) -> sozu_command::proto::command::ListenerType {
+            unreachable!("the expect stage never asks the proxy")
+        }
+        fn register_socket(
+            &self,
+            _socket: &mut TcpStream,
+            _token: Token,
+            _interest: Interest,
+        ) -> Result<(), std::io::Error> {
+            unreachable!("the expect stage never asks the proxy")
+        }
+        fn add_session(&self, _session: Rc<RefCell<dyn crate::ProxySession>>) -> Token {
+            unreachable!("the expect stage never asks the proxy")
+        }
+        fn remove_session(&self, _token: Token) -> bool {
+            unreachable!("the expect stage never asks the proxy")
+        }
+        fn clusters(
+            &self,
+        ) -> &std::collections::HashMap<
+            sozu_command::state::ClusterId,
+            sozu_command::proto::command::Cluster,
+        > {
+            unreachable!("the expect stage never asks the proxy")
+        }
+        fn sessions(&self) -> Rc<RefCell<crate::server::SessionManager>> {
+            unreachable!("the expect stage never asks the proxy")
+        }
+    }
+
+    /// Write `wire` from a loopback client, half-close the client's write
+    /// side, and hand the accepted socket to a fresh `ExpectProxyProtocol`
+    /// together with the readiness a real epoll instance reports for it once
+    /// both the bytes and the FIN are queued -- on Linux one coalesced
+    /// `READABLE | HUP` event (`EPOLLIN | EPOLLRDHUP`). The client is
+    /// returned so its still-open read side outlives the call.
+    #[cfg(target_os = "linux")]
+    fn half_closed_expect(wire: &[u8]) -> (ExpectProxyProtocol<TcpStream>, StdTcpStream) {
+        use std::net::{Shutdown, TcpListener as StdTcpListener};
+
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind the expect listener");
+        let mut client = StdTcpStream::connect(
+            listener
+                .local_addr()
+                .expect("the expect listener must expose its address"),
+        )
+        .expect("connect the client");
+        let (accepted, _) = listener.accept().expect("accept the client");
+        accepted
+            .set_nonblocking(true)
+            .expect("accepted socket nonblocking");
+        client.write_all(wire).expect("write the request stream");
+        client
+            .shutdown(Shutdown::Write)
+            .expect("half-close the client write side");
+
+        let mut frontend = TcpStream::from_std(accepted);
+        let mut poll = Poll::new().expect("create poll");
+        poll.registry()
+            .register(&mut frontend, Token(0), Interest::READABLE)
+            .expect("register the accepted socket");
+        let mut events = Events::with_capacity(4);
+        poll.poll(&mut events, Some(Duration::from_secs(2)))
+            .expect("poll the accepted socket");
+        let ready = events
+            .iter()
+            .find(|event| event.token() == Token(0))
+            .map(Ready::from)
+            .expect("the queued request and FIN produce an epoll event");
+        assert!(
+            ready.is_readable() && ready.is_hup(),
+            "the queued bytes and FIN must coalesce into READABLE|HUP: {ready:?}"
+        );
+        poll.registry()
+            .deregister(&mut frontend)
+            .expect("deregister the accepted socket");
+
+        let mut expect = ExpectProxyProtocol::new(
+            TimeoutContainer::new(Duration::from_secs(10), Token(0)),
+            frontend,
+            Token(0),
+            Ulid::generate(),
+        );
+        expect.update_readiness(Token(0), ready);
+        (expect, client)
+    }
+
+    fn ready_once(expect: &mut ExpectProxyProtocol<TcpStream>) -> SessionResult {
+        let session: Rc<RefCell<dyn crate::ProxySession>> = Rc::new(RefCell::new(UnusedSession));
+        let proxy: Rc<RefCell<dyn crate::L7Proxy>> = Rc::new(RefCell::new(UnusedProxy));
+        let mut metrics = SessionMetrics::new(None);
+        expect.ready(session, proxy, &mut metrics)
+    }
+
+    /// The HTTP/HTTPS expect stage must parse a complete PROXY-v2 header
+    /// that arrives in the same `READABLE | HUP` event as the client's FIN
+    /// and upgrade, handing HUP on to the next stage, instead of closing on
+    /// HUP before reading (sozu-proxy/sozu#1823).
+    ///
+    /// To SEE THIS RED: restore the unconditional
+    /// `if self.frontend_readiness.event.is_hup() { return SessionResult::Close; }`
+    /// before the readiness loop of `SessionState::ready`; the result is then
+    /// `Close` and no address is parsed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ready_parses_a_header_coalesced_with_the_client_half_close() {
+        let mut wire = HeaderV2::new(Command::Proxy, header_src(), header_dst()).into_bytes();
+        wire.extend_from_slice(b"GET / HTTP/1.1\r\n\r\n");
+        let (mut expect, _client) = half_closed_expect(&wire);
+
+        assert_eq!(ready_once(&mut expect), SessionResult::Upgrade);
+        assert_eq!(
+            expect.addresses.as_ref().and_then(ProxyAddr::source),
+            Some(header_src()),
+            "the coalesced header must be parsed before HUP is honoured"
+        );
+        assert!(
+            expect.frontend_readiness.event.is_hup(),
+            "HUP must survive the upgrade for the next stage to honour"
+        );
+    }
+
+    /// Negative space: a zero-byte half-close (a bare TCP health check) and
+    /// a truncated header followed by FIN must both still close once every
+    /// readable byte is consumed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ready_closes_a_half_close_without_a_complete_header() {
+        let (mut zero_bytes, _client) = half_closed_expect(&[]);
+        assert_eq!(ready_once(&mut zero_bytes), SessionResult::Close);
+
+        let header = HeaderV2::new(Command::Proxy, header_src(), header_dst()).into_bytes();
+        let (mut truncated, _client) = half_closed_expect(&header[..10]);
+        assert_eq!(ready_once(&mut truncated), SessionResult::Close);
+        assert_eq!(truncated.index, 10, "every readable byte must be consumed");
     }
 }
