@@ -239,7 +239,7 @@ const DEFAULT_MAX_EMPTY_DATA_PER_WINDOW: u32 = 2000;
 /// it likes (RFC 9113 §6.9): one per DATA frame, one per half window, … A
 /// flat per-second count therefore trips on any download fast enough —
 /// a peer with a 64 KiB window acking every 32 KiB at a few MB/s, or a Sōzu
-/// in front acking every 512 KiB of its 1 MiB window at 25 MB/s. Each DATA
+/// in front acking every 8 MiB of its 16 MiB window on a fast link. Each DATA
 /// frame the proxy sends instead earns
 /// [`WINDOW_UPDATE_STREAM0_CREDIT_PER_DATA_FRAME`] stream-0 updates that are
 /// not counted; only the excess reaches this threshold. Envoy bounds the same
@@ -293,9 +293,10 @@ const FLOOD_WINDOW_DURATION: std::time::Duration = std::time::Duration::from_sec
 /// per second sustained. Stream-close races are routine on a busy
 /// connection — a `WINDOW_UPDATE` or `RST_STREAM` crossing the response's
 /// `END_STREAM`, the DATA a client had in flight on a stream Sōzu reset —
-/// and one cancelled upload with a full 1 MiB window in flight is alone
-/// about 64 of them. nghttp2 budgets glitches at a 10 000 burst and 330 per
-/// second (`NGHTTP2_DEFAULT_GLITCH_BURST` / `_RATE`, `lib/nghttp2_session.h`).
+/// and one cancelled upload with its full 64 KiB stream window in flight
+/// is about four of them in 16 KiB frames, more in smaller ones. nghttp2
+/// budgets glitches at a 10 000 burst and 330 per second
+/// (`NGHTTP2_DEFAULT_GLITCH_BURST` / `_RATE`, `lib/nghttp2_session.h`).
 const DEFAULT_MAX_GLITCH_COUNT: u32 = 2000;
 
 /// Configurable thresholds for H2 flood detection.
@@ -2319,8 +2320,9 @@ mod tests {
         assert_eq!(detector.window_update_stream0_count, 0);
     }
 
-    /// A Sōzu in front acknowledges every half of its 1 MiB window, one
-    /// update per 32 frames of 16 KiB: at any throughput, all are credited.
+    /// A peer acknowledging every half of a 1 MiB window sends one update
+    /// per 32 frames of 16 KiB: at any throughput, all are credited. A Sōzu
+    /// in front, at one per half of its 16 MiB window, sends fewer still.
     #[test]
     fn test_flood_detector_chained_proxy_window_updates_are_not_counted() {
         let now = Instant::now();

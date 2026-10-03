@@ -4,8 +4,8 @@
 //! - HTTP/1.1: a global `max_connections_per_ip = 1` rejects the second
 //!   concurrent connection from the same source IP with `429 Too Many
 //!   Requests`. Confirms the answer-engine path (template registration,
-//!   `Answer429` variant, `connections.rejected_per_cluster_ip` metric)
-//!   and the SessionManager-side accounting (`untrack_all_cluster_ip`
+//!   `Answer429` variant; the `connections.rejected_per_cluster_ip` metric
+//!   is not asserted) and the SessionManager-side accounting (`untrack_all_cluster_ip`
 //!   on close releases the slot for a follow-up request).
 //! - HTTP/1.1 + per-cluster override: an unlimited cluster (`Some(0)`)
 //!   coexists with a capped cluster (`Some(1)`). Two concurrent
@@ -21,9 +21,9 @@
 //!   which holds one slot: a retry on it is admitted, a second
 //!   connection from the same IP gets 429.
 //!
-//! Tests run in serial within this module to keep `connections.rejected_per_cluster_ip`
-//! deterministic per-test and to avoid port-allocator contention with
-//! the heavier mux tests.
+//! Tests run in serial within this module to keep the per-IP slot
+//! accounting deterministic per-test and to avoid port-allocator
+//! contention with the heavier mux tests.
 
 use std::{
     io::{Read, Write},

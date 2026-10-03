@@ -832,7 +832,9 @@ pub struct ListenerBuilder {
     pub h2_stream_refusal_percent: Option<u32>,
     /// Per-stream idle timeout, in seconds. An open H2 stream that makes no
     /// forward progress for this duration is cancelled (RST_STREAM / CANCEL)
-    /// to defend against slow-multiplex Slowloris. Default: 30.
+    /// to defend against slow-multiplex Slowloris. Unset, it inherits
+    /// `back_timeout`, floored at 30 (so 30 with the default `back_timeout`);
+    /// an explicit value wins, `0` meaning 1.
     pub h2_stream_idle_timeout_seconds: Option<u32>,
     /// Maximum wall-clock seconds to wait for in-flight H2 streams after
     /// `GOAWAY(NO_ERROR)` has been sent during soft-stop. Once the deadline

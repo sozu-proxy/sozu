@@ -266,7 +266,9 @@ custom templates can opt into keep-alive by omitting the
 
 - Graceful FIN — no `SO_LINGER` reset trick, no `TCP RST`. The client
   sees a normal close before any backend connect attempt.
-- Same counter `connections.rejected_per_cluster_ip` increments.
+- No counter: `connections.rejected_per_cluster_ip` is incremented only
+  by the HTTP/HTTPS 429 answer, so a TCP rejection shows only in the
+  worker's debug log.
 
 ### 3.5.1 UDP flows
 
@@ -436,12 +438,14 @@ in their config to make it durable across restarts.
 
 | Key                                   | Type    | Meaning                                                   |
 | ------------------------------------- | ------- | --------------------------------------------------------- |
-| `connections.rejected_per_cluster_ip` | counter | per-cluster reject count (cluster-labelled)               |
+| `connections.rejected_per_cluster_ip` | counter | per-cluster HTTP/HTTPS 429 count (cluster-labelled)       |
 | `client.connect.per_source.bucket_*`  | counter | per-IP accept-queue admission histogram (already shipped) |
 | `udp.flows.shed.source_limit`         | counter | UDP flows dropped at a per-source limit (§3.5.1)          |
 
 The single counter `connections.rejected_per_cluster_ip` (with the
-`cluster_id` label) is the durable signal. Operators wanting per-IP
+`cluster_id` label) is the durable signal for HTTP/HTTPS; it is
+incremented by the 429 answer itself, so TCP rejections (§3.5) are not
+counted. Operators wanting per-IP
 attribution should pair it with the existing
 `client.connect.per_source.bucket_*` series.
 
@@ -452,10 +456,9 @@ End-to-end tests in `e2e/src/tests/cluster_ip_limit_tests.rs`:
 - **HTTP/1.1 global limit emits 429**: a global
   `max_connections_per_ip = 1` rejects the second concurrent
   connection from the same source IP with `429` + `Retry-After`.
-  Confirms the answer-engine path, the `Answer429` template variant,
-  the `connections.rejected_per_cluster_ip` counter, and the
-  SessionManager-side accounting (`untrack_all_cluster_ip` on close
-  releases the slot for a follow-up request).
+  Confirms the answer-engine path, the `Answer429` template variant
+  and the SessionManager-side accounting (`untrack_all_cluster_ip` on
+  close releases the slot for a follow-up request).
 - **HTTP/1.1 + per-cluster override**: an unlimited cluster
   (`Some(0)`) coexists with a capped cluster (`Some(1)`). Two
   concurrent connections to the unlimited cluster MUST both succeed;
