@@ -1989,9 +1989,9 @@ enum MetricDetail {
 // fan-out error tally (`extras.fanout.workers_err`); operators see "succeeded
 // with errors" rather than a dedicated capability-skip list. Production
 // deployments keep master + workers in sync via the `UpgradeMain` hot-upgrade
-// flow, so this mixed-version state is transient. The master itself also
-// leases (mirroring the symmetric `setup_metrics` path) so the audit log has a
-// single canonical row when an operator flips detail across the fleet.
+// flow, so this mixed-version state is transient. The master has no runtime
+// lease table: its response contribution is the configured floor initialized
+// by `setup_metrics`, while every worker owns and reports its leases.
 message SetMetricDetail {
     // Stable identifier for the leasing client (`sozu top` uses
     // `top:<pid>:<random>`). Required so multiple TUIs / scrapers / other

@@ -18,8 +18,8 @@ statement or branch inside an item; those were refreshed against `main` at
 
 ### 1.1 Boot — `begin_main_process`
 
-Entry point: `begin_main_process` (`bin/src/command/mod.rs`), called from
-`bin/src/main.rs:91` for the `start` sub-command. It:
+Entry point: `begin_main_process` (`bin/src/command/mod.rs`), called from `main`
+(`bin/src/main.rs`) for the `start` sub-command. It:
 
 1. Bumps process limits (`update_process_limits`,
    `bin/src/command/mod.rs`, one `#[cfg]` arm per target) — RLIMIT_NOFILE
@@ -290,21 +290,48 @@ live in `WorkerSession` (`bin/src/command/sessions.rs`).
 
 ## 4. Hot-Upgrade Interaction
 
-`bin/src/upgrade.rs` provides the re-exec orchestration. The supervisor:
+`bin/src/upgrade.rs` provides the re-exec orchestration. A main upgrade is a
+two-step ownership transfer of the whole [`CommandHub`](server.rs), not a
+replay of its commands:
 
-1. On `UpgradeMain`, calls `upgrade_main` (`bin/src/command/upgrade.rs`)
-   which serialises the master state via
-   `SerializedWorkerSession::try_from(&worker_session)`
-   (`Server::generate_upgrade_data`, `bin/src/command/server.rs`) into an `UpgradeData` blob, forks a
-   replacement master via `fork_main_into_new_main`
-   (`bin/src/upgrade.rs`), hands the blob over a pipe, and exits once
-   the new master takes over.
-2. The new master `exec`s into the freshly built `sozu` binary
-   (`get_executable_path` in `bin/src/util.rs`) and re-enters
-   `begin_main_process` with a flag indicating "resume from upgrade".
-3. Workers stay alive across the swap; they continue talking to the
-   surviving channel endpoints which are forwarded through the FD-handoff
-   protocol.
+1. Before changing descriptor flags or freezing the event loop, `upgrade_main`
+   (`bin/src/command/upgrade.rs`) runs the replacement executable's internal
+   protocol-v2 capability probe. A candidate without that protocol is rejected
+   while the old Hub remains authoritative.
+2. The old main snapshots every command client and worker session, including
+   channel buffers, worker pending queues and stopped workers that may still be
+   referenced by an upgrade task. It also snapshots active and queued tasks,
+   worker-response routes, subscribers, pending audit events, configuration
+   state, monotonic deadlines, task-local main-process metric contributions and
+   the counters that allocate future IDs.
+   Task restoration rebuilds the saved state directly; it never re-dispatches
+   an operator request or re-scatters work already sent to a worker.
+3. The replacement restores and registers those descriptors in a paused Hub.
+   Registration validates the graph and descriptor state but cannot read or
+   write command or worker data. It replies `PREPARED` with counts covering
+   sessions, tasks, routes and buffered work.
+4. The old main compares those counts and checks once more for a pending
+   `SIGTERM`. Before `COMMIT`, any rejection closes and reaps the candidate,
+   restores `CLOEXEC`, and resumes the unchanged old Hub. The first attempt to
+   send `COMMIT` is the irreversible fence: an ambiguous or failed
+   post-commit handoff never resumes the old event loop.
+5. After receiving the complete `COMMIT`, the replacement activates the Hub,
+   ticks every restored session once so userspace-only buffered frames make
+   progress, restores `CLOEXEC`, publishes its PID and systemd
+   `MAINPID`/`READY`, queues the initiating client's terminal response, then
+   sends `ACTIVATED`. The old main stays fenced until that acknowledgement and
+   then exits. A full client back buffer delays the terminal response without
+   losing or duplicating it. A restored stopped worker is retained while an
+   upgrade task or live response route still uses it, then its command and SCM
+   descriptors are closed without signalling its historical PID again.
+
+A binary that predates this protocol cannot export the missing client and task
+state. Deployments must introduce protocol v2 with a controlled service restart
+before using main hot-upgrade between later compatible binaries; the capability
+probe intentionally provides no lossy legacy fallback. A `SIGTERM` already in
+the old main's self-pipe aborts before `COMMIT` and is left for its normal event
+loop. A signal sent specifically to the old PID after that final check is not
+forwarded; service managers should signal the unit rather than a superseded PID.
 
 `UpgradeWorker` follows the analogous pattern through `upgrade_worker`
 (`bin/src/command/upgrade.rs`) and re-exec of an individual worker.

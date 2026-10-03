@@ -127,6 +127,14 @@ pub enum SubCmd {
         max_command_buffer_size: Option<u64>,
     },
     #[clap(
+        name = "upgrade-probe",
+        about = "check main-upgrade protocol support (internal command)"
+    )]
+    UpgradeProbe {
+        #[clap(long = "protocol", help = "main-upgrade protocol version")]
+        protocol: u16,
+    },
+    #[clap(
         name = "main",
         about = "start a new main process (internal command, should not be used directly)"
     )]
@@ -135,6 +143,8 @@ pub enum SubCmd {
         fd: i32,
         #[clap(long = "upgrade-fd", help = "upgrade data file descriptor")]
         upgrade_fd: i32,
+        #[clap(long = "upgrade-protocol", help = "main-upgrade protocol version")]
+        upgrade_protocol: u16,
         #[clap(
             long = "command-buffer-size",
             help = "Main process channel buffer size",
@@ -2142,6 +2152,24 @@ fn parse_tags(string_to_parse: &str) -> Result<BTreeMap<String, String>, String>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn main_upgrade_requires_v2_marker_and_exposes_a_preflight_probe() {
+        use clap::Parser;
+
+        assert!(
+            super::Args::try_parse_from(["sozu", "main", "--fd", "3", "--upgrade-fd", "4",])
+                .is_err(),
+            "a legacy sender without the V2 marker must be rejected before reading upgrade state"
+        );
+
+        let parsed = super::Args::try_parse_from(["sozu", "upgrade-probe", "--protocol", "2"])
+            .expect("a V2 binary must expose a side-effect-free capability probe");
+        assert!(matches!(
+            parsed.cmd,
+            super::SubCmd::UpgradeProbe { protocol: 2 }
+        ));
+    }
+
     #[test]
     fn parse_tags_from_string() {
         use super::*;

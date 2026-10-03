@@ -30,6 +30,37 @@ You can use the `sozu` binary as a CLI to interact with the reverse proxy.
 
 Check out the command line [documentation](./configure_cli.md) for more information.
 
+## Upgrade the main process without dropping control commands
+
+After installing a compatible replacement at the running main process's
+executable path, use a command timeout long enough for the replacement to
+prepare and activate:
+
+```bash
+sozu -c config.toml -t 30000 upgrade
+```
+
+Main-upgrade protocol v2 transfers the command socket clients, worker sessions,
+active and queued commands, worker-response correlations, buffered IPC data and
+their existing monotonic deadlines to the replacement main. Commands are
+continued from their saved state; they are not replayed. The initiating CLI
+keeps its original connection and waits for one terminal response from the new
+main.
+
+The running main first probes the installed candidate. If the candidate does
+not support protocol v2, the upgrade is rejected before the current main gives
+up ownership. Conversely, a main binary that predates protocol v2 cannot export
+the client and task state needed by a v2 replacement. Introduce v2 with a
+controlled service restart once; subsequent compatible binaries can use the
+hot-upgrade command.
+
+Before the handoff commits, a candidate failure is rolled back: the candidate
+is reaped and the old main resumes. Once commit transmission starts, ownership
+is irreversible. If activation then fails, the old main stays fenced to avoid
+two processes executing or delivering the same command; recover with the
+service manager. Signal the service unit during an upgrade instead of sending a
+signal to a PID captured before the upgrade.
+
 ## Run it with Docker
 
 The repository provides a multi-stage [Dockerfile][df]. The builder stage is the official

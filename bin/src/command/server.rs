@@ -14,7 +14,7 @@ use std::{
     io::{Error as IoError, ErrorKind, Read, Write},
     ops::{Deref, DerefMut},
     os::{
-        fd::{AsRawFd, FromRawFd, IntoRawFd},
+        fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
         unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     },
     path::Path,
@@ -32,28 +32,30 @@ use nix::{
     sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, kill, sigaction},
     unistd::Pid,
 };
+use serde::{Deserialize, Serialize};
 use sozu_command_lib::{
     channel::Channel,
     config::Config,
     proto::command::{
-        Event, EventKind, Request, ResponseContent, ResponseStatus, RunState, Status,
+        Event, EventKind, Request, Response, ResponseContent, ResponseStatus, RunState, Status,
         WorkerRequest, WorkerResponse, request::RequestType, response_content::ContentType,
     },
     ready::Ready,
-    scm_socket::{Listeners, ScmSocket, ScmSocketError},
+    scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
 };
 
 use sozu_lib::metrics::names;
 
-use super::upgrade::SerializedWorkerSession;
+use super::upgrade::{UpgradeDataError, UpgradeServerState, UpgradeSnapshot, monotonic_nanos};
 use crate::{
     command::{
-        requests::begin_stop,
+        requests::{AuditExtras, AuditResult, ClientRequestOutcome, audit_emit_inline, begin_stop},
         sessions::{
-            ClientResult, ClientSession, OptionalClient, WorkerResult, WorkerSession, wants_to_tick,
+            ClientResult, ClientSession, OptionalClient, PausedClientSession, PausedWorkerSession,
+            SessionSnapshotError, UpgradeResponseQueue, WorkerResult, WorkerSession, wants_to_tick,
         },
-        upgrade::UpgradeData,
+        upgrade::{UpgradeData, upgrade_main},
     },
     util::{UtilError, disable_close_on_exec, enable_close_on_exec, get_executable_path},
     worker::{WorkerError, fork_main_into_worker},
@@ -86,6 +88,34 @@ extern "C" fn sigterm_handler(_signal: libc::c_int) {
         }
     }
     Errno::set_raw(errno);
+}
+
+fn descriptor_has_pending_byte(fd: i32) -> Result<bool, IoError> {
+    let mut byte = 0u8;
+    loop {
+        // SAFETY: `byte` is a valid one-byte output buffer and MSG_PEEK keeps
+        // the stop intention available for the normal event-loop handler.
+        let read = unsafe {
+            libc::recv(
+                fd,
+                (&raw mut byte).cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        if read > 0 {
+            return Ok(true);
+        }
+        if read == 0 {
+            return Ok(false);
+        }
+        let error = IoError::last_os_error();
+        match error.kind() {
+            ErrorKind::Interrupted => continue,
+            ErrorKind::WouldBlock => return Ok(false),
+            _ => return Err(error),
+        }
+    }
 }
 
 pub type ClientId = u32;
@@ -230,7 +260,7 @@ pub trait Gatherer {
 
 /// Must be satisfied by commands that need to wait for worker responses
 #[allow(unused)]
-pub trait GatheringTask: Debug {
+pub(crate) trait GatheringTask: Debug {
     /// Return a payload-free identifier suitable for retained-task logs.
     fn kind(&self) -> &'static str {
         std::any::type_name::<Self>()
@@ -242,6 +272,15 @@ pub trait GatheringTask: Debug {
     /// get access to the gatherer for this task (each task can implement its own gathering strategy)
     fn get_gatherer(&mut self) -> &mut dyn Gatherer;
 
+    /// Capture the complete task state without replaying its request.
+    fn snapshot(&self, timing: TaskSnapshotTiming) -> Result<TaskSnapshot, TaskSnapshotError>;
+
+    /// Worker session whose SCM/channel state must outlive this task.
+    /// Only the first phase of a worker upgrade owns such a dependency.
+    fn retained_worker_token(&self) -> Option<Token> {
+        None
+    }
+
     /// This is called once every worker has answered
     /// It allows to operate both on the server (launch workers...) and the client (send an answer...)
     fn on_finish(
@@ -250,6 +289,102 @@ pub trait GatheringTask: Debug {
         client: &mut OptionalClient,
         timed_out: bool,
     );
+}
+
+/// One shared clock sample used while snapshotting every task in a handoff.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TaskSnapshotTiming {
+    pub(crate) now: Instant,
+}
+
+impl TaskSnapshotTiming {
+    pub(crate) fn now() -> Self {
+        Self {
+            now: Instant::now(),
+        }
+    }
+}
+
+/// Clock context used when rebuilding task-local elapsed timers.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TaskRestoreTiming {
+    pub(crate) now: Instant,
+    pub(crate) handoff_elapsed: Duration,
+}
+
+/// Serializable elapsed-time value used by task audit timers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ElapsedSnapshot {
+    nanos: u64,
+}
+
+impl ElapsedSnapshot {
+    pub(crate) fn capture(
+        started_at: Instant,
+        timing: TaskSnapshotTiming,
+    ) -> Result<Self, TaskSnapshotError> {
+        Ok(Self {
+            nanos: duration_nanos(
+                timing.now.saturating_duration_since(started_at),
+                "task elapsed time",
+            )?,
+        })
+    }
+
+    pub(crate) fn restore(self, timing: TaskRestoreTiming) -> Result<Instant, TaskSnapshotError> {
+        let elapsed = Duration::from_nanos(self.nanos)
+            .checked_add(timing.handoff_elapsed)
+            .ok_or(TaskSnapshotError::DurationOverflow(
+                "restored task elapsed time",
+            ))?;
+        timing
+            .now
+            .checked_sub(elapsed)
+            .ok_or(TaskSnapshotError::InstantOutOfRange)
+    }
+}
+
+fn duration_nanos(duration: Duration, field: &'static str) -> Result<u64, TaskSnapshotError> {
+    u64::try_from(duration.as_nanos()).map_err(|_| TaskSnapshotError::DurationOverflow(field))
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum TaskSnapshotError {
+    #[error("{0} exceeds the serializable monotonic duration range")]
+    DurationOverflow(&'static str),
+    #[error("restored task instant predates the process monotonic clock")]
+    InstantOutOfRange,
+    #[error("unknown audit tag pair {verb}/{counter}")]
+    UnknownAuditTag { verb: String, counter: String },
+    #[error("test-only task {0} cannot be upgraded")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    UnsupportedTestTask(&'static str),
+}
+
+/// Exhaustive wire representation of every production gathering task.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) enum TaskSnapshot {
+    Request(Box<super::requests::RequestTaskSnapshot>),
+    UpgradeWorker(super::upgrade::UpgradeWorkerTaskSnapshot),
+}
+
+impl TaskSnapshot {
+    pub(crate) fn is_stop(&self) -> bool {
+        match self {
+            Self::Request(snapshot) => snapshot.is_stop(),
+            Self::UpgradeWorker(_) => false,
+        }
+    }
+
+    pub(crate) fn restore(
+        self,
+        timing: TaskRestoreTiming,
+    ) -> Result<Box<dyn GatheringTask>, TaskSnapshotError> {
+        match self {
+            Self::Request(snapshot) => (*snapshot).restore(timing),
+            Self::UpgradeWorker(snapshot) => Ok(snapshot.restore()),
+        }
+    }
 }
 
 /// Implemented by all objects that can behave like a client (for instance: notify of processing request)
@@ -288,6 +423,74 @@ struct TaskContainer {
     timeout: Option<Instant>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct TaskContainerSnapshot {
+    job: TaskSnapshot,
+    deadline: DeadlineSnapshot,
+}
+
+impl TaskContainer {
+    fn snapshot(
+        &self,
+        timing: TaskSnapshotTiming,
+    ) -> Result<TaskContainerSnapshot, TaskSnapshotError> {
+        Ok(TaskContainerSnapshot {
+            job: self.job.snapshot(timing)?,
+            deadline: DeadlineSnapshot::capture(self.timeout, timing)?,
+        })
+    }
+}
+
+impl TaskContainerSnapshot {
+    pub(crate) fn is_stop(&self) -> bool {
+        self.job.is_stop()
+    }
+
+    fn restore(self, timing: TaskRestoreTiming) -> Result<TaskContainer, TaskSnapshotError> {
+        Ok(TaskContainer {
+            job: self.job.restore(timing)?,
+            timeout: self.deadline.restore(timing)?,
+        })
+    }
+}
+
+/// Remaining timeout budget at the snapshot boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct DeadlineSnapshot {
+    remaining_nanos: Option<u64>,
+}
+
+impl DeadlineSnapshot {
+    fn capture(
+        timeout: Option<Instant>,
+        timing: TaskSnapshotTiming,
+    ) -> Result<Self, TaskSnapshotError> {
+        Ok(Self {
+            remaining_nanos: timeout
+                .map(|deadline| {
+                    duration_nanos(
+                        deadline.saturating_duration_since(timing.now),
+                        "task deadline",
+                    )
+                })
+                .transpose()?,
+        })
+    }
+
+    fn restore(self, timing: TaskRestoreTiming) -> Result<Option<Instant>, TaskSnapshotError> {
+        self.remaining_nanos
+            .map(|remaining_nanos| {
+                let remaining =
+                    Duration::from_nanos(remaining_nanos).saturating_sub(timing.handoff_elapsed);
+                timing
+                    .now
+                    .checked_add(remaining)
+                    .ok_or(TaskSnapshotError::InstantOutOfRange)
+            })
+            .transpose()
+    }
+}
+
 impl Debug for TaskContainer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TaskContainer")
@@ -298,7 +501,7 @@ impl Debug for TaskContainer {
 }
 
 /// Default strategy when gathering responses from workers
-#[derive(Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct DefaultGatherer {
     /// number of OK responses received from workers
     pub ok: usize,
@@ -396,8 +599,21 @@ pub enum HubError {
     CreateServer(ServerError),
     #[error("could not get executable path")]
     GetExecutablePath(UtilError),
-    #[error("could not create SCM socket for worker {0}: {1}")]
-    CreateScmSocket(u32, ScmSocketError),
+    #[error("invalid main-upgrade data: {0}")]
+    InvalidUpgradeData(#[from] UpgradeDataError),
+    #[error("invalid main-upgrade snapshot: {0}")]
+    InvalidUpgradeSnapshot(String),
+    #[error("could not restore a command session: {0}")]
+    RestoreSession(#[from] SessionSnapshotError),
+    #[error("could not snapshot or restore a command task: {0}")]
+    RestoreTask(#[from] TaskSnapshotError),
+    #[error("could not register restored {kind} session {id}: {error}")]
+    RegisterRestoredSession {
+        kind: &'static str,
+        id: u32,
+        #[source]
+        error: IoError,
+    },
 }
 
 /// A platform to receive client connections, pass orders to workers,
@@ -416,6 +632,28 @@ pub struct CommandHub {
     command_socket_path: std::sync::Arc<str>,
     /// read end of the `SIGTERM` self-pipe, set by [`CommandHub::handle_sigterm`]
     sigterm_receiver: Option<UnixStream>,
+    /// Sessions whose userspace buffers or worker pending queue already held
+    /// work at the snapshot boundary. Mio cannot rediscover userspace bytes,
+    /// so each token is ticked once immediately after COMMIT.
+    restored_session_ticks: HashSet<Token>,
+    /// Terminal response owned by the new main but not yet admitted to the
+    /// initiating client's inherited back buffer.
+    pending_upgrade_completion: Option<(Token, Response)>,
+    /// Worker sessions inherited across this main handoff. Terminal entries
+    /// are collected once no restored task or live route can still use them.
+    restored_worker_tokens: HashSet<Token>,
+}
+
+/// Fully validated and registered replacement Hub that cannot touch any
+/// command or worker data descriptor until the handoff commits.
+pub struct PausedCommandHub {
+    server: Server,
+    clients: Vec<PausedClientSession>,
+    workers: Vec<PausedWorkerSession>,
+    tasks: HashMap<TaskId, TaskContainer>,
+    command_socket_path: std::sync::Arc<str>,
+    restored_session_ticks: HashSet<Token>,
+    restored_worker_tokens: HashSet<Token>,
 }
 
 impl Deref for CommandHub {
@@ -431,7 +669,210 @@ impl DerefMut for CommandHub {
     }
 }
 
+impl PausedCommandHub {
+    /// Cross the COMMIT boundary. This is the first point at which restored
+    /// client and worker channels can perform data I/O.
+    pub fn activate(mut self) -> Result<CommandHub, HubError> {
+        let mut clients = HashMap::with_capacity(self.clients.len());
+        for client in self.clients.drain(..) {
+            clients.insert(client.token(), client.resume());
+        }
+        for worker in self.workers.drain(..) {
+            self.server.workers.insert(worker.token(), worker.resume()?);
+        }
+        self.server.update_counts();
+        Ok(CommandHub {
+            server: self.server,
+            clients,
+            tasks: self.tasks,
+            command_socket_path: self.command_socket_path,
+            sigterm_receiver: None,
+            restored_session_ticks: self.restored_session_ticks,
+            pending_upgrade_completion: None,
+            restored_worker_tokens: self.restored_worker_tokens,
+        })
+    }
+}
+
 impl CommandHub {
+    /// Observe, without consuming, a SIGTERM already queued for the old main.
+    /// A pending stop wins over a not-yet-committed upgrade.
+    pub(crate) fn sigterm_pending(&self) -> Result<bool, IoError> {
+        self.sigterm_receiver
+            .as_ref()
+            .map_or(Ok(false), |receiver| {
+                descriptor_has_pending_byte(receiver.as_raw_fd())
+            })
+    }
+
+    /// Record the successful handoff and durably retain its terminal response
+    /// until the inherited client buffer can accept it.
+    pub fn complete_main_upgrade(
+        &mut self,
+        token: Token,
+        new_main_pid: u32,
+    ) -> Result<(), HubError> {
+        let audit_target = format!(
+            "executable:{} boot_generation:{}",
+            self.server.executable_path.as_str(),
+            self.server.boot_generation
+        );
+        {
+            let client = self.clients.get_mut(&token).ok_or_else(|| {
+                HubError::InvalidUpgradeSnapshot(format!(
+                    "upgrade client token {} disappeared before activation",
+                    token.0
+                ))
+            })?;
+            audit_emit_inline(
+                &mut self.server,
+                client,
+                EventKind::MainUpgraded,
+                "main_upgraded",
+                "config.main_upgraded",
+                audit_target,
+                AuditResult::Ok,
+                AuditExtras::default(),
+            );
+        }
+        self.flush_pending_audit_events();
+
+        let response = Response {
+            status: ResponseStatus::Ok.into(),
+            message: format!(
+                "Upgrade successful, closing main process. New main process has pid {new_main_pid}"
+            ),
+            content: None,
+        };
+        let client = self.clients.get_mut(&token).ok_or_else(|| {
+            HubError::InvalidUpgradeSnapshot(format!(
+                "upgrade client token {} disconnected during activation",
+                token.0
+            ))
+        })?;
+        match client.try_queue_upgrade_response(&response) {
+            UpgradeResponseQueue::Queued => Ok(()),
+            UpgradeResponseQueue::Backpressured => {
+                self.pending_upgrade_completion = Some((token, response));
+                self.restored_session_ticks.insert(token);
+                Ok(())
+            }
+            UpgradeResponseQueue::Fatal => Err(HubError::InvalidUpgradeSnapshot(
+                "could not queue the terminal main-upgrade response".to_owned(),
+            )),
+        }
+    }
+
+    fn retry_pending_upgrade_completion(&mut self) {
+        let Some((token, response)) = self.pending_upgrade_completion.take() else {
+            return;
+        };
+        let Some(client) = self.clients.get_mut(&token) else {
+            error!(
+                "initiating client {} disconnected before its main-upgrade response was queued",
+                token.0
+            );
+            return;
+        };
+        match client.try_queue_upgrade_response(&response) {
+            UpgradeResponseQueue::Queued => {}
+            UpgradeResponseQueue::Backpressured => {
+                self.pending_upgrade_completion = Some((token, response));
+            }
+            UpgradeResponseQueue::Fatal => {}
+        }
+    }
+
+    fn collect_unreferenced_restored_stopped_workers(&mut self) {
+        if self.restored_worker_tokens.is_empty() {
+            return;
+        }
+
+        let live_task_ids = self
+            .tasks
+            .keys()
+            .chain(self.server.queued_tasks.keys())
+            .copied()
+            .collect::<HashSet<_>>();
+        let retained_worker_tokens = self
+            .tasks
+            .values()
+            .chain(self.server.queued_tasks.values())
+            .filter_map(|task| task.job.retained_worker_token())
+            .collect::<HashSet<_>>();
+        let workers_with_live_routes = self
+            .server
+            .in_flight
+            .iter()
+            .filter_map(|(request_id, task_id)| {
+                live_task_ids
+                    .contains(task_id)
+                    .then(|| parse_scatter_request_id(request_id).map(|(worker_id, ..)| worker_id))
+                    .flatten()
+            })
+            .collect::<HashSet<_>>();
+        let collect = self
+            .restored_worker_tokens
+            .iter()
+            .copied()
+            .filter(|token| {
+                self.server.workers.get(token).is_none_or(|worker| {
+                    worker.run_state == RunState::Stopped
+                        && !retained_worker_tokens.contains(token)
+                        && !workers_with_live_routes.contains(&worker.id)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for token in collect {
+            self.restored_worker_tokens.remove(&token);
+            self.restored_session_ticks.remove(&token);
+            let Some(mut worker) = self.server.workers.remove(&token) else {
+                continue;
+            };
+            if let Err(error) = self.server.poll.registry().deregister(&mut worker.channel) {
+                warn!(
+                    "could not deregister restored stopped worker {}: {}",
+                    worker.id, error
+                );
+            }
+            let worker_id = worker.id;
+            if let Err(error) = worker.close_restored_descriptors() {
+                warn!(
+                    "could not close restored stopped worker {} SCM descriptor: {}",
+                    worker_id, error
+                );
+            }
+        }
+    }
+
+    /// Promote queued tasks into the active map and finish every task whose
+    /// gatherer or absolute deadline is already terminal. This is the first
+    /// task sweep the replacement Hub runs after COMMIT, so restored queued
+    /// tasks pass through the same callback path as pre-upgrade active tasks
+    /// without replaying their original request.
+    fn finish_ready_tasks(&mut self, now: Instant) {
+        let mut tasks = std::mem::take(&mut self.tasks);
+        let mut queued_tasks = std::mem::take(&mut self.server.queued_tasks);
+        self.tasks = tasks
+            .drain()
+            .chain(queued_tasks.drain())
+            .filter_map(|(task_id, mut task)| {
+                if task.job.get_gatherer().has_finished() {
+                    self.handle_finishing_task(task_id, task, false);
+                    return None;
+                }
+                if let Some(timeout) = task.timeout
+                    && timeout < now
+                {
+                    self.handle_finishing_task(task_id, task, true);
+                    return None;
+                }
+                Some((task_id, task))
+            })
+            .collect();
+    }
+
     pub fn new(
         unix_listener: UnixListener,
         config: Config,
@@ -448,6 +889,9 @@ impl CommandHub {
             tasks: HashMap::new(),
             command_socket_path,
             sigterm_receiver: None,
+            restored_session_ticks: HashSet::new(),
+            pending_upgrade_completion: None,
+            restored_worker_tokens: HashSet::new(),
         })
     }
 
@@ -631,19 +1075,83 @@ impl CommandHub {
             .map(|client| (&mut self.server, client))
     }
 
-    /// recreate the command hub when upgrading the main process
-    pub fn from_upgrade_data(upgrade_data: UpgradeData) -> Result<Self, HubError> {
-        let UpgradeData {
+    /// Recreate and register the command Hub without consuming any data.
+    ///
+    /// The returned wrapper deliberately exposes no event loop or sessions.
+    /// Registration validates descriptors during PREPARED; only `activate`
+    /// crosses the COMMIT boundary and makes data I/O possible.
+    pub fn prepare_from_upgrade_data(
+        upgrade_data: UpgradeData,
+    ) -> Result<PausedCommandHub, HubError> {
+        let UpgradeSnapshot {
             command_socket_fd,
             config,
-            workers,
-            state,
+            captured_monotonic_nanos,
+            server_state: UpgradeServerState::Running,
             next_client_id,
             next_session_id,
             next_task_id,
             next_worker_id,
+            upgrade_client_token,
+            clients,
+            workers,
+            event_subscribers,
+            in_flight,
+            tasks,
+            queued_tasks,
+            pending_audit_events,
+            state,
             boot_generation,
-        } = upgrade_data;
+        } = upgrade_data.into_snapshot()?;
+
+        let restored_monotonic_nanos = monotonic_nanos()?;
+        let handoff_nanos = restored_monotonic_nanos
+            .checked_sub(captured_monotonic_nanos)
+            .ok_or(UpgradeDataError::MonotonicClockWentBackwards)?;
+        let restore_timing = TaskRestoreTiming {
+            now: Instant::now(),
+            handoff_elapsed: Duration::from_nanos(handoff_nanos),
+        };
+
+        let command_buffer_size = usize::try_from(config.command_buffer_size).map_err(|_| {
+            HubError::InvalidUpgradeSnapshot("command buffer size exceeds usize".to_owned())
+        })?;
+        let max_command_buffer_size =
+            usize::try_from(config.max_command_buffer_size).map_err(|_| {
+                HubError::InvalidUpgradeSnapshot(
+                    "maximum command buffer size exceeds usize".to_owned(),
+                )
+            })?;
+        let client_initial_buffer_size = usize::try_from(CLIENT_CHANNEL_INITIAL_BUFFER_SIZE)
+            .map_err(|_| {
+                HubError::InvalidUpgradeSnapshot(
+                    "client command buffer size exceeds usize".to_owned(),
+                )
+            })?;
+        let worker_initial_buffer_size = command_buffer_size;
+
+        let mut inherited_fds = HashSet::new();
+        let mut add_fd = |kind: &str, fd: i32| -> Result<(), HubError> {
+            if fd < 0 {
+                return Err(HubError::InvalidUpgradeSnapshot(format!(
+                    "{kind} descriptor is negative: {fd}"
+                )));
+            }
+            if !inherited_fds.insert(fd) {
+                return Err(HubError::InvalidUpgradeSnapshot(format!(
+                    "descriptor {fd} is assigned more than once"
+                )));
+            }
+            Ok(())
+        };
+        add_fd("command listener", command_socket_fd)?;
+        for client in &clients {
+            add_fd("client channel", client.channel_fd())?;
+        }
+        for worker in &workers {
+            add_fd("worker channel", worker.channel_fd())?;
+            add_fd("worker SCM socket", worker.scm_fd())?;
+        }
 
         // SAFETY: `get_executable_path` is marked unsafe to keep its FFI
         // signature consistent across platforms (see `bin/src/util.rs`).
@@ -659,8 +1167,6 @@ impl CommandHub {
         // whose `Drop` closes the descriptor.
         let unix_listener = unsafe { UnixListener::from_raw_fd(command_socket_fd) };
 
-        let command_buffer_size = config.command_buffer_size;
-        let max_command_buffer_size = config.max_command_buffer_size;
         let command_socket_path: std::sync::Arc<str> = config
             .command_socket_path()
             .unwrap_or_else(|_| "unknown".to_owned())
@@ -670,51 +1176,199 @@ impl CommandHub {
             Server::new(unix_listener, config, executable_path).map_err(HubError::CreateServer)?;
 
         server.state = state;
-        server.update_counts();
+        server.run_state = ServerState::Running;
         server.next_client_id = next_client_id;
         server.next_session_id = next_session_id;
         server.next_task_id = next_task_id;
         server.next_worker_id = next_worker_id;
-        // Carry the boot generation forward; it will be bumped one more time
-        // by `upgrade_main` before the next re-exec.
         server.boot_generation = boot_generation;
+        server.event_subscribers = event_subscribers.into_iter().map(Token).collect();
+        server.in_flight = in_flight;
+        server.pending_audit_events = pending_audit_events;
 
-        // A `Stopping` worker is still draining the sessions it had when its
-        // own upgrade started: adopt it too, or its command channel closes with
-        // the old main and the worker returns from its event loop at once,
-        // cutting those sessions (`Server::run`, `lib/src/server.rs`). It
-        // keeps its `Stopping` state, so no request is fanned out to it and it
-        // does not count as alive; its channel closing when it exits marks it
-        // `Stopped` like any other worker.
-        for worker in workers.iter().filter(|w| w.run_state != RunState::Stopped) {
-            // SAFETY: `worker.channel_fd` was inherited via the upgrade
-            // hand-off (see `UpgradeData::workers`) and is not owned
-            // elsewhere in this freshly re-execed supervisor. Ownership
-            // transfers to the `UnixStream`, whose `Drop` closes the
-            // descriptor.
-            let worker_stream = unsafe { UnixStream::from_raw_fd(worker.channel_fd) };
-            let channel: Channel<WorkerRequest, WorkerResponse> =
-                Channel::new(worker_stream, command_buffer_size, max_command_buffer_size);
-
-            let scm_socket = ScmSocket::new(worker.scm_fd)
-                .map_err(|scm_err| HubError::CreateScmSocket(worker.id, scm_err))?;
-
-            match server.register_worker(worker.id, worker.pid, channel, scm_socket) {
-                Ok(session) => {
-                    if worker.run_state == RunState::Stopping {
-                        session.run_state = RunState::Stopping;
-                    }
-                }
-                Err(err) => error!("could not register worker: {}", err),
-            }
+        let task_ids = tasks.keys().copied().collect::<HashSet<_>>();
+        if let Some(duplicate) = queued_tasks.keys().find(|id| task_ids.contains(id)) {
+            return Err(HubError::InvalidUpgradeSnapshot(format!(
+                "task {duplicate} appears in both active and queued maps"
+            )));
+        }
+        if tasks
+            .values()
+            .chain(queued_tasks.values())
+            .any(TaskContainerSnapshot::is_stop)
+        {
+            return Err(HubError::InvalidUpgradeSnapshot(
+                "a dispatched stop task cannot be transferred while Running".to_owned(),
+            ));
+        }
+        let max_task_id = tasks
+            .keys()
+            .chain(queued_tasks.keys())
+            .chain(server.in_flight.values())
+            .copied()
+            .max();
+        if max_task_id.is_some_and(|id| next_task_id <= id) {
+            return Err(HubError::InvalidUpgradeSnapshot(format!(
+                "next task id {next_task_id} is not newer than live id {}",
+                max_task_id.unwrap_or_default()
+            )));
         }
 
-        Ok(CommandHub {
+        let restored_tasks = tasks
+            .into_iter()
+            .map(|(id, task)| task.restore(restore_timing).map(|task| (id, task)))
+            .collect::<Result<HashMap<_, _>, _>>()?;
+        server.queued_tasks = queued_tasks
+            .into_iter()
+            .map(|(id, task)| task.restore(restore_timing).map(|task| (id, task)))
+            .collect::<Result<HashMap<_, _>, _>>()?;
+
+        let mut paused_clients = Vec::with_capacity(clients.len());
+        for snapshot in clients {
+            let fd = snapshot.channel_fd();
+            // SAFETY: descriptor ownership in this process is transferred to
+            // the paused session after the all-FD uniqueness check above.
+            let stream = unsafe { UnixStream::from_raw_fd(fd) };
+            let mut session = ClientSession::restore_paused(
+                stream,
+                snapshot,
+                client_initial_buffer_size,
+                max_command_buffer_size,
+            )?;
+            session.register(server.poll.registry()).map_err(|error| {
+                HubError::RegisterRestoredSession {
+                    kind: "client",
+                    id: session.id(),
+                    error,
+                }
+            })?;
+            paused_clients.push(session);
+        }
+
+        let mut paused_workers = Vec::with_capacity(workers.len());
+        for snapshot in workers {
+            let channel_fd = snapshot.channel_fd();
+            let scm_fd = snapshot.scm_fd();
+            // SAFETY: both inherited descriptors passed the uniqueness check
+            // and become owned by the paused wrapper until activation/drop.
+            let stream = unsafe { UnixStream::from_raw_fd(channel_fd) };
+            let scm_fd = unsafe { OwnedFd::from_raw_fd(scm_fd) };
+            let mut session = WorkerSession::restore_paused(
+                stream,
+                scm_fd,
+                snapshot,
+                worker_initial_buffer_size,
+                max_command_buffer_size,
+            )?;
+            session.register(server.poll.registry()).map_err(|error| {
+                HubError::RegisterRestoredSession {
+                    kind: "worker",
+                    id: session.id(),
+                    error,
+                }
+            })?;
+            paused_workers.push(session);
+        }
+
+        let mut tokens = HashSet::new();
+        let mut client_ids = HashSet::new();
+        for client in &paused_clients {
+            if client.token() == Token(0) || client.token() == SIGTERM_TOKEN {
+                return Err(HubError::InvalidUpgradeSnapshot(format!(
+                    "client {} uses reserved token {}",
+                    client.id(),
+                    client.token().0
+                )));
+            }
+            if !tokens.insert(client.token()) || !client_ids.insert(client.id()) {
+                return Err(HubError::InvalidUpgradeSnapshot(format!(
+                    "duplicate client id or token for client {}",
+                    client.id()
+                )));
+            }
+        }
+        let mut worker_ids = HashSet::new();
+        for worker in &paused_workers {
+            if worker.token() == Token(0) || worker.token() == SIGTERM_TOKEN {
+                return Err(HubError::InvalidUpgradeSnapshot(format!(
+                    "worker {} uses reserved token {}",
+                    worker.id(),
+                    worker.token().0
+                )));
+            }
+            if !tokens.insert(worker.token()) || !worker_ids.insert(worker.id()) {
+                return Err(HubError::InvalidUpgradeSnapshot(format!(
+                    "duplicate worker id or token for worker {}",
+                    worker.id()
+                )));
+            }
+        }
+        if !tokens.contains(&Token(upgrade_client_token)) {
+            return Err(HubError::InvalidUpgradeSnapshot(format!(
+                "upgrade client token {upgrade_client_token} is not live"
+            )));
+        }
+        if next_session_id == 0
+            || next_session_id == SIGTERM_TOKEN.0
+            || next_client_id == ClientId::MAX
+            || next_worker_id == WorkerId::MAX
+            || next_task_id == TaskId::MAX
+            || paused_clients
+                .iter()
+                .map(PausedClientSession::id)
+                .max()
+                .is_some_and(|id| next_client_id <= id)
+            || paused_workers
+                .iter()
+                .map(PausedWorkerSession::id)
+                .max()
+                .is_some_and(|id| next_worker_id <= id)
+            || tokens
+                .iter()
+                .map(|token| token.0)
+                .max()
+                .is_some_and(|token| next_session_id <= token || next_session_id == SIGTERM_TOKEN.0)
+        {
+            return Err(HubError::InvalidUpgradeSnapshot(
+                "one or more next-id counters collide with restored state".to_owned(),
+            ));
+        }
+
+        let wire_tick_hints = paused_clients
+            .iter()
+            .filter(|session| session.requires_post_commit_tick())
+            .count()
+            + paused_workers
+                .iter()
+                .filter(|session| session.requires_post_commit_tick())
+                .count();
+        debug!(
+            "restored {} sessions; {} carried a post-commit tick hint",
+            paused_clients.len() + paused_workers.len(),
+            wire_tick_hints
+        );
+        // Schedule one unconditional post-COMMIT tick for every restored
+        // session. This is derived from the actual restored graph rather than
+        // trusting a wire boolean, and it covers userspace-only frames that
+        // kernel readiness cannot rediscover after mio registration.
+        let restored_session_ticks = paused_clients
+            .iter()
+            .map(PausedClientSession::token)
+            .chain(paused_workers.iter().map(PausedWorkerSession::token))
+            .collect();
+        let restored_worker_tokens = paused_workers
+            .iter()
+            .map(PausedWorkerSession::token)
+            .collect();
+
+        Ok(PausedCommandHub {
             server,
-            clients: HashMap::new(),
-            tasks: HashMap::new(),
+            clients: paused_clients,
+            workers: paused_workers,
+            tasks: restored_tasks,
             command_socket_path,
-            sigterm_receiver: None,
+            restored_session_ticks,
+            restored_worker_tokens,
         })
     }
 
@@ -734,28 +1388,18 @@ impl CommandHub {
         debug!("running the command hub: {:?}", self);
 
         loop {
+            self.retry_pending_upgrade_completion();
             let run_state = self.run_state;
             let now = Instant::now();
 
-            let mut tasks = std::mem::take(&mut self.tasks);
-            let mut queued_tasks = std::mem::take(&mut self.server.queued_tasks);
-            self.tasks = tasks
-                .drain()
-                .chain(queued_tasks.drain())
-                .filter_map(|(task_id, mut task)| {
-                    if task.job.get_gatherer().has_finished() {
-                        self.handle_finishing_task(task_id, task, false);
-                        return None;
-                    }
-                    if let Some(timeout) = task.timeout
-                        && timeout < now
-                    {
-                        self.handle_finishing_task(task_id, task, true);
-                        return None;
-                    }
-                    Some((task_id, task))
-                })
-                .collect();
+            self.finish_ready_tasks(now);
+
+            // A restored Stopped worker can still hold an SCM socket needed
+            // by UpgradeWorker phase one, or a buffered response with a live
+            // route. Once both correlations disappear, it has no owner left:
+            // remove it without signalling its historical PID and close both
+            // inherited descriptors before another main upgrade.
+            self.collect_unreferenced_restored_stopped_workers();
 
             let mut poll_timeout = self.next_poll_timeout(now);
 
@@ -769,29 +1413,28 @@ impl CommandHub {
                 }
             }
 
-            let sessions_to_tick = self
-                .clients
-                .iter()
-                .filter_map(|(t, s)| {
-                    if wants_to_tick(&s.channel) {
-                        Some((*t, Ready::EMPTY, None))
-                    } else {
-                        None
-                    }
-                })
-                .chain(self.workers.iter().filter_map(|(token, session)| {
-                    if session.run_state != RunState::Stopped && wants_to_tick(&session.channel) {
-                        Some((*token, Ready::EMPTY, None))
-                    } else {
-                        None
-                    }
-                }))
+            let mut tick_tokens = std::mem::take(&mut self.restored_session_ticks);
+            tick_tokens.extend(
+                self.clients.iter().filter_map(|(token, session)| {
+                    wants_to_tick(&session.channel).then_some(*token)
+                }),
+            );
+            tick_tokens.extend(self.workers.iter().filter_map(|(token, session)| {
+                (session.run_state != RunState::Stopped && wants_to_tick(&session.channel))
+                    .then_some(*token)
+            }));
+            let sessions_to_tick = tick_tokens
+                .into_iter()
+                .map(|token| (token, Ready::EMPTY, None))
                 .collect::<Vec<_>>();
 
             let workers_to_spawn = self.workers_to_spawn();
 
             // if we have sessions to tick or workers to spawn, we don't want to block on poll
-            if !sessions_to_tick.is_empty() || workers_to_spawn > 0 {
+            if !sessions_to_tick.is_empty()
+                || workers_to_spawn > 0
+                || self.pending_upgrade_completion.is_some()
+            {
                 poll_timeout = Some(Duration::default());
             }
 
@@ -829,14 +1472,18 @@ impl CommandHub {
                     SIGTERM_TOKEN => self.on_sigterm(),
                     token => {
                         trace!("{:?} got event: {:?}", token, event);
+                        let mut upgrade_requested = false;
+                        let mut handled_request = false;
                         if let Some((server, client)) = self.get_client_mut(&token) {
                             client.update_readiness(ready);
                             match client.ready() {
                                 ClientResult::NothingToDo => {}
                                 ClientResult::NewRequest(request) => {
                                     debug!("Received new request: {:?}", request);
-                                    server.handle_client_request(client, request);
-                                    self.flush_pending_audit_events();
+                                    handled_request = true;
+                                    upgrade_requested = server
+                                        .handle_client_request(client, request)
+                                        == ClientRequestOutcome::UpgradeMain;
                                 }
                                 ClientResult::CloseSession => {
                                     info!("Closing client {}", client.id);
@@ -863,6 +1510,14 @@ impl CommandHub {
                                     self.on_worker_channel_closed(&token, worker_id);
                                 }
                             }
+                        }
+                        if upgrade_requested {
+                            upgrade_main(self, token);
+                            if self.server.upgrading {
+                                return true;
+                            }
+                        } else if handled_request {
+                            self.flush_pending_audit_events();
                         }
                     }
                 }
@@ -1513,7 +2168,7 @@ impl Server {
     }
 
     /// Add a task in a queue to make it accessible until the next tick
-    pub fn new_task(&mut self, job: Box<dyn GatheringTask>, timeout: Timeout) -> TaskId {
+    pub(crate) fn new_task(&mut self, job: Box<dyn GatheringTask>, timeout: Timeout) -> TaskId {
         let task_id = self.next_task_id();
         // `next_task_id` is monotonic, so this id must be unused in the queue;
         // reusing one would silently drop the job already parked there.
@@ -1540,7 +2195,7 @@ impl Server {
         task_id
     }
 
-    pub fn scatter(
+    pub(crate) fn scatter(
         &mut self,
         request: Request,
         job: Box<dyn GatheringTask>,
@@ -1719,6 +2374,12 @@ impl Server {
 
     /// kill the worker process
     pub fn close_worker(&mut self, token: &Token) {
+        self.close_worker_with(token, |pid| {
+            kill(Pid::from_raw(pid), Signal::SIGKILL).is_ok()
+        });
+    }
+
+    fn close_worker_with(&mut self, token: &Token, mut terminate: impl FnMut(pid_t) -> bool) {
         let worker = match self.workers.get_mut(token) {
             Some(w) => w,
             None => {
@@ -1727,9 +2388,12 @@ impl Server {
             }
         };
 
-        match kill(Pid::from_raw(worker.pid), Signal::SIGKILL) {
-            Ok(()) => info!("Worker {} was successfully killed", worker.id),
-            Err(_) => info!("worker {} was already dead", worker.id),
+        if worker.run_state != RunState::Stopped {
+            if terminate(worker.pid) {
+                info!("Worker {} was successfully killed", worker.id);
+            } else {
+                info!("worker {} was already dead", worker.id);
+            }
         }
         worker.run_state = RunState::Stopped;
         // POST-CONDITION: a closed worker is terminal — `Stopped` excludes it
@@ -1748,69 +2412,165 @@ impl Server {
             "a closed worker must not report as active"
         );
     }
+}
 
-    /// Make the file descriptors of the channel survive the upgrade
-    pub fn disable_cloexec_before_upgrade(&mut self) -> Result<i32, ServerError> {
-        trace!(
-            "disabling cloexec on listener with file descriptor: {}",
-            self.unix_listener.as_raw_fd()
-        );
-
-        disable_close_on_exec(self.unix_listener.as_raw_fd()).map_err(ServerError::DisableCloexec)
+impl CommandHub {
+    pub(crate) fn notify_upgrade_processing(&mut self, token: Token) {
+        if let Some(client) = self.clients.get_mut(&token) {
+            client.return_processing("Upgrading the main process...");
+        }
     }
 
-    /// Restore `FD_CLOEXEC` on every descriptor `generate_upgrade_data` and
-    /// `disable_cloexec_before_upgrade` opened to `exec`: the channel and SCM
-    /// socket of each worker and the command socket. Called by the new main
-    /// once it adopted them, and by the old one when the upgrade fails, so no
-    /// worker forked afterwards inherits them. This also lets workers see EOF
-    /// when the main process dies.
-    pub fn enable_cloexec_after_upgrade(&mut self) -> Result<i32, ServerError> {
-        for worker in self.workers.values_mut() {
-            for (name, fd) in [
-                ("channel", worker.channel.fd()),
-                ("SCM socket", worker.scm_socket.raw_fd()),
-            ] {
-                let _ = enable_close_on_exec(fd).map_err(|e| {
-                    error!(
-                        "could not enable close on exec on the {} of worker {}: {}",
-                        name, worker.id, e
-                    );
-                });
+    pub(crate) fn fail_upgrade(&mut self, token: Token, message: String) {
+        if let Some(client) = self.clients.get_mut(&token) {
+            client.finish_failure(message);
+        } else {
+            error!(
+                "main upgrade failed after its initiating client disconnected: {}",
+                message
+            );
+        }
+    }
+
+    fn upgrade_fds(&self) -> Vec<i32> {
+        std::iter::once(self.server.unix_listener.as_raw_fd())
+            .chain(self.clients.values().map(|client| client.channel.fd()))
+            .chain(
+                self.server
+                    .workers
+                    .values()
+                    .flat_map(|worker| [worker.channel.fd(), worker.scm_socket.raw_fd()]),
+            )
+            .collect()
+    }
+
+    /// Make every descriptor represented by the snapshot survive exec.
+    /// Failure is all-or-nothing: descriptors already changed are restored.
+    pub fn disable_cloexec_before_upgrade(&mut self) -> Result<(), ServerError> {
+        let mut changed = Vec::new();
+        for fd in self.upgrade_fds() {
+            if let Err(error) = disable_close_on_exec(fd) {
+                for changed_fd in changed {
+                    let _ = enable_close_on_exec(changed_fd);
+                }
+                return Err(ServerError::DisableCloexec(error));
+            }
+            changed.push(fd);
+        }
+        Ok(())
+    }
+
+    /// Restore CLOEXEC on every descriptor inherited by the replacement main.
+    pub fn enable_cloexec_after_upgrade(&mut self) -> Result<(), ServerError> {
+        let mut first_error = None;
+        for fd in self.upgrade_fds() {
+            if let Err(error) = enable_close_on_exec(fd) {
+                error!(
+                    "could not enable close-on-exec on inherited fd {}: {}",
+                    fd, error
+                );
+                first_error.get_or_insert(error);
             }
         }
-        enable_close_on_exec(self.unix_listener.as_raw_fd()).map_err(ServerError::EnableCloexec)
+        match first_error {
+            Some(error) => Err(ServerError::EnableCloexec(error)),
+            None => Ok(()),
+        }
     }
 
-    /// summarize the server into what is needed to recreate it, when upgrading
-    pub fn generate_upgrade_data(&self) -> UpgradeData {
-        UpgradeData {
-            command_socket_fd: self.unix_listener.as_raw_fd(),
-            config: self.config.clone(),
-            // Only the workers the new main adopts, the running and the draining
-            // ones (`CommandHub::from_upgrade_data` skips `Stopped` workers):
-            // serializing a worker clears `FD_CLOEXEC` on its channel and SCM
-            // socket, and a descriptor nobody adopts would stay open, and
-            // inheritable, in the new main.
+    /// Capture the complete control-plane continuation without consuming it.
+    pub fn generate_upgrade_data(
+        &self,
+        upgrade_client_token: Token,
+    ) -> Result<UpgradeData, HubError> {
+        if self.server.run_state != ServerState::Running || self.server.upgrading {
+            return Err(HubError::InvalidUpgradeSnapshot(
+                "main upgrade requires a Running, unfenced command Hub".to_owned(),
+            ));
+        }
+        if self.pending_upgrade_completion.is_some() {
+            return Err(HubError::InvalidUpgradeSnapshot(
+                "previous main-upgrade response is still backpressured".to_owned(),
+            ));
+        }
+        if !self.clients.contains_key(&upgrade_client_token) {
+            return Err(HubError::InvalidUpgradeSnapshot(format!(
+                "upgrade client token {} is not live",
+                upgrade_client_token.0
+            )));
+        }
+
+        let mut unique_fds = HashSet::new();
+        for fd in self.upgrade_fds() {
+            if fd < 0 || !unique_fds.insert(fd) {
+                return Err(HubError::InvalidUpgradeSnapshot(format!(
+                    "upgrade descriptor {fd} is invalid or duplicated"
+                )));
+            }
+        }
+
+        // Start the cross-process monotonic interval before taking the
+        // Instant used by every task. Snapshot construction can be
+        // arbitrarily long; starting it afterwards would give restored tasks
+        // that time back by extending deadlines and shortening audit elapsed
+        // time. The tiny sampling gap is deliberately charged to the handoff,
+        // which is conservative for both contracts.
+        let captured_monotonic_nanos = monotonic_nanos()?;
+        let timing = TaskSnapshotTiming::now();
+        let tasks = self
+            .tasks
+            .iter()
+            .map(|(id, task)| task.snapshot(timing).map(|task| (*id, task)))
+            .collect::<Result<HashMap<_, _>, _>>()?;
+        let queued_tasks = self
+            .server
+            .queued_tasks
+            .iter()
+            .map(|(id, task)| task.snapshot(timing).map(|task| (*id, task)))
+            .collect::<Result<HashMap<_, _>, _>>()?;
+        if tasks
+            .values()
+            .chain(queued_tasks.values())
+            .any(TaskContainerSnapshot::is_stop)
+        {
+            return Err(HubError::InvalidUpgradeSnapshot(
+                "cannot upgrade while a stop task is dispatched".to_owned(),
+            ));
+        }
+        let boot_generation = self.server.boot_generation.checked_add(1).ok_or_else(|| {
+            HubError::InvalidUpgradeSnapshot("boot generation overflow".to_owned())
+        })?;
+
+        Ok(UpgradeData::new(UpgradeSnapshot {
+            command_socket_fd: self.server.unix_listener.as_raw_fd(),
+            config: self.server.config.clone(),
+            captured_monotonic_nanos,
+            server_state: UpgradeServerState::Running,
+            next_client_id: self.server.next_client_id,
+            next_session_id: self.server.next_session_id,
+            next_task_id: self.server.next_task_id,
+            next_worker_id: self.server.next_worker_id,
+            upgrade_client_token: upgrade_client_token.0,
+            clients: self.clients.values().map(ClientSession::snapshot).collect(),
             workers: self
+                .server
                 .workers
                 .values()
-                .filter(|session| session.run_state != RunState::Stopped)
-                .filter_map(|session| match SerializedWorkerSession::try_from(session) {
-                    Ok(serialized_session) => Some(serialized_session),
-                    Err(err) => {
-                        error!("failed to serialize worker session: {}", err);
-                        None
-                    }
-                })
+                .map(WorkerSession::snapshot)
                 .collect(),
-            state: self.state.clone(),
-            next_client_id: self.next_client_id,
-            next_session_id: self.next_session_id,
-            next_task_id: self.next_task_id,
-            next_worker_id: self.next_worker_id,
-            boot_generation: self.boot_generation,
-        }
+            event_subscribers: self
+                .server
+                .event_subscribers
+                .iter()
+                .map(|token| token.0)
+                .collect(),
+            in_flight: self.server.in_flight.clone(),
+            tasks,
+            queued_tasks,
+            pending_audit_events: self.server.pending_audit_events.clone(),
+            state: self.server.state.clone(),
+            boot_generation,
+        }))
     }
 }
 
@@ -2012,6 +2772,379 @@ mod tests {
             .expect("Could not create command hub")
     }
 
+    fn register_observable_client(hub: &mut CommandHub) -> (Token, Channel<Request, Response>) {
+        let (mut channel, peer): (Channel<Response, Request>, Channel<Request, Response>) =
+            Channel::generate_nonblocking(4096, 65536).expect("could not generate client channels");
+        let token = hub.server.next_session_token();
+        let id = hub.server.next_client_id();
+        hub.server
+            .register(token, &mut channel.sock)
+            .expect("could not register client channel");
+        hub.clients.insert(
+            token,
+            ClientSession::new(
+                channel,
+                id,
+                token,
+                PeerCred::default(),
+                None,
+                None,
+                std::sync::Arc::from("/tmp/sozu-upgrade-test.sock"),
+            ),
+        );
+        (token, peer)
+    }
+
+    fn flush_client_responses(
+        hub: &mut CommandHub,
+        token: Token,
+        peer: &mut Channel<Request, Response>,
+    ) {
+        let client = hub.clients.get_mut(&token).expect("test client is live");
+        client.channel.handle_events(Ready::WRITABLE);
+        client.channel.run().expect("client response should flush");
+        peer.handle_events(Ready::READABLE);
+        peer.run().expect("peer should buffer client responses");
+    }
+
+    #[test]
+    fn precommit_sigterm_probe_preserves_the_stop_byte_for_the_event_loop() {
+        let (mut sender, receiver) = UnixStream::pair().expect("could not create signal pair");
+        let mut hub = create_test_hub();
+        hub.sigterm_receiver = Some(receiver);
+        assert!(!hub.sigterm_pending().unwrap());
+        sender.write_all(&[1]).expect("could not queue stop byte");
+
+        assert!(hub.sigterm_pending().unwrap());
+        assert!(
+            hub.sigterm_pending().unwrap(),
+            "the PREPARE gate must observe without consuming the stop intention"
+        );
+
+        let mut byte = [0u8; 1];
+        hub.sigterm_receiver
+            .as_mut()
+            .expect("test SIGTERM receiver")
+            .read_exact(&mut byte)
+            .expect("normal event-loop path should still consume the byte");
+        assert_eq!(byte, [1]);
+        assert!(!hub.sigterm_pending().unwrap());
+    }
+
+    #[test]
+    fn hub_snapshot_captures_active_queued_routes_clients_and_pending_audit() {
+        #[derive(Debug)]
+        struct TransferTask {
+            client_token: Token,
+            gatherer: DefaultGatherer,
+        }
+        impl GatheringTask for TransferTask {
+            fn client_token(&self) -> Option<Token> {
+                Some(self.client_token)
+            }
+
+            fn get_gatherer(&mut self) -> &mut dyn Gatherer {
+                &mut self.gatherer
+            }
+
+            fn snapshot(
+                &self,
+                _timing: TaskSnapshotTiming,
+            ) -> Result<TaskSnapshot, TaskSnapshotError> {
+                Ok(TaskSnapshot::Request(Box::new(
+                    crate::command::requests::RequestTaskSnapshot::QueryClusters {
+                        client_token: self.client_token.0,
+                        gatherer: self.gatherer.clone(),
+                        main_process_response: None,
+                    },
+                )))
+            }
+
+            fn on_finish(
+                self: Box<Self>,
+                _server: &mut Server,
+                _client: &mut OptionalClient,
+                _timed_out: bool,
+            ) {
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("could not create temp dir");
+        let socket_path = dir.path().join("upgrade-snapshot.sock");
+        let listener = UnixListener::bind(&socket_path).expect("could not bind socket");
+        let config = Config {
+            command_buffer_size: DEFAULT_COMMAND_BUFFER_SIZE,
+            max_command_buffer_size: DEFAULT_MAX_COMMAND_BUFFER_SIZE,
+            ..Config::default()
+        };
+        let mut hub =
+            CommandHub::new(listener, config, "sozu".to_owned()).expect("could not create Hub");
+        let (_peer, accepted) =
+            std::os::unix::net::UnixStream::pair().expect("could not create client pair");
+        accepted
+            .set_nonblocking(true)
+            .expect("could not make client nonblocking");
+        hub.register_client(UnixStream::from_std(accepted));
+        let client_token = *hub.clients.keys().next().expect("registered client token");
+        hub.clients
+            .get_mut(&client_token)
+            .expect("registered client")
+            .return_processing("already buffered");
+        hub.server.event_subscribers.insert(client_token);
+        hub.server.pending_audit_events.push_back(Event::default());
+
+        let task = || TaskContainer {
+            job: Box::new(TransferTask {
+                client_token,
+                gatherer: DefaultGatherer {
+                    expected_responses: 1,
+                    ..DefaultGatherer::default()
+                },
+            }),
+            timeout: Some(Instant::now() + Duration::from_secs(30)),
+        };
+        hub.tasks.insert(2, task());
+        hub.server.queued_tasks.insert(3, task());
+        hub.server.in_flight.insert("worker-route".to_owned(), 2);
+        hub.server.next_task_id = 4;
+
+        let data = hub
+            .generate_upgrade_data(client_token)
+            .expect("complete Hub should snapshot");
+        assert_eq!(
+            data.counts(),
+            crate::command::upgrade::UpgradeCounts {
+                clients: 1,
+                workers: 0,
+                tasks: 2,
+                routes: 1,
+                buffered_bytes: data.counts().buffered_bytes,
+                pending_requests: 0,
+            }
+        );
+        assert!(data.counts().buffered_bytes > 0);
+        assert_eq!(data.snapshot().event_subscribers, [client_token.0]);
+        assert_eq!(data.snapshot().pending_audit_events.len(), 1);
+        assert_eq!(data.snapshot().upgrade_client_token, client_token.0);
+
+        let encoded = serde_json::to_vec(&data).expect("upgrade data should serialize");
+        let decoded: UpgradeData =
+            serde_json::from_slice(&encoded).expect("upgrade data should deserialize");
+        assert_eq!(decoded.counts(), data.counts());
+    }
+
+    #[test]
+    fn restored_queued_task_finishes_once_without_replaying_its_entrypoint() {
+        let mut hub = create_test_hub();
+        let (client_token, mut peer) = register_observable_client(&mut hub);
+        let timing = TaskSnapshotTiming::now();
+        let snapshot = TaskSnapshot::Request(Box::new(
+            crate::command::requests::RequestTaskSnapshot::QueryClusters {
+                client_token: client_token.0,
+                gatherer: DefaultGatherer::default(),
+                main_process_response: Some(ResponseContent::default()),
+            },
+        ));
+        let encoded = serde_json::to_vec(&snapshot).expect("queued task should serialize");
+        let restored: TaskSnapshot =
+            serde_json::from_slice(&encoded).expect("queued task should deserialize");
+        let restored = restored
+            .restore(TaskRestoreTiming {
+                now: timing.now,
+                handoff_elapsed: Duration::ZERO,
+            })
+            .expect("queued task should restore without dispatch");
+
+        hub.server.queued_tasks.insert(
+            7,
+            TaskContainer {
+                job: restored,
+                timeout: None,
+            },
+        );
+        hub.server.next_task_id = 8;
+        assert_eq!(
+            hub.clients[&client_token].channel.back_buf.available_data(),
+            0,
+            "snapshot/restore itself must not run the task callback"
+        );
+
+        hub.finish_ready_tasks(Instant::now());
+        hub.finish_ready_tasks(Instant::now());
+        assert!(hub.tasks.is_empty() && hub.server.queued_tasks.is_empty());
+
+        flush_client_responses(&mut hub, client_token, &mut peer);
+        let response = peer
+            .read_message()
+            .expect("restored queued task should answer once");
+        assert_eq!(response.status, ResponseStatus::Ok as i32);
+        assert_eq!(response.message, "Successfully queried clusters");
+        assert!(
+            peer.read_message().is_err(),
+            "a second task sweep must not execute the restored callback again"
+        );
+    }
+
+    #[test]
+    fn dispatched_stop_task_is_rejected_from_a_running_upgrade_snapshot() {
+        for queued in [false, true] {
+            let mut hub = create_test_hub();
+            let (client_token, _peer) = register_observable_client(&mut hub);
+            let task = TaskSnapshot::Request(Box::new(
+                crate::command::requests::RequestTaskSnapshot::Stop {
+                    client_token: Some(client_token.0),
+                    gatherer: DefaultGatherer::default(),
+                    hardness: false,
+                },
+            ))
+            .restore(TaskRestoreTiming {
+                now: Instant::now(),
+                handoff_elapsed: Duration::ZERO,
+            })
+            .expect("Stop task should restore for the rejection fixture");
+            let container = TaskContainer {
+                job: task,
+                timeout: None,
+            };
+            if queued {
+                hub.server.queued_tasks.insert(7, container);
+            } else {
+                hub.tasks.insert(7, container);
+            }
+            hub.server.next_task_id = 8;
+
+            let error = hub
+                .generate_upgrade_data(client_token)
+                .expect_err("a dispatched Stop task contradicts Running state");
+            assert!(
+                error.to_string().contains("stop task"),
+                "unexpected rejection for queued={queued}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn restored_ready_upgrade_worker_phase_one_runs_its_callback_once() {
+        let mut hub = create_test_hub();
+        hub.server.config.command_buffer_size = DEFAULT_COMMAND_BUFFER_SIZE;
+        hub.server.config.max_command_buffer_size = DEFAULT_MAX_COMMAND_BUFFER_SIZE;
+        let dir = tempfile::tempdir().expect("could not create fake worker directory");
+        let executable = dir.path().join("fake-sozu-worker");
+        std::fs::write(&executable, "#!/bin/sh\nexec sleep 30\n")
+            .expect("could not write fake worker executable");
+        std::fs::set_permissions(&executable, Permissions::from_mode(0o755))
+            .expect("could not make fake worker executable runnable");
+        hub.server.executable_path = executable.to_string_lossy().into_owned();
+
+        let (client_token, mut client_peer) = register_observable_client(&mut hub);
+        let (main_sock, _worker_sock) = UnixStream::pair().expect("could not create worker pair");
+        let main_channel: Channel<WorkerRequest, WorkerResponse> = Channel::new(
+            main_sock,
+            DEFAULT_COMMAND_BUFFER_SIZE,
+            DEFAULT_MAX_COMMAND_BUFFER_SIZE,
+        );
+        let (scm_owner, scm_peer) =
+            std::os::unix::net::UnixStream::pair().expect("could not create worker scm pair");
+        let main_scm = ScmSocket::new(scm_owner.as_raw_fd()).expect("could not create main SCM");
+        let peer_scm = ScmSocket::new(scm_peer.as_raw_fd()).expect("could not create peer SCM");
+        hub.server
+            .register_worker(7, 0, main_channel, main_scm)
+            .expect("old worker should register");
+        hub.server.next_worker_id = 8;
+        let old_worker_token = hub
+            .server
+            .workers
+            .iter()
+            .find_map(|(token, worker)| (worker.id == 7).then_some(*token))
+            .expect("old worker token");
+        peer_scm
+            .send_listeners(&Listeners::default())
+            .expect("old worker should return its empty listener set");
+
+        let snapshot: TaskSnapshot = serde_json::from_value(serde_json::json!({
+            "UpgradeWorker": {
+                "client_token": client_token.0,
+                "progress": {
+                    "RequestingListenSockets": {
+                        "old_worker_token": old_worker_token.0,
+                        "old_worker_id": 7
+                    }
+                },
+                "ok": 1,
+                "errors": 0,
+                "responses": [],
+                "expected_responses": 1
+            }
+        }))
+        .expect("phase-one task snapshot should deserialize");
+        let restored = snapshot
+            .restore(TaskRestoreTiming {
+                now: Instant::now(),
+                handoff_elapsed: Duration::ZERO,
+            })
+            .expect("phase-one task should restore without running its callback");
+        hub.server.queued_tasks.insert(
+            11,
+            TaskContainer {
+                job: restored,
+                timeout: None,
+            },
+        );
+        hub.server.next_task_id = 12;
+        assert_eq!(hub.server.workers.len(), 1);
+        assert_eq!(hub.server.next_worker_id, 8);
+        assert_eq!(
+            hub.clients[&client_token].channel.back_buf.available_data(),
+            0,
+            "PREPARED restore must not receive listeners or launch a worker"
+        );
+
+        hub.finish_ready_tasks(Instant::now());
+        assert_eq!(hub.server.next_worker_id, 9);
+        assert_eq!(hub.server.workers.len(), 2);
+        assert_eq!(hub.server.queued_tasks.len(), 1);
+        assert_eq!(hub.tasks.len(), 0);
+        hub.finish_ready_tasks(Instant::now());
+        assert_eq!(
+            hub.server.next_worker_id, 9,
+            "a later task sweep must not launch the replacement worker twice"
+        );
+        assert_eq!(hub.server.workers.len(), 2);
+        assert_eq!(hub.tasks.len(), 1, "phase two should now be active");
+        assert!(hub.server.queued_tasks.is_empty());
+
+        flush_client_responses(&mut hub, client_token, &mut client_peer);
+        let first = client_peer
+            .read_message()
+            .expect("phase one should report the launched worker");
+        let second = client_peer
+            .read_message()
+            .expect("phase one should report the old worker drain");
+        assert!(first.message.contains("Launched a new worker with id 8"));
+        assert!(second.message.contains("Soft stopping worker with id 7"));
+        assert!(
+            client_peer.read_message().is_err(),
+            "phase-one callback messages must not be duplicated"
+        );
+
+        let (new_token, new_pid) = hub
+            .server
+            .workers
+            .iter()
+            .find_map(|(token, worker)| (worker.id == 8).then_some((*token, worker.pid)))
+            .expect("replacement worker should be registered");
+        hub.server.close_worker(&new_token);
+        let _ = nix::sys::wait::waitpid(Pid::from_raw(new_pid), None);
+        let worker = hub
+            .server
+            .workers
+            .remove(&new_token)
+            .expect("replacement worker should still be registered");
+        worker
+            .close_restored_descriptors()
+            .expect("replacement worker descriptors should close");
+    }
+
     /// Regression (sozu#1430): the command-socket client channel is sized at
     /// `CLIENT_CHANNEL_INITIAL_BUFFER_SIZE`, never at the global
     /// `command_buffer_size`, and the two are deliberately independent.
@@ -2114,6 +3247,12 @@ mod tests {
             fn get_gatherer(&mut self) -> &mut dyn Gatherer {
                 &mut self.gatherer
             }
+            fn snapshot(
+                &self,
+                _timing: TaskSnapshotTiming,
+            ) -> Result<TaskSnapshot, TaskSnapshotError> {
+                Err(TaskSnapshotError::UnsupportedTestTask("RecordingTask"))
+            }
             fn on_finish(
                 self: Box<Self>,
                 _server: &mut Server,
@@ -2158,6 +3297,10 @@ mod tests {
 
         fn get_gatherer(&mut self) -> &mut dyn Gatherer {
             &mut self.gatherer
+        }
+
+        fn snapshot(&self, _timing: TaskSnapshotTiming) -> Result<TaskSnapshot, TaskSnapshotError> {
+            Err(TaskSnapshotError::UnsupportedTestTask("SecretBearingTask"))
         }
 
         fn on_finish(
@@ -2373,6 +3516,142 @@ mod tests {
         (worker_side, scm_main)
     }
 
+    #[test]
+    fn closing_an_already_stopped_worker_never_signals_its_saved_pid_again() {
+        let mut server = create_test_server();
+        let (_worker_side, _scm_owner) = register_test_worker(&mut server, 7, 4096, 65536);
+        let token = server
+            .workers
+            .iter_mut()
+            .find_map(|(token, worker)| {
+                (worker.id == 7).then(|| {
+                    worker.run_state = RunState::Stopped;
+                    worker.pid = 4242;
+                    *token
+                })
+            })
+            .expect("test worker should be registered");
+        let mut signalled = Vec::new();
+
+        server.close_worker_with(&token, |pid| {
+            signalled.push(pid);
+            true
+        });
+
+        assert!(
+            signalled.is_empty(),
+            "a restored Stopped session must not signal a PID that may have been reused"
+        );
+        assert_eq!(server.workers[&token].run_state, RunState::Stopped);
+    }
+
+    #[test]
+    fn restored_stopped_worker_is_retained_for_a_task_then_closes_both_descriptors() {
+        #[derive(Debug)]
+        struct RetainsWorkerTask {
+            worker_token: Token,
+            gatherer: DefaultGatherer,
+        }
+
+        impl GatheringTask for RetainsWorkerTask {
+            fn client_token(&self) -> Option<Token> {
+                None
+            }
+
+            fn get_gatherer(&mut self) -> &mut dyn Gatherer {
+                &mut self.gatherer
+            }
+
+            fn snapshot(
+                &self,
+                _timing: TaskSnapshotTiming,
+            ) -> Result<TaskSnapshot, TaskSnapshotError> {
+                Err(TaskSnapshotError::UnsupportedTestTask("RetainsWorkerTask"))
+            }
+
+            fn retained_worker_token(&self) -> Option<Token> {
+                Some(self.worker_token)
+            }
+
+            fn on_finish(
+                self: Box<Self>,
+                _server: &mut Server,
+                _client: &mut OptionalClient,
+                _timed_out: bool,
+            ) {
+            }
+        }
+
+        let mut hub = create_test_hub();
+        let (main_sock, worker_sock) = UnixStream::pair().expect("could not create channel pair");
+        let main_side: Channel<WorkerRequest, WorkerResponse> =
+            Channel::new(main_sock, 4096, 65536);
+        let mut worker_side: Channel<WorkerResponse, WorkerRequest> =
+            Channel::new(worker_sock, 4096, 65536);
+        let (scm_owner, mut scm_peer) =
+            std::os::unix::net::UnixStream::pair().expect("could not create scm pair");
+        scm_peer
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("could not bound the scm peer read");
+        let scm_socket =
+            ScmSocket::new(scm_owner.as_raw_fd()).expect("could not create scm socket");
+        hub.server
+            .register_worker(7, 0, main_side, scm_socket)
+            .expect("test worker should register");
+        let token = hub
+            .server
+            .workers
+            .iter_mut()
+            .find_map(|(token, worker)| {
+                (worker.id == 7).then(|| {
+                    worker.run_state = RunState::Stopped;
+                    *token
+                })
+            })
+            .expect("test worker should be registered");
+        // ScmSocket borrows this descriptor; transfer ownership to the Hub so
+        // the test can observe its peer closing without a competing owner.
+        let _scm_fd = scm_owner.into_raw_fd();
+        hub.restored_worker_tokens.insert(token);
+        hub.restored_session_ticks.insert(token);
+        hub.tasks.insert(
+            1,
+            TaskContainer {
+                job: Box::new(RetainsWorkerTask {
+                    worker_token: token,
+                    gatherer: DefaultGatherer {
+                        expected_responses: 1,
+                        ..DefaultGatherer::default()
+                    },
+                }),
+                timeout: None,
+            },
+        );
+
+        hub.collect_unreferenced_restored_stopped_workers();
+        assert!(
+            hub.server.workers.contains_key(&token),
+            "UpgradeWorker phase one must retain its stopped worker SCM socket"
+        );
+
+        hub.tasks.remove(&1);
+        hub.collect_unreferenced_restored_stopped_workers();
+        assert!(!hub.server.workers.contains_key(&token));
+        assert!(!hub.restored_worker_tokens.contains(&token));
+        assert!(!hub.restored_session_ticks.contains(&token));
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            worker_side.sock.read(&mut byte).expect("read channel peer"),
+            0,
+            "collecting the worker must close its command channel"
+        );
+        assert_eq!(
+            scm_peer.read(&mut byte).expect("read scm peer"),
+            0,
+            "collecting the worker must close its SCM descriptor after any concurrent fork reaches exec"
+        );
+    }
+
     /// A task that records its final tally, so a test can assert what the
     /// gatherer accounted without reaching into a boxed `dyn GatheringTask`.
     #[derive(Debug)]
@@ -2387,6 +3666,9 @@ mod tests {
         }
         fn get_gatherer(&mut self) -> &mut dyn Gatherer {
             &mut self.gatherer
+        }
+        fn snapshot(&self, _timing: TaskSnapshotTiming) -> Result<TaskSnapshot, TaskSnapshotError> {
+            Err(TaskSnapshotError::UnsupportedTestTask("TallyTask"))
         }
         fn on_finish(
             self: Box<Self>,
@@ -2846,5 +4128,232 @@ mod tests {
             "the unanswered SoftStop must be accounted as one failure"
         );
         assert!(hub.tasks.is_empty() && hub.server.queued_tasks.is_empty());
+    }
+
+    #[test]
+    fn task_elapsed_snapshot_includes_time_spent_in_handoff_without_sleeping() {
+        let capture_now = Instant::now();
+        let original_started_at = capture_now
+            .checked_sub(Duration::from_secs(7))
+            .expect("test clock supports seven seconds of history");
+        let snapshot =
+            ElapsedSnapshot::capture(original_started_at, TaskSnapshotTiming { now: capture_now })
+                .expect("elapsed audit timer should snapshot");
+        let restore_now = capture_now
+            .checked_add(Duration::from_secs(5))
+            .expect("test clock supports five seconds in the future");
+
+        let restored_started_at = snapshot
+            .restore(TaskRestoreTiming {
+                now: restore_now,
+                handoff_elapsed: Duration::from_secs(5),
+            })
+            .expect("elapsed audit timer should restore");
+
+        assert_eq!(restored_started_at, original_started_at);
+        assert_eq!(
+            restore_now.duration_since(restored_started_at),
+            Duration::from_secs(12),
+            "audit elapsed time must include the seven pre-freeze seconds and five handoff seconds"
+        );
+    }
+
+    #[test]
+    fn task_deadline_snapshot_spends_handoff_time_and_expires_without_sleeping() {
+        let capture_now = Instant::now();
+        let restore_now = capture_now
+            .checked_add(Duration::from_secs(7))
+            .expect("test clock supports seven seconds in the future");
+        let timing = TaskSnapshotTiming { now: capture_now };
+        let restore_timing = TaskRestoreTiming {
+            now: restore_now,
+            handoff_elapsed: Duration::from_secs(7),
+        };
+
+        let live = DeadlineSnapshot::capture(
+            Some(
+                capture_now
+                    .checked_add(Duration::from_secs(30))
+                    .expect("test clock supports a thirty-second deadline"),
+            ),
+            timing,
+        )
+        .expect("live deadline should snapshot")
+        .restore(restore_timing)
+        .expect("live deadline should restore")
+        .expect("live deadline should remain armed");
+        assert_eq!(live.duration_since(restore_now), Duration::from_secs(23));
+
+        let expired = DeadlineSnapshot::capture(
+            Some(
+                capture_now
+                    .checked_add(Duration::from_secs(5))
+                    .expect("test clock supports a five-second deadline"),
+            ),
+            timing,
+        )
+        .expect("deadline should snapshot")
+        .restore(restore_timing)
+        .expect("deadline should restore")
+        .expect("expired deadline should remain armed");
+        assert_eq!(expired, restore_now);
+
+        assert_eq!(
+            DeadlineSnapshot::capture(None, timing)
+                .expect("unarmed deadline should snapshot")
+                .restore(restore_timing)
+                .expect("unarmed deadline should restore"),
+            None
+        );
+    }
+
+    #[test]
+    fn hub_snapshot_clock_precedes_task_capture_and_charges_construction_time() {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicU64, Ordering},
+        };
+
+        #[derive(Debug)]
+        struct ClockObservedTask {
+            client_token: Token,
+            started_at: Instant,
+            observed_monotonic_nanos: Arc<AtomicU64>,
+            observed_timing: Arc<Mutex<Option<TaskSnapshotTiming>>>,
+            gatherer: DefaultGatherer,
+        }
+
+        impl GatheringTask for ClockObservedTask {
+            fn client_token(&self) -> Option<Token> {
+                Some(self.client_token)
+            }
+
+            fn get_gatherer(&mut self) -> &mut dyn Gatherer {
+                &mut self.gatherer
+            }
+
+            fn snapshot(
+                &self,
+                timing: TaskSnapshotTiming,
+            ) -> Result<TaskSnapshot, TaskSnapshotError> {
+                self.observed_monotonic_nanos.store(
+                    crate::command::upgrade::monotonic_nanos()
+                        .expect("test should sample CLOCK_MONOTONIC"),
+                    Ordering::SeqCst,
+                );
+                *self.observed_timing.lock().expect("timing mutex poisoned") = Some(timing);
+                Ok(TaskSnapshot::Request(Box::new(
+                    crate::command::requests::RequestTaskSnapshot::Worker(Box::new(
+                        crate::command::requests::WorkerTaskSnapshot {
+                            client_token: self.client_token.0,
+                            gatherer: self.gatherer.clone(),
+                            started_at: ElapsedSnapshot::capture(self.started_at, timing)?,
+                            audit: None,
+                            inline_audit: None,
+                            metric_detail_audit: None,
+                            clear_master_metrics_on_finish: false,
+                            rollback: None,
+                        },
+                    )),
+                )))
+            }
+
+            fn on_finish(
+                self: Box<Self>,
+                _server: &mut Server,
+                _client: &mut OptionalClient,
+                _timed_out: bool,
+            ) {
+            }
+        }
+
+        let mut hub = create_test_hub();
+        let (_peer, accepted) =
+            std::os::unix::net::UnixStream::pair().expect("could not create client pair");
+        accepted
+            .set_nonblocking(true)
+            .expect("could not make client nonblocking");
+        hub.register_client(UnixStream::from_std(accepted));
+        let client_token = *hub.clients.keys().next().expect("registered client token");
+        let observed_monotonic_nanos = Arc::new(AtomicU64::new(0));
+        let observed_timing = Arc::new(Mutex::new(None));
+        let original_started_at = Instant::now()
+            .checked_sub(Duration::from_secs(7))
+            .expect("test clock supports seven seconds of history");
+        let original_deadline = Instant::now()
+            .checked_add(Duration::from_secs(30))
+            .expect("test clock supports a thirty-second deadline");
+        hub.tasks.insert(
+            1,
+            TaskContainer {
+                job: Box::new(ClockObservedTask {
+                    client_token,
+                    started_at: original_started_at,
+                    observed_monotonic_nanos: Arc::clone(&observed_monotonic_nanos),
+                    observed_timing: Arc::clone(&observed_timing),
+                    gatherer: DefaultGatherer {
+                        expected_responses: 1,
+                        ..DefaultGatherer::default()
+                    },
+                }),
+                timeout: Some(original_deadline),
+            },
+        );
+        hub.server.next_task_id = 2;
+
+        let data = hub
+            .generate_upgrade_data(client_token)
+            .expect("Hub should snapshot");
+        let task_capture_monotonic = observed_monotonic_nanos.load(Ordering::SeqCst);
+        let snapshot = data.snapshot();
+        assert!(
+            snapshot.captured_monotonic_nanos <= task_capture_monotonic,
+            "the handoff clock must start no later than task serialization"
+        );
+
+        let capture_timing = observed_timing
+            .lock()
+            .expect("timing mutex poisoned")
+            .expect("task should record its capture timing");
+        let simulated_handoff = Duration::from_secs(5);
+        let restored_monotonic = task_capture_monotonic
+            .checked_add(duration_nanos(simulated_handoff, "test handoff").unwrap())
+            .expect("test monotonic clock should not overflow");
+        let restore_now = capture_timing
+            .now
+            .checked_add(simulated_handoff)
+            .expect("test Instant should not overflow");
+        let restore_timing = TaskRestoreTiming {
+            now: restore_now,
+            handoff_elapsed: Duration::from_nanos(
+                restored_monotonic - snapshot.captured_monotonic_nanos,
+            ),
+        };
+        let task_snapshot = snapshot.tasks.get(&1).expect("task should be serialized");
+        let restored_deadline = task_snapshot
+            .deadline
+            .restore(restore_timing)
+            .expect("deadline should restore")
+            .expect("deadline should remain armed");
+        assert!(
+            restored_deadline <= original_deadline,
+            "snapshot construction must never extend a task deadline"
+        );
+        let TaskSnapshot::Request(snapshot) = &task_snapshot.job else {
+            panic!("test task should serialize as WorkerTask");
+        };
+        let crate::command::requests::RequestTaskSnapshot::Worker(snapshot) = snapshot.as_ref()
+        else {
+            panic!("test task should serialize as WorkerTask");
+        };
+        let restored_started_at = snapshot
+            .started_at()
+            .restore(restore_timing)
+            .expect("elapsed timer should restore");
+        assert!(
+            restore_now.duration_since(restored_started_at)
+                >= capture_timing.now.duration_since(original_started_at) + simulated_handoff,
+            "snapshot construction must not subtract elapsed audit time"
+        );
     }
 }
