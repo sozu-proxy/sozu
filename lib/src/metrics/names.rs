@@ -283,13 +283,43 @@ pub mod h2 {
     // Flood-mitigation violation counters — one per flood class the H2
     // mux's `H2FloodDetector` recognises. Surfaced in the TUI's H2 pane
     // so operators can spot a flood-pattern before it pages.
-    pub const FLOOD_VIOLATION_CONTINUATION: &str = "h2.flood.violation.continuation";
     pub const FLOOD_VIOLATION_GLITCH_WINDOW: &str = "h2.flood.violation.glitch_window";
-    pub const FLOOD_VIOLATION_MADE_YOU_RESET: &str = "h2.flood.violation.made_you_reset";
-    pub const FLOOD_VIOLATION_PING: &str = "h2.flood.violation.ping";
-    pub const FLOOD_VIOLATION_PRIORITY: &str = "h2.flood.violation.priority";
-    pub const FLOOD_VIOLATION_RAPID_RESET: &str = "h2.flood.violation.rapid_reset";
-    pub const FLOOD_VIOLATION_SETTINGS: &str = "h2.flood.violation.settings";
+    pub const FLOOD_VIOLATION_RST_STREAM_WINDOW: &str = "h2.flood.violation.rst_stream_window";
+    pub const FLOOD_VIOLATION_RST_STREAM_LIFETIME: &str = "h2.flood.violation.rst_stream_lifetime";
+    pub const FLOOD_VIOLATION_RST_STREAM_PRE_RESPONSE_LIFETIME: &str =
+        "h2.flood.violation.rst_stream_pre_response_lifetime";
+    pub const FLOOD_VIOLATION_RST_STREAM_EMITTED_LIFETIME: &str =
+        "h2.flood.violation.rst_stream_emitted_lifetime";
+    pub const FLOOD_VIOLATION_PING_WINDOW: &str = "h2.flood.violation.ping_window";
+    pub const FLOOD_VIOLATION_PING_LIFETIME: &str = "h2.flood.violation.ping_lifetime";
+    pub const FLOOD_VIOLATION_SETTINGS_WINDOW: &str = "h2.flood.violation.settings_window";
+    pub const FLOOD_VIOLATION_SETTINGS_LIFETIME: &str = "h2.flood.violation.settings_lifetime";
+    pub const FLOOD_VIOLATION_EMPTY_DATA_WINDOW: &str = "h2.flood.violation.empty_data_window";
+    pub const FLOOD_VIOLATION_CONTINUATION_PER_BLOCK: &str =
+        "h2.flood.violation.continuation_per_block";
+    pub const FLOOD_VIOLATION_WINDOW_UPDATE_STREAM0_WINDOW: &str =
+        "h2.flood.violation.window_update_stream0_window";
+    pub const FLOOD_VIOLATION_HEADER_SIZE_PER_BLOCK: &str =
+        "h2.flood.violation.header_size_per_block";
+    /// Every `metric_key` an `H2FloodViolation` carries, one per flood class
+    /// (`lib/src/protocol/mux/h2_flood_detector.rs`). The detector's
+    /// `test_flood_violation_metric_keys_are_unique_and_namespaced` pins this
+    /// list to what it emits, and `sozu top` reads its H2 pane rows from it.
+    pub const FLOOD_VIOLATION_KEYS: [&str; 13] = [
+        FLOOD_VIOLATION_RST_STREAM_PRE_RESPONSE_LIFETIME,
+        FLOOD_VIOLATION_RST_STREAM_LIFETIME,
+        FLOOD_VIOLATION_RST_STREAM_EMITTED_LIFETIME,
+        FLOOD_VIOLATION_RST_STREAM_WINDOW,
+        FLOOD_VIOLATION_CONTINUATION_PER_BLOCK,
+        FLOOD_VIOLATION_HEADER_SIZE_PER_BLOCK,
+        FLOOD_VIOLATION_PING_WINDOW,
+        FLOOD_VIOLATION_PING_LIFETIME,
+        FLOOD_VIOLATION_SETTINGS_WINDOW,
+        FLOOD_VIOLATION_SETTINGS_LIFETIME,
+        FLOOD_VIOLATION_EMPTY_DATA_WINDOW,
+        FLOOD_VIOLATION_WINDOW_UPDATE_STREAM0_WINDOW,
+        FLOOD_VIOLATION_GLITCH_WINDOW,
+    ];
     /// A new client stream refused with `REFUSED_STREAM` in the soft state
     /// below the pre-response RST_STREAM cap (`h2_stream_refusal_percent`).
     /// The connection stays open; a rising rate is the early warning before

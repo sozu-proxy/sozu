@@ -2095,7 +2095,7 @@ mod tests {
                 .metric_key
         }
 
-        let keys: [&'static str; 12] = [
+        let keys: [&'static str; 13] = [
             // Lifetime methods on the detector itself.
             key_from_rst_lifetime(true),
             key_from_rst_lifetime(false),
@@ -2108,6 +2108,7 @@ mod tests {
             key_from_check_flood(|d| d.total_settings_received_lifetime = u32::MAX),
             key_from_check_flood(|d| d.empty_data_count = u32::MAX),
             key_from_check_flood(|d| d.continuation_count = u32::MAX),
+            key_from_check_flood(|d| d.window_update_stream0_count = u32::MAX),
             key_from_check_flood(|d| d.accumulated_header_size = u32::MAX),
             key_from_check_flood(|d| d.glitch_count = u32::MAX),
         ];
@@ -2125,6 +2126,12 @@ mod tests {
             deduped.len(),
             keys.len(),
             "metric keys must be unique across violation kinds; collisions: {keys:?}",
+        );
+        let mut published = crate::metrics::names::h2::FLOOD_VIOLATION_KEYS.to_vec();
+        published.sort_unstable();
+        assert_eq!(
+            deduped, published,
+            "names::h2::FLOOD_VIOLATION_KEYS (read by `sozu top`) must list exactly the emitted keys",
         );
     }
 
