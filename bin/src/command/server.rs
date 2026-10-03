@@ -757,8 +757,7 @@ impl CommandHub {
                 })
                 .collect();
 
-            let next_timeout = self.tasks.values().filter_map(|t| t.timeout).max();
-            let mut poll_timeout = next_timeout.map(|t| t.saturating_duration_since(now));
+            let mut poll_timeout = self.next_poll_timeout(now);
 
             if self.run_state == ServerState::Stopping {
                 // when closing, close all ClientSession which are not transfering data
@@ -881,6 +880,22 @@ impl CommandHub {
                 }
             }
         }
+    }
+
+    /// How long the event loop may block in `poll` before a task deadline
+    /// must be revisited: until the EARLIEST outstanding deadline, `None` when
+    /// no task has one.
+    ///
+    /// sozu#1826: this used to wait for the LATEST deadline. A silent worker
+    /// produces no readiness, so with two tasks pending, the one due first
+    /// was only reaped — and its client only answered — once the later one
+    /// expired.
+    fn next_poll_timeout(&self, now: Instant) -> Option<Duration> {
+        self.tasks
+            .values()
+            .filter_map(|task| task.timeout)
+            .min()
+            .map(|deadline| deadline.saturating_duration_since(now))
     }
 
     fn handle_worker_response(&mut self, worker_id: WorkerId, response: WorkerResponse) {
@@ -2562,6 +2577,56 @@ mod tests {
         assert_eq!(
             ids, expected,
             "every scattered entry must reach the worker, in order, past the back buffer ceiling"
+        );
+    }
+
+    /// Regression (sozu#1826): the event loop must wake up for the EARLIEST
+    /// task deadline, not the latest one.
+    ///
+    /// Two worker-backed tasks are scattered to a worker that never answers,
+    /// with deadlines A (50 ms) < B (60 s). Nothing else produces readiness,
+    /// so the `poll` timeout is the only thing that brings the loop back to
+    /// the sweep that reaps an expired task. That timeout must not outlast A.
+    ///
+    /// To SEE THIS RED: select the deadline with `.max()` in
+    /// `CommandHub::next_poll_timeout` — the loop then sleeps until B.
+    #[test]
+    fn poll_wakes_up_for_the_earliest_task_deadline() {
+        let mut hub = create_test_hub();
+        let (_silent_worker, _scm) = register_test_worker(&mut hub.server, 0, 4096, 65536);
+
+        let early = Duration::from_millis(50);
+        let late = Duration::from_secs(60);
+        let mut task_ids = vec![];
+        for timeout in [late, early] {
+            let task_id = hub.server.new_task(
+                Box::new(TallyTask {
+                    gatherer: DefaultGatherer::default(),
+                    seen: Default::default(),
+                }),
+                Timeout::Custom(timeout),
+            );
+            hub.server
+                .scatter_on(RequestType::Status(Status {}).into(), task_id, 1, None);
+            task_ids.push(task_id);
+        }
+        // What the top of `run` does once per iteration: queued tasks migrate
+        // into the hub's task map.
+        let queued = std::mem::take(&mut hub.server.queued_tasks);
+        hub.tasks.extend(queued);
+        assert_eq!(hub.tasks.len(), 2, "both tasks must be pending");
+        assert_eq!(
+            hub.server.in_flight.len(),
+            2,
+            "both tasks must still be owed an answer by the silent worker"
+        );
+
+        let poll_timeout = hub
+            .next_poll_timeout(Instant::now())
+            .expect("pending tasks with deadlines must bound the poll timeout");
+        assert!(
+            poll_timeout <= early,
+            "the loop must wake up by the earliest deadline ({early:?}), got {poll_timeout:?}"
         );
     }
 }

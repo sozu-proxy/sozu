@@ -49,7 +49,10 @@ The supervisor is a single-threaded mio event loop. Each tick:
   `LoadStaticConfigTask`, `WorkerTask`, `QueryMetricsTask`,
   `LoadStateTask`, `StatusTask`, `StopTask`, …);
 - ticks per-task timeouts (`Timeout`, `server.rs`) so a wedged worker
-  cannot block a client forever.
+  cannot block a client forever. `poll` blocks at most until the earliest
+  outstanding task deadline (`CommandHub::next_poll_timeout`), so a task
+  whose worker stays silent is reaped at its own deadline, not at the
+  latest deadline of any other pending task (sozu#1826).
 
 `CommandHub` (`server.rs`) owns the per-client and per-worker session
 maps; it derefs to `Server` (`Deref` / `DerefMut for CommandHub`,

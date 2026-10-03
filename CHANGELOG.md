@@ -3984,6 +3984,14 @@
 
 ### 🐛 Fixed
 
+- **`fix(command)`: a pending control command times out at its own deadline
+  ([#1826](https://github.com/sozu-proxy/sozu/issues/1826)).** The main-process event loop
+  computed its `poll` timeout from the LATEST deadline of the pending tasks. A worker that stays
+  silent produces no readiness, so with two worker-backed commands pending, the one due first was
+  only reaped, and its client only answered, once the later deadline expired. The loop now blocks
+  at most until the earliest outstanding deadline (`CommandHub::next_poll_timeout`,
+  `bin/src/command/server.rs`); pinned by `poll_wakes_up_for_the_earliest_task_deadline`.
+
 - **`test(e2e)`: `test_issue_806` no longer times the host's scheduler against its reconnect
   budget.** `try_backend_stop` (`e2e/src/tests/tests.rs`) compared the wall-clock round trip of the
   request that follows the backend stop with a 100 ms budget. On a loaded host the round trip of a
