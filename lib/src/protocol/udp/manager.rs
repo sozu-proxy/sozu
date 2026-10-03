@@ -6,8 +6,9 @@
 //! limits (`max_flows_per_ip` / `max_flows_per_subnet`), pluggable flow-key
 //! extraction ([`FlowKeyExtractor`]), backend selection for new flows (from
 //! the [`BackendSource`] view the embedder supplies), and the
-//! timer scheduling: a **single armed manager-wide deadline** plus per-flow
-//! **generation tokens** so a stale expiry can never close a refreshed flow.
+//! timer scheduling: a **single armed manager-wide deadline**, with each
+//! expiry **revalidating every flow's idle deadline** so a stale expiry can
+//! never close a refreshed flow.
 //!
 //! Pure: every entry point that depends on time takes `now: Instant`; the hash
 //! seed is injected at construction. The shell drives the manager with
@@ -579,10 +580,11 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
 
     // ---- timers ------------------------------------------------------------
 
-    /// Fire all flows whose idle deadline has elapsed at `now`. A flow is only
-    /// closed if its generation token still matches the scheduled deadline —
-    /// generation mismatch means the flow saw traffic and was rescheduled, so
-    /// the stale expiry is ignored (defeats the busy-loop / stale-close bug).
+    /// Fire all flows whose idle deadline has elapsed at `now`. Deadline
+    /// revalidation: a flow is selected, and re-checked before its close, by
+    /// `idle_deadline <= now` alone. A flow that saw traffic since the expiry
+    /// was armed has a later `idle_deadline`, so the stale expiry leaves it
+    /// open; `UdpFlow::timer_gen` is not consulted.
     ///
     /// Called ONLY from a wheel expiry: the shell's single timer entry has just
     /// been delivered and consumed. `now` is therefore the wheel's tick date,
@@ -626,8 +628,8 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
         // Strict-advance guard: after firing every flow due at `now`, the next
         // armed deadline (if any) MUST be strictly greater than `now`. A
         // deadline `<= now` would make the shell immediately re-fire and spin —
-        // the canonical sans-io busy-loop bug. This is the real reason the
-        // generation tokens + `reschedule` exist.
+        // the canonical sans-io busy-loop bug. Deadline revalidation above plus
+        // consume-then-reschedule are what uphold it.
         #[cfg(debug_assertions)]
         if let Some(next) = self.armed_deadline {
             debug_assert!(
@@ -1670,7 +1672,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_race_resolved_by_generation_token() {
+    fn idle_race_resolved_by_deadline_revalidation() {
         // A datagram refreshes the deadline; the stale expiry must NOT close.
         let mut cfg = cluster("dns");
         cfg.front_timeout = Duration::from_secs(10);
@@ -1706,7 +1708,12 @@ mod tests {
         );
         drain(&mut mgr);
         let gen1 = mgr.flow(flow).unwrap().timer_gen;
-        assert_ne!(gen0, gen1, "generation token must bump on touch");
+        assert_ne!(gen0, gen1, "touch advances the timer_gen refresh counter");
+        assert_eq!(
+            mgr.flow(flow).unwrap().idle_deadline,
+            t5 + Duration::from_secs(10),
+            "touch pushes the idle deadline, which handle_timeout revalidates"
+        );
         // Stale expiry at the original t=10 deadline must NOT close (deadline is
         // now t=15).
         mgr.handle_timeout(now + Duration::from_secs(10));
@@ -2252,12 +2259,12 @@ mod tests {
         quickcheck(prop as fn(Vec<Step>) -> bool);
     }
 
-    /// Property: an idle-timeout race is always resolved by generation tokens —
+    /// Property: an idle-timeout race is always resolved by deadline revalidation —
     /// for any refresh strictly inside the timeout window, a stale expiry at the
     /// original deadline never closes a refreshed flow, and the refreshed
     /// deadline eventually does.
     #[test]
-    fn prop_generation_token_defeats_stale_close() {
+    fn prop_deadline_revalidation_defeats_stale_close() {
         fn prop(refresh_offset: u8) -> bool {
             let timeout = 20u64;
             // Refresh at 1..=timeout-1 seconds (strictly inside the window).
@@ -2277,8 +2284,7 @@ mod tests {
             );
             while mgr.poll_output().is_some() {}
 
-            // Refresh inside the window: bumps the generation, pushes the
-            // deadline forward.
+            // Refresh inside the window: pushes the deadline forward.
             let refreshed_at = now + Duration::from_secs(offset);
             mgr.handle_input(
                 ManagerInput::ClientDatagram {
