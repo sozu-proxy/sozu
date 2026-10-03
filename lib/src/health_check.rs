@@ -1163,7 +1163,7 @@ mod tests {
     use sozu_command::proto::command::HttpStatusRange;
 
     use super::*;
-    use crate::backends::HealthState;
+    use crate::backends::{Backend, HealthState};
 
     /// An HTTP-mode config judging statuses by `expected_status` and
     /// `accepted_statuses` (given as `(start, end)` pairs).
@@ -1399,6 +1399,43 @@ mod tests {
 
         assert!(state.record_success(3));
         assert!(state.is_healthy());
+    }
+
+    #[test]
+    fn late_result_after_remove_and_readd_same_identity_does_not_mutate_replacement() {
+        const CLUSTER: &str = "late-result-cluster";
+        const BACKEND: &str = "late-result-backend";
+        let address: SocketAddr = "127.0.0.1:23110".parse().unwrap();
+        let mut backend_map = BackendMap::new();
+        backend_map.add_backend(CLUSTER, Backend::new(BACKEND, address, None, None, None));
+        let backends = Rc::new(RefCell::new(backend_map));
+
+        assert_eq!(
+            backends.borrow_mut().remove_backend(CLUSTER, &address),
+            vec![BACKEND.to_owned()]
+        );
+        backends
+            .borrow_mut()
+            .add_backend(CLUSTER, Backend::new(BACKEND, address, None, None, None));
+
+        let mut stale_config = h2c_config(0);
+        stale_config.unhealthy_threshold = 1;
+        HealthChecker::record_check_result(
+            &backends,
+            CLUSTER,
+            BACKEND,
+            address,
+            false,
+            &stale_config,
+        );
+
+        assert!(
+            backends.borrow().backends[CLUSTER].backends[0]
+                .borrow()
+                .health
+                .is_healthy(),
+            "a late result from the removed generation must not mark its replacement DOWN"
+        );
     }
 
     fn h2c_config(expected: u32) -> HealthCheckConfig {

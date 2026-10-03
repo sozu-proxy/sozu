@@ -1,0 +1,34 @@
+log_level = "info"
+log_target = "stdout"
+command_socket = "@SOCKET@"
+command_buffer_size = 16384
+max_command_buffer_size = 163840
+worker_count = 1
+worker_automatic_restart = false
+worker_timeout = 10
+handle_process_affinity = false
+max_connections = 100
+max_buffers = 200
+min_buffers = 1
+buffer_size = 16393
+ctl_command_timeout = 60000
+pid_file_path = "@PIDFILE@"
+front_timeout = 120
+back_timeout = 120
+connect_timeout = 3
+request_timeout = 120
+zombie_check_interval = 1800
+activate_listeners = true
+
+[[listeners]]
+protocol = "tcp"
+address = "127.0.0.1:@FRONT_PORT@"
+
+[clusters.long_lived_tcp]
+protocol = "tcp"
+frontends = [
+  { address = "127.0.0.1:@FRONT_PORT@" },
+]
+backends = [
+  { address = "127.0.0.1:@BACKEND_PORT@", backend_id = "long-lived-backend" },
+]

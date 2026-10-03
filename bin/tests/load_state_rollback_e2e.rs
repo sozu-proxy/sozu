@@ -1,7 +1,7 @@
 //! sozu#1313 end-to-end coverage: the state replay, against a real master and
 //! a real worker.
 //!
-//! Three cases, one per half of the incident:
+//! Four cases, one per replay lifecycle boundary:
 //!
 //! 1. [`a_state_file_larger_than_the_command_buffer_loads_completely`] — the
 //!    operator's actual shape. A state file many times larger than the worker
@@ -21,6 +21,11 @@
 //! 3. [`a_mixed_state_file_keeps_the_accepted_entries_and_reverts_the_rejected_one`]
 //!    — the two must coexist in ONE file: the rejected entry is reverted, every
 //!    accepted entry survives, and the operator is told how many were reverted.
+//! 4. [`a_malformed_suffix_reports_failure_after_applying_the_valid_prefix`]
+//!    — state replay is incremental rather than transactional. A valid prefix
+//!    reaches both the master's saved state and the worker's live state before
+//!    malformed trailing bytes make the command fail. This characterises the
+//!    recovery boundary without asserting an unsupported whole-file rollback.
 //!
 //! The rejected entry is an `AddHttpFrontend` on an address that has NO HTTP
 //! listener. It is well-formed, so it passes the master's pre-dispatch
@@ -610,5 +615,91 @@ fn a_mixed_state_file_keeps_the_accepted_entries_and_reverts_the_rejected_one() 
     assert!(
         load_output.contains("reverted entries: 1"),
         "the operator must be told how many entries were rolled back.\n{load_output}"
+    );
+}
+
+#[test]
+#[ignore = "process-level: spawns a real master and worker; run from the dedicated CI step or with --ignored (see module docs)"]
+fn a_malformed_suffix_reports_failure_after_applying_the_valid_prefix() {
+    const PREFIX_CLUSTER: &str = "prefix-applied-before-malformed-suffix";
+
+    let instance = Instance::start(163_840, None);
+    let state_path = instance.path("malformed-suffix.state");
+
+    let (before_main, before_main_text) = instance.saved_state();
+    let before_worker = instance.run(&["--json", "cluster", "list", "--id", PREFIX_CLUSTER]);
+    let before_worker_text = format!(
+        "stdout=\n{}\nstderr=\n{}",
+        String::from_utf8_lossy(&before_worker.stdout),
+        String::from_utf8_lossy(&before_worker.stderr),
+    );
+    assert!(
+        !before_main.hash_state().contains_key(PREFIX_CLUSTER),
+        "the fixture must start with no cluster in the master state:\n{before_main_text}"
+    );
+    assert!(
+        !before_worker_text.contains(PREFIX_CLUSTER),
+        "the fixture must start with no cluster in the worker state:\n{before_worker_text}"
+    );
+
+    let mut prefix = ConfigState::new();
+    prefix
+        .dispatch(
+            &RequestType::AddCluster(Cluster {
+                cluster_id: PREFIX_CLUSTER.to_owned(),
+                ..Default::default()
+            })
+            .into(),
+        )
+        .expect("ConfigState records the valid prefix cluster");
+    write_state_file(&prefix, &state_path);
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&state_path)
+        .expect("open the state file for corrupt suffix append");
+    file.write_all(b"{this-is-not-json}\n\0")
+        .expect("append the malformed state record");
+    file.flush().expect("flush the malformed state record");
+
+    let bytes = std::fs::read(&state_path).expect("read the malformed state fixture");
+    let (rest, requests) = parse_several_requests::<WorkerRequest>(&bytes)
+        .expect("the production parser must expose the valid prefix and malformed remainder");
+    assert_eq!(
+        requests.len(),
+        1,
+        "the fixture must contain one valid prefix record"
+    );
+    assert!(
+        !rest.is_empty(),
+        "the malformed suffix must remain unconsumed so LoadState reports failure"
+    );
+
+    let load = instance.run(&["state", "load", "-f", state_path.to_str().unwrap()]);
+    let load_output = format!(
+        "stdout=\n{}\nstderr=\n{}",
+        String::from_utf8_lossy(&load.stdout),
+        String::from_utf8_lossy(&load.stderr),
+    );
+    assert!(
+        !load.status.success(),
+        "a malformed state file must be rejected.\n{load_output}"
+    );
+
+    let (after_main, after_main_text) = instance.saved_state();
+    let after_worker = instance.run(&["--json", "cluster", "list", "--id", PREFIX_CLUSTER]);
+    let after_worker_text = format!(
+        "stdout=\n{}\nstderr=\n{}",
+        String::from_utf8_lossy(&after_worker.stdout),
+        String::from_utf8_lossy(&after_worker.stderr),
+    );
+    let master_retained_prefix = after_main.hash_state().contains_key(PREFIX_CLUSTER)
+        || after_main_text.contains(PREFIX_CLUSTER);
+    let worker_retained_prefix = after_worker_text.contains(PREFIX_CLUSTER);
+    assert_eq!(
+        (master_retained_prefix, worker_retained_prefix),
+        (true, true),
+        "LoadState applies its valid prefix before reporting the malformed suffix; \
+         master_retained={master_retained_prefix}, worker_retained={worker_retained_prefix}\n\
+         load output:\n{load_output}\nmaster state:\n{after_main_text}\nworker query:\n{after_worker_text}"
     );
 }

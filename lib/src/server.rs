@@ -5685,6 +5685,73 @@ mod remove_health_check_tests {
     }
 }
 
+/// Audit regression proof for removing a health check from a cluster whose
+/// probe already marked a backend DOWN.
+#[cfg(test)]
+mod health_check_removal_audit_test {
+    use sozu_command::proto::command::{HealthCheckConfig, LoadBalancingParams};
+
+    use super::listener_lifecycle_tests::bare_server;
+    use super::*;
+
+    const CLUSTER: &str = "health-check-removal-audit";
+
+    fn backend_is_healthy(server: &Server) -> bool {
+        server.backends.borrow().backends[CLUSTER].backends[0]
+            .borrow()
+            .health
+            .is_healthy()
+    }
+
+    #[test]
+    fn removing_health_check_restores_backend_left_down_by_probe() {
+        let mut server = bare_server();
+        server.notify_proxys(WorkerRequest {
+            id: "audit-add-cluster".to_owned(),
+            content: RequestType::AddCluster(Cluster {
+                cluster_id: CLUSTER.to_owned(),
+                health_check: Some(HealthCheckConfig {
+                    uri: "/livez".to_owned(),
+                    interval: 1,
+                    timeout: 1,
+                    healthy_threshold: 1,
+                    unhealthy_threshold: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .into(),
+        });
+        server.notify_proxys(WorkerRequest {
+            id: "audit-add-backend".to_owned(),
+            content: RequestType::AddBackend(AddBackend {
+                cluster_id: CLUSTER.to_owned(),
+                backend_id: format!("{CLUSTER}-0"),
+                address: SocketAddr::from(([127, 0, 0, 1], 23_111)).into(),
+                load_balancing_parameters: Some(LoadBalancingParams::default()),
+                sticky_id: None,
+                backup: None,
+            })
+            .into(),
+        });
+        server.backends.borrow().backends[CLUSTER].backends[0]
+            .borrow_mut()
+            .health
+            .record_failure(1);
+        assert!(!backend_is_healthy(&server), "test setup: backend DOWN");
+
+        server.notify_proxys(WorkerRequest {
+            id: "audit-remove-health-check".to_owned(),
+            content: RequestType::RemoveHealthCheck(CLUSTER.to_owned()).into(),
+        });
+
+        assert!(
+            backend_is_healthy(&server),
+            "removing the health check must restore a backend that no future probe can mark UP"
+        );
+    }
+}
+
 /// The SCM hand-off a worker upgrade performs: the retiring worker's listening
 /// sockets travel to the new worker over the SCM socket, and the new worker
 /// must ADOPT them instead of binding fresh ones.
@@ -5742,6 +5809,88 @@ mod remove_cluster_cascade_tests {
             address: SocketAddress::new_v4(127, 0, 0, 1, port),
             load_balancing_parameters: Some(LoadBalancingParams::default()),
             ..Default::default()
+        }
+    }
+
+    /// Admission leases belong to live frontend-session tokens, not to the
+    /// current cluster configuration object. Removing a cluster therefore
+    /// leaves the old session's contribution in both counters; re-adding the
+    /// same id lets a new session contribute alongside it; closing either
+    /// session releases exactly that token's contribution.
+    ///
+    /// To SEE THIS RED: change `untrack_all_cluster_ip`'s per-IP decrement from
+    /// `saturating_sub(1)` to `saturating_sub(0)`. The old lease then remains at
+    /// two and the post-close assertion fails, proving this observes release
+    /// rather than only reconfiguration.
+    #[test]
+    fn remove_then_readd_same_cluster_id_preserves_and_releases_live_admission_leases() {
+        let mut server = bare_server();
+        let cluster_id = ClusterId::from(REMOVED);
+        let source: IpAddr = "203.0.113.9".parse().expect("test address must parse");
+        let subnet = server.sessions.borrow().subnet_key(&source);
+        let old_token = Token(60_001);
+        let new_token = Token(60_002);
+
+        for response in send(
+            &mut server,
+            "add-old-incarnation",
+            RequestType::AddCluster(Cluster {
+                cluster_id: REMOVED.to_owned(),
+                max_connections_per_ip: Some(2),
+                max_connections_per_subnet: Some(2),
+                ..Default::default()
+            }),
+        ) {
+            assert_eq!(response.status, ResponseStatus::Ok as i32);
+        }
+        server.sessions.borrow_mut().track_cluster_connection(
+            old_token,
+            cluster_id.clone(),
+            source,
+            Some(2),
+        );
+
+        for response in send(
+            &mut server,
+            "remove-old-incarnation",
+            RequestType::RemoveCluster(REMOVED.to_owned()),
+        ) {
+            assert_eq!(response.status, ResponseStatus::Ok as i32);
+        }
+        for response in send(
+            &mut server,
+            "add-new-incarnation",
+            RequestType::AddCluster(Cluster {
+                cluster_id: REMOVED.to_owned(),
+                max_connections_per_ip: Some(2),
+                max_connections_per_subnet: Some(2),
+                ..Default::default()
+            }),
+        ) {
+            assert_eq!(response.status, ResponseStatus::Ok as i32);
+        }
+
+        {
+            let mut sessions = server.sessions.borrow_mut();
+            assert_eq!(sessions.connections_per_cluster_ip[REMOVED][&source], 1);
+            assert_eq!(sessions.connections_per_cluster_subnet[REMOVED][&subnet], 1);
+            sessions.track_cluster_connection(new_token, cluster_id, source, Some(2));
+            assert_eq!(sessions.connections_per_cluster_ip[REMOVED][&source], 2);
+            assert_eq!(sessions.connections_per_cluster_subnet[REMOVED][&subnet], 2);
+
+            sessions.untrack_all_cluster_ip(old_token);
+            assert_eq!(sessions.connections_per_cluster_ip[REMOVED][&source], 1);
+            assert_eq!(sessions.connections_per_cluster_subnet[REMOVED][&subnet], 1);
+            assert!(sessions.cluster_ip_tracks.contains_key(&new_token));
+            assert!(sessions.cluster_subnet_tracks.contains_key(&new_token));
+
+            sessions.untrack_all_cluster_ip(new_token);
+            assert!(!sessions.connections_per_cluster_ip.contains_key(REMOVED));
+            assert!(
+                !sessions
+                    .connections_per_cluster_subnet
+                    .contains_key(REMOVED)
+            );
         }
     }
 

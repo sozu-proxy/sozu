@@ -156,6 +156,7 @@ buffer_size = 16393
     // mouse capture (avoids stale escape sequences in the parent shell
     // if the test harness leaks them); `--snapshot 1` renders one
     // frame and exits.
+    let top_started = Instant::now();
     let output = Command::new(sozu_bin())
         .args([
             "-c",
@@ -167,6 +168,7 @@ buffer_size = 16393
         ])
         .output()
         .expect("spawn sozu top --snapshot 1");
+    let top_elapsed = top_started.elapsed();
 
     // Send SIGTERM to the master; SoftStop drains and exits. Give it 5 s.
     let _ = master.kill();
@@ -176,5 +178,10 @@ buffer_size = 16393
         output.status.success(),
         "sozu top --snapshot 1 exited non-zero: stderr=\n{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        top_elapsed < Duration::from_secs(2),
+        "one-frame sozu top blocked {:.2?} while joining sleeping collectors; shutdown must wake every collector",
+        top_elapsed,
     );
 }

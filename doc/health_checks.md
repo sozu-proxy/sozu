@@ -210,6 +210,20 @@ sozu cluster health-check set --id my-cluster --uri /livez --accepted-statuses 2
 Creates or replaces the health check configuration for the given cluster. Only
 `--id` is required — all other flags have sensible defaults (shown above).
 
+Each probe snapshots its policy when it is launched. `SetHealthCheck` validates
+and stores the replacement policy, then acknowledges the command without
+cancelling or rewriting probes already in flight. Those probes keep their old
+mode and request, timeout, accepted-status rule, and healthy/unhealthy thresholds
+through completion; their result can still update the backend's health after the
+new policy has been acknowledged. Only probes launched afterwards use the new
+policy. The acknowledgement is therefore a draining policy boundary, not an
+atomic cutover of work already in flight.
+
+Updating a policy does not itself launch a probe or reset the last launch time.
+The new interval controls when the next probe becomes eligible relative to that
+existing launch time. Removing a health check has the stronger cancellation and
+reset semantics described in [Remove a health check](#remove-a-health-check).
+
 The probe timeout is `--probe-timeout`, in seconds. `--timeout` (`-t`) is the
 global `sozu` command timeout, in milliseconds, on this subcommand as on every
 other: `sozu cluster health-check set --timeout 5 …` waits 5 ms for the answer

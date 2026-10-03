@@ -2630,7 +2630,6 @@ mod tests {
         ctx.closing = true;
         ctx.cluster_id = Some("cluster-1".into());
         ctx.backend_id = Some("backend-1".into());
-        ctx.sticky_session = Some("session-abc".to_owned());
 
         let original_id = ctx.id;
         let original_protocol = ctx.protocol;
@@ -2643,13 +2642,25 @@ mod tests {
         assert!(ctx.closing);
         assert_eq!(ctx.cluster_id.as_deref(), Some("cluster-1"));
         assert_eq!(ctx.backend_id.as_deref(), Some("backend-1"));
-        assert_eq!(ctx.sticky_session.as_deref(), Some("session-abc"));
         // The request id is request-scoped: a keep-alive connection's next
         // request must not inherit the previous one's.
         assert_ne!(ctx.id, original_id);
         assert_eq!(ctx.id, next_id);
         assert_eq!(ctx.protocol, original_protocol);
         assert_eq!(ctx.public_address, original_public_address);
+    }
+
+    /// Regression proof for the client-visible sticky-cookie leak reproduced
+    /// by `e2e/lifecycle/keepalive_cookie.py`: a non-sticky request on a reused
+    /// H1 connection must not inherit the preceding sticky request's value.
+    #[test]
+    fn test_reset_clears_sticky_session_for_next_request() {
+        let mut ctx = make_context();
+        ctx.sticky_session = Some("sticky-a".to_owned());
+
+        ctx.reset(Ulid::generate());
+
+        assert!(ctx.sticky_session.is_none());
     }
 
     // ── write_forwarded_for_by (RFC 7239 §6 IP-literal bracketing) ──────

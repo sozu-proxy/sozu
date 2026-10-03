@@ -2364,6 +2364,185 @@ mod tests {
         }
     }
 
+    /// Worker-backed task used to observe the command loop's real poll wakeup.
+    #[derive(Debug)]
+    struct TimeoutProbeTask {
+        gatherer: DefaultGatherer,
+        finished_at: std::rc::Rc<std::cell::Cell<Option<Instant>>>,
+        stop_server: bool,
+    }
+
+    impl GatheringTask for TimeoutProbeTask {
+        fn client_token(&self) -> Option<Token> {
+            None
+        }
+
+        fn get_gatherer(&mut self) -> &mut dyn Gatherer {
+            &mut self.gatherer
+        }
+
+        fn on_finish(
+            self: Box<Self>,
+            server: &mut Server,
+            _client: &mut OptionalClient,
+            timed_out: bool,
+        ) {
+            assert!(
+                timed_out,
+                "the silent worker must leave the task to time out"
+            );
+            self.finished_at.set(Some(Instant::now()));
+            if self.stop_server {
+                server.run_state = ServerState::Stopping;
+            }
+        }
+    }
+
+    /// Run the actual command event loop with worker-backed tasks and a worker
+    /// whose connected channel remains open but never answers.
+    fn run_silent_deadline_probe(deadlines: &[(Duration, bool)]) -> (Duration, usize, usize) {
+        let mut hub = create_test_hub();
+        let (_silent_worker, _scm) = register_test_worker(&mut hub.server, 0, 4096, 65536);
+        let started_at = Instant::now();
+        let finished_at = std::rc::Rc::new(std::cell::Cell::new(None));
+
+        for (index, (timeout, stop_server)) in deadlines.iter().copied().enumerate() {
+            let task_id = hub.server.new_task(
+                Box::new(TimeoutProbeTask {
+                    gatherer: DefaultGatherer::default(),
+                    finished_at: finished_at.clone(),
+                    stop_server,
+                }),
+                Timeout::Custom(timeout),
+            );
+            hub.server.scatter_on(
+                RequestType::Status(Status {}).into(),
+                task_id,
+                index + 1,
+                None,
+            );
+        }
+
+        assert_eq!(
+            hub.server.queued_tasks.len(),
+            deadlines.len(),
+            "every probe task must be admitted before the event loop starts"
+        );
+        assert_eq!(
+            hub.server.in_flight.len(),
+            deadlines.len(),
+            "every probe task must wait for one answer from the silent worker"
+        );
+
+        assert!(
+            !hub.run(),
+            "the probe stops normally; it is not a main-upgrade handoff"
+        );
+        let elapsed = finished_at
+            .get()
+            .expect("the designated early task must have timed out")
+            .duration_since(started_at);
+        (elapsed, hub.tasks.len(), hub.server.in_flight.len())
+    }
+
+    /// Regression (sozu#1826): one later task must not extend the poll sleep
+    /// past an earlier task's deadline.
+    ///
+    /// The first run is a positive witness for the same event loop, worker
+    /// channel and timeout callback with only A pending. The second admits A
+    /// and B (`A < B`) against one connected worker that never answers. With no
+    /// client traffic, worker reply or worker spawn, the poll deadline is the
+    /// only wakeup. The failure bound sits halfway between A and B so normal
+    /// scheduling latitude cannot make waiting until B look like waiting for A.
+    ///
+    /// To see this pass under a controlled mutation, select the minimum task
+    /// deadline at the `CommandHub::run` poll calculation. Restore the maximum
+    /// selector to see the A+B run stop around B and leave no B task pending.
+    #[test]
+    fn poll_wakes_for_the_earliest_silent_worker_task_deadline() {
+        let early = Duration::from_millis(100);
+        let late = Duration::from_secs(2);
+        let failure_bound = Duration::from_secs(1);
+
+        let (witness_elapsed, witness_remaining, witness_routes) =
+            run_silent_deadline_probe(&[(early, true)]);
+        assert_eq!(
+            witness_remaining, 0,
+            "the one-task witness must finish its only task"
+        );
+        assert_eq!(
+            witness_routes, 0,
+            "the one-task witness must retire its worker-response route"
+        );
+        assert!(
+            witness_elapsed < failure_bound,
+            "positive witness: A alone must finish before {failure_bound:?}, got {witness_elapsed:?}"
+        );
+
+        // Insert B first so neither insertion order nor task id accidentally
+        // makes the earlier deadline look privileged.
+        let (paired_elapsed, paired_remaining, paired_routes) =
+            run_silent_deadline_probe(&[(late, false), (early, true)]);
+        assert!(
+            paired_elapsed < failure_bound,
+            "A must finish before {failure_bound:?} even while B is pending; got {paired_elapsed:?}"
+        );
+        assert_eq!(
+            paired_remaining, 1,
+            "B must remain pending when A's earlier deadline wakes the loop"
+        );
+        assert_eq!(
+            paired_routes, 1,
+            "A's route must be retired while B's route remains owned by B"
+        );
+    }
+
+    /// A cancelled task must retire every response route that still names it.
+    ///
+    /// `load_state` cancels its gatherer after a framing or read error, including
+    /// errors discovered after a valid prefix was scattered. If cancellation
+    /// removes only the task container, each late worker response resolves the
+    /// retained `in_flight` id to a task that no longer exists and returns before
+    /// the terminal id is retired. Repeated failed loads then grow this map for
+    /// the lifetime of the main process.
+    #[test]
+    fn cancelling_a_task_retires_its_in_flight_response_routes() {
+        let mut server = create_test_server();
+        let task_id = server.new_task(
+            Box::new(TallyTask {
+                gatherer: DefaultGatherer::default(),
+                seen: std::rc::Rc::new(std::cell::Cell::new((0, 0, 0))),
+            }),
+            Timeout::None,
+        );
+        let unrelated_task_id = task_id + 1;
+        server.in_flight.insert(format!("0-{task_id}-1"), task_id);
+        server.in_flight.insert(format!("1-{task_id}-1"), task_id);
+        server
+            .in_flight
+            .insert(format!("0-{unrelated_task_id}-1"), unrelated_task_id);
+
+        server.cancel_task(task_id);
+
+        assert!(
+            !server.queued_tasks.contains_key(&task_id),
+            "cancellation must remove the task container"
+        );
+        assert!(
+            server
+                .in_flight
+                .values()
+                .all(|in_flight_task_id| *in_flight_task_id != task_id),
+            "cancellation must retire every late-response route for the removed task: {:?}",
+            server.in_flight
+        );
+        assert_eq!(
+            server.in_flight.get(&format!("0-{unrelated_task_id}-1")),
+            Some(&unrelated_task_id),
+            "cancellation must preserve another task's response route"
+        );
+    }
+
     /// Regression (sozu#1313): a request that can NEVER be delivered on a
     /// worker channel must be accounted as a `Failure` for the owning task.
     ///
