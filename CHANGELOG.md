@@ -3984,6 +3984,25 @@
 
 ### 🐛 Fixed
 
+- **BREAKING (library API) — `fix(backends)`: preserve backend identity and incarnation across
+  removal and health-check completion ([#1821](https://github.com/sozu-proxy/sozu/issues/1821)).**
+  `AddBackend` and `ConfigState` identify a backend by `(backend_id, address)` and admit two ids
+  at one address, but the worker dropped that identity in three places. `RemoveBackend` removed
+  every backend at the address, so removing id A answered ok while its sibling B, still listed
+  by `ConfigState` and its queries, stopped receiving traffic. HTTP/TCP and UDP health results
+  were applied to the first backend at the probed address, so a failed UDP probe of B marked A
+  DOWN. A probe still in flight when its backend was removed could complete after the same id
+  and address were added again and mark the new backend DOWN. Removal now drops only the backend
+  with the requested id at that address, and each probe captures the backend incarnation it was
+  launched for (a `Weak` handle on the live entry) and applies its result only while that entry
+  is still in the cluster: a result for a removed backend is discarded, the re-added backend
+  starts healthy, and it is probed on the next cycle without waiting for the old probe. One probe
+  is in flight per incarnation rather than per backend id. `RemoveCluster` still removes the
+  whole cluster. Library API: `BackendList::remove_backend(backend_id, address)` and
+  `BackendMap::remove_backend(cluster_id, backend_id, address)` take the backend id and return
+  whether the backend was present instead of the list of removed ids; new
+  `BackendList::find_backend_by_identity` and `BackendList::find_incarnation`.
+
 - **`test(e2e)`: `test_issue_806` no longer times the host's scheduler against its reconnect
   budget.** `try_backend_stop` (`e2e/src/tests/tests.rs`) compared the wall-clock round trip of the
   request that follows the backend stop with a 100 ms budget. On a loaded host the round trip of a

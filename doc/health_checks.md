@@ -56,6 +56,14 @@ every check cycle:
 4. Compares the HTTP status code against the accepted statuses
 5. Updates the backend's health state based on success or failure
 
+A probe is bound to the backend it was launched for, identified by its backend
+id and address: two backends of a cluster may share an address under distinct
+ids, and each probe updates only its own. When `RemoveBackend` removes a
+backend while one of its probes is in flight, the probe's result is discarded
+on completion, even if a backend with the same id and address was added in the
+meantime: the re-added backend is a new one, starts healthy, and is probed on
+the next check cycle without waiting for the old probe to end.
+
 ### Health state machine
 
 Each backend maintains a `HealthState` with counters for consecutive successes

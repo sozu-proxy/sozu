@@ -1451,6 +1451,12 @@ checks, bound to the endpoint:
 | `probe_interval_seconds` | `5`         | Delay between probes, in seconds.                                                                                         |
 | `probe_timeout_seconds`  | `2`         | Per-probe response timeout, in seconds.                                                                                   |
 
+Each probe result applies to the backend it was launched for, identified by
+its backend id and address, never to another backend at the same address. A
+probe still in flight when its backend is removed is discarded on completion,
+even if a backend with the same id and address was added in the meantime: the
+re-added backend starts with a fresh health state.
+
 A complete DNS cluster, with HRW affinity, single-reply flows, PROXY v2 to the
 backend, and a TCP-probe health check:
 

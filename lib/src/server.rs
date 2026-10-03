@@ -2973,33 +2973,18 @@ impl Server {
 
     fn remove_backend(&mut self, req_id: &str, backend: &RemoveBackend) -> WorkerResponse {
         let address = backend.address.into();
-        // Runtime removal is address-keyed and drops every backend at this
-        // address (A/B test, weighted variant, dedup race). The metrics
-        // layer is id-keyed — fan out one `remove_backend` per actually-
-        // removed id so the two identities stay in sync. Without this the
-        // `backend_id` field on the IPC message could name "A" while the
-        // runtime dropped both "A" and "B" at the same address, leaving
-        // "B"'s metrics rows orphaned forever.
-        let removed_ids = self
-            .backends
-            .borrow_mut()
-            .remove_backend(&backend.cluster_id, &address);
-        if removed_ids.is_empty() {
-            // Edge case: BackendList returned nothing (address never
-            // existed in this cluster). Honour the request's stated id
-            // anyway so a no-op request still tidies any orphan metric
-            // row from a prior identity-drift state.
-            METRICS.with(|metrics| {
-                (*metrics.borrow_mut()).remove_backend(&backend.cluster_id, &backend.backend_id);
-            });
-        } else {
-            METRICS.with(|metrics| {
-                let mut metrics = metrics.borrow_mut();
-                for id in &removed_ids {
-                    metrics.remove_backend(&backend.cluster_id, id);
-                }
-            });
-        }
+        // Runtime removal keys on `(backend_id, address)`, as `ConfigState`
+        // does: another id at the same address stays (#1821). The metrics
+        // layer is id-keyed, so the requested id is tidied even when the
+        // backend was already gone, clearing any orphan row.
+        self.backends.borrow_mut().remove_backend(
+            &backend.cluster_id,
+            &backend.backend_id,
+            &address,
+        );
+        METRICS.with(|metrics| {
+            (*metrics.borrow_mut()).remove_backend(&backend.cluster_id, &backend.backend_id);
+        });
 
         WorkerResponse::ok(req_id)
     }
