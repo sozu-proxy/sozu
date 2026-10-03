@@ -284,15 +284,7 @@ fn is_mutating_verb(req: &RequestType) -> bool {
 }
 
 impl Server {
-    /// `pending_tasks` is the number of control tasks still pending in the
-    /// command hub (`CommandHub::pending_task_count`); only `UpgradeMain`
-    /// reads it.
-    pub fn handle_client_request(
-        &mut self,
-        client: &mut ClientSession,
-        request: Request,
-        pending_tasks: usize,
-    ) {
+    pub fn handle_client_request(&mut self, client: &mut ClientSession, request: Request) {
         let request_type = match request.request_type {
             Some(req) => req,
             None => {
@@ -395,7 +387,7 @@ impl Server {
             RequestType::ListWorkers(_) => list_workers(self, client),
             RequestType::ListFrontends(inner) => list_frontend_command(self, client, inner),
             RequestType::ListListeners(_) => list_listeners(self, client),
-            RequestType::UpgradeMain(_) => upgrade_main(self, client, pending_tasks),
+            RequestType::UpgradeMain(_) => upgrade_main(self, client),
             RequestType::UpgradeWorker(worker_id) => upgrade_worker(self, client, worker_id),
             RequestType::SubscribeEvents(_) => subscribe_client_to_events(self, client),
             RequestType::ReloadConfiguration(path) => {
@@ -5953,7 +5945,7 @@ mod frontend_validation_tests {
 }
 
 #[cfg(test)]
-pub(crate) mod load_state_rollback_tests {
+mod load_state_rollback_tests {
     //! sozu#1313: the two BULK apply paths — [`super::load_state`] (the
     //! saved-state replay) and [`super::load_static_config`] — must revert PER
     //! ENTRY every entry no worker acknowledged, must end on a bounded
@@ -6105,9 +6097,9 @@ pub(crate) mod load_state_rollback_tests {
         gatherer
     }
 
-    pub(crate) type ClientPair = (ClientSession, Channel<Request, Response>);
+    pub(super) type ClientPair = (ClientSession, Channel<Request, Response>);
 
-    pub(crate) fn test_client() -> ClientPair {
+    pub(super) fn test_client() -> ClientPair {
         let (client_channel, peer) =
             Channel::<Response, Request>::generate_nonblocking(4096, 40960)
                 .expect("could not create a channel pair");
@@ -6130,7 +6122,7 @@ pub(crate) mod load_state_rollback_tests {
     /// Decode every framed `Response` queued on a client's back buffer: a
     /// nonblocking `write_message` only fills that buffer (the event loop is
     /// what flushes it), so this is where `finish_ok` / `finish_failure` land.
-    pub(crate) fn queued_responses(client: &ClientSession) -> Vec<Response> {
+    pub(super) fn queued_responses(client: &ClientSession) -> Vec<Response> {
         let data = client.channel.back_buf.data();
         let delimiter = delimiter_size();
         let mut responses = vec![];

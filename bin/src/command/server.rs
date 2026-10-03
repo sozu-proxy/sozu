@@ -829,14 +829,13 @@ impl CommandHub {
                     SIGTERM_TOKEN => self.on_sigterm(),
                     token => {
                         trace!("{:?} got event: {:?}", token, event);
-                        let pending_tasks = self.pending_task_count();
                         if let Some((server, client)) = self.get_client_mut(&token) {
                             client.update_readiness(ready);
                             match client.ready() {
                                 ClientResult::NothingToDo => {}
                                 ClientResult::NewRequest(request) => {
                                     debug!("Received new request: {:?}", request);
-                                    server.handle_client_request(client, request, pending_tasks);
+                                    server.handle_client_request(client, request);
                                     self.flush_pending_audit_events();
                                 }
                                 ClientResult::CloseSession => {
@@ -880,8 +879,8 @@ impl CommandHub {
     /// would double-count. The gate is `!= Stopped`, not `is_active`: a
     /// `Stopping` worker (the old worker of an `upgrade --worker`, whose
     /// `SoftStop` task has no deadline) that closes before answering must
-    /// still fail its requests, or that task never finishes and every later
-    /// `upgrade-main` is refused for a pending command (sozu#1832).
+    /// still fail its requests, or that task never finishes and its client is
+    /// never answered.
     fn on_worker_channel_closed(&mut self, token: &Token, worker_id: WorkerId) {
         let first_close = self
             .workers
@@ -891,20 +890,6 @@ impl CommandHub {
         if first_close {
             self.fail_in_flight_requests_of_worker(worker_id);
         }
-    }
-
-    /// Control tasks the main process still owes a terminal answer: the ones
-    /// migrated into [`Self::tasks`] and the ones queued during the current
-    /// event-loop iteration, minus those that already gathered every answer
-    /// and only wait for the next iteration to be reaped. `upgrade_main`
-    /// refuses to hand off while any is pending (sozu#1832).
-    fn pending_task_count(&mut self) -> usize {
-        self.tasks
-            .values_mut()
-            .chain(self.server.queued_tasks.values_mut())
-            .map(|task| task.job.get_gatherer().has_finished())
-            .filter(|finished| !finished)
-            .count()
     }
 
     /// How long the event loop may block in `poll` before a task deadline
@@ -2766,122 +2751,24 @@ mod tests {
         );
     }
 
-    /// Regression (sozu#1832): `upgrade-main` is refused, explicitly and at
-    /// once, while another control command is still pending.
-    ///
-    /// `UpgradeData` carries no client, task or in-flight route, and once the
-    /// handoff is confirmed the old main stops reading worker answers: a
-    /// command admitted before the upgrade had no continuation and its client
-    /// was never answered. The contract is that the upgrade waits for no one
-    /// and loses no one: it fails before any side effect (no generation bump,
-    /// no fork, no `Stopping`) and the pending command completes normally.
-    ///
-    /// The hub runs `/bin/false` as its "new binary", so a regression that
-    /// lets the upgrade proceed forks a child that exits at once instead of
-    /// re-running the test harness.
-    ///
-    /// To SEE THIS RED: drop the `pending_tasks` refusal at the top of
-    /// `upgrade_main` — the upgrade forks, bumps `boot_generation`, and fails
-    /// with "no feedback from the new main" instead.
-    #[test]
-    fn upgrade_main_is_refused_while_a_control_command_is_pending() {
-        use crate::command::requests::load_state_rollback_tests::{queued_responses, test_client};
-        use sozu_command_lib::proto::command::UpgradeMain;
-
-        let dir = tempfile::tempdir().expect("Could not create temp dir");
-        let unix_listener =
-            UnixListener::bind(dir.path().join("test.sock")).expect("Could not bind socket");
-        let mut hub = CommandHub::new(unix_listener, Config::default(), "/bin/false".to_owned())
-            .expect("Could not create command hub");
-        let (_silent_worker, _scm) = register_test_worker(&mut hub.server, 0, 4096, 65536);
-
-        // Client A's command: held by a worker that has not answered yet.
-        let seen = std::rc::Rc::new(std::cell::Cell::new((0, 0, 0)));
-        let pending = hub.server.new_task(
-            Box::new(TallyTask {
-                gatherer: DefaultGatherer::default(),
-                seen: seen.clone(),
-            }),
-            Timeout::Default,
-        );
-        hub.server
-            .scatter_on(RequestType::Status(Status {}).into(), pending, 1, None);
-        let queued = std::mem::take(&mut hub.server.queued_tasks);
-        hub.tasks.extend(queued);
-        assert_eq!(hub.pending_task_count(), 1);
-
-        // Client B asks for the upgrade meanwhile.
-        let (mut client_b, _peer) = test_client();
-        let pending_tasks = hub.pending_task_count();
-        hub.server.handle_client_request(
-            &mut client_b,
-            RequestType::UpgradeMain(UpgradeMain {}).into(),
-            pending_tasks,
-        );
-
-        let responses = queued_responses(&client_b);
-        let last = responses.last().expect("client B must be answered");
-        assert_eq!(
-            last.status,
-            ResponseStatus::Failure as i32,
-            "the upgrade must be refused: {responses:?}"
-        );
-        assert!(
-            last.message.contains("1 control command"),
-            "the refusal must name what the upgrade waits for: {:?}",
-            last.message
-        );
-        assert_eq!(
-            hub.server.boot_generation, 0,
-            "a refused upgrade is not a new generation"
-        );
-        assert_eq!(hub.server.run_state, ServerState::Running);
-        assert!(!hub.server.upgrading);
-
-        // Client A's command is untouched and completes as usual.
-        hub.handle_worker_response(
-            0,
-            WorkerResponse {
-                id: format!("0-{pending}-1"),
-                status: ResponseStatus::Ok.into(),
-                message: String::new(),
-                content: None,
-            },
-        );
-        let mut container = hub.tasks.remove(&pending).expect("the task must survive");
-        assert!(container.job.get_gatherer().has_finished());
-        hub.handle_finishing_task(pending, container, false);
-        assert_eq!(
-            seen.get(),
-            (1, 0, 1),
-            "the pending command must complete with its answer"
-        );
-        assert!(hub.server.in_flight.is_empty());
-        assert_eq!(hub.pending_task_count(), 0);
-    }
-
-    /// Regression (sozu#1832 follow-up): a `Stopping` worker that closes
-    /// before answering fails its in-flight requests, so a task with no
-    /// deadline waiting on it finishes and no longer blocks `upgrade-main`.
+    /// Regression: a `Stopping` worker that closes before answering fails
+    /// its in-flight requests, so a task with no deadline waiting on it
+    /// finishes and its client is answered.
     ///
     /// `upgrade --worker` marks the old worker `Stopping`, then waits for its
     /// `SoftStop` answer in a `Timeout::None` task. The close path only
     /// synthesised failures for an `is_active` worker, which `Stopping` is
-    /// not: the task never finished, `pending_task_count` stayed at one, and
-    /// every later `upgrade-main` was refused until the main process
-    /// restarted. The refusal is exactly `pending_task_count() > 0`, pinned by
-    /// `upgrade_main_is_refused_while_a_control_command_is_pending`; this test
-    /// asserts that input instead of driving `upgrade_main` to its `fork`,
-    /// which a multi-threaded test binary must not reach.
+    /// not: the task never finished and stayed in the hub, with its route in
+    /// `in_flight`, until the main process restarted.
     ///
     /// The worker's pid is a child this test owns, so the real
     /// `close_worker` `SIGKILL` reaches it and not the test's process group.
     ///
     /// To SEE THIS RED: gate `on_worker_channel_closed`'s failure synthesis on
-    /// `WorkerSession::is_active` again — the task stays unfinished and
-    /// pending.
+    /// `WorkerSession::is_active` again — the route stays in `in_flight` and
+    /// the task stays unfinished.
     #[test]
-    fn a_stopping_worker_closing_unblocks_upgrade_main() {
+    fn a_stopping_worker_closing_finishes_its_pending_task() {
         let mut hub = create_test_hub();
         let (_worker_0, _scm_0) = register_test_worker(&mut hub.server, 0, 4096, 65536);
         let mut child = std::process::Command::new("sleep")
@@ -2916,7 +2803,20 @@ mod tests {
         );
         let queued = std::mem::take(&mut hub.server.queued_tasks);
         hub.tasks.extend(queued);
-        assert_eq!(hub.pending_task_count(), 1);
+        assert_eq!(
+            hub.server.in_flight.len(),
+            1,
+            "the SoftStop must be owed an answer by the Stopping worker"
+        );
+        assert!(
+            !hub.tasks
+                .get_mut(&soft_stop)
+                .expect("the SoftStop task is pending")
+                .job
+                .get_gatherer()
+                .has_finished(),
+            "the SoftStop task must wait for its worker"
+        );
 
         // The old worker exits without answering its `SoftStop`.
         hub.on_worker_channel_closed(&token, 0);
@@ -2927,23 +2827,24 @@ mod tests {
         let status = child.wait().expect("could not reap the stand-in worker");
         assert!(!status.success(), "close_worker must have killed it");
 
-        assert!(hub.server.in_flight.is_empty());
-        assert_eq!(
-            hub.pending_task_count(),
-            0,
-            "a finished task must not refuse upgrade-main in the same poll batch"
+        assert!(
+            hub.server.in_flight.is_empty(),
+            "the Stopping worker's close must retire its in-flight route"
         );
         let mut container = hub
             .tasks
             .remove(&soft_stop)
             .expect("the task is reaped by the next loop iteration");
-        assert!(container.job.get_gatherer().has_finished());
+        assert!(
+            container.job.get_gatherer().has_finished(),
+            "the Stopping worker's close must finish the SoftStop task"
+        );
         hub.handle_finishing_task(soft_stop, container, false);
         assert_eq!(
             seen.get(),
             (0, 1, 1),
             "the unanswered SoftStop must be accounted as one failure"
         );
-        assert_eq!(hub.pending_task_count(), 0);
+        assert!(hub.tasks.is_empty() && hub.server.queued_tasks.is_empty());
     }
 }

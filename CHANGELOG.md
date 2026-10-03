@@ -3997,26 +3997,15 @@
 
 ### 🐛 Fixed
 
-- **`fix(command)`: `sozu upgrade` refuses to upgrade the main process while another control
-  command is pending
-  ([#1832](https://github.com/sozu-proxy/sozu/issues/1832)).** `UpgradeData` carries no client,
-  task or worker-response route, and the old main process stops reading worker answers once the
-  handoff is confirmed, so a command admitted before the upgrade (a `state load`, an
-  `upgrade --worker`, a soft `shutdown`, or any command a silent worker still holds) was never
-  answered. `upgrade_main` (`bin/src/command/upgrade.rs`) now refuses while
-  `CommandHub::pending_task_count` is non-zero: the requesting client receives an immediate
-  `Failure` (`Cannot upgrade the main process: N control command(s) still pending, which the new
-  main process would not inherit. Retry once they complete`) before any side effect, with no
-  `boot_generation` bump, no `MainUpgraded` audit success and no fork, and the pending commands
-  complete normally. A command with no deadline, such as an `upgrade --worker` waiting for the old
-  worker's soft stop, keeps the main-process upgrade refused until it completes, or until the old
-  worker's channel closes: the first close of a `Stopping` worker now answers its in-flight requests
-  with synthetic failures (`CommandHub::on_worker_channel_closed`), where the close path used to
-  skip any worker that was not active and left that task, and the refusal, in place until the main
-  process restarted. A task that already gathered every answer no longer counts as pending.
-  Documented in `doc/configure_cli.md` and `bin/src/command/LIFECYCLE.md`; pinned by
-  `upgrade_main_is_refused_while_a_control_command_is_pending` and
-  `a_stopping_worker_closing_unblocks_upgrade_main`.
+- **`fix(command)`: a stopping worker that closes answers its in-flight control commands.** The
+  old worker of an `upgrade --worker` is marked `Stopping`, then its `SoftStop` answer is awaited by
+  a task with no deadline. The worker-close path synthesised failures only for an active worker, so
+  a `Stopping` worker whose channel closed before it answered left that task, its `in_flight` route
+  and its client waiting until the main process restarted. The first close of any worker that is
+  not yet `Stopped` now answers its in-flight requests with synthetic failures
+  (`CommandHub::on_worker_channel_closed`, `bin/src/command/server.rs`); a repeated close of the
+  same, now `Stopped`, session still synthesises nothing. Documented in
+  `bin/src/command/LIFECYCLE.md`; pinned by `a_stopping_worker_closing_finishes_its_pending_task`.
 
 - **`fix(command)`: cancelling a control task retires its worker-response routes
   ([#1827](https://github.com/sozu-proxy/sozu/issues/1827)).** `Server::cancel_task`
@@ -4035,6 +4024,7 @@
   only reaped, and its client only answered, once the later deadline expired. The loop now blocks
   at most until the earliest outstanding deadline (`CommandHub::next_poll_timeout`,
   `bin/src/command/server.rs`); pinned by `poll_wakes_up_for_the_earliest_task_deadline`.
+
 - **`fix(metrics)`: metric-detail leases expire without another worker command
   ([#1831](https://github.com/sozu-proxy/sozu/issues/1831)).** The lease janitor
   (`Aggregator::lease_tick`) ran only at the top of `Server::notify`, which only a worker command
