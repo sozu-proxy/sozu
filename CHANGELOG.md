@@ -4026,6 +4026,18 @@
   `test_reset_preserves_connection_state` that `reset` keeps `sticky_session` encoded the defect
   and is removed.
 
+- **`fix(logging)`: protobuf access logs sent to a `tcp://` target no longer drop short-write
+  progress ([#1830](https://github.com/sozu-proxy/sozu/issues/1830)).** The protobuf `Tcp` arm of
+  `InnerLogger::log_access` (`command/src/logging/logs.rs`) called `TcpStream::write` once and
+  treated any byte count as success, so a stream that accepted only a prefix truncated the record,
+  and the decoder then read the next record's bytes as the rest of it. The record now goes through
+  `write_stream_record`, which uses `write_all` as the ASCII `Tcp` arm already did; an error still
+  surfaces to `log_access`, which reports it and revives the backend. The framing (length
+  delimiter, record, two zero bytes) moves unchanged into `encode_protobuf_access_log` so a test
+  can drive both steps through a short-writing sink. Tests:
+  `short_writes_keep_consecutive_protobuf_records_framed` (red with the pre-fix `write`: the first
+  record decodes with `BufferUnderflow`), `a_stream_record_error_is_propagated`.
+
 - **`fix(top)`: `sozu top` exits without waiting out its collectors' polling interval
   ([#1829](https://github.com/sozu-proxy/sozu/issues/1829)).** After the render loop returned,
   `run_top` (`bin/src/ctl/top/mod.rs`) joined the snapshot, listeners and certs threads, but

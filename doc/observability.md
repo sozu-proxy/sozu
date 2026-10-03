@@ -464,6 +464,13 @@ writes into the formatter, never `to_string()`, `format!` or
 `AsString::as_string_or` in the argument list of `InnerLogger::log_access`.
 The protobuf format (`access_logs_format = "protobuf"`) is a separate path,
 `RequestRecord::into_binary_access_log`, and these tests do not measure it.
+Each protobuf record is framed by `encode_protobuf_access_log`
+(`command/src/logging/logs.rs`): the prost length delimiter, the record, then
+two zero bytes. A `tcp://` target receives the frame through
+`write_stream_record`, which uses `write_all`: a stream may accept only a
+prefix, and a discarded count would truncate the record and shift every record
+after it ([#1830](https://github.com/sozu-proxy/sozu/issues/1830),
+`short_writes_keep_consecutive_protobuf_records_framed`).
 
 ### Where a frontend's `--tags` come from
 
