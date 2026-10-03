@@ -51,8 +51,13 @@ The supervisor is a single-threaded mio event loop. Each tick:
 - ticks per-task timeouts (`Timeout`, `server.rs`) so a wedged worker
   cannot block a client forever. `poll` blocks at most until the earliest
   outstanding task deadline (`CommandHub::next_poll_timeout`), so a task
-  whose worker stays silent is reaped at its own deadline, not at the
-  latest deadline of any other pending task (sozu#1826).
+  with a deadline whose worker stays silent is reaped at its own deadline,
+  not at the latest deadline of any other pending task (sozu#1826). A task
+  scattered with `Timeout::None` has no deadline: it ends only when its
+  workers answer or their channels close. The first close of any worker
+  that is not yet `Stopped`, a `Stopping` one included, answers its
+  in-flight requests with synthetic failures
+  (`CommandHub::on_worker_channel_closed`).
 
 `CommandHub` (`server.rs`) owns the per-client and per-worker session
 maps; it derefs to `Server` (`Deref` / `DerefMut for CommandHub`,
@@ -311,7 +316,9 @@ naming the number of pending commands, before any side effect (no
 pending commands complete normally. The operator retries once they are done.
 A command with no deadline, such as an `UpgradeWorker` waiting for the old
 worker's soft stop or a soft `shutdown` draining the fleet, keeps the upgrade
-refused until it completes.
+refused until it completes; an `UpgradeWorker` also completes when the old
+worker's channel closes before it answers. A task that already gathered every
+answer and only waits to be reaped is not counted as pending.
 
 `UpgradeWorker` follows the analogous pattern through `upgrade_worker`
 (`bin/src/command/upgrade.rs`) and re-exec of an individual worker.

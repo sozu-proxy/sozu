@@ -3996,9 +3996,14 @@
   main process would not inherit. Retry once they complete`) before any side effect, with no
   `boot_generation` bump, no `MainUpgraded` audit success and no fork, and the pending commands
   complete normally. A command with no deadline, such as an `upgrade --worker` waiting for the old
-  worker's soft stop, keeps the main-process upgrade refused until it completes. Documented in
-  `doc/configure_cli.md` and `bin/src/command/LIFECYCLE.md`; pinned by
-  `upgrade_main_is_refused_while_a_control_command_is_pending`.
+  worker's soft stop, keeps the main-process upgrade refused until it completes, or until the old
+  worker's channel closes: the first close of a `Stopping` worker now answers its in-flight requests
+  with synthetic failures (`CommandHub::on_worker_channel_closed`), where the close path used to
+  skip any worker that was not active and left that task, and the refusal, in place until the main
+  process restarted. A task that already gathered every answer no longer counts as pending.
+  Documented in `doc/configure_cli.md` and `bin/src/command/LIFECYCLE.md`; pinned by
+  `upgrade_main_is_refused_while_a_control_command_is_pending` and
+  `a_stopping_worker_closing_unblocks_upgrade_main`.
 
 - **`fix(command)`: cancelling a control task retires its worker-response routes
   ([#1827](https://github.com/sozu-proxy/sozu/issues/1827)).** `Server::cancel_task`

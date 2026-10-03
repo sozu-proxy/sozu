@@ -861,19 +861,7 @@ impl CommandHub {
                                     }
                                 }
                                 WorkerResult::CloseSession => {
-                                    // Only the FIRST close of a given worker
-                                    // synthesises failures: the session stays
-                                    // registered after `close_worker` and can
-                                    // report `CloseSession` again on the next
-                                    // poll, which would double-count.
-                                    let was_active = self
-                                        .workers
-                                        .get(&token)
-                                        .is_some_and(WorkerSession::is_active);
-                                    self.handle_worker_close(&token);
-                                    if was_active {
-                                        self.fail_in_flight_requests_of_worker(worker_id);
-                                    }
+                                    self.on_worker_channel_closed(&token, worker_id);
                                 }
                             }
                         }
@@ -883,12 +871,40 @@ impl CommandHub {
         }
     }
 
+    /// A worker channel reported `CloseSession`: kill the worker and answer
+    /// every request still in flight on it with a synthetic failure.
+    ///
+    /// Only the FIRST close of a given worker synthesises failures: the
+    /// session stays registered after `close_worker`, which leaves it
+    /// `Stopped`, and can report `CloseSession` again on the next poll, which
+    /// would double-count. The gate is `!= Stopped`, not `is_active`: a
+    /// `Stopping` worker (the old worker of an `upgrade --worker`, whose
+    /// `SoftStop` task has no deadline) that closes before answering must
+    /// still fail its requests, or that task never finishes and every later
+    /// `upgrade-main` is refused for a pending command (sozu#1832).
+    fn on_worker_channel_closed(&mut self, token: &Token, worker_id: WorkerId) {
+        let first_close = self
+            .workers
+            .get(token)
+            .is_some_and(|worker| worker.run_state != RunState::Stopped);
+        self.handle_worker_close(token);
+        if first_close {
+            self.fail_in_flight_requests_of_worker(worker_id);
+        }
+    }
+
     /// Control tasks the main process still owes a terminal answer: the ones
     /// migrated into [`Self::tasks`] and the ones queued during the current
-    /// event-loop iteration. `upgrade_main` refuses to hand off while any is
-    /// pending (sozu#1832).
-    fn pending_task_count(&self) -> usize {
-        self.tasks.len() + self.server.queued_tasks.len()
+    /// event-loop iteration, minus those that already gathered every answer
+    /// and only wait for the next iteration to be reaped. `upgrade_main`
+    /// refuses to hand off while any is pending (sozu#1832).
+    fn pending_task_count(&mut self) -> usize {
+        self.tasks
+            .values_mut()
+            .chain(self.server.queued_tasks.values_mut())
+            .map(|task| task.job.get_gatherer().has_finished())
+            .filter(|finished| !finished)
+            .count()
     }
 
     /// How long the event loop may block in `poll` before a task deadline
@@ -1976,7 +1992,7 @@ mod tests {
         proto::command::{
             AddBackend, CertificateSummary, CertificatesByAddress, Cluster,
             ListOfCertificatesByAddress, RequestHttpFrontend, RequestTcpFrontend, SocketAddress,
-            WorkerResponse, request::RequestType, response_content::ContentType,
+            SoftStop, WorkerResponse, request::RequestType, response_content::ContentType,
         },
     };
     use sozu_lib::metrics::METRICS;
@@ -2841,6 +2857,93 @@ mod tests {
             "the pending command must complete with its answer"
         );
         assert!(hub.server.in_flight.is_empty());
+        assert_eq!(hub.pending_task_count(), 0);
+    }
+
+    /// Regression (sozu#1832 follow-up): a `Stopping` worker that closes
+    /// before answering fails its in-flight requests, so a task with no
+    /// deadline waiting on it finishes and no longer blocks `upgrade-main`.
+    ///
+    /// `upgrade --worker` marks the old worker `Stopping`, then waits for its
+    /// `SoftStop` answer in a `Timeout::None` task. The close path only
+    /// synthesised failures for an `is_active` worker, which `Stopping` is
+    /// not: the task never finished, `pending_task_count` stayed at one, and
+    /// every later `upgrade-main` was refused until the main process
+    /// restarted. The refusal is exactly `pending_task_count() > 0`, pinned by
+    /// `upgrade_main_is_refused_while_a_control_command_is_pending`; this test
+    /// asserts that input instead of driving `upgrade_main` to its `fork`,
+    /// which a multi-threaded test binary must not reach.
+    ///
+    /// The worker's pid is a child this test owns, so the real
+    /// `close_worker` `SIGKILL` reaches it and not the test's process group.
+    ///
+    /// To SEE THIS RED: gate `on_worker_channel_closed`'s failure synthesis on
+    /// `WorkerSession::is_active` again — the task stays unfinished and
+    /// pending.
+    #[test]
+    fn a_stopping_worker_closing_unblocks_upgrade_main() {
+        let mut hub = create_test_hub();
+        let (_worker_0, _scm_0) = register_test_worker(&mut hub.server, 0, 4096, 65536);
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("could not spawn the stand-in worker process");
+        let token = {
+            let worker = hub
+                .server
+                .workers
+                .values_mut()
+                .find(|worker| worker.id == 0)
+                .expect("worker 0 is registered");
+            worker.pid = child.id() as pid_t;
+            worker.run_state = RunState::Stopping;
+            worker.token
+        };
+
+        let seen = std::rc::Rc::new(std::cell::Cell::new((0, 0, 0)));
+        let soft_stop = hub.server.new_task(
+            Box::new(TallyTask {
+                gatherer: DefaultGatherer::default(),
+                seen: seen.clone(),
+            }),
+            Timeout::None,
+        );
+        hub.server.scatter_on(
+            RequestType::SoftStop(SoftStop {}).into(),
+            soft_stop,
+            0,
+            Some(0),
+        );
+        let queued = std::mem::take(&mut hub.server.queued_tasks);
+        hub.tasks.extend(queued);
+        assert_eq!(hub.pending_task_count(), 1);
+
+        // The old worker exits without answering its `SoftStop`.
+        hub.on_worker_channel_closed(&token, 0);
+        // The session stays registered, now `Stopped`, and may report
+        // `CloseSession` again: that must not synthesise a second failure.
+        // Issued before reaping, while the pid still names our zombie child.
+        hub.on_worker_channel_closed(&token, 0);
+        let status = child.wait().expect("could not reap the stand-in worker");
+        assert!(!status.success(), "close_worker must have killed it");
+
+        assert!(hub.server.in_flight.is_empty());
+        assert_eq!(
+            hub.pending_task_count(),
+            0,
+            "a finished task must not refuse upgrade-main in the same poll batch"
+        );
+        let mut container = hub
+            .tasks
+            .remove(&soft_stop)
+            .expect("the task is reaped by the next loop iteration");
+        assert!(container.job.get_gatherer().has_finished());
+        hub.handle_finishing_task(soft_stop, container, false);
+        assert_eq!(
+            seen.get(),
+            (0, 1, 1),
+            "the unanswered SoftStop must be accounted as one failure"
+        );
         assert_eq!(hub.pending_task_count(), 0);
     }
 }
