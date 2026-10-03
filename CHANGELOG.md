@@ -642,6 +642,19 @@
 
 ### 🔄 Changed
 
+- **`docs(udp)`: describe stale idle-expiry handling as deadline revalidation
+  ([#1825](https://github.com/sozu-proxy/sozu/issues/1825)).** The UDP lifecycle documentation,
+  the `flow.rs`/`manager.rs`/`mod.rs` comments and two test names attributed the survival of a
+  refreshed flow to a generation token, but `UdpManager::handle_timeout` never reads
+  `UdpFlow::timer_gen`: it closes a flow only while `idle_deadline <= now`, and the
+  consume-then-reschedule rule re-arms the wheel. They now name that mechanism, and describe
+  `timer_gen` as a refresh counter that `touch` advances and no expiry path reads (the public field
+  stays, so the library API is unchanged). `LIFECYCLE.md` also cited `UdpListenerSession::close`
+  as the place the delivered `timer_handle` is dropped; it is the timeout handler,
+  `UdpListenerSession::timeout_at`. No behaviour changes. Tests renamed:
+  `idle_race_resolved_by_deadline_revalidation` (which now also asserts the refreshed
+  `idle_deadline`) and `prop_deadline_revalidation_defeats_stale_close`.
+
 - **`docs`: fix stale flood-window, idle-timeout and rejected-per-IP statements.** The
   `h2_flood_detector.rs` comments still sized the connection window at 1 MiB: a chained Sōzu acks
   every 8 MiB of its 16 MiB window, and a cancelled upload's in-flight DATA is bounded by the
@@ -3983,6 +3996,20 @@
   `left: 0, right: 1`.
 
 ### 🐛 Fixed
+
+- **`fix(metrics)`: metric-detail leases expire without another worker command
+  ([#1831](https://github.com/sozu-proxy/sozu/issues/1831)).** The lease janitor
+  (`Aggregator::lease_tick`) ran only at the top of `Server::notify`, which only a worker command
+  reaches, so a lease whose owner went away (a crashed `sozu top`) kept the worker's metric
+  cardinality elevated past its TTL until the next control request, whatever the data-plane
+  traffic. The janitor is now `tick_metric_detail_leases` in `lib/src/server.rs`, called once per
+  event-loop iteration (the loop wakes at least once per one-second poll timeout) as well as from
+  `notify`, still gated to one table walk per five seconds. An abandoned lease is retired, and its
+  `lease_tick_expired` `METRIC_DETAIL_CHANGED` event pushed, within TTL plus five seconds plus one
+  poll timeout. `test_abandoned_lease_expires_without_a_command`
+  (`e2e/src/tests/metrics_lifecycle_tests.rs`) applies a one-second lease on a real worker, sends
+  no further command while requests keep flowing, and waits for that event on the command channel
+  without writing to it.
 
 - **`fix(top)`: `sozu top` exits without waiting out its collectors' polling interval
   ([#1829](https://github.com/sozu-proxy/sozu/issues/1829)).** After the render loop returned,

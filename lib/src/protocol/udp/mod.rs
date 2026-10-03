@@ -3,8 +3,9 @@
 //! This module is the *pure* heart of the UDP datapath (issue #1273). It owns
 //! admission, the virtual 4-tuple flow table, the three-knob teardown
 //! state-machine, the LB-selection request protocol, and a single-deadline
-//! timer scheduler with generation tokens. It performs **no I/O**: there is no
-//! socket, no `Instant::now()` / `SystemTime`, no `rand`, and no `Arc<Mutex>`.
+//! timer scheduler that revalidates flow deadlines on expiry. It performs
+//! **no I/O**: there is no socket, no `Instant::now()` / `SystemTime`, no
+//! `rand`, and no `Arc<Mutex>`.
 //! Time is injected as `now: Instant` parameters; the hash seed is injected at
 //! construction. The single admission copy the design allows materialises the
 //! borrowed recv buffer into an owned `Vec<u8>` ([`Transmit::payload`]).
@@ -19,7 +20,7 @@
 //!   + flow-key extraction + LB request + timer scheduling.
 //! - [`flow::UdpFlow`]: per-admitted-flow teardown counters, idle /
 //!   lifetime deadlines, PPv2 bookkeeping, chosen backend, forward/return
-//!   decisions, and a `timer_gen`.
+//!   decisions, and a `timer_gen` refresh counter.
 //!
 //! Long-form lifecycle (flow state machine, NAT return, teardown, hardening):
 //! `lib/src/protocol/udp/LIFECYCLE.md`.

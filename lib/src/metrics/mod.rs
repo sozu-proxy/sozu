@@ -330,8 +330,10 @@ pub trait Subscriber {
 }
 
 /// How often `lease_tick` actually does work; cheaper than recomputing the
-/// effective level on every metric emission. Polled at the top of the worker's
-/// `notify` loop, so the cadence floats with traffic but is bounded by this.
+/// effective level on every metric emission. Polled once per worker event-loop
+/// iteration (which wakes at least once per one-second poll timeout) and on
+/// every worker command, so an expired lease is retired within this interval
+/// plus one poll timeout, with or without traffic or commands.
 const LEASE_TICK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Hard cap on lease TTL, mirroring the proto comment on `SetMetricDetail`.
@@ -721,8 +723,9 @@ impl Aggregator {
         self.leases.len() as u32
     }
 
-    /// Polled lease-expiry janitor. Called from the worker's `notify` loop
-    /// (and from periodic timers); cheap when nothing has expired. Returns
+    /// Polled lease-expiry janitor. Called from the worker's event loop on
+    /// every iteration and from `notify`, both gated by
+    /// [`Self::lease_tick_due`]; cheap when nothing has expired. Returns
     /// `Some(previous_effective)` when at least one lease expired AND that
     /// expiry actually moved the effective level (so the caller can emit a
     /// `MetricDetailChanged` audit event), or `None` for the no-change path.
@@ -768,8 +771,8 @@ impl Aggregator {
     }
 
     /// True when at least `LEASE_TICK_INTERVAL` has passed since the last
-    /// `lease_tick`. Use to gate the polled janitor at the top of `notify`
-    /// without paying a HashMap walk on every event-loop iteration.
+    /// `lease_tick`. Gates the polled janitor so the worker's event loop
+    /// does not pay a HashMap walk on every iteration.
     pub fn lease_tick_due(&self, now: Instant) -> bool {
         now.duration_since(self.last_lease_tick) >= LEASE_TICK_INTERVAL
     }
