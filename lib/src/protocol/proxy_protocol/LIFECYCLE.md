@@ -97,28 +97,30 @@ PROXY phase and the downstream protocol.
 ### 2.1 `ExpectProxyProtocol`
 
 - Type: `ExpectProxyProtocol<Front: SocketHandler>` (`expect.rs`).
-- Buffer: `frontend_buffer: [u8; 232]` — the maximum legal v2 header size
-  (Unix-socket family carries 2 × 108 bytes of address plus header overhead).
-  Hard-bounded to defend against a malicious peer that opens TCP and never
-  finishes the header.
+- Buffer: `frontend_buffer: [u8; 232]` — Sōzu's accepted v2-header capacity
+  (enough for the Unix-socket family, which carries 2 × 108 bytes of address
+  plus header overhead). It is hard-bounded to defend against a malicious peer
+  that opens TCP and never finishes the header.
 - Entry point: `ExpectProxyProtocol::readable` (`expect.rs`).
-  - `header_len` (`expect.rs:119-123`) tracks the expected read window;
-    starts at the v4 size (28 bytes), bumps to v6 (52) and finally Unix
-    (232) if `parse_v2_header` returns `Incomplete` after the prior cap.
-  - 0-byte read with `index == 0` (`expect.rs:201-214`) closes the session
+  - `read_target` starts at the fixed 16-byte v2 prelude. Once the parser has
+    validated that prelude and reports the address block incomplete, bytes
+    14-15 set the exact target to `16 + len`. The socket read never extends
+    beyond that target, so application payload coalesced after a short header
+    stays available to TCP, HTTP or HTTPS after the expect upgrade.
+  - A 0-byte read with `index == 0` closes the session
     immediately; this is the standard HAProxy bare-TCP healthcheck pattern
     (SYN/ACK/FIN with no `send-proxy`). Closing fast avoids zombie sessions
     sitting on `request_timeout` (default 10 s) and consuming the
     `nb_connections` quota.
-  - Index of 232 with the parser still `Incomplete` (`expect.rs:249-259`)
-    is the oversized-header sentinel — increment the
-    `proxy_protocol.errors` metric and close.
-  - Successful parse (`expect.rs:219-236`) stores the `ProxyAddr` into
-    `self.addresses` and returns `SessionResult::Upgrade`; the proxy then
-    swaps the session for a `Pipe` via `ExpectProxyProtocol::into_pipe` (`expect.rs`), which
-    prefers `ProxyAddr::source()` and falls back to the front socket's
-    `peer_addr` when it is `AfUnspec` — including for every `LOCAL` header
-    (§1).
+  - A target above 232 is rejected immediately after the prelude, before
+    another read. If the parser is still `Incomplete` at the declared target,
+    the header is malformed. Both cases increment `proxy_protocol.errors` and
+    close.
+  - A successful parse stores the `ProxyAddr` into `self.addresses` and returns
+    `SessionResult::Upgrade`; the proxy then swaps the session for a `Pipe` via
+    `ExpectProxyProtocol::into_pipe` (`expect.rs`), which prefers
+    `ProxyAddr::source()` and falls back to the front socket's `peer_addr` when
+    it is `AfUnspec` — including for every `LOCAL` header (§1).
 
 ### 2.2 `RelayProxyProtocol`
 
@@ -247,8 +249,8 @@ The PROXY-protocol surface is the very first byte path on a new connection,
 which makes it an attractive target. These rules are load-bearing.
 
 1. **Bounded buffers, no growth.** `ExpectProxyProtocol::frontend_buffer`
-   is a stack-sized `[u8; 232]` (`expect.rs:83`) — the maximum legal v2
-   header size. There is no growable backing — a peer that floods bytes
+   is a stack-sized `[u8; 232]` (`expect.rs:83`) — Sōzu's accepted v2-header
+   capacity. There is no growable backing — a peer that floods bytes
    without a valid header trips the oversized-header branch
    (`expect.rs:249-259`) and is closed.
 2. **TCP healthchecks bypass the protocol.** Upstream LBs probe backends

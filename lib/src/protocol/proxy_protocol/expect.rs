@@ -31,6 +31,9 @@ use crate::{
     timer::TimeoutContainer,
 };
 
+const V2_FIXED_HEADER_LEN: usize = 16;
+const MAX_HEADER_LEN: usize = 232;
+
 /// Module-level prefix used on every log line emitted from this module when
 /// no per-session state is in scope. Produces a bold bright-white
 /// `PROXY-EXPECT` label (uniform across every protocol) when the logger is in
@@ -69,6 +72,10 @@ macro_rules! log_context {
     }};
 }
 
+/// Legacy stage labels retained for library API compatibility.
+///
+/// `ExpectProxyProtocol` now derives its private read target from the v2
+/// header's length field instead of using these stages.
 #[derive(Clone, Copy)]
 pub enum HeaderLen {
     V4,
@@ -80,11 +87,11 @@ pub enum HeaderLen {
 pub struct ExpectProxyProtocol<Front: SocketHandler> {
     pub addresses: Option<ProxyAddr>,
     pub container_frontend_timeout: TimeoutContainer,
-    frontend_buffer: [u8; 232],
+    frontend_buffer: [u8; MAX_HEADER_LEN],
     pub frontend_readiness: Readiness,
     pub frontend_token: Token,
     pub frontend: Front,
-    header_len: HeaderLen,
+    read_target: usize,
     index: usize,
     pub request_id: Ulid,
 }
@@ -102,25 +109,21 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
         ExpectProxyProtocol {
             addresses: None,
             container_frontend_timeout,
-            frontend_buffer: [0; 232],
+            frontend_buffer: [0; MAX_HEADER_LEN],
             frontend_readiness: Readiness {
                 interest: Ready::READABLE | Ready::HUP | Ready::ERROR,
                 event: Ready::EMPTY,
             },
             frontend_token,
             frontend,
-            header_len: HeaderLen::V4,
+            read_target: V2_FIXED_HEADER_LEN,
             index: 0,
             request_id,
         }
     }
 
     pub fn readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-        let total_len = match self.header_len {
-            HeaderLen::V4 => 28,
-            HeaderLen::V6 => 52,
-            HeaderLen::Unix => 232,
-        };
+        let total_len = self.read_target;
 
         // Anti-oversized-header / partial-read invariant: the accumulation
         // cursor never runs past the staging window, and the per-stage target
@@ -225,6 +228,10 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
                     rest.len() <= self.index,
                     "parser remainder cannot exceed the accumulated input"
                 );
+                debug_assert!(
+                    rest.is_empty(),
+                    "exact-length reads must leave application payload in the socket"
+                );
                 trace!(
                     "{} got expect header: {:?}, rest.len() = {}",
                     log_context!(self),
@@ -234,31 +241,48 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
                 self.addresses = Some(header.addr);
                 SessionResult::Upgrade
             }
+            Err(Err::Incomplete(_)) if self.index < self.read_target => SessionResult::Continue,
+            Err(Err::Incomplete(_)) if self.read_target == V2_FIXED_HEADER_LEN => {
+                let declared_len =
+                    u16::from_be_bytes([self.frontend_buffer[14], self.frontend_buffer[15]])
+                        as usize;
+                let declared_total = V2_FIXED_HEADER_LEN + declared_len;
+
+                if declared_total > self.frontend_buffer.len() {
+                    error!(
+                        "{} proxy protocol header declares {} bytes, exceeding maximum size ({} bytes), closing",
+                        log_context!(self),
+                        declared_total,
+                        self.frontend_buffer.len()
+                    );
+                    incr!(names::proxy_protocol::ERRORS);
+                    self.frontend_readiness.reset();
+                    return SessionResult::Close;
+                }
+
+                if declared_total > V2_FIXED_HEADER_LEN {
+                    self.read_target = declared_total;
+                    return SessionResult::Continue;
+                }
+
+                error!(
+                    "{} proxy protocol header is incomplete at its declared length ({} bytes), closing",
+                    log_context!(self),
+                    declared_total
+                );
+                incr!(names::proxy_protocol::ERRORS);
+                self.frontend_readiness.reset();
+                SessionResult::Close
+            }
             Err(Err::Incomplete(_)) => {
-                match self.header_len {
-                    HeaderLen::V4 => {
-                        if self.index == 28 {
-                            self.header_len = HeaderLen::V6;
-                        }
-                    }
-                    HeaderLen::V6 => {
-                        if self.index == 52 {
-                            self.header_len = HeaderLen::Unix;
-                        }
-                    }
-                    HeaderLen::Unix => {
-                        if self.index == 232 {
-                            error!(
-                                "{} proxy protocol header exceeds maximum size (232 bytes), closing",
-                                log_context!(self)
-                            );
-                            incr!(names::proxy_protocol::ERRORS);
-                            self.frontend_readiness.reset();
-                            return SessionResult::Close;
-                        }
-                    }
-                };
-                SessionResult::Continue
+                error!(
+                    "{} proxy protocol header is incomplete at its declared length ({} bytes), closing",
+                    log_context!(self),
+                    self.read_target
+                );
+                incr!(names::proxy_protocol::ERRORS);
+                self.frontend_readiness.reset();
+                SessionResult::Close
             }
             Err(Err::Error(e)) | Err(Err::Failure(e)) => {
                 error!(
@@ -532,6 +556,55 @@ mod expect_test {
             None,
             "a LOCAL header must attribute no source, so into_pipe falls back to peer_addr"
         );
+    }
+
+    #[test]
+    fn oversized_declared_header_is_rejected_after_the_fixed_prelude() {
+        setup_test_logger!();
+        let listener = TcpListener::bind("127.0.0.1:0".parse().expect("parse address error"))
+            .expect("could not bind the middleware listener");
+        let middleware_addr = listener
+            .local_addr()
+            .expect("the middleware listener must expose its address");
+
+        let mut sender = StdTcpStream::connect(middleware_addr).expect("connect sender");
+        let mut wire = vec![
+            0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, 0x20, 0x00,
+            0x00, 0xD9, // 16 + 217 = 233, one byte beyond capacity
+        ];
+        wire.extend_from_slice(b"sentinel bytes must remain unread");
+        sender.write_all(&wire).expect("write oversized prelude");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let frontend = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "accept deadline elapsed"
+                    );
+                    thread::yield_now();
+                }
+                Err(error) => panic!("middleware accept failed: {error}"),
+            }
+        };
+
+        let mut metrics = SessionMetrics::new(None);
+        let mut expect = ExpectProxyProtocol::new(
+            TimeoutContainer::new(Duration::from_secs(10), Token(0)),
+            frontend,
+            Token(0),
+            Ulid::generate(),
+        );
+
+        assert_eq!(expect.readable(&mut metrics), SessionResult::Close);
+        assert_eq!(
+            metrics.bin, V2_FIXED_HEADER_LEN,
+            "the capacity check must happen before a second socket read"
+        );
+
+        drop(sender);
     }
 
     // Accept connection from an upfront proxy and expect to read a proxy protocol header in this stream.

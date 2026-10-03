@@ -22,7 +22,7 @@ to force that connection to close if too many of those are lingering.
 
 - `lib/src/protocol/mux/`: the HTTP/1.1 **and** HTTP/2 datapath (frame parser, HPACK, stream pool, flood detector, RFC 9218 priorities, GOAWAY drain, router, backend connect). The on-branch reference is `lib/src/protocol/mux/LIFECYCLE.md`.
 - `lib/src/protocol/kawa_h1/`: the H1 vocabulary the mux builds on — default answers and their templates, the `HttpContext` header editor, and the `Method` / hostname helpers, all on the [`kawa`](https://github.com/CleverCloud/kawa) zero-copy parser. Its own `Http` session state machine was removed on 2026-09-20 (sozu#1346) once the mux made it unreachable.
-- `lib/src/protocol/proxy_protocol/`: HAProxy PROXY protocol v1 + v2 ingest.
+- `lib/src/protocol/proxy_protocol/`: HAProxy PROXY protocol v2 ingest plus the legacy v1 header model (v1 is not accepted on the wire).
 - `lib/src/protocol/{pipe,rustls,tcp}.rs`: byte-stream pipe (post-upgrade), TLS handshake / ALPN driver, raw TCP proxy.
 - `lib/src/{http,https,tcp}.rs`: front-door dispatch for the three transport stacks.
 - `lib/src/server.rs`: the single-threaded mio event loop shared by every proxy in a worker.
