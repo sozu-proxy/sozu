@@ -49,7 +49,10 @@ The supervisor is a single-threaded mio event loop. Each tick:
   `LoadStaticConfigTask`, `WorkerTask`, `QueryMetricsTask`,
   `LoadStateTask`, `StatusTask`, `StopTask`, …);
 - ticks per-task timeouts (`Timeout`, `server.rs`) so a wedged worker
-  cannot block a client forever.
+  cannot block a client forever. `poll` blocks at most until the earliest
+  outstanding task deadline (`CommandHub::next_poll_timeout`), so a task
+  whose worker stays silent is reaped at its own deadline, not at the
+  latest deadline of any other pending task (sozu#1826).
 
 `CommandHub` (`server.rs`) owns the per-client and per-worker session
 maps; it derefs to `Server` (`Deref` / `DerefMut for CommandHub`,
@@ -259,7 +262,10 @@ closes (`CommandHub::fail_in_flight_requests_of_worker`) are accounted as
 synthetic `Failure`s, so `ok + errors` always reaches
 `expected_responses`; a terminal answer retires its `in_flight` entry
 immediately, so a worker that answers and then dies is not re-counted as a
-rejection. A bulk sender that fills a worker's back buffer past
+rejection. A replay that `load_state` abandons on a state-file parse error is
+cancelled with `Server::cancel_task`, which retires the task's `in_flight`
+routes together with the task and keeps every other task's (sozu#1827): a
+late answer or a worker closing then finds no route for it. A bulk sender that fills a worker's back buffer past
 `max_buffer_size` parks the overflow in the per-worker
 `WorkerSession::pending` queue and drains it from the WRITABLE path
 (`WorkerSession::flush_pending`), in scatter order: nothing is dropped and
@@ -294,6 +300,18 @@ live in `WorkerSession` (`bin/src/command/sessions.rs`).
 3. Workers stay alive across the swap; they continue talking to the
    surviving channel endpoints which are forwarded through the FD-handoff
    protocol.
+
+`UpgradeData` carries no client, task or `in_flight` route, and once the
+handoff is confirmed the old master stops reading worker answers. A control
+command still pending at that point would never be answered, so
+`upgrade_main` refuses the upgrade while `CommandHub::pending_task_count` is
+non-zero (sozu#1832): the requesting client receives an immediate `Failure`
+naming the number of pending commands, before any side effect (no
+`boot_generation` bump, no `MainUpgraded` audit success, no fork), and the
+pending commands complete normally. The operator retries once they are done.
+A command with no deadline, such as an `UpgradeWorker` waiting for the old
+worker's soft stop or a soft `shutdown` draining the fleet, keeps the upgrade
+refused until it completes.
 
 `UpgradeWorker` follows the analogous pattern through `upgrade_worker`
 (`bin/src/command/upgrade.rs`) and re-exec of an individual worker.

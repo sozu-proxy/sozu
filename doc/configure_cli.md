@@ -269,6 +269,26 @@ sozu --config /etc/sozu/config.toml state load --file state.json
 
 You should be able to request your cluster like before the shutdown.
 
+## Upgrade the main process
+
+```bash
+sozu --config /etc/sozu/config.toml upgrade
+```
+
+re-executes the binary installed at the running main process's path, hands the
+listeners, the state and the workers over to it, then upgrades every worker. The
+new main process does not inherit the commands the old one is still processing,
+so the upgrade is refused while any other command is pending, for example a
+`state load`, an `upgrade --worker <id>` or a soft `shutdown` still waiting
+for the workers:
+
+```text
+Cannot upgrade the main process: 1 control command(s) still pending, which the new main process would not inherit. Retry once they complete
+```
+
+Nothing is changed when this happens: the pending commands complete normally,
+and `upgrade` can be run again once they have.
+
 ### Monitor status of backends with events
 
 This CLI command:

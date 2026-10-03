@@ -757,8 +757,7 @@ impl CommandHub {
                 })
                 .collect();
 
-            let next_timeout = self.tasks.values().filter_map(|t| t.timeout).max();
-            let mut poll_timeout = next_timeout.map(|t| t.saturating_duration_since(now));
+            let mut poll_timeout = self.next_poll_timeout(now);
 
             if self.run_state == ServerState::Stopping {
                 // when closing, close all ClientSession which are not transfering data
@@ -830,13 +829,14 @@ impl CommandHub {
                     SIGTERM_TOKEN => self.on_sigterm(),
                     token => {
                         trace!("{:?} got event: {:?}", token, event);
+                        let pending_tasks = self.pending_task_count();
                         if let Some((server, client)) = self.get_client_mut(&token) {
                             client.update_readiness(ready);
                             match client.ready() {
                                 ClientResult::NothingToDo => {}
                                 ClientResult::NewRequest(request) => {
                                     debug!("Received new request: {:?}", request);
-                                    server.handle_client_request(client, request);
+                                    server.handle_client_request(client, request, pending_tasks);
                                     self.flush_pending_audit_events();
                                 }
                                 ClientResult::CloseSession => {
@@ -881,6 +881,30 @@ impl CommandHub {
                 }
             }
         }
+    }
+
+    /// Control tasks the main process still owes a terminal answer: the ones
+    /// migrated into [`Self::tasks`] and the ones queued during the current
+    /// event-loop iteration. `upgrade_main` refuses to hand off while any is
+    /// pending (sozu#1832).
+    fn pending_task_count(&self) -> usize {
+        self.tasks.len() + self.server.queued_tasks.len()
+    }
+
+    /// How long the event loop may block in `poll` before a task deadline
+    /// must be revisited: until the EARLIEST outstanding deadline, `None` when
+    /// no task has one.
+    ///
+    /// sozu#1826: this used to wait for the LATEST deadline. A silent worker
+    /// produces no readiness, so with two tasks pending, the one due first
+    /// was only reaped — and its client only answered — once the later one
+    /// expired.
+    fn next_poll_timeout(&self, now: Instant) -> Option<Duration> {
+        self.tasks
+            .values()
+            .filter_map(|task| task.timeout)
+            .min()
+            .map(|deadline| deadline.saturating_duration_since(now))
     }
 
     fn handle_worker_response(&mut self, worker_id: WorkerId, response: WorkerResponse) {
@@ -1625,8 +1649,21 @@ impl Server {
         self.queued_tasks.insert(task_id, container);
     }
 
+    /// Drop a task that is still queued, together with every worker response
+    /// route it registered.
+    ///
+    /// The task must not have migrated into `CommandHub::tasks` yet: its only
+    /// caller, `load_state`'s parse-error branch, cancels within the same
+    /// event-loop iteration as the scatter.
+    ///
+    /// sozu#1827: the routes used to stay in `in_flight`. A late worker answer
+    /// or a worker closing then resolved to the cancelled task, found no task,
+    /// and returned before any cleanup, so every failed replay leaked its
+    /// routes for the life of the main process. Routes of other tasks are kept.
     pub fn cancel_task(&mut self, task_id: TaskId) {
         self.queued_tasks.remove(&task_id);
+        self.in_flight
+            .retain(|_, in_flight_task_id| *in_flight_task_id != task_id);
     }
 
     /// Called when the main cannot communicate anymore with a worker (it's channel closed)
@@ -2563,5 +2600,247 @@ mod tests {
             ids, expected,
             "every scattered entry must reach the worker, in order, past the back buffer ceiling"
         );
+    }
+
+    /// Regression (sozu#1826): the event loop must wake up for the EARLIEST
+    /// task deadline, not the latest one.
+    ///
+    /// Two worker-backed tasks are scattered to a worker that never answers,
+    /// with deadlines A (50 ms) < B (60 s). Nothing else produces readiness,
+    /// so the `poll` timeout is the only thing that brings the loop back to
+    /// the sweep that reaps an expired task. That timeout must not outlast A.
+    ///
+    /// To SEE THIS RED: select the deadline with `.max()` in
+    /// `CommandHub::next_poll_timeout` — the loop then sleeps until B.
+    #[test]
+    fn poll_wakes_up_for_the_earliest_task_deadline() {
+        let mut hub = create_test_hub();
+        let (_silent_worker, _scm) = register_test_worker(&mut hub.server, 0, 4096, 65536);
+
+        let early = Duration::from_millis(50);
+        let late = Duration::from_secs(60);
+        let mut task_ids = vec![];
+        for timeout in [late, early] {
+            let task_id = hub.server.new_task(
+                Box::new(TallyTask {
+                    gatherer: DefaultGatherer::default(),
+                    seen: Default::default(),
+                }),
+                Timeout::Custom(timeout),
+            );
+            hub.server
+                .scatter_on(RequestType::Status(Status {}).into(), task_id, 1, None);
+            task_ids.push(task_id);
+        }
+        // What the top of `run` does once per iteration: queued tasks migrate
+        // into the hub's task map.
+        let queued = std::mem::take(&mut hub.server.queued_tasks);
+        hub.tasks.extend(queued);
+        assert_eq!(hub.tasks.len(), 2, "both tasks must be pending");
+        assert_eq!(
+            hub.server.in_flight.len(),
+            2,
+            "both tasks must still be owed an answer by the silent worker"
+        );
+
+        let poll_timeout = hub
+            .next_poll_timeout(Instant::now())
+            .expect("pending tasks with deadlines must bound the poll timeout");
+        assert!(
+            poll_timeout <= early,
+            "the loop must wake up by the earliest deadline ({early:?}), got {poll_timeout:?}"
+        );
+    }
+
+    /// Regression (sozu#1827): cancelling a task must retire every worker
+    /// response route it registered, and only those.
+    ///
+    /// `cancel_task` dropped the queued task but left its `in_flight` routes.
+    /// A late worker answer then resolved to a task that no longer exists, and
+    /// a worker closing re-fed every leftover route as a synthetic failure for
+    /// it; each failed state replay (`load_state`'s parse-error branch, the
+    /// only caller) leaked its routes for the life of the main process.
+    ///
+    /// To SEE THIS RED: drop the `in_flight.retain` from `Server::cancel_task`
+    /// — the cancelled task's two routes survive the cancellation.
+    #[test]
+    fn cancelling_a_task_retires_only_its_response_routes() {
+        let mut hub = create_test_hub();
+        let (_worker_0, _scm_0) = register_test_worker(&mut hub.server, 0, 4096, 65536);
+        let (_worker_1, _scm_1) = register_test_worker(&mut hub.server, 1, 4096, 65536);
+
+        let new_tally_task = |hub: &mut CommandHub, seen| {
+            hub.server.new_task(
+                Box::new(TallyTask {
+                    gatherer: DefaultGatherer::default(),
+                    seen,
+                }),
+                Timeout::None,
+            )
+        };
+        let cancelled_seen = std::rc::Rc::new(std::cell::Cell::new((0, 0, 0)));
+        let cancelled = new_tally_task(&mut hub, cancelled_seen.clone());
+        hub.server
+            .scatter_on(RequestType::Status(Status {}).into(), cancelled, 1, None);
+        let kept_seen = std::rc::Rc::new(std::cell::Cell::new((0, 0, 0)));
+        let kept = new_tally_task(&mut hub, kept_seen.clone());
+        hub.server
+            .scatter_on(RequestType::Status(Status {}).into(), kept, 1, Some(0));
+        assert_eq!(
+            hub.server.in_flight.len(),
+            3,
+            "2 + 1 routes before cancelling"
+        );
+
+        hub.server.cancel_task(cancelled);
+
+        let routes: Vec<(RequestId, TaskId)> = hub
+            .server
+            .in_flight
+            .iter()
+            .map(|(id, task)| (id.clone(), *task))
+            .collect();
+        assert_eq!(
+            routes,
+            vec![(format!("0-{kept}-1"), kept)],
+            "cancellation must retire the cancelled task's routes and keep the other task's"
+        );
+
+        // A late answer to the cancelled task finds no route at all...
+        hub.handle_worker_response(
+            1,
+            WorkerResponse {
+                id: format!("1-{cancelled}-1"),
+                status: ResponseStatus::Ok.into(),
+                message: String::new(),
+                content: None,
+            },
+        );
+        // ...and worker 0 closing fails only what is still owed on it: the
+        // kept task's route, never the cancelled task's.
+        hub.fail_in_flight_requests_of_worker(0);
+
+        assert!(
+            hub.server.in_flight.is_empty(),
+            "no route may outlive the worker answers and closure that retire them"
+        );
+        let mut container = hub
+            .server
+            .queued_tasks
+            .remove(&kept)
+            .expect("the kept task must still be queued");
+        assert!(
+            container.job.get_gatherer().has_finished(),
+            "worker 0 closing must complete the kept task"
+        );
+        hub.handle_finishing_task(kept, container, false);
+        assert_eq!(
+            kept_seen.get(),
+            (0, 1, 1),
+            "the kept task must account its own worker's closure as one failure"
+        );
+        assert!(
+            hub.server.queued_tasks.is_empty() && hub.tasks.is_empty(),
+            "the cancelled task must not be resurrected by a late answer"
+        );
+        assert_eq!(
+            cancelled_seen.get(),
+            (0, 0, 0),
+            "a cancelled task never finishes"
+        );
+    }
+
+    /// Regression (sozu#1832): `upgrade-main` is refused, explicitly and at
+    /// once, while another control command is still pending.
+    ///
+    /// `UpgradeData` carries no client, task or in-flight route, and once the
+    /// handoff is confirmed the old main stops reading worker answers: a
+    /// command admitted before the upgrade had no continuation and its client
+    /// was never answered. The contract is that the upgrade waits for no one
+    /// and loses no one: it fails before any side effect (no generation bump,
+    /// no fork, no `Stopping`) and the pending command completes normally.
+    ///
+    /// The hub runs `/bin/false` as its "new binary", so a regression that
+    /// lets the upgrade proceed forks a child that exits at once instead of
+    /// re-running the test harness.
+    ///
+    /// To SEE THIS RED: drop the `pending_tasks` refusal at the top of
+    /// `upgrade_main` — the upgrade forks, bumps `boot_generation`, and fails
+    /// with "no feedback from the new main" instead.
+    #[test]
+    fn upgrade_main_is_refused_while_a_control_command_is_pending() {
+        use crate::command::requests::load_state_rollback_tests::{queued_responses, test_client};
+        use sozu_command_lib::proto::command::UpgradeMain;
+
+        let dir = tempfile::tempdir().expect("Could not create temp dir");
+        let unix_listener =
+            UnixListener::bind(dir.path().join("test.sock")).expect("Could not bind socket");
+        let mut hub = CommandHub::new(unix_listener, Config::default(), "/bin/false".to_owned())
+            .expect("Could not create command hub");
+        let (_silent_worker, _scm) = register_test_worker(&mut hub.server, 0, 4096, 65536);
+
+        // Client A's command: held by a worker that has not answered yet.
+        let seen = std::rc::Rc::new(std::cell::Cell::new((0, 0, 0)));
+        let pending = hub.server.new_task(
+            Box::new(TallyTask {
+                gatherer: DefaultGatherer::default(),
+                seen: seen.clone(),
+            }),
+            Timeout::Default,
+        );
+        hub.server
+            .scatter_on(RequestType::Status(Status {}).into(), pending, 1, None);
+        let queued = std::mem::take(&mut hub.server.queued_tasks);
+        hub.tasks.extend(queued);
+        assert_eq!(hub.pending_task_count(), 1);
+
+        // Client B asks for the upgrade meanwhile.
+        let (mut client_b, _peer) = test_client();
+        let pending_tasks = hub.pending_task_count();
+        hub.server.handle_client_request(
+            &mut client_b,
+            RequestType::UpgradeMain(UpgradeMain {}).into(),
+            pending_tasks,
+        );
+
+        let responses = queued_responses(&client_b);
+        let last = responses.last().expect("client B must be answered");
+        assert_eq!(
+            last.status,
+            ResponseStatus::Failure as i32,
+            "the upgrade must be refused: {responses:?}"
+        );
+        assert!(
+            last.message.contains("1 control command"),
+            "the refusal must name what the upgrade waits for: {:?}",
+            last.message
+        );
+        assert_eq!(
+            hub.server.boot_generation, 0,
+            "a refused upgrade is not a new generation"
+        );
+        assert_eq!(hub.server.run_state, ServerState::Running);
+        assert!(!hub.server.upgrading);
+
+        // Client A's command is untouched and completes as usual.
+        hub.handle_worker_response(
+            0,
+            WorkerResponse {
+                id: format!("0-{pending}-1"),
+                status: ResponseStatus::Ok.into(),
+                message: String::new(),
+                content: None,
+            },
+        );
+        let mut container = hub.tasks.remove(&pending).expect("the task must survive");
+        assert!(container.job.get_gatherer().has_finished());
+        hub.handle_finishing_task(pending, container, false);
+        assert_eq!(
+            seen.get(),
+            (1, 0, 1),
+            "the pending command must complete with its answer"
+        );
+        assert!(hub.server.in_flight.is_empty());
+        assert_eq!(hub.pending_task_count(), 0);
     }
 }
