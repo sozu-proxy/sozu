@@ -49,7 +49,15 @@ The supervisor is a single-threaded mio event loop. Each tick:
   `LoadStaticConfigTask`, `WorkerTask`, `QueryMetricsTask`,
   `LoadStateTask`, `StatusTask`, `StopTask`, …);
 - ticks per-task timeouts (`Timeout`, `server.rs`) so a wedged worker
-  cannot block a client forever.
+  cannot block a client forever. `poll` blocks at most until the earliest
+  outstanding task deadline (`CommandHub::next_poll_timeout`), so a task
+  with a deadline whose worker stays silent is reaped at its own deadline,
+  not at the latest deadline of any other pending task (sozu#1826). A task
+  scattered with `Timeout::None` has no deadline: it ends only when its
+  workers answer or their channels close. The first close of any worker
+  that is not yet `Stopped`, a `Stopping` one included, answers its
+  in-flight requests with synthetic failures
+  (`CommandHub::on_worker_channel_closed`).
 
 `CommandHub` (`server.rs`) owns the per-client and per-worker session
 maps; it derefs to `Server` (`Deref` / `DerefMut for CommandHub`,
@@ -259,7 +267,10 @@ closes (`CommandHub::fail_in_flight_requests_of_worker`) are accounted as
 synthetic `Failure`s, so `ok + errors` always reaches
 `expected_responses`; a terminal answer retires its `in_flight` entry
 immediately, so a worker that answers and then dies is not re-counted as a
-rejection. A bulk sender that fills a worker's back buffer past
+rejection. A replay that `load_state` abandons on a state-file parse error is
+cancelled with `Server::cancel_task`, which retires the task's `in_flight`
+routes together with the task and keeps every other task's (sozu#1827): a
+late answer or a worker closing then finds no route for it. A bulk sender that fills a worker's back buffer past
 `max_buffer_size` parks the overflow in the per-worker
 `WorkerSession::pending` queue and drains it from the WRITABLE path
 (`WorkerSession::flush_pending`), in scatter order: nothing is dropped and

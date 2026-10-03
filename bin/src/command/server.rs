@@ -757,8 +757,7 @@ impl CommandHub {
                 })
                 .collect();
 
-            let next_timeout = self.tasks.values().filter_map(|t| t.timeout).max();
-            let mut poll_timeout = next_timeout.map(|t| t.saturating_duration_since(now));
+            let mut poll_timeout = self.next_poll_timeout(now);
 
             if self.run_state == ServerState::Stopping {
                 // when closing, close all ClientSession which are not transfering data
@@ -861,19 +860,7 @@ impl CommandHub {
                                     }
                                 }
                                 WorkerResult::CloseSession => {
-                                    // Only the FIRST close of a given worker
-                                    // synthesises failures: the session stays
-                                    // registered after `close_worker` and can
-                                    // report `CloseSession` again on the next
-                                    // poll, which would double-count.
-                                    let was_active = self
-                                        .workers
-                                        .get(&token)
-                                        .is_some_and(WorkerSession::is_active);
-                                    self.handle_worker_close(&token);
-                                    if was_active {
-                                        self.fail_in_flight_requests_of_worker(worker_id);
-                                    }
+                                    self.on_worker_channel_closed(&token, worker_id);
                                 }
                             }
                         }
@@ -881,6 +868,44 @@ impl CommandHub {
                 }
             }
         }
+    }
+
+    /// A worker channel reported `CloseSession`: kill the worker and answer
+    /// every request still in flight on it with a synthetic failure.
+    ///
+    /// Only the FIRST close of a given worker synthesises failures: the
+    /// session stays registered after `close_worker`, which leaves it
+    /// `Stopped`, and can report `CloseSession` again on the next poll, which
+    /// would double-count. The gate is `!= Stopped`, not `is_active`: a
+    /// `Stopping` worker (the old worker of an `upgrade --worker`, whose
+    /// `SoftStop` task has no deadline) that closes before answering must
+    /// still fail its requests, or that task never finishes and its client is
+    /// never answered.
+    fn on_worker_channel_closed(&mut self, token: &Token, worker_id: WorkerId) {
+        let first_close = self
+            .workers
+            .get(token)
+            .is_some_and(|worker| worker.run_state != RunState::Stopped);
+        self.handle_worker_close(token);
+        if first_close {
+            self.fail_in_flight_requests_of_worker(worker_id);
+        }
+    }
+
+    /// How long the event loop may block in `poll` before a task deadline
+    /// must be revisited: until the EARLIEST outstanding deadline, `None` when
+    /// no task has one.
+    ///
+    /// sozu#1826: this used to wait for the LATEST deadline. A silent worker
+    /// produces no readiness, so with two tasks pending, the one due first
+    /// was only reaped — and its client only answered — once the later one
+    /// expired.
+    fn next_poll_timeout(&self, now: Instant) -> Option<Duration> {
+        self.tasks
+            .values()
+            .filter_map(|task| task.timeout)
+            .min()
+            .map(|deadline| deadline.saturating_duration_since(now))
     }
 
     fn handle_worker_response(&mut self, worker_id: WorkerId, response: WorkerResponse) {
@@ -1625,8 +1650,21 @@ impl Server {
         self.queued_tasks.insert(task_id, container);
     }
 
+    /// Drop a task that is still queued, together with every worker response
+    /// route it registered.
+    ///
+    /// The task must not have migrated into `CommandHub::tasks` yet: its only
+    /// caller, `load_state`'s parse-error branch, cancels within the same
+    /// event-loop iteration as the scatter.
+    ///
+    /// sozu#1827: the routes used to stay in `in_flight`. A late worker answer
+    /// or a worker closing then resolved to the cancelled task, found no task,
+    /// and returned before any cleanup, so every failed replay leaked its
+    /// routes for the life of the main process. Routes of other tasks are kept.
     pub fn cancel_task(&mut self, task_id: TaskId) {
         self.queued_tasks.remove(&task_id);
+        self.in_flight
+            .retain(|_, in_flight_task_id| *in_flight_task_id != task_id);
     }
 
     /// Called when the main cannot communicate anymore with a worker (it's channel closed)
@@ -1939,7 +1977,7 @@ mod tests {
         proto::command::{
             AddBackend, CertificateSummary, CertificatesByAddress, Cluster,
             ListOfCertificatesByAddress, RequestHttpFrontend, RequestTcpFrontend, SocketAddress,
-            WorkerResponse, request::RequestType, response_content::ContentType,
+            SoftStop, WorkerResponse, request::RequestType, response_content::ContentType,
         },
     };
     use sozu_lib::metrics::METRICS;
@@ -2563,5 +2601,250 @@ mod tests {
             ids, expected,
             "every scattered entry must reach the worker, in order, past the back buffer ceiling"
         );
+    }
+
+    /// Regression (sozu#1826): the event loop must wake up for the EARLIEST
+    /// task deadline, not the latest one.
+    ///
+    /// Two worker-backed tasks are scattered to a worker that never answers,
+    /// with deadlines A (50 ms) < B (60 s). Nothing else produces readiness,
+    /// so the `poll` timeout is the only thing that brings the loop back to
+    /// the sweep that reaps an expired task. That timeout must not outlast A.
+    ///
+    /// To SEE THIS RED: select the deadline with `.max()` in
+    /// `CommandHub::next_poll_timeout` — the loop then sleeps until B.
+    #[test]
+    fn poll_wakes_up_for_the_earliest_task_deadline() {
+        let mut hub = create_test_hub();
+        let (_silent_worker, _scm) = register_test_worker(&mut hub.server, 0, 4096, 65536);
+
+        let early = Duration::from_millis(50);
+        let late = Duration::from_secs(60);
+        let mut task_ids = vec![];
+        for timeout in [late, early] {
+            let task_id = hub.server.new_task(
+                Box::new(TallyTask {
+                    gatherer: DefaultGatherer::default(),
+                    seen: Default::default(),
+                }),
+                Timeout::Custom(timeout),
+            );
+            hub.server
+                .scatter_on(RequestType::Status(Status {}).into(), task_id, 1, None);
+            task_ids.push(task_id);
+        }
+        // What the top of `run` does once per iteration: queued tasks migrate
+        // into the hub's task map.
+        let queued = std::mem::take(&mut hub.server.queued_tasks);
+        hub.tasks.extend(queued);
+        assert_eq!(hub.tasks.len(), 2, "both tasks must be pending");
+        assert_eq!(
+            hub.server.in_flight.len(),
+            2,
+            "both tasks must still be owed an answer by the silent worker"
+        );
+
+        let poll_timeout = hub
+            .next_poll_timeout(Instant::now())
+            .expect("pending tasks with deadlines must bound the poll timeout");
+        assert!(
+            poll_timeout <= early,
+            "the loop must wake up by the earliest deadline ({early:?}), got {poll_timeout:?}"
+        );
+    }
+
+    /// Regression (sozu#1827): cancelling a task must retire every worker
+    /// response route it registered, and only those.
+    ///
+    /// `cancel_task` dropped the queued task but left its `in_flight` routes.
+    /// A late worker answer then resolved to a task that no longer exists, and
+    /// a worker closing re-fed every leftover route as a synthetic failure for
+    /// it; each failed state replay (`load_state`'s parse-error branch, the
+    /// only caller) leaked its routes for the life of the main process.
+    ///
+    /// To SEE THIS RED: drop the `in_flight.retain` from `Server::cancel_task`
+    /// — the cancelled task's two routes survive the cancellation.
+    #[test]
+    fn cancelling_a_task_retires_only_its_response_routes() {
+        let mut hub = create_test_hub();
+        let (_worker_0, _scm_0) = register_test_worker(&mut hub.server, 0, 4096, 65536);
+        let (_worker_1, _scm_1) = register_test_worker(&mut hub.server, 1, 4096, 65536);
+
+        let new_tally_task = |hub: &mut CommandHub, seen| {
+            hub.server.new_task(
+                Box::new(TallyTask {
+                    gatherer: DefaultGatherer::default(),
+                    seen,
+                }),
+                Timeout::None,
+            )
+        };
+        let cancelled_seen = std::rc::Rc::new(std::cell::Cell::new((0, 0, 0)));
+        let cancelled = new_tally_task(&mut hub, cancelled_seen.clone());
+        hub.server
+            .scatter_on(RequestType::Status(Status {}).into(), cancelled, 1, None);
+        let kept_seen = std::rc::Rc::new(std::cell::Cell::new((0, 0, 0)));
+        let kept = new_tally_task(&mut hub, kept_seen.clone());
+        hub.server
+            .scatter_on(RequestType::Status(Status {}).into(), kept, 1, Some(0));
+        assert_eq!(
+            hub.server.in_flight.len(),
+            3,
+            "2 + 1 routes before cancelling"
+        );
+
+        hub.server.cancel_task(cancelled);
+
+        let routes: Vec<(RequestId, TaskId)> = hub
+            .server
+            .in_flight
+            .iter()
+            .map(|(id, task)| (id.clone(), *task))
+            .collect();
+        assert_eq!(
+            routes,
+            vec![(format!("0-{kept}-1"), kept)],
+            "cancellation must retire the cancelled task's routes and keep the other task's"
+        );
+
+        // A late answer to the cancelled task finds no route at all...
+        hub.handle_worker_response(
+            1,
+            WorkerResponse {
+                id: format!("1-{cancelled}-1"),
+                status: ResponseStatus::Ok.into(),
+                message: String::new(),
+                content: None,
+            },
+        );
+        // ...and worker 0 closing fails only what is still owed on it: the
+        // kept task's route, never the cancelled task's.
+        hub.fail_in_flight_requests_of_worker(0);
+
+        assert!(
+            hub.server.in_flight.is_empty(),
+            "no route may outlive the worker answers and closure that retire them"
+        );
+        let mut container = hub
+            .server
+            .queued_tasks
+            .remove(&kept)
+            .expect("the kept task must still be queued");
+        assert!(
+            container.job.get_gatherer().has_finished(),
+            "worker 0 closing must complete the kept task"
+        );
+        hub.handle_finishing_task(kept, container, false);
+        assert_eq!(
+            kept_seen.get(),
+            (0, 1, 1),
+            "the kept task must account its own worker's closure as one failure"
+        );
+        assert!(
+            hub.server.queued_tasks.is_empty() && hub.tasks.is_empty(),
+            "the cancelled task must not be resurrected by a late answer"
+        );
+        assert_eq!(
+            cancelled_seen.get(),
+            (0, 0, 0),
+            "a cancelled task never finishes"
+        );
+    }
+
+    /// Regression: a `Stopping` worker that closes before answering fails
+    /// its in-flight requests, so a task with no deadline waiting on it
+    /// finishes and its client is answered.
+    ///
+    /// `upgrade --worker` marks the old worker `Stopping`, then waits for its
+    /// `SoftStop` answer in a `Timeout::None` task. The close path only
+    /// synthesised failures for an `is_active` worker, which `Stopping` is
+    /// not: the task never finished and stayed in the hub, with its route in
+    /// `in_flight`, until the main process restarted.
+    ///
+    /// The worker's pid is a child this test owns, so the real
+    /// `close_worker` `SIGKILL` reaches it and not the test's process group.
+    ///
+    /// To SEE THIS RED: gate `on_worker_channel_closed`'s failure synthesis on
+    /// `WorkerSession::is_active` again — the route stays in `in_flight` and
+    /// the task stays unfinished.
+    #[test]
+    fn a_stopping_worker_closing_finishes_its_pending_task() {
+        let mut hub = create_test_hub();
+        let (_worker_0, _scm_0) = register_test_worker(&mut hub.server, 0, 4096, 65536);
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("could not spawn the stand-in worker process");
+        let token = {
+            let worker = hub
+                .server
+                .workers
+                .values_mut()
+                .find(|worker| worker.id == 0)
+                .expect("worker 0 is registered");
+            worker.pid = child.id() as pid_t;
+            worker.run_state = RunState::Stopping;
+            worker.token
+        };
+
+        let seen = std::rc::Rc::new(std::cell::Cell::new((0, 0, 0)));
+        let soft_stop = hub.server.new_task(
+            Box::new(TallyTask {
+                gatherer: DefaultGatherer::default(),
+                seen: seen.clone(),
+            }),
+            Timeout::None,
+        );
+        hub.server.scatter_on(
+            RequestType::SoftStop(SoftStop {}).into(),
+            soft_stop,
+            0,
+            Some(0),
+        );
+        let queued = std::mem::take(&mut hub.server.queued_tasks);
+        hub.tasks.extend(queued);
+        assert_eq!(
+            hub.server.in_flight.len(),
+            1,
+            "the SoftStop must be owed an answer by the Stopping worker"
+        );
+        assert!(
+            !hub.tasks
+                .get_mut(&soft_stop)
+                .expect("the SoftStop task is pending")
+                .job
+                .get_gatherer()
+                .has_finished(),
+            "the SoftStop task must wait for its worker"
+        );
+
+        // The old worker exits without answering its `SoftStop`.
+        hub.on_worker_channel_closed(&token, 0);
+        // The session stays registered, now `Stopped`, and may report
+        // `CloseSession` again: that must not synthesise a second failure.
+        // Issued before reaping, while the pid still names our zombie child.
+        hub.on_worker_channel_closed(&token, 0);
+        let status = child.wait().expect("could not reap the stand-in worker");
+        assert!(!status.success(), "close_worker must have killed it");
+
+        assert!(
+            hub.server.in_flight.is_empty(),
+            "the Stopping worker's close must retire its in-flight route"
+        );
+        let mut container = hub
+            .tasks
+            .remove(&soft_stop)
+            .expect("the task is reaped by the next loop iteration");
+        assert!(
+            container.job.get_gatherer().has_finished(),
+            "the Stopping worker's close must finish the SoftStop task"
+        );
+        hub.handle_finishing_task(soft_stop, container, false);
+        assert_eq!(
+            seen.get(),
+            (0, 1, 1),
+            "the unanswered SoftStop must be accounted as one failure"
+        );
+        assert!(hub.tasks.is_empty() && hub.server.queued_tasks.is_empty());
     }
 }

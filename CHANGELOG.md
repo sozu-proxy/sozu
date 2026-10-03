@@ -3997,6 +3997,34 @@
 
 ### 🐛 Fixed
 
+- **`fix(command)`: a stopping worker that closes answers its in-flight control commands.** The
+  old worker of an `upgrade --worker` is marked `Stopping`, then its `SoftStop` answer is awaited by
+  a task with no deadline. The worker-close path synthesised failures only for an active worker, so
+  a `Stopping` worker whose channel closed before it answered left that task, its `in_flight` route
+  and its client waiting until the main process restarted. The first close of any worker that is
+  not yet `Stopped` now answers its in-flight requests with synthetic failures
+  (`CommandHub::on_worker_channel_closed`, `bin/src/command/server.rs`); a repeated close of the
+  same, now `Stopped`, session still synthesises nothing. Documented in
+  `bin/src/command/LIFECYCLE.md`; pinned by `a_stopping_worker_closing_finishes_its_pending_task`.
+
+- **`fix(command)`: cancelling a control task retires its worker-response routes
+  ([#1827](https://github.com/sozu-proxy/sozu/issues/1827)).** `Server::cancel_task`
+  (`bin/src/command/server.rs`) dropped the queued task but left its `in_flight` routes. A late
+  worker answer, or a worker closing, then resolved to a task that no longer existed and returned
+  before any cleanup, so every state replay that `load_state` abandons on a parse error leaked its
+  routes for the life of the main process. Cancellation now retires every route of the cancelled
+  task and keeps the routes of other tasks; pinned by
+  `cancelling_a_task_retires_only_its_response_routes`, which also drives a late answer and a worker
+  closure after the cancellation.
+
+- **`fix(command)`: a pending control command times out at its own deadline
+  ([#1826](https://github.com/sozu-proxy/sozu/issues/1826)).** The main-process event loop
+  computed its `poll` timeout from the LATEST deadline of the pending tasks. A worker that stays
+  silent produces no readiness, so with two worker-backed commands pending, the one due first was
+  only reaped, and its client only answered, once the later deadline expired. The loop now blocks
+  at most until the earliest outstanding deadline (`CommandHub::next_poll_timeout`,
+  `bin/src/command/server.rs`); pinned by `poll_wakes_up_for_the_earliest_task_deadline`.
+
 - **`fix(metrics)`: metric-detail leases expire without another worker command
   ([#1831](https://github.com/sozu-proxy/sozu/issues/1831)).** The lease janitor
   (`Aggregator::lease_tick`) ran only at the top of `Server::notify`, which only a worker command
