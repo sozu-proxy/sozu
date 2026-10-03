@@ -656,6 +656,7 @@
   probe uses TCP mode and the new threshold. The file's `set_health_check` helper now returns the
   worker's answer to the request it sent instead of draining every pending answer. No behaviour
   change.
+
 - **`docs(udp)`: describe stale idle-expiry handling as deadline revalidation
   ([#1825](https://github.com/sozu-proxy/sozu/issues/1825)).** The UDP lifecycle documentation,
   the `flow.rs`/`manager.rs`/`mod.rs` comments and two test names attributed the survival of a
@@ -4011,6 +4012,34 @@
 
 ### 🐛 Fixed
 
+- **`fix(command)`: a stopping worker that closes answers its in-flight control commands.** The
+  old worker of an `upgrade --worker` is marked `Stopping`, then its `SoftStop` answer is awaited by
+  a task with no deadline. The worker-close path synthesised failures only for an active worker, so
+  a `Stopping` worker whose channel closed before it answered left that task, its `in_flight` route
+  and its client waiting until the main process restarted. The first close of any worker that is
+  not yet `Stopped` now answers its in-flight requests with synthetic failures
+  (`CommandHub::on_worker_channel_closed`, `bin/src/command/server.rs`); a repeated close of the
+  same, now `Stopped`, session still synthesises nothing. Documented in
+  `bin/src/command/LIFECYCLE.md`; pinned by `a_stopping_worker_closing_finishes_its_pending_task`.
+
+- **`fix(command)`: cancelling a control task retires its worker-response routes
+  ([#1827](https://github.com/sozu-proxy/sozu/issues/1827)).** `Server::cancel_task`
+  (`bin/src/command/server.rs`) dropped the queued task but left its `in_flight` routes. A late
+  worker answer, or a worker closing, then resolved to a task that no longer existed and returned
+  before any cleanup, so every state replay that `load_state` abandons on a parse error leaked its
+  routes for the life of the main process. Cancellation now retires every route of the cancelled
+  task and keeps the routes of other tasks; pinned by
+  `cancelling_a_task_retires_only_its_response_routes`, which also drives a late answer and a worker
+  closure after the cancellation.
+
+- **`fix(command)`: a pending control command times out at its own deadline
+  ([#1826](https://github.com/sozu-proxy/sozu/issues/1826)).** The main-process event loop
+  computed its `poll` timeout from the LATEST deadline of the pending tasks. A worker that stays
+  silent produces no readiness, so with two worker-backed commands pending, the one due first was
+  only reaped, and its client only answered, once the later deadline expired. The loop now blocks
+  at most until the earliest outstanding deadline (`CommandHub::next_poll_timeout`,
+  `bin/src/command/server.rs`); pinned by `poll_wakes_up_for_the_earliest_task_deadline`.
+
 - **BREAKING (library API) — `fix(backends)`: preserve backend identity and incarnation across
   removal and health-check completion ([#1821](https://github.com/sozu-proxy/sozu/issues/1821)).**
   `AddBackend` and `ConfigState` identify a backend by `(backend_id, address)` and admit two ids
@@ -4031,6 +4060,7 @@
   `BackendMap::remove_backend(cluster_id, backend_id, address)` take the backend id and return
   whether the backend was present instead of the list of removed ids; new
   `BackendList::find_backend_by_identity` and `BackendList::find_incarnation`.
+
 - **`fix(metrics)`: metric-detail leases expire without another worker command
   ([#1831](https://github.com/sozu-proxy/sozu/issues/1831)).** The lease janitor
   (`Aggregator::lease_tick`) ran only at the top of `Server::notify`, which only a worker command
@@ -4059,6 +4089,50 @@
   e2e `test_keep_alive_does_not_carry_a_sticky_cookie_over`; the assertion of
   `test_reset_preserves_connection_state` that `reset` keeps `sticky_session` encoded the defect
   and is removed.
+
+- **`fix(logging)`: protobuf access logs sent to a `tcp://` target no longer drop short-write
+  progress ([#1830](https://github.com/sozu-proxy/sozu/issues/1830)).** The protobuf `Tcp` arm of
+  `InnerLogger::log_access` (`command/src/logging/logs.rs`) called `TcpStream::write` once and
+  treated any byte count as success, so a stream that accepted only a prefix truncated the record,
+  and the decoder then read the next record's bytes as the rest of it. The record now goes through
+  `write_stream_record`, which uses `write_all` as the ASCII `Tcp` arm already did; an error still
+  surfaces to `log_access`, which reports it and revives the backend. The framing (length
+  delimiter, record, two zero bytes) moves unchanged into `encode_protobuf_access_log` so a test
+  can drive both steps through a short-writing sink. Tests:
+  `short_writes_keep_consecutive_protobuf_records_framed` (red with the pre-fix `write`: the first
+  record decodes with `BufferUnderflow`), `a_stream_record_error_is_propagated`.
+
+- **`fix(top)`: `sozu top` exits without waiting out its collectors' polling interval
+  ([#1829](https://github.com/sozu-proxy/sozu/issues/1829)).** After the render loop returned,
+  `run_top` (`bin/src/ctl/top/mod.rs`) joined the snapshot, listeners and certs threads, but
+  `poll_loop` (`bin/src/ctl/top/transport.rs`) waited between polls in `thread::sleep`, which
+  nothing could interrupt: exit took up to the 30 s certs cadence (29.85 s measured after a
+  `--snapshot 1` frame). `poll_loop` now waits in `recv_timeout` on a wake channel `run_top` owns,
+  and `run_top` drops its sender before the joins, so the three threads return at once. The
+  longest wait left is the events thread's 1 s bounded read. Test:
+  `sozu_top_tick_once_against_real_master` (`bin/tests/sozu_top_e2e.rs`) now asserts the gap
+  between the last frame byte and process exit is under 2 s, twice that read (red on `bd19a78e`:
+  29.85 s).
+
+- **`fix(proxy-protocol)`: an expect-proxy session parses a PROXY-v2 header that arrives with the
+  client's half-close ([#1823](https://github.com/sozu-proxy/sozu/issues/1823)).** On Linux a
+  client that sends its header and payload and then calls `shutdown(SHUT_WR)` can be reported in
+  one `READABLE | HUP` epoll event. `TcpSession::ready_inner` (`lib/src/tcp.rs`) handled the
+  frontend HUP before the readable bytes, and `TcpSession::front_hup` closes the expect state,
+  so the complete header was never parsed and the session closed before dialing the backend;
+  `SessionState::ready` for `ExpectProxyProtocol`
+  (`lib/src/protocol/proxy_protocol/expect.rs`), the HTTP and HTTPS listeners' expect stage,
+  closed on HUP the same way. Both now drain the readable bytes first: a complete header upgrades
+  and hands HUP on to the next stage (on TCP, `Pipe::frontend_hup` keeps the session while request
+  bytes the expect stage did not read remain to forward), while a zero-byte bare-TCP healthcheck
+  or a truncated header still closes without dialing a backend. On TCP, a zero-byte healthcheck
+  (connect then FIN, which Linux always reports as `READABLE | HUP`) now closes through the expect
+  stage's zero-byte branch instead of `TcpSession::front_hup`, so it no longer emits a TCP access-log
+  line or the end-of-session request/service timers; a truncated header followed by FIN still
+  logs one. The client still receives no backend response after its half-close: the TCP pipe
+  closes once the request is flushed, for every TCP session
+  ([#1840](https://github.com/sozu-proxy/sozu/issues/1840)). Relay sessions
+  (`RelayProxyProtocol`) are unchanged.
 
 - **`test(e2e)`: `test_issue_806` no longer times the host's scheduler against its reconnect
   budget.** `try_backend_stop` (`e2e/src/tests/tests.rs`) compared the wall-clock round trip of the

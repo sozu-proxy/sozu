@@ -82,9 +82,12 @@ impl CommandManager {
         //
         // The shutdown flag is the canonical wake-up for the events thread:
         // dropping its `Receiver<TopEvent>` cannot propagate across the
-        // unix socket. The three poll-driven threads still exit on
-        // receiver-drop, but we join them all on the way out for symmetry.
+        // unix socket. The three poll-driven threads wait out their polling
+        // interval on `collectors_wake`; dropping its only sender wakes them
+        // all at once, so the joins below never wait for the 5 s listeners
+        // or 30 s certs cadence (sozu#1829). Nothing is sent on it.
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (collectors_wake, collectors_wake_rx) = crossbeam_channel::bounded::<()>(0);
         // Shared status slot every background thread (lease renewer +
         // four transport collectors) publishes degraded-mode notes
         // into. The render loop drains it once per tick (see
@@ -95,6 +98,7 @@ impl CommandManager {
             self.config.clone(),
             args.refresh_ms,
             std::sync::Arc::clone(&lease_status_slot),
+            collectors_wake_rx.clone(),
         )?;
         let (events_rx, events) = spawn_events(
             self.config.clone(),
@@ -104,10 +108,12 @@ impl CommandManager {
         let (listeners_rx, listeners) = spawn_listeners(
             self.config.clone(),
             std::sync::Arc::clone(&lease_status_slot),
+            collectors_wake_rx.clone(),
         )?;
         let (certs_rx, certs) = spawn_certs(
             self.config.clone(),
             std::sync::Arc::clone(&lease_status_slot),
+            collectors_wake_rx,
         )?;
 
         // Apply the runtime cardinality lease. If the master/worker is too
@@ -152,11 +158,13 @@ impl CommandManager {
 
         // Drop order: lease first (issues the best-effort `clear`), then
         // flip the shutdown flag so the events thread observes it on the
-        // next bounded read, then join all four transport handles so we
-        // never return with background threads still queueing into a
-        // detached aggregator.
+        // next bounded read, then drop the collectors' wake sender so the
+        // three poll-driven threads leave their interval wait, then join
+        // all four transport handles so we never return with background
+        // threads still queueing into a detached aggregator.
         drop(lease);
         shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(collectors_wake);
         let _ = collector.join();
         let _ = listeners.join();
         let _ = certs.join();
