@@ -633,7 +633,8 @@ impl<Front: SocketHandler> Connection<Front> {
                 names::backend::CONNECTIONS_PER_BACKEND,
                 -1,
                 Some(cluster_id),
-                Some(&backend.backend_id)
+                Some(&backend.backend_id),
+                backend.metric_incarnation()
             );
             trace!("{} connection close: {:?}", log_module_context!(), backend);
         }

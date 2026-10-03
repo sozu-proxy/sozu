@@ -120,6 +120,10 @@ pub struct TcpSession {
     backend_token: Option<Token>,
     backend: Option<Rc<RefCell<Backend>>>,
     cluster_id: Option<ClusterId>,
+    /// Configured lifetime of `cluster_id` captured when this session routes.
+    /// Kept on the session rather than the public `SessionMetrics` value so
+    /// delayed TCP and Pipe emissions cannot target a replacement cluster.
+    cluster_metrics_incarnation: Option<crate::metrics::ClusterMetricsIncarnation>,
     configured_backend_timeout: Duration,
     connection_attempt: u8,
     container_backend_timeout: TimeoutContainer,
@@ -197,6 +201,9 @@ impl TcpSession {
         let container_frontend_timeout =
             TimeoutContainer::new(configured_frontend_timeout, frontend_token);
         let container_backend_timeout = TimeoutContainer::new_empty(configured_connect_timeout);
+        let cluster_metrics_incarnation = cluster_id
+            .as_deref()
+            .and_then(crate::metrics::cluster_incarnation);
 
         let state = match proxy_protocol {
             Some(ProxyProtocolConfig::RelayHeader) => {
@@ -253,6 +260,7 @@ impl TcpSession {
                     WebSocketContext::Tcp,
                 );
                 pipe.set_cluster_id(cluster_id.clone());
+                pipe.set_cluster_metrics_incarnation(cluster_metrics_incarnation);
                 TcpStateMachine::Pipe(pipe)
             }
         };
@@ -268,6 +276,7 @@ impl TcpSession {
             backend_token: None,
             backend: None,
             cluster_id,
+            cluster_metrics_incarnation,
             configured_backend_timeout,
             connection_attempt: 0,
             container_backend_timeout,
@@ -354,6 +363,7 @@ impl TcpSession {
             backend_token: None,
             backend: None,
             cluster_id: None,
+            cluster_metrics_incarnation: None,
             configured_backend_timeout,
             connection_attempt: 0,
             container_backend_timeout,
@@ -400,7 +410,8 @@ impl TcpSession {
     fn log_request(&self) {
         let listener = self.listener.borrow();
         let context = self.log_context();
-        self.metrics.register_end_of_session(&context);
+        self.metrics
+            .register_end_of_session_for_incarnation(&context, self.cluster_metrics_incarnation);
         // SNI-routed sessions carry the matched front's own tags key
         // (`sni_tags_key`, stashed by `upgrade_sni_preread`); everything
         // else keeps the historical bare-address key.
@@ -526,6 +537,8 @@ impl TcpSession {
             && let Some(outcome) = preread.outcome()
         {
             self.cluster_id = Some(outcome.cluster.clone());
+            self.cluster_metrics_incarnation =
+                crate::metrics::cluster_incarnation(outcome.cluster.as_ref());
             // Restore the listener's configured `front_timeout` THE MOMENT
             // routing succeeds, not only once the backend connect completes
             // (previously done only in `upgrade_sni_preread`, which can run
@@ -648,6 +661,7 @@ impl TcpSession {
             pipe.restore_readiness_events(frontend_event, backend_event);
 
             pipe.set_cluster_id(self.cluster_id.clone());
+            pipe.set_cluster_metrics_incarnation(self.cluster_metrics_incarnation);
             pipe.set_backend_address(self.backend_address);
             // Only `Some` when this `SendProxyProtocol` was itself reached
             // via `upgrade_sni_preread`'s `SendHeader` branch (sozu-proxy/sozu#1279)
@@ -676,6 +690,7 @@ impl TcpSession {
             let mut pipe =
                 rpp.into_pipe(self.backend_buffer.take().unwrap(), self.listener.clone());
             pipe.set_cluster_id(self.cluster_id.clone());
+            pipe.set_cluster_metrics_incarnation(self.cluster_metrics_incarnation);
             pipe.set_backend_address(self.backend_address);
             gauge_add!(names::protocol::PROXY_RELAY, -1);
             gauge_add!(names::protocol::TCP, 1);
@@ -703,6 +718,7 @@ impl TcpSession {
             );
 
             pipe.set_cluster_id(self.cluster_id.clone());
+            pipe.set_cluster_metrics_incarnation(self.cluster_metrics_incarnation);
             pipe.set_backend_address(self.backend_address);
             gauge_add!(names::protocol::PROXY_EXPECT, -1);
             gauge_add!(names::protocol::TCP, 1);
@@ -812,6 +828,8 @@ impl TcpSession {
         );
 
         self.cluster_id = Some(outcome.cluster.clone());
+        self.cluster_metrics_incarnation =
+            crate::metrics::cluster_incarnation(outcome.cluster.as_ref());
         // `container_frontend_timeout` is NOT restored here anymore: by the
         // time this runs, `TcpSession::readable`'s route-capture block has
         // already restored it to the listener's configured `front_timeout`
@@ -939,6 +957,7 @@ impl TcpSession {
             addr,
             WebSocketContext::Tcp,
         );
+        pipe.set_cluster_metrics_incarnation(self.cluster_metrics_incarnation);
         // `Pipe::new` armed backend-writable for the inherited frontend
         // accumulator (the ClientHello + any coalesced payload) via
         // `arm_inherited_buffer_writes`. Restore the preread's readiness
@@ -1084,7 +1103,8 @@ impl TcpSession {
                 names::backend::CONNECTIONS_PER_BACKEND,
                 1,
                 self.cluster_id.as_deref(),
-                self.metrics.backend_id.as_deref()
+                self.metrics.backend_id.as_deref(),
+                self.cluster_metrics_incarnation
             );
 
             // the back timeout was of connect_timeout duration before,
@@ -1104,13 +1124,15 @@ impl TcpSession {
                     incr!(
                         names::backend::UP,
                         self.cluster_id.as_deref(),
-                        self.metrics.backend_id.as_deref()
+                        self.metrics.backend_id.as_deref(),
+                        self.cluster_metrics_incarnation
                     );
                     gauge!(
                         names::backend::AVAILABLE,
                         1,
                         self.cluster_id.as_deref(),
-                        self.metrics.backend_id.as_deref()
+                        self.metrics.backend_id.as_deref(),
+                        self.cluster_metrics_incarnation
                     );
                     info!(
                         "{} backend server {} at {} is up",
@@ -1172,7 +1194,8 @@ impl TcpSession {
             incr!(
                 names::backend::CONNECTIONS_ERROR,
                 self.cluster_id.as_deref(),
-                self.metrics.backend_id.as_deref()
+                self.metrics.backend_id.as_deref(),
+                self.cluster_metrics_incarnation
             );
             if !already_unavailable && backend.retry_policy.is_down() {
                 error!(
@@ -1184,13 +1207,15 @@ impl TcpSession {
                 incr!(
                     names::backend::DOWN,
                     self.cluster_id.as_deref(),
-                    self.metrics.backend_id.as_deref()
+                    self.metrics.backend_id.as_deref(),
+                    self.cluster_metrics_incarnation
                 );
                 gauge!(
                     names::backend::AVAILABLE,
                     0,
                     self.cluster_id.as_deref(),
-                    self.metrics.backend_id.as_deref()
+                    self.metrics.backend_id.as_deref(),
+                    self.cluster_metrics_incarnation
                 );
 
                 push_event(Event {
@@ -1620,7 +1645,8 @@ impl TcpSession {
                 names::backend::CONNECTIONS_PER_BACKEND,
                 -1,
                 self.cluster_id.as_deref(),
-                self.metrics.backend_id.as_deref()
+                self.metrics.backend_id.as_deref(),
+                self.cluster_metrics_incarnation
             );
         }
 
@@ -1667,6 +1693,10 @@ impl TcpSession {
             .ok_or(BackendConnectionError::NotFound(ObjectKind::TcpCluster))?;
 
         self.cluster_id = Some(cluster_id.clone());
+        if self.cluster_metrics_incarnation.is_none() {
+            self.cluster_metrics_incarnation =
+                crate::metrics::cluster_incarnation(cluster_id.as_ref());
+        }
 
         // The cluster's own budget when it sets one, the worker's otherwise
         // (sozu-proxy/sozu#1800).
@@ -1685,7 +1715,8 @@ impl TcpSession {
             incr!(
                 names::backend::CONNECT_RETRIES_EXHAUSTED,
                 self.cluster_id.as_deref(),
-                self.metrics.backend_id.as_deref()
+                self.metrics.backend_id.as_deref(),
+                self.cluster_metrics_incarnation
             );
             warn!(
                 "{} Max connection attempt reached ({})",

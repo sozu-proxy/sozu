@@ -88,6 +88,9 @@ pub enum WebSocketContext {
 pub struct Pipe<Front: SocketHandler, L: ListenerHandler> {
     backend_buffer: Checkout,
     backend_id: Option<String>,
+    /// Routed cluster lifetime inherited from an HTTP request or TCP session
+    /// when that owner upgrades into this long-lived pipe.
+    cluster_metrics_incarnation: Option<crate::metrics::ClusterMetricsIncarnation>,
     /// Address of the backend this pipe forwards to, recorded when Sōzu
     /// picked it: from `backend` in `Pipe::new` (WebSocket upgrades), or
     /// through `set_backend_address` by the TCP proxy when it dials. The
@@ -178,6 +181,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         let mut session = Pipe {
             backend_buffer,
             backend_id,
+            cluster_metrics_incarnation: None,
             backend_address,
             backend_readiness: Readiness {
                 interest: Ready::READABLE | Ready::WRITABLE | Ready::HUP | Ready::ERROR,
@@ -236,6 +240,13 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         self.frontend_readiness.event = frontend_event;
         self.backend_readiness.event = backend_event;
         self.arm_inherited_buffer_writes();
+    }
+
+    pub(crate) fn set_cluster_metrics_incarnation(
+        &mut self,
+        incarnation: Option<crate::metrics::ClusterMetricsIncarnation>,
+    ) {
+        self.cluster_metrics_incarnation = incarnation;
     }
 
     /// Stamp connection-scoped TLS metadata onto the pipe for access-log
@@ -376,7 +387,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         let listener = self.listener.borrow();
         let context = self.log_context();
         let endpoint = self.log_endpoint();
-        metrics.register_end_of_session(&context);
+        metrics.register_end_of_session_for_incarnation(&context, self.cluster_metrics_incarnation);
         // TCP SNI-preread sessions carry the matched frontend's own tags
         // key (`set_tags_key`); every other path keeps the historical
         // bare-address lookup.

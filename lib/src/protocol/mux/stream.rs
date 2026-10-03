@@ -749,6 +749,7 @@ impl Stream {
     {
         let mut events: [Option<MetricEvent>; 2] = [None, None];
         let context = &self.context;
+        let metric_incarnation = self.context.cluster_metrics_incarnation();
         // Fall back to the per-stream timeout discriminator
         // (`access_log_message`) when the caller did not supply an explicit
         // `message`. The discriminator is set by `MuxState::timeout` before
@@ -789,7 +790,8 @@ impl Stream {
             incr!(
                 names::http::ERRORS,
                 context.cluster_id.as_deref(),
-                context.backend_id.as_deref()
+                context.backend_id.as_deref(),
+                metric_incarnation
             );
         }
         let protocol = match context.protocol {
@@ -826,7 +828,8 @@ impl Stream {
         incr!(
             bucket_key,
             context.cluster_id.as_deref(),
-            context.backend_id.as_deref()
+            context.backend_id.as_deref(),
+            metric_incarnation
         );
 
         if let Some(status) = context.status
@@ -835,7 +838,8 @@ impl Stream {
             incr!(
                 per_code,
                 context.cluster_id.as_deref(),
-                context.backend_id.as_deref()
+                context.backend_id.as_deref(),
+                metric_incarnation
             );
         }
 
@@ -926,7 +930,8 @@ impl Stream {
             #[cfg(not(feature = "opentelemetry"))]
             otel: None,
         };
-        self.metrics.register_end_of_session(&context.log_context());
+        self.metrics
+            .register_end_of_session_for_incarnation(&context.log_context(), metric_incarnation);
 
         events
     }

@@ -1836,7 +1836,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         incr!(
                             names::backend::RETRY_STALE_UPSTREAM,
                             stream.context.cluster_id.as_deref(),
-                            stream.context.backend_id.as_deref()
+                            stream.context.backend_id.as_deref(),
+                            stream.context.cluster_metrics_incarnation()
                         );
                         stream.state = StreamState::Link;
                         context.pending_links.push_back(stream_id);
@@ -2014,6 +2015,7 @@ mod tests {
             slot: BackendSlot(0),
             backend_id: Rc::from("test-backend"),
             address,
+            metric_incarnation: None,
         }
     }
 
@@ -2357,6 +2359,7 @@ mod tests {
             id: Ulid::generate(),
             backend_id: None,
             cluster_id: None,
+            cluster_metrics_incarnation: None,
             affinity_key: None,
             protocol: TransportKind::HTTP,
             public_address: "127.0.0.1:0"
