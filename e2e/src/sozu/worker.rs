@@ -24,7 +24,7 @@ use sozu_lib as sozu;
 use crate::port_registry::{
     attach_reserved_http_listener, attach_reserved_https_listener, attach_reserved_tcp_listener,
 };
-use crate::sozu::command_id::CommandID;
+use crate::{sched::current_tid, sozu::command_id::CommandID};
 
 /// Handle to a detached thread where a Sozu worker runs
 pub struct Worker {
@@ -36,6 +36,9 @@ pub struct Worker {
     pub command_channel: Channel<WorkerRequest, WorkerResponse>,
     pub command_id: CommandID,
     pub server_job: JoinHandle<()>,
+    /// Kernel id of the thread running the server, for
+    /// [`run_queue_delay`](crate::sched::run_queue_delay).
+    pub server_tid: Option<i32>,
 }
 
 /// Used to remove the CLOEXEC flag of socket
@@ -228,7 +231,9 @@ impl Worker {
 
         println!("Setting up logging");
 
+        let (tid_tx, tid_rx) = std::sync::mpsc::sync_channel(1);
         let server_job = thread::spawn(move || {
+            let _ = tid_tx.send(current_tid());
             let logging_setup = match logging {
                 None => setup_default_logging(false, "error", &thread_name),
                 Some((target, spec)) => Logger::init(
@@ -265,6 +270,7 @@ impl Worker {
             command_channel: cmd_main_to_worker,
             command_id: CommandID::new(),
             server_job,
+            server_tid: tid_rx.recv().ok().flatten(),
         }
     }
 

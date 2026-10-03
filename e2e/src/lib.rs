@@ -4,6 +4,7 @@
 mod http_utils;
 mod mock;
 mod port_registry;
+mod sched;
 mod sozu;
 #[cfg(test)]
 #[cfg(not(tarpaulin))]
