@@ -16,7 +16,7 @@ use prost::{Message, encoding::encoded_len_varint};
 use crate::{
     config::{Config, DEFAULT_LOG_TARGET},
     logging::{LogAddress, LogDuration, LogError, LogMessage, RequestRecord},
-    proto::command::ProtobufAccessLogFormat,
+    proto::command::{ProtobufAccessLog, ProtobufAccessLogFormat},
     writer::MultiLineWriter,
 };
 
@@ -305,6 +305,37 @@ fn log_arguments(
     }
 }
 
+/// Frame one protobuf access log into `buffer`: the prost length delimiter,
+/// the record, then two zero bytes. The decoder of a `tcp://` stream relies on
+/// that framing to find where each record starts.
+fn encode_protobuf_access_log(
+    binary_log: &ProtobufAccessLog,
+    buffer: &mut LoggerBuffer,
+) -> Result<(), IoError> {
+    let log_length = binary_log.encoded_len();
+    let total_length = log_length + encoded_len_varint(log_length as u64);
+    buffer.clear();
+    let current_capacity = buffer.capacity();
+    if current_capacity < total_length {
+        buffer.reserve(total_length - current_capacity);
+    }
+    binary_log
+        .encode_length_delimited(&mut buffer.0)
+        .map_err(|e| IoError::new(IoErrorKind::InvalidData, e))?;
+    buffer.extend_from_slice(&[0, 0]); // add two empty bytes after each protobuf access log
+    Ok(())
+}
+
+/// Hand one complete record to a stream sink.
+///
+/// A stream may accept FEWER bytes than offered: discarding the count of a
+/// bare `write` would truncate the record and desynchronise the framing of
+/// every record after it, so the record goes through `write_all`, as the
+/// ASCII `Tcp` arm of [`log_arguments`] does.
+fn write_stream_record<W: Write>(stream: &mut W, bytes: &[u8]) -> Result<(), IoError> {
+    stream.write_all(bytes)
+}
+
 impl InnerLogger {
     /// Drain the buffered records of both the main and the access-log backend.
     ///
@@ -341,25 +372,18 @@ impl InnerLogger {
         let io_result = match self.access_format {
             AccessLogFormat::Protobuf => {
                 let binary_log = log.into_binary_access_log();
-                let log_length = binary_log.encoded_len();
-                let total_length = log_length + encoded_len_varint(log_length as u64);
-                self.buffer.clear();
-                let current_capacity = self.buffer.capacity();
-                if current_capacity < total_length {
-                    self.buffer.reserve(total_length - current_capacity);
-                }
-
-                if let Err(e) = binary_log.encode_length_delimited(&mut self.buffer.0) {
-                    Err(IoError::new(IoErrorKind::InvalidData, e))
+                if let Err(e) = encode_protobuf_access_log(&binary_log, &mut self.buffer) {
+                    Err(e)
                 } else {
-                    self.buffer.extend_from_slice(&[0, 0]); // add two empty bytes after each protobuf access log
                     let bytes = &self.buffer;
                     match backend {
                         LoggerBackend::Stdout(stdout) => {
                             let _ = stdout.write(bytes);
                             return true;
                         }
-                        LoggerBackend::Tcp(socket) => socket.write(bytes),
+                        LoggerBackend::Tcp(socket) => {
+                            write_stream_record(socket, bytes).map(|()| bytes.len())
+                        }
                         LoggerBackend::File(file) => file.write(bytes),
                         LoggerBackend::Unix(socket) => socket.send(bytes),
                         LoggerBackend::Udp(socket, address) => socket.send_to(bytes, *address),
@@ -1194,6 +1218,12 @@ mod tests {
     //! the tag map and the OpenTelemetry field, and the proxy was measured at 82
     //! fragments per record.
     //!
+    //! `short_writes_keep_consecutive_protobuf_records_framed` covers the
+    //! protobuf `Tcp` arm of [`super::InnerLogger::log_access`], which goes
+    //! through [`super::write_stream_record`]. To see it red, make that helper
+    //! `stream.write(bytes).map(|_| ())`, the pre-fix arm: the first record is
+    //! truncated after `limit` bytes and decoding reports `BufferUnderflow`.
+    //!
     //! `cargo test` cannot count the `write(2)` syscalls the real
     //! `LoggerBackend::Tcp(TcpStream)` arm performs: the variant holds a
     //! concrete `TcpStream`, so no counting sink can be substituted, and the
@@ -1202,7 +1232,9 @@ mod tests {
     //! syscall count is proven outside the suite, by tracing the running proxy
     //! (81.7 `send(2)` per access-log line before, 1 after; see the
     //! `perf(logging)` CHANGELOG entry).
-    use super::LoggerBuffer;
+    use super::{LoggerBuffer, encode_protobuf_access_log, write_stream_record};
+    use crate::proto::command::ProtobufAccessLog;
+    use prost::Message;
     use std::io::{Error as IoError, ErrorKind, Write};
 
     /// Counts the calls a record arrives in, and records every chunk.
@@ -1412,6 +1444,79 @@ mod tests {
             sink.calls > 1,
             "the fixture must actually exercise the short-write path"
         );
+    }
+
+    /// A protobuf access log whose `tag` and `bytes_in` tell records apart.
+    fn protobuf_record(tag: &str, bytes_in: u64) -> ProtobufAccessLog {
+        ProtobufAccessLog {
+            message: Some("an error message long enough to need several short writes".into()),
+            protocol: "HTTP".into(),
+            tag: tag.into(),
+            bytes_in,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn short_writes_keep_consecutive_protobuf_records_framed() {
+        // Issue #1830: the protobuf `Tcp` arm of `InnerLogger::log_access` used
+        // a bare `write` and discarded its count, so a stream that accepted a
+        // prefix truncated the record, and the next record's bytes were read as
+        // the remainder of the first.
+        let mut buffer = LoggerBuffer(Vec::with_capacity(4096));
+        let mut sink = ShortWriteSink {
+            limit: 7,
+            calls: 0,
+            bytes: Vec::new(),
+        };
+        let records = [
+            protobuf_record("WRK-00", 91),
+            protobuf_record("WRK-01", 253),
+        ];
+
+        for record in &records {
+            encode_protobuf_access_log(record, &mut buffer).expect("the record is framed");
+            assert!(
+                buffer.len() > sink.limit,
+                "the fixture must actually exercise the short-write path"
+            );
+            write_stream_record(&mut sink, &buffer)
+                .expect("the record is written despite short writes");
+        }
+
+        let mut stream = sink.bytes.as_slice();
+        for expected in &records {
+            let decoded = ProtobufAccessLog::decode_length_delimited(&mut stream)
+                .expect("every record decodes from the stream, in order");
+            assert_eq!(
+                &decoded, expected,
+                "a short write must not truncate a record or shift the next one"
+            );
+            assert_eq!(
+                stream.get(..2),
+                Some(&[0u8, 0][..]),
+                "each record is followed by its two zero bytes"
+            );
+            stream = &stream[2..];
+        }
+        assert!(stream.is_empty(), "nothing follows the last record");
+    }
+
+    #[test]
+    fn a_stream_record_error_is_propagated() {
+        struct FailingSink;
+        impl Write for FailingSink {
+            fn write(&mut self, _: &[u8]) -> Result<usize, IoError> {
+                Err(IoError::new(ErrorKind::BrokenPipe, "peer went away"))
+            }
+            fn flush(&mut self) -> Result<(), IoError> {
+                Ok(())
+            }
+        }
+
+        let error = write_stream_record(&mut FailingSink, b"a protobuf record")
+            .expect_err("a dead sink must surface, so `log_access` can revive the backend");
+        assert_eq!(error.kind(), ErrorKind::BrokenPipe);
     }
 
     #[test]

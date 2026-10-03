@@ -3346,6 +3346,110 @@ pub fn try_stick() -> State {
     State::Success
 }
 
+/// #1822: one keep-alive client connection sends a request to a sticky
+/// frontend, then one to a frontend that does not stick. The second request
+/// reaches its own cluster, and its response must not carry the sticky
+/// cookie the first one was answered with: `HttpContext::reset` used to
+/// keep `sticky_session`, which the router writes only for a sticky
+/// frontend, so the response editor answered the second request with the
+/// first one's `Set-Cookie`.
+pub fn try_keep_alive_does_not_carry_a_sticky_cookie_over() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_sync_test(
+        "KA-STICKY-RESET",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        true,
+    );
+
+    let plain_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_1",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpFrontend(RequestHttpFrontend {
+        hostname: String::from("plain.localhost"),
+        ..Worker::default_http_frontend("cluster_1", front_address)
+    }));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_1",
+        "cluster_1-0",
+        plain_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let mut sticky = backends.pop().unwrap();
+    sticky.set_response("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: keep-alive\r\n\r\na");
+    sticky.connect();
+    let mut plain = SyncBackend::new(
+        "BACKEND_PLAIN",
+        plain_address,
+        "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: keep-alive\r\n\r\nb",
+    );
+    plain.connect();
+
+    let mut client = Client::new(
+        "client".to_string(),
+        front_address,
+        "GET /api HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    client.connect();
+    client.send();
+    sticky.accept(0);
+    if sticky.receive(0).is_none() {
+        println!("the sticky backend received nothing");
+        return State::Fail;
+    }
+    sticky.send(0);
+    let Some(first) = client.receive() else {
+        println!("the client received no response to the sticky request");
+        return State::Fail;
+    };
+    println!("sticky response: {first:?}");
+    if h1_header_value(&first, "Set-Cookie").as_deref()
+        != Some("SOZUBALANCEID=sticky_cluster_0-0; Path=/")
+    {
+        println!("premise: the sticky request must be answered with its cookie");
+        return State::Fail;
+    }
+    if !client.is_connected() {
+        println!("the client connection was closed after the sticky request");
+        return State::Fail;
+    }
+
+    client.set_request("GET /api HTTP/1.1\r\nHost: plain.localhost\r\n\r\n");
+    client.send();
+    plain.accept(0);
+    if plain.receive(0).is_none() {
+        println!("the plain backend received nothing");
+        return State::Fail;
+    }
+    plain.send(0);
+    let Some(second) = client.receive() else {
+        println!("the client received no response to the plain request");
+        return State::Fail;
+    };
+    println!("plain response: {second:?}");
+    if !second.ends_with("\r\n\r\nb") {
+        println!("the plain request must be answered by its own cluster");
+        return State::Fail;
+    }
+    if second.to_ascii_lowercase().contains("set-cookie") {
+        println!("the plain request must not carry the sticky request's cookie");
+        return State::Fail;
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    State::Success
+}
+
 fn try_max_connections() -> State {
     let front_address = create_local_address();
 
@@ -4073,6 +4177,18 @@ fn test_keep_alive_rotates_request_id() {
 fn test_stick() {
     assert_eq!(
         repeat_until_error_or(10, "Sticky session", try_stick),
+        State::Success
+    );
+}
+
+#[test]
+fn test_keep_alive_does_not_carry_a_sticky_cookie_over() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "Keep alive: a sticky cookie stays with its request",
+            try_keep_alive_does_not_carry_a_sticky_cookie_over
+        ),
         State::Success
     );
 }
