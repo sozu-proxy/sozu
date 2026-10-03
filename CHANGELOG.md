@@ -3990,6 +3990,22 @@
 
 ### 🐛 Fixed
 
+- **`test(e2e)`: `test_issue_806` no longer times the host's scheduler against its reconnect
+  budget.** `try_backend_stop` (`e2e/src/tests/tests.rs`) compared the wall-clock round trip of the
+  request that follows the backend stop with a 100 ms budget. On a loaded host the round trip of a
+  correct re-route (status 200, the surviving backend serving one request) reached 117-365 ms,
+  most of it spent with the client, worker or backend thread runnable but waiting for a CPU. The
+  budget now applies to the round trip less that run-queue wait, read per thread from
+  `/proc/self/task/<tid>/schedstat` (new `e2e/src/sched.rs`; `Worker::server_tid` and
+  `BackendHandle::tid` name the threads). A blocked wait is not run-queue time, so the documented
+  red check (a 150 ms sleep before the backend connect in `Mux::dial_backend`) still fails on the
+  first iteration, idle or loaded. The mock `AsyncBackend` thread now blocks in `poll` on its
+  listener, its clients and a stop waker instead of spinning on non-blocking `accept`/`read`, so
+  it is woken by a request rather than noticing it at its next time slice, and no longer holds a
+  CPU for the whole test. Measured with 60 busy loops on a 20-CPU host (load average 80-110): 17
+  failures in 20 runs before, 0 in 20 after (in each of two batches); over their 4 000
+  trials the raw round trip exceeded the budget 88 times while the compared value stayed under 4 ms.
+
 - **`ci(docker)`: build the Docker image with a pinned Rust image instead of Alpine edge's
   rolling `rust` package.** On 2026-10-02 Alpine edge shipped `rust 1.99.0-r0` with a broken
   standard library (``only metadata stub found for `rlib` dependency `std` ``, then ``requires

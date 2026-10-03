@@ -969,6 +969,14 @@ skipping it produced a real flaky-test or papered-over-bug commit.
   `aggregator.rs`. Setup helpers (`setup_sync_test`, `setup_async_test`,
   `create_local_address`, `repeat_until_error_or`) are in `e2e/src/tests/mod.rs`
   and `e2e/src/tests/tests.rs`.
+- **A latency budget times the scheduler too.** A wall-clock budget on a round
+  trip also counts the time each thread on its path spent runnable but waiting
+  for a CPU, which on a loaded CI runner can exceed the budget alone. Compare
+  the round trip less that wait instead: `run_queue_delay` (`e2e/src/sched.rs`)
+  sums it per thread from `/proc/self/task/<tid>/schedstat`, and
+  `Worker::server_tid`, `BackendHandle::tid` and `current_tid` name the threads.
+  `try_backend_stop` (`test_issue_806`) is the worked example. A blocked wait (a
+  sleep, a timer, a pending connect) is not run-queue time and stays measured.
 - **Know what e2e cannot reach, and write it down.** Some code is unreachable
   from a real worker for structural reasons, so a test aimed at it passes for
   the wrong reason and guards nothing. Before adding a test for a defect on a
