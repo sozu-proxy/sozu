@@ -30,7 +30,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::ErrorKind,
     net::SocketAddr,
-    rc::Rc,
+    rc::{Rc, Weak},
     time::{Duration, Instant},
 };
 
@@ -40,7 +40,7 @@ use mio::{
 };
 use sozu_command::{proto::command::UdpHealthConfig, state::ClusterId};
 
-use crate::backends::BackendMap;
+use crate::backends::{Backend, BackendMap};
 use crate::metrics::names;
 use crate::socket::udp_connect;
 
@@ -93,8 +93,11 @@ impl UdpHealthSettings {
 }
 
 /// A batch of backends due for probing, grouped by cluster:
-/// `(cluster_id, resolved settings, [(backend_id, address)])`.
-type ProbeBatch = Vec<(ClusterId, UdpHealthSettings, Vec<(String, SocketAddr)>)>;
+/// `(cluster_id, resolved settings, [(address, incarnation)])`.
+type ProbeBatch = Vec<(ClusterId, UdpHealthSettings, Vec<ProbeTarget>)>;
+
+/// A backend due for probing: `(address, incarnation)`.
+type ProbeTarget = (SocketAddr, Weak<RefCell<Backend>>);
 
 /// The transport of an in-flight probe.
 ///
@@ -127,8 +130,9 @@ struct InFlightProbe {
     socket: ProbeSocket,
     token: Token,
     cluster_id: ClusterId,
-    backend_id: String,
-    address: SocketAddr,
+    /// The backend incarnation this probe was launched for; see
+    /// [`UdpHealthChecker::record`] (#1821).
+    backend: Weak<RefCell<Backend>>,
     started_at: Instant,
     timeout: Duration,
     rise: u32,
@@ -257,7 +261,7 @@ impl UdpHealthChecker {
         let now = Instant::now();
         let backend_map = backends.borrow();
 
-        // Collect (cluster, settings, [(backend_id, address)]) to probe.
+        // Collect (cluster, settings, [(address, incarnation)]) to probe.
         let mut to_probe: ProbeBatch = Vec::new();
         for (cluster_id, settings) in &self.settings {
             let due = match self.last_check.get(cluster_id) {
@@ -268,20 +272,20 @@ impl UdpHealthChecker {
                 continue;
             }
             if let Some(list) = backend_map.backends.get(cluster_id) {
-                let targets: Vec<(String, SocketAddr)> =
-                    list.backends
-                        .iter()
-                        .filter(|b| {
-                            let b = b.borrow();
-                            !self.in_flight.iter().any(|p| {
-                                p.cluster_id == *cluster_id && p.backend_id == b.backend_id
-                            })
-                        })
-                        .map(|b| {
-                            let b = b.borrow();
-                            (b.backend_id.to_owned(), b.address)
-                        })
-                        .collect();
+                // Probes in flight are tracked per backend incarnation: one
+                // still draining for a removed incarnation does not delay
+                // the first probe of its replacement.
+                let targets: Vec<ProbeTarget> = list
+                    .backends
+                    .iter()
+                    .filter(|b| {
+                        !self
+                            .in_flight
+                            .iter()
+                            .any(|p| std::ptr::eq(p.backend.as_ptr(), Rc::as_ptr(b)))
+                    })
+                    .map(|b| (b.borrow().address, Rc::downgrade(b)))
+                    .collect();
                 if !targets.is_empty() {
                     to_probe.push((cluster_id.to_owned(), settings.clone(), targets));
                 }
@@ -291,14 +295,14 @@ impl UdpHealthChecker {
 
         for (cluster_id, settings, targets) in to_probe {
             self.last_check.insert(cluster_id.to_owned(), now);
-            for (backend_id, address) in targets {
+            for (address, incarnation) in targets {
                 // Primary: companion TCP probe (always runs).
                 self.spawn_tcp_probe(
                     backends,
                     registry,
                     &cluster_id,
-                    &backend_id,
                     address,
+                    &incarnation,
                     &settings,
                     now,
                 );
@@ -311,8 +315,8 @@ impl UdpHealthChecker {
                         backends,
                         registry,
                         &cluster_id,
-                        &backend_id,
                         address,
+                        &incarnation,
                         &settings,
                         now,
                     );
@@ -330,8 +334,8 @@ impl UdpHealthChecker {
         backends: &Rc<RefCell<BackendMap>>,
         registry: &Registry,
         cluster_id: &str,
-        backend_id: &str,
         address: SocketAddr,
+        incarnation: &Weak<RefCell<Backend>>,
         settings: &UdpHealthSettings,
         now: Instant,
     ) {
@@ -343,8 +347,7 @@ impl UdpHealthChecker {
             Self::record(
                 backends,
                 cluster_id,
-                backend_id,
-                address,
+                incarnation,
                 false,
                 settings.rise,
                 settings.fall,
@@ -367,8 +370,7 @@ impl UdpHealthChecker {
             socket: ProbeSocket::Tcp(stream),
             token,
             cluster_id: cluster_id.into(),
-            backend_id: backend_id.to_owned(),
-            address,
+            backend: incarnation.to_owned(),
             started_at: now,
             timeout: settings.timeout,
             rise: settings.rise,
@@ -387,8 +389,8 @@ impl UdpHealthChecker {
         backends: &Rc<RefCell<BackendMap>>,
         registry: &Registry,
         cluster_id: &str,
-        backend_id: &str,
         address: SocketAddr,
+        incarnation: &Weak<RefCell<Backend>>,
         settings: &UdpHealthSettings,
         now: Instant,
     ) {
@@ -399,8 +401,7 @@ impl UdpHealthChecker {
             Self::record(
                 backends,
                 cluster_id,
-                backend_id,
-                address,
+                incarnation,
                 false,
                 settings.rise,
                 settings.fall,
@@ -433,8 +434,7 @@ impl UdpHealthChecker {
             socket: ProbeSocket::Udp(socket),
             token,
             cluster_id: cluster_id.into(),
-            backend_id: backend_id.to_owned(),
-            address,
+            backend: incarnation.to_owned(),
             started_at: now,
             timeout: settings.timeout,
             rise: settings.rise,
@@ -489,8 +489,7 @@ impl UdpHealthChecker {
             Self::record(
                 backends,
                 &probe.cluster_id,
-                &probe.backend_id,
-                probe.address,
+                &probe.backend,
                 success,
                 probe.rise,
                 probe.fall,
@@ -498,14 +497,17 @@ impl UdpHealthChecker {
         }
     }
 
-    /// Apply a probe result to the backend's `HealthState` with rise/fall
-    /// hysteresis, log + count transitions, and re-evaluate cluster
-    /// availability so fail-open / recovery transitions surface.
+    /// Apply a probe result to the `HealthState` of the backend
+    /// `incarnation` it was launched for, with rise/fall hysteresis, log +
+    /// count transitions, and re-evaluate cluster availability so fail-open /
+    /// recovery transitions surface. A result whose incarnation left the
+    /// cluster (removed, or replaced by a re-add of the same id and address)
+    /// is dropped; it never lands on a sibling at the same address nor on the
+    /// replacement (#1821).
     fn record(
         backends: &Rc<RefCell<BackendMap>>,
         cluster_id: &str,
-        backend_id: &str,
-        address: SocketAddr,
+        incarnation: &Weak<RefCell<Backend>>,
         success: bool,
         rise: u32,
         fall: u32,
@@ -514,10 +516,17 @@ impl UdpHealthChecker {
         let Some(list) = backend_map.backends.get_mut(cluster_id) else {
             return;
         };
-        let Some(backend_ref) = list.find_backend(&address) else {
+        let Some(backend_ref) = list.find_incarnation(incarnation) else {
+            debug!(
+                "{} dropping a result for a backend no longer in cluster {}",
+                log_context!(),
+                cluster_id
+            );
             return;
         };
         let mut backend = backend_ref.borrow_mut();
+        let backend_id = backend.backend_id.to_owned();
+        let address = backend.address;
         if success {
             if backend.health.record_success(rise) {
                 info!(
@@ -632,6 +641,7 @@ mod tests {
             .borrow_mut()
             .add_backend(cluster, Backend::new("b1", address, None, None, None));
         let (rise, fall) = (2u32, 3u32);
+        let b1 = Rc::downgrade(&backend_map.borrow().backends[cluster].backends[0]);
 
         let is_healthy = |map: &Rc<RefCell<BackendMap>>| {
             let mut m = map.borrow_mut();
@@ -643,15 +653,100 @@ mod tests {
 
         // Secondary UDP probe goes silent: `fall` failures flip the backend DOWN.
         for _ in 0..fall {
-            UdpHealthChecker::record(&backend_map, cluster, "b1", address, false, rise, fall);
+            UdpHealthChecker::record(&backend_map, cluster, &b1, false, rise, fall);
         }
         assert!(!is_healthy(&backend_map));
 
         // A reply arrives: `rise` successes flip it back UP (hysteresis holds —
         // one success is not enough).
-        UdpHealthChecker::record(&backend_map, cluster, "b1", address, true, rise, fall);
+        UdpHealthChecker::record(&backend_map, cluster, &b1, true, rise, fall);
         assert!(!is_healthy(&backend_map));
-        UdpHealthChecker::record(&backend_map, cluster, "b1", address, true, rise, fall);
+        UdpHealthChecker::record(&backend_map, cluster, &b1, true, rise, fall);
         assert!(is_healthy(&backend_map));
+    }
+
+    /// The health of the backend `backend_id` in `cluster`.
+    fn is_healthy_by_id(map: &Rc<RefCell<BackendMap>>, cluster: &str, backend_id: &str) -> bool {
+        map.borrow().backends[cluster]
+            .backends
+            .iter()
+            .find(|backend| backend.borrow().backend_id == backend_id)
+            .expect("backend id is present")
+            .borrow()
+            .health
+            .is_healthy()
+    }
+
+    /// #1821: two ids may share an address; a probe result updates the id
+    /// that was probed, never the first sibling at that address.
+    #[test]
+    fn probe_result_updates_the_backend_id_that_was_probed() {
+        use crate::backends::{Backend, BackendMap};
+
+        let cluster = "dns";
+        let address: SocketAddr = ([127, 0, 0, 1], 5353).into();
+        let backend_map = Rc::new(RefCell::new(BackendMap::new()));
+        {
+            let mut map = backend_map.borrow_mut();
+            map.add_backend(cluster, Backend::new("a", address, None, None, None));
+            map.add_backend(cluster, Backend::new("b", address, None, None, None));
+        }
+        let probed = Rc::downgrade(
+            backend_map.borrow().backends[cluster]
+                .find_backend_by_identity("b", &address)
+                .expect("backend b is present"),
+        );
+
+        UdpHealthChecker::record(&backend_map, cluster, &probed, false, 1, 1);
+
+        assert_eq!(
+            (
+                is_healthy_by_id(&backend_map, cluster, "a"),
+                is_healthy_by_id(&backend_map, cluster, "b"),
+            ),
+            (true, false),
+            "a failed probe for backend b must mutate b, not the first backend at its address"
+        );
+    }
+
+    /// #1821: a probe launched before `RemoveBackend` that completes after
+    /// the same id and address are added again must not mutate the
+    /// replacement; a result for the replacement does apply.
+    #[test]
+    fn late_probe_result_after_remove_and_readd_does_not_mutate_replacement() {
+        use crate::backends::{Backend, BackendMap};
+
+        let cluster = "dns";
+        let address: SocketAddr = ([127, 0, 0, 1], 5354).into();
+        let backend_map = Rc::new(RefCell::new(BackendMap::new()));
+        backend_map
+            .borrow_mut()
+            .add_backend(cluster, Backend::new("b1", address, None, None, None));
+        // What `initiate` captures when it launches the probe, and a session
+        // still holding the removed backend, which keeps it alive.
+        let held = Rc::clone(&backend_map.borrow().backends[cluster].backends[0]);
+        let stale = Rc::downgrade(&held);
+
+        assert!(
+            backend_map
+                .borrow_mut()
+                .remove_backend(cluster, "b1", &address)
+        );
+        backend_map
+            .borrow_mut()
+            .add_backend(cluster, Backend::new("b1", address, None, None, None));
+
+        UdpHealthChecker::record(&backend_map, cluster, &stale, false, 1, 1);
+        assert!(
+            is_healthy_by_id(&backend_map, cluster, "b1"),
+            "a late result from the removed incarnation must not mark its replacement DOWN"
+        );
+
+        let current = Rc::downgrade(&backend_map.borrow().backends[cluster].backends[0]);
+        UdpHealthChecker::record(&backend_map, cluster, &current, false, 1, 1);
+        assert!(
+            !is_healthy_by_id(&backend_map, cluster, "b1"),
+            "a result for the live incarnation must mark it DOWN"
+        );
     }
 }
