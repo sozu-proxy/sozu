@@ -3984,6 +3984,20 @@
 
 ### 🐛 Fixed
 
+- **`fix(metrics)`: metric-detail leases expire without another worker command
+  ([#1831](https://github.com/sozu-proxy/sozu/issues/1831)).** The lease janitor
+  (`Aggregator::lease_tick`) ran only at the top of `Server::notify`, which only a worker command
+  reaches, so a lease whose owner went away (a crashed `sozu top`) kept the worker's metric
+  cardinality elevated past its TTL until the next control request, whatever the data-plane
+  traffic. The janitor is now `tick_metric_detail_leases` in `lib/src/server.rs`, called once per
+  event-loop iteration (the loop wakes at least once per one-second poll timeout) as well as from
+  `notify`, still gated to one table walk per five seconds. An abandoned lease is retired, and its
+  `lease_tick_expired` `METRIC_DETAIL_CHANGED` event pushed, within TTL plus five seconds plus one
+  poll timeout. `test_abandoned_lease_expires_without_a_command`
+  (`e2e/src/tests/metrics_lifecycle_tests.rs`) applies a one-second lease on a real worker, sends
+  no further command while requests keep flowing, and waits for that event on the command channel
+  without writing to it.
+
 - **`test(e2e)`: `test_issue_806` no longer times the host's scheduler against its reconnect
   budget.** `try_backend_stop` (`e2e/src/tests/tests.rs`) compared the wall-clock round trip of the
   request that follows the backend stop with a 100 ms budget. On a loaded host the round trip of a
