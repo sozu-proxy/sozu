@@ -1202,8 +1202,19 @@ mod tests {
     //! syscall count is proven outside the suite, by tracing the running proxy
     //! (81.7 `send(2)` per access-log line before, 1 after; see the
     //! `perf(logging)` CHANGELOG entry).
-    use super::LoggerBuffer;
-    use std::io::{Error as IoError, ErrorKind, Write};
+    use super::{AccessLogFormat, InnerLogger, LogLevel, LoggerBackend, LoggerBuffer, now};
+    use crate::{
+        logging::{EndpointRecord, LogContext, RequestRecord},
+        proto::command::ProtobufAccessLog,
+    };
+    use nix::sys::socket::{setsockopt, sockopt::SndBuf};
+    use prost::Message;
+    use rusty_ulid::Ulid;
+    use std::{
+        io::{Error as IoError, ErrorKind, Read, Write},
+        net::{Shutdown, TcpListener},
+        time::Duration,
+    };
 
     /// Counts the calls a record arrives in, and records every chunk.
     #[derive(Default)]
@@ -1439,6 +1450,183 @@ mod tests {
             ErrorKind::BrokenPipe,
             "the sink's error kind must survive: `log_access` reports it and \
              calls `LoggerBackend::revive`"
+        );
+    }
+
+    /// Build the exact record type that [`InnerLogger::log_access`] converts
+    /// and frames before selecting the concrete `LoggerBackend::Tcp` arm.
+    fn protobuf_access_record<'a>(message: &'a str, tag: &'a str, id: u128) -> RequestRecord<'a> {
+        let (now, precise_time) = now();
+        RequestRecord {
+            message: Some(message),
+            context: LogContext {
+                session_id: Ulid::from(id),
+                request_id: Some(Ulid::from(id + 1)),
+                cluster_id: Some("short-write-cluster"),
+                backend_id: Some("short-write-backend"),
+            },
+            session_address: None,
+            backend_address: None,
+            protocol: "tcp",
+            endpoint: EndpointRecord::Tcp,
+            tags: None,
+            client_rtt: None,
+            server_rtt: None,
+            user_agent: None,
+            x_request_id: None,
+            tls_version: None,
+            tls_cipher: None,
+            tls_sni: None,
+            tls_alpn: None,
+            xff_chain: None,
+            service_time: Duration::ZERO,
+            response_time: None,
+            request_time: Duration::ZERO,
+            start_time_ns: None,
+            bytes_in: id as usize,
+            bytes_out: (id + 1) as usize,
+            otel: None,
+            pid: 1,
+            tag,
+            level: LogLevel::Info,
+            now,
+            precise_time,
+        }
+    }
+
+    fn encode_protobuf_frame(record: RequestRecord<'_>) -> Vec<u8> {
+        let protobuf = record.into_binary_access_log();
+        let mut frame = Vec::new();
+        protobuf
+            .encode_length_delimited(&mut frame)
+            .expect("the protobuf access-log fixture must encode");
+        frame.extend_from_slice(&[0, 0]);
+        frame
+    }
+
+    fn drain_until_idle(peer: &mut std::net::TcpStream, captured: &mut Vec<u8>) -> usize {
+        let before = captured.len();
+        let mut bytes = [0u8; 64 * 1024];
+        loop {
+            match peer.read(&mut bytes) {
+                Ok(0) => break,
+                Ok(read) => captured.extend_from_slice(&bytes[..read]),
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("could not drain the loopback peer: {error}"),
+            }
+        }
+        captured.len() - before
+    }
+
+    fn decode_protobuf_tags(mut stream: &[u8]) -> Result<Vec<String>, String> {
+        let mut tags = Vec::new();
+        for record_index in 0..2 {
+            let record = ProtobufAccessLog::decode_length_delimited(&mut stream)
+                .map_err(|error| format!("record {record_index} did not decode: {error}"))?;
+            if !stream.starts_with(&[0, 0]) {
+                return Err(format!(
+                    "record {record_index} was not followed by its two zero bytes"
+                ));
+            }
+            stream = &stream[2..];
+            tags.push(record.tag);
+        }
+        if !stream.is_empty() {
+            return Err(format!(
+                "{} unframed bytes follow the records",
+                stream.len()
+            ));
+        }
+        Ok(tags)
+    }
+
+    #[test]
+    fn protobuf_tcp_short_write_completes_or_surfaces_error() {
+        // Contract (sozu-proxy/sozu#1830): a successful protobuf TCP access-log
+        // write covers the complete frame. Two successful records must remain
+        // independently decodable, including the two zero-byte separators.
+        // The refuting observation is `true` from `log_access` after the real
+        // socket accepted only a prefix and shifted the following frame.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind the loopback log sink");
+        let address = listener.local_addr().expect("read the log sink address");
+        let sender = std::net::TcpStream::connect(address).expect("connect the log backend");
+        let (mut peer, _) = listener.accept().expect("accept the log backend");
+
+        // A blocking production TcpStream may return a successful prefix when
+        // its send timeout fires after making progress. Shrinking SO_SNDBUF and
+        // withholding reads during each call makes that boundary deterministic.
+        setsockopt(&sender, SndBuf, &4096usize).expect("shrink the sender queue");
+        sender
+            .set_write_timeout(Some(Duration::from_millis(250)))
+            .expect("bound a blocked log write");
+        peer.set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("bound capture reads");
+
+        let log_target = format!("tcp://{address}");
+        let mut logger = InnerLogger {
+            directives: Vec::new(),
+            backend: LoggerBackend::Tcp(sender),
+            log_target,
+            colored: false,
+            access_backend: None,
+            access_logs_target: None,
+            access_format: AccessLogFormat::Protobuf,
+            access_colored: false,
+            buffer: LoggerBuffer(Vec::with_capacity(4096)),
+        };
+
+        let first_message = "A".repeat(1024 * 1024);
+        let second_message = "B".repeat(1024 * 1024);
+        let first_expected =
+            encode_protobuf_frame(protobuf_access_record(&first_message, "WRK-SHORT-00", 10));
+        let second_expected =
+            encode_protobuf_frame(protobuf_access_record(&second_message, "WRK-SHORT-01", 20));
+
+        let first_ok =
+            logger.log_access(protobuf_access_record(&first_message, "WRK-SHORT-00", 10));
+        if !first_ok {
+            // Surfacing the short write is an accepted implementation of the
+            // contract: the caller can revive the backend and no truncated
+            // record was reported as delivered.
+            return;
+        }
+
+        let mut captured = Vec::new();
+        let first_written = drain_until_idle(&mut peer, &mut captured);
+        assert!(
+            first_written > 0 && first_written < first_expected.len(),
+            "the harness must induce a real short write: captured {first_written} of {} bytes",
+            first_expected.len()
+        );
+
+        let second_ok =
+            logger.log_access(protobuf_access_record(&second_message, "WRK-SHORT-01", 20));
+        let second_written = drain_until_idle(&mut peer, &mut captured);
+
+        if let LoggerBackend::Tcp(sender) = &logger.backend {
+            sender
+                .shutdown(Shutdown::Write)
+                .expect("half-close the owned log socket");
+        }
+        let _ = drain_until_idle(&mut peer, &mut captured);
+
+        let mut expected = first_expected;
+        expected.extend_from_slice(&second_expected);
+        let decoded = decode_protobuf_tags(&captured);
+        assert!(
+            second_ok
+                && second_written > 0
+                && captured == expected
+                && decoded == Ok(vec!["WRK-SHORT-00".to_owned(), "WRK-SHORT-01".to_owned()]),
+            "two successful protobuf TCP writes must preserve progress and framing: \
+             first_ok={first_ok}, second_ok={second_ok}, first_written={first_written}, \
+             second_written={second_written}, captured={}, expected={}, decoded={decoded:?}",
+            captured.len(),
+            expected.len(),
         );
     }
 }

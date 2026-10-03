@@ -201,8 +201,8 @@ backends = [ {{ address = "127.0.0.1:{backend_port}", backend_id = "drain-backen
     let mut worker_upgrade = Command::new(env!("CARGO_BIN_EXE_sozu"))
         .args(["-c", config_path.to_str().unwrap(), "-t", "30000"])
         .args(["upgrade", "--worker", "0"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn upgrade --worker 0");
     let replaced_by = Instant::now() + Duration::from_secs(20);
@@ -216,16 +216,41 @@ backends = [ {{ address = "127.0.0.1:{backend_port}", backend_id = "drain-backen
     let old_main = main_pid(&pid_file);
     let main_upgrade = sozu(&config_path, &["upgrade"]);
     let deadline = Instant::now() + Duration::from_secs(30);
+    let mut old_main_status = None;
     while main_pid(&pid_file) == old_main && Instant::now() < deadline {
-        let _ = master.try_wait();
+        old_main_status = master.try_wait().expect("observe old main");
         thread::sleep(Duration::from_millis(100));
     }
+    if old_main_status.is_none() {
+        old_main_status = master.try_wait().expect("observe old main after handoff");
+    }
+    let new_main = main_pid(&pid_file);
 
     let response = slow.join().expect("slow request thread");
-    // The worker upgrade's client loses its main in the hand-off; only the
-    // request matters here.
-    let _ = worker_upgrade.kill();
-    let _ = worker_upgrade.wait();
+    let client_deadline = Instant::now() + Duration::from_secs(10);
+    let mut worker_upgrade_terminal = worker_upgrade
+        .try_wait()
+        .expect("observe pending worker-upgrade client");
+    while worker_upgrade_terminal.is_none() && Instant::now() < client_deadline {
+        thread::sleep(Duration::from_millis(50));
+        worker_upgrade_terminal = worker_upgrade
+            .try_wait()
+            .expect("observe pending worker-upgrade client");
+    }
+    let hit_client_bound = worker_upgrade_terminal.is_none();
+    if hit_client_bound {
+        let _ = worker_upgrade.kill();
+    }
+    let worker_upgrade_output = worker_upgrade
+        .wait_with_output()
+        .expect("collect worker-upgrade client outcome");
+    let running_workers = running_worker_ids(&config_path);
+    eprintln!(
+        "PENDING_UPGRADE_OBSERVATION old_main={old_main:?} old_main_status={old_main_status:?} new_main={new_main:?} worker_upgrade_status={:?} hit_client_bound={hit_client_bound} worker_upgrade_stdout={:?} worker_upgrade_stderr={:?} running_workers={running_workers:?}",
+        worker_upgrade_output.status,
+        String::from_utf8_lossy(&worker_upgrade_output.stdout),
+        String::from_utf8_lossy(&worker_upgrade_output.stderr),
+    );
     stop(&config_path, &pid_file, &mut master);
 
     assert!(

@@ -654,4 +654,40 @@ mod tests {
         UdpHealthChecker::record(&backend_map, cluster, "b1", address, true, rise, fall);
         assert!(is_healthy(&backend_map));
     }
+
+    #[test]
+    fn probe_result_updates_the_backend_id_that_was_probed() {
+        use crate::backends::{Backend, BackendMap};
+
+        let cluster = "dns";
+        let address: SocketAddr = ([127, 0, 0, 1], 5353).into();
+        let backend_map = Rc::new(RefCell::new(BackendMap::new()));
+        {
+            let mut map = backend_map.borrow_mut();
+            map.add_backend(cluster, Backend::new("a", address, None, None, None));
+            map.add_backend(cluster, Backend::new("b", address, None, None, None));
+        }
+
+        UdpHealthChecker::record(&backend_map, cluster, "b", address, false, 1, 1);
+
+        let health_by_id = {
+            let map = backend_map.borrow();
+            let list = map.backends.get(cluster).expect("cluster is present");
+            let health = |backend_id: &str| {
+                list.backends
+                    .iter()
+                    .find(|backend| backend.borrow().backend_id == backend_id)
+                    .expect("backend id is present")
+                    .borrow()
+                    .health
+                    .is_healthy()
+            };
+            (health("a"), health("b"))
+        };
+        assert_eq!(
+            health_by_id,
+            (true, false),
+            "a failed probe for backend b must mutate b, not the first backend at its address"
+        );
+    }
 }

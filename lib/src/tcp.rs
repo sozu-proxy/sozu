@@ -5515,6 +5515,163 @@ mod sni_routing_tests {
         }
     }
 
+    /// A real Linux `shutdown(SHUT_WR)` can report the final request bytes
+    /// and `EPOLLRDHUP` in the same epoll event. `Ready::from(&Event)` maps
+    /// that event to `READABLE | HUP` (without `WRITE_CLOSED`): the peer has
+    /// ended its request stream but still owns a usable response stream.
+    ///
+    /// An `ExpectProxyProtocol` session must therefore consume the complete
+    /// PROXY-v2 header before acting on HUP, upgrade to `Pipe`, drain the
+    /// payload already queued behind the header, and return the backend's
+    /// response through the client's still-open read side.
+    ///
+    /// TO SEE THIS RED on the audited tree: run this test unchanged. The
+    /// current `TcpSession::ready_inner` handles HUP before READABLE and
+    /// closes the expect state before it parses the already-buffered header.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn expect_proxy_half_close_drains_payload_and_returns_response() {
+        use std::{
+            io::{Read as _, Write as _},
+            net::Shutdown,
+            os::fd::AsRawFd,
+            time::Duration,
+        };
+
+        use mio::{Events, Interest, Poll, Token, unix::SourceFd};
+
+        let mut fixture = expect_proxy_fixture();
+        fixture
+            .client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set client read timeout");
+
+        let payload = b"request-after-proxy-header";
+        let response = b"response-after-client-fin";
+        let mut wire = proxy_protocol_v2_ipv4_header().to_vec();
+        wire.extend_from_slice(payload);
+        fixture
+            .client
+            .write_all(&wire)
+            .expect("write PROXY header and payload in one request stream");
+        fixture
+            .client
+            .shutdown(Shutdown::Write)
+            .expect("half-close the client write side");
+
+        // Register only after both the bytes and FIN are queued. This is a
+        // real epoll observation of the accepted socket, not a synthetic
+        // readiness word injected into the session.
+        let frontend_fd = fixture.session.borrow().state.front_socket().as_raw_fd();
+        let mut source = SourceFd(&frontend_fd);
+        let mut poll = Poll::new().expect("create frontend poll");
+        let observed_token = Token(7);
+        poll.registry()
+            .register(
+                &mut source,
+                observed_token,
+                Interest::READABLE | Interest::WRITABLE,
+            )
+            .expect("register accepted frontend socket");
+        let mut events = Events::with_capacity(4);
+        poll.poll(&mut events, Some(Duration::from_secs(2)))
+            .expect("poll accepted frontend socket");
+        let ready = events
+            .iter()
+            .find(|event| event.token() == observed_token)
+            .map(Ready::from)
+            .expect("the queued request and FIN produce an epoll event");
+        assert!(
+            ready.is_readable(),
+            "the final request bytes must be readable: {ready:?}"
+        );
+        assert!(
+            ready.is_hup(),
+            "the peer FIN must be reported as HUP: {ready:?}"
+        );
+        assert!(
+            !ready.is_write_closed(),
+            "EPOLLRDHUP leaves the response direction open: {ready:?}"
+        );
+
+        fixture
+            .session
+            .borrow_mut()
+            .update_readiness(fixture.frontend_token, ready);
+        let closed = fixture
+            .session
+            .borrow_mut()
+            .ready(fixture.proxy_session.clone());
+        assert!(
+            !closed,
+            "READABLE|HUP must parse the header and retain the response direction"
+        );
+        assert!(
+            !matches!(
+                fixture.session.borrow().state,
+                TcpStateMachine::ExpectProxyProtocol(_)
+            ),
+            "the complete header must upgrade the expect state"
+        );
+
+        let (mut backend, _) = fixture
+            ._backend_listener
+            .accept()
+            .expect("the parsed header triggers the backend dial");
+        backend
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set backend read timeout");
+        backend
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .expect("set backend write timeout");
+
+        let backend_token = fixture
+            .session
+            .borrow()
+            .backend_token
+            .expect("the upgraded session owns a backend token");
+        fixture
+            .session
+            .borrow_mut()
+            .update_readiness(backend_token, Ready::WRITABLE);
+        assert!(
+            !fixture
+                .session
+                .borrow_mut()
+                .ready(fixture.proxy_session.clone()),
+            "the backend connect and request flush keep the session alive"
+        );
+
+        let mut backend_received = vec![0; payload.len()];
+        backend
+            .read_exact(&mut backend_received)
+            .expect("backend receives the payload queued before FIN");
+        assert_eq!(backend_received, payload);
+
+        backend
+            .write_all(response)
+            .expect("backend writes its response");
+        fixture
+            .session
+            .borrow_mut()
+            .update_readiness(backend_token, Ready::READABLE);
+        fixture
+            .session
+            .borrow_mut()
+            .update_readiness(fixture.frontend_token, Ready::WRITABLE);
+        let _ = fixture
+            .session
+            .borrow_mut()
+            .ready(fixture.proxy_session.clone());
+
+        let mut client_received = vec![0; response.len()];
+        fixture
+            .client
+            .read_exact(&mut client_received)
+            .expect("half-closed client receives the backend response");
+        assert_eq!(client_received, response);
+    }
+
     /// Structural safety for `ready_inner`'s `Connecting` branch: it reads
     /// the backend readiness, which `back_readiness` has none of for
     /// `ExpectProxyProtocol` (and `unreachable!`s on for `FailedUpgrade`).

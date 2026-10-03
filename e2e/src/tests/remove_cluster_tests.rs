@@ -427,3 +427,69 @@ fn test_removed_backend_is_neither_reused_nor_kept() {
         State::Success,
     );
 }
+
+/// `ConfigState` keys removal on `(backend_id, address)`, and `AddBackend`
+/// admits two distinct ids at one address. The worker must therefore keep the
+/// sibling when only one of those identities is removed.
+///
+/// The candidate currently removes by address alone in `Server::remove_backend`
+/// / `BackendMap::remove_backend`, so this test is expected to reproduce the
+/// state/runtime split by receiving a 503 instead of the sibling's 200.
+#[test]
+fn test_removing_one_backend_id_keeps_same_address_sibling() {
+    let front_address = create_local_address();
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_sync_test(
+        "REMOVE-ONE-SHARED-ADDRESS-BACKEND",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+    let mut backend = backends.pop().expect("setup_sync_test returns one backend");
+    backend.connect();
+    let shared_address = backend.address;
+
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-sibling",
+        shared_address,
+        None,
+    )));
+    worker.read_to_last();
+    worker.send_proxy_request_type(RequestType::RemoveBackend(RemoveBackend {
+        cluster_id: "cluster_0".to_owned(),
+        backend_id: "cluster_0-0".to_owned(),
+        address: shared_address.into(),
+    }));
+    worker.read_to_last();
+
+    let mut client = Client::new(
+        "CLIENT",
+        front_address,
+        http_request("GET", "/api", "ping", "localhost"),
+    );
+    client.connect();
+    client.send();
+    let reached_sibling = backend.accept(0);
+    if reached_sibling {
+        backend.receive(0);
+        backend.send(0);
+    }
+    let response = client.receive_response(ANSWER_BUDGET);
+    println!(
+        "same-address sibling reached: {reached_sibling}; response after targeted removal: {response:?}"
+    );
+    let stopped = stop(worker);
+
+    assert!(reached_sibling, "the remaining backend id must still route");
+    assert!(
+        response
+            .as_deref()
+            .is_some_and(|answer| answer.starts_with("HTTP/1.1 200")),
+        "targeted removal must preserve the same-address sibling, got {response:?}"
+    );
+    assert!(stopped, "worker must stop cleanly after the reproduction");
+}
