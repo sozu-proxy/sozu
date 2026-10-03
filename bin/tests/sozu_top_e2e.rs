@@ -16,7 +16,8 @@
 
 #![cfg(feature = "tui")]
 
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// Path to the freshly-compiled `sozu` binary. Cargo populates this env
@@ -156,7 +157,7 @@ buffer_size = 16393
     // mouse capture (avoids stale escape sequences in the parent shell
     // if the test harness leaks them); `--snapshot 1` renders one
     // frame and exits.
-    let output = Command::new(sozu_bin())
+    let mut top = Command::new(sozu_bin())
         .args([
             "-c",
             config_path.to_str().unwrap(),
@@ -165,8 +166,29 @@ buffer_size = 16393
             "1",
             "--no-mouse",
         ])
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .expect("spawn sozu top --snapshot 1");
+
+    // The frame is the last thing `sozu top` writes: once it is out, the
+    // render loop has returned and `run_top` is shutting down. Stdout
+    // reaches EOF when the process exits, so the gap between the last
+    // frame byte and EOF is the shutdown latency, independent of how long
+    // startup and the first frame took on a loaded host.
+    let mut stdout = top.stdout.take().expect("piped stdout");
+    let mut chunk = [0u8; 8192];
+    let mut last_frame_byte = None;
+    loop {
+        match stdout.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(_) => last_frame_byte = Some(Instant::now()),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => panic!("read sozu top stdout: {e}"),
+        }
+    }
+    let exited = Instant::now();
+    let output = top.wait_with_output().expect("wait for sozu top");
 
     // Send SIGTERM to the master; SoftStop drains and exits. Give it 5 s.
     let _ = master.kill();
@@ -176,5 +198,19 @@ buffer_size = 16393
         output.status.success(),
         "sozu top --snapshot 1 exited non-zero: stderr=\n{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+
+    // sozu#1829: exit used to join collectors sleeping out their polling
+    // interval, up to the 30 s certs cadence. Once shutdown wakes them, the
+    // longest wait left is the events thread's 1 s bounded read
+    // (`EVENTS_READ_TIMEOUT` in `bin/src/ctl/top/transport.rs`); the bound
+    // is twice that.
+    let last_frame_byte = last_frame_byte.expect("sozu top --snapshot 1 wrote no frame");
+    let shutdown = exited.duration_since(last_frame_byte);
+    eprintln!("sozu top exited {shutdown:.2?} after its last frame");
+    assert!(
+        shutdown < Duration::from_secs(2),
+        "sozu top took {shutdown:.2?} to exit after its last frame: shutdown must \
+         wake the polling collectors instead of waiting out their interval",
     );
 }
