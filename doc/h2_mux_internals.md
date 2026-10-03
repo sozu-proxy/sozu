@@ -316,33 +316,28 @@ its RST_STREAM for a stream it opened crossed Sōzu's `REFUSED_STREAM` —
 disables the refusals for the rest of its connection just the same, which
 then behaves as it would without the soft state.
 
+A refused stream is never registered, so `ConnectionH2::enqueue_rst` keeps
+its id out of `rst_sent`; every refusal records it in the bounded
+recently-reset ring instead (`H2StreamTable::remember_refused`, #1815), so
+`H2StreamTable::was_reset_locally` knows it. The frames a client sent on it
+before reading its `REFUSED_STREAM` are ignored like those on a stream Sōzu
+reset (RFC 9113 §5.1): request trailers, and DATA, which is still credited to
+the connection window, within the same per-stream allowances, past which each
+frame counts one glitch. This holds for every refusal — flood pressure,
+draining (whose drain still ends with `NO_ERROR`),
+`SETTINGS_MAX_CONCURRENT_STREAMS`, buffer-pool exhaustion, and the oversized
+CONTINUATION block refused after its stream was removed. Refused ids share the
+ring's bound and eviction with reset streams; a refusal still costs its own
+glitch, so a client opening refused streams to spend their allowances meets
+the glitch budget first.
+
 A refused stream moves `H2StreamTable::highest_peer_stream_id` but not
 `ConnectionH2::last_stream_id`, which only an accepted stream moves. A HEADERS
 frame on a client id above `last_stream_id` and at or below
-`highest_peer_stream_id` — a refused id, or one the client skipped — opens no
-stream and is a connection error of type `PROTOCOL_ERROR`. An id below
-`last_stream_id` that was never opened takes the closed-stream branch and gets
-`GOAWAY(STREAM_CLOSED)`, as before.
-
-A refused stream is never registered, and `ConnectionH2::enqueue_rst` records
-only registered streams in `rst_sent`, so `H2StreamTable::was_reset_locally`
-does not know it. The frames a client sent on it before reading its
-`REFUSED_STREAM` are therefore not ignored: each DATA frame takes the
-closed-stream DATA branch (one glitch and one `RST_STREAM(STREAM_CLOSED)`; a
-refused browser upload filling a 64 KiB window costs about four, and the
-connection survives), and request trailers take the `PROTOCOL_ERROR` branch
-above (`GOAWAY(STREAM_CLOSED)` once a later stream was accepted). A client
-sending HEADERS, DATA and trailers in one burst thus reads
-`RST_STREAM(REFUSED_STREAM)`, `RST_STREAM(STREAM_CLOSED)`,
-`GOAWAY(PROTOCOL_ERROR)`, and loses every other stream in flight with the
-connection. This holds for every refusal — flood pressure, draining (whose
-drain then ends with `PROTOCOL_ERROR` instead of `NO_ERROR`),
-`SETTINGS_MAX_CONCURRENT_STREAMS` and buffer-pool exhaustion. Browsers and
-standard gRPC send no request trailers and are unaffected; a trailer-forwarding
-client such as Envoy can be. RFC 9113 §5.1 would have these frames ignored, the
-§5.1.1 reasoning holding only for skipped ids; the case is accepted as rare,
-and recording refused ids in the bounded recently-reset set
-(`H2StreamTable::was_reset_locally`) would close it.
+`highest_peer_stream_id` that the ring does not know — one the client skipped,
+or a refused id already evicted — opens no stream and is a connection error of
+type `PROTOCOL_ERROR` (§5.1.1). Such an id below `last_stream_id` takes the
+closed-stream branch and gets `GOAWAY(STREAM_CLOSED)`, as before.
 
 The per-window RST_STREAM rate has no soft state: it counts every reset, and
 with its half-decay a client at half the rate never reaches the limit.
@@ -742,7 +737,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:5071-5084
+```rust lib/src/protocol/mux/h2.rs:5058-5071
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -768,7 +763,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:5122-5128
+```rust lib/src/protocol/mux/h2.rs:5109-5115
 let events = stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -800,7 +795,7 @@ taken at the top of `H2WritePhase::Flush`'s post-flush tail
 (`ConnectionH2::poll_write_target`, `lib/src/protocol/mux/h2.rs`) and passes `stream.linked_token()` straight
 out of it:
 
-```rust lib/src/protocol/mux/h2.rs:3827-3828
+```rust lib/src/protocol/mux/h2.rs:3814-3815
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 ```
@@ -1153,7 +1148,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9424-9428
+```rust lib/src/protocol/mux/h2.rs:9416-9420
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1293,10 +1288,12 @@ Key decisions in this method:
   without END_STREAM counts toward the empty-DATA flood limit as on a live
   stream (CVE-2019-9518). Allowances are dropped with their stream's id from
   the ring, and held for at most `RESET_ALLOWANCES_CAPACITY` (512) streams,
-  since a stream refused or reset untracked stays in `rst_sent` and never
-  enters the ring. On a backend connection they are bounded by the backend's
+  since a stream still tracked in `rst_sent` holds one before it enters the
+  ring. On a backend connection they are bounded by the backend's
   own stream concurrency too, not by the emitted-RST cap, which the CANCEL
-  `ConnectionH2::end_stream` sends for a client that went away does not feed. WINDOW_UPDATE, PRIORITY and
+  `ConnectionH2::end_stream` sends for a client that went away does not feed.
+  The ring also holds the ids of the streams a frontend connection refused
+  (`H2StreamTable::remember_refused`), which are never tracked. WINDOW_UPDATE, PRIORITY and
   RST_STREAM keep their own handling, and so does every other frame type (a
   PUSH_PROMISE is still a connection error). A stream closed by END_STREAM in
   both directions keeps the connection error STREAM_CLOSED for HEADERS, and
@@ -1327,7 +1324,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9602-9606
+```rust lib/src/protocol/mux/h2.rs:9594-9598
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1802,7 +1799,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:8925
+```rust lib/src/protocol/mux/h2.rs:8917
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -2036,7 +2033,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:7456-7458
+```rust lib/src/protocol/mux/h2.rs:7448-7450
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -2044,7 +2041,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:7470-7476
+```rust lib/src/protocol/mux/h2.rs:7462-7468
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.

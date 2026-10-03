@@ -1741,31 +1741,25 @@ the moment Sōzu refuses it, its RST_STREAM crosses the `REFUSED_STREAM` and
 counts as a reset of a refused stream, and the refusals end for the rest of that
 connection, which then behaves as it would without the soft state.
 
+Frames a client sent on a refused stream before it read that stream's
+`REFUSED_STREAM` — DATA, request trailers — are ignored, as on any stream Sōzu
+reset (RFC 9113 §5.1): the refused stream costs the client that stream only,
+and the connection and its other streams carry on. This holds for every
+refusal, not only this soft state: over `SETTINGS_MAX_CONCURRENT_STREAMS`,
+during a graceful shutdown, whose drain still ends with `NO_ERROR`, and on
+buffer-pool exhaustion. Sōzu remembers refused ids in the same bounded list as
+the streams it reset (the last 256), and holds them to the same allowance: two
+header blocks per stream and DATA within the stream's initial window, still
+credited to the connection window. Each frame beyond that counts one glitch
+(`h2_max_glitch_count`), and each refusal still counts one as described above
+([#1815](https://github.com/sozu-proxy/sozu/issues/1815)).
+
 HEADERS on a client stream id that was never opened opens no stream. An id
 above the last stream Sōzu accepted and at or below the highest id the client
-used — refused, or skipped by the client — ends the connection with
-`GOAWAY(PROTOCOL_ERROR)` (RFC 9113 §5.1.1). An id below the last accepted
-stream, skipped or refused, takes the closed-stream path and ends it with
-`GOAWAY(STREAM_CLOSED)`, as before.
-
-This has one cost for a legitimate client, accepted as a rare case: a client
-that sends HEADERS, DATA and request trailers on a stream before it reads that
-stream's `REFUSED_STREAM` loses the connection, with every other stream in
-flight on it. The peer reads `RST_STREAM(REFUSED_STREAM)`, then
-`RST_STREAM(STREAM_CLOSED)` for its DATA, then `GOAWAY(PROTOCOL_ERROR)` for the
-trailers (`GOAWAY(STREAM_CLOSED)` once a later stream was accepted). It applies
-to every refusal, not only this soft state: over
-`SETTINGS_MAX_CONCURRENT_STREAMS`, during a graceful shutdown — whose drain can
-then end with `PROTOCOL_ERROR` instead of `NO_ERROR` — and on buffer-pool
-exhaustion. Browsers and standard gRPC clients send no request trailers (gRPC
-ends a request with END_STREAM on DATA) and are unaffected; a client that
-forwards request trailers, as Envoy can, may meet it. Each DATA frame of a
-refused stream costs one glitch and one `RST_STREAM(STREAM_CLOSED)` — a refused
-browser upload filling a 64 KiB window costs about four — and the connection
-survives that. Strictly, RFC 9113 §5.1 has an endpoint ignore frames on a
-stream it reset; the §5.1.1 reasoning holds only for ids the client skipped.
-Recording refused ids in the bounded list of recently reset streams, so their
-frames are ignored, is left for later.
+used, skipped by the client (or refused longer ago than the list of reset
+streams remembers), ends the connection with `GOAWAY(PROTOCOL_ERROR)` (RFC 9113
+§5.1.1). Such an id below the last accepted stream takes the closed-stream path
+and ends it with `GOAWAY(STREAM_CLOSED)`, as before.
 
 Clients that retry fast meet the refusals too. A gRPC client whose calls hit
 their deadlines cancels each one before its response — a pre-response reset —

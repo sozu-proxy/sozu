@@ -69,15 +69,9 @@
   them too. HEADERS on a client stream id above the last accepted stream and at or below the
   highest id the client used (refused or skipped, never opened) is now a connection error,
   `GOAWAY(PROTOCOL_ERROR)` (RFC 9113 §5.1.1), instead of being taken for a new stream; a lower
-  never-opened id keeps getting `GOAWAY(STREAM_CLOSED)`. Known limitation, accepted as rare: a
-  client that sends HEADERS, DATA and request trailers before reading its `REFUSED_STREAM` gets
-  `RST_STREAM(REFUSED_STREAM)`, `RST_STREAM(STREAM_CLOSED)` and `GOAWAY(PROTOCOL_ERROR)`, losing
-  every stream in flight, for every refusal kind (flood pressure,
-  `SETTINGS_MAX_CONCURRENT_STREAMS`, graceful drain, which then ends with `PROTOCOL_ERROR`
-  instead of `NO_ERROR`, and buffer-pool exhaustion); each DATA frame of a refused stream costs a
-  glitch and a `RST_STREAM(STREAM_CLOSED)`. Browsers and standard gRPC send no request trailers;
-  trailer-forwarding clients such as Envoy can. RFC 9113 §5.1 would ignore those frames; recording
-  refused ids in the bounded recently-reset set is left for later. New listener key `h2_stream_refusal_percent` (TOML;
+  never-opened id keeps getting `GOAWAY(STREAM_CLOSED)`. Frames a client sent on a refused stream
+  before reading its `REFUSED_STREAM` are ignored since
+  [#1815](https://github.com/sozu-proxy/sozu/issues/1815) (see 🐛 Fixed). New listener key `h2_stream_refusal_percent` (TOML;
   `command.proto` fields `HttpListenerConfig` 37, `HttpsListenerConfig` 50,
   `UpdateHttpListenerConfig` 43, `UpdateHttpsListenerConfig` 44; `--h2-stream-refusal-percent`
   on `sozu listener http|https update`) and counter `h2.flood.stream_refused`. Library API:
@@ -3978,6 +3972,27 @@
   `left: 0, right: 1`.
 
 ### 🐛 Fixed
+
+- **`fix(mux-h2)`: ignore frames on refused streams like on reset streams
+  ([#1815](https://github.com/sozu-proxy/sozu/issues/1815)).** A stream Sōzu refuses with
+  `RST_STREAM(REFUSED_STREAM)` (the soft flood refusal of
+  [#1797](https://github.com/sozu-proxy/sozu/issues/1797), `SETTINGS_MAX_CONCURRENT_STREAMS`, a
+  graceful drain, buffer-pool exhaustion) is never registered, so the bounded set of recently
+  reset streams did not know it, and the frames the client sent on it before reading the refusal
+  were not ignored. Request trailers ended the connection: the client read
+  `RST_STREAM(REFUSED_STREAM)`, `RST_STREAM(STREAM_CLOSED)` and `GOAWAY(PROTOCOL_ERROR)`
+  (`GOAWAY(STREAM_CLOSED)` once a later stream was accepted) and lost every stream in flight, and
+  a drain could end with `PROTOCOL_ERROR` instead of `NO_ERROR`. Each DATA frame cost a glitch and
+  a `RST_STREAM(STREAM_CLOSED)`, about four for a refused 64 KiB upload. Every refusal now records
+  the stream id in that set, with its bound (256 ids) and eviction, so those frames are ignored
+  as RFC 9113 §5.1 requires, within the existing reset-stream allowances: two header blocks, and
+  DATA within the stream's initial window, still credited to the connection window. Each frame
+  beyond them counts one glitch, and each refusal keeps its own glitch. HEADERS on an id the
+  client skipped keeps getting `GOAWAY(PROTOCOL_ERROR)` (§5.1.1), and a reset of a refused stream
+  still ends the soft refusal. Tests: `trailers_on_a_refused_stream_are_ignored`,
+  `data_on_a_refused_stream_is_ignored_and_credited`,
+  `a_drain_with_a_refused_upload_carrying_trailers_ends_with_no_error` (`h2.rs`, red on
+  `6c3b8e89`), `refused_streams_share_the_recently_reset_bound` (`h2_stream_table.rs`).
 
 - **`ci(docker)`: build the Docker image with a pinned Rust image instead of Alpine edge's
   rolling `rust` package.** On 2026-10-02 Alpine edge shipped `rust 1.99.0-r0` with a broken
