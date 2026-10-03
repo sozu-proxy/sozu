@@ -522,7 +522,9 @@ message HttpListenerConfig {
     // trickle DATA frames reset the timer on each non-empty frame. Defends
     // against slow-multiplex Slowloris where a client keeps connection-level
     // activity high (any frame resets the connection idle timer) while pinning
-    // up to `h2_max_concurrent_streams` streams. Default: 30.
+    // up to `h2_max_concurrent_streams` streams. Unset, it inherits
+    // `back_timeout`, floored at 30 (so 30 with the default `back_timeout`);
+    // an explicit value wins, `0` meaning 1.
     optional uint32 h2_stream_idle_timeout_seconds = 25;
     // Maximum HPACK dynamic table size (SETTINGS_HEADER_TABLE_SIZE) accepted
     // from the peer. Caps the peer-advertised value to prevent unbounded
@@ -687,7 +689,9 @@ message HttpsListenerConfig {
     // trickle DATA frames reset the timer on each non-empty frame. Defends
     // against slow-multiplex Slowloris where a client keeps connection-level
     // activity high (any frame resets the connection idle timer) while pinning
-    // up to `h2_max_concurrent_streams` streams. Default: 30.
+    // up to `h2_max_concurrent_streams` streams. Unset, it inherits
+    // `back_timeout`, floored at 30 (so 30 with the default `back_timeout`);
+    // an explicit value wins, `0` meaning 1.
     optional uint32 h2_stream_idle_timeout_seconds = 37;
     // Maximum HPACK dynamic table size (SETTINGS_HEADER_TABLE_SIZE) accepted
     // from the peer. Caps the peer-advertised value to prevent unbounded
