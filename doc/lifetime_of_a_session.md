@@ -414,7 +414,7 @@ already holds or asks for a dial.
 A session's backend connections live in its own `Router::backends`
 (`BackendConnections`: the first connection inline, the others in a
 `BTreeMap`). A keep-alive H1 backend whose previous response completed is
-reused with no system call and no liveness probe; a request that finds the
+reused, unless its backend was removed from the cluster since, with no system call and no liveness probe; a request that finds the
 reused connection already closed by the backend is replayed on a fresh one,
 from a copy of the bytes it sent (`ReplayOnFreshBackend`, `mux/LIFECYCLE.md`
 §8.5). Keeping that copy costs one allocation per request on a reused

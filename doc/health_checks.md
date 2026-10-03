@@ -62,7 +62,7 @@ Each backend maintains a `HealthState` with counters for consecutive successes
 and failures:
 
 - **Healthy → Unhealthy**: After `unhealthy_threshold` consecutive failed
-  checks, the backend is marked DOWN. Sōzu logs an error, increments the
+  checks, the backend is marked DOWN. Sōzu logs a warning, increments the
   `health_check.down` metric, and emits a `HealthCheckUnhealthy` event.
 - **Unhealthy → Healthy**: After `healthy_threshold` consecutive successful
   checks, the backend is marked UP. Sōzu logs an info message, increments the
@@ -267,8 +267,10 @@ The output is also available as JSON when using
 sozu cluster health-check remove --id my-cluster
 ```
 
-Stops health checking for the given cluster. All backends in the cluster are
-reset to healthy and resume receiving traffic immediately.
+Stops health checking for the given cluster. The backends keep the health
+state the last probes left them in: a backend marked DOWN stays out of rotation
+until the cluster is added again (`sozu cluster add` on the existing id)
+without a health check, which resets every backend of the cluster to healthy.
 
 ## Metrics
 
@@ -325,8 +327,9 @@ identity is moot — the event is about the cluster as a whole).
   section are not checked.
 - **Fail-open routing when ALL backends are unhealthy**: when every backend in a
   cluster has been marked DOWN by the threshold state machine, Sōzu falls back
-  to routing across all `Normal` backends instead of returning 503 — see
-  `lib/src/load_balancing.rs::BackendList::healthy`. The Amazon health-check
+  to routing across the `Normal` backends whose retry policy allows a try
+  instead of returning 503 — see `BackendList::select_tiers` in
+  `lib/src/backends.rs`. The Amazon health-check
   paper's reasoning (returning 503 is rarely the right answer when health-check
   signal itself may be wrong) drives this. A `warn!("fail-open: ...")` is logged
   when fail-open kicks in, and the `health_check.healthy_backends` gauge drops

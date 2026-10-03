@@ -174,9 +174,12 @@ address = "0.0.0.0:80"
 # answer_413 = "/absolute/path/to/custom_413.http"
 # a 502 response means the response sent by a backend could not be parsed by Sōzu
 # answer_502 = "/absolute/path/to/custom_502.http"
-# a 503 response is sent if there are no backend servers available
+# a 503 response is sent if there are no backend servers available, or if
+# every backend connection attempt of the request failed
 # answer_503 = "/absolute/path/to/custom_503.http"
-# a 504 response means the backend timed out
+# a 504 response means a connected backend sent no response in time, or the
+# frontend timed out while waiting on a backend (a connect timeout fails over
+# to another backend and ends in 503 once attempts are spent)
 # answer_504 = "/absolute/path/to/custom_504.http"
 # a 507 response occurs when the response sent by a backend is too big
 # answer_507 = "/absolute/path/to/custom_507.http"
@@ -212,9 +215,12 @@ address = "0.0.0.0:443"
 # answer_413 = "/absolute/path/to/custom_413.http"
 # a 502 response means the response sent by a backend could not be parsed by Sōzu
 # answer_502 = "/absolute/path/to/custom_502.http"
-# a 503 response is sent if there are no backend servers available
+# a 503 response is sent if there are no backend servers available, or if
+# every backend connection attempt of the request failed
 # answer_503 = "/absolute/path/to/custom_503.http"
-# a 504 response means the backend timed out
+# a 504 response means a connected backend sent no response in time, or the
+# frontend timed out while waiting on a backend (a connect timeout fails over
+# to another backend and ends in 503 once attempts are spent)
 # answer_504 = "/absolute/path/to/custom_504.http"
 # a 507 response occurs when the response sent by a backend is too big
 # answer_507 = "/absolute/path/to/custom_507.http"

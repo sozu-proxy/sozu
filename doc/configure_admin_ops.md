@@ -39,10 +39,10 @@ reference, including defaults, mutability class, and metric impact:
 | `alpn_protocols`                       | https          | yes               | Use `--reset-alpn` to restore `["h2", "http/1.1"]` default  |
 | `strict_sni_binding`                   | https          | yes               | `:authority` covered by served cert SANs (CWE-346 / CWE-444) |
 | `sozu_id_header`                       | http, https    | yes               | Rebranding the per-request correlation header               |
-| H2 flood thresholds (`h2_max_*`)       | https          | yes               | Per-connection setup; new connections only                  |
-| `h2_stream_idle_timeout_seconds`       | https          | yes               | Slow-multiplex Slowloris defence                            |
-| `h2_max_header_table_size`             | https          | yes               | HPACK dynamic-table cap                                     |
-| `h2_stream_shrink_ratio`               | https          | yes               | Per-connection scratch-Vec shrink threshold                 |
+| H2 flood thresholds (`h2_max_*`)       | http, https    | yes               | Per-connection setup; new connections only                  |
+| `h2_stream_idle_timeout_seconds`       | http, https    | yes               | Slow-multiplex Slowloris defence                            |
+| `h2_max_header_table_size`             | http, https    | yes               | HPACK dynamic-table cap                                     |
+| `h2_stream_shrink_ratio`               | http, https    | yes               | Per-connection scratch-Vec shrink threshold                 |
 | `expect_proxy`                         | tcp            | yes               | PROXY-v2 ingress                                            |
 
 CLI-level flag-to-field mapping lives in
@@ -91,8 +91,8 @@ sozu listener list
 
 # Halve the Rapid Reset budget on the HTTPS listener.
 sozu listener https update -a 0.0.0.0:8443 \
-    --h2-max-rst-stream-per-window 50 \
-    --h2-max-rst-stream-abusive-lifetime 25
+    --h2-max-rst-stream-per-window 1000 \
+    --h2-max-rst-stream-abusive-lifetime 500
 
 # Confirm the patch landed.
 sozu listener list
@@ -109,7 +109,9 @@ flags. See `doc/configure.md#h2-flood-detection-thresholds` for the
 catalogue.
 
 The relevant counters to watch on the receiving side are
-`h2.flood.violation.<kind>` (per CVE) and
+`h2.flood.violation.<kind>` (per CVE), `h2.flood.stream_refused` (new
+streams refused once a connection passes `h2_stream_refusal_percent` of the
+pre-response cap's floor, so lowering that floor also refuses earlier) and
 `h2.{goaway,rst_stream}.{sent,received}.<code>` (for error attribution
 of the GOAWAY / RST_STREAM emitted in response).
 
