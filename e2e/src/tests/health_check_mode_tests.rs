@@ -10,6 +10,9 @@
 //! - A legacy configuration (no mode, no list) keeps its meaning: any 2xx,
 //!   so the same 404 backend is marked down.
 //!
+//! - Removing the health check (`RemoveHealthCheck`) puts a backend a probe
+//!   had marked down back in rotation (sozu-proxy/sozu#1811).
+//!
 //! The mode switch itself is guarded by
 //! `test_health_check_tcp_mode_keeps_500_and_404_backends_up`: an HTTP probe
 //! marks those backends down, so it fails if `TCP` ever falls back to HTTP.
@@ -37,7 +40,10 @@ use sozu_command_lib::proto::command::{
 use sozu_lib::metrics::names::health_check::{DOWN, FAILURE, SUCCESS};
 
 use crate::{
-    mock::{aggregator::SimpleAggregator, async_backend::BackendHandle as AsyncBackend},
+    http_utils::http_request,
+    mock::{
+        aggregator::SimpleAggregator, async_backend::BackendHandle as AsyncBackend, client::Client,
+    },
     sozu::worker::Worker,
     tests::{
         State, repeat_until_error_or, setup_async_test,
@@ -422,6 +428,148 @@ fn test_health_check_legacy_config_marks_404_backend_down() {
             2,
             "legacy HTTP health check still marks a 404 backend down",
             try_legacy_config_marks_404_backend_down,
+        ),
+        State::Success
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Removing the health check
+// ---------------------------------------------------------------------------
+
+/// A backend answering `body` with 200 on every path except the probe path
+/// `/livez`, where it answers 404 when `fail_probe` is set: it serves real
+/// traffic while failing an HTTP probe.
+fn spawn_body_backend(
+    name: &str,
+    address: SocketAddr,
+    body: &'static str,
+    fail_probe: bool,
+) -> AsyncBackend<SimpleAggregator> {
+    AsyncBackend::spawn_detached_backend(
+        name,
+        address,
+        SimpleAggregator {
+            requests_received: 0,
+            responses_sent: 0,
+        },
+        Box::new(move |mut stream: &TcpStream, _name: &str, mut aggregator| {
+            let mut buf = [0u8; 4096];
+            let n = match stream.read(&mut buf) {
+                Ok(n) if n > 0 => n,
+                _ => return aggregator,
+            };
+            aggregator.requests_received += 1;
+            let response = if fail_probe && buf[..n].starts_with(b"GET /livez ") {
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_owned()
+            } else {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            };
+            if stream.write_all(response.as_bytes()).is_ok() {
+                aggregator.responses_sent += 1;
+            }
+            aggregator
+        }),
+    )
+}
+
+/// The body of one request through the frontend, if any.
+fn request_through(front_address: SocketAddr) -> Option<String> {
+    let mut client = Client::new(
+        "client",
+        front_address,
+        http_request("GET", "/api", "ping", "localhost"),
+    );
+    client.connect();
+    client.send();
+    client.receive()
+}
+
+/// Poll the frontend until a response contains `body` or the budget runs out.
+fn reaches(front_address: SocketAddr, body: &str) -> bool {
+    let deadline = Instant::now() + VERDICT_BUDGET;
+    while Instant::now() < deadline {
+        if request_through(front_address).is_some_and(|response| response.contains(body)) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// A backend a probe marked down serves traffic again once the health check is
+/// removed: `RemoveHealthCheck` stops probing, so nothing would ever mark it
+/// up again, and the removal must reset its health.
+///
+/// Two backends are needed: with every backend down the load balancer fails
+/// open and routes to them anyway, which would hide a stale DOWN.
+fn try_remove_health_check_restores_down_backend() -> State {
+    let front_address = create_local_address();
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, _) = setup_async_test(
+        "HC-REMOVE-RESET",
+        config,
+        listeners,
+        state,
+        front_address,
+        0,
+        false,
+    );
+
+    let address_down = create_local_address();
+    let address_up = create_local_address();
+    let mut backend_down = spawn_body_backend("HC_DOWN", address_down, "pong-down", true);
+    let mut backend_up = spawn_body_backend("HC_UP", address_up, "pong-up", false);
+    add_backend(&mut worker, "cluster_0-down", address_down);
+    add_backend(&mut worker, "cluster_0-up", address_up);
+    set_health_check(&mut worker, fast_health_check(HealthCheckMode::Http));
+
+    // Precondition: the probe marked exactly the failing backend down, and
+    // the load balancer now routes only to the other one.
+    let (success, failure, down) =
+        wait_for_counters(&mut worker, |success, _, down| down >= 1 && success >= 1);
+    let excluded = down == 1
+        && (0..10).all(|_| {
+            request_through(front_address).is_some_and(|response| response.contains("pong-up"))
+        });
+
+    let restored = if excluded {
+        worker.send_proxy_request_type(RequestType::RemoveHealthCheck("cluster_0".to_owned()));
+        worker.read_to_last();
+        reaches(front_address, "pong-down")
+    } else {
+        false
+    };
+
+    stop(worker);
+    backend_down.stop_and_get_aggregator();
+    backend_up.stop_and_get_aggregator();
+
+    if !excluded {
+        println!(
+            "precondition: expected the failing backend alone DOWN and excluded, got \
+             success={success} failure={failure} down={down}"
+        );
+        State::Fail
+    } else if !restored {
+        println!("the backend marked DOWN never served traffic after RemoveHealthCheck");
+        State::Fail
+    } else {
+        State::Success
+    }
+}
+
+#[test]
+fn test_remove_health_check_restores_down_backend() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "RemoveHealthCheck puts a backend marked down back in rotation",
+            try_remove_health_check_restores_down_backend,
         ),
         State::Success
     );

@@ -2710,6 +2710,12 @@ impl Server {
                     return;
                 }
                 self.add_cluster(cluster);
+                // An upsert without a health check clears it like
+                // `RemoveHealthCheck`: `add_cluster` already reset the
+                // backends, drop the probes still in flight too (#1811).
+                if cluster.health_check.is_none() {
+                    self.health_checker.remove_cluster(&cluster.cluster_id);
+                }
                 // Re-arm the metric drain tombstone in case this cluster id
                 // was previously removed — without this the drain would
                 // continue dropping every emission for the resurrected
@@ -2954,12 +2960,15 @@ impl Server {
         );
     }
 
+    /// Stop health checking `cluster_id`: drop its in-flight probes, then
+    /// forget its configuration and reset every backend it marked DOWN, since
+    /// no probe will ever mark them UP again (#1811). Dropping the probes first
+    /// keeps one already in flight from marking a backend DOWN after the reset.
     fn remove_health_check_state(&mut self, cluster_id: &str) {
         self.health_checker.remove_cluster(cluster_id);
         self.backends
             .borrow_mut()
-            .health_check_configs
-            .remove(cluster_id);
+            .set_health_check_config(cluster_id, None);
     }
 
     fn remove_backend(&mut self, req_id: &str, backend: &RemoveBackend) -> WorkerResponse {
@@ -5547,6 +5556,120 @@ mod add_cluster_validation_tests {
             list.select_with_key(Some(key), Instant::now()).1,
             ShardOutcome::Unsharded,
             "a refused AddCluster must not arm a shard"
+        );
+    }
+}
+
+/// Clearing a cluster's health check resets the backends a probe marked DOWN
+/// (#1811): no probe will ever mark them UP again.
+#[cfg(test)]
+mod remove_health_check_tests {
+    use sozu_command::proto::command::{HealthCheckConfig, LoadBalancingParams};
+
+    use super::listener_lifecycle_tests::bare_server;
+    use super::*;
+
+    const CLUSTER: &str = "health-checked";
+
+    fn health_check() -> HealthCheckConfig {
+        HealthCheckConfig {
+            uri: "/livez".to_owned(),
+            interval: 1,
+            timeout: 1,
+            healthy_threshold: 1,
+            unhealthy_threshold: 1,
+            ..Default::default()
+        }
+    }
+
+    fn add_cluster(server: &mut Server, health_check: Option<HealthCheckConfig>) {
+        server.notify_proxys(WorkerRequest {
+            id: "test-add-cluster".to_owned(),
+            content: RequestType::AddCluster(Cluster {
+                cluster_id: CLUSTER.to_owned(),
+                health_check,
+                ..Default::default()
+            })
+            .into(),
+        });
+    }
+
+    /// A server whose cluster carries a health check and one backend a probe
+    /// marked DOWN.
+    fn server_with_down_backend() -> Server {
+        let mut server = bare_server();
+        add_cluster(&mut server, Some(health_check()));
+        server.notify_proxys(WorkerRequest {
+            id: "test-add-backend".to_owned(),
+            content: RequestType::AddBackend(AddBackend {
+                cluster_id: CLUSTER.to_owned(),
+                backend_id: format!("{CLUSTER}-0"),
+                address: SocketAddr::from(([127, 0, 0, 1], 23_100)).into(),
+                load_balancing_parameters: Some(LoadBalancingParams::default()),
+                sticky_id: None,
+                backup: None,
+            })
+            .into(),
+        });
+        server.backends.borrow().backends[CLUSTER].backends[0]
+            .borrow_mut()
+            .health
+            .record_failure(1);
+        assert!(!backend_is_healthy(&server), "test setup: backend DOWN");
+        server
+    }
+
+    fn backend_is_healthy(server: &Server) -> bool {
+        server.backends.borrow().backends[CLUSTER].backends[0]
+            .borrow()
+            .health
+            .is_healthy()
+    }
+
+    /// TO SEE THIS RED: make `Server::remove_health_check_state` remove the
+    /// cluster from `health_check_configs` directly instead of calling
+    /// `set_health_check_config(cluster_id, None)`; the backend stays DOWN.
+    #[test]
+    fn remove_health_check_resets_a_backend_marked_down() {
+        let mut server = server_with_down_backend();
+        server.notify_proxys(WorkerRequest {
+            id: "test-remove-health-check".to_owned(),
+            content: RequestType::RemoveHealthCheck(CLUSTER.to_owned()).into(),
+        });
+        assert!(
+            !server
+                .backends
+                .borrow()
+                .health_check_configs
+                .contains_key(CLUSTER),
+            "RemoveHealthCheck must forget the cluster's configuration"
+        );
+        assert!(
+            backend_is_healthy(&server),
+            "RemoveHealthCheck must reset a backend a probe marked DOWN"
+        );
+    }
+
+    /// An `AddCluster` upsert without a health check clears it the same way.
+    ///
+    /// TO SEE THIS RED: delete the `set_health_check_config` call from
+    /// `Server::add_cluster`; the backend stays DOWN. The in-flight probes the
+    /// `AddCluster` arm drops are not covered: that needs a live probe socket.
+    #[test]
+    fn add_cluster_without_health_check_resets_a_backend_marked_down() {
+        let mut server = server_with_down_backend();
+        add_cluster(&mut server, None);
+        assert!(
+            !server
+                .backends
+                .borrow()
+                .health_check_configs
+                .contains_key(CLUSTER),
+            "an AddCluster without a health check must forget the configuration"
+        );
+        assert!(
+            backend_is_healthy(&server),
+            "an AddCluster without a health check must reset a backend marked DOWN"
         );
     }
 }

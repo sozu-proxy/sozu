@@ -663,15 +663,14 @@
   `doc/h2_mux_internals.md` count the fourteen `H2FloodConfig` thresholds, including
   `h2_stream_refusal_percent`. `doc/configure_admin_ops.md` halves the current flood defaults in its
   worked example, lists the H2 knobs for HTTP listeners too and names `h2.flood.stream_refused`.
-  `doc/health_checks.md` corrects `health-check remove` (backends keep the health state the last
-  probes left them in), the DOWN log level and the fail-open citation; `doc/metrics.md` no longer
-  calls the health-check counters per cluster. `doc/configure_cli.md` gains a health-check section
-  and the UDP affinity key. `doc/lifetime_of_a_session.md` notes that a pooled connection to a
-  removed backend is not reused, `doc/udp_simulation.md` lists the per-source flow limits and their
-  invariant, and `lib/src/protocol/mux/LIFECYCLE.md` limits the backend-timeout `504` to an
-  established connection and calls the `h2_control_tx.rs` bound a pending bound, not a lifetime
-  cap. The `--max-connection-attempts` and `connection-attempts set` help texts
-  mention the TCP close, the `--load-balancing-policy` help names the UDP affinity key, and the
+  `doc/health_checks.md` corrects the DOWN log level and the fail-open citation; `doc/metrics.md` no
+  longer calls the health-check counters per cluster. `doc/configure_cli.md` gains a health-check
+  section and the UDP affinity key. `doc/lifetime_of_a_session.md` notes that a pooled connection to
+  a removed backend is not reused, `doc/udp_simulation.md` lists the per-source flow limits and
+  their invariant, and `lib/src/protocol/mux/LIFECYCLE.md` limits the backend-timeout `504` to an
+  established connection and calls the `h2_control_tx.rs` bound a pending bound, not a lifetime cap.
+  The `--max-connection-attempts` and `connection-attempts set` help texts mention the TCP close,
+  the `--load-balancing-policy` help names the UDP affinity key, and the
   `UpdateHttp(s)ListenerConfig` comments give the `h2_stream_shrink_ratio` floor of 2. Documentation
   only, no behaviour change.
 
@@ -4004,6 +4003,17 @@
   phantom names and gains one constant per emitted key plus `FLOOD_VIOLATION_KEYS`; the detector's
   metric-key test now requires that list to match the emitted keys exactly, and a `sozu top` test
   requires the pane to read only and all of them.
+
+- **`fix(health-check)`: `sozu cluster health-check remove` resets the backends a probe marked
+  DOWN ([#1811](https://github.com/sozu-proxy/sozu/issues/1811)).** The worker's
+  `RemoveHealthCheck` handler (`Server::remove_health_check_state`) only forgot the cluster's
+  configuration: a backend a probe had marked DOWN stayed out of rotation with nothing left to
+  probe it UP again, until the cluster was added again without a health check. It now clears the
+  health check through `BackendMap::set_health_check_config(cluster_id, None)`, as `AddCluster`
+  does, which resets every backend of the cluster to healthy and re-emits the availability
+  gauges. An `AddCluster` upsert without a health check now also drops the cluster's in-flight
+  probes, as `RemoveHealthCheck` and `RemoveCluster` already did, so a probe launched before the
+  upsert can no longer mark a backend DOWN after the reset.
 
 - **BREAKING (library API, default change) — `fix(mux)`: a backend connect timeout fails over to
   another backend instead of answering 504
