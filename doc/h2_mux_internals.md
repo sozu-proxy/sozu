@@ -1156,7 +1156,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9416-9420
+```rust lib/src/protocol/mux/h2.rs:9417-9421
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1334,7 +1334,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9594-9598
+```rust lib/src/protocol/mux/h2.rs:9595-9599
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1809,7 +1809,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:8917
+```rust lib/src/protocol/mux/h2.rs:8918
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -1971,7 +1971,7 @@ and `tracestate` headers are extracted from inbound requests:
 At access log emission time (`Stream::generate_access_log`, in
 `lib/src/protocol/mux/stream.rs`):
 
-```rust lib/src/protocol/mux/stream.rs:924-927
+```rust lib/src/protocol/mux/stream.rs:928-931
 #[cfg(feature = "opentelemetry")]
 otel: context.otel.as_ref(),
 #[cfg(not(feature = "opentelemetry"))]

@@ -515,6 +515,7 @@ impl HttpSession {
             );
             return None;
         };
+        let metric_incarnation = backend_id.metric_incarnation();
         let backend_id = backend_id.backend_id.to_string();
 
         // Post-removal book-keeping: the backend is gone from the map and the
@@ -557,6 +558,7 @@ impl HttpSession {
             stream.context.session_address,
             ws_context,
         );
+        pipe.set_cluster_metrics_incarnation(metric_incarnation);
 
         pipe.restore_readiness_events(frontend_readiness.event, backend_readiness.event);
         // The WebSocket pipe inherits the live backend connection, so its back

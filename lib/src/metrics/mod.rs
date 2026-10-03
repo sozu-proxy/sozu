@@ -16,6 +16,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     io::{self, Write},
     net::SocketAddr,
+    num::NonZeroU64,
     str,
     time::{Duration, Instant},
 };
@@ -110,6 +111,21 @@ pub(crate) fn http_status_code_metric_name(status: u16) -> Option<&'static str> 
 
 thread_local! {
   pub static METRICS: RefCell<Aggregator> = RefCell::new(Aggregator::new(String::from("sozu")));
+}
+
+/// Opaque identity of one configured lifetime of a cluster metrics row.
+///
+/// A cluster id may be removed and re-added while sessions from its previous
+/// lifetime are still draining. Those sessions carry this value so their late
+/// metrics cannot mutate the replacement row that happens to use the same
+/// textual id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClusterMetricsIncarnation(NonZeroU64);
+
+/// Return the active metrics incarnation for `cluster_id`, if it is currently
+/// configured on this worker.
+pub(crate) fn cluster_incarnation(cluster_id: &str) -> Option<ClusterMetricsIncarnation> {
+    METRICS.with(|metrics| metrics.borrow().cluster_incarnation(cluster_id))
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -485,6 +501,14 @@ pub struct Aggregator {
     /// `lease_tick` call regardless of whether expiry happened, so the
     /// caller's "is it time to tick?" check stays cheap.
     last_lease_tick: Instant,
+    /// Active configured lifetime for each cluster id. This control-plane
+    /// identity deliberately survives metrics collection being disabled or
+    /// local storage being cleared: neither event removes the cluster.
+    cluster_incarnations: HashMap<String, ClusterMetricsIncarnation>,
+    /// Last allocated incarnation. Zero is reserved for `Option`'s niche and
+    /// checked arithmetic makes exhaustion fail closed instead of reusing an
+    /// old identity.
+    last_cluster_incarnation: u64,
 }
 
 impl Aggregator {
@@ -498,6 +522,8 @@ impl Aggregator {
             effective: default_detail,
             leases: HashMap::new(),
             last_lease_tick: Instant::now(),
+            cluster_incarnations: HashMap::new(),
+            last_cluster_incarnation: 0,
         }
     }
 
@@ -903,6 +929,7 @@ impl Aggregator {
     /// bound code path. Calling this from a metrics emission site would
     /// deadlock the thread-local on `borrow_mut`.
     pub fn remove_cluster(&mut self, cluster_id: &str) {
+        self.cluster_incarnations.remove(cluster_id);
         if let Some(ref mut net) = self.network.as_mut() {
             net.remove_cluster(cluster_id);
         }
@@ -915,10 +942,69 @@ impl Aggregator {
     /// cluster removed then re-added would stay tombstoned forever and
     /// every fresh metric emission would be dropped.
     pub fn add_cluster(&mut self, cluster_id: &str) {
+        if !self.cluster_incarnations.contains_key(cluster_id) {
+            let Some(next) = self.last_cluster_incarnation.checked_add(1) else {
+                error!(
+                    "cluster metrics incarnation space exhausted; refusing to reactivate metrics for cluster {:?}",
+                    cluster_id
+                );
+                return;
+            };
+            let Some(incarnation) = NonZeroU64::new(next).map(ClusterMetricsIncarnation) else {
+                unreachable!("checked increment from a live u64 incarnation cannot yield zero");
+            };
+            self.last_cluster_incarnation = next;
+            self.cluster_incarnations
+                .insert(cluster_id.to_owned(), incarnation);
+        }
         if let Some(ref mut net) = self.network.as_mut() {
             net.add_cluster(cluster_id);
         }
         self.local.add_cluster(cluster_id);
+    }
+
+    /// Return the active configured lifetime of `cluster_id`.
+    pub(crate) fn cluster_incarnation(
+        &self,
+        cluster_id: &str,
+    ) -> Option<ClusterMetricsIncarnation> {
+        self.cluster_incarnations.get(cluster_id).copied()
+    }
+
+    /// Receive a metric from an owner that captured a cluster incarnation.
+    ///
+    /// The identity check intentionally precedes cardinality filtering. A
+    /// stale event is rejected when the effective detail retains its cluster
+    /// label, protecting a same-id replacement row. At `Process` and
+    /// `Frontend` detail the label is deliberately removed to form a worker
+    /// aggregate, so the event remains part of that aggregate: while detail
+    /// stays at that level, an old connection's late `-1` still balances its
+    /// earlier `+1`. Existing detail transitions do not migrate stored gauge
+    /// contributions between shapes.
+    pub(crate) fn receive_metric_for_incarnation(
+        &mut self,
+        label: &'static str,
+        cluster_id: Option<&str>,
+        backend_id: Option<&str>,
+        incarnation: Option<ClusterMetricsIncarnation>,
+        metric: MetricValue,
+    ) {
+        if let Some(cluster_id) = cluster_id {
+            // Delayed owners must have captured a real configured lifetime.
+            // `None` is never a wildcard: allocation exhaustion and a missed
+            // capture both fail closed instead of silently sharing identity.
+            let Some(incarnation) = incarnation else {
+                return;
+            };
+            if matches!(
+                self.effective,
+                MetricDetailLevel::Cluster | MetricDetailLevel::Backend
+            ) && self.cluster_incarnation(cluster_id) != Some(incarnation)
+            {
+                return;
+            }
+        }
+        self.receive_metric(label, cluster_id, backend_id, metric);
     }
 
     /// Drop all metric storage for one backend across BOTH drains. Called
@@ -1010,6 +1096,19 @@ macro_rules! incr (
           (*metrics.borrow_mut()).receive_metric($key, $cluster_id, $backend_id, $crate::metrics::MetricValue::Count(1));
         });
     }
+  };
+  ($key:expr, $cluster_id:expr, $backend_id:expr, $incarnation:expr) => {
+    {
+        $crate::metrics::METRICS.with(|metrics| {
+          (*metrics.borrow_mut()).receive_metric_for_incarnation(
+            $key,
+            $cluster_id,
+            $backend_id,
+            $incarnation,
+            $crate::metrics::MetricValue::Count(1),
+          );
+        });
+    }
   }
 );
 
@@ -1035,6 +1134,20 @@ macro_rules! gauge (
           (*metrics.borrow_mut()).receive_metric($key, $cluster_id, $backend_id, $crate::metrics::MetricValue::Gauge(v as usize));
         });
     }
+  };
+  ($key:expr, $value:expr, $cluster_id:expr, $backend_id:expr, $incarnation:expr) => {
+    {
+        let v = $value;
+        $crate::metrics::METRICS.with(|metrics| {
+          (*metrics.borrow_mut()).receive_metric_for_incarnation(
+            $key,
+            $cluster_id,
+            $backend_id,
+            $incarnation,
+            $crate::metrics::MetricValue::Gauge(v as usize),
+          );
+        });
+    }
   }
 );
 
@@ -1053,6 +1166,20 @@ macro_rules! gauge_add (
 
         $crate::metrics::METRICS.with(|metrics| {
           (*metrics.borrow_mut()).receive_metric($key, $cluster_id, $backend_id, $crate::metrics::MetricValue::GaugeAdd(v));
+        });
+    }
+  };
+  ($key:expr, $value:expr, $cluster_id:expr, $backend_id:expr, $incarnation:expr) => {
+    {
+        let v = $value;
+        $crate::metrics::METRICS.with(|metrics| {
+          (*metrics.borrow_mut()).receive_metric_for_incarnation(
+            $key,
+            $cluster_id,
+            $backend_id,
+            $incarnation,
+            $crate::metrics::MetricValue::GaugeAdd(v),
+          );
         });
     }
   }
@@ -1077,6 +1204,22 @@ macro_rules! time (
       let cluster: &str = $cluster_id;
 
       m.receive_metric($key, Some(cluster), None, MetricValue::Time(v as usize));
+    });
+  });
+  ($key:expr, $cluster_id:expr, $value:expr, $incarnation:expr) => ({
+    use $crate::metrics::MetricValue;
+    let v = $value;
+    $crate::metrics::METRICS.with(|metrics| {
+      let m = &mut *metrics.borrow_mut();
+      let cluster: &str = $cluster_id;
+
+      m.receive_metric_for_incarnation(
+        $key,
+        Some(cluster),
+        None,
+        $incarnation,
+        MetricValue::Time(v as usize),
+      );
     });
   })
 );
@@ -1105,12 +1248,34 @@ macro_rules! record_backend_metrics (
 
       m.receive_metric($crate::metrics::names::backend::REQUESTS, Some(cluster_id), Some(backend_id), MetricValue::Count(1));
     });
+  };
+  ($cluster_id:expr, $backend_id:expr, $response_time:expr, $backend_connection_time:expr, $backend_header_time:expr, $bin:expr, $bout:expr, $incarnation:expr) => {
+    use $crate::metrics::MetricValue;
+    $crate::metrics::METRICS.with(|metrics| {
+      let m = &mut *metrics.borrow_mut();
+      let cluster_id: &str = $cluster_id;
+      let backend_id: &str = $backend_id;
+      let incarnation = $incarnation;
+
+      m.receive_metric_for_incarnation($crate::metrics::names::backend::BYTES_IN, Some(cluster_id), Some(backend_id), incarnation, MetricValue::Count($bin as i64));
+      m.receive_metric_for_incarnation($crate::metrics::names::backend::BYTES_OUT, Some(cluster_id), Some(backend_id), incarnation, MetricValue::Count($bout as i64));
+      m.receive_metric_for_incarnation($crate::metrics::names::backend::RESPONSE_TIME, Some(cluster_id), Some(backend_id), incarnation, MetricValue::Time($response_time as usize));
+      if let Some(t) = $backend_connection_time {
+        m.receive_metric_for_incarnation($crate::metrics::names::backend::CONNECTION_TIME, Some(cluster_id), Some(backend_id), incarnation, MetricValue::Time(t.as_millis() as usize));
+      }
+      if let Some(t) = $backend_header_time {
+        m.receive_metric_for_incarnation($crate::metrics::names::backend::HEADER_TIME, Some(cluster_id), Some(backend_id), incarnation, MetricValue::Time(t.as_millis() as usize));
+      }
+
+      m.receive_metric_for_incarnation($crate::metrics::names::backend::REQUESTS, Some(cluster_id), Some(backend_id), incarnation, MetricValue::Count(1));
+    });
   }
 );
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sozu_command::proto::command::filtered_metrics;
 
     #[test]
     fn filter_labels_process_drops_both() {
@@ -1135,6 +1300,90 @@ mod tests {
             filter_labels_for_detail(MetricDetailLevel::Cluster, Some("c"), Some("b")),
             (Some("c"), None),
         );
+    }
+
+    #[test]
+    fn cluster_incarnation_fences_labelled_rows_and_preserves_process_aggregates() {
+        let mut aggregator = Aggregator::new(String::new());
+        aggregator.set_up_detail(MetricDetailLevel::Backend);
+        aggregator.add_cluster("reused");
+        let old = aggregator.cluster_incarnation("reused");
+        assert!(old.is_some());
+
+        // Neither a live AddCluster update nor local collection controls end
+        // the configured cluster lifetime.
+        aggregator.add_cluster("reused");
+        assert_eq!(aggregator.cluster_incarnation("reused"), old);
+        aggregator.configure(&MetricsConfiguration::Disabled);
+        aggregator.configure(&MetricsConfiguration::Enabled);
+        aggregator.configure(&MetricsConfiguration::Clear);
+        assert_eq!(aggregator.cluster_incarnation("reused"), old);
+
+        aggregator.remove_cluster("reused");
+        aggregator.add_cluster("reused");
+        let replacement = aggregator.cluster_incarnation("reused");
+        assert!(replacement.is_some());
+        assert_ne!(replacement, old);
+
+        // At Backend detail an obsolete event is rejected instead of being
+        // applied to the replacement row.
+        aggregator.receive_metric_for_incarnation(
+            "incarnation_test",
+            Some("reused"),
+            Some("same-backend"),
+            old,
+            MetricValue::Count(7),
+        );
+        assert!(
+            !aggregator
+                .dump_local_proxy_metrics()
+                .contains_key("incarnation_test"),
+            "a labelled stale event must not become a proxy metric at backend detail",
+        );
+
+        // Process detail deliberately aggregates cluster/backend events by
+        // removing their labels. Both old and current work contribute while
+        // the effective detail remains at that level.
+        aggregator.set_up_detail(MetricDetailLevel::Process);
+        aggregator.receive_metric_for_incarnation(
+            "incarnation_test",
+            Some("reused"),
+            Some("same-backend"),
+            old,
+            MetricValue::Count(7),
+        );
+        aggregator.receive_metric_for_incarnation(
+            "incarnation_test",
+            Some("reused"),
+            Some("same-backend"),
+            replacement,
+            MetricValue::Count(3),
+        );
+        assert_eq!(
+            aggregator
+                .dump_local_proxy_metrics()
+                .get("incarnation_test")
+                .and_then(|metric| metric.inner.as_ref()),
+            Some(&filtered_metrics::Inner::Count(10)),
+        );
+
+        // A true proxy metric has no cluster identity and is independent of
+        // the incarnation gate at every detail level.
+        aggregator.receive_metric("direct_proxy_test", None, None, MetricValue::Count(5));
+        assert_eq!(
+            aggregator
+                .dump_local_proxy_metrics()
+                .get("direct_proxy_test")
+                .and_then(|metric| metric.inner.as_ref()),
+            Some(&filtered_metrics::Inner::Count(5)),
+        );
+
+        // Exhaustion never wraps to a previously issued identity and never
+        // re-arms the drain tombstone.
+        let mut exhausted = Aggregator::new(String::new());
+        exhausted.last_cluster_incarnation = u64::MAX;
+        exhausted.add_cluster("exhausted");
+        assert_eq!(exhausted.cluster_incarnation("exhausted"), None);
     }
 
     #[test]

@@ -633,6 +633,10 @@ pub struct HttpContext {
     pub id: Ulid,
     pub backend_id: Option<Rc<str>>,
     pub cluster_id: Option<sozu_command_lib::state::ClusterId>,
+    /// Configured cluster lifetime that owns this request's labelled metrics.
+    /// Captured after routing so successive requests on one H1 keep-alive
+    /// connection may belong to successive lifetimes of the same cluster id.
+    pub(crate) cluster_metrics_incarnation: Option<crate::metrics::ClusterMetricsIncarnation>,
     /// The client affinity key `Router::plan_connect`
     /// (`lib/src/protocol/mux/router.rs`) derived for this request when its
     /// cluster selects with `HRW` or `MAGLEV`: the hash of the cluster's
@@ -1177,6 +1181,7 @@ impl HttpContext {
             id: request_id,
             backend_id: None,
             cluster_id: None,
+            cluster_metrics_incarnation: None,
             affinity_key: None,
 
             closing: false,
@@ -1226,6 +1231,19 @@ impl HttpContext {
             access_log_message: None,
             backends_unavailable: false,
         }
+    }
+
+    pub(crate) fn set_cluster_metrics_incarnation(
+        &mut self,
+        incarnation: Option<crate::metrics::ClusterMetricsIncarnation>,
+    ) {
+        self.cluster_metrics_incarnation = incarnation;
+    }
+
+    pub(crate) fn cluster_metrics_incarnation(
+        &self,
+    ) -> Option<crate::metrics::ClusterMetricsIncarnation> {
+        self.cluster_metrics_incarnation
     }
 
     /// Callback for request:
@@ -2293,6 +2311,7 @@ impl HttpContext {
         self.keep_alive_frontend = true;
         self.sticky_session_found = None;
         self.affinity_key = None;
+        self.cluster_metrics_incarnation = None;
         self.method = None;
         self.authority = None;
         self.path = None;

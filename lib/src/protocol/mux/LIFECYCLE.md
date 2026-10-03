@@ -595,6 +595,18 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   carries. A backend added again, even at the same address, is a new `Rc` in a
   new slot, so the next request dials it.
 
+  The textual cluster and backend ids are likewise insufficient for delayed
+  metrics: a remove then add may reuse both ids and the address while the old
+  connection is still draining. `Router::plan_connect` captures the active
+  `ClusterMetricsIncarnation` per routed stream, and a newly dialled
+  `BackendId` carries it through connection close. H1 resets clear the stream
+  capture before the next request is routed; H2 streams capture independently.
+  At `cluster` and `backend` detail the metrics aggregator rejects a stale
+  incarnation before it can reach the replacement row. At `process` and
+  today's `frontend` detail the event still contributes to the intentional
+  worker aggregate after label removal, while separately emitted unlabelled
+  proxy counters also record the physical close.
+
   Once a retired connection carries no stream — an H1 `KeepAlive`, or an H2
   `Connected` connection with an empty stream table — `Mux::ready_inner` drops
   it (`Connection::idle_pooled_backend`, then `Connection::force_disconnect`).
@@ -3532,4 +3544,3 @@ once per `Mux` pass through the vDSO (§7.5).
 `cfg(test)` (`protocol::mux::sample_rtt`'s read count, `shutdown_write`'s
 shutdown count, `crate::socket::tls_writes`); the list of tests, one per
 property, is `doc/hot_path_zero_copy.md` §5.
-

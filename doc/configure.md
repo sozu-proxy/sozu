@@ -3243,6 +3243,17 @@ the network drain.
   the master-process `main_metrics` aggregator).
 - Per-cluster local-drain entries are dropped on `RemoveCluster` /
   `RemoveBackend` so the keyspace is bounded by the live configuration.
+- A remove then add of the same cluster id creates a new internal metrics
+  incarnation. In-flight HTTP, WebSocket and TCP sessions retain the
+  incarnation they were routed to, so their late cluster/backend emissions
+  cannot update the replacement's rows even when backend id and address are
+  reused. At `cluster` and `backend` detail, the incarnation check rejects
+  those old labelled events. At `process` and today's `frontend` detail, they
+  still contribute to the intentional worker aggregate after label removal,
+  so a late decrement balances its earlier increment. Metrics emitted
+  directly without cluster labels remain independent. A live `AddCluster`
+  update, disabling and re-enabling collection, and `sozu metrics clear`
+  preserve the current incarnation.
 - Implication for dashboards: counters in `sozu metrics` output are
   monotonic. Charts must compute `rate()` / `irate()` rather than treat
   successive snapshots as windowed counts. Histograms accumulate every
@@ -3282,6 +3293,14 @@ unit-tested exhaustively across all four levels. Workers receive the level over
 the SCM socket as a proto enum (`MetricDetail`); old binaries on either side
 fall back to `cluster` so a mixed-version rollout keeps emitting the historical
 metric shape.
+
+The effective level is applied independently to each emission. A static
+configuration change or runtime lease transition does not migrate or clear
+metrics already stored under the previous label shape. Long-lived gauge
+increments and decrements that straddle such a transition can therefore land
+in different shapes by inspection of that emission-time policy; no separate
+transition defect is asserted here. Cluster-incarnation filtering uses the
+effective level at the time of the emission and does not add migration.
 
 #### Runtime cardinality lease
 
