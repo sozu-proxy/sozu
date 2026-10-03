@@ -971,6 +971,29 @@ impl Aggregator {
         self.cluster_incarnations.get(cluster_id).copied()
     }
 
+    /// Whether an emission for `cluster_id` captured with `incarnation`
+    /// may reach the drains under the current effective detail.
+    ///
+    /// Only `Cluster` and `Backend` detail keep the cluster label, so only
+    /// they compare identities. The comparison is `Option == Option`: a
+    /// cluster that never received `AddCluster` (frontends and backends may
+    /// reference an undeclared cluster) captures and currently resolves to
+    /// `None`, so its events are recorded; any mismatch, including a missed
+    /// `None` capture against a current `Some`, is rejected. After the
+    /// 64-bit incarnation space is exhausted, a newly added cluster also
+    /// resolves to `None` and shares that identity with undeclared ones;
+    /// reaching that state takes 2^64 `AddCluster` allocations.
+    pub(crate) fn accepts_cluster_incarnation(
+        &self,
+        cluster_id: &str,
+        incarnation: Option<ClusterMetricsIncarnation>,
+    ) -> bool {
+        !matches!(
+            self.effective,
+            MetricDetailLevel::Cluster | MetricDetailLevel::Backend
+        ) || self.cluster_incarnation(cluster_id) == incarnation
+    }
+
     /// Receive a metric from an owner that captured a cluster incarnation.
     ///
     /// The identity check intentionally precedes cardinality filtering. A
@@ -980,7 +1003,8 @@ impl Aggregator {
     /// aggregate, so the event remains part of that aggregate: while detail
     /// stays at that level, an old connection's late `-1` still balances its
     /// earlier `+1`. Existing detail transitions do not migrate stored gauge
-    /// contributions between shapes.
+    /// contributions between shapes. See
+    /// [`Self::accepts_cluster_incarnation`] for the identity comparison.
     pub(crate) fn receive_metric_for_incarnation(
         &mut self,
         label: &'static str,
@@ -989,22 +1013,11 @@ impl Aggregator {
         incarnation: Option<ClusterMetricsIncarnation>,
         metric: MetricValue,
     ) {
-        if let Some(cluster_id) = cluster_id {
-            // Delayed owners must have captured a real configured lifetime.
-            // `None` is never a wildcard: allocation exhaustion and a missed
-            // capture both fail closed instead of silently sharing identity.
-            let Some(incarnation) = incarnation else {
-                return;
-            };
-            if matches!(
-                self.effective,
-                MetricDetailLevel::Cluster | MetricDetailLevel::Backend
-            ) && self.cluster_incarnation(cluster_id) != Some(incarnation)
-            {
-                return;
-            }
+        if cluster_id
+            .is_none_or(|cluster_id| self.accepts_cluster_incarnation(cluster_id, incarnation))
+        {
+            self.receive_metric(label, cluster_id, backend_id, metric);
         }
-        self.receive_metric(label, cluster_id, backend_id, metric);
     }
 
     /// Drop all metric storage for one backend across BOTH drains. Called
@@ -1250,24 +1263,27 @@ macro_rules! record_backend_metrics (
     });
   };
   ($cluster_id:expr, $backend_id:expr, $response_time:expr, $backend_connection_time:expr, $backend_header_time:expr, $bin:expr, $bout:expr, $incarnation:expr) => {
-    use $crate::metrics::MetricValue;
+    use $crate::metrics::{MetricValue,Subscriber};
     $crate::metrics::METRICS.with(|metrics| {
       let m = &mut *metrics.borrow_mut();
       let cluster_id: &str = $cluster_id;
       let backend_id: &str = $backend_id;
-      let incarnation = $incarnation;
 
-      m.receive_metric_for_incarnation($crate::metrics::names::backend::BYTES_IN, Some(cluster_id), Some(backend_id), incarnation, MetricValue::Count($bin as i64));
-      m.receive_metric_for_incarnation($crate::metrics::names::backend::BYTES_OUT, Some(cluster_id), Some(backend_id), incarnation, MetricValue::Count($bout as i64));
-      m.receive_metric_for_incarnation($crate::metrics::names::backend::RESPONSE_TIME, Some(cluster_id), Some(backend_id), incarnation, MetricValue::Time($response_time as usize));
-      if let Some(t) = $backend_connection_time {
-        m.receive_metric_for_incarnation($crate::metrics::names::backend::CONNECTION_TIME, Some(cluster_id), Some(backend_id), incarnation, MetricValue::Time(t.as_millis() as usize));
-      }
-      if let Some(t) = $backend_header_time {
-        m.receive_metric_for_incarnation($crate::metrics::names::backend::HEADER_TIME, Some(cluster_id), Some(backend_id), incarnation, MetricValue::Time(t.as_millis() as usize));
-      }
+      // One identity lookup gates the whole burst: every emission below
+      // shares the same cluster and captured incarnation.
+      if m.accepts_cluster_incarnation(cluster_id, $incarnation) {
+        m.receive_metric($crate::metrics::names::backend::BYTES_IN, Some(cluster_id), Some(backend_id), MetricValue::Count($bin as i64));
+        m.receive_metric($crate::metrics::names::backend::BYTES_OUT, Some(cluster_id), Some(backend_id), MetricValue::Count($bout as i64));
+        m.receive_metric($crate::metrics::names::backend::RESPONSE_TIME, Some(cluster_id), Some(backend_id), MetricValue::Time($response_time as usize));
+        if let Some(t) = $backend_connection_time {
+          m.receive_metric($crate::metrics::names::backend::CONNECTION_TIME, Some(cluster_id), Some(backend_id), MetricValue::Time(t.as_millis() as usize));
+        }
+        if let Some(t) = $backend_header_time {
+          m.receive_metric($crate::metrics::names::backend::HEADER_TIME, Some(cluster_id), Some(backend_id), MetricValue::Time(t.as_millis() as usize));
+        }
 
-      m.receive_metric_for_incarnation($crate::metrics::names::backend::REQUESTS, Some(cluster_id), Some(backend_id), incarnation, MetricValue::Count(1));
+        m.receive_metric($crate::metrics::names::backend::REQUESTS, Some(cluster_id), Some(backend_id), MetricValue::Count(1));
+      }
     });
   }
 );
@@ -1411,6 +1427,140 @@ mod tests {
         exhausted.last_cluster_incarnation = u64::MAX;
         exhausted.add_cluster("exhausted");
         assert_eq!(exhausted.cluster_incarnation("exhausted"), None);
+    }
+
+    /// Value of `key` in the local drain for `cluster_id`: the backend row
+    /// when `backend_id` is given, the cluster row otherwise.
+    fn local_labelled_value(
+        aggregator: &mut Aggregator,
+        cluster_id: &str,
+        backend_id: Option<&str>,
+        key: &str,
+    ) -> Option<filtered_metrics::Inner> {
+        let dump = aggregator
+            .local
+            .dump_cluster_metrics(&[])
+            .expect("dump cluster metrics");
+        let row = dump.get(cluster_id)?;
+        let metrics = match backend_id {
+            Some(backend_id) => {
+                &row.backends
+                    .iter()
+                    .find(|backend| backend.backend_id == backend_id)?
+                    .metrics
+            }
+            None => &row.cluster,
+        };
+        metrics.get(key)?.inner.clone()
+    }
+
+    #[test]
+    fn undeclared_cluster_none_incarnation_is_recorded_at_process_detail() {
+        // A frontend may route to a cluster that never received AddCluster;
+        // its owners capture `None`. The label-stripped worker aggregate must
+        // still count those events.
+        let mut aggregator = Aggregator::new(String::new());
+        aggregator.set_up_detail(MetricDetailLevel::Process);
+        aggregator.receive_metric_for_incarnation(
+            "undeclared_test",
+            Some("undeclared"),
+            Some("backend"),
+            None,
+            MetricValue::Count(4),
+        );
+        assert_eq!(
+            aggregator
+                .dump_local_proxy_metrics()
+                .get("undeclared_test")
+                .and_then(|metric| metric.inner.as_ref()),
+            Some(&filtered_metrics::Inner::Count(4)),
+        );
+    }
+
+    #[test]
+    fn undeclared_cluster_none_incarnation_is_recorded_at_labelled_detail() {
+        for detail in [MetricDetailLevel::Cluster, MetricDetailLevel::Backend] {
+            let mut aggregator = Aggregator::new(String::new());
+            aggregator.set_up_detail(detail);
+            assert_eq!(aggregator.cluster_incarnation("undeclared"), None);
+            aggregator.receive_metric_for_incarnation(
+                "undeclared_test",
+                Some("undeclared"),
+                Some("backend"),
+                None,
+                MetricValue::Count(4),
+            );
+            let backend_id = match detail {
+                MetricDetailLevel::Backend => Some("backend"),
+                _ => None,
+            };
+            let recorded =
+                local_labelled_value(&mut aggregator, "undeclared", backend_id, "undeclared_test");
+            assert_eq!(
+                recorded,
+                Some(filtered_metrics::Inner::Count(4)),
+                "None == None must pass the gate at {detail:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn mismatched_incarnation_is_dropped_at_labelled_detail() {
+        for detail in [MetricDetailLevel::Cluster, MetricDetailLevel::Backend] {
+            let mut aggregator = Aggregator::new(String::new());
+            aggregator.set_up_detail(detail);
+
+            // Captured Some(I1), current Some(I2).
+            aggregator.add_cluster("c");
+            let first = aggregator.cluster_incarnation("c");
+            aggregator.remove_cluster("c");
+            aggregator.add_cluster("c");
+            let second = aggregator.cluster_incarnation("c");
+            assert!(first.is_some() && second.is_some() && first != second);
+            aggregator.receive_metric_for_incarnation(
+                "mismatch_test",
+                Some("c"),
+                Some("b"),
+                first,
+                MetricValue::Count(1),
+            );
+
+            // Captured None, current Some(I2): a missed capture never adopts
+            // the current lifetime.
+            aggregator.receive_metric_for_incarnation(
+                "mismatch_test",
+                Some("c"),
+                Some("b"),
+                None,
+                MetricValue::Count(1),
+            );
+            assert!(
+                !aggregator
+                    .local
+                    .dump_cluster_metrics(&[])
+                    .expect("dump cluster metrics")
+                    .contains_key("c"),
+                "stale or missing capture must not reach the Some(I2) row at {detail:?}",
+            );
+
+            // Captured Some(I1), current None (cluster never declared under
+            // this id in this aggregator).
+            aggregator.receive_metric_for_incarnation(
+                "mismatch_test",
+                Some("other"),
+                Some("b"),
+                first,
+                MetricValue::Count(1),
+            );
+            assert!(
+                !aggregator
+                    .local
+                    .dump_cluster_metrics(&[])
+                    .expect("dump cluster metrics")
+                    .contains_key("other"),
+                "Some(I1) must not reach an undeclared (None) cluster at {detail:?}",
+            );
+        }
     }
 
     #[test]

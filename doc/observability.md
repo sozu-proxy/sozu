@@ -197,9 +197,16 @@ The public `SessionMetrics` shape and
 `SessionMetrics::register_end_of_session(&LogContext)` API retain their
 current-configuration semantics for embedders. Sōzu's delayed HTTP, WebSocket,
 and TCP owners use a separate internal registration path with the incarnation
-captured by their request, session, pipe, or backend handle. A missing internal
-capture is rejected for a cluster-labelled event rather than being treated as
-the current incarnation.
+captured by their request, session, pipe, or backend handle. At `cluster` and
+`backend` detail the gate compares the captured value with the current one,
+both optional: a cluster that frontends or backends reference without an
+`AddCluster` has no incarnation, captures none, and is therefore recorded at
+every detail level like any other cluster. Any mismatch is rejected, including
+a missing capture against a cluster that now has an incarnation, so a missing
+capture is never treated as the current incarnation. Should the 64-bit
+incarnation space ever be exhausted (2^64 `AddCluster` allocations), newly
+added clusters also have no incarnation and share that identity with
+undeclared clusters.
 
 Every request ends with a burst of emissions into the local drain
 (`SessionMetrics` end-of-session registration: two cluster-labelled times and,

@@ -827,9 +827,14 @@ impl TcpSession {
             preread.started_at().elapsed().as_millis() as i64
         );
 
-        self.cluster_id = Some(outcome.cluster.clone());
-        self.cluster_metrics_incarnation =
-            crate::metrics::cluster_incarnation(outcome.cluster.as_ref());
+        // `TcpSession::readable` normally captured this route (and its
+        // metrics incarnation) already; only capture when it did not, so the
+        // incarnation stays the one observed at routing time.
+        if self.cluster_id.as_ref() != Some(&outcome.cluster) {
+            self.cluster_id = Some(outcome.cluster.clone());
+            self.cluster_metrics_incarnation =
+                crate::metrics::cluster_incarnation(outcome.cluster.as_ref());
+        }
         // `container_frontend_timeout` is NOT restored here anymore: by the
         // time this runs, `TcpSession::readable`'s route-capture block has
         // already restored it to the listener's configured `front_timeout`
@@ -1719,10 +1724,14 @@ impl TcpSession {
             .or_else(|| self.listener.borrow().cluster_id.clone())
             .ok_or(BackendConnectionError::NotFound(ObjectKind::TcpCluster))?;
 
-        self.cluster_id = Some(cluster_id.clone());
-        if self.cluster_metrics_incarnation.is_none() {
+        // Capture the metrics incarnation exactly once, when the session is
+        // first routed. Every path that sets `cluster_id` (session creation,
+        // SNI preread) captures alongside it, so a retry with `cluster_id`
+        // already set keeps the original capture even when it is `None`.
+        if self.cluster_id.is_none() {
             self.cluster_metrics_incarnation =
                 crate::metrics::cluster_incarnation(cluster_id.as_ref());
+            self.cluster_id = Some(cluster_id.clone());
         }
 
         // The cluster's own budget when it sets one, the worker's otherwise

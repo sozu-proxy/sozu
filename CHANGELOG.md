@@ -4104,9 +4104,14 @@
   preserve the current incarnation. The public `SessionMetrics` literal shape
   and its current-configuration registration method remain compatible for
   embedders; only Sōzu's internal delayed owners use the captured-incarnation
-  path. Covered by
+  path. A cluster referenced without `AddCluster` has no incarnation on either
+  side of the comparison, so its metrics are still recorded at every detail
+  level. Covered by
   `test_old_http_session_metrics_do_not_decrement_same_identity_replacement`
   `cluster_incarnation_fences_labelled_rows_and_preserves_process_aggregates`,
+  `undeclared_cluster_none_incarnation_is_recorded_at_process_detail`,
+  `undeclared_cluster_none_incarnation_is_recorded_at_labelled_detail`,
+  `mismatched_incarnation_is_dropped_at_labelled_detail`,
   and `public_session_metrics_literal_and_registration_remain_supported`.
 
 - **`fix(metrics)`: metric-detail leases expire without another worker command
