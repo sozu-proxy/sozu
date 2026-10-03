@@ -642,6 +642,19 @@
 
 ### 🔄 Changed
 
+- **`docs(udp)`: describe stale idle-expiry handling as deadline revalidation
+  ([#1825](https://github.com/sozu-proxy/sozu/issues/1825)).** The UDP lifecycle documentation,
+  the `flow.rs`/`manager.rs`/`mod.rs` comments and two test names attributed the survival of a
+  refreshed flow to a generation token, but `UdpManager::handle_timeout` never reads
+  `UdpFlow::timer_gen`: it closes a flow only while `idle_deadline <= now`, and the
+  consume-then-reschedule rule re-arms the wheel. They now name that mechanism, and describe
+  `timer_gen` as a refresh counter that `touch` advances and no expiry path reads (the public field
+  stays, so the library API is unchanged). `LIFECYCLE.md` also cited `UdpListenerSession::close`
+  as the place the delivered `timer_handle` is dropped; it is the timeout handler,
+  `UdpListenerSession::timeout_at`. No behaviour changes. Tests renamed:
+  `idle_race_resolved_by_deadline_revalidation` (which now also asserts the refreshed
+  `idle_deadline`) and `prop_deadline_revalidation_defeats_stale_close`.
+
 - **`docs`: fix stale flood-window, idle-timeout and rejected-per-IP statements.** The
   `h2_flood_detector.rs` comments still sized the connection window at 1 MiB: a chained Sōzu acks
   every 8 MiB of its 16 MiB window, and a cancelled upload's in-flight DATA is bounded by the
