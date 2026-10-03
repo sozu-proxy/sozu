@@ -2682,7 +2682,8 @@ mod tests {
     /// call writes `sticky_session` only when the request's frontend sticks,
     /// so a request to a frontend that does not stick, following one to a
     /// frontend that does, used to answer with the previous request's
-    /// `Set-Cookie`, pinning the client to a backend of another cluster.
+    /// `Set-Cookie`, naming a backend of another cluster that frontend
+    /// never asked for and cannot use.
     ///
     /// TO SEE THIS RED: drop `self.sticky_session = None;` from
     /// `HttpContext::reset`.
