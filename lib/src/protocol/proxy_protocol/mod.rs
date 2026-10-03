@@ -1,4 +1,7 @@
-//! HAProxy PROXY protocol (v1 + v2) state surface.
+//! HAProxy PROXY protocol v2 state surface plus the legacy v1 header model.
+//!
+//! Runtime expect, relay and send states use v2 only; v1 is not accepted on
+//! the wire.
 //!
 //! Three distinct session roles compose into the front-end pipeline:
 //! `expect` ingests an inbound v2 header and hands off to the downstream

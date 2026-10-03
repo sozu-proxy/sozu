@@ -1561,6 +1561,121 @@ fn setup_tcp_expect_header_cluster_test(name: &str) -> (Worker, SocketAddr, Sock
     (worker, front_address, back_address)
 }
 
+/// A PROXY-v2 receiver must consume the exact `16 + len` bytes declared by
+/// the header. Payload bytes can arrive in the same TCP segment, and must stay
+/// available to the pipe after the expect state upgrades.
+fn try_tcp_expect_proxy_preserves_coalesced_payload() -> State {
+    const PAYLOAD: &[u8] = b"coalesced-application-payload";
+
+    let (mut worker, front_address, back_address) =
+        setup_tcp_expect_header_cluster_test("TCP-EXPECT-COALESCED-PAYLOAD");
+    let listener = bind_std_listener(back_address, "tcp expect-header payload backend");
+
+    let mut ipv4_with_tlv = pp_v2_proxy_ipv4(54321, front_address.port());
+    ipv4_with_tlv[14..16].copy_from_slice(&20u16.to_be_bytes());
+    ipv4_with_tlv.extend_from_slice(&[0xe0, 0, 5, 1, 2, 3, 4, 5]);
+
+    let mut ipv6_with_tlv = vec![
+        0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, // magic
+        0x21, // version 2, command PROXY
+        0x21, // AF_INET6, STREAM
+        0x00, 0x2C, // address length: 36 address bytes + 8 TLV bytes
+    ];
+    ipv6_with_tlv.extend_from_slice(&[0; 32]);
+    ipv6_with_tlv.extend_from_slice(&54321u16.to_be_bytes());
+    ipv6_with_tlv.extend_from_slice(&front_address.port().to_be_bytes());
+    ipv6_with_tlv.extend_from_slice(&[0xe0, 0, 5, 1, 2, 3, 4, 5]);
+
+    let mut max_header = vec![
+        0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, // magic
+        0x20, // version 2, command LOCAL
+        0x00, // AF_UNSPEC
+        0x00, 0xD8, // address length: 216 (232 bytes total)
+    ];
+    max_header.resize(232, 0);
+
+    let cases = [
+        (
+            "LOCAL-16",
+            vec![
+                0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, 0x20, 0x00,
+                0x00, 0x00,
+            ],
+        ),
+        (
+            "IPv4-28-positive-witness",
+            pp_v2_proxy_ipv4(54321, front_address.port()),
+        ),
+        ("IPv4-plus-TLV-36", ipv4_with_tlv),
+        ("IPv6-plus-TLV-60", ipv6_with_tlv),
+        ("LOCAL-maximum-232", max_header),
+    ];
+
+    let (backend_tx, backend_rx) = mpsc::channel();
+    let case_count = cases.len();
+    let backend_handle = thread::spawn(move || {
+        for _ in 0..case_count {
+            let (mut stream, _) = listener.accept().expect("backend accept failed");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .expect("set backend read timeout");
+            let received =
+                super::h2_utils::read_at_least(&mut stream, PAYLOAD.len(), Duration::from_secs(1));
+            backend_tx.send(received).expect("send backend observation");
+        }
+    });
+
+    // Keep every client write-open until the backend observations complete:
+    // this test does not exercise the half-close policy tracked in #1840.
+    let mut clients = Vec::new();
+    let mut observations = Vec::new();
+    for (name, header) in &cases {
+        let mut stream = raw_connect(front_address);
+        let mut coalesced = header.clone();
+        coalesced.extend_from_slice(PAYLOAD);
+        stream
+            .write_all(&coalesced)
+            .expect("write coalesced PROXY header and payload");
+        clients.push(stream);
+        observations.push((
+            *name,
+            backend_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("backend observation deadline elapsed"),
+        ));
+    }
+
+    backend_handle.join().expect("backend thread panicked");
+    let mut all_payloads_preserved = true;
+    for (name, received) in &observations {
+        println!(
+            "TCP expect-header {name}: received {}/{} payload bytes",
+            received.len(),
+            PAYLOAD.len()
+        );
+        all_payloads_preserved &= received.as_slice() == PAYLOAD;
+    }
+
+    drop(clients);
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    if all_payloads_preserved && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_tcp_expect_proxy_preserves_coalesced_payload() {
+    assert_eq!(
+        try_tcp_expect_proxy_preserves_coalesced_payload(),
+        State::Success,
+        "expect_proxy must consume exactly the declared v2 header length"
+    );
+}
+
 /// To SEE THIS RED: in `lib/src/tcp.rs`, delete the
 /// `if matches!(&self.state, TcpStateMachine::ExpectProxyProtocol(_)) { return None; }`
 /// guard from `attempt_backend_connect_if_needed`. The silent connection then

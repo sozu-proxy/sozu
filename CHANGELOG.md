@@ -4024,6 +4024,16 @@
   only reaped, and its client only answered, once the later deadline expired. The loop now blocks
   at most until the earliest outstanding deadline (`CommandHub::next_poll_timeout`,
   `bin/src/command/server.rs`); pinned by `poll_wakes_up_for_the_earliest_task_deadline`.
+- **`fix(proxy-protocol)`: keep payload coalesced after a short PROXY v2 header
+  ([#1841](https://github.com/sozu-proxy/sozu/issues/1841)).** `ExpectProxyProtocol` used fixed
+  28-, 52- and 232-byte read stages. A valid 16-byte `LOCAL` header, or a 36-/60-byte address
+  header carrying TLVs, therefore let the same socket read pull application bytes into the
+  header staging buffer; the expect-to-TCP/HTTP/HTTPS upgrades discarded that parser remainder.
+  The receiver now reads the 16-byte v2 prelude first, rejects a declared total above its
+  232-byte capacity, and then reads exactly the declared `16 + len` bytes. Coalesced payload
+  stays in the socket for the downstream protocol, while the accepted 232-byte boundary and
+  malformed-header rejection remain unchanged. `expect_proxy` and its error metric are also
+  documented as v2-only; Sōzu does not ingest PROXY v1.
 
 - **`fix(metrics)`: metric-detail leases expire without another worker command
   ([#1831](https://github.com/sozu-proxy/sozu/issues/1831)).** The lease janitor
