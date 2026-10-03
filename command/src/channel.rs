@@ -29,7 +29,7 @@ use crate::{buffer::growable::Buffer, ready::Ready};
 const HIGH_WATERMARK_RATIO: f64 = 0.8;
 const CHANNEL_SNAPSHOT_VERSION: u16 = 1;
 const CHANNEL_READY_MASK: u16 =
-    Ready::READABLE.0 | Ready::WRITABLE.0 | Ready::ERROR.0 | Ready::HUP.0;
+    Ready::READABLE.0 | Ready::WRITABLE.0 | Ready::ERROR.0 | Ready::HUP.0 | Ready::WRITE_CLOSED.0;
 
 #[derive(thiserror::Error, Debug)]
 pub enum ChannelError {
@@ -1569,7 +1569,8 @@ mod tests {
             .write_all(b"sent-back-pending")
             .expect("could not seed back buffer");
         channel.back_buf.consume(b"sent-".len());
-        channel.readiness = Ready::READABLE | Ready::WRITABLE | Ready::ERROR | Ready::HUP;
+        channel.readiness =
+            Ready::READABLE | Ready::WRITABLE | Ready::ERROR | Ready::HUP | Ready::WRITE_CLOSED;
         channel.interest = Ready::READABLE | Ready::WRITABLE;
         channel.front_high_watermark_logged = true;
 
@@ -1594,7 +1595,7 @@ mod tests {
         assert_eq!(restored.max_buffer_size, 64);
         assert_eq!(
             restored.readiness,
-            Ready::READABLE | Ready::WRITABLE | Ready::ERROR | Ready::HUP
+            Ready::READABLE | Ready::WRITABLE | Ready::ERROR | Ready::HUP | Ready::WRITE_CLOSED
         );
         assert_eq!(restored.interest, Ready::READABLE | Ready::WRITABLE);
         assert!(!restored.is_blocking());
@@ -1702,7 +1703,7 @@ mod tests {
         ));
 
         let (mut invalid_readiness, sock, _peer) = snapshot_and_socket();
-        invalid_readiness.readiness = 1 << 15;
+        invalid_readiness.readiness = 1 << 5;
         assert!(matches!(
             Channel::<ProtobufMessage, ProtobufMessage>::restore_paused(
                 sock,
@@ -1717,7 +1718,7 @@ mod tests {
         ));
 
         let (mut invalid_interest, sock, _peer) = snapshot_and_socket();
-        invalid_interest.interest = 1 << 15;
+        invalid_interest.interest = 1 << 5;
         assert!(matches!(
             Channel::<ProtobufMessage, ProtobufMessage>::restore_paused(
                 sock,
@@ -1730,6 +1731,47 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn channel_snapshot_accepts_every_defined_ready_subset_in_both_fields() {
+        let defined_bits = Ready::READABLE.0
+            | Ready::WRITABLE.0
+            | Ready::ERROR.0
+            | Ready::HUP.0
+            | Ready::WRITE_CLOSED.0;
+
+        for bits in 0..=defined_bits {
+            for field in ["readiness", "interest"] {
+                let (channel, _peer): (
+                    Channel<ProtobufMessage, ProtobufMessage>,
+                    Channel<ProtobufMessage, ProtobufMessage>,
+                ) = Channel::generate_nonblocking(8, 64).expect("could not generate channels");
+                let mut snapshot = channel.snapshot();
+                if field == "readiness" {
+                    snapshot.readiness = bits;
+                } else {
+                    snapshot.interest = bits;
+                }
+
+                let restored = Channel::<ProtobufMessage, ProtobufMessage>::restore_paused(
+                    channel.sock,
+                    snapshot,
+                    8,
+                    64,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("{field} rejected defined bits {bits:#04x}: {error}")
+                })
+                .resume();
+                let restored_bits = if field == "readiness" {
+                    restored.readiness.0
+                } else {
+                    restored.interest.0
+                };
+                assert_eq!(restored_bits, bits, "{field} changed bits {bits:#04x}");
+            }
+        }
     }
 
     #[test]
