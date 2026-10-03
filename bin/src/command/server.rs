@@ -1640,8 +1640,21 @@ impl Server {
         self.queued_tasks.insert(task_id, container);
     }
 
+    /// Drop a task that is still queued, together with every worker response
+    /// route it registered.
+    ///
+    /// The task must not have migrated into `CommandHub::tasks` yet: its only
+    /// caller, `load_state`'s parse-error branch, cancels within the same
+    /// event-loop iteration as the scatter.
+    ///
+    /// sozu#1827: the routes used to stay in `in_flight`. A late worker answer
+    /// or a worker closing then resolved to the cancelled task, found no task,
+    /// and returned before any cleanup, so every failed replay leaked its
+    /// routes for the life of the main process. Routes of other tasks are kept.
     pub fn cancel_task(&mut self, task_id: TaskId) {
         self.queued_tasks.remove(&task_id);
+        self.in_flight
+            .retain(|_, in_flight_task_id| *in_flight_task_id != task_id);
     }
 
     /// Called when the main cannot communicate anymore with a worker (it's channel closed)
@@ -2627,6 +2640,104 @@ mod tests {
         assert!(
             poll_timeout <= early,
             "the loop must wake up by the earliest deadline ({early:?}), got {poll_timeout:?}"
+        );
+    }
+
+    /// Regression (sozu#1827): cancelling a task must retire every worker
+    /// response route it registered, and only those.
+    ///
+    /// `cancel_task` dropped the queued task but left its `in_flight` routes.
+    /// A late worker answer then resolved to a task that no longer exists, and
+    /// a worker closing re-fed every leftover route as a synthetic failure for
+    /// it; each failed state replay (`load_state`'s parse-error branch, the
+    /// only caller) leaked its routes for the life of the main process.
+    ///
+    /// To SEE THIS RED: drop the `in_flight.retain` from `Server::cancel_task`
+    /// — the cancelled task's two routes survive the cancellation.
+    #[test]
+    fn cancelling_a_task_retires_only_its_response_routes() {
+        let mut hub = create_test_hub();
+        let (_worker_0, _scm_0) = register_test_worker(&mut hub.server, 0, 4096, 65536);
+        let (_worker_1, _scm_1) = register_test_worker(&mut hub.server, 1, 4096, 65536);
+
+        let new_tally_task = |hub: &mut CommandHub, seen| {
+            hub.server.new_task(
+                Box::new(TallyTask {
+                    gatherer: DefaultGatherer::default(),
+                    seen,
+                }),
+                Timeout::None,
+            )
+        };
+        let cancelled_seen = std::rc::Rc::new(std::cell::Cell::new((0, 0, 0)));
+        let cancelled = new_tally_task(&mut hub, cancelled_seen.clone());
+        hub.server
+            .scatter_on(RequestType::Status(Status {}).into(), cancelled, 1, None);
+        let kept_seen = std::rc::Rc::new(std::cell::Cell::new((0, 0, 0)));
+        let kept = new_tally_task(&mut hub, kept_seen.clone());
+        hub.server
+            .scatter_on(RequestType::Status(Status {}).into(), kept, 1, Some(0));
+        assert_eq!(
+            hub.server.in_flight.len(),
+            3,
+            "2 + 1 routes before cancelling"
+        );
+
+        hub.server.cancel_task(cancelled);
+
+        let routes: Vec<(RequestId, TaskId)> = hub
+            .server
+            .in_flight
+            .iter()
+            .map(|(id, task)| (id.clone(), *task))
+            .collect();
+        assert_eq!(
+            routes,
+            vec![(format!("0-{kept}-1"), kept)],
+            "cancellation must retire the cancelled task's routes and keep the other task's"
+        );
+
+        // A late answer to the cancelled task finds no route at all...
+        hub.handle_worker_response(
+            1,
+            WorkerResponse {
+                id: format!("1-{cancelled}-1"),
+                status: ResponseStatus::Ok.into(),
+                message: String::new(),
+                content: None,
+            },
+        );
+        // ...and worker 0 closing fails only what is still owed on it: the
+        // kept task's route, never the cancelled task's.
+        hub.fail_in_flight_requests_of_worker(0);
+
+        assert!(
+            hub.server.in_flight.is_empty(),
+            "no route may outlive the worker answers and closure that retire them"
+        );
+        let mut container = hub
+            .server
+            .queued_tasks
+            .remove(&kept)
+            .expect("the kept task must still be queued");
+        assert!(
+            container.job.get_gatherer().has_finished(),
+            "worker 0 closing must complete the kept task"
+        );
+        hub.handle_finishing_task(kept, container, false);
+        assert_eq!(
+            kept_seen.get(),
+            (0, 1, 1),
+            "the kept task must account its own worker's closure as one failure"
+        );
+        assert!(
+            hub.server.queued_tasks.is_empty() && hub.tasks.is_empty(),
+            "the cancelled task must not be resurrected by a late answer"
+        );
+        assert_eq!(
+            cancelled_seen.get(),
+            (0, 0, 0),
+            "a cancelled task never finishes"
         );
     }
 }

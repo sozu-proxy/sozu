@@ -262,7 +262,10 @@ closes (`CommandHub::fail_in_flight_requests_of_worker`) are accounted as
 synthetic `Failure`s, so `ok + errors` always reaches
 `expected_responses`; a terminal answer retires its `in_flight` entry
 immediately, so a worker that answers and then dies is not re-counted as a
-rejection. A bulk sender that fills a worker's back buffer past
+rejection. A replay that `load_state` abandons on a state-file parse error is
+cancelled with `Server::cancel_task`, which retires the task's `in_flight`
+routes together with the task and keeps every other task's (sozu#1827): a
+late answer or a worker closing then finds no route for it. A bulk sender that fills a worker's back buffer past
 `max_buffer_size` parks the overflow in the per-worker
 `WorkerSession::pending` queue and drains it from the WRITABLE path
 (`WorkerSession::flush_pending`), in scatter order: nothing is dropped and

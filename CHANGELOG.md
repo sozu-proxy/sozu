@@ -3984,6 +3984,16 @@
 
 ### 🐛 Fixed
 
+- **`fix(command)`: cancelling a control task retires its worker-response routes
+  ([#1827](https://github.com/sozu-proxy/sozu/issues/1827)).** `Server::cancel_task`
+  (`bin/src/command/server.rs`) dropped the queued task but left its `in_flight` routes. A late
+  worker answer, or a worker closing, then resolved to a task that no longer existed and returned
+  before any cleanup, so every state replay that `load_state` abandons on a parse error leaked its
+  routes for the life of the main process. Cancellation now retires every route of the cancelled
+  task and keeps the routes of other tasks; pinned by
+  `cancelling_a_task_retires_only_its_response_routes`, which also drives a late answer and a worker
+  closure after the cancellation.
+
 - **`fix(command)`: a pending control command times out at its own deadline
   ([#1826](https://github.com/sozu-proxy/sozu/issues/1826)).** The main-process event loop
   computed its `poll` timeout from the LATEST deadline of the pending tasks. A worker that stays
