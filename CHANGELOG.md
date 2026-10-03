@@ -3993,11 +3993,16 @@
   `SessionState::ready` for `ExpectProxyProtocol`
   (`lib/src/protocol/proxy_protocol/expect.rs`), the HTTP and HTTPS listeners' expect stage,
   closed on HUP the same way. Both now drain the readable bytes first: a complete header upgrades
-  and hands HUP on to the next stage (on TCP, `Pipe::frontend_hup` forwards the payload still
-  queued behind the header to the backend), while a zero-byte bare-TCP healthcheck or a truncated
-  header still closes without dialing a backend. A coalesced zero-byte close now takes the expect
-  stage's own zero-byte branch, which emits no access log, as the same close already did when the
-  FIN arrived in its own event. Relay sessions (`RelayProxyProtocol`) are unchanged.
+  and hands HUP on to the next stage (on TCP, `Pipe::frontend_hup` keeps the session while request
+  bytes the expect stage did not read remain to forward), while a zero-byte bare-TCP healthcheck
+  or a truncated header still closes without dialing a backend. On TCP, a zero-byte healthcheck
+  (connect then FIN, which Linux always reports as `READABLE | HUP`) now closes through the expect
+  stage's zero-byte branch instead of `TcpSession::front_hup`, so it no longer emits a TCP access-log
+  line or the end-of-session request/service timers; a truncated header followed by FIN still
+  logs one. The client still receives no backend response after its half-close: the TCP pipe
+  closes once the request is flushed, for every TCP session
+  ([#1840](https://github.com/sozu-proxy/sozu/issues/1840)). Relay sessions
+  (`RelayProxyProtocol`) are unchanged.
 
 - **`test(e2e)`: `test_issue_806` no longer times the host's scheduler against its reconnect
   budget.** `try_backend_stop` (`e2e/src/tests/tests.rs`) compared the wall-clock round trip of the

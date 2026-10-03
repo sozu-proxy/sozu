@@ -1416,12 +1416,14 @@ impl TcpSession {
         // A client that half-closes right behind its PROXY-v2 header and
         // payload can deliver both as ONE `READABLE | HUP` event (Linux
         // coalesces `EPOLLIN | EPOLLRDHUP`). `front_hup` closes every
-        // pre-`Pipe` state but `SniPreread`, so honouring HUP first would
-        // drop a complete, already-queued header (sozu-proxy/sozu#1823).
+        // pre-`Pipe` state (`SniPreread` without an access log), so
+        // honouring HUP first would drop a complete, already-queued header
+        // (sozu-proxy/sozu#1823).
         // Drain the expect state's readable bytes first: a parsed header
         // returns `Upgrade` and the recursive `ready()` hands the still-set
         // HUP to `Pipe::frontend_hup`, which keeps the session alive while
-        // request bytes remain to forward. An empty or truncated header
+        // request bytes remain in the kernel or the pipe's buffers. An empty
+        // or truncated header
         // ends with READABLE cleared (`readable` removes it on every
         // zero-byte read) or a `Close`, so a dead client still closes,
         // through `readable`'s own zero-byte arm or the HUP check below.

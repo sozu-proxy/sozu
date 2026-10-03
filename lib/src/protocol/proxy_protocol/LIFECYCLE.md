@@ -129,7 +129,9 @@ PROXY phase and the downstream protocol.
   HTTPS, `SessionState::ready` for `ExpectProxyProtocol` (`expect.rs`)
   closes on HUP only once READABLE is gone. A parsed header still
   upgrades and hands HUP on to the next stage (`Pipe::frontend_hup` keeps
-  the session while request bytes remain); an empty or truncated header
+  the session while unread or buffered request bytes remain; what the
+  pipe forwards is whatever `readable` did not consume as header); an
+  empty or truncated header
   ends with READABLE cleared by the zero-byte read and closes, so a
   bare-TCP healthcheck or a dead client never dials a backend.
 
