@@ -3980,6 +3980,20 @@
 
 ### 🐛 Fixed
 
+- **`ci(docker)`: build the Docker image with a pinned Rust image instead of Alpine edge's
+  rolling `rust` package.** On 2026-10-02 Alpine edge shipped `rust 1.99.0-r0` with a broken
+  standard library (``only metadata stub found for `rlib` dependency `std` ``, then ``requires
+  `sized` lang_item`` while compiling `unicode-ident`), and the `Docker build and push to Docker
+  Hub` job failed on `main` (for example on `1656cac7`) until Alpine published `1.99.0-r1`. The `Dockerfile` builder stage is now the
+  official `rust:1.93.1-alpine3.23` image, pinned by digest to the toolchain named in
+  `rust-toolchain`, with `RUSTUP_AUTO_INSTALL=0` so a mismatch fails instead of downloading
+  another toolchain. The musl target links statically, so the runtime stage moves from
+  `alpine:edge` to the stable `alpine:3.24` (`ALPINE_VERSION` now selects the runtime stage only)
+  with the same runtime packages, entrypoint, command, volumes and ports. `CRYPTO_PROVIDER`
+  values that need extra build dependencies install them in the builder: OpenSSL headers and
+  static libraries for `crypto-openssl`, Go and Perl for `fips`. Raise the builder image together with
+  `rust-toolchain`. `README.md` and `doc/how_to_use.md` describe the new image.
+
 - **BREAKING (library API, default change) — `fix(mux)`: a backend connect timeout fails over to
   another backend instead of answering 504
   ([#1800](https://github.com/sozu-proxy/sozu/issues/1800)).** A backend that accepted no

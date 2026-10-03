@@ -32,7 +32,10 @@ Check out the command line [documentation](./configure_cli.md) for more informat
 
 ## Run it with Docker
 
-The repository provides a multi-stage [Dockerfile][df] image based on `alpine:edge`.
+The repository provides a multi-stage [Dockerfile][df]. The builder stage is the official
+`rust:1.93.1-alpine3.23` image, pinned by digest to the toolchain named in `rust-toolchain`,
+and produces a statically linked musl binary; the runtime stage is a stable Alpine release
+(`alpine:3.24` by default).
 
 You can build the image by doing:
 
@@ -55,9 +58,14 @@ docker run \
   sozu
 ```
 
-To build an image with a specific version of Alpine:
+To run the image on another Alpine release (this selects the runtime stage only; the builder
+stays on the pinned Rust image):
 
-    docker build --build-arg ALPINE_VERSION=3.14 -t sozu:main-alpine-3.14 .
+    docker build --build-arg ALPINE_VERSION=3.23 -t sozu:main-alpine-3.23 .
+
+To build with another crypto provider (`crypto-ring` by default):
+
+    docker build --build-arg CRYPTO_PROVIDER=crypto-aws-lc-rs -t sozu:main-aws-lc-rs .
 
 ### Using a custom `config.toml` configuration file
 
