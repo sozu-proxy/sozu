@@ -25,6 +25,10 @@ sozu --version       # reports `+tui` when the subcommand is linked
     up/down, cluster added/removed, certificate added/removed, …).
   - **Listeners** polls `ListListeners` every 5 s.
   - **Certs** polls `QueryCertificatesFromTheState` every 30 s.
+  - On exit, the three polling threads leave their interval wait at
+    once, so quitting never waits out the 5 s or 30 s cadence: the
+    longest wait left is the events thread's 1 s bounded read, plus a
+    round trip already in flight.
 - A single UI thread owns the terminal, polls crossterm input on a
   30 fps cap, and synchronises frame output via DEC mode 2026
   (`BeginSynchronizedUpdate` / `EndSynchronizedUpdate`) so tmux and

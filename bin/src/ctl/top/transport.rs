@@ -27,9 +27,13 @@
 //! the sender to peek into the receiver's slot. The events thread uses the
 //! same shape, just with a `bounded(64)` buffer for burst tolerance.
 //!
-//! The three poll-driven threads exit cleanly when their `crossbeam_channel`
-//! peer is dropped (the UI thread owns the rx ends; tearing down the App
-//! drops the senders so `try_send` returns `Disconnected`). The events
+//! The three poll-driven threads exit when `run_top` drops the `Sender<()>`
+//! of their shared wake channel: each waits out its polling interval in
+//! `recv_timeout` on that channel rather than in `thread::sleep`, so the
+//! disconnect ends the wait at once instead of after up to `CERTS_INTERVAL`
+//! (sozu#1829). They also exit when their `crossbeam_channel` peer is
+//! dropped (the UI thread owns the rx ends, so `try_send` returns
+//! `Disconnected`), but only observe that after their next poll. The events
 //! thread does NOT see receiver-drop — its read blocks on the unix socket
 //! and dropping the crossbeam `Receiver<TopEvent>` cannot propagate across
 //! the socket. It exits on an `Arc<AtomicBool>` shutdown flag owned by
@@ -44,7 +48,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded};
 use sozu_command_lib::{
     channel::ChannelError,
     config::Config,
@@ -142,7 +146,9 @@ const SNAPSHOT_CAP: usize = 1;
 /// 4. on `Err(_)`: `eprintln!` and keep going (a transient socket error
 ///    never kills the thread; the next tick reconnects via the shared
 ///    `Channel` retry path inside `poll`)
-/// 5. sleep the remainder of `interval` if the round-trip was faster
+/// 5. wait out the remainder of `interval` on `wake` if the round-trip was
+///    faster; `run_top` dropping the wake sender ends the wait and the thread
+///    at once, instead of after up to a whole interval
 ///
 /// The events thread (`spawn_events`) has a different shape (single
 /// `SubscribeEvents` write + open-ended drain loop) and intentionally does
@@ -152,6 +158,7 @@ fn poll_loop<T, F>(
     interval: Duration,
     tx: Sender<T>,
     status: StatusSlot,
+    wake: Receiver<()>,
     mut channel: sozu_command_lib::channel::Channel<Request, Response>,
     mut poll: F,
 ) where
@@ -172,12 +179,18 @@ fn poll_loop<T, F>(
                 publish_status(&status, format!("{label} poll error: {err}"));
             }
         }
-        // Sleep the remaining slice of the configured interval so we don't
+        // Wait the remaining slice of the configured interval so we don't
         // hammer the master after a slow round-trip. If a poll took longer
-        // than `interval`, fire the next one immediately.
+        // than `interval`, fire the next one immediately. The wait is on the
+        // wake channel, not `thread::sleep`: nothing is ever sent on it, so
+        // the only early return is `Disconnected`, when `run_top` drops the
+        // sender on its way out and is about to join this thread.
         let elapsed = started.elapsed();
         if elapsed < interval {
-            std::thread::sleep(interval - elapsed);
+            match wake.recv_timeout(interval - elapsed) {
+                Err(RecvTimeoutError::Timeout) => {}
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
+            }
         }
     }
 }
@@ -189,6 +202,7 @@ pub fn spawn_collector(
     config: Config,
     refresh_ms: u64,
     status: StatusSlot,
+    wake: Receiver<()>,
 ) -> Result<(Receiver<Snapshot>, std::thread::JoinHandle<()>), CtlError> {
     // Open the dedicated polling channel up-front so a connection failure
     // surfaces synchronously (operator gets `CtlError::CreateChannel`)
@@ -199,7 +213,7 @@ pub fn spawn_collector(
     let handle = std::thread::Builder::new()
         .name("sozu-top-collector".into())
         .spawn(move || {
-            poll_loop("snapshot", interval, tx, status, channel, |ch| {
+            poll_loop("snapshot", interval, tx, status, wake, channel, |ch| {
                 poll_metrics(ch).map(|metrics| Snapshot {
                     metrics,
                     received_at: Instant::now(),
@@ -275,15 +289,22 @@ const CERTS_INTERVAL: Duration = Duration::from_secs(30);
 pub fn spawn_listeners(
     config: Config,
     status: StatusSlot,
+    wake: Receiver<()>,
 ) -> Result<(Receiver<ListenersSnapshot>, std::thread::JoinHandle<()>), CtlError> {
     let channel = create_channel(&config)?;
     let (tx, rx) = bounded::<ListenersSnapshot>(SNAPSHOT_CAP);
     let handle = std::thread::Builder::new()
         .name("sozu-top-listeners".into())
         .spawn(move || {
-            poll_loop("listeners", LISTENERS_INTERVAL, tx, status, channel, |ch| {
-                poll_listeners(ch).map(|list| ListenersSnapshot { list })
-            })
+            poll_loop(
+                "listeners",
+                LISTENERS_INTERVAL,
+                tx,
+                status,
+                wake,
+                channel,
+                |ch| poll_listeners(ch).map(|list| ListenersSnapshot { list }),
+            )
         })
         .map_err(|source| CtlError::SpawnFailed {
             label: "sozu-top-listeners",
@@ -335,13 +356,14 @@ fn poll_listeners(
 pub fn spawn_certs(
     config: Config,
     status: StatusSlot,
+    wake: Receiver<()>,
 ) -> Result<(Receiver<CertsSnapshot>, std::thread::JoinHandle<()>), CtlError> {
     let channel = create_channel(&config)?;
     let (tx, rx) = bounded::<CertsSnapshot>(SNAPSHOT_CAP);
     let handle = std::thread::Builder::new()
         .name("sozu-top-certs".into())
         .spawn(move || {
-            poll_loop("certs", CERTS_INTERVAL, tx, status, channel, |ch| {
+            poll_loop("certs", CERTS_INTERVAL, tx, status, wake, channel, |ch| {
                 poll_certs(ch).map(|list| CertsSnapshot { list })
             })
         })
