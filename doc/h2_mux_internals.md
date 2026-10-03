@@ -64,10 +64,11 @@ ConnectionH2
  |                                         // graceful_shutdown_deadline
  |
  |-- flood_detector: H2FloodDetector        // Closed API (h2_flood_detector.rs, private fields):
- |                                         // config: H2FloodConfig (13 configurable thresholds),
+ |                                         // config: H2FloodConfig (14 configurable thresholds),
  |                                         // per-window rate counters + never-decaying lifetime
- |                                         // ceilings (Rapid Reset / MadeYouReset / CONTINUATION /
- |                                         // Ping / Settings floods), glitch_count, window_start
+ |                                         // counters (Rapid Reset / MadeYouReset RST floors,
+ |                                         // fixed Ping / Settings ceilings), per-block
+ |                                         // CONTINUATION cap, glitch_count, window_start
  |
  |-- scheduler: H2Scheduler                 // Closed API (h2_scheduler.rs, private
  |                                         // fields): prioriser (priorities:
@@ -505,8 +506,8 @@ optional uint32 h2_stream_shrink_ratio = 21;
 That is an excerpt, not the full set: the same messages also carry the
 lifetime RST_STREAM caps, `h2_max_header_list_size`,
 `h2_max_header_table_size`, `h2_max_header_fields`,
-`h2_stream_idle_timeout_seconds`, `h2_graceful_shutdown_deadline_seconds` and
-`h2_max_window_update_stream0_per_window`. `doc/configure.md` is the
+`h2_stream_idle_timeout_seconds`, `h2_graceful_shutdown_deadline_seconds`,
+`h2_max_window_update_stream0_per_window` and `h2_stream_refusal_percent`. `doc/configure.md` is the
 user-facing reference for all of them.
 
 When absent (`None`), the built-in defaults apply:

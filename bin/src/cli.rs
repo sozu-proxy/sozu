@@ -443,7 +443,7 @@ pub enum SubnetConnectionLimitCmd {
 pub enum ConnectionAttemptsCmd {
     #[clap(
         name = "set",
-        about = "set how many backend connections a request may try, the first included, before it is answered 503 (1..=255)"
+        about = "set how many backend connections a request may try, the first included, before it is answered 503, or a TCP session is closed (1..=255)"
     )]
     Set {
         #[clap(help = "backend connection attempts per request, the first included (1..=255)")]
@@ -595,7 +595,7 @@ pub enum ClusterCmd {
         expect_proxy: bool,
         #[clap(
             long = "load-balancing-policy",
-            help = "Configures the load balancing policy. Possible values: 'round_robin', 'random', 'power_of_two', 'least_loaded', 'hrw', 'maglev' (case-insensitive). 'hrw' and 'maglev' pin each client to one backend: on the UDP flow key, and on HTTP, HTTPS and TCP clusters on the client source IP (or --affinity-header / --affinity-cookie)."
+            help = "Configures the load balancing policy. Possible values: 'round_robin', 'random', 'power_of_two', 'least_loaded', 'hrw', 'maglev' (case-insensitive). 'hrw' and 'maglev' pin each client to one backend: on UDP clusters on the source IP, or source IP and port per the UDP affinity_key of the cluster, and on HTTP, HTTPS and TCP clusters on the client source IP (or --affinity-header / --affinity-cookie)."
         )]
         load_balancing_policy: LoadBalancingAlgorithms,
         #[clap(
@@ -653,7 +653,7 @@ pub enum ClusterCmd {
         shard_strict: bool,
         #[clap(
             long = "max-connection-attempts",
-            help = "How many backend connections a request to this cluster may try, the first included, before it is answered 503 (1..=255). Defaults to the global max_connection_attempts."
+            help = "How many backend connections a request to this cluster may try, the first included, before it is answered 503, or a TCP session is closed (1..=255). Defaults to the global max_connection_attempts."
         )]
         max_connection_attempts: Option<u32>,
     },

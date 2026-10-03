@@ -179,7 +179,7 @@ into logical sub-structs for maintainability:
 - `H2FlowControl` — connection-level window, peer window, initial window size
 - `H2ByteAccounting` — overhead bytes, zero-window count
 - `H2DrainState` — RFC 9113 §6.8 GOAWAY/graceful-drain state machine; fields private to `h2_drain.rs`
-- `H2FloodConfig` — 6 configurable flood detection thresholds (per-listener)
+- `H2FloodConfig` — 14 configurable flood detection thresholds (per-listener)
 - `H2Scheduler` (`h2_scheduler.rs`) — RFC 9218 urgency + incremental tracking
   per stream, the write-pass stream order, and the round-robin cursor
 
@@ -321,7 +321,7 @@ lib/src/protocol/mux/
 │                            connection state, edge-trigger discipline
 ├── h2_close.rs              Whether a connection may close or must keep draining
 │                            under TLS backpressure
-├── h2_control_tx.rs         Proxy-emitted RST_STREAM queue and its lifetime cap
+├── h2_control_tx.rs         Proxy-emitted RST_STREAM queue and its pending bound
 ├── h2_drain.rs              RFC 9113 §6.8 double-GOAWAY drain state and transitions
 ├── h2_flood_detector.rs     Flood thresholds and counters: Rapid Reset, CONTINUATION
 │                            flood, MadeYouReset, PING/SETTINGS/empty-DATA rates
@@ -411,9 +411,13 @@ system calls and allocations is in `doc/lifetime_of_a_session.md`, and how those
   then stream ID, then incremental streams to the tail of their bucket, rotated by a
   round-robin cursor so same-urgency incremental downloads interleave. Default urgency
   is 3 per RFC 9218.
-- **Configurable flood detection**: Six thresholds (RST_STREAM, PING, SETTINGS, empty
-  DATA, CONTINUATION, glitch count) are configurable per-listener via protobuf, with
-  compile-time defaults. Exceeding any threshold triggers GOAWAY(ENHANCE_YOUR_CALM).
+- **Configurable flood detection**: Fourteen thresholds (per-window RST_STREAM, PING,
+  SETTINGS, empty DATA, stream-0 WINDOW_UPDATE and glitch count; the three RST_STREAM
+  lifetime floors; CONTINUATION frames, header list size, HPACK table size and header
+  fields per block; and the stream-refusal percentage) are configurable per-listener via
+  protobuf, with compile-time defaults. Exceeding any cap triggers GOAWAY(ENHANCE_YOUR_CALM);
+  the stream-refusal percentage instead refuses new streams with RST_STREAM(REFUSED_STREAM)
+  before the pre-response RST_STREAM cap.
 - **Proportional overhead distribution**: Connection-level overhead bytes (SETTINGS, PING,
   WINDOW_UPDATE) are distributed to streams proportional to their bytes transferred, not
   equally. This ensures accurate per-stream accounting for billing and metrics.

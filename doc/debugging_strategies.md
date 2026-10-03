@@ -174,26 +174,26 @@ Going further, backend connections issues are tracked by the following metrics:
 * `sozu.backend.connections.error`: could not connect to a backend server
 * `sozu.backend.down`: the retry policy triggered and marked the backend server as down
 
-The `sozu.http.503.errors` metric is incremented after a request sent back a 503 error, and a 503 error is sent
-after the circuit breaker triggered (we wait for 3 failed connections to the backend server).
+The `sozu.http.503.errors` metric is incremented after a request sent back a 503 error. A request may try
+`max_connection_attempts` backend connections, the first included (5 by default, overridable per cluster, see
+`doc/configure.md`); a connection that is refused, times out on `connect_timeout` or reports a socket error is
+retried on another backend, and once the budget is spent the request is answered 503 and
+`sozu.backend.connect.retries_exhausted` is incremented. A TCP session closes its client connection instead.
 
-A backend connection error would result in the following log message:
-
-```txt
-2018-09-21T14:36:08Z 823194694977734 71501 WRK-00 ERROR 839f592b-a194-4c3b-848b-8ef024129969    MyCluster    error connecting to backend, trying again
-```
-
-The circuit breaker triggering will write this to the logs:
+On a TCP listener, a failed backend connection logs at `DEBUG` level:
 
 ```txt
-2018-09-21T14:36:57Z 823243245414405 71524 WRK-00 ERROR 7029d66e-57a8-406e-ae61-e4bf9ff7b6b8    MyCluster    max connection attempt reached
+2018-09-21T14:36:08Z 823194694977734 71501 WRK-00 DEBUG 839f592b-a194-4c3b-848b-8ef024129969    MyCluster    error connecting to backend, trying again
 ```
 
-The retry policy marking a backend server as down will write the following log message:
+and an exhausted budget logs at `WARN` level:
 
 ```txt
-2018-09-21T14:37:31Z 823277868708804 71524 WRK-00 ERROR no more available backends for cluster MyCluster
+2018-09-21T14:36:57Z 823243245414405 71524 WRK-00 WARN 7029d66e-57a8-406e-ae61-e4bf9ff7b6b8    MyCluster    Max connection attempt reached (5)
 ```
+
+The HTTP and HTTPS listeners log nothing at that point; follow `sozu.backend.connect.retries_exhausted` and the
+503 in the access log instead.
 
 ### Scalability
 
