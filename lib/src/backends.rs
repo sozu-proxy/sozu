@@ -465,7 +465,6 @@ impl std::ops::Drop for Backend {
 #[derive(Debug)]
 pub struct BackendMap {
     pub backends: HashMap<ClusterId, BackendList>,
-    pub max_failures: usize,
     pub health_check_configs: HashMap<ClusterId, HealthCheckConfig>,
     /// Whether the cluster's backends speak HTTP/2 (cluster.http2 = true).
     /// Mirrors the same backend-capability hint the mux router reads at
@@ -512,7 +511,6 @@ impl BackendMap {
     fn with_rng(rng: StdRng) -> BackendMap {
         BackendMap {
             backends: HashMap::new(),
-            max_failures: 3,
             health_check_configs: HashMap::new(),
             cluster_http2: HashMap::new(),
             rng,
