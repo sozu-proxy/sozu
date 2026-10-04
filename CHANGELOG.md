@@ -4030,6 +4030,26 @@
   access, and `util::publish_pid_file` creates it after COMMIT; an existing file is still opened
   untruncated. Pinned by `open_pid_file_defers_creating_a_missing_file_until_publish`.
 
+- **`fix(upgrade)`: a dangling pid-file symlink into a missing directory rolls the main upgrade
+  back ([#1848](https://github.com/sozu-proxy/sozu/pull/1848) follow-up).** `util::open_pid_file`
+  (`bin/src/util.rs`) checked a missing pid file through the parent of the configured path, but
+  `O_CREAT` in `util::publish_pid_file` follows a dangling symlink and creates its final target.
+  A link into a missing directory therefore passed the pre-PREPARED check, the upgrade committed,
+  and the post-COMMIT create failed with `ENOENT` and was only logged. The check now follows the
+  link chain and tests the final target's parent, still creating nothing. Failures that cannot be
+  detected without creating a file (`ENOSPC`, quota, a security-module denial) remain logged after
+  COMMIT while the new main keeps running; this residual risk is documented on `open_pid_file`.
+  Pinned by `open_pid_file_rejects_a_dangling_symlink_into_a_missing_directory`,
+  `open_pid_file_follows_a_dangling_relative_symlink_to_its_target` and
+  `dangling_pid_file_symlink_rolls_back_main_upgrade_and_keeps_serving`.
+
+- **`test(e2e)`: the compatibility-matrix skip message no longer interleaves with libtest
+  output.** `bin/tests/main_upgrade_compatibility_matrix_e2e.rs` wrote it with an unbuffered
+  `writeln!`, one `write(2)` per format piece, so libtest's progress lines and the other case
+  split it (for example `... skipping option3-to-legacyok: set SOZU_MATRIX...`). It is now
+  formatted first and written by a single `write_all`, framed by newlines; whether the case runs
+  is unchanged.
+
 - **`fix(command)`: a stopping worker that closes answers its in-flight control commands.** The
   old worker of an `upgrade --worker` is marked `Stopping`, then its `SoftStop` answer is awaited by
   a task with no deadline. The worker-close path synthesised failures only for an active worker, so
