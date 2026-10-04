@@ -1788,6 +1788,41 @@ impl HttpsListener {
     /// a process-default crypto provider (which may be absent or ambiguous). An
     /// unknown `client_auth` value is rejected rather than treated as NONE, so a
     /// malformed or future enum value can never silently disable client auth.
+    /// Refuse two CRLs issued by the same CA.
+    ///
+    /// webpki checks a certificate against the first configured CRL that is
+    /// authoritative for its issuer and never reads the others, so with two
+    /// CRLs from one CA the order alone decides: an old CRL listed before its
+    /// replacement hides every revocation the replacement adds. That happens
+    /// naturally while rotating a CRL file, and nothing would show it.
+    /// Issuers are compared as the raw DER names webpki compares.
+    fn reject_crls_sharing_an_issuer(
+        crls: &[CertificateRevocationListDer<'_>],
+    ) -> Result<(), ListenerError> {
+        let mut issuers: Vec<Vec<u8>> = Vec::with_capacity(crls.len());
+        for (index, crl) in crls.iter().enumerate() {
+            let parsed = webpki::BorrowedCertRevocationList::from_der(crl.as_ref())
+                .map_err(|e| ListenerError::ClientAuth(format!("invalid CRL: {e}")))?;
+            let issuer = webpki::CertRevocationList::from(parsed).issuer().to_vec();
+            if let Some(first) = issuers.iter().position(|seen| *seen == issuer) {
+                return Err(ListenerError::ClientAuth(format!(
+                    "CRLs #{} and #{} (counted across client_ca_crls) are issued by the \
+                     same CA, and only the first would be consulted: configure one CRL per \
+                     issuer",
+                    first + 1,
+                    index + 1
+                )));
+            }
+            issuers.push(issuer);
+        }
+        debug_assert_eq!(
+            issuers.len(),
+            crls.len(),
+            "every CRL is either recorded with a distinct issuer or rejected"
+        );
+        Ok(())
+    }
+
     fn client_cert_verifier(
         config: &HttpsListenerConfig,
         provider: &Arc<CryptoProvider>,
@@ -1849,6 +1884,7 @@ impl HttpsListener {
                 ));
             }
         }
+        Self::reject_crls_sharing_an_issuer(&crls)?;
 
         let mut builder =
             WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone());
@@ -4889,29 +4925,56 @@ mod listener_sibling_tests {
     }
 
     #[test]
-    fn client_revocation_reads_only_the_first_crl_of_an_issuer() {
-        // webpki checks a certificate against the first configured CRL that
-        // is authoritative for its issuer and never reads the others. A CRL
-        // from another issuer does not shadow anything...
+    fn client_revocation_refuses_two_crls_from_the_same_issuer() {
+        // webpki would only read the first of them, so the order alone would
+        // decide: listing the revoking CRL second accepts the revoked client.
+        // Both orders must fail the listener instead.
+        let provider = test_crypto_provider();
+        for crls in [
+            [MTLS_CRL_CURRENT, MTLS_CRL_REVOKED],
+            [MTLS_CRL_REVOKED, MTLS_CRL_CURRENT],
+            [MTLS_CRL_EXPIRED, MTLS_CRL_CURRENT],
+        ] {
+            let config = https_config_with_client_auth(
+                ClientAuthMode::ClientAuthRequired,
+                &[MTLS_CA_PEM],
+                &crls,
+            );
+            assert!(
+                matches!(
+                    HttpsListener::client_cert_verifier(&config, &provider),
+                    Err(ListenerError::ClientAuth(ref reason)) if reason.contains("same CA")
+                ),
+                "two CRLs from one issuer must fail the listener"
+            );
+        }
+        // Two CRLs in one configured entry count the same as two entries.
+        let config = https_config_with_client_auth(
+            ClientAuthMode::ClientAuthRequired,
+            &[MTLS_CA_PEM],
+            &[&format!("{MTLS_CRL_CURRENT}{MTLS_CRL_REVOKED}")],
+        );
+        assert!(matches!(
+            HttpsListener::client_cert_verifier(&config, &provider),
+            Err(ListenerError::ClientAuth(_))
+        ));
+    }
+
+    #[test]
+    fn client_revocation_takes_one_crl_per_issuer() {
+        // Positive space of the rule above: CRLs from distinct issuers are
+        // all kept, and none shadows another.
         assert_eq!(
             verify_mtls_client(&[MTLS_CRL_OTHER_CA, MTLS_CRL_REVOKED]),
             Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::Revoked
             ))
         );
-        // ...but of two CRLs from the same issuer, the order alone decides.
-        // `doc/configure.md` tells operators to configure one CRL per issuer;
-        // this pins the behaviour that advice rests on.
         assert_eq!(
-            verify_mtls_client(&[MTLS_CRL_REVOKED, MTLS_CRL_CURRENT]),
+            verify_mtls_client(&[MTLS_CRL_REVOKED, MTLS_CRL_OTHER_CA]),
             Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::Revoked
             ))
-        );
-        assert_eq!(
-            verify_mtls_client(&[MTLS_CRL_CURRENT, MTLS_CRL_REVOKED]),
-            Ok(()),
-            "the later CRL of the same issuer is never consulted"
         );
     }
 }

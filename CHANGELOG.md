@@ -123,7 +123,8 @@
   certificate/revocation list, or an mTLS field set on a non-HTTPS listener is
   rejected rather than silently accepting unauthenticated or unrevoked clients.
   CRL expiration is enforced (a CRL past its `nextUpdate` is rejected instead of
-  trusted). In `none` mode CA/CRL paths are ignored entirely, so a stale path
+  trusted), and two CRLs issued by the same CA are refused, since rustls would
+  only consult the first. In `none` mode CA/CRL paths are ignored entirely, so a stale path
   never blocks the configuration from loading. `HttpsListenerConfig` gains the
   `ClientAuthMode` enum and the three fields; `ListenerError::ClientAuth` and
   `ConfigError::ClientAuthOnNonHttps` report misconfigured input.
