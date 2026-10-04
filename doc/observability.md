@@ -195,6 +195,19 @@ closed. `RemoveCluster` is the lifetime boundary: it drops the active identity,
 and the next route or add allocates a different one. A route-created
 replacement also re-arms both drains, so its metrics are visible without an
 `AddCluster`; emissions carrying the removed identity remain fenced.
+
+That boundary exists only for a declared cluster. The main process refuses a
+`RemoveCluster` for an id its configuration state never declared
+(`ConfigState::remove_cluster` returns `NotFound`), so the request never
+reaches a worker. An implicit identity therefore lasts until the worker exits.
+Removing the id's last frontend or backend does not end it, exactly as it does
+not end a declared cluster's identity: frontends and backends re-added later
+belong to the same lifetime and contribute to the same rows. The identity map
+grows by one entry per distinct implicit id referenced during the worker's
+life. To end such a lifetime explicitly, send `AddCluster` and then
+`RemoveCluster` for the id; the removal also removes any frontend or backend
+still naming it. `sozu metrics clear` empties the id's rows but keeps its
+identity.
 Disabling and re-enabling cluster metric collection, changing
 `metrics.detail`, and `sozu metrics clear` do not alter active identities. This
 keeps old emissions obsolete across collection controls even though a clear
