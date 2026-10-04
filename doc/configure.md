@@ -3014,7 +3014,7 @@ immediately after the patch is acknowledged.
 | Field                                     | Type            | Mutability class     | Default                 | Notes                                                                                                                                                        |
 | ----------------------------------------- | --------------- | -------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `public_address`                          | `SocketAddr`    | session-at-accept    | —                       | Source address reported to backends / logs                                                                                                                   |
-| `expect_proxy`                            | `bool`          | session-at-accept    | `false`                 | Enable PROXY protocol v1/v2 on new sessions                                                                                                                  |
+| `expect_proxy`                            | `bool`          | session-at-accept    | `false`                 | Enable PROXY protocol v2 on new sessions                                                                                                                     |
 | `sticky_name`                             | `string`        | session-at-accept    | `"SOZUBALANCEID"`       | Sticky-session cookie name                                                                                                                                   |
 | `front_timeout`                           | `u32` (seconds) | session-at-accept    | `60`                    | Max idle time on the client socket                                                                                                                           |
 | `back_timeout`                            | `u32` (seconds) | session-at-accept    | `30`                    | Max idle time on the backend socket                                                                                                                          |
@@ -4304,7 +4304,7 @@ guaranteed not to underflow on close / timeout / shed / error paths.
 | `http.trusting.x_port`         | counter | proxy            | Request had an existing `X-Forwarded-Port` header (trusted)  |
 | `http.trusting.x_port.diff`    | counter | proxy            | Trusted `X-Forwarded-Port` differed from actual port         |
 | `pipe.errors`                  | counter | proxy            | Pipe/WebSocket protocol errors                               |
-| `proxy_protocol.errors`        | counter | proxy            | PROXY protocol v1/v2 parsing errors                          |
+| `proxy_protocol.errors`        | counter | proxy            | PROXY protocol v2 parsing and framing errors                 |
 | `unsent-access-logs`           | counter | proxy            | Access log entries that could not be sent                    |
 | `access_logs.count`            | counter | cluster, backend | Access log entries emitted per cluster/backend               |
 

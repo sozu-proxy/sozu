@@ -54,6 +54,7 @@ mod metrics_lifecycle_tests;
 mod mux_tests;
 mod protocol_pair_matrix;
 mod proxy_protocol_local_tests;
+mod proxy_protocol_payload_tests;
 mod redirect_rewrite_auth_tests;
 mod remove_cluster_tests;
 mod router_hostname_tests;
