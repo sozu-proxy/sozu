@@ -248,6 +248,25 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps --all-features --locked
 
+      # `cargo doc --all-features` compiles every optional dependency into the
+      # shared `target`, including real-service test clients that the regular
+      # msrv-full test command does not enable. A lockfile cache miss starts
+      # this cell from an empty target, and retaining that documentation-only
+      # graph beside the later clippy and test artifacts exceeded the runner's
+      # 8Gi ephemeral-storage limit during `Test sozu-e2e`. The rustdoc gate is
+      # complete at this boundary; discard only the checkout-owned target and
+      # rebuild the actual matrix below. Cargo's registry/cache stays intact.
+      # The two bounded filesystem readings make future capacity changes
+      # attributable without a polling monitor or a wider cleanup.
+      - name: Measure and reset all-feature documentation target
+        if: matrix.cell == 'msrv-full'
+        run: |
+          du -sb target
+          df -B1 .
+          rm -rf -- target
+          test ! -e target
+          df -B1 .
+
       # Lint runs on the 1.93.1 MSRV cell so feature-specific lints
       # (e.g. only firing under `--features fips`) get caught.
       # Excluded on stable/beta/nightly because 1.95+ fires
