@@ -642,7 +642,8 @@
 
 ### 🔄 Changed
 
-- **`fix(load-balancing)`: one address is one share under every policy.** Two backend ids at
+- **`fix(load-balancing)`: one address is one share under every policy
+  ([#1856](https://github.com/sozu-proxy/sozu/pull/1856)).** Two backend ids at
   the same address in one cluster, which [#1839](https://github.com/sozu-proxy/sozu/pull/1839)
   made distinct backends (identity `(backend_id, address)`), now receive together the share of
   ONE backend, as `HRW` already gave them. `ROUND_ROBIN`, `RANDOM`, `LEAST_LOADED`,
@@ -659,9 +660,10 @@
   still keys on the address, so a rename without a move changes nothing. A cluster without a
   shared address pays no new work per selection; one with a shared address pays a quadratic
   scan of its candidates, without allocating. `LEAST_LOADED` and `POWER_OF_TWO` compare the
-  representative id's own counts, which carry the address's new connections. **Behaviour
-  change** for clusters declaring several ids at one address under any policy but `HRW`; no
-  configuration or API change. See "One address is one share" in `doc/configure.md`.
+  representative id's own counts, which carry the address's new connections. `HRW`'s keyed
+  path is unchanged; the round-robin fallback `HRW` and `MAGLEV` take for a request with no
+  client key collapses like `ROUND_ROBIN`. **Behaviour change** for clusters declaring several
+  ids at one address; no configuration or API change. See "One address is one share" in `doc/configure.md`.
 
 - **`docs(health-check)`: document and test `SetHealthCheck`'s draining policy boundary
   ([#1824](https://github.com/sozu-proxy/sozu/issues/1824)).** `SetHealthCheck` validates and

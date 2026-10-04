@@ -1235,6 +1235,18 @@ impl BackendList {
             self.next_id,
             self.backends.len()
         );
+        // `shares_address` gates the per-selection collapse: a stale `false`
+        // would silently hand a policy one candidate per id again.
+        let shares_address = self.backends.iter().enumerate().any(|(index, backend)| {
+            let address = backend.borrow().address;
+            self.backends[index + 1..]
+                .iter()
+                .any(|other| other.borrow().address == address)
+        });
+        debug_assert_eq!(
+            self.shares_address, shares_address,
+            "shares_address must match the backend list"
+        );
         // `(backend_id, address)` is the identity `remove_backend` keys on; two
         // live backends may legitimately share an address (A/B variant) but
         // must then differ by `backend_id`. The pair is therefore unique
