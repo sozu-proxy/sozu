@@ -1,10 +1,9 @@
 //! Master/worker hot-upgrade orchestration.
 //!
-//! Forks a child master, transfers listener and command-channel FDs over
-//! the SCM_RIGHTS unix socket (`command/src/scm_socket.rs`), re-exec's the
-//! `sozu` binary with the recovered state, and tears down the previous
-//! master once the new one acks. Keeps the data plane uninterrupted by
-//! handing off accepted listeners and existing worker FDs.
+//! Forks a child master, preserves listener and command-channel FDs across
+//! exec, restores their userspace state, and tears down the previous master
+//! once the new one acks. Keeps the data plane uninterrupted by handing off
+//! accepted listeners and existing worker FDs.
 
 use std::{
     fs::File,
@@ -13,7 +12,9 @@ use std::{
         io::{AsRawFd, FromRawFd},
         process::CommandExt,
     },
-    process::Command,
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use libc::pid_t;
@@ -33,7 +34,7 @@ use tempfile::tempfile;
 use crate::{
     command::{
         server::{CommandHub, HubError, ServerError},
-        upgrade::UpgradeData,
+        upgrade::{UpgradeData, UpgradeHandshake, UpgradeStage},
     },
     util::{self, UtilError},
 };
@@ -84,6 +85,46 @@ pub enum UpgradeError {
     HandleSigterm(ServerError),
     #[error("could not setup the logger: {0}")]
     SetupLogging(LogError),
+    #[error("could not start the main-upgrade protocol probe: {0}")]
+    ProbeSpawn(IoError),
+    #[error("main-upgrade candidate rejected protocol v2 with status {0}")]
+    ProbeRejected(std::process::ExitStatus),
+    #[error("main-upgrade candidate did not answer the protocol probe within {0:?}")]
+    ProbeTimeout(Duration),
+    #[error("unsupported main-upgrade protocol {0}")]
+    UnsupportedProtocol(u16),
+}
+
+/// Check protocol support before any live descriptor is made inheritable or
+/// the current Hub is frozen. An older binary rejects this unknown subcommand.
+pub fn probe_main_upgrade_candidate(executable_path: &str) -> Result<(), UpgradeError> {
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+    let mut child = Command::new(executable_path)
+        .arg("upgrade-probe")
+        .arg("--protocol")
+        .arg(crate::command::upgrade::UPGRADE_PROTOCOL_V2.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(UpgradeError::ProbeSpawn)?;
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait().map_err(UpgradeError::ProbeSpawn)? {
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(UpgradeError::ProbeRejected(status))
+            };
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(UpgradeError::ProbeTimeout(PROBE_TIMEOUT));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// unix-forks the main process
@@ -95,7 +136,7 @@ pub enum UpgradeError {
 pub fn fork_main_into_new_main(
     executable_path: String,
     upgrade_data: UpgradeData,
-) -> Result<(pid_t, Channel<(), bool>), UpgradeError> {
+) -> Result<(pid_t, Channel<UpgradeHandshake, UpgradeHandshake>), UpgradeError> {
     trace!("parent({})", std::process::id());
 
     let mut upgrade_file = tempfile().map_err(UpgradeError::CreateUpgradeFile)?;
@@ -112,9 +153,9 @@ pub fn fork_main_into_new_main(
     // the re-execed master will recover (round-trip below). Gated to debug:
     // the snapshots are read only inside the `#[cfg(debug_assertions)]` block.
     #[cfg(debug_assertions)]
-    let workers_to_handoff = upgrade_data.workers.len();
+    let workers_to_handoff = upgrade_data.snapshot().workers.len();
     #[cfg(debug_assertions)]
-    let boot_generation_handoff = upgrade_data.boot_generation;
+    let boot_generation_handoff = upgrade_data.snapshot().boot_generation;
 
     info!("Writing upgrade data to file");
     let upgrade_data_string =
@@ -144,12 +185,13 @@ pub fn fork_main_into_new_main(
         match serde_json::from_str::<UpgradeData>(&upgrade_data_string) {
             Ok(reparsed) => {
                 debug_assert_eq!(
-                    reparsed.workers.len(),
+                    reparsed.snapshot().workers.len(),
                     workers_to_handoff,
                     "round-tripped upgrade data must preserve the worker-session count"
                 );
                 debug_assert_eq!(
-                    reparsed.boot_generation, boot_generation_handoff,
+                    reparsed.snapshot().boot_generation,
+                    boot_generation_handoff,
                     "round-tripped upgrade data must preserve the boot generation"
                 );
                 let reserialized = serde_json::to_string(&reparsed)
@@ -180,7 +222,7 @@ pub fn fork_main_into_new_main(
     // distinct kernel objects — none handed off twice. Three are in play at
     // this site: the confirmation channel (`new_to_old`, passed as `--fd`),
     // the upgrade-state file (passed as `--upgrade-fd`), and the unix command
-    // listener carried inside `UpgradeData` (`command_socket_fd`). A collision
+    // listener carried inside `UpgradeData::snapshot` (`command_socket_fd`). A collision
     // would mean a single fd is being used for two roles after exec — an
     // fd-bookkeeping bug in the handoff.
     debug_assert!(
@@ -188,11 +230,11 @@ pub fn fork_main_into_new_main(
         "confirmation-channel fd must not alias the upgrade-state file fd"
     );
     debug_assert!(
-        new_to_old.as_raw_fd() != upgrade_data.command_socket_fd,
+        new_to_old.as_raw_fd() != upgrade_data.snapshot().command_socket_fd,
         "confirmation-channel fd must not alias the inherited command-socket fd"
     );
     debug_assert!(
-        upgrade_file.as_raw_fd() != upgrade_data.command_socket_fd,
+        upgrade_file.as_raw_fd() != upgrade_data.snapshot().command_socket_fd,
         "upgrade-state file fd must not alias the inherited command-socket fd"
     );
 
@@ -203,10 +245,10 @@ pub fn fork_main_into_new_main(
         }
     })?;
 
-    let mut fork_confirmation_channel: Channel<(), bool> = Channel::new(
+    let mut fork_confirmation_channel: Channel<UpgradeHandshake, UpgradeHandshake> = Channel::new(
         old_to_new,
-        upgrade_data.config.command_buffer_size,
-        upgrade_data.config.max_command_buffer_size,
+        upgrade_data.snapshot().config.command_buffer_size,
+        upgrade_data.snapshot().config.max_command_buffer_size,
     );
 
     fork_confirmation_channel
@@ -261,10 +303,24 @@ pub fn fork_main_into_new_main(
                 .arg(new_to_old.as_raw_fd().to_string())
                 .arg("--upgrade-fd")
                 .arg(upgrade_file.as_raw_fd().to_string())
+                .arg("--upgrade-protocol")
+                .arg(crate::command::upgrade::UPGRADE_PROTOCOL_V2.to_string())
                 .arg("--command-buffer-size")
-                .arg(upgrade_data.config.command_buffer_size.to_string())
+                .arg(
+                    upgrade_data
+                        .snapshot()
+                        .config
+                        .command_buffer_size
+                        .to_string(),
+                )
                 .arg("--max-command-buffer-size")
-                .arg(upgrade_data.config.max_command_buffer_size.to_string())
+                .arg(
+                    upgrade_data
+                        .snapshot()
+                        .config
+                        .max_command_buffer_size
+                        .to_string(),
+                )
                 .exec();
 
             error!("exec call failed: {:?}", res);
@@ -280,9 +336,13 @@ pub fn fork_main_into_new_main(
 pub fn begin_new_main_process(
     new_to_old_channel_fd: i32,
     upgrade_file_fd: i32,
+    upgrade_protocol: u16,
     command_buffer_size: u64,
     max_command_buffer_size: u64,
 ) -> Result<(), UpgradeError> {
+    if upgrade_protocol != crate::command::upgrade::UPGRADE_PROTOCOL_V2 {
+        return Err(UpgradeError::UnsupportedProtocol(upgrade_protocol));
+    }
     // Both descriptors were handed to us across the re-exec by the old master
     // (`fork_main_into_new_main`), each derived from a live `as_raw_fd()`: they
     // are valid (>= 0) and reference two distinct kernel objects (the
@@ -302,7 +362,7 @@ pub fn begin_new_main_process(
         "the confirmation channel and upgrade-state file must be two distinct fds"
     );
 
-    let mut fork_confirmation_channel: Channel<bool, ()> = Channel::new(
+    let mut fork_confirmation_channel: Channel<UpgradeHandshake, UpgradeHandshake> = Channel::new(
         // SAFETY: `new_to_old_channel_fd` was just inherited from the
         // pre-exec parent process via the `--fd` CLI argument. It is a valid
         // open descriptor with no other owner inside this freshly-execed
@@ -352,38 +412,74 @@ pub fn begin_new_main_process(
     let upgrade_data: UpgradeData =
         serde_json::from_str(&content).map_err(UpgradeError::SerdeReadError)?;
 
-    let config = upgrade_data.config.clone();
+    let config = upgrade_data.snapshot().config.clone();
+    let upgrade_client_token = mio::Token(upgrade_data.snapshot().upgrade_client_token);
+    let upgrade_counts = upgrade_data.counts();
 
     println!("Setting up logging");
 
     setup_logging_with_config(&config, "MAIN").map_err(UpgradeError::SetupLogging)?;
     util::setup_metrics(&config).map_err(UpgradeError::SetupMetrics)?;
 
-    let mut command_hub =
-        CommandHub::from_upgrade_data(upgrade_data).map_err(UpgradeError::CreateHub)?;
+    let mut paused_hub =
+        CommandHub::prepare_from_upgrade_data(upgrade_data).map_err(UpgradeError::CreateHub)?;
 
-    // `exec` reset the old main process's SIGTERM handler: install ours.
-    command_hub
-        .handle_sigterm()
-        .map_err(UpgradeError::HandleSigterm)?;
-
-    command_hub
+    // Every fallible preparation runs here, before PREPARED, where a failure
+    // still makes the old main roll back and keep serving. After COMMIT the
+    // old main is irreversibly fenced and exits whatever this process does,
+    // and its workers return from their event loops once their command
+    // channels close: a failure there would stop the whole proxy. None of
+    // these steps touches state shared with the old main. `FD_CLOEXEC` is a
+    // flag of this process's descriptor table, the SIGTERM self-pipe is
+    // private (and `exec` reset the old main's handler), and opening the pid
+    // file leaves its content alone until the publish step below.
+    paused_hub
         .enable_cloexec_after_upgrade()
         .map_err(UpgradeError::EnableCloexec)?;
-
-    util::write_pid_file(&config).map_err(UpgradeError::WritePidFile)?;
+    paused_hub
+        .handle_sigterm()
+        .map_err(UpgradeError::HandleSigterm)?;
+    let pid_file = util::open_pid_file(&config).map_err(UpgradeError::WritePidFile)?;
 
     fork_confirmation_channel
-        .write_message(&true)
+        .write_message(&UpgradeHandshake::prepared(upgrade_counts))
         .map_err(|channel_err| UpgradeError::SendConfirmation {
-            result: "success".to_string(),
+            result: "prepared".to_string(),
             channel_err,
         })?;
-    // The confirmation channel is used once and was inherited without
-    // `FD_CLOEXEC`: close it, or every worker this main forks inherits it.
-    drop(fork_confirmation_channel);
 
-    info!("starting new main loop");
+    let handoff_timeout = Duration::from_secs(config.worker_timeout.max(1) as u64);
+    match fork_confirmation_channel.read_message_blocking_timeout(Some(handoff_timeout)) {
+        Ok(message)
+            if message.stage() == UpgradeStage::Commit
+                && message.protocol == u32::from(crate::command::upgrade::UPGRADE_PROTOCOL_V2) => {}
+        Ok(message) => {
+            error!("unexpected pre-commit main-upgrade message: {:?}", message);
+            return Ok(());
+        }
+        Err(channel_err) => {
+            return Err(UpgradeError::SendConfirmation {
+                result: "waiting for commit".to_string(),
+                channel_err,
+            });
+        }
+    }
+
+    // COMMIT. From here on this process is the only main left: it publishes
+    // and runs. Activation is the one step that can still fail, because
+    // restoring each worker's SCM socket changes the blocking mode of a file
+    // description shared with the old main and so cannot happen earlier.
+    // Every other failure below is logged and must not stop the loop.
+    let mut command_hub = paused_hub.activate().map_err(UpgradeError::CreateHub)?;
+
+    if let Some((path, file)) = pid_file
+        && let Err(error) = util::publish_pid_file(&path, file)
+    {
+        error!(
+            "could not publish the new main pid after the upgrade committed, keeping the proxy running: {}",
+            error
+        );
+    }
 
     // #228: tell systemd that the new master pid takes over from the
     // pre-exec one (`Type=notify` + `NotifyAccess=main` are required
@@ -404,6 +500,28 @@ pub fn begin_new_main_process(
         Ok(false) => {}
         Err(e) => warn!("could not notify systemd READY=1: {}", e),
     }
+
+    if let Err(error) = command_hub.complete_main_upgrade(upgrade_client_token, new_pid) {
+        error!(
+            "could not answer the client that started the main upgrade, keeping the proxy running: {}",
+            error
+        );
+    }
+
+    // The old main stops whether or not this acknowledgement reaches it.
+    if let Err(error) =
+        fork_confirmation_channel.write_message(&UpgradeHandshake::new(UpgradeStage::Activated))
+    {
+        error!(
+            "could not acknowledge activation to the old main, keeping the proxy running: {}",
+            error
+        );
+    }
+    // The handshake channel was inherited without `FD_CLOEXEC`: close it, or
+    // every worker this main forks inherits it.
+    drop(fork_confirmation_channel);
+
+    info!("starting new main loop");
 
     command_hub.run();
 

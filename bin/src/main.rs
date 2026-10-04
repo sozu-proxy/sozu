@@ -75,6 +75,8 @@ enum MainError {
     Cli(CtlError),
     #[error("paw io error: {0}")]
     Io(std::io::Error),
+    #[error("unsupported main-upgrade protocol {0}")]
+    UnsupportedUpgradeProtocol(u16),
 }
 
 impl From<std::io::Error> for MainError {
@@ -114,6 +116,7 @@ fn main(args: Args) -> Result<(), MainError> {
         cli::SubCmd::Main {
             fd,
             upgrade_fd,
+            upgrade_protocol,
             command_buffer_size,
             max_command_buffer_size,
         } => {
@@ -122,10 +125,18 @@ fn main(args: Args) -> Result<(), MainError> {
             upgrade::begin_new_main_process(
                 fd,
                 upgrade_fd,
+                upgrade_protocol,
                 command_buffer_size,
                 max_command_buffer_size,
             )
             .map_err(MainError::BeginNewMain)
+        }
+        cli::SubCmd::UpgradeProbe { protocol } => {
+            if protocol == command::upgrade::UPGRADE_PROTOCOL_V2 {
+                Ok(())
+            } else {
+                Err(MainError::UnsupportedUpgradeProtocol(protocol))
+            }
         }
         _ => ctl::ctl(args).map_err(MainError::Cli),
     };

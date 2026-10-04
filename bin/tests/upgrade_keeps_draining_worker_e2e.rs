@@ -11,11 +11,11 @@
 //! was cut.
 //!
 //! Spawns the real `sozu` binary (`CARGO_BIN_EXE_sozu`) with one worker, an
-//! HTTP listener and an in-test backend that answers `/slow` after 8 seconds.
-//! It sends `GET /slow`, starts `upgrade --worker 0` once the backend holds the
-//! request, runs a main `upgrade` as soon as worker 1 replaced worker 0 (so
-//! worker 0 is still draining), and requires the slow request to complete with
-//! a `200`.
+//! HTTP listener and an in-test backend that holds `/slow` behind an explicit
+//! barrier. Client A starts `upgrade --worker 0`; client B upgrades the main
+//! once worker 1 replaces worker 0. Releasing the backend must complete both
+//! the HTTP request and client A's original command connection, and a fresh
+//! client C must still query the new main.
 //!
 //! `#[ignore]`d so a contributor's `cargo test` stays fast; CI runs it from its
 //! process-level e2e step (`.github/workflows/ci.yml`). Run it by hand with:
@@ -30,13 +30,33 @@ use std::{
     net::{TcpListener, TcpStream},
     path::Path,
     process::{Child, Command},
-    sync::mpsc,
+    sync::{Arc, Condvar, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
 
-/// How long the backend holds `/slow` before answering.
-const SLOW_RESPONSE_DELAY: Duration = Duration::from_secs(8);
+#[derive(Clone)]
+struct BackendBarrier(Arc<(Mutex<bool>, Condvar)>);
+
+impl BackendBarrier {
+    fn new() -> Self {
+        Self(Arc::new((Mutex::new(false), Condvar::new())))
+    }
+
+    fn wait(&self) {
+        let (released, wake) = &*self.0;
+        let mut released = released.lock().expect("lock backend barrier");
+        while !*released {
+            released = wake.wait(released).expect("wait on backend barrier");
+        }
+    }
+
+    fn release(&self) {
+        let (released, wake) = &*self.0;
+        *released.lock().expect("lock backend barrier") = true;
+        wake.notify_all();
+    }
+}
 
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
@@ -46,15 +66,16 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// Answer every request with an empty `200`, after `SLOW_RESPONSE_DELAY` for
-/// `/slow`. Reports on `slow_received` when a `/slow` request arrives.
-fn spawn_backend(slow_received: mpsc::Sender<()>) -> u16 {
+/// Answer every request with an empty `200`, holding `/slow` until the test
+/// releases `barrier`. Reports receipt before waiting on that barrier.
+fn spawn_backend(slow_received: mpsc::Sender<()>, barrier: BackendBarrier) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
     let port = listener.local_addr().expect("backend addr").port();
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
             let slow_received = slow_received.clone();
+            let barrier = barrier.clone();
             thread::spawn(move || {
                 let mut request = Vec::new();
                 let mut buffer = [0u8; 1024];
@@ -66,7 +87,7 @@ fn spawn_backend(slow_received: mpsc::Sender<()>) -> u16 {
                 }
                 if request.starts_with(b"GET /slow ") {
                     let _ = slow_received.send(());
-                    thread::sleep(SLOW_RESPONSE_DELAY);
+                    barrier.wait();
                 }
                 let _ = stream.write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -138,13 +159,14 @@ fn stop(config_path: &Path, pid_file: &Path, master: &mut Child) {
 
 #[test]
 #[ignore = "process-level: spawns a real master and worker, upgrades them and binds ephemeral ports; run from the dedicated CI step or with --ignored (see module docs)"]
-fn main_upgrade_keeps_a_draining_worker_serving_its_requests() {
+fn upgrade_main_preserves_in_flight_worker_command_and_original_client_response() {
     let temp = tempfile::tempdir().expect("tempdir");
     let socket_path = temp.path().join("sozu.sock");
     let config_path = temp.path().join("config.toml");
     let pid_file = temp.path().join("sozu.pid");
     let (slow_received_tx, slow_received) = mpsc::channel();
-    let backend_port = spawn_backend(slow_received_tx);
+    let backend_barrier = BackendBarrier::new();
+    let backend_port = spawn_backend(slow_received_tx, backend_barrier.clone());
     let front_port = free_port();
 
     let config = format!(
@@ -201,8 +223,8 @@ backends = [ {{ address = "127.0.0.1:{backend_port}", backend_id = "drain-backen
     let mut worker_upgrade = Command::new(env!("CARGO_BIN_EXE_sozu"))
         .args(["-c", config_path.to_str().unwrap(), "-t", "30000"])
         .args(["upgrade", "--worker", "0"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn upgrade --worker 0");
     let replaced_by = Instant::now() + Duration::from_secs(20);
@@ -213,6 +235,11 @@ backends = [ {{ address = "127.0.0.1:{backend_port}", backend_id = "drain-backen
         );
         thread::sleep(Duration::from_millis(50));
     }
+    let client_a_pending_before_main_upgrade = worker_upgrade
+        .try_wait()
+        .expect("observe pending worker-upgrade client")
+        .is_none();
+
     let old_main = main_pid(&pid_file);
     let main_upgrade = sozu(&config_path, &["upgrade"]);
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -221,11 +248,30 @@ backends = [ {{ address = "127.0.0.1:{backend_port}", backend_id = "drain-backen
         thread::sleep(Duration::from_millis(100));
     }
 
+    let new_main = main_pid(&pid_file);
+    let client_a_terminal_before_release = worker_upgrade
+        .try_wait()
+        .expect("observe client A after main handoff");
+    let client_a_survived_main_handoff = client_a_terminal_before_release.is_none();
+    backend_barrier.release();
+
     let response = slow.join().expect("slow request thread");
-    // The worker upgrade's client loses its main in the hand-off; only the
-    // request matters here.
-    let _ = worker_upgrade.kill();
-    let _ = worker_upgrade.wait();
+    let client_deadline = Instant::now() + Duration::from_secs(10);
+    let mut client_a_terminal = client_a_terminal_before_release;
+    while client_a_terminal.is_none() && Instant::now() < client_deadline {
+        thread::sleep(Duration::from_millis(50));
+        client_a_terminal = worker_upgrade
+            .try_wait()
+            .expect("observe client A terminal response");
+    }
+    let client_a_timed_out = client_a_terminal.is_none();
+    if client_a_timed_out {
+        let _ = worker_upgrade.kill();
+    }
+    let worker_upgrade_output = worker_upgrade
+        .wait_with_output()
+        .expect("collect client A response");
+    let command_c = sozu(&config_path, &["--json", "status"]);
     stop(&config_path, &pid_file, &mut master);
 
     assert!(
@@ -233,9 +279,49 @@ backends = [ {{ address = "127.0.0.1:{backend_port}", backend_id = "drain-backen
         "main upgrade failed: {}",
         String::from_utf8_lossy(&main_upgrade.stderr)
     );
+    assert_eq!(
+        String::from_utf8_lossy(&main_upgrade.stdout)
+            .matches("Success: Upgrade successful, closing main process.")
+            .count(),
+        1,
+        "client B must observe exactly one terminal main-upgrade success: {:?}",
+        String::from_utf8_lossy(&main_upgrade.stdout)
+    );
+    assert!(
+        client_a_pending_before_main_upgrade,
+        "client A completed before client B started the main upgrade"
+    );
+    assert!(
+        client_a_survived_main_handoff,
+        "client A terminated during the main handoff, before the backend barrier was released"
+    );
+    assert_ne!(
+        new_main, old_main,
+        "the pid file must identify the new main before releasing the backend"
+    );
     assert!(
         response.starts_with(b"HTTP/1.1 200"),
         "the request the draining worker was serving must complete across the main upgrade, got {:?}",
         String::from_utf8_lossy(&response)
+    );
+    assert!(
+        !client_a_timed_out && worker_upgrade_output.status.success(),
+        "client A must receive its terminal success on the original connection; status={:?}, stdout={:?}, stderr={:?}",
+        worker_upgrade_output.status,
+        String::from_utf8_lossy(&worker_upgrade_output.stdout),
+        String::from_utf8_lossy(&worker_upgrade_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&worker_upgrade_output.stdout)
+            .matches("- finished soft stop of worker 0")
+            .count(),
+        1,
+        "client A must observe exactly one terminal worker-upgrade success: {:?}",
+        String::from_utf8_lossy(&worker_upgrade_output.stdout)
+    );
+    assert!(
+        command_c.status.success(),
+        "client C could not query the new main: {}",
+        String::from_utf8_lossy(&command_c.stderr)
     );
 }

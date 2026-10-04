@@ -37,12 +37,13 @@ It addresses [#1155](https://github.com/sozu-proxy/sozu/issues/1155).
   command socket) has `FD_CLOEXEC` cleared explicitly by
   `util::disable_close_on_exec` in `bin/`, for that one hand-off only: the
   main end of a worker's SCM socket and channel lose the flag in
-  `SerializedWorkerSession::try_from`, for the workers the next main adopts
-  (every worker not yet `Stopped`: a `Stopping` one is still draining and
-  needs its command channel),
-  and `Server::enable_cloexec_after_upgrade` sets it back once they are
-  adopted or the upgrade failed. The new main closes its upgrade file and
-  confirmation channel once used, and a worker its state file once read.
+  `CommandHub::disable_cloexec_before_upgrade`, for every worker session the
+  next main adopts (a `Stopping` one is still draining and needs its command
+  channel), and it is set back by `PausedCommandHub::enable_cloexec_after_upgrade`
+  in the new main before it reports `PREPARED`, or by
+  `CommandHub::enable_cloexec_after_upgrade` in the old main when the upgrade
+  failed. The new main closes its upgrade file and confirmation channel once
+  used, and a worker its state file once read.
   `bin/tests/upgrade_fd_inheritance_e2e.rs` fails when two sozu processes
   share a socket after worker and main upgrades.
 

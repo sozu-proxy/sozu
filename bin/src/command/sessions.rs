@@ -6,23 +6,150 @@
 //! by the audit envelope so reused PIDs cannot impersonate another
 //! command source. Long-form lifecycle: `bin/src/command/LIFECYCLE.md`.
 
-use std::{collections::VecDeque, fmt::Debug, sync::Arc, time::SystemTime};
+use std::{
+    collections::VecDeque,
+    fmt::Debug,
+    io,
+    os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd},
+    sync::Arc,
+    time::SystemTime,
+};
 
 use libc::pid_t;
-use mio::Token;
+use mio::{Interest, Registry, Token, net::UnixStream as MioUnixStream};
 use prost::Message;
 use rusty_ulid::Ulid;
+use serde::{Deserialize, Serialize};
 use sozu_command_lib::{
-    channel::{Channel, ChannelError},
+    channel::{Channel, ChannelError, ChannelSnapshot, ChannelSnapshotError, PausedChannel},
     proto::command::{
         Request, Response, ResponseContent, ResponseStatus, RunState, WorkerInfo, WorkerRequest,
         WorkerResponse,
     },
     ready::Ready,
-    scm_socket::ScmSocket,
+    scm_socket::{ScmSocket, ScmSocketError},
 };
 
 use crate::command::server::{ClientId, MessageClient, PeerCred, WorkerId};
+
+const SESSION_SNAPSHOT_VERSION: u16 = 1;
+
+#[derive(thiserror::Error, Debug)]
+pub enum SessionSnapshotError {
+    #[error(
+        "unsupported {session} session snapshot version {version}; supported version is {supported}"
+    )]
+    UnsupportedVersion {
+        session: &'static str,
+        version: u16,
+        supported: u16,
+    },
+    #[error(transparent)]
+    Channel(#[from] ChannelSnapshotError),
+    #[error("could not validate received SCM descriptor {fd}: {error}")]
+    ValidateScmDescriptor { fd: RawFd, error: String },
+    #[error("could not activate received SCM descriptor after commit: {0}")]
+    ActivateScmDescriptor(#[source] ScmSocketError),
+}
+
+/// Serializable state needed to continue one command client after main upgrade.
+///
+/// Fields stay private so the only construction path captures a coherent live
+/// session. The source descriptor is manifest metadata; the Hub supplies the
+/// effective descriptor after fork/exec inheritance or explicit duplication.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClientSessionSnapshot {
+    version: u16,
+    channel_fd: RawFd,
+    channel: ChannelSnapshot,
+    id: ClientId,
+    session_ulid: Ulid,
+    token: usize,
+    actor_uid: Option<u32>,
+    actor_gid: Option<u32>,
+    actor_pid: Option<i32>,
+    actor_comm: Option<String>,
+    actor_user: Option<String>,
+    socket_path: String,
+    connect_ts: SystemTime,
+    requires_post_commit_tick: bool,
+}
+
+impl ClientSessionSnapshot {
+    /// Descriptor number in the sending process, for the transfer manifest.
+    pub fn channel_fd(&self) -> RawFd {
+        self.channel_fd
+    }
+
+    pub fn buffered_bytes(&self) -> usize {
+        self.channel.buffered_bytes()
+    }
+}
+
+/// Restored client state that is safe to register during PREPARED.
+///
+/// The active [`ClientSession`] remains inaccessible until `resume`, so this
+/// wrapper cannot read, write, or consume its userspace buffers before COMMIT.
+pub struct PausedClientSession {
+    channel: PausedChannel<Response, Request>,
+    id: ClientId,
+    session_ulid: Ulid,
+    token: Token,
+    actor_uid: Option<u32>,
+    actor_gid: Option<u32>,
+    actor_pid: Option<i32>,
+    actor_comm: Option<String>,
+    actor_user: Option<String>,
+    socket_path: Arc<str>,
+    connect_ts: SystemTime,
+    requires_post_commit_tick: bool,
+}
+
+impl PausedClientSession {
+    pub fn id(&self) -> ClientId {
+        self.id
+    }
+
+    pub fn token(&self) -> Token {
+        self.token
+    }
+
+    /// Command channel descriptor owned by this paused wrapper.
+    pub fn channel_fd(&self) -> RawFd {
+        self.channel.fd()
+    }
+
+    /// Whether the Hub must schedule this session once immediately after COMMIT.
+    pub fn requires_post_commit_tick(&self) -> bool {
+        self.requires_post_commit_tick
+    }
+
+    /// Validate mio registration during PREPARED without performing I/O.
+    pub fn register(&mut self, registry: &Registry) -> io::Result<()> {
+        self.channel.register(
+            registry,
+            self.token,
+            Interest::READABLE | Interest::WRITABLE,
+        )
+    }
+
+    /// Expose the active session only after the Hub commits the handoff.
+    pub fn resume(self) -> ClientSession {
+        ClientSession {
+            channel: self.channel.resume(),
+            id: self.id,
+            session_ulid: self.session_ulid,
+            token: self.token,
+            actor_uid: self.actor_uid,
+            actor_gid: self.actor_gid,
+            actor_pid: self.actor_pid,
+            actor_comm: self.actor_comm,
+            actor_user: self.actor_user,
+            socket_path: self.socket_path,
+            connect_ts: self.connect_ts,
+        }
+    }
+}
 
 /// Track a client from start to finish
 #[derive(Debug)]
@@ -77,6 +204,13 @@ pub enum ClientResult {
     CloseSession,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UpgradeResponseQueue {
+    Queued,
+    Backpressured,
+    Fatal,
+}
+
 impl ClientSession {
     pub fn new(
         mut channel: Channel<Response, Request>,
@@ -101,6 +235,93 @@ impl ClientSession {
             socket_path,
             connect_ts: SystemTime::now(),
         }
+    }
+
+    /// Capture this session without changing descriptor flags or performing I/O.
+    pub fn snapshot(&self) -> ClientSessionSnapshot {
+        ClientSessionSnapshot {
+            version: SESSION_SNAPSHOT_VERSION,
+            channel_fd: self.channel.fd(),
+            channel: self.channel.snapshot(),
+            id: self.id,
+            session_ulid: self.session_ulid,
+            token: self.token.0,
+            actor_uid: self.actor_uid,
+            actor_gid: self.actor_gid,
+            actor_pid: self.actor_pid,
+            actor_comm: self.actor_comm.clone(),
+            actor_user: self.actor_user.clone(),
+            socket_path: self.socket_path.to_string(),
+            connect_ts: self.connect_ts,
+            requires_post_commit_tick: self.channel.front_buf.available_data() > 0
+                || self.channel.back_buf.available_data() > 0
+                || wants_to_tick(&self.channel),
+        }
+    }
+
+    /// Queue the one terminal `UpgradeMain` response without losing it when
+    /// the inherited client back buffer is temporarily full. Only the new
+    /// main calls this, after COMMIT.
+    pub(crate) fn try_queue_upgrade_response(
+        &mut self,
+        response: &Response,
+    ) -> UpgradeResponseQueue {
+        match self.channel.write_message(response) {
+            Ok(()) => {
+                self.channel.interest.insert(Ready::WRITABLE);
+                UpgradeResponseQueue::Queued
+            }
+            Err(error) if is_transient_overflow(&error) => {
+                self.channel.interest.insert(Ready::WRITABLE);
+                UpgradeResponseQueue::Backpressured
+            }
+            Err(error) => {
+                error!("could not queue terminal main-upgrade response: {}", error);
+                self.channel.readiness = Ready::ERROR;
+                UpgradeResponseQueue::Fatal
+            }
+        }
+    }
+
+    /// Rebuild a client around the descriptor received by the new main.
+    ///
+    /// The descriptor remains paused after its flags and trusted receiver
+    /// limits are validated by `Channel::restore_paused`.
+    pub fn restore_paused(
+        sock: MioUnixStream,
+        snapshot: ClientSessionSnapshot,
+        expected_initial_buffer_size: usize,
+        expected_max_buffer_size: usize,
+    ) -> Result<PausedClientSession, SessionSnapshotError> {
+        if snapshot.version != SESSION_SNAPSHOT_VERSION {
+            return Err(SessionSnapshotError::UnsupportedVersion {
+                session: "client",
+                version: snapshot.version,
+                supported: SESSION_SNAPSHOT_VERSION,
+            });
+        }
+
+        let channel = Channel::restore_paused(
+            sock,
+            snapshot.channel,
+            expected_initial_buffer_size,
+            expected_max_buffer_size,
+        )?;
+
+        Ok(PausedClientSession {
+            channel,
+            id: snapshot.id,
+            session_ulid: snapshot.session_ulid,
+            token: Token(snapshot.token),
+            actor_uid: snapshot.actor_uid,
+            actor_gid: snapshot.actor_gid,
+            actor_pid: snapshot.actor_pid,
+            actor_comm: snapshot.actor_comm,
+            actor_user: snapshot.actor_user,
+            socket_path: Arc::from(snapshot.socket_path),
+            connect_ts: snapshot.connect_ts,
+            requires_post_commit_tick: snapshot.requires_post_commit_tick,
+        })
     }
 
     /// Render the captured peer UID for audit logs. Returns the literal
@@ -398,6 +619,107 @@ pub struct WorkerSession {
     pub token: Token,
 }
 
+/// Serializable state needed to continue one worker session after main upgrade.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkerSessionSnapshot {
+    version: u16,
+    channel_fd: RawFd,
+    channel: ChannelSnapshot,
+    id: WorkerId,
+    pending: VecDeque<WorkerRequest>,
+    pid: pid_t,
+    run_state: RunState,
+    scm_fd: RawFd,
+    token: usize,
+    requires_post_commit_tick: bool,
+}
+
+impl WorkerSessionSnapshot {
+    /// Channel descriptor number in the sending process.
+    pub fn channel_fd(&self) -> RawFd {
+        self.channel_fd
+    }
+
+    /// SCM descriptor number in the sending process.
+    pub fn scm_fd(&self) -> RawFd {
+        self.scm_fd
+    }
+
+    pub fn buffered_bytes(&self) -> usize {
+        self.channel.buffered_bytes()
+    }
+
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+}
+
+/// Restored worker state that owns received descriptors but cannot perform I/O.
+///
+/// Dropping this wrapper before COMMIT closes both the mio channel and the
+/// received SCM descriptor. Only `resume` turns the latter into a `ScmSocket`.
+pub struct PausedWorkerSession {
+    channel: PausedChannel<WorkerRequest, WorkerResponse>,
+    id: WorkerId,
+    pending: VecDeque<WorkerRequest>,
+    pid: pid_t,
+    run_state: RunState,
+    scm_fd: OwnedFd,
+    token: Token,
+    requires_post_commit_tick: bool,
+}
+
+impl PausedWorkerSession {
+    pub fn id(&self) -> WorkerId {
+        self.id
+    }
+
+    pub fn token(&self) -> Token {
+        self.token
+    }
+
+    /// Command channel descriptor owned by this paused wrapper.
+    pub fn channel_fd(&self) -> RawFd {
+        self.channel.fd()
+    }
+
+    /// Received SCM descriptor owned by this paused wrapper.
+    pub fn scm_fd(&self) -> RawFd {
+        self.scm_fd.as_raw_fd()
+    }
+
+    /// Whether the Hub must schedule this session once immediately after COMMIT.
+    pub fn requires_post_commit_tick(&self) -> bool {
+        self.requires_post_commit_tick
+    }
+
+    /// Validate mio registration during PREPARED without performing I/O.
+    pub fn register(&mut self, registry: &Registry) -> io::Result<()> {
+        self.channel.register(
+            registry,
+            self.token,
+            Interest::READABLE | Interest::WRITABLE,
+        )
+    }
+
+    /// Activate the worker after COMMIT, including its SCM socket.
+    pub fn resume(self) -> Result<WorkerSession, SessionSnapshotError> {
+        let scm_fd = self.scm_fd.into_raw_fd();
+        let scm_socket =
+            ScmSocket::new(scm_fd).map_err(SessionSnapshotError::ActivateScmDescriptor)?;
+
+        Ok(WorkerSession {
+            channel: self.channel.resume(),
+            id: self.id,
+            pending: self.pending,
+            pid: self.pid,
+            run_state: self.run_state,
+            scm_socket,
+            token: self.token,
+        })
+    }
+}
+
 /// The return type of the ready method
 #[derive(Debug)]
 pub enum WorkerResult {
@@ -422,6 +744,22 @@ fn is_transient_overflow(error: &ChannelError) -> bool {
 }
 
 impl WorkerSession {
+    /// Close both descriptors when a restored terminal session has no
+    /// remaining task or response correlation. `ScmSocket` deliberately
+    /// borrows its raw descriptor, so dropping the session alone closes only
+    /// the command channel.
+    pub(crate) fn close_restored_descriptors(self) -> io::Result<()> {
+        let scm_fd = self.scm_socket.raw_fd();
+        drop(self);
+        // SAFETY: the restored Hub owns this descriptor after COMMIT and
+        // removes the sole WorkerSession that names it before this call.
+        if unsafe { libc::close(scm_fd) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
     pub fn new(
         mut channel: Channel<WorkerRequest, WorkerResponse>,
         id: WorkerId,
@@ -439,6 +777,75 @@ impl WorkerSession {
             scm_socket,
             token,
         }
+    }
+
+    /// Capture this worker without changing CLOEXEC, blocking mode, or bytes.
+    pub fn snapshot(&self) -> WorkerSessionSnapshot {
+        WorkerSessionSnapshot {
+            version: SESSION_SNAPSHOT_VERSION,
+            channel_fd: self.channel.fd(),
+            channel: self.channel.snapshot(),
+            id: self.id,
+            pending: self.pending.iter().cloned().collect(),
+            pid: self.pid,
+            run_state: self.run_state,
+            scm_fd: self.scm_socket.raw_fd(),
+            token: self.token.0,
+            requires_post_commit_tick: self.channel.front_buf.available_data() > 0
+                || self.channel.back_buf.available_data() > 0
+                || !self.pending.is_empty()
+                || wants_to_tick(&self.channel),
+        }
+    }
+
+    /// Rebuild a worker around descriptors received by the new main.
+    ///
+    /// `received_scm_fd` stays owned by the paused wrapper. This method only
+    /// validates it with `F_GETFL`; `ScmSocket::new` and its `F_SETFL` happen
+    /// in `PausedWorkerSession::resume` after COMMIT.
+    pub fn restore_paused(
+        sock: MioUnixStream,
+        received_scm_fd: OwnedFd,
+        snapshot: WorkerSessionSnapshot,
+        expected_initial_buffer_size: usize,
+        expected_max_buffer_size: usize,
+    ) -> Result<PausedWorkerSession, SessionSnapshotError> {
+        if snapshot.version != SESSION_SNAPSHOT_VERSION {
+            return Err(SessionSnapshotError::UnsupportedVersion {
+                session: "worker",
+                version: snapshot.version,
+                supported: SESSION_SNAPSHOT_VERSION,
+            });
+        }
+
+        let scm_fd = received_scm_fd.as_raw_fd();
+        // SAFETY: `received_scm_fd` owns a live descriptor. F_GETFL only
+        // observes flags and cannot mutate the open file description shared
+        // with the old main during PREPARED.
+        if unsafe { libc::fcntl(scm_fd, libc::F_GETFL) } < 0 {
+            return Err(SessionSnapshotError::ValidateScmDescriptor {
+                fd: scm_fd,
+                error: io::Error::last_os_error().to_string(),
+            });
+        }
+
+        let channel = Channel::restore_paused(
+            sock,
+            snapshot.channel,
+            expected_initial_buffer_size,
+            expected_max_buffer_size,
+        )?;
+
+        Ok(PausedWorkerSession {
+            channel,
+            id: snapshot.id,
+            pending: snapshot.pending,
+            pid: snapshot.pid,
+            run_state: snapshot.run_state,
+            scm_fd: received_scm_fd,
+            token: Token(snapshot.token),
+            requires_post_commit_tick: snapshot.requires_post_commit_tick,
+        })
     }
 
     /// accept a request for delivery to the worker (the event loop does the
@@ -688,20 +1095,58 @@ pub fn wants_to_tick<Tx, Rx>(channel: &Channel<Tx, Rx>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        io::{ErrorKind, Read},
+        os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
+        os::unix::net::UnixStream as StdUnixStream,
+        sync::Arc,
+        time::{Duration, Instant, UNIX_EPOCH},
+    };
 
-    use mio::Token;
+    use mio::{Poll, Token};
     use sozu_command_lib::{
         channel::Channel,
-        proto::command::{Request, Response, request::RequestType},
+        proto::command::{
+            Request, Response, ResponseStatus, RunState, SoftStop, WorkerRequest, WorkerResponse,
+            request::RequestType,
+        },
         ready::Ready,
+        scm_socket::ScmSocket,
     };
 
     use super::{
-        ClientResult, ClientSession, extract_messages, sanitize_for_audit, sanitize_for_audit_kv,
-        wants_to_tick,
+        ClientResult, ClientSession, UpgradeResponseQueue, WorkerSession, extract_messages,
+        sanitize_for_audit, sanitize_for_audit_kv, wants_to_tick,
     };
     use crate::command::server::PeerCred;
+
+    fn wait_for_eof(reader: &mut impl Read, resource: &str) -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut byte = [0_u8; 1];
+        loop {
+            match reader.read(&mut byte) {
+                Ok(0) => return Ok(()),
+                Ok(count) => return Err(format!("{resource} produced {count} unexpected bytes")),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                    ) && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                    ) =>
+                {
+                    return Err(format!("{resource} did not reach EOF before the deadline"));
+                }
+                Err(error) => return Err(format!("{resource} read failed: {error}")),
+            }
+        }
+    }
 
     // -----------------------------------------------------------------
     // sanitize_for_audit_kv: strict, used for column-boundary fields
@@ -1068,6 +1513,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn main_upgrade_terminal_response_waits_for_inherited_backpressure() {
+        let (channel, mut peer): (Channel<Response, Request>, Channel<Request, Response>) =
+            Channel::generate_nonblocking(64, 512).expect("could not generate client channels");
+        let mut client = ClientSession::new(
+            channel,
+            1,
+            Token(1),
+            PeerCred::default(),
+            None,
+            None,
+            Arc::from("/tmp/sozu-test.sock"),
+        );
+        let existing = Response {
+            status: ResponseStatus::Processing.into(),
+            message: "existing".repeat(45),
+            content: None,
+        };
+        let terminal = Response {
+            status: ResponseStatus::Ok.into(),
+            message: "upgrade-complete".repeat(24),
+            content: None,
+        };
+        client
+            .channel
+            .write_message(&existing)
+            .expect("existing response should fit by itself");
+
+        assert_eq!(
+            client.try_queue_upgrade_response(&terminal),
+            UpgradeResponseQueue::Backpressured,
+            "terminal response must remain pending instead of poisoning the client channel"
+        );
+
+        client.channel.handle_events(Ready::WRITABLE);
+        client
+            .channel
+            .run()
+            .expect("existing response should flush");
+        peer.handle_events(Ready::READABLE);
+        peer.run().expect("existing response should buffer");
+        assert_eq!(
+            peer.read_message()
+                .expect("existing response should arrive"),
+            existing
+        );
+
+        assert_eq!(
+            client.try_queue_upgrade_response(&terminal),
+            UpgradeResponseQueue::Queued
+        );
+        client.channel.handle_events(Ready::WRITABLE);
+        client
+            .channel
+            .run()
+            .expect("terminal response should flush");
+        peer.handle_events(Ready::READABLE);
+        peer.run().expect("terminal response should buffer");
+        assert_eq!(
+            peer.read_message()
+                .expect("terminal response should arrive once"),
+            terminal
+        );
+        assert!(
+            peer.read_message().is_err(),
+            "retrying admission must not duplicate the terminal response"
+        );
+    }
+
     /// Regression for sozu-proxy/sozu#1445: a malformed frame must not strand
     /// the bytes behind it on a session nothing will schedule again. Which read
     /// failures leave a channel able to make progress, and why, is
@@ -1174,6 +1688,318 @@ mod tests {
             !wants_to_tick(&client.channel),
             "no queued response, no hup, no error: had the drain stopped early \
              the session would never have been ticked again"
+        );
+    }
+
+    fn worker_request(id: &str) -> WorkerRequest {
+        WorkerRequest {
+            id: id.to_owned(),
+            content: Request::default(),
+        }
+    }
+
+    fn fd_is_nonblocking(fd: std::os::fd::RawFd) -> bool {
+        // SAFETY: callers pass a live descriptor and F_GETFL only observes its
+        // shared open-file-description flags.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(flags >= 0, "could not read descriptor flags");
+        flags & libc::O_NONBLOCK != 0
+    }
+
+    #[test]
+    fn client_session_snapshot_round_trips_identity_buffers_and_post_commit_tick() {
+        let (channel, mut peer): (Channel<Response, Request>, Channel<Request, Response>) =
+            Channel::generate_nonblocking(32, 256).expect("could not generate client channels");
+        let mut client = ClientSession::new(
+            channel,
+            41,
+            Token(73),
+            PeerCred {
+                uid: Some(1000),
+                gid: Some(1001),
+                pid: Some(4242),
+            },
+            Some("sozu-cli".to_owned()),
+            Some("operator".to_owned()),
+            Arc::from("/run/sozu/control.sock"),
+        );
+        client.session_ulid = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+            .parse()
+            .expect("fixed ULID should parse");
+        client.connect_ts = UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789);
+
+        let request = Request::from(RequestType::SoftStop(SoftStop {}));
+        peer.write_message(&request)
+            .expect("could not frame client request");
+        peer.handle_events(Ready::WRITABLE);
+        peer.run().expect("could not write client request");
+        client.update_readiness(Ready::READABLE);
+        client
+            .channel
+            .readable()
+            .expect("could not buffer client request");
+        client.channel.readiness = Ready::EMPTY;
+
+        let response = Response {
+            status: ResponseStatus::Ok.into(),
+            message: "original-client-response".to_owned(),
+            content: None,
+        };
+        client.send(response);
+        client.channel.readiness = Ready::EMPTY;
+        let expected_front = client.channel.front_buf.data().to_owned();
+        let expected_back = client.channel.back_buf.data().to_owned();
+        let source_fd = client.channel.fd();
+
+        let snapshot = client.snapshot();
+        assert_eq!(snapshot.channel_fd(), source_fd);
+        let encoded = serde_json::to_vec(&snapshot).expect("client snapshot should serialize");
+        let snapshot =
+            serde_json::from_slice(&encoded).expect("client snapshot should deserialize");
+        let mut paused = ClientSession::restore_paused(client.channel.sock, snapshot, 32, 256)
+            .expect("client snapshot should restore paused");
+        assert_eq!(paused.id(), 41);
+        assert_eq!(paused.token(), Token(73));
+        assert!(
+            paused.requires_post_commit_tick(),
+            "a complete userspace frame with empty readiness needs one post-commit tick"
+        );
+
+        let poll = Poll::new().expect("could not create poll registry");
+        paused
+            .register(poll.registry())
+            .expect("paused client should register without I/O");
+        peer.handle_events(Ready::READABLE);
+        assert_eq!(
+            peer.readable().expect("peer read probe should not fail"),
+            0,
+            "PREPARED registration must not flush the buffered response"
+        );
+
+        let mut restored = paused.resume();
+        assert_eq!(restored.id, 41);
+        assert_eq!(restored.token, Token(73));
+        assert_eq!(
+            restored.session_ulid.to_string(),
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        );
+        assert_eq!(restored.actor_uid, Some(1000));
+        assert_eq!(restored.actor_gid, Some(1001));
+        assert_eq!(restored.actor_pid, Some(4242));
+        assert_eq!(restored.actor_comm.as_deref(), Some("sozu-cli"));
+        assert_eq!(restored.actor_user.as_deref(), Some("operator"));
+        assert_eq!(&*restored.socket_path, "/run/sozu/control.sock");
+        assert_eq!(
+            restored.connect_ts,
+            UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789)
+        );
+        assert_eq!(restored.channel.front_buf.data(), expected_front);
+        assert_eq!(restored.channel.back_buf.data(), expected_back);
+        assert_eq!(restored.channel.readiness, Ready::EMPTY);
+        assert!(matches!(
+            restored.ready(),
+            ClientResult::NewRequest(restored_request) if restored_request == request
+        ));
+        assert!(
+            matches!(restored.ready(), ClientResult::NothingToDo),
+            "the buffered Stop command must be dispatched exactly once after COMMIT"
+        );
+    }
+
+    #[test]
+    fn client_session_snapshot_rejects_pre_epoch_connect_time() {
+        let (channel, _peer): (Channel<Response, Request>, Channel<Request, Response>) =
+            Channel::generate_nonblocking(32, 256).expect("could not generate client channels");
+        let mut client = ClientSession::new(
+            channel,
+            1,
+            Token(2),
+            PeerCred {
+                uid: None,
+                gid: None,
+                pid: None,
+            },
+            None,
+            None,
+            Arc::from("/run/sozu/control.sock"),
+        );
+        client.connect_ts = UNIX_EPOCH - Duration::from_nanos(1);
+
+        let error = serde_json::to_vec(&client.snapshot())
+            .expect_err("serde's SystemTime representation rejects pre-epoch values");
+        assert!(error.to_string().contains("later than UNIX_EPOCH"));
+    }
+
+    #[test]
+    fn client_session_restore_rejects_unknown_snapshot_version() {
+        let (channel, _peer): (Channel<Response, Request>, Channel<Request, Response>) =
+            Channel::generate_nonblocking(32, 256).expect("could not generate client channels");
+        let client = ClientSession::new(
+            channel,
+            1,
+            Token(2),
+            PeerCred {
+                uid: None,
+                gid: None,
+                pid: None,
+            },
+            None,
+            None,
+            Arc::from("/run/sozu/control.sock"),
+        );
+        let mut snapshot = client.snapshot();
+        snapshot.version += 1;
+
+        assert!(matches!(
+            ClientSession::restore_paused(client.channel.sock, snapshot, 32, 256),
+            Err(super::SessionSnapshotError::UnsupportedVersion {
+                session: "client",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn worker_session_snapshot_round_trips_fifo_and_defers_scm_activation() {
+        let (channel, mut peer): (
+            Channel<WorkerRequest, WorkerResponse>,
+            Channel<WorkerResponse, WorkerRequest>,
+        ) = Channel::generate_nonblocking(64, 512).expect("could not generate worker channels");
+        let (source_scm_owner, _source_scm_peer) =
+            StdUnixStream::pair().expect("could not create source SCM pair");
+        let scm_socket =
+            ScmSocket::new(source_scm_owner.as_raw_fd()).expect("could not create SCM socket");
+        let mut worker = WorkerSession::new(channel, 17, 4242, Token(91), scm_socket);
+        worker.run_state = RunState::Stopping;
+        worker.pending.extend([
+            worker_request("first"),
+            worker_request("second"),
+            worker_request("third"),
+        ]);
+
+        let response = WorkerResponse {
+            id: "reply-in-front".to_owned(),
+            status: ResponseStatus::Ok.into(),
+            message: "ready".to_owned(),
+            content: None,
+        };
+        peer.write_message(&response)
+            .expect("could not frame worker response");
+        peer.handle_events(Ready::WRITABLE);
+        peer.run().expect("could not write worker response");
+        worker.update_readiness(Ready::READABLE);
+        worker
+            .channel
+            .readable()
+            .expect("could not buffer worker response");
+        worker.channel.readiness = Ready::EMPTY;
+        worker
+            .channel
+            .write_message(&worker_request("already-buffered"))
+            .expect("could not queue worker request");
+        worker.channel.readiness = Ready::EMPTY;
+        let expected_front = worker.channel.front_buf.data().to_owned();
+        let expected_back = worker.channel.back_buf.data().to_owned();
+
+        let snapshot = worker.snapshot();
+        assert_eq!(snapshot.channel_fd(), worker.channel.fd());
+        assert_eq!(snapshot.scm_fd(), source_scm_owner.as_raw_fd());
+        let encoded = serde_json::to_vec(&snapshot).expect("worker snapshot should serialize");
+        let snapshot =
+            serde_json::from_slice(&encoded).expect("worker snapshot should deserialize");
+
+        let (received_scm, _received_scm_peer) =
+            StdUnixStream::pair().expect("could not create received SCM pair");
+        received_scm
+            .set_nonblocking(true)
+            .expect("could not make received SCM descriptor nonblocking");
+        let received_scm_fd = received_scm.into_raw_fd();
+        // SAFETY: `into_raw_fd` transferred unique ownership to this test.
+        let received_scm = unsafe { OwnedFd::from_raw_fd(received_scm_fd) };
+        assert!(fd_is_nonblocking(received_scm_fd));
+
+        let mut paused =
+            WorkerSession::restore_paused(worker.channel.sock, received_scm, snapshot, 64, 512)
+                .expect("worker snapshot should restore paused");
+        assert_eq!(paused.id(), 17);
+        assert_eq!(paused.token(), Token(91));
+        assert!(paused.requires_post_commit_tick());
+        assert!(
+            fd_is_nonblocking(received_scm_fd),
+            "PREPARED restore must not change SCM blocking mode"
+        );
+        let poll = Poll::new().expect("could not create poll registry");
+        paused
+            .register(poll.registry())
+            .expect("paused worker should register without I/O");
+        assert!(
+            fd_is_nonblocking(received_scm_fd),
+            "PREPARED registration must not change SCM blocking mode"
+        );
+
+        let restored = paused
+            .resume()
+            .expect("COMMIT should activate the received SCM descriptor");
+        assert!(
+            !fd_is_nonblocking(received_scm_fd),
+            "resume is the first point allowed to make SCM blocking"
+        );
+        assert_eq!(restored.id, 17);
+        assert_eq!(restored.pid, 4242);
+        assert_eq!(restored.run_state, RunState::Stopping);
+        assert_eq!(restored.token, Token(91));
+        assert_eq!(restored.scm_socket.raw_fd(), received_scm_fd);
+        assert_eq!(restored.channel.front_buf.data(), expected_front);
+        assert_eq!(restored.channel.back_buf.data(), expected_back);
+        assert_eq!(
+            restored
+                .pending
+                .iter()
+                .map(|request| request.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second", "third"]
+        );
+    }
+
+    #[test]
+    fn dropping_paused_worker_closes_received_scm_descriptor() {
+        let (channel, mut channel_peer): (
+            Channel<WorkerRequest, WorkerResponse>,
+            Channel<WorkerResponse, WorkerRequest>,
+        ) = Channel::generate_nonblocking(64, 512).expect("could not generate worker channels");
+        let (source_scm_owner, _source_scm_peer) =
+            StdUnixStream::pair().expect("could not create source SCM pair");
+        let worker = WorkerSession::new(
+            channel,
+            17,
+            4242,
+            Token(91),
+            ScmSocket::new(source_scm_owner.as_raw_fd()).expect("could not create SCM socket"),
+        );
+        let snapshot = worker.snapshot();
+        let (received_scm, mut received_scm_peer) =
+            StdUnixStream::pair().expect("could not create received SCM pair");
+        received_scm_peer
+            .set_nonblocking(true)
+            .expect("could not make received SCM peer nonblocking");
+        let received_scm_fd = received_scm.into_raw_fd();
+        // SAFETY: `into_raw_fd` transferred unique ownership to this test.
+        let received_scm = unsafe { OwnedFd::from_raw_fd(received_scm_fd) };
+
+        let paused =
+            WorkerSession::restore_paused(worker.channel.sock, received_scm, snapshot, 64, 512)
+                .expect("worker snapshot should restore paused");
+        drop(paused);
+
+        // Observe both original peers before asserting either result. Numeric
+        // descriptors can be reused immediately by another parallel test;
+        // EOF identifies the socket endpoint and still fails if any real copy
+        // remains open across a concurrent fork-to-exec window.
+        let channel_eof = wait_for_eof(&mut channel_peer.sock, "paused worker channel");
+        let scm_eof = wait_for_eof(&mut received_scm_peer, "paused worker SCM socket");
+        assert!(
+            channel_eof.is_ok() && scm_eof.is_ok(),
+            "channel: {channel_eof:?}; SCM: {scm_eof:?}"
         );
     }
 }

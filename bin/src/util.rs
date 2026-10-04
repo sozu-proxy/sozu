@@ -1,6 +1,6 @@
 use std::{
     ffi::OsString,
-    fs::{File, read_link},
+    fs::{File, OpenOptions, read_link},
     io::{Error as IoError, Write},
     os::{fd::BorrowedFd, unix::io::RawFd},
     path::PathBuf,
@@ -118,6 +118,42 @@ pub fn write_pid_file(config: &Config) -> Result<(), UtilError> {
             .map_err(|sync_err| UtilError::SyncPidFile(path.to_owned(), sync_err))?;
     }
     Ok(())
+}
+
+/// Open the configured pid file for a later [`publish_pid_file`], without
+/// changing its content.
+///
+/// A replacement main calls this before PREPARED, while a failure still rolls
+/// back to the old main: an unwritable path (a directory, a missing parent, a
+/// read-only file system, a denied permission) fails here instead of after
+/// COMMIT. It creates the file when missing but never truncates it, so the old
+/// main's pid stays published if the upgrade rolls back.
+pub fn open_pid_file(config: &Config) -> Result<Option<(String, File)>, UtilError> {
+    let Some(path) = config.pid_file_path.as_deref() else {
+        return Ok(None);
+    };
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|io_err| UtilError::CreatePidFile(path.to_owned(), io_err))?;
+    Ok(Some((path.to_owned(), file)))
+}
+
+/// Replace the content of a pid file opened by [`open_pid_file`] with this
+/// process's pid.
+pub fn publish_pid_file(path: &str, mut file: File) -> Result<(), UtilError> {
+    // SAFETY: `libc::getpid` takes no input pointers, never fails, and
+    // returns a value type. No invariant beyond "FFI signature matches libc".
+    let pid = unsafe { libc::getpid() };
+
+    file.set_len(0)
+        .map_err(|write_err| UtilError::WritePidFile(path.to_owned(), write_err))?;
+    file.write_all(format!("{pid}").as_bytes())
+        .map_err(|write_err| UtilError::WritePidFile(path.to_owned(), write_err))?;
+    file.sync_all()
+        .map_err(|sync_err| UtilError::SyncPidFile(path.to_owned(), sync_err))
 }
 
 pub fn get_config_file_path(args: &cli::Args) -> Result<&str, UtilError> {

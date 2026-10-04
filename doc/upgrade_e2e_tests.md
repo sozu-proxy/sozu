@@ -290,6 +290,78 @@ Client₂            │                          │
 aggregate throughput (each client must receive at least 5 post-upgrade
 responses).
 
+## Main-process handoff tests
+
+The `sozu` crate also has three Linux-only process tests for the command-Hub
+handoff. They are ignored in the ordinary unit suite because they fork real
+main and worker processes and bind local sockets; run them explicitly and
+serially. A separate two-direction compatibility matrix needs frozen legacy
+and replacement binaries, so it remains a manual gate rather than a CI test.
+
+`upgrade_main_preserves_in_flight_worker_command_and_original_client_response`
+starts a real proxy, holds an HTTP request behind a backend barrier, and starts
+a worker upgrade through client A. Client B then upgrades the main process.
+After the handoff, releasing the backend must produce the HTTP 200 response,
+one terminal success on A's original command connection, and a successful
+command from client C. This proves the replacement continued the existing
+worker task and correlation instead of replaying it.
+
+`rejected_candidate_keeps_old_hub_authoritative_and_reaps_child` atomically
+replaces the test executable with a candidate that exits during the pre-commit
+probe. The old main PID must remain authoritative, the held command and HTTP
+request must complete once, a new command must succeed, the boot generation
+must stay unchanged, no successful `main_upgraded` audit may appear, and the
+candidate must be reaped with no descendant left behind.
+
+`sigterm_during_prepare_aborts_upgrade_then_stops_the_old_main` holds a V2
+replacement before it can send `PREPARED`, sends `SIGTERM` to the old main,
+then releases the replacement. The transfer must abort before `COMMIT`, reap
+the replacement, return a failure to the upgrade client, and let the old event
+loop consume the preserved stop intention and exit cleanly. A signal aimed
+only at the old PID after the final pre-commit observation is outside this
+contract; service managers should signal the service control group.
+
+`unwritable_pid_file_rolls_back_main_upgrade_and_keeps_serving` replaces the
+pid file with a directory before a main upgrade. The replacement must fail
+while opening the pid file, before `PREPARED`, so the upgrade client gets a
+failure while the old main, its worker and the frontend keep serving. A
+replacement that failed only after `COMMIT` would have stopped every process,
+because the fenced old main exits and its workers follow their closed command
+channels.
+
+```bash
+cargo test -p sozu --test upgrade_keeps_draining_worker_e2e --locked \
+  upgrade_main_preserves_in_flight_worker_command_and_original_client_response \
+  -- --ignored --exact --nocapture --test-threads=1
+
+cargo test -p sozu --test main_upgrade_transfer_rejection_e2e --locked \
+  rejected_candidate_keeps_old_hub_authoritative_and_reaps_child \
+  -- --ignored --exact --nocapture --test-threads=1
+
+cargo test -p sozu --test main_upgrade_transfer_rejection_e2e --locked \
+  sigterm_during_prepare_aborts_upgrade_then_stops_the_old_main \
+  -- --ignored --exact --nocapture --test-threads=1
+
+cargo test -p sozu --test upgrade_pid_file_failure_e2e --locked \
+  -- --ignored --nocapture --test-threads=1
+
+SOZU_MATRIX_LEGACY=/path/to/legacy-sozu \
+SOZU_MATRIX_OPTION3=/path/to/replacement-sozu \
+cargo test -p sozu --test main_upgrade_compatibility_matrix_e2e --locked \
+  -- --ignored --nocapture --test-threads=1
+```
+
+The compatibility matrix runs both protocol directions. Without both
+variables each case prints a skip line and passes, so a plain `-- --ignored`
+run of the whole crate is not stopped by it; CI never sets them. A replacement sender
+must reject a legacy candidate before exposing the live Hub, keep its boot
+generation and audit unchanged, and reap the candidate. A legacy sender cannot
+provide the same transactional accounting, but it must stay authoritative and
+continue its held and subsequent commands when the replacement refuses the
+legacy handoff. The first deployment therefore requires the controlled restart
+described above; the matrix does not turn a legacy sender into a lossless V2
+sender.
+
 ## Coverage matrix
 
 | Scenario | In-flight preserved | New connections | Keep-alive | Concurrency |

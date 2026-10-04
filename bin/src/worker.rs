@@ -386,8 +386,9 @@ pub fn fork_main_into_worker(
             // `main_to_worker_scm` stays close-on-exec: every worker forked
             // later must not inherit the main end of this worker's SCM
             // socket. Only a main upgrade hands it across `exec`, and
-            // `SerializedWorkerSession::try_from` (`bin/src/command/upgrade.rs`)
-            // clears the flag for that hand-off alone.
+            // `CommandHub::disable_cloexec_before_upgrade`
+            // (`bin/src/command/server.rs`) clears the flag for that hand-off
+            // alone.
             Ok((
                 worker_pid.into(),
                 main_to_worker_channel.into(),

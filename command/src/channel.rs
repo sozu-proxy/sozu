@@ -27,6 +27,9 @@ use crate::{buffer::growable::Buffer, ready::Ready};
 
 /// High watermark threshold: log a warning when buffer usage exceeds 80% of max
 const HIGH_WATERMARK_RATIO: f64 = 0.8;
+const CHANNEL_SNAPSHOT_VERSION: u16 = 1;
+const CHANNEL_READY_MASK: u16 =
+    Ready::READABLE.0 | Ready::WRITABLE.0 | Ready::ERROR.0 | Ready::HUP.0 | Ready::WRITE_CLOSED.0;
 
 #[derive(thiserror::Error, Debug)]
 pub enum ChannelError {
@@ -73,6 +76,144 @@ pub enum ChannelError {
     InvalidProtobufMessage(DecodeError),
     #[error("This should never happen (index out of bound on a tested buffer)")]
     MismatchBufferSize,
+}
+
+/// Serializable userspace state of a [`Channel`].
+///
+/// The Hub supplies the effective descriptor after fork/exec inheritance or
+/// explicit duplication. Only bytes that have not been consumed are captured;
+/// buffer offsets are normalized on restore while their capacities and
+/// backpressure state are preserved.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChannelSnapshot {
+    version: u16,
+    front: Vec<u8>,
+    back: Vec<u8>,
+    initial_buffer_size: usize,
+    max_buffer_size: usize,
+    front_buffer_capacity: usize,
+    back_buffer_capacity: usize,
+    readiness: u16,
+    interest: u16,
+    blocking: bool,
+    front_high_watermark_logged: bool,
+    back_high_watermark_logged: bool,
+}
+
+#[derive(thiserror::Error, Debug, Eq, PartialEq)]
+pub enum ChannelSnapshotError {
+    #[error("unsupported channel snapshot version {version}; supported version is {supported}")]
+    UnsupportedVersion { version: u16, supported: u16 },
+    #[error(
+        "invalid channel snapshot buffer bounds: initial capacity {initial} exceeds maximum {max}"
+    )]
+    InvalidBufferBounds { initial: usize, max: usize },
+    #[error(
+        "invalid {buffer} buffer capacity {capacity}; expected a value between initial {initial} and maximum {max}"
+    )]
+    InvalidBufferCapacity {
+        buffer: &'static str,
+        capacity: usize,
+        initial: usize,
+        max: usize,
+    },
+    #[error(
+        "{buffer} buffer carries {data_len} bytes but its restored capacity is only {capacity}"
+    )]
+    BufferedDataExceedsCapacity {
+        buffer: &'static str,
+        data_len: usize,
+        capacity: usize,
+    },
+    #[error("invalid channel snapshot {field} bits: {bits:#06x}")]
+    InvalidReadyBits { field: &'static str, bits: u16 },
+    #[error(
+        "channel snapshot buffer limits ({snapshot_initial}, {snapshot_max}) do not match the receiver's configured limits ({expected_initial}, {expected_max})"
+    )]
+    BufferLimitsMismatch {
+        snapshot_initial: usize,
+        snapshot_max: usize,
+        expected_initial: usize,
+        expected_max: usize,
+    },
+    #[error("could not read blocking mode of channel descriptor {fd}: {error}")]
+    BlockingModeQuery { fd: RawFd, error: String },
+    #[error(
+        "channel snapshot blocking mode ({snapshot_blocking}) disagrees with descriptor blocking mode ({fd_blocking})"
+    )]
+    BlockingModeMismatch {
+        snapshot_blocking: bool,
+        fd_blocking: bool,
+    },
+}
+
+impl ChannelSnapshot {
+    /// Whether restoring this channel leaves input already available in
+    /// userspace, independently of kernel readiness notifications.
+    pub fn has_buffered_input(&self) -> bool {
+        !self.front.is_empty()
+    }
+
+    /// Whether restoring this channel leaves output queued in userspace,
+    /// independently of kernel readiness notifications.
+    pub fn has_buffered_output(&self) -> bool {
+        !self.back.is_empty()
+    }
+
+    /// Total userspace bytes that the kernel cannot report through readiness.
+    pub fn buffered_bytes(&self) -> usize {
+        self.front.len().saturating_add(self.back.len())
+    }
+
+    fn validate(&self) -> Result<(), ChannelSnapshotError> {
+        if self.version != CHANNEL_SNAPSHOT_VERSION {
+            return Err(ChannelSnapshotError::UnsupportedVersion {
+                version: self.version,
+                supported: CHANNEL_SNAPSHOT_VERSION,
+            });
+        }
+        if self.initial_buffer_size > self.max_buffer_size {
+            return Err(ChannelSnapshotError::InvalidBufferBounds {
+                initial: self.initial_buffer_size,
+                max: self.max_buffer_size,
+            });
+        }
+
+        for (buffer, capacity) in [
+            ("front", self.front_buffer_capacity),
+            ("back", self.back_buffer_capacity),
+        ] {
+            if capacity < self.initial_buffer_size || capacity > self.max_buffer_size {
+                return Err(ChannelSnapshotError::InvalidBufferCapacity {
+                    buffer,
+                    capacity,
+                    initial: self.initial_buffer_size,
+                    max: self.max_buffer_size,
+                });
+            }
+        }
+
+        for (buffer, data_len, capacity) in [
+            ("front", self.front.len(), self.front_buffer_capacity),
+            ("back", self.back.len(), self.back_buffer_capacity),
+        ] {
+            if data_len > capacity {
+                return Err(ChannelSnapshotError::BufferedDataExceedsCapacity {
+                    buffer,
+                    data_len,
+                    capacity,
+                });
+            }
+        }
+
+        for (field, bits) in [("readiness", self.readiness), ("interest", self.interest)] {
+            if bits & !CHANNEL_READY_MASK != 0 {
+                return Err(ChannelSnapshotError::InvalidReadyBits { field, bits });
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Does this read failure leave a channel that could parse the peer's next
@@ -208,6 +349,40 @@ pub struct Channel<Tx, Rx> {
     phantom_rx: PhantomData<Rx>,
 }
 
+/// A restored channel that may be registered with mio but cannot perform I/O.
+///
+/// Keeping the active [`Channel`] private prevents the receiving process from
+/// reading or writing a shared socket before the upgrade handoff commits.
+pub struct PausedChannel<Tx, Rx> {
+    channel: Channel<Tx, Rx>,
+}
+
+impl<Tx, Rx> PausedChannel<Tx, Rx> {
+    /// Returns the received descriptor for handoff bookkeeping.
+    pub fn fd(&self) -> RawFd {
+        self.channel.sock.as_raw_fd()
+    }
+
+    /// Validate mio registration during the prepared handoff phase.
+    ///
+    /// Registration changes neither the socket's blocking mode nor its byte
+    /// streams. No readiness is handled until [`PausedChannel::resume`]
+    /// returns the active channel after commit.
+    pub fn register(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()> {
+        self.channel.sock.register(registry, token, interests)
+    }
+
+    /// Activate the restored channel after the upgrade handoff commits.
+    pub fn resume(self) -> Channel<Tx, Rx> {
+        self.channel
+    }
+}
+
 impl<Tx, Rx> std::fmt::Debug for Channel<Tx, Rx> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(&format!(
@@ -289,6 +464,105 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
             phantom_tx: PhantomData,
             phantom_rx: PhantomData,
         }
+    }
+
+    /// Capture every userspace byte and scheduling bit needed to continue this
+    /// channel after a main-process upgrade.
+    pub fn snapshot(&self) -> ChannelSnapshot {
+        debug_assert!(self.initial_buffer_size <= self.max_buffer_size);
+        debug_assert!(self.front_buf.capacity() <= self.max_buffer_size);
+        debug_assert!(self.back_buf.capacity() <= self.max_buffer_size);
+
+        ChannelSnapshot {
+            version: CHANNEL_SNAPSHOT_VERSION,
+            front: self.front_buf.data().to_owned(),
+            back: self.back_buf.data().to_owned(),
+            initial_buffer_size: self.initial_buffer_size,
+            max_buffer_size: self.max_buffer_size,
+            front_buffer_capacity: self.front_buf.capacity(),
+            back_buffer_capacity: self.back_buf.capacity(),
+            readiness: self.readiness.0,
+            interest: self.interest.0,
+            blocking: self.blocking,
+            front_high_watermark_logged: self.front_high_watermark_logged,
+            back_high_watermark_logged: self.back_high_watermark_logged,
+        }
+    }
+
+    /// Rebuild a channel around a received socket without reading, writing, or
+    /// changing flags on the shared open file description.
+    ///
+    /// The receiver supplies the configured buffer limits independently. A
+    /// snapshot cannot use its own size fields to authorize an allocation.
+    /// The descriptor's actual `O_NONBLOCK` flag must likewise agree with the
+    /// captured mode; neither validation changes that shared flag.
+    ///
+    /// The returned wrapper permits mio registration during PREPARED, but only
+    /// [`PausedChannel::resume`] exposes the active channel after COMMIT.
+    pub fn restore_paused(
+        sock: MioUnixStream,
+        snapshot: ChannelSnapshot,
+        expected_initial_buffer_size: usize,
+        expected_max_buffer_size: usize,
+    ) -> Result<PausedChannel<Tx, Rx>, ChannelSnapshotError> {
+        snapshot.validate()?;
+
+        if snapshot.initial_buffer_size != expected_initial_buffer_size
+            || snapshot.max_buffer_size != expected_max_buffer_size
+        {
+            return Err(ChannelSnapshotError::BufferLimitsMismatch {
+                snapshot_initial: snapshot.initial_buffer_size,
+                snapshot_max: snapshot.max_buffer_size,
+                expected_initial: expected_initial_buffer_size,
+                expected_max: expected_max_buffer_size,
+            });
+        }
+
+        let fd = sock.as_raw_fd();
+        // SAFETY: `sock` owns a live descriptor for this call. F_GETFL only
+        // reads flags from its open file description and cannot change the
+        // descriptor shared with the old main process during PREPARED.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(ChannelSnapshotError::BlockingModeQuery {
+                fd,
+                error: io::Error::last_os_error().to_string(),
+            });
+        }
+        let fd_blocking = flags & libc::O_NONBLOCK == 0;
+        if snapshot.blocking != fd_blocking {
+            return Err(ChannelSnapshotError::BlockingModeMismatch {
+                snapshot_blocking: snapshot.blocking,
+                fd_blocking,
+            });
+        }
+
+        let mut front_buf = Buffer::from_slice(&snapshot.front);
+        front_buf.grow(snapshot.front_buffer_capacity);
+        let mut back_buf = Buffer::from_slice(&snapshot.back);
+        back_buf.grow(snapshot.back_buffer_capacity);
+
+        debug_assert_eq!(front_buf.capacity(), snapshot.front_buffer_capacity);
+        debug_assert_eq!(back_buf.capacity(), snapshot.back_buffer_capacity);
+        debug_assert_eq!(front_buf.data(), snapshot.front);
+        debug_assert_eq!(back_buf.data(), snapshot.back);
+
+        Ok(PausedChannel {
+            channel: Channel {
+                sock,
+                front_buf,
+                back_buf,
+                initial_buffer_size: snapshot.initial_buffer_size,
+                max_buffer_size: snapshot.max_buffer_size,
+                readiness: Ready(snapshot.readiness),
+                interest: Ready(snapshot.interest),
+                blocking: snapshot.blocking,
+                front_high_watermark_logged: snapshot.front_high_watermark_logged,
+                back_high_watermark_logged: snapshot.back_high_watermark_logged,
+                phantom_tx: PhantomData,
+                phantom_rx: PhantomData,
+            },
+        })
     }
 
     pub fn into<Tx2: Debug + ProstMessage + Default, Rx2: Debug + ProstMessage + Default>(
@@ -1253,9 +1527,15 @@ impl<Tx, Rx> Source for Channel<Tx, Rx> {
 
 #[cfg(test)]
 mod tests {
-    use std::{thread, time::Duration};
+    use std::{
+        io::Write,
+        os::fd::{AsRawFd, FromRawFd, OwnedFd},
+        thread,
+        time::Duration,
+    };
 
     use super::*;
+    use mio::{Interest, Poll, Token};
 
     #[derive(Clone, PartialEq, prost::Message)]
     pub struct ProtobufMessage {
@@ -1268,6 +1548,350 @@ mod tests {
         Channel<ProtobufMessage, ProtobufMessage>,
     ) {
         Channel::generate(1000, 10000).expect("could not generate blocking channels for testing")
+    }
+
+    #[test]
+    fn channel_snapshot_round_trips_unconsumed_offsets_capacities_bits_and_mode() {
+        let (mut channel, _peer): (
+            Channel<ProtobufMessage, ProtobufMessage>,
+            Channel<ProtobufMessage, ProtobufMessage>,
+        ) = Channel::generate_nonblocking(8, 64).expect("could not generate channels");
+
+        channel.front_buf.grow(32);
+        channel
+            .front_buf
+            .write_all(b"retired-front-pending")
+            .expect("could not seed front buffer");
+        channel.front_buf.consume(b"retired-".len());
+        channel.back_buf.grow(48);
+        channel
+            .back_buf
+            .write_all(b"sent-back-pending")
+            .expect("could not seed back buffer");
+        channel.back_buf.consume(b"sent-".len());
+        channel.readiness =
+            Ready::READABLE | Ready::WRITABLE | Ready::ERROR | Ready::HUP | Ready::WRITE_CLOSED;
+        channel.interest = Ready::READABLE | Ready::WRITABLE;
+        channel.front_high_watermark_logged = true;
+
+        let snapshot_json =
+            serde_json::to_vec(&channel.snapshot()).expect("channel snapshot should serialize");
+        let snapshot: ChannelSnapshot =
+            serde_json::from_slice(&snapshot_json).expect("channel snapshot should deserialize");
+        assert!(snapshot.has_buffered_input());
+        assert!(snapshot.has_buffered_output());
+        let original_fd = channel.fd();
+        let paused: PausedChannel<ProtobufMessage, ProtobufMessage> =
+            Channel::restore_paused(channel.sock, snapshot, 8, 64)
+                .expect("valid channel snapshot should restore");
+
+        assert_eq!(paused.fd(), original_fd);
+        let restored = paused.resume();
+        assert_eq!(restored.front_buf.data(), b"front-pending");
+        assert_eq!(restored.back_buf.data(), b"back-pending");
+        assert_eq!(restored.front_buf.capacity(), 32);
+        assert_eq!(restored.back_buf.capacity(), 48);
+        assert_eq!(restored.initial_buffer_size, 8);
+        assert_eq!(restored.max_buffer_size, 64);
+        assert_eq!(
+            restored.readiness,
+            Ready::READABLE | Ready::WRITABLE | Ready::ERROR | Ready::HUP | Ready::WRITE_CLOSED
+        );
+        assert_eq!(restored.interest, Ready::READABLE | Ready::WRITABLE);
+        assert!(!restored.is_blocking());
+        assert!(restored.front_high_watermark_logged);
+        assert!(!restored.back_high_watermark_logged);
+    }
+
+    #[test]
+    fn channel_snapshot_paused_registration_does_not_flush_before_resume() {
+        let (mut channel, mut peer): (
+            Channel<ProtobufMessage, ProtobufMessage>,
+            Channel<ProtobufMessage, ProtobufMessage>,
+        ) = Channel::generate_nonblocking(32, 128).expect("could not generate channels");
+        channel
+            .write_message(&ProtobufMessage { inner: 42 })
+            .expect("could not queue message");
+        channel.handle_events(Ready::WRITABLE);
+
+        let snapshot = channel.snapshot();
+        let mut paused: PausedChannel<ProtobufMessage, ProtobufMessage> =
+            Channel::restore_paused(channel.sock, snapshot, 32, 128)
+                .expect("valid channel snapshot should restore");
+        let poll = Poll::new().expect("could not create poll registry");
+        paused
+            .register(
+                poll.registry(),
+                Token(7),
+                Interest::READABLE | Interest::WRITABLE,
+            )
+            .expect("paused channel should register");
+
+        peer.handle_events(Ready::READABLE);
+        assert_eq!(peer.readable().expect("peer read probe should not fail"), 0);
+        assert!(matches!(
+            peer.read_message(),
+            Err(ChannelError::NothingRead)
+        ));
+
+        let mut restored = paused.resume();
+        restored.run().expect("resumed channel should flush");
+        peer.handle_events(Ready::READABLE);
+        peer.readable().expect("peer should receive resumed bytes");
+        assert_eq!(
+            peer.read_message()
+                .expect("peer should decode queued message"),
+            ProtobufMessage { inner: 42 }
+        );
+    }
+
+    #[test]
+    fn channel_snapshot_rejects_invalid_version_capacities_bytes_and_ready_bits() {
+        fn snapshot_and_socket() -> (
+            ChannelSnapshot,
+            MioUnixStream,
+            Channel<ProtobufMessage, ProtobufMessage>,
+        ) {
+            let (channel, peer): (
+                Channel<ProtobufMessage, ProtobufMessage>,
+                Channel<ProtobufMessage, ProtobufMessage>,
+            ) = Channel::generate_nonblocking(8, 64).expect("could not generate channels");
+            (channel.snapshot(), channel.sock, peer)
+        }
+
+        let (mut invalid_version, sock, _peer) = snapshot_and_socket();
+        invalid_version.version += 1;
+        assert!(matches!(
+            Channel::<ProtobufMessage, ProtobufMessage>::restore_paused(
+                sock,
+                invalid_version,
+                8,
+                64,
+            ),
+            Err(ChannelSnapshotError::UnsupportedVersion { .. })
+        ));
+
+        let (mut invalid_bounds, sock, _peer) = snapshot_and_socket();
+        invalid_bounds.initial_buffer_size = invalid_bounds.max_buffer_size + 1;
+        assert!(matches!(
+            Channel::<ProtobufMessage, ProtobufMessage>::restore_paused(
+                sock,
+                invalid_bounds,
+                8,
+                64,
+            ),
+            Err(ChannelSnapshotError::InvalidBufferBounds { .. })
+        ));
+
+        let (mut invalid_capacity, sock, _peer) = snapshot_and_socket();
+        invalid_capacity.front_buffer_capacity = invalid_capacity.initial_buffer_size - 1;
+        assert!(matches!(
+            Channel::<ProtobufMessage, ProtobufMessage>::restore_paused(
+                sock,
+                invalid_capacity,
+                8,
+                64,
+            ),
+            Err(ChannelSnapshotError::InvalidBufferCapacity { .. })
+        ));
+
+        let (mut invalid_bytes, sock, _peer) = snapshot_and_socket();
+        invalid_bytes.front = vec![0; invalid_bytes.front_buffer_capacity + 1];
+        assert!(matches!(
+            Channel::<ProtobufMessage, ProtobufMessage>::restore_paused(sock, invalid_bytes, 8, 64,),
+            Err(ChannelSnapshotError::BufferedDataExceedsCapacity { .. })
+        ));
+
+        let (mut invalid_readiness, sock, _peer) = snapshot_and_socket();
+        invalid_readiness.readiness = 1 << 5;
+        assert!(matches!(
+            Channel::<ProtobufMessage, ProtobufMessage>::restore_paused(
+                sock,
+                invalid_readiness,
+                8,
+                64,
+            ),
+            Err(ChannelSnapshotError::InvalidReadyBits {
+                field: "readiness",
+                ..
+            })
+        ));
+
+        let (mut invalid_interest, sock, _peer) = snapshot_and_socket();
+        invalid_interest.interest = 1 << 5;
+        assert!(matches!(
+            Channel::<ProtobufMessage, ProtobufMessage>::restore_paused(
+                sock,
+                invalid_interest,
+                8,
+                64,
+            ),
+            Err(ChannelSnapshotError::InvalidReadyBits {
+                field: "interest",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn channel_snapshot_accepts_every_defined_ready_subset_in_both_fields() {
+        let defined_bits = Ready::READABLE.0
+            | Ready::WRITABLE.0
+            | Ready::ERROR.0
+            | Ready::HUP.0
+            | Ready::WRITE_CLOSED.0;
+
+        for bits in 0..=defined_bits {
+            for field in ["readiness", "interest"] {
+                let (channel, _peer): (
+                    Channel<ProtobufMessage, ProtobufMessage>,
+                    Channel<ProtobufMessage, ProtobufMessage>,
+                ) = Channel::generate_nonblocking(8, 64).expect("could not generate channels");
+                let mut snapshot = channel.snapshot();
+                if field == "readiness" {
+                    snapshot.readiness = bits;
+                } else {
+                    snapshot.interest = bits;
+                }
+
+                let restored = Channel::<ProtobufMessage, ProtobufMessage>::restore_paused(
+                    channel.sock,
+                    snapshot,
+                    8,
+                    64,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("{field} rejected defined bits {bits:#04x}: {error}")
+                })
+                .resume();
+                let restored_bits = if field == "readiness" {
+                    restored.readiness.0
+                } else {
+                    restored.interest.0
+                };
+                assert_eq!(restored_bits, bits, "{field} changed bits {bits:#04x}");
+            }
+        }
+    }
+
+    #[test]
+    fn channel_snapshot_rejects_blocking_mode_that_disagrees_with_received_socket() {
+        let (channel, _peer): (
+            Channel<ProtobufMessage, ProtobufMessage>,
+            Channel<ProtobufMessage, ProtobufMessage>,
+        ) = Channel::generate_nonblocking(8, 64).expect("could not generate channels");
+        let mut snapshot = channel.snapshot();
+        snapshot.blocking = true;
+
+        // SAFETY: `channel.fd()` is live for this call, and a non-negative
+        // result is immediately owned so every path closes the duplicate.
+        let duplicate_fd = unsafe { libc::dup(channel.fd()) };
+        assert!(duplicate_fd >= 0, "could not duplicate channel descriptor");
+        // SAFETY: `dup` returned a fresh descriptor owned by this test.
+        let duplicate = unsafe { OwnedFd::from_raw_fd(duplicate_fd) };
+        // SAFETY: `duplicate` owns a live descriptor and F_GETFL only reads its
+        // shared open-file-description flags.
+        let flags_before = unsafe { libc::fcntl(duplicate.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags_before >= 0, "could not read channel status flags");
+        assert_ne!(flags_before & libc::O_NONBLOCK, 0);
+
+        let restored = Channel::<ProtobufMessage, ProtobufMessage>::restore_paused(
+            channel.sock,
+            snapshot,
+            8,
+            64,
+        );
+
+        // SAFETY: the duplicate remains live even when restoration rejects
+        // and closes the separately owned descriptor supplied above.
+        let flags_after = unsafe { libc::fcntl(duplicate.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(
+            flags_after, flags_before,
+            "restore must not change fd flags"
+        );
+        assert!(matches!(
+            restored,
+            Err(ChannelSnapshotError::BlockingModeMismatch {
+                snapshot_blocking: true,
+                fd_blocking: false,
+            })
+        ));
+    }
+
+    #[test]
+    fn channel_snapshot_rejects_untrusted_limits_before_allocation() {
+        let (channel, _peer): (
+            Channel<ProtobufMessage, ProtobufMessage>,
+            Channel<ProtobufMessage, ProtobufMessage>,
+        ) = Channel::generate_nonblocking(8, 64).expect("could not generate channels");
+        let mut snapshot = channel.snapshot();
+        snapshot.max_buffer_size = usize::MAX;
+        snapshot.front_buffer_capacity = usize::MAX;
+        snapshot.back_buffer_capacity = usize::MAX;
+
+        assert!(matches!(
+            Channel::<ProtobufMessage, ProtobufMessage>::restore_paused(
+                channel.sock,
+                snapshot,
+                8,
+                64,
+            ),
+            Err(ChannelSnapshotError::BufferLimitsMismatch {
+                snapshot_initial: 8,
+                snapshot_max: usize::MAX,
+                expected_initial: 8,
+                expected_max: 64,
+            })
+        ));
+    }
+
+    #[test]
+    fn channel_snapshot_restores_full_front_buffer_backpressure_and_rearms_after_drain() {
+        let (mut frame_source, _frame_peer): (
+            Channel<ProtobufMessage, ProtobufMessage>,
+            Channel<ProtobufMessage, ProtobufMessage>,
+        ) = Channel::generate_nonblocking(32, 32).expect("could not generate channels");
+        frame_source
+            .write_delimited_message(&ProtobufMessage { inner: 7 })
+            .expect("could not frame message");
+        let frame = frame_source.back_buf.data().to_owned();
+        let (mut reader, _reader_peer): (
+            Channel<ProtobufMessage, ProtobufMessage>,
+            Channel<ProtobufMessage, ProtobufMessage>,
+        ) = Channel::generate_nonblocking(frame.len() as u64, frame.len() as u64)
+            .expect("could not generate capacity-bound reader");
+        reader
+            .front_buf
+            .write_all(&frame)
+            .expect("frame should fit");
+        reader.handle_events(Ready::READABLE);
+        assert_eq!(
+            reader.readable().expect("full buffer should backpressure"),
+            0
+        );
+        assert!(!reader.interest.is_readable());
+
+        let snapshot = reader.snapshot();
+        let paused: PausedChannel<ProtobufMessage, ProtobufMessage> =
+            Channel::restore_paused(reader.sock, snapshot, frame.len(), frame.len())
+                .expect("backpressured channel should restore");
+        let mut restored = paused.resume();
+
+        assert_eq!(restored.front_buf.data(), frame);
+        assert!(!restored.interest.is_readable());
+        assert!(restored.readiness.is_readable());
+        assert_eq!(
+            restored
+                .read_message()
+                .expect("buffered frame should decode"),
+            ProtobufMessage { inner: 7 }
+        );
+        assert!(matches!(
+            restored.read_message(),
+            Err(ChannelError::NothingRead)
+        ));
+        assert!(restored.interest.is_readable());
+        assert_eq!(restored.front_buf.available_data(), 0);
     }
 
     #[test]

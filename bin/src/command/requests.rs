@@ -19,6 +19,7 @@ use mio::Token;
 use nom::{HexDisplay, Offset};
 use prost::Message as _;
 use rusty_ulid::Ulid;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sozu_command_lib::{
     buffer::fixed::Buffer,
@@ -28,8 +29,8 @@ use sozu_command_lib::{
     parser::parse_several_requests,
     proto::command::{
         AggregatedMetrics, AvailableMetrics, CertificateAndKey, CertificatesWithFingerprints,
-        ClusterHashes, ClusterInformations, Event, EventKind, FrontendFilters, HardStop,
-        ListenerType, MetricDetail, MetricDetailStatus, MetricsConfiguration,
+        ClusterHashes, ClusterInformations, Event, EventKind, FilteredMetrics, FrontendFilters,
+        HardStop, ListenerType, MetricDetail, MetricDetailStatus, MetricsConfiguration,
         QueryCertificatesFilters, QueryHealthChecks, QueryMetricsOptions, RemoveListener, Request,
         ResponseContent, ResponseStatus, RunState, SetMetricDetail, SoftStop, Status,
         UpdateHttpListenerConfig, UpdateHttpsListenerConfig, UpdateTcpListenerConfig,
@@ -49,12 +50,312 @@ use sozu_lib::{
 
 use crate::command::{
     server::{
-        DefaultGatherer, Gatherer, GatheringTask, MessageClient, Server, ServerState, Timeout,
-        WorkerId, parse_scatter_request_id,
+        DefaultGatherer, ElapsedSnapshot, Gatherer, GatheringTask, MessageClient, Server,
+        ServerState, TaskRestoreTiming, TaskSnapshot, TaskSnapshotError, TaskSnapshotTiming,
+        Timeout, WorkerId, parse_scatter_request_id,
     },
     sessions::{ClientSession, OptionalClient, sanitize_for_audit, sanitize_for_audit_kv},
-    upgrade::{upgrade_main, upgrade_worker},
+    upgrade::upgrade_worker,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClientRequestOutcome {
+    Continue,
+    UpgradeMain,
+}
+
+macro_rules! task_audit_tags {
+    ($( $variant:ident => $verb:literal ),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+        enum TaskAuditTag {
+            $( $variant, )+
+        }
+
+        impl TaskAuditTag {
+            fn capture(verb: &'static str, counter: &'static str) -> Result<Self, TaskSnapshotError> {
+                match (verb, counter) {
+                    $( ($verb, concat!("config.", $verb)) => Ok(Self::$variant), )+
+                    _ => Err(TaskSnapshotError::UnknownAuditTag {
+                        verb: verb.to_owned(),
+                        counter: counter.to_owned(),
+                    }),
+                }
+            }
+
+            fn restore(self) -> (&'static str, &'static str) {
+                match self {
+                    $( Self::$variant => ($verb, concat!("config.", $verb)), )+
+                }
+            }
+        }
+    };
+}
+
+task_audit_tags! {
+    ClusterAdded => "cluster_added",
+    ClusterRemoved => "cluster_removed",
+    HttpFrontendAdded => "http_frontend_added",
+    HttpsFrontendAdded => "https_frontend_added",
+    TcpFrontendAdded => "tcp_frontend_added",
+    HttpFrontendRemoved => "http_frontend_removed",
+    HttpsFrontendRemoved => "https_frontend_removed",
+    TcpFrontendRemoved => "tcp_frontend_removed",
+    UdpFrontendAdded => "udp_frontend_added",
+    UdpFrontendRemoved => "udp_frontend_removed",
+    CertificateAdded => "certificate_added",
+    CertificateRemoved => "certificate_removed",
+    CertificateReplaced => "certificate_replaced",
+    ListenerActivated => "listener_activated",
+    ListenerDeactivated => "listener_deactivated",
+    HttpListenerUpdated => "http_listener_updated",
+    HttpsListenerUpdated => "https_listener_updated",
+    TcpListenerUpdated => "tcp_listener_updated",
+    UdpListenerUpdated => "udp_listener_updated",
+    HttpListenerAdded => "http_listener_added",
+    HttpsListenerAdded => "https_listener_added",
+    TcpListenerAdded => "tcp_listener_added",
+    UdpListenerAdded => "udp_listener_added",
+    ListenerRemoved => "listener_removed",
+    MetricsConfigured => "metrics_configured",
+    MetricDetailChanged => "metric_detail_changed",
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct AuditEntrySnapshot {
+    kind: EventKind,
+    tag: TaskAuditTag,
+    cluster_id: Option<String>,
+    backend_id: Option<String>,
+    address: Option<sozu_command_lib::proto::command::SocketAddress>,
+    target: String,
+    extras: AuditExtras,
+}
+
+impl AuditEntrySnapshot {
+    fn capture(entry: &AuditEntry) -> Result<Self, TaskSnapshotError> {
+        Ok(Self {
+            kind: entry.kind,
+            tag: TaskAuditTag::capture(entry.verb, entry.counter)?,
+            cluster_id: entry.cluster_id.clone(),
+            backend_id: entry.backend_id.clone(),
+            address: entry.address,
+            target: entry.target.clone(),
+            extras: entry.extras.clone(),
+        })
+    }
+
+    fn restore(self) -> AuditEntry {
+        let (verb, counter) = self.tag.restore();
+        AuditEntry {
+            kind: self.kind,
+            verb,
+            counter,
+            cluster_id: self.cluster_id,
+            backend_id: self.backend_id,
+            address: self.address,
+            target: self.target,
+            extras: self.extras,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct InlineAuditTargetSnapshot {
+    kind: EventKind,
+    tag: TaskAuditTag,
+    target: String,
+}
+
+impl InlineAuditTargetSnapshot {
+    fn capture(target: &InlineAuditTarget) -> Result<Self, TaskSnapshotError> {
+        Ok(Self {
+            kind: target.kind,
+            tag: TaskAuditTag::capture(target.verb, target.counter)?,
+            target: target.target.clone(),
+        })
+    }
+
+    fn restore(self) -> InlineAuditTarget {
+        let (verb, counter) = self.tag.restore();
+        InlineAuditTarget {
+            kind: self.kind,
+            verb,
+            counter,
+            target: self.target,
+        }
+    }
+}
+
+/// Serializable state of the eight command tasks implemented in this module.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) enum RequestTaskSnapshot {
+    QueryClusters {
+        client_token: usize,
+        gatherer: DefaultGatherer,
+        main_process_response: Option<ResponseContent>,
+    },
+    LoadStaticConfig {
+        gatherer: PerEntryGatherer,
+        client_token: Option<usize>,
+    },
+    Worker(Box<WorkerTaskSnapshot>),
+    SetMetricDetail {
+        client_token: usize,
+        gatherer: DefaultGatherer,
+        started_at: ElapsedSnapshot,
+        master_configured: MetricDetail,
+        master_previous_effective: MetricDetail,
+        inline_audit: InlineAuditTargetSnapshot,
+        metric_detail_audit: MetricDetailAuditFields,
+    },
+    QueryMetrics {
+        client_token: usize,
+        gatherer: DefaultGatherer,
+        options: QueryMetricsOptions,
+        main_process_metrics: BTreeMap<String, FilteredMetrics>,
+    },
+    LoadState {
+        client_token: Option<usize>,
+        gatherer: PerEntryGatherer,
+        path: String,
+    },
+    Status {
+        client_token: usize,
+        gatherer: DefaultGatherer,
+        worker_infos: HashMap<WorkerId, WorkerInfo>,
+    },
+    Stop {
+        client_token: Option<usize>,
+        gatherer: DefaultGatherer,
+        hardness: bool,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct WorkerTaskSnapshot {
+    pub(crate) client_token: usize,
+    pub(crate) gatherer: DefaultGatherer,
+    pub(crate) started_at: ElapsedSnapshot,
+    pub(crate) audit: Option<AuditEntrySnapshot>,
+    pub(crate) inline_audit: Option<InlineAuditTargetSnapshot>,
+    pub(crate) metric_detail_audit: Option<MetricDetailAuditFields>,
+    pub(crate) clear_master_metrics_on_finish: bool,
+    pub(crate) rollback: Option<Request>,
+}
+
+#[cfg(test)]
+impl WorkerTaskSnapshot {
+    pub(crate) fn started_at(&self) -> ElapsedSnapshot {
+        self.started_at
+    }
+}
+
+impl RequestTaskSnapshot {
+    pub(crate) fn is_stop(&self) -> bool {
+        matches!(self, Self::Stop { .. })
+    }
+
+    pub(crate) fn restore(
+        self,
+        timing: TaskRestoreTiming,
+    ) -> Result<Box<dyn GatheringTask>, TaskSnapshotError> {
+        Ok(match self {
+            Self::QueryClusters {
+                client_token,
+                gatherer,
+                main_process_response,
+            } => Box::new(QueryClustersTask {
+                client_token: Token(client_token),
+                gatherer,
+                main_process_response,
+            }),
+            Self::LoadStaticConfig {
+                gatherer,
+                client_token,
+            } => Box::new(LoadStaticConfigTask {
+                gatherer,
+                client_token: client_token.map(Token),
+            }),
+            Self::Worker(snapshot) => {
+                let WorkerTaskSnapshot {
+                    client_token,
+                    gatherer,
+                    started_at,
+                    audit,
+                    inline_audit,
+                    metric_detail_audit,
+                    clear_master_metrics_on_finish,
+                    rollback,
+                } = *snapshot;
+                Box::new(WorkerTask {
+                    client_token: Token(client_token),
+                    gatherer,
+                    started_at: started_at.restore(timing)?,
+                    audit: audit.map(AuditEntrySnapshot::restore),
+                    inline_audit: inline_audit.map(InlineAuditTargetSnapshot::restore),
+                    metric_detail_audit,
+                    clear_master_metrics_on_finish,
+                    rollback,
+                })
+            }
+            Self::SetMetricDetail {
+                client_token,
+                gatherer,
+                started_at,
+                master_configured,
+                master_previous_effective,
+                inline_audit,
+                metric_detail_audit,
+            } => Box::new(SetMetricDetailTask {
+                client_token: Token(client_token),
+                gatherer,
+                started_at: started_at.restore(timing)?,
+                master_configured,
+                master_previous_effective,
+                inline_audit: inline_audit.restore(),
+                metric_detail_audit,
+            }),
+            Self::QueryMetrics {
+                client_token,
+                gatherer,
+                options,
+                main_process_metrics,
+            } => Box::new(QueryMetricsTask {
+                client_token: Token(client_token),
+                gatherer,
+                options,
+                main_process_metrics: Some(main_process_metrics),
+            }),
+            Self::LoadState {
+                client_token,
+                gatherer,
+                path,
+            } => Box::new(LoadStateTask {
+                client_token: client_token.map(Token),
+                gatherer,
+                path,
+            }),
+            Self::Status {
+                client_token,
+                gatherer,
+                worker_infos,
+            } => Box::new(StatusTask {
+                client_token: Token(client_token),
+                gatherer,
+                worker_infos,
+            }),
+            Self::Stop {
+                client_token,
+                gatherer,
+                hardness,
+            } => Box::new(StopTask {
+                client_token: client_token.map(Token),
+                gatherer,
+                hardness,
+            }),
+        })
+    }
+}
 
 /// Pair a verb tag with its `config.<verb>` counter key in a single place so
 /// the two strings cannot drift. Both must be string literals because the
@@ -284,12 +585,16 @@ fn is_mutating_verb(req: &RequestType) -> bool {
 }
 
 impl Server {
-    pub fn handle_client_request(&mut self, client: &mut ClientSession, request: Request) {
+    pub(crate) fn handle_client_request(
+        &mut self,
+        client: &mut ClientSession,
+        request: Request,
+    ) -> ClientRequestOutcome {
         let request_type = match request.request_type {
             Some(req) => req,
             None => {
                 error!("empty request sent by client {:?}", client);
-                return;
+                return ClientRequestOutcome::Continue;
             }
         };
         // Optional UID allowlist. `None` preserves the historical
@@ -315,8 +620,12 @@ impl Server {
                         .map(|u| u.to_string())
                         .unwrap_or_else(|| "unknown".to_owned())
                 ));
-                return;
+                return ClientRequestOutcome::Continue;
             }
+        }
+
+        if matches!(request_type, RequestType::UpgradeMain(_)) {
+            return ClientRequestOutcome::UpgradeMain;
         }
 
         // #228: bracket every operator-issued command with
@@ -387,7 +696,7 @@ impl Server {
             RequestType::ListWorkers(_) => list_workers(self, client),
             RequestType::ListFrontends(inner) => list_frontend_command(self, client, inner),
             RequestType::ListListeners(_) => list_listeners(self, client),
-            RequestType::UpgradeMain(_) => upgrade_main(self, client),
+            RequestType::UpgradeMain(_) => unreachable!("handled before Server dispatch"),
             RequestType::UpgradeWorker(worker_id) => upgrade_worker(self, client, worker_id),
             RequestType::SubscribeEvents(_) => subscribe_client_to_events(self, client),
             RequestType::ReloadConfiguration(path) => {
@@ -475,6 +784,7 @@ impl Server {
         if mutating && let Err(e) = sd_notify::notify(sd_notify::STATE_READY) {
             warn!("could not notify systemd READY=1: {}", e);
         }
+        ClientRequestOutcome::Continue
     }
 
     /// get infos from the state of the main process
@@ -897,6 +1207,16 @@ impl GatheringTask for QueryClustersTask {
         &mut self.gatherer
     }
 
+    fn snapshot(&self, _timing: TaskSnapshotTiming) -> Result<TaskSnapshot, TaskSnapshotError> {
+        Ok(TaskSnapshot::Request(Box::new(
+            RequestTaskSnapshot::QueryClusters {
+                client_token: self.client_token.0,
+                gatherer: self.gatherer.clone(),
+                main_process_response: self.main_process_response.clone(),
+            },
+        )))
+    }
+
     fn on_finish(
         self: Box<Self>,
         _server: &mut Server,
@@ -1090,6 +1410,15 @@ impl GatheringTask for LoadStaticConfigTask {
         &mut self.gatherer
     }
 
+    fn snapshot(&self, _timing: TaskSnapshotTiming) -> Result<TaskSnapshot, TaskSnapshotError> {
+        Ok(TaskSnapshot::Request(Box::new(
+            RequestTaskSnapshot::LoadStaticConfig {
+                gatherer: self.gatherer.clone(),
+                client_token: self.client_token.map(|token| token.0),
+            },
+        )))
+    }
+
     fn on_finish(
         self: Box<Self>,
         server: &mut Server,
@@ -1191,7 +1520,7 @@ impl std::fmt::Display for AuditResult {
 /// emit path). Suppressing dead-code warnings keeps the taxonomy stable
 /// as we wire them up.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub(crate) enum AuditErrorCode {
     /// `state.dispatch` rejected the request on the main process.
     DispatchError,
@@ -1231,7 +1560,7 @@ impl std::fmt::Display for AuditErrorCode {
 }
 
 /// Worker fan-out outcome, rendered in the completion audit line.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub(crate) enum FanoutStatus {
     /// Every expected worker acknowledged with Ok.
     Ok,
@@ -1261,7 +1590,7 @@ impl std::fmt::Display for FanoutStatus {
 }
 
 /// Worker fan-out summary attached to completion-time audit emissions.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub(crate) struct FanoutSummary {
     status: FanoutStatus,
     workers_ok: u32,
@@ -1274,7 +1603,7 @@ pub(crate) struct FanoutSummary {
 /// construction so the existing build sites don't all need to set them;
 /// emitters that know these values fill them in via helper constructors
 /// before calling [`audit_emit`] / [`audit_emit_inline`].
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub(crate) struct AuditExtras {
     /// Wall-clock milliseconds between request acceptance and audit emission.
     pub(crate) elapsed_ms: Option<u64>,
@@ -2230,8 +2559,8 @@ struct InlineAuditTarget {
 /// `:` / `=` / `,` smuggled by an attacker cannot forge an adjacent
 /// audit column. `target` itself is kept master-controlled
 /// (`metric_detail:<level>` only).
-#[derive(Debug, Clone)]
-struct MetricDetailAuditFields {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MetricDetailAuditFields {
     /// `metric_detail:<level>` — fully master-controlled (level is an enum).
     target: String,
     /// Operator-supplied `SetMetricDetail.client_id`. Sanitised at render
@@ -2616,8 +2945,8 @@ fn bulk_replay_timeout(worker_timeout_secs: u32, entries: usize) -> Timeout {
 /// still in hand. [`Self::revert_unacknowledged`] then applies the very
 /// predicate the live fan-out uses, [`should_rollback_fanout`], to each entry
 /// on its own.
-#[derive(Debug, Default)]
-struct PerEntryGatherer {
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct PerEntryGatherer {
     /// fleet-wide tally, `has_finished` and the response log
     inner: DefaultGatherer,
     /// per scatter `request_id` breakdown
@@ -2625,7 +2954,7 @@ struct PerEntryGatherer {
 }
 
 /// What one entry of a bulk apply path scattered, and what came back for it.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct ScatteredEntry {
     expected: usize,
     ok: usize,
@@ -3132,6 +3461,29 @@ impl GatheringTask for WorkerTask {
         &mut self.gatherer
     }
 
+    fn snapshot(&self, timing: TaskSnapshotTiming) -> Result<TaskSnapshot, TaskSnapshotError> {
+        Ok(TaskSnapshot::Request(Box::new(
+            RequestTaskSnapshot::Worker(Box::new(WorkerTaskSnapshot {
+                client_token: self.client_token.0,
+                gatherer: self.gatherer.clone(),
+                started_at: ElapsedSnapshot::capture(self.started_at, timing)?,
+                audit: self
+                    .audit
+                    .as_ref()
+                    .map(AuditEntrySnapshot::capture)
+                    .transpose()?,
+                inline_audit: self
+                    .inline_audit
+                    .as_ref()
+                    .map(InlineAuditTargetSnapshot::capture)
+                    .transpose()?,
+                metric_detail_audit: self.metric_detail_audit.clone(),
+                clear_master_metrics_on_finish: self.clear_master_metrics_on_finish,
+                rollback: self.rollback.clone(),
+            })),
+        )))
+    }
+
     fn on_finish(
         self: Box<Self>,
         server: &mut Server,
@@ -3422,9 +3774,9 @@ struct SetMetricDetailTask {
     started_at: Instant,
     /// Master-side `(configured, effective_before)` captured pre-apply
     /// so the response can carry the `previous_effective` field that
-    /// `MetricDetailStatus` advertises. The master also runs an
-    /// `Aggregator`; its `effective` participates in operator-visible
-    /// cardinality alongside per-worker leases.
+    /// `MetricDetailStatus` advertises. The master has no lease table: its
+    /// effective level is the configured floor, while workers own runtime
+    /// leases independently.
     master_configured: MetricDetail,
     master_previous_effective: MetricDetail,
     /// Completion-time inline-audit target so the post-fanout audit
@@ -3613,6 +3965,20 @@ impl GatheringTask for SetMetricDetailTask {
         &mut self.gatherer
     }
 
+    fn snapshot(&self, timing: TaskSnapshotTiming) -> Result<TaskSnapshot, TaskSnapshotError> {
+        Ok(TaskSnapshot::Request(Box::new(
+            RequestTaskSnapshot::SetMetricDetail {
+                client_token: self.client_token.0,
+                gatherer: self.gatherer.clone(),
+                started_at: ElapsedSnapshot::capture(self.started_at, timing)?,
+                master_configured: self.master_configured,
+                master_previous_effective: self.master_previous_effective,
+                inline_audit: InlineAuditTargetSnapshot::capture(&self.inline_audit)?,
+                metric_detail_audit: self.metric_detail_audit.clone(),
+            },
+        )))
+    }
+
     fn on_finish(
         self: Box<Self>,
         server: &mut Server,
@@ -3657,7 +4023,8 @@ impl GatheringTask for SetMetricDetailTask {
             }
         }
 
-        let master_effective = METRICS.with(|m| MetricDetail::from(m.borrow().detail_effective()));
+        let master_effective =
+            METRICS.with(|metrics| MetricDetail::from(metrics.borrow().detail_effective()));
         let status = MetricDetailStatus {
             configured: self.master_configured as i32,
             effective: master_effective as i32,
@@ -3763,6 +4130,9 @@ struct QueryMetricsTask {
     pub client_token: Token,
     pub gatherer: DefaultGatherer,
     options: QueryMetricsOptions,
+    /// Main-process contribution captured during an upgrade snapshot.
+    /// Fresh tasks leave this empty and read the current aggregator at finish.
+    main_process_metrics: Option<BTreeMap<String, FilteredMetrics>>,
 }
 
 fn query_metrics(server: &mut Server, client: &mut ClientSession, options: QueryMetricsOptions) {
@@ -3774,6 +4144,7 @@ fn query_metrics(server: &mut Server, client: &mut ClientSession, options: Query
             client_token: client.token,
             gatherer: DefaultGatherer::default(),
             options,
+            main_process_metrics: None,
         }),
         Timeout::Default,
         None,
@@ -3789,14 +4160,29 @@ impl GatheringTask for QueryMetricsTask {
         &mut self.gatherer
     }
 
+    fn snapshot(&self, _timing: TaskSnapshotTiming) -> Result<TaskSnapshot, TaskSnapshotError> {
+        let main_process_metrics = self.main_process_metrics.clone().unwrap_or_else(|| {
+            METRICS.with(|metrics| (*metrics.borrow_mut()).dump_local_proxy_metrics())
+        });
+        Ok(TaskSnapshot::Request(Box::new(
+            RequestTaskSnapshot::QueryMetrics {
+                client_token: self.client_token.0,
+                gatherer: self.gatherer.clone(),
+                options: self.options.clone(),
+                main_process_metrics,
+            },
+        )))
+    }
+
     fn on_finish(
         self: Box<Self>,
         _server: &mut Server,
         client: &mut OptionalClient,
         _timed_out: bool,
     ) {
-        let main_metrics =
-            METRICS.with(|metrics| (*metrics.borrow_mut()).dump_local_proxy_metrics());
+        let main_metrics = self.main_process_metrics.unwrap_or_else(|| {
+            METRICS.with(|metrics| (*metrics.borrow_mut()).dump_local_proxy_metrics())
+        });
 
         if self.options.list {
             let mut summed_proxy_metrics = Vec::new();
@@ -4121,6 +4507,16 @@ impl GatheringTask for LoadStateTask {
         &mut self.gatherer
     }
 
+    fn snapshot(&self, _timing: TaskSnapshotTiming) -> Result<TaskSnapshot, TaskSnapshotError> {
+        Ok(TaskSnapshot::Request(Box::new(
+            RequestTaskSnapshot::LoadState {
+                client_token: self.client_token.map(|token| token.0),
+                gatherer: self.gatherer.clone(),
+                path: self.path.clone(),
+            },
+        )))
+    }
+
     fn on_finish(
         self: Box<Self>,
         server: &mut Server,
@@ -4231,6 +4627,16 @@ impl GatheringTask for StatusTask {
 
     fn get_gatherer(&mut self) -> &mut dyn Gatherer {
         &mut self.gatherer
+    }
+
+    fn snapshot(&self, _timing: TaskSnapshotTiming) -> Result<TaskSnapshot, TaskSnapshotError> {
+        Ok(TaskSnapshot::Request(Box::new(
+            RequestTaskSnapshot::Status {
+                client_token: self.client_token.0,
+                gatherer: self.gatherer.clone(),
+                worker_infos: self.worker_infos.clone(),
+            },
+        )))
     }
 
     fn on_finish(
@@ -4352,6 +4758,14 @@ impl GatheringTask for StopTask {
 
     fn get_gatherer(&mut self) -> &mut dyn Gatherer {
         &mut self.gatherer
+    }
+
+    fn snapshot(&self, _timing: TaskSnapshotTiming) -> Result<TaskSnapshot, TaskSnapshotError> {
+        Ok(TaskSnapshot::Request(Box::new(RequestTaskSnapshot::Stop {
+            client_token: self.client_token.map(|token| token.0),
+            gatherer: self.gatherer.clone(),
+            hardness: self.hardness,
+        })))
     }
 
     fn on_finish(
@@ -7023,5 +7437,148 @@ mod certificate_domain_filter_tests {
             vec!["aa".to_owned()],
             "skipping one unhostable name must not hide the certificate's other names"
         );
+    }
+}
+
+#[cfg(test)]
+mod upgrade_task_snapshot_tests {
+    use super::*;
+    use crate::command::server::{TaskRestoreTiming, TaskSnapshotTiming};
+
+    #[test]
+    fn all_request_task_variants_round_trip_without_replaying_entrypoints() {
+        let now = Instant::now();
+        let timing = TaskSnapshotTiming { now };
+        let started_at = now
+            .checked_sub(Duration::from_secs(7))
+            .expect("test clock supports seven seconds of history");
+        let (audit_verb, audit_counter) = audit_verb!("cluster_added");
+        let (inline_verb, inline_counter) = audit_verb!("metric_detail_changed");
+        let metric_detail_audit = MetricDetailAuditFields {
+            target: "metric_detail:cluster".to_owned(),
+            lease_id: "upgrade-snapshot-test".to_owned(),
+            reason: Some("round trip".to_owned()),
+        };
+
+        let tasks: Vec<(&str, Box<dyn GatheringTask>)> = vec![
+            (
+                "QueryClustersTask",
+                Box::new(QueryClustersTask {
+                    client_token: Token(11),
+                    gatherer: DefaultGatherer {
+                        ok: 1,
+                        errors: 2,
+                        responses: Vec::new(),
+                        expected_responses: 4,
+                    },
+                    main_process_response: Some(ResponseContent::default()),
+                }),
+            ),
+            (
+                "LoadStaticConfigTask",
+                Box::new(LoadStaticConfigTask {
+                    gatherer: PerEntryGatherer::default(),
+                    client_token: Some(Token(12)),
+                }),
+            ),
+            (
+                "WorkerTask",
+                Box::new(WorkerTask {
+                    client_token: Token(13),
+                    gatherer: DefaultGatherer::default(),
+                    started_at,
+                    audit: Some(AuditEntry {
+                        kind: EventKind::ClusterAdded,
+                        verb: audit_verb,
+                        counter: audit_counter,
+                        cluster_id: Some("cluster-a".to_owned()),
+                        backend_id: None,
+                        address: None,
+                        target: "cluster:cluster-a".to_owned(),
+                        extras: AuditExtras::default(),
+                    }),
+                    inline_audit: None,
+                    metric_detail_audit: None,
+                    clear_master_metrics_on_finish: false,
+                    rollback: Some(Request::default()),
+                }),
+            ),
+            (
+                "SetMetricDetailTask",
+                Box::new(SetMetricDetailTask {
+                    client_token: Token(14),
+                    gatherer: DefaultGatherer::default(),
+                    started_at,
+                    master_configured: MetricDetail::DetailCluster,
+                    master_previous_effective: MetricDetail::DetailFrontend,
+                    inline_audit: InlineAuditTarget {
+                        kind: EventKind::MetricDetailChanged,
+                        verb: inline_verb,
+                        counter: inline_counter,
+                        target: "metric_detail:cluster".to_owned(),
+                    },
+                    metric_detail_audit: metric_detail_audit.clone(),
+                }),
+            ),
+            (
+                "QueryMetricsTask",
+                Box::new(QueryMetricsTask {
+                    client_token: Token(15),
+                    gatherer: DefaultGatherer::default(),
+                    options: QueryMetricsOptions::default(),
+                    main_process_metrics: Some(BTreeMap::new()),
+                }),
+            ),
+            (
+                "LoadStateTask",
+                Box::new(LoadStateTask {
+                    client_token: Some(Token(16)),
+                    gatherer: PerEntryGatherer::default(),
+                    path: "/tmp/state.json".to_owned(),
+                }),
+            ),
+            (
+                "StatusTask",
+                Box::new(StatusTask {
+                    client_token: Token(17),
+                    gatherer: DefaultGatherer::default(),
+                    worker_infos: HashMap::from([(
+                        3,
+                        WorkerInfo {
+                            id: 3,
+                            pid: 42,
+                            run_state: RunState::Running as i32,
+                        },
+                    )]),
+                }),
+            ),
+            (
+                "StopTask",
+                Box::new(StopTask {
+                    client_token: Some(Token(18)),
+                    gatherer: DefaultGatherer::default(),
+                    hardness: true,
+                }),
+            ),
+        ];
+
+        for (expected_kind, task) in tasks {
+            let snapshot = task.snapshot(timing).expect("task should snapshot");
+            let encoded = serde_json::to_vec(&snapshot).expect("task snapshot should serialize");
+            let decoded: TaskSnapshot =
+                serde_json::from_slice(&encoded).expect("task snapshot should deserialize");
+            let restored = decoded
+                .restore(TaskRestoreTiming {
+                    now,
+                    handoff_elapsed: Duration::ZERO,
+                })
+                .expect("task snapshot should restore");
+            assert!(
+                restored.kind().ends_with(expected_kind),
+                "expected {expected_kind}, got {}",
+                restored.kind()
+            );
+            assert_eq!(restored.client_token(), task.client_token());
+        }
     }
 }
