@@ -642,6 +642,15 @@
 
 ### 🔄 Changed
 
+- **`ci(msrv-full)`: release all-feature rustdoc artifacts before clippy and tests.**
+  The documentation gate still runs `cargo doc --no-deps --all-features --locked` with warnings
+  denied, then logs the checkout target size and filesystem capacity, removes only that target,
+  verifies its absence, and logs capacity again. This prevents optional service-client artifacts
+  compiled solely for rustdoc from accumulating beside the later matrix-feature clippy and test
+  artifacts. Kubernetes evicted a cache-miss `msrv-full` runner during `Test sozu-e2e` when the pod
+  exceeded its 8 GiB ephemeral-storage limit. Cargo's registry/cache, feature selections, test
+  commands, assertions and timeouts are unchanged.
+
 - **`fix(load-balancing)`: one address is one share under every policy
   ([#1856](https://github.com/sozu-proxy/sozu/pull/1856)).** Two backend ids at
   the same address in one cluster, which [#1839](https://github.com/sozu-proxy/sozu/pull/1839)
