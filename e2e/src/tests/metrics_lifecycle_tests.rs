@@ -1858,6 +1858,104 @@ fn test_remove_backend_keeps_cluster_row_when_others_remain() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// Test 4b: RemoveBackend keeps the id's row while that id lives elsewhere
+// ══════════════════════════════════════════════════════════════════════
+//
+// `ConfigState` and the worker key backends on `(backend_id, address)`, so
+// one id may serve from two addresses, while backend metrics are labelled by
+// id alone: both entries feed one row. Removing one address must keep that
+// row while the other entry is live, and drop it with the last entry.
+
+fn try_remove_backend_keeps_row_shared_with_live_same_id_entry() -> State {
+    let front_address = create_local_address();
+    let back_address_a = create_local_address();
+    let back_address_b = create_local_address();
+    let cluster_id = "lifecycle_cluster_shared_backend_id";
+    let backend_id = "lifecycle_shared_back";
+
+    let mut worker = setup_worker_with_cluster(
+        "METRICS-LIFECYCLE-SHARED-BACKEND-ID",
+        cluster_id,
+        backend_id,
+        front_address,
+        back_address_a,
+    );
+    let detail_ack = lease_backend_metric_detail(&mut worker);
+    let mut backend_a = SyncBackend::new(
+        "metrics_lifecycle_backend_a",
+        back_address_a,
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\npong",
+    );
+    backend_a.connect();
+    let served = serve_one_request(&mut backend_a, front_address);
+    let before = wait_for_backend_2xx(&mut worker, cluster_id, backend_id);
+
+    // Same id, second address: a distinct backend that shares the row.
+    let added = request_acknowledged(
+        &mut worker,
+        RequestType::AddBackend(Worker::default_backend(
+            cluster_id,
+            backend_id,
+            back_address_b,
+            None,
+        )),
+    );
+    let removed_a = request_acknowledged(
+        &mut worker,
+        RequestType::RemoveBackend(RemoveBackend {
+            cluster_id: cluster_id.to_owned(),
+            backend_id: backend_id.to_owned(),
+            address: back_address_a.into(),
+        }),
+    );
+    let while_shared = backend_2xx_count(&mut worker, cluster_id, backend_id);
+
+    let removed_b = request_acknowledged(
+        &mut worker,
+        RequestType::RemoveBackend(RemoveBackend {
+            cluster_id: cluster_id.to_owned(),
+            backend_id: backend_id.to_owned(),
+            address: back_address_b.into(),
+        }),
+    );
+    let after_last = backend_2xx_count(&mut worker, cluster_id, backend_id);
+
+    let stopped = stop_worker_within(worker);
+    println!(
+        "detail_ack={detail_ack} served={served} before={before:?} added={added} \
+         removed_a={removed_a} while_shared={while_shared:?} removed_b={removed_b} \
+         after_last={after_last:?} stopped={stopped}"
+    );
+
+    if detail_ack
+        && served
+        && before == Some(1)
+        && added
+        && removed_a
+        && while_shared == before
+        && removed_b
+        && after_last.is_none()
+        && stopped
+    {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_remove_backend_keeps_row_shared_with_live_same_id_entry() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "RemoveBackend keeps the backend-id row while another address carries that id, and drops it with the last one",
+            try_remove_backend_keeps_row_shared_with_live_same_id_entry,
+        ),
+        State::Success,
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // Test 5: an abandoned metric-detail lease expires with no later command
 // ══════════════════════════════════════════════════════════════════════
 //

@@ -600,14 +600,15 @@ impl LocalDrain {
             let before = cluster.backends.len();
             cluster.backends.remove(backend_id);
             // The targeted backend is gone, and `remove` drops at most one
-            // entry (backend_ids are unique within a cluster).
+            // entry (one row per backend id; the caller drops it only once no
+            // backend of that id remains at any address).
             debug_assert!(
                 !cluster.contains_backend(backend_id),
                 "remove_backend must evict the targeted backend"
             );
             debug_assert!(
                 cluster.backends.len() == before || cluster.backends.len() == before - 1,
-                "remove_backend drops at most one backend (ids are unique per cluster)"
+                "remove_backend drops at most one backend row (rows are keyed by id)"
             );
             cluster.cluster.map.is_empty() && cluster.backends.is_empty()
         } else {

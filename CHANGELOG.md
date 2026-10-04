@@ -4012,6 +4012,16 @@
 
 ### 🐛 Fixed
 
+- **`fix(metrics)`: removing one address of a backend id keeps the metrics of the id's
+  remaining addresses.** `ConfigState` and the worker key backends on `(backend_id, address)`,
+  so one id may serve from several addresses, while backend metrics are labelled by id alone and
+  every such entry feeds one row. `Server::remove_backend` (`lib/src/server.rs`) dropped that row
+  on every `RemoveBackend`, so removing one address wiped the cumulative local-drain counters and
+  the queued StatsD lines of the id's addresses still serving. The row is now dropped only once
+  no backend of that id remains in the cluster (new `BackendMap::has_backend_id`); removing an
+  already-absent backend still clears an orphan row. Pinned by the e2e test
+  `test_remove_backend_keeps_row_shared_with_live_same_id_entry`.
+
 - **`fix(command)`: a signal no longer fails a blocking control-channel wait
   ([#1846](https://github.com/sozu-proxy/sozu/pull/1846) follow-up).**
   `Channel::read_message_blocking_timeout` (`command/src/channel.rs`) reads with `SO_RCVTIMEO`,

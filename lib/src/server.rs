@@ -2986,16 +2986,20 @@ impl Server {
         let address = backend.address.into();
         // Runtime removal keys on `(backend_id, address)`, as `ConfigState`
         // does: another id at the same address stays (#1821). The metrics
-        // layer is id-keyed, so the requested id is tidied even when the
-        // backend was already gone, clearing any orphan row.
-        self.backends.borrow_mut().remove_backend(
-            &backend.cluster_id,
-            &backend.backend_id,
-            &address,
-        );
-        METRICS.with(|metrics| {
-            (*metrics.borrow_mut()).remove_backend(&backend.cluster_id, &backend.backend_id);
-        });
+        // layer is id-keyed, so one row aggregates every entry carrying the
+        // id: it is dropped only once no entry of that id remains at any
+        // address, and is still tidied when the backend was already gone,
+        // clearing any orphan row.
+        let id_still_live = {
+            let mut backends = self.backends.borrow_mut();
+            backends.remove_backend(&backend.cluster_id, &backend.backend_id, &address);
+            backends.has_backend_id(&backend.cluster_id, &backend.backend_id)
+        };
+        if !id_still_live {
+            METRICS.with(|metrics| {
+                (*metrics.borrow_mut()).remove_backend(&backend.cluster_id, &backend.backend_id);
+            });
+        }
 
         WorkerResponse::ok(req_id)
     }

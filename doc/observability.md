@@ -227,8 +227,10 @@ holds the contract, and `lib/benches/local_drain.rs` measures the path per
 request for 1 to 10000 backends in one cluster. Because `backends` is a map, a
 metrics query lists a cluster's backends sorted by backend id.
 
-`RemoveBackend` drops the backend's row but, unlike `RemoveCluster`, arms no
-tombstone: a session still open on the removed backend re-creates the row
+Backend rows are keyed by backend id alone, while a cluster may hold one id at
+several addresses: `RemoveBackend` drops the id's row only once no backend of
+that id remains in the cluster, so removing one address keeps the counters the
+others still feed. Unlike `RemoveCluster`, it arms no tombstone: a session still open on the removed backend re-creates the row
 when it ends, and nothing removes it again until the next `RemoveBackend` for
 that id, `RemoveCluster`, or `sozu metrics clear`.
 
