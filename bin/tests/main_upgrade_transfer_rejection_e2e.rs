@@ -654,7 +654,9 @@ activate_listeners = false
 if [ "$1" = "upgrade-probe" ]; then
   exit 0
 fi
-printf '%s\n' "$$" > "$SOZU_TEST_CANDIDATE_PID"
+candidate_pid_staging="${SOZU_TEST_CANDIDATE_PID}.tmp.$$"
+printf '%s\n' "$$" > "$candidate_pid_staging" || exit 1
+mv "$candidate_pid_staging" "$SOZU_TEST_CANDIDATE_PID" || exit 1
 while [ ! -e "$SOZU_TEST_CANDIDATE_RELEASE" ]; do
   sleep 0.01
 done
