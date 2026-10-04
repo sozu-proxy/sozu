@@ -21,6 +21,10 @@
 //! ```bash
 //! cargo test -p sozu --test sigterm_soft_stop_e2e -- --ignored
 //! ```
+//!
+//! The spawned Sōzu process deliberately ignores an inherited `RUST_LOG`:
+//! this regression checks the configured `log_level = "info"` access-log
+//! flush, while production processes retain the normal environment override.
 #![cfg(target_os = "linux")]
 
 use std::{
@@ -157,6 +161,7 @@ backends = [ {{ address = "127.0.0.1:{backend_port}", backend_id = "sigterm-back
     std::fs::write(&config_path, &config).expect("write config");
 
     let mut master = Command::new(env!("CARGO_BIN_EXE_sozu"))
+        .env_remove("RUST_LOG")
         .args(["start", "-c", config_path.to_str().unwrap()])
         .spawn()
         .expect("spawn sozu start");
