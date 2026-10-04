@@ -23,6 +23,8 @@ rustls = { workspace = true }
 sha2 = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "time"] }
+tonic = { workspace = true, optional = true, features = ["codegen", "router", "transport"] }
+tonic-prost = { workspace = true, optional = true }
 
 sozu-command-lib = { workspace = true }
 sozu-lib = { workspace = true, features = ["e2e-hooks"] }
@@ -48,6 +50,9 @@ prost = { workspace = true }
 # FDs in sync by construction).
 nix = { workspace = true, features = ["socket", "uio"] }
 
+[build-dependencies]
+tonic-prost-build = { workspace = true, optional = true }
+
 [features]
 # Forward sozu-lib's `splice` feature so the dependency-tree compiles
 # the splice integration in `lib/src/protocol/pipe.rs`. The TCP tests
@@ -72,6 +77,7 @@ splice = ["sozu-lib/splice"]
 # crate that registers the provider explicitly, so the
 # `from_crate_features` path is not exercised.
 default = ["crypto-ring"]
+grpc-e2e = ["dep:tonic", "dep:tonic-prost", "dep:tonic-prost-build"]
 crypto-ring = ["sozu-lib/crypto-ring", "hyper-rustls/ring"]
 crypto-aws-lc-rs = ["sozu-lib/crypto-aws-lc-rs", "hyper-rustls/aws-lc-rs"]
 crypto-openssl = ["sozu-lib/crypto-openssl", "hyper-rustls/aws-lc-rs"]

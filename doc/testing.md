@@ -84,6 +84,7 @@ catching.
 |---|---|---|---|---|
 | **Unit** | `#[cfg(test)] mod tests` beside each module in `lib/src/**`, `command/src/**` | nothing beyond `protoc` + toolchain | run by `cargo test -p sozu-lib` | yes |
 | **Integration / e2e** | `e2e/src/tests/*` (registered in `e2e/src/tests/mod.rs`), mocks in `e2e/src/mock/*` | spawns real workers + mock clients/backends; `h2spec` for one conformance test | `cargo test -p sozu-e2e` | yes |
+| **Real gRPC e2e** | `e2e/src/tests/grpc_tests.rs` + `e2e/proto/lifecycle_grpc.proto` | Tonic client/server; HTTPS frontend negotiates ALPN `h2` to an h2c cluster, or raw TCP carries h2c unchanged; real Tonic deadline and cancellation release their stream resources | dedicated `gRPC E2E` workflow; `grpc-e2e` feature | yes |
 | **Fuzz** | `fuzz/fuzz_targets/*` (out-of-workspace `sozu-fuzz` crate) | nightly toolchain + `cargo-fuzz` | `fuzz` CI job (nightly toolchain, 300 s/target on every push/PR); `#[ignore]`-style runtime skip when prereqs absent | yes (300 s/target); daily 900 s sweep in `simulation-sweep.yml` |
 | **Deterministic simulation** | `sim/tests/h2_simulation.rs` (`sozu-sim`, moonpool-sim) — the byte-in / byte-out H2 core (`ConnectionH2`) driven over two in-memory byte queues, [#1359](https://github.com/sozu-proxy/sozu/issues/1359) C4 | same `--cfg tokio_unstable` gating as below | per-PR `udp-simulation` job (same job, added step, modest sweep); widened via `SOZU_H2_SIM_*` env knobs | yes |
 | **Deterministic simulation** | `sim/tests/udp_simulation.rs` (`sozu-sim`, moonpool-sim) | `RUSTFLAGS="--cfg tokio_unstable"` (scoped to the sim — cfg-gated, off by default) | per-PR `udp-simulation` job (modest sweep) + nightly deep swarm; widened via env knobs | yes |
@@ -302,6 +303,8 @@ cargo test -p sozu-lib --locked
 cargo test -p sozu-e2e -- h2_              # all H2 e2e tests
 cargo test -p sozu-e2e -- test_udp_        # all UDP e2e tests
 cargo test -p sozu-e2e test_upgrade        # worker-upgrade e2e (see doc/upgrade_e2e_tests.md)
+cargo test -p sozu-e2e --features grpc-e2e tests::grpc_tests::
+                                             # real unary+bidi gRPC over HTTPS/H2 and raw TCP
 
 # TCP/UDP lifecycle regressions against real workers and loopback services.
 # Select one exclusive crypto provider, as CI does:

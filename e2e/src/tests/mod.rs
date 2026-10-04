@@ -31,6 +31,8 @@ mod cluster_ip_limit_tests;
 mod command_channel_security_tests;
 mod eviction_tests;
 mod fuzz_tests;
+#[cfg(feature = "grpc-e2e")]
+mod grpc_tests;
 mod h1_security_tests;
 mod h2_clock_tests;
 mod h2_correctness_tests;
