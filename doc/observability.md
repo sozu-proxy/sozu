@@ -200,6 +200,22 @@ Disabling and re-enabling cluster metric collection, changing
 keeps old emissions obsolete across collection controls even though a clear
 resets drain storage and tombstones.
 
+`RemoveCluster` ends an identity only while the main process's configuration
+state declares the id. The main process refuses a `RemoveCluster` for an id its
+configuration state does not currently declare, whether it was never added or
+was already removed (`ConfigState::remove_cluster` returns `NotFound`), so the
+request never reaches a worker. An implicit identity, allocated by a route to a
+never-added id or by the first route that recreates a removed one, therefore
+lasts until the worker exits; a second `RemoveCluster` for the id is refused
+too. Removing the id's last frontend or backend does not end it, exactly as it
+does not end a declared cluster's identity: frontends and backends re-added
+later belong to the same lifetime and contribute to the same rows. The identity
+map holds at most one entry per distinct id referenced during the worker's
+life. To end such a lifetime explicitly, in both cases, send `AddCluster` and
+then `RemoveCluster` for the id; the removal also removes any frontend or
+backend still naming it. `sozu metrics clear` empties the id's rows but keeps
+its identity.
+
 The public `SessionMetrics` shape and
 `SessionMetrics::register_end_of_session(&LogContext)` API retain their
 current-configuration semantics for embedders. Sōzu's delayed HTTP, WebSocket,
@@ -227,8 +243,10 @@ holds the contract, and `lib/benches/local_drain.rs` measures the path per
 request for 1 to 10000 backends in one cluster. Because `backends` is a map, a
 metrics query lists a cluster's backends sorted by backend id.
 
-`RemoveBackend` drops the backend's row but, unlike `RemoveCluster`, arms no
-tombstone: a session still open on the removed backend re-creates the row
+Backend rows are keyed by backend id alone, while a cluster may hold one id at
+several addresses: `RemoveBackend` drops the id's row only once no backend of
+that id remains in the cluster, so removing one address keeps the counters the
+others still feed. Unlike `RemoveCluster`, it arms no tombstone: a session still open on the removed backend re-creates the row
 when it ends, and nothing removes it again until the next `RemoveBackend` for
 that id, `RemoveCluster`, or `sozu metrics clear`.
 

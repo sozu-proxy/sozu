@@ -11,8 +11,9 @@
 //! failure still rolls back to the old main.
 //!
 //! Spawns the real `sozu` binary (`CARGO_BIN_EXE_sozu`) with one worker and an
-//! HTTP listener in front of an in-test backend, replaces the pid file with a
-//! directory, then runs `sozu upgrade`. The upgrade must fail, the original
+//! HTTP listener in front of an in-test backend, makes the pid file path
+//! unpublishable (a directory, or a dangling symlink into a missing directory),
+//! then runs `sozu upgrade`. The upgrade must fail, the original
 //! main must stay alive, `status` must still list a running worker, and the
 //! frontend must keep answering.
 //!
@@ -146,9 +147,13 @@ fn process_state(pid: u32) -> Option<char> {
     stat.rsplit_once(") ")?.1.chars().next()
 }
 
-#[test]
-#[ignore = "process-level: spawns a real master and worker, attempts a main upgrade and binds ephemeral ports; run from the dedicated CI step or with --ignored (see module docs)"]
-fn unwritable_pid_file_rolls_back_main_upgrade_and_keeps_serving() {
+/// Start a proxy, let `break_pid_file` make its pid file path unpublishable,
+/// then require `sozu upgrade` to fail and roll back to the original main.
+/// `left_untouched` checks the failed upgrade did not repair the path.
+fn assert_upgrade_rolls_back(
+    break_pid_file: impl FnOnce(&Path),
+    left_untouched: impl FnOnce(&Path) -> bool,
+) {
     let temp = tempfile::tempdir().expect("tempdir");
     let socket_path = temp.path().join("sozu.sock");
     let config_path = temp.path().join("config.toml");
@@ -210,10 +215,7 @@ backends = [ {{ address = "127.0.0.1:{backend_port}", backend_id = "pidfile-back
         "no running worker before the upgrade"
     );
 
-    // The pid file path still names something the original main created, but
-    // no process can rewrite it any more.
-    fs::remove_file(&pid_file).expect("remove pid file");
-    fs::create_dir(&pid_file).expect("replace pid file with a directory");
+    break_pid_file(&pid_file);
 
     let upgrade = sozu(&config_path, &["upgrade"]);
 
@@ -250,7 +252,40 @@ backends = [ {{ address = "127.0.0.1:{backend_port}", backend_id = "pidfile-back
         String::from_utf8_lossy(&front)
     );
     assert!(
-        pid_file.is_dir(),
+        left_untouched(&pid_file),
         "the failed upgrade must not have replaced the pid file path"
+    );
+}
+
+#[test]
+#[ignore = "process-level: spawns a real master and worker, attempts a main upgrade and binds ephemeral ports; run from the dedicated CI step or with --ignored (see module docs)"]
+fn unwritable_pid_file_rolls_back_main_upgrade_and_keeps_serving() {
+    // The pid file path still names something the original main created, but
+    // no process can rewrite it any more.
+    assert_upgrade_rolls_back(
+        |pid_file| {
+            fs::remove_file(pid_file).expect("remove pid file");
+            fs::create_dir(pid_file).expect("replace pid file with a directory");
+        },
+        Path::is_dir,
+    );
+}
+
+#[test]
+#[ignore = "process-level: spawns a real master and worker, attempts a main upgrade and binds ephemeral ports; run from the dedicated CI step or with --ignored (see module docs)"]
+fn dangling_pid_file_symlink_rolls_back_main_upgrade_and_keeps_serving() {
+    // Opening the path without `O_CREAT` fails with `ENOENT`, and the link's
+    // own directory is writable, but `O_CREAT` follows the link into a
+    // directory that does not exist and fails with `ENOENT` as well.
+    assert_upgrade_rolls_back(
+        |pid_file| {
+            let target = pid_file.with_file_name("missing").join("sozu.pid");
+            fs::remove_file(pid_file).expect("remove pid file");
+            std::os::unix::fs::symlink(target, pid_file).expect("dangling pid file symlink");
+        },
+        |pid_file| {
+            fs::symlink_metadata(pid_file).is_ok_and(|meta| meta.file_type().is_symlink())
+                && !pid_file.with_file_name("missing").exists()
+        },
     );
 }

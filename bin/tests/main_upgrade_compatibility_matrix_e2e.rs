@@ -345,13 +345,19 @@ fn run_compatibility_case(direction: Direction) {
     // the whole test binary. libtest has no skipped outcome, so the case still
     // reports `ok`; writing to stderr directly instead of through
     // `println!`/`eprintln!` bypasses libtest's output capture and keeps the
-    // skip visible without `--nocapture`.
+    // skip visible without `--nocapture`. Unbuffered `writeln!` issues one
+    // `write(2)` per format piece, which libtest's own progress output (and
+    // the other case, running in parallel) interleaves with. The message is
+    // therefore formatted first and written by a single `write_all`, framed by
+    // newlines so it never shares a line with a `test … ...` prefix.
     let Some((sender_binary, candidate_binary)) = direction.binaries() else {
-        let _ = writeln!(
-            std::io::stderr(),
-            "skipping {}: set SOZU_MATRIX_LEGACY and SOZU_MATRIX_OPTION3 to the frozen binaries (see module docs)",
+        let message = format!(
+            "\nskipping {}: set SOZU_MATRIX_LEGACY and SOZU_MATRIX_OPTION3 to the frozen binaries (see module docs)\n",
             direction.label()
         );
+        let mut stderr = std::io::stderr().lock();
+        let _ = stderr.write_all(message.as_bytes());
+        let _ = stderr.flush();
         return;
     };
     assert!(sender_binary.is_file(), "sender binary is missing");
