@@ -308,19 +308,28 @@ replay of its commands:
    an operator request or re-scatters work already sent to a worker.
 3. The replacement restores and registers those descriptors in a paused Hub.
    Registration validates the graph and descriptor state but cannot read or
-   write command or worker data. It replies `PREPARED` with counts covering
-   sessions, tasks, routes and buffered work.
+   write command or worker data. It then runs every fallible preparation that
+   touches nothing shared with the old main: it restores `CLOEXEC` on the
+   inherited descriptors, installs its `SIGTERM` handler and opens its PID
+   file without changing its content (`begin_new_main_process`,
+   `bin/src/upgrade.rs`). A failure there still rolls back. It replies
+   `PREPARED` with counts covering sessions, tasks, routes and buffered work.
 4. The old main compares those counts and checks once more for a pending
    `SIGTERM`. Before `COMMIT`, any rejection closes and reaps the candidate,
    restores `CLOEXEC`, and resumes the unchanged old Hub. The first attempt to
    send `COMMIT` is the irreversible fence: an ambiguous or failed
-   post-commit handoff never resumes the old event loop.
+   post-commit handoff never resumes the old event loop. The old main exits,
+   and its workers return from their event loops once their command channels
+   close, so a replacement that fails after `COMMIT` stops the whole proxy.
 5. After receiving the complete `COMMIT`, the replacement activates the Hub,
    ticks every restored session once so userspace-only buffered frames make
-   progress, restores `CLOEXEC`, publishes its PID and systemd
-   `MAINPID`/`READY`, queues the initiating client's terminal response, then
-   sends `ACTIVATED`. The old main stays fenced until that acknowledgement and
-   then exits. A full client back buffer delays the terminal response without
+   progress, publishes its PID and systemd `MAINPID`/`READY`, queues the
+   initiating client's terminal response, then sends `ACTIVATED`. Activation
+   is the only step left that can fail, because restoring a worker's SCM socket
+   changes the blocking mode of a file description the old main shares; a
+   failure to write the PID file, queue the terminal response or send
+   `ACTIVATED` is logged and the replacement keeps running. The old main stays
+   fenced until that acknowledgement or its failure, and then exits. A full client back buffer delays the terminal response without
    losing or duplicating it. A restored stopped worker is retained while an
    upgrade task or live response route still uses it, then its command and SCM
    descriptors are closed without signalling its historical PID again.

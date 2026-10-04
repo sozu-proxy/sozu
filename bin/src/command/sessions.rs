@@ -114,6 +114,11 @@ impl PausedClientSession {
         self.token
     }
 
+    /// Command channel descriptor owned by this paused wrapper.
+    pub fn channel_fd(&self) -> RawFd {
+        self.channel.fd()
+    }
+
     /// Whether the Hub must schedule this session once immediately after COMMIT.
     pub fn requires_post_commit_tick(&self) -> bool {
         self.requires_post_commit_tick
@@ -671,6 +676,11 @@ impl PausedWorkerSession {
 
     pub fn token(&self) -> Token {
         self.token
+    }
+
+    /// Command channel descriptor owned by this paused wrapper.
+    pub fn channel_fd(&self) -> RawFd {
+        self.channel.fd()
     }
 
     /// Received SCM descriptor owned by this paused wrapper.

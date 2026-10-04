@@ -308,17 +308,19 @@ impl Direction {
         }
     }
 
-    fn binaries(self) -> (PathBuf, PathBuf) {
+    /// The frozen `(sender, candidate)` binaries, or `None` when either
+    /// variable is unset or empty.
+    fn binaries(self) -> Option<(PathBuf, PathBuf)> {
         let legacy = std::env::var_os("SOZU_MATRIX_LEGACY")
-            .map(PathBuf::from)
-            .expect("SOZU_MATRIX_LEGACY must name the frozen legacy binary");
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)?;
         let option3 = std::env::var_os("SOZU_MATRIX_OPTION3")
-            .map(PathBuf::from)
-            .expect("SOZU_MATRIX_OPTION3 must name the frozen Option3 binary");
-        match self {
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)?;
+        Some(match self {
             Self::Option3ToLegacy => (option3, legacy),
             Self::LegacyToOption3 => (legacy, option3),
-        }
+        })
     }
 
     fn transactional_sender(self) -> bool {
@@ -338,7 +340,16 @@ fn wait_for_children(parent: u32, expected: &BTreeSet<u32>, timeout: Duration) -
 }
 
 fn run_compatibility_case(direction: Direction) {
-    let (sender_binary, candidate_binary) = direction.binaries();
+    // Both binaries are built out of tree, so a plain `-- --ignored` run (and
+    // CI, which never sets the variables) skips this case instead of failing
+    // the whole test binary.
+    let Some((sender_binary, candidate_binary)) = direction.binaries() else {
+        println!(
+            "skipping {}: set SOZU_MATRIX_LEGACY and SOZU_MATRIX_OPTION3 to the frozen binaries (see module docs)",
+            direction.label()
+        );
+        return;
+    };
     assert!(sender_binary.is_file(), "sender binary is missing");
     assert!(candidate_binary.is_file(), "candidate binary is missing");
 

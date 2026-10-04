@@ -133,7 +133,7 @@ pub type RequestId = String;
 ///
 /// `command_buffer_size` sizes the one-or-few channel kinds: the
 /// supervisor↔worker channels (`crate::worker`, `crate::upgrade`,
-/// `CommandHub::from_upgrade_data`) and the CLI's own end of this very
+/// `CommandHub::prepare_from_upgrade_data`) and the CLI's own end of this very
 /// connection (`crate::ctl::create_channel`). This is the many-per-process
 /// kind: `CommandHub::run`'s accept loop registers one client per `accept()`
 /// with no connection cap, so whatever goes here is multiplied by the number
@@ -177,13 +177,13 @@ pub type RequestId = String;
 /// than assumed: `f0ecc544` introduced it as the only commit of PR #1060,
 /// which carries zero inline review comments, zero issue comments, and a body
 /// that mentions neither `4096` nor a buffer nor a capacity. In that same
-/// commit `from_upgrade_data` fifty lines below already passed
-/// `command_buffer_size` — so the author had the configured values in hand and
-/// diverged here, plausibly for one page per connection. The `usize::MAX`
-/// ceiling it was paired with rules out a CEILING defence, not a sizing
-/// intent, and the CWE-770 comment that later appeared at the call site argues
-/// that ceiling only. The argument above is why the value is kept now, written
-/// down so the next reader does not have to guess.
+/// commit `from_upgrade_data` (now `CommandHub::prepare_from_upgrade_data`)
+/// already passed `command_buffer_size` — so the author had the configured
+/// values in hand and diverged here, plausibly for one page per connection.
+/// The `usize::MAX` ceiling it was paired with rules out a CEILING defence,
+/// not a sizing intent, and the CWE-770 comment that later appeared at the
+/// call site argues that ceiling only. The argument above is why the value is
+/// kept now, written down so the next reader does not have to guess.
 ///
 /// What keeping it small costs is reallocation, and only on the READ side.
 /// `Channel::grow_size` has exactly two call sites, `Channel::readable` and
@@ -654,6 +654,9 @@ pub struct PausedCommandHub {
     command_socket_path: std::sync::Arc<str>,
     restored_session_ticks: HashSet<Token>,
     restored_worker_tokens: HashSet<Token>,
+    /// Read end of the SIGTERM self-pipe, installed during PREPARED so a
+    /// failure to create it still rolls back to the old main.
+    sigterm_receiver: Option<UnixStream>,
 }
 
 impl Deref for CommandHub {
@@ -669,7 +672,78 @@ impl DerefMut for CommandHub {
     }
 }
 
+/// Create the SIGTERM self-pipe, register its read end on `poll` under
+/// `SIGTERM_TOKEN`, then install the handler that writes to it.
+fn install_sigterm_handler(poll: &Poll) -> Result<UnixStream, ServerError> {
+    let (sender, mut receiver) = UnixStream::pair().map_err(ServerError::SigtermPipe)?;
+    poll.registry()
+        .register(&mut receiver, SIGTERM_TOKEN, Interest::READABLE)
+        .map_err(ServerError::SigtermPipe)?;
+    let previous = SIGTERM_WRITE_FD.swap(sender.into_raw_fd(), Ordering::Relaxed);
+    debug_assert_eq!(
+        previous, -1,
+        "the SIGTERM handler is installed once per process"
+    );
+
+    let action = SigAction::new(
+        SigHandler::Handler(sigterm_handler),
+        SaFlags::SA_RESTART,
+        SigSet::empty(),
+    );
+    // SAFETY: `sigterm_handler` only performs async-signal-safe operations.
+    unsafe { sigaction(Signal::SIGTERM, &action) }.map_err(ServerError::SigtermHandler)?;
+    Ok(receiver)
+}
+
+/// Set CLOEXEC on every descriptor, trying them all and reporting the first
+/// failure.
+fn enable_cloexec_on(fds: impl IntoIterator<Item = i32>) -> Result<(), ServerError> {
+    let mut first_error = None;
+    for fd in fds {
+        if let Err(error) = enable_close_on_exec(fd) {
+            error!(
+                "could not enable close-on-exec on inherited fd {}: {}",
+                fd, error
+            );
+            first_error.get_or_insert(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(ServerError::EnableCloexec(error)),
+        None => Ok(()),
+    }
+}
+
 impl PausedCommandHub {
+    /// Install the replacement main's SIGTERM handler before PREPARED.
+    ///
+    /// Nothing here touches a descriptor shared with the old main: the
+    /// self-pipe is private to this process and joins this Hub's own poll. A
+    /// SIGTERM received before COMMIT is held in the pipe; the old main aborts
+    /// the upgrade on its own pending SIGTERM and kills this process, and one
+    /// that arrives after its check is honoured by this Hub's event loop. See
+    /// [`CommandHub::handle_sigterm`].
+    pub fn handle_sigterm(&mut self) -> Result<(), ServerError> {
+        self.sigterm_receiver = Some(install_sigterm_handler(&self.server.poll)?);
+        Ok(())
+    }
+
+    /// Restore CLOEXEC on every inherited descriptor before PREPARED.
+    ///
+    /// `FD_CLOEXEC` is a flag of this process's descriptor table entry, not of
+    /// the open file description shared with the old main, so setting it
+    /// before COMMIT changes nothing the old main can observe.
+    pub fn enable_cloexec_after_upgrade(&self) -> Result<(), ServerError> {
+        let fds = std::iter::once(self.server.unix_listener.as_raw_fd())
+            .chain(self.clients.iter().map(PausedClientSession::channel_fd))
+            .chain(
+                self.workers
+                    .iter()
+                    .flat_map(|worker| [worker.channel_fd(), worker.scm_fd()]),
+            );
+        enable_cloexec_on(fds)
+    }
+
     /// Cross the COMMIT boundary. This is the first point at which restored
     /// client and worker channels can perform data I/O.
     pub fn activate(mut self) -> Result<CommandHub, HubError> {
@@ -686,7 +760,7 @@ impl PausedCommandHub {
             clients,
             tasks: self.tasks,
             command_socket_path: self.command_socket_path,
-            sigterm_receiver: None,
+            sigterm_receiver: self.sigterm_receiver,
             restored_session_ticks: self.restored_session_ticks,
             pending_upgrade_completion: None,
             restored_worker_tokens: self.restored_worker_tokens,
@@ -908,29 +982,11 @@ impl CommandHub {
     /// The handler writes to a socket pair whose read end joins the event loop
     /// under `SIGTERM_TOKEN`; the loop does the actual work
     /// (`CommandHub::on_sigterm`). Call it once per process, from the two entry
-    /// points that run the loop: `begin_main_process` and
-    /// `begin_new_main_process`.
+    /// points that run the loop: `begin_main_process` here, and
+    /// `begin_new_main_process` through [`PausedCommandHub::handle_sigterm`]
+    /// before PREPARED.
     pub fn handle_sigterm(&mut self) -> Result<(), ServerError> {
-        let (sender, mut receiver) = UnixStream::pair().map_err(ServerError::SigtermPipe)?;
-        self.server
-            .poll
-            .registry()
-            .register(&mut receiver, SIGTERM_TOKEN, Interest::READABLE)
-            .map_err(ServerError::SigtermPipe)?;
-        self.sigterm_receiver = Some(receiver);
-        let previous = SIGTERM_WRITE_FD.swap(sender.into_raw_fd(), Ordering::Relaxed);
-        debug_assert_eq!(
-            previous, -1,
-            "the SIGTERM handler is installed once per process"
-        );
-
-        let action = SigAction::new(
-            SigHandler::Handler(sigterm_handler),
-            SaFlags::SA_RESTART,
-            SigSet::empty(),
-        );
-        // SAFETY: `sigterm_handler` only performs async-signal-safe operations.
-        unsafe { sigaction(Signal::SIGTERM, &action) }.map_err(ServerError::SigtermHandler)?;
+        self.sigterm_receiver = Some(install_sigterm_handler(&self.server.poll)?);
         Ok(())
     }
 
@@ -1122,12 +1178,15 @@ impl CommandHub {
                     "maximum command buffer size exceeds usize".to_owned(),
                 )
             })?;
-        let client_initial_buffer_size = usize::try_from(CLIENT_CHANNEL_INITIAL_BUFFER_SIZE)
-            .map_err(|_| {
-                HubError::InvalidUpgradeSnapshot(
-                    "client command buffer size exceeds usize".to_owned(),
-                )
-            })?;
+        // `register_client` hands `Channel::new` this constant, which clamps
+        // it to the ceiling (sozu-proxy/sozu#1416): expect the same value.
+        let client_initial_buffer_size =
+            usize::try_from(CLIENT_CHANNEL_INITIAL_BUFFER_SIZE.min(config.max_command_buffer_size))
+                .map_err(|_| {
+                    HubError::InvalidUpgradeSnapshot(
+                        "client command buffer size exceeds usize".to_owned(),
+                    )
+                })?;
         let worker_initial_buffer_size = command_buffer_size;
 
         let mut inherited_fds = HashSet::new();
@@ -1369,6 +1428,7 @@ impl CommandHub {
             command_socket_path,
             restored_session_ticks,
             restored_worker_tokens,
+            sigterm_receiver: None,
         })
     }
 
@@ -2460,22 +2520,10 @@ impl CommandHub {
         Ok(())
     }
 
-    /// Restore CLOEXEC on every descriptor inherited by the replacement main.
+    /// Restore CLOEXEC on every descriptor `disable_cloexec_before_upgrade`
+    /// cleared, once a main upgrade failed and this Hub keeps running.
     pub fn enable_cloexec_after_upgrade(&mut self) -> Result<(), ServerError> {
-        let mut first_error = None;
-        for fd in self.upgrade_fds() {
-            if let Err(error) = enable_close_on_exec(fd) {
-                error!(
-                    "could not enable close-on-exec on inherited fd {}: {}",
-                    fd, error
-                );
-                first_error.get_or_insert(error);
-            }
-        }
-        match first_error {
-            Some(error) => Err(ServerError::EnableCloexec(error)),
-            None => Ok(()),
-        }
+        enable_cloexec_on(self.upgrade_fds())
     }
 
     /// Capture the complete control-plane continuation without consuming it.
@@ -2833,6 +2881,49 @@ mod tests {
         client.channel.run().expect("client response should flush");
         peer.handle_events(Ready::READABLE);
         peer.run().expect("peer should buffer client responses");
+    }
+
+    /// `register_client` clamps a client channel's initial capacity to
+    /// `max_command_buffer_size` when that ceiling is below
+    /// `CLIENT_CHANNEL_INITIAL_BUFFER_SIZE` (sozu-proxy/sozu#1416). The
+    /// replacement main must expect that same clamped value, or every main
+    /// upgrade of such a configuration fails on the upgrading client itself.
+    #[test]
+    fn prepare_from_upgrade_data_accepts_clamped_client_channel_capacity() {
+        for max_command_buffer_size in [2048, DEFAULT_MAX_COMMAND_BUFFER_SIZE] {
+            let dir = tempfile::tempdir().expect("could not create temp dir");
+            let socket_path = dir.path().join("clamped-client.sock");
+            let listener = UnixListener::bind(&socket_path).expect("could not bind socket");
+            let config = Config {
+                command_buffer_size: max_command_buffer_size.min(DEFAULT_COMMAND_BUFFER_SIZE),
+                max_command_buffer_size,
+                ..Config::default()
+            };
+            let mut hub =
+                CommandHub::new(listener, config, "sozu".to_owned()).expect("could not create Hub");
+            let (_peer, accepted) =
+                std::os::unix::net::UnixStream::pair().expect("could not create client pair");
+            accepted
+                .set_nonblocking(true)
+                .expect("could not make client nonblocking");
+            hub.register_client(UnixStream::from_std(accepted));
+            let client_token = *hub.clients.keys().next().expect("registered client token");
+
+            let data = hub
+                .generate_upgrade_data(client_token)
+                .expect("Hub should snapshot");
+            // The replacement main takes ownership of every descriptor named
+            // by the snapshot; the old Hub must not close them as well.
+            std::mem::forget(hub);
+
+            let paused = CommandHub::prepare_from_upgrade_data(data).unwrap_or_else(|error| {
+                panic!(
+                    "max_command_buffer_size={max_command_buffer_size}: a clamped client \
+                     channel must restore, got {error}"
+                )
+            });
+            assert_eq!(paused.clients.len(), 1);
+        }
     }
 
     #[test]

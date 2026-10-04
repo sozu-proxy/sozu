@@ -4065,15 +4065,24 @@
   commit is reaped while the old main resumes without advancing the boot
   generation or publishing a successful upgrade audit. Once commit starts,
   the old main stays fenced so an ambiguous failure cannot execute a command
-  twice. A protocol probe rejects incompatible candidates before descriptors
+  twice, which means a replacement that fails after commit stops the whole
+  proxy. The replacement therefore restores close-on-exec, installs its
+  SIGTERM handler and opens its pid file before `PREPARED`, so an unwritable
+  pid file rolls the upgrade back; after commit only restoring a worker's SCM
+  socket can still fail, and a pid-file write, terminal-response or
+  acknowledgement failure is logged without stopping the new main. A main
+  upgrade also accepts the command-socket client channels that start at
+  `max_command_buffer_size` when it is below 4096 bytes. A protocol probe rejects incompatible candidates before descriptors
   are exposed. Restored stopped workers close both inherited channels without
   signalling their historical PID after their last task or response
   correlation. A running main from before this protocol cannot export the
   missing state, so introduce this version with one controlled service restart
   before using hot-upgrade between compatible binaries. Covered by
   `upgrade_main_preserves_in_flight_worker_command_and_original_client_response`,
-  `rejected_candidate_keeps_old_hub_authoritative_and_reaps_child`, and
-  `sigterm_during_prepare_aborts_upgrade_then_stops_the_old_main`; the manual
+  `rejected_candidate_keeps_old_hub_authoritative_and_reaps_child`,
+  `sigterm_during_prepare_aborts_upgrade_then_stops_the_old_main`,
+  `unwritable_pid_file_rolls_back_main_upgrade_and_keeps_serving`, and
+  `prepare_from_upgrade_data_accepts_clamped_client_channel_capacity`; the manual
   `main_upgrade_compatibility_matrix_e2e` exercises both protocol directions
   with frozen legacy and replacement binaries.
 

@@ -421,8 +421,25 @@ pub fn begin_new_main_process(
     setup_logging_with_config(&config, "MAIN").map_err(UpgradeError::SetupLogging)?;
     util::setup_metrics(&config).map_err(UpgradeError::SetupMetrics)?;
 
-    let paused_hub =
+    let mut paused_hub =
         CommandHub::prepare_from_upgrade_data(upgrade_data).map_err(UpgradeError::CreateHub)?;
+
+    // Every fallible preparation runs here, before PREPARED, where a failure
+    // still makes the old main roll back and keep serving. After COMMIT the
+    // old main is irreversibly fenced and exits whatever this process does,
+    // and its workers return from their event loops once their command
+    // channels close: a failure there would stop the whole proxy. None of
+    // these steps touches state shared with the old main. `FD_CLOEXEC` is a
+    // flag of this process's descriptor table, the SIGTERM self-pipe is
+    // private (and `exec` reset the old main's handler), and opening the pid
+    // file leaves its content alone until the publish step below.
+    paused_hub
+        .enable_cloexec_after_upgrade()
+        .map_err(UpgradeError::EnableCloexec)?;
+    paused_hub
+        .handle_sigterm()
+        .map_err(UpgradeError::HandleSigterm)?;
+    let pid_file = util::open_pid_file(&config).map_err(UpgradeError::WritePidFile)?;
 
     fork_confirmation_channel
         .write_message(&UpgradeHandshake::prepared(upgrade_counts))
@@ -448,18 +465,21 @@ pub fn begin_new_main_process(
         }
     }
 
+    // COMMIT. From here on this process is the only main left: it publishes
+    // and runs. Activation is the one step that can still fail, because
+    // restoring each worker's SCM socket changes the blocking mode of a file
+    // description shared with the old main and so cannot happen earlier.
+    // Every other failure below is logged and must not stop the loop.
     let mut command_hub = paused_hub.activate().map_err(UpgradeError::CreateHub)?;
-    command_hub
-        .enable_cloexec_after_upgrade()
-        .map_err(UpgradeError::EnableCloexec)?;
 
-    // `exec` reset the old main process's SIGTERM handler. Install the new
-    // main's handler only after COMMIT, when this Hub owns control I/O.
-    command_hub
-        .handle_sigterm()
-        .map_err(UpgradeError::HandleSigterm)?;
-
-    util::write_pid_file(&config).map_err(UpgradeError::WritePidFile)?;
+    if let Some((path, file)) = pid_file
+        && let Err(error) = util::publish_pid_file(&path, file)
+    {
+        error!(
+            "could not publish the new main pid after the upgrade committed, keeping the proxy running: {}",
+            error
+        );
+    }
 
     // #228: tell systemd that the new master pid takes over from the
     // pre-exec one (`Type=notify` + `NotifyAccess=main` are required
@@ -481,16 +501,22 @@ pub fn begin_new_main_process(
         Err(e) => warn!("could not notify systemd READY=1: {}", e),
     }
 
-    command_hub
-        .complete_main_upgrade(upgrade_client_token, new_pid)
-        .map_err(UpgradeError::CreateHub)?;
+    if let Err(error) = command_hub.complete_main_upgrade(upgrade_client_token, new_pid) {
+        error!(
+            "could not answer the client that started the main upgrade, keeping the proxy running: {}",
+            error
+        );
+    }
 
-    fork_confirmation_channel
-        .write_message(&UpgradeHandshake::new(UpgradeStage::Activated))
-        .map_err(|channel_err| UpgradeError::SendConfirmation {
-            result: "activated".to_string(),
-            channel_err,
-        })?;
+    // The old main stops whether or not this acknowledgement reaches it.
+    if let Err(error) =
+        fork_confirmation_channel.write_message(&UpgradeHandshake::new(UpgradeStage::Activated))
+    {
+        error!(
+            "could not acknowledge activation to the old main, keeping the proxy running: {}",
+            error
+        );
+    }
     // The handshake channel was inherited without `FD_CLOEXEC`: close it, or
     // every worker this main forks inherits it.
     drop(fork_confirmation_channel);
