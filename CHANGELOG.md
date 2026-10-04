@@ -4022,6 +4022,24 @@
   already-absent backend still clears an orphan row. Pinned by the e2e test
   `test_remove_backend_keeps_row_shared_with_live_same_id_entry`.
 
+- **`fix(upgrade)`: `sozu upgrade --worker` no longer reports a failed second phase as a
+  success.** In `UpgradeWorkerTask::on_finish` (`bin/src/command/upgrade.rs`), the
+  `StopOldActivateNew` arm answered "Upgrade successful" whatever its workers replied. An old
+  worker that exited without answering its `SoftStop` (the failure
+  `CommandHub::fail_in_flight_requests_of_worker` synthesizes as "worker N closed before
+  answering") and a new worker that rejected an activation request were both reported as
+  finished. The arm now attributes each failure through the worker id carried by its responses
+  and answers `Failure`, as `WorkerTask`, `LoadStateTask` and the task's own first phase do. The
+  message names the old worker that did not finish its soft stop, or the new worker whose
+  activation failed, with each distinct reason, and still states that the new worker is serving
+  when its activation finished. **CLI exit status changes:** `sozu upgrade --worker N` now exits
+  non-zero in both cases. `sozu upgrade` (main) is unchanged: after the main handoff it upgrades
+  each worker in its own thread, logs a failed one as `error upgrading worker N: …`, continues
+  with the others and still exits 0. Pinned by
+  `upgrade_worker_reports_an_old_worker_closing_before_its_soft_stop_as_a_failure`,
+  `upgrade_worker_reports_a_failed_new_worker_activation_as_a_failure` and
+  `upgrade_worker_reports_success_when_both_workers_answer_ok`.
+
 - **`fix(command)`: a signal no longer fails a blocking control-channel wait
   ([#1846](https://github.com/sozu-proxy/sozu/pull/1846) follow-up).**
   `Channel::read_message_blocking_timeout` (`command/src/channel.rs`) reads with `SO_RCVTIMEO`,

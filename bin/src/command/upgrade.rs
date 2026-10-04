@@ -316,11 +316,60 @@ impl GatheringTask for UpgradeWorkerTask {
                 old_worker_id,
                 new_worker_id,
             } => {
-                client.finish_ok(
-                    format!(
-                        "Upgrade successful:\n- finished soft stop of worker {old_worker_id:?}\n- finished activation of new worker {new_worker_id:?}"
-                    )
-                );
+                // A failure is attributed by the worker that produced it: a
+                // rejected or unanswered `SoftStop` of the old worker
+                // (`CommandHub::fail_in_flight_requests_of_worker` synthesizes
+                // "worker N closed before answering" when it exits first), or
+                // a rejected activation request of the new worker. A worker
+                // that dies fails every request it owes with the same reason,
+                // so identical reasons are reported once.
+                let failure_reasons = |target: WorkerId| {
+                    let mut reasons: Vec<&str> = Vec::new();
+                    for (worker_id, response) in &self.responses {
+                        if *worker_id == target
+                            && ResponseStatus::try_from(response.status)
+                                == Ok(ResponseStatus::Failure)
+                            && !reasons.contains(&response.message.as_str())
+                        {
+                            reasons.push(response.message.as_str());
+                        }
+                    }
+                    reasons
+                };
+                let old_failures = failure_reasons(old_worker_id);
+                let new_failures = failure_reasons(new_worker_id);
+
+                if old_failures.is_empty() && new_failures.is_empty() {
+                    client.finish_ok(
+                        format!(
+                            "Upgrade successful:\n- finished soft stop of worker {old_worker_id:?}\n- finished activation of new worker {new_worker_id:?}"
+                        )
+                    );
+                    return;
+                }
+
+                let mut message = format!("Upgrade of worker {old_worker_id} failed:");
+                if old_failures.is_empty() {
+                    message.push_str(&format!(
+                        "\n- finished soft stop of old worker {old_worker_id}"
+                    ));
+                } else {
+                    message.push_str(&format!(
+                        "\n- old worker {old_worker_id} did not finish its soft stop: {}",
+                        old_failures.join("; ")
+                    ));
+                }
+                if new_failures.is_empty() {
+                    message.push_str(&format!(
+                        "\n- new worker {new_worker_id} is serving: its activation finished"
+                    ));
+                } else {
+                    message.push_str(&format!(
+                        "\n- new worker {new_worker_id} activation failed: {}",
+                        new_failures.join("; ")
+                    ));
+                }
+                client.finish_failure(message);
             }
         }
     }
@@ -758,6 +807,8 @@ mod tests {
         time::Instant,
     };
 
+    use std::sync::Arc;
+
     use mio::{Token, net::UnixListener};
     use prost::Message;
     use serde_json::Value;
@@ -767,11 +818,19 @@ mod tests {
         UpgradeSnapshot, UpgradeStage, UpgradeWorkerProgress, UpgradeWorkerTask,
         commit_and_wait_for_activation, validate_prepared,
     };
-    use crate::command::server::{
-        CommandHub, GatheringTask, ServerState, TaskRestoreTiming, TaskSnapshotTiming,
+    use crate::command::{
+        server::{
+            CommandHub, GatheringTask, PeerCred, ServerState, TaskRestoreTiming,
+            TaskSnapshotTiming, WorkerId,
+        },
+        sessions::ClientSession,
     };
     use sozu_command_lib::channel::Channel;
     use sozu_command_lib::{config::Config, state::ConfigState};
+    use sozu_command_lib::{
+        proto::command::{Request, Response, ResponseStatus, WorkerResponse},
+        ready::Ready,
+    };
 
     fn sample_upgrade_data() -> UpgradeData {
         UpgradeData::new(UpgradeSnapshot {
@@ -991,5 +1050,149 @@ mod tests {
             .expect("restored snapshot should serialize");
             assert_eq!(actual, expected);
         }
+    }
+
+    fn worker_response(id: &str, status: ResponseStatus, message: &str) -> WorkerResponse {
+        WorkerResponse {
+            id: id.to_owned(),
+            status: status.into(),
+            message: message.to_owned(),
+            content: None,
+        }
+    }
+
+    /// Runs the `StopOldActivateNew` completion of `upgrade --worker 11` (new
+    /// worker 12) over `responses` and returns the single terminal answer its
+    /// client receives. The arm reads no worker session, so no worker process
+    /// is registered.
+    fn finish_stop_old_activate_new(responses: Vec<(WorkerId, WorkerResponse)>) -> Response {
+        let mut hub = test_hub();
+        let (channel, mut peer): (Channel<Response, Request>, Channel<Request, Response>) =
+            Channel::generate_nonblocking(4096, 65536).expect("create client channels");
+        let mut client = ClientSession::new(
+            channel,
+            1,
+            Token(1),
+            PeerCred::default(),
+            None,
+            None,
+            Arc::from("/tmp/sozu-upgrade-worker-test.sock"),
+        );
+        let ok = responses
+            .iter()
+            .filter(|(_, response)| response.status == ResponseStatus::Ok as i32)
+            .count();
+        let task = Box::new(UpgradeWorkerTask {
+            client_token: client.token,
+            progress: UpgradeWorkerProgress::StopOldActivateNew {
+                old_worker_id: 11,
+                new_worker_id: 12,
+            },
+            ok,
+            errors: responses.len() - ok,
+            expected_responses: responses.len(),
+            responses,
+        });
+
+        task.on_finish(&mut hub.server, &mut Some(&mut client), false);
+
+        client.channel.handle_events(Ready::WRITABLE);
+        client.channel.run().expect("client response should flush");
+        peer.handle_events(Ready::READABLE);
+        peer.run().expect("peer should buffer the client response");
+        let response = peer
+            .read_message()
+            .expect("the task must answer its client");
+        assert!(
+            peer.read_message().is_err(),
+            "the task must answer its client exactly once"
+        );
+        response
+    }
+
+    /// The old worker exits without answering its `SoftStop`:
+    /// `CommandHub::fail_in_flight_requests_of_worker` synthesizes a failure
+    /// for it. The client used to read "Upgrade successful".
+    #[test]
+    fn upgrade_worker_reports_an_old_worker_closing_before_its_soft_stop_as_a_failure() {
+        let response = finish_stop_old_activate_new(vec![
+            (
+                11,
+                worker_response(
+                    "UPGRADE-11-0",
+                    ResponseStatus::Failure,
+                    "worker 11 closed before answering",
+                ),
+            ),
+            (12, worker_response("UPGRADE-12-1", ResponseStatus::Ok, "")),
+            (12, worker_response("UPGRADE-12-2", ResponseStatus::Ok, "")),
+        ]);
+
+        assert_eq!(
+            response.status,
+            ResponseStatus::Failure as i32,
+            "{response:?}"
+        );
+        assert!(
+            response.message.contains("old worker 11")
+                && response
+                    .message
+                    .contains("worker 11 closed before answering"),
+            "the failure must name the old worker and its reason: {response:?}"
+        );
+        assert!(
+            response.message.contains("new worker 12 is serving"),
+            "the new worker activated fully and must be reported serving: {response:?}"
+        );
+    }
+
+    /// A rejected activation of the new worker used to be ignored and
+    /// reported as "finished activation of new worker".
+    #[test]
+    fn upgrade_worker_reports_a_failed_new_worker_activation_as_a_failure() {
+        let response = finish_stop_old_activate_new(vec![
+            (11, worker_response("UPGRADE-11-0", ResponseStatus::Ok, "")),
+            (12, worker_response("UPGRADE-12-1", ResponseStatus::Ok, "")),
+            (
+                12,
+                worker_response(
+                    "UPGRADE-12-2",
+                    ResponseStatus::Failure,
+                    "could not activate listener 127.0.0.1:8080",
+                ),
+            ),
+        ]);
+
+        assert_eq!(
+            response.status,
+            ResponseStatus::Failure as i32,
+            "{response:?}"
+        );
+        assert!(
+            response.message.contains("new worker 12")
+                && response
+                    .message
+                    .contains("could not activate listener 127.0.0.1:8080"),
+            "the failure must name the new worker and its reason: {response:?}"
+        );
+        assert!(
+            !response.message.contains("is serving"),
+            "a partially activated worker must not be reported serving: {response:?}"
+        );
+    }
+
+    #[test]
+    fn upgrade_worker_reports_success_when_both_workers_answer_ok() {
+        let response = finish_stop_old_activate_new(vec![
+            (11, worker_response("UPGRADE-11-0", ResponseStatus::Ok, "")),
+            (12, worker_response("UPGRADE-12-1", ResponseStatus::Ok, "")),
+            (12, worker_response("UPGRADE-12-2", ResponseStatus::Ok, "")),
+        ]);
+
+        assert_eq!(response.status, ResponseStatus::Ok as i32, "{response:?}");
+        assert_eq!(
+            response.message,
+            "Upgrade successful:\n- finished soft stop of worker 11\n- finished activation of new worker 12"
+        );
     }
 }
