@@ -2849,12 +2849,20 @@ fn test_h2_listener_rejects_alpn_absent() {
 // Test 8: mTLS — frontend client certificate authentication
 // ============================================================================
 
-/// Trusted CA and client identity, reused from the TCP-SNI mTLS assets.
-/// `mtls-client-cert.pem` is signed by `ca-cert.pem` and carries the
+/// Trusted CA, client identity and CRLs from `lib/assets/mtls/generate.sh`.
+/// `client-cert.pem` is issued by `ca-cert.pem` and carries the
 /// `TLS Web Client Authentication` extended key usage.
-const MTLS_CA_CERT: &[u8] = include_bytes!("../../assets/tcp_sni/ca-cert.pem");
-const MTLS_CLIENT_CERT: &[u8] = include_bytes!("../../assets/tcp_sni/mtls-client-cert.pem");
-const MTLS_CLIENT_KEY: &[u8] = include_bytes!("../../assets/tcp_sni/mtls-client-key.pem");
+const MTLS_CA_CERT: &[u8] = include_bytes!("../../../lib/assets/mtls/ca-cert.pem");
+const MTLS_CLIENT_CERT: &[u8] = include_bytes!("../../../lib/assets/mtls/client-cert.pem");
+const MTLS_CLIENT_KEY: &[u8] = include_bytes!("../../../lib/assets/mtls/client-key.pem");
+/// Issued by the CA, nextUpdate in 2125, revokes nothing.
+const MTLS_CRL_CURRENT: &str = include_str!("../../../lib/assets/mtls/crl-current.pem");
+/// Issued by the CA, nextUpdate in 2125, revokes the client.
+const MTLS_CRL_REVOKED: &str = include_str!("../../../lib/assets/mtls/crl-revoked.pem");
+/// Issued by the CA, nextUpdate in January 2020, revokes nothing.
+const MTLS_CRL_EXPIRED: &str = include_str!("../../../lib/assets/mtls/crl-expired.pem");
+/// Issued by another CA: covers nothing in the client's chain.
+const MTLS_CRL_OTHER_CA: &str = include_str!("../../../lib/assets/mtls/crl-other-ca.pem");
 
 /// What a client identity does to the handshake, for a given listener mode.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2883,6 +2891,7 @@ fn run_mtls_handshake(
     worker_name: &str,
     mode: ClientAuthMode,
     identity: ClientIdentity,
+    crls: &[&str],
 ) -> (Option<Vec<u8>>, usize) {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
@@ -2902,6 +2911,7 @@ fn run_mtls_handshake(
     https_listener.client_auth = Some(mode as i32);
     https_listener.client_ca_certificates =
         vec![String::from_utf8(MTLS_CA_CERT.to_vec()).expect("CA PEM is valid UTF-8")];
+    https_listener.client_ca_crls = crls.iter().map(|crl| (*crl).to_owned()).collect();
     worker.send_proxy_request_type(RequestType::add_https_listener(https_listener));
 
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
@@ -3034,6 +3044,7 @@ fn try_mtls_required_rejects_client_without_cert() -> State {
         "TLS-MTLS-REQUIRED-REJECT",
         ClientAuthMode::ClientAuthRequired,
         ClientIdentity::None,
+        &[],
     );
 
     println!(
@@ -3070,6 +3081,7 @@ fn try_mtls_required_accepts_trusted_client_cert() -> State {
         "TLS-MTLS-REQUIRED-OK",
         ClientAuthMode::ClientAuthRequired,
         ClientIdentity::Trusted,
+        &[],
     );
 
     let responded = response
@@ -3109,6 +3121,7 @@ fn try_mtls_optional_accepts_client_without_cert() -> State {
         "TLS-MTLS-OPTIONAL-OK",
         ClientAuthMode::ClientAuthOptional,
         ClientIdentity::None,
+        &[],
     );
 
     let responded = response
@@ -3133,6 +3146,91 @@ fn test_mtls_optional_accepts_client_without_cert() {
             5,
             "TLS mTLS: client_auth=optional admits a client presenting no certificate",
             try_mtls_optional_accepts_client_without_cert,
+        ),
+        State::Success,
+    );
+}
+
+/// A `required` listener trusting the test CA with `crls`, facing the
+/// trusted client certificate: the whole path from the listener config to the
+/// handshake, with the request either reaching the backend or never leaving
+/// the client.
+///
+/// A rejection here does not say why the handshake failed. The reason is
+/// pinned by the `client_revocation_*` unit tests in `lib/src/https.rs`, on
+/// the rustls error itself; these tests prove the configured CRLs reach the
+/// listener and decide the handshake.
+fn try_mtls_required_with_crls(worker_name: &str, crls: &[&str], accepted: bool) -> State {
+    let (response, requests_received) = run_mtls_handshake(
+        worker_name,
+        ClientAuthMode::ClientAuthRequired,
+        ClientIdentity::Trusted,
+        crls,
+    );
+
+    let responded = response
+        .as_ref()
+        .is_some_and(|r| r.starts_with(b"HTTP/1.1 200"));
+    println!(
+        "responded={responded} requests_received={requests_received} response={:?}",
+        response.as_ref().map(|r| String::from_utf8_lossy(r))
+    );
+
+    let outcome_matches = if accepted {
+        responded && requests_received == 1
+    } else {
+        response.is_none() && requests_received == 0
+    };
+    if outcome_matches {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_mtls_crl_that_does_not_list_the_client_accepts_it() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TLS mTLS: a current CRL from the issuer that does not list the client admits it",
+            || try_mtls_required_with_crls("TLS-MTLS-CRL-CURRENT", &[MTLS_CRL_CURRENT], true),
+        ),
+        State::Success,
+    );
+}
+
+#[test]
+fn test_mtls_crl_that_revokes_the_client_rejects_it() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TLS mTLS: a current CRL listing the client certificate rejects it",
+            || try_mtls_required_with_crls("TLS-MTLS-CRL-REVOKED", &[MTLS_CRL_REVOKED], false),
+        ),
+        State::Success,
+    );
+}
+
+#[test]
+fn test_mtls_expired_crl_rejects_the_client() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TLS mTLS: an expired CRL from the issuer rejects a client it does not list",
+            || try_mtls_required_with_crls("TLS-MTLS-CRL-EXPIRED", &[MTLS_CRL_EXPIRED], false),
+        ),
+        State::Success,
+    );
+}
+
+#[test]
+fn test_mtls_crl_of_another_issuer_rejects_the_client() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TLS mTLS: a client whose issuer no configured CRL covers is rejected",
+            || try_mtls_required_with_crls("TLS-MTLS-CRL-UNKNOWN", &[MTLS_CRL_OTHER_CA], false),
         ),
         State::Success,
     );
