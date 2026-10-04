@@ -512,6 +512,25 @@ practical consequence is that supplying CRLs is an all-or-nothing commitment:
   CRL rejects the clients it covers, even those it never listed as revoked.
 - CRL contents are inlined at config-load and never re-read (see above), so
   refreshing a CRL file on disk requires reloading the configuration.
+- Configure **one CRL per issuing CA**. Only the first configured CRL issued by
+  a given CA is consulted for the certificates that CA issued; the others are
+  never read. An old CRL listed before its replacement hides every revocation
+  the replacement adds, and an expired one listed first rejects all of that
+  CA's clients whatever follows. When rotating a CRL, replace the file rather
+  than adding the new one next to it.
+- A CRL must be signed by the CA that issued the certificates it covers, and if
+  that CA's certificate carries a KeyUsage extension it must include
+  `cRLSign`; a CRL that fails either check rejects the handshake. CRL files are
+  PEM (`-----BEGIN X509 CRL-----`); a DER file holds no PEM CRL and is refused
+  at listener creation.
+
+Before deploying a CRL, check its issuer and expiry, and that it gives the
+verdict you expect for a client certificate:
+
+```bash
+openssl crl -in client-ca.crl.pem -noout -issuer -nextupdate
+openssl verify -crl_check -CAfile client-ca.pem -CRLfile client-ca.crl.pem client.pem
+```
 
 This is a deliberate fail-closed posture: a revocation check that silently
 degrades to "allow" is indistinguishable from having no revocation at all. If
