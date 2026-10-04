@@ -303,6 +303,12 @@ cargo test -p sozu-e2e -- h2_              # all H2 e2e tests
 cargo test -p sozu-e2e -- test_udp_        # all UDP e2e tests
 cargo test -p sozu-e2e test_upgrade        # worker-upgrade e2e (see doc/upgrade_e2e_tests.md)
 
+# TCP/UDP lifecycle regressions against real workers and loopback services.
+# Select one exclusive crypto provider, as CI does:
+cargo test -p sozu-e2e --lib tests::tcp_tests::test_tcp_proxy_half_close_starts_fresh_session_for_every_proxy_mode --features crypto-ring -- --exact --nocapture
+cargo test -p sozu-e2e --lib tests::metrics_lifecycle_tests::test_old_tcp_session_metrics_do_not_decrement_same_identity_replacement --features crypto-ring -- --exact --nocapture
+cargo test -p sozu-e2e --lib tests::udp_tests::test_udp_remove_readd_preserves_old_flow_until_idle_then_reopens --features crypto-ring -- --exact --nocapture
+
 # Deterministic UDP simulation (moonpool-sim, sozu-sim crate): cfg-gated, so the
 # flag is REQUIRED — without it the crate compiles to an empty 0-test binary:
 RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim --test udp_simulation
@@ -319,6 +325,20 @@ RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim --test h2_simulation
 # Deterministic backend-selection simulation (same crate, same cfg gating):
 RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim --test backend_selection_sim
 ```
+
+The focused lifecycle tests above deliberately separate three contracts:
+
+| Boundary | Observable oracle |
+|---|---|
+| TCP client `shutdown(SHUT_WR)` in plain, PROXY Expect, Relay and Send modes | The old session drains the exact 256 KiB request and then closes at both ends. Plain and Expect expose only the payload to the backend; Relay preserves the client's exact 28-byte PPv2 header before it; Send synthesizes a 28-byte PPv2 header from the accepted client and listener addresses. No response is promised on that old session. A newly opened connection then carries one exact request and response with no replay of the old bytes. |
+| Raw TCP cluster remove/re-add with the same cluster id, backend id and address | A held old connection and an active replacement first make the proxy connection gauge `2`. Closing the old one makes the proxy gauge `1`; a causally later replacement response advances `bytes_out`; the replacement's labelled `connections_per_backend` gauge remains `1`. |
+| UDP cluster remove/re-add with the same cluster id, backend id and address | `RemoveCluster` stops admission but does not terminate an existing flow: the old client keeps the same proxy-side upstream peer after re-add. A distinct client gets another flow. Idle expiry then balances created/evicted/active as `(2, 2, 0)` and releases both upstream sockets; the original client subsequently creates a fresh flow, yielding `(3, 2, 1)`. |
+
+The TCP half-close contract is a clean-session contract, not transparent retry:
+the caller explicitly opens the second connection. The UDP contract differs
+because a flow already owns its connected upstream socket; cluster/backend
+control-plane replacement affects new admission, while that flow terminates on
+its normal timeout, request/response cap, listener shutdown or explicit drain.
 
 ### Simulation sweep + single-seed replay
 

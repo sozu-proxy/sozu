@@ -1376,6 +1376,158 @@ fn test_udp_every_idle_flow_is_torn_down() {
 }
 
 // =========================================================================
+// Remove/re-add preserves an old flow until its normal idle terminal path.
+//
+// Removing a UDP cluster stops admission but deliberately does not tear down
+// already-established flows: they own a connected upstream socket and keep
+// their captured backend for the rest of that flow lifetime. Re-adding the
+// exact same cluster/backend/address admits a distinct client's new flow.
+// After both flows expire normally, the original client source must open a
+// fresh flow rather than reviving the retired one.
+// =========================================================================
+
+fn try_udp_remove_readd_preserves_old_flow_until_idle() -> State {
+    const IDLE_TIMEOUT_SECS: u32 = 1;
+    let cluster = udp_cluster(CLUSTER, LoadBalancingAlgorithms::RoundRobin);
+    let (mut worker, backends, front) = setup_udp_test_with_idle_timeout(
+        "UDP-REMOVE-READD-FLOW-LIFECYCLE",
+        cluster.clone(),
+        1,
+        Some(IDLE_TIMEOUT_SECS),
+    );
+    let backend_address = backends[0];
+    let backend_id = format!("{CLUSTER}-0");
+    let old_backend = UdpBackend::bind("OLD", backend_address, 1).spawn();
+    let old_client = UdpClient::new("OLD-FLOW", front);
+
+    let old_reply = old_client.round_trip(b"old-before-remove", RT);
+    let old_received = old_backend.wait_for_requests(1, RT);
+    let old_observed = old_backend.observed();
+    let old_peer = old_observed.first().map(|datagram| datagram.peer);
+    let before_remove = udp_flow_metrics(&mut worker);
+    let open_before_remove = connected_upstream_sockets(&backends);
+
+    worker.send_proxy_request_type(RequestType::RemoveCluster(CLUSTER.to_owned()));
+    worker.read_to_last();
+    old_backend.stop();
+    let new_backend = UdpBackend::bind("NEW", backend_address, 1).spawn();
+    worker.send_proxy_request_type(RequestType::AddCluster(cluster));
+    worker.send_proxy_request_type(RequestType::AddUdpFrontend(udp_frontend(CLUSTER, front)));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        CLUSTER,
+        &backend_id,
+        backend_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    // The old source still addresses its established flow. Its connected
+    // upstream socket survives the cluster control-plane replacement, so the
+    // newly bound service observes the exact same proxy-side peer.
+    let old_after_reply = old_client.round_trip(b"old-after-readd", RT);
+    let old_after_received = new_backend.wait_for_requests(1, RT);
+    let old_after = new_backend.observed();
+    let old_peer_after = old_after
+        .iter()
+        .find(|datagram| datagram.payload == b"old-after-readd")
+        .map(|datagram| datagram.peer);
+
+    // A distinct source is admitted after re-add and owns a separate connected
+    // upstream socket, proving the replacement configuration makes progress
+    // without migrating the pre-existing flow.
+    let fresh_client = UdpClient::new("FRESH-FLOW", front);
+    let fresh_reply = fresh_client.round_trip(b"fresh-after-readd", RT);
+    let fresh_received = new_backend.wait_for_requests(2, RT);
+    let after_readd = new_backend.observed();
+    let fresh_peer = after_readd
+        .iter()
+        .find(|datagram| datagram.payload == b"fresh-after-readd")
+        .map(|datagram| datagram.peer);
+    let after_readd_metrics = udp_flow_metrics(&mut worker);
+    let open_after_readd = connected_upstream_sockets(&backends);
+
+    // Normal idle expiry is the terminal path. It releases both sockets and
+    // flow records; RemoveCluster itself is not used as a teardown signal.
+    std::thread::sleep(Duration::from_secs(u64::from(IDLE_TIMEOUT_SECS) * 3));
+    let after_idle_metrics = udp_flow_metrics(&mut worker);
+    let open_after_idle = connected_upstream_sockets(&backends);
+
+    let reopened_reply = old_client.round_trip(b"old-source-reopened", RT);
+    let reopened_received = new_backend.wait_for_requests(3, RT);
+    let final_observed = new_backend.observed();
+    let reopened_peer = final_observed
+        .iter()
+        .find(|datagram| datagram.payload == b"old-source-reopened")
+        .map(|datagram| datagram.peer);
+    let after_reopen_metrics = udp_flow_metrics(&mut worker);
+    let open_after_reopen = connected_upstream_sockets(&backends);
+
+    let reply_payload = |reply: Option<Vec<u8>>, expected_backend: &str, expected: &[u8]| {
+        matches!(
+            reply.as_deref().and_then(strip_reply_tag),
+            Some((name, payload)) if name == expected_backend && payload == expected
+        )
+    };
+    let old_lifetime_preserved = old_received
+        && reply_payload(old_reply, "OLD", b"old-before-remove")
+        && old_after_received
+        && reply_payload(old_after_reply, "NEW", b"old-after-readd")
+        && old_peer.is_some()
+        && old_peer_after == old_peer;
+    let replacement_flow_progressed = fresh_received
+        && reply_payload(fresh_reply, "NEW", b"fresh-after-readd")
+        && fresh_peer.is_some()
+        && fresh_peer != old_peer;
+    let old_source_reopened_fresh = reopened_received
+        && reply_payload(reopened_reply, "NEW", b"old-source-reopened")
+        && reopened_peer.is_some();
+    let lifecycle_balanced = before_remove == (1, 0, 1)
+        && after_readd_metrics == (2, 0, 2)
+        && after_idle_metrics == (2, 2, 0)
+        && after_reopen_metrics == (3, 2, 1)
+        && open_before_remove == 1
+        && open_after_readd == 2
+        && open_after_idle == 0
+        && open_after_reopen == 1;
+
+    println!(
+        "UDP remove/re-add lifecycle: old_peer={old_peer:?} old_after={old_peer_after:?} \
+         fresh_peer={fresh_peer:?} reopened_peer={reopened_peer:?} \
+         metrics before={before_remove:?} readd={after_readd_metrics:?} \
+         idle={after_idle_metrics:?} reopen={after_reopen_metrics:?} \
+         sockets={open_before_remove}->{open_after_readd}->{open_after_idle}->{open_after_reopen} \
+         old_preserved={old_lifetime_preserved} replacement={replacement_flow_progressed} \
+         reopened={old_source_reopened_fresh}"
+    );
+
+    new_backend.stop();
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    if old_lifetime_preserved
+        && replacement_flow_progressed
+        && old_source_reopened_fresh
+        && lifecycle_balanced
+        && stopped
+    {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_udp_remove_readd_preserves_old_flow_until_idle_then_reopens() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "UDP remove/re-add: old flow survives, replacement admits, idle closes, source reopens",
+            try_udp_remove_readd_preserves_old_flow_until_idle,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
 // Test 16: per-source flow limit.
 //
 // With `max_connections_per_ip = 2` on the cluster, a third socket of one
