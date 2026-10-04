@@ -4168,10 +4168,12 @@
   preserve the current incarnation. A legal route before `AddCluster`
   allocates an implicit incarnation which a later add preserves; only
   `RemoveCluster` ends it. The main process refuses `RemoveCluster` for an id
-  it never declared, so an implicit incarnation of a never-declared id lasts
-  until the worker exits, one identity-map entry per distinct id; removing the
-  id's last frontend or backend does not end it, and `AddCluster` followed by
-  `RemoveCluster` does (`doc/observability.md`). The first legal route after removal also clears the
+  its configuration state does not currently declare (never added, or already
+  removed), so an implicit incarnation of such an id, including one a route
+  recreates after removal, lasts until the worker exits, one identity-map entry
+  per distinct id; removing the id's last frontend or backend does not end it,
+  and `AddCluster` followed by `RemoveCluster` does in both cases
+  (`doc/observability.md`). The first legal route after removal also clears the
   old drain tombstone, allowing that implicit replacement to emit without an
   `AddCluster` while the removed incarnation remains fenced. Missing and
   exhausted captures remain distinct and
