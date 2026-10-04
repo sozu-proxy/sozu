@@ -61,6 +61,9 @@ time = "^0.3.55"
 tiny_http = "^0.12.0"
 tokio = "^1.53.1"
 toml = { version = "^1.1.6", features = ["preserve_order"] }
+tonic = { version = "^0.14.6", default-features = false }
+tonic-prost = "^0.14.6"
+tonic-prost-build = "^0.14.6"
 x509-parser = "^0.18.1"
 
 # Dependencies for the `sozu top` TUI subcommand. All gated behind the

@@ -1,0 +1,38 @@
+---
+name: gRPC E2E
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  grpc-e2e:
+    name: HTTPS H2 and TCP
+    runs-on: sozu-general
+    timeout-minutes: 20
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install Rust 1.93.1
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.93.1'
+
+      - name: Cache Cargo target
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
+        with:
+          cache-all-crates: true
+          prefix-key: ci-grpc-e2e
+
+      - name: Run real gRPC routes
+        run: "cargo test -p sozu-e2e --locked --features grpc-e2e tests::grpc_tests:: --verbose"

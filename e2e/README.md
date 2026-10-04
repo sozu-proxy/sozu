@@ -30,6 +30,16 @@ shown up on `feat/h2-mux`:
   `mux_tests.rs`, `h1_security_tests.rs`.
 - TLS handshake, ALPN, SNI binding: `tls_tests.rs`.
 - Raw TCP proxy: `tcp_tests.rs`.
+- Real gRPC over both supported routes: `grpc_tests.rs` runs a Tonic
+  server/client through HTTPS with ALPN `h2` and an h2c backend, then through
+  the raw TCP proxy. It covers unary Put/Get, ordered bidirectional streaming,
+  terminal status metadata, a real Tonic deadline propagating as `Cancelled`,
+  deadline and cancellation resource cleanup, reuse of the surviving channel,
+  and a new frontend connection without replay. Enable it explicitly with the
+  `grpc-e2e` feature.
+  The reconnect oracle counts client connector calls at the Sōzu frontend.
+  It deliberately requires only that the h2c backend accepts a connection:
+  Sōzu may validly reuse or pool an upstream HTTP/2 transport.
 - Listener live-update: `listener_update_tests.rs`.
 - Hot upgrade discipline: `test_upgrade*` cases (run with
   `cargo test -p sozu-e2e test_upgrade`).
@@ -62,6 +72,10 @@ The tests are flagged with the usual macros, so they will run with all other tes
 You can run just one test using
 
     cargo test test_issue_810_timeout
+
+Run the two real gRPC routes with:
+
+    cargo test -p sozu-e2e --features grpc-e2e tests::grpc_tests::
 
 If you want to run all e2e tests at once, do:
 
