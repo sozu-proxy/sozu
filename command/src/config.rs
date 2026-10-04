@@ -8081,6 +8081,86 @@ mod tests {
         assert!(config.client_ca_crls.is_empty());
     }
 
+    /// The configuration file names the CA and CRL files; the main process
+    /// reads them at config-load and sends their contents to the workers, on
+    /// the verb a worker that predates mutual TLS cannot decode.
+    #[test]
+    fn client_auth_listener_inlines_its_ca_and_crl_files_into_the_listener_request() {
+        let asset =
+            |name: &str| format!("{}/../lib/assets/mtls/{name}", env!("CARGO_MANIFEST_DIR"));
+        let (ca_path, crl_path) = (asset("ca-cert.pem"), asset("crl-revoked.pem"));
+        let toml_content = format!(
+            r#"
+            command_socket = "/tmp/sozu.sock"
+            saved_state    = "./state.json"
+            worker_count   = 1
+
+            [[listeners]]
+            protocol = "https"
+            address  = "127.0.0.1:8443"
+            client_auth = "required"
+            client_ca_certificates = ["{ca_path}"]
+            client_ca_crls = ["{crl_path}"]
+        "#
+        );
+        let file_config: FileConfig =
+            toml::from_str(&toml_content).expect("Could not parse TOML config");
+        let config = ConfigBuilder::new(file_config, "/tmp/test_config.toml")
+            .into_config()
+            .expect("a client auth listener with readable CA and CRL files must load");
+
+        let listeners: Vec<HttpsListenerConfig> = config
+            .generate_config_messages()
+            .expect("the config must produce its worker requests")
+            .into_iter()
+            .filter_map(|request| match request.content.request_type {
+                Some(RequestType::AddHttpsListenerWithClientAuth(listener)) => Some(listener),
+                Some(RequestType::AddHttpsListener(_)) => {
+                    panic!("a client auth listener must not go out as AddHttpsListener")
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(listeners.len(), 1, "one HTTPS listener is configured");
+        let listener = &listeners[0];
+        assert_eq!(
+            listener.client_auth,
+            Some(ClientAuthMode::ClientAuthRequired as i32)
+        );
+        assert_eq!(
+            listener.client_ca_certificates,
+            vec![std::fs::read_to_string(&ca_path).expect("read the CA fixture")],
+            "the CA file content, not its path, must reach the worker"
+        );
+        assert_eq!(
+            listener.client_ca_crls,
+            vec![std::fs::read_to_string(&crl_path).expect("read the CRL fixture")],
+            "the CRL file content, not its path, must reach the worker"
+        );
+        assert!(
+            listener.client_ca_crls[0].contains("BEGIN X509 CRL"),
+            "the inlined CRL is the PEM body"
+        );
+    }
+
+    #[test]
+    fn client_auth_listener_with_an_unreadable_crl_file_does_not_load() {
+        // A CRL the operator configured but Sozu cannot read would silently
+        // disable the revocation they asked for.
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 9443);
+        let mut https = ListenerBuilder::new_https(address);
+        https.client_auth = Some(ClientAuthConfig::Required);
+        https.client_ca_certificates = Some(vec![format!(
+            "{}/../lib/assets/mtls/ca-cert.pem",
+            env!("CARGO_MANIFEST_DIR")
+        )]);
+        https.client_ca_crls = Some(vec!["/nonexistent/crl.pem".to_owned()]);
+        assert!(
+            https.to_tls(None).is_err(),
+            "an unreadable CRL file must fail the listener, not drop the revocation check"
+        );
+    }
+
     #[test]
     fn client_auth_config_parses_documented_lowercase_names() {
         // The documented TOML values (`none`/`optional`/`required`) must parse,
