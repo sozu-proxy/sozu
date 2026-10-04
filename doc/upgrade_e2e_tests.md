@@ -329,6 +329,13 @@ replacement that failed only after `COMMIT` would have stopped every process,
 because the fenced old main exits and its workers follow their closed command
 channels.
 
+`dangling_pid_file_symlink_rolls_back_main_upgrade_and_keeps_serving` replaces
+it with a dangling symlink into a missing directory: `O_CREAT` follows the link,
+so the pre-`PREPARED` check tests the final target's parent and the upgrade must
+roll back the same way. Create failures that cannot be detected without
+creating a file (`ENOSPC`, quota, a security-module denial) still surface only
+after `COMMIT`, where they are logged and the new main keeps running.
+
 ```bash
 cargo test -p sozu --test upgrade_keeps_draining_worker_e2e --locked \
   upgrade_main_preserves_in_flight_worker_command_and_original_client_response \
