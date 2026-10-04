@@ -67,11 +67,29 @@ pub(crate) fn outranks_at_address(
     backend: &Backend,
     position: usize,
 ) -> bool {
+    count_sibling_step();
     if other.address != backend.address || other_position == position {
         return false;
     }
     let (other_weight, weight) = (backend_weight(other), backend_weight(backend));
     other_weight > weight || (other_weight == weight && other_position < position)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Work spent on shared addresses: one per [`outranks_at_address`]
+    /// comparison and one per step along a sibling ring. Lets a test hold
+    /// that a selection pays for the ids that share an address, not for the
+    /// size of the list.
+    pub(crate) static SIBLING_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Count one unit of shared-address work, in tests only (see
+/// `SIBLING_STEPS`); compiles to nothing otherwise.
+#[inline(always)]
+pub(crate) fn count_sibling_step() {
+    #[cfg(test)]
+    SIBLING_STEPS.with(|steps| steps.set(steps.get() + 1));
 }
 
 /// Deterministic, seedable 64-bit hash over the backend's STABLE identifier.
@@ -332,6 +350,10 @@ impl Hasher for FnvHasher {
 pub struct Candidates<'a> {
     backends: &'a [Rc<RefCell<Backend>>],
     indices: &'a [usize],
+    /// Sibling ring of `backends`: `siblings[i]` is the next position whose
+    /// backend shares the address of position `i`, cyclically, and `i` itself
+    /// for an address with one id. Empty when the caller tracks no siblings.
+    siblings: &'a [usize],
     now: Instant,
 }
 
@@ -354,8 +376,53 @@ impl<'a> Candidates<'a> {
         Self {
             backends,
             indices,
+            siblings: &[],
             now,
         }
+    }
+
+    /// [`Candidates::new`] with the sibling ring of `backends` (see the
+    /// field docs), which [`Candidates::siblings`] walks so a load-aware
+    /// policy can read the load of a whole address.
+    pub fn with_siblings(
+        backends: &'a [Rc<RefCell<Backend>>],
+        indices: &'a [usize],
+        siblings: &'a [usize],
+        now: Instant,
+    ) -> Self {
+        debug_assert_eq!(
+            siblings.len(),
+            backends.len(),
+            "the sibling ring covers every backend"
+        );
+        debug_assert!(
+            siblings.iter().all(|&next| next < backends.len()),
+            "a sibling must address a slot of the backend list"
+        );
+        Self {
+            siblings,
+            ..Self::new(backends, indices, now)
+        }
+    }
+
+    /// Every OTHER backend at the address of the candidate at `index`,
+    /// eligible or not: the ids a collapsed address hides behind its
+    /// representative. Empty without a sibling ring, and for an address with
+    /// one id, which costs one read.
+    pub fn siblings(
+        &self,
+        index: usize,
+    ) -> impl Iterator<Item = &'a Rc<RefCell<Backend>>> + use<'a> {
+        let start = self.indices[index];
+        let ring = self.siblings;
+        let backends = self.backends;
+        let next = move |position: usize| ring.get(position).copied().unwrap_or(start);
+        std::iter::successors(Some(next(start)), move |&position| Some(next(position)))
+            .take_while(move |&position| position != start)
+            .map(move |position| {
+                count_sibling_step();
+                &backends[position]
+            })
     }
 
     /// The instant this selection happens at.
@@ -620,6 +687,26 @@ impl LoadBalancingAlgorithm for Random {
     }
 }
 
+/// The load of the candidate at `index` under a count metric, summed over
+/// every id at its address ([`Candidates::siblings`]): what a server serving
+/// two ids actually carries. The connection-time average is a latency, not a
+/// count, and is read from the representative alone.
+fn address_count(
+    candidates: Candidates<'_>,
+    index: usize,
+    count: impl Fn(&Backend) -> usize,
+) -> usize {
+    let own = count(&candidates[index].borrow());
+    let total = candidates.siblings(index).fold(own, |sum, sibling| {
+        sum.saturating_add(count(&sibling.borrow()))
+    });
+    debug_assert!(
+        total >= own,
+        "an address carries at least its representative's load"
+    );
+    total
+}
+
 #[derive(Debug)]
 pub struct LeastLoaded {
     pub metric: LoadMetric,
@@ -632,13 +719,15 @@ impl LoadBalancingAlgorithm for LeastLoaded {
         backends: Candidates<'_>,
     ) -> Option<Rc<RefCell<Backend>>> {
         let was_empty = backends.is_empty();
+        // One address is one share: a count metric reads the address's load,
+        // the sum over its ids (`address_count`). The first minimum wins.
         let opt_b = match self.metric {
-            LoadMetric::Connections => backends
-                .iter()
-                .min_by_key(|backend| backend.borrow().active_connections),
-            LoadMetric::Requests => backends
-                .iter()
-                .min_by_key(|backend| backend.borrow().active_requests),
+            LoadMetric::Connections => (0..backends.len())
+                .min_by_key(|&index| address_count(backends, index, |b| b.active_connections))
+                .and_then(|index| backends.get(index)),
+            LoadMetric::Requests => (0..backends.len())
+                .min_by_key(|&index| address_count(backends, index, |b| b.active_requests))
+                .and_then(|index| backends.get(index)),
             LoadMetric::ConnectionTime => {
                 let mut b = None;
                 let now = backends.now();
@@ -774,11 +863,18 @@ impl PowerOfTwo {
     /// call count is the algorithm, not an implementation detail of it. The
     /// `ConnectionTime` arm needs `borrow_mut` because `peak_ewma_connection`
     /// decays the EWMA, to the selection's instant `now`, as it reads it.
-    fn measure(&self, backend: &Rc<RefCell<Backend>>, now: Instant) -> f64 {
+    ///
+    /// A count metric reads the load of the candidate's whole address, the
+    /// sum over its ids (`address_count`).
+    fn measure(&self, backends: Candidates<'_>, index: usize) -> f64 {
         match self.metric {
-            LoadMetric::Connections => backend.borrow().active_connections as f64,
-            LoadMetric::Requests => backend.borrow().active_requests as f64,
-            LoadMetric::ConnectionTime => backend.borrow_mut().peak_ewma_connection(now),
+            LoadMetric::Connections => {
+                address_count(backends, index, |b| b.active_connections) as f64
+            }
+            LoadMetric::Requests => address_count(backends, index, |b| b.active_requests) as f64,
+            LoadMetric::ConnectionTime => backends[index]
+                .borrow_mut()
+                .peak_ewma_connection(backends.now()),
         }
     }
 }
@@ -818,8 +914,8 @@ impl LoadBalancingAlgorithm for PowerOfTwo {
             "the shifted second index must stay inside the candidate set"
         );
 
-        let first_measure = self.measure(&backends[first], backends.now());
-        let second_measure = self.measure(&backends[second], backends.now());
+        let first_measure = self.measure(backends, first);
+        let second_measure = self.measure(backends, second);
 
         // Keep the lighter of the two samples. An exact tie is broken by a
         // coin flip rather than by index order: ties are the common case

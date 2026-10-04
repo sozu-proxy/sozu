@@ -657,10 +657,14 @@
   `MAGLEV` builds one table entry per distinct address, weighted by the heaviest of its ids over
   the full set. Shuffle sharding ranks and counts distinct primary addresses (`k`,
   `shard_min_backends`) and puts every primary id of a selected address in the shard. Placement
-  still keys on the address, so a rename without a move changes nothing. A cluster without a
-  shared address pays no new work per selection; one with a shared address pays a quadratic
-  scan of its candidates, without allocating. `LEAST_LOADED` and `POWER_OF_TWO` compare the
-  representative id's own counts, which carry the address's new connections. `HRW`'s keyed
+  still keys on the address, so a rename without a move changes nothing. `LEAST_LOADED` and
+  `POWER_OF_TWO` compare an address's load as the sum of its ids' connection (or request)
+  counts; `CONNECTION_TIME` reads the representative's own average. The ids of each address are
+  linked on the control plane (a sibling ring, plus each id's precomputed shard rank), so a
+  cluster without a shared address selects exactly as before at no new cost, and one with a
+  shared address pays per selection only for the ids at shared addresses, without allocating
+  (release build, round robin, one shared pair: 1000 backends 5.2 µs per selection, against
+  3.9–4.5 µs before the change and 2.5 ms with a per-candidate scan). `HRW`'s keyed
   path is unchanged; the round-robin fallback `HRW` and `MAGLEV` take for a request with no
   client key collapses like `ROUND_ROBIN`. **Behaviour change** for clusters declaring several
   ids at one address; no configuration or API change. See "One address is one share" in `doc/configure.md`.

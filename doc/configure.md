@@ -1021,9 +1021,11 @@ one share per id: with `A` and `B` at one address, `C` at another and equal
 weights, each address takes half the traffic under every policy. Among the ids
 of an address that can take a connection, the heaviest represents it — the
 first in declaration order when their weights are equal, the usual case — and
-the address weighs what that id weighs. That id is the one selected, and its
-connection and request counts are the ones `LEAST_LOADED` and `POWER_OF_TWO`
-compare. An id that is down, backing off or excluded by a retry never
+the address weighs what that id weighs. That id is the one selected.
+`LEAST_LOADED` and `POWER_OF_TWO` compare an address's load as the sum of the
+connection (or request) counts of all its ids, eligible or not, since they all
+reach the same server; under `CONNECTION_TIME` they read the representative's
+own average, a latency rather than a count. An id that is down, backing off or excluded by a retry never
 represents its address while a sibling there can take a connection: the
 sibling serves instead. `MAGLEV` builds its table over the full configured set,
 health aside, so an address claims the slots of one backend weighted by the
@@ -1032,6 +1034,12 @@ applied, since it scores an address, not an id; the other policies follow it
 since 2026-10-04 (`outranks_at_address` in `lib/src/load_balancing.rs`), and
 placement still keys on the address, so renaming an id without moving it
 leaves `HRW`, `MAGLEV` and shard placement unchanged.
+
+The ids sharing an address are linked when the backend list or a backend's
+configuration changes, never per request. A cluster without a shared address
+pays nothing for this rule; one with shared addresses pays, per selection,
+work proportional to the ids at shared addresses (a walk of each such
+address's ids), not to the size of the cluster, and allocates nothing.
 
 #### Backend connection failover
 
