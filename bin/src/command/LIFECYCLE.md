@@ -57,7 +57,10 @@ The supervisor is a single-threaded mio event loop. Each tick:
   workers answer or their channels close. The first close of any worker
   that is not yet `Stopped`, a `Stopping` one included, answers its
   in-flight requests with synthetic failures
-  (`CommandHub::on_worker_channel_closed`).
+  (`CommandHub::on_worker_channel_closed`). Each task turns them into the
+  client answer it would give a real rejection: an old worker that closes
+  before answering the `SoftStop` of an `upgrade --worker` fails that
+  upgrade (§4).
 
 `CommandHub` (`server.rs`) owns the per-client and per-worker session
 maps; it derefs to `Server` (`Deref` / `DerefMut for CommandHub`,
@@ -343,7 +346,17 @@ loop. A signal sent specifically to the old PID after that final check is not
 forwarded; service managers should signal the unit rather than a superseded PID.
 
 `UpgradeWorker` follows the analogous pattern through `upgrade_worker`
-(`bin/src/command/upgrade.rs`) and re-exec of an individual worker.
+(`bin/src/command/upgrade.rs`) and re-exec of an individual worker. Its first
+phase takes the old worker's listeners and launches the new worker with them;
+its second phase (`StopOldActivateNew`) soft-stops the old worker and sends the
+activation requests to the new one. `UpgradeWorkerTask::on_finish` answers
+`Ok` only when every response of that second phase is `Ok`. A failure of the
+old worker's `SoftStop`, including the synthetic "closed before answering" of
+§1.2, or of any activation request of the new worker, answers `Failure` naming
+the worker and its reasons, and says whether the new worker is serving. The
+CLI maps that answer to a non-zero exit of `sozu upgrade --worker N`; the
+per-worker upgrades that `sozu upgrade` runs after a main handoff only log
+such a failure (`bin/src/ctl/command.rs`).
 
 ---
 
