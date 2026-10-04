@@ -2744,6 +2744,34 @@ mod tests {
 
     use sozu_command_lib::proto::command::{PathRule, RulePosition, filtered_metrics};
 
+    fn wait_for_eof(reader: &mut impl Read, resource: &str) -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut byte = [0_u8; 1];
+        loop {
+            match reader.read(&mut byte) {
+                Ok(0) => return Ok(()),
+                Ok(count) => return Err(format!("{resource} produced {count} unexpected bytes")),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                    ) && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                    ) =>
+                {
+                    return Err(format!("{resource} did not reach EOF before the deadline"));
+                }
+                Err(error) => return Err(format!("{resource} read failed: {error}")),
+            }
+        }
+    }
+
     /// Helper to read a gauge value from the thread-local METRICS
     fn read_gauge(key: &str) -> Option<u64> {
         METRICS.with(|metrics| {
@@ -3591,8 +3619,8 @@ mod tests {
         let (scm_owner, mut scm_peer) =
             std::os::unix::net::UnixStream::pair().expect("could not create scm pair");
         scm_peer
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .expect("could not bound the scm peer read");
+            .set_nonblocking(true)
+            .expect("could not make the scm peer nonblocking");
         let scm_socket =
             ScmSocket::new(scm_owner.as_raw_fd()).expect("could not create scm socket");
         hub.server
@@ -3639,16 +3667,15 @@ mod tests {
         assert!(!hub.server.workers.contains_key(&token));
         assert!(!hub.restored_worker_tokens.contains(&token));
         assert!(!hub.restored_session_ticks.contains(&token));
-        let mut byte = [0_u8; 1];
-        assert_eq!(
-            worker_side.sock.read(&mut byte).expect("read channel peer"),
-            0,
-            "collecting the worker must close its command channel"
-        );
-        assert_eq!(
-            scm_peer.read(&mut byte).expect("read scm peer"),
-            0,
-            "collecting the worker must close its SCM descriptor after any concurrent fork reaches exec"
+        // A concurrent fork may retain CLOEXEC descriptors until its exec.
+        // Observe both endpoint identities before asserting either result;
+        // the bound still fails on a durable duplicate instead of accepting
+        // WouldBlock as successful cleanup.
+        let channel_eof = wait_for_eof(&mut worker_side.sock, "restored worker channel");
+        let scm_eof = wait_for_eof(&mut scm_peer, "restored worker SCM socket");
+        assert!(
+            channel_eof.is_ok() && scm_eof.is_ok(),
+            "channel: {channel_eof:?}; SCM: {scm_eof:?}"
         );
     }
 

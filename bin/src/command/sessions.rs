@@ -1086,10 +1086,11 @@ pub fn wants_to_tick<Tx, Rx>(channel: &Channel<Tx, Rx>) -> bool {
 #[cfg(test)]
 mod tests {
     use std::{
+        io::{ErrorKind, Read},
         os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
         os::unix::net::UnixStream as StdUnixStream,
         sync::Arc,
-        time::{Duration, UNIX_EPOCH},
+        time::{Duration, Instant, UNIX_EPOCH},
     };
 
     use mio::{Poll, Token};
@@ -1108,6 +1109,34 @@ mod tests {
         sanitize_for_audit, sanitize_for_audit_kv, wants_to_tick,
     };
     use crate::command::server::PeerCred;
+
+    fn wait_for_eof(reader: &mut impl Read, resource: &str) -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut byte = [0_u8; 1];
+        loop {
+            match reader.read(&mut byte) {
+                Ok(0) => return Ok(()),
+                Ok(count) => return Err(format!("{resource} produced {count} unexpected bytes")),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                    ) && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                    ) =>
+                {
+                    return Err(format!("{resource} did not reach EOF before the deadline"));
+                }
+                Err(error) => return Err(format!("{resource} read failed: {error}")),
+            }
+        }
+    }
 
     // -----------------------------------------------------------------
     // sanitize_for_audit_kv: strict, used for column-boundary fields
@@ -1924,7 +1953,7 @@ mod tests {
 
     #[test]
     fn dropping_paused_worker_closes_received_scm_descriptor() {
-        let (channel, _peer): (
+        let (channel, mut channel_peer): (
             Channel<WorkerRequest, WorkerResponse>,
             Channel<WorkerResponse, WorkerRequest>,
         ) = Channel::generate_nonblocking(64, 512).expect("could not generate worker channels");
@@ -1937,10 +1966,12 @@ mod tests {
             Token(91),
             ScmSocket::new(source_scm_owner.as_raw_fd()).expect("could not create SCM socket"),
         );
-        let received_channel_fd = worker.channel.fd();
         let snapshot = worker.snapshot();
-        let (received_scm, _received_scm_peer) =
+        let (received_scm, mut received_scm_peer) =
             StdUnixStream::pair().expect("could not create received SCM pair");
+        received_scm_peer
+            .set_nonblocking(true)
+            .expect("could not make received SCM peer nonblocking");
         let received_scm_fd = received_scm.into_raw_fd();
         // SAFETY: `into_raw_fd` transferred unique ownership to this test.
         let received_scm = unsafe { OwnedFd::from_raw_fd(received_scm_fd) };
@@ -1950,21 +1981,15 @@ mod tests {
                 .expect("worker snapshot should restore paused");
         drop(paused);
 
-        // SAFETY: F_GETFL only probes numeric descriptors; EBADF is the
-        // expected proof that both resources owned by PausedWorkerSession were
-        // closed on rollback.
-        assert_eq!(
-            unsafe { libc::fcntl(received_channel_fd, libc::F_GETFL) },
-            -1
-        );
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::EBADF)
-        );
-        assert_eq!(unsafe { libc::fcntl(received_scm_fd, libc::F_GETFL) }, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::EBADF)
+        // Observe both original peers before asserting either result. Numeric
+        // descriptors can be reused immediately by another parallel test;
+        // EOF identifies the socket endpoint and still fails if any real copy
+        // remains open across a concurrent fork-to-exec window.
+        let channel_eof = wait_for_eof(&mut channel_peer.sock, "paused worker channel");
+        let scm_eof = wait_for_eof(&mut received_scm_peer, "paused worker SCM socket");
+        assert!(
+            channel_eof.is_ok() && scm_eof.is_ok(),
+            "channel: {channel_eof:?}; SCM: {scm_eof:?}"
         );
     }
 }
