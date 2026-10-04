@@ -17,12 +17,20 @@ http-body-util = { workspace = true }
 hyper = { workspace = true, features = ["client", "server", "http1", "http2"] }
 hyper-rustls = { workspace = true, features = ["webpki-tokio", "http1", "http2", "tls12", "logging"] }
 hyper-util = { workspace = true, features = ["client-legacy", "http1", "http2", "server-auto", "service", "tokio"] }
+hickory-proto = { workspace = true, optional = true }
 libc = { workspace = true }
+lapin = { workspace = true, optional = true, features = ["tokio"] }
+magnetar = { workspace = true, optional = true, features = ["tokio", "crypto-ring"] }
 mio = { workspace = true }
+mongodb = { workspace = true, optional = true, features = ["compat-3-0-0", "rustls-tls"] }
+mysql_async = { workspace = true, optional = true, features = ["minimal-rust"] }
+redis = { workspace = true, optional = true, features = ["tokio-comp"] }
+rskafka = { workspace = true, optional = true }
 rustls = { workspace = true }
 sha2 = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "time"] }
+tokio-postgres = { workspace = true, optional = true, features = ["runtime"] }
 tonic = { workspace = true, optional = true, features = ["codegen", "router", "transport"] }
 tonic-prost = { workspace = true, optional = true }
 
@@ -94,3 +102,14 @@ simd = ["sozu-lib/simd"]
 # `tests/h1_security_tests.rs`) can be selected with
 # `cargo test -p sozu-e2e --features tolerant-http1-parser`.
 tolerant-http1-parser = ["sozu-lib/tolerant-http1-parser"]
+
+# Real protocol services are isolated opt-ins so the regular E2E and crypto
+# matrices do not compile heavyweight database or broker clients.
+service-postgres = ["dep:tokio-postgres"]
+service-mysql = ["dep:mysql_async"]
+service-redis = ["dep:redis"]
+service-mongodb = ["dep:mongodb"]
+service-kafka = ["dep:rskafka"]
+service-rabbitmq = ["dep:lapin"]
+service-pulsar = ["dep:magnetar"]
+service-coredns = ["dep:hickory-proto"]

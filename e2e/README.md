@@ -81,3 +81,68 @@ If you want to run all e2e tests at once, do:
 
     cd e2e
     cargo test
+
+## Real protocol services
+
+The real-service tests start one pinned container, put its published endpoint
+behind a Sōzu TCP or UDP listener, and use a native Rust protocol client only
+against the Sōzu frontend. They are opt-in because they download service images
+and compile client libraries that are irrelevant to the regular protocol
+matrix. An enabled feature fails when neither Docker nor Podman can reach a
+container server; it never turns a missing service into a skipped test.
+
+| Feature | Service and application operations |
+| --- | --- |
+| `service-postgres` | PostgreSQL transactions, update, savepoint rollback, exact reconnect read |
+| `service-mysql` | MySQL transactions, update, rollback, exact reconnect read |
+| `service-redis` | Redis pipeline, exact `MGET`, `DEL`, and absence check |
+| `service-mongodb` | MongoDB `insert_many`, update, sorted reconnect read, database removal |
+| `service-kafka` | One Kafka KRaft broker, keyed batch produce/fetch and exact offsets; no consumer-group coverage |
+| `service-rabbitmq` | RabbitMQ publisher confirms, fresh consumer connection, exact deliveries and acknowledgements |
+| `service-pulsar` | Pulsar standalone, Magnetar 1.7.2 producer/consumer acknowledgements and exact reconnect delivery |
+| `service-coredns` | CoreDNS authoritative A, AAAA, TXT and NXDOMAIN over raw UDP, flow expiry and listener reactivation |
+
+Pulsar uses Magnetar with its `tokio` and `crypto-ring` features. This focused
+job validates that client/provider combination and does not claim coverage for
+the other Sōzu crypto-provider cells. Its container becomes ready only after the
+broker health endpoint returns the exact `ok` body and the standalone
+`public/default` namespace exists. Kafka uses the pure-Rust `rskafka` client;
+the standalone stream test deliberately does not exercise consumer groups.
+The DNS client uses `hickory-proto` only to encode and decode datagrams on a
+connected `UdpSocket`; there is no system resolver and no hidden TCP fallback.
+
+The fixture takes ownership of each container ID before readiness polling. If
+startup fails, it saves the container logs, inspect data, and exit state before
+removing only an object whose engine and run labels still match, together with
+that object's anonymous volumes. When the
+engine returns no usable ID and no uniquely named object with those exact
+labels can be resolved, the fixture reports the failure without deleting an
+unverified object; the workflow finalizer removes only resources bearing the
+current run label.
+
+RabbitMQ health checks run `rabbitmq-diagnostics` through the image's
+`su-exec rabbitmq` path. Docker otherwise executes the health command as the
+image's root user, which can race broker startup by creating the shared Erlang
+cookie under `/var/lib/rabbitmq` with permissions that exclude the broker user.
+The failing historical cookie's ownership was not retained after its exact
+container cleanup; the preserved exit log and the pinned image's user and
+entrypoint behavior establish this startup boundary.
+
+For example:
+
+```sh
+SOZU_CONTAINER_ENGINE=docker \
+SOZU_PROTOCOL_SERVICE_ARTIFACT_DIR=/tmp/sozu-protocol-services \
+cargo test -p sozu-e2e -j4 --features service-postgres \
+  tests::real_services_tcp::postgres::round_trip_and_reconnect_via_sozu \
+  -- --exact --nocapture --test-threads=1
+```
+
+Each fixture assigns a unique owner label, removes only its exact container ID,
+and verifies disappearance after normal completion. On failure it writes the
+owned container log beneath `SOZU_PROTOCOL_SERVICE_ARTIFACT_DIR`. CI also sets
+a run-specific label so its `always()` cleanup can remove and archive only
+resources from that matrix cell. The fixtures create no named container volume;
+the CoreDNS zone is an invocation-owned temporary bind mount. Every test
+disables the Sōzu listener while the backend remains healthy and proves that a
+fresh application client cannot bypass the proxy before reactivation.
