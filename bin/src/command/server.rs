@@ -721,8 +721,10 @@ impl PausedCommandHub {
     /// self-pipe is private to this process and joins this Hub's own poll. A
     /// SIGTERM received before COMMIT is held in the pipe; the old main aborts
     /// the upgrade on its own pending SIGTERM and kills this process, and one
-    /// that arrives after its check is honoured by this Hub's event loop. See
-    /// [`CommandHub::handle_sigterm`].
+    /// that arrives after its check is honoured by this Hub's event loop. The
+    /// blocking wait for COMMIT retries the read the signal interrupts (a read
+    /// with `SO_RCVTIMEO` is never restarted, even under `SA_RESTART`), so the
+    /// signal cannot fail the handoff. See [`CommandHub::handle_sigterm`].
     pub fn handle_sigterm(&mut self) -> Result<(), ServerError> {
         self.sigterm_receiver = Some(install_sigterm_handler(&self.server.poll)?);
         Ok(())

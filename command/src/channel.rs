@@ -919,6 +919,10 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
     }
 
     /// Wait for the front buffer to be filled, and parses a message from it.
+    ///
+    /// The wait ends with a message, a read error, or once `timeout` has
+    /// elapsed since the call. A read interrupted by a signal (`EINTR`) is
+    /// retried against that same deadline, never restarting it.
     pub fn read_message_blocking_timeout(
         &mut self,
         timeout: Option<Duration>,
@@ -948,7 +952,13 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
                 Ok(0) => return Err(ChannelError::NoByteToRead),
                 Ok(bytes_read) => self.front_buf.fill(bytes_read),
                 Err(io_error) => match io_error.kind() {
-                    ErrorKind::WouldBlock => continue, // ignore 10 millisecond timeouts
+                    // The 100 ms `SO_RCVTIMEO` slice elapsed with no byte.
+                    ErrorKind::WouldBlock => continue,
+                    // signal(7): a read with `SO_RCVTIMEO` is never restarted,
+                    // even under `SA_RESTART`, so any handled signal (the main
+                    // process's `SIGTERM`) lands here. Retry: the deadline
+                    // check at the top of the loop still bounds the wait.
+                    ErrorKind::Interrupted => continue,
                     _ => break Err(ChannelError::Read(io_error)),
                 },
             };
@@ -1971,6 +1981,108 @@ mod tests {
             .expect("error with receiving message from awaiting thread");
 
         assert!(arrived_too_late.is_err());
+    }
+
+    /// Install a no-op `SIGUSR1` handler with `SA_RESTART`, as the main
+    /// process does for `SIGTERM`. signal(7): a socket read with a receive
+    /// timeout (`SO_RCVTIMEO`) is never restarted, it fails with `EINTR`.
+    #[cfg(target_os = "linux")]
+    fn install_restarting_sigusr1_handler() {
+        extern "C" fn ignore(_: libc::c_int) {}
+        // SAFETY: the handler is async-signal-safe (it does nothing), and the
+        // `sigaction` struct is fully initialised before the call.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = ignore as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            assert_eq!(
+                libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()),
+                0
+            );
+        }
+    }
+
+    /// Spawn a reader blocked in `read_message_blocking_timeout`, then
+    /// interrupt its thread with `SIGUSR1` every 5 ms for `flood`, so at least
+    /// one signal lands while the 100 ms `SO_RCVTIMEO` read is blocked.
+    #[cfg(target_os = "linux")]
+    fn read_blocking_under_signal_flood(
+        timeout: Duration,
+        flood: Duration,
+        message: Option<ProtobufMessage>,
+    ) -> (Result<ProtobufMessage, ChannelError>, Duration) {
+        install_restarting_sigusr1_handler();
+        let (mut reading_channel, mut writing_channel) = test_channels();
+        writing_channel.blocking().expect("Could not block channel");
+
+        let (thread_sender, thread_receiver) = std::sync::mpsc::channel();
+        let reader = thread::spawn(move || {
+            // SAFETY: `pthread_self` has no preconditions.
+            thread_sender
+                .send(unsafe { libc::pthread_self() })
+                .expect("send reader thread id");
+            let started = std::time::Instant::now();
+            let message = reading_channel.read_message_blocking_timeout(Some(timeout));
+            (message, started.elapsed(), reading_channel)
+        });
+        let reader_thread = thread_receiver.recv().expect("reader thread id");
+
+        let flood_end = std::time::Instant::now() + flood;
+        while std::time::Instant::now() < flood_end {
+            thread::sleep(Duration::from_millis(5));
+            // SAFETY: `reader` is joined below, so `reader_thread` names a
+            // thread that is running or exited but not yet joined.
+            unsafe { libc::pthread_kill(reader_thread, libc::SIGUSR1) };
+        }
+        if let Some(message) = message {
+            writing_channel
+                .write_message(&message)
+                .expect("Could not write message on channel");
+        }
+
+        let (result, elapsed, _reading_channel) = reader.join().expect("reader thread");
+        (result, elapsed)
+    }
+
+    /// A signal delivered while a blocking read waits (a whole-cgroup
+    /// `SIGTERM` reaching a replacement main that waits for COMMIT) must not
+    /// abort the wait: the message sent afterwards is still received.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_message_blocking_with_timeout_survives_interrupting_signals() {
+        let (result, _) = read_blocking_under_signal_flood(
+            Duration::from_secs(5),
+            Duration::from_millis(300),
+            Some(ProtobufMessage { inner: 7 }),
+        );
+        assert_eq!(
+            result.expect("an interrupted read must keep waiting"),
+            ProtobufMessage { inner: 7 }
+        );
+    }
+
+    /// Retrying an interrupted read keeps the caller's deadline: signals
+    /// arriving for longer than the timeout neither abort nor extend it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_message_blocking_with_timeout_keeps_its_deadline_under_signals() {
+        let timeout = Duration::from_millis(300);
+        let (result, elapsed) =
+            read_blocking_under_signal_flood(timeout, Duration::from_millis(600), None);
+        assert!(
+            matches!(result, Err(ChannelError::TimeoutReached(reached)) if reached == timeout),
+            "expected the deadline to be reached, got {result:?}"
+        );
+        assert!(
+            elapsed >= timeout,
+            "returned before the deadline: {elapsed:?}"
+        );
+        // One 100 ms `SO_RCVTIMEO` slice of overshoot, plus scheduling slack.
+        assert!(
+            elapsed < timeout + Duration::from_millis(400),
+            "the deadline was extended: {elapsed:?}"
+        );
     }
 
     #[test]

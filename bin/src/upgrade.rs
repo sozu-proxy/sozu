@@ -431,8 +431,8 @@ pub fn begin_new_main_process(
     // channels close: a failure there would stop the whole proxy. None of
     // these steps touches state shared with the old main. `FD_CLOEXEC` is a
     // flag of this process's descriptor table, the SIGTERM self-pipe is
-    // private (and `exec` reset the old main's handler), and opening the pid
-    // file leaves its content alone until the publish step below.
+    // private (and `exec` reset the old main's handler), and checking the pid
+    // file neither creates nor rewrites it before the publish step below.
     paused_hub
         .enable_cloexec_after_upgrade()
         .map_err(UpgradeError::EnableCloexec)?;
