@@ -7614,6 +7614,14 @@
 
 ### ➖ Removed
 
+- **BREAKING (library API) — `refactor(backends)`: the public `BackendMap::max_failures` field is
+  removed.** `BackendMap::new` and `BackendMap::with_seed` initialised it to `3` and nothing in the
+  workspace read it; it has had no effect since at least
+  [#514](https://github.com/sozu-proxy/sozu/issues/514). Backend failure handling is the
+  per-backend `ExponentialBackoffPolicy` retry policy plus the session-level
+  `max_connection_attempts` limit. An embedder that set or read the field drops it. No runtime
+  behaviour changes.
+
 - **BREAKING (library API) — `refactor(lib)`: `BackendMap::backend_from_sticky_session` is removed
   ([#1684](https://github.com/sozu-proxy/sozu/issues/1684)).** Once the mux reserved through
   `BackendMap::reserve_sticky_backend`, its only callers were its own three tests. They now exercise
