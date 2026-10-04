@@ -161,27 +161,34 @@ fn prime_with_one_request(front_address: SocketAddr, back_address: SocketAddr) {
     serve_one_request(&mut backend, front_address);
 }
 
-/// Send one `Connection: close` request through the worker and let
-/// `backend` (already bound) answer it.
-fn serve_one_request(backend: &mut SyncBackend, front_address: SocketAddr) {
+/// Route one `Connection: close` request through the worker and return whether
+/// the real backend response crossed the full data-plane path.
+fn serve_one_request(backend: &mut SyncBackend, front_address: SocketAddr) -> bool {
     let mut client = crate::mock::client::Client::new(
         "metrics_lifecycle_client",
         front_address,
         "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".to_owned(),
     );
     client.connect();
-    client.send();
+    if client.send().is_none() {
+        return false;
+    }
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    while std::time::Instant::now() < deadline {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut served = false;
+    while Instant::now() < deadline {
         if backend.accept(0) {
             backend.receive(0);
             backend.send(0);
+            served = true;
             break;
         }
         thread::sleep(Duration::from_millis(50));
     }
-    let _ = client.receive();
+    served
+        && client
+            .receive_response(Duration::from_secs(1))
+            .is_some_and(|response| response.ends_with("\r\n\r\npong"))
 }
 
 /// Query the worker for the per-cluster metrics row of `cluster_id`.

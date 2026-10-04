@@ -3821,6 +3821,10 @@ mod tests {
             &mut self.gatherer
         }
 
+        fn snapshot(&self, _timing: TaskSnapshotTiming) -> Result<TaskSnapshot, TaskSnapshotError> {
+            Err(TaskSnapshotError::UnsupportedTestTask("TimeoutProbeTask"))
+        }
+
         fn on_finish(
             self: Box<Self>,
             server: &mut Server,
