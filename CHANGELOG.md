@@ -4012,6 +4012,16 @@
 
 ### 🐛 Fixed
 
+- **`fix(metrics)`: removing one address of a backend id keeps the metrics of the id's
+  remaining addresses.** `ConfigState` and the worker key backends on `(backend_id, address)`,
+  so one id may serve from several addresses, while backend metrics are labelled by id alone and
+  every such entry feeds one row. `Server::remove_backend` (`lib/src/server.rs`) dropped that row
+  on every `RemoveBackend`, so removing one address wiped the cumulative local-drain counters and
+  the queued StatsD lines of the id's addresses still serving. The row is now dropped only once
+  no backend of that id remains in the cluster (new `BackendMap::has_backend_id`); removing an
+  already-absent backend still clears an orphan row. Pinned by the e2e test
+  `test_remove_backend_keeps_row_shared_with_live_same_id_entry`.
+
 - **`fix(upgrade)`: `sozu upgrade --worker` no longer reports a failed second phase as a
   success.** In `UpgradeWorkerTask::on_finish` (`bin/src/command/upgrade.rs`), the
   `StopOldActivateNew` arm answered "Upgrade successful" whatever its workers replied. An old
@@ -4047,6 +4057,26 @@
   where none existed. A missing file is now only checked through its parent directory's write
   access, and `util::publish_pid_file` creates it after COMMIT; an existing file is still opened
   untruncated. Pinned by `open_pid_file_defers_creating_a_missing_file_until_publish`.
+
+- **`fix(upgrade)`: a dangling pid-file symlink into a missing directory rolls the main upgrade
+  back ([#1848](https://github.com/sozu-proxy/sozu/pull/1848) follow-up).** `util::open_pid_file`
+  (`bin/src/util.rs`) checked a missing pid file through the parent of the configured path, but
+  `O_CREAT` in `util::publish_pid_file` follows a dangling symlink and creates its final target.
+  A link into a missing directory therefore passed the pre-PREPARED check, the upgrade committed,
+  and the post-COMMIT create failed with `ENOENT` and was only logged. The check now follows the
+  link chain and tests the final target's parent, still creating nothing. Failures that cannot be
+  detected without creating a file (`ENOSPC`, quota, a security-module denial) remain logged after
+  COMMIT while the new main keeps running; this residual risk is documented on `open_pid_file`.
+  Pinned by `open_pid_file_rejects_a_dangling_symlink_into_a_missing_directory`,
+  `open_pid_file_follows_a_dangling_relative_symlink_to_its_target` and
+  `dangling_pid_file_symlink_rolls_back_main_upgrade_and_keeps_serving`.
+
+- **`test(e2e)`: the compatibility-matrix skip message no longer interleaves with libtest
+  output.** `bin/tests/main_upgrade_compatibility_matrix_e2e.rs` wrote it with an unbuffered
+  `writeln!`, one `write(2)` per format piece, so libtest's progress lines and the other case
+  split it (for example `... skipping option3-to-legacyok: set SOZU_MATRIX...`). It is now
+  formatted first and written by a single `write_all`, framed by newlines; whether the case runs
+  is unchanged.
 
 - **`fix(command)`: a stopping worker that closes answers its in-flight control commands.** The
   old worker of an `upgrade --worker` is marked `Stopping`, then its `SoftStop` answer is awaited by
@@ -4185,7 +4215,13 @@
   `AddCluster` updates and metric disable/enable, clear, and detail controls
   preserve the current incarnation. A legal route before `AddCluster`
   allocates an implicit incarnation which a later add preserves; only
-  `RemoveCluster` ends it. The first legal route after removal also clears the
+  `RemoveCluster` ends it. The main process refuses `RemoveCluster` for an id
+  its configuration state does not currently declare (never added, or already
+  removed), so an implicit incarnation of such an id, including one a route
+  recreates after removal, lasts until the worker exits, one identity-map entry
+  per distinct id; removing the id's last frontend or backend does not end it,
+  and `AddCluster` followed by `RemoveCluster` does in both cases
+  (`doc/observability.md`). The first legal route after removal also clears the
   old drain tombstone, allowing that implicit replacement to emit without an
   `AddCluster` while the removed incarnation remains fenced. Missing and
   exhausted captures remain distinct and

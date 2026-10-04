@@ -121,6 +121,10 @@ pub fn write_pid_file(config: &Config) -> Result<(), UtilError> {
     Ok(())
 }
 
+/// Symbolic links followed while resolving a missing pid file, Linux's
+/// `MAXSYMLINKS`; a longer chain already fails the first `open` with `ELOOP`.
+const MAX_SYMLINKS: usize = 40;
+
 /// Check that the configured pid file can be published later by
 /// [`publish_pid_file`], without changing anything on disk.
 ///
@@ -129,10 +133,18 @@ pub fn write_pid_file(config: &Config) -> Result<(), UtilError> {
 /// read-only file system, a denied permission) fails here instead of after
 /// COMMIT. An existing file is opened for writing but never truncated, so the
 /// old main's pid stays published if the upgrade rolls back. A missing file
-/// is not created: only its parent directory is checked for write and search
-/// access, and [`publish_pid_file`] creates it after COMMIT. Creating it here
+/// is not created: only the directory that will hold it is checked for write
+/// and search access, and [`publish_pid_file`] creates it after COMMIT. When
+/// the path is a dangling symlink, that directory is the parent of the link's
+/// final target, which `O_CREAT` follows and creates. Creating the file here
 /// would leave an empty pid file behind every rolled-back upgrade, including
 /// one where the old main SIGKILLs this process before it could clean up.
+///
+/// Some failures cannot be detected without creating a file: `ENOSPC`, an
+/// exhausted inode or disk quota, or a security module denying the create.
+/// They surface only in [`publish_pid_file`] after COMMIT, where the upgrade
+/// can no longer roll back, so they are logged and the new main keeps running
+/// (systemd still learns its pid through `MAINPID=`).
 pub fn open_pid_file(config: &Config) -> Result<Option<(String, Option<File>)>, UtilError> {
     let Some(path) = config.pid_file_path.as_deref() else {
         return Ok(None);
@@ -140,7 +152,27 @@ pub fn open_pid_file(config: &Config) -> Result<Option<(String, Option<File>)>, 
     match OpenOptions::new().write(true).truncate(false).open(path) {
         Ok(file) => Ok(Some((path.to_owned(), Some(file)))),
         Err(io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
-            let parent = match Path::new(path).parent() {
+            // `O_CREAT` follows a dangling symlink and creates its final
+            // target, so that target's directory is the one to check.
+            let mut target = PathBuf::from(path);
+            for _ in 0..MAX_SYMLINKS {
+                if !std::fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink()) {
+                    break;
+                }
+                let link = read_link(&target)
+                    .map_err(|io_err| UtilError::CreatePidFile(path.to_owned(), io_err))?;
+                target = match target.parent() {
+                    Some(parent) => parent.join(link),
+                    None => link,
+                };
+            }
+            if std::fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err(UtilError::CreatePidFile(
+                    path.to_owned(),
+                    IoError::from(Errno::ELOOP),
+                ));
+            }
+            let parent = match target.parent() {
                 Some(parent) if !parent.as_os_str().is_empty() => parent,
                 _ => Path::new("."),
             };
@@ -595,5 +627,46 @@ mod tests {
             Err(UtilError::CreatePidFile(_, _))
         ));
         assert!(!path.exists());
+    }
+
+    /// `O_CREAT` follows a dangling symlink and creates its target, so the
+    /// directory that must accept the new file is the target's parent, not
+    /// the link's. A link into a missing directory passes a check of the
+    /// link's parent but fails the post-COMMIT publish with `ENOENT`.
+    #[test]
+    fn open_pid_file_rejects_a_dangling_symlink_into_a_missing_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("sozu.pid");
+        let target = temp.path().join("missing").join("sozu.pid");
+        std::os::unix::fs::symlink(&target, &path).expect("symlink");
+
+        assert!(matches!(
+            open_pid_file(&pid_file_config(&path)),
+            Err(UtilError::CreatePidFile(_, _))
+        ));
+        assert!(!temp.path().join("missing").exists());
+    }
+
+    /// A dangling symlink whose target directory exists stays publishable:
+    /// the check creates nothing, and the publish creates the target.
+    #[test]
+    fn open_pid_file_follows_a_dangling_relative_symlink_to_its_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(temp.path().join("run")).expect("target directory");
+        let path = temp.path().join("sozu.pid");
+        std::os::unix::fs::symlink("run/sozu.pid", &path).expect("symlink");
+
+        let (published_path, file) = open_pid_file(&pid_file_config(&path))
+            .expect("the symlink target's parent is writable")
+            .expect("a configured pid file is returned");
+        assert!(file.is_none());
+        assert!(!temp.path().join("run").join("sozu.pid").exists());
+
+        publish_pid_file(&published_path, file).expect("publish creates the target");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("run").join("sozu.pid"))
+                .expect("read pid file"),
+            std::process::id().to_string()
+        );
     }
 }
