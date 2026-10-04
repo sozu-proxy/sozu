@@ -998,6 +998,14 @@ impl Aggregator {
         if let ClusterMetricsCapture::Active(incarnation) = capture {
             self.cluster_incarnations
                 .insert(cluster_id.to_owned(), incarnation);
+            // This implicit route starts the replacement lifetime just as an
+            // AddCluster would. Re-arm both drains so the new identity can
+            // create its row while the identity gate still rejects owners
+            // captured before RemoveCluster.
+            if let Some(ref mut net) = self.network.as_mut() {
+                net.add_cluster(cluster_id);
+            }
+            self.local.add_cluster(cluster_id);
         }
         capture
     }
@@ -1729,6 +1737,53 @@ mod tests {
     }
 
     #[test]
+    fn implicit_route_after_remove_rearms_drains_without_add_cluster() {
+        let mut aggregator = Aggregator::new(String::new());
+        aggregator.set_up_detail(MetricDetailLevel::Backend);
+
+        let first = aggregator.capture_cluster_metrics("implicit-replacement");
+        aggregator.receive_metric_for_incarnation(
+            "implicit_replacement",
+            Some("implicit-replacement"),
+            Some("backend"),
+            first,
+            MetricValue::Count(1),
+        );
+        aggregator.remove_cluster("implicit-replacement");
+
+        // Frontends and backends may legally recreate this id without an
+        // AddCluster. The first new route is therefore both the identity and
+        // drain-lifetime boundary for the replacement.
+        let replacement = aggregator.capture_cluster_metrics("implicit-replacement");
+        assert_ne!(replacement, first);
+        aggregator.receive_metric_for_incarnation(
+            "implicit_replacement",
+            Some("implicit-replacement"),
+            Some("backend"),
+            replacement,
+            MetricValue::Count(2),
+        );
+        aggregator.receive_metric_for_incarnation(
+            "implicit_replacement",
+            Some("implicit-replacement"),
+            Some("backend"),
+            first,
+            MetricValue::Count(4),
+        );
+
+        assert_eq!(
+            local_labelled_value(
+                &mut aggregator,
+                "implicit-replacement",
+                Some("backend"),
+                "implicit_replacement",
+            ),
+            Some(filtered_metrics::Inner::Count(2)),
+            "the replacement implicit lifetime must be visible while the removed lifetime stays fenced",
+        );
+    }
+
+    #[test]
     fn exhausted_add_is_not_an_implicit_identity() {
         let mut aggregator = Aggregator::new(String::new());
         aggregator.set_up_detail(MetricDetailLevel::Backend);
@@ -1751,6 +1806,46 @@ mod tests {
                 .expect("dump metrics after exhausted emission")
                 .contains_key("reviewer-exhausted"),
             "allocation exhaustion must fail closed instead of sharing the undeclared identity",
+        );
+    }
+
+    #[test]
+    fn exhausted_implicit_capture_does_not_rearm_removed_drains() {
+        let mut aggregator = Aggregator::new(String::new());
+        aggregator.set_up_detail(MetricDetailLevel::Backend);
+        assert!(matches!(
+            aggregator.capture_cluster_metrics("exhausted-after-remove"),
+            ClusterMetricsCapture::Active(_),
+        ));
+        aggregator.remove_cluster("exhausted-after-remove");
+        aggregator.last_cluster_incarnation = u64::MAX;
+
+        let exhausted = aggregator.capture_cluster_metrics("exhausted-after-remove");
+        assert_eq!(exhausted, ClusterMetricsCapture::Invalid);
+        aggregator.receive_metric_for_incarnation(
+            "exhausted_after_remove",
+            Some("exhausted-after-remove"),
+            Some("backend"),
+            exhausted,
+            MetricValue::Count(1),
+        );
+        // Probe the drain directly as well: the identity-aware call above is
+        // rejected before dispatch and therefore cannot prove that allocation
+        // exhaustion left the RemoveCluster tombstone armed.
+        aggregator.receive_metric(
+            "exhausted_after_remove_probe",
+            Some("exhausted-after-remove"),
+            Some("backend"),
+            MetricValue::Count(1),
+        );
+
+        assert!(
+            !aggregator
+                .local
+                .dump_cluster_metrics(&[])
+                .expect("dump metrics after exhausted implicit capture")
+                .contains_key("exhausted-after-remove"),
+            "allocation exhaustion must leave the removed drain tombstone armed",
         );
     }
 

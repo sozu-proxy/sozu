@@ -4103,7 +4103,10 @@
   `AddCluster` updates and metric disable/enable, clear, and detail controls
   preserve the current incarnation. A legal route before `AddCluster`
   allocates an implicit incarnation which a later add preserves; only
-  `RemoveCluster` ends it. Missing and exhausted captures remain distinct and
+  `RemoveCluster` ends it. The first legal route after removal also clears the
+  old drain tombstone, allowing that implicit replacement to emit without an
+  `AddCluster` while the removed incarnation remains fenced. Missing and
+  exhausted captures remain distinct and
   fail closed whenever cluster labels are retained. The public `SessionMetrics` literal shape
   and its current-configuration registration method remain compatible for
   embedders; only Sōzu's internal delayed owners use the captured-incarnation
@@ -4116,7 +4119,9 @@
   `implicit_cluster_capture_is_recorded_at_labelled_detail`,
   `add_without_remove_keeps_implicit_identity_and_balances_labelled_gauge`,
   `removed_implicit_capture_stays_rejected_after_clear`,
+  `implicit_route_after_remove_rearms_drains_without_add_cluster`,
   `exhausted_add_is_not_an_implicit_identity`,
+  `exhausted_implicit_capture_does_not_rearm_removed_drains`,
   `every_capture_state_keeps_process_and_frontend_aggregates`,
   `real_http_session_without_add_cluster_records_labelled_metrics`,
   `static_tcp_route_keeps_its_capture_after_cluster_replacement`,

@@ -155,9 +155,10 @@ H2 / WebSocket / TCP sessions continue emitting access-log /
 response-time / gauge metrics for the removed cluster. Without the
 tombstone those emissions would keep growing the cluster row until the
 last session closed; with it, the wire and the local drain stay quiet.
-The tombstone is cleared on `AddCluster` for the same id (a cluster can
-come back after a remove) and on `sozu metrics clear` (operator-initiated
-full reset).
+The tombstone is cleared when the replacement lifetime starts: on
+`AddCluster`, or on the first legal route after removal when frontends and
+backends recreate the id without an `AddCluster`. `sozu metrics clear` also
+clears it as part of the operator-initiated full reset.
 
 The tombstone alone cannot distinguish that replacement from the removed
 cluster. Each effective cluster lifetime therefore has an opaque metrics
@@ -191,10 +192,13 @@ The first legal route to an id allocates an incarnation even when no
 implicit cluster. A later `AddCluster` without an intervening removal keeps the
 same identity, so a labelled gauge opened by the implicit route can still be
 closed. `RemoveCluster` is the lifetime boundary: it drops the active identity,
-and the next route or add allocates a different one. Disabling and re-enabling
-cluster metric collection, changing `metrics.detail`, and `sozu metrics clear`
-do not alter active identities. This keeps old emissions obsolete across
-collection controls even though a clear resets drain storage and tombstones.
+and the next route or add allocates a different one. A route-created
+replacement also re-arms both drains, so its metrics are visible without an
+`AddCluster`; emissions carrying the removed identity remain fenced.
+Disabling and re-enabling cluster metric collection, changing
+`metrics.detail`, and `sozu metrics clear` do not alter active identities. This
+keeps old emissions obsolete across collection controls even though a clear
+resets drain storage and tombstones.
 
 The public `SessionMetrics` shape and
 `SessionMetrics::register_end_of_session(&LogContext)` API retain their
