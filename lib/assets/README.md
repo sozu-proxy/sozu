@@ -29,3 +29,33 @@ openssl req -x509 -nodes -newkey rsa:2048 \
 
 The matching private key is `multi-sni-key.pem`. Both files are
 checked in; rotate them together if the cert expires.
+
+## mTLS client authentication (`mtls/`)
+
+Throwaway CA, client identity and CRLs for client certificate
+authentication and revocation, consumed by the `client_revocation_*` unit
+tests in `lib/src/https.rs`, the `client_auth_*` tests in
+`command/src/config.rs` and the `test_mtls_*` e2e tests in
+`e2e/src/tests/tls_tests.rs`. Every private key here is public on purpose:
+nothing outside the tests trusts this CA.
+
+| File                   | What it is                                                         |
+|------------------------|--------------------------------------------------------------------|
+| `ca-cert.pem` / `ca-key.pem` | CA `CN=sozu-test-mtls-ca`, KeyUsage `keyCertSign, cRLSign`   |
+| `client-cert.pem` / `client-key.pem` | client `CN=sozu-test-mtls-client`, serial `0x1001`, EKU `clientAuth`, issued by the CA |
+| `crl-current.pem`      | issued by the CA, `nextUpdate` 2125, revokes nothing               |
+| `crl-revoked.pem`      | issued by the CA, `nextUpdate` 2125, revokes the client            |
+| `crl-expired.pem`      | issued by the CA, `nextUpdate` 2020-01-02, revokes nothing         |
+| `crl-other-ca.pem`     | issued by `CN=sozu-test-mtls-other-ca`, covers nothing in the client's chain |
+| `other-ca-cert.pem`    | the CA that issued `crl-other-ca.pem` (its key is not kept)        |
+
+Each CRL leaves exactly one reason to accept or reject the client: the
+revoking one is current, so only the serial lookup rejects; the expired one
+is from the right issuer and revokes nothing, so only the expiry rejects.
+Keep it that way when changing them.
+
+Regenerate everything together (OpenSSL >= 3.0):
+
+```bash
+sh lib/assets/mtls/generate.sh
+```

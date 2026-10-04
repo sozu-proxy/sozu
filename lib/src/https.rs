@@ -4788,4 +4788,130 @@ mod listener_sibling_tests {
             Err(ListenerError::ClientAuth(_))
         ));
     }
+
+    // ── Client certificate revocation ──
+    //
+    // The fixtures come from `lib/assets/mtls/generate.sh`: one CA, one
+    // client it issued, and CRLs that each leave exactly one reason to accept
+    // or reject that client. The verdict is checked on the rustls error, not
+    // only on accept/reject, because a handshake rejected for the wrong
+    // reason would still look like a pass at the TLS level.
+
+    const MTLS_CA_PEM: &str = include_str!("../assets/mtls/ca-cert.pem");
+    const MTLS_CLIENT_PEM: &str = include_str!("../assets/mtls/client-cert.pem");
+    /// Issued by the CA, nextUpdate in 2125, revokes nothing.
+    const MTLS_CRL_CURRENT: &str = include_str!("../assets/mtls/crl-current.pem");
+    /// Issued by the CA, nextUpdate in 2125, revokes the client.
+    const MTLS_CRL_REVOKED: &str = include_str!("../assets/mtls/crl-revoked.pem");
+    /// Issued by the CA, nextUpdate in January 2020, revokes nothing.
+    const MTLS_CRL_EXPIRED: &str = include_str!("../assets/mtls/crl-expired.pem");
+    /// Issued by another CA: covers nothing in the client's chain.
+    const MTLS_CRL_OTHER_CA: &str = include_str!("../assets/mtls/crl-other-ca.pem");
+
+    /// The verdict of a `required` listener trusting the test CA with `crls`
+    /// on the test client's certificate, at the current time.
+    fn verify_mtls_client(crls: &[&str]) -> Result<(), rustls::Error> {
+        let config =
+            https_config_with_client_auth(ClientAuthMode::ClientAuthRequired, &[MTLS_CA_PEM], crls);
+        let verifier = HttpsListener::client_cert_verifier(&config, &test_crypto_provider())
+            .expect("a CA and well-formed CRLs must build a verifier")
+            .expect("required client auth must install a verifier");
+        let client = CertificateDer::from_pem_slice(MTLS_CLIENT_PEM.as_bytes())
+            .expect("the client fixture is a PEM certificate");
+        verifier
+            .verify_client_cert(&client, &[], rustls::pki_types::UnixTime::now())
+            .map(|_| ())
+    }
+
+    #[test]
+    fn client_revocation_accepts_a_client_no_crl_revokes() {
+        assert_eq!(
+            verify_mtls_client(&[]),
+            Ok(()),
+            "precondition: the client chains to the CA"
+        );
+        assert_eq!(
+            verify_mtls_client(&[MTLS_CRL_CURRENT]),
+            Ok(()),
+            "a current CRL from the client's issuer that does not list it must not reject it"
+        );
+    }
+
+    #[test]
+    fn client_revocation_rejects_a_revoked_client() {
+        // The CRL is current, so only the serial lookup can reject the client.
+        // Without `with_crls`, the client would be accepted.
+        assert_eq!(
+            verify_mtls_client(&[MTLS_CRL_REVOKED]),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::Revoked
+            ))
+        );
+    }
+
+    #[test]
+    fn client_revocation_rejects_a_client_checked_against_an_expired_crl() {
+        // Same issuer and an empty revocation list, so only the expiry can
+        // reject the client. Without `enforce_revocation_expiration`, rustls
+        // keeps trusting the stale CRL and accepts it.
+        let verdict = verify_mtls_client(&[MTLS_CRL_EXPIRED]);
+        assert!(
+            matches!(
+                verdict,
+                Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::ExpiredRevocationList
+                        | rustls::CertificateError::ExpiredRevocationListContext { .. }
+                ))
+            ),
+            "an expired CRL from the client's issuer must reject it, got {verdict:?}"
+        );
+        // Positive space: the current CRL from the same issuer accepts it,
+        // so the rejection above is the expiry and nothing else.
+        assert_eq!(verify_mtls_client(&[MTLS_CRL_CURRENT]), Ok(()));
+    }
+
+    #[test]
+    fn client_revocation_rejects_a_client_no_configured_crl_covers() {
+        // Once any CRL is configured, a client whose issuer no CRL covers has
+        // an unknown revocation status, which rustls's default
+        // `UnknownStatusPolicy::Deny` rejects.
+        assert_eq!(
+            verify_mtls_client(&[MTLS_CRL_OTHER_CA]),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownRevocationStatus
+            ))
+        );
+        // Adding the issuer's own current CRL restores the verdict.
+        assert_eq!(
+            verify_mtls_client(&[MTLS_CRL_OTHER_CA, MTLS_CRL_CURRENT]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn client_revocation_reads_only_the_first_crl_of_an_issuer() {
+        // webpki checks a certificate against the first configured CRL that
+        // is authoritative for its issuer and never reads the others. A CRL
+        // from another issuer does not shadow anything...
+        assert_eq!(
+            verify_mtls_client(&[MTLS_CRL_OTHER_CA, MTLS_CRL_REVOKED]),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::Revoked
+            ))
+        );
+        // ...but of two CRLs from the same issuer, the order alone decides.
+        // `doc/configure.md` tells operators to configure one CRL per issuer;
+        // this pins the behaviour that advice rests on.
+        assert_eq!(
+            verify_mtls_client(&[MTLS_CRL_REVOKED, MTLS_CRL_CURRENT]),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::Revoked
+            ))
+        );
+        assert_eq!(
+            verify_mtls_client(&[MTLS_CRL_CURRENT, MTLS_CRL_REVOKED]),
+            Ok(()),
+            "the later CRL of the same issuer is never consulted"
+        );
+    }
 }

@@ -27,6 +27,7 @@ include = [
   "assets/certificate.pem",
   "assets/certificate_chain.pem",
   "assets/key.pem",
+  "assets/mtls/*.pem",
 ]
 
 [dependencies]
