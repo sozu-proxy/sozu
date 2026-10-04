@@ -326,7 +326,7 @@ pub struct BackendId {
     /// Metrics lifetime captured by the request that opened this connection.
     /// It stays with the connection through draining so its close cannot
     /// mutate a replacement cluster with the same labels.
-    metric_incarnation: Option<crate::metrics::ClusterMetricsIncarnation>,
+    metric_incarnation: crate::metrics::ClusterMetricsCapture,
 }
 
 impl BackendId {
@@ -344,18 +344,15 @@ impl BackendId {
             slot: BackendSlot(slot),
             backend_id,
             address,
-            metric_incarnation: None,
+            metric_incarnation: Default::default(),
         }
     }
 
-    pub(crate) fn metric_incarnation(&self) -> Option<crate::metrics::ClusterMetricsIncarnation> {
+    pub(crate) fn metric_incarnation(&self) -> crate::metrics::ClusterMetricsCapture {
         self.metric_incarnation
     }
 
-    fn set_metric_incarnation(
-        &mut self,
-        incarnation: Option<crate::metrics::ClusterMetricsIncarnation>,
-    ) {
+    fn set_metric_incarnation(&mut self, incarnation: crate::metrics::ClusterMetricsCapture) {
         self.metric_incarnation = incarnation;
     }
 
@@ -487,7 +484,7 @@ impl BackendRegistry {
             slot,
             backend_id: entry.backend_id.clone(),
             address: entry.address,
-            metric_incarnation: None,
+            metric_incarnation: Default::default(),
         }
     }
 

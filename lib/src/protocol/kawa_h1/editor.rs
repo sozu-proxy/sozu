@@ -636,7 +636,7 @@ pub struct HttpContext {
     /// Configured cluster lifetime that owns this request's labelled metrics.
     /// Captured after routing so successive requests on one H1 keep-alive
     /// connection may belong to successive lifetimes of the same cluster id.
-    pub(crate) cluster_metrics_incarnation: Option<crate::metrics::ClusterMetricsIncarnation>,
+    pub(crate) cluster_metrics_incarnation: crate::metrics::ClusterMetricsCapture,
     /// The client affinity key `Router::plan_connect`
     /// (`lib/src/protocol/mux/router.rs`) derived for this request when its
     /// cluster selects with `HRW` or `MAGLEV`: the hash of the cluster's
@@ -1181,7 +1181,7 @@ impl HttpContext {
             id: request_id,
             backend_id: None,
             cluster_id: None,
-            cluster_metrics_incarnation: None,
+            cluster_metrics_incarnation: Default::default(),
             affinity_key: None,
 
             closing: false,
@@ -1235,14 +1235,12 @@ impl HttpContext {
 
     pub(crate) fn set_cluster_metrics_incarnation(
         &mut self,
-        incarnation: Option<crate::metrics::ClusterMetricsIncarnation>,
+        incarnation: crate::metrics::ClusterMetricsCapture,
     ) {
         self.cluster_metrics_incarnation = incarnation;
     }
 
-    pub(crate) fn cluster_metrics_incarnation(
-        &self,
-    ) -> Option<crate::metrics::ClusterMetricsIncarnation> {
+    pub(crate) fn cluster_metrics_incarnation(&self) -> crate::metrics::ClusterMetricsCapture {
         self.cluster_metrics_incarnation
     }
 
@@ -2317,7 +2315,7 @@ impl HttpContext {
         // frontend that does not stick the previous request's cookie.
         self.sticky_session = None;
         self.affinity_key = None;
-        self.cluster_metrics_incarnation = None;
+        self.cluster_metrics_incarnation = Default::default();
         self.method = None;
         self.authority = None;
         self.path = None;

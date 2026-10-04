@@ -717,11 +717,9 @@ impl Router {
                 )
             });
             stream.context.affinity_key = key;
-            stream
-                .context
-                .set_cluster_metrics_incarnation(crate::metrics::cluster_incarnation(
-                    routed.as_ref(),
-                ));
+            stream.context.set_cluster_metrics_incarnation(
+                crate::metrics::capture_cluster_metrics(routed.as_ref()),
+            );
             stream.context.cluster_id = Some(routed);
         }
         let stream_context = &stream.context;

@@ -2018,7 +2018,7 @@ mod tests {
             slot: BackendSlot(0),
             backend_id: Rc::from("test-backend"),
             address,
-            metric_incarnation: None,
+            metric_incarnation: Default::default(),
         }
     }
 
@@ -2362,7 +2362,7 @@ mod tests {
             id: Ulid::generate(),
             backend_id: None,
             cluster_id: None,
-            cluster_metrics_incarnation: None,
+            cluster_metrics_incarnation: Default::default(),
             affinity_key: None,
             protocol: TransportKind::HTTP,
             public_address: "127.0.0.1:0"

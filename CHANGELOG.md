@@ -4101,16 +4101,26 @@
   shapes, a boundary this change does not attempt to alter or newly diagnose.
   The incarnation gate follows the detail effective at emission time. Live
   `AddCluster` updates and metric disable/enable, clear, and detail controls
-  preserve the current incarnation. The public `SessionMetrics` literal shape
+  preserve the current incarnation. A legal route before `AddCluster`
+  allocates an implicit incarnation which a later add preserves; only
+  `RemoveCluster` ends it. Missing and exhausted captures remain distinct and
+  fail closed whenever cluster labels are retained. The public `SessionMetrics` literal shape
   and its current-configuration registration method remain compatible for
   embedders; only Sōzu's internal delayed owners use the captured-incarnation
-  path. A cluster referenced without `AddCluster` has no incarnation on either
-  side of the comparison, so its metrics are still recorded at every detail
-  level. Covered by
+  path. A cluster referenced without `AddCluster` therefore retains metrics at
+  every detail level without conflating absence with a removed or exhausted
+  lifetime. Covered by
   `test_old_http_session_metrics_do_not_decrement_same_identity_replacement`
   `cluster_incarnation_fences_labelled_rows_and_preserves_process_aggregates`,
-  `undeclared_cluster_none_incarnation_is_recorded_at_process_detail`,
-  `undeclared_cluster_none_incarnation_is_recorded_at_labelled_detail`,
+  `implicit_cluster_capture_is_recorded_at_process_detail`,
+  `implicit_cluster_capture_is_recorded_at_labelled_detail`,
+  `add_without_remove_keeps_implicit_identity_and_balances_labelled_gauge`,
+  `removed_implicit_capture_stays_rejected_after_clear`,
+  `exhausted_add_is_not_an_implicit_identity`,
+  `every_capture_state_keeps_process_and_frontend_aggregates`,
+  `real_http_session_without_add_cluster_records_labelled_metrics`,
+  `static_tcp_route_keeps_its_capture_after_cluster_replacement`,
+  `sni_tcp_route_keeps_its_capture_after_cluster_replacement`,
   `mismatched_incarnation_is_dropped_at_labelled_detail`,
   and `public_session_metrics_literal_and_registration_remain_supported`.
 

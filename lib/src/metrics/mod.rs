@@ -113,19 +113,33 @@ thread_local! {
   pub static METRICS: RefCell<Aggregator> = RefCell::new(Aggregator::new(String::from("sozu")));
 }
 
-/// Opaque identity of one configured lifetime of a cluster metrics row.
+/// Opaque identity of one active lifetime of a cluster metrics row.
 ///
-/// A cluster id may be removed and re-added while sessions from its previous
-/// lifetime are still draining. Those sessions carry this value so their late
-/// metrics cannot mutate the replacement row that happens to use the same
-/// textual id.
+/// A lifetime starts either when a legal route first references a cluster or
+/// when `AddCluster` arrives first. `AddCluster` without an intervening
+/// `RemoveCluster` keeps the identity so gauges opened by the implicit route
+/// remain balanced. A remove followed by another route or add allocates a new
+/// identity, fencing late metrics from the previous lifetime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ClusterMetricsIncarnation(NonZeroU64);
 
-/// Return the active metrics incarnation for `cluster_id`, if it is currently
-/// configured on this worker.
-pub(crate) fn cluster_incarnation(cluster_id: &str) -> Option<ClusterMetricsIncarnation> {
-    METRICS.with(|metrics| metrics.borrow().cluster_incarnation(cluster_id))
+/// Identity state captured by one delayed metric owner.
+///
+/// `Missing` is the default before routing. `Invalid` records the terminal
+/// allocation-exhaustion path. Neither may be mistaken for a legal implicit
+/// cluster lifetime when labels are retained.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ClusterMetricsCapture {
+    #[default]
+    Missing,
+    Active(ClusterMetricsIncarnation),
+    Invalid,
+}
+
+/// Capture (and, for a legal first implicit reference, allocate) the active
+/// metrics identity for `cluster_id`.
+pub(crate) fn capture_cluster_metrics(cluster_id: &str) -> ClusterMetricsCapture {
+    METRICS.with(|metrics| metrics.borrow_mut().capture_cluster_metrics(cluster_id))
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -501,9 +515,11 @@ pub struct Aggregator {
     /// `lease_tick` call regardless of whether expiry happened, so the
     /// caller's "is it time to tick?" check stays cheap.
     last_lease_tick: Instant,
-    /// Active configured lifetime for each cluster id. This control-plane
-    /// identity deliberately survives metrics collection being disabled or
-    /// local storage being cleared: neither event removes the cluster.
+    /// Active lifetime for each cluster id. A legal implicit route allocates
+    /// an entry before `AddCluster`; the add reuses it because only
+    /// `RemoveCluster` is a lifetime boundary. This identity deliberately
+    /// survives metrics collection being disabled or local storage being
+    /// cleared.
     cluster_incarnations: HashMap<String, ClusterMetricsIncarnation>,
     /// Last allocated incarnation. Zero is reserved for `Option`'s niche and
     /// checked arithmetic makes exhaustion fail closed instead of reusing an
@@ -943,17 +959,11 @@ impl Aggregator {
     /// every fresh metric emission would be dropped.
     pub fn add_cluster(&mut self, cluster_id: &str) {
         if !self.cluster_incarnations.contains_key(cluster_id) {
-            let Some(next) = self.last_cluster_incarnation.checked_add(1) else {
-                error!(
-                    "cluster metrics incarnation space exhausted; refusing to reactivate metrics for cluster {:?}",
-                    cluster_id
-                );
+            let ClusterMetricsCapture::Active(incarnation) =
+                self.allocate_cluster_metrics_incarnation(cluster_id)
+            else {
                 return;
             };
-            let Some(incarnation) = NonZeroU64::new(next).map(ClusterMetricsIncarnation) else {
-                unreachable!("checked increment from a live u64 incarnation cannot yield zero");
-            };
-            self.last_cluster_incarnation = next;
             self.cluster_incarnations
                 .insert(cluster_id.to_owned(), incarnation);
         }
@@ -963,7 +973,36 @@ impl Aggregator {
         self.local.add_cluster(cluster_id);
     }
 
-    /// Return the active configured lifetime of `cluster_id`.
+    fn allocate_cluster_metrics_incarnation(&mut self, cluster_id: &str) -> ClusterMetricsCapture {
+        let Some(next) = self.last_cluster_incarnation.checked_add(1) else {
+            error!(
+                "cluster metrics incarnation space exhausted; refusing metrics identity for cluster {:?}",
+                cluster_id
+            );
+            return ClusterMetricsCapture::Invalid;
+        };
+        let Some(incarnation) = NonZeroU64::new(next).map(ClusterMetricsIncarnation) else {
+            unreachable!("checked increment from a live u64 incarnation cannot yield zero");
+        };
+        self.last_cluster_incarnation = next;
+        ClusterMetricsCapture::Active(incarnation)
+    }
+
+    /// Capture the active lifetime of `cluster_id`, allocating it when a
+    /// legal frontend/backend route references the id before `AddCluster`.
+    fn capture_cluster_metrics(&mut self, cluster_id: &str) -> ClusterMetricsCapture {
+        if let Some(incarnation) = self.cluster_incarnations.get(cluster_id).copied() {
+            return ClusterMetricsCapture::Active(incarnation);
+        }
+        let capture = self.allocate_cluster_metrics_incarnation(cluster_id);
+        if let ClusterMetricsCapture::Active(incarnation) = capture {
+            self.cluster_incarnations
+                .insert(cluster_id.to_owned(), incarnation);
+        }
+        capture
+    }
+
+    /// Return the active lifetime of `cluster_id`.
     pub(crate) fn cluster_incarnation(
         &self,
         cluster_id: &str,
@@ -971,27 +1010,30 @@ impl Aggregator {
         self.cluster_incarnations.get(cluster_id).copied()
     }
 
-    /// Whether an emission for `cluster_id` captured with `incarnation`
+    /// Whether an emission for `cluster_id` captured with `capture`
     /// may reach the drains under the current effective detail.
     ///
-    /// Only `Cluster` and `Backend` detail keep the cluster label, so only
-    /// they compare identities. The comparison is `Option == Option`: a
-    /// cluster that never received `AddCluster` (frontends and backends may
-    /// reference an undeclared cluster) captures and currently resolves to
-    /// `None`, so its events are recorded; any mismatch, including a missed
-    /// `None` capture against a current `Some`, is rejected. After the
-    /// 64-bit incarnation space is exhausted, a newly added cluster also
-    /// resolves to `None` and shares that identity with undeclared ones;
-    /// reaching that state takes 2^64 `AddCluster` allocations.
-    pub(crate) fn accepts_cluster_incarnation(
+    /// Process and Frontend detail discard cluster/backend labels, so every
+    /// capture state contributes to that aggregate: a late decrement must
+    /// balance the earlier increment. Cluster and Backend detail retain the
+    /// label and therefore require a real captured identity equal to the
+    /// current active identity. Missing and exhausted captures fail closed.
+    pub(crate) fn accepts_cluster_capture(
         &self,
         cluster_id: &str,
-        incarnation: Option<ClusterMetricsIncarnation>,
+        capture: ClusterMetricsCapture,
     ) -> bool {
-        !matches!(
+        if !matches!(
             self.effective,
             MetricDetailLevel::Cluster | MetricDetailLevel::Backend
-        ) || self.cluster_incarnation(cluster_id) == incarnation
+        ) {
+            return true;
+        }
+        matches!(
+            capture,
+            ClusterMetricsCapture::Active(incarnation)
+                if self.cluster_incarnation(cluster_id) == Some(incarnation)
+        )
     }
 
     /// Receive a metric from an owner that captured a cluster incarnation.
@@ -1004,18 +1046,16 @@ impl Aggregator {
     /// stays at that level, an old connection's late `-1` still balances its
     /// earlier `+1`. Existing detail transitions do not migrate stored gauge
     /// contributions between shapes. See
-    /// [`Self::accepts_cluster_incarnation`] for the identity comparison.
+    /// [`Self::accepts_cluster_capture`] for the identity comparison.
     pub(crate) fn receive_metric_for_incarnation(
         &mut self,
         label: &'static str,
         cluster_id: Option<&str>,
         backend_id: Option<&str>,
-        incarnation: Option<ClusterMetricsIncarnation>,
+        capture: ClusterMetricsCapture,
         metric: MetricValue,
     ) {
-        if cluster_id
-            .is_none_or(|cluster_id| self.accepts_cluster_incarnation(cluster_id, incarnation))
-        {
+        if cluster_id.is_none_or(|cluster_id| self.accepts_cluster_capture(cluster_id, capture)) {
             self.receive_metric(label, cluster_id, backend_id, metric);
         }
     }
@@ -1271,7 +1311,7 @@ macro_rules! record_backend_metrics (
 
       // One identity lookup gates the whole burst: every emission below
       // shares the same cluster and captured incarnation.
-      if m.accepts_cluster_incarnation(cluster_id, $incarnation) {
+      if m.accepts_cluster_capture(cluster_id, $incarnation) {
         m.receive_metric($crate::metrics::names::backend::BYTES_IN, Some(cluster_id), Some(backend_id), MetricValue::Count($bin as i64));
         m.receive_metric($crate::metrics::names::backend::BYTES_OUT, Some(cluster_id), Some(backend_id), MetricValue::Count($bout as i64));
         m.receive_metric($crate::metrics::names::backend::RESPONSE_TIME, Some(cluster_id), Some(backend_id), MetricValue::Time($response_time as usize));
@@ -1323,23 +1363,27 @@ mod tests {
         let mut aggregator = Aggregator::new(String::new());
         aggregator.set_up_detail(MetricDetailLevel::Backend);
         aggregator.add_cluster("reused");
-        let old = aggregator.cluster_incarnation("reused");
-        assert!(old.is_some());
+        let old_token = aggregator
+            .cluster_incarnation("reused")
+            .expect("configured cluster has an identity");
+        let old = ClusterMetricsCapture::Active(old_token);
 
         // Neither a live AddCluster update nor local collection controls end
         // the configured cluster lifetime.
         aggregator.add_cluster("reused");
-        assert_eq!(aggregator.cluster_incarnation("reused"), old);
+        assert_eq!(aggregator.cluster_incarnation("reused"), Some(old_token));
         aggregator.configure(&MetricsConfiguration::Disabled);
         aggregator.configure(&MetricsConfiguration::Enabled);
         aggregator.configure(&MetricsConfiguration::Clear);
-        assert_eq!(aggregator.cluster_incarnation("reused"), old);
+        assert_eq!(aggregator.cluster_incarnation("reused"), Some(old_token));
 
         aggregator.remove_cluster("reused");
         aggregator.add_cluster("reused");
-        let replacement = aggregator.cluster_incarnation("reused");
-        assert!(replacement.is_some());
-        assert_ne!(replacement, old);
+        let replacement_token = aggregator
+            .cluster_incarnation("reused")
+            .expect("replacement cluster has an identity");
+        let replacement = ClusterMetricsCapture::Active(replacement_token);
+        assert_ne!(replacement_token, old_token);
 
         // At Backend detail an obsolete event is rejected instead of being
         // applied to the replacement row.
@@ -1455,17 +1499,58 @@ mod tests {
     }
 
     #[test]
-    fn undeclared_cluster_none_incarnation_is_recorded_at_process_detail() {
+    fn add_without_remove_keeps_implicit_identity_and_balances_labelled_gauge() {
+        let mut aggregator = Aggregator::new(String::new());
+        aggregator.set_up_detail(MetricDetailLevel::Backend);
+        let capture = aggregator.capture_cluster_metrics("implicit-then-added");
+        let ClusterMetricsCapture::Active(token) = capture else {
+            panic!("implicit route must allocate an active identity");
+        };
+        aggregator.receive_metric_for_incarnation(
+            "implicit_balance",
+            Some("implicit-then-added"),
+            Some("backend"),
+            capture,
+            MetricValue::GaugeAdd(1),
+        );
+
+        aggregator.add_cluster("implicit-then-added");
+        assert_eq!(
+            aggregator.cluster_incarnation("implicit-then-added"),
+            Some(token),
+        );
+        aggregator.receive_metric_for_incarnation(
+            "implicit_balance",
+            Some("implicit-then-added"),
+            Some("backend"),
+            capture,
+            MetricValue::GaugeAdd(-1),
+        );
+
+        assert_eq!(
+            local_labelled_value(
+                &mut aggregator,
+                "implicit-then-added",
+                Some("backend"),
+                "implicit_balance",
+            ),
+            Some(filtered_metrics::Inner::Gauge(0)),
+        );
+    }
+
+    #[test]
+    fn implicit_cluster_capture_is_recorded_at_process_detail() {
         // A frontend may route to a cluster that never received AddCluster;
-        // its owners capture `None`. The label-stripped worker aggregate must
-        // still count those events.
+        // its owners capture a valid implicit identity. The label-stripped
+        // worker aggregate must still count those events.
         let mut aggregator = Aggregator::new(String::new());
         aggregator.set_up_detail(MetricDetailLevel::Process);
+        let capture = aggregator.capture_cluster_metrics("undeclared");
         aggregator.receive_metric_for_incarnation(
             "undeclared_test",
             Some("undeclared"),
             Some("backend"),
-            None,
+            capture,
             MetricValue::Count(4),
         );
         assert_eq!(
@@ -1478,16 +1563,17 @@ mod tests {
     }
 
     #[test]
-    fn undeclared_cluster_none_incarnation_is_recorded_at_labelled_detail() {
+    fn implicit_cluster_capture_is_recorded_at_labelled_detail() {
         for detail in [MetricDetailLevel::Cluster, MetricDetailLevel::Backend] {
             let mut aggregator = Aggregator::new(String::new());
             aggregator.set_up_detail(detail);
-            assert_eq!(aggregator.cluster_incarnation("undeclared"), None);
+            let capture = aggregator.capture_cluster_metrics("undeclared");
+            assert!(matches!(capture, ClusterMetricsCapture::Active(_)));
             aggregator.receive_metric_for_incarnation(
                 "undeclared_test",
                 Some("undeclared"),
                 Some("backend"),
-                None,
+                capture,
                 MetricValue::Count(4),
             );
             let backend_id = match detail {
@@ -1499,7 +1585,7 @@ mod tests {
             assert_eq!(
                 recorded,
                 Some(filtered_metrics::Inner::Count(4)),
-                "None == None must pass the gate at {detail:?}",
+                "the active implicit identity must pass the gate at {detail:?}",
             );
         }
     }
@@ -1512,26 +1598,29 @@ mod tests {
 
             // Captured Some(I1), current Some(I2).
             aggregator.add_cluster("c");
-            let first = aggregator.cluster_incarnation("c");
+            let first = aggregator
+                .cluster_incarnation("c")
+                .expect("first configured identity");
             aggregator.remove_cluster("c");
             aggregator.add_cluster("c");
-            let second = aggregator.cluster_incarnation("c");
-            assert!(first.is_some() && second.is_some() && first != second);
+            let second = aggregator
+                .cluster_incarnation("c")
+                .expect("replacement configured identity");
+            assert_ne!(first, second);
             aggregator.receive_metric_for_incarnation(
                 "mismatch_test",
                 Some("c"),
                 Some("b"),
-                first,
+                ClusterMetricsCapture::Active(first),
                 MetricValue::Count(1),
             );
 
-            // Captured None, current Some(I2): a missed capture never adopts
-            // the current lifetime.
+            // A missing capture never adopts the current lifetime.
             aggregator.receive_metric_for_incarnation(
                 "mismatch_test",
                 Some("c"),
                 Some("b"),
-                None,
+                ClusterMetricsCapture::Missing,
                 MetricValue::Count(1),
             );
             assert!(
@@ -1543,13 +1632,12 @@ mod tests {
                 "stale or missing capture must not reach the Some(I2) row at {detail:?}",
             );
 
-            // Captured Some(I1), current None (cluster never declared under
-            // this id in this aggregator).
+            // Captured I1, current identity absent under this id.
             aggregator.receive_metric_for_incarnation(
                 "mismatch_test",
                 Some("other"),
                 Some("b"),
-                first,
+                ClusterMetricsCapture::Active(first),
                 MetricValue::Count(1),
             );
             assert!(
@@ -1559,6 +1647,139 @@ mod tests {
                     .expect("dump cluster metrics")
                     .contains_key("other"),
                 "Some(I1) must not reach an undeclared (None) cluster at {detail:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn removed_implicit_capture_stays_rejected_after_clear() {
+        let mut aggregator = Aggregator::new(String::new());
+        aggregator.set_up_detail(MetricDetailLevel::Backend);
+
+        // A legal route allocates an implicit identity before this cluster
+        // has ever received AddCluster.
+        let captured_before_add = aggregator.capture_cluster_metrics("reviewer-reused");
+        let ClusterMetricsCapture::Active(implicit_token) = captured_before_add else {
+            panic!("a legal implicit route must capture an active identity");
+        };
+
+        aggregator.add_cluster("reviewer-reused");
+        assert_eq!(
+            aggregator.cluster_incarnation("reviewer-reused"),
+            Some(implicit_token),
+            "AddCluster without RemoveCluster keeps the implicit lifetime",
+        );
+        aggregator.remove_cluster("reviewer-reused");
+
+        // Clear is a supported metrics operation. It clears drain storage,
+        // including tombstones, but it must not make a removed lifetime's
+        // earlier identity become current again.
+        aggregator.configure(&MetricsConfiguration::Clear);
+        aggregator.receive_metric_for_incarnation(
+            "reviewer_late_close",
+            Some("reviewer-reused"),
+            Some("backend"),
+            captured_before_add,
+            MetricValue::Count(1),
+        );
+
+        assert!(
+            !aggregator
+                .local
+                .dump_cluster_metrics(&[])
+                .expect("dump metrics after late removed emission")
+                .contains_key("reviewer-reused"),
+            "a removed lifetime must stay fenced after Clear removes the drain tombstone",
+        );
+
+        let replacement = aggregator.capture_cluster_metrics("reviewer-reused");
+        let ClusterMetricsCapture::Active(replacement_token) = replacement else {
+            panic!("a route after removal must allocate a replacement identity");
+        };
+        assert_ne!(replacement_token, implicit_token);
+        aggregator.add_cluster("reviewer-reused");
+        assert_eq!(
+            aggregator.cluster_incarnation("reviewer-reused"),
+            Some(replacement_token),
+        );
+        aggregator.receive_metric_for_incarnation(
+            "reviewer_replacement",
+            Some("reviewer-reused"),
+            Some("backend"),
+            captured_before_add,
+            MetricValue::Count(1),
+        );
+        aggregator.receive_metric_for_incarnation(
+            "reviewer_replacement",
+            Some("reviewer-reused"),
+            Some("backend"),
+            replacement,
+            MetricValue::Count(2),
+        );
+        assert_eq!(
+            local_labelled_value(
+                &mut aggregator,
+                "reviewer-reused",
+                Some("backend"),
+                "reviewer_replacement",
+            ),
+            Some(filtered_metrics::Inner::Count(2)),
+            "only the post-remove identity may reach the replacement row",
+        );
+    }
+
+    #[test]
+    fn exhausted_add_is_not_an_implicit_identity() {
+        let mut aggregator = Aggregator::new(String::new());
+        aggregator.set_up_detail(MetricDetailLevel::Backend);
+        aggregator.last_cluster_incarnation = u64::MAX;
+        aggregator.add_cluster("reviewer-exhausted");
+        assert_eq!(aggregator.cluster_incarnation("reviewer-exhausted"), None);
+
+        aggregator.receive_metric_for_incarnation(
+            "reviewer_exhausted",
+            Some("reviewer-exhausted"),
+            Some("backend"),
+            ClusterMetricsCapture::Invalid,
+            MetricValue::Count(1),
+        );
+
+        assert!(
+            !aggregator
+                .local
+                .dump_cluster_metrics(&[])
+                .expect("dump metrics after exhausted emission")
+                .contains_key("reviewer-exhausted"),
+            "allocation exhaustion must fail closed instead of sharing the undeclared identity",
+        );
+    }
+
+    #[test]
+    fn every_capture_state_keeps_process_and_frontend_aggregates() {
+        for detail in [MetricDetailLevel::Process, MetricDetailLevel::Frontend] {
+            let mut aggregator = Aggregator::new(String::new());
+            aggregator.set_up_detail(detail);
+            let active = aggregator.capture_cluster_metrics("reviewer-undeclared");
+            for capture in [
+                active,
+                ClusterMetricsCapture::Missing,
+                ClusterMetricsCapture::Invalid,
+            ] {
+                aggregator.receive_metric_for_incarnation(
+                    "reviewer_unconfigured_aggregate",
+                    Some("reviewer-undeclared"),
+                    Some("backend"),
+                    capture,
+                    MetricValue::Count(1),
+                );
+            }
+            assert_eq!(
+                aggregator
+                    .dump_local_proxy_metrics()
+                    .get("reviewer_unconfigured_aggregate")
+                    .and_then(|metric| metric.inner.as_ref()),
+                Some(&filtered_metrics::Inner::Count(3)),
+                "identity state cannot suppress a label-free {detail:?} aggregate",
             );
         }
     }

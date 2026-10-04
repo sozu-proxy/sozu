@@ -99,6 +99,55 @@ fn setup_worker_with_cluster(
     worker
 }
 
+/// Same legal control-plane shape as `setup_worker_with_cluster`, except the
+/// frontend and backend refer to a cluster id that never receives AddCluster.
+fn setup_worker_without_cluster(
+    name: &str,
+    cluster_id: &str,
+    backend_id: &str,
+    front_address: SocketAddr,
+    back_address: SocketAddr,
+) -> Worker {
+    let config = default_config();
+    let mut listeners = Listeners::default();
+    attach_reserved_http_listener(&mut listeners, front_address);
+    let state = ConfigState::new();
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
+
+    worker.send_proxy_request(Request {
+        request_type: Some(RequestType::AddHttpListener(
+            sozu_command_lib::config::ListenerBuilder::new_http(front_address.into())
+                .to_http(None)
+                .unwrap(),
+        )),
+    });
+    worker.send_proxy_request(Request {
+        request_type: Some(RequestType::ActivateListener(ActivateListener {
+            interface: None,
+            address: front_address.into(),
+            proxy: ListenerType::Http.into(),
+            from_scm: false,
+        })),
+    });
+    worker.send_proxy_request(
+        RequestType::AddHttpFrontend(RequestHttpFrontend {
+            ..Worker::default_http_frontend(cluster_id, front_address)
+        })
+        .into(),
+    );
+    worker.send_proxy_request(
+        RequestType::AddBackend(Worker::default_backend(
+            cluster_id,
+            backend_id,
+            back_address,
+            None,
+        ))
+        .into(),
+    );
+    worker.read_to_last();
+    worker
+}
+
 /// Drive one HTTP/1.1 request through the worker so the metrics layer
 /// records cluster-scoped samples (access log, response time, backend
 /// counters). Without this primer the cluster row never materialises.
@@ -677,6 +726,63 @@ fn test_old_http_session_metrics_do_not_decrement_same_identity_replacement() {
         try_old_http_session_does_not_decrement_same_identity_replacement(),
         State::Success,
     );
+}
+
+#[test]
+fn real_http_session_without_add_cluster_records_labelled_metrics() {
+    let front_address = create_local_address();
+    let back_address = create_local_address();
+    let cluster_id = "reviewer_undeclared_cluster";
+    let backend_id = "reviewer_undeclared_backend";
+    let mut worker = setup_worker_without_cluster(
+        "METRICS-REVIEWER-UNDECLARED",
+        cluster_id,
+        backend_id,
+        front_address,
+        back_address,
+    );
+    let detail_ack = lease_backend_metric_detail(&mut worker);
+    let mut backend = SyncBackend::new(
+        "METRICS-REVIEWER-UNDECLARED-BACKEND",
+        back_address,
+        http_ok_response("undeclared-cluster"),
+    );
+    backend.connect();
+    let mut client = Client::new(
+        "METRICS-REVIEWER-UNDECLARED-CLIENT",
+        front_address,
+        http_request("GET", "/undeclared", "", "localhost"),
+    );
+    client.connect();
+    client.send();
+
+    let reached_backend = wait_for_backend_request(&mut backend, 0);
+    let sent = reached_backend && backend.send(0).is_some();
+    let response_ok = sent
+        && client
+            .receive_response(SESSION_BARRIER_BUDGET)
+            .as_deref()
+            .is_some_and(|response| response.ends_with("undeclared-cluster"));
+    let labelled_2xx = if response_ok {
+        wait_for_backend_2xx(&mut worker, cluster_id, backend_id)
+    } else {
+        None
+    };
+
+    client.disconnect();
+    let _ = backend.close(0);
+    backend.disconnect();
+    let worker_stopped = stop_worker_within(worker);
+
+    println!(
+        "undeclared real caller: detail_ack={detail_ack} reached={reached_backend} sent={sent} \
+         response_ok={response_ok} labelled_2xx={labelled_2xx:?} stopped={worker_stopped}"
+    );
+    assert!(detail_ack);
+    assert!(reached_backend);
+    assert!(response_ok);
+    assert!(labelled_2xx.is_some_and(|count| count > 0));
+    assert!(worker_stopped);
 }
 
 // ══════════════════════════════════════════════════════════════════════

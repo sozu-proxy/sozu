@@ -1661,7 +1661,7 @@ impl SessionMetrics {
     pub(crate) fn register_end_of_session_for_incarnation(
         &self,
         context: &LogContext,
-        incarnation: Option<metrics::ClusterMetricsIncarnation>,
+        incarnation: metrics::ClusterMetricsCapture,
     ) {
         let request_time = self.request_time();
         let service_time = self.service_time();

@@ -90,7 +90,7 @@ pub struct Pipe<Front: SocketHandler, L: ListenerHandler> {
     backend_id: Option<String>,
     /// Routed cluster lifetime inherited from an HTTP request or TCP session
     /// when that owner upgrades into this long-lived pipe.
-    cluster_metrics_incarnation: Option<crate::metrics::ClusterMetricsIncarnation>,
+    cluster_metrics_incarnation: crate::metrics::ClusterMetricsCapture,
     /// Address of the backend this pipe forwards to, recorded when Sōzu
     /// picked it: from `backend` in `Pipe::new` (WebSocket upgrades), or
     /// through `set_backend_address` by the TCP proxy when it dials. The
@@ -181,7 +181,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         let mut session = Pipe {
             backend_buffer,
             backend_id,
-            cluster_metrics_incarnation: None,
+            cluster_metrics_incarnation: Default::default(),
             backend_address,
             backend_readiness: Readiness {
                 interest: Ready::READABLE | Ready::WRITABLE | Ready::HUP | Ready::ERROR,
@@ -244,7 +244,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
     pub(crate) fn set_cluster_metrics_incarnation(
         &mut self,
-        incarnation: Option<crate::metrics::ClusterMetricsIncarnation>,
+        incarnation: crate::metrics::ClusterMetricsCapture,
     ) {
         self.cluster_metrics_incarnation = incarnation;
     }

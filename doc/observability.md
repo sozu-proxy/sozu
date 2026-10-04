@@ -186,27 +186,27 @@ layer or claim a separately reproduced defect there. The
 cluster-incarnation gate follows the effective detail at the time of the late
 emission.
 
-An `AddCluster` update while the cluster remains configured preserves its
-incarnation; only remove then add creates the next one. Disabling and
-re-enabling cluster metric collection, changing `metrics.detail`, and
-`sozu metrics clear` do not alter that identity. This keeps old emissions
-obsolete across collection controls even though a clear resets the drain
-storage and its tombstones.
+The first legal route to an id allocates an incarnation even when no
+`AddCluster` has arrived; frontends and backends are allowed to reference that
+implicit cluster. A later `AddCluster` without an intervening removal keeps the
+same identity, so a labelled gauge opened by the implicit route can still be
+closed. `RemoveCluster` is the lifetime boundary: it drops the active identity,
+and the next route or add allocates a different one. Disabling and re-enabling
+cluster metric collection, changing `metrics.detail`, and `sozu metrics clear`
+do not alter active identities. This keeps old emissions obsolete across
+collection controls even though a clear resets drain storage and tombstones.
 
 The public `SessionMetrics` shape and
 `SessionMetrics::register_end_of_session(&LogContext)` API retain their
 current-configuration semantics for embedders. Sōzu's delayed HTTP, WebSocket,
-and TCP owners use a separate internal registration path with the incarnation
-captured by their request, session, pipe, or backend handle. At `cluster` and
-`backend` detail the gate compares the captured value with the current one,
-both optional: a cluster that frontends or backends reference without an
-`AddCluster` has no incarnation, captures none, and is therefore recorded at
-every detail level like any other cluster. Any mismatch is rejected, including
-a missing capture against a cluster that now has an incarnation, so a missing
-capture is never treated as the current incarnation. Should the 64-bit
-incarnation space ever be exhausted (2^64 `AddCluster` allocations), newly
-added clusters also have no incarnation and share that identity with
-undeclared clusters.
+and TCP owners use a separate internal registration path with the capture made
+by their request, session, pipe, or backend handle. That closed capture state
+distinguishes an active identity from a missing capture and terminal 64-bit
+identity exhaustion. At `cluster` and `backend` detail only an active captured
+identity equal to the current one reaches the drains; missing and exhausted
+captures fail closed. At `process` and today's `frontend` detail the labels are
+removed, so every capture state still contributes to the worker aggregate and
+a late decrement can balance its earlier increment.
 
 Every request ends with a burst of emissions into the local drain
 (`SessionMetrics` end-of-session registration: two cluster-labelled times and,

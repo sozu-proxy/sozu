@@ -123,7 +123,7 @@ pub struct TcpSession {
     /// Configured lifetime of `cluster_id` captured when this session routes.
     /// Kept on the session rather than the public `SessionMetrics` value so
     /// delayed TCP and Pipe emissions cannot target a replacement cluster.
-    cluster_metrics_incarnation: Option<crate::metrics::ClusterMetricsIncarnation>,
+    cluster_metrics_incarnation: crate::metrics::ClusterMetricsCapture,
     configured_backend_timeout: Duration,
     connection_attempt: u8,
     container_backend_timeout: TimeoutContainer,
@@ -203,7 +203,7 @@ impl TcpSession {
         let container_backend_timeout = TimeoutContainer::new_empty(configured_connect_timeout);
         let cluster_metrics_incarnation = cluster_id
             .as_deref()
-            .and_then(crate::metrics::cluster_incarnation);
+            .map_or_else(Default::default, crate::metrics::capture_cluster_metrics);
 
         let state = match proxy_protocol {
             Some(ProxyProtocolConfig::RelayHeader) => {
@@ -363,7 +363,7 @@ impl TcpSession {
             backend_token: None,
             backend: None,
             cluster_id: None,
-            cluster_metrics_incarnation: None,
+            cluster_metrics_incarnation: Default::default(),
             configured_backend_timeout,
             connection_attempt: 0,
             container_backend_timeout,
@@ -538,7 +538,7 @@ impl TcpSession {
         {
             self.cluster_id = Some(outcome.cluster.clone());
             self.cluster_metrics_incarnation =
-                crate::metrics::cluster_incarnation(outcome.cluster.as_ref());
+                crate::metrics::capture_cluster_metrics(outcome.cluster.as_ref());
             // Restore the listener's configured `front_timeout` THE MOMENT
             // routing succeeds, not only once the backend connect completes
             // (previously done only in `upgrade_sni_preread`, which can run
@@ -833,7 +833,7 @@ impl TcpSession {
         if self.cluster_id.as_ref() != Some(&outcome.cluster) {
             self.cluster_id = Some(outcome.cluster.clone());
             self.cluster_metrics_incarnation =
-                crate::metrics::cluster_incarnation(outcome.cluster.as_ref());
+                crate::metrics::capture_cluster_metrics(outcome.cluster.as_ref());
         }
         // `container_frontend_timeout` is NOT restored here anymore: by the
         // time this runs, `TcpSession::readable`'s route-capture block has
@@ -1730,7 +1730,7 @@ impl TcpSession {
         // already set keeps the original capture even when it is `None`.
         if self.cluster_id.is_none() {
             self.cluster_metrics_incarnation =
-                crate::metrics::cluster_incarnation(cluster_id.as_ref());
+                crate::metrics::capture_cluster_metrics(cluster_id.as_ref());
             self.cluster_id = Some(cluster_id.clone());
         }
 
@@ -6119,6 +6119,142 @@ mod sni_routing_tests {
             .ready(fixture.proxy_session.clone());
         assert!(!closed, "precondition: the dial keeps the session open");
         fixture
+    }
+
+    #[test]
+    fn static_tcp_route_keeps_its_capture_after_cluster_replacement() {
+        let fixture = dial_fixture(
+            false,
+            |back_buffer, front_buffer, token, listener, proxy, socket, peer| {
+                TcpSession::new(
+                    back_buffer,
+                    None,
+                    Some("cluster-dial".into()),
+                    Duration::from_secs(30),
+                    Duration::from_secs(30),
+                    Duration::from_secs(30),
+                    front_buffer,
+                    token,
+                    listener,
+                    None,
+                    proxy,
+                    socket,
+                    peer,
+                    Duration::from_millis(0),
+                )
+            },
+        );
+        let initial_capture = fixture.session.borrow().cluster_metrics_incarnation;
+        assert!(
+            matches!(
+                initial_capture,
+                crate::metrics::ClusterMetricsCapture::Active(_)
+            ),
+            "precondition: the static route captured an implicit active identity",
+        );
+
+        crate::metrics::METRICS.with(|metrics| {
+            let mut metrics = metrics.borrow_mut();
+            metrics.remove_cluster("cluster-dial");
+            metrics.add_cluster("cluster-dial");
+            let replacement = metrics
+                .cluster_incarnation("cluster-dial")
+                .expect("replacement cluster identity");
+            assert_ne!(
+                initial_capture,
+                crate::metrics::ClusterMetricsCapture::Active(replacement),
+            );
+        });
+        fixture
+            .session
+            .borrow_mut()
+            .update_readiness(fixture.frontend_token, Ready::WRITABLE);
+        let closed = fixture
+            .session
+            .borrow_mut()
+            .ready(fixture.proxy_session.clone());
+        assert!(!closed, "the backend dial must keep the session open");
+        assert_eq!(
+            fixture.session.borrow().cluster_metrics_incarnation,
+            initial_capture,
+            "a retry after replacement must keep the identity captured at static routing time",
+        );
+        crate::metrics::METRICS.with(|metrics| metrics.borrow_mut().remove_cluster("cluster-dial"));
+    }
+
+    #[test]
+    fn sni_tcp_route_keeps_its_capture_after_cluster_replacement() {
+        use std::io::Write as _;
+
+        let mut fixture = dial_fixture(
+            true,
+            |back_buffer, front_buffer, token, listener, proxy, socket, peer| {
+                TcpSession::new_sni_preread(
+                    back_buffer,
+                    Duration::from_secs(30),
+                    Duration::from_secs(30),
+                    front_buffer,
+                    token,
+                    listener,
+                    proxy,
+                    socket,
+                    peer,
+                    Duration::from_millis(0),
+                    Duration::from_secs(3),
+                    16384,
+                )
+            },
+        );
+        fixture
+            .client
+            .write_all(&minimal_client_hello_wire("example.com"))
+            .expect("write ClientHello");
+        fixture.client.flush().ok();
+        for _ in 0..10 {
+            if fixture.session.borrow().cluster_id.is_some() {
+                break;
+            }
+            let _ = fixture.session.borrow_mut().readable();
+        }
+        assert_eq!(
+            fixture.session.borrow().cluster_id.as_deref(),
+            Some("cluster-dial")
+        );
+        let initial_capture = fixture.session.borrow().cluster_metrics_incarnation;
+        assert!(
+            matches!(
+                initial_capture,
+                crate::metrics::ClusterMetricsCapture::Active(_)
+            ),
+            "precondition: SNI routing captured an implicit active identity",
+        );
+
+        crate::metrics::METRICS.with(|metrics| {
+            let mut metrics = metrics.borrow_mut();
+            metrics.remove_cluster("cluster-dial");
+            metrics.add_cluster("cluster-dial");
+            let replacement = metrics
+                .cluster_incarnation("cluster-dial")
+                .expect("replacement cluster identity");
+            assert_ne!(
+                initial_capture,
+                crate::metrics::ClusterMetricsCapture::Active(replacement),
+            );
+        });
+        let closed = fixture
+            .session
+            .borrow_mut()
+            .ready(fixture.proxy_session.clone());
+        assert!(
+            !closed,
+            "the SNI-routed backend dial must keep the session open"
+        );
+        assert_eq!(
+            fixture.session.borrow().cluster_metrics_incarnation,
+            initial_capture,
+            "SNI upgrade and retry after replacement must keep the route-time identity",
+        );
+        crate::metrics::METRICS.with(|metrics| metrics.borrow_mut().remove_cluster("cluster-dial"));
     }
 
     /// Upgrade a dialed, not-yet-`Pipe` session and assert the `Pipe` reports
