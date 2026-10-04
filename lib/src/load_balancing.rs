@@ -44,6 +44,36 @@ fn backend_weight(backend: &Backend) -> u32 {
     weight
 }
 
+/// Whether `other`, at list position `other_position`, takes the place of
+/// `backend`, at `position`, as the one candidate of their shared address.
+///
+/// One address is one share: however many backend ids a cluster configures
+/// at one address, the policies see that address as ONE candidate. Its
+/// representative is the heaviest of its ids ([`backend_weight`], clamped),
+/// the earliest in list order among equally heavy ones; the address then
+/// weighs what its representative weighs. That is the rule [`Rendezvous`]
+/// has always applied, and it is spelled here so every other policy and
+/// shuffle sharding apply it too: the HRW score of an address grows with the
+/// weight, and a tie keeps the earliest backend, so HRW picks exactly this
+/// representative among the ids of an address. With equal weights, the
+/// common case, the representative is the first id in list order.
+///
+/// Callers compare candidates that already passed their eligibility filter,
+/// so a down or backing-off id never represents an address an eligible
+/// sibling could serve.
+pub(crate) fn outranks_at_address(
+    other: &Backend,
+    other_position: usize,
+    backend: &Backend,
+    position: usize,
+) -> bool {
+    if other.address != backend.address || other_position == position {
+        return false;
+    }
+    let (other_weight, weight) = (backend_weight(other), backend_weight(backend));
+    other_weight > weight || (other_weight == weight && other_position < position)
+}
+
 /// Deterministic, seedable 64-bit hash over the backend's STABLE identifier.
 ///
 /// We hash the backend **socket address** (`SocketAddr`) rather than the
@@ -54,6 +84,12 @@ fn backend_weight(backend: &Backend) -> u32 {
 /// the backend matching both, so two ids may share an address), but placement
 /// deliberately keys on the address alone: HRW/Maglev then stay stable when
 /// the control plane renames a backend without moving it.
+///
+/// Keying on the address also means one address is one share: two ids at one
+/// address hash identically, so under HRW they compete once, and Maglev
+/// claims table slots once per distinct address. Every policy follows the
+/// same rule, since `BackendList` hands it one candidate per address, the
+/// representative [`outranks_at_address`] defines.
 ///
 /// Uses `std::hash::SipHasher13` indirectly via a tiny FNV-1a construction with
 /// an injected seed — fully reproducible, never `RandomState`.
@@ -277,6 +313,10 @@ impl Hasher for FnvHasher {
 
 /// The candidates of one selection: a borrowed view of a cluster's backend
 /// list, restricted to the positions a caller retained.
+///
+/// `BackendList` retains one position per address: when several eligible ids
+/// share an address, only their representative ([`outranks_at_address`]) is
+/// a candidate, so every policy gives that address the share of one backend.
 ///
 /// Position `i` of the view is `backends[indices[i]]`, so a policy that
 /// indexes the view (`RoundRobin`'s cursor, `PowerOfTwo`'s two samples,
@@ -947,6 +987,11 @@ impl LoadBalancingAlgorithm for Rendezvous {
 /// until the table is full; a backend's share of slots is proportional to its
 /// weight.
 ///
+/// The table holds one entry per distinct **address**: several backend ids at
+/// one address claim the slots of one backend, weighted by the heaviest of
+/// them over the full set ([`outranks_at_address`]), and the lookup returns
+/// the one candidate the caller retained at that address.
+///
 /// # Rebuild discipline (never on the hot path)
 ///
 /// The table is rebuilt **only when the full backend set changes**
@@ -1032,23 +1077,30 @@ impl Maglev {
         &mut self,
         backends: impl ExactSizeIterator<Item = &'a Rc<RefCell<Backend>>>,
     ) {
-        let n = backends.len();
+        let ids = backends.len();
         self.backend_addrs.clear();
         self.table.clear();
-        if n == 0 || self.size == 0 {
+        if ids == 0 || self.size == 0 {
             return;
         }
 
         let m = self.size;
 
-        // Per-backend (offset, skip) permutation parameters and weights.
-        let mut offsets = Vec::with_capacity(n);
-        let mut skips = Vec::with_capacity(n);
-        let mut weights = Vec::with_capacity(n);
-        let mut total_weight: u64 = 0;
+        // Per-address (offset, skip) permutation parameters and weights. One
+        // address is one share: a second id at an address already captured
+        // claims no slots of its own, it only raises the address's weight to
+        // the heaviest of its ids. Linear search, on the control plane.
+        let mut offsets = Vec::with_capacity(ids);
+        let mut skips = Vec::with_capacity(ids);
+        let mut weights: Vec<u64> = Vec::with_capacity(ids);
         for backend in backends {
             let b = backend.borrow();
             let addr = b.address;
+            let w = backend_weight(&b) as u64;
+            if let Some(known) = self.backend_addrs.iter().position(|a| *a == addr) {
+                weights[known] = weights[known].max(w);
+                continue;
+            }
             self.backend_addrs.push(addr);
             // Two independent seeded hashes give the permutation seeds. We mix
             // distinct domain separators into the `key` slot of `hash_backend`
@@ -1067,10 +1119,14 @@ impl Maglev {
             );
             offsets.push(offset);
             skips.push(skip);
-            let w = backend_weight(&b) as u64;
             weights.push(w);
-            total_weight += w;
         }
+        let n = self.backend_addrs.len();
+        let total_weight: u64 = weights.iter().sum();
+        debug_assert!(
+            (1..=ids).contains(&n),
+            "Maglev captures between one and every backend's address"
+        );
         // Every backend contributes weight >= 1, so a non-empty set has a
         // strictly positive total — the proportional target math divides by it.
         debug_assert!(
@@ -1764,6 +1820,40 @@ mod test {
             heavy > total * 70 / 100,
             "weighted Maglev did not favor the heavy backend: {heavy}/{total}"
         );
+    }
+
+    /// One address, one share: two ids at one address claim the table slots
+    /// of ONE backend, weighted by the heaviest of them, not one share each.
+    ///
+    /// TO SEE THIS RED: push every backend in `Maglev::rebuild_from` instead
+    /// of one entry per distinct address; the shared address then holds two
+    /// thirds of the table.
+    #[test]
+    fn maglev_gives_a_shared_address_the_slots_of_one_backend() {
+        let count_shared = |backends: &[Rc<RefCell<Backend>>]| {
+            let mut mag = Maglev::with_seed_and_size(DEFAULT_HASH_SEED, 1009);
+            mag.rebuild(backends);
+            let shared = chosen_addr(&backends[0]);
+            mag.table
+                .iter()
+                .filter(|&&index| mag.backend_addrs[index] == shared)
+                .count()
+        };
+        let equal = vec![
+            rc(addr_backend("a", 1, 8001, None)),
+            rc(addr_backend("b", 1, 8001, None)),
+            rc(addr_backend("c", 2, 8002, None)),
+        ];
+        // 1009 slots between two addresses of equal weight.
+        assert_eq!(count_shared(&equal), 505);
+
+        // The heaviest id weighs for the address: 300 against 100.
+        let unequal = vec![
+            rc(addr_backend("a", 1, 8001, Some(100))),
+            rc(addr_backend("b", 1, 8001, Some(300))),
+            rc(addr_backend("c", 2, 8002, Some(100))),
+        ];
+        assert_eq!(count_shared(&unequal), 1009 * 3 / 4 + 1);
     }
 
     // ----- Random / PowerOfTwo: injected, seedable entropy -----

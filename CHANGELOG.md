@@ -642,6 +642,27 @@
 
 ### 🔄 Changed
 
+- **`fix(load-balancing)`: one address is one share under every policy.** Two backend ids at
+  the same address in one cluster, which [#1839](https://github.com/sozu-proxy/sozu/pull/1839)
+  made distinct backends (identity `(backend_id, address)`), now receive together the share of
+  ONE backend, as `HRW` already gave them. `ROUND_ROBIN`, `RANDOM`, `LEAST_LOADED`,
+  `POWER_OF_TWO` and `MAGLEV` gave such an address the sum of its ids' shares: with `A` and `B`
+  at one address and `C` at another, equal weights, the shared address took about 2/3 of the
+  traffic (measured over 20 000 selections: 0.667 under round robin, least loaded and power of
+  two, 0.666 random, 0.668 Maglev); it now takes 1/2 under all six. `BackendList` hands the
+  policy one candidate per address, after the health, retry-exclusion and shard filters: the
+  heaviest eligible id, the first in declaration order among equal weights, so a down or
+  backing-off id never hides an eligible sibling. The address weighs what that id weighs.
+  `MAGLEV` builds one table entry per distinct address, weighted by the heaviest of its ids over
+  the full set. Shuffle sharding ranks and counts distinct primary addresses (`k`,
+  `shard_min_backends`) and puts every primary id of a selected address in the shard. Placement
+  still keys on the address, so a rename without a move changes nothing. A cluster without a
+  shared address pays no new work per selection; one with a shared address pays a quadratic
+  scan of its candidates, without allocating. `LEAST_LOADED` and `POWER_OF_TWO` compare the
+  representative id's own counts, which carry the address's new connections. **Behaviour
+  change** for clusters declaring several ids at one address under any policy but `HRW`; no
+  configuration or API change. See "One address is one share" in `doc/configure.md`.
+
 - **`docs(health-check)`: document and test `SetHealthCheck`'s draining policy boundary
   ([#1824](https://github.com/sozu-proxy/sozu/issues/1824)).** `SetHealthCheck` validates and
   stores the replacement policy and acknowledges it without cancelling the probes already in

@@ -1013,6 +1013,26 @@ stops being read. Every datapath supplies a key (below), so that fallback is
 reached only by a request with no source address.
 An unset `weight` defaults to 100 wherever one is read.
 
+**One address is one share.** A cluster may declare several backend ids at the
+same address (their identity is the `(backend_id, address)` pair, so removing
+or health-checking one leaves the other untouched). Every policy treats such
+an address as **one** candidate, so it receives the share of one backend, not
+one share per id: with `A` and `B` at one address, `C` at another and equal
+weights, each address takes half the traffic under every policy. Among the ids
+of an address that can take a connection, the heaviest represents it — the
+first in declaration order when their weights are equal, the usual case — and
+the address weighs what that id weighs. That id is the one selected, and its
+connection and request counts are the ones `LEAST_LOADED` and `POWER_OF_TWO`
+compare. An id that is down, backing off or excluded by a retry never
+represents its address while a sibling there can take a connection: the
+sibling serves instead. `MAGLEV` builds its table over the full configured set,
+health aside, so an address claims the slots of one backend weighted by the
+heaviest of all its ids, healthy or not. This is the rule `HRW` has always
+applied, since it scores an address, not an id; the other policies follow it
+since 2026-10-04 (`outranks_at_address` in `lib/src/load_balancing.rs`), and
+placement still keys on the address, so renaming an id without moving it
+leaves `HRW`, `MAGLEV` and shard placement unchanged.
+
 #### Backend connection failover
 
 A backend connection that fails to establish is retried on another backend
@@ -1219,7 +1239,10 @@ Sōzu takes a client's shard as the top `k` of the
 Chinya Ravishankar, *Using name-based mappings to increase hit rates*, IEEE/ACM
 Transactions on Networking, 1998) of its client key — the same key and the same
 weighted score `HRW` uses, see "Client affinity" — over the cluster's
-**configured** primary backends, healthy or not. That makes a shard:
+**configured** primary addresses, healthy or not. Several ids at one address
+count as one address (see "One address is one share" above): it is ranked
+once, and a shard that holds it holds every primary id there, so a sibling
+can serve when the address's representative is down. That makes a shard:
 
 - **the same on every worker and across restarts**, since the key and the
   ranking are pure functions of the client and the backend addresses. On HTTP,
@@ -1243,8 +1266,8 @@ saturates as it approaches every shard.
 
 | key | default | description |
 |---|---|---|
-| `shard_percent` | unset (off) | Share of the primary backends in a shard, `1..=100`: `k = max(2, ceil(shard_percent × N / 100))`, capped at `N`. The floor of 2 keeps a retry possible inside the shard. |
-| `shard_min_backends` | `8` | Shard only while the cluster has at least this many primary backends; below it the cluster selects over all of them, exactly as without sharding. At least 2. |
+| `shard_percent` | unset (off) | Share of the primary backends in a shard, `1..=100`: `k = max(2, ceil(shard_percent × N / 100))`, capped at `N`, where `N` counts distinct primary addresses. The floor of 2 keeps a retry possible inside the shard. |
+| `shard_min_backends` | `8` | Shard only while the cluster has at least this many primary backends (distinct addresses); below it the cluster selects over all of them, exactly as without sharding. At least 2. |
 | `shard_mode` | `"FALLBACK"` | When no backend of a client's shard can take a connection: `"FALLBACK"` selects over the rest of the cluster (backup tier and fail-open included) and counts `backend.shard.spillover`; `"STRICT"` selects nothing — HTTP answers 503, TCP closes the connection — and counts `backend.shard.exhausted`. |
 
 `shard_min_backends` and `shard_mode` are refused without `shard_percent`, and
