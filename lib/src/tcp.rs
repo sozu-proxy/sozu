@@ -120,6 +120,10 @@ pub struct TcpSession {
     backend_token: Option<Token>,
     backend: Option<Rc<RefCell<Backend>>>,
     cluster_id: Option<ClusterId>,
+    /// Configured lifetime of `cluster_id` captured when this session routes.
+    /// Kept on the session rather than the public `SessionMetrics` value so
+    /// delayed TCP and Pipe emissions cannot target a replacement cluster.
+    cluster_metrics_incarnation: crate::metrics::ClusterMetricsCapture,
     configured_backend_timeout: Duration,
     connection_attempt: u8,
     container_backend_timeout: TimeoutContainer,
@@ -197,6 +201,9 @@ impl TcpSession {
         let container_frontend_timeout =
             TimeoutContainer::new(configured_frontend_timeout, frontend_token);
         let container_backend_timeout = TimeoutContainer::new_empty(configured_connect_timeout);
+        let cluster_metrics_incarnation = cluster_id
+            .as_deref()
+            .map_or_else(Default::default, crate::metrics::capture_cluster_metrics);
 
         let state = match proxy_protocol {
             Some(ProxyProtocolConfig::RelayHeader) => {
@@ -253,6 +260,7 @@ impl TcpSession {
                     WebSocketContext::Tcp,
                 );
                 pipe.set_cluster_id(cluster_id.clone());
+                pipe.set_cluster_metrics_incarnation(cluster_metrics_incarnation);
                 TcpStateMachine::Pipe(pipe)
             }
         };
@@ -268,6 +276,7 @@ impl TcpSession {
             backend_token: None,
             backend: None,
             cluster_id,
+            cluster_metrics_incarnation,
             configured_backend_timeout,
             connection_attempt: 0,
             container_backend_timeout,
@@ -354,6 +363,7 @@ impl TcpSession {
             backend_token: None,
             backend: None,
             cluster_id: None,
+            cluster_metrics_incarnation: Default::default(),
             configured_backend_timeout,
             connection_attempt: 0,
             container_backend_timeout,
@@ -400,7 +410,8 @@ impl TcpSession {
     fn log_request(&self) {
         let listener = self.listener.borrow();
         let context = self.log_context();
-        self.metrics.register_end_of_session(&context);
+        self.metrics
+            .register_end_of_session_for_incarnation(&context, self.cluster_metrics_incarnation);
         // SNI-routed sessions carry the matched front's own tags key
         // (`sni_tags_key`, stashed by `upgrade_sni_preread`); everything
         // else keeps the historical bare-address key.
@@ -526,6 +537,8 @@ impl TcpSession {
             && let Some(outcome) = preread.outcome()
         {
             self.cluster_id = Some(outcome.cluster.clone());
+            self.cluster_metrics_incarnation =
+                crate::metrics::capture_cluster_metrics(outcome.cluster.as_ref());
             // Restore the listener's configured `front_timeout` THE MOMENT
             // routing succeeds, not only once the backend connect completes
             // (previously done only in `upgrade_sni_preread`, which can run
@@ -648,6 +661,7 @@ impl TcpSession {
             pipe.restore_readiness_events(frontend_event, backend_event);
 
             pipe.set_cluster_id(self.cluster_id.clone());
+            pipe.set_cluster_metrics_incarnation(self.cluster_metrics_incarnation);
             pipe.set_backend_address(self.backend_address);
             // Only `Some` when this `SendProxyProtocol` was itself reached
             // via `upgrade_sni_preread`'s `SendHeader` branch (sozu-proxy/sozu#1279)
@@ -676,6 +690,7 @@ impl TcpSession {
             let mut pipe =
                 rpp.into_pipe(self.backend_buffer.take().unwrap(), self.listener.clone());
             pipe.set_cluster_id(self.cluster_id.clone());
+            pipe.set_cluster_metrics_incarnation(self.cluster_metrics_incarnation);
             pipe.set_backend_address(self.backend_address);
             gauge_add!(names::protocol::PROXY_RELAY, -1);
             gauge_add!(names::protocol::TCP, 1);
@@ -703,6 +718,7 @@ impl TcpSession {
             );
 
             pipe.set_cluster_id(self.cluster_id.clone());
+            pipe.set_cluster_metrics_incarnation(self.cluster_metrics_incarnation);
             pipe.set_backend_address(self.backend_address);
             gauge_add!(names::protocol::PROXY_EXPECT, -1);
             gauge_add!(names::protocol::TCP, 1);
@@ -811,7 +827,14 @@ impl TcpSession {
             preread.started_at().elapsed().as_millis() as i64
         );
 
-        self.cluster_id = Some(outcome.cluster.clone());
+        // `TcpSession::readable` normally captured this route (and its
+        // metrics incarnation) already; only capture when it did not, so the
+        // incarnation stays the one observed at routing time.
+        if self.cluster_id.as_ref() != Some(&outcome.cluster) {
+            self.cluster_id = Some(outcome.cluster.clone());
+            self.cluster_metrics_incarnation =
+                crate::metrics::capture_cluster_metrics(outcome.cluster.as_ref());
+        }
         // `container_frontend_timeout` is NOT restored here anymore: by the
         // time this runs, `TcpSession::readable`'s route-capture block has
         // already restored it to the listener's configured `front_timeout`
@@ -939,6 +962,7 @@ impl TcpSession {
             addr,
             WebSocketContext::Tcp,
         );
+        pipe.set_cluster_metrics_incarnation(self.cluster_metrics_incarnation);
         // `Pipe::new` armed backend-writable for the inherited frontend
         // accumulator (the ClientHello + any coalesced payload) via
         // `arm_inherited_buffer_writes`. Restore the preread's readiness
@@ -1084,7 +1108,8 @@ impl TcpSession {
                 names::backend::CONNECTIONS_PER_BACKEND,
                 1,
                 self.cluster_id.as_deref(),
-                self.metrics.backend_id.as_deref()
+                self.metrics.backend_id.as_deref(),
+                self.cluster_metrics_incarnation
             );
 
             // the back timeout was of connect_timeout duration before,
@@ -1104,13 +1129,15 @@ impl TcpSession {
                     incr!(
                         names::backend::UP,
                         self.cluster_id.as_deref(),
-                        self.metrics.backend_id.as_deref()
+                        self.metrics.backend_id.as_deref(),
+                        self.cluster_metrics_incarnation
                     );
                     gauge!(
                         names::backend::AVAILABLE,
                         1,
                         self.cluster_id.as_deref(),
-                        self.metrics.backend_id.as_deref()
+                        self.metrics.backend_id.as_deref(),
+                        self.cluster_metrics_incarnation
                     );
                     info!(
                         "{} backend server {} at {} is up",
@@ -1172,7 +1199,8 @@ impl TcpSession {
             incr!(
                 names::backend::CONNECTIONS_ERROR,
                 self.cluster_id.as_deref(),
-                self.metrics.backend_id.as_deref()
+                self.metrics.backend_id.as_deref(),
+                self.cluster_metrics_incarnation
             );
             if !already_unavailable && backend.retry_policy.is_down() {
                 error!(
@@ -1184,13 +1212,15 @@ impl TcpSession {
                 incr!(
                     names::backend::DOWN,
                     self.cluster_id.as_deref(),
-                    self.metrics.backend_id.as_deref()
+                    self.metrics.backend_id.as_deref(),
+                    self.cluster_metrics_incarnation
                 );
                 gauge!(
                     names::backend::AVAILABLE,
                     0,
                     self.cluster_id.as_deref(),
-                    self.metrics.backend_id.as_deref()
+                    self.metrics.backend_id.as_deref(),
+                    self.cluster_metrics_incarnation
                 );
 
                 push_event(Event {
@@ -1647,7 +1677,8 @@ impl TcpSession {
                 names::backend::CONNECTIONS_PER_BACKEND,
                 -1,
                 self.cluster_id.as_deref(),
-                self.metrics.backend_id.as_deref()
+                self.metrics.backend_id.as_deref(),
+                self.cluster_metrics_incarnation
             );
         }
 
@@ -1693,7 +1724,15 @@ impl TcpSession {
             .or_else(|| self.listener.borrow().cluster_id.clone())
             .ok_or(BackendConnectionError::NotFound(ObjectKind::TcpCluster))?;
 
-        self.cluster_id = Some(cluster_id.clone());
+        // Capture the metrics incarnation exactly once, when the session is
+        // first routed. Every path that sets `cluster_id` (session creation,
+        // SNI preread) captures alongside it, so a retry with `cluster_id`
+        // already set keeps the original capture even when it is `None`.
+        if self.cluster_id.is_none() {
+            self.cluster_metrics_incarnation =
+                crate::metrics::capture_cluster_metrics(cluster_id.as_ref());
+            self.cluster_id = Some(cluster_id.clone());
+        }
 
         // The cluster's own budget when it sets one, the worker's otherwise
         // (sozu-proxy/sozu#1800).
@@ -1712,7 +1751,8 @@ impl TcpSession {
             incr!(
                 names::backend::CONNECT_RETRIES_EXHAUSTED,
                 self.cluster_id.as_deref(),
-                self.metrics.backend_id.as_deref()
+                self.metrics.backend_id.as_deref(),
+                self.cluster_metrics_incarnation
             );
             warn!(
                 "{} Max connection attempt reached ({})",
@@ -6079,6 +6119,142 @@ mod sni_routing_tests {
             .ready(fixture.proxy_session.clone());
         assert!(!closed, "precondition: the dial keeps the session open");
         fixture
+    }
+
+    #[test]
+    fn static_tcp_route_keeps_its_capture_after_cluster_replacement() {
+        let fixture = dial_fixture(
+            false,
+            |back_buffer, front_buffer, token, listener, proxy, socket, peer| {
+                TcpSession::new(
+                    back_buffer,
+                    None,
+                    Some("cluster-dial".into()),
+                    Duration::from_secs(30),
+                    Duration::from_secs(30),
+                    Duration::from_secs(30),
+                    front_buffer,
+                    token,
+                    listener,
+                    None,
+                    proxy,
+                    socket,
+                    peer,
+                    Duration::from_millis(0),
+                )
+            },
+        );
+        let initial_capture = fixture.session.borrow().cluster_metrics_incarnation;
+        assert!(
+            matches!(
+                initial_capture,
+                crate::metrics::ClusterMetricsCapture::Active(_)
+            ),
+            "precondition: the static route captured an implicit active identity",
+        );
+
+        crate::metrics::METRICS.with(|metrics| {
+            let mut metrics = metrics.borrow_mut();
+            metrics.remove_cluster("cluster-dial");
+            metrics.add_cluster("cluster-dial");
+            let replacement = metrics
+                .cluster_incarnation("cluster-dial")
+                .expect("replacement cluster identity");
+            assert_ne!(
+                initial_capture,
+                crate::metrics::ClusterMetricsCapture::Active(replacement),
+            );
+        });
+        fixture
+            .session
+            .borrow_mut()
+            .update_readiness(fixture.frontend_token, Ready::WRITABLE);
+        let closed = fixture
+            .session
+            .borrow_mut()
+            .ready(fixture.proxy_session.clone());
+        assert!(!closed, "the backend dial must keep the session open");
+        assert_eq!(
+            fixture.session.borrow().cluster_metrics_incarnation,
+            initial_capture,
+            "a retry after replacement must keep the identity captured at static routing time",
+        );
+        crate::metrics::METRICS.with(|metrics| metrics.borrow_mut().remove_cluster("cluster-dial"));
+    }
+
+    #[test]
+    fn sni_tcp_route_keeps_its_capture_after_cluster_replacement() {
+        use std::io::Write as _;
+
+        let mut fixture = dial_fixture(
+            true,
+            |back_buffer, front_buffer, token, listener, proxy, socket, peer| {
+                TcpSession::new_sni_preread(
+                    back_buffer,
+                    Duration::from_secs(30),
+                    Duration::from_secs(30),
+                    front_buffer,
+                    token,
+                    listener,
+                    proxy,
+                    socket,
+                    peer,
+                    Duration::from_millis(0),
+                    Duration::from_secs(3),
+                    16384,
+                )
+            },
+        );
+        fixture
+            .client
+            .write_all(&minimal_client_hello_wire("example.com"))
+            .expect("write ClientHello");
+        fixture.client.flush().ok();
+        for _ in 0..10 {
+            if fixture.session.borrow().cluster_id.is_some() {
+                break;
+            }
+            let _ = fixture.session.borrow_mut().readable();
+        }
+        assert_eq!(
+            fixture.session.borrow().cluster_id.as_deref(),
+            Some("cluster-dial")
+        );
+        let initial_capture = fixture.session.borrow().cluster_metrics_incarnation;
+        assert!(
+            matches!(
+                initial_capture,
+                crate::metrics::ClusterMetricsCapture::Active(_)
+            ),
+            "precondition: SNI routing captured an implicit active identity",
+        );
+
+        crate::metrics::METRICS.with(|metrics| {
+            let mut metrics = metrics.borrow_mut();
+            metrics.remove_cluster("cluster-dial");
+            metrics.add_cluster("cluster-dial");
+            let replacement = metrics
+                .cluster_incarnation("cluster-dial")
+                .expect("replacement cluster identity");
+            assert_ne!(
+                initial_capture,
+                crate::metrics::ClusterMetricsCapture::Active(replacement),
+            );
+        });
+        let closed = fixture
+            .session
+            .borrow_mut()
+            .ready(fixture.proxy_session.clone());
+        assert!(
+            !closed,
+            "the SNI-routed backend dial must keep the session open"
+        );
+        assert_eq!(
+            fixture.session.borrow().cluster_metrics_incarnation,
+            initial_capture,
+            "SNI upgrade and retry after replacement must keep the route-time identity",
+        );
+        crate::metrics::METRICS.with(|metrics| metrics.borrow_mut().remove_cluster("cluster-dial"));
     }
 
     /// Upgrade a dialed, not-yet-`Pipe` session and assert the `Pipe` reports

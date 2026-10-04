@@ -213,6 +213,7 @@ pub(crate) fn set_default_answer_with_retry_after(
     answers: &HttpAnswers,
     retry_after: Option<u32>,
 ) {
+    let metric_incarnation = stream.context.cluster_metrics_incarnation();
     let context = &mut stream.context;
     let kawa = &mut stream.back;
     kawa.clear();
@@ -237,7 +238,8 @@ pub(crate) fn set_default_answer_with_retry_after(
     incr!(
         key,
         context.cluster_id.as_deref(),
-        context.backend_id.as_deref()
+        context.backend_id.as_deref(),
+        metric_incarnation
     );
 
     // Routing layer stashes both the resolved `Location` URL (for 301) and
@@ -382,6 +384,7 @@ mod tests {
             id: Ulid::generate(),
             backend_id: None,
             cluster_id: None,
+            cluster_metrics_incarnation: Default::default(),
             affinity_key: None,
             protocol: Protocol::HTTPS,
             public_address: SocketAddress::new_v4(127, 0, 0, 1, 0).into(),

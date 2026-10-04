@@ -4097,6 +4097,50 @@
   `BackendMap::remove_backend(cluster_id, backend_id, address)` take the backend id and return
   whether the backend was present instead of the list of removed ids; new
   `BackendList::find_backend_by_identity` and `BackendList::find_incarnation`.
+- **`fix(metrics)`: draining sessions cannot mutate a same-id replacement
+  cluster ([#1828](https://github.com/sozu-proxy/sozu/issues/1828)).** A
+  `RemoveCluster` followed by `AddCluster` cleared the textual-id tombstone,
+  so a backend connection created before the removal could later emit
+  `connections_per_backend -1` into the replacement's row when cluster id,
+  backend id and address were all reused. Each configured cluster lifetime
+  now has an opaque incarnation captured per HTTP stream or TCP route and
+  retained by its backend connection. At `cluster` and `backend` detail the
+  aggregator rejects stale emissions before both drains. At `process` and
+  `frontend` detail they still balance the intentional worker aggregate after
+  label removal when the effective detail stays at that level, while separately
+  emitted proxy-wide connection metrics also record the physical close.
+  Existing detail/lease transitions do not migrate stored gauge contributions;
+  by source inspection a pair spanning a transition may therefore use two
+  shapes, a boundary this change does not attempt to alter or newly diagnose.
+  The incarnation gate follows the detail effective at emission time. Live
+  `AddCluster` updates and metric disable/enable, clear, and detail controls
+  preserve the current incarnation. A legal route before `AddCluster`
+  allocates an implicit incarnation which a later add preserves; only
+  `RemoveCluster` ends it. The first legal route after removal also clears the
+  old drain tombstone, allowing that implicit replacement to emit without an
+  `AddCluster` while the removed incarnation remains fenced. Missing and
+  exhausted captures remain distinct and
+  fail closed whenever cluster labels are retained. The public `SessionMetrics` literal shape
+  and its current-configuration registration method remain compatible for
+  embedders; only Sōzu's internal delayed owners use the captured-incarnation
+  path. A cluster referenced without `AddCluster` therefore retains metrics at
+  every detail level without conflating absence with a removed or exhausted
+  lifetime. Covered by
+  `test_old_http_session_metrics_do_not_decrement_same_identity_replacement`
+  `cluster_incarnation_fences_labelled_rows_and_preserves_process_aggregates`,
+  `implicit_cluster_capture_is_recorded_at_process_detail`,
+  `implicit_cluster_capture_is_recorded_at_labelled_detail`,
+  `add_without_remove_keeps_implicit_identity_and_balances_labelled_gauge`,
+  `removed_implicit_capture_stays_rejected_after_clear`,
+  `implicit_route_after_remove_rearms_drains_without_add_cluster`,
+  `exhausted_add_is_not_an_implicit_identity`,
+  `exhausted_implicit_capture_does_not_rearm_removed_drains`,
+  `every_capture_state_keeps_process_and_frontend_aggregates`,
+  `real_http_session_without_add_cluster_records_labelled_metrics`,
+  `static_tcp_route_keeps_its_capture_after_cluster_replacement`,
+  `sni_tcp_route_keeps_its_capture_after_cluster_replacement`,
+  `mismatched_incarnation_is_dropped_at_labelled_detail`,
+  and `public_session_metrics_literal_and_registration_remain_supported`.
 
 - **`fix(metrics)`: metric-detail leases expire without another worker command
   ([#1831](https://github.com/sozu-proxy/sozu/issues/1831)).** The lease janitor

@@ -650,7 +650,8 @@ impl Router {
             incr!(
                 names::backend::CONNECT_RETRIES_EXHAUSTED,
                 stream.context.cluster_id.as_deref(),
-                stream.context.backend_id.as_deref()
+                stream.context.backend_id.as_deref(),
+                stream.context.cluster_metrics_incarnation()
             );
             return Err(BackendConnectionError::MaxConnectionRetries(
                 stream.context.cluster_id.clone(),
@@ -716,6 +717,9 @@ impl Router {
                 )
             });
             stream.context.affinity_key = key;
+            stream.context.set_cluster_metrics_incarnation(
+                crate::metrics::capture_cluster_metrics(routed.as_ref()),
+            );
             stream.context.cluster_id = Some(routed);
         }
         let stream_context = &stream.context;

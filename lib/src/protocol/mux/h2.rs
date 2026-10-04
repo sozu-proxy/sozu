@@ -8466,7 +8466,8 @@ impl ConnectionH2 {
                                 incr!(
                                     names::backend::RETRY_STALE_UPSTREAM,
                                     stream.context.cluster_id.as_deref(),
-                                    stream.context.backend_id.as_deref()
+                                    stream.context.backend_id.as_deref(),
+                                    stream.context.cluster_metrics_incarnation()
                                 );
                                 stream.state = StreamState::Link;
                                 context.pending_links.push_back(stream_gid);
@@ -10568,6 +10569,7 @@ mod tests {
             id: Ulid::generate(),
             backend_id: None,
             cluster_id: None,
+            cluster_metrics_incarnation: Default::default(),
             affinity_key: None,
             protocol: Protocol::HTTPS,
             public_address: "127.0.0.1:0".parse().unwrap(),
@@ -15400,6 +15402,7 @@ mod tests {
                 slot: super::super::BackendSlot(0),
                 backend_id: Rc::from("rtt-backend"),
                 address: "127.0.0.1:1".parse().expect("a literal socket address"),
+                metric_incarnation: Default::default(),
             },
             BackendStatus::Connected,
         );
@@ -24181,6 +24184,7 @@ mod tests {
                 slot: super::super::BackendSlot(0),
                 backend_id: Rc::from("settings-backend"),
                 address: "127.0.0.1:1".parse().expect("a literal socket address"),
+                metric_incarnation: Default::default(),
             },
             BackendStatus::Connected,
         );
