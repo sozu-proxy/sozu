@@ -21,8 +21,8 @@ use std::{
 use sozu_command_lib::{
     config::ListenerBuilder,
     proto::command::{
-        ActivateListener, ListenerType, QueryMetricsOptions, ResponseStatus, filtered_metrics,
-        request::RequestType, response_content::ContentType,
+        ActivateListener, ListenerType, ProxyProtocolConfig, QueryMetricsOptions, ResponseStatus,
+        filtered_metrics, request::RequestType, response_content::ContentType,
     },
 };
 
@@ -417,56 +417,204 @@ fn test_tcp_proxy_large_payload() {
 }
 
 // =========================================================================
-// Test 3: TCP half-close handling
+// Test 3: TCP half-close handling across every PROXY-protocol role
 //
-// Verifies that Sozu correctly handles TCP half-close: the client sends
-// data and then shuts down its write side (FIN). The backend should still
-// receive all data, and the backend's response should still reach the
-// client through the still-open read side.
+// A client FIN does not promise that the old session will carry a backend
+// response. The accepted contract is narrower: drain every request byte that
+// preceded the FIN, close that session, then let the client start a clean new
+// session. Expect consumes the inbound PPv2 header, Relay forwards it verbatim,
+// and Send synthesizes one before the payload. The first request is deliberately
+// larger than the userspace pipe buffer so the FIN can race with bytes still in
+// flight; the second connection proves that no transparent replay or stale
+// session state is needed for progress.
 // =========================================================================
 
-fn try_tcp_proxy_half_close() -> State {
-    let (mut worker, _backend_addrs, front_address) = setup_tcp_test("TCP-HALFCLOSE", 1);
+fn proxy_mode_wire_bytes(
+    mode: Option<ProxyProtocolConfig>,
+    front_address: SocketAddr,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut wire = match mode {
+        Some(ProxyProtocolConfig::ExpectHeader | ProxyProtocolConfig::RelayHeader) => {
+            pp_v2_proxy_ipv4(54_321, front_address.port())
+        }
+        Some(ProxyProtocolConfig::SendHeader) | None => Vec::new(),
+    };
+    wire.extend_from_slice(payload);
+    wire
+}
 
-    // Use SyncBackend to handle the backend side reliably
-    let back_address = _backend_addrs[0];
-    let mut backend = SyncBackend::new("BACKEND_0", back_address, "half-close-response");
-    backend.connect();
+fn proxy_mode_backend_bytes(
+    mode: Option<ProxyProtocolConfig>,
+    front_address: SocketAddr,
+    client_address: SocketAddr,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut expected = match mode {
+        Some(ProxyProtocolConfig::ExpectHeader) | None => Vec::new(),
+        Some(ProxyProtocolConfig::RelayHeader) => pp_v2_proxy_ipv4(54_321, front_address.port()),
+        Some(ProxyProtocolConfig::SendHeader) => {
+            pp_v2_proxy_ipv4(client_address.port(), front_address.port())
+        }
+    };
+    expected.extend_from_slice(payload);
+    expected
+}
 
-    // Client: connect, send data, then half-close
-    let mut stream = raw_connect(front_address);
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("set read timeout");
+fn try_tcp_proxy_half_close_starts_fresh_session() -> State {
+    const FRESH_PAYLOAD: &[u8] = b"fresh-session-request";
+    const FRESH_RESPONSE: &[u8] = b"fresh-session-response";
 
-    let request = b"half-close-request";
-    stream.write_all(request).expect("client write failed");
-    stream.flush().unwrap();
-    println!("Client: sent {} bytes", request.len());
+    let half_closed_payload: Vec<u8> = (0..256 * 1024)
+        .map(|index| b'a' + (index % 23) as u8)
+        .collect();
+    let modes = [
+        (None, "plain"),
+        (Some(ProxyProtocolConfig::ExpectHeader), "expect"),
+        (Some(ProxyProtocolConfig::RelayHeader), "relay"),
+        (Some(ProxyProtocolConfig::SendHeader), "send"),
+    ];
 
-    // Small delay to let Sozu forward data before half-close
-    thread::sleep(Duration::from_millis(100));
+    let mut all_modes_ok = true;
+    for (mode, name) in modes {
+        let (mut worker, front_address, back_address) =
+            setup_tcp_proxy_mode_cluster_test(&format!("TCP-HALFCLOSE-{name}"), mode);
+        let listener = bind_std_listener(back_address, "tcp half-close backend");
+        let (expected_tx, expected_rx) = mpsc::channel::<Vec<u8>>();
+        let (observed_tx, observed_rx) = mpsc::channel::<(Vec<u8>, bool)>();
 
-    // Half-close: shut down the write side only
-    stream
-        .shutdown(Shutdown::Write)
-        .expect("client shutdown(Write) failed");
-    println!("Client: shutdown(Write) — half-closed");
+        let backend = thread::spawn(move || {
+            for session in 0..2 {
+                let (mut stream, _) = listener.accept().expect("backend accept failed");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("set backend read timeout");
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .expect("set backend write timeout");
+                let expected = expected_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("expected backend bytes");
+                let received = super::h2_utils::read_at_least(
+                    &mut stream,
+                    expected.len(),
+                    Duration::from_secs(2),
+                );
 
-    // The key verification: Sozu didn't crash from the half-close.
-    // TCP proxies may or may not forward data after client half-close.
-    thread::sleep(Duration::from_millis(200));
+                if session == 0 {
+                    let mut extra = [0u8; 1];
+                    let closed_after_request = match stream.read(&mut extra) {
+                        Ok(0) => true,
+                        Err(error)
+                            if !matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            true
+                        }
+                        Ok(_) | Err(_) => false,
+                    };
+                    observed_tx
+                        .send((received, closed_after_request))
+                        .expect("send old-session observation");
+                } else {
+                    stream
+                        .write_all(FRESH_RESPONSE)
+                        .expect("write fresh-session response");
+                    observed_tx
+                        .send((received, true))
+                        .expect("send fresh-session observation");
+                }
+            }
+        });
 
-    // Verify worker is still alive by checking if it accepts TCP connections
-    let probe_ok =
-        std::net::TcpStream::connect_timeout(&front_address, Duration::from_secs(1)).is_ok();
-    println!("Worker survived half-close: {probe_ok}");
+        let mut old_client = raw_connect(front_address);
+        old_client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set old-client read timeout");
+        let old_expected = proxy_mode_backend_bytes(
+            mode,
+            front_address,
+            old_client.local_addr().expect("old client local address"),
+            &half_closed_payload,
+        );
+        expected_tx
+            .send(old_expected.clone())
+            .expect("send expected old bytes");
+        old_client
+            .write_all(&proxy_mode_wire_bytes(
+                mode,
+                front_address,
+                &half_closed_payload,
+            ))
+            .expect("write half-closed request");
+        old_client
+            .shutdown(Shutdown::Write)
+            .expect("half-close old client");
 
-    drop(stream);
-    worker.soft_stop();
-    let success = worker.wait_for_server_stop();
+        let (old_received, backend_saw_close) = observed_rx
+            .recv_timeout(Duration::from_secs(4))
+            .expect("old-session observation deadline");
+        let mut unexpected = [0u8; 1];
+        let old_client_closed = match old_client.read(&mut unexpected) {
+            Ok(0) => true,
+            Err(error)
+                if !matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                true
+            }
+            Ok(_) | Err(_) => false,
+        };
 
-    if success && probe_ok {
+        let mut fresh_client = raw_connect(front_address);
+        fresh_client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set fresh-client read timeout");
+        let fresh_expected = proxy_mode_backend_bytes(
+            mode,
+            front_address,
+            fresh_client
+                .local_addr()
+                .expect("fresh client local address"),
+            FRESH_PAYLOAD,
+        );
+        expected_tx
+            .send(fresh_expected.clone())
+            .expect("send expected fresh bytes");
+        fresh_client
+            .write_all(&proxy_mode_wire_bytes(mode, front_address, FRESH_PAYLOAD))
+            .expect("write fresh request");
+        let mut fresh_response = vec![0u8; FRESH_RESPONSE.len()];
+        let fresh_response_ok = fresh_client.read_exact(&mut fresh_response).is_ok()
+            && fresh_response == FRESH_RESPONSE;
+        let (fresh_received, _) = observed_rx
+            .recv_timeout(Duration::from_secs(4))
+            .expect("fresh-session observation deadline");
+
+        backend.join().expect("backend thread panicked");
+        worker.soft_stop();
+        let stopped = worker.wait_for_server_stop();
+        let mode_ok = old_received == old_expected
+            && backend_saw_close
+            && old_client_closed
+            && fresh_received == fresh_expected
+            && fresh_response_ok
+            && stopped;
+        println!(
+            "half-close {name}: old={}/{} backend_closed={backend_saw_close} client_closed={old_client_closed} fresh={}/{} response={fresh_response_ok} stopped={stopped}",
+            old_received.len(),
+            old_expected.len(),
+            fresh_received.len(),
+            fresh_expected.len(),
+        );
+        all_modes_ok &= mode_ok;
+    }
+
+    if all_modes_ok {
         State::Success
     } else {
         State::Fail
@@ -474,14 +622,11 @@ fn try_tcp_proxy_half_close() -> State {
 }
 
 #[test]
-fn test_tcp_proxy_half_close() {
+fn test_tcp_proxy_half_close_starts_fresh_session_for_every_proxy_mode() {
     assert_eq!(
-        repeat_until_error_or(
-            10,
-            "TCP half-close: client shutdown(Write) still allows backend response",
-            try_tcp_proxy_half_close,
-        ),
+        try_tcp_proxy_half_close_starts_fresh_session(),
         State::Success,
+        "TCP half-close must drain the old request, close it, and admit a clean new session"
     );
 }
 
@@ -1517,11 +1662,13 @@ fn test_tcp_soft_stop_with_active_sessions() {
 // reaped before the second, well-behaved session proves the worker is intact.
 // =========================================================================
 
-/// Set up a Sozu worker whose CLUSTER expects an inbound PROXY-v2 header
-/// (`ProxyProtocolConfig::ExpectHeader`), as opposed to
-/// [`setup_tcp_proxy_protocol_test`], which sets `expect_proxy` on the
-/// LISTENER. The cluster flag is what selects `TcpStateMachine::ExpectProxyProtocol`.
-fn setup_tcp_expect_header_cluster_test(name: &str) -> (Worker, SocketAddr, SocketAddr) {
+/// Set up a Sōzu worker whose cluster selects one PROXY-protocol role. This is
+/// distinct from [`setup_tcp_proxy_protocol_test`], which sets `expect_proxy`
+/// on the listener even though raw TCP treats that listener flag as passthrough.
+fn setup_tcp_proxy_mode_cluster_test(
+    name: &str,
+    proxy_protocol: Option<ProxyProtocolConfig>,
+) -> (Worker, SocketAddr, SocketAddr) {
     let front_address = create_local_address();
     let back_address = create_local_address();
     let (config, listeners, state) = Worker::empty_tcp_config(front_address);
@@ -1540,9 +1687,7 @@ fn setup_tcp_expect_header_cluster_test(name: &str) -> (Worker, SocketAddr, Sock
     }));
     worker.send_proxy_request_type(RequestType::AddCluster(
         sozu_command_lib::proto::command::Cluster {
-            proxy_protocol: Some(
-                sozu_command_lib::proto::command::ProxyProtocolConfig::ExpectHeader as i32,
-            ),
+            proxy_protocol: proxy_protocol.map(|mode| mode as i32),
             ..Worker::default_cluster("cluster_0")
         },
     ));
@@ -1567,8 +1712,10 @@ fn setup_tcp_expect_header_cluster_test(name: &str) -> (Worker, SocketAddr, Sock
 fn try_tcp_expect_proxy_preserves_coalesced_payload() -> State {
     const PAYLOAD: &[u8] = b"coalesced-application-payload";
 
-    let (mut worker, front_address, back_address) =
-        setup_tcp_expect_header_cluster_test("TCP-EXPECT-COALESCED-PAYLOAD");
+    let (mut worker, front_address, back_address) = setup_tcp_proxy_mode_cluster_test(
+        "TCP-EXPECT-COALESCED-PAYLOAD",
+        Some(ProxyProtocolConfig::ExpectHeader),
+    );
     let listener = bind_std_listener(back_address, "tcp expect-header payload backend");
 
     let mut ipv4_with_tlv = pp_v2_proxy_ipv4(54321, front_address.port());
@@ -1684,8 +1831,10 @@ fn test_tcp_expect_proxy_preserves_coalesced_payload() {
 /// the worker thread dies, the second session gets no answer, and the harness
 /// fails on the dead command channel.
 fn try_tcp_expect_proxy_zero_bytes_keeps_the_worker_alive() -> State {
-    let (mut worker, front_address, back_address) =
-        setup_tcp_expect_header_cluster_test("TCP-EXPECT-SILENT");
+    let (mut worker, front_address, back_address) = setup_tcp_proxy_mode_cluster_test(
+        "TCP-EXPECT-SILENT",
+        Some(ProxyProtocolConfig::ExpectHeader),
+    );
 
     // A client that completes the handshake and sends NOTHING. Held open for
     // the rest of the test.

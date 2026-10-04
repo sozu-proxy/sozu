@@ -20,7 +20,7 @@ use std::{
 };
 
 use sozu_command_lib::{
-    config::FileConfig,
+    config::{FileConfig, ListenerBuilder},
     proto::command::{
         ActivateListener, ListenerType, MetricDetail, QueryMetricsOptions, RemoveBackend, Request,
         RequestHttpFrontend, ResponseStatus, ServerConfig, SetMetricDetail, WorkerMetrics,
@@ -480,6 +480,41 @@ fn wait_for_backend_2xx(worker: &mut Worker, cluster_id: &str, backend_id: &str)
     while Instant::now() < deadline {
         let actual = backend_2xx_count(worker, cluster_id, backend_id);
         if actual.is_some_and(|count| count > 0) {
+            return actual;
+        }
+        thread::yield_now();
+    }
+    None
+}
+
+fn proxy_count(worker: &mut Worker, metric_name: &str) -> Option<i64> {
+    let metrics = query_worker_metrics(
+        worker,
+        QueryMetricsOptions {
+            list: false,
+            cluster_ids: vec![],
+            backend_ids: vec![],
+            metric_names: vec![metric_name.to_owned()],
+            no_clusters: true,
+            workers: false,
+        },
+    )?;
+    metrics
+        .proxy
+        .get(metric_name)?
+        .inner
+        .as_ref()
+        .and_then(|inner| match inner {
+            filtered_metrics::Inner::Count(value) => Some(*value),
+            _ => None,
+        })
+}
+
+fn wait_for_proxy_bytes_out(worker: &mut Worker, previous: i64) -> Option<i64> {
+    let deadline = Instant::now() + SESSION_BARRIER_BUDGET;
+    while Instant::now() < deadline {
+        let actual = proxy_count(worker, "bytes_out");
+        if actual.is_some_and(|count| count > previous) {
             return actual;
         }
         thread::yield_now();
@@ -978,6 +1013,199 @@ fn try_old_http_session_does_not_decrement_same_identity_replacement() -> State 
 fn test_old_http_session_metrics_do_not_decrement_same_identity_replacement() {
     assert_eq!(
         try_old_http_session_does_not_decrement_same_identity_replacement(),
+        State::Success,
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// A real raw-TCP close is fenced from its same-identity replacement
+// ══════════════════════════════════════════════════════════════════════
+//
+// HTTP, H2 and WebSocket exercise their own session owners above/below. Raw
+// TCP closes through `TcpSession::log_request`, so it needs its own runtime
+// oracle: an old connection is held at the real backend, the cluster is
+// removed and recreated with the exact same cluster/backend/address, and a
+// replacement connection becomes active before the old one closes. The
+// proxy-wide 2 -> 1 gauge is the terminal old-close witness. Only then does
+// the replacement emit `bytes_out`, which traverses the same LocalDrain before
+// the final labelled gauge query.
+fn try_old_tcp_session_does_not_decrement_same_identity_replacement() -> State {
+    let front_address = create_local_address();
+    let back_address = create_local_address();
+    let cluster_id = "tcp_lifecycle_cluster_incarnation";
+    let backend_id = "tcp_lifecycle_backend_incarnation";
+
+    let (config, listeners, state) = Worker::empty_tcp_config(front_address);
+    let mut worker = Worker::start_new_worker_owned(
+        "TCP-METRICS-LIFECYCLE-INCARNATION",
+        config,
+        listeners,
+        state,
+    );
+    worker.send_proxy_request_type(RequestType::AddTcpListener(
+        ListenerBuilder::new_tcp(front_address.into())
+            .to_tcp(None)
+            .expect("tcp listener config"),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
+        address: front_address.into(),
+        proxy: ListenerType::Tcp.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(cluster_id)));
+    worker.send_proxy_request_type(RequestType::AddTcpFrontend(Worker::default_tcp_frontend(
+        cluster_id,
+        front_address,
+    )));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        cluster_id,
+        backend_id,
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let metric_detail_ack = lease_backend_metric_detail(&mut worker);
+    let mut backend = SyncBackend::new(
+        "TCP-METRICS-LIFECYCLE-SAME-BACKEND",
+        back_address,
+        "replacement-tcp-response",
+    );
+    backend.connect();
+
+    let mut old_client = Client::new(
+        "TCP-METRICS-LIFECYCLE-OLD-CLIENT",
+        front_address,
+        "old-tcp-request",
+    );
+    old_client.connect();
+    old_client.send();
+    let old_session_held = wait_for_backend_request(&mut backend, 0);
+
+    let mut remove_ack = false;
+    let mut add_cluster_ack = false;
+    let mut add_frontend_ack = false;
+    let mut add_backend_ack = false;
+    let mut new_session_reached_backend = false;
+    let mut replacement_gauge_before_old_close = None;
+    let mut proxy_gauge_before_old_close = None;
+    let mut old_session_terminated = false;
+    let mut proxy_gauge_after_old_close = None;
+    let mut new_session_progressed = false;
+    let mut bytes_out_before_new_response = None;
+    let mut new_bytes_out = None;
+    let mut replacement_gauge_after_old_close = None;
+    let mut new_client = None;
+
+    if metric_detail_ack && old_session_held {
+        remove_ack = request_acknowledged(
+            &mut worker,
+            RequestType::RemoveCluster(cluster_id.to_owned()),
+        );
+        add_cluster_ack = request_acknowledged(
+            &mut worker,
+            RequestType::AddCluster(Worker::default_cluster(cluster_id)),
+        );
+        add_frontend_ack = request_acknowledged(
+            &mut worker,
+            RequestType::AddTcpFrontend(Worker::default_tcp_frontend(cluster_id, front_address)),
+        );
+        add_backend_ack = request_acknowledged(
+            &mut worker,
+            RequestType::AddBackend(Worker::default_backend(
+                cluster_id,
+                backend_id,
+                back_address,
+                None,
+            )),
+        );
+
+        if remove_ack && add_cluster_ack && add_frontend_ack && add_backend_ack {
+            let mut current = Client::new(
+                "TCP-METRICS-LIFECYCLE-NEW-CLIENT",
+                front_address,
+                "new-tcp-request",
+            );
+            current.connect();
+            current.send();
+            new_session_reached_backend = wait_for_backend_request(&mut backend, 1);
+            if new_session_reached_backend {
+                replacement_gauge_before_old_close =
+                    backend_connection_gauge(&mut worker, cluster_id, backend_id);
+                proxy_gauge_before_old_close = proxy_backend_connection_gauge(&mut worker);
+            }
+
+            let _ = backend.close(0);
+            old_session_terminated = wait_for_client_termination(&mut old_client);
+            if old_session_terminated && proxy_gauge_before_old_close == Some(2) {
+                proxy_gauge_after_old_close = wait_for_proxy_backend_connections(&mut worker, 1);
+            }
+
+            bytes_out_before_new_response =
+                Some(proxy_count(&mut worker, "bytes_out").unwrap_or(0));
+            let sent = backend.send(1).is_some();
+            new_session_progressed =
+                sent && wait_for_client_payload(&mut current, "replacement-tcp-response");
+            if new_session_progressed && let Some(before) = bytes_out_before_new_response {
+                new_bytes_out = wait_for_proxy_bytes_out(&mut worker, before);
+            }
+            if new_bytes_out.is_some() {
+                replacement_gauge_after_old_close =
+                    backend_connection_gauge(&mut worker, cluster_id, backend_id);
+            }
+            new_client = Some(current);
+        }
+    }
+
+    old_client.disconnect();
+    if let Some(client) = new_client.as_mut() {
+        client.disconnect();
+    }
+    let _ = backend.close(1);
+    backend.disconnect();
+    let worker_stopped = stop_worker_within(worker);
+
+    println!(
+        "TCP incarnation metrics same identity: detail_ack={metric_detail_ack} \
+         old_held={old_session_held} remove_ack={remove_ack} add_cluster_ack={add_cluster_ack} \
+         add_frontend_ack={add_frontend_ack} add_backend_ack={add_backend_ack} \
+         new_reached={new_session_reached_backend} replacement_before={replacement_gauge_before_old_close:?} \
+         proxy_before={proxy_gauge_before_old_close:?} old_terminated={old_session_terminated} \
+         proxy_after={proxy_gauge_after_old_close:?} new_progressed={new_session_progressed} \
+         bytes_out_before={bytes_out_before_new_response:?} new_bytes_out={new_bytes_out:?} \
+         replacement_after={replacement_gauge_after_old_close:?} \
+         worker_stopped={worker_stopped}"
+    );
+
+    if !old_session_held {
+        return State::Undecided;
+    }
+    if metric_detail_ack
+        && remove_ack
+        && add_cluster_ack
+        && add_frontend_ack
+        && add_backend_ack
+        && new_session_reached_backend
+        && replacement_gauge_before_old_close == Some(1)
+        && proxy_gauge_before_old_close == Some(2)
+        && old_session_terminated
+        && proxy_gauge_after_old_close == Some(1)
+        && new_session_progressed
+        && new_bytes_out.is_some_and(|count| count > 0)
+        && replacement_gauge_after_old_close == Some(1)
+        && worker_stopped
+    {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_old_tcp_session_metrics_do_not_decrement_same_identity_replacement() {
+    assert_eq!(
+        try_old_tcp_session_does_not_decrement_same_identity_replacement(),
         State::Success,
     );
 }
