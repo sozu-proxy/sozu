@@ -333,7 +333,7 @@ impl Hasher for FnvHasher {
 /// list, restricted to the positions a caller retained.
 ///
 /// `BackendList` retains one position per address: when several eligible ids
-/// share an address, only their representative ([`outranks_at_address`]) is
+/// share an address, only their representative (`outranks_at_address`) is
 /// a candidate, so every policy gives that address the share of one backend.
 ///
 /// Position `i` of the view is `backends[indices[i]]`, so a policy that
@@ -390,11 +390,14 @@ impl<'a> Candidates<'a> {
         siblings: &'a [usize],
         now: Instant,
     ) -> Self {
-        debug_assert_eq!(
-            siblings.len(),
-            backends.len(),
-            "the sibling ring covers every backend"
-        );
+        // A ring of another length was built for another list (a caller
+        // edited the public backend list directly): ignore it rather than
+        // follow stale positions, as if no address were shared.
+        let siblings = if siblings.len() == backends.len() {
+            siblings
+        } else {
+            &[]
+        };
         debug_assert!(
             siblings.iter().all(|&next| next < backends.len()),
             "a sibling must address a slot of the backend list"
@@ -1085,7 +1088,7 @@ impl LoadBalancingAlgorithm for Rendezvous {
 ///
 /// The table holds one entry per distinct **address**: several backend ids at
 /// one address claim the slots of one backend, weighted by the heaviest of
-/// them over the full set ([`outranks_at_address`]), and the lookup returns
+/// them over the full set (`outranks_at_address`), and the lookup returns
 /// the one candidate the caller retained at that address.
 ///
 /// # Rebuild discipline (never on the hot path)

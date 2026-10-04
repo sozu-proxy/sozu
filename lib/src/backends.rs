@@ -1413,8 +1413,8 @@ impl BackendList {
     /// [`Self::sibling_ring`], [`Self::shard_representative`] and
     /// [`Self::shard_addresses`] — from the backend list and its
     /// configuration. Control plane only: it allocates a map of the
-    /// addresses, linear in the list length, plus a walk of each address's
-    /// ring.
+    /// addresses, linear in the list length, plus, for each shared address
+    /// of `g` ids, up to `g²` comparisons to rank them.
     fn refresh_siblings(&mut self) {
         let mut groups: HashMap<SocketAddr, Vec<usize>> = HashMap::new();
         for (index, backend) in self.backends.iter().enumerate() {
@@ -1460,11 +1460,17 @@ impl BackendList {
     /// Free when no address is shared. Otherwise one pass over the
     /// candidates, where only an id with a sibling walks its address's ring
     /// (`sibling_ring`) and looks each sibling up among the candidates by
-    /// binary search: `O(c + s·log c)` for `c` candidates and `s` ids at
-    /// shared addresses, never a scan of the list per candidate. Allocates
-    /// nothing (`collapsed` is reserved by `add_backend`).
+    /// binary search: linear in the `c` candidates plus, for each shared
+    /// address of `g` ids, up to `g²` ring steps (about `g²/2` when the
+    /// walks stop at the first outranking sibling), each with an
+    /// `O(log c)` lookup — never a scan of the list per candidate.
+    /// Allocates nothing (`collapsed` is reserved by `add_backend`).
+    ///
+    /// A list whose `backends` a caller grew or shrank directly, bypassing
+    /// `add_backend`/`remove_backend`, has a ring of another length: the
+    /// collapse is then skipped rather than indexing a stale ring.
     fn collapse_shared_addresses(&mut self) -> usize {
-        if !self.shares_address {
+        if !self.shares_address || self.sibling_ring.len() != self.backends.len() {
             return self.candidates.len();
         }
         let backends = &self.backends;
@@ -1526,7 +1532,11 @@ impl BackendList {
     /// representative is precomputed (`shard_representative`), and a shared
     /// address brings its other ids in by walking its ring, so a shared
     /// address adds work only for its own ids. The buffers are reserved by
-    /// `add_backend`, so this allocates nothing.
+    /// `add_backend`, so this allocates nothing. If a caller grew or shrank
+    /// the public `backends` directly, the precomputed state has another
+    /// length and is ignored: every primary then ranks as its own address,
+    /// as before shared addresses were collapsed, and nothing is indexed out
+    /// of bounds.
     fn compute_shard(&mut self, key: Option<u64>) -> bool {
         let (Some(sharding), Some(key)) = (self.shuffle_sharding, key) else {
             return false;
@@ -1539,16 +1549,29 @@ impl BackendList {
         // its own representative.
         let backends = &self.backends;
         let shares_address = self.shares_address;
-        let ring = &self.sibling_ring;
+        let synced = self.shard_representative.len() == backends.len()
+            && self.sibling_ring.len() == backends.len();
+        let ring: &[usize] = if synced { &self.sibling_ring } else { &[] };
         // Size the shard before hashing anything, so a cluster below
         // `shard_min_backends` pays no walk and no hash.
-        let primaries = self.shard_addresses;
+        let primaries = if synced {
+            self.shard_addresses
+        } else {
+            backends
+                .iter()
+                .filter(|backend| !backend.borrow().backup)
+                .count()
+        };
         let Some(k) = sharding.shard_size(primaries) else {
             return false;
         };
         self.shard_scores.clear();
         for (index, backend) in backends.iter().enumerate() {
-            if self.shard_representative[index] {
+            let represents = match self.shard_representative.get(index) {
+                Some(&represents) if synced => represents,
+                _ => !backend.borrow().backup,
+            };
+            if represents {
                 self.shard_scores
                     .push((hrw_score(key, &backend.borrow()), index));
             }
@@ -1565,13 +1588,14 @@ impl BackendList {
         self.shard.clear();
         for &(_, representative) in &self.shard_scores[..k] {
             self.shard.push(representative);
-            let mut sibling = ring[representative];
+            let next = |position: usize| ring.get(position).copied().unwrap_or(representative);
+            let mut sibling = next(representative);
             while sibling != representative {
                 count_sibling_step();
                 if !backends[sibling].borrow().backup {
                     self.shard.push(sibling);
                 }
-                sibling = ring[sibling];
+                sibling = next(sibling);
             }
         }
         self.shard.sort_unstable();
@@ -3813,6 +3837,46 @@ mod same_address_tests {
                     worst <= 8,
                     "{policy:?} (sharded: {sharded}) spent {worst} steps on one shared pair"
                 );
+            }
+        }
+    }
+
+    /// `backends` is public: a library user may push or pop a backend
+    /// without `add_backend`/`remove_backend`, leaving the sibling state of
+    /// another length. Selection must then neither panic nor index a stale
+    /// ring, under every policy, sharded or not.
+    #[test]
+    fn a_list_edited_directly_still_selects_without_panicking() {
+        let now = Instant::now();
+        let sharding = Some(ShuffleSharding {
+            percent: 50,
+            min_backends: 2,
+            mode: ShardMode::Fallback,
+        });
+        for policy in POLICIES {
+            for sharded in [false, true] {
+                // Grown: a pushed sibling of the shared address, and a
+                // pushed backend at a new address.
+                let mut grown = equal_list(policy);
+                grown.set_shuffle_sharding(sharded.then_some(sharding).flatten());
+                for (id, port) in [("pushed-sibling", 9300), ("pushed", 9302)] {
+                    let address = SocketAddr::from(([127, 0, 0, 1], port));
+                    grown
+                        .backends
+                        .push(Rc::new(RefCell::new(weighted(id, address, None))));
+                }
+                // Shrunk: the last backend popped, the ring still covers it.
+                let mut shrunk = equal_list(policy);
+                shrunk.set_shuffle_sharding(sharded.then_some(sharding).flatten());
+                shrunk.backends.pop();
+                for list in [&mut grown, &mut shrunk] {
+                    for key in 0..64 {
+                        assert!(
+                            list.select_with_key(Some(key), now).0.is_some(),
+                            "{policy:?} (sharded: {sharded}) selected nothing"
+                        );
+                    }
+                }
             }
         }
     }

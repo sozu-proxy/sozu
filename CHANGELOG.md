@@ -662,7 +662,8 @@
   counts; `CONNECTION_TIME` reads the representative's own average. The ids of each address are
   linked on the control plane (a sibling ring, plus each id's precomputed shard rank), so a
   cluster without a shared address selects exactly as before at no new cost, and one with a
-  shared address pays per selection only for the ids at shared addresses, without allocating
+  shared address pays per selection a pass over its candidates plus up to `g²` steps per shared
+  address of `g` ids (quadratic only in that address's own ids), without allocating
   (release build, round robin, one shared pair: 1000 backends 5.2 µs per selection, against
   3.9–4.5 µs before the change and 2.5 ms with a per-candidate scan). `HRW`'s keyed
   path is unchanged; the round-robin fallback `HRW` and `MAGLEV` take for a request with no

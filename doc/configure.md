@@ -1037,9 +1037,11 @@ leaves `HRW`, `MAGLEV` and shard placement unchanged.
 
 The ids sharing an address are linked when the backend list or a backend's
 configuration changes, never per request. A cluster without a shared address
-pays nothing for this rule; one with shared addresses pays, per selection,
-work proportional to the ids at shared addresses (a walk of each such
-address's ids), not to the size of the cluster, and allocates nothing.
+pays nothing for this rule. One with shared addresses pays, per selection, a
+pass over the candidates plus, for each shared address of `g` ids, at most `g²`
+steps over that address's own ids (about `g²/2` in practice) — never a cost
+growing with the square of the cluster — and allocates nothing. Relinking on
+a change costs the same: linear in the cluster plus `g²` per shared address.
 
 #### Backend connection failover
 
