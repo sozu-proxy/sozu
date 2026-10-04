@@ -3,7 +3,7 @@ use std::{
     fs::{File, OpenOptions, read_link},
     io::{Error as IoError, Write},
     os::{fd::BorrowedFd, unix::io::RawFd},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 #[cfg(target_os = "linux")]
@@ -11,6 +11,7 @@ use libc::{cpu_set_t, pid_t};
 use nix::{
     errno::Errno,
     fcntl::{FcntlArg, FdFlag, fcntl},
+    unistd::{AccessFlags, access},
 };
 use sozu_command_lib::config::Config;
 use sozu_lib::metrics::{self, MetricError};
@@ -120,30 +121,49 @@ pub fn write_pid_file(config: &Config) -> Result<(), UtilError> {
     Ok(())
 }
 
-/// Open the configured pid file for a later [`publish_pid_file`], without
-/// changing its content.
+/// Check that the configured pid file can be published later by
+/// [`publish_pid_file`], without changing anything on disk.
 ///
 /// A replacement main calls this before PREPARED, while a failure still rolls
 /// back to the old main: an unwritable path (a directory, a missing parent, a
 /// read-only file system, a denied permission) fails here instead of after
-/// COMMIT. It creates the file when missing but never truncates it, so the old
-/// main's pid stays published if the upgrade rolls back.
-pub fn open_pid_file(config: &Config) -> Result<Option<(String, File)>, UtilError> {
+/// COMMIT. An existing file is opened for writing but never truncated, so the
+/// old main's pid stays published if the upgrade rolls back. A missing file
+/// is not created: only its parent directory is checked for write and search
+/// access, and [`publish_pid_file`] creates it after COMMIT. Creating it here
+/// would leave an empty pid file behind every rolled-back upgrade, including
+/// one where the old main SIGKILLs this process before it could clean up.
+pub fn open_pid_file(config: &Config) -> Result<Option<(String, Option<File>)>, UtilError> {
     let Some(path) = config.pid_file_path.as_deref() else {
         return Ok(None);
     };
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-        .map_err(|io_err| UtilError::CreatePidFile(path.to_owned(), io_err))?;
-    Ok(Some((path.to_owned(), file)))
+    match OpenOptions::new().write(true).truncate(false).open(path) {
+        Ok(file) => Ok(Some((path.to_owned(), Some(file)))),
+        Err(io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
+            let parent = match Path::new(path).parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent,
+                _ => Path::new("."),
+            };
+            access(parent, AccessFlags::W_OK | AccessFlags::X_OK)
+                .map_err(|errno| UtilError::CreatePidFile(path.to_owned(), IoError::from(errno)))?;
+            Ok(Some((path.to_owned(), None)))
+        }
+        Err(io_err) => Err(UtilError::CreatePidFile(path.to_owned(), io_err)),
+    }
 }
 
-/// Replace the content of a pid file opened by [`open_pid_file`] with this
-/// process's pid.
-pub fn publish_pid_file(path: &str, mut file: File) -> Result<(), UtilError> {
+/// Replace the content of the pid file checked by [`open_pid_file`] with this
+/// process's pid, creating it when it did not exist then.
+pub fn publish_pid_file(path: &str, file: Option<File>) -> Result<(), UtilError> {
+    let mut file = match file {
+        Some(file) => file,
+        None => OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|io_err| UtilError::CreatePidFile(path.to_owned(), io_err))?,
+    };
     // SAFETY: `libc::getpid` takes no input pointers, never fails, and
     // returns a value type. No invariant beyond "FFI signature matches libc".
     let pid = unsafe { libc::getpid() };
@@ -513,5 +533,67 @@ mod tests {
         assert!(warning.contains("'hpet'"), "{warning}");
         assert!(!warning.contains("hpet\n"), "{warning}");
         assert_eq!(slow_clocksource_warning(" \n"), None);
+    }
+
+    fn pid_file_config(path: &std::path::Path) -> Config {
+        Config {
+            pid_file_path: Some(path.to_str().expect("utf-8 temp path").to_owned()),
+            ..Default::default()
+        }
+    }
+
+    /// A rolled-back main upgrade must not leave an empty pid file behind:
+    /// checking a missing pid file creates nothing, and only the post-COMMIT
+    /// publish writes it.
+    #[test]
+    fn open_pid_file_defers_creating_a_missing_file_until_publish() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("sozu.pid");
+
+        let (published_path, file) = open_pid_file(&pid_file_config(&path))
+            .expect("a writable parent directory is accepted")
+            .expect("a configured pid file is returned");
+        assert!(file.is_none());
+        assert!(
+            !path.exists(),
+            "the pre-COMMIT check must not create the file"
+        );
+
+        publish_pid_file(&published_path, file).expect("publish creates the file");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read pid file"),
+            std::process::id().to_string()
+        );
+    }
+
+    #[test]
+    fn open_pid_file_keeps_an_existing_file_until_publish() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("sozu.pid");
+        std::fs::write(&path, "123456789").expect("seed pid file");
+
+        let (published_path, file) = open_pid_file(&pid_file_config(&path))
+            .expect("an existing writable file is accepted")
+            .expect("a configured pid file is returned");
+        assert!(file.is_some());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "123456789");
+
+        publish_pid_file(&published_path, file).expect("publish rewrites the file");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            std::process::id().to_string()
+        );
+    }
+
+    #[test]
+    fn open_pid_file_rejects_a_missing_parent_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("missing").join("sozu.pid");
+
+        assert!(matches!(
+            open_pid_file(&pid_file_config(&path)),
+            Err(UtilError::CreatePidFile(_, _))
+        ));
+        assert!(!path.exists());
     }
 }

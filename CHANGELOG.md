@@ -4012,6 +4012,24 @@
 
 ### 🐛 Fixed
 
+- **`fix(command)`: a signal no longer fails a blocking control-channel wait
+  ([#1846](https://github.com/sozu-proxy/sozu/pull/1846) follow-up).**
+  `Channel::read_message_blocking_timeout` (`command/src/channel.rs`) reads with `SO_RCVTIMEO`,
+  which Linux never restarts after a handled signal even under `SA_RESTART` (signal(7)), and it
+  retried only `WouldBlock`. A whole-cgroup `SIGTERM` reaching a replacement main while it waited
+  for COMMIT therefore made it exit "waiting for commit" while the old main was already fenced,
+  stopping the proxy abruptly instead of softly; the old main's own PREPARED and ACTIVATED waits
+  had the same exposure. An interrupted read is now retried against the unchanged deadline.
+  Pinned by `read_message_blocking_with_timeout_survives_interrupting_signals` and
+  `read_message_blocking_with_timeout_keeps_its_deadline_under_signals`.
+
+- **`fix(upgrade)`: a rolled-back main upgrade no longer leaves an empty pid file.**
+  `util::open_pid_file` (`bin/src/util.rs`) created a missing pid file before PREPARED, so an
+  upgrade that rolled back (including one whose child the old main SIGKILLs) left a 0-byte file
+  where none existed. A missing file is now only checked through its parent directory's write
+  access, and `util::publish_pid_file` creates it after COMMIT; an existing file is still opened
+  untruncated. Pinned by `open_pid_file_defers_creating_a_missing_file_until_publish`.
+
 - **`fix(command)`: a stopping worker that closes answers its in-flight control commands.** The
   old worker of an `upgrade --worker` is marked `Stopping`, then its `SoftStop` answer is awaited by
   a task with no deadline. The worker-close path synthesised failures only for an active worker, so

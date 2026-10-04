@@ -342,9 +342,13 @@ fn wait_for_children(parent: u32, expected: &BTreeSet<u32>, timeout: Duration) -
 fn run_compatibility_case(direction: Direction) {
     // Both binaries are built out of tree, so a plain `-- --ignored` run (and
     // CI, which never sets the variables) skips this case instead of failing
-    // the whole test binary.
+    // the whole test binary. libtest has no skipped outcome, so the case still
+    // reports `ok`; writing to stderr directly instead of through
+    // `println!`/`eprintln!` bypasses libtest's output capture and keeps the
+    // skip visible without `--nocapture`.
     let Some((sender_binary, candidate_binary)) = direction.binaries() else {
-        println!(
+        let _ = writeln!(
+            std::io::stderr(),
             "skipping {}: set SOZU_MATRIX_LEGACY and SOZU_MATRIX_OPTION3 to the frozen binaries (see module docs)",
             direction.label()
         );
