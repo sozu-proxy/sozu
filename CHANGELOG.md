@@ -642,6 +642,34 @@
 
 ### 🔄 Changed
 
+- **`fix(load-balancing)`: one address is one share under every policy
+  ([#1856](https://github.com/sozu-proxy/sozu/pull/1856)).** Two backend ids at
+  the same address in one cluster, which [#1839](https://github.com/sozu-proxy/sozu/pull/1839)
+  made distinct backends (identity `(backend_id, address)`), now receive together the share of
+  ONE backend, as `HRW` already gave them. `ROUND_ROBIN`, `RANDOM`, `LEAST_LOADED`,
+  `POWER_OF_TWO` and `MAGLEV` gave such an address the sum of its ids' shares: with `A` and `B`
+  at one address and `C` at another, equal weights, the shared address took about 2/3 of the
+  traffic (measured over 20 000 selections: 0.667 under round robin, least loaded and power of
+  two, 0.666 random, 0.668 Maglev); it now takes 1/2 under all six. `BackendList` hands the
+  policy one candidate per address, after the health, retry-exclusion and shard filters: the
+  heaviest eligible id, the first in declaration order among equal weights, so a down or
+  backing-off id never hides an eligible sibling. The address weighs what that id weighs.
+  `MAGLEV` builds one table entry per distinct address, weighted by the heaviest of its ids over
+  the full set. Shuffle sharding ranks and counts distinct primary addresses (`k`,
+  `shard_min_backends`) and puts every primary id of a selected address in the shard. Placement
+  still keys on the address, so a rename without a move changes nothing. `LEAST_LOADED` and
+  `POWER_OF_TWO` compare an address's load as the sum of its ids' connection (or request)
+  counts; `CONNECTION_TIME` reads the representative's own average. The ids of each address are
+  linked on the control plane (a sibling ring, plus each id's precomputed shard rank), so a
+  cluster without a shared address selects exactly as before at no new cost, and one with a
+  shared address pays per selection a pass over its candidates plus up to `g²` steps per shared
+  address of `g` ids (quadratic only in that address's own ids), without allocating
+  (release build, round robin, one shared pair: 1000 backends 5.2 µs per selection, against
+  3.9–4.5 µs before the change and 2.5 ms with a per-candidate scan). `HRW`'s keyed
+  path is unchanged; the round-robin fallback `HRW` and `MAGLEV` take for a request with no
+  client key collapses like `ROUND_ROBIN`. **Behaviour change** for clusters declaring several
+  ids at one address; no configuration or API change. See "One address is one share" in `doc/configure.md`.
+
 - **`docs(health-check)`: document and test `SetHealthCheck`'s draining policy boundary
   ([#1824](https://github.com/sozu-proxy/sozu/issues/1824)).** `SetHealthCheck` validates and
   stores the replacement policy and acknowledges it without cancelling the probes already in
