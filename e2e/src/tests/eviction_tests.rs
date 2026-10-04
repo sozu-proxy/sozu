@@ -12,10 +12,13 @@
 //!   connection MUST be admitted (eviction made room) and the
 //!   `sessions.evicted` counter MUST advance. The eviction predicate is
 //!   `last_event()`-based (`Server::evict_least_active_sessions`) so the
-//!   OLDEST connection is the one chosen.
+//!   OLDEST connection is the one chosen. The fresh connection is served,
+//!   so `listener.connection_capped` MUST stay at zero.
 //! - `test_evict_on_queue_full_disabled_drops_overflow` — with the knob
 //!   at its default `false`, the same saturated slab MUST refuse the
-//!   fresh connection instead of evicting an idle one.
+//!   fresh connection instead of evicting an idle one, and
+//!   `listener.connection_capped` MUST count that one dropped socket
+//!   exactly once.
 //!
 //! NOT covered here: the soft-stop short-circuit. `Server::create_sessions`
 //! breaks out of the eviction branch while `shutting_down.is_some()`, so
@@ -40,8 +43,9 @@ use std::{
 use sozu_command_lib::{
     config::FileConfig,
     proto::command::{
-        ActivateListener, ListenerType, Request, RequestHttpFrontend, ServerConfig,
-        request::RequestType,
+        ActivateListener, ListenerType, QueryMetricsOptions, Request, RequestHttpFrontend,
+        ResponseStatus, ServerConfig, filtered_metrics, request::RequestType,
+        response_content::ContentType,
     },
     state::ConfigState,
 };
@@ -81,6 +85,39 @@ fn open_dangling_connection(addr: SocketAddr) -> Option<TcpStream> {
         .write_all(b"GET /idle HTTP/1.1\r\nHost: localhost\r\n")
         .ok()?;
     Some(stream)
+}
+
+/// Read the worker's `listener.connection_capped` counter. `Some(0)` when
+/// the counter was never incremented (the local drain has no row for it),
+/// `None` when the metrics query itself failed.
+fn connection_capped_count(worker: &mut Worker) -> Option<i64> {
+    const NAME: &str = "listener.connection_capped";
+    worker.send_proxy_request_type(RequestType::QueryMetrics(QueryMetricsOptions {
+        list: false,
+        cluster_ids: vec![],
+        backend_ids: vec![],
+        metric_names: vec![NAME.to_owned()],
+        no_clusters: true,
+        workers: false,
+    }));
+    let expected_id = worker.command_id.last.clone();
+    loop {
+        let response = worker.read_proxy_response()?;
+        if response.id != expected_id {
+            continue;
+        }
+        if response.status != ResponseStatus::Ok as i32 {
+            return None;
+        }
+        let ContentType::WorkerMetrics(metrics) = response.content?.content_type? else {
+            return None;
+        };
+        return match metrics.proxy.get(NAME).and_then(|m| m.inner.as_ref()) {
+            None => Some(0),
+            Some(filtered_metrics::Inner::Count(value)) => Some(*value),
+            Some(_) => None,
+        };
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -194,11 +231,16 @@ fn try_evict_on_queue_full_accepts_after_eviction() -> State {
     backend.send(0);
     let resp = client.receive();
 
+    // The fresh connection was served after eviction made room: it was
+    // not refused, so it must not be counted as capped.
+    let capped = connection_capped_count(&mut worker);
+    println!("listener.connection_capped after a served post-eviction connection: {capped:?}");
+
     worker.soft_stop();
     worker.wait_for_server_stop();
 
     match resp {
-        Some(r) if r.contains("200") => State::Success,
+        Some(r) if r.contains("200") && capped == Some(0) => State::Success,
         _ => State::Fail,
     }
 }
@@ -308,11 +350,27 @@ fn try_evict_disabled_drops_overflow() -> State {
         thread::sleep(Duration::from_millis(50));
     }
 
+    // The fresh connection was refused and dropped: exactly one capped
+    // count, and no further increment once the refusal has happened.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut capped = connection_capped_count(&mut worker);
+    while capped != Some(1) && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+        capped = connection_capped_count(&mut worker);
+    }
+    thread::sleep(Duration::from_millis(200));
+    let capped_later = connection_capped_count(&mut worker);
+    println!(
+        "listener.connection_capped after one refused connection: {capped:?} then {capped_later:?}"
+    );
+
     worker.soft_stop();
     worker.wait_for_server_stop();
 
     if accepted {
         // Eviction fired even though we asked it not to — regression.
+        State::Fail
+    } else if capped != Some(1) || capped_later != Some(1) {
         State::Fail
     } else {
         State::Success

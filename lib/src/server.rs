@@ -3972,14 +3972,13 @@ impl Server {
             }
 
             if !self.sessions.borrow_mut().check_limits() {
-                // The socket we just popped will not be served, plus every
-                // remaining queued socket below `break` will time out.
-                // `listener.connection_capped` counts the popped socket so
-                // the counter aligns with `check_limits` invocations rather
-                // than with queue depth at the time of refusal.
-                incr!(names::listener::CONNECTION_CAPPED);
-
+                // Every `break` below drops the socket we just popped,
+                // unserved, while the remaining queued sockets wait for the
+                // next pass or time out. `listener.connection_capped` counts
+                // exactly that dropped socket, once, at each `break`: a socket
+                // served after eviction made room is not a refusal.
                 if !self.evict_on_queue_full {
+                    incr!(names::listener::CONNECTION_CAPPED);
                     break;
                 }
 
@@ -3987,6 +3986,7 @@ impl Server {
                 // shutting_down semantics and is wasted work since the
                 // worker is winding down anyway.
                 if self.shutting_down.is_some() {
+                    incr!(names::listener::CONNECTION_CAPPED);
                     break;
                 }
 
@@ -4007,6 +4007,7 @@ impl Server {
                     // ineligible. Stay at warn so operators see it in info-
                     // level production logs.
                     warn!("evict_on_queue_full enabled but no candidate sessions to evict");
+                    incr!(names::listener::CONNECTION_CAPPED);
                     break;
                 }
 
@@ -4017,6 +4018,7 @@ impl Server {
                 );
 
                 if !self.sessions.borrow_mut().check_limits() {
+                    incr!(names::listener::CONNECTION_CAPPED);
                     break;
                 }
             }

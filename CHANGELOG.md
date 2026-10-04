@@ -4012,6 +4012,17 @@
 
 ### 🐛 Fixed
 
+- **`fix(metrics)`: `listener.connection_capped` no longer counts a connection served after
+  eviction.** `Server::create_sessions` (`lib/src/server.rs`) incremented the counter as soon as
+  `SessionManager::check_limits` refused, before the `evict_on_queue_full` branch ran, so with
+  eviction enabled a socket that eviction then made room for was both served and counted as
+  capped. The counter is now incremented only where the refused socket is dropped: exactly once per
+  dropped socket, with or without eviction, and never for a socket that is served. Evicting another
+  session stays a separate event, counted by `sessions.evicted`. The default path
+  (`evict_on_queue_full = false`) is unchanged. Pinned by the counter assertions in
+  `test_evict_on_queue_full_accepts_after_eviction` and
+  `test_evict_on_queue_full_disabled_drops_overflow` (`e2e/src/tests/eviction_tests.rs`).
+
 - **`fix(command)`: a signal no longer fails a blocking control-channel wait
   ([#1846](https://github.com/sozu-proxy/sozu/pull/1846) follow-up).**
   `Channel::read_message_blocking_timeout` (`command/src/channel.rs`) reads with `SO_RCVTIMEO`,
