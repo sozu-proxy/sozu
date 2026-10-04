@@ -642,6 +642,34 @@
 
 ### 🔄 Changed
 
+- **`fix(load-balancing)`: one address is one share under every policy
+  ([#1856](https://github.com/sozu-proxy/sozu/pull/1856)).** Two backend ids at
+  the same address in one cluster, which [#1839](https://github.com/sozu-proxy/sozu/pull/1839)
+  made distinct backends (identity `(backend_id, address)`), now receive together the share of
+  ONE backend, as `HRW` already gave them. `ROUND_ROBIN`, `RANDOM`, `LEAST_LOADED`,
+  `POWER_OF_TWO` and `MAGLEV` gave such an address the sum of its ids' shares: with `A` and `B`
+  at one address and `C` at another, equal weights, the shared address took about 2/3 of the
+  traffic (measured over 20 000 selections: 0.667 under round robin, least loaded and power of
+  two, 0.666 random, 0.668 Maglev); it now takes 1/2 under all six. `BackendList` hands the
+  policy one candidate per address, after the health, retry-exclusion and shard filters: the
+  heaviest eligible id, the first in declaration order among equal weights, so a down or
+  backing-off id never hides an eligible sibling. The address weighs what that id weighs.
+  `MAGLEV` builds one table entry per distinct address, weighted by the heaviest of its ids over
+  the full set. Shuffle sharding ranks and counts distinct primary addresses (`k`,
+  `shard_min_backends`) and puts every primary id of a selected address in the shard. Placement
+  still keys on the address, so a rename without a move changes nothing. `LEAST_LOADED` and
+  `POWER_OF_TWO` compare an address's load as the sum of its ids' connection (or request)
+  counts; `CONNECTION_TIME` reads the representative's own average. The ids of each address are
+  linked on the control plane (a sibling ring, plus each id's precomputed shard rank), so a
+  cluster without a shared address selects exactly as before at no new cost, and one with a
+  shared address pays per selection a pass over its candidates plus up to `g²` steps per shared
+  address of `g` ids (quadratic only in that address's own ids), without allocating
+  (release build, round robin, one shared pair: 1000 backends 5.2 µs per selection, against
+  3.9–4.5 µs before the change and 2.5 ms with a per-candidate scan). `HRW`'s keyed
+  path is unchanged; the round-robin fallback `HRW` and `MAGLEV` take for a request with no
+  client key collapses like `ROUND_ROBIN`. **Behaviour change** for clusters declaring several
+  ids at one address; no configuration or API change. See "One address is one share" in `doc/configure.md`.
+
 - **`docs(health-check)`: document and test `SetHealthCheck`'s draining policy boundary
   ([#1824](https://github.com/sozu-proxy/sozu/issues/1824)).** `SetHealthCheck` validates and
   stores the replacement policy and acknowledges it without cancelling the probes already in
@@ -4021,6 +4049,24 @@
   no backend of that id remains in the cluster (new `BackendMap::has_backend_id`); removing an
   already-absent backend still clears an orphan row. Pinned by the e2e test
   `test_remove_backend_keeps_row_shared_with_live_same_id_entry`.
+
+- **`fix(upgrade)`: `sozu upgrade --worker` no longer reports a failed second phase as a
+  success.** In `UpgradeWorkerTask::on_finish` (`bin/src/command/upgrade.rs`), the
+  `StopOldActivateNew` arm answered "Upgrade successful" whatever its workers replied. An old
+  worker that exited without answering its `SoftStop` (the failure
+  `CommandHub::fail_in_flight_requests_of_worker` synthesizes as "worker N closed before
+  answering") and a new worker that rejected an activation request were both reported as
+  finished. The arm now attributes each failure through the worker id carried by its responses
+  and answers `Failure`, as `WorkerTask`, `LoadStateTask` and the task's own first phase do. The
+  message names the old worker that did not finish its soft stop, or the new worker whose
+  activation failed, with each distinct reason, and still states that the new worker is serving
+  when its activation finished. **CLI exit status changes:** `sozu upgrade --worker N` now exits
+  non-zero in both cases. `sozu upgrade` (main) is unchanged: after the main handoff it upgrades
+  each worker in its own thread, logs a failed one as `error upgrading worker N: …`, continues
+  with the others and still exits 0. Pinned by
+  `upgrade_worker_reports_an_old_worker_closing_before_its_soft_stop_as_a_failure`,
+  `upgrade_worker_reports_a_failed_new_worker_activation_as_a_failure` and
+  `upgrade_worker_reports_success_when_both_workers_answer_ok`.
 
 - **`fix(metrics)`: `listener.connection_capped` no longer counts a connection served after
   eviction.** `Server::create_sessions` (`lib/src/server.rs`) incremented the counter as soon as
@@ -7660,6 +7706,14 @@
 
 
 ### ➖ Removed
+
+- **BREAKING (library API) — `refactor(backends)`: the public `BackendMap::max_failures` field is
+  removed.** `BackendMap::new` and `BackendMap::with_seed` initialised it to `3` and nothing in the
+  workspace read it; it has had no effect since at least
+  [#514](https://github.com/sozu-proxy/sozu/issues/514). Backend failure handling is the
+  per-backend `ExponentialBackoffPolicy` retry policy plus the session-level
+  `max_connection_attempts` limit. An embedder that set or read the field drops it. No runtime
+  behaviour changes.
 
 - **BREAKING (library API) — `refactor(lib)`: `BackendMap::backend_from_sticky_session` is removed
   ([#1684](https://github.com/sozu-proxy/sozu/issues/1684)).** Once the mux reserved through

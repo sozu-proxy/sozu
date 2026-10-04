@@ -24,7 +24,7 @@ use crate::{
     PeakEWMA,
     load_balancing::{
         Candidates, LeastLoaded, LoadBalancingAlgorithm, Maglev, PowerOfTwo, Random, Rendezvous,
-        RoundRobin, ShuffleSharding, hrw_score,
+        RoundRobin, ShuffleSharding, count_sibling_step, hrw_score, outranks_at_address,
     },
     retry::{self, RetryPolicy},
     server::{self, push_event},
@@ -465,7 +465,6 @@ impl std::ops::Drop for Backend {
 #[derive(Debug)]
 pub struct BackendMap {
     pub backends: HashMap<ClusterId, BackendList>,
-    pub max_failures: usize,
     pub health_check_configs: HashMap<ClusterId, HealthCheckConfig>,
     /// Whether the cluster's backends speak HTTP/2 (cluster.http2 = true).
     /// Mirrors the same backend-capability hint the mux router reads at
@@ -512,7 +511,6 @@ impl BackendMap {
     fn with_rng(rng: StdRng) -> BackendMap {
         BackendMap {
             backends: HashMap::new(),
-            max_failures: 3,
             health_check_configs: HashMap::new(),
             cluster_http2: HashMap::new(),
             rng,
@@ -1154,6 +1152,28 @@ pub struct BackendList {
     shard_scores: Vec<(f64, usize)>,
     /// The positions of the current selection's shard members, sorted.
     shard: Vec<usize>,
+    /// Whether two backends of the list share an address. Recomputed by
+    /// `refresh_siblings`, so a list without a shared address — the common
+    /// case — skips `collapse_shared_addresses` entirely.
+    shares_address: bool,
+    /// Sibling ring: `sibling_ring[i]` is the next position whose backend
+    /// shares the address of position `i`, cyclically through each address's
+    /// ids in list order, and `i` itself for an address with one id. Lets a
+    /// selection reach the siblings of an id without scanning the list.
+    /// Recomputed by `refresh_siblings` on every mutation of the list or of
+    /// a backend's configuration (`add_backend`, `remove_backend`).
+    sibling_ring: Vec<usize>,
+    /// Whether position `i` ranks for shuffle sharding: a primary backend no
+    /// primary sibling outranks ([`outranks_at_address`]). A function of the
+    /// configuration alone (address, weight, `backup`, list position), so it
+    /// is precomputed by `refresh_siblings`.
+    shard_representative: Vec<bool>,
+    /// How many positions are `shard_representative`: the distinct primary
+    /// addresses a shard size is computed from.
+    shard_addresses: usize,
+    /// Reused scratch `collapse_shared_addresses` filters the candidates
+    /// into, reserved in `add_backend` like `candidates`.
+    collapsed: Vec<usize>,
 }
 
 /// How shuffle sharding shaped one selection, for the caller that knows the
@@ -1200,6 +1220,11 @@ impl BackendList {
             shuffle_sharding: None,
             shard_scores: Vec::new(),
             shard: Vec::new(),
+            shares_address: false,
+            sibling_ring: Vec::new(),
+            shard_representative: Vec::new(),
+            shard_addresses: 0,
+            collapsed: Vec::new(),
         }
     }
 
@@ -1237,6 +1262,63 @@ impl BackendList {
             "next_id ({}) must be >= live backend count ({})",
             self.next_id,
             self.backends.len()
+        );
+        // The precomputed sibling state gates and drives every selection: a
+        // stale value would silently hand a policy one candidate per id
+        // again, or rank a wrong representative. Check it in `O(n)` plus the
+        // rings' lengths, so the sweep stays affordable on large lists.
+        let n = self.backends.len();
+        debug_assert_eq!(self.sibling_ring.len(), n, "one ring slot per backend");
+        debug_assert_eq!(self.shard_representative.len(), n);
+        // A permutation whose links join ids of one address...
+        let mut targeted = vec![false; n];
+        for (index, &next) in self.sibling_ring.iter().enumerate() {
+            debug_assert!(!targeted[next], "the sibling ring is a permutation");
+            targeted[next] = true;
+            debug_assert_eq!(
+                self.backends[next].borrow().address,
+                self.backends[index].borrow().address,
+                "a sibling ring links only ids of one address"
+            );
+        }
+        // ...with exactly one cycle per address: every id of an address
+        // reaches the same cycle leader, the cycle's smallest position.
+        let mut leaders: HashMap<SocketAddr, usize> = HashMap::new();
+        for index in 0..n {
+            let mut leader = index;
+            let mut next = self.sibling_ring[index];
+            while next != index {
+                leader = leader.min(next);
+                next = self.sibling_ring[next];
+            }
+            let address = self.backends[index].borrow().address;
+            debug_assert_eq!(
+                *leaders.entry(address).or_insert(leader),
+                leader,
+                "an address has one sibling ring"
+            );
+            let backend = self.backends[index].borrow();
+            let mut represents = !backend.backup;
+            let mut sibling = self.sibling_ring[index];
+            while sibling != index {
+                let other = self.backends[sibling].borrow();
+                represents &=
+                    other.backup || !outranks_at_address(&other, sibling, &backend, index);
+                sibling = self.sibling_ring[sibling];
+            }
+            debug_assert_eq!(
+                self.shard_representative[index], represents,
+                "shard_representative must match the configuration"
+            );
+        }
+        debug_assert_eq!(
+            self.shares_address,
+            leaders.len() < n,
+            "shares_address must match the backend list"
+        );
+        debug_assert_eq!(
+            self.shard_addresses,
+            self.shard_representative.iter().filter(|r| **r).count()
         );
         // `(backend_id, address)` is the identity `remove_backend` keys on; two
         // live backends may legitimately share an address (A/B variant) but
@@ -1330,8 +1412,114 @@ impl BackendList {
         self.shard_scores.reserve(self.backends.len());
         self.shard.clear();
         self.shard.reserve(self.backends.len());
+        self.collapsed.clear();
+        self.collapsed.reserve(self.backends.len());
+        self.refresh_siblings();
         #[cfg(debug_assertions)]
         self.check_invariants();
+    }
+
+    /// Recompute the sibling state — [`Self::shares_address`],
+    /// [`Self::sibling_ring`], [`Self::shard_representative`] and
+    /// [`Self::shard_addresses`] — from the backend list and its
+    /// configuration. Control plane only: it allocates a map of the
+    /// addresses, linear in the list length, plus, for each shared address
+    /// of `g` ids, up to `g²` comparisons to rank them.
+    fn refresh_siblings(&mut self) {
+        let mut groups: HashMap<SocketAddr, Vec<usize>> = HashMap::new();
+        for (index, backend) in self.backends.iter().enumerate() {
+            groups
+                .entry(backend.borrow().address)
+                .or_default()
+                .push(index);
+        }
+        self.sibling_ring.clear();
+        self.sibling_ring.extend(0..self.backends.len());
+        self.shares_address = false;
+        for group in groups.values() {
+            if group.len() > 1 {
+                self.shares_address = true;
+                for (rank, &index) in group.iter().enumerate() {
+                    self.sibling_ring[index] = group[(rank + 1) % group.len()];
+                }
+            }
+        }
+        self.shard_representative.clear();
+        for (index, backend) in self.backends.iter().enumerate() {
+            let backend = backend.borrow();
+            let mut represents = !backend.backup;
+            let mut sibling = self.sibling_ring[index];
+            while represents && sibling != index {
+                let other = self.backends[sibling].borrow();
+                represents = other.backup || !outranks_at_address(&other, sibling, &backend, index);
+                sibling = self.sibling_ring[sibling];
+            }
+            self.shard_representative.push(represents);
+        }
+        self.shard_addresses = self.shard_representative.iter().filter(|r| **r).count();
+    }
+
+    /// Keep one candidate per address, its representative
+    /// ([`outranks_at_address`]: the heaviest eligible id, the first in list
+    /// order among equals), so every policy gives an address the share of
+    /// one backend however many ids it carries (decided 2026-10-04). Runs on
+    /// the candidates that passed the tier and shard filters, so a down or
+    /// backing-off id never hides an eligible sibling. A filter: the
+    /// candidates stay in list order, as `Candidates::new` requires.
+    ///
+    /// Free when no address is shared. Otherwise one pass over the
+    /// candidates, where only an id with a sibling walks its address's ring
+    /// (`sibling_ring`) and looks each sibling up among the candidates by
+    /// binary search: linear in the `c` candidates plus, for each shared
+    /// address of `g` ids, up to `g²` ring steps (about `g²/2` when the
+    /// walks stop at the first outranking sibling), each with an
+    /// `O(log c)` lookup — never a scan of the list per candidate.
+    /// Allocates nothing (`collapsed` is reserved by `add_backend`).
+    ///
+    /// A list whose `backends` a caller grew or shrank directly, bypassing
+    /// `add_backend`/`remove_backend`, has a ring of another length: the
+    /// collapse is then skipped rather than indexing a stale ring.
+    fn collapse_shared_addresses(&mut self) -> usize {
+        if !self.shares_address || self.sibling_ring.len() != self.backends.len() {
+            return self.candidates.len();
+        }
+        let backends = &self.backends;
+        let candidates = &self.candidates;
+        let ring = &self.sibling_ring;
+        self.collapsed.clear();
+        for &position in candidates {
+            let mut outranked = false;
+            let mut sibling = ring[position];
+            if sibling != position {
+                let backend = backends[position].borrow();
+                while !outranked && sibling != position {
+                    count_sibling_step();
+                    outranked = candidates.binary_search(&sibling).is_ok()
+                        && outranks_at_address(
+                            &backends[sibling].borrow(),
+                            sibling,
+                            &backend,
+                            position,
+                        );
+                    sibling = ring[sibling];
+                }
+            }
+            if !outranked {
+                self.collapsed.push(position);
+            }
+        }
+        std::mem::swap(&mut self.candidates, &mut self.collapsed);
+        // `collapsed` now holds the uncollapsed candidates: collapsing only
+        // drops ids, and keeps one per address, so a non-empty set stays so.
+        debug_assert!(
+            self.candidates.len() <= self.collapsed.len(),
+            "collapsing never adds a candidate"
+        );
+        debug_assert!(
+            self.collapsed.is_empty() || !self.candidates.is_empty(),
+            "every address keeps one candidate"
+        );
+        self.candidates.len()
     }
 
     /// Set or clear the cluster's shuffle sharding. Takes effect from the
@@ -1344,47 +1532,91 @@ impl BackendList {
     /// say whether sharding applies to this selection at all.
     ///
     /// The shard is the top `k` of the HRW ranking of `key` over the
-    /// **configured** primary backends, healthy or not: a backend going down
+    /// **configured** primary addresses, healthy or not, with every primary
+    /// id at those addresses (one address is one share, see
+    /// `collapse_shared_addresses`): a backend going down
     /// must not pull another one into the shard, or a shard could never be
     /// exhausted and isolation would leak exactly when it matters. Ties are
     /// broken by list position so the shard is a function of the scores.
-    /// Partitioning with `select_nth_unstable_by` is `O(N)`; the two buffers
-    /// are reserved by `add_backend`, so this allocates nothing.
+    /// Partitioning with `select_nth_unstable_by` is `O(N)`; each address's
+    /// representative is precomputed (`shard_representative`), and a shared
+    /// address brings its other ids in by walking its ring, so a shared
+    /// address adds work only for its own ids. The buffers are reserved by
+    /// `add_backend`, so this allocates nothing. If a caller grew or shrank
+    /// the public `backends` directly, the precomputed state has another
+    /// length and is ignored: every primary then ranks as its own address,
+    /// as before shared addresses were collapsed, and nothing is indexed out
+    /// of bounds.
     fn compute_shard(&mut self, key: Option<u64>) -> bool {
         let (Some(sharding), Some(key)) = (self.shuffle_sharding, key) else {
             return false;
         };
+        // One address is one share: a shard counts and ranks primary
+        // ADDRESSES, each scored through its representative primary id
+        // (`outranks_at_address`), and takes in every primary id at the
+        // addresses it selects, so the sibling of a down representative still
+        // serves inside the shard. Without a shared address every primary is
+        // its own representative.
+        let backends = &self.backends;
+        let shares_address = self.shares_address;
+        let synced = self.shard_representative.len() == backends.len()
+            && self.sibling_ring.len() == backends.len();
+        let ring: &[usize] = if synced { &self.sibling_ring } else { &[] };
         // Size the shard before hashing anything, so a cluster below
-        // `shard_min_backends` pays one walk of `backup` flags and no hash.
-        let primaries = self
-            .backends
-            .iter()
-            .filter(|backend| !backend.borrow().backup)
-            .count();
+        // `shard_min_backends` pays no walk and no hash.
+        let primaries = if synced {
+            self.shard_addresses
+        } else {
+            backends
+                .iter()
+                .filter(|backend| !backend.borrow().backup)
+                .count()
+        };
         let Some(k) = sharding.shard_size(primaries) else {
             return false;
         };
         self.shard_scores.clear();
-        for (index, backend) in self.backends.iter().enumerate() {
-            let backend = backend.borrow();
-            if !backend.backup {
-                self.shard_scores.push((hrw_score(key, &backend), index));
+        for (index, backend) in backends.iter().enumerate() {
+            let represents = match self.shard_representative.get(index) {
+                Some(&represents) if synced => represents,
+                _ => !backend.borrow().backup,
+            };
+            if represents {
+                self.shard_scores
+                    .push((hrw_score(key, &backend.borrow()), index));
             }
         }
         debug_assert_eq!(
             self.shard_scores.len(),
             primaries,
-            "one score per primary backend"
+            "one score per primary address"
         );
         let by_rank = |a: &(f64, usize), b: &(f64, usize)| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1));
         if k < self.shard_scores.len() {
             self.shard_scores.select_nth_unstable_by(k - 1, by_rank);
         }
         self.shard.clear();
-        self.shard
-            .extend(self.shard_scores[..k].iter().map(|&(_, index)| index));
+        for &(_, representative) in &self.shard_scores[..k] {
+            self.shard.push(representative);
+            let next = |position: usize| ring.get(position).copied().unwrap_or(representative);
+            let mut sibling = next(representative);
+            while sibling != representative {
+                count_sibling_step();
+                if !backends[sibling].borrow().backup {
+                    self.shard.push(sibling);
+                }
+                sibling = next(sibling);
+            }
+        }
         self.shard.sort_unstable();
-        debug_assert_eq!(self.shard.len(), k, "a shard holds exactly k backends");
+        debug_assert!(
+            self.shard.len() >= k,
+            "a shard holds every primary id of its k addresses"
+        );
+        debug_assert!(
+            shares_address || self.shard.len() == k,
+            "without a shared address a shard holds exactly k backends"
+        );
         debug_assert!(
             self.shard
                 .iter()
@@ -1439,6 +1671,7 @@ impl BackendList {
         // stateless policies.
         if removed {
             self.load_balancing.rebuild(&self.backends);
+            self.refresh_siblings();
         }
         #[cfg(debug_assertions)]
         self.check_invariants();
@@ -1680,9 +1913,15 @@ impl BackendList {
                 );
                 self.fail_open_warned = false;
             }
+            self.collapse_shared_addresses();
             let picked = self.load_balancing.next_available_backend(
                 key,
-                Candidates::new(&self.backends, &self.candidates, now),
+                Candidates::with_siblings(
+                    &self.backends,
+                    &self.candidates,
+                    &self.sibling_ring,
+                    now,
+                ),
             );
             debug_assert!(
                 picked.as_ref().is_none_or(|b| {
@@ -1750,9 +1989,11 @@ impl BackendList {
         }
         count!(names::backend::FAIL_OPEN, 1);
 
-        let picked = self
-            .load_balancing
-            .next_available_backend(key, Candidates::new(&self.backends, &self.candidates, now));
+        self.collapse_shared_addresses();
+        let picked = self.load_balancing.next_available_backend(
+            key,
+            Candidates::with_siblings(&self.backends, &self.candidates, &self.sibling_ring, now),
+        );
         let outcome = self.settle_spill_outcome(outcome, picked.as_ref());
         (picked, outcome)
     }
@@ -3319,5 +3560,360 @@ mod exclusion_tests {
             address(9201),
             "the cookie names a backend the request already failed to reach"
         );
+    }
+}
+
+/// Two backend ids at one address share that address's load, under every
+/// policy: the address is one candidate, whatever the number of ids
+/// configured on it.
+#[cfg(test)]
+mod same_address_tests {
+    use super::*;
+    use crate::load_balancing::affinity_key_from_value;
+
+    const POLICIES: [LoadBalancingAlgorithms; 6] = [
+        LoadBalancingAlgorithms::RoundRobin,
+        LoadBalancingAlgorithms::Random,
+        LoadBalancingAlgorithms::LeastLoaded,
+        LoadBalancingAlgorithms::PowerOfTwo,
+        LoadBalancingAlgorithms::Hrw,
+        LoadBalancingAlgorithms::Maglev,
+    ];
+
+    /// Picks per measured distribution.
+    const PICKS: u32 = 20_000;
+
+    const SHARED: SocketAddr = SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+        9300,
+    );
+    const OTHER: SocketAddr = SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+        9301,
+    );
+
+    fn weighted(id: &str, address: SocketAddr, weight: Option<i32>) -> Backend {
+        Backend::new(
+            id,
+            address,
+            None,
+            weight.map(|weight| LoadBalancingParams { weight }),
+            None,
+        )
+    }
+
+    /// `a` and `b` at [`SHARED`], `c` at [`OTHER`], in that list order.
+    fn shared_list(policy: LoadBalancingAlgorithms, a: Backend, b: Backend) -> BackendList {
+        let mut list = BackendList::with_seed(1839);
+        list.add_backend(a);
+        list.add_backend(b);
+        list.add_backend(weighted("c", OTHER, None));
+        list.set_load_balancing_policy(policy, Some(LoadMetric::Connections), 1839);
+        list
+    }
+
+    fn equal_list(policy: LoadBalancingAlgorithms) -> BackendList {
+        shared_list(
+            policy,
+            weighted("a", SHARED, None),
+            weighted("b", SHARED, None),
+        )
+    }
+
+    /// Run [`PICKS`] selections and return the picked backend ids. A
+    /// load-aware policy sees each pick as one more open connection, and an
+    /// affinity policy sees a fresh, well-spread client key per pick.
+    fn picks(list: &mut BackendList) -> Vec<String> {
+        let now = Instant::now();
+        (0..PICKS)
+            .map(|index| {
+                let key = affinity_key_from_value(&index.to_le_bytes());
+                let picked = list
+                    .next_available_backend_with_key(Some(key), now)
+                    .expect("three healthy backends");
+                let mut picked = picked.borrow_mut();
+                picked.active_connections += 1;
+                picked.backend_id.to_owned()
+            })
+            .collect()
+    }
+
+    fn share_of(ids: &[String], wanted: &[&str]) -> f64 {
+        ids.iter()
+            .filter(|id| wanted.contains(&id.as_str()))
+            .count() as f64
+            / ids.len() as f64
+    }
+
+    /// The decision of 2026-10-04: one address, one share. Two ids at one
+    /// address and one id at another, equal weights: each address takes
+    /// half the selections, as HRW already gave it.
+    ///
+    /// TO SEE THIS RED: remove the `collapse_shared_addresses` calls from
+    /// `BackendList::select_tiers`; round robin, random, least loaded and
+    /// power of two then give the shared address two thirds.
+    #[test]
+    fn a_shared_address_takes_the_share_of_one_backend_under_every_policy() {
+        let skewed: Vec<String> = POLICIES
+            .into_iter()
+            .filter_map(|policy| {
+                let mut list = equal_list(policy);
+                let shared = share_of(&picks(&mut list), &["a", "b"]);
+                (!(0.47..=0.53).contains(&shared)).then(|| format!("{policy:?}: {shared:.3}"))
+            })
+            .collect();
+        assert!(
+            skewed.is_empty(),
+            "the shared address did not take 1/2 of the selections under {skewed:?}"
+        );
+    }
+
+    /// The shared address is served by its first id in list order when the
+    /// weights are equal: the second id is never picked while the first can
+    /// take a connection.
+    #[test]
+    fn the_first_id_at_a_shared_address_represents_it() {
+        for policy in POLICIES {
+            let mut list = equal_list(policy);
+            let ids = picks(&mut list);
+            assert!(
+                ids.iter().all(|id| id != "b"),
+                "{policy:?} picked the second id of the shared address"
+            );
+            assert!(ids.iter().any(|id| id == "a"), "{policy:?} never picked a");
+        }
+    }
+
+    /// A down id never serves its address: its eligible sibling does, and
+    /// the address keeps the share of one backend.
+    #[test]
+    fn a_down_id_yields_its_address_to_an_eligible_sibling() {
+        for policy in POLICIES {
+            let mut down = weighted("a", SHARED, None);
+            down.health.record_failure(1);
+            assert!(!down.health.is_healthy());
+            let mut list = shared_list(policy, down, weighted("b", SHARED, None));
+            let ids = picks(&mut list);
+            assert!(
+                ids.iter().all(|id| id != "a"),
+                "{policy:?} picked the unhealthy id"
+            );
+            let shared = share_of(&ids, &["b"]);
+            assert!(
+                (0.47..=0.53).contains(&shared),
+                "{policy:?} gave the shared address {shared:.3} of the selections, not 1/2"
+            );
+        }
+    }
+
+    /// Unequal weights at one address: the heaviest id represents it, as the
+    /// HRW score — monotonic in weight for one address — has always decided.
+    #[test]
+    fn the_heaviest_id_at_a_shared_address_represents_it() {
+        for policy in POLICIES {
+            let mut list = shared_list(
+                policy,
+                weighted("a", SHARED, Some(50)),
+                weighted("b", SHARED, Some(200)),
+            );
+            let ids = picks(&mut list);
+            assert!(
+                ids.iter().all(|id| id != "a"),
+                "{policy:?} picked the lighter id of the shared address"
+            );
+        }
+    }
+
+    /// A shard counts addresses, not ids: eight addresses, one carrying two
+    /// ids, at 25% make shards of two addresses, and a shard that holds the
+    /// shared address holds both its ids, so the sibling of a down
+    /// representative still serves inside the shard.
+    #[test]
+    fn a_shard_counts_a_shared_address_once_and_holds_all_its_ids() {
+        let mut list = BackendList::with_seed(524);
+        list.set_load_balancing_policy(LoadBalancingAlgorithms::Hrw, None, 524);
+        for index in 0..8u16 {
+            list.add_backend(Backend::new(
+                &format!("shard-{index}"),
+                SocketAddr::from(([127, 0, 0, 1], 20_000 + index)),
+                None,
+                None,
+                None,
+            ));
+        }
+        let shared = SocketAddr::from(([127, 0, 0, 1], 20_000));
+        list.add_backend(Backend::new("shard-0-bis", shared, None, None, None));
+        list.set_shuffle_sharding(Some(ShuffleSharding {
+            percent: 25,
+            min_backends: 4,
+            mode: ShardMode::Fallback,
+        }));
+
+        let mut holding_shared = 0;
+        for key in 0..256u64 {
+            assert!(list.compute_shard(Some(key)), "the list must shard");
+            let mut addresses: Vec<SocketAddr> = list
+                .shard
+                .iter()
+                .map(|&index| list.backends[index].borrow().address)
+                .collect();
+            let ids = addresses.len();
+            addresses.sort_unstable();
+            addresses.dedup();
+            assert_eq!(addresses.len(), 2, "key {key}: a shard holds two addresses");
+            if addresses.contains(&shared) {
+                holding_shared += 1;
+                assert_eq!(ids, 3, "key {key}: the shared address brings both ids");
+            } else {
+                assert_eq!(ids, 2, "key {key}: one id per unshared address");
+            }
+        }
+        assert!(
+            holding_shared > 0,
+            "some shard must hold the shared address"
+        );
+    }
+
+    /// `LEAST_LOADED` and `POWER_OF_TWO` read an address's load as the sum
+    /// over its ids: the representative `a` is idle, but its sibling `b`
+    /// carries 5 connections, so the address weighs 5 against `c`'s 3 and
+    /// `c` is picked.
+    #[test]
+    fn a_load_aware_policy_reads_the_load_of_the_whole_address() {
+        let now = Instant::now();
+        for policy in [
+            LoadBalancingAlgorithms::LeastLoaded,
+            LoadBalancingAlgorithms::PowerOfTwo,
+        ] {
+            let mut list = equal_list(policy);
+            list.backends[1].borrow_mut().active_connections = 5;
+            list.backends[2].borrow_mut().active_connections = 3;
+            for key in 0..64 {
+                let picked = list
+                    .next_available_backend_with_key(Some(key), now)
+                    .expect("three healthy backends");
+                assert_eq!(
+                    picked.borrow().backend_id,
+                    "c",
+                    "{policy:?} compared the representative's own load, not its address's"
+                );
+            }
+        }
+    }
+
+    /// The cost guard: one shared pair among 1000 backends costs a selection
+    /// a few units of shared-address work (`SIBLING_STEPS`: one per
+    /// representative comparison or sibling-ring step), not one per
+    /// candidate. A scan of the candidates per candidate costs a million.
+    ///
+    /// TO SEE THIS RED: replace the ring walk in
+    /// `BackendList::collapse_shared_addresses` with
+    /// `candidates.iter().any(|&other| outranks_at_address(..))`.
+    #[test]
+    fn one_shared_pair_costs_a_selection_constant_work() {
+        use crate::load_balancing::SIBLING_STEPS;
+
+        let now = Instant::now();
+        // Built once: the debug-only invariant sweep after each insertion is
+        // quadratic in the list, so a list per case would dominate the run.
+        let mut list = BackendList::with_seed(1856);
+        for index in 0..1000u16 {
+            let address = SocketAddr::from(([10, (index >> 8) as u8, index as u8, 1], 8080));
+            list.add_backend(Backend::new(
+                &format!("b{index}"),
+                address,
+                None,
+                None,
+                None,
+            ));
+        }
+        let shared = SocketAddr::from(([10, 0, 0, 1], 8080));
+        list.add_backend(Backend::new("dup", shared, None, None, None));
+        for sharded in [false, true] {
+            list.set_shuffle_sharding(sharded.then_some(ShuffleSharding {
+                percent: 25,
+                min_backends: 8,
+                mode: ShardMode::Fallback,
+            }));
+            for policy in POLICIES {
+                list.set_load_balancing_policy(policy, Some(LoadMetric::Connections), 1856);
+                let mut worst = 0;
+                for key in 0..64u64 {
+                    SIBLING_STEPS.with(|steps| steps.set(0));
+                    assert!(list.select_with_key(Some(key), now).0.is_some());
+                    worst = worst.max(SIBLING_STEPS.with(|steps| steps.get()));
+                }
+                assert!(
+                    worst <= 8,
+                    "{policy:?} (sharded: {sharded}) spent {worst} steps on one shared pair"
+                );
+            }
+        }
+    }
+
+    /// `backends` is public: a library user may push or pop a backend
+    /// without `add_backend`/`remove_backend`, leaving the sibling state of
+    /// another length. Selection must then neither panic nor index a stale
+    /// ring, under every policy, sharded or not.
+    #[test]
+    fn a_list_edited_directly_still_selects_without_panicking() {
+        let now = Instant::now();
+        let sharding = Some(ShuffleSharding {
+            percent: 50,
+            min_backends: 2,
+            mode: ShardMode::Fallback,
+        });
+        for policy in POLICIES {
+            for sharded in [false, true] {
+                // Grown: a pushed sibling of the shared address, and a
+                // pushed backend at a new address.
+                let mut grown = equal_list(policy);
+                grown.set_shuffle_sharding(sharded.then_some(sharding).flatten());
+                for (id, port) in [("pushed-sibling", 9300), ("pushed", 9302)] {
+                    let address = SocketAddr::from(([127, 0, 0, 1], port));
+                    grown
+                        .backends
+                        .push(Rc::new(RefCell::new(weighted(id, address, None))));
+                }
+                // Shrunk: the last backend popped, the ring still covers it.
+                let mut shrunk = equal_list(policy);
+                shrunk.set_shuffle_sharding(sharded.then_some(sharding).flatten());
+                shrunk.backends.pop();
+                for list in [&mut grown, &mut shrunk] {
+                    for key in 0..64 {
+                        assert!(
+                            list.select_with_key(Some(key), now).0.is_some(),
+                            "{policy:?} (sharded: {sharded}) selected nothing"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Collapsing allocates nothing: the scratch buffer is reserved on the
+    /// control plane like the candidate buffer.
+    #[test]
+    fn a_selection_over_a_shared_address_allocates_nothing() {
+        use std::hint::black_box;
+
+        use crate::test_allocations::allocations;
+
+        let now = Instant::now();
+        for policy in POLICIES {
+            let mut list = equal_list(policy);
+            drop(list.select_with_key(Some(0), now));
+            let mut allocated = 0;
+            for key in 0..256u64 {
+                let before = allocations();
+                let picked = black_box(&mut list).select_with_key(black_box(Some(key)), now);
+                allocated += allocations() - before;
+                assert!(picked.0.is_some());
+            }
+            assert_eq!(
+                allocated, 0,
+                "{policy:?}: 256 selections made {allocated} allocations"
+            );
+        }
     }
 }

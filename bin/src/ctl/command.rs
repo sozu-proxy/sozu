@@ -194,6 +194,11 @@ impl CommandManager {
                     json: false,
                 };
 
+                // A failed worker upgrade (old worker closed before finishing
+                // its soft stop, new worker activation failed) is logged and
+                // the others continue: the main upgrade already succeeded, so
+                // `sozu upgrade` still exits 0. `sozu upgrade --worker N`
+                // exits non-zero on the same failure.
                 match command_manager.upgrade_worker(worker.id) {
                     Ok(()) => info!("successfully upgraded worker {}", worker.id),
                     Err(e) => error!("error upgrading worker {}: {}", worker.id, e),
