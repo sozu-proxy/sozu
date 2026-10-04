@@ -3248,7 +3248,9 @@ the network drain.
   everything (counts, gauges, histograms, proxy-wide and per-cluster, AND
   the master-process `main_metrics` aggregator).
 - Per-cluster local-drain entries are dropped on `RemoveCluster` /
-  `RemoveBackend` so the keyspace is bounded by the live configuration.
+  `RemoveBackend` so the keyspace is bounded by the live configuration. A
+  backend row is keyed by backend id alone, so `RemoveBackend` drops it only
+  once no backend of that id remains in the cluster at any address.
 - A remove then add of the same cluster id creates a new internal metrics
   incarnation. In-flight HTTP, WebSocket and TCP sessions retain the
   incarnation they were routed to, so their late cluster/backend emissions

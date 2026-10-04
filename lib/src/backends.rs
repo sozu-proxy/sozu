@@ -787,6 +787,18 @@ impl BackendMap {
         }
     }
 
+    /// Whether `cluster_id` still holds a backend carrying `backend_id`, at
+    /// any address. Backend metrics are labelled by id alone, so every entry
+    /// sharing an id feeds one metrics row.
+    pub fn has_backend_id(&self, cluster_id: &str, backend_id: &str) -> bool {
+        self.backends.get(cluster_id).is_some_and(|backends| {
+            backends
+                .backends
+                .iter()
+                .any(|backend| backend.borrow().backend_id == backend_id)
+        })
+    }
+
     pub fn has_backend(&self, cluster_id: &str, backend: &Backend) -> bool {
         self.backends
             .get(cluster_id)
