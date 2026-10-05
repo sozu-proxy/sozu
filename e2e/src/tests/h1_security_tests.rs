@@ -816,16 +816,21 @@ fn test_h1_host_port_zero_not_routed() {
 }
 
 // =========================================================================
-// Test 8: Invalid UTF-8 in custom method does not crash the worker
+// Test 8: Invalid UTF-8 in custom method is rejected under the strict parser
 //
 // kawa rejects non-token method bytes at request-line parsing under the
-// strict default. The defence at `Method::new` ensures that even under
-// `--features tolerant-http1-parser`, where kawa accepts bytes
-// `0xA0..=0xFF` as method-token characters, malformed network bytes never
-// reach `from_utf8_unchecked`. See `test_h1_tolerant_high_byte_method_no_ub`
-// below for the feature-gated end-to-end coverage of that path.
+// strict default, so `\xFFBAD` must be answered 400 before any backend
+// sees it. That rejection is the strict parser's contract only: under
+// `--features tolerant-http1-parser` kawa accepts bytes `0xA0..=0xFF` as
+// method-token characters and the request is legitimately forwarded, so
+// this oracle does not apply there and the test is compiled out (#1869).
+// The tolerant path is covered by `test_h1_tolerant_high_byte_method_no_ub`
+// below, which sends the same `0xFF` byte (and `0xA5`) and proves that the
+// defence at `Method::new` keeps malformed network bytes away from
+// `from_utf8_unchecked` and the worker healthy.
 // =========================================================================
 
+#[cfg(not(feature = "tolerant-http1-parser"))]
 fn try_h1_invalid_utf8_method_no_crash() -> State {
     try_h1_bad_authority_rejected(
         "BAD-METHOD-UTF8",
@@ -834,6 +839,7 @@ fn try_h1_invalid_utf8_method_no_crash() -> State {
     )
 }
 
+#[cfg(not(feature = "tolerant-http1-parser"))]
 #[test]
 fn test_h1_invalid_utf8_method_no_crash() {
     assert_eq!(
@@ -856,10 +862,15 @@ fn test_h1_invalid_utf8_method_no_crash() {
 // continuation byte such as `0xA5` is not valid UTF-8 and would produce
 // undefined behaviour. With `from_utf8_lossy`, the method is safely
 // represented as `U+FFFD…` and the worker remains healthy.
+//
+// Both `0xA5` (a lone continuation byte) and `0xFF` (never valid in
+// UTF-8) are exercised: `0xFF` is the byte the strict-only
+// `test_h1_invalid_utf8_method_no_crash` sends, so it keeps end-to-end
+// coverage when that test is compiled out under this feature.
 // =========================================================================
 
 #[cfg(feature = "tolerant-http1-parser")]
-fn try_h1_tolerant_high_byte_method_no_ub() -> State {
+fn try_h1_tolerant_high_byte_method_no_ub(method_byte: u8) -> State {
     let label = "TOLERANT-HIGH-BYTE-METHOD";
     let front_address = create_local_address();
 
@@ -871,12 +882,14 @@ fn try_h1_tolerant_high_byte_method_no_ub() -> State {
     // Canned reply: under tolerant parsing the proxy may forward the
     // request with a lossy method, so the backend must answer
     // *without* calling `receive()`, which would panic on the raw
-    // 0xA5 byte that sozu re-emits on the wire.
+    // high byte that sozu re-emits on the wire.
     backend.set_response("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
 
+    let mut request = vec![method_byte];
+    request.extend_from_slice(b"BAD /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     let mut stream = raw_connect(front_address);
     stream
-        .write_all(b"\xA5BAD /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .write_all(&request)
         .expect("write high-byte method attack");
 
     // Drain whichever side reacts first within the deadline. Under
@@ -912,8 +925,16 @@ fn test_h1_tolerant_high_byte_method_no_ub() {
     assert_eq!(
         repeat_until_error_or(
             5,
-            "H1 security: high-byte method under tolerant parser does not UB",
-            try_h1_tolerant_high_byte_method_no_ub,
+            "H1 security: 0xA5 method under tolerant parser does not UB",
+            || try_h1_tolerant_high_byte_method_no_ub(0xA5),
+        ),
+        State::Success,
+    );
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H1 security: 0xFF method under tolerant parser does not UB",
+            || try_h1_tolerant_high_byte_method_no_ub(0xFF),
         ),
         State::Success,
     );
