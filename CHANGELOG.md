@@ -7724,6 +7724,19 @@
   `max_connection_attempts` limit. An embedder that set or read the field drops it. No runtime
   behaviour changes.
 
+- **BREAKING (library API) — `refactor(backends)`: the `BackendList::backends` field is no longer
+  public.** It is now `pub(crate)`, and the new read-only accessor `BackendList::backends()`
+  returns `&[Rc<RefCell<Backend>>]`. Since
+  [#1856](https://github.com/sozu-proxy/sozu/pull/1856), a `BackendList` derives its sibling ring,
+  its shuffle-sharding representatives and its shared-address flag from that vector, and
+  `add_backend`/`remove_backend` are the only methods that refresh them (and the Maglev table). An
+  embedder that pushed to, removed from or replaced the vector directly left that state stale; it
+  now goes through `add_backend`/`remove_backend`, and a reader calls `backends()` instead of
+  reading the field. Two doctests on the accessor hold the guarantee: one reads the list through
+  `backends()`, and an otherwise identical `compile_fail` one pushes to the field from outside the
+  crate. The length-mismatch guards #1856 added stay, for misuse inside the crate. No runtime
+  behaviour changes.
+
 - **BREAKING (library API) — `refactor(lib)`: `BackendMap::backend_from_sticky_session` is removed
   ([#1684](https://github.com/sozu-proxy/sozu/issues/1684)).** Once the mux reserved through
   `BackendMap::reserve_sticky_backend`, its only callers were its own three tests. They now exercise
