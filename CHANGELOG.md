@@ -4049,6 +4049,16 @@
 
 ### 🐛 Fixed
 
+- **`test(e2e)`: the invalid-UTF-8 method rejection test no longer runs under
+  `tolerant-http1-parser` ([#1869](https://github.com/sozu-proxy/sozu/issues/1869)).**
+  `test_h1_invalid_utf8_method_no_crash` (`e2e/src/tests/h1_security_tests.rs`) sends
+  `\xFFBAD` and requires a 400 before the backend, which is the strict parser's contract. With
+  the tolerant parser kawa accepts `0xA0..=0xFF` as method-token bytes and forwards the request,
+  so the mock backend panicked decoding it as UTF-8 in every tolerant feature-matrix cell. The
+  test is now compiled only without that feature, unchanged. Its tolerant counterpart
+  `test_h1_tolerant_high_byte_method_no_ub` now sends `0xFF` as well as `0xA5` and checks worker
+  health after each, so the `0xFF` byte keeps end-to-end coverage in both builds.
+
 - **`fix(metrics)`: removing one address of a backend id keeps the metrics of the id's
   remaining addresses.** `ConfigState` and the worker key backends on `(backend_id, address)`,
   so one id may serve from several addresses, while backend metrics are labelled by id alone and
