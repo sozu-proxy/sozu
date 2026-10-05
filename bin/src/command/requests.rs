@@ -4367,7 +4367,15 @@ pub fn load_state(server: &mut Server, mut client: OptionalClient, path: &str) {
         bulk_replay_timeout(worker_timeout, 0),
     );
 
-    let mut buffer = Buffer::with_capacity(200000);
+    // One record must fit whole in the buffer, or parsing stops there and
+    // every record after it is lost. A listener's record carries its client
+    // CA and CRL contents, so it can grow as large as a request the worker
+    // channels accept: size the buffer for that, never below the historical
+    // 200 kB.
+    let capacity = usize::try_from(server.config.max_command_buffer_size)
+        .unwrap_or(usize::MAX)
+        .max(200_000);
+    let mut buffer = Buffer::with_capacity(capacity);
     let mut scatter_request_counter = 0usize;
     // sozu#1313: entries the pre-dispatch validation refused. Counted here
     // rather than on `LoadStateTask` because the task is already owned by the
@@ -6475,7 +6483,7 @@ mod load_state_rollback_tests {
     };
     use mio::{Token, net::UnixListener};
     use sozu_command_lib::config::Config;
-    use sozu_command_lib::proto::command::WorkerRequest;
+    use sozu_command_lib::proto::command::{HttpsListenerConfig, WorkerRequest};
     use std::collections::BTreeMap;
     use std::{fs::File, io::Write as _};
 
@@ -6653,6 +6661,67 @@ mod load_state_rollback_tests {
                 .iter()
                 .any(|response| response.message.contains("skipped 1 invalid entries")),
             "the entry the state refused must be reported in the skipped tally, got {responses:?}"
+        );
+    }
+
+    /// A saved listener record can outgrow the historical 200 kB parse
+    /// buffer once it carries client CA or CRL contents. Parsing used to stop
+    /// at such a record and drop every record after it; it must load, and so
+    /// must what follows.
+    #[test]
+    fn a_state_record_larger_than_200_kb_loads_with_what_follows() {
+        let (mut hub, _dir) = create_test_hub();
+        // What a loaded configuration holds: `Config::default()` leaves it 0.
+        hub.server.config.max_command_buffer_size =
+            sozu_command_lib::config::DEFAULT_MAX_COMMAND_BUFFER_SIZE;
+        let (mut client, _peer) = test_client();
+
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let large_listener = HttpsListenerConfig {
+            // Mode none: the CA content is kept but never parsed, so the
+            // record is valid whatever it holds.
+            client_ca_certificates: vec!["A".repeat(300_000)],
+            ..ListenerBuilder::new_https(address)
+                .to_tls(None)
+                .expect("an HTTPS listener config")
+        };
+        let records = [
+            Request::from(RequestType::add_https_listener(large_listener)),
+            Request::from(RequestType::AddHttpFrontend(frontend(
+                "after.example.com",
+                8080,
+            ))),
+        ];
+        let state_path = _dir.path().join("large.state");
+        {
+            let mut state_file = File::create(&state_path).expect("a temporary state file");
+            for (counter, record) in records.iter().enumerate() {
+                let message = WorkerRequest::new(format!("SAVE-{counter}"), record.clone());
+                let serialized = serde_json::to_string(&message).expect("a serializable request");
+                state_file
+                    .write_all(serialized.as_bytes())
+                    .expect("writing the state entry");
+                state_file
+                    .write_all(b"\n\0")
+                    .expect("writing the delimiter");
+            }
+        }
+        assert!(
+            std::fs::metadata(&state_path).expect("state file").len() > 300_000,
+            "precondition: the first record is larger than the historical buffer"
+        );
+
+        load_state(
+            &mut hub.server,
+            Some(&mut client),
+            state_path.to_str().expect("a UTF-8 temp path"),
+        );
+
+        assert_eq!(hub.server.state.https_listeners.len(), 1);
+        assert_eq!(
+            hub.server.state.count_frontends(),
+            1,
+            "the record after the large one must load too"
         );
     }
 
