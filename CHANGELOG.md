@@ -120,7 +120,8 @@
   reordered, and default to empty when missing from an older record).
   Configuration fails closed: an unknown `client_auth` value, a non-`none` mode
   with no trusted CA, an unreadable CA/CRL file, a CA or CRL entry that yields no
-  certificate/revocation list, or an mTLS field set on a non-HTTPS listener is
+  certificate/revocation list, CA or CRL files with no `client_auth` mode, or an
+  mTLS field set on a non-HTTPS listener is
   rejected rather than silently accepting unauthenticated or unrevoked clients.
   CRL expiration is enforced (a CRL past its `nextUpdate` is rejected instead of
   trusted), a CRL already expired is refused when the listener is built, and

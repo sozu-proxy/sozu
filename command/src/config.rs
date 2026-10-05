@@ -599,6 +599,15 @@ pub enum ConfigError {
          client_ca_crls are only valid on HTTPS listeners"
     )]
     ClientAuthOnNonHttps(String),
+    /// An HTTPS listener names client CA or CRL files but no `client_auth`
+    /// mode. The mode defaults to `none`, which ignores those files, so the
+    /// listener would start without the client authentication they suggest.
+    #[error(
+        "invalid client auth config at {0}: client_ca_certificates / client_ca_crls are set \
+         but client_auth is not; set client_auth to \"optional\" or \"required\", or to \
+         \"none\" to keep them unused"
+    )]
+    ClientAuthModeMissing(String),
     /// A TCP frontend's `hostname` (mapped to the wire `sni` field) is
     /// neither an exact hostname nor a single leading `*.` wildcard label
     /// (sozu-proxy/sozu#1279). Rejects `*.*.example.com`, an embedded `*`
@@ -1569,9 +1578,36 @@ impl ListenerBuilder {
         // dropped CRL would silently disable revocation for certificates the
         // operator meant to reject. Failing closed keeps client auth honest.
         //
-        // Files are read only for OPTIONAL/REQUIRED. In NONE (the default) the
-        // runtime ignores CA/CRL data, so a stale path left in the config must
-        // not block the whole configuration from loading.
+        // Files are read only for OPTIONAL/REQUIRED. In NONE the runtime
+        // ignores CA/CRL data, so a stale path left in the config must not
+        // block the whole configuration from loading. That tolerance needs an
+        // explicit `client_auth = "none"`: CA or CRL files with no mode at all
+        // most likely mean the operator expected client authentication, and
+        // the default would start the listener without it.
+        let has_client_auth_files = self
+            .client_ca_certificates
+            .as_ref()
+            .is_some_and(|paths| !paths.is_empty())
+            || self
+                .client_ca_crls
+                .as_ref()
+                .is_some_and(|paths| !paths.is_empty());
+        match self.client_auth {
+            None if has_client_auth_files => {
+                return Err(ConfigError::ClientAuthModeMissing(format!(
+                    "HTTPS listener {}",
+                    self.address
+                )));
+            }
+            Some(ClientAuthConfig::None) if has_client_auth_files => {
+                warn!(
+                    "HTTPS listener {}: client_auth is \"none\", so its client_ca_certificates \
+                     and client_ca_crls are ignored and clients are not authenticated",
+                    self.address
+                );
+            }
+            _ => {}
+        }
         let mode = self.client_auth.unwrap_or_default();
         let client_auth = self
             .client_auth
@@ -8159,6 +8195,32 @@ mod tests {
             https.to_tls(None).is_err(),
             "an unreadable CRL file must fail the listener, not drop the revocation check"
         );
+    }
+
+    #[test]
+    fn client_auth_files_without_a_mode_are_rejected() {
+        // The mode defaults to `none`, which ignores these files: a listener
+        // naming a CA or a CRL with no mode would start unauthenticated.
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 9443);
+        for (cas, crls) in [
+            (Some(vec!["/etc/sozu/client-ca.pem".to_owned()]), None),
+            (None, Some(vec!["/etc/sozu/client-ca.crl.pem".to_owned()])),
+        ] {
+            let mut https = ListenerBuilder::new_https(address);
+            https.client_ca_certificates = cas;
+            https.client_ca_crls = crls;
+            assert!(matches!(
+                https.to_tls(None),
+                Err(ConfigError::ClientAuthModeMissing(_))
+            ));
+        }
+        // Positive space: an explicit `none` keeps the files unused (and is
+        // only warned about), and no file at all needs no mode.
+        let mut explicit_none = ListenerBuilder::new_https(address);
+        explicit_none.client_auth = Some(ClientAuthConfig::None);
+        explicit_none.client_ca_certificates = Some(vec!["/nonexistent/ca.pem".to_owned()]);
+        assert!(explicit_none.to_tls(None).is_ok());
+        assert!(ListenerBuilder::new_https(address).to_tls(None).is_ok());
     }
 
     #[test]
