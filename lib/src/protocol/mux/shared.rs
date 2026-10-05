@@ -36,13 +36,50 @@ use super::Stream;
 /// work one connection can make sozu do after its response.
 pub(super) const LINGER_MAX_BYTES: usize = 4 * 1024 * 1024;
 
+/// Wall-clock bound of the lingering close that follows a final GOAWAY
+/// carrying an error code (a protocol violation, a flood). Never longer than
+/// the graceful bound: the deadline is the smaller of this and the listener's
+/// `request_timeout`, fixed when the linger is decided and not moved by what
+/// the client sends.
+///
+/// That linger exists only so the GOAWAY reaches the client: a close with the
+/// client's frames unread makes the kernel answer with a reset, which drops
+/// the GOAWAY still queued in the socket (sozu-proxy/sozu#1861). By the time
+/// the drain starts the GOAWAY and `close_notify` are already handed to the
+/// kernel and the write side is shut down, so the drain only has to keep the
+/// receive queue empty while the client reads them: a few round trips, which
+/// one second covers even on an intercontinental path (~300 ms RTT), while
+/// costing a misbehaving peer's slot and buffer at most a tenth of the
+/// default 10 s `request_timeout`.
+pub(super) const ERROR_GOAWAY_LINGER_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(1);
+
+/// Most bytes the lingering close after an error GOAWAY reads and discards
+/// before it closes anyway.
+///
+/// Sōzu sets no `SO_RCVBUF` on a frontend socket, so a connection starts with
+/// Linux's default receive buffer, `net.ipv4.tcp_rmem[1]` = 128 KiB, and
+/// autotuning only grows it while the reader keeps up — which stops at the
+/// final GOAWAY, when reading does. 256 KiB is that default buffer, what
+/// can already be queued when the drain starts, plus as much again arriving
+/// before the client reads the GOAWAY. A peer that sends more is still
+/// sending regardless of the GOAWAY, and the reset it then gets is its own.
+pub(super) const ERROR_GOAWAY_LINGER_MAX_BYTES: usize = 256 * 1024;
+
+const _: () = assert!(
+    ERROR_GOAWAY_LINGER_MAX_BYTES <= LINGER_MAX_BYTES,
+    "the error-GOAWAY linger reads no more than a graceful one"
+);
+
 /// Size of one lingering read. A stack buffer: the drain allocates nothing.
 pub(super) const LINGER_READ_CHUNK: usize = 16 * 1024;
 
 /// Lingering close of a frontend that closes while its client may still be
 /// sending: an H1 connection whose request was not received whole when its
 /// response ended (RFC 9112 §9.6), or an H2 connection after its final
-/// GOAWAY (RFC 9113 §6.8 leaves the peer free to send until it reads it).
+/// GOAWAY (RFC 9113 §6.8 leaves the peer free to send until it reads it) —
+/// under [`ERROR_GOAWAY_LINGER_TIMEOUT`] and [`ERROR_GOAWAY_LINGER_MAX_BYTES`]
+/// when that GOAWAY carries an error code.
 ///
 /// Closing a socket whose receive queue still holds data, or that receives
 /// data after the close, makes the kernel send a reset, and a reset discards

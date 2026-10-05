@@ -47,8 +47,9 @@ use crate::{
         parser::{self, Frame, FrameHeader, FrameType, H2Error, Headers, WindowUpdate},
         pkawa, remove_backend_stream, serializer, set_default_answer,
         shared::{
-            EndStreamAction, LINGER_MAX_BYTES, Linger, LingerRead, drain_discard,
-            drain_tls_close_notify, end_stream_decision,
+            ERROR_GOAWAY_LINGER_MAX_BYTES, ERROR_GOAWAY_LINGER_TIMEOUT, EndStreamAction,
+            LINGER_MAX_BYTES, Linger, LingerRead, drain_discard, drain_tls_close_notify,
+            end_stream_decision,
         },
         update_readiness_after_read, update_readiness_after_write,
     },
@@ -1041,8 +1042,8 @@ pub struct ConnectionH2 {
     /// [`super::shared::Linger`].
     pub(super) linger: Linger,
     /// Whether the final GOAWAY this connection queued carried `NO_ERROR`.
-    /// Only such a close lingers: one that answers a protocol error or a
-    /// flood does not keep reading from that peer.
+    /// Selects the lingering close's bounds ([`Self::linger_budget`]): one
+    /// that answers a protocol error or a flood lingers only briefly.
     pub(super) graceful_goaway: bool,
 }
 /// Renders the peer address this connection snapshotted at construction,
@@ -1947,24 +1948,46 @@ impl ConnectionH2 {
     }
 
     /// Whether a close the next writable pass decides should linger instead:
-    /// a frontend whose final GOAWAY carried `NO_ERROR` (a graceful drain,
-    /// a soft stop, an answer to the client's own GOAWAY), whose client has
-    /// not hung up, and which does not drain already — or one whose linger
-    /// is already [`Linger::Pending`] behind a TLS `close_notify`. The client
-    /// may still be sending frames it wrote before it read the GOAWAY (RFC
-    /// 9113 §6.8); closing with them unread, or receiving more, makes the
-    /// kernel reset the connection and discard the response bytes still
-    /// queued.
+    /// a frontend that has queued its final GOAWAY, whose client has not hung
+    /// up, and which does not drain already — or one whose linger is already
+    /// [`Linger::Pending`] behind a TLS `close_notify`. The client may still
+    /// be sending frames it wrote before it read the GOAWAY (RFC 9113 §6.8);
+    /// closing with them unread, or receiving more, makes the kernel reset
+    /// the connection and discard the bytes still queued, the GOAWAY itself
+    /// included (sozu-proxy/sozu#1861). Whatever the GOAWAY's error code;
+    /// [`Self::linger_budget`] decides how long and how much.
     fn lingers_instead_of_closing(&self) -> bool {
         if matches!(self.linger, Linger::Pending { .. }) {
             return true;
         }
         self.position.is_server()
             && matches!(self.state, H2State::GoAway)
-            && self.graceful_goaway
             && self.drain.draining()
             && !self.frontend_hung_up_while_draining()
             && matches!(self.linger, Linger::Off)
+    }
+
+    /// The lingering close's wall-clock duration and byte budget. After a
+    /// final GOAWAY(NO_ERROR) the client may still be sending a request it is
+    /// owed an answer to, so the linger takes the listener's
+    /// `request_timeout` and [`LINGER_MAX_BYTES`]. After a GOAWAY carrying an
+    /// error code it only has to deliver that GOAWAY:
+    /// [`ERROR_GOAWAY_LINGER_TIMEOUT`] (never more than `request_timeout`)
+    /// and [`ERROR_GOAWAY_LINGER_MAX_BYTES`].
+    fn linger_budget(&self) -> (Duration, usize) {
+        let budget = if self.graceful_goaway {
+            (self.linger_timeout, LINGER_MAX_BYTES)
+        } else {
+            (
+                self.linger_timeout.min(ERROR_GOAWAY_LINGER_TIMEOUT),
+                ERROR_GOAWAY_LINGER_MAX_BYTES,
+            )
+        };
+        debug_assert!(
+            budget.0 <= self.linger_timeout && budget.1 <= LINGER_MAX_BYTES,
+            "no linger outlasts or outreads the graceful one"
+        );
+        budget
     }
 
     /// Shared constructor for both server and client H2 connections.
@@ -9446,9 +9469,10 @@ impl<Front: SocketHandler> H2Shell<Front> {
         {
             return result;
         }
+        let (duration, max_bytes) = self.core.linger_budget();
         let deadline = match self.core.linger {
             Linger::Pending { deadline } => deadline,
-            _ => match self.core.now.checked_add(self.core.linger_timeout) {
+            _ => match self.core.now.checked_add(duration) {
                 Some(deadline) => deadline,
                 None => return MuxResult::CloseSession,
             },
@@ -9475,7 +9499,7 @@ impl<Front: SocketHandler> H2Shell<Front> {
         );
         self.core.linger = Linger::Draining {
             deadline,
-            remaining: LINGER_MAX_BYTES,
+            remaining: max_bytes,
         };
         // Fixed, never re-armed: the deadline bounds the whole drain.
         self.core.timeout_deadline = Some(deadline);
