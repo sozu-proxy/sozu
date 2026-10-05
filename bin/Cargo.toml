@@ -15,7 +15,13 @@ authors = [
 categories = ["network-programming"]
 edition = "2024"
 rust-version = "1.93.1"
-include = ["README.md", "Cargo.toml", "build.rs", "src/**/*"]
+include = [
+  "README.md",
+  "Cargo.toml",
+  "build.rs",
+  "src/**/*",
+  "tests/sozu_top_e2e.rs",
+]
 
 [lib]
 name = "sozu"
@@ -24,6 +30,11 @@ path = "src/lib.rs"
 [[bin]]
 name = "sozu"
 path = "src/main.rs"
+
+[[test]]
+name = "sozu_top_e2e"
+path = "tests/sozu_top_e2e.rs"
+required-features = ["tui"]
 
 [dependencies]
 clap = { workspace = true, features = ["derive"] }

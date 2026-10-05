@@ -100,6 +100,12 @@ catching.
 
 Notes:
 
+- A feature-gated integration-test crate declares the same condition to Cargo
+  with `required-features`. For example, `sozu_top_e2e` is applicable only
+  when `tui` is enabled, so Cargo omits that target from other feature cells.
+  The feature-matrix runner still rejects every emitted test executable whose
+  inventory is empty; a source-level `cfg` is not a substitute for target
+  applicability metadata.
 - The e2e suite includes H1/H2/TLS/TCP/UDP coverage plus targeted security and
   feature suites; see `e2e/src/tests/mod.rs` for the full module list
   (`h2_tests`, `h2_security_*`, `mux_tests`, `tls_tests`, `tcp_tests`,
