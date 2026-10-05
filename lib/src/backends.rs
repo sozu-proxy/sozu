@@ -1123,7 +1123,12 @@ impl crate::protocol::udp::BackendSource for BackendMap {
 pub struct BackendList {
     pub backends: Vec<Rc<RefCell<Backend>>>,
     pub next_id: u32,
-    pub load_balancing: Box<dyn LoadBalancingAlgorithm>,
+    /// The cluster's selection policy. Crate-private: a Maglev policy keeps
+    /// a lookup table built from `backends`, and only
+    /// [`Self::set_load_balancing_policy`] seeds it when the policy is
+    /// installed, so a direct assignment would leave the table empty or
+    /// stale.
+    pub(crate) load_balancing: Box<dyn LoadBalancingAlgorithm>,
     /// Latches the fail-open `warn!`. Set to `true` when fail-open routing
     /// emits its entry warning so subsequent routing decisions in the same
     /// regime stay quiet; reset to `false` when a healthy backend is
@@ -2021,6 +2026,26 @@ impl BackendList {
 
     /// Replace the cluster's policy. `seed` seeds the policies that draw at
     /// random, `Random` and `PowerOfTwo`; the others ignore it.
+    ///
+    /// This is the only way to change the policy: it builds the Maglev
+    /// lookup table from the current backends when it installs `Maglev`.
+    /// Code outside this crate cannot assign the field directly:
+    ///
+    /// ```
+    /// use sozu_command_lib::proto::command::LoadBalancingAlgorithms;
+    /// use sozu_lib::backends::{Backend, BackendList};
+    ///
+    /// let mut list = BackendList::with_seed(1);
+    /// list.add_backend(Backend::new("b1", "127.0.0.1:8080".parse().unwrap(), None, None, None));
+    /// list.set_load_balancing_policy(LoadBalancingAlgorithms::Maglev, None, 1);
+    /// ```
+    ///
+    /// ```compile_fail,E0616
+    /// use sozu_lib::{backends::BackendList, load_balancing::Maglev};
+    ///
+    /// let mut list = BackendList::with_seed(1);
+    /// list.load_balancing = Box::new(Maglev::new());
+    /// ```
     pub fn set_load_balancing_policy(
         &mut self,
         load_balancing_policy: LoadBalancingAlgorithms,

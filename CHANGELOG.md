@@ -7724,6 +7724,19 @@
   `max_connection_attempts` limit. An embedder that set or read the field drops it. No runtime
   behaviour changes.
 
+- **BREAKING (library API) — `refactor(backends)`: the `BackendList::load_balancing` field is no
+  longer public.** It is now `pub(crate)`. `BackendList::set_load_balancing_policy` is the only way to
+  change a cluster's policy, and it seeds the Maglev lookup table from the current backends
+  (`maglev.rebuild(&self.backends)`) when it installs `MAGLEV`. An embedder that assigned a boxed
+  policy to the field directly skipped that step, so a `Maglev` installed that way selected from an
+  empty or stale table until the next `add_backend`/`remove_backend`; it now calls
+  `set_load_balancing_policy` with the matching `LoadBalancingAlgorithms` variant, metric and seed.
+  Nothing outside the crate read the field, so no read accessor is added. The workspace's only
+  direct assignments, the `Random` and `PowerOfTwo` arms of `lib/tests/backend_selection.rs`, now go
+  through the method with the same seed and metric, which installs identical policies. A
+  `compile_fail` doctest on `set_load_balancing_policy` assigns the field from outside the crate and
+  holds the guarantee. No runtime behaviour changes.
+
 - **BREAKING (library API) — `refactor(lib)`: `BackendMap::backend_from_sticky_session` is removed
   ([#1684](https://github.com/sozu-proxy/sozu/issues/1684)).** Once the mux reserved through
   `BackendMap::reserve_sticky_backend`, its only callers were its own three tests. They now exercise
