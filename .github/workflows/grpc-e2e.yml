@@ -5,34 +5,103 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: 'Optional decimal seed; an omitted seed is derived from the commit SHA'
+        required: false
+        type: string
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+  SOZU_FEATURE_MATRIX_TOOLCHAIN: path
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  grpc-e2e:
-    name: HTTPS H2 and TCP
+  plan:
+    name: Generate bounded gRPC matrix
     runs-on: sozu-general
-    timeout-minutes: 20
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      seed: ${{ steps.matrix.outputs.seed }}
     steps:
       - name: Checkout sources
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - name: Install Rust 1.93.1
-        uses: dtolnay/rust-toolchain@master
+      - name: Install Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
-          toolchain: '1.93.1'
+          python-version: "3.12"
+
+      - name: Generate deterministic matrix
+        id: matrix
+        env:
+          REQUESTED_SEED: ${{ inputs.seed }}
+        run: |
+          if [[ -n "$REQUESTED_SEED" ]]; then
+            seed="$REQUESTED_SEED"
+          else
+            seed="$((16#${GITHUB_SHA:0:15}))"
+          fi
+          matrix="$(python3 .github/scripts/feature_matrix.py --seed "$seed" matrix grpc)"
+          printf 'seed=%s\n' "$seed" >> "$GITHUB_OUTPUT"
+          printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
+
+  grpc-e2e:
+    name: ${{ matrix.config_id }} HTTPS H2 and TCP
+    needs: plan
+    runs-on: sozu-general
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust 1.93.1
+        uses: dtolnay/rust-toolchain@1.93.1
 
       - name: Cache Cargo target
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
         with:
           cache-all-crates: true
-          prefix-key: ci-grpc-e2e
+          prefix-key: ci-grpc-e2e-${{ matrix.config_id }}
 
       - name: Run real gRPC routes
-        run: "cargo test -p sozu-e2e --locked --features grpc-e2e tests::grpc_tests:: --verbose"
+        env:
+          STATE_DIR: ${{ runner.temp }}/sozu-grpc-swarm/${{ matrix.config_id }}
+        run: |
+          mkdir -p "$STATE_DIR"
+          python3 .github/scripts/run_feature_matrix.py \
+            --mode bounded \
+            --seed '${{ needs.plan.outputs.seed }}' \
+            --repo-root . \
+            --state-dir "$STATE_DIR" \
+            --cell '${{ matrix.cell_id }}' \
+            --suites grpc \
+            --jobs 4 > "$STATE_DIR/command-output.json"
+          cat "$STATE_DIR/command-output.json"
+
+      - name: Upload receipts and compressed logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: grpc-swarm-${{ matrix.config_id }}-${{ github.sha }}
+          path: ${{ runner.temp }}/sozu-grpc-swarm/${{ matrix.config_id }}
+          if-no-files-found: error
+          retention-days: 14
