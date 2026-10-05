@@ -28,7 +28,6 @@ use rand::{SeedableRng, rngs::StdRng};
 use sozu_command_lib::proto::command::{LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric};
 use sozu_lib::{
     backends::{Backend, BackendList, BackendStatus},
-    load_balancing::{PowerOfTwo, Random},
     retry::RetryPolicy,
 };
 
@@ -203,12 +202,14 @@ fn apply(list: &mut BackendList, policy: Policy) {
         Policy::RoundRobin => {
             list.set_load_balancing_policy(LoadBalancingAlgorithms::RoundRobin, None, SEED)
         }
-        Policy::Random => list.load_balancing = Box::new(Random::with_seed(SEED)),
+        Policy::Random => {
+            list.set_load_balancing_policy(LoadBalancingAlgorithms::Random, None, SEED)
+        }
         Policy::LeastLoaded(metric) => {
             list.set_load_balancing_policy(LoadBalancingAlgorithms::LeastLoaded, Some(metric), SEED)
         }
         Policy::PowerOfTwo(metric) => {
-            list.load_balancing = Box::new(PowerOfTwo::with_seed(SEED, metric))
+            list.set_load_balancing_policy(LoadBalancingAlgorithms::PowerOfTwo, Some(metric), SEED)
         }
         Policy::Hrw => list.set_load_balancing_policy(LoadBalancingAlgorithms::Hrw, None, SEED),
         Policy::Maglev => {
