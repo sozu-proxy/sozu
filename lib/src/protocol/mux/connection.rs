@@ -569,6 +569,17 @@ impl<Front: SocketHandler> Connection<Front> {
         }
     }
 
+    /// True while an H2 frontend lingers after a final GOAWAY that carried
+    /// an error code. Its streams get no answer, so `Mux` releases them and
+    /// their backends when the linger starts instead of when it ends
+    /// (`Mux::release_streams_and_backends_for_error_linger`).
+    pub(super) fn lingers_after_error_goaway(&self) -> bool {
+        match self {
+            Connection::H1(_) => false,
+            Connection::H2(c) => c.core.is_lingering() && !c.core.graceful_goaway,
+        }
+    }
+
     /// Whether the client may have sent bytes this connection has not read:
     /// a read is due, or the read stopped on buffer pressure with the rest
     /// still in the kernel. An H1 connection parks with its READABLE event

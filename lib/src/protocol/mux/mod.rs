@@ -2398,6 +2398,50 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             self.router.backends
         );
 
+        self.log_and_recycle_open_streams();
+
+        self.frontend
+            .close(&mut self.context, EndpointClient(&mut self.router));
+
+        // Release every wheel handle: the session is going away and
+        // `TimeoutContainer::drop` cancels each entry. This replaces the
+        // per-backend `timeout_container().cancel()` the loop below used to do
+        // and additionally covers the frontend, which it never did. The
+        // frontend's handle is a field rather than a map entry, so it is
+        // replaced by an unarmed one, which is what a later `reschedule`
+        // would have inserted in its place.
+        self.timeouts.frontend = TimeoutContainer::new_empty(self.timeouts.frontend.duration());
+        self.timeouts.backends.clear();
+
+        self.close_backend_connections(&proxy);
+
+        // The session is going away, so this is the last chance to settle the
+        // ledger against the worker's registry. Everything the frontend close
+        // and the loop above decided is performed here.
+        self.apply_backend_deltas();
+    }
+
+    /// Thin wrapper over `Mux::shutting_down_inner`: it drives frontend I/O
+    /// and can change a core deadline, so it owes the wheel a reschedule on
+    /// every exit.
+    fn shutting_down(&mut self) -> SessionIsToBeClosed {
+        let result = self.shutting_down_inner();
+        self.apply_backend_deltas();
+        self.reschedule();
+        result
+    }
+}
+
+/// The bodies the `SessionState` wrappers above drive. They are inherent
+/// methods rather than trait methods so the wrappers can own the one thing
+/// every exit path needs: the [`Mux::reschedule`] that pushes the cores'
+/// deadlines onto the timer wheel.
+impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHandler> Mux<Front, L> {
+    /// Emit the access log of every stream still open with a request start,
+    /// with the connection overhead shared among them, and recycle it.
+    /// Called by `Mux::close` at teardown and by
+    /// [`Self::release_streams_and_backends_for_error_linger`].
+    fn log_and_recycle_open_streams(&mut self) {
         // Log active streams at session teardown for timeout diagnosis
         let active_count = self
             .context
@@ -2481,20 +2525,13 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 stream.state = StreamState::Recycle;
             }
         }
+    }
 
-        self.frontend
-            .close(&mut self.context, EndpointClient(&mut self.router));
-
-        // Release every wheel handle: the session is going away and
-        // `TimeoutContainer::drop` cancels each entry. This replaces the
-        // per-backend `timeout_container().cancel()` the loop below used to do
-        // and additionally covers the frontend, which it never did. The
-        // frontend's handle is a field rather than a map entry, so it is
-        // replaced by an unarmed one, which is what a later `reschedule`
-        // would have inserted in its place.
-        self.timeouts.frontend = TimeoutContainer::new_empty(self.timeouts.frontend.duration());
-        self.timeouts.backends.clear();
-
+    /// Shut down, deregister from the session slab and account for every
+    /// backend connection (`StreamsEnded`, `ConnectionClosed`, the backend
+    /// gauges), then clear the backend-stream reverse index. The connections
+    /// stay in `router.backends`: at teardown they drop with the `Mux`.
+    fn close_backend_connections(&mut self, proxy: &Rc<RefCell<dyn L7Proxy>>) {
         for (token, client) in &mut self.router.backends {
             let proxy_borrow = proxy.borrow();
             let peer_closed = client.peer_closed();
@@ -2588,29 +2625,70 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         // Clear the reverse index after all backends have charged their
         // `StreamsEnded` deltas (whose counts come from that index).
         self.context.backend_streams.clear();
-
-        // The session is going away, so this is the last chance to settle the
-        // ledger against the worker's registry. Everything the frontend close
-        // and the loop above decided is performed here.
-        self.apply_backend_deltas();
     }
 
-    /// Thin wrapper over `Mux::shutting_down_inner`: it drives frontend I/O
-    /// and can change a core deadline, so it owes the wheel a reschedule on
-    /// every exit.
-    fn shutting_down(&mut self) -> SessionIsToBeClosed {
-        let result = self.shutting_down_inner();
-        self.apply_backend_deltas();
-        self.reschedule();
-        result
+    /// Release the streams and backends of an H2 frontend that lingers after
+    /// a final GOAWAY carrying an error code, at the linger's start rather
+    /// than its end, the order `ngx_http_v2_finalize_connection` follows.
+    ///
+    /// Such a GOAWAY can leave streams open (a flood, a protocol or flow
+    /// control error, a SETTINGS timeout), unlike a final GOAWAY(NO_ERROR),
+    /// which waits for the stream table to empty. None of them will be
+    /// answered, so their access logs are emitted now with the same outcome
+    /// the immediate close gave them before (`session close`), the slots
+    /// recycled, and the backend connections shut down, accounted for and
+    /// dropped, closing their sockets. With every stream recycled, nothing
+    /// can be re-linked: the `pending_links` pass of `Mux::ready_inner`
+    /// skips any stream not in `StreamState::Link`, and no backend is left
+    /// to report a failure that would queue one. The recycled slots keep
+    /// their buffers until the `Mux` drops, at the latest when the linger's
+    /// short deadline (`shared::ERROR_GOAWAY_LINGER_TIMEOUT`) closes it.
+    ///
+    /// Idempotent: a second call finds nothing open and no backend. A
+    /// graceful linger is left alone: its stream table is already empty.
+    fn release_streams_and_backends_for_error_linger(&mut self, proxy: &Rc<RefCell<dyn L7Proxy>>) {
+        if !self.frontend.lingers_after_error_goaway() {
+            return;
+        }
+        let has_open_stream = self
+            .context
+            .streams
+            .iter()
+            .any(|s| s.state.is_open() && s.metrics.start.is_some());
+        if !has_open_stream && self.router.backends.is_empty() {
+            return;
+        }
+        debug!(
+            "{} H2 error GOAWAY linger: releasing {} backend connection(s) and the open streams",
+            log_context!(self),
+            self.router.backends.len()
+        );
+        self.log_and_recycle_open_streams();
+        self.close_backend_connections(proxy);
+        let tokens: Vec<Token> = (&self.router.backends)
+            .into_iter()
+            .map(|(token, _)| *token)
+            .collect();
+        for token in tokens {
+            // Dropping the connection closes its socket, which leaves the
+            // epoll set with its last close (see `Mux::close`).
+            drop(self.router.backends.remove(&token));
+        }
+        self.timeouts.backends.clear();
+        debug_assert!(
+            self.router.backends.is_empty() && self.context.backend_streams.is_empty(),
+            "an error-GOAWAY linger holds no backend connection"
+        );
+        debug_assert!(
+            !self
+                .context
+                .streams
+                .iter()
+                .any(|s| matches!(s.state, StreamState::Link | StreamState::Linked(_))),
+            "an error-GOAWAY linger keeps no stream that could reach a backend"
+        );
     }
-}
 
-/// The bodies the `SessionState` wrappers above drive. They are inherent
-/// methods rather than trait methods so the wrappers can own the one thing
-/// every exit path needs: the [`Mux::reschedule`] that pushes the cores'
-/// deadlines onto the timer wheel.
-impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHandler> Mux<Front, L> {
     /// Fulfil a [`router::ConnectPlan::Dial`]: select a backend, dial it,
     /// build the connection, register it, and hand it to
     /// `Router::commit_dialed`.
@@ -2910,6 +2988,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         _metrics: &mut SessionMetrics,
     ) -> SessionResult {
         let mut counter = 0;
+
+        // A linger started outside this function (a timeout, a soft stop)
+        // releases at the next pass; see the call after the frontend write.
+        self.release_streams_and_backends_for_error_linger(&proxy);
 
         if self.frontend.is_lingering() && self.frontend.readiness().event.is_hup() {
             // A lingering frontend reads to the client's EOF before it closes:
@@ -3444,6 +3526,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             return SessionResult::Upgrade;
                         }
                     }
+                    // The pass that starts an error-GOAWAY linger releases its
+                    // streams and backends before anything below can touch
+                    // them, `pending_links` included.
+                    self.release_streams_and_backends_for_error_linger(&proxy);
                     // Cross-readiness: the frontend write can hand work back to
                     // a backend — a parked one resumes once its peer drained
                     // buffer space, and forwarding an interim 1xx re-arms the
@@ -4830,6 +4916,274 @@ mod tests {
             matches!(after_client_close, MuxResult::CloseSession),
             "the client's EOF ends the drain, got {after_client_close:?}"
         );
+    }
+
+    /// Start the lingering close of an H2 frontend that queued its final
+    /// GOAWAY through `ConnectionH2::goaway` — `NO_ERROR` when `graceful`,
+    /// `ENHANCE_YOUR_CALM` (a flood) otherwise — with
+    /// a 10 s `request_timeout`; then have its client send `sent` bytes
+    /// without closing, move the drain's clock `elapsed` past the linger's
+    /// start, and drive the drain until it closes or 200 passes go by. Answers the linger the close started with, the instants that
+    /// bracket it, and whether the drain closed.
+    fn h2_linger_after_goaway(
+        graceful: bool,
+        sent: usize,
+        elapsed: Duration,
+    ) -> (shared::Linger, Instant, Instant, bool) {
+        use std::io::Write;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (socket, peer) = connected_socket();
+        let mut h2 = h2::H2Shell::new(
+            Ulid::generate(),
+            socket,
+            Position::Server,
+            &mut PoolBufferSource::new(Rc::downgrade(&pool)),
+            H2FloodConfig::default(),
+            H2ConnectionConfig::default(),
+            Duration::from_secs(30),
+            None,
+            Duration::from_secs(10),
+            None,
+            Ready::WRITABLE | Ready::HUP | Ready::ERROR,
+        )
+        .expect("a pool with free buffers must yield an H2 connection");
+        // The real entry point: `goaway` queues the final GOAWAY, records
+        // its error code and asks for the write that flushes it.
+        let queued = h2.core.goaway(if graceful {
+            H2Error::NoError
+        } else {
+            H2Error::EnhanceYourCalm
+        });
+        assert!(
+            matches!(queued, MuxResult::Continue),
+            "the GOAWAY is queued"
+        );
+
+        let mut frontend = Connection::H2(h2);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        let before = Instant::now();
+        context.now = before;
+        let result = frontend.writable(&mut context, EndpointClient(&mut router));
+        let after = Instant::now();
+        assert!(
+            frontend.is_lingering() && matches!(result, MuxResult::Continue),
+            "premise: the frontend lingers after its final GOAWAY, got {result:?}"
+        );
+        let Connection::H2(h2) = &frontend else {
+            unreachable!("built as H2")
+        };
+        let linger = h2.core.linger;
+
+        // The client keeps sending and never closes; it is kept open until
+        // the drain has decided.
+        peer.set_nonblocking(false)
+            .expect("the client writes blocking");
+        let mut writer = peer.try_clone().expect("the client socket clones");
+        let sender = std::thread::spawn(move || {
+            let _ = writer.write_all(&vec![0u8; sent]);
+        });
+        context.now = after + elapsed;
+        let mut closed = false;
+        for _ in 0..200 {
+            frontend.readiness_mut().event.insert(Ready::READABLE);
+            if matches!(
+                frontend.readable(&mut context, EndpointClient(&mut router)),
+                MuxResult::CloseSession
+            ) {
+                closed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(frontend);
+        let _ = sender.join();
+        drop(peer);
+        (linger, before, after, closed)
+    }
+
+    /// The lingering close after a GOAWAY carrying an error code exists only
+    /// to deliver that GOAWAY (sozu-proxy/sozu#1861): its deadline is
+    /// `shared::ERROR_GOAWAY_LINGER_TIMEOUT` from its start and its byte
+    /// budget `shared::ERROR_GOAWAY_LINGER_MAX_BYTES`, so a client that keeps
+    /// sending is cut off once that much is read. A graceful GOAWAY keeps the
+    /// listener's `request_timeout` and `shared::LINGER_MAX_BYTES`, and the
+    /// same traffic does not close it. With no traffic at all, the short
+    /// deadline closes the error linger and leaves the graceful one open.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::linger_budget` (`h2.rs`), return
+    /// the graceful pair for every GOAWAY.
+    #[test]
+    fn an_error_goaway_lingers_under_the_short_budget_and_a_graceful_one_keeps_its_own() {
+        let sent = shared::ERROR_GOAWAY_LINGER_MAX_BYTES + 64 * 1024;
+
+        let (linger, before, after, closed) = h2_linger_after_goaway(false, sent, Duration::ZERO);
+        let shared::Linger::Draining {
+            deadline,
+            remaining,
+        } = linger
+        else {
+            panic!("an error GOAWAY drains at once on a plain socket, got {linger:?}");
+        };
+        assert_eq!(remaining, shared::ERROR_GOAWAY_LINGER_MAX_BYTES);
+        assert!(
+            deadline >= before + shared::ERROR_GOAWAY_LINGER_TIMEOUT
+                && deadline <= after + shared::ERROR_GOAWAY_LINGER_TIMEOUT,
+            "the error linger's deadline is the short one, {:?} past its start",
+            deadline.saturating_duration_since(before)
+        );
+        assert!(
+            closed,
+            "the byte budget ends the error linger while the client still sends"
+        );
+
+        let (linger, before, after, closed) = h2_linger_after_goaway(true, sent, Duration::ZERO);
+        let shared::Linger::Draining {
+            deadline,
+            remaining,
+        } = linger
+        else {
+            panic!("a graceful GOAWAY drains at once on a plain socket, got {linger:?}");
+        };
+        assert_eq!(remaining, shared::LINGER_MAX_BYTES);
+        assert!(
+            deadline >= before + Duration::from_secs(10)
+                && deadline <= after + Duration::from_secs(10),
+            "the graceful linger keeps request_timeout, {:?} past its start",
+            deadline.saturating_duration_since(before)
+        );
+        assert!(
+            !closed,
+            "a graceful linger keeps draining a client that is still sending"
+        );
+
+        let (.., closed) = h2_linger_after_goaway(false, 0, shared::ERROR_GOAWAY_LINGER_TIMEOUT);
+        assert!(closed, "the short deadline ends a silent error linger");
+        let (.., closed) = h2_linger_after_goaway(true, 0, shared::ERROR_GOAWAY_LINGER_TIMEOUT);
+        assert!(!closed, "the short deadline does not end a graceful linger");
+    }
+
+    /// Run one `Mux::ready` pass over an H2 frontend that queued its final
+    /// GOAWAY (`NO_ERROR` when `graceful`, `ENHANCE_YOUR_CALM` otherwise)
+    /// while one stream is still linked to a backend. Answers the `Mux`
+    /// after the pass and the backend's peer socket.
+    fn mux_after_final_goaway_with_a_linked_stream(
+        pool: &Rc<RefCell<Pool>>,
+        graceful: bool,
+    ) -> (
+        Mux<mio::net::TcpStream, test_support::TestListener>,
+        std::net::TcpStream,
+        std::net::TcpStream,
+    ) {
+        let (socket, front_peer) = connected_socket();
+        let mut h2 = h2::H2Shell::new(
+            Ulid::generate(),
+            socket,
+            Position::Server,
+            &mut PoolBufferSource::new(Rc::downgrade(pool)),
+            H2FloodConfig::default(),
+            H2ConnectionConfig::default(),
+            Duration::from_secs(30),
+            None,
+            Duration::from_secs(10),
+            None,
+            Ready::WRITABLE | Ready::HUP | Ready::ERROR,
+        )
+        .expect("a pool with free buffers must yield an H2 connection");
+        let queued = h2.core.goaway(if graceful {
+            H2Error::NoError
+        } else {
+            H2Error::EnhanceYourCalm
+        });
+        assert!(
+            matches!(queued, MuxResult::Continue),
+            "the GOAWAY is queued"
+        );
+
+        let mut context = test_context(pool);
+        context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("test context must create a stream");
+        let mut mux = Mux {
+            configured_frontend_timeout: Duration::from_secs(10),
+            frontend_token: Token(0),
+            frontend: Connection::H2(h2),
+            router: Router::new(Duration::from_secs(30), Duration::from_secs(30)),
+            context,
+            session_ulid: Ulid::generate(),
+            timeouts: MuxTimeouts::new(TimeoutContainer::new_empty(Duration::from_secs(10))),
+            backend_registry: BackendRegistry::default(),
+            backends: Rc::default(),
+        };
+        let (backend, back_peer) = test_backend_connection(&mut mux, Duration::from_secs(30));
+        mux.router.backends.insert(Token(1), backend);
+        mux.context.link_stream(0, Token(1));
+        mux.timeouts.backends.get_or_insert_with(Token(1), || {
+            TimeoutContainer::new_empty(Duration::from_secs(30))
+        });
+
+        let session: Rc<RefCell<dyn ProxySession>> = Rc::new(RefCell::new(NoDialSession));
+        let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(RemoveOnlyProxy));
+        let mut metrics = SessionMetrics::new(None);
+        let result = mux.ready(session, proxy, &mut metrics);
+        assert!(
+            matches!(result, SessionResult::Continue) && mux.frontend.is_lingering(),
+            "premise: the pass that flushes the final GOAWAY starts the linger, got {result:?}"
+        );
+        (mux, front_peer, back_peer)
+    }
+
+    /// A final GOAWAY carrying an error code can leave streams open, and none
+    /// of them will be answered: the pass that starts its linger logs and
+    /// recycles them and shuts down, accounts for and drops their backend
+    /// connections, instead of holding them until the linger ends. A graceful
+    /// linger is left as it was.
+    ///
+    /// TO SEE THIS RED: remove both calls to
+    /// `Mux::release_streams_and_backends_for_error_linger` from
+    /// `Mux::ready_inner`.
+    #[test]
+    fn an_error_goaway_linger_releases_its_streams_and_backends_when_it_starts() {
+        use std::io::Read;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mux, _front_peer, mut back_peer) =
+            mux_after_final_goaway_with_a_linked_stream(&pool, false);
+        assert!(
+            mux.router.backends.is_empty(),
+            "the backend connection is released when the error linger starts"
+        );
+        assert!(
+            mux.context.backend_streams.is_empty() && mux.timeouts.backends.is_empty(),
+            "no reverse-index entry or backend timer survives the release"
+        );
+        assert_eq!(
+            mux.context.streams[0].state,
+            StreamState::Recycle,
+            "the stream that will get no answer is logged and recycled"
+        );
+        back_peer
+            .set_nonblocking(false)
+            .expect("the backend peer reads blocking");
+        back_peer
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("the backend peer read is bounded");
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            back_peer.read(&mut buf).ok(),
+            Some(0),
+            "the backend socket is closed: its peer reads EOF"
+        );
+
+        let (mux, _front_peer, _back_peer) =
+            mux_after_final_goaway_with_a_linked_stream(&pool, true);
+        assert_eq!(
+            mux.router.backends.len(),
+            1,
+            "a graceful linger keeps its backend, as before"
+        );
+        assert_eq!(mux.context.streams[0].state, StreamState::Linked(Token(1)));
     }
 
     /// A soft stop must still close a lingering H2 session once the H2

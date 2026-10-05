@@ -1531,22 +1531,52 @@ Two GOAWAY frames in `ConnectionH2::graceful_goaway` (`h2.rs`):
 `peer_gone_after_final_goaway` (`h2.rs`) guards against deadlock on a
 peer-side HUP after the final GOAWAY.
 
-**The close after a final GOAWAY(NO_ERROR) lingers.** The client may still be
+**The close after a final GOAWAY lingers.** The client may still be
 sending frames it wrote before it read the GOAWAY (RFC 9113 §6.8 lets it), and
 reading stops at the GOAWAY; a close with those frames unread, or followed by
 more, makes the kernel reset the connection and discard response bytes still
-queued in the socket. So when a `writable` pass that began in `H2State::GoAway`
-after a `NO_ERROR` GOAWAY (`ConnectionH2::graceful_goaway` set by
-`goaway_with_last_stream_id`) decides `CloseSession`, and the client has not
+queued in the socket, the GOAWAY itself included. So when a `writable` pass
+that began in `H2State::GoAway` decides `CloseSession`, and the client has not
 hung up, `H2Shell::linger_instead_of_closing` stages the close the way §8.4
 does for H1, through the same `Linger` state and `shared::drain_discard`:
 `close_notify` first — when it is still pending the linger is
 `Linger::Pending` and the next pass, whose state is `Error` by then, resumes
 it — then `shutdown_write`, then the raw socket is read and dropped until the
-client's EOF, `LINGER_MAX_BYTES`, or the listener's `request_timeout`.
-`ConnectionH2::arm_timeout` and `set_timeout_duration` leave that deadline in
-place. A GOAWAY carrying an error (a protocol violation, a flood) does not
-linger: sozu does not keep reading from that peer. The lingering `readable`
+client's EOF, the byte budget, or the deadline that `ConnectionH2::linger_budget`
+picks from the GOAWAY's error code (`ConnectionH2::graceful_goaway`, set by
+`goaway_with_last_stream_id`). After `NO_ERROR` they are `LINGER_MAX_BYTES`
+and the listener's `request_timeout`. After an error code (a protocol
+violation, a flood) the linger only has to deliver the GOAWAY, so it is
+short: `shared::ERROR_GOAWAY_LINGER_MAX_BYTES` (256 KiB) and
+`shared::ERROR_GOAWAY_LINGER_TIMEOUT` (1 s, or `request_timeout` when that is
+shorter). Before sozu-proxy/sozu#1861 such a connection closed at once, and
+the reset that close drew discarded the GOAWAY: a client flooding refused
+streams read a prefix of its RST_STREAM frames, then `ECONNRESET`, never the
+GOAWAY(ENHANCE_YOUR_CALM). One second is a few round trips even on a ~300 ms
+path, all the drain needs once the GOAWAY and `close_notify` are in the
+kernel; 256 KiB is Linux's default initial receive buffer
+(`net.ipv4.tcp_rmem[1]`, 128 KiB — sozu sets no `SO_RCVBUF`, and autotuning
+stops growing it once reading stops at the GOAWAY) plus as much again in
+flight. An error GOAWAY can leave streams open, unlike a final
+GOAWAY(NO_ERROR), which waits for the stream table to empty, and none of them
+will be answered. So the pass that starts such a linger first releases them,
+the order `ngx_http_v2_finalize_connection` follows:
+`Mux::release_streams_and_backends_for_error_linger` emits their access logs
+with the outcome the immediate close gave them (`session close`), recycles
+them, and shuts down, accounts for and drops every backend connection, through
+the same `Mux::log_and_recycle_open_streams` and
+`Mux::close_backend_connections` that `Mux::close` runs. It is called in
+`Mux::ready_inner` after the frontend write, before the `pending_links` pass,
+which skips every recycled stream, so nothing is re-linked; and again at the
+top of `Mux::ready_inner`, for a linger started by a timeout or a soft stop,
+neither of which holds the proxy. Recycled slots keep their buffers until the
+session drops, at the latest at the short deadline. With that, lingering after
+an error costs a session slot, two stream buffers per recycled slot and a
+socket for at most 1 s and 256 KiB of reads. Pinned by
+`an_error_goaway_lingers_under_the_short_budget_and_a_graceful_one_keeps_its_own`
+and `an_error_goaway_linger_releases_its_streams_and_backends_when_it_starts`
+(`mod.rs`). `ConnectionH2::arm_timeout` and `set_timeout_duration` leave the
+deadline in place, so bytes the client sends never extend it. The lingering `readable`
 and `writable` passes adopt the pass's clock (`ConnectionH2::adopt_now`)
 before they return, so the bounds are: the linger deadline,
 `request_timeout` from the linger's start, which `Mux::timeout_inner`

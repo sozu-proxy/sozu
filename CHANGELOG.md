@@ -4890,6 +4890,35 @@
   of an interim response on an unlinked stream is now `H1::Interim` (was `H1::EarlyHint`). Covered
   by `test_h1_interim_102_before_final` and `test_h1_interim_150_before_final`
   (`e2e/src/tests/tests.rs`), which also send a second exchange on the same connections.
+- **`fix(h2)`: a final GOAWAY carrying an error code gets a short lingering close, so it reaches
+  the client ([#1861](https://github.com/sozu-proxy/sozu/issues/1861)).** The lingering close of
+  [#1764](https://github.com/sozu-proxy/sozu/issues/1764) applied only to a final
+  GOAWAY(NO_ERROR). A connection ended by a protocol error or a flood flushed its GOAWAY and
+  closed at once, with the rest of what the client had already sent unread in the kernel receive
+  queue. Linux answers that close with a reset and drops the bytes still queued in sozu's socket,
+  the GOAWAY included: a client that opened 2300 streams past `SETTINGS_MAX_CONCURRENT_STREAMS`
+  read a variable prefix of its RST_STREAM(REFUSED_STREAM) frames, then `ECONNRESET`, and never
+  the GOAWAY(ENHANCE_YOUR_CALM) the glitch budget had decided. Such a close now lingers too, but
+  only long enough to deliver the GOAWAY (`ConnectionH2::linger_budget`,
+  `lib/src/protocol/mux/h2.rs`): what the client still sends is read from the raw socket and
+  dropped, never parsed, until its EOF, 256 KiB (`ERROR_GOAWAY_LINGER_MAX_BYTES`), or 1 s
+  (`ERROR_GOAWAY_LINGER_TIMEOUT`, never longer than `request_timeout`), both in
+  `lib/src/protocol/mux/shared.rs`. The deadline is fixed when the linger starts; incoming bytes
+  do not extend it. One second is a few round trips even on a ~300 ms path, all the drain needs
+  once the GOAWAY and `close_notify` are in the kernel. 256 KiB is Linux's default initial receive
+  buffer (`net.ipv4.tcp_rmem[1]`, 128 KiB: sozu sets no `SO_RCVBUF`, and autotuning stops growing
+  it once reading stops at the GOAWAY) plus as much again in flight. An error GOAWAY can leave
+  streams open, none of which will be answered: the pass that starts its linger first emits
+  their access logs (`session close`, as the immediate close did), recycles them, and shuts down
+  and drops their backend connections (`Mux::release_streams_and_backends_for_error_linger`,
+  `lib/src/protocol/mux/mod.rs`), so nothing is held or re-linked while it drains. A
+  GOAWAY(NO_ERROR) keeps its 4 MiB / `request_timeout` linger unchanged. No configuration key is added. Documented in
+  `lib/src/protocol/mux/LIFECYCLE.md` §8.1, `doc/h2_mux_internals.md` and `doc/configure.md`.
+  Covered by the unit tests
+  `an_error_goaway_lingers_under_the_short_budget_and_a_graceful_one_keeps_its_own` and
+  `an_error_goaway_linger_releases_its_streams_and_backends_when_it_starts`, and by
+  `test_h2_outbound_flood_from_rst_stream` (`e2e/src/tests/h2_tests.rs`), which failed in release
+  builds.
 - **`fix(h2)`: linger before closing after the final GOAWAY
   ([#1764](https://github.com/sozu-proxy/sozu/issues/1764)).** Once an H2 frontend had flushed its
   final GOAWAY, it stopped reading and closed the session at once. The client may still be
@@ -4905,7 +4934,9 @@
   - What the client still sends is read from the raw socket and dropped until its EOF, 4 MiB,
     or the listener's `request_timeout`.
   - `ConnectionH2::arm_timeout` and `set_timeout_duration` leave that deadline in place.
-  - A GOAWAY carrying an error code does not linger.
+  - A GOAWAY carrying an error code did not linger. Since
+    [#1861](https://github.com/sozu-proxy/sozu/issues/1861) it gets a short linger (1 s, 256 KiB)
+    that only delivers the GOAWAY.
   - The linger is bounded by `request_timeout` from its start. During a soft stop, the H2
     graceful-shutdown budget also closes it when that budget is armed and elapses first: the
     lingering passes keep the connection's clock fresh. A drain the client's own GOAWAY started
