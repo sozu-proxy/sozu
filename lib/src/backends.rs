@@ -1121,7 +1121,13 @@ impl crate::protocol::udp::BackendSource for BackendMap {
 
 #[derive(Debug)]
 pub struct BackendList {
-    pub backends: Vec<Rc<RefCell<Backend>>>,
+    /// The cluster's backends, in registration order. Crate-private: the
+    /// sibling state (`sibling_ring`, `shard_representative`,
+    /// `shares_address`) and the policy table are derived from it and
+    /// refreshed only by [`Self::add_backend`] and [`Self::remove_backend`],
+    /// so a direct push or removal would leave them stale. Read it through
+    /// [`Self::backends`].
+    pub(crate) backends: Vec<Rc<RefCell<Backend>>>,
     pub next_id: u32,
     /// The cluster's selection policy. Crate-private: a Maglev policy keeps
     /// a lookup table built from `backends`, and only
@@ -1231,6 +1237,38 @@ impl BackendList {
             shard_addresses: 0,
             collapsed: Vec::new(),
         }
+    }
+
+    /// The cluster's backends, in registration order.
+    ///
+    /// Read-only: the list is mutated only through [`Self::add_backend`] and
+    /// [`Self::remove_backend`], which refresh the sibling state and the
+    /// policy table derived from it. Code outside this crate cannot reach
+    /// the field itself:
+    ///
+    /// ```
+    /// use std::{cell::RefCell, rc::Rc};
+    ///
+    /// use sozu_lib::backends::{Backend, BackendList};
+    ///
+    /// let mut list = BackendList::with_seed(1);
+    /// let backend = Backend::new("b1", "127.0.0.1:8080".parse().unwrap(), None, None, None);
+    /// list.add_backend(backend);
+    /// let backends: &[Rc<RefCell<Backend>>] = list.backends();
+    /// assert_eq!(backends.len(), 1);
+    /// ```
+    ///
+    /// ```compile_fail,E0616
+    /// use std::{cell::RefCell, rc::Rc};
+    ///
+    /// use sozu_lib::backends::{Backend, BackendList};
+    ///
+    /// let mut list = BackendList::with_seed(1);
+    /// let backend = Backend::new("b1", "127.0.0.1:8080".parse().unwrap(), None, None, None);
+    /// list.backends.push(Rc::new(RefCell::new(backend)));
+    /// ```
+    pub fn backends(&self) -> &[Rc<RefCell<Backend>>] {
+        &self.backends
     }
 
     /// Count `(available, total)` for this cluster. Delegates to

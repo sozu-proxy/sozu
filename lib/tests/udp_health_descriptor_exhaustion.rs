@@ -138,7 +138,7 @@ fn a_timed_out_probe_is_recorded_even_when_no_descriptor_is_free() {
             .backends
             .get(CLUSTER)
             .expect("the cluster's backend list")
-            .backends[0]
+            .backends()[0]
             .borrow()
             .health
             .consecutive_failures
