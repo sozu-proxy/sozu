@@ -1875,9 +1875,12 @@ H2 stream state, GOAWAY sequencing, and rustls buffering interact:
   dropped until its EOF, 4 MiB, or `request_timeout` after a GOAWAY(NO_ERROR),
   and until its EOF, 256 KiB, or 1 s (never more than `request_timeout`)
   after a GOAWAY carrying an error code, which the linger only has to
-  deliver (`ConnectionH2::linger_budget`). Such a linger first releases the
-  streams the error left open and their backend connections
-  (`Mux::release_streams_and_backends_for_error_linger`). Closing with those
+  deliver (`ConnectionH2::linger_budget`). The pass that decides such a
+  linger, still pending on `close_notify` or already draining
+  (`Connection::lingers_after_error_goaway`), first releases the streams the
+  error left open and their backend connections
+  (`Mux::release_streams_and_backends_for_error_linger`), before the
+  `pending_links` pass can dial for one of them. Closing with those
   frames unread
   made Linux reset the connection and discard the bytes the client had not
   read yet, the GOAWAY included (sozu-proxy/sozu#1861). See `LIFECYCLE.md`

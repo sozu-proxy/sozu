@@ -1559,8 +1559,16 @@ kernel; 256 KiB is Linux's default initial receive buffer
 stops growing it once reading stops at the GOAWAY) plus as much again in
 flight. An error GOAWAY can leave streams open, unlike a final
 GOAWAY(NO_ERROR), which waits for the stream table to empty, and none of them
-will be answered. So the pass that starts such a linger first releases them,
-the order `ngx_http_v2_finalize_connection` follows:
+will be answered. So the pass that decides such a linger first releases
+them, the order `ngx_http_v2_finalize_connection` follows. Decided means
+`Linger::Pending` or `Linger::Draining` after a GOAWAY that is not graceful
+(`Connection::lingers_after_error_goaway`), not draining alone: on TLS, a
+GOAWAY that leaves streams open goes out without `close_notify`
+(`ConnectionH2::output_flush_closes_connection` wants an empty stream table),
+so the deciding pass queues the alert and leaves the linger pending, and when
+the kernel refuses the alert's record nothing re-arms the write and that pass
+reaches `pending_links` with the linger still pending; a gate on draining
+alone let that pass dial a backend for a stream the next pass then closed.
 `Mux::release_streams_and_backends_for_error_linger` emits their access logs
 with the outcome the immediate close gave them (`session close`), recycles
 them, and shuts down, accounts for and drops every backend connection, through
@@ -1573,8 +1581,9 @@ neither of which holds the proxy. Recycled slots keep their buffers until the
 session drops, at the latest at the short deadline. With that, lingering after
 an error costs a session slot, two stream buffers per recycled slot and a
 socket for at most 1 s and 256 KiB of reads. Pinned by
-`an_error_goaway_lingers_under_the_short_budget_and_a_graceful_one_keeps_its_own`
-and `an_error_goaway_linger_releases_its_streams_and_backends_when_it_starts`
+`an_error_goaway_lingers_under_the_short_budget_and_a_graceful_one_keeps_its_own`,
+`an_error_goaway_linger_releases_its_streams_and_backends_when_it_starts`
+and `an_error_goaway_linger_pending_on_close_notify_releases_before_pending_links`
 (`mod.rs`). `ConnectionH2::arm_timeout` and `set_timeout_duration` leave the
 deadline in place, so bytes the client sends never extend it. The lingering `readable`
 and `writable` passes adopt the pass's clock (`ConnectionH2::adopt_now`)

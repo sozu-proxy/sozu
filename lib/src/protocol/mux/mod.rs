@@ -2628,8 +2628,13 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     }
 
     /// Release the streams and backends of an H2 frontend that lingers after
-    /// a final GOAWAY carrying an error code, at the linger's start rather
-    /// than its end, the order `ngx_http_v2_finalize_connection` follows.
+    /// a final GOAWAY carrying an error code, in the pass that decides the
+    /// linger rather than at its end, the order
+    /// `ngx_http_v2_finalize_connection` follows. A linger still pending on
+    /// its TLS `close_notify` counts as decided
+    /// (`Connection::lingers_after_error_goaway`): the pass that queues the
+    /// alert can end with the kernel refusing it and nothing re-armed, and
+    /// then reach the `pending_links` pass with its streams still open.
     ///
     /// Such a GOAWAY can leave streams open (a flood, a protocol or flow
     /// control error, a SETTINGS timeout), unlike a final GOAWAY(NO_ERROR),
@@ -2989,7 +2994,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     ) -> SessionResult {
         let mut counter = 0;
 
-        // A linger started outside this function (a timeout, a soft stop)
+        // A linger decided outside this function (a timeout, a soft stop)
         // releases at the next pass; see the call after the frontend write.
         self.release_streams_and_backends_for_error_linger(&proxy);
 
@@ -3526,7 +3531,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             return SessionResult::Upgrade;
                         }
                     }
-                    // The pass that starts an error-GOAWAY linger releases its
+                    // The pass that decides an error-GOAWAY linger, pending
+                    // on `close_notify` or already draining, releases its
                     // streams and backends before anything below can touch
                     // them, `pending_links` included.
                     self.release_streams_and_backends_for_error_linger(&proxy);
@@ -5184,6 +5190,102 @@ mod tests {
             "a graceful linger keeps its backend, as before"
         );
         assert_eq!(mux.context.streams[0].state, StreamState::Linked(Token(1)));
+    }
+
+    /// A TLS frontend whose final GOAWAY carries an error code and leaves a
+    /// stream open sends that GOAWAY without `close_notify` behind it
+    /// (`ConnectionH2::output_flush_closes_connection` wants an empty stream
+    /// table). The close its next writable pass decides queues the alert and
+    /// turns into a pending linger (`H2Shell::linger_instead_of_closing`);
+    /// when the kernel then refuses the alert's record, nothing re-arms the
+    /// write and `Mux::ready_inner`'s loop ends with the linger still
+    /// pending. The release must already have run by then: a stream queued
+    /// in `pending_links` by the same pass is never routed nor dialed.
+    ///
+    /// TO SEE THIS RED: gate `Connection::lingers_after_error_goaway` on
+    /// `is_lingering()` alone, as before. The `pending_links` pass then
+    /// reaches the routing view for the stream and panics in
+    /// `RemoveOnlyProxy::sessions` ("closing a backend only removes its
+    /// session").
+    #[test]
+    fn an_error_goaway_linger_pending_on_close_notify_releases_before_pending_links() {
+        use std::io::Write;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut h2, _peer, _client) = h2::tests::rustls_h2_connection(&pool, H2State::Header);
+        let mut context = test_context(&pool);
+        let stream_id = context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("test context must create a stream");
+        // A request the same read pass parsed whole and queued for a backend.
+        context.streams[stream_id].state = StreamState::Link;
+        context.pending_links.push_back(stream_id);
+        h2.core.__test_insert_wire_mapping_only(1, stream_id);
+
+        assert!(
+            matches!(
+                h2.core.goaway(H2Error::EnhanceYourCalm),
+                MuxResult::Continue
+            ),
+            "the GOAWAY is queued"
+        );
+        h2.flush_output_buffer();
+        assert!(
+            h2.core.output_pending().is_empty() && !h2.socket.socket_wants_write(),
+            "premise: the GOAWAY reached the kernel, with no close_notify behind it"
+        );
+        // The client stops reading: fill the frontend's send queue so the
+        // kernel refuses the close_notify record.
+        let junk = [0u8; 4096];
+        let mut filled = false;
+        for _ in 0..4096 {
+            match h2.socket.stream.write(&junk) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    filled = true;
+                    break;
+                }
+                Err(e) => panic!("filling the frontend send queue failed: {e:?}"),
+            }
+        }
+        assert!(filled, "premise: the frontend send queue is full");
+        h2.core.readiness.event.insert(Ready::WRITABLE);
+
+        let mut mux = Mux {
+            configured_frontend_timeout: Duration::from_secs(10),
+            frontend_token: Token(0),
+            frontend: Connection::H2(h2),
+            router: Router::new(Duration::from_secs(30), Duration::from_secs(30)),
+            context,
+            session_ulid: Ulid::generate(),
+            timeouts: MuxTimeouts::new(TimeoutContainer::new_empty(Duration::from_secs(10))),
+            backend_registry: BackendRegistry::default(),
+            backends: Rc::default(),
+        };
+        let session: Rc<RefCell<dyn ProxySession>> = Rc::new(RefCell::new(NoDialSession));
+        let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(RemoveOnlyProxy));
+        let mut metrics = SessionMetrics::new(None);
+        let result = mux.ready(session, proxy, &mut metrics);
+
+        let Connection::H2(h2) = &mux.frontend else {
+            unreachable!("the frontend was built as H2")
+        };
+        assert!(
+            matches!(result, SessionResult::Continue)
+                && matches!(h2.core.linger, shared::Linger::Pending { .. }),
+            "premise: the pass ends with the linger pending on close_notify, got \
+             {result:?} with {:?}",
+            h2.core.linger
+        );
+        assert_eq!(
+            mux.context.streams[stream_id].state,
+            StreamState::Recycle,
+            "the stream that will get no answer is released, not linked"
+        );
+        assert!(
+            mux.context.pending_links.is_empty() && mux.router.backends.is_empty(),
+            "nothing is left to link and no backend was dialed"
+        );
     }
 
     /// A soft stop must still close a lingering H2 session once the H2
