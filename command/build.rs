@@ -88,6 +88,11 @@ pub fn main() {
             "#[serde(default)]",
         )
         .field_attribute("HttpsListenerConfig.client_ca_crls", "#[serde(default)]")
+        .field_attribute(
+            "ClientAuthPolicy.client_ca_certificates",
+            "#[serde(default)]",
+        )
+        .field_attribute("ClientAuthPolicy.client_ca_crls", "#[serde(default)]")
         .skip_debug([
             "CertificateAndKey",
             "CertificateSummary",
@@ -107,6 +112,7 @@ pub fn main() {
             "ResponseContent",
             "UpdateHttpListenerConfig",
             "UpdateHttpsListenerConfig",
+            "ClientAuthPolicy",
             "WorkerRequest",
             "WorkerResponse",
             "WorkerResponses",

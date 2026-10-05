@@ -572,6 +572,7 @@ fn is_mutating_verb(req: &RequestType) -> bool {
             | RequestType::ReplaceCertificate(_)
             | RequestType::UpdateHttpListener(_)
             | RequestType::UpdateHttpsListener(_)
+            | RequestType::UpdateHttpsListenerWithClientAuth(_)
             | RequestType::UpdateTcpListener(_)
             | RequestType::UpdateUdpListener(_)
             | RequestType::SetHealthCheck(_)
@@ -730,6 +731,7 @@ impl Server {
             | RequestType::ReplaceCertificate(_)
             | RequestType::UpdateHttpListener(_)
             | RequestType::UpdateHttpsListener(_)
+            | RequestType::UpdateHttpsListenerWithClientAuth(_)
             | RequestType::UpdateTcpListener(_)
             | RequestType::UpdateUdpListener(_)
             | RequestType::SetHealthCheck(_)
@@ -1353,7 +1355,23 @@ pub fn load_static_config(server: &mut Server, mut client: OptionalClient, path:
     );
 
     for (request_index, message) in config_messages.into_iter().enumerate() {
-        let request = message.content;
+        let mut request = message.content;
+        // A listener the state already holds is refused below as existing,
+        // which leaves every other change to it unapplied. Its client
+        // authentication policy is the exception: a CRL or CA bundle must be
+        // refreshable by a reload, so it goes out as a patch instead.
+        if let Some(
+            RequestType::AddHttpsListener(listener)
+            | RequestType::AddHttpsListenerWithClientAuth(listener),
+        ) = &request.request_type
+            && let Some(patch) = server.state.client_auth_refresh(listener)
+        {
+            info!(
+                "reload refreshes the client authentication policy of HTTPS listener {}",
+                listener.address
+            );
+            request = RequestType::update_https_listener(patch).into();
+        }
         // sozu#1301: skip an unbuildable listener at boot without reserving its
         // address, so a corrected reload can still add it. sozu#1313: skip a
         // frontend the workers' router refuses, so it never enters the state
@@ -1997,7 +2015,8 @@ fn audit_entry_for(
                 extras: AuditExtras::default(),
             })
         }
-        RequestType::UpdateHttpsListener(patch) => {
+        RequestType::UpdateHttpsListener(patch)
+        | RequestType::UpdateHttpsListenerWithClientAuth(patch) => {
             let (verb, counter) = audit_verb!("https_listener_updated");
             // The listener the patch resolves to: the one on its address, or
             // none when several share it (the state refuses that patch).
@@ -2632,8 +2651,14 @@ fn validate_listener_request(request: &RequestType) -> Result<(), String> {
         RequestType::UpdateHttpListener(patch) => {
             patch_templates(patch.http_answers.as_ref(), &patch.answers)
         }
-        RequestType::UpdateHttpsListener(patch) => {
-            patch_templates(patch.http_answers.as_ref(), &patch.answers)
+        RequestType::UpdateHttpsListener(patch)
+        | RequestType::UpdateHttpsListenerWithClientAuth(patch) => {
+            patch_templates(patch.http_answers.as_ref(), &patch.answers).and_then(|()| {
+                patch.client_auth_policy.as_ref().map_or(
+                    Ok(()),
+                    sozu_lib::https::HttpsListener::validate_client_auth_policy,
+                )
+            })
         }
         _ => return Ok(()),
     }
@@ -5000,6 +5025,21 @@ fn format_patch_diff_https(
         };
         parts.push(format!("alpn_protocols={old}→{new}"));
     }
+    if let Some(ref policy) = p.client_auth_policy {
+        // Mode and counts only: the CA and CRL entries are PEM bodies.
+        let summary = |policy: &sozu_command_lib::proto::command::ClientAuthPolicy| {
+            format!(
+                "{}/{}ca/{}crl",
+                policy.client_auth.unwrap_or_default(),
+                policy.client_ca_certificates.len(),
+                policy.client_ca_crls.len()
+            )
+        };
+        let old = current
+            .map(|c| summary(&c.client_auth_policy()))
+            .unwrap_or_else(|| "?".to_owned());
+        parts.push(format!("client_auth_policy={old}→{}", summary(policy)));
+    }
     diff_opt_copy!(strict_sni_binding);
     diff_opt_copy!(disable_http11);
     diff_opt_copy!(h2_max_rst_stream_per_window);
@@ -6787,6 +6827,78 @@ mod load_state_rollback_tests {
             vec!["team-b"],
             "only the UDP frontend no worker acknowledged must be reverted; its sibling in the \
              same cluster must survive"
+        );
+    }
+
+    /// A reload is how an operator refreshes a CRL or a CA bundle, and it
+    /// replays `AddHttpsListener`, which the state refuses for a listener it
+    /// already holds. The reload must send the new policy as a patch instead,
+    /// or a CRL past its `nextUpdate` would lock every client out until a
+    /// restart.
+    #[test]
+    fn a_reload_refreshes_the_crl_of_a_running_client_auth_listener() {
+        let (mut hub, dir) = create_test_hub();
+        let asset =
+            |name: &str| format!("{}/../lib/assets/mtls/{name}", env!("CARGO_MANIFEST_DIR"));
+        let saved_state = dir.path().join("state.json");
+        File::create(&saved_state).expect("create the saved state file");
+        let write_config = |file: &str, crl: &str| {
+            let path = dir.path().join(file);
+            let mut config = File::create(&path).expect("create the config file");
+            write!(
+                config,
+                r#"
+                command_socket = "{socket}"
+                saved_state    = "{state}"
+                worker_count   = 1
+
+                [[listeners]]
+                protocol = "https"
+                address  = "127.0.0.1:8443"
+                client_auth = "required"
+                client_ca_certificates = ["{ca}"]
+                client_ca_crls = ["{crl}"]
+                "#,
+                socket = dir.path().join("test.sock").display(),
+                state = saved_state.display(),
+                ca = asset("ca-cert.pem"),
+                crl = asset(crl),
+            )
+            .expect("write the config file");
+            path.to_str().expect("a UTF-8 temp path").to_owned()
+        };
+        let crls = |hub: &CommandHub| -> Vec<String> {
+            hub.server
+                .state
+                .https_listeners
+                .values()
+                .flat_map(|listener| listener.client_ca_crls.clone())
+                .collect()
+        };
+        let read = |name: &str| std::fs::read_to_string(asset(name)).expect("read a fixture");
+
+        let (mut client, _peer) = test_client();
+        load_static_config(
+            &mut hub.server,
+            Some(&mut client),
+            Some(&write_config("before.toml", "crl-current.pem")),
+        );
+        assert_eq!(crls(&hub), vec![read("crl-current.pem")]);
+
+        load_static_config(
+            &mut hub.server,
+            None,
+            Some(&write_config("after.toml", "crl-revoked.pem")),
+        );
+        assert_eq!(
+            crls(&hub),
+            vec![read("crl-revoked.pem")],
+            "the reload must replace the CRL of the listener it already runs"
+        );
+        assert_eq!(
+            hub.server.state.https_listeners.len(),
+            1,
+            "the listener is patched in place, not added a second time"
         );
     }
 

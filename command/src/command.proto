@@ -192,6 +192,16 @@ message Request {
     // a worker. A listener without client authentication keeps
     // `add_https_listener`, which every worker version understands.
     HttpsListenerConfig add_https_listener_with_client_auth = 63;
+    // patch a running HTTPS listener whose patch replaces its client
+    // authentication policy (`UpdateHttpsListenerConfig.client_auth_policy`
+    // set). Same payload as `update_https_listener`, distinct verb for the
+    // reason given on `add_https_listener_with_client_auth`: a worker that
+    // predates this field would skip it and acknowledge the patch, keeping
+    // the CA and CRLs it had, so a revocation the new CRL adds would never
+    // apply there. It cannot decode this verb, so the patch fails instead.
+    // `RequestType::into_canonical` picks the verb, and the main process
+    // applies it to every request it fans out to workers.
+    UpdateHttpsListenerConfig update_https_listener_with_client_auth = 64;
   }
 }
 
@@ -419,6 +429,22 @@ message UpdateHttpsListenerConfig {
     // Soft stream-refusal share of the pre-response RST_STREAM cap, in percent —
     // see HttpsListenerConfig.
     optional uint32 h2_stream_refusal_percent       = 44;
+    // Client authentication policy. Full replacement: when set, the mode, the
+    // trusted CAs and the CRLs all take the values given here, so a CA or CRL
+    // left out is dropped, not kept; when absent, the policy is unchanged.
+    // This is how a CRL or CA bundle is refreshed without recreating the
+    // listener. Only new handshakes see the new policy.
+    optional ClientAuthPolicy client_auth_policy    = 45;
+}
+
+// The client authentication policy of an HTTPS listener, as carried by an
+// `UpdateHttpsListenerConfig` patch. Same meaning as the `client_auth`,
+// `client_ca_certificates` and `client_ca_crls` fields of
+// `HttpsListenerConfig`.
+message ClientAuthPolicy {
+    optional ClientAuthMode client_auth = 1;
+    repeated string client_ca_certificates = 2;
+    repeated string client_ca_crls = 3;
 }
 
 // Partial-update patch for a running TCP listener.

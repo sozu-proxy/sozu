@@ -457,7 +457,7 @@ client_ca_certificates = ["/etc/sozu/client-ca.pem"]
 client_ca_crls = ["/etc/sozu/client-ca.crl.pem"]
 ```
 
-Both path lists are read from disk at config-load and their PEM contents inlined into the listener configuration, so the files are not re-read afterwards. Unlike `certificate` and `key`, whose read errors are logged and skipped, an unreadable CA or CRL path aborts the whole configuration: starting a listener with a reduced trust set or without the revocation data the operator asked for would weaken authentication silently.
+Both path lists are read from disk at config-load and their PEM contents inlined into the listener configuration, so the files are not re-read until the next `sozu reload` (see "Refreshing CRLs and CAs" below). Unlike `certificate` and `key`, whose read errors are logged and skipped, an unreadable CA or CRL path aborts the whole configuration: starting a listener with a reduced trust set or without the revocation data the operator asked for would weaken authentication silently.
 
 ##### Modes
 
@@ -511,8 +511,8 @@ practical consequence is that supplying CRLs is an all-or-nothing commitment:
   intermediate's issuer locks out otherwise valid clients.
 - Every configured CRL must be refreshed before its `nextUpdate`. An expired
   CRL rejects the clients it covers, even those it never listed as revoked.
-- CRL contents are inlined at config-load and never re-read (see above), so
-  refreshing a CRL file on disk requires reloading the configuration.
+- Every configured CRL must be refreshed, with a configuration reload, before
+  its `nextUpdate`: see "Refreshing CRLs and CAs" below.
 - Configure **one CRL per issuing CA**; a listener given two CRLs from the
   same CA fails to build. rustls only consults the first CRL a CA issued, so
   with two of them an old CRL listed before its replacement would hide every
@@ -538,12 +538,35 @@ maintaining complete, current CRL coverage for the full chain is not
 operationally feasible, leave `client_ca_crls` empty rather than configuring a
 partial set — chain validation against `client_ca_certificates` still applies.
 
+##### Refreshing CRLs and CAs
+
+Edit the CRL or CA files, or the three keys, then run `sozu reload`. For an
+HTTPS listener that is already running, the reload compares the policy it
+reads (mode, CA contents, CRL contents) with the one the listener runs, and
+when they differ it replaces the policy in place with an
+`UpdateHttpsListenerConfig` carrying `client_auth_policy`. The listener keeps
+its socket, its certificates and its frontends. Every other key of a running
+listener is still left as it is by a reload.
+
+- The replacement is complete: a CA or CRL missing from the new configuration
+  is dropped, not kept.
+- It applies to new handshakes only. Connections already established keep the
+  verdict they were given.
+- The new policy is checked by the main process before anything changes; a CA
+  or CRL a worker could not use fails the reload entry and the listener keeps
+  its current policy.
+- A worker that predates this change cannot decode the patch and fails it
+  rather than keeping its old CRLs (see the note on mixed versions below).
+
+Schedule the reload ahead of each CRL's `nextUpdate`: once a CRL has lapsed,
+every client it covers is rejected until a reload brings a current one.
+
 ##### Notes
 
 - The policy is per-listener, not per-frontend. Every frontend served by an HTTPS listener with `client_auth = "required"` requires a client certificate.
-- `UpdateHttpsListenerConfig` carries no mTLS fields, so a hot-reconfig partial update cannot downgrade a running listener's client-auth policy. Changing it means recreating the listener.
+- A running listener's policy changes only through a full `client_auth_policy` replacement (a reload, or an `UpdateHttpsListenerConfig` sent by a client), never through the other patch fields.
 - The verifier is built with the same explicitly selected `CryptoProvider` as the server config, so it works in single-provider builds (`crypto-openssl` only) and in multi-provider builds where no process-default provider is installed.
-- A listener with `client_auth` other than `none` is sent to the workers as `AddHttpsListenerWithClientAuth`, not `AddHttpsListener`. A worker that predates mutual TLS cannot decode that request, so it never builds the listener rather than building it without client authentication. Between `sozu upgrade` and the replacement of the last old worker, such a listener is therefore served only by the upgraded workers, and adding it counts each old worker as failed once `worker_timeout` expires, since such a worker does not answer a request it cannot decode. The same holds for a saved state file loaded by a version that predates mutual TLS: it rejects the listener instead of loading it unauthenticated. Listeners without client authentication keep `AddHttpsListener` and work across versions as before.
+- A listener with `client_auth` other than `none` is sent to the workers as `AddHttpsListenerWithClientAuth`, and a policy patch as `UpdateHttpsListenerWithClientAuth`, not as the historical `AddHttpsListener` / `UpdateHttpsListener`. A worker that predates mutual TLS cannot decode them, so it never builds the listener, or never applies the patch, rather than building it without client authentication or keeping its old CRLs. Between `sozu upgrade` and the replacement of the last old worker, such a listener is therefore served only by the upgraded workers, and each old worker is counted as failed once `worker_timeout` expires, since it does not answer a request it cannot decode. Listeners without client authentication keep the historical verbs and work across versions as before.
 
 #### Options specific to Rustls based HTTPS listeners
 

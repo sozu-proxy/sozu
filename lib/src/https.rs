@@ -38,11 +38,12 @@ use sozu_command::{
     config::{DEFAULT_ALPN_PROTOCOLS, DEFAULT_CIPHER_LIST},
     listener_key::ListenerKey,
     proto::command::{
-        AddCertificate, CertificateSummary, CertificatesByAddress, ClientAuthMode, Cluster,
-        ForwardedHeaders, HttpsListenerConfig, ListOfCertificatesByAddress, ListenerType,
-        RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
-        ResponseContent, TlsVersion, UpdateHttpsListenerConfig, WorkerRequest, WorkerResponse,
-        request::RequestType, response_content::ContentType,
+        AddCertificate, CertificateSummary, CertificatesByAddress, ClientAuthMode,
+        ClientAuthPolicy, Cluster, ForwardedHeaders, HttpsListenerConfig,
+        ListOfCertificatesByAddress, ListenerType, RemoveCertificate, RemoveListener,
+        ReplaceCertificate, RequestHttpFrontend, ResponseContent, TlsVersion,
+        UpdateHttpsListenerConfig, WorkerRequest, WorkerResponse, request::RequestType,
+        response_content::ContentType,
     },
     ready::Ready,
     response::HttpFrontend,
@@ -1773,21 +1774,6 @@ impl HttpsListener {
         Ok(server_config)
     }
 
-    /// Build the rustls client-certificate verifier for a listener's mTLS
-    /// configuration, or `None` when client auth is disabled.
-    ///
-    /// Returns `None` only for [`ClientAuthMode::ClientAuthNone`] (and for an
-    /// absent `client_auth` field, which decodes to that variant), preserving
-    /// the historical `.with_no_client_auth()` path. For OPTIONAL/REQUIRED it
-    /// parses `client_ca_certificates` into a root store and, when present,
-    /// `client_ca_crls` into revocation lists. OPTIONAL additionally allows
-    /// unauthenticated clients (no certificate presented); REQUIRED aborts the
-    /// handshake in that case.
-    ///
-    /// The verifier is built with the caller's `provider` so it never relies on
-    /// a process-default crypto provider (which may be absent or ambiguous). An
-    /// unknown `client_auth` value is rejected rather than treated as NONE, so a
-    /// malformed or future enum value can never silently disable client auth.
     /// Refuse two CRLs issued by the same CA.
     ///
     /// webpki checks a certificate against the first configured CRL that is
@@ -1823,6 +1809,32 @@ impl HttpsListener {
         Ok(())
     }
 
+    /// Check a client authentication policy the way a listener would build
+    /// it, without a listener: the main process runs this on an
+    /// `UpdateHttpsListenerConfig.client_auth_policy` patch before it commits
+    /// the patch to its state, so a policy no worker could build is refused
+    /// up front rather than fanned out.
+    pub fn validate_client_auth_policy(policy: &ClientAuthPolicy) -> Result<(), ListenerError> {
+        let mut config = HttpsListenerConfig::default();
+        config.apply_client_auth_policy(policy);
+        Self::client_cert_verifier(&config, &Arc::new(default_provider())).map(|_| ())
+    }
+
+    /// Build the rustls client-certificate verifier for a listener's mTLS
+    /// configuration, or `None` when client auth is disabled.
+    ///
+    /// Returns `None` only for [`ClientAuthMode::ClientAuthNone`] (and for an
+    /// absent `client_auth` field, which decodes to that variant), preserving
+    /// the historical `.with_no_client_auth()` path. For OPTIONAL/REQUIRED it
+    /// parses `client_ca_certificates` into a root store and, when present,
+    /// `client_ca_crls` into revocation lists. OPTIONAL additionally allows
+    /// unauthenticated clients (no certificate presented); REQUIRED aborts the
+    /// handshake in that case.
+    ///
+    /// The verifier is built with the caller's `provider` so it never relies on
+    /// a process-default crypto provider (which may be absent or ambiguous). An
+    /// unknown `client_auth` value is rejected rather than treated as NONE, so a
+    /// malformed or future enum value can never silently disable client auth.
     fn client_cert_verifier(
         config: &HttpsListenerConfig,
         provider: &Arc<CryptoProvider>,
@@ -2061,6 +2073,9 @@ impl HttpsListener {
             // Empty values vec = reset to default (runtime treats empty as default)
             config.alpn_protocols = alpn_wrapper.values.clone();
         }
+        if let Some(ref policy) = patch.client_auth_policy {
+            config.apply_client_auth_policy(policy);
+        }
 
         // --- ALPN rebuild (may force a rustls ServerConfig rebuild) ---
         //
@@ -2070,7 +2085,10 @@ impl HttpsListener {
         // leaves the listener observably unchanged. The main-process state
         // would still diverge from that worker-side refusal: the main process
         // cannot build this worker's rustls context before it commits.
-        let new_rustls = if patch.alpn_protocols.is_some() {
+        // A client authentication policy lives in the rustls context's client
+        // certificate verifier, so a new policy needs the same rebuild; an
+        // invalid one fails it here and the listener keeps its old policy.
+        let new_rustls = if patch.alpn_protocols.is_some() || patch.client_auth_policy.is_some() {
             Some(Arc::new(Self::create_rustls_context(
                 &config,
                 self.resolver.clone(),
@@ -4976,5 +4994,64 @@ mod listener_sibling_tests {
                 rustls::CertificateError::Revoked
             ))
         );
+    }
+
+    /// The in-place refresh of a running listener's client authentication
+    /// policy: the patch replaces the policy and rebuilds the rustls context
+    /// that holds the verifier; a policy the verifier cannot be built from
+    /// leaves the listener exactly as it was. Its effect on handshakes is
+    /// covered by `test_mtls_policy_patch_*` in `e2e/src/tests/tls_tests.rs`.
+    #[test]
+    fn a_client_auth_policy_patch_rebuilds_the_listener_verifier() {
+        let config = https_config_with_client_auth(
+            ClientAuthMode::ClientAuthRequired,
+            &[MTLS_CA_PEM],
+            &[MTLS_CRL_CURRENT],
+        );
+        let mut listener =
+            HttpsListener::try_new(config.clone(), Token(0)).expect("build the mTLS listener");
+        let original_context = listener.rustls_details.clone();
+
+        let refreshed = HttpsListenerConfig {
+            client_ca_crls: vec![MTLS_CRL_REVOKED.to_owned()],
+            ..config.clone()
+        }
+        .client_auth_policy();
+        listener
+            .update_config(&UpdateHttpsListenerConfig {
+                address: config.address,
+                client_auth_policy: Some(refreshed.clone()),
+                ..Default::default()
+            })
+            .expect("a buildable policy must be applied");
+        assert_eq!(listener.config.client_auth_policy(), refreshed);
+        assert!(
+            !Arc::ptr_eq(&listener.rustls_details, &original_context),
+            "the verifier lives in the rustls context, which must be rebuilt"
+        );
+
+        let applied_context = listener.rustls_details.clone();
+        let unbuildable = ClientAuthPolicy {
+            client_auth: Some(ClientAuthMode::ClientAuthRequired as i32),
+            client_ca_certificates: vec![],
+            client_ca_crls: vec![],
+        };
+        assert!(
+            listener
+                .update_config(&UpdateHttpsListenerConfig {
+                    address: config.address,
+                    client_auth_policy: Some(unbuildable.clone()),
+                    ..Default::default()
+                })
+                .is_err(),
+            "required client auth with no trusted CA must be refused"
+        );
+        assert!(HttpsListener::validate_client_auth_policy(&unbuildable).is_err());
+        assert_eq!(
+            listener.config.client_auth_policy(),
+            refreshed,
+            "a refused policy leaves the applied one in place"
+        );
+        assert!(Arc::ptr_eq(&listener.rustls_details, &applied_context));
     }
 }

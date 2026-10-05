@@ -13,9 +13,10 @@ use rusty_ulid::Ulid;
 use crate::{
     proto::{
         command::{
-            ClientAuthMode, HttpsListenerConfig, InitialState, IpAddress, LoadBalancingAlgorithms,
-            PathRuleKind, Request, RequestHttpFrontend, RulePosition, SocketAddress, Uint128,
-            WorkerRequest, ip_address, request::RequestType,
+            ClientAuthMode, ClientAuthPolicy, HttpsListenerConfig, InitialState, IpAddress,
+            LoadBalancingAlgorithms, PathRuleKind, Request, RequestHttpFrontend, RulePosition,
+            SocketAddress, Uint128, UpdateHttpsListenerConfig, WorkerRequest, ip_address,
+            request::RequestType,
         },
         display::format_request_type,
     },
@@ -106,6 +107,7 @@ impl Request {
             | RequestType::AddUdpListener(_)
             | RequestType::UpdateHttpListener(_)
             | RequestType::UpdateHttpsListener(_)
+            | RequestType::UpdateHttpsListenerWithClientAuth(_)
             | RequestType::UpdateTcpListener(_)
             | RequestType::UpdateUdpListener(_)
             | RequestType::RemoveListener(_)
@@ -199,6 +201,25 @@ impl HttpsListenerConfig {
         self.client_auth
             .is_some_and(|mode| mode != ClientAuthMode::ClientAuthNone as i32)
     }
+
+    /// The listener's client authentication policy, as a patch would carry it.
+    pub fn client_auth_policy(&self) -> ClientAuthPolicy {
+        ClientAuthPolicy {
+            client_auth: self.client_auth,
+            client_ca_certificates: self.client_ca_certificates.clone(),
+            client_ca_crls: self.client_ca_crls.clone(),
+        }
+    }
+
+    /// Replace the client authentication policy with `policy`, all three
+    /// fields at once: a CA or CRL the policy leaves out is dropped. The main
+    /// process and the workers both apply a patch through this, so their
+    /// copies of the listener cannot diverge.
+    pub fn apply_client_auth_policy(&mut self, policy: &ClientAuthPolicy) {
+        self.client_auth = policy.client_auth;
+        self.client_ca_certificates = policy.client_ca_certificates.clone();
+        self.client_ca_crls = policy.client_ca_crls.clone();
+    }
 }
 
 impl RequestType {
@@ -218,19 +239,36 @@ impl RequestType {
         }
     }
 
-    /// The same request, with an HTTPS listener addition moved to the verb
-    /// [`RequestType::add_https_listener`] picks for its config. Every other
+    /// The request that applies this HTTPS listener patch: a patch that
+    /// replaces the client authentication policy goes out as
+    /// `UpdateHttpsListenerWithClientAuth`, which a worker that predates the
+    /// policy field cannot decode, so it fails the patch instead of keeping
+    /// the CA and CRLs it had. Any other patch keeps `UpdateHttpsListener`.
+    pub fn update_https_listener(patch: UpdateHttpsListenerConfig) -> Self {
+        if patch.client_auth_policy.is_some() {
+            RequestType::UpdateHttpsListenerWithClientAuth(patch)
+        } else {
+            RequestType::UpdateHttpsListener(patch)
+        }
+    }
+
+    /// The same request, with an HTTPS listener addition or patch moved to
+    /// the verb [`RequestType::add_https_listener`] or
+    /// [`RequestType::update_https_listener`] picks for it. Every other
     /// request is returned unchanged.
     ///
     /// The main process applies this to every request it fans out to the
-    /// workers, so a client that sends client authentication on the
-    /// historical `AddHttpsListener` cannot get it silently dropped by a
-    /// worker that predates mutual TLS.
+    /// workers, so a client that sends client authentication on a historical
+    /// verb cannot get it silently dropped by a worker that predates it.
     pub fn into_canonical(self) -> Self {
         match self {
             RequestType::AddHttpsListener(listener)
             | RequestType::AddHttpsListenerWithClientAuth(listener) => {
                 RequestType::add_https_listener(listener)
+            }
+            RequestType::UpdateHttpsListener(patch)
+            | RequestType::UpdateHttpsListenerWithClientAuth(patch) => {
+                RequestType::update_https_listener(patch)
             }
             other => other,
         }
@@ -614,7 +652,7 @@ mod tests {
 
     #[derive(Clone, PartialEq, Message)]
     struct LegacyRequest {
-        #[prost(oneof = "LegacyRequestType", tags = "27")]
+        #[prost(oneof = "LegacyRequestType", tags = "27, 48")]
         request_type: Option<LegacyRequestType>,
     }
 
@@ -624,6 +662,10 @@ mod tests {
         /// client authentication field.
         #[prost(message, tag = "27")]
         AddHttpsListener(LegacyHttpsListenerConfig),
+        /// `update_https_listener`, holding an `UpdateHttpsListenerConfig`
+        /// that has no client authentication policy field.
+        #[prost(message, tag = "48")]
+        UpdateHttpsListener(LegacyHttpsListenerConfig),
     }
 
     #[derive(Clone, PartialEq, Message)]
@@ -683,6 +725,84 @@ mod tests {
                     address: Some(SocketAddress::new_v4(127, 0, 0, 1, 8443)),
                 }
             ))
+        );
+    }
+
+    fn policy_patch(policy: Option<ClientAuthPolicy>) -> UpdateHttpsListenerConfig {
+        UpdateHttpsListenerConfig {
+            address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
+            client_auth_policy: policy,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn update_https_listener_picks_the_verb_from_the_policy_field() {
+        assert!(matches!(
+            RequestType::update_https_listener(policy_patch(None)),
+            RequestType::UpdateHttpsListener(_)
+        ));
+        // Any policy, even one turning client auth off: a worker that ignored
+        // it would keep enforcing, or keep trusting, what the patch replaces.
+        for client_auth in [None, Some(NONE), Some(REQUIRED)] {
+            let policy = ClientAuthPolicy {
+                client_auth,
+                ..Default::default()
+            };
+            assert!(
+                matches!(
+                    RequestType::update_https_listener(policy_patch(Some(policy))),
+                    RequestType::UpdateHttpsListenerWithClientAuth(_)
+                ),
+                "a patch carrying a policy ({client_auth:?}) needs the mTLS verb"
+            );
+        }
+        let with_policy = policy_patch(Some(ClientAuthPolicy::default()));
+        assert_eq!(
+            RequestType::UpdateHttpsListener(with_policy.clone()).into_canonical(),
+            RequestType::UpdateHttpsListenerWithClientAuth(with_policy)
+        );
+        assert_eq!(
+            RequestType::UpdateHttpsListenerWithClientAuth(policy_patch(None)).into_canonical(),
+            RequestType::UpdateHttpsListener(policy_patch(None))
+        );
+    }
+
+    #[test]
+    fn a_worker_that_predates_mtls_cannot_decode_a_client_auth_policy_patch() {
+        let refresh = policy_patch(Some(https_listener(Some(REQUIRED)).client_auth_policy()));
+        assert!(
+            matches!(
+                decode_on_a_legacy_worker(RequestType::UpdateHttpsListener(refresh.clone())),
+                Some(LegacyRequestType::UpdateHttpsListener(_))
+            ),
+            "precondition: the historical verb decodes on an old worker without its policy"
+        );
+        assert_eq!(
+            decode_on_a_legacy_worker(RequestType::update_https_listener(refresh)),
+            None,
+            "a patch replacing the client auth policy must be undecodable by an old worker"
+        );
+        assert!(matches!(
+            decode_on_a_legacy_worker(RequestType::update_https_listener(policy_patch(None))),
+            Some(LegacyRequestType::UpdateHttpsListener(_))
+        ));
+    }
+
+    #[test]
+    fn applying_a_client_auth_policy_replaces_all_of_it() {
+        let mut listener = https_listener(Some(REQUIRED));
+        listener.client_ca_crls = vec!["OLD CRL".to_owned()];
+        let policy = ClientAuthPolicy {
+            client_auth: Some(OPTIONAL),
+            client_ca_certificates: vec!["NEW CA".to_owned()],
+            client_ca_crls: vec![],
+        };
+        listener.apply_client_auth_policy(&policy);
+        assert_eq!(listener.client_auth_policy(), policy);
+        assert!(
+            listener.client_ca_crls.is_empty(),
+            "a CRL the policy leaves out is dropped, not kept"
         );
     }
 }

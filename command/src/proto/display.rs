@@ -121,6 +121,7 @@ pub fn format_request_type(request_type: &RequestType) -> &str {
         RequestType::QueryCertificatesFromWorkers(_) => "QueryCertificatesFromWorkers",
         RequestType::UpdateHttpListener(_) => "UpdateHttpListener",
         RequestType::UpdateHttpsListener(_) => "UpdateHttpsListener",
+        RequestType::UpdateHttpsListenerWithClientAuth(_) => "UpdateHttpsListenerWithClientAuth",
         RequestType::UpdateTcpListener(_) => "UpdateTcpListener",
         RequestType::SetMaxConnectionsPerIp(_) => "SetMaxConnectionsPerIp",
         RequestType::QueryMaxConnectionsPerIp(_) => "QueryMaxConnectionsPerIp",

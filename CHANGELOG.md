@@ -133,6 +133,13 @@
   picks the verb, and the main process rewrites every fan-out to it), so a
   worker or main process that predates mutual TLS fails the request instead of
   building the listener without client authentication.
+  A configuration reload now refreshes the CA bundle and the CRLs of a running
+  listener in place: when the policy it reads differs from the one running, it
+  sends an `UpdateHttpsListenerConfig` whose new `client_auth_policy` replaces
+  mode, CAs and CRLs together, and the worker rebuilds the listener's verifier
+  for new handshakes. The patch travels on `UpdateHttpsListenerWithClientAuth`,
+  which an older worker cannot decode, so it fails the patch rather than keep
+  its old CRLs.
 
 - **BREAKING (library API) — `feat(udp)`: opt-in per-source flow limit on UDP clusters.** Each
   client source IP and port is its own UDP flow, with its own upstream socket and `max_flows` slot,

@@ -2825,7 +2825,10 @@ impl Server {
             Some(RequestType::UpdateHttpListener(patch)) => {
                 push_queue(self.notify_update_http_listener(&req_id, patch));
             }
-            Some(RequestType::UpdateHttpsListener(patch)) => {
+            Some(
+                RequestType::UpdateHttpsListener(patch)
+                | RequestType::UpdateHttpsListenerWithClientAuth(patch),
+            ) => {
                 push_queue(self.notify_update_https_listener(&req_id, patch));
             }
             Some(RequestType::UpdateTcpListener(patch)) => {
