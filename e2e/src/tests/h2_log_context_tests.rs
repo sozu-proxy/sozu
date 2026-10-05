@@ -1,4 +1,5 @@
-//! End-to-end coverage for the `peer=` slot of the H2 mux's `MUX-H2` log
+//! End-to-end coverage for the client address in an H2 access log and, when
+//! trace events are compiled, the `peer=` slot of the H2 mux's `MUX-H2` log
 //! envelope, on a PROXY-protocol v2 frontend.
 //!
 //! `log_context!` / `log_context_stream!` (`lib/src/protocol/mux/h2.rs`) render
@@ -51,10 +52,10 @@
 //! the worker at `error`, so the capture stays in the tens of kilobytes.
 //!
 //! Note that `trace!` is compiled in under `any(debug_assertions,
-//! feature = "logs-trace")` (`command/src/logging/logs.rs`). Every CI cell
-//! runs `cargo test` in the dev profile, so `debug_assertions` holds; a
-//! `--release` e2e run without `logs-trace` would capture nothing, and the
-//! failure message below says so.
+//! feature = "logs-trace")` (`command/src/logging/logs.rs`). Release builds
+//! without `logs-trace` therefore cannot inspect `MUX-H2` lines. They still
+//! assert the same advertised client through the always-emitted access log;
+//! builds that compile trace events additionally keep every mux-slot check.
 
 use std::{
     io::Write,
@@ -95,6 +96,16 @@ const PROXY_ADVERTISED_CLIENT_PORT: u16 = 9973;
 /// The protocol tag every `ConnectionH2` log line carries, and the only one
 /// `log_context!` / `log_context_stream!` in `h2.rs` emit.
 const MUX_H2_TAG: &str = "MUX-H2";
+
+/// Extract the session address from one ASCII access-log record.
+///
+/// `LogContext` ends at the first `] ` after `INFO-ACCESS`; the next token is
+/// `RequestRecord::session_address` (`command/src/logging/logs.rs`).
+fn access_session_address(line: &str) -> Option<SocketAddr> {
+    let (_, record) = line.split_once("INFO-ACCESS")?;
+    let (_, after_context) = record.split_once("] ")?;
+    after_context.split_whitespace().next()?.parse().ok()
+}
 
 /// A 28-byte PROXY-protocol v2 `PROXY` header for an IPv4/STREAM connection
 /// from `127.0.0.1:source_port` to `127.0.0.1:destination_port`. Same shape as
@@ -274,6 +285,45 @@ fn try_h2_proxy_protocol_peer_is_the_advertised_client() -> State {
     let mut backends = vec![backend];
     for b in backends.iter_mut() {
         b.stop_and_get_aggregator();
+    }
+
+    let access_lines: Vec<String> = capture
+        .lines_containing("INFO-ACCESS")
+        .into_iter()
+        .filter(|line| {
+            line.split_once("INFO-ACCESS")
+                .and_then(|(_, record)| record.trim_start().strip_prefix("H2-PP-PEER\t"))
+                .is_some_and(|record| record.ends_with(" 200 | H2::Complete"))
+        })
+        .collect();
+    let advertised_access: SocketAddr = format!("127.0.0.1:{PROXY_ADVERTISED_CLIENT_PORT}")
+        .parse()
+        .expect("advertised client address must parse");
+    let access_addresses: Vec<Option<SocketAddr>> = access_lines
+        .iter()
+        .map(|line| access_session_address(line))
+        .collect();
+    println!(
+        "H2 PP peer - access lines={}, session addresses={access_addresses:?}, \
+         advertised={advertised_access}, raw={raw_peer}, stopped={stopped}, \
+         got_response={got_response}",
+        access_lines.len(),
+    );
+    if access_lines.is_empty()
+        || access_addresses
+            .iter()
+            .any(|address| *address != Some(advertised_access) || *address == Some(raw_peer))
+        || !stopped
+        || !got_response
+    {
+        for line in access_lines.iter().take(5) {
+            println!("H2 PP peer - access: {line}");
+        }
+        return State::Fail;
+    }
+
+    if !cfg!(any(debug_assertions, feature = "logs-trace")) {
+        return State::Success;
     }
 
     let mux_lines = capture.lines_containing(MUX_H2_TAG);

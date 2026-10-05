@@ -814,11 +814,15 @@ def _validate_effective_feature_graph(
             manifests["sozu-lib"],
             library_requested,
         )
-    command_requested = {
-        feature
-        for feature in cell.config.features_for("command")
-        if feature in {"logs-debug", "logs-trace"}
-    }
+    command_requested = (
+        set()
+        if package_name == "sozu-lib"
+        else {
+            feature
+            for feature in cell.config.features_for("command")
+            if feature in {"logs-debug", "logs-trace"}
+        }
+    )
     _validate_package_features(
         text,
         "sozu-command-lib",
@@ -836,6 +840,23 @@ def _inventory_command(spec: CommandSpec) -> tuple[str, ...] | None:
     test_arguments = argv[separator + 1 :] if separator < len(argv) else []
     filtered = [argument for argument in test_arguments if argument not in {"--nocapture"}]
     return tuple((*cargo_arguments, "--", *filtered, "--list"))
+
+
+def _validate_e2e_inventory(cell: SuiteCell, payload: bytes) -> None:
+    if cell.suite != "e2e" or cell.config is None:
+        return
+    tolerant = b"test_h1_tolerant_high_byte_method_no_ub"
+    tolerant_expected = "tolerant-http1-parser" in cell.config.enabled
+    if (tolerant in payload) != tolerant_expected:
+        raise RuntimeError(
+            f"tolerant parser inventory mismatch for {cell.id}: "
+            f"expected={tolerant_expected}"
+        )
+    proxy_peer = b"test_h2_proxy_protocol_peer_is_the_advertised_client"
+    if proxy_peer not in payload:
+        raise RuntimeError(
+            f"H2 PROXY peer inventory mismatch for {cell.id}: expected=True"
+        )
 
 
 def test_inventory(
@@ -873,13 +894,7 @@ def test_inventory(
             return output
         raise RuntimeError(f"no test inventory command for {cell.id}")
     payload = b"\0".join(inventories)
-    tolerant = b"test_h1_tolerant_high_byte_method_no_ub"
-    if cell.suite == "e2e" and cell.config is not None:
-        expected = "tolerant-http1-parser" in cell.config.enabled
-        if (tolerant in payload) != expected:
-            raise RuntimeError(
-                f"tolerant parser inventory mismatch for {cell.id}: expected={expected}"
-            )
+    _validate_e2e_inventory(cell, payload)
     return payload
 
 
@@ -1120,13 +1135,7 @@ def prepare_cell_for_worker(
         if package is not None
         else False
     )
-    tolerant = b"test_h1_tolerant_high_byte_method_no_ub"
-    if cell.suite == "e2e" and cell.config is not None:
-        expected = "tolerant-http1-parser" in cell.config.enabled
-        if (tolerant in inventory) != expected:
-            raise RuntimeError(
-                f"tolerant parser inventory mismatch for {cell.id}: expected={expected}"
-            )
+    _validate_e2e_inventory(cell, inventory)
     graph = effective_feature_graph(
         cell,
         repo_root,

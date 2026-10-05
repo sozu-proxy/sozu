@@ -906,6 +906,75 @@ class FeatureMatrixTests(unittest.TestCase):
                 cell, missing_forward, SCRIPT_DIR.parent.parent
             )
 
+    def test_library_graph_does_not_invent_command_logging_forwarding(self) -> None:
+        config = feature_matrix.ProductConfig(
+            "crypto-ring", "debug", frozenset({"simd"})
+        )
+        cell = run_feature_matrix.SuiteCell(
+            id="lib/debug",
+            suite="lib",
+            projection="lib",
+            projection_id=config.projection_id("lib"),
+            product_ids=(config.id,),
+            config=config,
+        )
+        valid = "\n".join(
+            (
+                "sozu-lib v2.2.1|crypto-ring,logs-debug,simd",
+                "sozu-command-lib v2.2.1|",
+            )
+        )
+        run_feature_matrix._validate_effective_feature_graph(
+            cell, valid, SCRIPT_DIR.parent.parent
+        )
+
+        unexpected_forward = valid.replace(
+            "sozu-command-lib v2.2.1|",
+            "sozu-command-lib v2.2.1|logs-debug",
+        )
+        with self.assertRaisesRegex(RuntimeError, "unexpected=.*logs-debug"):
+            run_feature_matrix._validate_effective_feature_graph(
+                cell, unexpected_forward, SCRIPT_DIR.parent.parent
+            )
+
+    def test_release_e2e_inventory_keeps_the_proxy_peer_oracle(self) -> None:
+        spec = run_feature_matrix.CommandSpec(
+            "generic-e2e", ("cargo", "test", "-p", "sozu-e2e", "--release")
+        )
+        proxy_test = b"tests::h2_log_context_tests::test_h2_proxy_protocol_peer_is_the_advertised_client: test\n"
+
+        for log_level in ("off", "debug", "trace"):
+            with self.subTest(log_level=log_level):
+                config = feature_matrix.ProductConfig(
+                    "crypto-ring", log_level, frozenset()
+                )
+                cell = run_feature_matrix.SuiteCell(
+                    id=f"e2e/{log_level}",
+                    suite="e2e",
+                    projection="e2e",
+                    projection_id=config.projection_id("e2e"),
+                    product_ids=(config.id,),
+                    config=config,
+                )
+                result = subprocess.CompletedProcess(
+                    spec.argv, 0, stdout=b"other: test\n", stderr=b""
+                )
+                with mock.patch.object(
+                    run_feature_matrix.subprocess, "run", return_value=result
+                ), self.assertRaisesRegex(RuntimeError, "H2 PROXY peer inventory mismatch"):
+                    run_feature_matrix.test_inventory(
+                        cell, (spec,), SCRIPT_DIR.parent.parent
+                    )
+                result = subprocess.CompletedProcess(
+                    spec.argv, 0, stdout=proxy_test, stderr=b""
+                )
+                with mock.patch.object(
+                    run_feature_matrix.subprocess, "run", return_value=result
+                ):
+                    run_feature_matrix.test_inventory(
+                        cell, (spec,), SCRIPT_DIR.parent.parent
+                    )
+
     def test_exhaustive_campaign_plans_every_applicable_suite(self) -> None:
         plan = run_feature_matrix.build_campaign_plan(mode="exhaustive", seed=20_261_005)
         self.assertEqual(

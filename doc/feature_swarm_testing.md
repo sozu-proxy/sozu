@@ -53,6 +53,13 @@ effective feature graph before running tests. Production graphs must remain
 free of harness-only features, while E2E graphs must explicitly contain the
 features required by their fixtures.
 
+Logging features apply to each selected package's public feature surface. The
+binary and E2E packages explicitly forward their logging mode to both
+`sozu-lib` and `sozu-command-lib`. A `sozu-lib`-rooted cell enables that mode
+on `sozu-lib` only because its manifest deliberately does not forward the
+feature to `sozu-command-lib`; the effective-graph oracle preserves this
+package boundary instead of inventing dependency features.
+
 ## Bounded CI matrix
 
 The pull-request matrix contains 16 release configurations. It is a covering
@@ -135,6 +142,10 @@ A cell is eligible to run only after two checks:
 
 This prevents a green compile from hiding a re-enabled default provider and
 prevents a successful zero-test selection from being counted as coverage.
+Feature-gated inventory is checked in both the serial and prepared-worker
+paths. The H2 PROXY-peer oracle remains present in every E2E cell: it checks
+the access-log address in every build and adds the detailed `MUX-H2` peer-slot
+checks when `debug_assertions` or `logs-trace` compiles those trace events.
 
 Each terminal outcome is bound to the source fingerprint, `Cargo.lock`, matrix
 generator, normalized commands, effective feature graph, test inventory,
