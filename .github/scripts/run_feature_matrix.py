@@ -846,11 +846,18 @@ def _validate_e2e_inventory(cell: SuiteCell, payload: bytes) -> None:
     if cell.suite != "e2e" or cell.config is None:
         return
     tolerant = b"test_h1_tolerant_high_byte_method_no_ub"
+    strict = b"test_h1_invalid_utf8_method_no_crash"
     tolerant_expected = "tolerant-http1-parser" in cell.config.enabled
     if (tolerant in payload) != tolerant_expected:
         raise RuntimeError(
             f"tolerant parser inventory mismatch for {cell.id}: "
             f"expected={tolerant_expected}"
+        )
+    strict_expected = not tolerant_expected
+    if (strict in payload) != strict_expected:
+        raise RuntimeError(
+            f"strict parser inventory mismatch for {cell.id}: "
+            f"expected={strict_expected}"
         )
     proxy_peer = b"test_h2_proxy_protocol_peer_is_the_advertised_client"
     if proxy_peer not in payload:

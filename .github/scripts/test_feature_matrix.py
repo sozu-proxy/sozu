@@ -942,6 +942,7 @@ class FeatureMatrixTests(unittest.TestCase):
             "generic-e2e", ("cargo", "test", "-p", "sozu-e2e", "--release")
         )
         proxy_test = b"tests::h2_log_context_tests::test_h2_proxy_protocol_peer_is_the_advertised_client: test\n"
+        strict_test = b"test_h1_invalid_utf8_method_no_crash: test\n"
 
         for log_level in ("off", "debug", "trace"):
             with self.subTest(log_level=log_level):
@@ -957,7 +958,7 @@ class FeatureMatrixTests(unittest.TestCase):
                     config=config,
                 )
                 result = subprocess.CompletedProcess(
-                    spec.argv, 0, stdout=b"other: test\n", stderr=b""
+                    spec.argv, 0, stdout=b"other: test\n" + strict_test, stderr=b""
                 )
                 with mock.patch.object(
                     run_feature_matrix.subprocess, "run", return_value=result
@@ -966,11 +967,70 @@ class FeatureMatrixTests(unittest.TestCase):
                         cell, (spec,), SCRIPT_DIR.parent.parent
                     )
                 result = subprocess.CompletedProcess(
-                    spec.argv, 0, stdout=proxy_test, stderr=b""
+                    spec.argv, 0, stdout=proxy_test + strict_test, stderr=b""
                 )
                 with mock.patch.object(
                     run_feature_matrix.subprocess, "run", return_value=result
                 ):
+                    run_feature_matrix.test_inventory(
+                        cell, (spec,), SCRIPT_DIR.parent.parent
+                    )
+
+    def test_release_e2e_inventory_switches_the_h1_parser_oracle(self) -> None:
+        spec = run_feature_matrix.CommandSpec(
+            "generic-e2e", ("cargo", "test", "-p", "sozu-e2e", "--release")
+        )
+        proxy_test = b"test_h2_proxy_protocol_peer_is_the_advertised_client: test\n"
+        strict_test = b"test_h1_invalid_utf8_method_no_crash: test\n"
+        tolerant_test = b"test_h1_tolerant_high_byte_method_no_ub: test\n"
+
+        for tolerant_enabled in (False, True):
+            with self.subTest(tolerant_enabled=tolerant_enabled):
+                enabled = (
+                    frozenset({"tolerant-http1-parser"})
+                    if tolerant_enabled
+                    else frozenset()
+                )
+                config = feature_matrix.ProductConfig("crypto-ring", "off", enabled)
+                cell = run_feature_matrix.SuiteCell(
+                    id=f"e2e/tolerant-{tolerant_enabled}",
+                    suite="e2e",
+                    projection="e2e",
+                    projection_id=config.projection_id("e2e"),
+                    product_ids=(config.id,),
+                    config=config,
+                )
+                expected = tolerant_test if tolerant_enabled else strict_test
+                forbidden = strict_test if tolerant_enabled else tolerant_test
+                valid = subprocess.CompletedProcess(
+                    spec.argv, 0, stdout=proxy_test + expected, stderr=b""
+                )
+                with mock.patch.object(
+                    run_feature_matrix.subprocess, "run", return_value=valid
+                ):
+                    run_feature_matrix.test_inventory(
+                        cell, (spec,), SCRIPT_DIR.parent.parent
+                    )
+
+                missing = subprocess.CompletedProcess(
+                    spec.argv, 0, stdout=proxy_test, stderr=b""
+                )
+                with mock.patch.object(
+                    run_feature_matrix.subprocess, "run", return_value=missing
+                ), self.assertRaisesRegex(RuntimeError, "parser inventory mismatch"):
+                    run_feature_matrix.test_inventory(
+                        cell, (spec,), SCRIPT_DIR.parent.parent
+                    )
+
+                both = subprocess.CompletedProcess(
+                    spec.argv,
+                    0,
+                    stdout=proxy_test + expected + forbidden,
+                    stderr=b"",
+                )
+                with mock.patch.object(
+                    run_feature_matrix.subprocess, "run", return_value=both
+                ), self.assertRaisesRegex(RuntimeError, "parser inventory mismatch"):
                     run_feature_matrix.test_inventory(
                         cell, (spec,), SCRIPT_DIR.parent.parent
                     )

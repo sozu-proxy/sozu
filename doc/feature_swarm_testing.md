@@ -89,6 +89,12 @@ test observes the feature indirectly. The gRPC suite and the eight real-service
 suites use harness features layered onto the projected E2E graph; those
 harness features are not additional product axes.
 
+The E2E inventory also treats the HTTP/1 parser contract as a complementary
+pair. Cells without `tolerant-http1-parser` must include the strict invalid-byte
+rejection test and exclude the tolerant forwarding test. Cells with the feature
+must do the reverse, so a configuration cannot silently exercise neither path
+or certify both mutually exclusive contracts.
+
 ## Exhaustive local campaign
 
 The exhaustive local campaign enumerates all 768 product configurations, then
