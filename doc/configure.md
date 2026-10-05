@@ -482,10 +482,10 @@ The configuration is rejected rather than silently degraded in every case below.
 | A `client_ca_certificates` or `client_ca_crls` path cannot be read   | **Error** at config-materialization. A dropped CA weakens trust; a dropped CRL silently disables revocation.                                 |
 | A CA entry parses to zero certificates (empty file, wrong PEM section) | **Error**. Skipping it would start the listener with a subset of the configured trust anchors, and clients issued by the omitted CA would fail with no visible cause. |
 | A CRL entry parses to zero revocation lists                          | **Error**. Same reasoning: revocation would be silently disabled.                                                                           |
-| Two configured CRLs are issued by the same CA                        | **Error** `ListenerError::ClientAuth` when the listener is built. Only the first would be consulted, so the order alone would decide whether the second one's revocations apply. |
+| Two configured CRLs of one CA cover overlapping certificates (the same distribution point, or one of them has none) | **Error** `ListenerError::ClientAuth` when the listener is built. Only the first would be consulted, so the order alone would decide whether the second one's revocations apply. Partitions with distinct distribution points are accepted. |
 | `client_auth` / `client_ca_certificates` / `client_ca_crls` on an HTTP, TCP, or UDP listener | **Error** `ConfigError::ClientAuthOnNonHttps` at config-load. Those listeners have no field to carry the policy, so it would be discarded.  |
 | `client_auth = "none"` with stale CA/CRL paths still present         | **Allowed** — the paths are not read at all in `none` mode, so a leftover path never blocks configuration loading.                           |
-| A configured CRL past its `nextUpdate`                               | **Rejected at handshake.** Sōzu enables `enforce_revocation_expiration()`; rustls defaults to ignoring expiration, which would keep trusting a stale CRL. |
+| A configured CRL already past its `nextUpdate`                       | **Error** `ListenerError::ClientAuth` when the listener is built or the policy patched: it would reject every client it covers. A CRL that lapses while the listener runs is **rejected at handshake**, since Sōzu enables `enforce_revocation_expiration()` (rustls defaults to ignoring expiration, which would keep trusting a stale CRL). |
 
 The rejections above happen at two distinct stages. Reading the CA/CRL files and refusing mTLS keys on a non-HTTPS listener happen at config-load, in the master. Parsing the PEM bodies and building the verifier happen worker-side, when the listener is created. In both cases the listener is never activated: `create_rustls_context` returns an error, so there is no fallback to an unauthenticated listener.
 
@@ -513,11 +513,13 @@ practical consequence is that supplying CRLs is an all-or-nothing commitment:
   CRL rejects the clients it covers, even those it never listed as revoked.
 - Every configured CRL must be refreshed, with a configuration reload, before
   its `nextUpdate`: see "Refreshing CRLs and CAs" below.
-- Configure **one CRL per issuing CA**; a listener given two CRLs from the
-  same CA fails to build. rustls only consults the first CRL a CA issued, so
-  with two of them an old CRL listed before its replacement would hide every
-  revocation the replacement adds. When rotating a CRL, replace the file
-  rather than adding the new one next to it.
+- Configure **one CRL per issuing CA**, or one per distribution point when the
+  CA partitions its list (each partition carrying its own
+  `IssuingDistributionPoint`). A listener given two CRLs of one CA that cover
+  the same certificates fails to build: rustls only consults the first CRL
+  that covers a certificate, so an old CRL listed before its replacement would
+  hide every revocation the replacement adds. When rotating a CRL, replace the
+  file rather than adding the new one next to it.
 - A CRL must be signed by the CA that issued the certificates it covers, and if
   that CA's certificate carries a KeyUsage extension it must include
   `cRLSign`; a CRL that fails either check rejects the handshake. CRL files are

@@ -43,12 +43,23 @@ default_md = sha256
 crl_extensions = crl_ext
 [crl_ext]
 authorityKeyIdentifier = keyid:always
+[crl_ext_partition_a]
+authorityKeyIdentifier = keyid:always
+issuingDistributionPoint = critical, @idp_a
+[idp_a]
+fullname = URI:http://crl.sozu.test/partition-a.crl
+[crl_ext_partition_b]
+authorityKeyIdentifier = keyid:always
+issuingDistributionPoint = critical, @idp_b
+[idp_b]
+fullname = URI:http://crl.sozu.test/partition-b.crl
 EOF
 }
 
-gencrl() { # <ca name> <out> <lastUpdate> <nextUpdate>
+gencrl() { # <ca name> <out> <lastUpdate> <nextUpdate> [crl extension section]
     openssl ca -batch -config "$work/$1/ca.cnf" -keyfile "$1-key.pem" -cert "$1-cert.pem" \
-        -gencrl -crl_lastupdate "$3" -crl_nextupdate "$4" -out "$2" 2>/dev/null
+        -gencrl -crl_lastupdate "$3" -crl_nextupdate "$4" -crlexts "${5:-crl_ext}" \
+        -out "$2" 2>/dev/null
 }
 
 new_ca ca sozu-test-mtls-ca
@@ -79,6 +90,10 @@ gencrl ca crl-expired.pem 20200101000000Z 20200102000000Z
 # Another CA's current CRL: it covers nothing in the client's chain, so the
 # client's revocation status is unknown.
 gencrl other-ca crl-other-ca.pem "$NOW" "$FAR_FUTURE"
+# Two partitions of the CA's revocation list, told apart by their
+# IssuingDistributionPoint; neither covers the client, which names none.
+gencrl ca crl-partition-a.pem "$NOW" "$FAR_FUTURE" crl_ext_partition_a
+gencrl ca crl-partition-b.pem "$NOW" "$FAR_FUTURE" crl_ext_partition_b
 # Current, revokes the client. Generated last: revoking updates the database.
 openssl ca -batch -config "$work/ca/ca.cnf" -keyfile ca-key.pem -cert ca-cert.pem \
     -revoke client-cert.pem 2>/dev/null

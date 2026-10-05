@@ -3263,18 +3263,6 @@ fn test_mtls_crl_that_revokes_the_client_rejects_it() {
 }
 
 #[test]
-fn test_mtls_expired_crl_rejects_the_client() {
-    assert_eq!(
-        repeat_until_error_or(
-            3,
-            "TLS mTLS: an expired CRL from the issuer rejects a client it does not list",
-            || try_mtls_required_with_crls("TLS-MTLS-CRL-EXPIRED", &[MTLS_CRL_EXPIRED], false),
-        ),
-        State::Success,
-    );
-}
-
-#[test]
 fn test_mtls_crl_of_another_issuer_rejects_the_client() {
     assert_eq!(
         repeat_until_error_or(
@@ -3287,9 +3275,9 @@ fn test_mtls_crl_of_another_issuer_rejects_the_client() {
 }
 
 /// A CRL refresh on a running listener, without recreating it: each patch
-/// replaces the client authentication policy and decides the next handshake
-/// of the same client. The expired-then-current step is the recovery a
-/// listener needs once its CRL has lapsed.
+/// the worker applies replaces the client authentication policy and decides
+/// the next handshake of the same client, and a patch it refuses (an expired
+/// CRL) leaves the running policy as it was.
 fn try_mtls_policy_patch_applies_to_new_handshakes() -> State {
     let mut listener = MtlsListener::start(
         "TLS-MTLS-POLICY-PATCH",
@@ -3308,23 +3296,27 @@ fn try_mtls_policy_patch_applies_to_new_handshakes() -> State {
             .is_some_and(|response| response.starts_with(b"HTTP/1.1 200"))
     };
 
-    let mut steps = vec![("current", accepted(&listener), true)];
-    for (name, crl, expected) in [
-        ("revoked", MTLS_CRL_REVOKED, false),
-        ("expired", MTLS_CRL_EXPIRED, false),
-        ("current again", MTLS_CRL_CURRENT, true),
+    // (step, patch applied, client accepted afterwards)
+    let mut steps = vec![("current", true, accepted(&listener))];
+    for (name, crl) in [
+        ("expired", MTLS_CRL_EXPIRED),
+        ("revoked", MTLS_CRL_REVOKED),
+        ("current again", MTLS_CRL_CURRENT),
     ] {
         let applied = listener.patch_policy(policy(crl));
-        steps.push((name, applied && accepted(&listener), expected));
+        steps.push((name, applied, accepted(&listener)));
     }
     let requests_received = listener.stop();
 
     println!("steps={steps:?} requests_received={requests_received}");
-    if steps
-        .iter()
-        .all(|(_, accepted, expected)| accepted == expected)
-        && requests_received == 2
-    {
+    let expected = [
+        ("current", true, true),
+        // Refused: the listener keeps the current CRL and keeps admitting.
+        ("expired", false, true),
+        ("revoked", true, false),
+        ("current again", true, true),
+    ];
+    if steps == expected && requests_received == 3 {
         State::Success
     } else {
         State::Fail

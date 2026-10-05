@@ -1774,38 +1774,61 @@ impl HttpsListener {
         Ok(server_config)
     }
 
-    /// Refuse two CRLs issued by the same CA.
+    /// Refuse a CRL set rustls would read differently from what the operator
+    /// configured.
     ///
-    /// webpki checks a certificate against the first configured CRL that is
-    /// authoritative for its issuer and never reads the others, so with two
-    /// CRLs from one CA the order alone decides: an old CRL listed before its
-    /// replacement hides every revocation the replacement adds. That happens
-    /// naturally while rotating a CRL file, and nothing would show it.
-    /// Issuers are compared as the raw DER names webpki compares.
-    fn reject_crls_sharing_an_issuer(
+    /// - Two CRLs of one CA whose scopes overlap: webpki checks a certificate
+    ///   against the first configured CRL that is authoritative for it and
+    ///   never reads the others, so the order alone would decide, and an old
+    ///   CRL listed before its replacement would hide every revocation the
+    ///   replacement adds. A CRL without an `IssuingDistributionPoint` covers
+    ///   everything its CA issued; partitions of one CA, each with its own
+    ///   distribution point, do not overlap and are accepted together.
+    /// - A CRL already past its `nextUpdate` at `now` (seconds since the Unix
+    ///   epoch): with revocation expiry enforced it would reject every client
+    ///   it covers, which is better reported now than found at the first
+    ///   handshake.
+    ///
+    /// Issuers and distribution points are compared as the raw DER webpki
+    /// compares.
+    fn check_crl_set(
         crls: &[CertificateRevocationListDer<'_>],
+        now: i64,
     ) -> Result<(), ListenerError> {
-        let mut issuers: Vec<Vec<u8>> = Vec::with_capacity(crls.len());
+        let mut scopes: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::with_capacity(crls.len());
         for (index, crl) in crls.iter().enumerate() {
             let parsed = webpki::BorrowedCertRevocationList::from_der(crl.as_ref())
                 .map_err(|e| ListenerError::ClientAuth(format!("invalid CRL: {e}")))?;
-            let issuer = webpki::CertRevocationList::from(parsed).issuer().to_vec();
-            if let Some(first) = issuers.iter().position(|seen| *seen == issuer) {
+            let parsed = webpki::CertRevocationList::from(parsed);
+            if let Some(next_update) = sozu_command::certificate::crl_next_update(crl.as_ref())
+                && next_update <= now
+            {
+                return Err(ListenerError::ClientAuth(format!(
+                    "CRL #{} (counted across client_ca_crls) expired {} seconds ago: its \
+                     nextUpdate is past, refresh it",
+                    index + 1,
+                    now - next_update
+                )));
+            }
+            let issuer = parsed.issuer().to_vec();
+            let distribution_point = parsed.issuing_distribution_point().map(<[u8]>::to_vec);
+            let overlapping = scopes.iter().position(|(seen_issuer, seen_point)| {
+                *seen_issuer == issuer
+                    && (seen_point.is_none()
+                        || distribution_point.is_none()
+                        || *seen_point == distribution_point)
+            });
+            if let Some(first) = overlapping {
                 return Err(ListenerError::ClientAuth(format!(
                     "CRLs #{} and #{} (counted across client_ca_crls) are issued by the \
-                     same CA, and only the first would be consulted: configure one CRL per \
-                     issuer",
+                     same CA for overlapping certificates, and only the first would be \
+                     consulted: configure one CRL per issuer, or one per distribution point",
                     first + 1,
                     index + 1
                 )));
             }
-            issuers.push(issuer);
+            scopes.push((issuer, distribution_point));
         }
-        debug_assert_eq!(
-            issuers.len(),
-            crls.len(),
-            "every CRL is either recorded with a distinct issuer or rejected"
-        );
         Ok(())
     }
 
@@ -1896,7 +1919,12 @@ impl HttpsListener {
                 ));
             }
         }
-        Self::reject_crls_sharing_an_issuer(&crls)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+            });
+        Self::check_crl_set(&crls, now)?;
 
         let mut builder =
             WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone());
@@ -4861,10 +4889,22 @@ mod listener_sibling_tests {
     const MTLS_CRL_EXPIRED: &str = include_str!("../assets/mtls/crl-expired.pem");
     /// Issued by another CA: covers nothing in the client's chain.
     const MTLS_CRL_OTHER_CA: &str = include_str!("../assets/mtls/crl-other-ca.pem");
+    /// Two partitions of the CA's list, each with its own
+    /// IssuingDistributionPoint, neither covering the client.
+    const MTLS_CRL_PARTITION_A: &str = include_str!("../assets/mtls/crl-partition-a.pem");
+    const MTLS_CRL_PARTITION_B: &str = include_str!("../assets/mtls/crl-partition-b.pem");
 
     /// The verdict of a `required` listener trusting the test CA with `crls`
     /// on the test client's certificate, at the current time.
     fn verify_mtls_client(crls: &[&str]) -> Result<(), rustls::Error> {
+        verify_mtls_client_at(crls, rustls::pki_types::UnixTime::now())
+    }
+
+    /// The same verdict, for a handshake at `time`.
+    fn verify_mtls_client_at(
+        crls: &[&str],
+        time: rustls::pki_types::UnixTime,
+    ) -> Result<(), rustls::Error> {
         let config =
             https_config_with_client_auth(ClientAuthMode::ClientAuthRequired, &[MTLS_CA_PEM], crls);
         let verifier = HttpsListener::client_cert_verifier(&config, &test_crypto_provider())
@@ -4872,9 +4912,19 @@ mod listener_sibling_tests {
             .expect("required client auth must install a verifier");
         let client = CertificateDer::from_pem_slice(MTLS_CLIENT_PEM.as_bytes())
             .expect("the client fixture is a PEM certificate");
-        verifier
-            .verify_client_cert(&client, &[], rustls::pki_types::UnixTime::now())
-            .map(|_| ())
+        verifier.verify_client_cert(&client, &[], time).map(|_| ())
+    }
+
+    /// Whether a `required` listener can be built with `crls`, and the
+    /// reason when it cannot.
+    fn build_mtls_listener(crls: &[&str]) -> Result<(), String> {
+        let config =
+            https_config_with_client_auth(ClientAuthMode::ClientAuthRequired, &[MTLS_CA_PEM], crls);
+        match HttpsListener::client_cert_verifier(&config, &test_crypto_provider()) {
+            Ok(_) => Ok(()),
+            Err(ListenerError::ClientAuth(reason)) => Err(reason),
+            Err(other) => panic!("unexpected listener error {other:?}"),
+        }
     }
 
     #[test]
@@ -4904,11 +4954,30 @@ mod listener_sibling_tests {
     }
 
     #[test]
-    fn client_revocation_rejects_a_client_checked_against_an_expired_crl() {
-        // Same issuer and an empty revocation list, so only the expiry can
-        // reject the client. Without `enforce_revocation_expiration`, rustls
-        // keeps trusting the stale CRL and accepts it.
-        let verdict = verify_mtls_client(&[MTLS_CRL_EXPIRED]);
+    fn client_revocation_refuses_a_crl_already_expired_when_the_listener_is_built() {
+        // An expired CRL would reject every client it covers: refuse it up
+        // front, where the operator sees why, not at the first handshake.
+        let refused = build_mtls_listener(&[MTLS_CRL_EXPIRED]);
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|reason| reason.contains("expired")),
+            "an expired CRL must fail the listener, got {refused:?}"
+        );
+        assert_eq!(build_mtls_listener(&[MTLS_CRL_CURRENT]), Ok(()));
+    }
+
+    #[test]
+    fn client_revocation_rejects_a_client_once_its_crl_has_lapsed() {
+        // A CRL current when the listener was built lapses while it runs.
+        // In June 2125 the current CRL (nextUpdate January 2125) has lapsed
+        // and the client certificate (notAfter 2126) has not, so only the
+        // CRL expiry can reject the client. Without
+        // `enforce_revocation_expiration`, rustls keeps trusting the stale CRL
+        // and accepts it.
+        let june_2125 =
+            rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(4_905_100_800));
+        let verdict = verify_mtls_client_at(&[MTLS_CRL_CURRENT], june_2125);
         assert!(
             matches!(
                 verdict,
@@ -4917,11 +4986,11 @@ mod listener_sibling_tests {
                         | rustls::CertificateError::ExpiredRevocationListContext { .. }
                 ))
             ),
-            "an expired CRL from the client's issuer must reject it, got {verdict:?}"
+            "a CRL past its nextUpdate must reject the client, got {verdict:?}"
         );
-        // Positive space: the current CRL from the same issuer accepts it,
-        // so the rejection above is the expiry and nothing else.
-        assert_eq!(verify_mtls_client(&[MTLS_CRL_CURRENT]), Ok(()));
+        // Positive space: without CRLs the client is still valid then, so the
+        // rejection above is the CRL expiry and nothing else.
+        assert_eq!(verify_mtls_client_at(&[], june_2125), Ok(()));
     }
 
     #[test]
@@ -4943,39 +5012,39 @@ mod listener_sibling_tests {
     }
 
     #[test]
-    fn client_revocation_refuses_two_crls_from_the_same_issuer() {
+    fn client_revocation_refuses_two_crls_of_one_issuer_with_overlapping_scopes() {
         // webpki would only read the first of them, so the order alone would
         // decide: listing the revoking CRL second accepts the revoked client.
-        // Both orders must fail the listener instead.
-        let provider = test_crypto_provider();
+        // Every order must fail the listener instead.
         for crls in [
-            [MTLS_CRL_CURRENT, MTLS_CRL_REVOKED],
-            [MTLS_CRL_REVOKED, MTLS_CRL_CURRENT],
-            [MTLS_CRL_EXPIRED, MTLS_CRL_CURRENT],
+            vec![MTLS_CRL_CURRENT, MTLS_CRL_REVOKED],
+            vec![MTLS_CRL_REVOKED, MTLS_CRL_CURRENT],
+            // A full CRL covers every partition of its CA.
+            vec![MTLS_CRL_CURRENT, MTLS_CRL_PARTITION_A],
+            vec![MTLS_CRL_PARTITION_A, MTLS_CRL_CURRENT],
+            // The same partition twice.
+            vec![MTLS_CRL_PARTITION_A, MTLS_CRL_PARTITION_A],
         ] {
-            let config = https_config_with_client_auth(
-                ClientAuthMode::ClientAuthRequired,
-                &[MTLS_CA_PEM],
-                &crls,
-            );
+            let refused = build_mtls_listener(&crls);
             assert!(
-                matches!(
-                    HttpsListener::client_cert_verifier(&config, &provider),
-                    Err(ListenerError::ClientAuth(ref reason)) if reason.contains("same CA")
-                ),
-                "two CRLs from one issuer must fail the listener"
+                refused
+                    .as_ref()
+                    .is_err_and(|reason| reason.contains("overlapping")),
+                "overlapping CRLs of one issuer must fail the listener, got {refused:?}"
             );
         }
         // Two CRLs in one configured entry count the same as two entries.
-        let config = https_config_with_client_auth(
-            ClientAuthMode::ClientAuthRequired,
-            &[MTLS_CA_PEM],
-            &[&format!("{MTLS_CRL_CURRENT}{MTLS_CRL_REVOKED}")],
+        assert!(build_mtls_listener(&[&format!("{MTLS_CRL_CURRENT}{MTLS_CRL_REVOKED}")]).is_err());
+    }
+
+    #[test]
+    fn client_revocation_takes_the_partitions_of_one_issuer() {
+        // Partitions told apart by their distribution point cover disjoint
+        // certificates, so a CA publishing its list that way stays usable.
+        assert_eq!(
+            build_mtls_listener(&[MTLS_CRL_PARTITION_A, MTLS_CRL_PARTITION_B]),
+            Ok(())
         );
-        assert!(matches!(
-            HttpsListener::client_cert_verifier(&config, &provider),
-            Err(ListenerError::ClientAuth(_))
-        ));
     }
 
     #[test]
