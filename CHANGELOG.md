@@ -4049,6 +4049,16 @@
 
 ### 🐛 Fixed
 
+- **`test(e2e)`: the gRPC lifecycle tests record the backend's `grpc-timeout` observation before
+  announcing the Wait ([#1877](https://github.com/sozu-proxy/sozu/issues/1877)).**
+  `StoreService::wait` (`e2e/src/tests/grpc_tests.rs`) bumped `waits_started` and notified the
+  test before storing `deadline_header_seen`, so `wait_for_started` could return and the test
+  read the flag before the backend task wrote it: pinned to one CPU, both gRPC lifecycle tests
+  failed 39 to 89 runs in 100 on "the backend must receive the gRPC timeout contract through
+  Sōzu". The flag is now stored first, so the SeqCst increment publishes it to the reader. The
+  intermittent `BrokenPipe` on the fresh raw TCP frontend connection tracked by #1877 is a
+  separate failure and is not addressed here.
+
 - **`fix(h2)`: an error-GOAWAY linger pending on TLS `close_notify` releases its streams before
   any backend is dialed for them ([#1873](https://github.com/sozu-proxy/sozu/pull/1873),
   [#1861](https://github.com/sozu-proxy/sozu/issues/1861)).** #1873 releases the streams and
