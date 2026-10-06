@@ -117,6 +117,14 @@ pub const DEFAULT_ALPN_PROTOCOLS: [&str; 2] = ["h2", "http/1.1"];
 /// maximum time of inactivity for a frontend socket (60 seconds)
 pub const DEFAULT_FRONT_TIMEOUT: u32 = 60;
 
+/// permission bits given to the unix command socket when `command_socket_mode`
+/// is absent: owner read/write only, the mode Sōzu has always used
+pub const DEFAULT_COMMAND_SOCKET_MODE: u32 = 0o600;
+
+/// every permission bit `command_socket_mode` may set. setuid, setgid and the
+/// sticky bit mean nothing on a socket and are refused.
+pub const MAX_COMMAND_SOCKET_MODE: u32 = 0o777;
+
 /// maximum time of inactivity for a backend socket (30 seconds)
 pub const DEFAULT_BACK_TIMEOUT: u32 = 30;
 
@@ -425,6 +433,10 @@ pub enum ConfigError {
         value: u32,
         maximum: u32,
     },
+    /// `command_socket_mode` is not an octal permission string within
+    /// [`MAX_COMMAND_SOCKET_MODE`]. See [`parse_command_socket_mode`].
+    #[error("command_socket_mode = {value:?} is invalid: {reason}")]
+    InvalidCommandSocketMode { value: String, reason: &'static str },
     /// `disable_http11 = true` and `alpn_protocols` containing `"http/1.1"`
     /// are mutually exclusive: the proxy advertises `http/1.1` to peers,
     /// then refuses every connection that negotiates
@@ -3775,6 +3787,11 @@ impl ClusterConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default, Deserialize)]
 pub struct FileConfig {
     pub command_socket: Option<String>,
+    /// Permission bits of the unix command socket, as an octal string such
+    /// as `"0660"` or `"660"`. `None` keeps [`DEFAULT_COMMAND_SOCKET_MODE`].
+    /// Parsed by [`parse_command_socket_mode`] when the config is built.
+    #[serde(default)]
+    pub command_socket_mode: Option<String>,
     pub command_buffer_size: Option<u64>,
     pub max_command_buffer_size: Option<u64>,
     pub max_connections: Option<usize>,
@@ -4537,8 +4554,14 @@ impl ConfigBuilder {
             return Err(ConfigError::Missing(MissingKind::SavedState));
         }
 
+        let command_socket_mode = match self.file.command_socket_mode.as_deref() {
+            Some(mode) => parse_command_socket_mode(mode)?,
+            None => DEFAULT_COMMAND_SOCKET_MODE,
+        };
+
         let config = Config {
             command_socket: command_socket_path,
+            command_socket_mode,
             ..self.built.clone()
         };
 
@@ -4575,6 +4598,12 @@ impl ConfigBuilder {
 pub struct Config {
     pub config_path: String,
     pub command_socket: String,
+    /// Permission bits applied to the command socket after `bind(2)`, at most
+    /// [`MAX_COMMAND_SOCKET_MODE`]. An upgrade snapshot written by a main
+    /// process that predates the key deserializes to
+    /// [`DEFAULT_COMMAND_SOCKET_MODE`].
+    #[serde(default = "default_command_socket_mode")]
+    pub command_socket_mode: u32,
     pub command_buffer_size: u64,
     pub max_command_buffer_size: u64,
     pub max_connections: usize,
@@ -4688,6 +4717,39 @@ pub struct Config {
     /// without the `splice` feature.
     #[serde(default)]
     pub splice_pipe_capacity_bytes: Option<u64>,
+}
+
+fn default_command_socket_mode() -> u32 {
+    DEFAULT_COMMAND_SOCKET_MODE
+}
+
+/// Parse `command_socket_mode`: one to four octal digits, a leading `0`
+/// allowed (`"0660"` and `"660"` are the same mode), no `0o` prefix and no
+/// sign. The value must not exceed [`MAX_COMMAND_SOCKET_MODE`], which refuses
+/// setuid, setgid and the sticky bit, and must keep the owner's read and
+/// write bits: without them the proxy's own user could no longer connect to
+/// run `status`, `reload` or `upgrade`.
+pub fn parse_command_socket_mode(value: &str) -> Result<u32, ConfigError> {
+    let invalid = |reason| ConfigError::InvalidCommandSocketMode {
+        value: value.to_owned(),
+        reason,
+    };
+    if value.is_empty() || value.len() > 4 || !value.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+        return Err(invalid(
+            "expected one to four octal digits, such as \"0660\" or \"660\"",
+        ));
+    }
+    let mode =
+        u32::from_str_radix(value, 8).map_err(|_| invalid("expected one to four octal digits"))?;
+    if mode > MAX_COMMAND_SOCKET_MODE {
+        return Err(invalid(
+            "only permission bits (at most 0777) are allowed; setuid, setgid and sticky are refused",
+        ));
+    }
+    if mode & 0o600 != 0o600 {
+        return Err(invalid("the owner must keep read and write (0600)"));
+    }
+    Ok(mode)
 }
 
 fn default_front_timeout() -> u32 {
@@ -5011,6 +5073,10 @@ impl fmt::Debug for Config {
         f.debug_struct("Config")
             .field("config_path", &self.config_path)
             .field("command_socket", &self.command_socket)
+            .field(
+                "command_socket_mode",
+                &format_args!("{:o}", self.command_socket_mode),
+            )
             .field("command_buffer_size", &self.command_buffer_size)
             .field("max_command_buffer_size", &self.max_command_buffer_size)
             .field("max_connections", &self.max_connections)
@@ -6406,6 +6472,96 @@ mod tests {
             result.is_ok(),
             "non-H2 HTTPS listener with sub-16393 buffer should be accepted: {result:?}"
         );
+    }
+
+    fn command_socket_mode_of(mode_line: &str) -> Result<Config, ConfigError> {
+        let toml_content = format!(
+            r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+            {mode_line}
+        "#
+        );
+        let file_config: FileConfig =
+            toml::from_str(&toml_content).expect("Could not parse TOML config");
+        ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config()
+    }
+
+    #[test]
+    fn command_socket_mode_defaults_to_0600() {
+        let config = command_socket_mode_of("").expect("config without the key must load");
+        assert_eq!(config.command_socket_mode, 0o600);
+        assert_eq!(DEFAULT_COMMAND_SOCKET_MODE, 0o600);
+    }
+
+    #[test]
+    fn command_socket_mode_accepts_octal_strings() {
+        for (value, expected) in [
+            ("0660", 0o660),
+            ("660", 0o660),
+            ("0600", 0o600),
+            ("0666", 0o666),
+            ("777", 0o777),
+            ("0777", 0o777),
+            ("600", 0o600),
+            ("0640", 0o640),
+        ] {
+            let config = command_socket_mode_of(&format!("command_socket_mode = \"{value}\""))
+                .unwrap_or_else(|e| panic!("{value:?} must load: {e}"));
+            assert_eq!(config.command_socket_mode, expected, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn command_socket_mode_rejects_invalid_values() {
+        for value in [
+            "", "8", "0668", "abc", "0o660", "0x1b6", "-660", "+660", " 660", "660 ", "1660",
+            "2770", "4755", "7777", "01000", "00660", "0", "0000", "0066", "0200", "0400", "0466",
+        ] {
+            match command_socket_mode_of(&format!("command_socket_mode = \"{value}\"")) {
+                Err(ConfigError::InvalidCommandSocketMode {
+                    value: rejected, ..
+                }) => {
+                    assert_eq!(rejected, value)
+                }
+                other => panic!("{value:?} must be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn command_socket_mode_rejects_a_toml_integer() {
+        // `660` as a TOML integer is decimal 660 = 0o1224: refuse the type
+        // rather than guess which base the operator meant. The refusal is a
+        // TOML deserialization error, raised before `parse_command_socket_mode`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "command_socket = \"/tmp/sozu_test.sock\"\ncommand_socket_mode = 660\n",
+        )
+        .expect("write config");
+        match FileConfig::load_from_path(path.to_str().expect("utf-8 path")) {
+            Err(ConfigError::DeserializeToml(message)) => assert!(
+                message.contains("invalid type: integer"),
+                "unexpected message: {message}"
+            ),
+            other => panic!("an integer mode must fail as DeserializeToml, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_without_command_socket_mode_deserializes_to_0600() {
+        // An upgrade snapshot written by a main process that predates the key
+        // carries a `Config` without it.
+        let mut encoded = serde_json::to_value(Config::default()).expect("serialize Config");
+        encoded
+            .as_object_mut()
+            .expect("Config serializes to an object")
+            .remove("command_socket_mode")
+            .expect("Config serializes command_socket_mode");
+        let decoded: Config = serde_json::from_value(encoded).expect("deserialize Config");
+        assert_eq!(decoded.command_socket_mode, 0o600);
     }
 
     #[test]

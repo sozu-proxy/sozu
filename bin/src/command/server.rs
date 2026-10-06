@@ -2714,7 +2714,7 @@ pub(crate) fn peer_comm(_pid: i32) -> Option<String> {
 /// main event loop for tens of seconds. This caches the last lookups
 /// in a process-local map so a steady-state operator UID is paid at
 /// most once per main lifetime. Capped via `MAX_PEER_USER_CACHE` to
-/// stop a misbehaving peer from inflating it (the unix socket is
+/// stop a misbehaving peer from inflating it (the unix socket defaults to
 /// `0o600` so this is mostly a defense-in-depth bound).
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn peer_user(uid: u32) -> Option<String> {

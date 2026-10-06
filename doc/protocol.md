@@ -18,7 +18,7 @@ It addresses [#1155](https://github.com/sozu-proxy/sozu/issues/1155).
 ## At a glance
 
 - **Transport**: unix domain stream socket (`AF_UNIX`, `SOCK_STREAM`),
-  mode `0o600` by default.
+  mode `0o600` by default, configurable with `command_socket_mode`.
 - **Authentication**: `SO_PEERCRED` UID check (and the optional
   `command_allowed_uids` allowlist) at `accept(2)` time. The socket file
   permission is itself a coarse gate; UIDs that pass kernel-level access
@@ -237,9 +237,11 @@ the prost-generated `Request` / `Response` types.
   attribution (UID/GID/PID/comm via `SO_PEERCRED` + `/proc/<pid>/stat`)
   and a 16-hex SHA-256 fingerprint for replay correlation. See the
   control-plane audit log section of [`doc/observability.md`](observability.md).
-- **Mode 0o600** on the socket file blocks cross-UID access at the
-  kernel level. Combine with `command_allowed_uids` for defence in
-  depth when multiple daemons run as the same UID.
+- **Mode 0o600** (the `command_socket_mode` default) on the socket file
+  blocks cross-UID access at the kernel level. A wider mode such as
+  `0o660` admits the socket's group, and every UID it admits can drive
+  the proxy. Combine with `command_allowed_uids` for defence in depth
+  when multiple daemons run as the same UID.
 
 ## Related
 

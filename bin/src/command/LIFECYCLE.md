@@ -28,7 +28,7 @@ Entry point: `begin_main_process` (`bin/src/command/mod.rs`), called from `main`
 2. Initialises logging (`logging::setup_logging`).
 3. Constructs the `Server` (`bin/src/command/server.rs`) and binds the
    unix command socket (`UnixListener` per the configured `command_socket`
-   path with mode `0o600`).
+   path, then `chmod` to `command_socket_mode`, `0o600` by default).
 4. Forks the configured number of workers via `fork_main_into_worker`
    (`bin/src/worker.rs`). Each worker inherits a `Channel` pair plus an
    `ScmSocket` for FD passing.
