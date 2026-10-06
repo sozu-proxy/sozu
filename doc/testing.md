@@ -12,11 +12,6 @@ and early*, in seconds of simulation rather than days of production traffic.
 
 Three public bodies of work shape the doctrine and are cited throughout:
 
-The [feature-matrix and swarm-testing guide](feature_swarm_testing.md) defines
-the bounded release matrix, the exhaustive 768-configuration local campaign,
-and the distinction between Cargo feature variation and generated-workload
-swarm testing.
-
 - **TigerBeetle's TigerStyle** — assertion-first programming, assertion density,
   and pair (positive + negative space) assertions.
   <https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md>
@@ -41,6 +36,11 @@ swarm testing.
   (`manager.rs`/`flow.rs`) and the `fuzz_udp_flow` target remain the
   harness-independent safety net and are exercised on every debug build.
   <https://crates.io/crates/moonpool-sim>
+
+The [feature-matrix and swarm-testing guide](feature_swarm_testing.md) defines
+the bounded release matrix, the exhaustive 768-configuration local campaign,
+and the distinction between Cargo feature variation and generated-workload
+swarm testing.
 
 ---
 
