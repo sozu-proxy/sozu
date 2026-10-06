@@ -4073,6 +4073,13 @@
 
 ### 🐛 Fixed
 
+- **`test(e2e)`: `test_h1_tolerant_high_byte_method_no_ub` requires the tolerant parser to
+  forward the high-byte method.** Under `tolerant-http1-parser`, kawa accepts `0xA0..=0xFF` as
+  method-token bytes, so a `0xA5`/`0xFF` method must reach the backend through the lossy
+  `Method::new` conversion. The test accepted a direct 400 as well and only checked worker health
+  afterwards, so a strict rejection passed without exercising that conversion. It now fails unless
+  the backend accepts the connection and the client receives the backend's `200 OK`/`ok`; with the
+  feature gate removed on a strict build, the old body passes and the new one fails on the 400.
 - **`test(e2e)`: `test_h2_proxy_protocol_peer_is_the_advertised_client` keeps an oracle in
   release builds without `logs-trace` ([#1860](https://github.com/sozu-proxy/sozu/issues/1860)).**
   Its only oracle was the `peer=` slot of healthy `MUX-H2` lines, which are `trace!` and compiled

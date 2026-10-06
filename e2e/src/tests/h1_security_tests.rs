@@ -879,7 +879,7 @@ fn try_h1_tolerant_high_byte_method_no_ub(method_byte: u8) -> State {
         setup_sync_test(label, config, listeners, state, front_address, 1, false);
     let mut backend = backends.pop().unwrap();
     backend.connect();
-    // Canned reply: under tolerant parsing the proxy may forward the
+    // Canned reply: under tolerant parsing the proxy forwards the
     // request with a lossy method, so the backend must answer
     // *without* calling `receive()`, which would panic on the raw
     // high byte that sozu re-emits on the wire.
@@ -892,20 +892,41 @@ fn try_h1_tolerant_high_byte_method_no_ub(method_byte: u8) -> State {
         .write_all(&request)
         .expect("write high-byte method attack");
 
-    // Drain whichever side reacts first within the deadline. Under
-    // tolerant-parsing the proxy is expected to forward to the
-    // backend; under strict parsing the byte is a stop char and the
-    // proxy answers 400 directly. Both outcomes are acceptable here —
-    // the assertion of interest is the post-attack health check, not
-    // the rejection code.
+    // Tolerant parsing must route the request to the backend. A direct
+    // 400 response would exercise the strict parser and leave the
+    // lossy conversion path untested.
     let start = Instant::now();
+    let mut accepted = false;
     while start.elapsed() < Duration::from_millis(300) {
         if backend.accept(0) {
-            backend.send(0);
+            accepted = true;
             break;
         }
     }
-    let _ = raw_read(&mut stream);
+    if !accepted {
+        println!(
+            "{label}: tolerant parser did not route method byte 0x{method_byte:02X}; response={:?}",
+            raw_read(&mut stream)
+        );
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+    if !matches!(backend.send(0), Some(written) if written > 0) {
+        println!("{label}: backend could not send the canned response");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+    match raw_read(&mut stream) {
+        Some(response) if response.contains("200 OK") && response.contains("\r\n\r\nok") => {}
+        other => {
+            println!("{label}: expected the backend 200/ok response, got {other:?}");
+            worker.soft_stop();
+            worker.wait_for_server_stop();
+            return State::Fail;
+        }
+    }
     drop(stream);
 
     if !verify_sozu_healthy(front_address, &mut backend, false) {
