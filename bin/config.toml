@@ -74,6 +74,19 @@ log_target = "stdout"
 # default value points to "sozu.sock" file in the current directory
 command_socket = "./sozu.sock"
 
+# permission bits of the command socket, as an octal string ("0660" or "660"),
+# at most "0777". Defaults to "0600": only sozu's own user can connect.
+# A client that can connect can drive the proxy (routes, certificates, shutdown,
+# upgrade): "0660" with a dedicated group limits that to chosen users, "0666"
+# opens it to every local account. Sozu does not set the group: use a setgid
+# parent directory, or chgrp the socket after each start. The added user needs
+# search (x) permission on every parent directory of the socket. Its sozu client
+# loads its whole -c configuration, TLS certificate and key paths included, and
+# fails on an unreadable one: give it a minimal configuration with only
+# command_socket (plus the command buffer sizes when not default).
+# A mode without owner read and write (e.g. "0066") is refused.
+# command_socket_mode = "0660"
+
 # initial size in bytes of a command channel's buffers: the supervisor<->worker
 # channels and sozu ctl's own end of the command socket. It does NOT size the main
 # process's end of the command socket, which no key configures -- see

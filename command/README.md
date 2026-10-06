@@ -77,8 +77,8 @@ forge additional audit lines via embedded `\t` / `\n` / ANSI escapes.
 
 The optional `command_allowed_uids: Vec<u32>` config field rejects any
 `SO_PEERCRED` UID outside the list at the top of `Server::handle_client_request`
-(defence in depth on top of the `0o600` socket mode). Actor identity is
-captured via `SO_PEERCRED` and enriched on accept with `/proc/<pid>/comm` and
+(defence in depth on top of the socket mode, `command_socket_mode`, `0o600`
+by default). Actor identity is captured via `SO_PEERCRED` and enriched on accept with `/proc/<pid>/comm` and
 NSS `getpwuid_r(uid)`; `peer_comm` opens `/proc/<pid>/stat` first so a recycled
 PID returns `None` rather than the new owner's `comm`, and `peer_user` caches
 results in a 16-entry process-local LRU so an SSSD/LDAP wedge cannot stall the

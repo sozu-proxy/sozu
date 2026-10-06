@@ -4,6 +4,30 @@
 
 ### ✨ Added
 
+- **`feat(command)`: make the command socket mode configurable.** The command socket was
+  always chmod-ed to `0600`, so only the proxy's own user could reach it and a monitoring agent
+  running as another account, such as Zabbix, could not query it. The new global key
+  `command_socket_mode` takes an octal string, `"0660"` or `"660"`, at most `"0777"`; setuid,
+  setgid and sticky bits, non-octal digits, and a mode without owner read and write (which
+  would lock out the proxy's own user) are rejected at config load
+  (`ConfigError::InvalidCommandSocketMode`), and a TOML integer fails as a TOML type error
+  (`ConfigError::DeserializeToml`). **The default stays `"0600"`, so nothing changes
+  until an operator sets the key.** A client that can connect to the command socket can drive
+  the proxy (routes, certificates, shutdown, upgrade): `0660` with a dedicated group limits that
+  to chosen users, `0666` opens it to every local account. Sōzu sets the mode only; the group
+  comes from a setgid parent directory or a `chgrp` after start. The monitoring user needs
+  search permission on the socket's parent directories and, because its `sozu` client loads the
+  whole `-c` configuration including TLS key paths, a minimal configuration holding only
+  `command_socket`. The mode is applied once, when
+  `sozu start` binds the socket: a main upgrade inherits the bound socket and a reload does not
+  touch it, so a change takes effect at the next restart. An upgrade hand-off from a main
+  process that predates the key restores `0600`, and an older main ignores the field. No
+  `command.proto` change. Library API: `FileConfig` and `Config` gain a public
+  `command_socket_mode` field, so a struct literal must name it or use `..Default::default()`;
+  `ConfigError` gains `InvalidCommandSocketMode`; new `parse_command_socket_mode`,
+  `DEFAULT_COMMAND_SOCKET_MODE` and `MAX_COMMAND_SOCKET_MODE`. Documented in
+  `doc/configure.md` and `bin/config.toml`.
+
 - **BREAKING (library API) — `feat(health-check)`: TCP connect probe mode and configurable
   accepted HTTP statuses ([#1801](https://github.com/sozu-proxy/sozu/issues/1801)).**
   `HealthCheckConfig` gains a `mode` (proto field 7, `HealthCheckMode`): `HTTP`, the default and

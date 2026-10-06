@@ -103,8 +103,14 @@ pub fn begin_main_process(args: &Args) -> Result<(), StartError> {
 
     let unix_listener = UnixListener::bind(&path).map_err(StartError::BindToListener)?;
 
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-        .map_err(StartError::SetPermissions)?;
+    // `command_socket_mode`, `0o600` unless configured. Applied once, here:
+    // a main upgrade inherits the bound descriptor and a reload never
+    // touches the socket file, so both keep the mode set at `start`.
+    fs::set_permissions(
+        &path,
+        fs::Permissions::from_mode(config.command_socket_mode),
+    )
+    .map_err(StartError::SetPermissions)?;
 
     // Create a copy of the state path to load state later
     let saved_state_path = config.saved_state.clone();
