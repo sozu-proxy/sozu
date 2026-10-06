@@ -1891,13 +1891,13 @@ impl HttpsListener {
             }
             if roots.len() == before {
                 return Err(ListenerError::ClientAuth(
-                    "a configured trusted-CA entry contained no certificate".to_string(),
+                    "a configured trusted-CA entry contained no certificate".to_owned(),
                 ));
             }
         }
         if roots.is_empty() {
             return Err(ListenerError::ClientAuth(
-                "client auth requested but no trusted CA certificate was provided".to_string(),
+                "client auth requested but no trusted CA certificate was provided".to_owned(),
             ));
         }
 
@@ -1915,7 +1915,7 @@ impl HttpsListener {
             }
             if crls.len() == before {
                 return Err(ListenerError::ClientAuth(
-                    "a configured CRL entry contained no certificate revocation list".to_string(),
+                    "a configured CRL entry contained no certificate revocation list".to_owned(),
                 ));
             }
         }

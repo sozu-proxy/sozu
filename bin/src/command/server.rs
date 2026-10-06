@@ -2290,18 +2290,11 @@ impl Server {
         // before, made `ok + errors` unreachable and hung the task.
         let mut write_failures: Vec<(WorkerId, RequestId)> = Vec::new();
         // A worker that predates mutual TLS skips the client authentication
-        // fields of an `AddHttpsListener` and builds the listener without it.
-        // Whatever verb the client used, a listener that asks for a client
-        // certificate leaves here as `AddHttpsListenerWithClientAuth`, which
-        // such a worker cannot decode and therefore never builds.
+        // fields of an `AddHttpsListener` or `UpdateHttpsListener` and applies
+        // the rest. Whatever verb the client used, a request that carries
+        // client authentication leaves here on its `*WithClientAuth` verb,
+        // which such a worker cannot decode and therefore never applies.
         let request = request.into_canonical();
-        debug_assert!(
-            !matches!(
-                &request.request_type,
-                Some(RequestType::AddHttpsListener(listener)) if listener.requests_client_auth()
-            ),
-            "an HTTPS listener asking for a client certificate must not reach a worker as AddHttpsListener"
-        );
         let mut worker_request = WorkerRequest {
             id: String::new(),
             content: request,

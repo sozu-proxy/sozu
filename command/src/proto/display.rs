@@ -1234,8 +1234,9 @@ fn format_tags_to_string(tags: &BTreeMap<String, String>) -> String {
 /// always emitted, including for the `none` default.
 ///
 /// CA and CRL entries are PEM bodies. They are summarised as counts only —
-/// never rendered — matching the redaction the hand-written `Debug` impl in
-/// `proto/mod.rs` applies to `certificate` / `key`.
+/// never rendered — matching the redaction the hand-written
+/// `Debug for HttpsListenerConfig` (`command/src/proto/mod.rs`) applies to
+/// `certificate` / `key`.
 fn add_client_auth_rows(
     table: &mut Table,
     client_auth: &Option<i32>,

@@ -8096,7 +8096,7 @@ mod tests {
 
         // A CA bundle without an explicit mode is equally a misconfiguration.
         let mut http = ListenerBuilder::new_http(address);
-        http.client_ca_certificates = Some(vec!["ca.pem".to_string()]);
+        http.client_ca_certificates = Some(vec!["ca.pem".to_owned()]);
         assert!(matches!(
             http.to_http(None),
             Err(ConfigError::ClientAuthOnNonHttps(_))
@@ -8110,8 +8110,8 @@ mod tests {
         let address = SocketAddress::new_v4(127, 0, 0, 1, 9443);
         let mut https = ListenerBuilder::new_https(address);
         https.client_auth = Some(ClientAuthConfig::None);
-        https.client_ca_certificates = Some(vec!["/nonexistent/ca.pem".to_string()]);
-        https.client_ca_crls = Some(vec!["/nonexistent/crl.pem".to_string()]);
+        https.client_ca_certificates = Some(vec!["/nonexistent/ca.pem".to_owned()]);
+        https.client_ca_crls = Some(vec!["/nonexistent/crl.pem".to_owned()]);
         let config = https.to_tls(None).expect("NONE mode must ignore CA paths");
         assert!(config.client_ca_certificates.is_empty());
         assert!(config.client_ca_crls.is_empty());
