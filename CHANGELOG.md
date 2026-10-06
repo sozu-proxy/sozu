@@ -4049,6 +4049,21 @@
 
 ### 🐛 Fixed
 
+- **`fix(h2)`: an error-GOAWAY linger pending on TLS `close_notify` releases its streams before
+  any backend is dialed for them ([#1873](https://github.com/sozu-proxy/sozu/pull/1873),
+  [#1861](https://github.com/sozu-proxy/sozu/issues/1861)).** #1873 releases the streams and
+  backends of an H2 frontend that lingers after a GOAWAY carrying an error code in the pass that
+  starts the linger, but `Connection::lingers_after_error_goaway` (`lib/src/protocol/mux/connection.rs`)
+  only recognised a linger already draining. On TLS, a GOAWAY that leaves streams open goes out
+  without `close_notify`, so the deciding pass queues the alert and leaves the linger
+  `Pending`; when the kernel refused that record, nothing re-armed the write and the
+  `pending_links` pass of `Mux::ready_inner` could dial a backend for a stream queued in the
+  same read pass, which the next pass then closed (within the 1 s linger). The gate now counts a
+  pending linger as decided, so the release runs in the pass that decides it, before
+  `pending_links`. Pinned by
+  `an_error_goaway_linger_pending_on_close_notify_releases_before_pending_links`
+  (`lib/src/protocol/mux/mod.rs`).
+
 - **`test(e2e)`: the invalid-UTF-8 method rejection test no longer runs under
   `tolerant-http1-parser` ([#1869](https://github.com/sozu-proxy/sozu/issues/1869)).**
   `test_h1_invalid_utf8_method_no_crash` (`e2e/src/tests/h1_security_tests.rs`) sends
