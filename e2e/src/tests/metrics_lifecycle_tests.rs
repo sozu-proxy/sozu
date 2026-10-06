@@ -1996,10 +1996,7 @@ fn try_abandoned_lease_expires_without_a_command() -> State {
         peer_session_ulid: None,
     }));
     let mut lease_applied = false;
-    loop {
-        let Some(response) = worker.read_proxy_response() else {
-            break;
-        };
+    while let Some(response) = worker.read_proxy_response() {
         let terminal = response.id == worker.command_id.last;
         if let Some(ContentType::WorkerMetricDetailStatus(status)) =
             response.content.and_then(|content| content.content_type)
