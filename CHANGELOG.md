@@ -4073,6 +4073,26 @@
 
 ### 🐛 Fixed
 
+- **`fix(upgrade)`: import the 2.2.1 main snapshot on Linux with an idle control
+  plane.** A replacement started without the internal `--upgrade-protocol`
+  argument accepts the legacy flat snapshot and restores configuration, state,
+  counters and worker sessions. It acknowledges preparation using the legacy
+  boolean reply, then waits on a pidfd for the old main to exit before using
+  shared sockets. Pending administrative tasks and buffers cannot be imported:
+  suspend controllers and finish outstanding commands for this first handoff.
+  A slow old main produces a diagnostic and leaves the replacement paused; it
+  is never forcibly terminated. Explicit protocol-v2 transfers remain strict.
+  The legacy path refuses notify-supervised handoffs (`NOTIFY_SOCKET`); the
+  shipped systemd units require a controlled restart until their supervision
+  transfer is qualified. See the [upgrade procedure](doc/how_to_use.md#first-hot-upgrade-from-221).
+
+- **`fix(cli)`: report partial worker-upgrade failures from `sozu upgrade`.**
+  After replacing the main, the CLI still attempts every active worker and
+  collects every result, but now exits nonzero if any worker request fails or
+  its upgrade thread panics. The error identifies failed workers and states
+  that the main was upgraded. Already draining or stopped workers are skipped.
+  Covered by the `upgrade_cli_result` process tests.
+
 - **`test(e2e)`: `test_h1_tolerant_high_byte_method_no_ub` requires the tolerant parser to
   forward the high-byte method.** Under `tolerant-http1-parser`, kawa accepts `0xA0..=0xFF` as
   method-token bytes, so a `0xA5`/`0xFF` method must reach the backend through the lossy
@@ -4169,9 +4189,8 @@
   message names the old worker that did not finish its soft stop, or the new worker whose
   activation failed, with each distinct reason, and still states that the new worker is serving
   when its activation finished. **CLI exit status changes:** `sozu upgrade --worker N` now exits
-  non-zero in both cases. `sozu upgrade` (main) is unchanged: after the main handoff it upgrades
-  each worker in its own thread, logs a failed one as `error upgrading worker N: …`, continues
-  with the others and still exits 0. Pinned by
+  non-zero in both cases. `sozu upgrade` also reports partial worker failures
+  after collecting all worker results, as described above. Pinned by
   `upgrade_worker_reports_an_old_worker_closing_before_its_soft_stop_as_a_failure`,
   `upgrade_worker_reports_a_failed_new_worker_activation_as_a_failure` and
   `upgrade_worker_reports_success_when_both_workers_answer_ok`.
@@ -4289,8 +4308,9 @@
   are exposed. Restored stopped workers close both inherited channels without
   signalling their historical PID after their last task or response
   correlation. A running main from before this protocol cannot export the
-  missing state, so introduce this version with one controlled service restart
-  before using hot-upgrade between compatible binaries. Covered by
+  missing client and task state: the separate 2.2.1 import described above
+  requires an idle control plane and has narrower supervision support.
+  Otherwise introduce this version with a controlled service restart. Covered by
   `upgrade_main_preserves_in_flight_worker_command_and_original_client_response`,
   `rejected_candidate_keeps_old_hub_authoritative_and_reaps_child`,
   `sigterm_during_prepare_aborts_upgrade_then_stops_the_old_main`,

@@ -49,10 +49,8 @@ main.
 
 The running main first probes the installed candidate. If the candidate does
 not support protocol v2, the upgrade is rejected before the current main gives
-up ownership. Conversely, a main binary that predates protocol v2 cannot export
-the client and task state needed by a v2 replacement. Introduce v2 with a
-controlled service restart once; subsequent compatible binaries can use the
-hot-upgrade command.
+up ownership. A running 2.2.1 main uses a separate legacy import path described
+below; it cannot transfer pending control commands.
 
 Before the handoff commits, a candidate failure is rolled back: the candidate
 is reaped and the old main resumes. Once commit transmission starts, ownership
@@ -60,6 +58,60 @@ is irreversible. If activation then fails, the old main stays fenced to avoid
 two processes executing or delivering the same command; recover with the
 service manager. Signal the service unit during an upgrade instead of sending a
 signal to a PID captured before the upgrade.
+
+### First hot upgrade from 2.2.1
+
+The replacement accepts the flat snapshot sent by release `2.2.1`
+(`cd023104fab02084f948a93364315944748d74cd`) on Linux with `pidfd_open`
+support (Linux 5.3 or later, permitted by the service's syscall policy).
+It refuses a parent with PID 1: exiting a PID-namespace init would also kill
+the replacement and workers. Containers must use a supervisor that survives
+the old main, or use their normal container replacement procedure.
+The first transition requires an idle control plane:
+
+1. Suspend every producer of administrative commands, including controllers,
+   health/status polling and event subscriptions. Let outstanding operations
+   finish and close their command connections. Data-plane traffic may continue.
+2. Install the replacement at the running main's executable path and run the
+   **replacement CLI** with `sozu -c config.toml -t 30000 upgrade`. Keep the
+   existing configuration until the main and all workers have upgraded.
+3. Check the command's exit status, the published main PID, worker status and
+   traffic. Resume controllers with fresh command connections only after
+   verifying the result. Enable new features after all workers are replaced.
+
+The legacy snapshot contains configuration, routing state, counters and worker
+descriptors, but no client buffers, tasks or response correlations. The receiver
+cannot prove that the old control plane is idle; the operator must establish
+this precondition. Legacy worker-channel buffers are also absent: an asynchronous
+worker event partially read by the old main can still be lost or leave its
+channel out of frame. This bridge retains that v1 limitation; it does not offer
+v2's lossless control-channel guarantee, even with administrative clients idle.
+Worker upgrade failures must be investigated before the rollout is declared
+complete. Use a controlled restart when that legacy limitation is unacceptable.
+The old main returns its success response before it exits.
+The replacement waits for that actual process to exit before using the shared
+sockets, including the worker SCM channels. If this takes longer than
+`worker_timeout`, it logs a diagnostic and keeps waiting without touching the
+sockets or killing the old main. A CLI timeout is therefore an ambiguous result:
+inspect the processes and logs before deciding on recovery or another upgrade.
+
+**systemd limitation:** the legacy import refuses before acknowledgement when
+`NOTIFY_SOCKET` is present. The shipped `Type=notify`/`NotifyAccess=main` units
+can stop the service when the old main exits before accepting the new main's
+identity. Use a controlled service restart for this first transition under
+these units; unsetting `NOTIFY_SOCKET` is not a safe workaround. A hot transition
+under systemd needs a separately verified supervision handoff. Other process
+supervisors must also allow the replacement to outlive the original main.
+
+A refusal leaves the old main serving, but 2.2.1 has already advanced its boot
+generation and emitted a successful main-upgrade audit entry before asking the
+replacement. Neither that entry nor the old main's first success response
+proves that the replacement activated; verify its PID and worker results.
+
+`sozu upgrade` upgrades the main and then all active workers, skipping workers
+already draining or stopped. A worker failure makes the command exit nonzero
+after collecting all worker results. This is a partial upgrade, not a rollback
+of the main: inspect the reported worker IDs and retry or recover those workers.
 
 ## Run it with Docker
 

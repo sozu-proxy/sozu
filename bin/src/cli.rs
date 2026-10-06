@@ -144,7 +144,7 @@ pub enum SubCmd {
         #[clap(long = "upgrade-fd", help = "upgrade data file descriptor")]
         upgrade_fd: i32,
         #[clap(long = "upgrade-protocol", help = "main-upgrade protocol version")]
-        upgrade_protocol: u16,
+        upgrade_protocol: Option<u16>,
         #[clap(
             long = "command-buffer-size",
             help = "Main process channel buffer size",
@@ -2153,14 +2153,38 @@ fn parse_tags(string_to_parse: &str) -> Result<BTreeMap<String, String>, String>
 #[cfg(test)]
 mod tests {
     #[test]
-    fn main_upgrade_requires_v2_marker_and_exposes_a_preflight_probe() {
+    fn main_upgrade_accepts_the_legacy_missing_marker_and_exposes_the_v2_probe() {
         use clap::Parser;
 
-        assert!(
-            super::Args::try_parse_from(["sozu", "main", "--fd", "3", "--upgrade-fd", "4",])
-                .is_err(),
-            "a legacy sender without the V2 marker must be rejected before reading upgrade state"
-        );
+        let legacy =
+            super::Args::try_parse_from(["sozu", "main", "--fd", "3", "--upgrade-fd", "4"])
+                .expect("the exact 2.2.1 invocation without a marker must select legacy upgrade");
+        assert!(matches!(
+            legacy.cmd,
+            super::SubCmd::Main {
+                upgrade_protocol: None,
+                ..
+            }
+        ));
+
+        let v2 = super::Args::try_parse_from([
+            "sozu",
+            "main",
+            "--fd",
+            "3",
+            "--upgrade-fd",
+            "4",
+            "--upgrade-protocol",
+            "2",
+        ])
+        .expect("an explicit V2 marker must keep selecting protocol V2");
+        assert!(matches!(
+            v2.cmd,
+            super::SubCmd::Main {
+                upgrade_protocol: Some(2),
+                ..
+            }
+        ));
 
         let parsed = super::Args::try_parse_from(["sozu", "upgrade-probe", "--protocol", "2"])
             .expect("a V2 binary must expose a side-effect-free capability probe");

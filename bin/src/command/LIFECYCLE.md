@@ -338,9 +338,22 @@ replay of its commands:
    descriptors are closed without signalling its historical PID again.
 
 A binary that predates this protocol cannot export the missing client and task
-state. Deployments must introduce protocol v2 with a controlled service restart
-before using main hot-upgrade between later compatible binaries; the capability
-probe intentionally provides no lossy legacy fallback. A `SIGTERM` already in
+state. The replacement accepts the flat 2.2.1 snapshot only on the legacy
+receiver path selected by an absent internal `--upgrade-protocol` argument.
+It restores configuration, state, counters and paused worker sessions, then
+sends the legacy boolean acknowledgement. A Linux pidfd observing the actual
+parent's exit is the ownership barrier: acknowledgement and confirmation-channel
+EOF are not barriers because the old event loop can still process its current
+batch. No shared channel I/O or SCM mode change occurs before parent exit.
+A delayed parent produces a diagnostic after `worker_timeout`; the receiver
+keeps waiting, without killing the parent or releasing the inherited channels.
+This path requires externally quiescent administration and fresh client
+connections afterward; it cannot preserve tasks or buffers absent from the old
+snapshot. It refuses before acknowledgement under notify supervision
+(`NOTIFY_SOCKET`), which requires a separately verified supervisor handoff or
+a controlled restart. See [the 2.2.1 upgrade procedure](../../../doc/how_to_use.md#first-hot-upgrade-from-221).
+Explicit v2 imports remain strict, and the outgoing capability probe still
+rejects legacy candidates. A `SIGTERM` already in
 the old main's self-pipe aborts before `COMMIT` and is left for its normal event
 loop. A signal sent specifically to the old PID after that final check is not
 forwarded; service managers should signal the unit rather than a superseded PID.
@@ -355,8 +368,9 @@ old worker's `SoftStop`, including the synthetic "closed before answering" of
 §1.2, or of any activation request of the new worker, answers `Failure` naming
 the worker and its reasons, and says whether the new worker is serving. The
 CLI maps that answer to a non-zero exit of `sozu upgrade --worker N`; the
-per-worker upgrades that `sozu upgrade` runs after a main handoff only log
-such a failure (`bin/src/ctl/command.rs`).
+per-worker upgrades that `sozu upgrade` runs after a main handoff collect all
+results and also exit nonzero if any worker fails. The main handoff is already
+committed and is not rolled back (`bin/src/ctl/command.rs`).
 
 ---
 
