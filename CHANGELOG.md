@@ -4073,6 +4073,30 @@
 
 ### 🐛 Fixed
 
+- **`test(e2e)`: `test_h1_tolerant_high_byte_method_no_ub` requires the tolerant parser to
+  forward the high-byte method.** Under `tolerant-http1-parser`, kawa accepts `0xA0..=0xFF` as
+  method-token bytes, so a `0xA5`/`0xFF` method must reach the backend through the lossy
+  `Method::new` conversion. The test accepted a direct 400 as well and only checked worker health
+  afterwards, so a strict rejection passed without exercising that conversion. It now fails unless
+  the backend accepts the connection and the client receives the backend's `200 OK`/`ok`; with the
+  feature gate removed on a strict build, the old body passes and the new one fails on the 400.
+- **`test(e2e)`: `test_h2_proxy_protocol_peer_is_the_advertised_client` keeps an oracle in
+  release builds without `logs-trace` ([#1860](https://github.com/sozu-proxy/sozu/issues/1860)).**
+  Its only oracle was the `peer=` slot of healthy `MUX-H2` lines, which are `trace!` and compiled
+  out of a release build without `logs-trace`, so it failed there although the request completed
+  with 200. It now first requires the request's access log to carry the PROXY-advertised client
+  as its session address and not the raw peer, in every build, and keeps the `MUX-H2` peer-slot
+  check wherever `trace!` is compiled in (`debug_assertions` or `logs-trace`); a build without it
+  prints that only the access-log oracle ran. `sozu-e2e` gains `logs-debug` and `logs-trace`
+  features forwarding to `sozu-lib` and `sozu-command-lib`.
+- **`fix(lib)`: `sozu-lib`'s `logs-debug` and `logs-trace` features now enable the same feature
+  on `sozu-command-lib` ([#1870](https://github.com/sozu-proxy/sozu/issues/1870)).** The
+  `debug!`/`trace!` macros evaluate their `cfg(feature = ...)` in the crate that expands them, so
+  `sozu-lib --features logs-trace` compiled in `sozu-lib`'s own call sites but left
+  `sozu-command-lib`'s (command channel, SCM socket, config) stripped in release builds, unlike
+  the `sozu` binary and `sozu-e2e`, which already forward both. Measured on the release `http`
+  example: `channel available space` (`Channel::readable`, `command/src/channel.rs`) was absent
+  before and is present after. The `sozu` binary is unaffected.
 - **`test(e2e)`: the gRPC lifecycle tests record the backend's `grpc-timeout` observation before
   announcing the Wait ([#1877](https://github.com/sozu-proxy/sozu/issues/1877)).**
   `StoreService::wait` (`e2e/src/tests/grpc_tests.rs`) bumped `waits_started` and notified the

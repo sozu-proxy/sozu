@@ -119,8 +119,12 @@ crypto-ring = ["rustls/ring"]
 crypto-aws-lc-rs = ["rustls/aws-lc-rs"]
 crypto-openssl = ["dep:rustls-openssl"]
 fips = ["crypto-aws-lc-rs", "rustls/fips"]
-logs-debug = []
-logs-trace = []
+# `debug!`/`trace!` are `macro_rules!` exported by `sozu-command-lib`; their
+# `cfg(feature = ...)` is evaluated in the crate that expands them. Forward both
+# so `sozu-command-lib`'s own call sites (channel, SCM socket, config) compile
+# in alongside this crate's, as `bin` and `e2e` already do.
+logs-debug = ["sozu-command-lib/logs-debug"]
+logs-trace = ["sozu-command-lib/logs-trace"]
 opentelemetry = []
 simd = ["kawa/simd"]
 splice = []

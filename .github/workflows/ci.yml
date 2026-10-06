@@ -323,10 +323,12 @@ jobs:
       #
       # Gated to one cell rather than run per crypto provider, and carrying no
       # `${{ matrix.flags }}`. Both follow from the same measurement:
-      # `command/src/` contains ZERO `cfg(feature)` — its only features
-      # (`unstable`, `logs-debug`, `logs-trace`) are empty markers and it has no
-      # crypto-provider feature at all, so nothing in it varies by matrix cell
-      # and four cells would re-run one identical result four times. The flags
+      # its only features (`unstable`, `logs-debug`, `logs-trace`) declare no
+      # dependency, the log ones only compile in the `debug!`/`trace!` arms of
+      # `command/src/logging/logs.rs` (which this debug-profile step already has
+      # through `debug_assertions`), and it has no crypto-provider feature at
+      # all, so nothing in it varies by matrix cell and four cells would re-run
+      # one identical result four times. The flags
       # are not merely redundant but rejected: `cargo test -p sozu-command-lib
       # --no-default-features --features crypto-ring,opentelemetry,splice,simd`
       # fails with "the package 'sozu-command-lib' does not contain these
@@ -366,9 +368,9 @@ jobs:
       # GitHub runner serves them fine. They stay `#[ignore]`d so a
       # contributor's `cargo test` stays fast, and this step is what runs them;
       # before it existed they never ran anywhere. `sozu_top_e2e` is absent
-      # here: it is `#![cfg(feature = "tui")]` and no matrix cell's flags
-      # enable that feature, so its target compiles to an empty binary. The
-      # next step runs it.
+      # here: it is `#![cfg(feature = "tui")]`, `bin/Cargo.toml` declares it with
+      # `required-features = ["tui"]`, and no matrix cell's flags enable that
+      # feature, so Cargo leaves the target out. The next step runs it.
       - name: Test sozu (process-level e2e)
         run: |
           cargo test -p sozu --locked ${{ matrix.flags }} --test load_state_rollback_e2e -- --ignored

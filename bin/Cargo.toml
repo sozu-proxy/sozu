@@ -25,6 +25,14 @@ path = "src/lib.rs"
 name = "sozu"
 path = "src/main.rs"
 
+# `tests/sozu_top_e2e.rs` is `#![cfg(feature = "tui")]`. Declaring the
+# feature here makes Cargo omit the target from non-`tui` builds instead of
+# emitting an empty 0-test executable.
+[[test]]
+name = "sozu_top_e2e"
+path = "tests/sozu_top_e2e.rs"
+required-features = ["tui"]
+
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
 libc = { workspace = true }

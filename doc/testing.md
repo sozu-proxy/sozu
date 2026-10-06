@@ -95,6 +95,14 @@ catching.
 
 Notes:
 
+- An integration-test file gated as a whole on a Cargo feature declares the
+  same condition with `required-features` on its `[[test]]` target, so Cargo
+  omits it from builds without the feature instead of emitting an empty 0-test
+  executable. `bin/tests/sozu_top_e2e.rs` is `#![cfg(feature = "tui")]` and its
+  target in `bin/Cargo.toml` requires `tui`. A gate on a non-feature `cfg`
+  (`target_os = "linux"` in `bin/tests/*`, `tokio_unstable` in `sim/tests/*`)
+  has no manifest equivalent and still builds an empty executable where it is
+  off.
 - The e2e suite includes H1/H2/TLS/TCP/UDP coverage plus targeted security and
   feature suites; see `e2e/src/tests/mod.rs` for the full module list
   (`h2_tests`, `h2_security_*`, `mux_tests`, `tls_tests`, `tcp_tests`,
