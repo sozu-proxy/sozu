@@ -1230,8 +1230,11 @@ fn format_tags_to_string(tags: &BTreeMap<String, String>) -> String {
 /// An operator reading `sozu listeners` must be able to tell a listener that
 /// requires a client certificate from one that does not: the two are otherwise
 /// indistinguishable in this table, which is exactly the confusion that turns a
-/// misapplied policy into silent unauthenticated access. The row is therefore
-/// always emitted, including for the `none` default.
+/// misapplied policy into silent unauthenticated access. The rows are emitted
+/// whenever any client authentication key is set, an explicit `none`
+/// included, so a listener with a policy always shows it; a listener with
+/// none of the keys renders as it did before client authentication existed,
+/// like the other optional rows of this table.
 ///
 /// CA and CRL entries are PEM bodies. They are summarised as counts only —
 /// never rendered — matching the redaction the hand-written
@@ -1472,12 +1475,17 @@ impl Display for HttpsListenerConfig {
         if let Some(v) = self.forwarded_headers {
             table.add_row(row!["forwarded headers", forwarded_headers_label(v)]);
         }
-        add_client_auth_rows(
-            &mut table,
-            &self.client_auth,
-            &self.client_ca_certificates,
-            &self.client_ca_crls,
-        );
+        if self.client_auth.is_some()
+            || !self.client_ca_certificates.is_empty()
+            || !self.client_ca_crls.is_empty()
+        {
+            add_client_auth_rows(
+                &mut table,
+                &self.client_auth,
+                &self.client_ca_certificates,
+                &self.client_ca_crls,
+            );
+        }
         write!(f, "{table}")
     }
 }
@@ -1689,7 +1697,10 @@ mod tests {
         // with `required` client auth used to be byte-identical to one with
         // client auth disabled, so an operator could not verify an applied
         // mTLS policy from the CLI.
-        let none = format!("{}", https_config(None, &[], &[]));
+        let none = format!(
+            "{}",
+            https_config(Some(ClientAuthMode::ClientAuthNone as i32), &[], &[])
+        );
         let required = format!(
             "{}",
             https_config(
@@ -1701,7 +1712,14 @@ mod tests {
 
         assert!(
             none.contains(ClientAuthMode::ClientAuthNone.as_str_name()),
-            "an absent client_auth must render as the none default: {none}"
+            "an explicit none must be visible: {none}"
+        );
+        // A listener with no client authentication key renders as before
+        // client authentication existed.
+        let unset = format!("{}", https_config(None, &[], &[]));
+        assert!(
+            !unset.contains("client auth"),
+            "a listener without client auth keys must show no client auth row: {unset}"
         );
         assert!(
             required.contains(ClientAuthMode::ClientAuthRequired.as_str_name()),
