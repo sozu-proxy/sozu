@@ -183,9 +183,13 @@ terminates only the attempt's recorded process group, and lets later safe cells
 run. A command that exits while leaving a live descendant records a failure;
 the claim is never removed until its process group is empty. Failure to prove
 or perform that exact cleanup blocks the campaign without a terminal receipt.
-Each protocol-service attempt also gets a unique Docker ownership label, so a
-different worktree running the same projected cell cannot be selected by its
-cleanup.
+Each protocol-service attempt also gets a unique Docker ownership label,
+`$SOZU_PROTOCOL_SERVICE_RUN_ID-<attempt id>`, so a different worktree running
+the same projected cell cannot be selected by its cleanup. The workflow's final
+cleanup step matches that prefix, so it still removes the containers of a job
+the runner could not clean up itself. A command may also declare a required
+output line: the Redis cell's fixture-cleanup run must print
+`test result: ok. 2 passed; 0 failed;`, otherwise it fails even on exit 0.
 
 The exhaustive runner checks disk, memory, swap, and one-minute load before
 admission. Later batches repeat the disk, memory, and swap checks, while merely

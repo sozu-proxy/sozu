@@ -105,24 +105,32 @@ jobs:
             --state-dir "$STATE_DIR" \
             --cell '${{ matrix.cell_id }}' \
             --suites services \
-            --jobs 4 > "$STATE_DIR/command-output.json"
+            --jobs 4 > "$STATE_DIR/command-output.json" || status=$?
           cat "$STATE_DIR/command-output.json"
+          exit "${status:-0}"
 
       - name: Collect and remove only this cell's containers
         if: always()
         env:
           SOZU_PROTOCOL_SERVICE_ARTIFACT_DIR: ${{ runner.temp }}/sozu-protocol-services/${{ matrix.service }}-${{ matrix.config_id }}
         run: |
+          set -o pipefail
           mkdir -p "$SOZU_PROTOCOL_SERVICE_ARTIFACT_DIR"
-          mapfile -t ids < <(docker ps -aq \
-            --filter "label=org.sozu.e2e.run=$SOZU_PROTOCOL_SERVICE_RUN_ID")
+          # The runner labels each attempt's containers with
+          # "$SOZU_PROTOCOL_SERVICE_RUN_ID-<attempt id>", so match the prefix.
+          owned() {
+            docker ps -a --filter label=org.sozu.e2e.run \
+              --format '{{.ID}} {{.Label "org.sozu.e2e.run"}}' \
+              | awk -v run="$SOZU_PROTOCOL_SERVICE_RUN_ID" \
+                  '$2 == run || index($2, run "-") == 1 { print $1 }'
+          }
+          mapfile -t ids < <(owned)
           for id in "${ids[@]}"; do
             docker logs "$id" \
               > "$SOZU_PROTOCOL_SERVICE_ARTIFACT_DIR/$id.log" 2>&1 || true
             docker rm --volumes --force "$id"
           done
-          remaining="$(docker ps -aq \
-            --filter "label=org.sozu.e2e.run=$SOZU_PROTOCOL_SERVICE_RUN_ID")"
+          remaining="$(owned)"
           test -z "$remaining"
 
       - name: Upload receipts and service logs

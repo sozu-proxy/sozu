@@ -96,8 +96,9 @@ jobs:
             --state-dir "$STATE_DIR" \
             --config-id '${{ matrix.config_id }}' \
             --suites bin,lib,e2e,command,process,tui-process \
-            --jobs 4 > "$STATE_DIR/command-output.json"
+            --jobs 4 > "$STATE_DIR/command-output.json" || status=$?
           cat "$STATE_DIR/command-output.json"
+          exit "${status:-0}"
 
       - name: Upload receipts and compressed logs
         if: always()

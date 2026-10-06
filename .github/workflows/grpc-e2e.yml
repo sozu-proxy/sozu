@@ -94,8 +94,9 @@ jobs:
             --state-dir "$STATE_DIR" \
             --cell '${{ matrix.cell_id }}' \
             --suites grpc \
-            --jobs 4 > "$STATE_DIR/command-output.json"
+            --jobs 4 > "$STATE_DIR/command-output.json" || status=$?
           cat "$STATE_DIR/command-output.json"
+          exit "${status:-0}"
 
       - name: Upload receipts and compressed logs
         if: always()
