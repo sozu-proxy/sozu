@@ -591,7 +591,7 @@ def _recorded_live_leaders(payload: Mapping[str, object]) -> tuple[int, ...]:
             )
             actual = _process_stat(leader_pid)
             state = _process_state(leader_pid)
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             continue
         except (KeyError, TypeError, ValueError) as error:
             raise RuntimeError("orphan claim has incomplete process identity") from error

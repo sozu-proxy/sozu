@@ -1658,7 +1658,8 @@ def _active_process_group_members(process_group_id: int) -> tuple[int, ...]:
             continue
         try:
             raw = (entry / "stat").read_text(encoding="utf-8")
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
+            # A process that exits between open() and read() yields ESRCH.
             continue
         closing = raw.rfind(")")
         if closing < 0:
@@ -1733,13 +1734,15 @@ def _recorded_process_group(
         state.note_process_group(identity, attempt_id, process.pid)
         yield cleanup_result
     finally:
-        cleanup_result[0] = _terminate_owned_process_group(
-            process,
-            destination,
-            reason=cleanup_reason,
-        )
-        if process.stdout is not None:
-            process.stdout.close()
+        try:
+            cleanup_result[0] = _terminate_owned_process_group(
+                process,
+                destination,
+                reason=cleanup_reason,
+            )
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
 
 
 def _run_specs(

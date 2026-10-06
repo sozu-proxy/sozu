@@ -2002,5 +2002,53 @@ class FeatureMatrixTests(unittest.TestCase):
         self.assertEqual(receipts["cell-failed"]["identity_sha256"], failed_identity)
 
 
+    def test_process_group_scan_skips_a_process_that_exits_between_open_and_read(
+        self,
+    ) -> None:
+        # Reading /proc/<pid>/stat of a process reaped after open() raises
+        # ProcessLookupError (ESRCH), not FileNotFoundError (#1864).
+        leader = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        self.addCleanup(leader.wait)
+        self.addCleanup(leader.kill)
+        original_read_text = pathlib.Path.read_text
+        vanished: list[str] = []
+
+        def read_text(path: pathlib.Path, *args: object, **kwargs: object) -> str:
+            pid = path.parent.name
+            if path.name == "stat" and pid != str(leader.pid) and not vanished:
+                vanished.append(pid)
+                raise ProcessLookupError(3, "No such process")
+            return original_read_text(path, *args, **kwargs)
+
+        with mock.patch.object(pathlib.Path, "read_text", read_text):
+            members = run_feature_matrix._active_process_group_members(leader.pid)
+
+        self.assertEqual(len(vanished), 1)
+        self.assertEqual(members, (leader.pid,))
+
+    def test_recorded_process_group_closes_output_when_cleanup_fails(self) -> None:
+        process = subprocess.Popen(
+            ["true"], stdout=subprocess.PIPE, start_new_session=True
+        )
+        process.wait()
+        state = mock.Mock()
+        with mock.patch.object(
+            run_feature_matrix,
+            "_terminate_owned_process_group",
+            side_effect=run_feature_matrix.OwnedProcessGroupError("cleanup failed"),
+        ):
+            with self.assertRaises(run_feature_matrix.OwnedProcessGroupError):
+                with run_feature_matrix._recorded_process_group(
+                    process,
+                    state=state,
+                    identity=mock.Mock(),
+                    attempt_id="attempt",
+                    destination=mock.Mock(),
+                    cleanup_reason="test",
+                ):
+                    pass
+
+        self.assertTrue(process.stdout.closed)
+
 if __name__ == "__main__":
     unittest.main()
