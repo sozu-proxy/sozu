@@ -4073,6 +4073,14 @@
 
 ### 🐛 Fixed
 
+- **`fix(lib)`: `sozu-lib`'s `logs-debug` and `logs-trace` features now enable the same feature
+  on `sozu-command-lib` ([#1870](https://github.com/sozu-proxy/sozu/issues/1870)).** The
+  `debug!`/`trace!` macros evaluate their `cfg(feature = ...)` in the crate that expands them, so
+  `sozu-lib --features logs-trace` compiled in `sozu-lib`'s own call sites but left
+  `sozu-command-lib`'s (command channel, SCM socket, config) stripped in release builds, unlike
+  the `sozu` binary and `sozu-e2e`, which already forward both. Measured on the release `http`
+  example: `channel available space` (`Channel::readable`, `command/src/channel.rs`) was absent
+  before and is present after. The `sozu` binary is unaffected.
 - **`test(e2e)`: the gRPC lifecycle tests record the backend's `grpc-timeout` observation before
   announcing the Wait ([#1877](https://github.com/sozu-proxy/sozu/issues/1877)).**
   `StoreService::wait` (`e2e/src/tests/grpc_tests.rs`) bumped `waits_started` and notified the
