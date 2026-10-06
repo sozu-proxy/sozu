@@ -4073,6 +4073,15 @@
 
 ### 🐛 Fixed
 
+- **`test(e2e)`: `test_h2_proxy_protocol_peer_is_the_advertised_client` keeps an oracle in
+  release builds without `logs-trace` ([#1860](https://github.com/sozu-proxy/sozu/issues/1860)).**
+  Its only oracle was the `peer=` slot of healthy `MUX-H2` lines, which are `trace!` and compiled
+  out of a release build without `logs-trace`, so it failed there although the request completed
+  with 200. It now first requires the request's access log to carry the PROXY-advertised client
+  as its session address and not the raw peer, in every build, and keeps the `MUX-H2` peer-slot
+  check wherever `trace!` is compiled in (`debug_assertions` or `logs-trace`); a build without it
+  prints that only the access-log oracle ran. `sozu-e2e` gains `logs-debug` and `logs-trace`
+  features forwarding to `sozu-lib` and `sozu-command-lib`.
 - **`fix(lib)`: `sozu-lib`'s `logs-debug` and `logs-trace` features now enable the same feature
   on `sozu-command-lib` ([#1870](https://github.com/sozu-proxy/sozu/issues/1870)).** The
   `debug!`/`trace!` macros evaluate their `cfg(feature = ...)` in the crate that expands them, so

@@ -95,6 +95,14 @@ fips = ["sozu-lib/fips", "hyper-rustls/aws-lc-rs"]
 # not fail with "Package `sozu-e2e` does not have feature `<name>`".
 # The features only affect `sozu-lib` internals; the e2e suite does
 # not itself observe behaviour differences.
+#
+# `logs-debug` / `logs-trace` compile `debug!` / `trace!` into release
+# builds. They are forwarded so a `--release` e2e run can enable them and
+# so a test can gate a log oracle on
+# `cfg!(any(debug_assertions, feature = "logs-trace"))`
+# (`e2e/src/tests/h2_log_context_tests.rs`).
+logs-debug = ["sozu-lib/logs-debug", "sozu-command-lib/logs-debug"]
+logs-trace = ["sozu-lib/logs-trace", "sozu-command-lib/logs-trace"]
 opentelemetry = ["sozu-lib/opentelemetry"]
 simd = ["sozu-lib/simd"]
 # Pass-through for the tolerant H1 parser, so feature-gated e2e tests
