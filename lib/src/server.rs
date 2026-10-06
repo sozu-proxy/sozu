@@ -1623,6 +1623,11 @@ impl Server {
     /// The server runs in a loop until a shutdown is ordered
     pub fn run(&mut self) {
         let mut events = Events::with_capacity(1024); // TODO: make event capacity configurable?
+        // The session owning each event's token when `epoll_wait` returned,
+        // by event position; see `Server::ready_if_still_owned`. Reused
+        // across turns so the loop allocates it once.
+        let mut event_owners: Vec<Option<Rc<RefCell<dyn ProxySession>>>> =
+            Vec::with_capacity(events.capacity());
         self.last_sessions_len = self.sessions.borrow().slab.len();
 
         self.last_zombie_check = Instant::now();
@@ -1654,7 +1659,8 @@ impl Server {
 
             self.send_queue();
 
-            for event in events.iter() {
+            self.snapshot_event_owners(events.iter().map(|event| event.token()), &mut event_owners);
+            for (event, owner) in events.iter().zip(event_owners.drain(..)) {
                 match event.token() {
                     // this is the command channel
                     Token(0) => {
@@ -1715,7 +1721,7 @@ impl Server {
                     token if self.udp.borrow().health_owns_token(token) => {
                         self.udp.borrow_mut().health_ready(token);
                     }
-                    token => self.ready(token, Ready::from(event)),
+                    token => self.ready_if_still_owned(token, Ready::from(event), owner),
                 }
             }
 
@@ -4088,6 +4094,65 @@ impl Server {
         gauge!(names::accept_queue::CONNECTIONS, self.accept_queue.len());
     }
 
+    /// Record, for each token of one `epoll_wait` result, the session its
+    /// slab slot holds right now, before any of the result is dispatched.
+    fn snapshot_event_owners(
+        &self,
+        tokens: impl Iterator<Item = Token>,
+        owners: &mut Vec<Option<Rc<RefCell<dyn ProxySession>>>>,
+    ) {
+        debug_assert!(
+            owners.is_empty(),
+            "the previous turn must have consumed every event owner"
+        );
+        let sessions = self.sessions.borrow();
+        owners.extend(tokens.map(|token| sessions.slab.get(token.0).cloned()));
+    }
+
+    /// Dispatch `events` through `Server::ready` only if `token` still
+    /// belongs to `owner`, the session `Server::snapshot_event_owners`
+    /// recorded for it when `epoll_wait` returned.
+    ///
+    /// A session that closes while the loop walks one `epoll_wait` result
+    /// frees its slab slots at once, and the slab hands the most recently
+    /// freed key to the next allocation. A session dispatched later in the
+    /// same result can therefore take that key for its new backend
+    /// (`TcpSession::connect_to_backend` in `lib/src/tcp.rs`, or the mux's
+    /// backend dial through `L7Proxy::add_session`, `lib/src/lib.rs`) while the
+    /// result still holds an event, typically a HUP, from the closed
+    /// session's own socket. Delivered under the reused token, that event
+    /// reads as the new backend hanging up, and the new session closes
+    /// (sozu-proxy/sozu#1877). Comparing with the recorded owner drops it.
+    /// The recorded `Rc` stays alive until this call, so no new session can
+    /// sit at its address and pass the comparison by accident.
+    ///
+    /// The guard compares sessions, not sockets: a session that closes one of
+    /// its own backends and dials another in the same result, on a different
+    /// descriptor's event, gets the freed key back under the same `Rc`, and a
+    /// queued event of the old socket still reaches it.
+    fn ready_if_still_owned(
+        &mut self,
+        token: Token,
+        events: Ready,
+        owner: Option<Rc<RefCell<dyn ProxySession>>>,
+    ) {
+        let still_owned = owner.is_some_and(|owner| {
+            self.sessions
+                .borrow()
+                .slab
+                .get(token.0)
+                .is_some_and(|current| Rc::ptr_eq(current, &owner))
+        });
+        if !still_owned {
+            trace!(
+                "PROXY\t{:?} dropping events {:?} from a socket whose session closed earlier in this epoll result",
+                token, events
+            );
+            return;
+        }
+        self.ready(token, events);
+    }
+
     pub fn ready(&mut self, token: Token, events: Ready) {
         trace!("PROXY\t{:?} got events: {:?}", token, events);
 
@@ -4691,6 +4756,158 @@ mod accept_ready_tests {
         assert!(
             server.accept_ready.is_empty(),
             "a listen token with no session must be dropped from accept_ready"
+        );
+    }
+}
+/// One `epoll_wait` result can hold events for a session that closes while
+/// the loop walks it, after another session took over one of its slab keys.
+/// `Server::ready_if_still_owned` must deliver such an event to nobody
+/// (sozu-proxy/sozu#1877).
+#[cfg(test)]
+mod event_owner_tests {
+    use super::*;
+
+    /// A session that closes on its first `ready` and frees its backend slot
+    /// from `close`, as `TcpSession::close_backend` (`lib/src/tcp.rs`) does.
+    struct ClosingSession {
+        sessions: Rc<RefCell<SessionManager>>,
+        frontend: Token,
+        backend: Token,
+    }
+
+    impl ProxySession for ClosingSession {
+        fn protocol(&self) -> Protocol {
+            Protocol::TCP
+        }
+        fn ready(&mut self, _session: Rc<RefCell<dyn ProxySession>>) -> SessionIsToBeClosed {
+            true
+        }
+        fn shutting_down(&mut self) -> SessionIsToBeClosed {
+            true
+        }
+        fn update_readiness(&mut self, _token: Token, _events: Ready) {}
+        fn close(&mut self) {
+            self.sessions.borrow_mut().slab.try_remove(self.backend.0);
+        }
+        fn timeout(&mut self, _token: Token) -> SessionIsToBeClosed {
+            false
+        }
+        fn last_event(&self) -> Instant {
+            Instant::now()
+        }
+        fn print_session(&self) {}
+        fn frontend_token(&self) -> Token {
+            self.frontend
+        }
+    }
+
+    /// A session whose first `ready` dials a backend, taking the slab's next
+    /// vacant key as `TcpSession::connect_to_backend` (`lib/src/tcp.rs`) does,
+    /// and that records every token it is handed readiness for.
+    struct DialingSession {
+        sessions: Rc<RefCell<SessionManager>>,
+        frontend: Token,
+        backend: Option<Token>,
+        delivered: Vec<Token>,
+    }
+
+    impl ProxySession for DialingSession {
+        fn protocol(&self) -> Protocol {
+            Protocol::TCP
+        }
+        fn ready(&mut self, session: Rc<RefCell<dyn ProxySession>>) -> SessionIsToBeClosed {
+            if self.backend.is_none() {
+                self.backend = Some(Token(self.sessions.borrow_mut().slab.insert(session)));
+            }
+            false
+        }
+        fn shutting_down(&mut self) -> SessionIsToBeClosed {
+            true
+        }
+        fn update_readiness(&mut self, token: Token, _events: Ready) {
+            self.delivered.push(token);
+        }
+        fn close(&mut self) {}
+        fn timeout(&mut self, _token: Token) -> SessionIsToBeClosed {
+            false
+        }
+        fn last_event(&self) -> Instant {
+            Instant::now()
+        }
+        fn print_session(&self) {}
+        fn frontend_token(&self) -> Token {
+            self.frontend
+        }
+    }
+
+    /// The batch of sozu-proxy/sozu#1877: the client's FIN on the first
+    /// session's frontend, the first readiness of the second session, then
+    /// the HUP of the first session's backend socket, in that order.
+    ///
+    /// To SEE THIS RED: make `Server::ready_if_still_owned` call
+    /// `self.ready(token, events)` unconditionally — the dialing session then
+    /// receives the closed backend's HUP under its own backend token.
+    #[test]
+    fn an_event_of_a_closed_session_is_not_delivered_to_the_session_reusing_its_token() {
+        let (mut server, _listen_token, _address) =
+            super::accept_ready_tests::server_with_tcp_listener();
+        let sessions = server.sessions.clone();
+
+        let closing = Rc::new(RefCell::new(ClosingSession {
+            sessions: sessions.clone(),
+            frontend: Token(0),
+            backend: Token(0),
+        }));
+        let dialing = Rc::new(RefCell::new(DialingSession {
+            sessions: sessions.clone(),
+            frontend: Token(0),
+            backend: None,
+            delivered: Vec::new(),
+        }));
+        {
+            let mut sessions = sessions.borrow_mut();
+            let closing_session: Rc<RefCell<dyn ProxySession>> = closing.clone();
+            let frontend = Token(sessions.slab.insert(closing_session.clone()));
+            let backend = Token(sessions.slab.insert(closing_session));
+            let mut closing = closing.borrow_mut();
+            closing.frontend = frontend;
+            closing.backend = backend;
+            let dialing_session: Rc<RefCell<dyn ProxySession>> = dialing.clone();
+            dialing.borrow_mut().frontend = Token(sessions.slab.insert(dialing_session));
+            sessions.incr();
+            sessions.incr();
+        }
+        let closed_frontend = closing.borrow().frontend;
+        let closed_backend = closing.borrow().backend;
+        let dialing_frontend = dialing.borrow().frontend;
+
+        let batch = [
+            (closed_frontend, Ready::READABLE | Ready::HUP),
+            (dialing_frontend, Ready::READABLE | Ready::WRITABLE),
+            (
+                closed_backend,
+                Ready::READABLE | Ready::WRITABLE | Ready::HUP,
+            ),
+        ];
+        let mut owners = Vec::new();
+        server.snapshot_event_owners(batch.iter().map(|(token, _)| *token), &mut owners);
+        for ((token, events), owner) in batch.into_iter().zip(owners.drain(..)) {
+            server.ready_if_still_owned(token, events, owner);
+        }
+
+        assert_eq!(
+            dialing.borrow().backend,
+            Some(closed_backend),
+            "precondition: the dial must reuse the key the closed session freed in this batch"
+        );
+        assert!(
+            !sessions.borrow().slab.contains(closed_frontend.0),
+            "the closed session must have left the slab"
+        );
+        assert_eq!(
+            dialing.borrow().delivered,
+            vec![dialing_frontend],
+            "the closed backend's HUP must not reach the session that reused its token"
         );
     }
 }
