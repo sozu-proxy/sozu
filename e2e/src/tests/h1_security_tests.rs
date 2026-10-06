@@ -879,7 +879,7 @@ fn try_h1_tolerant_high_byte_method_no_ub(method_byte: u8) -> State {
         setup_sync_test(label, config, listeners, state, front_address, 1, false);
     let mut backend = backends.pop().unwrap();
     backend.connect();
-    // Canned reply: under tolerant parsing the proxy may forward the
+    // Canned reply: under tolerant parsing the proxy forwards the
     // request with a lossy method, so the backend must answer
     // *without* calling `receive()`, which would panic on the raw
     // high byte that sozu re-emits on the wire.
