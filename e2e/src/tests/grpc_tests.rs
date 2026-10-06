@@ -169,11 +169,14 @@ impl LifecycleStore for StoreService {
     }
 
     async fn wait(&self, request: Request<WaitRequest>) -> Result<Response<ValueReply>, Status> {
-        let _active = ActiveWait::new(Arc::clone(&self.state));
+        // Record the header before `ActiveWait::new` announces the start:
+        // `wait_for_started` returns on that announcement and the caller
+        // reads `deadline_header_seen` immediately after.
         self.state.deadline_header_seen.store(
             request.metadata().contains_key("grpc-timeout"),
             Ordering::SeqCst,
         );
+        let _active = ActiveWait::new(Arc::clone(&self.state));
         let _request = request.into_inner();
         std::future::pending::<()>().await;
         unreachable!("the Wait RPC only ends when its request is cancelled")
