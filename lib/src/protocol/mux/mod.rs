@@ -2655,6 +2655,18 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         if !self.frontend.lingers_after_error_goaway() {
             return;
         }
+        // Pre: the `metrics.start` filter below cannot skip a stream that
+        // could reach a backend. Every entry into `StreamState::Link` arms
+        // the start first (`SessionMetrics::service_start`) or re-links a
+        // stream that was already linked, and no `SessionMetrics::reset`
+        // leaves a stream in either state.
+        debug_assert!(
+            !self.context.streams.iter().any(|s| {
+                matches!(s.state, StreamState::Link | StreamState::Linked(_))
+                    && s.metrics.start.is_none()
+            }),
+            "a stream queued for or linked to a backend carries its request start"
+        );
         let has_open_stream = self
             .context
             .streams
@@ -5205,8 +5217,8 @@ mod tests {
     /// TO SEE THIS RED: gate `Connection::lingers_after_error_goaway` on
     /// `is_lingering()` alone, as before. The `pending_links` pass then
     /// reaches the routing view for the stream and panics in
-    /// `RemoveOnlyProxy::sessions` ("closing a backend only removes its
-    /// session").
+    /// `NoRoutingProxy` ("pending_links routed a stream of an error-GOAWAY
+    /// linger").
     #[test]
     fn an_error_goaway_linger_pending_on_close_notify_releases_before_pending_links() {
         use std::io::Write;
@@ -5263,7 +5275,7 @@ mod tests {
             backends: Rc::default(),
         };
         let session: Rc<RefCell<dyn ProxySession>> = Rc::new(RefCell::new(NoDialSession));
-        let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(RemoveOnlyProxy));
+        let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(NoRoutingProxy));
         let mut metrics = SessionMetrics::new(None);
         let result = mux.ready(session, proxy, &mut metrics);
 
@@ -8036,6 +8048,41 @@ mod tests {
         }
         fn sessions(&self) -> Rc<RefCell<crate::server::SessionManager>> {
             unreachable!("closing a backend only removes its session")
+        }
+    }
+
+    /// An `L7Proxy` for a pass that must have released every stream before
+    /// the `pending_links` pass of `Mux::ready_inner` runs: removing a
+    /// backend session is allowed, and reaching the routing view or
+    /// registering a backend names the regression.
+    struct NoRoutingProxy;
+
+    impl L7Proxy for NoRoutingProxy {
+        fn kind(&self) -> sozu_command::proto::command::ListenerType {
+            unreachable!("pending_links routed a stream of an error-GOAWAY linger")
+        }
+        fn register_socket(
+            &self,
+            _socket: &mut TcpStream,
+            _token: Token,
+            _interest: Interest,
+        ) -> Result<(), std::io::Error> {
+            unreachable!("pending_links routed a stream of an error-GOAWAY linger")
+        }
+        fn add_session(&self, _session: Rc<RefCell<dyn ProxySession>>) -> Token {
+            unreachable!("pending_links routed a stream of an error-GOAWAY linger")
+        }
+        fn remove_session(&self, _token: Token) -> bool {
+            true
+        }
+        fn clusters(
+            &self,
+        ) -> &HashMap<sozu_command::state::ClusterId, sozu_command::proto::command::Cluster>
+        {
+            unreachable!("pending_links routed a stream of an error-GOAWAY linger")
+        }
+        fn sessions(&self) -> Rc<RefCell<crate::server::SessionManager>> {
+            unreachable!("pending_links routed a stream of an error-GOAWAY linger")
         }
     }
 
