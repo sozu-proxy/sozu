@@ -3275,9 +3275,10 @@ fn test_mtls_crl_of_another_issuer_rejects_the_client() {
 }
 
 /// A CRL refresh on a running listener, without recreating it: each patch
-/// the worker applies replaces the client authentication policy and decides
-/// the next handshake of the same client, and a patch it refuses (an expired
-/// CRL) leaves the running policy as it was.
+/// replaces the client authentication policy and decides the next handshake
+/// of the same client. The worker applies an expired CRL (the main process
+/// is the one that refuses it when an operator states it) and rejects the
+/// client at handshake, and the next patch with a current CRL recovers.
 fn try_mtls_policy_patch_applies_to_new_handshakes() -> State {
     let mut listener = MtlsListener::start(
         "TLS-MTLS-POLICY-PATCH",
@@ -3311,12 +3312,11 @@ fn try_mtls_policy_patch_applies_to_new_handshakes() -> State {
     println!("steps={steps:?} requests_received={requests_received}");
     let expected = [
         ("current", true, true),
-        // Refused: the listener keeps the current CRL and keeps admitting.
-        ("expired", false, true),
+        ("expired", true, false),
         ("revoked", true, false),
         ("current again", true, true),
     ];
-    if steps == expected && requests_received == 3 {
+    if steps == expected && requests_received == 2 {
         State::Success
     } else {
         State::Fail

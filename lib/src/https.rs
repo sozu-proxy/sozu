@@ -1774,42 +1774,24 @@ impl HttpsListener {
         Ok(server_config)
     }
 
-    /// Refuse a CRL set rustls would read differently from what the operator
-    /// configured.
-    ///
-    /// - Two CRLs of one CA whose scopes overlap: webpki checks a certificate
-    ///   against the first configured CRL that is authoritative for it and
-    ///   never reads the others, so the order alone would decide, and an old
-    ///   CRL listed before its replacement would hide every revocation the
-    ///   replacement adds. A CRL without an `IssuingDistributionPoint` covers
-    ///   everything its CA issued; partitions of one CA, each with its own
-    ///   distribution point, do not overlap and are accepted together.
-    /// - A CRL already past its `nextUpdate` at `now` (seconds since the Unix
-    ///   epoch): with revocation expiry enforced it would reject every client
-    ///   it covers, which is better reported now than found at the first
-    ///   handshake.
+    /// Refuse two CRLs of one CA whose scopes overlap: webpki checks a
+    /// certificate against the first configured CRL that is authoritative for
+    /// it and never reads the others, so the order alone would decide, and an
+    /// old CRL listed before its replacement would hide every revocation the
+    /// replacement adds. A CRL without an `IssuingDistributionPoint` covers
+    /// everything its CA issued; partitions of one CA, each with its own
+    /// distribution point, do not overlap and are accepted together.
     ///
     /// Issuers and distribution points are compared as the raw DER webpki
-    /// compares.
-    fn check_crl_set(
-        crls: &[CertificateRevocationListDer<'_>],
-        now: i64,
-    ) -> Result<(), ListenerError> {
+    /// compares. The check does not depend on time, so every worker runs it
+    /// when it builds the listener; [`Self::check_crls_current`] is the one
+    /// that does.
+    fn check_crl_set(crls: &[CertificateRevocationListDer<'_>]) -> Result<(), ListenerError> {
         let mut scopes: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::with_capacity(crls.len());
         for (index, crl) in crls.iter().enumerate() {
             let parsed = webpki::BorrowedCertRevocationList::from_der(crl.as_ref())
                 .map_err(|e| ListenerError::ClientAuth(format!("invalid CRL: {e}")))?;
             let parsed = webpki::CertRevocationList::from(parsed);
-            if let Some(next_update) = sozu_command::certificate::crl_next_update(crl.as_ref())
-                && next_update <= now
-            {
-                return Err(ListenerError::ClientAuth(format!(
-                    "CRL #{} (counted across client_ca_crls) expired {} seconds ago: its \
-                     nextUpdate is past, refresh it",
-                    index + 1,
-                    now - next_update
-                )));
-            }
             let issuer = parsed.issuer().to_vec();
             let distribution_point = parsed.issuing_distribution_point().map(<[u8]>::to_vec);
             let overlapping = scopes.iter().position(|(seen_issuer, seen_point)| {
@@ -1828,6 +1810,38 @@ impl HttpsListener {
                 )));
             }
             scopes.push((issuer, distribution_point));
+        }
+        Ok(())
+    }
+
+    /// Refuse a CRL already past its `nextUpdate` at `now` (seconds since the
+    /// Unix epoch): with revocation expiry enforced it would reject every
+    /// client it covers, which is better reported when the operator states it
+    /// than found at the first handshake.
+    ///
+    /// Main process only, on what an operator states (configuration load,
+    /// reload, a client request), never on a replay or in a worker: a CRL
+    /// that lapses while the listener runs must not stop a worker started
+    /// later from building the listener, or the reload that brings a current
+    /// CRL would find nothing to patch there. Such a worker builds it and
+    /// rejects the clients at handshake until that reload.
+    pub fn check_crls_current(crls: &[String], now: i64) -> Result<(), ListenerError> {
+        let mut index = 0;
+        for pem in crls {
+            for crl in CertificateRevocationListDer::pem_slice_iter(pem.as_bytes()) {
+                let crl =
+                    crl.map_err(|e| ListenerError::ClientAuth(format!("invalid CRL PEM: {e}")))?;
+                index += 1;
+                if let Some(next_update) = sozu_command::certificate::crl_next_update(crl.as_ref())
+                    && next_update <= now
+                {
+                    return Err(ListenerError::ClientAuth(format!(
+                        "CRL #{index} (counted across client_ca_crls) expired {} seconds ago: \
+                         its nextUpdate is past, refresh it",
+                        now - next_update
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -1919,12 +1933,7 @@ impl HttpsListener {
                 ));
             }
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| {
-                i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
-            });
-        Self::check_crl_set(&crls, now)?;
+        Self::check_crl_set(&crls)?;
 
         let mut builder =
             WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone());
@@ -4954,17 +4963,38 @@ mod listener_sibling_tests {
     }
 
     #[test]
-    fn client_revocation_refuses_a_crl_already_expired_when_the_listener_is_built() {
-        // An expired CRL would reject every client it covers: refuse it up
-        // front, where the operator sees why, not at the first handshake.
-        let refused = build_mtls_listener(&[MTLS_CRL_EXPIRED]);
+    fn client_revocation_refuses_an_expired_crl_only_where_the_operator_states_it() {
+        // The main process refuses a CRL already past its nextUpdate in what
+        // an operator states: it would reject every client it covers.
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a clock after 1970")
+                .as_secs(),
+        )
+        .expect("a clock within i64");
+        let refused = HttpsListener::check_crls_current(&[MTLS_CRL_EXPIRED.to_owned()], now);
         assert!(
-            refused
-                .as_ref()
-                .is_err_and(|reason| reason.contains("expired")),
-            "an expired CRL must fail the listener, got {refused:?}"
+            matches!(refused, Err(ListenerError::ClientAuth(ref reason)) if reason.contains("expired")),
+            "an expired CRL must be refused when stated, got {refused:?}"
         );
-        assert_eq!(build_mtls_listener(&[MTLS_CRL_CURRENT]), Ok(()));
+        assert!(
+            HttpsListener::check_crls_current(
+                &[MTLS_CRL_CURRENT.to_owned(), MTLS_CRL_OTHER_CA.to_owned()],
+                now
+            )
+            .is_ok()
+        );
+        // A worker still builds a listener whose CRL lapsed while it ran (a
+        // restarted worker replaying the state), so a later reload has a
+        // listener to patch; the lapsed CRL rejects clients at handshake.
+        assert_eq!(build_mtls_listener(&[MTLS_CRL_EXPIRED]), Ok(()));
+        let config = https_config_with_client_auth(
+            ClientAuthMode::ClientAuthRequired,
+            &[MTLS_CA_PEM],
+            &[MTLS_CRL_EXPIRED],
+        );
+        assert!(HttpsListener::try_new(config, Token(0)).is_ok());
     }
 
     #[test]

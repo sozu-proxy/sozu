@@ -2769,8 +2769,44 @@ fn validate_request(request: &RequestType, origin: RequestOrigin) -> Result<(), 
     validate_listener_request(request)?;
     if origin == RequestOrigin::Authored {
         validate_h2_knob_floors(request)?;
+        validate_client_crls_current(request, unix_now())?;
     }
     validate_frontend_request(request)
+}
+
+/// Refuse a client authentication CRL already past its `nextUpdate` in a
+/// listener or policy an operator states.
+///
+/// Like [`validate_h2_knob_floors`], a policy about what may be stated, not a
+/// buildability check: workers build a listener whose CRL has lapsed (and
+/// reject its clients at handshake), so a state replay or a restarted worker
+/// keeps the listener a later reload can patch with a current CRL. Every
+/// other request returns `Ok`.
+fn validate_client_crls_current(request: &RequestType, now: i64) -> Result<(), String> {
+    let crls = match request {
+        RequestType::AddHttpsListener(config)
+        | RequestType::AddHttpsListenerWithClientAuth(config) => &config.client_ca_crls,
+        RequestType::UpdateHttpsListener(patch)
+        | RequestType::UpdateHttpsListenerWithClientAuth(patch) => {
+            match &patch.client_auth_policy {
+                Some(policy) => &policy.client_ca_crls,
+                None => return Ok(()),
+            }
+        }
+        _ => return Ok(()),
+    };
+    sozu_lib::https::HttpsListener::check_crls_current(crls, now)
+        .map_err(|listener_error| listener_error.to_string())
+}
+
+/// Seconds since the Unix epoch, saturating instead of failing on a clock
+/// set before 1970 or past the `i64` range.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+        })
 }
 
 /// The inverse of a mutating request, used by the fan-out rollback safety-net
@@ -6198,6 +6234,62 @@ mod listener_validation_tests {
                 "the UDP inverse must target the very frontend that was added, tags included"
             ),
             other => panic!("expected a RemoveUdpFrontend inverse, got {other:?}"),
+        }
+    }
+
+    /// A CRL already past its `nextUpdate` is refused in what an operator
+    /// states, a new listener or a policy patch, and only there: a replayed
+    /// state keeps the listener, so a reload with a current CRL can patch it.
+    #[test]
+    fn an_expired_client_auth_crl_is_refused_when_authored_and_kept_when_replayed() {
+        let fixture = |name: &str| {
+            std::fs::read_to_string(format!(
+                "{}/../lib/assets/mtls/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .expect("read an mTLS fixture")
+        };
+        let policy = |crl: &str| sozu_command_lib::proto::command::ClientAuthPolicy {
+            client_auth: Some(
+                sozu_command_lib::proto::command::ClientAuthMode::ClientAuthRequired as i32,
+            ),
+            client_ca_certificates: vec![fixture("ca-cert.pem")],
+            client_ca_crls: vec![fixture(crl)],
+        };
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let listener = |crl: &str| {
+            let mut config = ListenerBuilder::new_https(address)
+                .to_tls(None)
+                .expect("an HTTPS listener config");
+            config.apply_client_auth_policy(&policy(crl));
+            RequestType::add_https_listener(config)
+        };
+        let patch = |crl: &str| {
+            RequestType::update_https_listener(
+                sozu_command_lib::proto::command::UpdateHttpsListenerConfig {
+                    address,
+                    client_auth_policy: Some(policy(crl)),
+                    ..Default::default()
+                },
+            )
+        };
+
+        for request in [listener("crl-expired.pem"), patch("crl-expired.pem")] {
+            let refused = validate_request(&request, RequestOrigin::Authored);
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|reason| reason.contains("expired")),
+                "an expired CRL must be refused when stated, got {refused:?}"
+            );
+            assert_eq!(
+                validate_request(&request, RequestOrigin::Replayed),
+                Ok(()),
+                "a replayed expired CRL must be kept so a reload can patch it"
+            );
+        }
+        for request in [listener("crl-current.pem"), patch("crl-current.pem")] {
+            assert_eq!(validate_request(&request, RequestOrigin::Authored), Ok(()));
         }
     }
 }

@@ -125,7 +125,8 @@
   mTLS field set on a non-HTTPS listener is
   rejected rather than silently accepting unauthenticated or unrevoked clients.
   CRL expiration is enforced (a CRL past its `nextUpdate` is rejected instead of
-  trusted), a CRL already expired is refused when the listener is built, and
+  trusted), a CRL already expired is refused when an operator states it
+  (configuration load, reload, client request), and
   two CRLs of one CA covering the same certificates are refused, since rustls
   would only consult the first (partitions with distinct
   `IssuingDistributionPoint`s are accepted). In `none` mode CA/CRL paths are ignored entirely, so a stale path
