@@ -82,6 +82,8 @@ class CommandSpec:
     environment: tuple[tuple[str, str], ...] = ()
     runtime_arguments: tuple[str, ...] = ()
     timeout_seconds: int = DEFAULT_COMMAND_TIMEOUT_SECONDS
+    # A successful exit also requires this text in the command's output.
+    required_output: str = ""
 
     def normalized(self) -> str:
         payload = dataclasses.asdict(self)
@@ -322,6 +324,7 @@ def command_specs(cell: SuiteCell, *, jobs: int, fuzz_seconds: int = 300) -> tup
                     ),
                     environment,
                     ("tests::real_services_tcp::fixture::tests::", "--nocapture", "--test-threads=1"),
+                    required_output="test result: ok. 2 passed; 0 failed;",
                 )
             )
         return tuple(commands)
@@ -533,6 +536,18 @@ def source_fingerprint(repo_root: pathlib.Path) -> str:
 
 class SourceDriftError(RuntimeError):
     """Raised when a campaign no longer runs against its admitted source."""
+
+
+class _RetainingWriter:
+    """Forward command output to the log while retaining a copy to inspect."""
+
+    def __init__(self, destination: object) -> None:
+        self.destination = destination
+        self.retained = bytearray()
+
+    def write(self, chunk: bytes) -> int:
+        self.retained.extend(chunk)
+        return self.destination.write(chunk)
 
 
 class OwnedProcessGroupError(RuntimeError):
@@ -1789,10 +1804,20 @@ def _run_specs(
                     destination=log,
                     cleanup_reason="owned process group survived command handling",
                 ) as descendant_cleanup:
+                    output = _RetainingWriter(log) if spec.required_output else log
                     try:
                         command_exit_code = _copy_process_output(
-                            process, log, timeout_seconds=spec.timeout_seconds
+                            process, output, timeout_seconds=spec.timeout_seconds
                         )
+                        if (
+                            command_exit_code == 0
+                            and spec.required_output
+                            and spec.required_output.encode() not in output.retained
+                        ):
+                            command_exit_code = 1
+                            log.write(
+                                f"COMMAND OUTPUT MISSING {spec.required_output!r}\n".encode()
+                            )
                     except subprocess.TimeoutExpired:
                         command_exit_code = 124
                         log.write(

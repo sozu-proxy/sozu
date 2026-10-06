@@ -1099,6 +1099,52 @@ class FeatureMatrixTests(unittest.TestCase):
                 cleanup[0].runtime_arguments[0],
                 "tests::real_services_tcp::fixture::tests::",
             )
+            self.assertEqual(
+                cleanup[0].required_output,
+                "test result: ok. 2 passed; 0 failed;",
+            )
+
+    def test_command_without_its_required_output_fails(self) -> None:
+        cell = run_feature_matrix.SuiteCell(
+            id="sim/required-output",
+            suite="sim",
+            projection="fixed-auxiliary",
+            projection_id="fixed-ring",
+            product_ids=(),
+            auxiliary="required-output",
+        )
+        required = "test result: ok. 2 passed; 0 failed;"
+        outcomes = {}
+        for label, printed in (
+            ("one-passed", "test result: ok. 1 passed; 0 failed;"),
+            ("two-passed", "test result: ok. 2 passed; 0 failed; 0 ignored"),
+        ):
+            with tempfile.TemporaryDirectory() as directory:
+                state_dir = pathlib.Path(directory)
+                state = feature_matrix.CampaignState(state_dir)
+                identity = feature_matrix.CellIdentity.for_test(label)
+                attempt_id = state.start(identity)
+                exit_code, log_path, _metrics = run_feature_matrix._run_specs(
+                    cell,
+                    (
+                        run_feature_matrix.CommandSpec(
+                            label,
+                            (sys.executable, "-c", f"print({printed!r})"),
+                            required_output=required,
+                        ),
+                    ),
+                    repo_root=SCRIPT_DIR.parent.parent,
+                    state_dir=state_dir,
+                    state=state,
+                    identity=identity,
+                    attempt_id=attempt_id,
+                )
+                with gzip.open(log_path, "rt", encoding="utf-8") as log:
+                    outcomes[label] = (exit_code, log.read())
+
+        self.assertEqual(outcomes["two-passed"][0], 0)
+        self.assertEqual(outcomes["one-passed"][0], 1)
+        self.assertIn("COMMAND OUTPUT MISSING", outcomes["one-passed"][1])
 
     def test_dry_run_writes_no_success_receipts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
