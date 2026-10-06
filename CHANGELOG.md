@@ -4082,6 +4082,22 @@
   Sōzu". The flag is now stored first, so the SeqCst increment publishes it to the reader. The
   intermittent `BrokenPipe` on the fresh raw TCP frontend connection tracked by #1877 is a
   separate failure and is not addressed here.
+- **`fix(server)`: an event left in an `epoll_wait` result by a session that closed earlier in
+  that result no longer reaches the session that took over its slab token
+  ([#1877](https://github.com/sozu-proxy/sozu/issues/1877)).** A closing session frees its slab
+  slots at once, and the slab hands the most recently freed key to the next allocation. When a
+  raw TCP session closed on its client's FIN and a second session, dispatched next in the same
+  result, dialed its backend, `TcpSession::connect_to_backend` (`lib/src/tcp.rs`) reused the
+  first session's backend token; the first backend's own HUP, still queued further down the
+  result, was then delivered to the new backend, which `TcpSession::ready_inner` took for a
+  hang-up, closing the fresh client connection after one exchange. The gRPC raw TCP lifecycle
+  e2e test failed on this intermittently (h2 `BrokenPipe` on its second frontend connection).
+  The same reuse was reachable through the mux's backend dial (`L7Proxy::add_session`).
+  `Server::run` (`lib/src/server.rs`) now records the session owning each event's token before
+  dispatching the result, and `Server::ready_if_still_owned` drops an event whose token has
+  changed hands since. Timer expiries are not affected: a closing session cancels its timeouts.
+  Pinned by `an_event_of_a_closed_session_is_not_delivered_to_the_session_reusing_its_token`
+  (`lib/src/server.rs`).
 
 - **`fix(h2)`: an error-GOAWAY linger pending on TLS `close_notify` releases its streams before
   any backend is dialed for them ([#1873](https://github.com/sozu-proxy/sozu/pull/1873),

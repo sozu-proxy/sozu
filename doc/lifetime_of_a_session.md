@@ -39,7 +39,9 @@ poller, then loops in `Server::run`:
    `poll_timeout` (1 s);
 2. the command channel (token 0), the timer wheel (token 1), the metrics socket
    (token 2), the TCP and UDP health checkers, then every other token through
-   `Server::ready` to the session that owns it;
+   `Server::ready` to the session that owns it — the session that owned it when
+   `epoll_wait` returned: `Server::ready_if_still_owned` drops an event whose
+   token another session took over earlier in the same result (§11);
 3. `handle_remaining_readiness`, `create_sessions` (the accept queue, §3.2),
    `zombie_check`, the health checkers' `poll` and `UdpProxy::health_poll`;
 4. the gauges, the metrics flush, and — during a soft stop — one
@@ -821,7 +823,18 @@ file from every epoll set on its last close, so an `EPOLL_CTL_DEL` just before
 that close costs a system call and removes nothing. The argument needs the
 close to be the *last* one: a duplicated descriptor would keep the file, and
 its registration, alive under a slab token that may already belong to a new
-session. Nothing duplicates a session socket: there is no `dup` or `try_clone`
+session. What the close cannot reach is the result being walked: the slab
+hands the most recently freed key to the next allocation, so a session
+dispatched later in the same `epoll_wait` result can dial a backend under a
+token freed a moment earlier while that result still carries an event of the
+closed socket. `Server::run` records the session owning each event's token
+before dispatching the result, and `Server::ready_if_still_owned` drops an
+event whose token changed hands since
+([#1877](https://github.com/sozu-proxy/sozu/issues/1877)). The guard compares
+sessions, not sockets: a session that closes one of its own backends and dials
+a new one in the same result, on another descriptor's event, gets the freed
+key back under the same session, and a queued event of the old socket still
+reaches it. Nothing duplicates a session socket: there is no `dup` or `try_clone`
 of one, a worker never forks, and SCM_RIGHTS (`command/src/scm_socket.rs`)
 carries only listeners. mio keeps no per-source state on epoll or kqueue that a
 deregister would release, and BSD also drops a descriptor's kevents on close.

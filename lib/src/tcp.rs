@@ -1624,7 +1624,10 @@ impl TcpSession {
     fn close_backend(&mut self) {
         // No `EPOLL_CTL_DEL` for the backend socket: its last `close(2)`
         // takes it out of the epoll set, and it comes before the next
-        // `epoll_wait`, so the freed slab token cannot receive a stale event.
+        // `epoll_wait`, so no later result carries the freed token for it.
+        // The result being dispatched may still hold one of its events, and
+        // another session can take the freed key before that event's turn:
+        // `Server::ready_if_still_owned` (`lib/src/server.rs`) drops it.
         // From `close()`, the server drops the session right after. From
         // `ready_inner`'s retry, `connect_to_backend` either replaces the
         // socket (`set_back_socket` drops the old one) or fails, and every
