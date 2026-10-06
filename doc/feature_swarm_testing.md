@@ -201,7 +201,8 @@ campaign with known red cells intentionally exits non-zero.
 
 Failures are associated with issues in a separate triage index keyed by the
 exact receipt identity. Editing that index never changes the source, command,
-or receipt fingerprint. Reusing one issue for several cells requires verified
+or receipt fingerprint. A `--triage-index` path must name an existing, valid
+index: the runner reads it before any cell runs and refuses to start otherwise. Reusing one issue for several cells requires verified
 evidence that they share a cause; matching error text alone is insufficient.
 
 ## Commands

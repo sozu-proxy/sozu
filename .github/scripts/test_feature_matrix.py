@@ -2096,5 +2096,30 @@ class FeatureMatrixTests(unittest.TestCase):
 
         self.assertTrue(process.stdout.closed)
 
+    def test_missing_triage_index_fails_before_any_cell_runs(self) -> None:
+        # #1878: a supplied but missing index used to crash only when the
+        # first report was written, hours into the campaign.
+        plan = run_feature_matrix.build_campaign_plan(mode="bounded", seed=20_261_005)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.multiple(
+            run_feature_matrix,
+            _run_campaign_locked=mock.DEFAULT,
+            _run_campaign_parallel=mock.DEFAULT,
+        ) as mocks:
+            state_dir = pathlib.Path(directory)
+            for workers, dry_run in ((1, False), (2, False), (1, True)):
+                with self.assertRaises(FileNotFoundError):
+                    run_feature_matrix.run_campaign(
+                        plan,
+                        repo_root=SCRIPT_DIR.parent.parent,
+                        state_dir=state_dir,
+                        suites={"bin"},
+                        dry_run=dry_run,
+                        jobs=4,
+                        workers=workers,
+                        triage_index_path=state_dir / "missing-triage.json",
+                    )
+            mocks["_run_campaign_locked"].assert_not_called()
+            mocks["_run_campaign_parallel"].assert_not_called()
+
 if __name__ == "__main__":
     unittest.main()

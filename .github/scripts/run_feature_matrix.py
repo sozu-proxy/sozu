@@ -2895,6 +2895,10 @@ def run_campaign(
     triage_index_path: pathlib.Path | None = None,
     replay_failed: bool = False,
 ) -> dict[str, object]:
+    # Read and validate a supplied triage index before any cell runs, so a
+    # missing or malformed index fails at launch rather than at the first
+    # report (#1878).
+    load_triage_index(triage_index_path)
     arguments = {
         "repo_root": repo_root,
         "state_dir": state_dir,
@@ -2989,7 +2993,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--triage-index",
         type=pathlib.Path,
-        help="external issue index; it never participates in cell fingerprints",
+        help=(
+            "existing external issue index, validated before any cell runs; "
+            "it never participates in cell fingerprints"
+        ),
     )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
