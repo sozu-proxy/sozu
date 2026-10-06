@@ -569,14 +569,21 @@ impl<Front: SocketHandler> Connection<Front> {
         }
     }
 
-    /// True while an H2 frontend lingers after a final GOAWAY that carried
-    /// an error code. Its streams get no answer, so `Mux` releases them and
-    /// their backends when the linger starts instead of when it ends
-    /// (`Mux::release_streams_and_backends_for_error_linger`).
+    /// True once an H2 frontend has decided to linger after a final GOAWAY
+    /// that carried an error code: the linger is pending (its TLS
+    /// `close_notify` still to flush) or draining. Its streams get no answer,
+    /// so `Mux` releases them and their backends in the pass that decides
+    /// the linger instead of when it ends
+    /// (`Mux::release_streams_and_backends_for_error_linger`). Pending
+    /// counts: when the kernel refuses the alert's record, nothing re-arms
+    /// the write and that pass would otherwise reach the `pending_links`
+    /// pass of `Mux::ready_inner` with the streams still open.
     pub(super) fn lingers_after_error_goaway(&self) -> bool {
         match self {
             Connection::H1(_) => false,
-            Connection::H2(c) => c.core.is_lingering() && !c.core.graceful_goaway,
+            Connection::H2(c) => {
+                !matches!(c.core.linger, super::shared::Linger::Off) && !c.core.graceful_goaway
+            }
         }
     }
 

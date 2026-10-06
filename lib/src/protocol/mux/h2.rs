@@ -9872,7 +9872,7 @@ impl<Front: SocketHandler> H2Shell<Front> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
     use super::*;
@@ -21163,7 +21163,7 @@ mod tests {
     /// `state` is a parameter for the same reason
     /// `connection_with_backpressure` takes one: the close decision reads it
     /// as `H2State::GoAway` and the write pass reads it as `H2State::Header`.
-    fn rustls_h2_connection(
+    pub(in crate::protocol::mux) fn rustls_h2_connection(
         pool: &Rc<RefCell<Pool>>,
         state: H2State,
     ) -> (
