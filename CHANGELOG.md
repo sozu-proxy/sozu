@@ -106,6 +106,7 @@
   `headers_below_a_refused_stream_id_is_a_protocol_error`,
   `soft_refusals_count_toward_the_glitch_budget` and
   `a_client_reset_of_a_refused_stream_on_the_wire_ends_the_refusals` (`h2.rs`).
+
 - **`feat(https)`: mutual TLS (client certificate authentication) on HTTPS listeners** ([#1299](https://github.com/sozu-proxy/sozu/issues/1299)).
   An HTTPS listener can now require or request a client certificate instead of
   always disabling client auth. A new per-listener `client_auth` mode
@@ -143,6 +144,16 @@
   for new handshakes. The patch travels on `UpdateHttpsListenerWithClientAuth`,
   which an older worker cannot decode, so it fails the patch rather than keep
   its old CRLs.
+  Protobuf: `HttpsListenerConfig` fields 51-53 (`client_auth`,
+  `client_ca_certificates`, `client_ca_crls`), `UpdateHttpsListenerConfig`
+  field 45 (`client_auth_policy`, a new `ClientAuthPolicy` message) and
+  `Request` fields 63 (`add_https_listener_with_client_auth`) and 64
+  (`update_https_listener_with_client_auth`). Covered by the `test_mtls_*` e2e
+  tests (`e2e/src/tests/tls_tests.rs`), the `client_revocation_*` and
+  `a_client_auth_policy_patch_rebuilds_the_listener_verifier` unit tests
+  (`lib/src/https.rs`), the old-worker decoding tests in
+  `command/src/request.rs`, and the reload tests in `command/src/state.rs`
+  and `bin/src/command/requests.rs`.
 
 - **BREAKING (library API) — `feat(udp)`: opt-in per-source flow limit on UDP clusters.** Each
   client source IP and port is its own UDP flow, with its own upstream socket and `max_flows` slot,

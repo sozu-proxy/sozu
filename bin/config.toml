@@ -460,6 +460,17 @@ address = "0.0.0.0:8443"
 # # HSTS policy that the operator wants to harden centrally.
 # force_replace_backend = false
 
+# Client certificate authentication (mTLS), see "mTLS — client certificate
+# authentication" in `doc/configure.md`. `none` (the default) asks for no
+# client certificate; `optional` asks for one but admits clients without;
+# `required` aborts the handshake of a client without a certificate issued by
+# one of `client_ca_certificates`. The CA and CRL files are read at config-load
+# and refreshed by `sozu reload`; CA or CRL files with no `client_auth` are
+# rejected.
+# client_auth = "required"
+# client_ca_certificates = ["/etc/sozu/client-ca.pem"]
+# client_ca_crls = ["/etc/sozu/client-ca.crl.pem"]
+
 # Supported TLS versions. Possible values are "SSL_V2", "SSL_V3", "TLSv1", "TLS_V11", "TLS_V12", "TLS_V13".
 # Defaults to `["TLS_V12", "TLS_V13"]`. Besides, `rustls` tls provider only support "TLS_V12" and "TLS_V13" values.
 tls_versions = ["TLS_V12", "TLS_V13"]
