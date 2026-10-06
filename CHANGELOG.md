@@ -4197,6 +4197,12 @@
   test is now compiled only without that feature, unchanged. Its tolerant counterpart
   `test_h1_tolerant_high_byte_method_no_ub` now sends `0xFF` as well as `0xA5` and checks worker
   health after each, so the `0xFF` byte keeps end-to-end coverage in both builds.
+- **`fix(command)`: `sozu state load` and the boot-time load of `saved_state` read records up to
+  `max_command_buffer_size`.** The parse buffer was a fixed 200 kB, so a record larger than that
+  stopped the load with `Error consuming load state message` and every record after it was lost.
+  It is now sized to `max_command_buffer_size` (2 MB by default, never below 200 kB), the bound
+  the worker channels already apply, and allocated up front on each load. Covered by
+  `a_state_record_larger_than_200_kb_loads_with_what_follows` (`bin/src/command/requests.rs`).
 
 - **`fix(metrics)`: removing one address of a backend id keeps the metrics of the id's
   remaining addresses.** `ConfigState` and the worker key backends on `(backend_id, address)`,
