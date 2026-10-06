@@ -478,7 +478,7 @@ The configuration is rejected rather than silently degraded in every case below.
 | Configuration                                                        | Outcome                                                                                                                                     |
 |----------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
 | `client_auth` with a value other than the three above                | **Error** at config-load, from TOML parsing. A typo is never folded to `none`.                                                               |
-| `client_auth = "optional"` / `"required"` with no trusted CA         | **Error** `ListenerError::ClientAuth` when the worker builds the listener — client auth was requested with an empty trust set, which no client could ever satisfy. |
+| `client_auth = "optional"` / `"required"` with no trusted CA         | **Error** `ListenerError::ClientAuth` when the main process validates the listener, before it reaches a worker — client auth was requested with an empty trust set, which no client could ever satisfy. |
 | A `client_ca_certificates` or `client_ca_crls` path cannot be read   | **Error** at config-materialization. A dropped CA weakens trust; a dropped CRL silently disables revocation.                                 |
 | A CA entry parses to zero certificates (empty file, wrong PEM section) | **Error**. Skipping it would start the listener with a subset of the configured trust anchors, and clients issued by the omitted CA would fail with no visible cause. |
 | A CRL entry parses to zero revocation lists                          | **Error**. Same reasoning: revocation would be silently disabled.                                                                           |
@@ -510,10 +510,9 @@ practical consequence is that supplying CRLs is an all-or-nothing commitment:
 - Every issuing CA in every accepted chain — intermediates included — must be
   covered by a configured CRL. A CRL set that covers the leaf issuer but not an
   intermediate's issuer locks out otherwise valid clients.
-- Every configured CRL must be refreshed before its `nextUpdate`. An expired
-  CRL rejects the clients it covers, even those it never listed as revoked.
 - Every configured CRL must be refreshed, with a configuration reload, before
-  its `nextUpdate`: see "Refreshing CRLs and CAs" below.
+  its `nextUpdate`: an expired CRL rejects the clients it covers, even those it
+  never listed as revoked. See "Refreshing CRLs and CAs" below.
 - Configure **one CRL per issuing CA**, or one per distribution point when the
   CA partitions its list (each partition carrying its own
   `IssuingDistributionPoint`). A listener given two CRLs of one CA that cover
@@ -552,7 +551,8 @@ its socket, its certificates and its frontends. Every other key of a running
 listener is still left as it is by a reload.
 
 - The replacement is complete: a CA or CRL missing from the new configuration
-  is dropped, not kept.
+  is dropped, not kept. Removing the three keys and reloading turns client
+  authentication off on the running listener.
 - It applies to new handshakes only. Connections already established keep the
   verdict they were given.
 - The new policy is checked by the main process before anything changes; a CA
@@ -3227,7 +3227,7 @@ immediately after the patch is acknowledged.
 | `strict_sni_binding` | `bool`     | per-handshake    | `true`              | Require `:authority`/`Host` covered by served cert SAN dNSName (RFC 6125 §6.4.3/6.4.4, CWE-346/CWE-444). Default-cert handshakes fall back to legacy SNI exact-match. Miss → 421 (RFC 9110 §15.5.20). |
 | `disable_http11`     | `bool`     | per-handshake    | `false`             | Drop clients that do not negotiate `h2` via ALPN                                                                                          |
 
-The mTLS keys (`client_auth`, `client_ca_certificates`, `client_ca_crls`) are **not** patchable: `UpdateHttpsListenerConfig` carries no mTLS field, so a partial update can never downgrade a running listener's client-auth policy. Changing it means `RemoveListener` + add. See [mTLS — client certificate authentication](#mtls--client-certificate-authentication).
+The mTLS keys (`client_auth`, `client_ca_certificates`, `client_ca_crls`) change only together, through `client_auth_policy`. That field replaces the mode, the CAs and the CRLs in full, and is sent by `sozu reload` or by a client. The main process validates the new policy before it commits it. The patch travels on `UpdateHttpsListenerWithClientAuth`, which a worker that predates mutual TLS fails. A replacement can lower the policy, down to `none`, and it applies to new handshakes only. See [Refreshing CRLs and CAs](#refreshing-crls-and-cas).
 
 #### TCP listeners
 

@@ -1247,7 +1247,7 @@ fn add_client_auth_rows(
     // An unknown value must not be folded to `none`: the worker rejects it at
     // listener build time, and displaying it as "none" here would hide why.
     let mode = match ClientAuthMode::try_from(raw) {
-        Ok(mode) => mode.as_str_name().to_string(),
+        Ok(mode) => mode.as_str_name().to_owned(),
         Err(_) => format!("UNKNOWN ({raw})"),
     };
     table.add_row(row!["client auth", mode]);

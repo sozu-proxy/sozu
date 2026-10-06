@@ -1226,25 +1226,6 @@ impl ConfigState {
         Ok(())
     }
 
-    /// Validate and apply a partial patch to an existing HTTPS listener.
-    ///
-    /// Only `Some` fields in the patch are written; `None` fields preserve the
-    /// current value. Returns `StateError::NotFound` if the address is unknown,
-    /// `StateError::InvalidValue` if a flood-knob value is below the required
-    /// minimum, an ALPN value is unknown, an `hsts` block lacks `enabled`, or
-    /// another field is invalid.
-    ///
-    /// All-or-nothing (sozu-proxy/sozu#1703), as
-    /// [`Self::update_http_listener`]: every fallible check runs before the
-    /// first write.
-    ///
-    /// `hsts` is recorded as a full-object replacement, as the workers apply
-    /// it, so `SaveState`, `ListListeners` and the replay to a new worker
-    /// carry the patched listener default (sozu-proxy/sozu#1715). The
-    /// `enabled` check makes the main process refuse the same patch every
-    /// worker refuses (`ListenerError::HstsEnabledRequired` in
-    /// `HttpsListener::update_config`, `lib/src/https.rs`) instead of
-    /// recording its fields while no worker applies them.
     /// The patch a configuration reload sends for an HTTPS listener that is
     /// already running with another client authentication policy.
     ///
@@ -1267,6 +1248,25 @@ impl ConfigState {
         })
     }
 
+    /// Validate and apply a partial patch to an existing HTTPS listener.
+    ///
+    /// Only `Some` fields in the patch are written; `None` fields preserve the
+    /// current value. Returns `StateError::NotFound` if the address is unknown,
+    /// `StateError::InvalidValue` if a flood-knob value is below the required
+    /// minimum, an ALPN value is unknown, an `hsts` block lacks `enabled`, or
+    /// another field is invalid.
+    ///
+    /// All-or-nothing (sozu-proxy/sozu#1703), as
+    /// [`Self::update_http_listener`]: every fallible check runs before the
+    /// first write.
+    ///
+    /// `hsts` is recorded as a full-object replacement, as the workers apply
+    /// it, so `SaveState`, `ListListeners` and the replay to a new worker
+    /// carry the patched listener default (sozu-proxy/sozu#1715). The
+    /// `enabled` check makes the main process refuse the same patch every
+    /// worker refuses (`ListenerError::HstsEnabledRequired` in
+    /// `HttpsListener::update_config`, `lib/src/https.rs`) instead of
+    /// recording its fields while no worker applies them.
     fn update_https_listener(
         &mut self,
         patch: &UpdateHttpsListenerConfig,

@@ -816,8 +816,7 @@ message HttpsListenerConfig {
     repeated string client_ca_certificates = 52;
     // Optional PEM-encoded certificate revocation lists (CRLs). When present,
     // a presented client certificate is rejected if it (or an intermediate)
-    // appears revoked. Ignored when client_auth is NONE or no trusted CA is
-    // configured.
+    // appears revoked. Ignored when client_auth is NONE.
     repeated string client_ca_crls = 53;
 }
 

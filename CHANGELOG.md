@@ -131,8 +131,9 @@
   would only consult the first (partitions with distinct
   `IssuingDistributionPoint`s are accepted). In `none` mode CA/CRL paths are ignored entirely, so a stale path
   never blocks the configuration from loading. `HttpsListenerConfig` gains the
-  `ClientAuthMode` enum and the three fields; `ListenerError::ClientAuth` and
-  `ConfigError::ClientAuthOnNonHttps` report misconfigured input.
+  `ClientAuthMode` enum and the three fields; `ListenerError::ClientAuth`,
+  `ConfigError::ClientAuthOnNonHttps` and `ConfigError::ClientAuthModeMissing`
+  report misconfigured input.
   A listener that asks for a client certificate travels on a new
   `AddHttpsListenerWithClientAuth` request (`RequestType::add_https_listener`
   picks the verb, and the main process rewrites every fan-out to it), so a
@@ -148,8 +149,8 @@
   Protobuf: `HttpsListenerConfig` fields 51-53 (`client_auth`,
   `client_ca_certificates`, `client_ca_crls`), `UpdateHttpsListenerConfig`
   field 45 (`client_auth_policy`, a new `ClientAuthPolicy` message) and
-  `Request` fields 63 (`add_https_listener_with_client_auth`) and 64
-  (`update_https_listener_with_client_auth`). Covered by the `test_mtls_*` e2e
+  `Request` fields 63 (`AddHttpsListenerWithClientAuth`) and 64
+  (`UpdateHttpsListenerWithClientAuth`). Covered by the `test_mtls_*` e2e
   tests (`e2e/src/tests/tls_tests.rs`), the `client_revocation_*` and
   `a_client_auth_policy_patch_rebuilds_the_listener_verifier` unit tests
   (`lib/src/https.rs`), the old-worker decoding tests in
