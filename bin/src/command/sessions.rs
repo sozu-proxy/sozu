@@ -30,7 +30,10 @@ use sozu_command_lib::{
     scm_socket::{ScmSocket, ScmSocketError},
 };
 
-use crate::command::server::{ClientId, MessageClient, PeerCred, WorkerId};
+use crate::command::{
+    server::{ClientId, MessageClient, PeerCred, WorkerId},
+    upgrade::LegacySerializedWorkerSession,
+};
 
 const SESSION_SNAPSHOT_VERSION: u16 = 1;
 
@@ -48,6 +51,12 @@ pub enum SessionSnapshotError {
     Channel(#[from] ChannelSnapshotError),
     #[error("could not validate received SCM descriptor {fd}: {error}")]
     ValidateScmDescriptor { fd: RawFd, error: String },
+    #[error("could not validate legacy worker channel descriptor {fd}: {error}")]
+    ValidateLegacyChannelDescriptor { fd: RawFd, error: String },
+    #[error("legacy worker channel descriptor {0} is blocking")]
+    BlockingLegacyChannelDescriptor(RawFd),
+    #[error("legacy worker SCM descriptor {0} is nonblocking")]
+    NonblockingLegacyScmDescriptor(RawFd),
     #[error("could not activate received SCM descriptor after commit: {0}")]
     ActivateScmDescriptor(#[source] ScmSocketError),
 }
@@ -658,8 +667,42 @@ impl WorkerSessionSnapshot {
 ///
 /// Dropping this wrapper before COMMIT closes both the mio channel and the
 /// received SCM descriptor. Only `resume` turns the latter into a `ScmSocket`.
+enum PausedWorkerChannel {
+    Snapshot(PausedChannel<WorkerRequest, WorkerResponse>),
+    Legacy(Channel<WorkerRequest, WorkerResponse>),
+}
+
+impl PausedWorkerChannel {
+    fn fd(&self) -> RawFd {
+        match self {
+            Self::Snapshot(channel) => channel.fd(),
+            Self::Legacy(channel) => channel.fd(),
+        }
+    }
+
+    fn register(&mut self, registry: &Registry, token: Token) -> io::Result<()> {
+        match self {
+            Self::Snapshot(channel) => {
+                channel.register(registry, token, Interest::READABLE | Interest::WRITABLE)
+            }
+            Self::Legacy(channel) => registry.register(
+                &mut channel.sock,
+                token,
+                Interest::READABLE | Interest::WRITABLE,
+            ),
+        }
+    }
+
+    fn resume(self) -> Channel<WorkerRequest, WorkerResponse> {
+        match self {
+            Self::Snapshot(channel) => channel.resume(),
+            Self::Legacy(channel) => channel,
+        }
+    }
+}
+
 pub struct PausedWorkerSession {
-    channel: PausedChannel<WorkerRequest, WorkerResponse>,
+    channel: PausedWorkerChannel,
     id: WorkerId,
     pending: VecDeque<WorkerRequest>,
     pid: pid_t,
@@ -695,18 +738,22 @@ impl PausedWorkerSession {
 
     /// Validate mio registration during PREPARED without performing I/O.
     pub fn register(&mut self, registry: &Registry) -> io::Result<()> {
-        self.channel.register(
-            registry,
-            self.token,
-            Interest::READABLE | Interest::WRITABLE,
-        )
+        self.channel.register(registry, self.token)
     }
 
     /// Activate the worker after COMMIT, including its SCM socket.
     pub fn resume(self) -> Result<WorkerSession, SessionSnapshotError> {
+        let legacy_scm_is_already_blocking =
+            matches!(&self.channel, PausedWorkerChannel::Legacy(_));
         let scm_fd = self.scm_fd.into_raw_fd();
-        let scm_socket =
-            ScmSocket::new(scm_fd).map_err(SessionSnapshotError::ActivateScmDescriptor)?;
+        let scm_socket = if legacy_scm_is_already_blocking {
+            ScmSocket {
+                fd: scm_fd,
+                blocking: true,
+            }
+        } else {
+            ScmSocket::new(scm_fd).map_err(SessionSnapshotError::ActivateScmDescriptor)?
+        };
 
         Ok(WorkerSession {
             channel: self.channel.resume(),
@@ -828,7 +875,6 @@ impl WorkerSession {
                 error: io::Error::last_os_error().to_string(),
             });
         }
-
         let channel = Channel::restore_paused(
             sock,
             snapshot.channel,
@@ -837,7 +883,7 @@ impl WorkerSession {
         )?;
 
         Ok(PausedWorkerSession {
-            channel,
+            channel: PausedWorkerChannel::Snapshot(channel),
             id: snapshot.id,
             pending: snapshot.pending,
             pid: snapshot.pid,
@@ -845,6 +891,68 @@ impl WorkerSession {
             scm_fd: received_scm_fd,
             token: Token(snapshot.token),
             requires_post_commit_tick: snapshot.requires_post_commit_tick,
+        })
+    }
+
+    /// Rebuild the descriptor-only worker shape exported by Sōzu 2.2.1.
+    ///
+    /// The legacy payload contains neither userspace channel buffers nor a
+    /// pending-request queue. Callers therefore require a quiescent control
+    /// plane and schedule one immediate post-handoff tick to consume any bytes
+    /// that remained in the kernel socket buffer.
+    pub(crate) fn restore_legacy_paused(
+        sock: MioUnixStream,
+        received_scm_fd: OwnedFd,
+        worker: LegacySerializedWorkerSession,
+        token: Token,
+        buffer_size: u64,
+        max_buffer_size: u64,
+    ) -> Result<PausedWorkerSession, SessionSnapshotError> {
+        let channel_fd = sock.as_raw_fd();
+        debug_assert_eq!(worker.channel_fd, channel_fd);
+        debug_assert_eq!(worker.scm_fd, received_scm_fd.as_raw_fd());
+        // SAFETY: `sock` owns a live descriptor. F_GETFL only observes flags
+        // and cannot change the open file description shared with the old main.
+        let channel_flags = unsafe { libc::fcntl(channel_fd, libc::F_GETFL) };
+        if channel_flags < 0 {
+            return Err(SessionSnapshotError::ValidateLegacyChannelDescriptor {
+                fd: channel_fd,
+                error: io::Error::last_os_error().to_string(),
+            });
+        }
+        if channel_flags & libc::O_NONBLOCK == 0 {
+            return Err(SessionSnapshotError::BlockingLegacyChannelDescriptor(
+                channel_fd,
+            ));
+        }
+
+        let scm_fd = received_scm_fd.as_raw_fd();
+        // SAFETY: `received_scm_fd` owns a live descriptor. F_GETFL only
+        // observes the historical blocking mode and does not mutate the open
+        // file description shared with the old main.
+        let scm_flags = unsafe { libc::fcntl(scm_fd, libc::F_GETFL) };
+        if scm_flags < 0 {
+            return Err(SessionSnapshotError::ValidateScmDescriptor {
+                fd: scm_fd,
+                error: io::Error::last_os_error().to_string(),
+            });
+        }
+        // The 2.2.1 worker-upgrade path sets this endpoint blocking before it
+        // can enter the main-upgrade payload. Enforce that historical shape so
+        // activation never has to mutate a shared file description post-ACK.
+        if scm_flags & libc::O_NONBLOCK != 0 {
+            return Err(SessionSnapshotError::NonblockingLegacyScmDescriptor(scm_fd));
+        }
+
+        Ok(PausedWorkerSession {
+            channel: PausedWorkerChannel::Legacy(Channel::new(sock, buffer_size, max_buffer_size)),
+            id: worker.id,
+            pending: VecDeque::new(),
+            pid: worker.pid,
+            run_state: worker.run_state,
+            scm_fd: received_scm_fd,
+            token,
+            requires_post_commit_tick: true,
         })
     }
 
@@ -1115,8 +1223,9 @@ mod tests {
     };
 
     use super::{
-        ClientResult, ClientSession, UpgradeResponseQueue, WorkerSession, extract_messages,
-        sanitize_for_audit, sanitize_for_audit_kv, wants_to_tick,
+        ClientResult, ClientSession, LegacySerializedWorkerSession, SessionSnapshotError,
+        UpgradeResponseQueue, WorkerSession, extract_messages, sanitize_for_audit,
+        sanitize_for_audit_kv, wants_to_tick,
     };
     use crate::command::server::PeerCred;
 
@@ -1959,6 +2068,100 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["first", "second", "third"]
         );
+    }
+
+    #[test]
+    fn legacy_worker_restore_stays_paused_and_ticks_after_parent_exit() {
+        let (channel, _channel_peer): (
+            Channel<WorkerRequest, WorkerResponse>,
+            Channel<WorkerResponse, WorkerRequest>,
+        ) = Channel::generate_nonblocking(64, 512).expect("could not generate worker channels");
+        let channel_fd = channel.fd();
+        let (received_scm, _received_scm_peer) =
+            StdUnixStream::pair().expect("could not create received SCM pair");
+        let received_scm_fd = received_scm.into_raw_fd();
+        // SAFETY: `into_raw_fd` transferred unique ownership to this test.
+        let received_scm = unsafe { OwnedFd::from_raw_fd(received_scm_fd) };
+
+        let mut paused = WorkerSession::restore_legacy_paused(
+            channel.sock,
+            received_scm,
+            LegacySerializedWorkerSession {
+                channel_fd,
+                pid: 4242,
+                id: 17,
+                run_state: RunState::Stopping,
+                scm_fd: received_scm_fd,
+            },
+            Token(91),
+            64,
+            512,
+        )
+        .expect("the legacy worker should restore without touching shared I/O");
+        assert_eq!(paused.id(), 17);
+        assert_eq!(paused.token(), Token(91));
+        assert!(paused.requires_post_commit_tick());
+        assert!(!fd_is_nonblocking(received_scm_fd));
+
+        let poll = Poll::new().expect("could not create poll registry");
+        paused
+            .register(poll.registry())
+            .expect("legacy worker should register while paused");
+        assert!(
+            !fd_is_nonblocking(received_scm_fd),
+            "PREPARED registration must preserve the legacy blocking SCM mode"
+        );
+
+        let restored = paused
+            .resume()
+            .expect("parent exit should activate the legacy worker descriptors");
+        assert!(!fd_is_nonblocking(received_scm_fd));
+        assert_eq!(restored.id, 17);
+        assert_eq!(restored.pid, 4242);
+        assert_eq!(restored.run_state, RunState::Stopping);
+        assert_eq!(restored.token, Token(91));
+        assert!(restored.pending.is_empty());
+        assert!(restored.channel.front_buf.data().is_empty());
+        assert!(restored.channel.back_buf.data().is_empty());
+    }
+
+    #[test]
+    fn legacy_worker_restore_rejects_nonblocking_scm_before_ack() {
+        let (channel, _channel_peer): (
+            Channel<WorkerRequest, WorkerResponse>,
+            Channel<WorkerResponse, WorkerRequest>,
+        ) = Channel::generate_nonblocking(64, 512).expect("could not generate worker channels");
+        let channel_fd = channel.fd();
+        let (received_scm, _received_scm_peer) =
+            StdUnixStream::pair().expect("could not create received SCM pair");
+        received_scm
+            .set_nonblocking(true)
+            .expect("could not make received SCM descriptor nonblocking");
+        let received_scm_fd = received_scm.into_raw_fd();
+        // SAFETY: `into_raw_fd` transferred unique ownership to this test.
+        let received_scm = unsafe { OwnedFd::from_raw_fd(received_scm_fd) };
+
+        let error = match WorkerSession::restore_legacy_paused(
+            channel.sock,
+            received_scm,
+            LegacySerializedWorkerSession {
+                channel_fd,
+                pid: 4242,
+                id: 17,
+                run_state: RunState::Running,
+                scm_fd: received_scm_fd,
+            },
+            Token(91),
+            64,
+            512,
+        ) {
+            Ok(_) => panic!("a nonblocking SCM descriptor violates the 2.2.1 contract"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            SessionSnapshotError::NonblockingLegacyScmDescriptor(fd) if fd == received_scm_fd
+        ));
     }
 
     #[test]

@@ -8,9 +8,12 @@
 use std::{
     fs::File,
     io::{Error as IoError, Read, Seek, Write},
-    os::unix::{
-        io::{AsRawFd, FromRawFd},
-        process::CommandExt,
+    os::{
+        fd::{OwnedFd, RawFd},
+        unix::{
+            io::{AsRawFd, FromRawFd},
+            process::CommandExt,
+        },
     },
     process::{Command, Stdio},
     thread,
@@ -34,7 +37,7 @@ use tempfile::tempfile;
 use crate::{
     command::{
         server::{CommandHub, HubError, ServerError},
-        upgrade::{UpgradeData, UpgradeHandshake, UpgradeStage},
+        upgrade::{LegacyUpgradeData, UpgradeData, UpgradeHandshake, UpgradeStage},
     },
     util::{self, UtilError},
 };
@@ -93,6 +96,27 @@ pub enum UpgradeError {
     ProbeTimeout(Duration),
     #[error("unsupported main-upgrade protocol {0}")]
     UnsupportedProtocol(u16),
+    #[error(
+        "legacy main upgrade is unavailable while NOTIFY_SOCKET is set; use a controlled restart for this systemd service"
+    )]
+    LegacyUpgradeUnderSystemd,
+    #[cfg(not(target_os = "linux"))]
+    #[error("legacy main upgrade requires Linux pidfd support")]
+    LegacyUpgradeUnsupportedPlatform,
+    #[error("legacy main upgrade cannot follow invalid parent pid {0}")]
+    InvalidLegacyParent(pid_t),
+    #[error("invalid inherited {name} descriptor {fd}")]
+    InvalidInheritedDescriptor { name: &'static str, fd: RawFd },
+    #[error(
+        "legacy main-upgrade parent changed from pid {expected} to {actual} before acknowledgement"
+    )]
+    LegacyParentChanged { expected: pid_t, actual: pid_t },
+    #[error("could not open pidfd for legacy main-upgrade parent {pid}: {error}")]
+    OpenLegacyParentPidfd { pid: pid_t, error: IoError },
+    #[error("could not inspect pending SIGTERM before legacy acknowledgement: {0}")]
+    InspectLegacySigterm(IoError),
+    #[error("legacy main upgrade interrupted by SIGTERM before parent exit")]
+    LegacyUpgradeInterrupted,
 }
 
 /// Check protocol support before any live descriptor is made inheritable or
@@ -336,13 +360,34 @@ pub fn fork_main_into_new_main(
 pub fn begin_new_main_process(
     new_to_old_channel_fd: i32,
     upgrade_file_fd: i32,
-    upgrade_protocol: u16,
+    upgrade_protocol: Option<u16>,
     command_buffer_size: u64,
     max_command_buffer_size: u64,
 ) -> Result<(), UpgradeError> {
-    if upgrade_protocol != crate::command::upgrade::UPGRADE_PROTOCOL_V2 {
-        return Err(UpgradeError::UnsupportedProtocol(upgrade_protocol));
+    match upgrade_protocol {
+        Some(crate::command::upgrade::UPGRADE_PROTOCOL_V2) => begin_v2_main_process(
+            new_to_old_channel_fd,
+            upgrade_file_fd,
+            command_buffer_size,
+            max_command_buffer_size,
+        ),
+        None => begin_legacy_main_process(
+            new_to_old_channel_fd,
+            upgrade_file_fd,
+            command_buffer_size,
+            max_command_buffer_size,
+            std::env::var_os("NOTIFY_SOCKET").is_some(),
+        ),
+        Some(protocol) => Err(UpgradeError::UnsupportedProtocol(protocol)),
     }
+}
+
+fn begin_v2_main_process(
+    new_to_old_channel_fd: i32,
+    upgrade_file_fd: i32,
+    command_buffer_size: u64,
+    max_command_buffer_size: u64,
+) -> Result<(), UpgradeError> {
     // Both descriptors were handed to us across the re-exec by the old master
     // (`fork_main_into_new_main`), each derived from a live `as_raw_fd()`: they
     // are valid (>= 0) and reference two distinct kernel objects (the
@@ -534,4 +579,350 @@ pub fn begin_new_main_process(
 
     info!("main process stopped");
     Ok(())
+}
+
+fn begin_legacy_main_process(
+    new_to_old_channel_fd: RawFd,
+    upgrade_file_fd: RawFd,
+    command_buffer_size: u64,
+    max_command_buffer_size: u64,
+    notify_socket_present: bool,
+) -> Result<(), UpgradeError> {
+    validate_inherited_fd("legacy confirmation channel", new_to_old_channel_fd)?;
+    // SAFETY: the descriptor was inherited from the old main and validated
+    // above. Ownership transfers to this channel in the freshly execed child.
+    let mut confirmation_channel: Channel<bool, ()> = Channel::new(
+        unsafe { UnixStream::from_raw_fd(new_to_old_channel_fd) },
+        command_buffer_size,
+        max_command_buffer_size,
+    );
+    confirmation_channel
+        .blocking()
+        .map_err(UpgradeError::BlockChannel)?;
+
+    if notify_socket_present {
+        send_legacy_confirmation(&mut confirmation_channel, false, "rejection")?;
+        return Err(UpgradeError::LegacyUpgradeUnderSystemd);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = upgrade_file_fd;
+        send_legacy_confirmation(&mut confirmation_channel, false, "rejection")?;
+        return Err(UpgradeError::LegacyUpgradeUnsupportedPlatform);
+    }
+
+    #[cfg(target_os = "linux")]
+    begin_legacy_linux_main_process(confirmation_channel, upgrade_file_fd)
+}
+
+fn validate_inherited_fd(name: &'static str, fd: RawFd) -> Result<(), UpgradeError> {
+    if fd < 0 {
+        return Err(UpgradeError::InvalidInheritedDescriptor { name, fd });
+    }
+    // SAFETY: F_GETFD only observes the descriptor table entry.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return Err(UpgradeError::InvalidInheritedDescriptor { name, fd });
+    }
+    Ok(())
+}
+
+fn send_legacy_confirmation(
+    channel: &mut Channel<bool, ()>,
+    accepted: bool,
+    result: &'static str,
+) -> Result<(), UpgradeError> {
+    channel
+        .write_message(&accepted)
+        .map_err(|channel_err| UpgradeError::SendConfirmation {
+            result: result.to_owned(),
+            channel_err,
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn begin_legacy_linux_main_process(
+    mut confirmation_channel: Channel<bool, ()>,
+    upgrade_file_fd: RawFd,
+) -> Result<(), UpgradeError> {
+    if confirmation_channel.fd() == upgrade_file_fd {
+        send_legacy_confirmation(&mut confirmation_channel, false, "rejection")?;
+        return Err(UpgradeError::InvalidInheritedDescriptor {
+            name: "legacy upgrade state",
+            fd: upgrade_file_fd,
+        });
+    }
+    if let Err(error) = validate_inherited_fd("legacy upgrade state", upgrade_file_fd) {
+        send_legacy_confirmation(&mut confirmation_channel, false, "rejection")?;
+        return Err(error);
+    }
+
+    // The old 2.2.1 main is blocked waiting for our boolean, so it cannot exit
+    // normally during this identity check. A parent change means it died for
+    // another reason; do not accidentally wait on the reaper instead.
+    let parent_pid = unsafe { libc::getppid() };
+    if parent_pid <= 1 {
+        send_legacy_confirmation(&mut confirmation_channel, false, "rejection")?;
+        return Err(UpgradeError::InvalidLegacyParent(parent_pid));
+    }
+    let parent_pidfd = open_pidfd(parent_pid)?;
+    let observed_parent = unsafe { libc::getppid() };
+    if observed_parent != parent_pid {
+        send_legacy_confirmation(&mut confirmation_channel, false, "rejection")?;
+        return Err(UpgradeError::LegacyParentChanged {
+            expected: parent_pid,
+            actual: observed_parent,
+        });
+    }
+
+    println!("reading legacy upgrade data from file");
+    // SAFETY: ownership of the validated inherited descriptor transfers to
+    // this File in the freshly execed child.
+    let mut upgrade_file = unsafe { File::from_raw_fd(upgrade_file_fd) };
+    let mut content = String::new();
+    upgrade_file
+        .read_to_string(&mut content)
+        .map_err(UpgradeError::ReadFile)?;
+    drop(upgrade_file);
+    debug_assert!(
+        !content.is_empty(),
+        "legacy upgrade state must not be empty"
+    );
+    debug_assert!(
+        content.trim_start().starts_with('{'),
+        "legacy upgrade state must be a JSON object"
+    );
+
+    let upgrade_data: LegacyUpgradeData =
+        serde_json::from_str(&content).map_err(UpgradeError::SerdeReadError)?;
+    let config = upgrade_data.config.clone();
+
+    println!("Setting up logging");
+    setup_logging_with_config(&config, "MAIN").map_err(UpgradeError::SetupLogging)?;
+    util::setup_metrics(&config).map_err(UpgradeError::SetupMetrics)?;
+
+    let mut paused_hub = CommandHub::prepare_from_legacy_upgrade_data(upgrade_data)
+        .map_err(UpgradeError::CreateHub)?;
+    paused_hub
+        .enable_cloexec_after_upgrade()
+        .map_err(UpgradeError::EnableCloexec)?;
+    paused_hub
+        .handle_sigterm()
+        .map_err(UpgradeError::HandleSigterm)?;
+    let pid_file = util::open_pid_file(&config).map_err(UpgradeError::WritePidFile)?;
+
+    match paused_hub.sigterm_pending() {
+        Ok(false) => {}
+        Ok(true) => {
+            send_legacy_confirmation(&mut confirmation_channel, false, "rejection")?;
+            return Err(UpgradeError::LegacyUpgradeInterrupted);
+        }
+        Err(error) => {
+            send_legacy_confirmation(&mut confirmation_channel, false, "rejection")?;
+            return Err(UpgradeError::InspectLegacySigterm(error));
+        }
+    }
+
+    send_legacy_confirmation(&mut confirmation_channel, true, "success")?;
+    drop(confirmation_channel);
+
+    let handoff_timeout = Duration::from_secs(config.worker_timeout.max(1) as u64);
+    wait_for_parent_exit(parent_pidfd.as_raw_fd(), parent_pid, handoff_timeout);
+    drop(parent_pidfd);
+
+    let mut command_hub = paused_hub.activate().map_err(UpgradeError::CreateHub)?;
+    if let Some((path, file)) = pid_file
+        && let Err(error) = util::publish_pid_file(&path, file)
+    {
+        error!(
+            "could not publish the new main pid after the legacy parent exited, keeping the proxy running: {}",
+            error
+        );
+    }
+
+    info!(
+        "legacy main-upgrade parent {} exited; starting replacement main loop",
+        parent_pid
+    );
+    command_hub.run();
+    info!("main process stopped");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn open_pidfd(pid: pid_t) -> Result<OwnedFd, UpgradeError> {
+    // SAFETY: pidfd_open takes an integer pid and zero flags and returns a new
+    // descriptor owned by the caller on success.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        return Err(UpgradeError::OpenLegacyParentPidfd {
+            pid,
+            error: IoError::last_os_error(),
+        });
+    }
+    // SAFETY: the successful syscall returned a fresh owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_parent_exit(pidfd: RawFd, parent_pid: pid_t, diagnostic_timeout: Duration) {
+    let mut descriptor = libc::pollfd {
+        fd: pidfd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let mut timeout_ms = i32::try_from(diagnostic_timeout.as_millis())
+        .unwrap_or(i32::MAX)
+        .max(1);
+    let mut timeout_reported = false;
+
+    loop {
+        descriptor.revents = 0;
+        // SAFETY: `descriptor` is one initialized pollfd and remains alive and
+        // exclusively borrowed for the syscall.
+        let result = unsafe { libc::poll(&raw mut descriptor, 1, timeout_ms) };
+        if result < 0 {
+            let error = IoError::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            error!(
+                "could not poll legacy main-upgrade parent {}: {}; replacement remains paused",
+                parent_pid, error
+            );
+            thread::sleep(Duration::from_secs(1));
+            timeout_ms = -1;
+            continue;
+        }
+        if result == 0 {
+            debug_assert!(!timeout_reported, "the diagnostic timeout fires only once");
+            warn!(
+                "legacy main-upgrade parent {} did not exit within {:?}; replacement remains paused and will keep waiting",
+                parent_pid, diagnostic_timeout
+            );
+            timeout_reported = true;
+            timeout_ms = -1;
+            continue;
+        }
+
+        if descriptor.revents & libc::POLLIN != 0 {
+            return;
+        }
+        if descriptor.revents != 0 {
+            error!(
+                "legacy main-upgrade parent {} pidfd returned events {:#x} without POLLIN; replacement remains paused",
+                parent_pid, descriptor.revents
+            );
+            thread::sleep(Duration::from_secs(1));
+            timeout_ms = -1;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        os::fd::{AsRawFd, IntoRawFd},
+        os::unix::net::UnixStream as StdUnixStream,
+        sync::mpsc,
+        thread,
+        time::Duration,
+    };
+
+    #[cfg(target_os = "linux")]
+    use nix::sys::wait::waitpid;
+    #[cfg(target_os = "linux")]
+    use nix::unistd::ForkResult;
+
+    use sozu_command_lib::channel::Channel;
+
+    use super::{UpgradeError, begin_legacy_main_process, begin_new_main_process};
+    #[cfg(target_os = "linux")]
+    use super::{open_pidfd, wait_for_parent_exit};
+
+    #[test]
+    fn explicit_legacy_or_unknown_protocol_is_rejected_before_fd_use() {
+        for protocol in [1, 3, u16::MAX] {
+            let error = begin_new_main_process(-1, -1, Some(protocol), 64, 512)
+                .expect_err("an explicit non-v2 protocol must be rejected");
+            assert!(
+                matches!(error, UpgradeError::UnsupportedProtocol(actual) if actual == protocol)
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_upgrade_under_systemd_sends_false_before_reading_state_fd() {
+        let (candidate_channel, mut old_main_channel): (Channel<bool, ()>, Channel<(), bool>) =
+            Channel::generate_nonblocking(64, 512).expect("could not create legacy handshake");
+        let candidate_fd = candidate_channel.sock.into_raw_fd();
+        old_main_channel
+            .blocking()
+            .expect("could not block old-main side of handshake");
+
+        let error = begin_legacy_main_process(candidate_fd, -1, 64, 512, true)
+            .expect_err("legacy upgrades under systemd must fail closed");
+        assert!(
+            matches!(error, UpgradeError::LegacyUpgradeUnderSystemd),
+            "unexpected refusal error: {error:?}"
+        );
+        assert!(
+            !old_main_channel
+                .read_message()
+                .expect("the old main must receive its negative acknowledgement")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pidfd_barrier_survives_diagnostic_timeout_until_process_exit() {
+        let (release_child, child_gate) =
+            StdUnixStream::pair().expect("could not create child gate");
+        // SAFETY: the child performs only async-signal-safe descriptor I/O and
+        // `_exit`; the parent retains all Rust test-harness state.
+        match unsafe { nix::unistd::fork().expect("could not fork barrier child") } {
+            ForkResult::Child => {
+                drop(release_child);
+                let mut byte = 0_u8;
+                // SAFETY: `child_gate` is live and `byte` is a valid one-byte
+                // output buffer. The child blocks until the parent releases it.
+                let read = unsafe { libc::read(child_gate.as_raw_fd(), (&raw mut byte).cast(), 1) };
+                unsafe { libc::_exit(i32::from(read != 1)) }
+            }
+            ForkResult::Parent { child } => {
+                drop(child_gate);
+                let pidfd = open_pidfd(child.as_raw()).expect("could not open child pidfd");
+                let (finished_tx, finished_rx) = mpsc::channel();
+                thread::spawn(move || {
+                    wait_for_parent_exit(
+                        pidfd.as_raw_fd(),
+                        child.as_raw(),
+                        Duration::from_millis(5),
+                    );
+                    finished_tx
+                        .send(())
+                        .expect("could not report barrier completion");
+                });
+
+                let before_exit = finished_rx.recv_timeout(Duration::from_millis(50));
+                let byte = 1_u8;
+                // SAFETY: the parent owns the live gate endpoint and `byte`
+                // remains valid for the one-byte write.
+                let written =
+                    unsafe { libc::write(release_child.as_raw_fd(), (&raw const byte).cast(), 1) };
+                assert_eq!(written, 1, "could not release barrier child");
+                let after_exit = finished_rx.recv_timeout(Duration::from_secs(1));
+                waitpid(child, None).expect("could not reap barrier child");
+
+                assert!(
+                    before_exit.is_err(),
+                    "the diagnostic timeout must not open the ownership barrier"
+                );
+                assert!(
+                    after_exit.is_ok(),
+                    "the pidfd becoming readable must open the ownership barrier"
+                );
+            }
+        }
+    }
 }

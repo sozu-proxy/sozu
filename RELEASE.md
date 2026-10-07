@@ -33,6 +33,15 @@ Launch sozu with `worker_automatic_restart` on, test a request, kill a worker, t
 
 For minor and patch releases, the upgrade process must always pass correctly.
 
+For the first transition from 2.2.1, use the exact published release and follow
+the [legacy upgrade preconditions](doc/how_to_use.md#first-hot-upgrade-from-221):
+quiesce the control plane, verify preserved traffic and state, and verify every
+worker's replacement. A main-only success is insufficient. Record the tested
+source SHA, binary checksums, platform and supervisor. The legacy bridge refuses
+notify-supervised handoffs; qualifying a hot upgrade with the shipped systemd
+units remains a release gate, or requires an explicitly accepted controlled
+restart procedure for that deployment.
+
 ### Update the changelog
 
 Move the contents of `## [Unreleased]` into a new `## X.Y.Z - DATE` release section and reset the unreleased block. Do this **before** pushing the tag — the release workflow's `awk` extractor at `.github/workflows/release.yml` keys off the `## <version>` heading (the `## X.Y.Z - DATE` form used by every released section; a bracketed `## [X.Y.Z]` is also accepted) and reads until the next `## ` heading. If the section is missing, the draft release body falls back to a placeholder and the workflow emits a `::warning::`.

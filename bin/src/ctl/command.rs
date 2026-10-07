@@ -166,50 +166,65 @@ impl CommandManager {
             info!("trying to upgrade worker {}", worker.id);
             let config = self.config.clone();
 
-            upgrade_jobs.push(std::thread::spawn(move || {
-                if let Err(e) =
-                    setup_logging_with_config(&config, &format!("UPGRADE-WRK-{}", worker.id))
-                {
-                    error!("Could not setup logging: {}", e);
-                }
-
-                info!("creating channel to upgrade worker {}", worker.id);
-                let channel = match create_channel(&config) {
-                    Ok(channel) => channel,
-                    Err(e) => {
-                        error!(
-                            "could not create channel to worker {}, this is critical: {}",
-                            worker.id, e
-                        );
-                        return;
+            upgrade_jobs.push((
+                worker.id,
+                std::thread::spawn(move || {
+                    if let Err(e) =
+                        setup_logging_with_config(&config, &format!("UPGRADE-WRK-{}", worker.id))
+                    {
+                        error!("Could not setup logging: {}", e);
                     }
-                };
 
-                info!("created channel to upgrade worker {}", worker.id);
+                    info!("creating channel to upgrade worker {}", worker.id);
+                    let channel = match create_channel(&config) {
+                        Ok(channel) => channel,
+                        Err(e) => {
+                            error!(
+                                "could not create channel to worker {}, this is critical: {}",
+                                worker.id, e
+                            );
+                            return Err(e);
+                        }
+                    };
 
-                let mut command_manager = CommandManager {
-                    channel,
-                    timeout: Some(Duration::from_secs(60)), // overriden by upgrade_timeout anyway
-                    config,
-                    json: false,
-                };
+                    info!("created channel to upgrade worker {}", worker.id);
 
-                // A failed worker upgrade (old worker closed before finishing
-                // its soft stop, new worker activation failed) is logged and
-                // the others continue: the main upgrade already succeeded, so
-                // `sozu upgrade` still exits 0. `sozu upgrade --worker N`
-                // exits non-zero on the same failure.
-                match command_manager.upgrade_worker(worker.id) {
-                    Ok(()) => info!("successfully upgraded worker {}", worker.id),
-                    Err(e) => error!("error upgrading worker {}: {}", worker.id, e),
-                }
-            }));
+                    let mut command_manager = CommandManager {
+                        channel,
+                        timeout: Some(Duration::from_secs(60)), // overriden by upgrade_timeout anyway
+                        config,
+                        json: false,
+                    };
+
+                    let result = command_manager.upgrade_worker(worker.id);
+                    match &result {
+                        Ok(()) => info!("successfully upgraded worker {}", worker.id),
+                        Err(e) => error!("error upgrading worker {}: {}", worker.id, e),
+                    }
+                    result
+                }),
+            ));
         }
 
-        for job in upgrade_jobs {
-            if let Err(e) = job.join() {
-                error!("an upgrading job panicked: {:?}", e)
+        // Join every job even after a failure: the main has already changed
+        // and the remaining workers still need their upgrade outcome reported.
+        let mut failures = Vec::new();
+        for (worker_id, job) in upgrade_jobs {
+            match job.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => failures.push(format!("worker {worker_id}: {error}")),
+                Err(error) => {
+                    error!("an upgrading job panicked: {:?}", error);
+                    failures.push(format!("worker {worker_id}: upgrade thread panicked"));
+                }
             }
+        }
+
+        if !failures.is_empty() {
+            return Err(CtlError::Failure(format!(
+                "main upgraded, but some worker upgrades failed: {}",
+                failures.join("; ")
+            )));
         }
 
         info!("Finished upgrading");

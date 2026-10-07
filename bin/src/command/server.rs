@@ -47,7 +47,9 @@ use sozu_command_lib::{
 
 use sozu_lib::metrics::names;
 
-use super::upgrade::{UpgradeDataError, UpgradeServerState, UpgradeSnapshot, monotonic_nanos};
+use super::upgrade::{
+    LegacyUpgradeData, UpgradeDataError, UpgradeServerState, UpgradeSnapshot, monotonic_nanos,
+};
 use crate::{
     command::{
         requests::{AuditExtras, AuditResult, ClientRequestOutcome, audit_emit_inline, begin_stop},
@@ -730,6 +732,15 @@ impl PausedCommandHub {
         Ok(())
     }
 
+    /// Observe a queued stop without consuming it before a legacy ACK.
+    pub(crate) fn sigterm_pending(&self) -> Result<bool, IoError> {
+        self.sigterm_receiver
+            .as_ref()
+            .map_or(Ok(false), |receiver| {
+                descriptor_has_pending_byte(receiver.as_raw_fd())
+            })
+    }
+
     /// Restore CLOEXEC on every inherited descriptor before PREPARED.
     ///
     /// `FD_CLOEXEC` is a flag of this process's descriptor table entry, not of
@@ -1131,6 +1142,175 @@ impl CommandHub {
         self.clients
             .get_mut(token)
             .map(|client| (&mut self.server, client))
+    }
+
+    /// Recreate the descriptor-only Hub exported by Sōzu 2.2.1 without
+    /// consuming command or worker data before the old main exits.
+    pub(crate) fn prepare_from_legacy_upgrade_data(
+        upgrade_data: LegacyUpgradeData,
+    ) -> Result<PausedCommandHub, HubError> {
+        let LegacyUpgradeData {
+            command_socket_fd,
+            config,
+            next_client_id,
+            next_session_id,
+            next_task_id,
+            next_worker_id,
+            workers,
+            state,
+            boot_generation,
+        } = upgrade_data;
+
+        usize::try_from(config.command_buffer_size).map_err(|_| {
+            HubError::InvalidUpgradeSnapshot("command buffer size exceeds usize".to_owned())
+        })?;
+        usize::try_from(config.max_command_buffer_size).map_err(|_| {
+            HubError::InvalidUpgradeSnapshot("maximum command buffer size exceeds usize".to_owned())
+        })?;
+
+        let mut inherited_fds = HashSet::new();
+        let mut add_fd = |kind: &str, fd: i32| -> Result<(), HubError> {
+            if fd < 0 {
+                return Err(HubError::InvalidUpgradeSnapshot(format!(
+                    "{kind} descriptor is negative: {fd}"
+                )));
+            }
+            if !inherited_fds.insert(fd) {
+                return Err(HubError::InvalidUpgradeSnapshot(format!(
+                    "descriptor {fd} is assigned more than once"
+                )));
+            }
+            // SAFETY: F_GETFD only validates this process's inherited
+            // descriptor and does not mutate the shared open file description.
+            if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+                return Err(HubError::InvalidUpgradeSnapshot(format!(
+                    "could not validate {kind} descriptor {fd}: {}",
+                    IoError::last_os_error()
+                )));
+            }
+            Ok(())
+        };
+        add_fd("command listener", command_socket_fd)?;
+        for worker in &workers {
+            add_fd("worker channel", worker.channel_fd)?;
+            add_fd("worker SCM socket", worker.scm_fd)?;
+        }
+
+        let mut worker_ids = HashSet::new();
+        for worker in &workers {
+            if !worker_ids.insert(worker.id) {
+                return Err(HubError::InvalidUpgradeSnapshot(format!(
+                    "duplicate worker id {}",
+                    worker.id
+                )));
+            }
+        }
+        let live_worker_count = workers
+            .iter()
+            .filter(|worker| worker.run_state != RunState::Stopped)
+            .count();
+        let next_session_after_restore = next_session_id
+            .checked_add(live_worker_count)
+            .filter(|next| *next != SIGTERM_TOKEN.0)
+            .ok_or_else(|| {
+                HubError::InvalidUpgradeSnapshot(
+                    "legacy worker tokens collide with the reserved SIGTERM token".to_owned(),
+                )
+            })?;
+        if next_session_id == 0
+            || next_session_id == SIGTERM_TOKEN.0
+            || next_client_id == ClientId::MAX
+            || next_worker_id == WorkerId::MAX
+            || next_task_id == TaskId::MAX
+            || workers
+                .iter()
+                .map(|worker| worker.id)
+                .max()
+                .is_some_and(|id| next_worker_id <= id)
+        {
+            return Err(HubError::InvalidUpgradeSnapshot(
+                "one or more legacy next-id counters collide with restored state".to_owned(),
+            ));
+        }
+
+        // SAFETY: `get_executable_path` is process-local observation; see the
+        // corresponding V2 restoration path below.
+        let executable_path =
+            unsafe { get_executable_path().map_err(HubError::GetExecutablePath)? };
+        // SAFETY: the descriptor was inherited from the old main, validated
+        // above, and has one owner in this freshly execed process.
+        let unix_listener = unsafe { UnixListener::from_raw_fd(command_socket_fd) };
+        let command_socket_path: std::sync::Arc<str> = config
+            .command_socket_path()
+            .unwrap_or_else(|_| "unknown".to_owned())
+            .into();
+        let command_buffer_size = config.command_buffer_size;
+        let max_command_buffer_size = config.max_command_buffer_size;
+        let mut server =
+            Server::new(unix_listener, config, executable_path).map_err(HubError::CreateServer)?;
+        server.state = state;
+        server.run_state = ServerState::Running;
+        server.next_client_id = next_client_id;
+        server.next_session_id = next_session_id;
+        server.next_task_id = next_task_id;
+        server.next_worker_id = next_worker_id;
+        server.boot_generation = boot_generation;
+        server.update_counts();
+
+        let mut paused_workers = Vec::with_capacity(live_worker_count);
+        for worker in workers {
+            if worker.run_state == RunState::Stopped {
+                // SAFETY: both validated descriptors have unique ownership in
+                // this child. Dropping the child copies cannot affect the old
+                // main's descriptor table or shared open file descriptions.
+                drop(unsafe { OwnedFd::from_raw_fd(worker.channel_fd) });
+                drop(unsafe { OwnedFd::from_raw_fd(worker.scm_fd) });
+                continue;
+            }
+            let token = server.next_session_token();
+            // SAFETY: both inherited descriptors passed the live/uniqueness
+            // validation and ownership transfers to the paused session.
+            let stream = unsafe { UnixStream::from_raw_fd(worker.channel_fd) };
+            let scm_fd = unsafe { OwnedFd::from_raw_fd(worker.scm_fd) };
+            let mut session = WorkerSession::restore_legacy_paused(
+                stream,
+                scm_fd,
+                worker,
+                token,
+                command_buffer_size,
+                max_command_buffer_size,
+            )?;
+            session.register(server.poll.registry()).map_err(|error| {
+                HubError::RegisterRestoredSession {
+                    kind: "worker",
+                    id: session.id(),
+                    error,
+                }
+            })?;
+            paused_workers.push(session);
+        }
+        debug_assert_eq!(paused_workers.len(), live_worker_count);
+        debug_assert_eq!(server.next_session_id, next_session_after_restore);
+
+        let restored_session_ticks = paused_workers
+            .iter()
+            .map(PausedWorkerSession::token)
+            .collect();
+        let restored_worker_tokens = paused_workers
+            .iter()
+            .map(PausedWorkerSession::token)
+            .collect();
+
+        Ok(PausedCommandHub {
+            server,
+            clients: Vec::new(),
+            workers: paused_workers,
+            tasks: HashMap::new(),
+            command_socket_path,
+            restored_session_ticks,
+            restored_worker_tokens,
+            sigterm_receiver: None,
+        })
     }
 
     /// Recreate and register the command Hub without consuming any data.
@@ -2926,6 +3106,71 @@ mod tests {
             });
             assert_eq!(paused.clients.len(), 1);
         }
+    }
+
+    #[test]
+    fn legacy_upgrade_preserves_stopping_worker_with_fresh_token_and_tick() {
+        // No bind is needed: this test only exercises descriptor ownership and
+        // mio registration, and some sandboxes forbid filesystem socket binds.
+        // SAFETY: socket returns a uniquely owned descriptor on success.
+        let listener_fd =
+            unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0) };
+        assert!(
+            listener_fd >= 0,
+            "could not create test listener descriptor"
+        );
+        // SAFETY: ownership of the descriptor returned above transfers here.
+        let listener = unsafe { UnixListener::from_raw_fd(listener_fd) };
+        let (worker_channel, _worker_peer): (
+            Channel<WorkerRequest, WorkerResponse>,
+            Channel<WorkerResponse, WorkerRequest>,
+        ) = Channel::generate_nonblocking(64, 512).expect("could not create worker channel");
+        let channel_fd = worker_channel.sock.into_raw_fd();
+        let (scm_socket, _scm_peer) =
+            std::os::unix::net::UnixStream::pair().expect("could not create SCM socket pair");
+        let scm_fd = scm_socket.into_raw_fd();
+
+        let data = crate::command::upgrade::LegacyUpgradeData {
+            command_socket_fd: listener.into_raw_fd(),
+            config: Config {
+                command_buffer_size: 64,
+                max_command_buffer_size: 512,
+                ..Config::default()
+            },
+            next_client_id: 3,
+            next_session_id: 7,
+            next_task_id: 5,
+            next_worker_id: 11,
+            workers: vec![crate::command::upgrade::LegacySerializedWorkerSession {
+                channel_fd,
+                pid: 4242,
+                id: 9,
+                run_state: RunState::Stopping,
+                scm_fd,
+            }],
+            state: ConfigState::new(),
+            boot_generation: 4,
+        };
+
+        let paused = CommandHub::prepare_from_legacy_upgrade_data(data)
+            .expect("the legacy Hub should prepare without shared data I/O");
+        assert_eq!(paused.workers.len(), 1);
+        assert_eq!(paused.workers[0].token(), Token(7));
+        assert!(paused.restored_session_ticks.contains(&Token(7)));
+        assert!(paused.restored_worker_tokens.contains(&Token(7)));
+        assert_eq!(paused.server.next_session_id, 8);
+
+        let hub = paused
+            .activate()
+            .expect("parent exit should activate the prepared Hub");
+        let worker = hub
+            .server
+            .workers
+            .get(&Token(7))
+            .expect("the draining legacy worker should survive the handoff");
+        assert_eq!(worker.id, 9);
+        assert_eq!(worker.run_state, RunState::Stopping);
+        assert_eq!(hub.server.boot_generation, 4);
     }
 
     #[test]

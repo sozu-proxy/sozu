@@ -3,6 +3,7 @@ use std::{
     time::Duration,
 };
 
+use libc::pid_t;
 use mio::Token;
 use nix::{
     sys::{
@@ -420,6 +421,35 @@ impl Gatherer for UpgradeWorkerTask {
 
 pub const UPGRADE_PROTOCOL_V2: u16 = 2;
 
+/// Exact descriptor-only worker shape emitted by Sōzu 2.2.1.
+#[derive(Debug, Deserialize)]
+pub(crate) struct LegacySerializedWorkerSession {
+    pub(crate) channel_fd: i32,
+    pub(crate) pid: pid_t,
+    pub(crate) id: WorkerId,
+    pub(crate) run_state: RunState,
+    pub(crate) scm_fd: i32,
+}
+
+/// Exact flat main-upgrade payload emitted by Sōzu 2.2.1.
+///
+/// The absent protocol marker selects this compatibility path. The payload
+/// intentionally carries no command-client sessions, tasks, or userspace
+/// channel buffers, so callers must keep the legacy control plane quiescent.
+#[derive(Debug, Deserialize)]
+pub(crate) struct LegacyUpgradeData {
+    pub(crate) command_socket_fd: i32,
+    pub(crate) config: Config,
+    pub(crate) next_client_id: ClientId,
+    pub(crate) next_session_id: SessionId,
+    pub(crate) next_task_id: TaskId,
+    pub(crate) next_worker_id: WorkerId,
+    pub(crate) workers: Vec<LegacySerializedWorkerSession>,
+    pub(crate) state: ConfigState,
+    #[serde(default)]
+    pub(crate) boot_generation: u32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
 #[repr(i32)]
 pub enum UpgradeStage {
@@ -814,9 +844,9 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        UPGRADE_PROTOCOL_V2, UpgradeCounts, UpgradeData, UpgradeHandshake, UpgradeServerState,
-        UpgradeSnapshot, UpgradeStage, UpgradeWorkerProgress, UpgradeWorkerTask,
-        commit_and_wait_for_activation, validate_prepared,
+        LegacyUpgradeData, UPGRADE_PROTOCOL_V2, UpgradeCounts, UpgradeData, UpgradeHandshake,
+        UpgradeServerState, UpgradeSnapshot, UpgradeStage, UpgradeWorkerProgress,
+        UpgradeWorkerTask, commit_and_wait_for_activation, validate_prepared,
     };
     use crate::command::{
         server::{
@@ -828,7 +858,7 @@ mod tests {
     use sozu_command_lib::channel::Channel;
     use sozu_command_lib::{config::Config, state::ConfigState};
     use sozu_command_lib::{
-        proto::command::{Request, Response, ResponseStatus, WorkerResponse},
+        proto::command::{Request, Response, ResponseStatus, RunState, WorkerResponse},
         ready::Ready,
     };
 
@@ -853,6 +883,43 @@ mod tests {
             state: ConfigState::new(),
             boot_generation: 16,
         })
+    }
+
+    #[test]
+    fn legacy_flat_upgrade_payload_deserializes_without_v2_envelope() {
+        let payload = serde_json::json!({
+            "command_socket_fd": 11,
+            "config": Config::default(),
+            "next_client_id": 12,
+            "next_session_id": 13,
+            "next_task_id": 14,
+            "next_worker_id": 15,
+            "workers": [{
+                "channel_fd": 16,
+                "pid": 17,
+                "id": 18,
+                "run_state": RunState::Stopping,
+                "scm_fd": 19
+            }],
+            "state": ConfigState::new()
+        });
+        assert!(payload.get("protocol").is_none());
+        assert!(payload.get("snapshot").is_none());
+
+        let parsed: LegacyUpgradeData =
+            serde_json::from_value(payload).expect("the legacy flat DTO should deserialize");
+        assert_eq!(parsed.command_socket_fd, 11);
+        assert_eq!(parsed.next_client_id, 12);
+        assert_eq!(parsed.next_session_id, 13);
+        assert_eq!(parsed.next_task_id, 14);
+        assert_eq!(parsed.next_worker_id, 15);
+        assert_eq!(parsed.boot_generation, 0);
+        assert_eq!(parsed.workers.len(), 1);
+        assert_eq!(parsed.workers[0].channel_fd, 16);
+        assert_eq!(parsed.workers[0].pid, 17);
+        assert_eq!(parsed.workers[0].id, 18);
+        assert_eq!(parsed.workers[0].run_state, RunState::Stopping);
+        assert_eq!(parsed.workers[0].scm_fd, 19);
     }
 
     #[test]

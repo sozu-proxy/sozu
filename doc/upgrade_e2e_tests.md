@@ -292,7 +292,7 @@ responses).
 
 ## Main-process handoff tests
 
-The `sozu` crate also has three Linux-only process tests for the command-Hub
+The `sozu` crate also has Linux-only process tests for the command-Hub
 handoff. They are ignored in the ordinary unit suite because they fork real
 main and worker processes and bind local sockets; run them explicitly and
 serially. A separate two-direction compatibility matrix needs frozen legacy
@@ -358,16 +358,43 @@ cargo test -p sozu --test main_upgrade_compatibility_matrix_e2e --locked \
   -- --ignored --nocapture --test-threads=1
 ```
 
-The compatibility matrix runs both protocol directions. Without both
-variables each case prints a skip line and passes, so a plain `-- --ignored`
-run of the whole crate is not stopped by it; CI never sets them. A replacement sender
-must reject a legacy candidate before exposing the live Hub, keep its boot
-generation and audit unchanged, and reap the candidate. A legacy sender cannot
-provide the same transactional accounting, but it must stay authoritative and
-continue its held and subsequent commands when the replacement refuses the
-legacy handoff. The first deployment therefore requires the controlled restart
-described above; the matrix does not turn a legacy sender into a lossless V2
-sender.
+The compatibility matrix covers the outgoing v2 rejection of a legacy candidate
+and the incoming 2.2.1 bridge. Set both variables explicitly: the historical
+outgoing case skips without them, while the 2.2.1 cases fail when the binaries
+are missing. The positive bridge test checks the legacy binary's embedded
+`cd02310` revision; use the published 2.2.1 artifact and verify its archive against
+the release's `SHA256SUMS` before running it. A build's package version alone
+does not prove its provenance because unreleased builds also say `2.2.1`.
+
+`legacy_2_2_1_upgrades_to_current_and_drains_its_worker` starts the old binary,
+holds a data-plane request, replaces the executable and requests the main
+handoff with otherwise idle administration. It checks the old main's exit,
+the new PID and executable checksum, continued HTTP/HTTPS/TCP/UDP traffic,
+worker replacement, saved routing state and certificate material. The HTTPS
+probe requires `curl` on `PATH`; it disables user curl configuration and proxies,
+uses HTTP/1.1 and accepts the repository's self-signed test certificate with
+`--insecure`. This tests TLS transport through the upgrade, not CA trust policy.
+`legacy_2_2_1_upgrade_refuses_notify_supervision_before_ack` verifies refusal
+with `NOTIFY_SOCKET` set while the old main keeps serving. This checks the
+refusal policy, not a successful systemd supervision transfer.
+`legacy_2_2_1_preserves_authority_when_candidate_exits_nonzero` installs a
+candidate that exits before acknowledging; the CLI must fail while the old
+PID and its HTTP route remain available.
+
+The outgoing v2 sender must still reject a legacy candidate before exposing the
+live Hub, without advancing generation or audit, and reap the candidate. The
+legacy sender has weaker accounting: it advances generation and emits its
+success audit before knowing the receiver result. The bridge cannot reconstruct
+omitted client/task/worker-buffer state and does not turn that sender into a
+lossless v2 sender. Follow the [2.2.1 operator procedure](how_to_use.md#first-hot-upgrade-from-221).
+
+The ordinary `upgrade_cli_result` tests use a scripted command peer to check
+that full upgrades report a worker failure with a nonzero exit status, still
+attempt all active workers and skip already draining/stopped workers:
+
+```bash
+cargo test -p sozu --test upgrade_cli_result --locked
+```
 
 ## Coverage matrix
 
