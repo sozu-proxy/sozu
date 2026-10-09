@@ -25,8 +25,11 @@ use mio::{
     net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream},
 };
 use rustls::{
-    CipherSuite, ProtocolVersion, ServerConfig as RustlsServerConfig, ServerConnection,
-    SupportedCipherSuite, crypto::CryptoProvider,
+    CipherSuite, ProtocolVersion, RootCertStore, ServerConfig as RustlsServerConfig,
+    ServerConnection, SupportedCipherSuite,
+    crypto::CryptoProvider,
+    pki_types::{CertificateDer, CertificateRevocationListDer, pem::PemObject},
+    server::WebPkiClientVerifier,
 };
 use rusty_ulid::Ulid;
 use socket2::SockRef;
@@ -35,9 +38,10 @@ use sozu_command::{
     config::{DEFAULT_ALPN_PROTOCOLS, DEFAULT_CIPHER_LIST},
     listener_key::ListenerKey,
     proto::command::{
-        AddCertificate, CertificateSummary, CertificatesByAddress, Cluster, ForwardedHeaders,
-        HttpsListenerConfig, ListOfCertificatesByAddress, ListenerType, RemoveCertificate,
-        RemoveListener, ReplaceCertificate, RequestHttpFrontend, ResponseContent, TlsVersion,
+        AddCertificate, CertificateSummary, CertificatesByAddress, ClientAuthMode,
+        ClientAuthPolicy, Cluster, ForwardedHeaders, HttpsListenerConfig,
+        ListOfCertificatesByAddress, ListenerType, RemoveCertificate, RemoveListener,
+        ReplaceCertificate, RequestHttpFrontend, ResponseContent, TlsVersion,
         UpdateHttpsListenerConfig, WorkerRequest, WorkerResponse, request::RequestType,
         response_content::ContentType,
     },
@@ -1727,17 +1731,31 @@ impl HttpsListener {
                 .collect::<Vec<_>>()
         };
 
-        let provider = CryptoProvider {
+        let provider = Arc::new(CryptoProvider {
             cipher_suites: ciphers,
             kx_groups,
             ..default_provider()
+        });
+
+        let builder = RustlsServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&versions[..])
+            .map_err(|err| ListenerError::BuildRustls(err.to_string()))?;
+
+        // mTLS: `client_auth` decodes to `ClientAuthMode` (NONE at field 0).
+        // NONE keeps the historical `.with_no_client_auth()`; OPTIONAL and
+        // REQUIRED install a WebPki client-certificate verifier built from the
+        // listener's trusted CA bundle (and optional CRLs). OPTIONAL differs
+        // only by allowing connections that present no certificate at all. The
+        // verifier is built from the same `provider` as the server config so it
+        // works in single-provider builds (`crypto-openssl`-only) and in
+        // multi-provider builds (`--all-features`) where no process-default
+        // provider is installed.
+        let builder = match Self::client_cert_verifier(config, &provider)? {
+            Some(verifier) => builder.with_client_cert_verifier(verifier),
+            None => builder.with_no_client_auth(),
         };
 
-        let mut server_config = RustlsServerConfig::builder_with_provider(provider.into())
-            .with_protocol_versions(&versions[..])
-            .map_err(|err| ListenerError::BuildRustls(err.to_string()))?
-            .with_no_client_auth()
-            .with_cert_resolver(resolver);
+        let mut server_config = builder.with_cert_resolver(resolver);
         server_config.send_tls13_tickets = config.send_tls13_tickets as usize;
 
         server_config.alpn_protocols = if config.alpn_protocols.is_empty() {
@@ -1754,6 +1772,185 @@ impl HttpsListener {
         };
 
         Ok(server_config)
+    }
+
+    /// Refuse two CRLs of one CA whose scopes overlap: webpki checks a
+    /// certificate against the first configured CRL that is authoritative for
+    /// it and never reads the others, so the order alone would decide, and an
+    /// old CRL listed before its replacement would hide every revocation the
+    /// replacement adds. A CRL without an `IssuingDistributionPoint` covers
+    /// everything its CA issued; partitions of one CA, each with its own
+    /// distribution point, do not overlap and are accepted together.
+    ///
+    /// Issuers and distribution points are compared as the raw DER webpki
+    /// compares. The check does not depend on time, so every worker runs it
+    /// when it builds the listener; [`Self::check_crls_current`] is the one
+    /// that does.
+    fn check_crl_set(crls: &[CertificateRevocationListDer<'_>]) -> Result<(), ListenerError> {
+        let mut scopes: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::with_capacity(crls.len());
+        for (index, crl) in crls.iter().enumerate() {
+            let parsed = webpki::BorrowedCertRevocationList::from_der(crl.as_ref())
+                .map_err(|e| ListenerError::ClientAuth(format!("invalid CRL: {e}")))?;
+            let parsed = webpki::CertRevocationList::from(parsed);
+            let issuer = parsed.issuer().to_vec();
+            let distribution_point = parsed.issuing_distribution_point().map(<[u8]>::to_vec);
+            let overlapping = scopes.iter().position(|(seen_issuer, seen_point)| {
+                *seen_issuer == issuer
+                    && (seen_point.is_none()
+                        || distribution_point.is_none()
+                        || *seen_point == distribution_point)
+            });
+            if let Some(first) = overlapping {
+                return Err(ListenerError::ClientAuth(format!(
+                    "CRLs #{} and #{} (counted across client_ca_crls) are issued by the \
+                     same CA for overlapping certificates, and only the first would be \
+                     consulted: configure one CRL per issuer, or one per distribution point",
+                    first + 1,
+                    index + 1
+                )));
+            }
+            scopes.push((issuer, distribution_point));
+        }
+        Ok(())
+    }
+
+    /// Refuse a CRL already past its `nextUpdate` at `now` (seconds since the
+    /// Unix epoch): with revocation expiry enforced it would reject every
+    /// client it covers, which is better reported when the operator states it
+    /// than found at the first handshake.
+    ///
+    /// Main process only, on what an operator states (configuration load,
+    /// reload, a client request), never on a replay or in a worker: a CRL
+    /// that lapses while the listener runs must not stop a worker started
+    /// later from building the listener, or the reload that brings a current
+    /// CRL would find nothing to patch there. Such a worker builds it and
+    /// rejects the clients at handshake until that reload.
+    pub fn check_crls_current(crls: &[String], now: i64) -> Result<(), ListenerError> {
+        let mut index = 0;
+        for pem in crls {
+            for crl in CertificateRevocationListDer::pem_slice_iter(pem.as_bytes()) {
+                let crl =
+                    crl.map_err(|e| ListenerError::ClientAuth(format!("invalid CRL PEM: {e}")))?;
+                index += 1;
+                if let Some(next_update) = sozu_command::certificate::crl_next_update(crl.as_ref())
+                    && next_update <= now
+                {
+                    return Err(ListenerError::ClientAuth(format!(
+                        "CRL #{index} (counted across client_ca_crls) expired {} seconds ago: \
+                         its nextUpdate is past, refresh it",
+                        now - next_update
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Check a client authentication policy the way a listener would build
+    /// it, without a listener: the main process runs this on an
+    /// `UpdateHttpsListenerConfig.client_auth_policy` patch before it commits
+    /// the patch to its state, so a policy no worker could build is refused
+    /// up front rather than fanned out.
+    pub fn validate_client_auth_policy(policy: &ClientAuthPolicy) -> Result<(), ListenerError> {
+        let mut config = HttpsListenerConfig::default();
+        config.apply_client_auth_policy(policy);
+        Self::client_cert_verifier(&config, &Arc::new(default_provider())).map(|_| ())
+    }
+
+    /// Build the rustls client-certificate verifier for a listener's mTLS
+    /// configuration, or `None` when client auth is disabled.
+    ///
+    /// Returns `None` only for [`ClientAuthMode::ClientAuthNone`] (and for an
+    /// absent `client_auth` field, which decodes to that variant), preserving
+    /// the historical `.with_no_client_auth()` path. For OPTIONAL/REQUIRED it
+    /// parses `client_ca_certificates` into a root store and, when present,
+    /// `client_ca_crls` into revocation lists. OPTIONAL additionally allows
+    /// unauthenticated clients (no certificate presented); REQUIRED aborts the
+    /// handshake in that case.
+    ///
+    /// The verifier is built with the caller's `provider` so it never relies on
+    /// a process-default crypto provider (which may be absent or ambiguous). An
+    /// unknown `client_auth` value is rejected rather than treated as NONE, so a
+    /// malformed or future enum value can never silently disable client auth.
+    fn client_cert_verifier(
+        config: &HttpsListenerConfig,
+        provider: &Arc<CryptoProvider>,
+    ) -> Result<Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>, ListenerError> {
+        // Reject unknown enum values instead of failing open to NONE.
+        let raw = config
+            .client_auth
+            .unwrap_or(ClientAuthMode::ClientAuthNone as i32);
+        let mode = ClientAuthMode::try_from(raw).map_err(|_| {
+            ListenerError::ClientAuth(format!("unknown client_auth mode value {raw}"))
+        })?;
+        if mode == ClientAuthMode::ClientAuthNone {
+            return Ok(None);
+        }
+
+        // Parse every trusted-CA PEM entry into the root store. Each entry may
+        // itself hold a concatenated PEM chain, so iterate per entry. An entry
+        // that contributes no certificate (empty text, or PEM carrying another
+        // section type) is rejected rather than skipped: it would start the
+        // listener with only a subset of the configured trust anchors, so
+        // clients issued by the omitted CA would fail with no visible cause.
+        let mut roots = RootCertStore::empty();
+        for pem in &config.client_ca_certificates {
+            let before = roots.len();
+            for cert in CertificateDer::pem_slice_iter(pem.as_bytes()) {
+                let cert =
+                    cert.map_err(|e| ListenerError::ClientAuth(format!("invalid CA PEM: {e}")))?;
+                roots
+                    .add(cert)
+                    .map_err(|e| ListenerError::ClientAuth(format!("untrusted CA: {e}")))?;
+            }
+            if roots.len() == before {
+                return Err(ListenerError::ClientAuth(
+                    "a configured trusted-CA entry contained no certificate".to_owned(),
+                ));
+            }
+        }
+        if roots.is_empty() {
+            return Err(ListenerError::ClientAuth(
+                "client auth requested but no trusted CA certificate was provided".to_owned(),
+            ));
+        }
+
+        // Parse CRLs per configured entry. An entry that yields zero CRLs (empty
+        // text, or PEM carrying another section type) is a misconfiguration: it
+        // would silently disable revocation, so reject it rather than build a
+        // verifier that skips `with_crls`.
+        let mut crls = Vec::new();
+        for pem in &config.client_ca_crls {
+            let before = crls.len();
+            for crl in CertificateRevocationListDer::pem_slice_iter(pem.as_bytes()) {
+                crls.push(
+                    crl.map_err(|e| ListenerError::ClientAuth(format!("invalid CRL PEM: {e}")))?,
+                );
+            }
+            if crls.len() == before {
+                return Err(ListenerError::ClientAuth(
+                    "a configured CRL entry contained no certificate revocation list".to_owned(),
+                ));
+            }
+        }
+        Self::check_crl_set(&crls)?;
+
+        let mut builder =
+            WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone());
+        if !crls.is_empty() {
+            // rustls defaults to `ExpirationPolicy::Ignore`, which keeps trusting
+            // a CRL past its `nextUpdate`. Enforce expiration so a stale CRL is
+            // rejected rather than silently accepting certificates whose
+            // revocation status is no longer known.
+            builder = builder.with_crls(crls).enforce_revocation_expiration();
+        }
+        if mode == ClientAuthMode::ClientAuthOptional {
+            builder = builder.allow_unauthenticated();
+        }
+        let verifier = builder
+            .build()
+            .map_err(|e| ListenerError::ClientAuth(e.to_string()))?;
+        Ok(Some(verifier))
     }
 
     /// Apply a partial-update patch to this listener's live configuration.
@@ -1913,6 +2110,9 @@ impl HttpsListener {
             // Empty values vec = reset to default (runtime treats empty as default)
             config.alpn_protocols = alpn_wrapper.values.clone();
         }
+        if let Some(ref policy) = patch.client_auth_policy {
+            config.apply_client_auth_policy(policy);
+        }
 
         // --- ALPN rebuild (may force a rustls ServerConfig rebuild) ---
         //
@@ -1922,7 +2122,10 @@ impl HttpsListener {
         // leaves the listener observably unchanged. The main-process state
         // would still diverge from that worker-side refusal: the main process
         // cannot build this worker's rustls context before it commits.
-        let new_rustls = if patch.alpn_protocols.is_some() {
+        // A client authentication policy lives in the rustls context's client
+        // certificate verifier, so a new policy needs the same rebuild; an
+        // invalid one fails it here and the listener keeps its old policy.
+        let new_rustls = if patch.alpn_protocols.is_some() || patch.client_auth_policy.is_some() {
             Some(Arc::new(Self::create_rustls_context(
                 &config,
                 self.resolver.clone(),
@@ -4534,5 +4737,420 @@ mod listener_sibling_tests {
             );
             assert_eq!(served_hsts(&proxy, 0), None);
         }
+    }
+
+    /// A self-signed cert usable as a CA root anchor in the verifier tests.
+    const TEST_CA_PEM: &str = include_str!("../assets/certificate.pem");
+
+    fn test_crypto_provider() -> Arc<CryptoProvider> {
+        Arc::new(default_provider())
+    }
+
+    fn https_config_with_client_auth(
+        mode: ClientAuthMode,
+        cas: &[&str],
+        crls: &[&str],
+    ) -> HttpsListenerConfig {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 1049);
+        let mut config = ListenerBuilder::new_https(address)
+            .to_tls(None)
+            .expect("default HTTPS listener config");
+        config.client_auth = Some(mode as i32);
+        config.client_ca_certificates = cas.iter().map(|s| s.to_string()).collect();
+        config.client_ca_crls = crls.iter().map(|s| s.to_string()).collect();
+        config
+    }
+
+    #[test]
+    fn client_cert_verifier_none_is_disabled() {
+        // NONE (and an absent field) must keep the no-client-auth path.
+        let provider = test_crypto_provider();
+        let config = https_config_with_client_auth(ClientAuthMode::ClientAuthNone, &[], &[]);
+        assert!(
+            HttpsListener::client_cert_verifier(&config, &provider)
+                .expect("verifier build")
+                .is_none()
+        );
+
+        let mut absent = config;
+        absent.client_auth = None;
+        assert!(
+            HttpsListener::client_cert_verifier(&absent, &provider)
+                .expect("verifier build")
+                .is_none(),
+            "absent client_auth must decode to NONE"
+        );
+    }
+
+    #[test]
+    fn client_cert_verifier_rejects_unknown_mode() {
+        // An unknown (future/garbage) enum value must be rejected, never fold
+        // to NONE and silently accept unauthenticated clients.
+        let provider = test_crypto_provider();
+        let mut config =
+            https_config_with_client_auth(ClientAuthMode::ClientAuthRequired, &[TEST_CA_PEM], &[]);
+        config.client_auth = Some(999);
+        assert!(matches!(
+            HttpsListener::client_cert_verifier(&config, &provider),
+            Err(ListenerError::ClientAuth(_))
+        ));
+    }
+
+    #[test]
+    fn client_cert_verifier_required_builds_with_ca() {
+        let provider = test_crypto_provider();
+        let config =
+            https_config_with_client_auth(ClientAuthMode::ClientAuthRequired, &[TEST_CA_PEM], &[]);
+        assert!(
+            HttpsListener::client_cert_verifier(&config, &provider)
+                .expect("verifier build")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn client_cert_verifier_optional_builds_with_ca() {
+        let provider = test_crypto_provider();
+        let config =
+            https_config_with_client_auth(ClientAuthMode::ClientAuthOptional, &[TEST_CA_PEM], &[]);
+        assert!(
+            HttpsListener::client_cert_verifier(&config, &provider)
+                .expect("verifier build")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn client_cert_verifier_requires_a_trusted_ca() {
+        // A non-NONE mode with an empty CA bundle is a configuration error, not
+        // a silently-permissive listener.
+        let provider = test_crypto_provider();
+        let config = https_config_with_client_auth(ClientAuthMode::ClientAuthRequired, &[], &[]);
+        assert!(matches!(
+            HttpsListener::client_cert_verifier(&config, &provider),
+            Err(ListenerError::ClientAuth(_))
+        ));
+    }
+
+    #[test]
+    fn client_cert_verifier_rejects_malformed_ca() {
+        let provider = test_crypto_provider();
+        let config = https_config_with_client_auth(
+            ClientAuthMode::ClientAuthRequired,
+            &["not a pem certificate"],
+            &[],
+        );
+        // A CA entry that parses to zero anchors is a configuration error.
+        assert!(matches!(
+            HttpsListener::client_cert_verifier(&config, &provider),
+            Err(ListenerError::ClientAuth(_))
+        ));
+    }
+
+    #[test]
+    fn client_cert_verifier_rejects_empty_ca_entry_among_valid_ones() {
+        // A valid CA followed by an entry contributing no certificate must be
+        // rejected, not silently dropped, so the configured trust set is never
+        // quietly reduced to a subset.
+        let provider = test_crypto_provider();
+        let config = https_config_with_client_auth(
+            ClientAuthMode::ClientAuthRequired,
+            &[TEST_CA_PEM, "not a certificate"],
+            &[],
+        );
+        assert!(matches!(
+            HttpsListener::client_cert_verifier(&config, &provider),
+            Err(ListenerError::ClientAuth(_))
+        ));
+    }
+
+    #[test]
+    fn client_cert_verifier_rejects_empty_crl_entry() {
+        // A configured CRL entry that yields zero CRLs would silently disable
+        // revocation; it must be rejected rather than skipped.
+        let provider = test_crypto_provider();
+        let config = https_config_with_client_auth(
+            ClientAuthMode::ClientAuthRequired,
+            &[TEST_CA_PEM],
+            &["not a crl"],
+        );
+        assert!(matches!(
+            HttpsListener::client_cert_verifier(&config, &provider),
+            Err(ListenerError::ClientAuth(_))
+        ));
+    }
+
+    // ── Client certificate revocation ──
+    //
+    // The fixtures come from `lib/assets/mtls/generate.sh`: one CA, one
+    // client it issued, and CRLs that each leave exactly one reason to accept
+    // or reject that client. The verdict is checked on the rustls error, not
+    // only on accept/reject, because a handshake rejected for the wrong
+    // reason would still look like a pass at the TLS level.
+
+    const MTLS_CA_PEM: &str = include_str!("../assets/mtls/ca-cert.pem");
+    const MTLS_CLIENT_PEM: &str = include_str!("../assets/mtls/client-cert.pem");
+    /// Issued by the CA, nextUpdate in 2125, revokes nothing.
+    const MTLS_CRL_CURRENT: &str = include_str!("../assets/mtls/crl-current.pem");
+    /// Issued by the CA, nextUpdate in 2125, revokes the client.
+    const MTLS_CRL_REVOKED: &str = include_str!("../assets/mtls/crl-revoked.pem");
+    /// Issued by the CA, nextUpdate in January 2020, revokes nothing.
+    const MTLS_CRL_EXPIRED: &str = include_str!("../assets/mtls/crl-expired.pem");
+    /// Issued by another CA: covers nothing in the client's chain.
+    const MTLS_CRL_OTHER_CA: &str = include_str!("../assets/mtls/crl-other-ca.pem");
+    /// Two partitions of the CA's list, each with its own
+    /// IssuingDistributionPoint, neither covering the client.
+    const MTLS_CRL_PARTITION_A: &str = include_str!("../assets/mtls/crl-partition-a.pem");
+    const MTLS_CRL_PARTITION_B: &str = include_str!("../assets/mtls/crl-partition-b.pem");
+
+    /// The verdict of a `required` listener trusting the test CA with `crls`
+    /// on the test client's certificate, at the current time.
+    fn verify_mtls_client(crls: &[&str]) -> Result<(), rustls::Error> {
+        verify_mtls_client_at(crls, rustls::pki_types::UnixTime::now())
+    }
+
+    /// The same verdict, for a handshake at `time`.
+    fn verify_mtls_client_at(
+        crls: &[&str],
+        time: rustls::pki_types::UnixTime,
+    ) -> Result<(), rustls::Error> {
+        let config =
+            https_config_with_client_auth(ClientAuthMode::ClientAuthRequired, &[MTLS_CA_PEM], crls);
+        let verifier = HttpsListener::client_cert_verifier(&config, &test_crypto_provider())
+            .expect("a CA and well-formed CRLs must build a verifier")
+            .expect("required client auth must install a verifier");
+        let client = CertificateDer::from_pem_slice(MTLS_CLIENT_PEM.as_bytes())
+            .expect("the client fixture is a PEM certificate");
+        verifier.verify_client_cert(&client, &[], time).map(|_| ())
+    }
+
+    /// Whether a `required` listener can be built with `crls`, and the
+    /// reason when it cannot.
+    fn build_mtls_listener(crls: &[&str]) -> Result<(), String> {
+        let config =
+            https_config_with_client_auth(ClientAuthMode::ClientAuthRequired, &[MTLS_CA_PEM], crls);
+        match HttpsListener::client_cert_verifier(&config, &test_crypto_provider()) {
+            Ok(_) => Ok(()),
+            Err(ListenerError::ClientAuth(reason)) => Err(reason),
+            Err(other) => panic!("unexpected listener error {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_revocation_accepts_a_client_no_crl_revokes() {
+        assert_eq!(
+            verify_mtls_client(&[]),
+            Ok(()),
+            "precondition: the client chains to the CA"
+        );
+        assert_eq!(
+            verify_mtls_client(&[MTLS_CRL_CURRENT]),
+            Ok(()),
+            "a current CRL from the client's issuer that does not list it must not reject it"
+        );
+    }
+
+    #[test]
+    fn client_revocation_rejects_a_revoked_client() {
+        // The CRL is current, so only the serial lookup can reject the client.
+        // Without `with_crls`, the client would be accepted.
+        assert_eq!(
+            verify_mtls_client(&[MTLS_CRL_REVOKED]),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::Revoked
+            ))
+        );
+    }
+
+    #[test]
+    fn client_revocation_refuses_an_expired_crl_only_where_the_operator_states_it() {
+        // The main process refuses a CRL already past its nextUpdate in what
+        // an operator states: it would reject every client it covers.
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a clock after 1970")
+                .as_secs(),
+        )
+        .expect("a clock within i64");
+        let refused = HttpsListener::check_crls_current(&[MTLS_CRL_EXPIRED.to_owned()], now);
+        assert!(
+            matches!(refused, Err(ListenerError::ClientAuth(ref reason)) if reason.contains("expired")),
+            "an expired CRL must be refused when stated, got {refused:?}"
+        );
+        assert!(
+            HttpsListener::check_crls_current(
+                &[MTLS_CRL_CURRENT.to_owned(), MTLS_CRL_OTHER_CA.to_owned()],
+                now
+            )
+            .is_ok()
+        );
+        // A worker still builds a listener whose CRL lapsed while it ran (a
+        // restarted worker replaying the state), so a later reload has a
+        // listener to patch; the lapsed CRL rejects clients at handshake.
+        assert_eq!(build_mtls_listener(&[MTLS_CRL_EXPIRED]), Ok(()));
+        let config = https_config_with_client_auth(
+            ClientAuthMode::ClientAuthRequired,
+            &[MTLS_CA_PEM],
+            &[MTLS_CRL_EXPIRED],
+        );
+        assert!(HttpsListener::try_new(config, Token(0)).is_ok());
+    }
+
+    #[test]
+    fn client_revocation_rejects_a_client_once_its_crl_has_lapsed() {
+        // A CRL current when the listener was built lapses while it runs.
+        // In June 2125 the current CRL (nextUpdate January 2125) has lapsed
+        // and the client certificate (notAfter 2126) has not, so only the
+        // CRL expiry can reject the client. Without
+        // `enforce_revocation_expiration`, rustls keeps trusting the stale CRL
+        // and accepts it.
+        let june_2125 =
+            rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(4_905_100_800));
+        let verdict = verify_mtls_client_at(&[MTLS_CRL_CURRENT], june_2125);
+        assert!(
+            matches!(
+                verdict,
+                Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::ExpiredRevocationList
+                        | rustls::CertificateError::ExpiredRevocationListContext { .. }
+                ))
+            ),
+            "a CRL past its nextUpdate must reject the client, got {verdict:?}"
+        );
+        // Positive space: without CRLs the client is still valid then, so the
+        // rejection above is the CRL expiry and nothing else.
+        assert_eq!(verify_mtls_client_at(&[], june_2125), Ok(()));
+    }
+
+    #[test]
+    fn client_revocation_rejects_a_client_no_configured_crl_covers() {
+        // Once any CRL is configured, a client whose issuer no CRL covers has
+        // an unknown revocation status, which rustls's default
+        // `UnknownStatusPolicy::Deny` rejects.
+        assert_eq!(
+            verify_mtls_client(&[MTLS_CRL_OTHER_CA]),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownRevocationStatus
+            ))
+        );
+        // Adding the issuer's own current CRL restores the verdict.
+        assert_eq!(
+            verify_mtls_client(&[MTLS_CRL_OTHER_CA, MTLS_CRL_CURRENT]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn client_revocation_refuses_two_crls_of_one_issuer_with_overlapping_scopes() {
+        // webpki would only read the first of them, so the order alone would
+        // decide: listing the revoking CRL second accepts the revoked client.
+        // Every order must fail the listener instead.
+        for crls in [
+            vec![MTLS_CRL_CURRENT, MTLS_CRL_REVOKED],
+            vec![MTLS_CRL_REVOKED, MTLS_CRL_CURRENT],
+            // A full CRL covers every partition of its CA.
+            vec![MTLS_CRL_CURRENT, MTLS_CRL_PARTITION_A],
+            vec![MTLS_CRL_PARTITION_A, MTLS_CRL_CURRENT],
+            // The same partition twice.
+            vec![MTLS_CRL_PARTITION_A, MTLS_CRL_PARTITION_A],
+        ] {
+            let refused = build_mtls_listener(&crls);
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|reason| reason.contains("overlapping")),
+                "overlapping CRLs of one issuer must fail the listener, got {refused:?}"
+            );
+        }
+        // Two CRLs in one configured entry count the same as two entries.
+        assert!(build_mtls_listener(&[&format!("{MTLS_CRL_CURRENT}{MTLS_CRL_REVOKED}")]).is_err());
+    }
+
+    #[test]
+    fn client_revocation_takes_the_partitions_of_one_issuer() {
+        // Partitions told apart by their distribution point cover disjoint
+        // certificates, so a CA publishing its list that way stays usable.
+        assert_eq!(
+            build_mtls_listener(&[MTLS_CRL_PARTITION_A, MTLS_CRL_PARTITION_B]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn client_revocation_takes_one_crl_per_issuer() {
+        // Positive space of the rule above: CRLs from distinct issuers are
+        // all kept, and none shadows another.
+        assert_eq!(
+            verify_mtls_client(&[MTLS_CRL_OTHER_CA, MTLS_CRL_REVOKED]),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::Revoked
+            ))
+        );
+        assert_eq!(
+            verify_mtls_client(&[MTLS_CRL_REVOKED, MTLS_CRL_OTHER_CA]),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::Revoked
+            ))
+        );
+    }
+
+    /// The in-place refresh of a running listener's client authentication
+    /// policy: the patch replaces the policy and rebuilds the rustls context
+    /// that holds the verifier; a policy the verifier cannot be built from
+    /// leaves the listener exactly as it was. Its effect on handshakes is
+    /// covered by `test_mtls_policy_patch_*` in `e2e/src/tests/tls_tests.rs`.
+    #[test]
+    fn a_client_auth_policy_patch_rebuilds_the_listener_verifier() {
+        let config = https_config_with_client_auth(
+            ClientAuthMode::ClientAuthRequired,
+            &[MTLS_CA_PEM],
+            &[MTLS_CRL_CURRENT],
+        );
+        let mut listener =
+            HttpsListener::try_new(config.clone(), Token(0)).expect("build the mTLS listener");
+        let original_context = listener.rustls_details.clone();
+
+        let refreshed = HttpsListenerConfig {
+            client_ca_crls: vec![MTLS_CRL_REVOKED.to_owned()],
+            ..config.clone()
+        }
+        .client_auth_policy();
+        listener
+            .update_config(&UpdateHttpsListenerConfig {
+                address: config.address,
+                client_auth_policy: Some(refreshed.clone()),
+                ..Default::default()
+            })
+            .expect("a buildable policy must be applied");
+        assert_eq!(listener.config.client_auth_policy(), refreshed);
+        assert!(
+            !Arc::ptr_eq(&listener.rustls_details, &original_context),
+            "the verifier lives in the rustls context, which must be rebuilt"
+        );
+
+        let applied_context = listener.rustls_details.clone();
+        let unbuildable = ClientAuthPolicy {
+            client_auth: Some(ClientAuthMode::ClientAuthRequired as i32),
+            client_ca_certificates: vec![],
+            client_ca_crls: vec![],
+        };
+        assert!(
+            listener
+                .update_config(&UpdateHttpsListenerConfig {
+                    address: config.address,
+                    client_auth_policy: Some(unbuildable.clone()),
+                    ..Default::default()
+                })
+                .is_err(),
+            "required client auth with no trusted CA must be refused"
+        );
+        assert!(HttpsListener::validate_client_auth_policy(&unbuildable).is_err());
+        assert_eq!(
+            listener.config.client_auth_policy(),
+            refreshed,
+            "a refused policy leaves the applied one in place"
+        );
+        assert!(Arc::ptr_eq(&listener.rustls_details, &applied_context));
     }
 }

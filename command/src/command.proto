@@ -173,6 +173,35 @@ message Request {
     // A cluster's own `Cluster.max_connection_attempts` takes precedence.
     // Not persisted: a worker started later reads `ServerConfig`.
     uint32 set_max_connection_attempts = 62;
+    // add an HTTPS listener that authenticates clients with a certificate
+    // (`client_auth` set to anything other than CLIENT_AUTH_NONE).
+    //
+    // Same payload as `add_https_listener`, distinct verb on purpose. A
+    // worker or main process that predates mutual TLS decodes
+    // `add_https_listener` but skips the unknown `client_auth` /
+    // `client_ca_*` tags, so it would build the listener without client
+    // authentication and acknowledge it. It cannot decode this verb at all,
+    // so it never builds the listener: the request fails instead of
+    // degrading to unauthenticated access. This matters while the fleet is
+    // mixed, between `UpgradeMain` and the replacement of every worker.
+    //
+    // Emitters pick the verb from the config with
+    // `RequestType::add_https_listener`, and the main process rewrites every
+    // request it fans out to workers to that canonical verb, so an
+    // `add_https_listener` that carries client authentication never reaches
+    // a worker. A listener without client authentication keeps
+    // `add_https_listener`, which every worker version understands.
+    HttpsListenerConfig add_https_listener_with_client_auth = 63;
+    // patch a running HTTPS listener whose patch replaces its client
+    // authentication policy (`UpdateHttpsListenerConfig.client_auth_policy`
+    // set). Same payload as `update_https_listener`, distinct verb for the
+    // reason given on `add_https_listener_with_client_auth`: a worker that
+    // predates this field would skip it and acknowledge the patch, keeping
+    // the CA and CRLs it had, so a revocation the new CRL adds would never
+    // apply there. It cannot decode this verb, so the patch fails instead.
+    // `RequestType::into_canonical` picks the verb, and the main process
+    // applies it to every request it fans out to workers.
+    UpdateHttpsListenerConfig update_https_listener_with_client_auth = 64;
   }
 }
 
@@ -400,6 +429,22 @@ message UpdateHttpsListenerConfig {
     // Soft stream-refusal share of the pre-response RST_STREAM cap, in percent —
     // see HttpsListenerConfig.
     optional uint32 h2_stream_refusal_percent       = 44;
+    // Client authentication policy. Full replacement: when set, the mode, the
+    // trusted CAs and the CRLs all take the values given here, so a CA or CRL
+    // left out is dropped, not kept; when absent, the policy is unchanged.
+    // This is how a CRL or CA bundle is refreshed without recreating the
+    // listener. Only new handshakes see the new policy.
+    optional ClientAuthPolicy client_auth_policy    = 45;
+}
+
+// The client authentication policy of an HTTPS listener, as carried by an
+// `UpdateHttpsListenerConfig` patch. Same meaning as the `client_auth`,
+// `client_ca_certificates` and `client_ca_crls` fields of
+// `HttpsListenerConfig`.
+message ClientAuthPolicy {
+    optional ClientAuthMode client_auth = 1;
+    repeated string client_ca_certificates = 2;
+    repeated string client_ca_crls = 3;
 }
 
 // Partial-update patch for a running TCP listener.
@@ -757,6 +802,22 @@ message HttpsListenerConfig {
     // ends the connection with GOAWAY(ENHANCE_YOUR_CALM). 0 disables the soft
     // state; 100 or more never engages it before the cap. Default: 50.
     optional uint32 h2_stream_refusal_percent = 50;
+    // Mutual TLS (client certificate authentication) mode for this listener.
+    // Absent or CLIENT_AUTH_NONE (the field-0 default) keeps the current
+    // behavior: no CertificateRequest is sent and any client certificate is
+    // ignored. OPTIONAL requests a client certificate but still accepts
+    // connections that present none; REQUIRED aborts the handshake when the
+    // client does not present a certificate chaining to a trusted CA.
+    optional ClientAuthMode client_auth = 51;
+    // PEM-encoded trusted CA certificates a client certificate must chain to
+    // for OPTIONAL/REQUIRED modes. Ignored when client_auth is NONE. Multiple
+    // entries build a single root store; each entry may itself hold a
+    // concatenated PEM chain.
+    repeated string client_ca_certificates = 52;
+    // Optional PEM-encoded certificate revocation lists (CRLs). When present,
+    // a presented client certificate is rejected if it (or an intermediate)
+    // appears revoked. Ignored when client_auth is NONE.
+    repeated string client_ca_crls = 53;
 }
 
 // details of an TCP listener
@@ -1215,6 +1276,21 @@ enum TlsVersion {
     TLS_V1_1 = 3;
     TLS_V1_2 = 4;
     TLS_V1_3 = 5;
+}
+
+// Mutual TLS client-certificate authentication policy for an HTTPS listener.
+// NONE is field 0 so an absent `client_auth` decodes to the current
+// no-client-auth behavior, keeping legacy state files byte-compatible.
+enum ClientAuthMode {
+    // No CertificateRequest; client certificates are neither requested nor
+    // verified. The historical default.
+    CLIENT_AUTH_NONE = 0;
+    // Request a client certificate but accept connections that present none.
+    // Presented certificates must still chain to a trusted CA.
+    CLIENT_AUTH_OPTIONAL = 1;
+    // Require a client certificate chaining to a trusted CA; abort the
+    // handshake otherwise.
+    CLIENT_AUTH_REQUIRED = 2;
 }
 
 // How a UDP flow is keyed for backend affinity. SOURCE_IP keys on the

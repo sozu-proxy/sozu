@@ -94,12 +94,20 @@ impl std::fmt::Debug for command::request::RequestType {
             RequestType::AddHttpsListener(value) => {
                 f.debug_tuple("AddHttpsListener").field(value).finish()
             }
+            RequestType::AddHttpsListenerWithClientAuth(value) => f
+                .debug_tuple("AddHttpsListenerWithClientAuth")
+                .field(value)
+                .finish(),
             RequestType::UpdateHttpListener(value) => {
                 f.debug_tuple("UpdateHttpListener").field(value).finish()
             }
             RequestType::UpdateHttpsListener(value) => {
                 f.debug_tuple("UpdateHttpsListener").field(value).finish()
             }
+            RequestType::UpdateHttpsListenerWithClientAuth(value) => f
+                .debug_tuple("UpdateHttpsListenerWithClientAuth")
+                .field(value)
+                .finish(),
             RequestType::QueryCertificatesFromTheState(value) => f
                 .debug_tuple("QueryCertificatesFromTheState")
                 .field(value)
@@ -417,7 +425,30 @@ impl std::fmt::Debug for command::UpdateHttpsListenerConfig {
             .field("answers_key_len", &answers_key_len)
             .field("answers_value_len", &answers_value_len)
             .field("forwarded_headers", &self.forwarded_headers)
+            .field("client_auth_policy", &self.client_auth_policy)
             .finish_non_exhaustive()
+    }
+}
+
+/// CA and CRL entries are PEM bodies: counted and measured, never printed.
+impl std::fmt::Debug for command::ClientAuthPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientAuthPolicy")
+            .field("client_auth", &self.client_auth)
+            .field(
+                "client_ca_certificates_count",
+                &self.client_ca_certificates.len(),
+            )
+            .field(
+                "client_ca_certificates_len",
+                &total_string_len(&self.client_ca_certificates),
+            )
+            .field("client_ca_crls_count", &self.client_ca_crls.len())
+            .field(
+                "client_ca_crls_len",
+                &total_string_len(&self.client_ca_crls),
+            )
+            .finish()
     }
 }
 
@@ -538,6 +569,20 @@ impl std::fmt::Debug for command::HttpsListenerConfig {
             .field("hsts", &self.hsts)
             .field("h2_max_header_fields", &self.h2_max_header_fields)
             .field("h2_stream_refusal_percent", &self.h2_stream_refusal_percent)
+            .field("client_auth", &self.client_auth)
+            .field(
+                "client_ca_certificates_count",
+                &self.client_ca_certificates.len(),
+            )
+            .field(
+                "client_ca_certificates_len",
+                &total_string_len(&self.client_ca_certificates),
+            )
+            .field("client_ca_crls_count", &self.client_ca_crls.len())
+            .field(
+                "client_ca_crls_len",
+                &total_string_len(&self.client_ca_crls),
+            )
             .finish()
     }
 }

@@ -46,6 +46,9 @@ regex = "^1.13.1"
 redis = { version = "^1.7.1", default-features = false }
 rskafka = { version = "^0.6.0", default-features = false }
 rustls-openssl = { version = "^0.4.1", default-features = false, features = ["tls12"] }
+# The certificate parser rustls verifies with. No crypto feature: Sozu only
+# reads CRL issuers with it, rustls keeps doing every signature check.
+rustls-webpki = { version = "^0.103.15", default-features = false, features = ["alloc"] }
 rustls = { version = "^0.23.45", default-features = false, features = [
   "logging",
   "std",

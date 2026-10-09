@@ -7,7 +7,7 @@ use x509_parser::{
     certificate::X509Certificate,
     extensions::{GeneralName, ParsedExtension},
     oid_registry::{OID_X509_COMMON_NAME, OID_X509_EXT_SUBJECT_ALT_NAME},
-    parse_x509_certificate,
+    parse_x509_certificate, parse_x509_crl,
     pem::{Pem, parse_x509_pem},
 };
 
@@ -272,6 +272,14 @@ impl<'de> serde::Deserialize<'de> for Fingerprint {
 }
 
 /// Compute fingerprint from decoded pem as binary value
+/// The `nextUpdate` of a DER-encoded certificate revocation list, in seconds
+/// since the Unix epoch. `None` when the CRL does not parse or carries no
+/// `nextUpdate`.
+pub fn crl_next_update(crl_der: &[u8]) -> Option<i64> {
+    let (_, crl) = parse_x509_crl(crl_der).ok()?;
+    crl.next_update().map(|next_update| next_update.timestamp())
+}
+
 pub fn calculate_fingerprint_from_der(certificate: &[u8]) -> Vec<u8> {
     let fingerprint: Vec<u8> = Sha256::digest(certificate).iter().cloned().collect();
     // POST: a SHA-256 digest is unconditionally 32 bytes. Anything else

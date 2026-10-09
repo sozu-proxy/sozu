@@ -33,7 +33,7 @@ by the main process and workers (like the log level):
 | `command_socket`              | path to the unix socket command                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |                                           |
 | `command_socket_mode`         | permission bits of the command socket, as an octal string: `"0660"` or `"660"`, at most `"0777"`. Setuid, setgid and sticky bits, non-octal digits, and a mode without owner read and write (such as `"0066"`, which would lock out the proxy's own user) are rejected at config load (`ConfigError::InvalidCommandSocketMode`); a TOML integer fails earlier, as a TOML type error (`ConfigError::DeserializeToml`). Defaults to `"0600"`, the proxy's own user only. Connecting requires write permission, so a group needs `rw` (`0660`). A client that can connect to the command socket can drive the proxy (routes, certificates, shutdown, upgrade): `0660` with a dedicated group limits that to chosen users, `0666` opens it to every local account. Sōzu sets the mode only; give the socket its group outside Sōzu, with a setgid parent directory or `chgrp` after each start. When `command_allowed_uids` is set, it must also list the added users. The added user also needs search (`x`) permission on every parent directory of the socket. Its `sozu` client loads the whole `-c` configuration, including every TLS certificate and key path, and fails on an unreadable one before touching the socket: give that user a minimal configuration holding only `command_socket` (plus `command_buffer_size` / `max_command_buffer_size` when not default) pointing at the same socket. Applied once, when `sozu start` binds the socket: a main upgrade and a configuration reload keep the socket and its mode, so a change takes effect at the next restart. | `"0660"` |
 | `command_buffer_size`         | initial size, in bytes, of a command channel's two buffers, and the size a grown one shrinks back to. Must not exceed `max_command_buffer_size`; config load is rejected otherwise (`ConfigError::CommandBufferSizeExceedsMax`, sozu-proxy/sozu#1416). It sizes the supervisor↔worker channels and `sozu ctl`'s end of the command socket, but **not** the main process's end: `CommandHub::register_client` passes `CLIENT_CHANNEL_INITIAL_BUFFER_SIZE` (4096 bytes) instead, which no key configures — see `doc/configure_admin_ops.md` §5.2. Only `max_command_buffer_size` applies there, and below 4096 it clamps: `Channel::new` starts the channel at that ceiling, with a warning, never above. Defaults to `1000000`              |                                           |
-| `max_command_buffer_size`     | ceiling every command channel buffer may grow to by doubling, **and** the bound a peer-declared message length is rejected against. Unlike the row above, it applies to all three channel kinds — the main process's command-socket client channels included. Defaults to `2000000`                                                                                                                                                                                                                                                                                                                                                                                                                                                        |                                           |
+| `max_command_buffer_size`     | ceiling every command channel buffer may grow to by doubling, **and** the bound a peer-declared message length is rejected against. Unlike the row above, it applies to all three channel kinds — the main process's command-socket client channels included. Defaults to `2000000`. Also the size of the buffer `sozu state load` and the boot-time `saved_state` load parse records with (never below 200 kB), so it bounds the largest saved record, an HTTPS listener with its client CA and CRL contents included.                                                                                                                                                                                                                                                                                                                                                                                                                                                        |                                           |
 | `worker_count`                | number of workers                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |                                           |
 | `worker_automatic_restart`    | if activated, workers that panicked or crashed are restarted (activated by default)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |                                           |
 | `worker_timeout`              | maximum time (in seconds) the main process waits for a worker reply before marking it `NotAnswering`. Defaults to `10`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | seconds                                   |
@@ -431,6 +431,148 @@ Path 2 was added after the initial HSTS rollout to fix a silent skip that affect
 | `http.hsts.unrendered`              | counter | Defense-in-depth: a frontend reached `Frontend::new` with `hsts.enabled = true` but `render_hsts` returned `None` (max_age missing). The TOML loader and the CLI helper both substitute `DEFAULT_HSTS_MAX_AGE` so this counter only fires when a programmatic IPC sender ships an ill-formed `HstsConfig`. |
 | `http.hsts.listener_default_patched`| counter | A `UpdateHttpsListenerConfig.hsts` patch was applied. Fires once per patch. |
 | `http.hsts.frontend_refreshed`      | counter | An inheriting frontend was refreshed during a listener-default HSTS patch (one increment per refreshed entry). Sum across a patch interval = number of frontends touched by that patch. |
+
+#### mTLS — client certificate authentication
+
+Mutual TLS makes the client prove its identity during the handshake, on top of the server certificate Sōzu already presents. When enabled on an HTTPS listener, Sōzu sends a TLS `CertificateRequest` and validates the certificate the client returns against a listener-scoped bundle of trusted CAs, optionally consulting certificate revocation lists (CRLs).
+
+Three keys drive it, all under an `[[listeners]]` entry with `protocol = "https"`:
+
+```toml
+[[listeners]]
+protocol = "https"
+address  = "0.0.0.0:443"
+
+# "none" (default) | "optional" | "required"
+client_auth = "required"
+
+# Filesystem paths to PEM-encoded CA certificates a client certificate must
+# chain to. Required whenever client_auth is not "none". Each file may hold a
+# concatenated PEM chain; several files may be listed.
+client_ca_certificates = ["/etc/sozu/client-ca.pem"]
+
+# Optional: filesystem paths to PEM-encoded CRLs. When present, revocation is
+# checked across the whole client chain and fails closed — see "Revocation"
+# below before supplying a partial CRL set.
+client_ca_crls = ["/etc/sozu/client-ca.crl.pem"]
+```
+
+Both path lists are read from disk at config-load and their PEM contents inlined into the listener configuration, so the files are not re-read until the next `sozu reload` (see "Refreshing CRLs and CAs" below). Unlike `certificate` and `key`, whose read errors are logged and skipped, an unreadable CA or CRL path aborts the whole configuration: starting a listener with a reduced trust set or without the revocation data the operator asked for would weaken authentication silently.
+
+##### Modes
+
+| `client_auth` | `CertificateRequest` sent | Client presents no certificate | Client presents a certificate                          |
+|---------------|---------------------------|--------------------------------|--------------------------------------------------------|
+| `"none"` (default) | No                   | Connection proceeds            | Never requested, never inspected                       |
+| `"optional"`  | Yes                       | Connection proceeds            | Fully chain-validated; handshake aborts if it fails    |
+| `"required"`  | Yes                       | **Handshake aborts**           | Fully chain-validated; handshake aborts if it fails    |
+
+`"optional"` is not a bypass: a certificate that *is* presented gets the same validation as under `"required"`. It only tolerates clients that present none, which is the mode to use while migrating a fleet to mTLS.
+
+A state file written before mTLS existed carries none of the three keys and loads unchanged: the absent `client_auth` decodes to `"none"` and the two path lists default to empty.
+
+##### Validation matrix
+
+The configuration is rejected rather than silently degraded in every case below. mTLS that fails open is worse than mTLS that fails to start.
+
+| Configuration                                                        | Outcome                                                                                                                                     |
+|----------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
+| `client_auth` with a value other than the three above                | **Error** at config-load, from TOML parsing. A typo is never folded to `none`.                                                               |
+| `client_auth = "optional"` / `"required"` with no trusted CA         | **Error** `ListenerError::ClientAuth` when the main process validates the listener, before it reaches a worker — client auth was requested with an empty trust set, which no client could ever satisfy. |
+| A `client_ca_certificates` or `client_ca_crls` path cannot be read   | **Error** at config-materialization. A dropped CA weakens trust; a dropped CRL silently disables revocation.                                 |
+| A CA entry parses to zero certificates (empty file, wrong PEM section) | **Error**. Skipping it would start the listener with a subset of the configured trust anchors, and clients issued by the omitted CA would fail with no visible cause. |
+| A CRL entry parses to zero revocation lists                          | **Error**. Same reasoning: revocation would be silently disabled.                                                                           |
+| Two configured CRLs of one CA cover overlapping certificates (the same distribution point, or one of them has none) | **Error** `ListenerError::ClientAuth` when the listener is built. Only the first would be consulted, so the order alone would decide whether the second one's revocations apply. Partitions with distinct distribution points are accepted. |
+| `client_auth` / `client_ca_certificates` / `client_ca_crls` on an HTTP, TCP, or UDP listener | **Error** `ConfigError::ClientAuthOnNonHttps` at config-load. Those listeners have no field to carry the policy, so it would be discarded.  |
+| `client_ca_certificates` / `client_ca_crls` with no `client_auth` key | **Error** `ConfigError::ClientAuthModeMissing` at config-load. The mode would default to `none` and ignore the files, starting the listener without the client authentication they suggest. |
+| `client_auth = "none"` with stale CA/CRL paths still present         | **Allowed, with a warning** — the paths are not read at all in `none` mode, so a leftover path never blocks configuration loading.          |
+| A configured CRL already past its `nextUpdate`                       | **Error** `ListenerError::ClientAuth` when the main process accepts a listener or a policy patch an operator states (configuration load, reload, a client request): it would reject every client it covers. A CRL that lapses while the listener runs is **rejected at handshake**, since Sōzu enables `enforce_revocation_expiration()` (rustls defaults to ignoring expiration, which would keep trusting a stale CRL); workers, and the replay of a saved state, still build such a listener, so the reload that brings a current CRL can patch it. |
+
+The rejections above happen at two distinct stages, both in the main process. Reading the CA/CRL files and refusing mTLS keys on a non-HTTPS listener happen at config-load. Parsing the PEM bodies and building the verifier happen when the main process validates the listener (or a policy patch) before committing it to its state, so a listener it refuses never reaches a worker; each worker builds the verifier again when it creates the listener, as a second check. In every case the listener is never activated without its verifier: `create_rustls_context` returns an error, so there is no fallback to an unauthenticated listener.
+
+##### Revocation
+
+`client_ca_crls` is not a best-effort filter. Sōzu passes the configured CRLs to
+rustls with `with_crls(...).enforce_revocation_expiration()` and keeps rustls's
+defaults for the other two revocation knobs, so as soon as at least one CRL is
+configured a handshake is rejected in **three** distinct cases, not just one:
+
+| Situation                                                                 | Outcome                                                                                                                     |
+|---------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------|
+| A certificate in the chain is listed as revoked                            | **Rejected.** The expected case.                                                                                            |
+| Revocation status cannot be established for a certificate in the chain     | **Rejected.** rustls defaults to `UnknownStatusPolicy::Deny`; "no CRL covers this issuer" is treated as revoked, not as OK.  |
+| A CRL that does cover the chain is past its `nextUpdate`                   | **Rejected.** `enforce_revocation_expiration()` is enabled; rustls would otherwise keep trusting a stale CRL.                |
+
+Revocation is checked over the **whole chain** (rustls's default
+`RevocationCheckDepth::Chain`), not only the end-entity certificate. The
+practical consequence is that supplying CRLs is an all-or-nothing commitment:
+
+- Every issuing CA in every accepted chain — intermediates included — must be
+  covered by a configured CRL. A CRL set that covers the leaf issuer but not an
+  intermediate's issuer locks out otherwise valid clients.
+- Every configured CRL must be refreshed, with a configuration reload, before
+  its `nextUpdate`: an expired CRL rejects the clients it covers, even those it
+  never listed as revoked. See "Refreshing CRLs and CAs" below.
+- Configure **one CRL per issuing CA**, or one per distribution point when the
+  CA partitions its list (each partition carrying its own
+  `IssuingDistributionPoint`). A listener given two CRLs of one CA that cover
+  the same certificates fails to build: rustls only consults the first CRL
+  that covers a certificate, so an old CRL listed before its replacement would
+  hide every revocation the replacement adds. When rotating a CRL, replace the
+  file rather than adding the new one next to it.
+- A CRL must be signed by the CA that issued the certificates it covers, and if
+  that CA's certificate carries a KeyUsage extension it must include
+  `cRLSign`; a CRL that fails either check rejects the handshake. CRL files are
+  PEM (`-----BEGIN X509 CRL-----`); a DER file holds no PEM CRL and is refused
+  at listener creation.
+
+Before deploying a CRL, check its issuer and expiry, and that it gives the
+verdict you expect for a client certificate:
+
+```bash
+openssl crl -in client-ca.crl.pem -noout -issuer -nextupdate
+openssl verify -crl_check -CAfile client-ca.pem -CRLfile client-ca.crl.pem client.pem
+```
+
+This is a deliberate fail-closed posture: a revocation check that silently
+degrades to "allow" is indistinguishable from having no revocation at all. If
+maintaining complete, current CRL coverage for the full chain is not
+operationally feasible, leave `client_ca_crls` empty rather than configuring a
+partial set — chain validation against `client_ca_certificates` still applies.
+
+##### Refreshing CRLs and CAs
+
+Edit the CRL or CA files, or the three keys, then run `sozu reload`. For an
+HTTPS listener that is already running, the reload compares the policy it
+reads (mode, CA contents, CRL contents) with the one the listener runs, and
+when they differ it replaces the policy in place with an
+`UpdateHttpsListenerConfig` carrying `client_auth_policy`. The listener keeps
+its socket, its certificates and its frontends. Every other key of a running
+listener is still left as it is by a reload.
+
+- The replacement is complete: a CA or CRL missing from the new configuration
+  is dropped, not kept. Removing the three keys and reloading turns client
+  authentication off on the running listener.
+- It applies to new handshakes only. Connections already established keep the
+  verdict they were given.
+- The new policy is checked by the main process before anything changes; a CA
+  or CRL a worker could not use fails the reload entry and the listener keeps
+  its current policy.
+- A worker that predates this change cannot decode the patch and fails it
+  rather than keeping its old CRLs (see the note on mixed versions below).
+
+Schedule the reload ahead of each CRL's `nextUpdate`: once a CRL has lapsed,
+every client it covers is rejected until a reload brings a current one.
+
+##### Notes
+
+- The policy is per-listener, not per-frontend. Every frontend served by an HTTPS listener with `client_auth = "required"` requires a client certificate.
+- **The client identity is not passed to backends.** Sōzu sets no header with the verification result or the certificate subject, so a backend cannot tell an authenticated client from another. Client authentication is therefore only an admission control on the listener: with `required`, any client holding a certificate from a trusted CA reaches every frontend of the listener, with no per-frontend or per-identity authorization; with `optional`, a client that presents no certificate gets exactly the same access as one that does, so `optional` grants nothing that no client authentication would not.
+- A running listener's policy changes only through a full `client_auth_policy` replacement (a reload, or an `UpdateHttpsListenerConfig` sent by a client), never through the other patch fields.
+- The verifier is built with the same explicitly selected `CryptoProvider` as the server config, so it works in single-provider builds (`crypto-openssl` only) and in multi-provider builds where no process-default provider is installed.
+- A listener with `client_auth` other than `none` is sent to the workers as `AddHttpsListenerWithClientAuth`, and a policy patch as `UpdateHttpsListenerWithClientAuth`, not as the historical `AddHttpsListener` / `UpdateHttpsListener`. A worker that predates mutual TLS cannot decode them, so it never builds the listener, or never applies the patch, rather than building it without client authentication or keeping its old CRLs. Between `sozu upgrade` and the replacement of the last old worker, such a listener is therefore served only by the upgraded workers, and each old worker is counted as failed once `worker_timeout` expires, since it does not answer a request it cannot decode. Listeners without client authentication keep the historical verbs and work across versions as before.
+- **Rolling back to a version that predates mutual TLS**: such a version stops reading a saved state file at the first `AddHttpsListenerWithClientAuth` record, and every record after it is lost, not just that listener. Saved state lists listeners before clusters, frontends and certificates, so that is most of the state. Before rolling back, remove the listeners that use client authentication, along with their keys in the configuration file (an older version refuses those keys), then save the state again.
+- A listener's saved state record carries its CA and CRL contents. `sozu state load` reads records of up to `max_command_buffer_size` bytes (never less than 200 kB), the same bound the worker channels apply; keep CA bundles and CRLs below it.
 
 #### Options specific to Rustls based HTTPS listeners
 
@@ -3084,6 +3226,8 @@ immediately after the patch is acknowledged.
 | `alpn_protocols`     | `string[]` | per-handshake    | `["h2","http/1.1"]` | Rebuilds the rustls `ServerConfig`. In-flight handshakes finish on the old config. Pass `--reset-alpn` on the CLI to restore the default. |
 | `strict_sni_binding` | `bool`     | per-handshake    | `true`              | Require `:authority`/`Host` covered by served cert SAN dNSName (RFC 6125 §6.4.3/6.4.4, CWE-346/CWE-444). Default-cert handshakes fall back to legacy SNI exact-match. Miss → 421 (RFC 9110 §15.5.20). |
 | `disable_http11`     | `bool`     | per-handshake    | `false`             | Drop clients that do not negotiate `h2` via ALPN                                                                                          |
+
+The mTLS keys (`client_auth`, `client_ca_certificates`, `client_ca_crls`) change only together, through `client_auth_policy`. That field replaces the mode, the CAs and the CRLs in full, and is sent by `sozu reload` or by a client. The main process validates the new policy before it commits it. The patch travels on `UpdateHttpsListenerWithClientAuth`, which a worker that predates mutual TLS fails. A replacement can lower the policy, down to `none`, and it applies to new handshakes only. See [Refreshing CRLs and CAs](#refreshing-crls-and-cas).
 
 #### TCP listeners
 

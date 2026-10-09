@@ -107,6 +107,56 @@
   `soft_refusals_count_toward_the_glitch_budget` and
   `a_client_reset_of_a_refused_stream_on_the_wire_ends_the_refusals` (`h2.rs`).
 
+- **`feat(https)`: mutual TLS (client certificate authentication) on HTTPS listeners** ([#1299](https://github.com/sozu-proxy/sozu/issues/1299)).
+  An HTTPS listener can now require or request a client certificate instead of
+  always disabling client auth. A new per-listener `client_auth` mode
+  (`none` / `optional` / `required`) drives the rustls `WebPkiClientVerifier`:
+  `required` aborts the handshake unless the client presents a certificate
+  chaining to a configured trusted CA, `optional` requests one but still
+  accepts connections that present none (a presented certificate must still
+  validate). New listener fields carry the PEM-encoded trusted CA bundle
+  (`client_ca_certificates`) and optional revocation lists (`client_ca_crls`).
+  Absent config decodes to `none`, preserving the previous behavior and keeping
+  existing state files loadable (new protobuf fields are appended, none
+  reordered, and default to empty when missing from an older record).
+  Configuration fails closed: an unknown `client_auth` value, a non-`none` mode
+  with no trusted CA, an unreadable CA/CRL file, a CA or CRL entry that yields no
+  certificate/revocation list, CA or CRL files with no `client_auth` mode, or an
+  mTLS field set on a non-HTTPS listener is
+  rejected rather than silently accepting unauthenticated or unrevoked clients.
+  CRL expiration is enforced (a CRL past its `nextUpdate` is rejected instead of
+  trusted), a CRL already expired is refused when an operator states it
+  (configuration load, reload, client request), and
+  two CRLs of one CA covering the same certificates are refused, since rustls
+  would only consult the first (partitions with distinct
+  `IssuingDistributionPoint`s are accepted). In `none` mode CA/CRL paths are ignored entirely, so a stale path
+  never blocks the configuration from loading. `HttpsListenerConfig` gains the
+  `ClientAuthMode` enum and the three fields; `ListenerError::ClientAuth`,
+  `ConfigError::ClientAuthOnNonHttps` and `ConfigError::ClientAuthModeMissing`
+  report misconfigured input.
+  A listener that asks for a client certificate travels on a new
+  `AddHttpsListenerWithClientAuth` request (`RequestType::add_https_listener`
+  picks the verb, and the main process rewrites every fan-out to it), so a
+  worker or main process that predates mutual TLS fails the request instead of
+  building the listener without client authentication.
+  A configuration reload now refreshes the CA bundle and the CRLs of a running
+  listener in place: when the policy it reads differs from the one running, it
+  sends an `UpdateHttpsListenerConfig` whose new `client_auth_policy` replaces
+  mode, CAs and CRLs together, and the worker rebuilds the listener's verifier
+  for new handshakes. The patch travels on `UpdateHttpsListenerWithClientAuth`,
+  which an older worker cannot decode, so it fails the patch rather than keep
+  its old CRLs.
+  Protobuf: `HttpsListenerConfig` fields 51-53 (`client_auth`,
+  `client_ca_certificates`, `client_ca_crls`), `UpdateHttpsListenerConfig`
+  field 45 (`client_auth_policy`, a new `ClientAuthPolicy` message) and
+  `Request` fields 63 (`AddHttpsListenerWithClientAuth`) and 64
+  (`UpdateHttpsListenerWithClientAuth`). Covered by the `test_mtls_*` e2e
+  tests (`e2e/src/tests/tls_tests.rs`), the `client_revocation_*` and
+  `a_client_auth_policy_patch_rebuilds_the_listener_verifier` unit tests
+  (`lib/src/https.rs`), the old-worker decoding tests in
+  `command/src/request.rs`, and the reload tests in `command/src/state.rs`
+  and `bin/src/command/requests.rs`.
+
 - **BREAKING (library API) — `feat(udp)`: opt-in per-source flow limit on UDP clusters.** Each
   client source IP and port is its own UDP flow, with its own upstream socket and `max_flows` slot,
   and nothing bounded the flows one source address held. A cluster's own `max_connections_per_ip`
@@ -4167,6 +4217,12 @@
   test is now compiled only without that feature, unchanged. Its tolerant counterpart
   `test_h1_tolerant_high_byte_method_no_ub` now sends `0xFF` as well as `0xA5` and checks worker
   health after each, so the `0xFF` byte keeps end-to-end coverage in both builds.
+- **`fix(command)`: `sozu state load` and the boot-time load of `saved_state` read records up to
+  `max_command_buffer_size`.** The parse buffer was a fixed 200 kB, so a record larger than that
+  stopped the load with `Error consuming load state message` and every record after it was lost.
+  It is now sized to `max_command_buffer_size` (2 MB by default, never below 200 kB), the bound
+  the worker channels already apply, and allocated up front on each load. Covered by
+  `a_state_record_larger_than_200_kb_loads_with_what_follows` (`bin/src/command/requests.rs`).
 
 - **`fix(metrics)`: removing one address of a backend id keeps the metrics of the id's
   remaining addresses.** `ConfigState` and the worker key backends on `(backend_id, address)`,

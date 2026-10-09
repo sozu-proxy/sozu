@@ -19,12 +19,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rustls::ClientConfig;
+use rustls::{
+    ClientConfig,
+    pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
+};
 use sozu_command_lib::{
     config::ListenerBuilder,
     proto::command::{
-        ActivateListener, AddCertificate, CertificateAndKey, ListenerType, RequestHttpFrontend,
-        SocketAddress, request::RequestType,
+        ActivateListener, AddCertificate, CertificateAndKey, ClientAuthMode, ClientAuthPolicy,
+        ListenerType, RequestHttpFrontend, ResponseStatus, SocketAddress,
+        UpdateHttpsListenerConfig, request::RequestType,
     },
 };
 
@@ -2839,5 +2843,494 @@ fn test_h2_listener_rejects_alpn_absent() {
             try_h2_listener_rejects_alpn_absent
         ),
         State::Success
+    );
+}
+
+// ============================================================================
+// Test 8: mTLS — frontend client certificate authentication
+// ============================================================================
+
+/// Trusted CA, client identity and CRLs from `lib/assets/mtls/generate.sh`.
+/// `client-cert.pem` is issued by `ca-cert.pem` and carries the
+/// `TLS Web Client Authentication` extended key usage.
+const MTLS_CA_CERT: &[u8] = include_bytes!("../../../lib/assets/mtls/ca-cert.pem");
+const MTLS_CLIENT_CERT: &[u8] = include_bytes!("../../../lib/assets/mtls/client-cert.pem");
+const MTLS_CLIENT_KEY: &[u8] = include_bytes!("../../../lib/assets/mtls/client-key.pem");
+/// Issued by the CA, nextUpdate in 2125, revokes nothing.
+const MTLS_CRL_CURRENT: &str = include_str!("../../../lib/assets/mtls/crl-current.pem");
+/// Issued by the CA, nextUpdate in 2125, revokes the client.
+const MTLS_CRL_REVOKED: &str = include_str!("../../../lib/assets/mtls/crl-revoked.pem");
+/// Issued by the CA, nextUpdate in January 2020, revokes nothing.
+const MTLS_CRL_EXPIRED: &str = include_str!("../../../lib/assets/mtls/crl-expired.pem");
+/// Issued by another CA: covers nothing in the client's chain.
+const MTLS_CRL_OTHER_CA: &str = include_str!("../../../lib/assets/mtls/crl-other-ca.pem");
+
+/// What a client identity does to the handshake, for a given listener mode.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClientIdentity {
+    /// `with_no_client_auth()` — the client presents nothing.
+    None,
+    /// A certificate chaining to the listener's trusted CA.
+    Trusted,
+}
+
+/// Drive a real TLS handshake against an HTTPS listener configured with
+/// `client_auth = mode`, then send an HTTP/1.1 request and report whether a
+/// response came back from the backend.
+///
+/// This exercises what the unit tests in `lib/src/https.rs` structurally
+/// cannot: those only assert that `client_cert_verifier` builds or errors for
+/// a given config. The failure mode that matters is an auth bypass at
+/// handshake time — e.g. `allow_unauthenticated()` applied on the wrong
+/// branch would still build a verifier and pass every unit test, while
+/// silently turning `required` into `optional` on the wire.
+///
+/// Returns `Some(response_bytes)` when the exchange completed, `None` when the
+/// handshake was rejected. The backend aggregator count is returned alongside
+/// so callers can assert the request never reached the cluster on a reject.
+fn run_mtls_handshake(
+    worker_name: &str,
+    mode: ClientAuthMode,
+    identity: ClientIdentity,
+    crls: &[&str],
+) -> (Option<Vec<u8>>, usize) {
+    let listener = MtlsListener::start(worker_name, mode, crls);
+    let response = mtls_request(listener.front_port, identity);
+    (response, listener.stop())
+}
+
+/// A worker serving one HTTPS listener with client authentication, in front
+/// of one backend, kept running across several handshakes.
+struct MtlsListener {
+    worker: Worker,
+    backend: AsyncBackend<SimpleAggregator>,
+    front_port: u16,
+    front_address: SocketAddress,
+}
+
+impl MtlsListener {
+    fn start(worker_name: &str, mode: ClientAuthMode, crls: &[&str]) -> Self {
+        let front_port = provide_port();
+        let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+        let back_address = create_local_address();
+
+        let (config, listeners, state) = Worker::empty_https_config(front_address.into());
+        let mut worker = Worker::start_new_worker_owned(worker_name, config, listeners, state);
+
+        // `ListenerBuilder` exposes no mTLS setter, so mutate the generated
+        // config in place (same approach as the disable_http11 test above).
+        // `HttpsListenerConfig` carries inlined PEM, not paths: the TOML loader
+        // is what turns `client_ca_certificates` paths into these bodies, so a
+        // test driving the proxy directly supplies the PEM itself.
+        let mut https_listener = ListenerBuilder::new_https(front_address.clone())
+            .to_tls(None)
+            .expect("could not build HTTPS listener config");
+        https_listener.client_auth = Some(mode as i32);
+        https_listener.client_ca_certificates =
+            vec![String::from_utf8(MTLS_CA_CERT.to_vec()).expect("CA PEM is valid UTF-8")];
+        https_listener.client_ca_crls = crls.iter().map(|crl| (*crl).to_owned()).collect();
+        worker.send_proxy_request_type(RequestType::add_https_listener(https_listener));
+
+        worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+            address: front_address.clone(),
+            proxy: ListenerType::Https.into(),
+            from_scm: false,
+            interface: None,
+        }));
+        worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+            "cluster_0",
+        )));
+        worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+            hostname: "localhost".to_owned(),
+            ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+        }));
+
+        let certificate_and_key = CertificateAndKey {
+            certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+            key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+            certificate_chain: vec![],
+            versions: vec![],
+            names: vec![],
+        };
+        worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+            address: front_address.clone(),
+            certificate: certificate_and_key,
+            expired_at: None,
+        }));
+        worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+            "cluster_0",
+            "cluster_0-0",
+            back_address,
+            None,
+        )));
+
+        let backend = AsyncBackend::spawn_detached_backend(
+            "BACKEND",
+            back_address,
+            SimpleAggregator::default(),
+            AsyncBackend::http_handler("pong"),
+        );
+
+        worker.read_to_last();
+
+        MtlsListener {
+            worker,
+            backend,
+            front_port,
+            front_address,
+        }
+    }
+
+    /// Replace the listener's client authentication policy in place and
+    /// return whether the worker applied it.
+    fn patch_policy(&mut self, policy: ClientAuthPolicy) -> bool {
+        self.worker
+            .send_proxy_request_type(RequestType::update_https_listener(
+                UpdateHttpsListenerConfig {
+                    address: self.front_address.clone(),
+                    client_auth_policy: Some(policy),
+                    ..Default::default()
+                },
+            ));
+        self.worker
+            .read_proxy_response()
+            .is_some_and(|response| response.status == ResponseStatus::Ok as i32)
+    }
+
+    /// Stop the worker and the backend, and return how many requests reached
+    /// the backend.
+    fn stop(mut self) -> usize {
+        self.worker.soft_stop();
+        self.worker.wait_for_server_stop();
+        self.backend
+            .stop_and_get_aggregator()
+            .expect("Could not get aggregator")
+            .requests_received
+    }
+}
+
+/// One HTTP/1.1 exchange over a fresh TLS connection to the listener, with
+/// the given client identity. `Some(response)` when the exchange completed,
+/// `None` when the handshake was rejected.
+fn mtls_request(front_port: u16, identity: ClientIdentity) -> Option<Vec<u8>> {
+    // The server certificate is the test one, so keep the permissive
+    // `Verifier` on the client side: this test is about CLIENT auth.
+    let tls_config = match identity {
+        ClientIdentity::None => ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(Verifier))
+            .with_no_client_auth(),
+        ClientIdentity::Trusted => {
+            let cert =
+                CertificateDer::from_pem_slice(MTLS_CLIENT_CERT).expect("parse client cert PEM");
+            let key = PrivateKeyDer::from_pem_slice(MTLS_CLIENT_KEY).expect("parse client key PEM");
+            ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(Verifier))
+                .with_client_auth_cert(vec![cert], key)
+                .expect("attach client identity cert+key")
+        }
+    };
+
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let conn = rustls::ClientConnection::new(Arc::new(tls_config), server_name.to_owned()).unwrap();
+
+    let addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).expect("connect to sozu");
+    tcp.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    tcp.set_write_timeout(Some(Duration::from_secs(5)))
+        .expect("set write timeout");
+
+    let mut tls_stream = rustls::StreamOwned::new(conn, tcp);
+
+    // Either the write or the read may surface a handshake rejection,
+    // depending on which flight the fatal alert lands on.
+    let request = "GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let write_result = tls_stream.write_all(request.as_bytes());
+    let _ = tls_stream.flush();
+
+    // Read until EOF rather than once: a single read sees one segment.
+    let mut response_bytes = Vec::new();
+    let mut buf = [0u8; 1024];
+    let start = Instant::now();
+    let mut read_failed = false;
+    loop {
+        match tls_stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                response_bytes.extend_from_slice(&buf[..n]);
+                if start.elapsed() > Duration::from_secs(10) {
+                    break;
+                }
+            }
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                if start.elapsed() > Duration::from_secs(10) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => {
+                read_failed = true;
+                break;
+            }
+        }
+    }
+    drop(tls_stream);
+
+    let rejected = write_result.is_err() || (read_failed && response_bytes.is_empty());
+    if rejected || response_bytes.is_empty() {
+        None
+    } else {
+        Some(response_bytes)
+    }
+}
+
+/// mTLS negative space: `required` must abort the handshake for a client
+/// that presents no certificate, and the request must never reach the
+/// backend.
+fn try_mtls_required_rejects_client_without_cert() -> State {
+    let (response, requests_received) = run_mtls_handshake(
+        "TLS-MTLS-REQUIRED-REJECT",
+        ClientAuthMode::ClientAuthRequired,
+        ClientIdentity::None,
+        &[],
+    );
+
+    println!(
+        "response={:?} requests_received={requests_received}",
+        response.as_ref().map(|r| String::from_utf8_lossy(r))
+    );
+
+    // No response AND an untouched backend. Asserting only on the absence of
+    // a response would also pass if Sozu answered a 4xx after admitting the
+    // session, which is not what `required` means.
+    if response.is_none() && requests_received == 0 {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_mtls_required_rejects_client_without_cert() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "TLS mTLS: client_auth=required rejects a client presenting no certificate",
+            try_mtls_required_rejects_client_without_cert,
+        ),
+        State::Success,
+    );
+}
+
+/// mTLS positive space: `required` accepts a certificate chaining to the
+/// listener's trusted CA, and the request reaches the backend.
+fn try_mtls_required_accepts_trusted_client_cert() -> State {
+    let (response, requests_received) = run_mtls_handshake(
+        "TLS-MTLS-REQUIRED-OK",
+        ClientAuthMode::ClientAuthRequired,
+        ClientIdentity::Trusted,
+        &[],
+    );
+
+    let responded = response
+        .as_ref()
+        .is_some_and(|r| r.starts_with(b"HTTP/1.1 200"));
+    println!(
+        "responded={responded} requests_received={requests_received} response={:?}",
+        response.as_ref().map(|r| String::from_utf8_lossy(r))
+    );
+
+    if responded && requests_received == 1 {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_mtls_required_accepts_trusted_client_cert() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "TLS mTLS: client_auth=required accepts a certificate chaining to the trusted CA",
+            try_mtls_required_accepts_trusted_client_cert,
+        ),
+        State::Success,
+    );
+}
+
+/// mTLS `optional`: a client presenting no certificate is admitted. This is
+/// the branch that `allow_unauthenticated()` controls — if it were applied to
+/// the `required` arm instead, this test would still pass while
+/// `test_mtls_required_rejects_client_without_cert` above would fail, which is
+/// how the pair pins the mode boundary.
+fn try_mtls_optional_accepts_client_without_cert() -> State {
+    let (response, requests_received) = run_mtls_handshake(
+        "TLS-MTLS-OPTIONAL-OK",
+        ClientAuthMode::ClientAuthOptional,
+        ClientIdentity::None,
+        &[],
+    );
+
+    let responded = response
+        .as_ref()
+        .is_some_and(|r| r.starts_with(b"HTTP/1.1 200"));
+    println!(
+        "responded={responded} requests_received={requests_received} response={:?}",
+        response.as_ref().map(|r| String::from_utf8_lossy(r))
+    );
+
+    if responded && requests_received == 1 {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_mtls_optional_accepts_client_without_cert() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "TLS mTLS: client_auth=optional admits a client presenting no certificate",
+            try_mtls_optional_accepts_client_without_cert,
+        ),
+        State::Success,
+    );
+}
+
+/// A `required` listener trusting the test CA with `crls`, facing the
+/// trusted client certificate: the whole path from the listener config to the
+/// handshake, with the request either reaching the backend or never leaving
+/// the client.
+///
+/// A rejection here does not say why the handshake failed. The reason is
+/// pinned by the `client_revocation_*` unit tests in `lib/src/https.rs`, on
+/// the rustls error itself; these tests prove the configured CRLs reach the
+/// listener and decide the handshake.
+fn try_mtls_required_with_crls(worker_name: &str, crls: &[&str], accepted: bool) -> State {
+    let (response, requests_received) = run_mtls_handshake(
+        worker_name,
+        ClientAuthMode::ClientAuthRequired,
+        ClientIdentity::Trusted,
+        crls,
+    );
+
+    let responded = response
+        .as_ref()
+        .is_some_and(|r| r.starts_with(b"HTTP/1.1 200"));
+    println!(
+        "responded={responded} requests_received={requests_received} response={:?}",
+        response.as_ref().map(|r| String::from_utf8_lossy(r))
+    );
+
+    let outcome_matches = if accepted {
+        responded && requests_received == 1
+    } else {
+        response.is_none() && requests_received == 0
+    };
+    if outcome_matches {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_mtls_crl_that_does_not_list_the_client_accepts_it() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TLS mTLS: a current CRL from the issuer that does not list the client admits it",
+            || try_mtls_required_with_crls("TLS-MTLS-CRL-CURRENT", &[MTLS_CRL_CURRENT], true),
+        ),
+        State::Success,
+    );
+}
+
+#[test]
+fn test_mtls_crl_that_revokes_the_client_rejects_it() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TLS mTLS: a current CRL listing the client certificate rejects it",
+            || try_mtls_required_with_crls("TLS-MTLS-CRL-REVOKED", &[MTLS_CRL_REVOKED], false),
+        ),
+        State::Success,
+    );
+}
+
+#[test]
+fn test_mtls_crl_of_another_issuer_rejects_the_client() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TLS mTLS: a client whose issuer no configured CRL covers is rejected",
+            || try_mtls_required_with_crls("TLS-MTLS-CRL-UNKNOWN", &[MTLS_CRL_OTHER_CA], false),
+        ),
+        State::Success,
+    );
+}
+
+/// A CRL refresh on a running listener, without recreating it: each patch
+/// replaces the client authentication policy and decides the next handshake
+/// of the same client. The worker applies an expired CRL (the main process
+/// is the one that refuses it when an operator states it) and rejects the
+/// client at handshake, and the next patch with a current CRL recovers.
+fn try_mtls_policy_patch_applies_to_new_handshakes() -> State {
+    let mut listener = MtlsListener::start(
+        "TLS-MTLS-POLICY-PATCH",
+        ClientAuthMode::ClientAuthRequired,
+        &[MTLS_CRL_CURRENT],
+    );
+    let policy = |crl: &str| ClientAuthPolicy {
+        client_auth: Some(ClientAuthMode::ClientAuthRequired as i32),
+        client_ca_certificates: vec![
+            String::from_utf8(MTLS_CA_CERT.to_vec()).expect("CA PEM is valid UTF-8"),
+        ],
+        client_ca_crls: vec![crl.to_owned()],
+    };
+    let accepted = |listener: &MtlsListener| {
+        mtls_request(listener.front_port, ClientIdentity::Trusted)
+            .is_some_and(|response| response.starts_with(b"HTTP/1.1 200"))
+    };
+
+    // (step, patch applied, client accepted afterwards)
+    let mut steps = vec![("current", true, accepted(&listener))];
+    for (name, crl) in [
+        ("expired", MTLS_CRL_EXPIRED),
+        ("revoked", MTLS_CRL_REVOKED),
+        ("current again", MTLS_CRL_CURRENT),
+    ] {
+        let applied = listener.patch_policy(policy(crl));
+        steps.push((name, applied, accepted(&listener)));
+    }
+    let requests_received = listener.stop();
+
+    println!("steps={steps:?} requests_received={requests_received}");
+    let expected = [
+        ("current", true, true),
+        ("expired", true, false),
+        ("revoked", true, false),
+        ("current again", true, true),
+    ];
+    if steps == expected && requests_received == 2 {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_mtls_policy_patch_applies_to_new_handshakes() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TLS mTLS: a client auth policy patch decides the next handshakes of a running listener",
+            try_mtls_policy_patch_applies_to_new_handshakes,
+        ),
+        State::Success,
     );
 }

@@ -289,7 +289,10 @@ impl ConfigState {
             RequestType::AddCluster(cluster) => self.add_cluster(cluster),
             RequestType::RemoveCluster(cluster_id) => self.remove_cluster(cluster_id),
             RequestType::AddHttpListener(listener) => self.add_http_listener(listener),
-            RequestType::AddHttpsListener(listener) => self.add_https_listener(listener),
+            RequestType::AddHttpsListener(listener)
+            | RequestType::AddHttpsListenerWithClientAuth(listener) => {
+                self.add_https_listener(listener)
+            }
             RequestType::AddTcpListener(listener) => self.add_tcp_listener(listener),
             RequestType::AddUdpListener(listener) => self.add_udp_listener(listener),
             RequestType::RemoveListener(remove) => self.remove_listener(remove),
@@ -309,7 +312,10 @@ impl ConfigState {
             RequestType::AddBackend(add_backend) => self.add_backend(add_backend),
             RequestType::RemoveBackend(backend) => self.remove_backend(backend),
             RequestType::UpdateHttpListener(patch) => self.update_http_listener(patch),
-            RequestType::UpdateHttpsListener(patch) => self.update_https_listener(patch),
+            RequestType::UpdateHttpsListener(patch)
+            | RequestType::UpdateHttpsListenerWithClientAuth(patch) => {
+                self.update_https_listener(patch)
+            }
             RequestType::UpdateTcpListener(patch) => self.update_tcp_listener(patch),
             RequestType::UpdateUdpListener(patch) => self.update_udp_listener(patch),
             RequestType::SetHealthCheck(set) => self.set_health_check(set),
@@ -1220,6 +1226,28 @@ impl ConfigState {
         Ok(())
     }
 
+    /// The patch a configuration reload sends for an HTTPS listener that is
+    /// already running with another client authentication policy.
+    ///
+    /// A reload replays `AddHttpsListener` for every listener of the file,
+    /// and the state refuses it for an address it already holds, so a CA or
+    /// CRL refreshed on disk would never reach the workers. With revocation
+    /// expiry enforced, a CRL that could not be refreshed would end up
+    /// rejecting every client. `None` when no listener is at that key, or
+    /// when its policy already matches.
+    pub fn client_auth_refresh(
+        &self,
+        listener: &HttpsListenerConfig,
+    ) -> Option<UpdateHttpsListenerConfig> {
+        let running = self.https_listeners.get(&listener.listener_key())?;
+        let policy = listener.client_auth_policy();
+        (running.client_auth_policy() != policy).then(|| UpdateHttpsListenerConfig {
+            address: listener.address,
+            client_auth_policy: Some(policy),
+            ..Default::default()
+        })
+    }
+
     /// Validate and apply a partial patch to an existing HTTPS listener.
     ///
     /// Only `Some` fields in the patch are written; `None` fields preserve the
@@ -1314,6 +1342,9 @@ impl ConfigState {
         }
         if let Some(v) = patch.disable_http11 {
             listener.disable_http11 = Some(v);
+        }
+        if let Some(ref policy) = patch.client_auth_policy {
+            listener.apply_client_auth_policy(policy);
         }
         // H2 flood knobs
         if let Some(v) = patch.h2_max_rst_stream_per_window {
@@ -2290,7 +2321,7 @@ impl ConfigState {
         }
 
         for listener in self.https_listeners.values() {
-            v.push(RequestType::AddHttpsListener(listener.clone()).into());
+            v.push(RequestType::add_https_listener(listener.clone()).into());
             if listener.active {
                 v.push(
                     RequestType::ActivateListener(ActivateListener {
@@ -2663,7 +2694,7 @@ impl ConfigState {
         }
 
         for address in added_https_listeners.clone() {
-            v.push(RequestType::AddHttpsListener(other.https_listeners[*address].clone()).into());
+            v.push(RequestType::add_https_listener(other.https_listeners[*address].clone()).into());
 
             if other.https_listeners[*address].active {
                 v.push(
@@ -2844,7 +2875,7 @@ impl ConfigState {
                 // any added listener should be unactive
                 let mut listener_to_add = their_listener.clone();
                 listener_to_add.active = false;
-                v.push(RequestType::AddHttpsListener(listener_to_add).into());
+                v.push(RequestType::add_https_listener(listener_to_add).into());
 
                 // The Remove + Add(active=false) above wipes the listener's
                 // active state. Re-emit an ActivateListener whenever the target
@@ -3879,8 +3910,8 @@ mod tests {
 
     use super::*;
     use crate::proto::command::{
-        CustomHttpAnswers, Header, HeaderPosition, HstsConfig, LoadBalancingParams, PathRuleKind,
-        RedirectPolicy, RedirectScheme, RequestHttpFrontend, RequestTcpFrontend,
+        ClientAuthMode, CustomHttpAnswers, Header, HeaderPosition, HstsConfig, LoadBalancingParams,
+        PathRuleKind, RedirectPolicy, RedirectScheme, RequestHttpFrontend, RequestTcpFrontend,
         RequestUdpFrontend, RulePosition, UdpListenerConfig, UpdateUdpListenerConfig,
     };
 
@@ -5897,6 +5928,135 @@ mod tests {
             )
             .expect("Could not execute request");
         assert_eq!(state.count_frontends(), 3);
+    }
+
+    /// A state that holds an HTTPS listener requiring a client certificate
+    /// must rebuild it on `AddHttpsListenerWithClientAuth`: those requests
+    /// are the initial state of every new worker, the saved state file and
+    /// the reload diff, and a peer that predates mutual TLS would build the
+    /// listener without client auth from `AddHttpsListener`.
+    #[test]
+    fn https_listener_requests_carry_client_auth_on_their_own_verb() {
+        let mtls_address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let plain_address = SocketAddress::new_v4(127, 0, 0, 1, 8444);
+        let mtls = HttpsListenerConfig {
+            client_auth: Some(ClientAuthMode::ClientAuthRequired as i32),
+            client_ca_certificates: vec!["CLIENT CA PEM".to_owned()],
+            ..make_https_listener(mtls_address)
+        };
+
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpsListenerWithClientAuth(mtls.clone()).into())
+            .expect("the mTLS verb must add the listener to the state");
+        state
+            .dispatch(&RequestType::AddHttpsListener(make_https_listener(plain_address)).into())
+            .expect("the historical verb must keep adding listeners without client auth");
+        assert_eq!(
+            state.https_listeners.len(),
+            2,
+            "both verbs add a listener to the same state"
+        );
+
+        let https_adds = |requests: Vec<Request>| -> Vec<(SocketAddress, bool)> {
+            requests
+                .into_iter()
+                .filter_map(|request| match request.request_type {
+                    Some(RequestType::AddHttpsListener(listener)) => {
+                        Some((listener.address, false))
+                    }
+                    Some(RequestType::AddHttpsListenerWithClientAuth(listener)) => {
+                        Some((listener.address, true))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut generated = https_adds(state.generate_requests());
+        generated.sort_by_key(|(address, _)| address.port);
+        assert_eq!(
+            generated,
+            vec![(mtls_address, true), (plain_address, false)],
+            "generate_requests must put only the listener asking for a client certificate on the mTLS verb"
+        );
+
+        let diff = https_adds(ConfigState::new().diff(&state));
+        assert!(
+            diff.contains(&(mtls_address, true)) && !diff.contains(&(mtls_address, false)),
+            "the reload diff must add the mTLS listener on the mTLS verb: {diff:?}"
+        );
+    }
+
+    /// A configuration reload must be able to refresh the CA bundle or the
+    /// CRLs of a running listener: replaying `AddHttpsListener` is refused
+    /// for an address the state holds, so the reload sends the patch
+    /// `client_auth_refresh` builds, and the state applies it.
+    #[test]
+    fn a_reload_refreshes_the_client_auth_policy_of_a_running_listener() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let with_crl = |crl: &str| HttpsListenerConfig {
+            client_auth: Some(ClientAuthMode::ClientAuthRequired as i32),
+            client_ca_certificates: vec!["CLIENT CA PEM".to_owned()],
+            client_ca_crls: vec![crl.to_owned()],
+            ..make_https_listener(address)
+        };
+
+        let mut state = ConfigState::new();
+        assert_eq!(
+            state.client_auth_refresh(&with_crl("CRL 1")),
+            None,
+            "a listener the state does not hold is added, not patched"
+        );
+        state
+            .dispatch(&RequestType::add_https_listener(with_crl("CRL 1")).into())
+            .expect("add the listener");
+        assert_eq!(
+            state.client_auth_refresh(&with_crl("CRL 1")),
+            None,
+            "an unchanged policy needs no patch"
+        );
+        assert!(
+            matches!(
+                state.dispatch(&RequestType::add_https_listener(with_crl("CRL 2")).into()),
+                Err(StateError::Exists { .. })
+            ),
+            "precondition: replaying the add for a held address is refused"
+        );
+
+        let patch = state
+            .client_auth_refresh(&with_crl("CRL 2"))
+            .expect("a refreshed CRL must produce a patch");
+        assert_eq!(patch.address, address);
+        assert_eq!(
+            patch.client_auth_policy,
+            Some(with_crl("CRL 2").client_auth_policy())
+        );
+        assert_eq!(
+            UpdateHttpsListenerConfig {
+                client_auth_policy: None,
+                ..patch.clone()
+            },
+            UpdateHttpsListenerConfig {
+                address,
+                ..Default::default()
+            },
+            "the patch carries the policy and nothing else"
+        );
+
+        state
+            .dispatch(&RequestType::update_https_listener(patch).into())
+            .expect("the state must apply the policy patch");
+        let running = state
+            .https_listeners
+            .values()
+            .next()
+            .expect("the listener is still there");
+        assert_eq!(running.client_ca_crls, vec!["CRL 2".to_owned()]);
+        assert_eq!(
+            state.client_auth_refresh(&with_crl("CRL 2")),
+            None,
+            "once applied, the same reload has nothing left to refresh"
+        );
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────

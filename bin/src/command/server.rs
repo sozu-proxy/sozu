@@ -2469,6 +2469,12 @@ impl Server {
         // rollback attribution sees the rejection. Dropping it silently, as
         // before, made `ok + errors` unreachable and hung the task.
         let mut write_failures: Vec<(WorkerId, RequestId)> = Vec::new();
+        // A worker that predates mutual TLS skips the client authentication
+        // fields of an `AddHttpsListener` or `UpdateHttpsListener` and applies
+        // the rest. Whatever verb the client used, a request that carries
+        // client authentication leaves here on its `*WithClientAuth` verb,
+        // which such a worker cannot decode and therefore never applies.
+        let request = request.into_canonical();
         let mut worker_request = WorkerRequest {
             id: String::new(),
             content: request,
@@ -2965,9 +2971,10 @@ mod tests {
     use sozu_command_lib::{
         config::{Config, DEFAULT_COMMAND_BUFFER_SIZE, DEFAULT_MAX_COMMAND_BUFFER_SIZE},
         proto::command::{
-            AddBackend, CertificateSummary, CertificatesByAddress, Cluster,
-            ListOfCertificatesByAddress, RequestHttpFrontend, RequestTcpFrontend, SocketAddress,
-            SoftStop, WorkerResponse, request::RequestType, response_content::ContentType,
+            AddBackend, CertificateSummary, CertificatesByAddress, ClientAuthMode, Cluster,
+            HttpsListenerConfig, ListOfCertificatesByAddress, RequestHttpFrontend,
+            RequestTcpFrontend, SocketAddress, SoftStop, WorkerResponse, request::RequestType,
+            response_content::ContentType,
         },
     };
     use sozu_lib::metrics::METRICS;
@@ -4856,6 +4863,81 @@ mod tests {
             restore_now.duration_since(restored_started_at)
                 >= capture_timing.now.duration_since(original_started_at) + simulated_handoff,
             "snapshot construction must not subtract elapsed audit time"
+        );
+    }
+
+    /// A client may send an HTTPS listener that asks for a client
+    /// certificate on the historical `AddHttpsListener`. A worker that
+    /// predates mutual TLS decodes that verb, skips the client authentication
+    /// fields and builds the listener without them, so the fan-out must move
+    /// it to `AddHttpsListenerWithClientAuth`, which that worker cannot
+    /// decode. A listener without client auth keeps the historical verb.
+    ///
+    /// To SEE THIS RED: drop the `into_canonical` call in `scatter_on`.
+    #[test]
+    fn scatter_sends_client_auth_listeners_on_the_mtls_verb() {
+        let mut hub = create_test_hub();
+        let (mut worker_side, _scm) = register_test_worker(&mut hub.server, 0, 4096, 65536);
+
+        let listener = |port: u16, client_auth: Option<ClientAuthMode>| HttpsListenerConfig {
+            address: SocketAddress::new_v4(127, 0, 0, 1, port),
+            client_auth: client_auth.map(|mode| mode as i32),
+            client_ca_certificates: vec!["CLIENT CA PEM".to_owned()],
+            ..Default::default()
+        };
+        let task_id = hub.server.new_task(
+            Box::new(TallyTask {
+                gatherer: DefaultGatherer::default(),
+                seen: std::rc::Rc::new(std::cell::Cell::new((0, 0, 0))),
+            }),
+            Timeout::None,
+        );
+        hub.server.scatter_on(
+            RequestType::AddHttpsListener(listener(8443, Some(ClientAuthMode::ClientAuthRequired)))
+                .into(),
+            task_id,
+            1,
+            None,
+        );
+        hub.server.scatter_on(
+            RequestType::AddHttpsListenerWithClientAuth(listener(8444, None)).into(),
+            task_id,
+            2,
+            None,
+        );
+
+        let mut received = vec![];
+        for _ in 0..16 {
+            for worker in hub.server.workers.values_mut() {
+                worker.update_readiness(Ready::WRITABLE);
+                let _ = worker.ready();
+            }
+            worker_side.handle_events(Ready::READABLE);
+            received.extend(crate::command::sessions::extract_messages(&mut worker_side));
+            if received.len() >= 2 {
+                break;
+            }
+        }
+
+        let verbs: Vec<(u16, &str)> = received
+            .iter()
+            .filter_map(|request| match &request.content.request_type {
+                Some(RequestType::AddHttpsListener(l)) => {
+                    Some((l.address.port as u16, "AddHttpsListener"))
+                }
+                Some(RequestType::AddHttpsListenerWithClientAuth(l)) => {
+                    Some((l.address.port as u16, "AddHttpsListenerWithClientAuth"))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            verbs,
+            vec![
+                (8443, "AddHttpsListenerWithClientAuth"),
+                (8444, "AddHttpsListener"),
+            ],
+            "the fan-out must carry each HTTPS listener on the verb its client auth calls for"
         );
     }
 }
