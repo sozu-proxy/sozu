@@ -14,19 +14,19 @@ hdrhistogram = "^7.6.0"
 hex = "^0.4.3"
 hickory-proto = "^0.26.3"
 http-body-util = "^0.1.5"
-hyper = "^1.11.1"
+hyper = "^1.12.0"
 hyper-rustls = { version = "^0.27.10", default-features = false }
 hyper-util = "^0.1.21"
 idna = "^1.1.0"
 itoa = "^1.0.18"
 jemallocator = "^0.5.4"
 kawa = { version = "^0.7.2", default-features = false }
-lapin = { version = "^4.12.0", default-features = false }
-libc = "^0.2.189"
+lapin = { version = "^4.12.2", default-features = false }
+libc = "^0.2.190"
 log = "^0.4.34"
 magnetar = { package = "magnetar-driver", version = "^1.7.2", default-features = false }
 memchr = "^2.8.3"
-mio = "^1.2.3"
+mio = "^1.2.4"
 mongodb = { version = "^3.9.1", default-features = false }
 moonpool-sim = "^0.8.0"
 mysql_async = { version = "^0.37.1", default-features = false }
@@ -45,7 +45,7 @@ rand = "^0.10.3"
 regex = "^1.13.1"
 redis = { version = "^1.7.1", default-features = false }
 rskafka = { version = "^0.6.0", default-features = false }
-rustls-openssl = { version = "^0.4.1", default-features = false, features = ["tls12"] }
+rustls-openssl = { version = "^0.4.2", default-features = false, features = ["tls12"] }
 # The certificate parser rustls verifies with. No crypto feature: Sozu only
 # reads CRL issuers with it, rustls keeps doing every signature check.
 rustls-webpki = { version = "^0.103.15", default-features = false, features = ["alloc"] }
@@ -56,9 +56,9 @@ rustls = { version = "^0.23.45", default-features = false, features = [
 ] }
 rusty_ulid = "^2.0.1"
 serde = "^1.0.229"
-serde_json = "^1.0.151"
+serde_json = "^1.0.154"
 serial_test = "^4.0.1"
-sha2 = "^0.11.0"
+sha2 = "^0.11.1"
 slab = "^0.4.12"
 socket2 = "^0.6.5"
 sozu-command-lib = { version = "^2.2.1", path = "command" }
@@ -69,9 +69,9 @@ termion = "^4.0.6"
 thiserror = "^2.0.21"
 time = "^0.3.55"
 tiny_http = "^0.12.0"
-tokio = "^1.53.1"
+tokio = "^1.53.3"
 tokio-postgres = { version = "^0.7.18", default-features = false }
-toml = { version = "^1.1.6", features = ["preserve_order"] }
+toml = { version = "^1.1.8", features = ["preserve_order"] }
 tonic = { version = "^0.14.6", default-features = false }
 tonic-prost = "^0.14.6"
 tonic-prost-build = "^0.14.6"
