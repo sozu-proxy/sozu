@@ -2,6 +2,51 @@
 
 ## [Unreleased]
 
+## 2.3.0 - 2026-10-14
+
+### Highlights
+
+- HTTPS listeners support mutual TLS, trusted client CAs, certificate revocation
+  lists, and live policy reloads.
+- Backend health checks support TCP-connect probes and configurable accepted HTTP
+  status ranges. Load balancing gains shuffle sharding and header/cookie affinity.
+- UDP clusters gain per-source flow limits, alongside reliability and resource
+  accounting improvements across TCP, UDP, HTTP/1.1 and HTTP/2.
+- HTTP/2 scheduling, flow control, draining and flood mitigation are hardened.
+- The command socket mode is configurable, and the optional `sozu top` dashboard
+  provides live operational visibility.
+- Main upgrades use transactional handoffs; worker-upgrade failures are reported
+  explicitly. Dependencies are refreshed, and the minimum Rust version is 1.93.1.
+- rustls 0.23.46 includes the fixes for RUSTSEC-2026-0346 through
+  RUSTSEC-2026-0349.
+
+### Upgrading from 2.2.1
+
+**The first migration under the shipped `Type=notify` systemd units requires a
+controlled service restart, with the deployment's normal drain and health checks.**
+The legacy hot-upgrade path refuses `NOTIFY_SOCKET`; removing that variable or
+changing the unit alone is not a safe workaround. Containers whose main has PID 1
+must use their normal replacement procedure.
+
+On supported Linux deployments outside those units, the legacy bridge requires
+an idle control plane, the replacement CLI, and verification of every worker,
+routing state and traffic. Follow the
+[migration procedure](https://github.com/sozu-proxy/sozu/blob/2.3.0/doc/how_to_use.md#first-hot-upgrade-from-221).
+
+### Compatibility
+
+Review the detailed breaking-change entries before upgrading: the default
+connection-attempt budget increases from three to five, and `POWER_OF_TWO` load
+balancing and `path_type = REGEX` matching change. Several public library APIs
+gain fields or change signatures; upgrade `sozu-command-lib`, `sozu-lib` and
+`sozu` together. Upgrade the main, all workers and administrative clients before
+enabling new cluster or listener features.
+
+The [complete changelog](https://github.com/sozu-proxy/sozu/blob/2.3.0/CHANGELOG.md#230---2026-10-14)
+below retains every detailed change. [Compare 2.2.1 with 2.3.0](https://github.com/sozu-proxy/sozu/compare/2.2.1...2.3.0).
+
+<!-- release-notes:end -->
+
 ### ✨ Added
 
 - **`feat(command)`: make the command socket mode configurable.** The command socket was

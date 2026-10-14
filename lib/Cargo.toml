@@ -4,7 +4,7 @@ description = "sozu library to build hot reconfigurable HTTP reverse proxies"
 repository = "https://github.com/sozu-proxy/sozu"
 documentation = "https://docs.rs/sozu-lib"
 homepage = "https://sozu.io"
-version = "2.2.1"
+version = "2.3.0"
 license = "AGPL-3.0"
 authors = [
   "Clément Delafargue <clement@delafargue.name>",

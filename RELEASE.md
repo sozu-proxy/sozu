@@ -44,7 +44,7 @@ restart procedure for that deployment.
 
 ### Update the changelog
 
-Move the contents of `## [Unreleased]` into a new `## X.Y.Z - DATE` release section and reset the unreleased block. Do this **before** pushing the tag — the release workflow's `awk` extractor at `.github/workflows/release.yml` keys off the `## <version>` heading (the `## X.Y.Z - DATE` form used by every released section; a bracketed `## [X.Y.Z]` is also accepted) and reads until the next `## ` heading. If the section is missing, the draft release body falls back to a placeholder and the workflow emits a `::warning::`.
+Move the contents of `## [Unreleased]` into a new `## X.Y.Z - DATE` release section and reset the unreleased block. Do this **before** pushing the tag — the release workflow's `awk` extractor at `.github/workflows/release.yml` keys off the `## <version>` heading (the `## X.Y.Z - DATE` form used by every released section; a bracketed `## [X.Y.Z]` is also accepted) and reads until the next `## ` heading or an exact `<!-- release-notes:end -->` line. For a long changelog, put a concise release summary and a link to the complete tagged changelog before that boundary, and preserve the detailed entries below it. GitHub release bodies are limited to 125000 characters; the workflow fails explicitly above that limit. If the section is missing, the draft release body falls back to a placeholder and the workflow emits a `::warning::`.
 
 ## Publish the new version
 
@@ -67,9 +67,15 @@ The crates published from this repository, in mandatory dependency order, are:
 
 `e2e/` (`sozu-e2e`), `sim/` (`sozu-sim`) and `fuzz/` (`sozu-fuzz`) all carry `publish = false` and are never published.
 
-Run `cargo build --locked` at the root of the project to refresh `Cargo.lock`.
+Refresh both lockfiles through Cargo after the version changes:
 
-Commit the `Cargo.toml` and `Cargo.lock` changes.
+```sh
+cargo update --workspace
+cargo update --manifest-path fuzz/Cargo.toml --workspace
+cargo build --locked
+```
+
+Commit all changed manifests, both lockfiles, the RPM version and the changelog.
 
 Wait for the GitHub Actions build to pass (<https://github.com/sozu-proxy/sozu/actions>).
 

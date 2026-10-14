@@ -356,7 +356,8 @@ jobs:
           # and pass it to action-gh-release via `body_path` (heredoc-safe).
           # Released sections use `## X.Y.Z - DATE` (a bracketed
           # `## [X.Y.Z]` heading is also accepted); the section runs until
-          # the next `## ` heading. If the section is missing, emit a
+          # the next `## ` heading or an exact `<!-- release-notes:end -->`
+          # boundary after a concise summary. If the section is missing, emit a
           # `::warning::` so the run page surfaces the silent skip —
           # operators can still edit the draft before publishing — but DO
           # NOT fail the workflow: missing changelog stanzas should not
@@ -367,6 +368,7 @@ jobs:
               if (in_section) exit
               if ($0 ~ ("^## \\[?" ver "\\]?( |$)")) { in_section = 1; next }
             }
+            in_section && $0 == "<!-- release-notes:end -->" { exit }
             in_section { print }
           ' CHANGELOG.md > RELEASE_BODY.md
           if [ ! -s RELEASE_BODY.md ]; then
@@ -378,6 +380,10 @@ jobs:
               echo ""
               echo "_NOTE_: this body was auto-generated because the maintainer did not move the \`## [Unreleased]\` block into a \`## ${VERSION}\` section before tagging. Edit before publishing."
             } > RELEASE_BODY.md
+          fi
+          if [ "$(LC_ALL=C.UTF-8 wc -m < RELEASE_BODY.md)" -gt 125000 ]; then
+            echo "::error::Release notes exceed GitHub's 125000-character limit. Add a concise summary and a release-notes:end boundary in CHANGELOG.md."
+            exit 1
           fi
           cat RELEASE_BODY.md
 

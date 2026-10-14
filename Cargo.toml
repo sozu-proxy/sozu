@@ -49,7 +49,7 @@ rustls-openssl = { version = "^0.4.2", default-features = false, features = ["tl
 # The certificate parser rustls verifies with. No crypto feature: Sozu only
 # reads CRL issuers with it, rustls keeps doing every signature check.
 rustls-webpki = { version = "^0.103.15", default-features = false, features = ["alloc"] }
-rustls = { version = "^0.23.45", default-features = false, features = [
+rustls = { version = "^0.23.46", default-features = false, features = [
   "logging",
   "std",
   "tls12",
@@ -61,8 +61,8 @@ serial_test = "^4.0.1"
 sha2 = "^0.11.1"
 slab = "^0.4.12"
 socket2 = "^0.6.5"
-sozu-command-lib = { version = "^2.2.1", path = "command" }
-sozu-lib = { version = "^2.2.1", path = "lib", default-features = false }
+sozu-command-lib = { version = "^2.3.0", path = "command" }
+sozu-lib = { version = "^2.3.0", path = "lib", default-features = false }
 subtle = "^2.6.1"
 tempfile = "^3.27.0"
 termion = "^4.0.6"

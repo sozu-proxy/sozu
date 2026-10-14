@@ -67,7 +67,7 @@ To get started check out our [documentation](./doc/README.md) !
 
 ## Quickstart
 
-Once the prerequisites (`protoc`, Rust 1.91 via the pinned `rust-toolchain`) are installed, building and starting Sōzu takes two commands:
+Once the prerequisites (`protoc`, Rust 1.93.1 via the pinned `rust-toolchain`) are installed, building and starting Sōzu takes two commands:
 
 ```sh
 cargo build -p sozu --release --locked
@@ -78,7 +78,7 @@ target/release/sozu start -c bin/config.toml
 
 ## Exploring the source
 
-The Cargo workspace ships five crates (Rust 2024 edition, MSRV 1.91):
+The Cargo workspace ships five crates (Rust 2024 edition, MSRV 1.93.1):
 
 - `lib/`: the `sozu-lib` reverse proxy library hosts the single-threaded mio event loop, the HTTP/1.1 (Kawa) and HTTP/2 multiplexer, TCP, UDP, and TLS protocols, routing, per-IP rate limiting, sockets, metrics, and the buffer pool.
 - `bin/`: the `sozu` binary wraps the library in a master/worker supervisor, exposes the unix command socket, orchestrates hot reconfiguration and zero-downtime upgrades, and ships the optional `sozu top` TUI behind the `tui` feature.
