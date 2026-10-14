@@ -91,6 +91,7 @@ catching.
 | **Deterministic simulation** | `sim/tests/backend_selection_sim.rs` (`sozu-sim`, moonpool-sim) — HTTP backend selection through `Router::backend_from_request` and a selector the harness owns over a seeded `BackendMap`, [#1684](https://github.com/sozu-proxy/sozu/issues/1684) | same `--cfg tokio_unstable` gating as below | per-PR `udp-simulation` job (same job, added step, 64 seeds); widened via `SOZU_BACKEND_SELECTION_SIM_*` env knobs | yes |
 | **Deterministic simulation** | `sim/tests/tcp_preread_sim.rs` (`sozu-sim`, moonpool-sim) — TCP SNI-preread core, [#1279](https://github.com/sozu-proxy/sozu/issues/1279) | same `--cfg tokio_unstable` gating as above | per-PR `udp-simulation` job (same job, added step, modest sweep) + nightly `tcp-preread-simulation-sweep` job in `simulation-sweep.yml` (deep swarm); widened via `SOZU_TCP_PREREAD_SIM_*` env knobs | yes |
 | **Deterministic simulation** | `sim/tests/metrics_lease_sim.rs` (`sozu-sim`, moonpool-sim) — metrics cardinality-lease core (`Aggregator::lease_apply`/`lease_clear`/`lease_tick` plus the `remove_cluster`/`add_cluster`/`remove_backend` tombstone) | same `--cfg tokio_unstable` gating as above | no CI job yet — run manually with the command below; widened via `SOZU_METRICS_LEASE_SIM_*` env knobs | no (not yet wired into CI — see this section's closing note) |
+| **Deterministic simulation** | `sim/tests/mutable_commands_simulation.rs` (`sozu-sim`, moonpool-sim) — all 30 persisted `ConfigState` mutation verbs, refusal atomicity, direct map invariants, and diff replay | same `--cfg tokio_unstable` gating as above | per-PR `udp-simulation` job (same job, dedicated bounded 16 × 100 step); replay via `SOZU_MUTABLE_COMMANDS_SIM_*` | yes |
 | **Regression guards** | `lib/tests/log_layout.rs` | nothing | runs in `cargo test -p sozu-lib`; build-time `cargo:warning=` echo from `lib/build.rs` | yes |
 
 Notes:
@@ -335,6 +336,9 @@ RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim --test h2_simulation
 
 # Deterministic backend-selection simulation (same crate, same cfg gating):
 RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim --test backend_selection_sim
+
+# Persisted mutable-command simulation (same crate, same cfg gating):
+RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim --test mutable_commands_simulation
 ```
 
 The focused lifecycle tests above deliberately separate three contracts:
@@ -392,6 +396,28 @@ the same contract under `SOZU_METRICS_LEASE_SIM_SEED` / `_SEEDS` / `_STEPS`
 ```bash
 RUSTFLAGS="--cfg tokio_unstable" SOZU_METRICS_LEASE_SIM_SEED=0xdeadbeef \
   cargo test -p sozu-sim --test metrics_lease_sim
+```
+
+The persisted mutable-command simulator
+(`sim/tests/mutable_commands_simulation.rs`) starts every run with fixed
+accepted cases for all 30 `ConfigState` mutation verbs, including the two
+client-auth HTTPS compatibility verbs. It independently checks stored cluster,
+backend, listener, frontend, certificate and health-check content; rejected
+orders must preserve every business map. It then replays `ConfigState::diff`
+from an empty state after every operation. Empty backend/TCP/UDP buckets are
+normalised because no persisted order represents an empty bucket.
+
+The default campaign is deliberately bounded to 16 seeds × 100 generated
+operations. `SOZU_MUTABLE_COMMANDS_SIM_SEED` replays one seed and prints its
+trace; `_SEEDS` and `_STEPS` may reduce or widen a run only up to those same
+caps. This model does not instantiate a worker, sockets, TLS providers or the
+operating system, and it does not prove main-to-worker fan-out, mixed worker
+acknowledgements or an unknown transport outcome. Those claims require the
+process-level E2E suites.
+
+```bash
+RUSTFLAGS="--cfg tokio_unstable" SOZU_MUTABLE_COMMANDS_SIM_SEED=0xdeadbeef \
+  cargo test -p sozu-sim --test mutable_commands_simulation -- --nocapture
 ```
 
 The H2-core simulator (`sim/tests/h2_simulation.rs`, `ConnectionH2` driven
