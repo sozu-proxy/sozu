@@ -58,6 +58,47 @@ const _: fn() = || {
     assert_send_sync::<crate::response::Backend>();
 };
 
+/// Build the unambiguous inverse of a mutating request.
+///
+/// The main process and each worker use the same inverse to restore their
+/// respective [`ConfigState`] when no runtime worker accepts a command. Only
+/// verbs whose prior value is fully determined by the request are covered.
+/// Upserts, listener updates, cluster removals, and certificate mutations need
+/// a snapshot of the displaced value and therefore return `None`.
+pub fn rollback_request(request: &RequestType) -> Option<Request> {
+    let inverse = match request {
+        RequestType::AddHttpListener(config) => RequestType::RemoveListener(RemoveListener {
+            interface: config.interface.clone(),
+            address: config.address,
+            proxy: ListenerType::Http.into(),
+        }),
+        RequestType::AddHttpsListener(config)
+        | RequestType::AddHttpsListenerWithClientAuth(config) => {
+            RequestType::RemoveListener(RemoveListener {
+                interface: config.interface.clone(),
+                address: config.address,
+                proxy: ListenerType::Https.into(),
+            })
+        }
+        RequestType::AddTcpListener(config) => RequestType::RemoveListener(RemoveListener {
+            interface: config.interface.clone(),
+            address: config.address,
+            proxy: ListenerType::Tcp.into(),
+        }),
+        RequestType::AddUdpListener(config) => RequestType::RemoveListener(RemoveListener {
+            interface: config.interface.clone(),
+            address: config.address,
+            proxy: ListenerType::Udp.into(),
+        }),
+        RequestType::AddHttpFrontend(front) => RequestType::RemoveHttpFrontend(front.clone()),
+        RequestType::AddHttpsFrontend(front) => RequestType::RemoveHttpsFrontend(front.clone()),
+        RequestType::AddTcpFrontend(front) => RequestType::RemoveTcpFrontend(front.clone()),
+        RequestType::AddUdpFrontend(front) => RequestType::RemoveUdpFrontend(front.clone()),
+        _ => return None,
+    };
+    Some(inverse.into())
+}
+
 #[derive(thiserror::Error)]
 pub enum StateError {
     #[error("Request came in empty")]
@@ -275,6 +316,67 @@ impl std::fmt::Debug for ConfigState {
 impl ConfigState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Capture the compensating request that restores this exact state if
+    /// `request` is accepted here but refused by the runtime afterwards.
+    ///
+    /// Additions whose inverse is independent of prior state use
+    /// [`rollback_request`]. Frontend removals instead snapshot the stored
+    /// frontend before dispatch: their wire request is only a selector and
+    /// can omit metadata that an `Add` must restore.
+    pub fn rollback_for(&self, request: &RequestType) -> Option<Request> {
+        if let Some(rollback) = rollback_request(request) {
+            return Some(rollback);
+        }
+
+        let inverse = match request {
+            RequestType::RemoveHttpFrontend(selector) => self
+                .http_fronts
+                .get(&selector.to_string())
+                .filter(|stored| stored.cluster_id.as_deref() == selector.cluster_id.as_deref())
+                .cloned()
+                .map(RequestHttpFrontend::from)
+                .map(RequestType::AddHttpFrontend),
+            RequestType::RemoveHttpsFrontend(selector) => self
+                .https_fronts
+                .get(&selector.to_string())
+                .filter(|stored| stored.cluster_id.as_deref() == selector.cluster_id.as_deref())
+                .cloned()
+                .map(RequestHttpFrontend::from)
+                .map(RequestType::AddHttpsFrontend),
+            RequestType::RemoveTcpFrontend(selector) => {
+                let address: SocketAddr = selector.address.into();
+                let sni = selector.sni.as_deref().map(str::to_ascii_lowercase);
+                let alpn = canonical_tcp_alpn(&selector.alpn);
+                self.tcp_fronts
+                    .get(selector.cluster_id.as_str())
+                    .and_then(|frontends| {
+                        frontends
+                            .iter()
+                            .find(|stored| tcp_frontend_matches(stored, address, &sni, &alpn))
+                    })
+                    .cloned()
+                    .map(RequestTcpFrontend::from)
+                    .map(RequestType::AddTcpFrontend)
+            }
+            RequestType::RemoveUdpFrontend(selector) => {
+                let address: SocketAddr = selector.address.into();
+                self.udp_fronts
+                    .get(selector.cluster_id.as_str())
+                    .and_then(|frontends| {
+                        frontends.iter().find(|stored| {
+                            stored.address == address && stored.tags == selector.tags
+                        })
+                    })
+                    .cloned()
+                    .map(RequestUdpFrontend::from)
+                    .map(RequestType::AddUdpFrontend)
+            }
+            _ => None,
+        };
+
+        inverse.map(Into::into)
     }
 
     pub fn dispatch(&mut self, request: &Request) -> Result<(), StateError> {
