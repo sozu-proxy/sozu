@@ -7,7 +7,9 @@ use command::{
 use prost::UnknownEnumValue;
 
 /// Contains all types received by and sent from Sōzu
-pub mod command;
+pub mod command {
+    include!(concat!(env!("OUT_DIR"), "/command.rs"));
+}
 
 /// Implementation of fmt::Display for the protobuf types, used in the CLI
 pub mod display;

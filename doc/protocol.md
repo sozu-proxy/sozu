@@ -173,7 +173,7 @@ fan-out is not cancellable mid-flight) but the response is dropped.
 
 A follow-up commit can run `protoc-gen-doc` against
 `command/src/command.proto` so the auto-generated
-`command/src/proto/command.rs` is paired with a fresh wire-level
+Rust types in Cargo's `OUT_DIR`, exposed by `proto::command`, are paired with a fresh wire-level
 reference document.
 
 Until then, the canonical wire reference is `command/src/command.proto`

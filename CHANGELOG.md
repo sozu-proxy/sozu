@@ -19,6 +19,8 @@
   explicitly. Dependencies are refreshed, and the minimum Rust version is 1.93.1.
 - rustls 0.23.46 includes the fixes for RUSTSEC-2026-0346 through
   RUSTSEC-2026-0349.
+- Rust crate packages build from clean source archives without special Cargo
+  verification flags.
 
 ### Upgrading from 2.2.1
 

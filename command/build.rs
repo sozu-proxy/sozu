@@ -137,7 +137,6 @@ pub fn main() {
             "#[derive(Hash, Eq, Ord, PartialOrd)]",
         )
         .format(true)
-        .out_dir("src/proto")
         .compile_protos(&["command.proto"], &["src"])
         .expect("Could not compile protobuf types in command.proto");
 }

@@ -13,6 +13,10 @@ The idea is to define the data _once_ in this format, so that various libraries
 of various languages can translate it to their own.
 
 All types are defined in the `command.proto` file.
+At build time, `prost-build` generates `command.rs` in Cargo's `OUT_DIR`; the
+public `proto::command` module includes it from there. Building a source archive
+requires `protoc` and leaves the source tree unchanged.
+
 There are two main types received by, and sent from, Sōzu:
 
 - `Request`
