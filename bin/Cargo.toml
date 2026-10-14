@@ -4,7 +4,7 @@ description = "sozu, a fast, reliable, hot reconfigurable HTTP reverse proxy"
 repository = "https://github.com/sozu-proxy/sozu"
 documentation = "https://docs.rs/sozu"
 homepage = "https://sozu.io"
-version = "2.3.0"
+version = "2.3.1"
 license = "AGPL-3.0"
 authors = [
   "Geoffroy Couprie <geo.couprie@gmail.com>",

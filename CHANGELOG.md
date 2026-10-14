@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## 2.3.1 - 2026-10-14
+
 ### Fixed
 
 - A worker whose HTTP, HTTPS, TCP or UDP proxy refused a frontend addition or
@@ -18,6 +20,28 @@
   leave a pre-existing heterogeneous runtime only partially changed when one
   listener refuses the order; this fix restores `ConfigState`, but it does not
   reconstruct that runtime-only state.
+
+### Upgrade notes
+
+- This patch does not change the command schema, configuration format or saved
+  state format. A 2.3.0 main and its workers can hot-upgrade to 2.3.1.
+- The first migration from 2.2.1 under the shipped `Type=notify` systemd units
+  still requires a controlled service restart with the deployment's normal
+  drain and health checks. The legacy hot-upgrade path still refuses
+  `NOTIFY_SOCKET`; removing the variable or changing the unit is not a safe
+  workaround. Deployments outside those units must follow the documented
+  legacy-upgrade preconditions and verify every worker, routing state and
+  traffic.
+
+This fix makes rejected frontend orders restore their recorded configuration
+state. It does not make every Sōzu mutation transactional: mixed worker
+acknowledgements, upserts, listener updates, cluster removals, certificate
+mutations and pre-existing heterogeneous multi-listener runtime state retain the
+limits above.
+
+[Compare 2.3.0 with 2.3.1](https://github.com/sozu-proxy/sozu/compare/2.3.0...2.3.1).
+
+<!-- release-notes:end -->
 
 ## 2.3.0 - 2026-10-14
 
