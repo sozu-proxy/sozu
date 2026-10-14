@@ -2657,6 +2657,15 @@ impl Server {
             _ => Vec::new(),
         };
 
+        // Snapshot a compensating request before dispatch: removal requests
+        // carry only an identity selector, while the stored frontend carries
+        // the metadata an exact re-add needs.
+        let rollback_candidate = request
+            .content
+            .request_type
+            .as_ref()
+            .and_then(|request_type| self.config_state.rollback_for(request_type));
+        let mut rollback = None;
         if let Err(e) = self.config_state.dispatch(&request.content) {
             if self
                 .config_state
@@ -2690,6 +2699,8 @@ impl Server {
                 return;
             }
             error!("Could not execute order on config state: {}", e);
+        } else {
+            rollback = rollback_candidate;
         }
 
         let req_id = request.id.clone();
@@ -2802,40 +2813,48 @@ impl Server {
             }
         }
         if let Some(response) = notify_response {
-            push_queue(response);
+            self.finish_proxy_order(&mut rollback, response);
         }
 
         match request.content.request_type {
             // special case for adding listeners, because we need to register a listener
             Some(RequestType::AddHttpListener(listener)) => {
-                push_queue(self.notify_add_http_listener(&req_id, listener));
+                let response = self.notify_add_http_listener(&req_id, listener);
+                self.finish_proxy_order(&mut rollback, response);
             }
             Some(
                 RequestType::AddHttpsListener(listener)
                 | RequestType::AddHttpsListenerWithClientAuth(listener),
             ) => {
-                push_queue(self.notify_add_https_listener(&req_id, listener));
+                let response = self.notify_add_https_listener(&req_id, listener);
+                self.finish_proxy_order(&mut rollback, response);
             }
             Some(RequestType::AddTcpListener(listener)) => {
-                push_queue(self.notify_add_tcp_listener(&req_id, listener));
+                let response = self.notify_add_tcp_listener(&req_id, listener);
+                self.finish_proxy_order(&mut rollback, response);
             }
             Some(RequestType::AddUdpListener(listener)) => {
-                push_queue(self.notify_add_udp_listener(&req_id, listener));
+                let response = self.notify_add_udp_listener(&req_id, listener);
+                self.finish_proxy_order(&mut rollback, response);
             }
             Some(RequestType::UpdateHttpListener(patch)) => {
-                push_queue(self.notify_update_http_listener(&req_id, patch));
+                let response = self.notify_update_http_listener(&req_id, patch);
+                self.finish_proxy_order(&mut rollback, response);
             }
             Some(
                 RequestType::UpdateHttpsListener(patch)
                 | RequestType::UpdateHttpsListenerWithClientAuth(patch),
             ) => {
-                push_queue(self.notify_update_https_listener(&req_id, patch));
+                let response = self.notify_update_https_listener(&req_id, patch);
+                self.finish_proxy_order(&mut rollback, response);
             }
             Some(RequestType::UpdateTcpListener(patch)) => {
-                push_queue(self.notify_update_tcp_listener(&req_id, patch));
+                let response = self.notify_update_tcp_listener(&req_id, patch);
+                self.finish_proxy_order(&mut rollback, response);
             }
             Some(RequestType::UpdateUdpListener(patch)) => {
-                push_queue(self.notify_update_udp_listener(&req_id, patch));
+                let response = self.notify_update_udp_listener(&req_id, patch);
+                self.finish_proxy_order(&mut rollback, response);
             }
             Some(RequestType::RemoveListener(ref remove)) => {
                 debug!("{} remove {:?} listener {:?}", req_id, remove.proxy, remove);
@@ -2876,16 +2895,43 @@ impl Server {
                     self.accept_ready.remove(&ListenToken(token.0));
                     info!("released listen token {:?}", token);
                 }
-                push_queue(response);
+                self.finish_proxy_order(&mut rollback, response);
             }
             Some(RequestType::ActivateListener(ref activate)) => {
-                push_queue(self.notify_activate_listener(&req_id, activate));
+                let response = self.notify_activate_listener(&req_id, activate);
+                self.finish_proxy_order(&mut rollback, response);
             }
             Some(RequestType::DeactivateListener(ref deactivate)) => {
-                push_queue(self.notify_deactivate_listener(&req_id, deactivate));
+                let response = self.notify_deactivate_listener(&req_id, deactivate);
+                self.finish_proxy_order(&mut rollback, response);
             }
             _other_request => {}
         };
+    }
+
+    /// Queue a proxy response and restore the worker's persisted view when a
+    /// single-plane runtime order was refused after `ConfigState::dispatch`.
+    fn finish_proxy_order(&mut self, rollback: &mut Option<Request>, response: WorkerResponse) {
+        if response.is_failure()
+            && let Some(rollback) = rollback.take()
+        {
+            debug_assert!(
+                rollback.request_type.is_some(),
+                "a ConfigState rollback must carry one request"
+            );
+            if let Err(error) = self.config_state.dispatch(&rollback) {
+                error!(
+                    "Could not roll back worker config state after a proxy refused an order: {}",
+                    error
+                );
+            }
+            debug_assert!(
+                rollback.request_type.is_some(),
+                "dispatching a rollback must not consume its request type"
+            );
+        }
+
+        push_queue(response);
     }
 
     fn add_cluster(&mut self, cluster: &Cluster) {
@@ -5947,6 +5993,309 @@ mod remove_cluster_cascade_tests {
             address: SocketAddress::new_v4(127, 0, 0, 1, 0),
             ..Default::default()
         }
+    }
+
+    /// A proxy can reject an order after the worker's `ConfigState` accepted
+    /// it. The worker must then restore its state, or `QueryClusterById`
+    /// reports an object the runtime never installed and disagrees with the
+    /// main process after its own rollback.
+    #[test]
+    fn a_proxy_rejection_rolls_back_reversible_worker_state() {
+        let cluster_id = "worker-rollback";
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let http = http_front(Some(cluster_id), "rollback.test", "/");
+
+        let requests = [
+            RequestType::AddHttpFrontend(RequestHttpFrontend {
+                address,
+                ..http.clone()
+            }),
+            RequestType::AddHttpsFrontend(RequestHttpFrontend { address, ..http }),
+            RequestType::AddTcpFrontend(RequestTcpFrontend {
+                cluster_id: cluster_id.to_owned(),
+                address,
+                ..Default::default()
+            }),
+            RequestType::AddUdpFrontend(RequestUdpFrontend {
+                cluster_id: cluster_id.to_owned(),
+                address,
+                ..Default::default()
+            }),
+        ];
+
+        for (index, request) in requests.into_iter().enumerate() {
+            let mut server = bare_server();
+            for response in send(
+                &mut server,
+                &format!("cluster-{index}"),
+                RequestType::AddCluster(Cluster {
+                    cluster_id: cluster_id.to_owned(),
+                    ..Default::default()
+                }),
+            ) {
+                assert_eq!(response.status, ResponseStatus::Ok as i32);
+            }
+
+            let responses = send(&mut server, &format!("frontend-{index}"), request);
+            assert_eq!(
+                responses
+                    .iter()
+                    .map(|response| response.status)
+                    .collect::<Vec<_>>(),
+                vec![ResponseStatus::Failure as i32],
+                "a frontend with no listener must be refused: {responses:?}"
+            );
+
+            let cluster = server
+                .config_state
+                .cluster_state(cluster_id)
+                .expect("the setup cluster must stay in worker state");
+            assert!(
+                cluster.http_frontends.is_empty()
+                    && cluster.https_frontends.is_empty()
+                    && cluster.tcp_frontends.is_empty()
+                    && cluster.udp_frontends.is_empty(),
+                "a refused frontend must not remain in worker ConfigState: {cluster:?}"
+            );
+        }
+    }
+
+    /// Removing a frontend is keyed by only its routing identity. If the
+    /// runtime refuses the removal after `ConfigState` accepted it, rollback
+    /// must restore the complete stored frontend rather than manufacture an
+    /// `Add` from the removal selector and lose metadata.
+    #[test]
+    fn a_refused_frontend_removal_restores_the_exact_stored_frontend() {
+        let cluster_id = "worker-remove-rollback";
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let tags = std::collections::BTreeMap::from([("owner".to_owned(), "preserved".to_owned())]);
+        let mut http = http_front(Some(cluster_id), "remove.test", "/api");
+        http.address = address;
+        http.method = Some("POST".to_owned());
+        http.position = RulePosition::Post.into();
+        http.tags = tags.clone();
+        http.rewrite_host = Some("internal.test".to_owned());
+
+        let mut http_selector = http.clone();
+        http_selector.position = RulePosition::Tree.into();
+        http_selector.tags.clear();
+        http_selector.rewrite_host = None;
+
+        let mut https = http.clone();
+        https.hostname = "secure-remove.test".to_owned();
+        let mut https_selector = https.clone();
+        https_selector.position = RulePosition::Tree.into();
+        https_selector.tags.clear();
+        https_selector.rewrite_host = None;
+
+        let tcp = RequestTcpFrontend {
+            cluster_id: cluster_id.to_owned(),
+            address,
+            tags: tags.clone(),
+            sni: Some("REMOVE.TEST".to_owned()),
+            alpn: vec!["http/1.1".to_owned(), "h2".to_owned()],
+        };
+        let tcp_selector = RequestTcpFrontend {
+            tags: Default::default(),
+            sni: Some("remove.test".to_owned()),
+            alpn: vec!["h2".to_owned(), "http/1.1".to_owned()],
+            ..tcp.clone()
+        };
+
+        let udp = RequestUdpFrontend {
+            cluster_id: cluster_id.to_owned(),
+            address,
+            tags,
+        };
+
+        let cases = [
+            (
+                "http",
+                RequestType::AddHttpFrontend(http),
+                RequestType::RemoveHttpFrontend(http_selector),
+            ),
+            (
+                "https",
+                RequestType::AddHttpsFrontend(https),
+                RequestType::RemoveHttpsFrontend(https_selector),
+            ),
+            (
+                "tcp",
+                RequestType::AddTcpFrontend(tcp),
+                RequestType::RemoveTcpFrontend(tcp_selector),
+            ),
+            (
+                "udp",
+                RequestType::AddUdpFrontend(udp.clone()),
+                RequestType::RemoveUdpFrontend(udp),
+            ),
+        ];
+
+        for (protocol, add, remove) in cases {
+            let mut server = bare_server();
+            server
+                .config_state
+                .dispatch(
+                    &RequestType::AddCluster(Cluster {
+                        cluster_id: cluster_id.to_owned(),
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect("the setup cluster must enter worker state");
+            server
+                .config_state
+                .dispatch(&add.into())
+                .unwrap_or_else(|error| {
+                    panic!("the {protocol} setup frontend must be stored: {error}")
+                });
+            let before = server
+                .config_state
+                .cluster_state(cluster_id)
+                .expect("the setup cluster must expose its frontend");
+
+            let responses = send(&mut server, &format!("remove-{protocol}"), remove);
+            assert_eq!(
+                responses
+                    .iter()
+                    .map(|response| response.status)
+                    .collect::<Vec<_>>(),
+                vec![ResponseStatus::Failure as i32],
+                "a frontend removal with no runtime listener must be refused: {responses:?}"
+            );
+            assert_eq!(
+                server.config_state.cluster_state(cluster_id),
+                Some(before),
+                "a refused {protocol} removal must restore the complete stored frontend"
+            );
+        }
+    }
+
+    /// A request-only inverse is safe only after the corresponding `Add`
+    /// entered `ConfigState`. A duplicate is rejected before mutation; if the
+    /// runtime then refuses it too, applying the inverse would delete the
+    /// frontend that predated the request.
+    #[test]
+    fn a_refused_duplicate_frontend_add_preserves_the_preexisting_frontend() {
+        let cluster_id = "worker-add-rollback";
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let tags =
+            std::collections::BTreeMap::from([("owner".to_owned(), "preexisting".to_owned())]);
+        let mut http = http_front(Some(cluster_id), "duplicate.test", "/api");
+        http.address = address;
+        http.method = Some("PATCH".to_owned());
+        http.position = RulePosition::Pre.into();
+        http.tags = tags.clone();
+
+        let mut https = http.clone();
+        https.hostname = "secure-duplicate.test".to_owned();
+        let tcp = RequestTcpFrontend {
+            cluster_id: cluster_id.to_owned(),
+            address,
+            tags: tags.clone(),
+            sni: Some("duplicate.test".to_owned()),
+            alpn: vec!["h2".to_owned()],
+        };
+        let udp = RequestUdpFrontend {
+            cluster_id: cluster_id.to_owned(),
+            address,
+            tags,
+        };
+
+        let cases = [
+            ("http", RequestType::AddHttpFrontend(http)),
+            ("https", RequestType::AddHttpsFrontend(https)),
+            ("tcp", RequestType::AddTcpFrontend(tcp)),
+            ("udp", RequestType::AddUdpFrontend(udp)),
+        ];
+
+        for (protocol, add) in cases {
+            let mut server = bare_server();
+            server
+                .config_state
+                .dispatch(
+                    &RequestType::AddCluster(Cluster {
+                        cluster_id: cluster_id.to_owned(),
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect("the setup cluster must enter worker state");
+            server
+                .config_state
+                .dispatch(&add.clone().into())
+                .unwrap_or_else(|error| {
+                    panic!("the {protocol} setup frontend must be stored: {error}")
+                });
+            let before = server
+                .config_state
+                .cluster_state(cluster_id)
+                .expect("the setup cluster must expose its frontend");
+
+            let responses = send(&mut server, &format!("duplicate-{protocol}"), add);
+            assert_eq!(
+                responses
+                    .iter()
+                    .map(|response| response.status)
+                    .collect::<Vec<_>>(),
+                vec![ResponseStatus::Failure as i32],
+                "a duplicate frontend with no runtime listener must be refused: {responses:?}"
+            );
+            assert_eq!(
+                server.config_state.cluster_state(cluster_id),
+                Some(before),
+                "a refused duplicate {protocol} add must preserve the preexisting frontend"
+            );
+        }
+    }
+
+    /// Listener adds are request-invertible only on the vacant state path. A
+    /// duplicate state error must leave rollback unarmed when the runtime also
+    /// refuses the order.
+    #[test]
+    fn a_refused_duplicate_listener_add_preserves_the_preexisting_listener() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let listener = ListenerBuilder::new_http(address)
+            .to_http(None)
+            .expect("the test HTTP listener configuration must build");
+        let mut server = bare_server();
+        server
+            .config_state
+            .dispatch(&RequestType::AddHttpListener(listener.clone()).into())
+            .expect("the setup listener must enter worker state");
+        let before = server.config_state.http_listeners.clone();
+
+        // Fill the reserved slab headroom so the worker takes the explicit
+        // refusal path before attempting to install a runtime listener.
+        let threshold = server.sessions.borrow().accept_slab_threshold();
+        while server.sessions.borrow().slab.len() < threshold {
+            server
+                .sessions
+                .borrow_mut()
+                .slab
+                .insert(Rc::new(RefCell::new(ListenSession {
+                    protocol: Protocol::HTTPListen,
+                })));
+        }
+        assert!(server.sessions.borrow().at_capacity());
+
+        let responses = send(
+            &mut server,
+            "duplicate-listener",
+            RequestType::AddHttpListener(listener),
+        );
+        assert_eq!(
+            responses
+                .iter()
+                .map(|response| response.status)
+                .collect::<Vec<_>>(),
+            vec![ResponseStatus::Failure as i32],
+            "the full session slab must refuse the duplicate listener: {responses:?}"
+        );
+        assert_eq!(
+            server.config_state.http_listeners, before,
+            "a refused duplicate listener add must preserve the preexisting listener"
+        );
     }
 
     fn backend(cluster_id: &str, port: u16) -> AddBackend {

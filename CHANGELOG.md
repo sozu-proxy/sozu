@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A worker whose HTTP, HTTPS, TCP or UDP proxy refused a frontend addition or
+  removal could keep a `ConfigState` that disagreed with the runtime. When
+  every worker refused the order, the main process could then disagree with
+  the workers too. Workers now apply the same compensating path as the main
+  process before returning the failure. Adds use their request-only inverse;
+  removals snapshot the matching stored frontend so tags, method, path,
+  position and routing policy are restored exactly. Listener additions use
+  the request-only path. Upserts, listener updates, cluster removals and
+  certificate mutations remain outside this compensating path because they
+  need a distinct snapshot of the displaced value or runtime state. HTTP and
+  HTTPS frontend changes that target several same-address listeners can also
+  leave a pre-existing heterogeneous runtime only partially changed when one
+  listener refuses the order; this fix restores `ConfigState`, but it does not
+  reconstruct that runtime-only state.
+
 ## 2.3.0 - 2026-10-14
 
 ### Highlights

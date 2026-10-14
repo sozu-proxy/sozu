@@ -30,16 +30,15 @@ use sozu_command_lib::{
     proto::command::{
         AggregatedMetrics, AvailableMetrics, CertificateAndKey, CertificatesWithFingerprints,
         ClusterHashes, ClusterInformations, Event, EventKind, FilteredMetrics, FrontendFilters,
-        HardStop, ListenerType, MetricDetail, MetricDetailStatus, MetricsConfiguration,
-        QueryCertificatesFilters, QueryHealthChecks, QueryMetricsOptions, RemoveListener, Request,
-        ResponseContent, ResponseStatus, RunState, SetMetricDetail, SoftStop, Status,
-        UpdateHttpListenerConfig, UpdateHttpsListenerConfig, UpdateTcpListenerConfig,
-        UpdateUdpListenerConfig, WorkerInfo, WorkerInfos, WorkerRequest, WorkerResponse,
-        WorkerResponses, request::RequestType, response_content::ContentType,
+        HardStop, MetricDetail, MetricDetailStatus, MetricsConfiguration, QueryCertificatesFilters,
+        QueryHealthChecks, QueryMetricsOptions, Request, ResponseContent, ResponseStatus, RunState,
+        SetMetricDetail, SoftStop, Status, UpdateHttpListenerConfig, UpdateHttpsListenerConfig,
+        UpdateTcpListenerConfig, UpdateUdpListenerConfig, WorkerInfo, WorkerInfos, WorkerRequest,
+        WorkerResponse, WorkerResponses, request::RequestType, response_content::ContentType,
     },
     proto::display::forwarded_headers_label,
     sd_notify,
-    state::ConfigState,
+    state::{ConfigState, rollback_request},
 };
 use sozu_lib::{
     ListenerError,
@@ -2809,8 +2808,8 @@ fn unix_now() -> i64 {
         })
 }
 
-/// The inverse of a mutating request, used by the fan-out rollback safety-net
-/// (sozu#1301/sozu#1314, defense-in-depth on top of `validate_listener_request`).
+/// The shared inverse from [`rollback_request`], used by the main-process
+/// fan-out rollback safety-net (sozu#1301/sozu#1314).
 ///
 /// When the main process commits a request to its `ConfigState` and fans it
 /// out, but **no** worker acknowledges it, [`WorkerTask::on_finish`] applies
@@ -2822,8 +2821,8 @@ fn unix_now() -> i64 {
 ///
 /// Only requests whose inverse is unambiguous WITHOUT capturing the prior value
 /// are covered: the non-upsert `Add` verbs — every listener type (inverse
-/// `RemoveListener`) and HTTP/HTTPS frontends (inverse is the same payload under
-/// the `Remove` variant). Upsert verbs (`AddCluster`, `AddBackend`, which
+/// `RemoveListener`) and HTTP/HTTPS/TCP/UDP frontends (inverse is the same
+/// payload under the `Remove` variant). Upsert verbs (`AddCluster`, `AddBackend`, which
 /// replace a prior value in place) and certificates would need the prior value
 /// captured to revert correctly, so they are deliberately NOT covered and keep
 /// today's best-effort behavior; every other request returns `None`.
@@ -2866,56 +2865,7 @@ fn unix_now() -> i64 {
 /// `ReplaceCertificate` still carries, same as `AddCertificate`/
 /// `RemoveCertificate` above.
 fn compute_rollback(request: &RequestType) -> Option<Request> {
-    let inverse = match request {
-        RequestType::AddHttpListener(config) => RequestType::RemoveListener(RemoveListener {
-            interface: config.interface.clone(),
-            address: config.address,
-            proxy: ListenerType::Http.into(),
-        }),
-        RequestType::AddHttpsListener(config)
-        | RequestType::AddHttpsListenerWithClientAuth(config) => {
-            RequestType::RemoveListener(RemoveListener {
-                interface: config.interface.clone(),
-                address: config.address,
-                proxy: ListenerType::Https.into(),
-            })
-        }
-        RequestType::AddTcpListener(config) => RequestType::RemoveListener(RemoveListener {
-            interface: config.interface.clone(),
-            address: config.address,
-            proxy: ListenerType::Tcp.into(),
-        }),
-        RequestType::AddUdpListener(config) => RequestType::RemoveListener(RemoveListener {
-            interface: config.interface.clone(),
-            address: config.address,
-            proxy: ListenerType::Udp.into(),
-        }),
-        RequestType::AddHttpFrontend(front) => RequestType::RemoveHttpFrontend(front.clone()),
-        RequestType::AddHttpsFrontend(front) => RequestType::RemoveHttpsFrontend(front.clone()),
-        // `remove_tcp_frontend` matches on the very (address, sni, alpn) key
-        // `add_tcp_frontend` admitted — its own `INV:` comment and its
-        // "drops exactly one entry" assertion pin that mirror — so this inverse
-        // evicts exactly the frontend the add inserted. Leaving it out kept
-        // sozu#1313's poisoned-state loop open for every TCP frontend.
-        //
-        // `AddUdpFrontend` inverts the same way now that `remove_udp_frontend`
-        // keys on the (cluster_id, address, tags) identity `add_udp_frontend`
-        // admits -- same `INV:` comment and same "drops exactly one entry"
-        // assertion -- so the inverse evicts exactly the unacknowledged entry
-        // and leaves every other acknowledged frontend in place. While the
-        // removal key was the address alone it was coarser than its add and
-        // stayed out for that reason. Since `add_udp_frontend` admits one
-        // frontend per address across every cluster, the entry this inverse
-        // removes is the only one on its address, which is what makes the
-        // eviction unambiguous. Pinned by
-        // `a_udp_frontend_add_inverts_to_its_exact_removal` below and by
-        // `remove_udp_frontend_drops_exactly_the_frontend_its_tags_name` in
-        // `command/src/state.rs`.
-        RequestType::AddTcpFrontend(front) => RequestType::RemoveTcpFrontend(front.clone()),
-        RequestType::AddUdpFrontend(front) => RequestType::RemoveUdpFrontend(front.clone()),
-        _ => return None,
-    };
-    Some(inverse.into())
+    rollback_request(request)
 }
 
 /// sozu#1301 / sozu#1314: does the fan-out outcome justify reverting the
@@ -3267,6 +3217,13 @@ pub fn worker_request(
 
     let request: sozu_command_lib::proto::command::Request = request_content.into();
     let request_sha256 = compute_request_sha256(&request);
+    // Snapshot before dispatch: frontend removal requests are selectors and
+    // do not carry all fields needed to restore the stored frontend if every
+    // worker refuses the runtime mutation.
+    let rollback = request
+        .request_type
+        .as_ref()
+        .and_then(|request_type| server.state.rollback_for(request_type));
 
     // Snapshot the state hash so the error path can assert the rejected
     // dispatch was a true no-op on `ConfigState` — a partially-applied
@@ -3497,12 +3454,6 @@ pub fn worker_request(
     let clear_master_metrics_on_finish = metrics_configuration == Some(MetricsConfiguration::Clear);
 
     client.return_processing("Processing worker request...");
-
-    // sozu#1301/sozu#1314 rollback safety-net: compute the inverse of this
-    // request now, while we still hold it, so `on_finish` can revert the
-    // main-process state if no worker acknowledges the change. `None` for verbs
-    // without a defined inverse (they keep today's best-effort behavior).
-    let rollback = request.request_type.as_ref().and_then(compute_rollback);
 
     server.scatter(
         request,
