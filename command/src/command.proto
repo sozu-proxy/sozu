@@ -202,7 +202,23 @@ message Request {
     // `RequestType::into_canonical` picks the verb, and the main process
     // applies it to every request it fans out to workers.
     UpdateHttpsListenerConfig update_https_listener_with_client_auth = 64;
+    // close the HTTP, HTTPS, TCP and WebSocket sessions of a cluster, or of
+    // one backend of a cluster, on every worker. An action, never saved in
+    // the state nor replayed by `load_state` or an upgrade. Workers reply
+    // with `ClosedSessions`, which the main process gathers per worker in
+    // `WorkerResponses`. See `doc/configure_cli.md` for the close semantics.
+    CloseSessions close_sessions = 65;
   }
+}
+
+// Selects the sessions `Request.close_sessions` closes: those with a backend
+// connection to `cluster_id`, narrowed to one backend when `backend_id`, or
+// `address`, or both are set (a backend matches only if every set field
+// matches).
+message CloseSessions {
+    required string cluster_id = 1;
+    optional string backend_id = 2;
+    optional SocketAddress address = 3;
 }
 
 message QueryHealthChecks {
@@ -1660,7 +1676,21 @@ message ResponseContent {
         // only: without them in the reply an operator could read the
         // live cap but had no way to learn what it is a cap ON.
         MaxConnectionsPerSubnetLimit max_connections_per_subnet_limit = 18;
+        // one worker's outcome of `Request.close_sessions`
+        ClosedSessions closed_sessions = 19;
     }
+}
+
+// The sessions one worker matched for `Request.close_sessions`, counted at
+// the moment it answered.
+message ClosedSessions {
+    // sessions closed right away: idle ones, TCP and WebSocket ones
+    required uint64 closed = 1;
+    // sessions finishing their in-flight HTTP work before they close: an
+    // HTTP/1.1 response is sent with `Connection: close`, an HTTP/2 session
+    // receives a GOAWAY and is closed by its graceful-shutdown deadline at
+    // the latest
+    required uint64 draining = 2;
 }
 
 message HealthChecksList {

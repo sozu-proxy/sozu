@@ -443,6 +443,53 @@ pub trait ProxySession {
     fn needs_ready_pass(&self) -> bool {
         false
     }
+    /// Whether this session holds a backend connection `target` names, which
+    /// makes it one of the sessions a `CloseSessions` request closes.
+    ///
+    /// `false` for listeners, channels and every session that has no backend
+    /// connection yet, such as one still in its TLS handshake.
+    fn targets(&self, _target: &SessionTarget) -> bool {
+        false
+    }
+}
+
+/// The backend connections a `CloseSessions` request selects: those to
+/// `cluster_id`, narrowed by `backend_id` and `address` when they are set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionTarget {
+    pub cluster_id: String,
+    pub backend_id: Option<String>,
+    pub address: Option<SocketAddr>,
+}
+
+impl SessionTarget {
+    /// Whether a backend connection to `backend_id` at `address` in
+    /// `cluster_id` is one this target selects. Every field the target sets
+    /// must match; a connection that does not know a field the target sets
+    /// does not match.
+    pub fn matches(
+        &self,
+        cluster_id: &str,
+        backend_id: Option<&str>,
+        address: Option<SocketAddr>,
+    ) -> bool {
+        self.cluster_id == cluster_id
+            && self
+                .backend_id
+                .as_deref()
+                .is_none_or(|wanted| backend_id == Some(wanted))
+            && self.address.is_none_or(|wanted| address == Some(wanted))
+    }
+}
+
+impl From<&sozu_command::proto::command::CloseSessions> for SessionTarget {
+    fn from(request: &sozu_command::proto::command::CloseSessions) -> Self {
+        SessionTarget {
+            cluster_id: request.cluster_id.to_owned(),
+            backend_id: request.backend_id.to_owned(),
+            address: request.address.map(SocketAddr::from),
+        }
+    }
 }
 
 #[macro_export]
@@ -547,6 +594,7 @@ macro_rules! StateMachineBuilder {
                     _fn_impl!{print_state(&, self, context: &str) | marker => error!("{} Session(FailedUpgrade({:?}))", context, marker)}
                     _fn_impl!{close(&mut, self, proxy: Rc<RefCell<dyn L7Proxy>>, metrics: &mut SessionMetrics) | _ => {}}
                     _fn_impl!{shutting_down(&mut, self) -> SessionIsToBeClosed | _ => true}
+                    _fn_impl!{targets(&, self, target: &$crate::SessionTarget) -> bool | _ => false}
                 }
             } else {}
         }
@@ -1322,6 +1370,57 @@ impl Readiness {
         );
         #[cfg(debug_assertions)]
         self.check_invariants();
+    }
+}
+
+#[cfg(test)]
+mod session_target_tests {
+    use std::net::SocketAddr;
+
+    use sozu_command::proto::command::CloseSessions;
+
+    use super::SessionTarget;
+
+    const ADDRESS: &str = "10.0.0.1:8080";
+
+    fn target(backend_id: Option<&str>, address: Option<&str>) -> SessionTarget {
+        SessionTarget::from(&CloseSessions {
+            cluster_id: "cluster".to_owned(),
+            backend_id: backend_id.map(ToOwned::to_owned),
+            address: address.map(|a| a.parse::<SocketAddr>().unwrap().into()),
+        })
+    }
+
+    #[test]
+    fn a_cluster_target_selects_every_backend_of_the_cluster_only() {
+        let address = ADDRESS.parse().ok();
+        let cluster = target(None, None);
+        assert!(cluster.matches("cluster", Some("a"), address));
+        assert!(cluster.matches("cluster", None, None));
+        assert!(!cluster.matches("other", Some("a"), address));
+        assert!(!cluster.matches("cluster-2", Some("a"), address));
+    }
+
+    #[test]
+    fn a_backend_target_selects_only_what_matches_every_field_it_sets() {
+        let address = ADDRESS.parse().ok();
+        let elsewhere = "10.0.0.2:8080".parse().ok();
+
+        let by_id = target(Some("a"), None);
+        assert!(by_id.matches("cluster", Some("a"), elsewhere));
+        assert!(!by_id.matches("cluster", Some("b"), address));
+        assert!(!by_id.matches("cluster", None, address));
+        assert!(!by_id.matches("other", Some("a"), address));
+
+        let by_address = target(None, Some(ADDRESS));
+        assert!(by_address.matches("cluster", Some("b"), address));
+        assert!(!by_address.matches("cluster", Some("a"), elsewhere));
+        assert!(!by_address.matches("cluster", Some("a"), None));
+
+        let by_both = target(Some("a"), Some(ADDRESS));
+        assert!(by_both.matches("cluster", Some("a"), address));
+        assert!(!by_both.matches("cluster", Some("b"), address));
+        assert!(!by_both.matches("cluster", Some("a"), elsewhere));
     }
 }
 
