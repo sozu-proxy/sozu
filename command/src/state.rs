@@ -121,6 +121,20 @@ pub enum StateError {
         .id.len()
     )]
     Exists { kind: ObjectKind, id: String },
+    /// The object belongs to a cluster the state does not hold, never added
+    /// or already removed. A backend belongs to its cluster
+    /// (`ConfigState::add_backend`), so it is refused rather than stored
+    /// without one. Per `doc/observability.md` a cluster identifier is
+    /// protected material in error text: `Display`/`Debug` render only its
+    /// length, and the raw field stays lossless for callers.
+    #[error(
+        "{kind:?} names a cluster that does not exist (cluster_id_bytes={}); add the cluster first",
+        .cluster_id.len()
+    )]
+    ClusterNotFound {
+        kind: ObjectKind,
+        cluster_id: String,
+    },
     #[error("Wrong field value: {0}")]
     WrongFieldValue(UnknownEnumValue),
     #[error("Could not add certificate: error_kind={}", certificate_error_kind(.0))]
@@ -703,6 +717,8 @@ impl ConfigState {
             | RequestType::SetMaxConnectionsPerSubnet(_)
             | RequestType::QueryMaxConnectionsPerSubnet(_)
             | RequestType::SetMaxConnectionAttempts(_)
+            // an action on live sessions: never saved, never replayed
+            | RequestType::CloseSessions(_)
             | RequestType::HardStop(_) => Ok(()),
 
             _other_request => Err(StateError::UndispatchableRequest),
@@ -771,6 +787,12 @@ impl ConfigState {
         // the per-cluster Vec must stay deduplicated on (backend_id, address) —
         // `add_backend` upserts, so duplicates would mean lost state.
         for (cluster_id, backends) in &self.backends {
+            // A backend belongs to its cluster: `add_backend` refuses one of
+            // an unknown cluster and `remove_cluster` removes the bucket.
+            debug_assert!(
+                backends.is_empty() || self.clusters.contains_key(cluster_id),
+                "a backend bucket must belong to an existing cluster"
+            );
             for backend in backends {
                 debug_assert_eq!(
                     &backend.cluster_id, cluster_id,
@@ -2722,7 +2744,24 @@ impl ConfigState {
         Ok(())
     }
 
+    /// Add or update a backend of an existing cluster. A backend belongs to
+    /// its cluster: one naming a cluster the state does not hold, never added
+    /// or already removed (`Self::remove_cluster` removes its backends), is
+    /// refused with `ClusterNotFound` and the state is left untouched.
+    /// Frontends stay independent of their cluster's presence.
     fn add_backend(&mut self, add_backend: &AddBackend) -> Result<(), StateError> {
+        if !self.clusters.contains_key(add_backend.cluster_id.as_str()) {
+            debug_assert!(
+                self.backends
+                    .get(add_backend.cluster_id.as_str())
+                    .is_none_or(Vec::is_empty),
+                "no backend may outlive its cluster"
+            );
+            return Err(StateError::ClusterNotFound {
+                kind: ObjectKind::Backend,
+                cluster_id: add_backend.cluster_id.to_owned(),
+            });
+        }
         let backend = Backend {
             address: add_backend.address.into(),
             cluster_id: add_backend.cluster_id.as_str().into(),
@@ -4536,9 +4575,10 @@ mod tests {
 
     use super::*;
     use crate::proto::command::{
-        ClientAuthMode, CustomHttpAnswers, Header, HeaderPosition, HstsConfig, LoadBalancingParams,
-        PathRuleKind, RedirectPolicy, RedirectScheme, RequestHttpFrontend, RequestTcpFrontend,
-        RequestUdpFrontend, RulePosition, UdpListenerConfig, UpdateUdpListenerConfig,
+        ClientAuthMode, CloseSessions, CustomHttpAnswers, Header, HeaderPosition, HstsConfig,
+        LoadBalancingParams, PathRuleKind, RedirectPolicy, RedirectScheme, RequestHttpFrontend,
+        RequestTcpFrontend, RequestUdpFrontend, RulePosition, UdpListenerConfig,
+        UpdateUdpListenerConfig,
     };
 
     fn capture_test_logs(run: impl FnOnce() + Send + 'static) -> String {
@@ -5621,6 +5661,10 @@ mod tests {
                 kind: ObjectKind::Cluster,
                 id: long_value(),
             },
+            StateError::ClusterNotFound {
+                kind: ObjectKind::Backend,
+                cluster_id: long_value(),
+            },
             StateError::AddCertificate(CertificateError::ParsePEMCertificate(long_value())),
             StateError::RemoveCertificate(long_value()),
             StateError::ReplaceCertificate(long_value()),
@@ -5857,9 +5901,26 @@ mod tests {
         }
     }
 
+    /// A backend belongs to its cluster (`ConfigState::add_backend`): add
+    /// the clusters a test's backends name before them.
+    fn add_clusters(state: &mut ConfigState, cluster_ids: &[&str]) {
+        for cluster_id in cluster_ids {
+            state
+                .dispatch(
+                    &RequestType::AddCluster(Cluster {
+                        cluster_id: cluster_id.to_string(),
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect("Could not add the test cluster");
+        }
+    }
+
     #[test]
     fn serialize() {
         let mut state: ConfigState = Default::default();
+        add_clusters(&mut state, &["cluster_1", "cluster_2"]);
         state
             .dispatch(
                 &RequestType::AddHttpFrontend(RequestHttpFrontend {
@@ -5955,6 +6016,7 @@ mod tests {
     #[test]
     fn diff() {
         let mut state: ConfigState = Default::default();
+        add_clusters(&mut state, &["cluster_1", "cluster_2"]);
         state
             .dispatch(
                 &RequestType::AddHttpFrontend(RequestHttpFrontend {
@@ -6029,6 +6091,7 @@ mod tests {
             .expect("Could not execute request");
 
         let mut state2: ConfigState = Default::default();
+        add_clusters(&mut state2, &["cluster_1"]);
         state2
             .dispatch(
                 &RequestType::AddHttpFrontend(RequestHttpFrontend {
@@ -6528,6 +6591,122 @@ mod tests {
         assert_same_routing(&replayed, &state, "replaying generate_requests");
     }
 
+    fn add_backend_to(cluster_id: &str, port: u16) -> Request {
+        RequestType::AddBackend(AddBackend {
+            cluster_id: cluster_id.to_owned(),
+            backend_id: format!("{cluster_id}-{port}"),
+            address: SocketAddress::new_v4(127, 0, 0, 1, port),
+            ..Default::default()
+        })
+        .into()
+    }
+
+    /// A backend belongs to its cluster: an `AddBackend` naming a cluster the
+    /// state does not hold, never added or already removed, is refused and
+    /// leaves the state untouched, not even an empty bucket for that cluster.
+    #[test]
+    fn add_backend_for_an_unknown_cluster_is_refused() {
+        let mut state = ConfigState::new();
+
+        let refused = state.dispatch(&add_backend_to("orphan", 1026));
+        assert!(
+            matches!(refused, Err(StateError::ClusterNotFound { .. })),
+            "a backend of a cluster never added must be refused, got {refused:?}"
+        );
+        assert!(
+            state.backends.is_empty(),
+            "a refused AddBackend must not leave a bucket behind: {:?}",
+            state.backends
+        );
+
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("orphan"),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("adding the cluster must succeed");
+        state
+            .dispatch(&add_backend_to("orphan", 1026))
+            .expect("a backend of an existing cluster must be added");
+        assert_eq!(state.count_backends(), 1);
+
+        state
+            .dispatch(&RequestType::RemoveCluster(String::from("orphan")).into())
+            .expect("removing an existing cluster must succeed");
+        assert!(
+            state.backends.is_empty(),
+            "RemoveCluster must remove the cluster's backends"
+        );
+        let refused = state.dispatch(&add_backend_to("orphan", 1027));
+        assert!(
+            matches!(refused, Err(StateError::ClusterNotFound { .. })),
+            "a backend of a removed cluster must be refused, got {refused:?}"
+        );
+        assert!(
+            state.backends.is_empty(),
+            "a backend must never outlive its cluster: {:?}",
+            state.backends
+        );
+    }
+
+    /// The refusal leaves the error text bounded: a cluster id is protected
+    /// material (`doc/observability.md`), so `Display` names only its length.
+    #[test]
+    fn unknown_cluster_error_names_the_object_without_the_cluster_id() {
+        let mut state = ConfigState::new();
+        let error = state
+            .dispatch(&add_backend_to("secret-cluster-id", 1026))
+            .expect_err("a backend of an unknown cluster must be refused");
+        let message = error.to_string();
+        assert!(
+            !message.contains("secret-cluster-id"),
+            "the error must not echo the cluster id: {message}"
+        );
+        assert!(
+            message.contains("Backend") && message.contains("add the cluster first"),
+            "the error must say what to do: {message}"
+        );
+    }
+
+    /// The configuration file emits each cluster's `AddCluster` before its
+    /// backends, so a TOML load still adds every backend.
+    #[test]
+    fn a_configuration_file_adds_each_cluster_before_its_backends() {
+        let config = crate::config::Config::load_from_path("assets/config.toml")
+            .expect("the test configuration must load");
+        let mut state = ConfigState::new();
+        for message in config
+            .generate_config_messages()
+            .expect("the test configuration must generate its orders")
+        {
+            let result = state.dispatch(&message.content);
+            if let Some(RequestType::AddBackend(_) | RequestType::AddCluster(_)) =
+                &message.content.request_type
+            {
+                result.unwrap_or_else(|e| panic!("could not apply {message:?}: {e}"));
+            }
+        }
+        assert_eq!(state.clusters.len(), 3);
+        assert_eq!(state.count_backends(), 5);
+    }
+
+    /// `diff` towards a state with a new cluster emits its `AddCluster`
+    /// before its `AddBackend`s, so the orders replay onto `self`.
+    #[test]
+    fn diff_adds_a_cluster_before_its_backends() {
+        let target = state_with_clusters_owning_every_object_kind(&["cascade_a", "cascade_b"]);
+        let mut state = ConfigState::new();
+        for request in state.diff(&target) {
+            state
+                .dispatch(&request)
+                .unwrap_or_else(|e| panic!("could not replay {request:?}: {e}"));
+        }
+        assert_same_routing(&state, &target, "replaying diff(empty, target)");
+    }
+
     #[test]
     fn cluster_ids_by_domain() {
         let mut config = ConfigState::new();
@@ -6607,6 +6786,7 @@ mod tests {
     #[test]
     fn duplicate_backends() {
         let mut state: ConfigState = Default::default();
+        add_clusters(&mut state, &["cluster_1"]);
         state
             .dispatch(
                 &RequestType::AddBackend(AddBackend {
@@ -7000,6 +7180,7 @@ mod tests {
     #[test]
     fn count_backends_across_clusters() {
         let mut state: ConfigState = Default::default();
+        add_clusters(&mut state, &["cluster_1", "cluster_2"]);
 
         assert_eq!(state.count_backends(), 0);
 
@@ -10593,5 +10774,56 @@ mod tests {
             vec![Some("stable")],
             "removing the canary must leave its base"
         );
+    }
+
+    /// `CloseSessions` acts on live sessions only: the state accepts it,
+    /// stores nothing, and neither `generate_requests` (what `save_state`
+    /// writes and `load_state` / an upgrade replay) nor the cluster hashes
+    /// change.
+    #[test]
+    fn close_sessions_is_never_saved_nor_replayed() {
+        let mut state: ConfigState = Default::default();
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("cluster_1"),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        state
+            .dispatch(
+                &RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-0"),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        let requests_before = state.generate_requests();
+        let hashes_before = state.hash_state();
+
+        state
+            .dispatch(
+                &RequestType::CloseSessions(CloseSessions {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: Some(String::from("cluster_1-0")),
+                    address: Some(SocketAddress::new_v4(127, 0, 0, 1, 1026)),
+                })
+                .into(),
+            )
+            .expect("CloseSessions must be accepted by the state");
+
+        let requests_after = state.generate_requests();
+        assert_eq!(requests_after, requests_before);
+        assert!(
+            !requests_after
+                .iter()
+                .any(|request| matches!(request.request_type, Some(RequestType::CloseSessions(_))))
+        );
+        assert_eq!(state.hash_state(), hashes_before);
     }
 }

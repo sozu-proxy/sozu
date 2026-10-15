@@ -75,7 +75,8 @@ message Request {
     RequestTcpFrontend add_tcp_frontend = 22;
     // remove a TCP frontend
     RequestTcpFrontend remove_tcp_frontend = 23;
-    // add a backend
+    // add a backend to an existing cluster: a backend naming a cluster that
+    // was never added, or was removed, is refused
     AddBackend add_backend = 24;
     // remove a backend
     RemoveBackend remove_backend = 25;
@@ -202,6 +203,12 @@ message Request {
     // `RequestType::into_canonical` picks the verb, and the main process
     // applies it to every request it fans out to workers.
     UpdateHttpsListenerConfig update_https_listener_with_client_auth = 64;
+    // close the HTTP, HTTPS, TCP and WebSocket sessions of a cluster, or of
+    // one backend of a cluster, on every worker. An action, never saved in
+    // the state nor replayed by `load_state` or an upgrade. Workers reply
+    // with `ClosedSessions`, which the main process gathers per worker in
+    // `WorkerResponses`. See `doc/configure_cli.md` for the close semantics.
+    CloseSessions close_sessions = 65;
     // add, or remove, an HTTP or HTTPS frontend that carries header
     // predicates (`RequestHttpFrontend.header_predicates` non-empty).
     //
@@ -217,8 +224,9 @@ message Request {
     // `RequestType::into_canonical`. A frontend without predicates keeps the
     // historical verbs, which every worker version understands.
     //
-    // Tags 65 (`close_sessions`), 70-71 (silent-close add HTTP/HTTPS) and 72
-    // (UDS add backend) are allocated to other changes; do not reuse them.
+    // Tags 65 (`close_sessions`) and 70-71 (silent-close add HTTP/HTTPS) are
+    // allocated to other verbs, and tag 72 is reserved for a UDS AddBackend:
+    // do not reuse them.
     RequestHttpFrontend add_http_frontend_with_header_predicates = 66;
     RequestHttpFrontend remove_http_frontend_with_header_predicates = 67;
     RequestHttpFrontend add_https_frontend_with_header_predicates = 68;
@@ -237,6 +245,16 @@ message Request {
     // `add_http_frontend_with_silent_close`.
     RequestHttpFrontend add_https_frontend_with_silent_close = 71;
   }
+}
+
+// Selects the sessions `Request.close_sessions` closes: those with a backend
+// connection to `cluster_id`, narrowed to one backend when `backend_id`, or
+// `address`, or both are set (a backend matches only if every set field
+// matches).
+message CloseSessions {
+    required string cluster_id = 1;
+    optional string backend_id = 2;
+    optional SocketAddress address = 3;
 }
 
 message QueryHealthChecks {
@@ -1614,7 +1632,8 @@ enum LoadMetric {
     CONNECTION_TIME = 2;
 }
 
-// add a backend
+// add a backend to the cluster `cluster_id` names, which must exist: the
+// backend belongs to it and is removed with it
 message AddBackend {
     required string cluster_id = 1;
     required string backend_id = 2;
@@ -1733,7 +1752,22 @@ message ResponseContent {
         // only: without them in the reply an operator could read the
         // live cap but had no way to learn what it is a cap ON.
         MaxConnectionsPerSubnetLimit max_connections_per_subnet_limit = 18;
+        // one worker's outcome of `Request.close_sessions`
+        ClosedSessions closed_sessions = 19;
     }
+}
+
+// The sessions one worker matched for `Request.close_sessions`, counted at
+// the moment it answered.
+message ClosedSessions {
+    // sessions closed right away: idle ones, TCP and WebSocket ones
+    required uint64 closed = 1;
+    // sessions finishing their in-flight HTTP work before they close: an
+    // HTTP/1.1 response gets `Connection: close` while its backend headers
+    // are not parsed yet, an HTTP/2 session receives a GOAWAY and is closed
+    // by its graceful-shutdown deadline when that is nonzero (`0` drains
+    // without bound)
+    required uint64 draining = 2;
 }
 
 message HealthChecksList {

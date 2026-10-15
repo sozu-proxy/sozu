@@ -1830,6 +1830,13 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
             self.backend_readiness
         );
     }
+
+    /// A WebSocket pipe is targeted by the backend it was upgraded on.
+    fn targets(&self, target: &crate::SessionTarget) -> bool {
+        self.cluster_id.as_deref().is_some_and(|cluster_id| {
+            target.matches(cluster_id, self.backend_id.as_deref(), self.backend_address)
+        })
+    }
 }
 
 #[cfg(test)]

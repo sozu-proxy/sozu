@@ -12,7 +12,7 @@ use sozu_command_lib::{
     config::ListenerBuilder,
     logging::setup_default_logging,
     proto::command::{
-        AddBackend, AddCertificate, CertificateAndKey, LoadBalancingParams, PathRule,
+        AddBackend, AddCertificate, CertificateAndKey, Cluster, LoadBalancingParams, PathRule,
         RequestHttpFrontend, SocketAddress, WorkerRequest, request::RequestType,
     },
 };
@@ -64,6 +64,16 @@ fn main() -> anyhow::Result<()> {
         backup: None,
     };
 
+    // a backend belongs to its cluster: the worker refuses one of an unknown cluster
+    command.write_message(&WorkerRequest {
+        id: String::from("ID_CLUSTER1"),
+        content: RequestType::AddCluster(Cluster {
+            cluster_id: String::from("cluster_1"),
+            ..Default::default()
+        })
+        .into(),
+    });
+
     command.write_message(&WorkerRequest {
         id: String::from("ID_ABCD"),
         content: RequestType::AddHttpFrontend(http_front).into(),
@@ -74,8 +84,9 @@ fn main() -> anyhow::Result<()> {
         content: RequestType::AddBackend(http_backend).into(),
     });
 
-    info!("MAIN\tHTTP -> {:?}", command.read_message());
-    info!("MAIN\tHTTP -> {:?}", command.read_message());
+    for _ in 0..3 {
+        println!("MAIN\tHTTP -> {:?}", command.read_message());
+    }
 
     let https_listener =
         ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 8443)).to_tls(None)?;
@@ -109,6 +120,15 @@ fn main() -> anyhow::Result<()> {
             address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
             certificate: certificate_and_key,
             expired_at: None,
+        })
+        .into(),
+    });
+
+    command2.write_message(&WorkerRequest {
+        id: String::from("ID_CLUSTER1"),
+        content: RequestType::AddCluster(Cluster {
+            cluster_id: String::from("cluster_1"),
+            ..Default::default()
         })
         .into(),
     });
@@ -160,6 +180,15 @@ fn main() -> anyhow::Result<()> {
         .into(),
     });
 
+    command2.write_message(&WorkerRequest {
+        id: String::from("ID_CLUSTER2"),
+        content: RequestType::AddCluster(Cluster {
+            cluster_id: String::from("cluster_2"),
+            ..Default::default()
+        })
+        .into(),
+    });
+
     let tls_front2 = RequestHttpFrontend {
         cluster_id: Some(String::from("cluster_2")),
         address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
@@ -187,10 +216,9 @@ fn main() -> anyhow::Result<()> {
         content: RequestType::AddBackend(tls_backend2).into(),
     });
 
-    info!("MAIN\tTLS -> {:?}", command2.read_message());
-    info!("MAIN\tTLS -> {:?}", command2.read_message());
-    info!("MAIN\tTLS -> {:?}", command2.read_message());
-    info!("MAIN\tTLS -> {:?}", command2.read_message());
+    for _ in 0..8 {
+        println!("MAIN\tTLS -> {:?}", command2.read_message());
+    }
 
     let _ = jg.join();
     let _ = jg2.join();

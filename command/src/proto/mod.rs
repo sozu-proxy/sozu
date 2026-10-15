@@ -744,6 +744,7 @@ fn response_content_kind(content: Option<&command::ResponseContent>) -> Option<&
             ContentType::HealthChecksList(_) => "health_checks_list",
             ContentType::MetricDetailStatus(_) => "metric_detail_status",
             ContentType::WorkerMetricDetailStatus(_) => "worker_metric_detail_status",
+            ContentType::ClosedSessions(_) => "closed_sessions",
         })
 }
 

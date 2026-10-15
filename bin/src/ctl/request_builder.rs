@@ -14,9 +14,9 @@ use sozu_command_lib::{
         validate_health_check_config,
     },
     proto::command::{
-        ActivateListener, AddBackend, AddCertificate, AlpnProtocols, Cluster, CountRequests,
-        CustomHttpAnswers, DeactivateListener, ForwardedHeaders, FrontendFilters, HardStop,
-        HealthCheckConfig, HealthCheckMode, ListListeners, ListedFrontends, ListenerType,
+        ActivateListener, AddBackend, AddCertificate, AlpnProtocols, CloseSessions, Cluster,
+        CountRequests, CustomHttpAnswers, DeactivateListener, ForwardedHeaders, FrontendFilters,
+        HardStop, HealthCheckConfig, HealthCheckMode, ListListeners, ListedFrontends, ListenerType,
         LoadBalancingParams, MetricsConfiguration, PathRule, ProxyProtocolConfig,
         QueryCertificatesFilters, QueryClusterByDomain, QueryClustersHashes, QueryHealthChecks,
         QueryMaxConnectionsPerIp, QueryMaxConnectionsPerSubnet, RemoveBackend, RemoveCertificate,
@@ -317,6 +317,18 @@ impl CommandManager {
                 )
             }
             ClusterCmd::Remove { id } => self.send_request(RequestType::RemoveCluster(id).into()),
+            ClusterCmd::CloseSessions {
+                id,
+                backend_id,
+                address,
+            } => self.send_request(
+                RequestType::CloseSessions(CloseSessions {
+                    cluster_id: id,
+                    backend_id,
+                    address: address.map(SocketAddress::from),
+                })
+                .into(),
+            ),
             ClusterCmd::ConnectionAttempts { cmd } => self.cluster_connection_attempts_command(cmd),
             ClusterCmd::Tags { id } => self.cluster_tags(id),
             ClusterCmd::H2 { cmd } => self.cluster_h2_command(cmd),
