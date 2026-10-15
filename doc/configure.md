@@ -1228,7 +1228,11 @@ while running, and a plain `sozu reload` replays the configuration loaded at
 startup without reading the file again, so it does not re-resolve either: a
 DNS change reaches the proxy only through `sozu reload --file <path>` or a
 restart. Workers and the command channel only ever see socket addresses;
-`sozu backend add` still takes one.
+`sozu backend add` still takes one. The other `sozu` control commands (status,
+shutdown, `backend remove`, …) read the file for their own settings only and
+never resolve its backend names; `sozu config check` does. A host made only of
+digits and dots must be a valid IP literal: `010.0.0.1:80` and `1.2.3:80` are
+refused rather than read as `8.0.0.1` and `1.2.0.3`.
 
 Each distinct address the name resolves to becomes its own backend, in sorted
 address order, carrying the entry's `weight` and `backup`. Its id is derived

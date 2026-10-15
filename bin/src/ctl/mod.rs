@@ -83,7 +83,15 @@ pub struct CommandManager {
 pub fn ctl(args: cli::Args) -> Result<(), CtlError> {
     let config_path = get_config_file_path(&args).map_err(CtlError::GetConfig)?;
 
-    let config = Config::load_from_path(config_path).map_err(CtlError::LoadConfig)?;
+    // `config check` validates the whole file, backend names included; any
+    // other command only needs the settings, and must not depend on DNS.
+    let config = match args.cmd {
+        SubCmd::Config {
+            cmd: ConfigCmd::Check,
+        } => Config::load_from_path(config_path),
+        _ => Config::load_from_path_for_control(config_path),
+    }
+    .map_err(CtlError::LoadConfig)?;
 
     // prevent logging for json responses for a clean output
     if !args.json {
