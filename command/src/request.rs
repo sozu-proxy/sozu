@@ -14,9 +14,9 @@ use crate::{
     proto::{
         command::{
             ClientAuthMode, ClientAuthPolicy, HttpsListenerConfig, InitialState, IpAddress,
-            LoadBalancingAlgorithms, PathRuleKind, Request, RequestHttpFrontend, RulePosition,
-            SocketAddress, Uint128, UpdateHttpsListenerConfig, WorkerRequest, ip_address,
-            request::RequestType,
+            LoadBalancingAlgorithms, PathRuleKind, RedirectPolicy, Request, RequestHttpFrontend,
+            RulePosition, SocketAddress, Uint128, UpdateHttpsListenerConfig, WorkerRequest,
+            ip_address, request::RequestType,
         },
         display::format_request_type,
     },
@@ -50,6 +50,7 @@ impl Request {
 
         match request_type {
             RequestType::AddHttpFrontend(_)
+            | RequestType::AddHttpFrontendWithSilentClose(_)
             | RequestType::RemoveHttpFrontend(_)
             | RequestType::AddHttpFrontendWithHeaderPredicates(_)
             | RequestType::RemoveHttpFrontendWithHeaderPredicates(_) => {
@@ -57,6 +58,7 @@ impl Request {
             }
 
             RequestType::AddHttpsFrontend(_)
+            | RequestType::AddHttpsFrontendWithSilentClose(_)
             | RequestType::RemoveHttpsFrontend(_)
             | RequestType::AddHttpsFrontendWithHeaderPredicates(_)
             | RequestType::RemoveHttpsFrontendWithHeaderPredicates(_)
@@ -259,7 +261,9 @@ impl RequestType {
 
     /// The same request, with an HTTPS listener addition or patch moved to
     /// the verb [`RequestType::add_https_listener`] or
-    /// [`RequestType::update_https_listener`] picks for it. Every other
+    /// [`RequestType::update_https_listener`] picks for it, and an HTTP(S)
+    /// frontend addition moved to the verb [`RequestType::add_http_frontend`]
+    /// or [`RequestType::add_https_frontend`] picks for it. Every other
     /// request is returned unchanged.
     ///
     /// The main process applies this to every request it fans out to the
@@ -276,6 +280,7 @@ impl RequestType {
                 RequestType::update_https_listener(patch)
             }
             RequestType::AddHttpFrontend(front)
+            | RequestType::AddHttpFrontendWithSilentClose(front)
             | RequestType::AddHttpFrontendWithHeaderPredicates(front) => {
                 RequestType::add_http_frontend(front)
             }
@@ -284,6 +289,7 @@ impl RequestType {
                 RequestType::remove_http_frontend(front)
             }
             RequestType::AddHttpsFrontend(front)
+            | RequestType::AddHttpsFrontendWithSilentClose(front)
             | RequestType::AddHttpsFrontendWithHeaderPredicates(front) => {
                 RequestType::add_https_frontend(front)
             }
@@ -295,17 +301,24 @@ impl RequestType {
         }
     }
 
-    /// The request that adds this HTTP frontend, on the verb its header
-    /// predicates call for: a frontend with predicates goes out as
+    /// The request that adds this HTTP frontend, on the verb it calls for.
+    ///
+    /// A frontend with header predicates goes out as
     /// `AddHttpFrontendWithHeaderPredicates`, which a worker that predates
     /// header routing cannot decode, so it fails the request instead of
-    /// installing the frontend without its guard. Any other frontend keeps
-    /// `AddHttpFrontend`, which every version understands.
+    /// installing the frontend without its guard. Otherwise a frontend whose
+    /// redirect policy is `SILENT_CLOSE` goes out as
+    /// `AddHttpFrontendWithSilentClose`, which a worker that predates the
+    /// policy cannot decode, so it fails the request instead of resolving the
+    /// unknown policy to `FORWARD` and forwarding the traffic. Any other
+    /// frontend keeps `AddHttpFrontend`, which every version understands.
     pub fn add_http_frontend(front: RequestHttpFrontend) -> Self {
-        if front.header_predicates.is_empty() {
-            RequestType::AddHttpFrontend(front)
-        } else {
+        if !front.header_predicates.is_empty() {
             RequestType::AddHttpFrontendWithHeaderPredicates(front)
+        } else if front.redirect == Some(RedirectPolicy::SilentClose as i32) {
+            RequestType::AddHttpFrontendWithSilentClose(front)
+        } else {
+            RequestType::AddHttpFrontend(front)
         }
     }
 
@@ -321,10 +334,12 @@ impl RequestType {
 
     /// As [`RequestType::add_http_frontend`], for an HTTPS frontend.
     pub fn add_https_frontend(front: RequestHttpFrontend) -> Self {
-        if front.header_predicates.is_empty() {
-            RequestType::AddHttpsFrontend(front)
-        } else {
+        if !front.header_predicates.is_empty() {
             RequestType::AddHttpsFrontendWithHeaderPredicates(front)
+        } else if front.redirect == Some(RedirectPolicy::SilentClose as i32) {
+            RequestType::AddHttpsFrontendWithSilentClose(front)
+        } else {
+            RequestType::AddHttpsFrontend(front)
         }
     }
 
@@ -703,6 +718,105 @@ mod tests {
         }
     }
 
+    /// A worker that predates `RedirectPolicy::SilentClose` resolves the
+    /// unknown enum value to `Forward` and would forward the traffic, so a
+    /// silent-close frontend must leave on a verb such a worker cannot decode.
+    #[test]
+    fn silent_close_frontends_travel_on_their_own_verb() {
+        let front = |redirect: Option<RedirectPolicy>| RequestHttpFrontend {
+            hostname: "example.com".to_owned(),
+            redirect: redirect.map(|policy| policy as i32),
+            ..Default::default()
+        };
+        let silent = front(Some(RedirectPolicy::SilentClose));
+        assert_eq!(
+            RequestType::AddHttpFrontend(silent.clone()).into_canonical(),
+            RequestType::AddHttpFrontendWithSilentClose(silent.clone()),
+            "silent close sent on the historical verb must be moved to its own verb"
+        );
+        assert_eq!(
+            RequestType::AddHttpsFrontend(silent.clone()).into_canonical(),
+            RequestType::AddHttpsFrontendWithSilentClose(silent.clone()),
+        );
+        for policy in [
+            None,
+            Some(RedirectPolicy::Forward),
+            Some(RedirectPolicy::Unauthorized),
+        ] {
+            let plain = front(policy);
+            assert_eq!(
+                RequestType::AddHttpFrontendWithSilentClose(plain.clone()).into_canonical(),
+                RequestType::AddHttpFrontend(plain.clone()),
+                "a frontend that is not silent close keeps the verb every worker decodes"
+            );
+            assert_eq!(
+                RequestType::AddHttpsFrontendWithSilentClose(plain.clone()).into_canonical(),
+                RequestType::AddHttpsFrontend(plain),
+            );
+        }
+    }
+
+    /// The silent-close verbs sit on tags 70 and 71. Tags 66-69 are reserved
+    /// for the header-predicate verbs and 72 for a UDS `AddBackend`, and a
+    /// worker that predates these tags sees an unknown `oneof` member, so the
+    /// request carries no route there instead of a forwarding one.
+    #[test]
+    fn silent_close_verbs_use_their_allocated_wire_tags() {
+        // A 2.3.1 worker drops the silent-close verbs as unknown members and
+        // keeps decoding the historical verbs of a non-silent frontend.
+        let silent = RequestHttpFrontend {
+            hostname: "example.com".to_owned(),
+            redirect: Some(RedirectPolicy::SilentClose as i32),
+            ..Default::default()
+        };
+        assert_eq!(
+            decode_on_a_legacy_worker(RequestType::add_http_frontend(silent.clone())),
+            None
+        );
+        assert_eq!(
+            decode_on_a_legacy_worker(RequestType::add_https_frontend(silent.clone())),
+            None
+        );
+        let plain = RequestHttpFrontend {
+            redirect: Some(RedirectPolicy::Forward as i32),
+            ..silent
+        };
+        assert_eq!(
+            decode_on_a_legacy_worker(RequestType::add_http_frontend(plain.clone())),
+            Some(LegacyRequestType::AddHttpFrontend(plain.clone()))
+        );
+        assert_eq!(
+            decode_on_a_legacy_worker(RequestType::add_https_frontend(plain.clone())),
+            Some(LegacyRequestType::AddHttpsFrontend(plain))
+        );
+
+        let front = RequestHttpFrontend {
+            hostname: "example.com".to_owned(),
+            redirect: Some(RedirectPolicy::SilentClose as i32),
+            ..Default::default()
+        };
+        let encode = |request_type| {
+            Request {
+                request_type: Some(request_type),
+            }
+            .encode_to_vec()
+        };
+        // key = (tag << 3) | length-delimited(2), as a varint
+        assert_eq!(
+            &encode(RequestType::AddHttpFrontendWithSilentClose(front.clone()))[..2],
+            &[0xB2, 0x04],
+            "tag 70"
+        );
+        assert_eq!(
+            &encode(RequestType::AddHttpsFrontendWithSilentClose(front.clone()))[..2],
+            &[0xBA, 0x04],
+            "tag 71"
+        );
+        // the legacy verbs keep their historical tags
+        let legacy = encode(RequestType::AddHttpFrontend(front));
+        assert_ne!(&legacy[..2], &[0xB2, 0x04]);
+    }
+
     #[test]
     fn into_canonical_moves_https_listeners_to_their_verb_both_ways() {
         let required = https_listener(Some(REQUIRED));
@@ -749,12 +863,18 @@ mod tests {
 
     #[derive(Clone, PartialEq, Message)]
     struct LegacyRequest {
-        #[prost(oneof = "LegacyRequestType", tags = "27, 48")]
+        #[prost(oneof = "LegacyRequestType", tags = "15, 17, 27, 48")]
         request_type: Option<LegacyRequestType>,
     }
 
     #[derive(Clone, PartialEq, prost::Oneof)]
     enum LegacyRequestType {
+        /// `add_http_frontend`, understood by every worker.
+        #[prost(message, tag = "15")]
+        AddHttpFrontend(RequestHttpFrontend),
+        /// `add_https_frontend`, understood by every worker.
+        #[prost(message, tag = "17")]
+        AddHttpsFrontend(RequestHttpFrontend),
         /// `add_https_listener`, holding an `HttpsListenerConfig` that has no
         /// client authentication field.
         #[prost(message, tag = "27")]

@@ -23,6 +23,50 @@
   verbs. Repeated identical predicates canonicalize to one identity, a TCP
   frontend rejects `header_predicates` instead of ignoring them, and frontend
   listings show a redacted predicate count rather than names or values.
+- **`feat(mux)`: `redirect = "silent_close"` refuses a request without any
+  response** ([#767](https://github.com/sozu-proxy/sozu/issues/767)), the
+  equivalent of nginx's `return 444`. A new `RedirectPolicy::SILENT_CLOSE = 5`
+  (appended to the protobuf enum; TOML `redirect = "silent_close"`, CLI
+  `--redirect silent_close`) makes an HTTP/1.x frontend close the connection
+  without writing a byte and an HTTP/2 frontend reset only the refused stream
+  with `RST_STREAM(CANCEL)`, leaving the connection's other streams running. The
+  backend is never contacted, whether or not the frontend names a cluster, and
+  the policy wins over the frontend's other redirect, rewrite and authentication
+  settings. The access log records status `444` with message `silent_close`; the
+  line is not an error (`http.errors` is not incremented) and counts in
+  `http.status.4xx`. The main sends a `silent_close` add as
+  `AddHttpFrontendWithSilentClose` (field 70) or
+  `AddHttpsFrontendWithSilentClose` (field 71); other frontends keep the legacy
+  verbs. A worker older than 2.3.2 cannot decode these requests and fails them,
+  so it never installs an unguarded forwarding route.
+
+<!-- changelog-slot:header-routing -->
+
+<!-- changelog-slot:unix-backends -->
+
+<!-- changelog-slot:backend-dns -->
+
+<!-- changelog-slot:close-sessions -->
+
+### 🔄 Changed
+
+- **`feat(load-balancing)`: every policy honours `weight`
+  ([#676](https://github.com/sozu-proxy/sozu/issues/676)).** `ROUND_ROBIN`,
+  `LEAST_LOADED` and `POWER_OF_TWO` ignored a backend's `weight`; only
+  `RANDOM`, `HRW` and `MAGLEV` read it. `ROUND_ROBIN` now runs smooth weighted
+  round robin (nginx's scheme): over every `Σw` selections a backend of weight
+  `w` is picked exactly `w` times, interleaved (`5, 1, 1` selects
+  `a a b a c a a`). `LEAST_LOADED` and `POWER_OF_TWO` compare each candidate's
+  load divided by its weight, exactly (cross-multiplied in integers for the
+  connection and request counts). With no client key, `HRW` and `MAGLEV` fall
+  back to the weighted round robin. A `0` or negative weight counts as `1`, as
+  under `HRW` and `MAGLEV`; `RANDOM` keeps reading the raw value. **Behaviour
+  change:** a cluster that sets unequal weights under one of these three
+  policies now spreads its traffic by them. A cluster whose backends all
+  carry the same weight (the default, 100, when unset) selects exactly the
+  same sequence as before. No command, configuration or state format changes.
+
+<!-- changelog-slot:backend-ownership -->
 
 ### Fixed
 

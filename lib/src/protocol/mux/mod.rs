@@ -179,6 +179,7 @@ use crate::{
     timer::TimeoutContainer,
 };
 
+use crate::protocol::mux::answers::silent_close_answer;
 pub(crate) use crate::protocol::mux::answers::{
     forcefully_terminate_answer, set_default_answer, set_default_answer_with_retry_after,
 };
@@ -3810,6 +3811,27 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             BE::RetrieveClusterError(RetrieveClusterError::UnauthorizedRoute) => {
                                 set_default_answer(stream, front_readiness, 401, &answers);
                             }
+                            BE::RetrieveClusterError(RetrieveClusterError::SilentClose) => {
+                                // No response byte (sozu-proxy/sozu#767): an
+                                // H2 frontend resets this stream with
+                                // RST_STREAM(CANCEL) while the connection's
+                                // other streams continue; an H1 frontend
+                                // closes the connection without writing.
+                                // The RTT is sampled for this refusal only,
+                                // as the access-log sites do (#1590).
+                                let client_rtt = self.frontend.rtt();
+                                for event in silent_close_answer(
+                                    stream,
+                                    self.frontend.readiness_mut(),
+                                    context.listener.clone(),
+                                    client_rtt,
+                                )
+                                .into_iter()
+                                .flatten()
+                                {
+                                    crate::protocol::mux::h2::record_metric(event);
+                                }
+                            }
                             BE::RetrieveClusterError(
                                 RetrieveClusterError::SniAuthorityMismatch { .. },
                             ) => {
@@ -3912,9 +3934,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         context.debug.push(DebugEvent::CCF(stream_id, error));
                     }
                 }
-                // Every routing error arm sets a default answer, moving the
-                // stream out of Link state, except a failed `connect(2)`,
-                // which re-queues it above for another backend.
+                // Every routing error arm sets a default answer, or for a
+                // silent close an errored empty one, moving the stream out of
+                // Link state, except a failed `connect(2)`, which re-queues it
+                // above for another backend.
             }
             if !dirty || budget_extra_pass {
                 break;

@@ -15,12 +15,20 @@
 //!
 //! ## Test list
 //! 1. [`test_header_predicate_canary_routes_h1_and_h2`]
+//! 2. [`test_header_predicate_silent_close_h1_and_h2`]
+
+use std::{
+    io::{ErrorKind, Read, Write},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use sozu_command_lib::{
     config::ListenerBuilder,
     proto::command::{
         ActivateListener, AddCertificate, CertificateAndKey, HeaderMatchKind, HeaderPredicate,
-        ListenerType, RequestHttpFrontend, ResponseStatus, SocketAddress, request::RequestType,
+        ListenerType, RedirectPolicy, RequestHttpFrontend, ResponseStatus, SocketAddress,
+        request::RequestType,
     },
 };
 
@@ -33,7 +41,16 @@ use crate::{
         },
     },
     sozu::worker::Worker,
-    tests::{State, provide_port, repeat_until_error_or, tests::create_local_address},
+    tests::{
+        State,
+        h2_utils::{
+            H2_FRAME_HEADERS, H2Frame, collect_response_frames, contains_goaway,
+            contains_rst_stream_with_error, h2_handshake, log_frames, raw_h2_connection,
+            setup_h2_test, stream_status_matches,
+        },
+        provide_port, repeat_until_error_or,
+        tests::create_local_address,
+    },
 };
 
 const STABLE: &str = "stable";
@@ -198,6 +215,184 @@ fn test_header_predicate_canary_routes_h1_and_h2() {
             2,
             "router: a header-predicate canary serves exactly the requests carrying its header, over H1 and H2",
             try_header_predicate_canary_routes_h1_and_h2,
+        ),
+        State::Success,
+    );
+}
+
+const DROP_HEADER: &str = "x-drop";
+const DROP_VALUE: &str = "yes";
+
+/// Budget for sozu to close a silently closed H1 connection; the close
+/// follows the routing decision on the same event-loop pass.
+const SILENT_CLOSE_DEADLINE_MS: u64 = 2000;
+
+/// RFC 9113 §7 CANCEL.
+const H2_ERROR_CANCEL: u32 = 0x8;
+
+/// HPACK block for `GET https://localhost/` plus one optional literal
+/// header (RFC 7541 §6.2.2, new name, neither side Huffman-coded).
+fn h2_get_headers(header: Option<(&str, &str)>) -> Vec<u8> {
+    let mut block = vec![0x82, 0x87, 0x84, 0x41, 0x09];
+    block.extend_from_slice(b"localhost");
+    if let Some((name, value)) = header {
+        assert!(
+            name.len() < 0x7f && value.len() < 0x7f,
+            "single-octet lengths"
+        );
+        block.extend_from_slice(&[0x00, name.len() as u8]);
+        block.extend_from_slice(name.as_bytes());
+        block.push(value.len() as u8);
+        block.extend_from_slice(value.as_bytes());
+    }
+    block
+}
+
+/// To SEE THIS RED: in `lib/src/protocol/mux/router.rs`, pass
+/// `&crate::router::NoHeaders` instead of `&FrontRequestHeaders(front)` to
+/// `frontend_from_request` in `route_from_request`; the predicated
+/// silent-close frontend is then never selected, so the matching H1 request
+/// is answered by the backend and the matching H2 stream is not reset.
+fn try_header_predicate_silent_close_h1_and_h2() -> State {
+    let (mut worker, mut backends, front_port) = setup_h2_test("HEADER-SILENT", 1);
+    let front_address: std::net::SocketAddr = format!("127.0.0.1:{front_port}")
+        .parse()
+        .expect("front address must parse");
+    // One configuration for every case below: the default `localhost`
+    // frontend forwards, the predicated one silently refuses.
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        header_predicates: vec![HeaderPredicate {
+            name: DROP_HEADER.to_owned(),
+            kind: HeaderMatchKind::Exact as i32,
+            value: Some(DROP_VALUE.to_owned()),
+        }],
+        redirect: Some(RedirectPolicy::SilentClose as i32),
+        ..Worker::default_http_frontend("cluster_0", front_address)
+    }));
+    worker.read_to_last();
+
+    // H1 over TLS, matching header: the connection ends with zero bytes.
+    let mut tls_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(crate::mock::https_client::Verifier))
+        .with_no_client_auth();
+    tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let server_name = rustls::pki_types::ServerName::try_from("localhost")
+        .expect("SNI must parse")
+        .to_owned();
+    let connection = rustls::ClientConnection::new(Arc::new(tls_config), server_name)
+        .expect("client TLS state must build");
+    let tcp = std::net::TcpStream::connect(front_address).expect("connect to the H1 frontend");
+    tcp.set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("set read timeout");
+    let mut tls = rustls::StreamOwned::new(connection, tcp);
+    tls.write_all(
+        format!(
+            "GET / HTTP/1.1\r\nHost: localhost\r\n{DROP_HEADER}: {DROP_VALUE}\r\nConnection: keep-alive\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+        .expect("send the matching H1 request");
+    tls.flush().expect("flush the matching H1 request");
+    let deadline = Instant::now() + Duration::from_millis(SILENT_CLOSE_DEADLINE_MS);
+    let mut h1_received = Vec::new();
+    let mut h1_closed = false;
+    while Instant::now() < deadline {
+        let mut buf = [0u8; 1024];
+        match tls.read(&mut buf) {
+            Ok(0) => {
+                h1_closed = true;
+                break;
+            }
+            Ok(n) => h1_received.extend_from_slice(&buf[..n]),
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            // close_notify is optional; a reset or an EOF without it ends
+            // the connection too. Nothing may have been written first.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::UnexpectedEof
+                        | ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::BrokenPipe
+                ) =>
+            {
+                h1_closed = true;
+                break;
+            }
+            Err(e) => {
+                println!("HEADER-SILENT: unexpected H1 read error: {e}");
+                break;
+            }
+        }
+    }
+    drop(tls);
+
+    // H1, header present with another value: the normal backend answers.
+    let h1_fallthrough = reached(build_https_client, front_port, Some((DROP_HEADER, "no")));
+
+    // H2 on one connection: stream 1 matches and is reset; streams 3 and 5
+    // do not match and are answered, so the connection survives.
+    let mut h2 = raw_h2_connection(front_address);
+    h2_handshake(&mut h2);
+    for (stream_id, header) in [
+        (1, Some((DROP_HEADER, DROP_VALUE))),
+        (3, Some((DROP_HEADER, "no"))),
+        (5, None),
+    ] {
+        h2.write_all(&H2Frame::headers(stream_id, h2_get_headers(header), true, true).encode())
+            .expect("send the H2 request");
+    }
+    h2.flush().expect("flush the H2 requests");
+    let frames = collect_response_frames(&mut h2, 200, 8, 250);
+    log_frames("header silent close H2", &frames);
+    let h2_reset_with_cancel = contains_rst_stream_with_error(&frames, 1, H2_ERROR_CANCEL);
+    let h2_matching_answered = frames
+        .iter()
+        .any(|(ft, _, sid, _)| *ft == H2_FRAME_HEADERS && *sid == 1);
+    let h2_others_answered =
+        stream_status_matches(&frames, 3, 200) && stream_status_matches(&frames, 5, 200);
+    let h2_goaway = contains_goaway(&frames);
+    drop(h2);
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    // Only the three non-matching requests reach the backend.
+    let requests_received = backends
+        .iter_mut()
+        .filter_map(|backend| backend.stop_and_get_aggregator())
+        .map(|aggregator| aggregator.requests_received)
+        .sum::<usize>();
+
+    println!(
+        "HEADER-SILENT: h1_closed={h1_closed} h1_received={h1_received:?} h1_fallthrough={h1_fallthrough:?} \
+         h2_reset_with_cancel={h2_reset_with_cancel} h2_matching_answered={h2_matching_answered} \
+         h2_others_answered={h2_others_answered} h2_goaway={h2_goaway} \
+         requests_received={requests_received} stopped={stopped}"
+    );
+    if h1_closed
+        && h1_received.is_empty()
+        && h1_fallthrough.as_deref() == Some("pong0")
+        && h2_reset_with_cancel
+        && !h2_matching_answered
+        && h2_others_answered
+        && !h2_goaway
+        && requests_received == 3
+        && stopped
+    {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_header_predicate_silent_close_h1_and_h2() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "router: a SILENT_CLOSE header-predicate frontend closes the matching H1 connection and resets the matching H2 stream only",
+            try_header_predicate_silent_close_h1_and_h2,
         ),
         State::Success,
     );

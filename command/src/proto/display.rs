@@ -90,6 +90,8 @@ pub fn format_request_type(request_type: &RequestType) -> &str {
         RequestType::AddHttpFrontend(_) => "AddHttpFrontend",
         RequestType::RemoveHttpFrontend(_) => "RemoveHttpFrontend",
         RequestType::AddHttpsFrontend(_) => "AddHttpsFrontend",
+        RequestType::AddHttpFrontendWithSilentClose(_) => "AddHttpFrontendWithSilentClose",
+        RequestType::AddHttpsFrontendWithSilentClose(_) => "AddHttpsFrontendWithSilentClose",
         RequestType::RemoveHttpsFrontend(_) => "RemoveHttpsFrontend",
         RequestType::AddHttpFrontendWithHeaderPredicates(_) => {
             "AddHttpFrontendWithHeaderPredicates"

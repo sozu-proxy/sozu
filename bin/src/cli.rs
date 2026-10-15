@@ -922,7 +922,7 @@ pub enum HttpFrontendCmd {
         tags: Option<BTreeMap<String, String>>,
         #[clap(
             long = "redirect",
-            help = "Redirect policy. Possible values: 'forward' (default), 'permanent', 'unauthorized'"
+            help = "Redirect policy. Possible values: 'forward' (default), 'permanent', 'unauthorized', 'silent_close' (close without any response)"
         )]
         redirect: Option<String>,
         #[clap(

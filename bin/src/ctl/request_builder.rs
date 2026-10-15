@@ -1757,7 +1757,7 @@ fn build_http_frontend_add(cmd: HttpFrontendCmd) -> Result<RequestHttpFrontend, 
         ));
     };
 
-    // Map `--redirect <forward|permanent|unauthorized>` onto the proto
+    // Map `--redirect <forward|permanent|unauthorized|silent_close>` onto the proto
     // enum. Unknown / mistyped value surfaces a typed error here.
     let redirect_proto = match redirect.as_deref() {
         None => None,
@@ -1765,9 +1765,10 @@ fn build_http_frontend_add(cmd: HttpFrontendCmd) -> Result<RequestHttpFrontend, 
             "forward" => sozu_command_lib::proto::command::RedirectPolicy::Forward as i32,
             "permanent" => sozu_command_lib::proto::command::RedirectPolicy::Permanent as i32,
             "unauthorized" => sozu_command_lib::proto::command::RedirectPolicy::Unauthorized as i32,
+            "silent_close" => sozu_command_lib::proto::command::RedirectPolicy::SilentClose as i32,
             other => {
                 return Err(CtlError::ArgsNeeded(
-                    "redirect in {forward, permanent, unauthorized}".to_owned(),
+                    "redirect in {forward, permanent, unauthorized, silent_close}".to_owned(),
                     format!("got --redirect={other:?}"),
                 ));
             }

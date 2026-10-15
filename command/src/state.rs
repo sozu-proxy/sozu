@@ -90,10 +90,12 @@ pub fn rollback_request(request: &RequestType) -> Option<Request> {
             proxy: ListenerType::Udp.into(),
         }),
         RequestType::AddHttpFrontend(front)
+        | RequestType::AddHttpFrontendWithSilentClose(front)
         | RequestType::AddHttpFrontendWithHeaderPredicates(front) => {
             RequestType::remove_http_frontend(front.clone())
         }
         RequestType::AddHttpsFrontend(front)
+        | RequestType::AddHttpsFrontendWithSilentClose(front)
         | RequestType::AddHttpsFrontendWithHeaderPredicates(front) => {
             RequestType::remove_https_frontend(front.clone())
         }
@@ -642,6 +644,7 @@ impl ConfigState {
             RequestType::ActivateListener(activate) => self.activate_listener(activate),
             RequestType::DeactivateListener(deactivate) => self.deactivate_listener(deactivate),
             RequestType::AddHttpFrontend(front)
+            | RequestType::AddHttpFrontendWithSilentClose(front)
             | RequestType::AddHttpFrontendWithHeaderPredicates(front) => {
                 self.add_http_frontend(front)
             }
@@ -653,6 +656,7 @@ impl ConfigState {
             RequestType::RemoveCertificate(remove) => self.remove_certificate(remove),
             RequestType::ReplaceCertificate(replace) => self.replace_certificate(replace),
             RequestType::AddHttpsFrontend(front)
+            | RequestType::AddHttpsFrontendWithSilentClose(front)
             | RequestType::AddHttpsFrontendWithHeaderPredicates(front) => {
                 self.add_https_frontend(front)
             }

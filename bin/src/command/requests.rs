@@ -556,8 +556,10 @@ fn is_mutating_verb(req: &RequestType) -> bool {
             | RequestType::AddHttpsFrontendWithHeaderPredicates(_)
             | RequestType::RemoveHttpFrontendWithHeaderPredicates(_)
             | RequestType::RemoveHttpsFrontendWithHeaderPredicates(_)
+            | RequestType::AddHttpFrontendWithSilentClose(_)
             | RequestType::AddHttpListener(_)
             | RequestType::AddHttpsFrontend(_)
+            | RequestType::AddHttpsFrontendWithSilentClose(_)
             | RequestType::AddHttpsListener(_)
             | RequestType::AddHttpsListenerWithClientAuth(_)
             | RequestType::AddTcpFrontend(_)
@@ -719,8 +721,10 @@ impl Server {
             | RequestType::AddHttpsFrontendWithHeaderPredicates(_)
             | RequestType::RemoveHttpFrontendWithHeaderPredicates(_)
             | RequestType::RemoveHttpsFrontendWithHeaderPredicates(_)
+            | RequestType::AddHttpFrontendWithSilentClose(_)
             | RequestType::AddHttpListener(_)
             | RequestType::AddHttpsFrontend(_)
+            | RequestType::AddHttpsFrontendWithSilentClose(_)
             | RequestType::AddHttpsListener(_)
             | RequestType::AddHttpsListenerWithClientAuth(_)
             | RequestType::AddTcpFrontend(_)
@@ -1844,6 +1848,7 @@ fn audit_entry_for(
             })
         }
         RequestType::AddHttpFrontend(frontend)
+        | RequestType::AddHttpFrontendWithSilentClose(frontend)
         | RequestType::AddHttpFrontendWithHeaderPredicates(frontend) => {
             let (verb, counter) = audit_verb!("http_frontend_added");
             Some(AuditEntry {
@@ -1858,6 +1863,7 @@ fn audit_entry_for(
             })
         }
         RequestType::AddHttpsFrontend(frontend)
+        | RequestType::AddHttpsFrontendWithSilentClose(frontend)
         | RequestType::AddHttpsFrontendWithHeaderPredicates(frontend) => {
             let (verb, counter) = audit_verb!("https_frontend_added");
             Some(AuditEntry {
@@ -2737,8 +2743,10 @@ fn validate_listener_request(request: &RequestType) -> Result<(), String> {
 fn validate_frontend_request(request: &RequestType) -> Result<(), String> {
     let front = match request {
         RequestType::AddHttpFrontend(front)
-        | RequestType::AddHttpsFrontend(front)
+        | RequestType::AddHttpFrontendWithSilentClose(front)
         | RequestType::AddHttpFrontendWithHeaderPredicates(front)
+        | RequestType::AddHttpsFrontend(front)
+        | RequestType::AddHttpsFrontendWithSilentClose(front)
         | RequestType::AddHttpsFrontendWithHeaderPredicates(front) => front,
         _ => return Ok(()),
     };

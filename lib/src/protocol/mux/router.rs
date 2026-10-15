@@ -1219,6 +1219,17 @@ impl Router {
         // here explicitly or the build breaks.
         context.tags = tags;
 
+        // ── 0. Explicit `RedirectPolicy::SILENT_CLOSE` ────────────────────
+        // nginx `return 444` parity (sozu-proxy/sozu#767): the request is
+        // refused without writing a single response byte. Resolved before
+        // every other policy, and before the cluster lookup it does not need,
+        // so it holds whether or not a cluster is bound; the caller resets the
+        // H2 stream or closes the H1 connection.
+        if matches!(redirect, RedirectPolicy::SilentClose) {
+            trace!("{} RouteResult::silent_close", log_module_context!(context));
+            return Err(RetrieveClusterError::SilentClose);
+        }
+
         // ── HSTS (RFC 6797) snapshot hoist for HTTPS ──────────────────────
         // The response snapshot is built in two passes so HSTS reaches
         // every HTTPS response code (RFC 6797 §8.1 — including
@@ -1290,7 +1301,9 @@ impl Router {
             // below; keeping them named here forces an exhaustive
             // match so a future RedirectPolicy variant doesn't
             // silently fall through to `None`.
-            RedirectPolicy::Forward | RedirectPolicy::Unauthorized => None,
+            RedirectPolicy::Forward
+            | RedirectPolicy::Unauthorized
+            | RedirectPolicy::SilentClose => None,
         };
         if let Some(status_code) = redirect_status {
             let scheme = resolve_redirect_scheme(redirect_scheme, context);
@@ -2070,7 +2083,8 @@ mod tests {
     use sozu_command::{
         config::ListenerBuilder,
         proto::command::{
-            ForwardedHeaders, PathRule, RequestHttpFrontend, RulePosition, SocketAddress,
+            ForwardedHeaders, PathRule, RedirectPolicy, RequestHttpFrontend, RulePosition,
+            SocketAddress,
         },
     };
 
@@ -2299,6 +2313,93 @@ mod tests {
                 forwarded_host.as_deref(),
                 expected.map(str::as_bytes),
                 "{authority}: X-Forwarded-Host carries the authority the client sent, on a rewrite only",
+            );
+        }
+    }
+
+    /// A frontend whose policy is `RedirectPolicy::SilentClose` refuses the
+    /// request with `RetrieveClusterError::SilentClose` whether or not it is
+    /// bound to a cluster, before any redirect or 401 decision, so the caller
+    /// writes no response at all (sozu-proxy/sozu#767).
+    ///
+    /// To SEE THIS RED: delete the `RedirectPolicy::SilentClose` early return
+    /// that opens the policy steps of `Router::route_from_request`
+    /// (`lib/src/protocol/mux/router.rs`). The bound frontend then forwards
+    /// (`Ok`) and the clusterless one answers `UnauthorizedRoute`.
+    #[test]
+    fn a_silent_close_frontend_refuses_without_an_answer_bound_or_clusterless() {
+        let port = crate::testing::provide_port();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, port);
+        let config = ListenerBuilder::new_http(address)
+            .to_http(None)
+            .expect("test http listener config must build");
+        let parts = crate::testing::prebuild_server(10, 16_384, false)
+            .expect("test server parts must build");
+        let pool = parts.pool.clone();
+        let mut proxy = HttpProxy::new(parts.registry, parts.sessions, parts.pool, parts.backends);
+        let token = mio::Token(0);
+        proxy
+            .add_listener(config, token)
+            .expect("test listener must register");
+        for (hostname, cluster_id) in [
+            ("bound.example.com", Some("cluster-767")),
+            ("clusterless.example.com", None),
+        ] {
+            proxy
+                .add_http_frontend(RequestHttpFrontend {
+                    cluster_id: cluster_id.map(str::to_owned),
+                    address,
+                    hostname: hostname.to_owned(),
+                    path: PathRule::prefix("/".to_owned()),
+                    position: RulePosition::Tree.into(),
+                    redirect: Some(RedirectPolicy::SilentClose as i32),
+                    ..Default::default()
+                })
+                .unwrap_or_else(|error| panic!("{hostname} must register: {error}"));
+        }
+        let listener = proxy
+            .get_listener(&token)
+            .expect("the registered listener must be reachable");
+        let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(proxy));
+        let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+
+        for authority in ["bound.example.com", "clusterless.example.com"] {
+            let mut context = HttpContext::new(
+                rusty_ulid::Ulid::generate(),
+                rusty_ulid::Ulid::generate(),
+                crate::Protocol::HTTP,
+                "127.0.0.1:80"
+                    .parse()
+                    .expect("test public address must parse"),
+                None,
+                "SOZUBALANCEID".to_owned(),
+                "Sozu-Id".to_owned(),
+                false,
+                false,
+            );
+            context.authority = Some(authority.to_owned());
+            context.path = Some("/".to_owned());
+            context.method = Some(Method::Get);
+            let mut stream = Stream::new(
+                &mut PoolBufferSource::new(Rc::downgrade(&pool)),
+                context,
+                crate::protocol::mux::test_support::test_answers(),
+                65_535,
+            )
+            .expect("test stream must check out its buffers");
+            let split = &mut stream;
+            let proxy_ref = proxy.borrow();
+            let view = RoutingView::new(proxy_ref.clusters(), proxy_ref.kind());
+            let result =
+                router.route_from_request(&mut split.context, &mut split.front, &listener, &view);
+
+            assert!(
+                matches!(result, Err(crate::RetrieveClusterError::SilentClose)),
+                "{authority}: a silent-close frontend must refuse with SilentClose, got {result:?}",
+            );
+            assert_eq!(
+                split.context.redirect_status, None,
+                "{authority}: a silent close must not stage a redirect answer",
             );
         }
     }

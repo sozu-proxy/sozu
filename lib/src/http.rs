@@ -1807,6 +1807,7 @@ impl ProxyConfiguration for HttpProxy {
             }
             Some(
                 RequestType::AddHttpFrontend(front)
+                | RequestType::AddHttpFrontendWithSilentClose(front)
                 | RequestType::AddHttpFrontendWithHeaderPredicates(front),
             ) => {
                 debug!(

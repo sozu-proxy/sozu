@@ -3069,6 +3069,7 @@ impl ProxyConfiguration for HttpsProxy {
                 self.remove_cluster(&cluster_id)
             }
             RequestType::AddHttpsFrontend(front)
+            | RequestType::AddHttpsFrontendWithSilentClose(front)
             | RequestType::AddHttpsFrontendWithHeaderPredicates(front) => {
                 debug!(
                     "{} {} add https front {:?}",

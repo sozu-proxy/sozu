@@ -223,6 +223,19 @@ message Request {
     RequestHttpFrontend remove_http_frontend_with_header_predicates = 67;
     RequestHttpFrontend add_https_frontend_with_header_predicates = 68;
     RequestHttpFrontend remove_https_frontend_with_header_predicates = 69;
+
+    // add an HTTP frontend whose `redirect` is `SILENT_CLOSE`. Same payload as
+    // `add_http_frontend`, distinct verb for the reason given on
+    // `add_https_listener_with_client_auth`: a worker that predates
+    // `SILENT_CLOSE` decodes the unknown enum value, resolves it to
+    // `FORWARD` and installs a route that forwards the traffic the operator
+    // asked to drop. It cannot decode this verb, so the request fails.
+    // `RequestType::add_http_frontend` / `RequestType::into_canonical` pick
+    // the verb, and the main process applies it to every request it fans out.
+    RequestHttpFrontend add_http_frontend_with_silent_close = 70;
+    // add an HTTPS frontend whose `redirect` is `SILENT_CLOSE`. See
+    // `add_http_frontend_with_silent_close`.
+    RequestHttpFrontend add_https_frontend_with_silent_close = 71;
   }
 }
 
@@ -1055,12 +1068,17 @@ message ListenersList {
 // UNAUTHORIZED returns 401 with `WWW-Authenticate: Basic realm=...`
 // using `cluster.www_authenticate`; suitable for blanket deny-by-default
 // routes that still want to surface a login prompt.
+// SILENT_CLOSE sends no response at all, like nginx's `return 444`: an H1
+// frontend connection is closed, an H2 frontend stream is reset with
+// RST_STREAM(CANCEL) while the connection's other streams continue. The
+// backend is never contacted; the access log records status 444.
 enum RedirectPolicy {
     FORWARD = 0;
     PERMANENT = 1;
     UNAUTHORIZED = 2;
     FOUND = 3;
     PERMANENT_REDIRECT = 4;
+    SILENT_CLOSE = 5;
 }
 
 // Scheme to use when building the `Location` header for a permanent redirect.
