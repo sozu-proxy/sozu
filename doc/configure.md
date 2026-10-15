@@ -1267,23 +1267,40 @@ backend set they read on every request:
 
 | value | selection | load reads per request |
 |---|---|---|
-| `ROUND_ROBIN` | next backend in declaration order | none |
+| `ROUND_ROBIN` | next backend in declaration order, each picked in proportion to `weight` | none |
 | `RANDOM` | one backend drawn at random, weighted by `weight` | none |
-| `LEAST_LOADED` | the least loaded backend of the whole set | `n` |
-| `POWER_OF_TWO` | two backends drawn at random, the less loaded of the two wins | 2 |
+| `LEAST_LOADED` | the backend of the whole set with the least load per unit of `weight` | `n` |
+| `POWER_OF_TWO` | two backends drawn at random, the one with less load per unit of `weight` wins | 2 |
 | `HRW` | rendezvous hashing on the client key, scaled by `weight` (see "Client affinity") | none |
 | `MAGLEV` | consistent hashing on the client key, slot share proportional to `weight` (see "Client affinity") | none |
 
-**Three policies honour `weight` and three ignore it.** `RANDOM`, `HRW` and
-`MAGLEV` read it; `ROUND_ROBIN`, `LEAST_LOADED` and `POWER_OF_TWO` do not, so
-a `weight` set on a cluster using one of those three has no effect. `RANDOM`
-feeds it straight into its weighted draw. `HRW` multiplies each backend's
-rendezvous score by it, and `MAGLEV` gives each backend a share of lookup-table
-slots proportional to it — but both only on the keyed path: asked for a
-backend with no client key, each falls back to `ROUND_ROBIN` and the weight
-stops being read. Every datapath supplies a key (below), so that fallback is
-reached only by a request with no source address.
-An unset `weight` defaults to 100 wherever one is read.
+**Every policy honours `weight`.** An unset `weight` defaults to 100.
+
+- `ROUND_ROBIN` runs smooth weighted round robin (the scheme of nginx's
+  upstream module): over every `Σw` selections a backend of weight `w` is
+  picked exactly `w` times, and the picks interleave rather than bunch —
+  weights `5`, `1`, `1` select `a a b a c a a`, not `a a a a a b c`. When every
+  candidate carries the same weight, the usual case, it is the plain cursor
+  over the declaration order, so an unweighted cluster selects exactly as it
+  did before `ROUND_ROBIN` read the weight.
+- `LEAST_LOADED` and `POWER_OF_TWO` compare each candidate's load divided by
+  its weight: a backend of weight 200 carrying 10 connections is as loaded as
+  one of weight 100 carrying 5. With equal weights the comparison is the one
+  on raw loads, and ties break as before (the first in declaration order for
+  `LEAST_LOADED`, a seeded coin flip for `POWER_OF_TWO`).
+- `RANDOM` feeds it straight into its weighted draw.
+- `HRW` multiplies each backend's rendezvous score by it, and `MAGLEV` gives
+  each backend a share of lookup-table slots proportional to it. Asked for a
+  backend with no client key, each falls back to `ROUND_ROBIN`, weighted as
+  above. Every datapath supplies a key (below), so that fallback is reached
+  only by a request with no source address.
+
+A `weight` of `0` or below counts as `1` under `ROUND_ROBIN`, `LEAST_LOADED`,
+`POWER_OF_TWO`, `HRW` and `MAGLEV`: the backend keeps the smallest share and
+is never taken out of rotation. `RANDOM` alone reads the raw value: a backend
+of weight `0` among positive weights is never drawn, and a negative weight, or
+weights that are all `0`, make it draw uniformly. To stop sending traffic to a
+backend, remove it or mark it `backup` rather than setting its weight to `0`.
 
 **One address is one share.** A cluster may declare several backend ids at the
 same address (their identity is the `(backend_id, address)` pair, so removing
@@ -1707,7 +1724,7 @@ also valid for HTTP, HTTPS and TCP clusters, see "Client affinity"):
 
 | `load_balancing` | Affinity | Notes                                                                                                                                  |
 | ---------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `ROUND_ROBIN`    | none     | Rotate through backends. The existing default; no source affinity.                                                                     |
+| `ROUND_ROBIN`    | none     | Rotate through backends, each in proportion to `weight`. The existing default; no source affinity.                                     |
 | `HRW`            | yes      | Highest-Random-Weight / rendezvous hashing — the recommended UDP default. `O(N)` per selection, no precomputed table, so no rebuild stall on hot-reconfig and provably-minimal flow remapping when backends change. |
 | `MAGLEV`         | yes      | Maglev consistent hashing — `O(1)` per-packet table lookup, near-perfect balance, for large backend sets / high pps. The lookup table is rebuilt in the control-plane reconcile step on a backend-set change (not per-packet) and remaps ~2× more keys than HRW on churn. |
 
@@ -3102,7 +3119,7 @@ Three top-level knobs drive different policies:
 address  = "0.0.0.0:80"
 hostname = "old.example.com"
 # Force a permanent 301 to the canonical name on a different port.
-redirect        = "permanent"      # forward (default) | permanent | found | permanent_redirect | unauthorized
+redirect        = "permanent"      # forward (default) | permanent | found | permanent_redirect | unauthorized | silent_close
 redirect_scheme = "use-https"      # use-same (default) | use-http | use-https
 rewrite_host    = "new.example.com"
 rewrite_port    = 8443             # paired with `cluster.https_redirect_port`
@@ -3121,6 +3138,18 @@ e.g. an API endpoint relocation. Pick `found` (302) for short-lived forwards
 (login flows, A/B-testing gates). `redirect = "unauthorized"` returns 401
 unconditionally — useful for blanket deny-by-default frontends that still want
 to surface a login prompt with the cluster's `www_authenticate` realm.
+
+`redirect = "silent_close"` refuses the request without sending any response,
+the equivalent of nginx's `return 444`: on an HTTP/1.x frontend Sōzu closes the
+connection without writing a byte, and on an HTTP/2 frontend it resets only that
+stream with `RST_STREAM(CANCEL)`, so the connection's other streams carry on. The
+backend is never contacted, with or without a `cluster_id`, and the policy wins
+over every other redirect, rewrite or authentication setting of the frontend. The
+access log records the request with status `444` and message `silent_close`, not
+as an error (`http.errors` is not incremented); the status counts in
+`http.status.4xx`. Use it for traffic that should get no answer at all, such as
+scanners hitting a blocked path. The CLI spelling is
+`sozu frontend http add ... --redirect silent_close`.
 
 `rewrite_host` and `rewrite_path` accept a small template grammar: `$HOST[n]`
 references the n-th host capture (0 is the full hostname; 1+ are regex /
@@ -3465,7 +3494,10 @@ closed (operator-visible API once shipped):
 
 Non-timeout default-answer paths (e.g. 503 from `Router::route_from_request`,
 401 from auth, 301 from redirects) leave the field as `None` and the access log
-emits `message: None` exactly as before. Sessions that complete normally are
+emits `message: None` exactly as before. One non-timeout outcome carries its own token: a request
+refused by a `redirect = "silent_close"` frontend is logged with message
+`silent_close` and status `444`, a status that never reaches the wire (the
+client gets a closed connection or an `RST_STREAM(CANCEL)`). Sessions that complete normally are
 also unaffected.
 
 #### Backend health checks
