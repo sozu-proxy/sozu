@@ -20,6 +20,10 @@ Two probe modes exist (`mode`):
   rotation on a platform where an application answering 3xx, 401, 404 or even
   500 on a fixed path is still serving.
 
+Both modes dial each backend's address, unless `port` is set: the probe then
+connects to the backend's IP address on that port, for a backend whose health
+endpoint or companion listener lives beside its data port.
+
 > **Before enabling `TCP` mode or `accepted_statuses`, upgrade the main process
 > and every worker, and use the new `sozu` CLI.** Both are new protocol fields
 > (`HealthCheckConfig` fields 7 and 8) that an older Sōzu ignores, so it
@@ -33,6 +37,12 @@ Two probe modes exist (`mode`):
 > on every worker; and with an older binary loading a saved state written by a
 > newer one. Downgrading while a cluster uses either field is not supported.
 
+> **Before setting `port`, upgrade the main process and every worker, and use
+> the new `sozu` CLI**, for the same reasons: `port` is `HealthCheckConfig`
+> field 9, which an older Sōzu ignores, so it probes the backend's data port
+> instead — and in `TCP` mode passes every backend that accepts connections
+> there, whatever the probe port would have answered.
+
 ## How it works
 
 Health checks run inside the main mio event loop using non-blocking TCP
@@ -42,7 +52,8 @@ with normal request processing.
 For each cluster with a health check configured, Sōzu performs the following on
 every check cycle:
 
-1. Opens a non-blocking TCP connection to each backend in the cluster. In `TCP`
+1. Opens a non-blocking TCP connection to each backend in the cluster: to its
+   address, or to its IP address on `port` when that is set. In `TCP`
    mode the check ends here: it passes once the connection is established
    (the socket becomes writable with no pending error) and fails on a
    connection error or when `timeout` elapses first
@@ -50,7 +61,8 @@ every check cycle:
    (`GET <uri> HTTP/1.1` with `Connection: close`) when `cluster.http2 = false`
    (the default), or HTTP/2 prior-knowledge (connection preface + empty
    SETTINGS + HEADERS frame on stream 1 carrying `GET <uri>`) when
-   `cluster.http2 = true`
+   `cluster.http2 = true`. Its `Host` (h2c `:authority`) is the `ip:port`
+   dialed, so it names the probe port when `port` is set
 3. Reads the response: HTTP/1.1 status line for the default path, or HTTP/2
    frames until a HEADERS frame on stream 1 yields `:status` for h2c
 4. Compares the HTTP status code against the accepted statuses
@@ -152,6 +164,15 @@ uri = "/livez"
 accepted_statuses = ["200-499"]
 ```
 
+A probe on a port other than the backends' data port, here an HTTP health
+endpoint on port 9090 of each backend:
+
+```toml
+[clusters.my-cluster.health_check]
+uri = "/health"
+port = 9090
+```
+
 ### Configuration parameters
 
 | Parameter             | Type     | Default  | Description                                                                                                     |
@@ -164,6 +185,7 @@ accepted_statuses = ["200-499"]
 | `unhealthy_threshold` | u32      | `3`      | Consecutive failures required to transition from healthy to unhealthy.                                          |
 | `expected_status`     | u32      | `0`      | `HTTP` mode, when `accepted_statuses` is empty: `0` accepts any 2xx, any other value exactly that status. Must stay `0` in `TCP` mode. |
 | `accepted_statuses`   | [string] | `[]`     | `HTTP` mode: the accepted statuses (see below). Exclusive with a non-zero `expected_status`; refused in `TCP` mode. |
+| `port`                | u32      | —        | Port the probe dials on the backend's IP address, in `1-65535`, in both modes. Unset = the backend's data port. |
 
 Each `accepted_statuses` entry is one of:
 
@@ -177,6 +199,7 @@ Each `accepted_statuses` entry is one of:
 Every bound must lie in `100-599` (RFC 9110 §15). In the protocol
 (`HealthCheckConfig`), `mode` is field 7 (`HealthCheckMode`) and
 `accepted_statuses` field 8, a list of inclusive `HttpStatusRange { start, end }`;
+`port` is the optional field 9, absent when unset;
 `uri` stays a required field on the wire and may be empty in `TCP` mode. A
 message without field 7 decodes as `HTTP`, so configurations written before
 the modes existed keep their meaning.
@@ -213,6 +236,9 @@ sozu cluster health-check set --id my-cluster --mode tcp
 
 # HTTP probe accepting every non-5xx answer
 sozu cluster health-check set --id my-cluster --uri /livez --accepted-statuses 200-499
+
+# TCP connect probe on port 9090 of each backend instead of its data port
+sozu cluster health-check set --id my-cluster --mode tcp --port 9090
 ```
 
 Creates or replaces the health check configuration for the given cluster. Only
@@ -251,6 +277,7 @@ the two flags collided and every `health-check set` invocation panicked.
 | `--unhealthy-threshold` | no       | `3`     | Consecutive failures to mark a backend DOWN.                                               |
 | `--expected-status`     | no       | `0`     | Expected HTTP status code (`0` = any 2xx). Exclusive with `--accepted-statuses`.           |
 | `--accepted-statuses`   | no       | —       | Comma-separated accepted statuses: codes, ranges, classes or `any` (e.g. `200-399,404`).   |
+| `--port`                | no       | —       | Port the probe dials on the backend's IP address, `1-65535`. Unset = the data port.        |
 
 #### List health check configurations
 
@@ -265,18 +292,20 @@ sozu cluster health-check list --id my-cluster
 Example output:
 
 ```
-┌────────────┬──────┬─────────┬──────────┬─────────┬───────────────────┬─────────────────────┬───────────────────┐
-│ cluster    │ mode │ uri     │ interval │ timeout │ healthy threshold │ unhealthy threshold │ accepted statuses │
-├────────────┼──────┼─────────┼──────────┼─────────┼───────────────────┼─────────────────────┼───────────────────┤
-│ api        │ http │ /ready  │ 5s       │ 3s      │ 2                 │ 5                   │ 200               │
-│ apps       │ tcp  │ -       │ 10s      │ 5s      │ 3                 │ 3                   │ -                 │
-│ my-cluster │ http │ /health │ 10s      │ 5s      │ 3                 │ 3                   │ 2xx               │
-│ web        │ http │ /livez  │ 10s      │ 5s      │ 3                 │ 3                   │ 200-399,404       │
-└────────────┴──────┴─────────┴──────────┴─────────┴───────────────────┴─────────────────────┴───────────────────┘
+┌────────────┬──────┬──────┬─────────┬──────────┬─────────┬───────────────────┬─────────────────────┬───────────────────┐
+│ cluster    │ mode │ port │ uri     │ interval │ timeout │ healthy threshold │ unhealthy threshold │ accepted statuses │
+├────────────┼──────┼──────┼─────────┼──────────┼─────────┼───────────────────┼─────────────────────┼───────────────────┤
+│ api        │ http │ data │ /ready  │ 5s       │ 3s      │ 2                 │ 5                   │ 200               │
+│ apps       │ tcp  │ 9090 │ -       │ 10s      │ 5s      │ 3                 │ 3                   │ -                 │
+│ my-cluster │ http │ data │ /health │ 10s      │ 5s      │ 3                 │ 3                   │ 2xx               │
+│ web        │ http │ data │ /livez  │ 10s      │ 5s      │ 3                 │ 3                   │ 200-399,404       │
+└────────────┴──────┴──────┴─────────┴──────────┴─────────┴───────────────────┴─────────────────────┴───────────────────┘
 ```
 
-The `accepted statuses` column uses the `--accepted-statuses` syntax; a legacy
-`expected_status` shows as `2xx` (for `0`) or as its code.
+The `port` column shows the probe `port`, or `data` when the probe dials each
+backend's data port. The `accepted statuses` column uses the
+`--accepted-statuses` syntax; a legacy `expected_status` shows as `2xx` (for
+`0`) or as its code.
 
 When `--id` is provided, only the health check for that cluster is shown. When
 omitted, all clusters with a health check are listed. Clusters without a health
@@ -347,8 +376,8 @@ identity is moot — the event is about the cluster as a whole).
 - **Non-blocking**: Health checks share the mio event loop with normal proxy
   operations. There are no additional threads, and checks never block request
   processing.
-- **Per-cluster configuration**: Each cluster can have its own probe mode, URI,
-  interval, thresholds, and accepted statuses. Clusters without a `health_check`
+- **Per-cluster configuration**: Each cluster can have its own probe mode, port,
+  URI, interval, thresholds, and accepted statuses. Clusters without a `health_check`
   section are not checked.
 - **Fail-open routing when ALL backends are unhealthy**: when every backend in a
   cluster has been marked DOWN by the threshold state machine, Sōzu falls back

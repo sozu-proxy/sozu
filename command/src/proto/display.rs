@@ -1150,6 +1150,7 @@ fn print_health_checks(list: &HealthChecksList) -> Result<(), DisplayError> {
     table.add_row(row![
         "cluster",
         "mode",
+        "port",
         "uri",
         "interval",
         "timeout",
@@ -1167,10 +1168,15 @@ fn print_health_checks(list: &HealthChecksList) -> Result<(), DisplayError> {
             Ok(HealthCheckMode::Tcp) => ("tcp", "-", "-".to_owned()),
             Err(_) => ("unknown", config.uri.as_str(), "-".to_owned()),
         };
+        // Unset probes the backend's own data port.
+        let port = config
+            .port
+            .map_or_else(|| "data".to_owned(), |port| port.to_string());
 
         table.add_row(row![
             cluster_id,
             mode,
+            port,
             uri,
             format!("{}s", config.interval),
             format!("{}s", config.timeout),

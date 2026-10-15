@@ -72,7 +72,8 @@ const HEALTH_CHECK_TOKEN_CAPACITY: usize = 1 << 16;
 /// `h2c` mirrors `cluster.http2` (the same backend-capability hint the
 /// mux router uses) so the probe wire format matches what the proxy
 /// will actually use to reach those backends. Each backend to check is
-/// `(backend_id, address, incarnation)`.
+/// `(backend_id, address, incarnation)`, where `address` is the one the
+/// probe dials ([`probe_address`]).
 type PendingChecks = Vec<(
     ClusterId,
     HealthCheckConfig,
@@ -87,6 +88,8 @@ struct InFlightCheck {
     token: Token,
     cluster_id: ClusterId,
     backend_id: String,
+    /// The probed address: the backend's, or its IP with the health check's
+    /// probe `port`. Logs only; the result goes to `backend`.
     address: SocketAddr,
     /// The backend incarnation this probe was launched for. The result
     /// applies to it only while it is still in the cluster's list, so a
@@ -281,7 +284,9 @@ impl HealthChecker {
                             let backend = b.borrow();
                             (
                                 backend.backend_id.to_owned(),
-                                backend.address,
+                                // The dial, the HTTP `Host` and the logs
+                                // all name the probed address.
+                                probe_address(backend.address, config.port),
                                 Rc::downgrade(b),
                             )
                         })
@@ -855,6 +860,32 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
+/// The address a probe dials: the backend's `address`, with its port
+/// replaced by the health check's probe `port` when one is set. The HTTP
+/// probe names this address in its `Host` (h2c `:authority`), since it is
+/// the one probed.
+fn probe_address(address: SocketAddr, port: Option<u32>) -> SocketAddr {
+    // PRE: the worker `SetHealthCheck` handler ran
+    // `sozu_command::config::validate_health_check_config`, which bounds
+    // the probe port to 1..=65535.
+    debug_assert!(
+        port.is_none_or(|port| port != 0 && u16::try_from(port).is_ok()),
+        "a validated probe port is a non-zero 16-bit port, got {port:?}"
+    );
+    let Some(port) = port else {
+        return address;
+    };
+    // `set_port` keeps an IPv6 scope id, which a link-local backend needs.
+    // An out-of-range port cannot pass validation; should one get here, port
+    // 0 makes the dial fail, so the probe fails rather than silently probing
+    // the data port.
+    let mut probed = address;
+    probed.set_port(u16::try_from(port).unwrap_or(0));
+    // POST: only the port moves; the probe targets the backend's own IP.
+    debug_assert_eq!(probed.ip(), address.ip(), "the probe keeps the backend IP");
+    probed
+}
+
 /// Outcome of a connect-only probe on a readiness event: `Some(true)` once
 /// the handshake completed, `Some(false)` when the socket reports an error
 /// (refused, unreachable, reset), `None` while the connect is still in
@@ -1380,6 +1411,34 @@ mod tests {
         assert_eq!(outcome, Some(false), "a refused connection must fail");
     }
 
+    /// An unset probe port keeps the backend's data port; a set one
+    /// replaces the port alone, on IPv4 and IPv6.
+    #[test]
+    fn probe_address_replaces_only_the_port_when_one_is_set() {
+        for address in ["192.0.2.10:8080", "[2001:db8::10]:8080"] {
+            let address: SocketAddr = address.parse().unwrap();
+            assert_eq!(
+                probe_address(address, None),
+                address,
+                "an unset probe port keeps the data port"
+            );
+            for port in [1, 9090, 65535] {
+                let probed = probe_address(address, Some(port));
+                assert_eq!(probed.ip(), address.ip(), "the probe keeps the backend IP");
+                assert_eq!(
+                    u32::from(probed.port()),
+                    port,
+                    "the probe dials its own port"
+                );
+            }
+        }
+        assert_eq!(
+            probe_address("[2001:db8::10]:8080".parse().unwrap(), Some(9090)).to_string(),
+            "[2001:db8::10]:9090",
+            "an IPv6 probe address renders bracketed, as the Host header needs"
+        );
+    }
+
     #[test]
     fn test_try_parse_status_line() {
         let config = HealthCheckConfig {
@@ -1391,6 +1450,7 @@ mod tests {
             expected_status: 0,
             mode: HealthCheckMode::Http as i32,
             accepted_statuses: Vec::new(),
+            port: None,
         };
 
         let buf = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
@@ -1572,6 +1632,7 @@ mod tests {
             expected_status: expected,
             mode: HealthCheckMode::Http as i32,
             accepted_statuses: Vec::new(),
+            port: None,
         }
     }
 

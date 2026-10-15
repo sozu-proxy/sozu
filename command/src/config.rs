@@ -2720,6 +2720,10 @@ pub struct FileHealthCheckConfig {
     /// `"200-399"`, `"2xx"` or `"any"` (see [`parse_http_status_range`]).
     #[serde(default)]
     pub accepted_statuses: Vec<String>,
+    /// Port the probe dials on the backend's IP address, in `1..=65535`.
+    /// Unset probes the backend's data port.
+    #[serde(default)]
+    pub port: Option<u32>,
 }
 
 impl FileHealthCheckConfig {
@@ -2741,6 +2745,7 @@ impl FileHealthCheckConfig {
             expected_status: self.expected_status,
             mode: self.mode.unwrap_or(HealthCheckMode::Http) as i32,
             accepted_statuses,
+            port: self.port,
         };
         // POST: the proto mirrors the file config exactly — the URI and all
         // timing knobs are carried through verbatim (no clamping or defaulting
@@ -2752,6 +2757,10 @@ impl FileHealthCheckConfig {
                 && proto.healthy_threshold == self.healthy_threshold
                 && proto.unhealthy_threshold == self.unhealthy_threshold,
             "proto timing knobs must mirror the file config"
+        );
+        debug_assert_eq!(
+            proto.port, self.port,
+            "proto probe port must mirror the file config"
         );
         debug_assert_eq!(
             proto.accepted_statuses.len(),
@@ -2919,8 +2928,9 @@ pub fn validate_shuffle_sharding(
 /// smuggle a second HTTP message on the wire (RFC 9110 §5.1 —
 /// request-target; the leading `/` is only required in HTTP mode, the
 /// only one that sends it), accepted status ranges within `100..=599`,
-/// at most one of `expected_status` / `accepted_statuses`, and neither in
-/// TCP mode, which judges no status. Used by
+/// at most one of `expected_status` / `accepted_statuses`, neither in
+/// TCP mode, which judges no status, and a probe `port`, when set, within
+/// `1..=65535`. Used by
 /// the CLI request builder and the worker `SetHealthCheck` handler so
 /// off-channel inputs (TOML reload, third-party clients) are
 /// constrained the same way as `sozu cluster health-check set`.
@@ -2977,6 +2987,13 @@ pub fn validate_health_check_config(cfg: &HealthCheckConfig) -> Result<(), &'sta
              leave them unset with mode TCP",
         );
     }
+    // The probe dials `ip:port`: 0 names no port, and a TCP port is 16 bits.
+    if cfg
+        .port
+        .is_some_and(|port| !(1..=u32::from(u16::MAX)).contains(&port))
+    {
+        return Err("health check port must lie in 1..=65535");
+    }
     // POST: a validated config has strictly-positive timing knobs (a zero
     // interval/timeout/threshold would make the health-check loop spin or
     // never converge) and a request-target the worker can splice into an HTTP
@@ -3001,6 +3018,11 @@ pub fn validate_health_check_config(cfg: &HealthCheckConfig) -> Result<(), &'sta
         mode == HealthCheckMode::Http
             || (cfg.expected_status == 0 && cfg.accepted_statuses.is_empty()),
         "a validated TCP health check sets no status field"
+    );
+    debug_assert!(
+        cfg.port
+            .is_none_or(|port| port != 0 && u16::try_from(port).is_ok()),
+        "a validated health-check probe port is a non-zero 16-bit port"
     );
     Ok(())
 }
@@ -6080,6 +6102,7 @@ mod tests {
             expected_status: 0,
             mode: HealthCheckMode::Http as i32,
             accepted_statuses: Vec::new(),
+            port: None,
         };
         assert_eq!(validate_health_check_config(&http), Ok(()));
 
@@ -6224,6 +6247,67 @@ mod tests {
                     parse(bad).to_cluster_config("checked", &HashSet::new()),
                     Err(ConfigError::InvalidHealthCheck { .. })
                 ),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// The probe `port` is optional; when set it must be a non-zero 16-bit
+    /// port, in either mode.
+    #[test]
+    fn health_check_validation_bounds_the_probe_port() {
+        for mode in [HealthCheckMode::Http, HealthCheckMode::Tcp] {
+            let config = |port: Option<u32>| HealthCheckConfig {
+                uri: "/health".to_owned(),
+                interval: 10,
+                timeout: 5,
+                healthy_threshold: 3,
+                unhealthy_threshold: 3,
+                mode: mode as i32,
+                port,
+                ..Default::default()
+            };
+            for port in [None, Some(1), Some(8080), Some(65535)] {
+                assert_eq!(
+                    validate_health_check_config(&config(port)),
+                    Ok(()),
+                    "{mode:?} probe port {port:?} must be accepted"
+                );
+            }
+            for port in [0, 65536, u32::MAX] {
+                assert_eq!(
+                    validate_health_check_config(&config(Some(port))),
+                    Err("health check port must lie in 1..=65535"),
+                    "{mode:?} probe port {port} must be refused"
+                );
+            }
+        }
+    }
+
+    /// The TOML `port` reaches the `AddCluster` order, an absent one stays
+    /// unset, and an out-of-range one is refused at load.
+    #[test]
+    fn health_check_toml_port_reaches_the_add_cluster_order() {
+        let build = |block: &str| {
+            toml::from_str::<FileClusterConfig>(&format!(
+                "protocol = \"tcp\"\nfrontends = []\nbackends = []\n[health_check]\n{block}"
+            ))
+            .expect("the cluster must parse")
+            .to_cluster_config("checked", &HashSet::new())
+        };
+        let port = |block: &str| -> Option<u32> {
+            let Ok(ClusterConfig::Tcp(tcp)) = build(block) else {
+                panic!("a tcp cluster with a valid health check must build as one");
+            };
+            tcp.health_check.expect("the health check must travel").port
+        };
+
+        assert_eq!(port("mode = \"TCP\"\n"), None);
+        assert_eq!(port("mode = \"TCP\"\nport = 8081\n"), Some(8081));
+        assert_eq!(port("uri = \"/health\"\nport = 65535\n"), Some(65535));
+        for bad in ["port = 0\n", "port = 65536\n"] {
+            assert!(
+                matches!(build(bad), Err(ConfigError::InvalidHealthCheck { .. })),
                 "{bad:?} must be refused"
             );
         }

@@ -8759,6 +8759,66 @@ mod tests {
         assert_eq!(state.clusters["app"].health_check, Some(tcp));
     }
 
+    /// `SetHealthCheck` refuses a probe port outside `1..=65535` and keeps
+    /// the previous config; a valid port is stored as sent.
+    #[test]
+    fn set_health_check_out_of_range_port_rejected() {
+        use crate::proto::command::{HealthCheckConfig, HealthCheckMode, SetHealthCheck};
+
+        let mut state = ConfigState::new();
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("app"),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("the cluster is added");
+        let probe = HealthCheckConfig {
+            uri: String::new(),
+            interval: 10,
+            timeout: 5,
+            healthy_threshold: 3,
+            unhealthy_threshold: 3,
+            mode: HealthCheckMode::Tcp as i32,
+            port: Some(8081),
+            ..Default::default()
+        };
+        let set = |config: HealthCheckConfig| {
+            RequestType::SetHealthCheck(SetHealthCheck {
+                cluster_id: String::from("app"),
+                config,
+            })
+            .into()
+        };
+
+        for port in [0, 65536] {
+            let err = state
+                .dispatch(&set(HealthCheckConfig {
+                    port: Some(port),
+                    ..probe.clone()
+                }))
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    StateError::InvalidValue {
+                        field: "health_check",
+                        ..
+                    }
+                ),
+                "expected InvalidValue for probe port {port}, got: {err}"
+            );
+            assert_eq!(state.clusters["app"].health_check, None);
+        }
+
+        state
+            .dispatch(&set(probe.clone()))
+            .expect("a probe port within 1..=65535 is accepted");
+        assert_eq!(state.clusters["app"].health_check, Some(probe));
+    }
+
     /// ALPN validation: reject unknown ALPN values.
     #[test]
     fn update_https_listener_alpn_unknown_value_rejected() {

@@ -1499,6 +1499,12 @@ message HealthCheckConfig {
     // HTTP mode: the response statuses that count as healthy. When
     // non-empty it replaces `expected_status`, which must then be `0`.
     repeated HttpStatusRange accepted_statuses = 8;
+    // Port the probe dials, in `1..=65535`; unset = the backend's data
+    // port. When set, both HTTP and TCP probes connect to the backend's IP
+    // address with this port, and the HTTP probe's `Host` names that
+    // address. A peer that predates this field ignores it and probes the
+    // data port.
+    optional uint32 port = 9;
     // The probe wire format is derived from `Cluster.http2` (the same
     // backend-capability hint the mux router reads). When the cluster
     // sets `http2 = true`, the probe sends the HTTP/2 connection

@@ -2,6 +2,36 @@
 
 ## [Unreleased]
 
+### Added
+
+- **BREAKING (library API) — `feat(health-check)`: probe port.** `HealthCheckConfig` gains an
+  optional `port` (proto field 9): when set, both `HTTP` and `TCP` probes connect to the
+  backend's IP address on that port instead of its data port, and the HTTP probe's `Host`
+  (h2c `:authority`) names that `ip:port`. Unset, the probe dials the data port as before. It
+  serves backends whose health endpoint or companion listener lives on another port, as
+  `UdpHealthConfig.tcp_port` already does for UDP clusters. `validate_health_check_config`
+  refuses a port outside `1..=65535` at the CLI, the TOML loader, the master state and the
+  worker. New TOML key `port` in `[clusters.<id>.health_check]` and `sozu cluster health-check
+  set` flag `--port`; `sozu cluster health-check list` gains a `port` column (`data` when
+  unset). Library API: `HealthCheckConfig` and `FileHealthCheckConfig` gain the public field
+  `port`, so a struct literal must name it or use `..Default::default()`. A message or saved
+  state without the field decodes as before.
+
+  **Before enabling it.** Upgrade the main process and every worker, and use the new CLI,
+  before setting `port`: an older worker ignores field 9 and probes the data port, which in
+  `TCP` mode passes every backend accepting connections there; an older `sozu` CLI that
+  patches a cluster by read-modify-write (`sozu cluster h2 enable|disable`) drops it, and so
+  does an older binary loading the saved state. Documented in `doc/health_checks.md`,
+  `doc/configure.md` and `doc/configure_cli.md`; covered by
+  `test_health_check_tcp_mode_probe_port_closed_marks_serving_backend_down`,
+  `test_health_check_http_mode_probe_port_closed_marks_serving_backend_down`,
+  `test_health_check_tcp_mode_probe_port_answering_keeps_backend_up` and
+  `test_health_check_http_mode_probe_port_answering_keeps_backend_up`
+  (`e2e/src/tests/health_check_mode_tests.rs`),
+  `probe_address_replaces_only_the_port_when_one_is_set` (`lib/src/health_check.rs`),
+  `set_health_check_out_of_range_port_rejected` (`command/src/state.rs`), plus unit tests in
+  `command/src/config.rs` and `bin/src/cli.rs`.
+
 ### Fixed
 
 - Re-adding the last HTTP, HTTPS, TCP or UDP listener removed from an address

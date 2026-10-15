@@ -144,12 +144,14 @@ reads `max_connection_attempts` from the configuration file, so mirror the chang
 ```bash
 sozu --config /etc/sozu/config.toml cluster health-check set --id <my_cluster_id> --uri /health --accepted-statuses 200-399,404
 sozu --config /etc/sozu/config.toml cluster health-check set --id <my_cluster_id> --mode tcp
+sozu --config /etc/sozu/config.toml cluster health-check set --id <my_cluster_id> --mode tcp --port 9090
 sozu --config /etc/sozu/config.toml cluster health-check list
 sozu --config /etc/sozu/config.toml cluster health-check remove --id <my_cluster_id>
 ```
 
 `--mode` is `http` (the default) or `tcp`, which only checks that a TCP connection is
-established. The probe timeout is `--probe-timeout` (seconds); `--timeout` is the global
+established. `--port` probes that port on each backend's IP address instead of its data
+port. The probe timeout is `--probe-timeout` (seconds); `--timeout` is the global
 command timeout in milliseconds. See `doc/health_checks.md` for every flag and default.
 
 ## Remove a cluster
