@@ -1,5 +1,6 @@
 use std::{
-    cell::RefCell, fmt::Debug, hash::Hasher, net::SocketAddr, ops::Index, rc::Rc, time::Instant,
+    cell::RefCell, cmp::Ordering, fmt::Debug, hash::Hasher, net::SocketAddr, ops::Index, rc::Rc,
+    time::Instant,
 };
 
 use rand::{
@@ -428,6 +429,16 @@ impl<'a> Candidates<'a> {
             })
     }
 
+    /// The position in the backend list of the candidate at `index`.
+    fn position(&self, index: usize) -> usize {
+        self.indices[index]
+    }
+
+    /// The length of the backend list the view reads.
+    fn list_len(&self) -> usize {
+        self.backends.len()
+    }
+
     /// The instant this selection happens at.
     pub fn now(&self) -> Instant {
         self.now
@@ -488,14 +499,56 @@ pub trait LoadBalancingAlgorithm: Debug {
 
     /// Called by the control plane when the live backend set for a cluster
     /// changes, so table-based policies (Maglev) can recompute their lookup
-    /// table off the datapath. The default is a no-op; only [`Maglev`]
-    /// overrides it.
+    /// table off the datapath. The default is a no-op; [`Maglev`] rebuilds
+    /// its table, and [`RoundRobin`] (with the round-robin fallback of
+    /// [`Rendezvous`] and [`Maglev`]) resets its running weights.
     fn rebuild(&mut self, _backends: &[Rc<RefCell<Backend>>]) {}
 }
 
+/// Round-robin selection, weighted by `weight` through smooth weighted round
+/// robin (the nginx `ngx_http_upstream_get_peer` scheme).
+///
+/// # Equal weights: the cursor
+///
+/// When every candidate carries the same weight — the default, since an unset
+/// `weight` reads as `DEFAULT_WEIGHT` — the selection is the historical
+/// cursor over the candidate view: position `next_backend % len`, then the
+/// cursor advances. The weighted scheme would visit a fixed set in the same
+/// order, but the cursor is what decides how a selection continues once the
+/// set shrinks or grows (a backend backs off, recovers, or is excluded by a
+/// retry), so keeping it for equal weights keeps every such sequence exactly
+/// as it was.
+///
+/// # Unequal weights: smooth weighted round robin
+///
+/// Each backend of the list carries a running `current` weight. A selection
+/// adds every candidate's weight to its `current`, picks the candidate with
+/// the largest `current` (the first in view order on a tie), and subtracts the
+/// sum of the candidates' weights from the winner's. Over a fixed set, a
+/// backend of weight `w` is picked exactly `w` times in every `Σw` selections,
+/// and the picks interleave rather than bunch: weights `5, 1, 1` yield
+/// `a a b a c a a`, not `a a a a a b c`.
+///
+/// The weight is `backend_weight`'s, clamped to at least `1`, as for
+/// [`Rendezvous`] and [`Maglev`]: a `0` or negative weight leaves a backend in
+/// the rotation at the smallest share, never out of it.
+///
+/// The running weights are indexed by list position. [`Self::rebuild`], which
+/// the backend list calls whenever a backend is added, removed or reweighted,
+/// resets them, off the datapath; a backend that is not a candidate of one
+/// selection keeps its running weight for the next.
+///
+/// Telling the two cases apart reads every candidate's weight on each
+/// selection. That is deliberate: the candidates are the eligible subset of
+/// the list, which changes with health and retries, so a flag cached on the
+/// list could not say whether THIS subset is uniform.
 #[derive(Debug)]
 pub struct RoundRobin {
     pub next_backend: u32,
+    /// Smooth weighted round robin's running weight of each backend, by list
+    /// position. Sized to the list by [`Self::rebuild`]; a selection over a
+    /// list of another length resizes it first.
+    current_weights: Vec<i64>,
 }
 
 impl LoadBalancingAlgorithm for RoundRobin {
@@ -514,6 +567,10 @@ impl LoadBalancingAlgorithm for RoundRobin {
             !backends.is_empty(),
             "round-robin index math runs only on a non-empty set"
         );
+
+        if !uniform_weights(backends) {
+            return Some(self.smooth_weighted(backends));
+        }
 
         let index = self.next_backend as usize % backends.len();
         // The reduced index always addresses a real slot, so the lookup yields
@@ -534,6 +591,20 @@ impl LoadBalancingAlgorithm for RoundRobin {
         );
         res
     }
+
+    fn rebuild(&mut self, backends: &[Rc<RefCell<Backend>>]) {
+        self.current_weights.clear();
+        self.current_weights.resize(backends.len(), 0);
+    }
+}
+
+/// Whether every candidate carries the same [`backend_weight`].
+fn uniform_weights(backends: Candidates<'_>) -> bool {
+    let mut weights = backends.iter().map(|b| backend_weight(&b.borrow()));
+    match weights.next() {
+        Some(first) => weights.all(|weight| weight == first),
+        None => true,
+    }
 }
 
 impl Default for RoundRobin {
@@ -544,7 +615,51 @@ impl Default for RoundRobin {
 
 impl RoundRobin {
     pub fn new() -> Self {
-        Self { next_backend: 0 }
+        Self {
+            next_backend: 0,
+            current_weights: Vec::new(),
+        }
+    }
+
+    /// One step of smooth weighted round robin over a non-empty `backends`.
+    fn smooth_weighted(&mut self, backends: Candidates<'_>) -> Rc<RefCell<Backend>> {
+        debug_assert!(
+            !backends.is_empty(),
+            "smooth weighted round robin runs only on a non-empty set"
+        );
+        if self.current_weights.len() != backends.list_len() {
+            // A list `rebuild` never saw: start every running weight afresh.
+            self.current_weights.clear();
+            self.current_weights.resize(backends.list_len(), 0);
+        }
+
+        let mut total: i64 = 0;
+        let mut best: Option<usize> = None;
+        for index in 0..backends.len() {
+            let position = backends.position(index);
+            let weight = i64::from(backend_weight(&backends[index].borrow()));
+            self.current_weights[position] += weight;
+            total += weight;
+            let current = self.current_weights[position];
+            // Strictly greater: the first candidate in view order wins a tie.
+            if best.is_none_or(|best| current > self.current_weights[backends.position(best)]) {
+                best = Some(index);
+            }
+        }
+        let best = best.expect("a non-empty set yields a winner");
+        let position = backends.position(best);
+        self.current_weights[position] -= total;
+        // The candidates' running weights were raised by `total` in all and
+        // the winner's lowered by it: a step moves no weight in or out, so
+        // the running weights of the whole list still sum to zero, as they
+        // did when reset.
+        debug_assert!(total >= backends.len() as i64, "every weight is at least 1");
+        debug_assert_eq!(
+            self.current_weights.iter().sum::<i64>(),
+            0,
+            "smooth weighted round robin's running weights must sum to zero"
+        );
+        backends[best].clone()
     }
 }
 
@@ -710,6 +825,55 @@ fn address_count(
     total
 }
 
+/// Order two candidates by load per unit of weight, `load_a / weight_a`
+/// against `load_b / weight_b`, without a division: the two are compared
+/// cross-multiplied, exactly, in `u128`. With equal weights this is the order
+/// of the raw loads, so an unweighted cluster selects exactly as before.
+fn cmp_count_per_weight(load_a: usize, weight_a: u32, load_b: usize, weight_b: u32) -> Ordering {
+    debug_assert!(
+        weight_a >= 1 && weight_b >= 1,
+        "a weight reaches the comparison clamped to at least 1"
+    );
+    let order =
+        (load_a as u128 * u128::from(weight_b)).cmp(&(load_b as u128 * u128::from(weight_a)));
+    debug_assert!(
+        weight_a != weight_b || order == load_a.cmp(&load_b),
+        "equal weights must order the raw loads"
+    );
+    order
+}
+
+/// [`cmp_count_per_weight`] for a load that is a latency (`f64`). Equal weights
+/// compare the raw values, untouched by any rounding, so the comparison is
+/// then exactly the one the policies made before they read `weight`; unequal
+/// weights compare the cross-multiplied values. `None` only when a value is
+/// NaN, as `f64::partial_cmp`.
+fn cmp_cost_per_weight(cost_a: f64, weight_a: u32, cost_b: f64, weight_b: u32) -> Option<Ordering> {
+    debug_assert!(
+        weight_a >= 1 && weight_b >= 1,
+        "a weight reaches the comparison clamped to at least 1"
+    );
+    if weight_a == weight_b {
+        cost_a.partial_cmp(&cost_b)
+    } else {
+        (cost_a * f64::from(weight_b)).partial_cmp(&(cost_b * f64::from(weight_a)))
+    }
+}
+
+/// The least loaded candidate, load measured per unit of weight.
+///
+/// A candidate's load (`address_count` under a count metric, the
+/// representative's peak-EWMA connection time under
+/// [`LoadMetric::ConnectionTime`]) is divided by its `backend_weight`: a
+/// backend of weight `200` carrying `10` connections is as loaded as one of
+/// weight `100` carrying `5`. The weight is clamped to at least `1`, as for
+/// every weighted policy but [`Random`], so a `0` or negative weight counts as
+/// `1`, the smallest share, and never excludes a backend.
+///
+/// The first minimum in view order wins a tie. With equal weights (the
+/// default: an unset weight reads as `DEFAULT_WEIGHT`) the comparison is the
+/// one on raw loads, so the selection is the one made before the weight was
+/// read.
 #[derive(Debug)]
 pub struct LeastLoaded {
     pub metric: LoadMetric,
@@ -722,38 +886,51 @@ impl LoadBalancingAlgorithm for LeastLoaded {
         backends: Candidates<'_>,
     ) -> Option<Rc<RefCell<Backend>>> {
         let was_empty = backends.is_empty();
+        let weight = |index: usize| backend_weight(&backends[index].borrow());
         // One address is one share: a count metric reads the address's load,
-        // the sum over its ids (`address_count`). The first minimum wins.
+        // the sum over its ids (`address_count`), and the address weighs what
+        // its representative weighs. `min_by` keeps the first minimum.
+        let count = |metric: fn(&Backend) -> usize| {
+            (0..backends.len())
+                .map(|index| (address_count(backends, index, metric), weight(index), index))
+                .min_by(|&(load_a, weight_a, _), &(load_b, weight_b, _)| {
+                    cmp_count_per_weight(load_a, weight_a, load_b, weight_b)
+                })
+                .and_then(|(_, _, index)| backends.get(index))
+        };
         let opt_b = match self.metric {
-            LoadMetric::Connections => (0..backends.len())
-                .min_by_key(|&index| address_count(backends, index, |b| b.active_connections))
-                .and_then(|index| backends.get(index)),
-            LoadMetric::Requests => (0..backends.len())
-                .min_by_key(|&index| address_count(backends, index, |b| b.active_requests))
-                .and_then(|index| backends.get(index)),
+            LoadMetric::Connections => count(|b| b.active_connections),
+            LoadMetric::Requests => count(|b| b.active_requests),
             LoadMetric::ConnectionTime => {
-                let mut b = None;
+                let mut b: Option<(f64, u32, &Rc<RefCell<Backend>>)> = None;
                 let now = backends.now();
                 for backend in backends.iter() {
                     let cost2 = backend.borrow_mut().peak_ewma_connection(now);
+                    let weight2 = backend_weight(&backend.borrow());
 
                     match b.take() {
-                        None => b = Some((cost2, backend)),
-                        Some((cost1, back1)) => {
-                            if cost1 <= cost2 {
-                                b = Some((cost1, back1));
+                        None => b = Some((cost2, weight2, backend)),
+                        Some((cost1, weight1, back1)) => {
+                            // Keep the earlier unless the later is strictly
+                            // lighter (or the earlier's cost is NaN), as the
+                            // raw `cost1 <= cost2` did.
+                            if matches!(
+                                cmp_cost_per_weight(cost1, weight1, cost2, weight2),
+                                Some(Ordering::Less | Ordering::Equal)
+                            ) {
+                                b = Some((cost1, weight1, back1));
                             } else {
-                                b = Some((cost2, backend));
+                                b = Some((cost2, weight2, backend));
                             }
                         }
                     }
                 }
 
-                b.map(|(_cost, backend)| backend)
+                b.map(|(_cost, _weight, backend)| backend)
             }
         };
         // Least-loaded over a non-empty set always finds a minimum; an empty
-        // set yields nothing. (`min_by_key` / the manual fold both have this
+        // set yields nothing. (`min_by` / the manual fold both have this
         // shape.)
         debug_assert_eq!(
             opt_b.is_some(),
@@ -868,9 +1045,10 @@ impl PowerOfTwo {
     /// decays the EWMA, to the selection's instant `now`, as it reads it.
     ///
     /// A count metric reads the load of the candidate's whole address, the
-    /// sum over its ids (`address_count`).
-    fn measure(&self, backends: Candidates<'_>, index: usize) -> f64 {
-        match self.metric {
+    /// sum over its ids (`address_count`). The load comes back with the
+    /// candidate's [`backend_weight`], which the caller divides it by.
+    fn measure(&self, backends: Candidates<'_>, index: usize) -> (f64, u32) {
+        let load = match self.metric {
             LoadMetric::Connections => {
                 address_count(backends, index, |b| b.active_connections) as f64
             }
@@ -878,7 +1056,8 @@ impl PowerOfTwo {
             LoadMetric::ConnectionTime => backends[index]
                 .borrow_mut()
                 .peak_ewma_connection(backends.now()),
-        }
+        };
+        (load, backend_weight(&backends[index].borrow()))
     }
 }
 
@@ -917,30 +1096,29 @@ impl LoadBalancingAlgorithm for PowerOfTwo {
             "the shifted second index must stay inside the candidate set"
         );
 
-        let first_measure = self.measure(backends, first);
-        let second_measure = self.measure(backends, second);
+        let (first_load, first_weight) = self.measure(backends, first);
+        let (second_load, second_weight) = self.measure(backends, second);
+        // Load per unit of weight: with equal weights, the raw loads.
+        let order = cmp_cost_per_weight(first_load, first_weight, second_load, second_weight);
 
         // Keep the lighter of the two samples. An exact tie is broken by a
         // coin flip rather than by index order: ties are the common case
         // (every backend starts at zero load), and always awarding them to
         // the lower index would reintroduce the herding P2C exists to avoid
         // — see the struct docs.
-        let chosen = if first_measure < second_measure {
-            first
-        } else if second_measure < first_measure {
-            second
-        } else if self.rng.random_bool(0.5) {
-            first
-        } else {
-            second
+        let chosen = match order {
+            Some(Ordering::Less) => first,
+            Some(Ordering::Greater) => second,
+            _ if self.rng.random_bool(0.5) => first,
+            _ => second,
         };
         // Asserted on the already-computed measures on purpose: re-reading a
         // backend under `LoadMetric::ConnectionTime` decays its EWMA, and a
         // `debug_assert!` that mutates would make debug and release builds
         // diverge.
         debug_assert!(
-            (chosen == first && first_measure <= second_measure)
-                || (chosen == second && second_measure <= first_measure),
+            (chosen == first && order != Some(Ordering::Greater))
+                || (chosen == second && order != Some(Ordering::Less)),
             "power-of-two must never keep the strictly heavier of its two samples"
         );
 
@@ -1075,6 +1253,11 @@ impl LoadBalancingAlgorithm for Rendezvous {
             }
         }
         best.map(|(_, backend)| backend.clone())
+    }
+
+    fn rebuild(&mut self, backends: &[Rc<RefCell<Backend>>]) {
+        // Only the round-robin fallback keeps state across selections.
+        self.round_robin.rebuild(backends);
     }
 }
 
@@ -1424,6 +1607,7 @@ impl LoadBalancingAlgorithm for Maglev {
 
     fn rebuild(&mut self, backends: &[Rc<RefCell<Backend>>]) {
         Maglev::rebuild(self, backends);
+        self.round_robin.rebuild(backends);
     }
 }
 
@@ -1521,7 +1705,10 @@ mod test {
             Rc::new(RefCell::new(create_backend("yoto".to_string(), None))),
         ];
 
-        let mut roundrobin = RoundRobin { next_backend: 1 };
+        let mut roundrobin = RoundRobin {
+            next_backend: 1,
+            ..RoundRobin::new()
+        };
         let backend = pick(&mut roundrobin, None, &backends);
         assert_eq!(backend.as_ref(), backends.get(1));
 
@@ -2574,5 +2761,230 @@ mod test {
             "min_backends defaults to 8 and the mode to FALLBACK"
         );
         assert_eq!(ShuffleSharding::from_cluster(None, Some(4), Some(1)), None);
+    }
+
+    // ----- `weight` under ROUND_ROBIN, LEAST_LOADED and POWER_OF_TWO -----
+
+    /// Backends at distinct addresses carrying `weights`, `None` for unset.
+    fn weighted_backends(weights: &[Option<i32>]) -> Vec<Rc<RefCell<Backend>>> {
+        weights
+            .iter()
+            .enumerate()
+            .map(|(i, &weight)| rc(addr_backend(&format!("w{i}"), i as u8 + 1, 8000, weight)))
+            .collect()
+    }
+
+    /// The list positions `policy` picks over `count` selections.
+    fn sequence(
+        policy: &mut impl LoadBalancingAlgorithm,
+        backends: &[Rc<RefCell<Backend>>],
+        count: usize,
+    ) -> Vec<usize> {
+        (0..count)
+            .map(|_| {
+                let picked = pick(policy, None, backends).expect("a non-empty set selects");
+                backends
+                    .iter()
+                    .position(|backend| Rc::ptr_eq(backend, &picked))
+                    .expect("the pick is one of the candidates")
+            })
+            .collect()
+    }
+
+    /// Smooth weighted round robin interleaves the heavy backend's picks
+    /// instead of bunching them, and repeats every `Σw` selections.
+    ///
+    /// TO SEE THIS RED: drop the `smooth_weighted` branch of
+    /// `RoundRobin::next_available_backend`; the cursor then yields
+    /// `0 1 2 0 1 2 0`.
+    #[test]
+    fn round_robin_smooth_weighted_interleaves_picks() {
+        let backends = weighted_backends(&[Some(5), Some(1), Some(1)]);
+        let mut round_robin = RoundRobin::new();
+        let cycle = [0, 0, 1, 0, 2, 0, 0];
+        let expected: Vec<usize> = cycle.iter().chain(cycle.iter()).copied().collect();
+        assert_eq!(sequence(&mut round_robin, &backends, 14), expected);
+    }
+
+    /// Over one full cycle of `Σw` selections, each backend is picked exactly
+    /// `w` times. A `0` or negative weight counts as `1`: the backend keeps
+    /// the smallest share, as under `HRW` and `MAGLEV`.
+    #[test]
+    fn round_robin_picks_each_backend_exactly_its_weight_per_cycle() {
+        let backends = weighted_backends(&[Some(300), None, Some(0), Some(-5), Some(7)]);
+        // `None` reads as the default weight, 100.
+        let weights = [300, DEFAULT_WEIGHT as usize, 1, 1, 7];
+        let total: usize = weights.iter().sum();
+        let mut round_robin = RoundRobin::new();
+        for cycle in 0..3 {
+            let mut counts = [0usize; 5];
+            for position in sequence(&mut round_robin, &backends, total) {
+                counts[position] += 1;
+            }
+            assert_eq!(counts, weights, "cycle {cycle}");
+        }
+    }
+
+    /// Equal weights, whatever their value, select exactly as the historical
+    /// cursor does, including across a removal from the set; so do weights
+    /// that only clamp to equal (`0` and `1`).
+    #[test]
+    fn round_robin_equal_weights_reproduce_the_cursor_sequence() {
+        let reference = weighted_backends(&[None, None, None, None]);
+        for weights in [
+            [Some(50); 4],
+            [Some(DEFAULT_WEIGHT); 4],
+            [Some(0), Some(1), Some(-3), Some(1)],
+        ] {
+            let mut reference = reference.clone();
+            let mut backends = weighted_backends(&weights);
+            let mut expected_policy = RoundRobin::new();
+            let mut policy = RoundRobin::new();
+            assert_eq!(
+                sequence(&mut policy, &backends, 9),
+                sequence(&mut expected_policy, &reference, 9),
+                "{weights:?}"
+            );
+            reference.remove(1);
+            backends.remove(1);
+            assert_eq!(
+                sequence(&mut policy, &backends, 7),
+                sequence(&mut expected_policy, &reference, 7),
+                "{weights:?} after a removal"
+            );
+        }
+    }
+
+    /// With no client key, `HRW` and `MAGLEV` fall back to round robin, now
+    /// weighted like it.
+    #[test]
+    fn affinity_fallback_round_robin_honors_weight() {
+        let backends = weighted_backends(&[Some(3), Some(1)]);
+        let expected = vec![0, 0, 1, 0, 0, 0, 1, 0];
+        assert_eq!(
+            sequence(&mut Rendezvous::new(), &backends, 8),
+            expected,
+            "HRW"
+        );
+        let mut maglev = Maglev::new();
+        maglev.rebuild(&backends);
+        assert_eq!(sequence(&mut maglev, &backends, 8), expected, "MAGLEV");
+    }
+
+    /// `rebuild`, which the backend list runs when a weight changes, starts
+    /// the running weights afresh: the selection after a reweight is the one
+    /// a fresh policy makes over the new weights.
+    #[test]
+    fn round_robin_rebuild_resets_running_weights() {
+        use crate::{backends::BackendList, sozu_command::proto::command::LoadBalancingAlgorithms};
+
+        let address = |port| SocketAddr::from(([127, 0, 0, 1], port));
+        let backend = |id: &str, port, weight| {
+            Backend::new(
+                id,
+                address(port),
+                None,
+                Some(LoadBalancingParams { weight }),
+                None,
+            )
+        };
+        let mut list = BackendList::with_seed(1);
+        list.set_load_balancing_policy(LoadBalancingAlgorithms::RoundRobin, None, 1);
+        list.add_backend(backend("a", 9200, 3));
+        list.add_backend(backend("b", 9201, 1));
+        let now = Instant::now();
+        let picked = |list: &mut BackendList| {
+            list.next_available_backend(now)
+                .expect("a healthy list selects")
+                .borrow()
+                .address
+        };
+        // Running weights after this pick: a = -1, b = 1.
+        assert_eq!(picked(&mut list), address(9200));
+        // Reweighted to (3, 2): kept running weights would make b win
+        // (a = 2, b = 3); reset ones make a win (a = 3, b = 2).
+        list.add_backend(backend("b", 9201, 2));
+        assert_eq!(picked(&mut list), address(9200));
+    }
+
+    /// `LEAST_LOADED` divides each load by its weight: `10` connections on
+    /// weight `100` is lighter than `4` on weight `10`.
+    ///
+    /// TO SEE THIS RED: compare the raw loads in `LeastLoaded`; the second
+    /// backend then wins.
+    #[test]
+    fn least_loaded_compares_load_per_unit_of_weight() {
+        for metric in [LoadMetric::Connections, LoadMetric::Requests] {
+            let backends = weighted_backends(&[Some(100), Some(10)]);
+            for (backend, load) in backends.iter().zip([10, 4]) {
+                let mut backend = backend.borrow_mut();
+                backend.active_connections = load;
+                backend.active_requests = load;
+            }
+            let mut policy = LeastLoaded { metric };
+            assert_eq!(sequence(&mut policy, &backends, 1), [0], "{metric:?}");
+
+            // Equal per-weight loads (10/100 against 1/10): the first wins.
+            backends[1].borrow_mut().active_connections = 1;
+            backends[1].borrow_mut().active_requests = 1;
+            assert_eq!(sequence(&mut policy, &backends, 1), [0], "{metric:?} tie");
+        }
+    }
+
+    /// Equal weights keep `LEAST_LOADED`'s raw-load order and first-minimum
+    /// tie-break.
+    #[test]
+    fn least_loaded_equal_weights_compare_raw_loads() {
+        let backends = weighted_backends(&[Some(7), Some(7), Some(7)]);
+        for (backend, load) in backends.iter().zip([5, 3, 3]) {
+            backend.borrow_mut().active_connections = load;
+        }
+        let mut policy = LeastLoaded {
+            metric: LoadMetric::Connections,
+        };
+        assert_eq!(sequence(&mut policy, &backends, 1), [1]);
+    }
+
+    /// `POWER_OF_TWO` divides each sample's load by its weight. With two
+    /// backends both are sampled on every selection, so the lighter per unit
+    /// of weight wins every time.
+    ///
+    /// TO SEE THIS RED: compare the raw loads in `PowerOfTwo`; the second
+    /// backend then wins every time.
+    #[test]
+    fn power_of_two_compares_load_per_unit_of_weight() {
+        for metric in [LoadMetric::Connections, LoadMetric::Requests] {
+            let backends = weighted_backends(&[Some(100), Some(10)]);
+            for (backend, load) in backends.iter().zip([10, 4]) {
+                let mut backend = backend.borrow_mut();
+                backend.active_connections = load;
+                backend.active_requests = load;
+            }
+            let mut policy = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, metric);
+            assert_eq!(
+                sequence(&mut policy, &backends, 64),
+                vec![0; 64],
+                "{metric:?}"
+            );
+        }
+    }
+
+    /// The per-weight comparison is exact and, with equal weights, is the
+    /// raw comparison.
+    #[test]
+    fn per_weight_comparisons_are_exact() {
+        assert_eq!(cmp_count_per_weight(10, 100, 4, 10), Ordering::Less);
+        assert_eq!(cmp_count_per_weight(10, 100, 1, 10), Ordering::Equal);
+        assert_eq!(
+            cmp_count_per_weight(usize::MAX, 1, usize::MAX, 2),
+            Ordering::Greater
+        );
+        assert_eq!(cmp_count_per_weight(3, 7, 4, 7), Ordering::Less);
+        assert_eq!(
+            cmp_cost_per_weight(2.0, 200, 1.5, 100),
+            Some(Ordering::Less)
+        );
+        assert_eq!(cmp_cost_per_weight(1.0, 5, 1.0, 5), Some(Ordering::Equal));
+        assert_eq!(cmp_cost_per_weight(f64::NAN, 5, 1.0, 5), None);
     }
 }
