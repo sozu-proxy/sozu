@@ -15,9 +15,11 @@
   the policy wins over the frontend's other redirect, rewrite and authentication
   settings. The access log records status `444` with message `silent_close`; the
   line is not an error (`http.errors` is not incremented) and counts in
-  `http.status.4xx`. Workers that predate this version decode the new value as
-  an unknown enum and treat the frontend as `forward` (a clusterless one answers
-  401), so upgrade every worker before adding a `silent_close` frontend.
+  `http.status.4xx`. The main sends a `silent_close` add as
+  `AddHttpFrontendWithSilentClose` (field 70) or
+  `AddHttpsFrontendWithSilentClose` (field 71); other frontends keep the legacy
+  verbs. A worker older than 2.3.2 cannot decode these requests and fails them,
+  so it never installs an unguarded forwarding route.
 
 ### Fixed
 
