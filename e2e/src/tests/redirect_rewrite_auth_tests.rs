@@ -1686,3 +1686,345 @@ fn test_clusterless_permanent_redirect_emits_301() {
         State::Success,
     );
 }
+
+// ═════════════════════════════════════════════════════════════════════
+// Silent close — RedirectPolicy::SilentClose answers nothing (#767)
+// ═════════════════════════════════════════════════════════════════════
+
+/// Budget for sozu to close the H1 connection of a silently closed
+/// request. The close follows the routing decision on the same event-loop
+/// pass, so this only absorbs a slow CI runner.
+const SILENT_CLOSE_DEADLINE_MS: u64 = 2000;
+
+/// Accept budget used to prove the backend is never contacted. The
+/// refusal is decided before any connect, so a dial that never happens
+/// cannot be "late"; this only bounds the negative check.
+const SILENT_CLOSE_BACKEND_BUDGET_MS: u64 = 500;
+
+/// `RedirectPolicy::SilentClose` on an H1 frontend: sozu closes the
+/// connection without writing a single byte (nginx `return 444`) and never
+/// contacts the backend. A FIN or an RST both end the connection; what
+/// matters is that it ends, and that nothing was written before it did.
+pub fn try_silent_close_h1_writes_nothing() -> State {
+    use std::{
+        io::{ErrorKind, Read, Write},
+        net::TcpStream,
+        time::Instant,
+    };
+
+    let front_address = create_local_address();
+    let back_address = create_local_address();
+    let mut worker = spawn_worker_with_http_listener("SILENT-H1", front_address);
+
+    worker.send_proxy_request(
+        RequestType::AddCluster(Worker::default_cluster("silent_cluster")).into(),
+    );
+    worker.send_proxy_request(
+        RequestType::AddHttpFrontend(RequestHttpFrontend {
+            redirect: Some(RedirectPolicy::SilentClose as i32),
+            ..Worker::default_http_frontend("silent_cluster", front_address)
+        })
+        .into(),
+    );
+    add_backend(&mut worker, "silent_cluster", "silent_back_0", back_address);
+    let mut backend = SyncBackend::new(
+        "silent_back",
+        back_address,
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\npong",
+    );
+    backend.connect();
+    worker.read_to_last();
+
+    let mut stream = TcpStream::connect(front_address).expect("connect to the H1 frontend");
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("set read timeout");
+    stream
+        .write_all(http_request("GET", "/blocked", "", "localhost").as_bytes())
+        .expect("send the request");
+
+    let deadline = Instant::now() + Duration::from_millis(SILENT_CLOSE_DEADLINE_MS);
+    let mut received = Vec::new();
+    let mut closed = false;
+    while Instant::now() < deadline {
+        let mut buf = [0u8; 1024];
+        match stream.read(&mut buf) {
+            Ok(0) => {
+                closed = true;
+                break;
+            }
+            Ok(n) => received.extend_from_slice(&buf[..n]),
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(e) if e.kind() == ErrorKind::ConnectionReset => {
+                closed = true;
+                break;
+            }
+            Err(e) => {
+                eprintln!("unexpected read error: {e}");
+                break;
+            }
+        }
+    }
+    let backend_contacted = accept_with_retry(&mut backend, 0, SILENT_CLOSE_BACKEND_BUDGET_MS);
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    if closed && received.is_empty() && !backend_contacted {
+        State::Success
+    } else {
+        eprintln!(
+            "expected a close with no byte and no backend contact; closed={closed} \
+             received={:?} backend_contacted={backend_contacted}",
+            String::from_utf8_lossy(&received)
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_silent_close_h1_writes_nothing() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "silent close H1 writes nothing",
+            try_silent_close_h1_writes_nothing
+        ),
+        State::Success
+    );
+}
+
+/// HPACK block for `GET https://localhost{path}`: `:method GET` and
+/// `:scheme https` from the static table, `:path` as a literal without
+/// indexing on static name 4, `:authority localhost` as a literal.
+fn h2_get_headers_for_path(path: &str) -> Vec<u8> {
+    let path_len = u8::try_from(path.len()).expect("test path must fit a 7-bit length");
+    assert!(
+        path_len < 0x7f,
+        "test path must fit a single-octet HPACK length"
+    );
+    let mut block = vec![0x82, 0x87, 0x04, path_len];
+    block.extend_from_slice(path.as_bytes());
+    block.extend_from_slice(&[0x41, 0x09]);
+    block.extend_from_slice(b"localhost");
+    block
+}
+
+/// `RedirectPolicy::SilentClose` on an H2 frontend resets only the refused
+/// stream, with RST_STREAM(CANCEL) and no HEADERS: a second stream on the
+/// SAME connection, routed to a forwarding frontend, still gets its 200,
+/// and the connection is never sent a GOAWAY. The backend sees only the
+/// forwarded request.
+pub fn try_silent_close_h2_resets_only_the_stream() -> State {
+    use super::h2_utils::{
+        H2_FRAME_HEADERS, H2Frame, collect_response_frames, contains_goaway,
+        contains_rst_stream_with_error, h2_handshake, log_frames, raw_h2_connection, setup_h2_test,
+        stream_status_matches,
+    };
+    use std::io::Write;
+
+    /// RFC 9113 §7 CANCEL.
+    const H2_ERROR_CANCEL: u32 = 0x8;
+
+    let (mut worker, mut backends, front_port) = setup_h2_test("SILENT-H2", 1);
+    let front_address: std::net::SocketAddr = format!("127.0.0.1:{front_port}")
+        .parse()
+        .expect("front address must parse");
+    worker.send_proxy_request(
+        RequestType::AddHttpsFrontend(RequestHttpFrontend {
+            redirect: Some(RedirectPolicy::SilentClose as i32),
+            path: sozu_command_lib::proto::command::PathRule::prefix("/blocked".to_owned()),
+            ..Worker::default_http_frontend("cluster_0", front_address)
+        })
+        .into(),
+    );
+    worker.read_to_last();
+
+    let mut tls = raw_h2_connection(front_address);
+    h2_handshake(&mut tls);
+    let blocked = H2Frame::headers(1, h2_get_headers_for_path("/blocked"), true, true);
+    let allowed = H2Frame::headers(3, h2_get_headers_for_path("/"), true, true);
+    tls.write_all(&blocked.encode())
+        .expect("send the blocked request");
+    tls.write_all(&allowed.encode())
+        .expect("send the allowed request");
+    tls.flush().expect("flush both requests");
+
+    let frames = collect_response_frames(&mut tls, 200, 8, 250);
+    log_frames("silent close H2", &frames);
+    let reset_with_cancel = contains_rst_stream_with_error(&frames, 1, H2_ERROR_CANCEL);
+    let blocked_answered = frames
+        .iter()
+        .any(|(ft, _, sid, _)| *ft == H2_FRAME_HEADERS && *sid == 1);
+    let allowed_answered = stream_status_matches(&frames, 3, 200);
+    let goaway = contains_goaway(&frames);
+
+    drop(tls);
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    let requests_received = backends
+        .iter_mut()
+        .filter_map(|backend| backend.stop_and_get_aggregator())
+        .map(|aggregator| aggregator.requests_received)
+        .sum::<usize>();
+
+    if reset_with_cancel
+        && !blocked_answered
+        && allowed_answered
+        && !goaway
+        && requests_received == 1
+    {
+        State::Success
+    } else {
+        eprintln!(
+            "expected RST_STREAM(CANCEL) on 1 only, a 200 on 3 and one backend request; \
+             reset_with_cancel={reset_with_cancel} blocked_answered={blocked_answered} \
+             allowed_answered={allowed_answered} goaway={goaway} \
+             requests_received={requests_received}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_silent_close_h2_resets_only_the_stream() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "silent close H2 resets only the stream",
+            try_silent_close_h2_resets_only_the_stream
+        ),
+        State::Success
+    );
+}
+
+/// `RedirectPolicy::SilentClose` on an HTTPS H1 frontend, on a keep-alive
+/// connection that already carried a complete response: the next request, to
+/// the silent-close frontend, ends the connection without a single byte
+/// behind that first response (no 4xx, no stale answer), and only the first
+/// request reaches the backend.
+pub fn try_silent_close_https_h1_keep_alive_writes_nothing() -> State {
+    use super::h2_utils::setup_h2_test;
+    use std::{
+        io::{ErrorKind, Read, Write},
+        sync::Arc,
+        time::Instant,
+    };
+
+    let (mut worker, mut backends, front_port) = setup_h2_test("SILENT-H1-TLS", 1);
+    let front_address: std::net::SocketAddr = format!("127.0.0.1:{front_port}")
+        .parse()
+        .expect("front address must parse");
+    worker.send_proxy_request(
+        RequestType::AddHttpsFrontend(RequestHttpFrontend {
+            redirect: Some(RedirectPolicy::SilentClose as i32),
+            path: sozu_command_lib::proto::command::PathRule::prefix("/blocked".to_owned()),
+            ..Worker::default_http_frontend("cluster_0", front_address)
+        })
+        .into(),
+    );
+    worker.read_to_last();
+
+    let mut tls_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(crate::mock::https_client::Verifier))
+        .with_no_client_auth();
+    tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let server_name = rustls::pki_types::ServerName::try_from("localhost")
+        .expect("SNI must parse")
+        .to_owned();
+    let connection = rustls::ClientConnection::new(Arc::new(tls_config), server_name)
+        .expect("client TLS state must build");
+    let tcp = std::net::TcpStream::connect(front_address).expect("connect to the H1 frontend");
+    tcp.set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("set read timeout");
+    let mut tls = rustls::StreamOwned::new(connection, tcp);
+
+    tls.write_all(http_request("GET", "/", "", "localhost").as_bytes())
+        .expect("send the allowed request");
+    tls.flush().expect("flush the allowed request");
+
+    // Read exactly the first response: head plus `Content-Length` bytes.
+    let deadline = Instant::now() + Duration::from_millis(SILENT_CLOSE_DEADLINE_MS);
+    let mut first = Vec::new();
+    let mut first_len = None;
+    while Instant::now() < deadline && first_len.is_none_or(|len| first.len() < len) {
+        let mut buf = [0u8; 4096];
+        match tls.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => first.extend_from_slice(&buf[..n]),
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(_) => break,
+        }
+        if first_len.is_none()
+            && let Some(head_end) = first.windows(4).position(|w| w == b"\r\n\r\n")
+        {
+            let head = String::from_utf8_lossy(&first[..head_end]).to_ascii_lowercase();
+            let body_len = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            first_len = Some(head_end + 4 + body_len);
+        }
+    }
+    let first_ok = first.starts_with(b"HTTP/1.1 200") && first_len == Some(first.len());
+
+    tls.write_all(http_request("GET", "/blocked", "", "localhost").as_bytes())
+        .expect("send the blocked request on the same connection");
+    tls.flush().expect("flush the blocked request");
+
+    let deadline = Instant::now() + Duration::from_millis(SILENT_CLOSE_DEADLINE_MS);
+    let mut after = Vec::new();
+    let mut closed = false;
+    while Instant::now() < deadline {
+        let mut buf = [0u8; 1024];
+        match tls.read(&mut buf) {
+            Ok(0) => {
+                closed = true;
+                break;
+            }
+            Ok(n) => after.extend_from_slice(&buf[..n]),
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            // close_notify is optional and a reset ends the connection too;
+            // either way no byte followed the first response.
+            Err(_) => {
+                closed = true;
+                break;
+            }
+        }
+    }
+
+    drop(tls);
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    let requests_received = backends
+        .iter_mut()
+        .filter_map(|backend| backend.stop_and_get_aggregator())
+        .map(|aggregator| aggregator.requests_received)
+        .sum::<usize>();
+
+    if first_ok && closed && after.is_empty() && requests_received == 1 {
+        State::Success
+    } else {
+        eprintln!(
+            "expected a 200, then a close with no byte and one backend request; \
+             first_ok={first_ok} closed={closed} after={:?} \
+             requests_received={requests_received}",
+            String::from_utf8_lossy(&after)
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_silent_close_https_h1_keep_alive_writes_nothing() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "silent close HTTPS H1 keep-alive writes nothing",
+            try_silent_close_https_h1_keep_alive_writes_nothing
+        ),
+        State::Success
+    );
+}
