@@ -157,6 +157,12 @@ interface = "wg0"
   they need nothing more; a unit that drops privileges (`User=`,
   `CapabilityBoundingSet=`, `AmbientCapabilities=`) on a kernel before 5.7 must
   keep `CAP_NET_RAW` in both sets.
+- A definitive runtime refusal of an activation restores an inactive listener
+  in both main-process and worker configuration state, and the activation can
+  be retried after correcting the bind failure. A fan-out timeout is
+  indeterminate: when no acknowledgement arrived the main process restores its
+  inactive flag, but a worker may still complete the bind and answer late.
+  Restart or reconcile the workers before retrying after such a timeout.
 - The interface is part of the listener identity: two listeners may share an
   `address` when their interfaces differ (`0.0.0.0:443` on `wg0` and on
   `eth1`), and a listener without `interface` is the one it always was. On the
@@ -171,6 +177,11 @@ interface = "wg0"
   configuration file, listeners sharing an address must use the same protocol,
   because a file frontend finds its listener's protocol from its address.
   Per-interface routing is not supported.
+- Removing the last listener on an address does not remove its frontends or TLS
+  certificates from the configuration state. Adding a listener for that
+  protocol and address again restores those retained objects before the add is
+  acknowledged. If restoration fails, the worker discards only the new
+  listener and reports the add as failed; existing listeners are left intact.
 - `interface` cannot be patched with `sozu listener <protocol> update`: moving a
   listener to another interface means removing it and adding it again. An update
   names its listener by address, and is refused when several listeners share
@@ -253,6 +264,15 @@ answer_404 = "/path/to/my-404-answer.http"
 answer_503 = "/path/to/my-503-answer.http"
 # answer_507 = ...
 ```
+
+Runtime cluster additions can also carry per-cluster answer templates. Sōzu
+parses those templates in the main process before it records an `AddCluster`:
+an invalid initial addition, upsert or state replay is refused without changing
+the prior cluster state or the answer already serving traffic. When both forms
+provide status 503, the `answers["503"]` map entry overrides the legacy
+`answer_503` field, matching the HTTP and HTTPS worker registries. This
+pre-dispatch check prevents new invalid state; it does not automatically repair
+a malformed cluster entry persisted by an older Sōzu version.
 
 If a frontend has a `sticky_session`, the sticky name is defined at the listener
 level.
@@ -726,6 +746,79 @@ Sōzu supports the following certificate and key types:
 
 All certificate files must be PEM-encoded. The `certificate_chain` should
 contain intermediate CA certificates (not the root CA).
+
+Runtime `AddCertificate` and `ReplaceCertificate` commands validate the PEM,
+signing-key buildability, demonstrable certificate/key consistency and every
+normalised SNI name before the main process records the command. Workers run the
+same validator before mutating their resolver. A refusal therefore keeps saved
+state and the certificate already serving traffic unchanged. Some crypto
+providers cannot expose the public-key material needed for a consistency check;
+rustls reports `InconsistentKeys::Unknown` in that case, which Sōzu accepts to
+match rustls' `CertifiedKey::from_der` contract. This proves buildability, but it
+does not claim that such a provider preflighted certificate/key equality.
+
+`ReplaceCertificate` canonicalises an empty `names` list from the replacement
+certificate's SAN/CN before recording it, exactly like `AddCertificate`.
+Reusing the same leaf fingerprint is a strict no-op only when the canonical
+certificate material and effective expiration are also identical. A changed
+chain, key, protocol-version list, name list or expiration refreshes the worker
+resolver atomically; an identical retry preserves the existing SNI tie ordering
+and does not republish the expiration gauge.
+
+The main process records two pieces of selection metadata beside each
+certificate: the effective `expired_at` override and a per-listener insertion
+order. The certificate with the latest effective expiration serves a matching
+name; the later insertion wins when expirations are equal. `SaveState`,
+`LoadState`, main-process handoff, worker bootstrap and worker upgrade retain
+both values. Consequently, removing the last HTTPS listener and adding it back
+also rebuilds the same resolver selection, rather than replaying an unordered
+certificate map with no overrides.
+
+`ConfigState::certificate_metadata` is a serialized sidecar keyed like the
+existing public `ConfigState::certificates` map. The map and command protobufs
+remain unchanged, but adding the public field is a Rust source compatibility
+change for downstream code that constructs `ConfigState` with an exhaustive
+struct literal. Serialized JSON from older versions has no sidecar and remains
+readable. Entries missing metadata come first in fingerprint order; known
+entries follow their stored ordinal, with the fingerprint breaking equal
+ordinals. The resulting order, including any gaps, is normalized to contiguous
+ordinals on the first state-changing certificate command. A duplicate
+`AddCertificate` and a
+strictly identical `ReplaceCertificate` remain no-ops and therefore do not
+normalize by themselves. Code that mutates the public `certificates` map
+directly bypasses sidecar maintenance; use `ConfigState::dispatch` for writes.
+Appending to a canonical index is `O(1)`. `RemoveCertificate` and effective
+`ReplaceCertificate` reuse a trusted index without sorting, then compact the
+remaining ordinals in `O(N)` for that address. A reconciliation that must move
+or replace `N` certificates can consequently take `O(N²)` state work.
+
+When reconciliation sees the same certificate set in a different order, it
+keeps the longest target prefix already present as a subsequence and moves the
+remaining suffix with `RemoveCertificate` followed by `AddCertificate`. A
+fresh diff after any interrupted request converges to the target order, but the
+pair is not atomic. A name found only on the certificate being moved can fall
+back to another certificate or become temporarily unavailable. Replacing the
+whole set can temporarily leave no certificate. Operators must verify the
+served fingerprint after reconciliation rather than treating an intermediate
+acknowledgement as an all-or-nothing transaction.
+
+The first upgrade from 2.3.1 has a one-time boundary: that main process did not
+store expiration overrides or resolver insertion order. The new main accepts
+its legacy state, records `expired_at = None` and derives deterministic fallback
+order, but it cannot reconstruct the discarded values. Between `UpgradeMain`
+and replacement of every worker, an older worker can keep serving its historical
+resolver while queries against the new main report another winner. Upgrading
+the worker converges runtime selection and the expiration gauge to the new main
+and can change the certificate served. Subsequent saves, replays and upgrades
+preserve that normalized state. If explicit overrides must survive the first
+worker replacement, re-emit `ReplaceCertificate` commands from the
+authoritative certificate source after the main upgrade and before upgrading
+workers. Loading a new saved state into 2.3.1 likewise loses these values again
+inside its main process, even though its workers accept `expired_at` on the wire.
+An actual 2.3.1 SaveState file emits `AddCertificate` requests in one concrete
+but arbitrary `HashMap` iteration order. Loading that file into the new main
+records the order carried by the request stream; it does not infer the earlier
+resolver order.
 
 **Generating test certificates:**
 
@@ -2721,12 +2814,13 @@ and still loads and still serves its subtree. This is the rule TCP SNI routes
 have always had.
 
 The refusal is per certificate, not per name: one bad entry rejects the whole
-`AddCertificate`, before any part of it is registered, so a partially-loaded
-certificate is not a state the worker can reach. When the `names` override is
-left empty the worker derives the names from the certificate's own SAN / CN, so
-the refusal can also fire on a certificate carrying no dNSName SAN and a Common
-Name that contains a slash — reissue it with a proper dNSName SAN, or state the
-intended hostnames explicitly in `names`.
+`AddCertificate` or `ReplaceCertificate`, before any main-process state or
+worker resolver is mutated, so a partially-loaded certificate is not a state
+the command can reach. When the `names` override is left empty the validator
+derives the names from the certificate's own SAN / CN, so the refusal can also
+fire on a certificate carrying no dNSName SAN and a Common Name that contains a
+slash — reissue it with a proper dNSName SAN, or state the intended hostnames
+explicitly in `names`.
 
 ### Regex hostname segments
 
@@ -4122,7 +4216,7 @@ of `is_handshaking()` (both through the `readable` and `writable` exit paths).
 
 | Metric                            | Type  | Scope | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | --------------------------------- | ----- | ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `tls.cert.min_expires_at_seconds` | gauge | proxy | Unix-seconds timestamp of the soonest-expiring certificate currently loaded in the `CertificateResolver`. Recomputed on every add/remove/replace at `lib/src/tls.rs`. Aggregate only — per-SNI granularity is intentionally omitted because statsd has no label support and the resolver can hold tens of thousands of names; operators query per-cert detail through the command API. Already-expired certificates clamp to `0`, which dashboards should interpret as the "rotate now" alert condition. |
+| `tls.cert.min_expires_at_seconds` | gauge | proxy | Unix-seconds timestamp of the soonest-expiring certificate currently loaded in the `CertificateResolver`. Recomputed after a successful certificate-set or effective-material mutation at `lib/src/tls.rs`; a strict duplicate add, missing removal or identical replace retry leaves the gauge untouched. Aggregate only — per-SNI granularity is intentionally omitted because statsd has no label support and the resolver can hold tens of thousands of names; operators query per-cert detail through the command API. Already-expired certificates clamp to `0`, which dashboards should interpret as the "rotate now" alert condition. |
 
 #### HTTP/2 specific
 
