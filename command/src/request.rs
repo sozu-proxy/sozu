@@ -449,7 +449,7 @@ impl Display for RequestHttpFrontend {
         // `ConfigState`. Nothing is appended without predicates, so every
         // pre-existing key is unchanged. Names compare case-insensitively
         // and the list is a conjunction, so the key lowercases names and
-        // sorts entries: two spellings of one rule share one key. Values
+        // sorts and deduplicates entries, as the router does: two spellings of one rule share one key. Values
         // are `Debug`-quoted so a `"` or `;` inside one cannot forge a
         // boundary.
         if !self.header_predicates.is_empty() {
@@ -465,6 +465,7 @@ impl Display for RequestHttpFrontend {
                 })
                 .collect();
             predicates.sort();
+            predicates.dedup();
             for (name, kind, value) in predicates {
                 write!(f, ";H{kind}:{name:?}")?;
                 if let Some(value) = value {
@@ -922,13 +923,13 @@ mod tests {
     #[derive(Clone, PartialEq, prost::Oneof)]
     enum LegacyFrontendRequestType {
         #[prost(message, tag = "15")]
-        AddHttpFrontend(LegacyHttpFrontend),
+        AddHttp(LegacyHttpFrontend),
         #[prost(message, tag = "16")]
-        RemoveHttpFrontend(LegacyHttpFrontend),
+        RemoveHttp(LegacyHttpFrontend),
         #[prost(message, tag = "17")]
-        AddHttpsFrontend(LegacyHttpFrontend),
+        AddHttps(LegacyHttpFrontend),
         #[prost(message, tag = "18")]
-        RemoveHttpsFrontend(LegacyHttpFrontend),
+        RemoveHttps(LegacyHttpFrontend),
     }
 
     #[derive(Clone, PartialEq, Message)]
@@ -1014,7 +1015,7 @@ mod tests {
         assert!(
             matches!(
                 decode_frontend_on_a_legacy_worker(RequestType::AddHttpFrontend(guarded.clone())),
-                Some(LegacyFrontendRequestType::AddHttpFrontend(_))
+                Some(LegacyFrontendRequestType::AddHttp(_))
             ),
             "precondition: the historical verb decodes on an old worker without its guard"
         );
@@ -1035,11 +1036,9 @@ mod tests {
         // Positive space: unguarded frontends stay readable in a mixed fleet.
         assert_eq!(
             decode_frontend_on_a_legacy_worker(RequestType::add_http_frontend(frontend(false))),
-            Some(LegacyFrontendRequestType::AddHttpFrontend(
-                LegacyHttpFrontend {
-                    hostname: "example.com".to_owned()
-                }
-            ))
+            Some(LegacyFrontendRequestType::AddHttp(LegacyHttpFrontend {
+                hostname: "example.com".to_owned()
+            }))
         );
     }
 

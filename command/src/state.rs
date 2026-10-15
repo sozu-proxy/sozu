@@ -10508,6 +10508,21 @@ mod tests {
         );
         assert_eq!(canary.to_string(), canary_respelled.to_string());
 
+        // The worker deduplicates repeated predicates, so a repeated
+        // predicate (even under another name case) shares the single key.
+        let single = RequestHttpFrontend {
+            header_predicates: vec![predicate("X-Beta", HeaderMatchKind::Present, None)],
+            ..base.clone()
+        };
+        let repeated = RequestHttpFrontend {
+            header_predicates: vec![
+                predicate("X-Beta", HeaderMatchKind::Present, None),
+                predicate("x-beta", HeaderMatchKind::Present, None),
+            ],
+            ..base.clone()
+        };
+        assert_eq!(single.to_string(), repeated.to_string());
+
         let mut state = ConfigState::default();
         state.add_http_frontend(&base).expect("base");
         state

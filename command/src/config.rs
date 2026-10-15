@@ -2338,6 +2338,12 @@ impl FileClusterFrontendConfig {
             ));
         }
 
+        if self.header_predicates.is_some() {
+            return Err(ConfigError::InvalidFrontendConfig(
+                "header_predicates".to_string(),
+            ));
+        }
+
         // `hostname` maps to the TCP frontend's `sni` (sozu-proxy/sozu#1279):
         // an SNI-scoped frontend reads the same TOML key HTTP frontends use
         // for their routing hostname, validated for the TCP-specific
@@ -7562,6 +7568,42 @@ mod tests {
         match frontend.to_http_front("api") {
             Err(ConfigError::InvalidFrontendConfig(field)) => assert_eq!(field, "alpn"),
             other => panic!("expected InvalidFrontendConfig(\"alpn\"), got {other:?}"),
+        }
+    }
+
+    /// `header_predicates` is an HTTP-only guard; a TCP frontend that sets it
+    /// is rejected instead of silently routing unconditionally.
+    #[test]
+    fn header_predicates_rejected_on_tcp_frontend() {
+        let frontend = FileClusterFrontendConfig {
+            address: "127.0.0.1:8080".parse().unwrap(),
+            hostname: None,
+            alpn: vec![],
+            path: None,
+            path_type: None,
+            method: None,
+            certificate: None,
+            key: None,
+            certificate_chain: None,
+            tls_versions: vec![],
+            position: RulePosition::Tree,
+            tags: None,
+            redirect: None,
+            redirect_scheme: None,
+            redirect_template: None,
+            rewrite_host: None,
+            rewrite_path: None,
+            rewrite_port: None,
+            required_auth: None,
+            headers: None,
+            hsts: None,
+            header_predicates: Some(vec![]),
+        };
+        match frontend.to_tcp_front() {
+            Err(ConfigError::InvalidFrontendConfig(field)) => {
+                assert_eq!(field, "header_predicates")
+            }
+            other => panic!("expected InvalidFrontendConfig(\"header_predicates\"), got {other:?}"),
         }
     }
 

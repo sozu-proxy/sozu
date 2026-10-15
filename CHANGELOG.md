@@ -20,7 +20,10 @@
   (`AddHttpFrontendWithHeaderPredicates` & co) that a worker predating the
   feature cannot decode, so it fails the request instead of installing the
   route without its guard; frontends without predicates keep the historical
-  verbs.
+  verbs. Repeated identical predicates canonicalize to one identity, a TCP
+  frontend rejects `header_predicates` instead of ignoring them, and frontend
+  listings show a redacted predicate count rather than names or values.
+
 ### Fixed
 
 - Re-adding the last HTTP, HTTPS, TCP or UDP listener removed from an address

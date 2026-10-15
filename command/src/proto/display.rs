@@ -20,9 +20,10 @@ use crate::{
             HealthCheckConfig, HealthCheckMode, HealthChecksList, HttpEndpoint, HttpListenerConfig,
             HttpStatusRange, HttpsListenerConfig, ListOfCertificatesByAddress, ListedFrontends,
             ListenersList, MetricDetailStatus, ProtobufEndpoint, QueryCertificatesFilters,
-            RequestCounts, Response, ResponseContent, ResponseStatus, RunState, SocketAddress,
-            TlsVersion, WorkerInfos, WorkerMetrics, WorkerResponses, filtered_metrics,
-            protobuf_endpoint, request::RequestType, response_content::ContentType,
+            RequestCounts, RequestHttpFrontend, Response, ResponseContent, ResponseStatus,
+            RunState, SocketAddress, TlsVersion, WorkerInfos, WorkerMetrics, WorkerResponses,
+            filtered_metrics, protobuf_endpoint, request::RequestType,
+            response_content::ContentType,
         },
     },
 };
@@ -566,68 +567,80 @@ fn print_available_metrics(available_metrics: &AvailableMetrics) -> Result<(), D
     Ok(())
 }
 
+/// Table of HTTP(S) frontends for `ListFrontends`. The header predicates are
+/// summarised by their count only: names and values may carry secrets.
+fn http_frontends_table(title: &str, frontends: &[RequestHttpFrontend]) -> Table {
+    let mut table = Table::new();
+    table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
+    table.add_row(row![title]);
+    table.add_row(row![
+        "cluster_id",
+        "address",
+        "hostname",
+        "path",
+        "method",
+        "position",
+        "header_predicates",
+        "tags"
+    ]);
+    for frontend in frontends.iter() {
+        table.add_row(row!(
+            frontend.cluster_id.clone().unwrap_or("Deny".to_owned()),
+            frontend.address.to_string(),
+            frontend.hostname.to_string(),
+            format!("{:?}", frontend.path),
+            format!("{:?}", frontend.method),
+            format!("{:?}", frontend.position),
+            frontend.header_predicates.len(),
+            format_tags_to_string(&frontend.tags)
+        ));
+    }
+    table
+}
+
+/// Table of the HTTP(S) frontends of `ListClusters`, one marker column per
+/// worker. Same redaction rule as [`http_frontends_table`].
+fn cluster_http_frontends_table(
+    frontends: &BTreeMap<&RequestHttpFrontend, Vec<String>>,
+    worker_responses: &WorkerResponses,
+) -> Table {
+    let mut table = create_cluster_table(
+        vec!["id", "hostname", "path", "header_predicates"],
+        &worker_responses.map,
+    );
+    for (key, values) in frontends.iter() {
+        let mut row = Vec::new();
+        match &key.cluster_id {
+            Some(cluster_id) => row.push(cell!(cluster_id)),
+            None => row.push(cell!("-")),
+        }
+        row.push(cell!(key.hostname));
+        row.push(cell!(key.path));
+        row.push(cell!(key.header_predicates.len()));
+
+        for val in values.iter() {
+            if worker_responses.map.contains_key(val) {
+                row.push(cell!("X"));
+            } else {
+                row.push(cell!(""));
+            }
+        }
+
+        table.add_row(Row::new(row));
+    }
+    table
+}
+
 fn print_frontends(frontends: &ListedFrontends) -> Result<(), DisplayError> {
     trace!(" We received this frontends to display {:#?}", frontends);
     // HTTP frontends
     if !frontends.http_frontends.is_empty() {
-        let mut table = Table::new();
-        table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
-        table.add_row(row!["HTTP frontends "]);
-        table.add_row(row![
-            "cluster_id",
-            "address",
-            "hostname",
-            "path",
-            "method",
-            "position",
-            "tags"
-        ]);
-        for http_frontend in frontends.http_frontends.iter() {
-            table.add_row(row!(
-                http_frontend
-                    .cluster_id
-                    .clone()
-                    .unwrap_or("Deny".to_owned()),
-                http_frontend.address.to_string(),
-                http_frontend.hostname.to_string(),
-                format!("{:?}", http_frontend.path),
-                format!("{:?}", http_frontend.method),
-                format!("{:?}", http_frontend.position),
-                format_tags_to_string(&http_frontend.tags)
-            ));
-        }
-        table.printstd();
+        http_frontends_table("HTTP frontends ", &frontends.http_frontends).printstd();
     }
 
     // HTTPS frontends
     if !frontends.https_frontends.is_empty() {
-        let mut table = Table::new();
-        table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
-        table.add_row(row!["HTTPS frontends"]);
-        table.add_row(row![
-            "cluster_id",
-            "address",
-            "hostname",
-            "path",
-            "method",
-            "position",
-            "tags"
-        ]);
-        for https_frontend in frontends.https_frontends.iter() {
-            table.add_row(row!(
-                https_frontend
-                    .cluster_id
-                    .clone()
-                    .unwrap_or("Deny".to_owned()),
-                https_frontend.address.to_string(),
-                https_frontend.hostname.to_string(),
-                format!("{:?}", https_frontend.path),
-                format!("{:?}", https_frontend.method),
-                format!("{:?}", https_frontend.position),
-                format_tags_to_string(&https_frontend.tags)
-            ));
-        }
-        table.printstd();
+        http_frontends_table("HTTPS frontends", &frontends.https_frontends).printstd();
     }
 
     // TCP frontends
@@ -781,12 +794,6 @@ fn print_cluster_infos(worker_responses: &WorkerResponses) -> Result<(), Display
         &worker_responses.map,
     );
 
-    let mut frontend_table =
-        create_cluster_table(vec!["id", "hostname", "path"], &worker_responses.map);
-
-    let mut https_frontend_table =
-        create_cluster_table(vec!["id", "hostname", "path"], &worker_responses.map);
-
     let mut tcp_frontend_table = create_cluster_table(vec!["id", "address"], &worker_responses.map);
 
     let mut udp_frontend_table = create_cluster_table(vec!["id", "address"], &worker_responses.map);
@@ -891,51 +898,11 @@ fn print_cluster_infos(worker_responses: &WorkerResponses) -> Result<(), Display
 
     println!("\nHTTP frontends configuration for:\n");
 
-    for (key, values) in http_frontends.iter() {
-        let mut row = Vec::new();
-        match &key.cluster_id {
-            Some(cluster_id) => row.push(cell!(cluster_id)),
-            None => row.push(cell!("-")),
-        }
-        row.push(cell!(key.hostname));
-        row.push(cell!(key.path));
-
-        for val in values.iter() {
-            if worker_ids.contains(val) {
-                row.push(cell!("X"));
-            } else {
-                row.push(cell!(""));
-            }
-        }
-
-        frontend_table.add_row(Row::new(row));
-    }
-
-    frontend_table.printstd();
+    cluster_http_frontends_table(&http_frontends, worker_responses).printstd();
 
     println!("\nHTTPS frontends configuration for:\n");
 
-    for (key, values) in https_frontends.iter() {
-        let mut row = Vec::new();
-        match &key.cluster_id {
-            Some(cluster_id) => row.push(cell!(cluster_id)),
-            None => row.push(cell!("-")),
-        }
-        row.push(cell!(key.hostname));
-        row.push(cell!(key.path));
-
-        for val in values.iter() {
-            if worker_ids.contains(val) {
-                row.push(cell!("X"));
-            } else {
-                row.push(cell!(""));
-            }
-        }
-
-        https_frontend_table.add_row(Row::new(row));
-    }
-
-    https_frontend_table.printstd();
+    cluster_http_frontends_table(&https_frontends, worker_responses).printstd();
 
     println!("\nTCP frontends configuration:\n");
 
@@ -1688,7 +1655,14 @@ impl Display for Event {
 
 #[cfg(test)]
 mod tests {
-    use crate::proto::command::{ClientAuthMode, HttpsListenerConfig, SocketAddress};
+    use std::collections::BTreeMap;
+
+    use crate::proto::command::{
+        ClientAuthMode, HeaderMatchKind, HeaderPredicate, HttpsListenerConfig, PathRule,
+        RequestHttpFrontend, ResponseContent, SocketAddress, WorkerResponses,
+    };
+
+    use super::{cluster_http_frontends_table, http_frontends_table};
 
     const CA_PEM_SENTINEL: &str = "CLIENT_CA_PEM_BODY_SENTINEL";
     const CRL_PEM_SENTINEL: &str = "CLIENT_CRL_PEM_BODY_SENTINEL";
@@ -1789,5 +1763,66 @@ mod tests {
             !output.contains(ClientAuthMode::ClientAuthNone.as_str_name()),
             "an unknown client_auth value must not render as none: {output}"
         );
+    }
+
+    /// A guarded frontend must be distinguishable in both listing surfaces
+    /// (`ListFrontends`, `ListClusters`) by its predicate count, without the
+    /// predicate names or values being rendered.
+    #[test]
+    fn frontend_listings_show_header_predicate_count_only() {
+        const NAME_SENTINEL: &str = "X-NAME-SENTINEL";
+        const VALUE_SENTINEL: &str = "VALUE_SENTINEL";
+
+        let guarded = RequestHttpFrontend {
+            cluster_id: Some("canary".to_owned()),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 8080),
+            hostname: "api.example.com".to_owned(),
+            path: PathRule::prefix("/".to_owned()),
+            header_predicates: vec![
+                HeaderPredicate {
+                    name: NAME_SENTINEL.to_owned(),
+                    kind: HeaderMatchKind::Exact as i32,
+                    value: Some(VALUE_SENTINEL.to_owned()),
+                },
+                HeaderPredicate {
+                    name: "x-other".to_owned(),
+                    kind: HeaderMatchKind::Present as i32,
+                    value: None,
+                },
+                HeaderPredicate {
+                    name: "x-third".to_owned(),
+                    kind: HeaderMatchKind::Present as i32,
+                    value: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let listed =
+            http_frontends_table("HTTP frontends ", std::slice::from_ref(&guarded)).to_string();
+        assert!(listed.contains("header_predicates"), "{listed}");
+        assert!(
+            listed.contains("│ 3 "),
+            "the predicate count must be listed:\n{listed}"
+        );
+
+        let mut worker_responses = WorkerResponses::default();
+        worker_responses
+            .map
+            .insert("0".to_owned(), ResponseContent::default());
+        let mut frontends = BTreeMap::new();
+        frontends.insert(&guarded, vec!["0".to_owned()]);
+        let clusters = cluster_http_frontends_table(&frontends, &worker_responses).to_string();
+        assert!(clusters.contains("header_predicates"), "{clusters}");
+        assert!(
+            clusters.contains("│ 3 "),
+            "the predicate count must be listed:\n{clusters}"
+        );
+
+        for rendered in [&listed, &clusters] {
+            assert!(!rendered.contains(NAME_SENTINEL), "{rendered}");
+            assert!(!rendered.contains(VALUE_SENTINEL), "{rendered}");
+            assert!(!rendered.to_lowercase().contains("x-other"), "{rendered}");
+        }
     }
 }
