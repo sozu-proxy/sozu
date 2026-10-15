@@ -21,6 +21,14 @@
   verbs. A worker older than 2.3.2 cannot decode these requests and fails them,
   so it never installs an unguarded forwarding route.
 
+<!-- changelog-slot:header-routing -->
+
+<!-- changelog-slot:unix-backends -->
+
+<!-- changelog-slot:backend-dns -->
+
+<!-- changelog-slot:close-sessions -->
+
 ### 🔄 Changed
 
 - **`feat(load-balancing)`: every policy honours `weight`
@@ -38,6 +46,8 @@
   policies now spreads its traffic by them. A cluster whose backends all
   carry the same weight (the default, 100, when unset) selects exactly the
   same sequence as before. No command, configuration or state format changes.
+
+<!-- changelog-slot:backend-ownership -->
 
 ### Fixed
 
