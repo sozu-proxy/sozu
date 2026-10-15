@@ -3035,7 +3035,11 @@ The rules:
 - **Identity.** Predicates are part of a frontend's identity, next to address,
   hostname, path and method: a canary and its base coexist, and removing a
   frontend — `sozu frontend http remove … --match-header …` — must name the
-  same predicates, in any order and name case. Removing one leaves the other.
+  same predicates. Order and header-name case do not matter, and a predicate
+  repeated verbatim counts once. Removing one leaves the other.
+- **HTTP and HTTPS only.** `header_predicates` is valid on `http` and `https`
+  frontends. A `tcp` cluster frontend that sets it is refused at configuration
+  load, never silently discarded.
 - **Mixed versions.** A frontend with predicates is sent to the workers as
   `AddHttpFrontendWithHeaderPredicates` / `AddHttpsFrontendWithHeaderPredicates`
   (and removed with the matching `Remove…` verbs), not as the historical
@@ -3047,8 +3051,9 @@ The rules:
   verbs and work across versions as before.
 - **Visibility.** The predicate values appear in clear in the saved state and
   in the main process's state key, exactly as hostnames and paths already do;
-  `Debug` logs carry only their count and lengths. Do not put a secret in an
-  `exact` value.
+  `Debug` logs carry only their count and lengths. The human-readable frontend
+  and cluster listing tables show only the number of predicates, not their
+  values. Do not put a secret in an `exact` value.
 
 ### Regex limitations — no look-around
 
