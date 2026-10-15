@@ -1122,7 +1122,40 @@ frontends = [
 backends  = [
   { address = "127.0.0.1:1026" }
 ]
+# additional options for backends: weight, sticky_id, backup, backend_id
 ```
+
+A backend `address` is either a socket address (`"127.0.0.1:1026"`,
+`"[::1]:1026"`) or a `host:port` such as `"ingress.internal:1026"`
+([#347](https://github.com/sozu-proxy/sozu/issues/347)). A name is resolved
+**once, when the configuration file is loaded** — at startup, and when
+`sozu reload --file <path>` reads a file — with the system resolver
+(`/etc/hosts`, then DNS, as `getaddrinfo` does). Sōzu does not re-resolve it
+while running, and a plain `sozu reload` replays the configuration loaded at
+startup without reading the file again, so it does not re-resolve either: a
+DNS change reaches the proxy only through `sozu reload --file <path>` or a
+restart. Workers and the command channel only ever see socket addresses;
+`sozu backend add` still takes one.
+
+Each distinct address the name resolves to becomes its own backend, in sorted
+address order, carrying the entry's `weight` and `backup`. Its id is derived
+from the entry and the address, so the same answer always yields the same ids:
+`<backend_id>-<address>` when the entry sets `backend_id`,
+`<cluster_id>-<host:port>-<address>` otherwise (for example
+`MyCluster-ingress.internal:1026-10.0.0.2:1026`). When the name resolves to
+more than one address, a configured `sticky_id` is suffixed with `-<address>`
+as well, so each resolved backend keeps a sticky id of its own. A
+socket-address literal is never resolved and keeps its configured
+`backend_id`, or the positional default `<cluster_id>-<index>-<address>`,
+where `<index>` is its position among the cluster's backends once every name
+is expanded; give such a literal a `backend_id` when it follows a name, so its
+id does not move when the name's answer changes size.
+
+A name that does not resolve, or an address with no port, refuses the whole
+file with an error naming the cluster and the entry, for example
+`cluster MyCluster: cannot resolve backend address "ingress.internal:1026": …`.
+A `sozu reload --file <path>` of such a file is rejected and the running
+configuration stays in place.
 
 A cluster owns the frontends and backends declared under it. Removing the
 cluster at runtime (`sozu cluster remove`, the `RemoveCluster` order) removes
