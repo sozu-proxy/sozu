@@ -138,8 +138,8 @@ impl Router {
     /// Within each of the pre list, one trie leaf and the post list, a rule
     /// whose predicates all hold outranks every rule without predicates;
     /// among rules of one class the historical precedence applies
-    /// unchanged — declaration order for pre/post, [`select_tree_rule`]'s
-    /// path/method order for the tree. A rule whose predicates do not all
+    /// unchanged — declaration order for pre/post, the path/method order of
+    /// the private `select_tree_rule` for the tree. A rule whose predicates do not all
     /// hold is skipped, exactly like a rule whose method does not match. A
     /// route table without predicates therefore resolves every request as
     /// it did before, and `headers` is never read.
@@ -1251,7 +1251,7 @@ impl HeaderRules {
     /// Compile a frontend's predicates, held to
     /// [`validate_header_predicate`] first. A `regex` value is compiled
     /// anchored, refused when it does not compile exactly like a `REGEX`
-    /// path rule ([`anchored_regex`]).
+    /// path rule (the private `anchored_regex` helper compiles both).
     pub fn from_config(predicates: &[HeaderPredicate]) -> Result<Self, RouterError> {
         let mut rules = Vec::with_capacity(predicates.len());
         for (index, predicate) in predicates.iter().enumerate() {
