@@ -594,12 +594,15 @@ pub trait L7ListenerHandler {
 
     fn get_connect_timeout(&self) -> u32;
 
-    /// retrieve a frontend by parsing a request's hostname, uri and method
+    /// retrieve a frontend by parsing a request's hostname, uri and method,
+    /// with its headers for the frontends that carry header predicates
+    /// (sozu-proxy/sozu#1253)
     fn frontend_from_request(
         &self,
         host: &str,
         uri: &str,
         method: &Method,
+        headers: &dyn router::RequestHeaders,
     ) -> Result<RouteResult, FrontendFromRequestError>;
 
     /// retrieve the listener's configured HTTP answers (templates)

@@ -4741,6 +4741,7 @@ pub(crate) mod test_support {
             _host: &str,
             _uri: &str,
             _method: &Method,
+            _headers: &dyn crate::router::RequestHeaders,
         ) -> Result<RouteResult, FrontendFromRequestError> {
             Err(FrontendFromRequestError::InvalidCharsAfterHost(
                 "test listener routes nothing".to_owned(),

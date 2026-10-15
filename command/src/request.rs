@@ -49,12 +49,17 @@ impl Request {
         };
 
         match request_type {
-            RequestType::AddHttpFrontend(_) | RequestType::RemoveHttpFrontend(_) => {
+            RequestType::AddHttpFrontend(_)
+            | RequestType::RemoveHttpFrontend(_)
+            | RequestType::AddHttpFrontendWithHeaderPredicates(_)
+            | RequestType::RemoveHttpFrontendWithHeaderPredicates(_) => {
                 proxy_destination.to_http_proxy = true
             }
 
             RequestType::AddHttpsFrontend(_)
             | RequestType::RemoveHttpsFrontend(_)
+            | RequestType::AddHttpsFrontendWithHeaderPredicates(_)
+            | RequestType::RemoveHttpsFrontendWithHeaderPredicates(_)
             | RequestType::AddCertificate(_)
             | RequestType::QueryCertificatesFromWorkers(_)
             | RequestType::ReplaceCertificate(_)
@@ -270,7 +275,65 @@ impl RequestType {
             | RequestType::UpdateHttpsListenerWithClientAuth(patch) => {
                 RequestType::update_https_listener(patch)
             }
+            RequestType::AddHttpFrontend(front)
+            | RequestType::AddHttpFrontendWithHeaderPredicates(front) => {
+                RequestType::add_http_frontend(front)
+            }
+            RequestType::RemoveHttpFrontend(front)
+            | RequestType::RemoveHttpFrontendWithHeaderPredicates(front) => {
+                RequestType::remove_http_frontend(front)
+            }
+            RequestType::AddHttpsFrontend(front)
+            | RequestType::AddHttpsFrontendWithHeaderPredicates(front) => {
+                RequestType::add_https_frontend(front)
+            }
+            RequestType::RemoveHttpsFrontend(front)
+            | RequestType::RemoveHttpsFrontendWithHeaderPredicates(front) => {
+                RequestType::remove_https_frontend(front)
+            }
             other => other,
+        }
+    }
+
+    /// The request that adds this HTTP frontend, on the verb its header
+    /// predicates call for: a frontend with predicates goes out as
+    /// `AddHttpFrontendWithHeaderPredicates`, which a worker that predates
+    /// header routing cannot decode, so it fails the request instead of
+    /// installing the frontend without its guard. Any other frontend keeps
+    /// `AddHttpFrontend`, which every version understands.
+    pub fn add_http_frontend(front: RequestHttpFrontend) -> Self {
+        if front.header_predicates.is_empty() {
+            RequestType::AddHttpFrontend(front)
+        } else {
+            RequestType::AddHttpFrontendWithHeaderPredicates(front)
+        }
+    }
+
+    /// As [`RequestType::add_http_frontend`], for the removal. An old worker
+    /// would otherwise remove the unpredicated sibling sharing the key.
+    pub fn remove_http_frontend(front: RequestHttpFrontend) -> Self {
+        if front.header_predicates.is_empty() {
+            RequestType::RemoveHttpFrontend(front)
+        } else {
+            RequestType::RemoveHttpFrontendWithHeaderPredicates(front)
+        }
+    }
+
+    /// As [`RequestType::add_http_frontend`], for an HTTPS frontend.
+    pub fn add_https_frontend(front: RequestHttpFrontend) -> Self {
+        if front.header_predicates.is_empty() {
+            RequestType::AddHttpsFrontend(front)
+        } else {
+            RequestType::AddHttpsFrontendWithHeaderPredicates(front)
+        }
+    }
+
+    /// As [`RequestType::remove_http_frontend`], for an HTTPS frontend.
+    pub fn remove_https_frontend(front: RequestHttpFrontend) -> Self {
+        if front.header_predicates.is_empty() {
+            RequestType::RemoveHttpsFrontend(front)
+        } else {
+            RequestType::RemoveHttpsFrontendWithHeaderPredicates(front)
         }
     }
 }
@@ -339,6 +402,7 @@ impl RequestHttpFrontend {
             required_auth: self.required_auth,
             headers: self.headers,
             hsts: self.hsts,
+            header_predicates: self.header_predicates,
         };
 
         // POST: routing identity (hostname + cluster_id) is carried through
@@ -375,9 +439,40 @@ impl Display for RequestHttpFrontend {
         };
 
         match &self.method {
-            Some(method) => write!(f, "{s};{method}"),
-            None => write!(f, "{s}"),
+            Some(method) => write!(f, "{s};{method}")?,
+            None => write!(f, "{s}")?,
         }
+
+        // Header predicates are part of the frontend's identity
+        // (sozu-proxy/sozu#1253): a canary frontend that differs from its
+        // base only by a predicate must not collide with it in
+        // `ConfigState`. Nothing is appended without predicates, so every
+        // pre-existing key is unchanged. Names compare case-insensitively
+        // and the list is a conjunction, so the key lowercases names and
+        // sorts entries: two spellings of one rule share one key. Values
+        // are `Debug`-quoted so a `"` or `;` inside one cannot forge a
+        // boundary.
+        if !self.header_predicates.is_empty() {
+            let mut predicates: Vec<(String, i32, Option<&str>)> = self
+                .header_predicates
+                .iter()
+                .map(|predicate| {
+                    (
+                        predicate.name.to_ascii_lowercase(),
+                        predicate.kind,
+                        predicate.value.as_deref(),
+                    )
+                })
+                .collect();
+            predicates.sort();
+            for (name, kind, value) in predicates {
+                write!(f, ";H{kind}:{name:?}")?;
+                if let Some(value) = value {
+                    write!(f, "={value:?}")?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -568,6 +663,7 @@ mod tests {
     use prost::Message;
 
     use super::*;
+    use crate::proto::command::{HeaderMatchKind, HeaderPredicate};
 
     fn https_listener(client_auth: Option<i32>) -> HttpsListenerConfig {
         HttpsListenerConfig {
@@ -804,5 +900,167 @@ mod tests {
             listener.client_ca_crls.is_empty(),
             "a CRL the policy leaves out is dropped, not kept"
         );
+    }
+
+    /// `WorkerRequest` of a worker that predates header routing: the four
+    /// historical frontend verbs, holding a `RequestHttpFrontend` that has no
+    /// `header_predicates` field.
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacyFrontendWorkerRequest {
+        #[prost(string, tag = "1")]
+        id: String,
+        #[prost(message, optional, tag = "2")]
+        content: Option<LegacyFrontendRequest>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacyFrontendRequest {
+        #[prost(oneof = "LegacyFrontendRequestType", tags = "15, 16, 17, 18")]
+        request_type: Option<LegacyFrontendRequestType>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    enum LegacyFrontendRequestType {
+        #[prost(message, tag = "15")]
+        AddHttpFrontend(LegacyHttpFrontend),
+        #[prost(message, tag = "16")]
+        RemoveHttpFrontend(LegacyHttpFrontend),
+        #[prost(message, tag = "17")]
+        AddHttpsFrontend(LegacyHttpFrontend),
+        #[prost(message, tag = "18")]
+        RemoveHttpsFrontend(LegacyHttpFrontend),
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacyHttpFrontend {
+        #[prost(string, tag = "3")]
+        hostname: String,
+    }
+
+    fn decode_frontend_on_a_legacy_worker(
+        request: RequestType,
+    ) -> Option<LegacyFrontendRequestType> {
+        let bytes = WorkerRequest::new("ID-1".to_owned(), request.into()).encode_to_vec();
+        LegacyFrontendWorkerRequest::decode(bytes.as_slice())
+            .expect("a legacy worker decodes the envelope of every request")
+            .content
+            .expect("the envelope always carries a request")
+            .request_type
+    }
+
+    fn frontend(with_predicate: bool) -> RequestHttpFrontend {
+        RequestHttpFrontend {
+            cluster_id: Some("canary".to_owned()),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 8080),
+            hostname: "example.com".to_owned(),
+            header_predicates: if with_predicate {
+                vec![HeaderPredicate {
+                    name: "X-Canary".to_owned(),
+                    kind: HeaderMatchKind::Present as i32,
+                    value: None,
+                }]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn frontend_verbs_follow_the_header_predicates() {
+        let guarded = frontend(true);
+        let plain = frontend(false);
+        assert!(matches!(
+            RequestType::add_http_frontend(guarded.clone()),
+            RequestType::AddHttpFrontendWithHeaderPredicates(_)
+        ));
+        assert!(matches!(
+            RequestType::remove_http_frontend(guarded.clone()),
+            RequestType::RemoveHttpFrontendWithHeaderPredicates(_)
+        ));
+        assert!(matches!(
+            RequestType::add_https_frontend(guarded.clone()),
+            RequestType::AddHttpsFrontendWithHeaderPredicates(_)
+        ));
+        assert!(matches!(
+            RequestType::remove_https_frontend(guarded.clone()),
+            RequestType::RemoveHttpsFrontendWithHeaderPredicates(_)
+        ));
+        // routes without predicates keep the historical verbs
+        assert_eq!(
+            RequestType::add_http_frontend(plain.clone()),
+            RequestType::AddHttpFrontend(plain.clone())
+        );
+        assert_eq!(
+            RequestType::remove_https_frontend(plain.clone()),
+            RequestType::RemoveHttpsFrontend(plain.clone())
+        );
+        // whatever verb the client used, the fan-out sends the canonical one
+        assert_eq!(
+            RequestType::AddHttpFrontend(guarded.clone()).into_canonical(),
+            RequestType::AddHttpFrontendWithHeaderPredicates(guarded.clone())
+        );
+        assert_eq!(
+            RequestType::RemoveHttpsFrontendWithHeaderPredicates(plain.clone()).into_canonical(),
+            RequestType::RemoveHttpsFrontend(plain)
+        );
+    }
+
+    #[test]
+    fn a_worker_that_predates_header_routing_cannot_decode_a_guarded_frontend() {
+        let guarded = frontend(true);
+        // The failure mode the dedicated verbs exist for: on a historical
+        // verb the old worker installs the route and drops its guard.
+        assert!(
+            matches!(
+                decode_frontend_on_a_legacy_worker(RequestType::AddHttpFrontend(guarded.clone())),
+                Some(LegacyFrontendRequestType::AddHttpFrontend(_))
+            ),
+            "precondition: the historical verb decodes on an old worker without its guard"
+        );
+        for request in [
+            RequestType::add_http_frontend(guarded.clone()),
+            RequestType::remove_http_frontend(guarded.clone()),
+            RequestType::add_https_frontend(guarded.clone()),
+            RequestType::remove_https_frontend(guarded.clone()),
+            RequestType::AddHttpsFrontend(guarded.clone()).into_canonical(),
+            RequestType::RemoveHttpFrontend(guarded.clone()).into_canonical(),
+        ] {
+            assert_eq!(
+                decode_frontend_on_a_legacy_worker(request),
+                None,
+                "a guarded frontend must be undecodable by an old worker"
+            );
+        }
+        // Positive space: unguarded frontends stay readable in a mixed fleet.
+        assert_eq!(
+            decode_frontend_on_a_legacy_worker(RequestType::add_http_frontend(frontend(false))),
+            Some(LegacyFrontendRequestType::AddHttpFrontend(
+                LegacyHttpFrontend {
+                    hostname: "example.com".to_owned()
+                }
+            ))
+        );
+    }
+
+    /// The tags are wire contract: 65 belongs to `close_sessions`, 70-72 to
+    /// other pending verbs, so a drift here collides with them.
+    #[test]
+    fn header_predicate_verbs_use_the_allocated_wire_tags() {
+        let guarded = frontend(true);
+        for (request, tag) in [
+            (RequestType::add_http_frontend(guarded.clone()), 66u32),
+            (RequestType::remove_http_frontend(guarded.clone()), 67),
+            (RequestType::add_https_frontend(guarded.clone()), 68),
+            (RequestType::remove_https_frontend(guarded.clone()), 69),
+        ] {
+            let bytes = Request::from(request).encode_to_vec();
+            // first byte is the key of the oneof field: (tag << 3) | length-delimited
+            let (key, _) = prost::encoding::decode_varint(&mut bytes.as_slice())
+                .map(|k| (k, ()))
+                .expect("a request starts with a field key");
+            assert_eq!(key >> 3, u64::from(tag));
+            assert_eq!(key & 7, 2);
+        }
     }
 }

@@ -69,7 +69,7 @@ use crate::{
         proxy_protocol::expect::ExpectProxyProtocol,
         rustls::TlsHandshake,
     },
-    router::{RouteResult, Router},
+    router::{RequestHeaders, RouteResult, Router},
     server::{ListenToken, SessionManager},
     socket::{FrontRustls, RecvMemory, server_bind},
     timer::TimeoutContainer,
@@ -1335,6 +1335,7 @@ impl L7ListenerHandler for HttpsListener {
         host: &str,
         uri: &str,
         method: &Method,
+        headers: &dyn RequestHeaders,
     ) -> Result<RouteResult, FrontendFromRequestError> {
         let start = Instant::now();
         let (remaining_input, (hostname, _)) = match hostname_and_port(host.as_bytes()) {
@@ -1364,10 +1365,13 @@ impl L7ListenerHandler for HttpsListener {
         // bytes are ASCII (≤ 0x7F), so the slice is valid single-byte UTF-8.
         let host = unsafe { from_utf8_unchecked(hostname) };
 
-        let route = self.fronts.lookup(host, uri, method).map_err(|e| {
-            incr!(names::http::FAILED_BACKEND_MATCHING);
-            FrontendFromRequestError::NoClusterFound(e)
-        })?;
+        let route = self
+            .fronts
+            .lookup_with_headers(host, uri, method, headers)
+            .map_err(|e| {
+                incr!(names::http::FAILED_BACKEND_MATCHING);
+                FrontendFromRequestError::NoClusterFound(e)
+            })?;
 
         let now = Instant::now();
 
@@ -3064,7 +3068,8 @@ impl ProxyConfiguration for HttpsProxy {
                 );
                 self.remove_cluster(&cluster_id)
             }
-            RequestType::AddHttpsFrontend(front) => {
+            RequestType::AddHttpsFrontend(front)
+            | RequestType::AddHttpsFrontendWithHeaderPredicates(front) => {
                 debug!(
                     "{} {} add https front {:?}",
                     log_module_context!(),
@@ -3073,7 +3078,8 @@ impl ProxyConfiguration for HttpsProxy {
                 );
                 self.add_https_frontend(front)
             }
-            RequestType::RemoveHttpsFrontend(front) => {
+            RequestType::RemoveHttpsFrontend(front)
+            | RequestType::RemoveHttpsFrontendWithHeaderPredicates(front) => {
                 debug!(
                     "{} {} remove https front {:?}",
                     log_module_context!(),
@@ -3787,7 +3793,12 @@ mod tests {
         };
 
         println!("TEST {}", line!());
-        let frontend1 = listener.frontend_from_request("lolcatho.st", "/", &Method::Get);
+        let frontend1 = listener.frontend_from_request(
+            "lolcatho.st",
+            "/",
+            &Method::Get,
+            &crate::router::NoHeaders,
+        );
         assert_eq!(
             frontend1
                 .expect("should find a frontend")
@@ -3796,7 +3807,12 @@ mod tests {
             Some("cluster_1")
         );
         println!("TEST {}", line!());
-        let frontend2 = listener.frontend_from_request("lolcatho.st", "/test", &Method::Get);
+        let frontend2 = listener.frontend_from_request(
+            "lolcatho.st",
+            "/test",
+            &Method::Get,
+            &crate::router::NoHeaders,
+        );
         assert_eq!(
             frontend2
                 .expect("should find a frontend")
@@ -3805,7 +3821,12 @@ mod tests {
             Some("cluster_1")
         );
         println!("TEST {}", line!());
-        let frontend3 = listener.frontend_from_request("lolcatho.st", "/yolo/test", &Method::Get);
+        let frontend3 = listener.frontend_from_request(
+            "lolcatho.st",
+            "/yolo/test",
+            &Method::Get,
+            &crate::router::NoHeaders,
+        );
         assert_eq!(
             frontend3
                 .expect("should find a frontend")
@@ -3814,7 +3835,12 @@ mod tests {
             Some("cluster_2")
         );
         println!("TEST {}", line!());
-        let frontend4 = listener.frontend_from_request("lolcatho.st", "/yolo/swag", &Method::Get);
+        let frontend4 = listener.frontend_from_request(
+            "lolcatho.st",
+            "/yolo/swag",
+            &Method::Get,
+            &crate::router::NoHeaders,
+        );
         assert_eq!(
             frontend4
                 .expect("should find a frontend")
@@ -3823,7 +3849,8 @@ mod tests {
             Some("cluster_3")
         );
         println!("TEST {}", line!());
-        let frontend5 = listener.frontend_from_request("domain", "/", &Method::Get);
+        let frontend5 =
+            listener.frontend_from_request("domain", "/", &Method::Get, &crate::router::NoHeaders);
         assert!(frontend5.is_err());
         // assert!(false);
     }

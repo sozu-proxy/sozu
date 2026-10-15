@@ -89,8 +89,14 @@ pub fn rollback_request(request: &RequestType) -> Option<Request> {
             address: config.address,
             proxy: ListenerType::Udp.into(),
         }),
-        RequestType::AddHttpFrontend(front) => RequestType::RemoveHttpFrontend(front.clone()),
-        RequestType::AddHttpsFrontend(front) => RequestType::RemoveHttpsFrontend(front.clone()),
+        RequestType::AddHttpFrontend(front)
+        | RequestType::AddHttpFrontendWithHeaderPredicates(front) => {
+            RequestType::remove_http_frontend(front.clone())
+        }
+        RequestType::AddHttpsFrontend(front)
+        | RequestType::AddHttpsFrontendWithHeaderPredicates(front) => {
+            RequestType::remove_https_frontend(front.clone())
+        }
         RequestType::AddTcpFrontend(front) => RequestType::RemoveTcpFrontend(front.clone()),
         RequestType::AddUdpFrontend(front) => RequestType::RemoveUdpFrontend(front.clone()),
         _ => return None,
@@ -534,20 +540,22 @@ impl ConfigState {
         }
 
         let inverse = match request {
-            RequestType::RemoveHttpFrontend(selector) => self
+            RequestType::RemoveHttpFrontend(selector)
+            | RequestType::RemoveHttpFrontendWithHeaderPredicates(selector) => self
                 .http_fronts
                 .get(&selector.to_string())
                 .filter(|stored| stored.cluster_id.as_deref() == selector.cluster_id.as_deref())
                 .cloned()
                 .map(RequestHttpFrontend::from)
-                .map(RequestType::AddHttpFrontend),
-            RequestType::RemoveHttpsFrontend(selector) => self
+                .map(RequestType::add_http_frontend),
+            RequestType::RemoveHttpsFrontend(selector)
+            | RequestType::RemoveHttpsFrontendWithHeaderPredicates(selector) => self
                 .https_fronts
                 .get(&selector.to_string())
                 .filter(|stored| stored.cluster_id.as_deref() == selector.cluster_id.as_deref())
                 .cloned()
                 .map(RequestHttpFrontend::from)
-                .map(RequestType::AddHttpsFrontend),
+                .map(RequestType::add_https_frontend),
             RequestType::RemoveTcpFrontend(selector) => {
                 let address: SocketAddr = selector.address.into();
                 let sni = selector.sni.as_deref().map(str::to_ascii_lowercase);
@@ -633,13 +641,25 @@ impl ConfigState {
             RequestType::RemoveListener(remove) => self.remove_listener(remove),
             RequestType::ActivateListener(activate) => self.activate_listener(activate),
             RequestType::DeactivateListener(deactivate) => self.deactivate_listener(deactivate),
-            RequestType::AddHttpFrontend(front) => self.add_http_frontend(front),
-            RequestType::RemoveHttpFrontend(front) => self.remove_http_frontend(front),
+            RequestType::AddHttpFrontend(front)
+            | RequestType::AddHttpFrontendWithHeaderPredicates(front) => {
+                self.add_http_frontend(front)
+            }
+            RequestType::RemoveHttpFrontend(front)
+            | RequestType::RemoveHttpFrontendWithHeaderPredicates(front) => {
+                self.remove_http_frontend(front)
+            }
             RequestType::AddCertificate(add) => self.add_certificate(add),
             RequestType::RemoveCertificate(remove) => self.remove_certificate(remove),
             RequestType::ReplaceCertificate(replace) => self.replace_certificate(replace),
-            RequestType::AddHttpsFrontend(front) => self.add_https_frontend(front),
-            RequestType::RemoveHttpsFrontend(front) => self.remove_https_frontend(front),
+            RequestType::AddHttpsFrontend(front)
+            | RequestType::AddHttpsFrontendWithHeaderPredicates(front) => {
+                self.add_https_frontend(front)
+            }
+            RequestType::RemoveHttpsFrontend(front)
+            | RequestType::RemoveHttpsFrontendWithHeaderPredicates(front) => {
+                self.remove_https_frontend(front)
+            }
             RequestType::AddTcpFrontend(front) => self.add_tcp_frontend(front),
             RequestType::RemoveTcpFrontend(front) => self.remove_tcp_frontend(front),
             RequestType::AddUdpFrontend(front) => self.add_udp_frontend(front),
@@ -1089,13 +1109,13 @@ impl ConfigState {
             self.http_fronts
                 .values()
                 .filter(owned)
-                .map(|front| RequestType::RemoveHttpFrontend(front.clone().into()).into()),
+                .map(|front| RequestType::remove_http_frontend(front.clone().into()).into()),
         );
         requests.extend(
             self.https_fronts
                 .values()
                 .filter(owned)
-                .map(|front| RequestType::RemoveHttpsFrontend(front.clone().into()).into()),
+                .map(|front| RequestType::remove_https_frontend(front.clone().into()).into()),
         );
         requests.extend(
             self.tcp_fronts
@@ -1151,7 +1171,10 @@ impl ConfigState {
         }
         let cluster_id = match &request.request_type {
             Some(
-                RequestType::RemoveHttpFrontend(front) | RequestType::RemoveHttpsFrontend(front),
+                RequestType::RemoveHttpFrontend(front)
+                | RequestType::RemoveHttpFrontendWithHeaderPredicates(front)
+                | RequestType::RemoveHttpsFrontend(front)
+                | RequestType::RemoveHttpsFrontendWithHeaderPredicates(front),
             ) => front.cluster_id.as_deref(),
             Some(RequestType::RemoveTcpFrontend(front)) => Some(front.cluster_id.as_str()),
             Some(RequestType::RemoveUdpFrontend(front)) => Some(front.cluster_id.as_str()),
@@ -1168,13 +1191,19 @@ impl ConfigState {
     /// address, which one: that object is not removed.
     pub fn removed_with_its_cluster_message(&self, request: &Request) -> String {
         let (cluster_id, owner) = match &request.request_type {
-            Some(RequestType::RemoveHttpFrontend(front)) => (
+            Some(
+                RequestType::RemoveHttpFrontend(front)
+                | RequestType::RemoveHttpFrontendWithHeaderPredicates(front),
+            ) => (
                 front.cluster_id.clone(),
                 self.http_fronts
                     .get(&front.to_string())
                     .map(|stored| stored.cluster_id.as_deref().map(str::to_owned)),
             ),
-            Some(RequestType::RemoveHttpsFrontend(front)) => (
+            Some(
+                RequestType::RemoveHttpsFrontend(front)
+                | RequestType::RemoveHttpsFrontendWithHeaderPredicates(front),
+            ) => (
                 front.cluster_id.clone(),
                 self.https_fronts
                     .get(&front.to_string())
@@ -2833,7 +2862,7 @@ impl ConfigState {
         }
 
         for front in self.http_fronts.values() {
-            v.push(RequestType::AddHttpFrontend(front.clone().into()).into());
+            v.push(RequestType::add_http_frontend(front.clone().into()).into());
         }
 
         for add in self.certificate_add_requests() {
@@ -2841,7 +2870,7 @@ impl ConfigState {
         }
 
         for front in self.https_fronts.values() {
-            v.push(RequestType::AddHttpsFrontend(front.clone().into()).into());
+            v.push(RequestType::add_https_frontend(front.clone().into()).into());
         }
 
         for front_list in self.tcp_fronts.values() {
@@ -3471,11 +3500,11 @@ impl ConfigState {
         let added_http_fronts = their_http_fronts.difference(&my_http_fronts);
 
         for &(_, front) in removed_http_fronts {
-            v.push(RequestType::RemoveHttpFrontend(front.clone().into()).into());
+            v.push(RequestType::remove_http_frontend(front.clone().into()).into());
         }
 
         for &(_, front) in added_http_fronts {
-            v.push(RequestType::AddHttpFrontend(front.clone().into()).into());
+            v.push(RequestType::add_http_frontend(front.clone().into()).into());
         }
 
         let mut my_https_fronts: HashSet<(&String, &HttpFrontend)> = HashSet::new();
@@ -3490,11 +3519,11 @@ impl ConfigState {
         let added_https_fronts = their_https_fronts.difference(&my_https_fronts);
 
         for &(_, front) in removed_https_fronts {
-            v.push(RequestType::RemoveHttpsFrontend(front.clone().into()).into());
+            v.push(RequestType::remove_https_frontend(front.clone().into()).into());
         }
 
         for &(_, front) in added_https_fronts {
-            v.push(RequestType::AddHttpsFrontend(front.clone().into()).into());
+            v.push(RequestType::add_https_frontend(front.clone().into()).into());
         }
 
         let mut my_tcp_fronts: HashSet<(&ClusterId, &TcpFrontend)> = HashSet::new();
@@ -5524,6 +5553,7 @@ mod tests {
             required_auth: None,
             headers: Vec::new(),
             hsts: None,
+            header_predicates: Vec::new(),
         };
         let mut state = ConfigState::default();
         state
@@ -5711,6 +5741,7 @@ mod tests {
                 preload: Some(false),
                 force_replace_backend: Some(true),
             }),
+            header_predicates: Vec::new(),
         };
         let retained = request
             .clone()
@@ -10430,6 +10461,118 @@ mod tests {
             before,
             state.list_listeners(),
             "a refused patch must leave the listeners untouched"
+        );
+    }
+
+    /// sozu-proxy/sozu#1253: header predicates are part of a frontend's
+    /// state key. A canary that differs from its base only by a predicate
+    /// is stored beside it, a respelling of the same conjunction (other
+    /// order, other name case) is the same key, removing the canary leaves
+    /// the base, and a frontend without predicates keeps its historical key.
+    #[test]
+    fn header_predicates_are_part_of_the_frontend_state_key() {
+        use crate::proto::command::{HeaderMatchKind, HeaderPredicate};
+
+        let predicate = |name: &str, kind: HeaderMatchKind, value: Option<&str>| HeaderPredicate {
+            name: name.to_owned(),
+            kind: kind as i32,
+            value: value.map(str::to_owned),
+        };
+        let base = RequestHttpFrontend {
+            cluster_id: Some("stable".to_owned()),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 8080),
+            hostname: "api.example.com".to_owned(),
+            path: PathRule::prefix("/".to_owned()),
+            ..Default::default()
+        };
+        let canary = RequestHttpFrontend {
+            cluster_id: Some("canary".to_owned()),
+            header_predicates: vec![
+                predicate("X-Canary", HeaderMatchKind::Exact, Some("always")),
+                predicate("X-Beta", HeaderMatchKind::Present, None),
+            ],
+            ..base.clone()
+        };
+        let canary_respelled = RequestHttpFrontend {
+            header_predicates: vec![
+                predicate("x-beta", HeaderMatchKind::Present, None),
+                predicate("x-canary", HeaderMatchKind::Exact, Some("always")),
+            ],
+            ..canary.clone()
+        };
+
+        assert_eq!(
+            base.to_string(),
+            "127.0.0.1:8080;api.example.com;P/",
+            "a frontend without predicates keeps its historical key"
+        );
+        assert_eq!(canary.to_string(), canary_respelled.to_string());
+
+        let mut state = ConfigState::default();
+        state.add_http_frontend(&base).expect("base");
+        state
+            .add_http_frontend(&canary)
+            .expect("a canary must coexist with its base");
+        assert!(matches!(
+            state.add_http_frontend(&canary_respelled),
+            Err(StateError::Exists { .. })
+        ));
+        assert_eq!(state.http_fronts.len(), 2);
+
+        // A replay of the saved orders rebuilds the same state, predicates
+        // included.
+        let mut replayed = ConfigState::default();
+        for request in state.generate_requests() {
+            replayed.dispatch(&request).expect("replay must succeed");
+        }
+        assert_eq!(replayed.http_fronts, state.http_fronts);
+
+        // The replay (and any worker bound to it) sees the predicated
+        // frontend on its dedicated verb only, so an older worker refuses it
+        // instead of dropping the guard; the base keeps the historical one.
+        let replay_types: Vec<_> = state
+            .generate_requests()
+            .into_iter()
+            .filter_map(|request| request.request_type)
+            .collect();
+        assert!(replay_types.contains(&RequestType::AddHttpFrontend(base.clone())));
+        assert!(
+            replay_types.contains(&RequestType::AddHttpFrontendWithHeaderPredicates(
+                canary.clone()
+            ))
+        );
+        assert!(!replay_types.contains(&RequestType::AddHttpFrontend(canary.clone())));
+
+        // Rolling back a predicated addition removes that route only, on the
+        // matching verb, in either spelling of the add.
+        for add in [
+            RequestType::AddHttpFrontend(canary.clone()),
+            RequestType::AddHttpFrontendWithHeaderPredicates(canary.clone()),
+        ] {
+            assert_eq!(
+                rollback_request(&add).and_then(|request| request.request_type),
+                Some(RequestType::RemoveHttpFrontendWithHeaderPredicates(
+                    canary.clone()
+                ))
+            );
+        }
+        assert_eq!(
+            rollback_request(&RequestType::AddHttpFrontend(base.clone()))
+                .and_then(|request| request.request_type),
+            Some(RequestType::RemoveHttpFrontend(base.clone()))
+        );
+
+        state
+            .remove_http_frontend(&canary_respelled)
+            .expect("a respelled removal must find the canary");
+        assert_eq!(
+            state
+                .http_fronts
+                .values()
+                .map(|front| front.cluster_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("stable")],
+            "removing the canary must leave its base"
         );
     }
 }

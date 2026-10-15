@@ -90,6 +90,18 @@ pub fn format_request_type(request_type: &RequestType) -> &str {
         RequestType::RemoveHttpFrontend(_) => "RemoveHttpFrontend",
         RequestType::AddHttpsFrontend(_) => "AddHttpsFrontend",
         RequestType::RemoveHttpsFrontend(_) => "RemoveHttpsFrontend",
+        RequestType::AddHttpFrontendWithHeaderPredicates(_) => {
+            "AddHttpFrontendWithHeaderPredicates"
+        }
+        RequestType::RemoveHttpFrontendWithHeaderPredicates(_) => {
+            "RemoveHttpFrontendWithHeaderPredicates"
+        }
+        RequestType::AddHttpsFrontendWithHeaderPredicates(_) => {
+            "AddHttpsFrontendWithHeaderPredicates"
+        }
+        RequestType::RemoveHttpsFrontendWithHeaderPredicates(_) => {
+            "RemoveHttpsFrontendWithHeaderPredicates"
+        }
         RequestType::AddCertificate(_) => "AddCertificate",
         RequestType::ReplaceCertificate(_) => "ReplaceCertificate",
         RequestType::RemoveCertificate(_) => "RemoveCertificate",

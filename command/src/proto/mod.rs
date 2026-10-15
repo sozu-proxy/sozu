@@ -75,6 +75,22 @@ impl std::fmt::Debug for command::request::RequestType {
             RequestType::RemoveHttpsFrontend(value) => {
                 f.debug_tuple("RemoveHttpsFrontend").field(value).finish()
             }
+            RequestType::AddHttpFrontendWithHeaderPredicates(value) => f
+                .debug_tuple("AddHttpFrontendWithHeaderPredicates")
+                .field(value)
+                .finish(),
+            RequestType::RemoveHttpFrontendWithHeaderPredicates(value) => f
+                .debug_tuple("RemoveHttpFrontendWithHeaderPredicates")
+                .field(value)
+                .finish(),
+            RequestType::AddHttpsFrontendWithHeaderPredicates(value) => f
+                .debug_tuple("AddHttpsFrontendWithHeaderPredicates")
+                .field(value)
+                .finish(),
+            RequestType::RemoveHttpsFrontendWithHeaderPredicates(value) => f
+                .debug_tuple("RemoveHttpsFrontendWithHeaderPredicates")
+                .field(value)
+                .finish(),
             RequestType::AddCertificate(value) => {
                 f.debug_tuple("AddCertificate").field(value).finish()
             }
@@ -222,6 +238,16 @@ impl std::fmt::Debug for command::Header {
     }
 }
 
+impl std::fmt::Debug for command::HeaderPredicate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeaderPredicate")
+            .field("kind", &self.kind)
+            .field("name_len", &self.name.len())
+            .field("value_len", &self.value.as_ref().map(String::len))
+            .finish_non_exhaustive()
+    }
+}
+
 impl std::fmt::Debug for command::RequestHttpFrontend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let tags_len = self.tags.iter().fold(0usize, |total, (key, value)| {
@@ -262,6 +288,7 @@ impl std::fmt::Debug for command::RequestHttpFrontend {
             .field("headers_count", &self.headers.len())
             .field("headers_len", &headers_len)
             .field("hsts", &self.hsts)
+            .field("header_predicates_count", &self.header_predicates.len())
             .finish_non_exhaustive()
     }
 }
@@ -909,13 +936,14 @@ mod tests {
     use super::command::{
         AddCertificate, AlpnProtocols, Bucket, CertificateAndKey, CertificateSummary,
         CertificatesByAddress, CertificatesWithFingerprints, Cluster, ClusterMetrics,
-        CustomHttpAnswers, FilteredHistogram, FilteredMetrics, Header, HeaderPosition,
-        HttpListenerConfig, HttpsListenerConfig, ListOfCertificatesByAddress, PathRule,
-        PathRuleKind, Percentiles, QueryCertificatesFilters, RedirectPolicy, RedirectScheme,
-        RemoveCertificate, ReplaceCertificate, Request, RequestHttpFrontend, RequestTcpFrontend,
-        ResponseContent, ResponseStatus, RulePosition, TlsVersion, UpdateHttpListenerConfig,
-        UpdateHttpsListenerConfig, WorkerMetrics, WorkerRequest, WorkerResponse, WorkerResponses,
-        filtered_metrics::Inner, request::RequestType, response_content::ContentType,
+        CustomHttpAnswers, FilteredHistogram, FilteredMetrics, Header, HeaderMatchKind,
+        HeaderPosition, HeaderPredicate, HttpListenerConfig, HttpsListenerConfig,
+        ListOfCertificatesByAddress, PathRule, PathRuleKind, Percentiles, QueryCertificatesFilters,
+        RedirectPolicy, RedirectScheme, RemoveCertificate, ReplaceCertificate, Request,
+        RequestHttpFrontend, RequestTcpFrontend, ResponseContent, ResponseStatus, RulePosition,
+        TlsVersion, UpdateHttpListenerConfig, UpdateHttpsListenerConfig, WorkerMetrics,
+        WorkerRequest, WorkerResponse, WorkerResponses, filtered_metrics::Inner,
+        request::RequestType, response_content::ContentType,
     };
 
     #[test]
@@ -1315,6 +1343,8 @@ mod tests {
         const REWRITE_PATH_SECRET: &str = "HTTP_FRONTEND_REWRITE_PATH_SECRET_SENTINEL";
         const HEADER_KEY_SECRET: &str = "HTTP_FRONTEND_HEADER_KEY_SECRET_SENTINEL";
         const HEADER_VALUE_SECRET: &str = "HTTP_FRONTEND_HEADER_VALUE_SECRET_SENTINEL";
+        const PREDICATE_NAME_SECRET: &str = "HTTP_FRONTEND_PREDICATE_NAME_SECRET_SENTINEL";
+        const PREDICATE_VALUE_SECRET: &str = "HTTP_FRONTEND_PREDICATE_VALUE_SECRET_SENTINEL";
 
         let long_value = |marker: &str| format!("{marker}{}", "x".repeat(4096));
         let frontend = RequestHttpFrontend {
@@ -1341,6 +1371,11 @@ mod tests {
                 val: long_value(HEADER_VALUE_SECRET),
             }],
             hsts: None,
+            header_predicates: vec![HeaderPredicate {
+                name: long_value(PREDICATE_NAME_SECRET),
+                kind: HeaderMatchKind::Exact as i32,
+                value: Some(long_value(PREDICATE_VALUE_SECRET)),
+            }],
         };
         let request_type = RequestType::AddHttpsFrontend(frontend.clone());
         let request = Request::from(request_type.clone());
@@ -1366,6 +1401,8 @@ mod tests {
             REWRITE_PATH_SECRET,
             HEADER_KEY_SECRET,
             HEADER_VALUE_SECRET,
+            PREDICATE_NAME_SECRET,
+            PREDICATE_VALUE_SECRET,
         ];
 
         for (label, output) in &debug_outputs {
@@ -1390,6 +1427,7 @@ mod tests {
             format!("method_len: Some({})", long_value(METHOD_SECRET).len()),
             "tags_count: 1".to_owned(),
             "headers_count: 1".to_owned(),
+            "header_predicates_count: 1".to_owned(),
         ];
         for safe_metadata in expected_metadata {
             assert!(

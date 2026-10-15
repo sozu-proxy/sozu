@@ -961,6 +961,11 @@ pub enum HttpFrontendCmd {
         )]
         header: Vec<String>,
         #[clap(
+            long = "match-header",
+            help = "Header predicate the request must satisfy for this frontend to match, format: <match>=<name>[=<value>]. <match> is 'exact' (the first <name> header equals <value>, byte for byte), 'regex' (it matches the regex <value>, anchored at both ends like --path-regex) or 'present' (the header is carried, no <value>). <name> is case-insensitive and cannot be Host or Cookie. Repeatable: every predicate must hold. Part of the frontend identity, so `frontend remove` must repeat the same predicates."
+        )]
+        match_header: Vec<String>,
+        #[clap(
             long = "hsts-max-age",
             help = "HSTS (RFC 6797) `max-age` directive in seconds. Setting any of the --hsts-* flags enables HSTS on this frontend. Defaults to 31536000 (1 year, HSTS preload list minimum) when --hsts-max-age is omitted but another --hsts-* flag is set. `0` is the RFC 6797 §11.4 kill switch."
         )]
@@ -1017,6 +1022,11 @@ pub enum HttpFrontendCmd {
             help = "HTTP method, matched case-sensitively (RFC 9110 §9.1): write it in the exact case the client sends"
         )]
         method: Option<String>,
+        #[clap(
+            long = "match-header",
+            help = "Header predicate of the frontend to remove, format: <match>=<name>[=<value>], as given to `frontend add`. Repeatable."
+        )]
+        match_header: Vec<String>,
     },
 }
 

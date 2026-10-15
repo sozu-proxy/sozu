@@ -10,10 +10,11 @@ use std::{
 
 use regex::bytes::Regex;
 use sozu_command::{
+    config::validate_header_predicate,
     logging::CachedTags,
     proto::command::{
-        HeaderPosition, HstsConfig, PathRule as CommandPathRule, PathRuleKind, RedirectPolicy,
-        RedirectScheme, RulePosition,
+        HeaderMatchKind, HeaderPosition, HeaderPredicate, HstsConfig, PathRule as CommandPathRule,
+        PathRuleKind, RedirectPolicy, RedirectScheme, RulePosition,
     },
     response::HttpFrontend,
     state::ClusterId,
@@ -66,6 +67,11 @@ pub enum RouterError {
     InvalidPathRewrite(String),
     #[error("Could not add route, route_bytes={}", .0.len())]
     AddRoute(String),
+    /// A frontend header predicate is not a usable routing condition
+    /// (sozu-proxy/sozu#1253). Carries the predicate's position and a fixed
+    /// reason, never the operator's name or value.
+    #[error("invalid header predicate at index {index}: {reason}")]
+    InvalidHeaderPredicate { index: usize, reason: &'static str },
     #[error("Could not remove route, route_bytes={}", .0.len())]
     RemoveRoute(String),
     #[error("route_not_found method={method:?} host_bytes={} path_bytes={}", .host.len(), .path.len())]
@@ -86,9 +92,9 @@ impl fmt::Debug for RouterError {
 /// over its routes (`HttpProxy::add_listener`, `lib/src/http.rs`).
 #[derive(Clone)]
 pub struct Router {
-    pre: Vec<(DomainRule, PathRule, MethodRule, Route)>,
-    pub tree: TrieNode<Vec<(PathRule, MethodRule, Route)>>,
-    post: Vec<(DomainRule, PathRule, MethodRule, Route)>,
+    pre: Vec<(DomainRule, PathRule, MethodRule, HeaderRules, Route)>,
+    pub tree: TrieNode<Vec<(PathRule, MethodRule, HeaderRules, Route)>>,
+    post: Vec<(DomainRule, PathRule, MethodRule, HeaderRules, Route)>,
 }
 
 impl Default for Router {
@@ -114,11 +120,35 @@ impl Router {
     /// minimal `RouteResult` so existing call sites keep working, while
     /// [`Route::Frontend`] runs the full Frontend → RouteResult pipeline,
     /// substituting host/path captures into [`RewriteParts`] templates.
+    ///
+    /// A request looked up here carries no header, so a rule with header
+    /// predicates never matches it; see [`Self::lookup_with_headers`].
     pub fn lookup(
         &self,
         hostname: &str,
         path: &str,
         method: &Method,
+    ) -> Result<RouteResult, RouterError> {
+        self.lookup_with_headers(hostname, path, method, &NoHeaders)
+    }
+
+    /// [`Self::lookup`], with the request's headers for the frontends that
+    /// carry header predicates (sozu-proxy/sozu#1253).
+    ///
+    /// Within each of the pre list, one trie leaf and the post list, a rule
+    /// whose predicates all hold outranks every rule without predicates;
+    /// among rules of one class the historical precedence applies
+    /// unchanged — declaration order for pre/post, [`select_tree_rule`]'s
+    /// path/method order for the tree. A rule whose predicates do not all
+    /// hold is skipped, exactly like a rule whose method does not match. A
+    /// route table without predicates therefore resolves every request as
+    /// it did before, and `headers` is never read.
+    pub fn lookup_with_headers(
+        &self,
+        hostname: &str,
+        path: &str,
+        method: &Method,
+        headers: &dyn RequestHeaders,
     ) -> Result<RouteResult, RouterError> {
         // The route table stores every hostname LABEL ASCII-lowercased
         // (`add_tree_rule` via `tree_hostname_to_ascii`, and
@@ -142,19 +172,16 @@ impl Router {
         let normalized_hostname = normalize_hostname(hostname);
         let hostname_b = normalized_hostname.as_bytes();
         let path_b = path.as_bytes();
-        for (domain_rule, path_rule, method_rule, route) in &self.pre {
-            if domain_rule.matches(hostname_b)
-                && path_rule.matches(path_b) != PathRuleResult::None
-                && method_rule.matches(method) != MethodRuleResult::None
-            {
-                return Ok(RouteResult::new_no_trie(
-                    hostname_b,
-                    domain_rule,
-                    path_b,
-                    path_rule,
-                    route,
-                ));
-            }
+        if let Some((domain_rule, path_rule, _, _, route)) =
+            select_listed_rule(&self.pre, hostname_b, path_b, method, headers)
+        {
+            return Ok(RouteResult::new_no_trie(
+                hostname_b,
+                domain_rule,
+                path_b,
+                path_rule,
+                route,
+            ));
         }
 
         // The hostname candidates the trie holds are tried
@@ -173,8 +200,8 @@ impl Router {
             hostname_b,
             true,
             &mut trie_matches,
-            &mut |(_, path_rules)| select_tree_rule(path_rules, path_b, method).is_some(),
-        ) && let Some((path_rule, route)) = select_tree_rule(path_rules, path_b, method)
+            &mut |(_, path_rules)| select_tree_rule(path_rules, path_b, method, headers).is_some(),
+        ) && let Some((path_rule, route)) = select_tree_rule(path_rules, path_b, method, headers)
         {
             // The second call cannot disagree with the predicate: same
             // pure function, same leaf, same request. Re-running it is how
@@ -198,19 +225,16 @@ impl Router {
             ));
         }
 
-        for (domain_rule, path_rule, method_rule, route) in self.post.iter() {
-            if domain_rule.matches(hostname_b)
-                && path_rule.matches(path_b) != PathRuleResult::None
-                && method_rule.matches(method) != MethodRuleResult::None
-            {
-                return Ok(RouteResult::new_no_trie(
-                    hostname_b,
-                    domain_rule,
-                    path_b,
-                    path_rule,
-                    route,
-                ));
-            }
+        if let Some((domain_rule, path_rule, _, _, route)) =
+            select_listed_rule(&self.post, hostname_b, path_b, method, headers)
+        {
+            return Ok(RouteResult::new_no_trie(
+                hostname_b,
+                domain_rule,
+                path_b,
+                path_rule,
+                route,
+            ));
         }
 
         Err(RouterError::RouteNotFound {
@@ -254,6 +278,8 @@ impl Router {
             .ok_or(RouterError::InvalidPathRule(front.path.to_string()))?;
 
         let method_rule = MethodRule::new(front.method.clone());
+
+        let header_rules = HeaderRules::from_config(&front.header_predicates)?;
 
         // Decide between the legacy `Route::ClusterId`/`Route::Deny` shape
         // and the rich `Route::Frontend(Rc<Frontend>)` shape: any non-
@@ -318,11 +344,27 @@ impl Router {
         };
 
         let success = match front.position {
-            RulePosition::Pre => self.add_pre_rule(&domain, &path_rule, &method_rule, &route),
-            RulePosition::Post => self.add_post_rule(&domain, &path_rule, &method_rule, &route),
-            RulePosition::Tree => {
-                self.add_tree_rule(front.hostname.as_bytes(), &path_rule, &method_rule, &route)
-            }
+            RulePosition::Pre => self.add_pre_rule_with_headers(
+                &domain,
+                &path_rule,
+                &method_rule,
+                &header_rules,
+                &route,
+            ),
+            RulePosition::Post => self.add_post_rule_with_headers(
+                &domain,
+                &path_rule,
+                &method_rule,
+                &header_rules,
+                &route,
+            ),
+            RulePosition::Tree => self.add_tree_rule_with_headers(
+                front.hostname.as_bytes(),
+                &path_rule,
+                &method_rule,
+                &header_rules,
+                &route,
+            ),
         };
         if !success {
             return Err(RouterError::AddRoute(format!("{front:?}")));
@@ -344,6 +386,8 @@ impl Router {
 
         let method_rule = MethodRule::new(front.method.clone());
 
+        let header_rules = HeaderRules::from_config(&front.header_predicates)?;
+
         let remove_success = match front.position {
             RulePosition::Pre => {
                 let domain = front.hostname.parse::<DomainRule>().map_err(|_| {
@@ -352,7 +396,7 @@ impl Router {
                     }
                 })?;
 
-                self.remove_pre_rule(&domain, &path_rule, &method_rule)
+                self.remove_pre_rule_with_headers(&domain, &path_rule, &method_rule, &header_rules)
             }
             RulePosition::Post => {
                 let domain = front.hostname.parse::<DomainRule>().map_err(|_| {
@@ -361,11 +405,14 @@ impl Router {
                     }
                 })?;
 
-                self.remove_post_rule(&domain, &path_rule, &method_rule)
+                self.remove_post_rule_with_headers(&domain, &path_rule, &method_rule, &header_rules)
             }
-            RulePosition::Tree => {
-                self.remove_tree_rule(front.hostname.as_bytes(), &path_rule, &method_rule)
-            }
+            RulePosition::Tree => self.remove_tree_rule_with_headers(
+                front.hostname.as_bytes(),
+                &path_rule,
+                &method_rule,
+                &header_rules,
+            ),
         };
         if !remove_success {
             return Err(RouterError::RemoveRoute(format!("{front:?}")));
@@ -373,11 +420,26 @@ impl Router {
         Ok(())
     }
 
+    /// [`Self::add_tree_rule_with_headers`] for a rule without header
+    /// predicates.
     pub fn add_tree_rule(
         &mut self,
         hostname: &[u8],
         path: &PathRule,
         method: &MethodRule,
+        cluster: &Route,
+    ) -> bool {
+        self.add_tree_rule_with_headers(hostname, path, method, &HeaderRules::default(), cluster)
+    }
+
+    /// Add a tree rule. Its identity in the leaf is `(path, method,
+    /// headers)`: rules that differ only by their header predicates coexist.
+    pub fn add_tree_rule_with_headers(
+        &mut self,
+        hostname: &[u8],
+        path: &PathRule,
+        method: &MethodRule,
+        headers: &HeaderRules,
         cluster: &Route,
     ) -> bool {
         let hostname = match from_utf8(hostname) {
@@ -392,8 +454,16 @@ impl Router {
                 if let Some((_, paths)) = self.tree.domain_lookup_mut(hostname.as_bytes(), false) {
                     empty = false;
                     let before = paths.len();
-                    if !paths.iter().any(|(p, m, _)| p == path && m == method) {
-                        paths.push((path.to_owned(), method.to_owned(), cluster.to_owned()));
+                    if !paths
+                        .iter()
+                        .any(|(p, m, h, _)| p == path && m == method && h == headers)
+                    {
+                        paths.push((
+                            path.to_owned(),
+                            method.to_owned(),
+                            headers.to_owned(),
+                            cluster.to_owned(),
+                        ));
                         // Append must add exactly one (path, method) leaf
                         // and the new rule must now be present.
                         debug_assert_eq!(
@@ -402,8 +472,10 @@ impl Router {
                             "appending a tree rule must grow the leaf's rule list by exactly one",
                         );
                         debug_assert!(
-                            paths.iter().any(|(p, m, _)| p == path && m == method),
-                            "the freshly appended (path, method) rule must be present after insert",
+                            paths
+                                .iter()
+                                .any(|(p, m, h, _)| p == path && m == method && h == headers),
+                            "the freshly appended (path, method, headers) rule must be present after insert",
                         );
                         return true;
                     }
@@ -417,7 +489,12 @@ impl Router {
                     let inserted_host = hostname.clone().into_bytes();
                     let insert_result = self.tree.domain_insert(
                         hostname.into_bytes(),
-                        vec![(path.to_owned(), method.to_owned(), cluster.to_owned())],
+                        vec![(
+                            path.to_owned(),
+                            method.to_owned(),
+                            headers.to_owned(),
+                            cluster.to_owned(),
+                        )],
                     );
                     // A malformed hostname reaches us straight from the
                     // control plane (`AddHttpFrontend` over the command
@@ -458,7 +535,7 @@ impl Router {
                             .domain_lookup_mut(&inserted_host, false)
                             .is_some_and(|(_, paths)| paths
                                 .iter()
-                                .any(|(p, m, _)| p == path && m == method)),
+                                .any(|(p, m, h, _)| p == path && m == method && h == headers)),
                         "a freshly inserted tree domain must resolve to its inserted rule",
                     );
                     return true;
@@ -470,12 +547,26 @@ impl Router {
         }
     }
 
+    /// [`Self::remove_tree_rule_with_headers`] for a rule without header
+    /// predicates.
     pub fn remove_tree_rule(
         &mut self,
         hostname: &[u8],
         path: &PathRule,
         method: &MethodRule,
         // _cluster: &Route,
+    ) -> bool {
+        self.remove_tree_rule_with_headers(hostname, path, method, &HeaderRules::default())
+    }
+
+    /// Remove the tree rule whose identity is `(path, method, headers)`; a
+    /// rule that differs only by its header predicates stays.
+    pub fn remove_tree_rule_with_headers(
+        &mut self,
+        hostname: &[u8],
+        path: &PathRule,
+        method: &MethodRule,
+        headers: &HeaderRules,
     ) -> bool {
         let hostname = match from_utf8(hostname) {
             Err(_) => return false,
@@ -488,12 +579,14 @@ impl Router {
                     let paths_opt = self.tree.domain_lookup_mut(hostname.as_bytes(), false);
 
                     if let Some((_, paths)) = paths_opt {
-                        paths.retain(|(p, m, _)| p != path || m != method);
-                        // `retain` evicts every matching (path, method)
-                        // rule; none may survive the filter.
+                        paths.retain(|(p, m, h, _)| p != path || m != method || h != headers);
+                        // `retain` evicts every matching (path, method,
+                        // headers) rule; none may survive the filter.
                         debug_assert!(
-                            !paths.iter().any(|(p, m, _)| p == path && m == method),
-                            "remove must evict every matching (path, method) rule from the leaf",
+                            !paths
+                                .iter()
+                                .any(|(p, m, h, _)| p == path && m == method && h == headers),
+                            "remove must evict every matching (path, method, headers) rule from the leaf",
                         );
                     }
 
@@ -613,20 +706,22 @@ impl Router {
             }
         };
 
-        for (_, _, _, route) in self.pre.iter_mut() {
+        for (_, _, _, _, route) in self.pre.iter_mut() {
             visit(route);
         }
         self.tree.for_each_value_mut(&mut |paths| {
-            for (_, _, route) in paths.iter_mut() {
+            for (_, _, _, route) in paths.iter_mut() {
                 visit(route);
             }
         });
-        for (_, _, _, route) in self.post.iter_mut() {
+        for (_, _, _, _, route) in self.post.iter_mut() {
             visit(route);
         }
         refreshed
     }
 
+    /// [`Self::add_pre_rule_with_headers`] for a rule without header
+    /// predicates.
     pub fn add_pre_rule(
         &mut self,
         domain: &DomainRule,
@@ -634,16 +729,30 @@ impl Router {
         method: &MethodRule,
         cluster_id: &Route,
     ) -> bool {
+        self.add_pre_rule_with_headers(domain, path, method, &HeaderRules::default(), cluster_id)
+    }
+
+    /// Add a pre-rule. Its identity is `(domain, path, method,
+    /// headers)`: rules that differ only by their header predicates coexist.
+    pub fn add_pre_rule_with_headers(
+        &mut self,
+        domain: &DomainRule,
+        path: &PathRule,
+        method: &MethodRule,
+        headers: &HeaderRules,
+        cluster_id: &Route,
+    ) -> bool {
         let before = self.pre.len();
         if !self
             .pre
             .iter()
-            .any(|(d, p, m, _)| d == domain && p == path && m == method)
+            .any(|(d, p, m, h, _)| d == domain && p == path && m == method && h == headers)
         {
             self.pre.push((
                 domain.to_owned(),
                 path.to_owned(),
                 method.to_owned(),
+                headers.to_owned(),
                 cluster_id.to_owned(),
             ));
             // A new pre-rule grows the list by exactly one and is now
@@ -657,7 +766,7 @@ impl Router {
             debug_assert!(
                 self.pre
                     .iter()
-                    .any(|(d, p, m, _)| d == domain && p == path && m == method),
+                    .any(|(d, p, m, h, _)| d == domain && p == path && m == method && h == headers),
                 "the freshly added pre-rule must be present",
             );
             true
@@ -671,6 +780,8 @@ impl Router {
         }
     }
 
+    /// [`Self::add_post_rule_with_headers`] for a rule without header
+    /// predicates.
     pub fn add_post_rule(
         &mut self,
         domain: &DomainRule,
@@ -678,16 +789,30 @@ impl Router {
         method: &MethodRule,
         cluster_id: &Route,
     ) -> bool {
+        self.add_post_rule_with_headers(domain, path, method, &HeaderRules::default(), cluster_id)
+    }
+
+    /// Add a post-rule. Its identity is `(domain, path, method,
+    /// headers)`: rules that differ only by their header predicates coexist.
+    pub fn add_post_rule_with_headers(
+        &mut self,
+        domain: &DomainRule,
+        path: &PathRule,
+        method: &MethodRule,
+        headers: &HeaderRules,
+        cluster_id: &Route,
+    ) -> bool {
         let before = self.post.len();
         if !self
             .post
             .iter()
-            .any(|(d, p, m, _)| d == domain && p == path && m == method)
+            .any(|(d, p, m, h, _)| d == domain && p == path && m == method && h == headers)
         {
             self.post.push((
                 domain.to_owned(),
                 path.to_owned(),
                 method.to_owned(),
+                headers.to_owned(),
                 cluster_id.to_owned(),
             ));
             debug_assert_eq!(
@@ -698,7 +823,7 @@ impl Router {
             debug_assert!(
                 self.post
                     .iter()
-                    .any(|(d, p, m, _)| d == domain && p == path && m == method),
+                    .any(|(d, p, m, h, _)| d == domain && p == path && m == method && h == headers),
                 "the freshly added post-rule must be present",
             );
             true
@@ -712,17 +837,31 @@ impl Router {
         }
     }
 
+    /// [`Self::remove_pre_rule_with_headers`] for a rule without header
+    /// predicates.
     pub fn remove_pre_rule(
         &mut self,
         domain: &DomainRule,
         path: &PathRule,
         method: &MethodRule,
     ) -> bool {
+        self.remove_pre_rule_with_headers(domain, path, method, &HeaderRules::default())
+    }
+
+    /// Remove the pre-rule whose identity is `(domain, path, method,
+    /// headers)`; a rule that differs only by its header predicates stays.
+    pub fn remove_pre_rule_with_headers(
+        &mut self,
+        domain: &DomainRule,
+        path: &PathRule,
+        method: &MethodRule,
+        headers: &HeaderRules,
+    ) -> bool {
         let before = self.pre.len();
         match self
             .pre
             .iter()
-            .position(|(d, p, m, _)| d == domain && p == path && m == method)
+            .position(|(d, p, m, h, _)| d == domain && p == path && m == method && h == headers)
         {
             None => {
                 debug_assert_eq!(
@@ -742,10 +881,10 @@ impl Router {
                     "removing a pre-rule must drop exactly one entry",
                 );
                 debug_assert!(
-                    !self
-                        .pre
-                        .iter()
-                        .any(|(d, p, m, _)| d == domain && p == path && m == method),
+                    !self.pre.iter().any(|(d, p, m, h, _)| d == domain
+                        && p == path
+                        && m == method
+                        && h == headers),
                     "the removed pre-rule must no longer be present",
                 );
                 true
@@ -753,17 +892,31 @@ impl Router {
         }
     }
 
+    /// [`Self::remove_post_rule_with_headers`] for a rule without header
+    /// predicates.
     pub fn remove_post_rule(
         &mut self,
         domain: &DomainRule,
         path: &PathRule,
         method: &MethodRule,
     ) -> bool {
+        self.remove_post_rule_with_headers(domain, path, method, &HeaderRules::default())
+    }
+
+    /// Remove the post-rule whose identity is `(domain, path, method,
+    /// headers)`; a rule that differs only by its header predicates stays.
+    pub fn remove_post_rule_with_headers(
+        &mut self,
+        domain: &DomainRule,
+        path: &PathRule,
+        method: &MethodRule,
+        headers: &HeaderRules,
+    ) -> bool {
         let before = self.post.len();
         match self
             .post
             .iter()
-            .position(|(d, p, m, _)| d == domain && p == path && m == method)
+            .position(|(d, p, m, h, _)| d == domain && p == path && m == method && h == headers)
         {
             None => {
                 debug_assert_eq!(
@@ -782,10 +935,10 @@ impl Router {
                     "removing a post-rule must drop exactly one entry",
                 );
                 debug_assert!(
-                    !self
-                        .post
-                        .iter()
-                        .any(|(d, p, m, _)| d == domain && p == path && m == method),
+                    !self.post.iter().any(|(d, p, m, h, _)| d == domain
+                        && p == path
+                        && m == method
+                        && h == headers),
                     "the removed post-rule must no longer be present",
                 );
                 true
@@ -808,7 +961,7 @@ impl Router {
         let hostname_b = hostname.as_bytes();
 
         // Check pre rules
-        for (domain_rule, _, _, _) in &self.pre {
+        for (domain_rule, _, _, _, _) in &self.pre {
             if domain_rule.matches(hostname_b) {
                 return true;
             }
@@ -825,7 +978,7 @@ impl Router {
         }
 
         // Check post rules
-        for (domain_rule, _, _, _) in &self.post {
+        for (domain_rule, _, _, _, _) in &self.post {
             if domain_rule.matches(hostname_b) {
                 return true;
             }
@@ -835,8 +988,8 @@ impl Router {
     }
 }
 
-/// Pick the rule a trie leaf serves `path` and `method` with, or `None`
-/// when the leaf carries nothing for this request.
+/// Pick the rule a trie leaf serves `path`, `method` and `headers` with, or
+/// `None` when the leaf carries nothing for this request.
 ///
 /// An `EQUALS`/`REGEX` rule whose `method` matches exactly wins
 /// immediately; otherwise the longest matching `PREFIX` wins, with a
@@ -845,53 +998,309 @@ impl Router {
 /// prefix can lose to a shorter one (`doc/configure.md`, "Path matching
 /// precedence within a frontend").
 ///
-/// Lifted out of [`Router::lookup`] so the trie walk can use the very
-/// same selection as its acceptance predicate: a hostname candidate that
-/// selects nothing must not end the lookup (sozu#1351). Two copies of
-/// this would drift, and the drift would be a route that the trie
+/// Header predicates (sozu-proxy/sozu#1253) split the leaf into two
+/// classes, each selected by the rule above: a rule whose predicates all
+/// hold outranks every rule without predicates, and a rule whose
+/// predicates do not all hold is skipped like a rule whose method does not
+/// match. A leaf without predicates selects exactly as it always did, and
+/// declaration order never decides between a canary and its base.
+///
+/// Lifted out of [`Router::lookup_with_headers`] so the trie walk can use
+/// the very same selection as its acceptance predicate: a hostname
+/// candidate that selects nothing must not end the lookup (sozu#1351). Two
+/// copies of this would drift, and the drift would be a route that the trie
 /// accepted and the router then refused to serve.
 fn select_tree_rule<'a>(
-    path_rules: &'a [(PathRule, MethodRule, Route)],
+    path_rules: &'a [(PathRule, MethodRule, HeaderRules, Route)],
     path: &[u8],
     method: &Method,
+    headers: &dyn RequestHeaders,
 ) -> Option<(&'a PathRule, &'a Route)> {
-    let mut prefix_length = 0;
-    let mut matched: Option<(&PathRule, &Route)> = None;
+    let mut predicated = TreeSelection::default();
+    let mut unpredicated = TreeSelection::default();
 
-    for (rule, method_rule, route) in path_rules {
-        match rule.matches(path) {
-            PathRuleResult::Regex | PathRuleResult::Equals => match method_rule.matches(method) {
-                MethodRuleResult::Equals => return Some((rule, route)),
+    for (rule, method_rule, header_rules, route) in path_rules {
+        let class = if header_rules.is_empty() {
+            &mut unpredicated
+        } else {
+            &mut predicated
+        };
+        // A class that already holds an exact winner takes no other rule:
+        // this is the historical early return, per class.
+        if class.exact {
+            continue;
+        }
+        let path_result = rule.matches(path);
+        if path_result == PathRuleResult::None {
+            continue;
+        }
+        let method_result = method_rule.matches(method);
+        if method_result == MethodRuleResult::None {
+            continue;
+        }
+        // Headers are read last, and only for a rule that could otherwise
+        // serve this request.
+        if !header_rules.is_empty() && !header_rules.matches(headers) {
+            continue;
+        }
+        class.offer(path_result, method_result, path.len(), rule, route);
+        if predicated.exact {
+            // Nothing outranks an exact match among satisfied predicates.
+            break;
+        }
+    }
+
+    // A predicate-free rule may only be served when no satisfied
+    // predicated rule exists: the pair below is the class precedence.
+    debug_assert!(
+        !predicated.exact || predicated.matched.is_some(),
+        "an exact selection must carry its rule",
+    );
+    predicated.matched.or(unpredicated.matched)
+}
+
+/// One class of [`select_tree_rule`]'s scan: the historical
+/// longest-prefix / exact-method selection, run over the rules of that
+/// class only.
+#[derive(Default)]
+struct TreeSelection<'a> {
+    prefix_length: usize,
+    matched: Option<(&'a PathRule, &'a Route)>,
+    /// An `EQUALS`/`REGEX` rule with an exactly matching method was taken:
+    /// the class is decided.
+    exact: bool,
+}
+
+impl<'a> TreeSelection<'a> {
+    fn offer(
+        &mut self,
+        path_result: PathRuleResult,
+        method_result: MethodRuleResult,
+        path_len: usize,
+        rule: &'a PathRule,
+        route: &'a Route,
+    ) {
+        debug_assert!(!self.exact, "a decided class must not take another rule");
+        debug_assert!(
+            path_result != PathRuleResult::None && method_result != MethodRuleResult::None,
+            "only a rule that matches path and method is offered",
+        );
+        match path_result {
+            PathRuleResult::Regex | PathRuleResult::Equals => match method_result {
+                MethodRuleResult::Equals => {
+                    self.matched = Some((rule, route));
+                    self.exact = true;
+                }
                 MethodRuleResult::All => {
-                    prefix_length = path.len();
-                    matched = Some((rule, route));
+                    self.prefix_length = path_len;
+                    self.matched = Some((rule, route));
                 }
                 MethodRuleResult::None => {}
             },
             PathRuleResult::Prefix(size) => {
-                if size >= prefix_length {
-                    match method_rule.matches(method) {
-                        // FIXME: the rule order will be important here
-                        MethodRuleResult::Equals | MethodRuleResult::All => {
-                            // Longest-prefix wins: the selected length is
-                            // monotonically non-decreasing across the
-                            // candidate scan.
-                            debug_assert!(
-                                size >= prefix_length,
-                                "longest-prefix selection must never shrink the match length",
-                            );
-                            prefix_length = size;
-                            matched = Some((rule, route));
-                        }
-                        MethodRuleResult::None => {}
-                    }
+                if size >= self.prefix_length {
+                    // FIXME: the rule order will be important here
+                    // Longest-prefix wins: the selected length is
+                    // monotonically non-decreasing across the candidate
+                    // scan.
+                    debug_assert!(
+                        size >= self.prefix_length,
+                        "longest-prefix selection must never shrink the match length",
+                    );
+                    self.prefix_length = size;
+                    self.matched = Some((rule, route));
                 }
             }
             PathRuleResult::None => {}
         }
     }
+}
 
-    matched
+/// Pick the rule an ordered pre or post list serves the request with.
+///
+/// The first rule in declaration order whose domain, path and method match
+/// wins — except that a rule whose header predicates all hold outranks
+/// every rule without predicates (sozu-proxy/sozu#1253), the same class
+/// precedence [`select_tree_rule`] applies to a trie leaf. A rule whose
+/// predicates do not all hold is skipped.
+fn select_listed_rule<'a>(
+    rules: &'a [(DomainRule, PathRule, MethodRule, HeaderRules, Route)],
+    hostname: &[u8],
+    path: &[u8],
+    method: &Method,
+    headers: &dyn RequestHeaders,
+) -> Option<&'a (DomainRule, PathRule, MethodRule, HeaderRules, Route)> {
+    let mut unpredicated = None;
+    for entry in rules {
+        let (domain_rule, path_rule, method_rule, header_rules, _) = entry;
+        // Once a predicate-free rule is held, only a predicated one can
+        // still change the answer.
+        if unpredicated.is_some() && header_rules.is_empty() {
+            continue;
+        }
+        if !(domain_rule.matches(hostname)
+            && path_rule.matches(path) != PathRuleResult::None
+            && method_rule.matches(method) != MethodRuleResult::None)
+        {
+            continue;
+        }
+        if header_rules.is_empty() {
+            unpredicated = Some(entry);
+        } else if header_rules.matches(headers) {
+            return Some(entry);
+        }
+    }
+    debug_assert!(
+        unpredicated.is_none_or(|(_, _, _, header_rules, _)| header_rules.is_empty()),
+        "the fallback of a listed selection must be a predicate-free rule",
+    );
+    unpredicated
+}
+
+/// The request headers a [`Router`] lookup may read to evaluate header
+/// predicates (sozu-proxy/sozu#1253).
+pub trait RequestHeaders {
+    /// The value of the FIRST occurrence of the header `name`, compared
+    /// ASCII-case-insensitively (RFC 9110 §5.1), raw as the request carried
+    /// it; `None` when the request does not carry it.
+    fn header(&self, name: &[u8]) -> Option<&[u8]>;
+}
+
+/// A request without any header, for lookups that have none to offer.
+pub struct NoHeaders;
+
+impl RequestHeaders for NoHeaders {
+    fn header(&self, _name: &[u8]) -> Option<&[u8]> {
+        None
+    }
+}
+
+/// How one [`HeaderRule`] tests the value of its header.
+#[derive(Clone, Debug)]
+enum HeaderMatch {
+    Exact(Vec<u8>),
+    /// Anchored at both ends, like a `REGEX` path rule ([`anchored_regex`]).
+    Regex(Regex),
+    Present,
+}
+
+impl PartialEq for HeaderMatch {
+    /// `Regex` carries no `PartialEq`: patterns compare by source, as
+    /// [`PathRule`]'s do.
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (HeaderMatch::Exact(a), HeaderMatch::Exact(b)) => a == b,
+            (HeaderMatch::Regex(a), HeaderMatch::Regex(b)) => a.as_str() == b.as_str(),
+            (HeaderMatch::Present, HeaderMatch::Present) => true,
+            _ => false,
+        }
+    }
+}
+
+/// One compiled header predicate: a lowercased header name and its test.
+#[derive(Clone, Debug, PartialEq)]
+struct HeaderRule {
+    name: Vec<u8>,
+    matcher: HeaderMatch,
+}
+
+impl HeaderRule {
+    fn matches(&self, headers: &dyn RequestHeaders) -> bool {
+        let Some(value) = headers.header(&self.name) else {
+            return false;
+        };
+        match &self.matcher {
+            HeaderMatch::Exact(expected) => value == expected.as_slice(),
+            HeaderMatch::Regex(regex) => {
+                let start = Instant::now();
+                let is_a_match = regex.is_match(value);
+                time!(
+                    names::event_loop::REGEX_MATCHING_TIME,
+                    start.elapsed().as_millis()
+                );
+                is_a_match
+            }
+            HeaderMatch::Present => true,
+        }
+    }
+
+    /// The canonical sort key of a rule within a [`HeaderRules`].
+    fn sort_key(&self) -> (&[u8], u8, &[u8]) {
+        match &self.matcher {
+            HeaderMatch::Exact(value) => (&self.name, 0, value),
+            HeaderMatch::Regex(regex) => (&self.name, 1, regex.as_str().as_bytes()),
+            HeaderMatch::Present => (&self.name, 2, b""),
+        }
+    }
+}
+
+/// The header predicates of one route-table rule (sozu-proxy/sozu#1253):
+/// a conjunction, empty for a rule without predicates.
+///
+/// It is part of the rule's identity: [`Router`]'s add and remove paths
+/// compare it alongside the path and method, so a canary rule that differs
+/// from its base only by a predicate coexists with it, and removing one
+/// leaves the other. The rules are kept in a canonical order, so two
+/// spellings of one conjunction (other declaration order, other name case)
+/// are one rule — the same canonicalisation the `ConfigState` key applies
+/// (`RequestHttpFrontend`'s `Display` in `command/src/request.rs`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HeaderRules(Vec<HeaderRule>);
+
+impl HeaderRules {
+    /// Compile a frontend's predicates, held to
+    /// [`validate_header_predicate`] first. A `regex` value is compiled
+    /// anchored, refused when it does not compile exactly like a `REGEX`
+    /// path rule ([`anchored_regex`]).
+    pub fn from_config(predicates: &[HeaderPredicate]) -> Result<Self, RouterError> {
+        let mut rules = Vec::with_capacity(predicates.len());
+        for (index, predicate) in predicates.iter().enumerate() {
+            validate_header_predicate(predicate)
+                .map_err(|reason| RouterError::InvalidHeaderPredicate { index, reason })?;
+            let value = predicate.value.as_deref().unwrap_or_default();
+            let matcher = match HeaderMatchKind::try_from(predicate.kind) {
+                Ok(HeaderMatchKind::Exact) => HeaderMatch::Exact(value.as_bytes().to_owned()),
+                Ok(HeaderMatchKind::Regex) => HeaderMatch::Regex(anchored_regex(value).ok_or(
+                    RouterError::InvalidHeaderPredicate {
+                        index,
+                        reason: "the regex value does not compile",
+                    },
+                )?),
+                Ok(HeaderMatchKind::Present) => HeaderMatch::Present,
+                Err(_) => {
+                    return Err(RouterError::InvalidHeaderPredicate {
+                        index,
+                        reason: "unknown match kind",
+                    });
+                }
+            };
+            rules.push(HeaderRule {
+                name: predicate.name.as_bytes().to_ascii_lowercase(),
+                matcher,
+            });
+        }
+        rules.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+        rules.dedup();
+        debug_assert!(
+            rules.len() <= predicates.len(),
+            "compiling predicates never adds a rule",
+        );
+        debug_assert!(
+            rules.is_empty() == predicates.is_empty(),
+            "a frontend has predicates exactly when its rule does",
+        );
+        Ok(HeaderRules(rules))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Whether every predicate holds for `headers`. True for an empty
+    /// conjunction, which never reads `headers`.
+    pub fn matches(&self, headers: &dyn RequestHeaders) -> bool {
+        self.0.iter().all(|rule| rule.matches(headers))
+    }
 }
 
 /// ASCII-lowercase a hostname for routing, borrowing it when it already is.
@@ -1412,8 +1821,7 @@ impl PathRule {
     /// assertions in `\A(?:^/abc$)\z` collapse. Measured: that pattern matches
     /// `/abc` and not `/xabcd`, exactly as `\A(?:/abc)\z` does.
     fn anchored_regex(value: &str) -> Option<Regex> {
-        Regex::new(value).ok()?;
-        Regex::new(&format!("\\A(?:{value})\\z")).ok()
+        anchored_regex(value)
     }
 
     pub fn from_config(rule: CommandPathRule) -> Option<Self> {
@@ -1424,6 +1832,15 @@ impl PathRule {
             Err(_) => None,
         }
     }
+}
+
+/// Compile `value` anchored at both ends, refusing a value that does not
+/// compile on its own. [`PathRule::anchored_regex`] documents why both
+/// steps are needed; header predicates (sozu-proxy/sozu#1253) reuse it so
+/// a `regex` header value and a `REGEX` path follow one grammar.
+fn anchored_regex(value: &str) -> Option<Regex> {
+    Regex::new(value).ok()?;
+    Regex::new(&format!("\\A(?:{value})\\z")).ok()
 }
 
 /// `Regex` carries no `PartialEq`, so the comparison is written by hand
@@ -2541,6 +2958,7 @@ mod tests {
             required_auth: None,
             headers: Vec::new(),
             hsts: None,
+            header_predicates: Vec::new(),
         }
     }
 
@@ -3014,12 +3432,14 @@ mod tests {
             DomainRule::Any,
             PathRule::Prefix("/api".to_owned()),
             MethodRule::new(None),
+            HeaderRules::default(),
             Route::Frontend(Rc::new(inheriting)),
         ));
         router.post.push((
             DomainRule::Any,
             PathRule::Prefix("/legacy".to_owned()),
             MethodRule::new(None),
+            HeaderRules::default(),
             Route::Frontend(Rc::new(explicit)),
         ));
 
@@ -3033,7 +3453,7 @@ mod tests {
         let count = router.refresh_inheriting_hsts(Some(&new_hsts));
         assert_eq!(count, 1, "only the inheriting frontend should refresh");
 
-        if let Route::Frontend(rc) = &router.pre[0].3 {
+        if let Route::Frontend(rc) = &router.pre[0].4 {
             let response: Vec<_> = rc.headers_response.iter().collect();
             assert_eq!(
                 &*response.last().unwrap().val,
@@ -3043,7 +3463,7 @@ mod tests {
         } else {
             panic!("pre[0] should be Route::Frontend");
         }
-        if let Route::Frontend(rc) = &router.post[0].3 {
+        if let Route::Frontend(rc) = &router.post[0].4 {
             let response: Vec<_> = rc.headers_response.iter().collect();
             assert_eq!(
                 &*response.last().unwrap().val,
@@ -3074,6 +3494,7 @@ mod tests {
                 DomainRule::Any,
                 PathRule::Prefix("/".to_owned()),
                 MethodRule::new(None),
+                HeaderRules::default(),
                 Route::ClusterId("api".into()),
             )],
         };
@@ -3088,7 +3509,7 @@ mod tests {
         let count = router.refresh_inheriting_hsts(Some(&new_hsts));
         assert_eq!(count, 1, "the ClusterId entry must be promoted + counted");
 
-        let Route::Frontend(rc) = &router.post[0].3 else {
+        let Route::Frontend(rc) = &router.post[0].4 else {
             panic!("post[0] should now be Route::Frontend, not the original Route::ClusterId");
         };
         assert_eq!(rc.cluster_id.as_deref(), Some("api"));
@@ -3129,6 +3550,7 @@ mod tests {
                 DomainRule::Any,
                 PathRule::Prefix("/forbidden".to_owned()),
                 MethodRule::new(None),
+                HeaderRules::default(),
                 Route::Deny,
             )],
         };
@@ -3143,7 +3565,7 @@ mod tests {
         let count = router.refresh_inheriting_hsts(Some(&new_hsts));
         assert_eq!(count, 1);
 
-        let Route::Frontend(rc) = &router.post[0].3 else {
+        let Route::Frontend(rc) = &router.post[0].4 else {
             panic!("post[0] should now be Route::Frontend, not the original Route::Deny");
         };
         assert_eq!(rc.cluster_id, None, "promoted Deny stays clusterless");
@@ -3176,6 +3598,7 @@ mod tests {
                 DomainRule::Any,
                 PathRule::Prefix("/".to_owned()),
                 MethodRule::new(None),
+                HeaderRules::default(),
                 Route::ClusterId("api".into()),
             )],
             tree: TrieNode::root(),
@@ -3183,6 +3606,7 @@ mod tests {
                 DomainRule::Any,
                 PathRule::Prefix("/forbidden".to_owned()),
                 MethodRule::new(None),
+                HeaderRules::default(),
                 Route::Deny,
             )],
         };
@@ -3214,11 +3638,11 @@ mod tests {
             let count = router.refresh_inheriting_hsts(hsts.as_ref());
             assert_eq!(count, 0, "no promotion expected for {label}");
             assert!(
-                matches!(router.pre[0].3, Route::ClusterId(_)),
+                matches!(router.pre[0].4, Route::ClusterId(_)),
                 "{label}: ClusterId must stay lightweight"
             );
             assert!(
-                matches!(router.post[0].3, Route::Deny),
+                matches!(router.post[0].4, Route::Deny),
                 "{label}: Deny must stay lightweight"
             );
         }
@@ -3238,6 +3662,7 @@ mod tests {
                 DomainRule::Any,
                 PathRule::Prefix("/".to_owned()),
                 MethodRule::new(None),
+                HeaderRules::default(),
                 Route::ClusterId("api".into()),
             )],
         };
@@ -3264,7 +3689,7 @@ mod tests {
             "the previously promoted entry must be re-counted via the path-1 branch"
         );
 
-        let Route::Frontend(rc) = &router.post[0].3 else {
+        let Route::Frontend(rc) = &router.post[0].4 else {
             panic!("post[0] should still be Route::Frontend after the second patch");
         };
         let response: Vec<_> = rc.headers_response.iter().collect();
@@ -3293,6 +3718,7 @@ mod tests {
                 DomainRule::Any,
                 PathRule::Prefix("/".to_owned()),
                 MethodRule::new(None),
+                HeaderRules::default(),
                 Route::ClusterId("api".into()),
             )],
             tree: TrieNode::root(),
@@ -3321,7 +3747,7 @@ mod tests {
             "the promoted entry must still be touched on disable to strip its STS edit"
         );
 
-        let Route::Frontend(rc) = &router.pre[0].3 else {
+        let Route::Frontend(rc) = &router.pre[0].4 else {
             panic!("pre[0] should still be Route::Frontend (no demotion)");
         };
         assert_eq!(rc.cluster_id.as_deref(), Some("api"));
@@ -3373,7 +3799,7 @@ mod tests {
             .domain_lookup_mut(b"example.com", false)
             .expect("trie leaf still present after refresh");
         assert_eq!(paths.len(), 1);
-        let Route::Frontend(rc) = &paths[0].2 else {
+        let Route::Frontend(rc) = &paths[0].3 else {
             panic!("trie leaf should now be Route::Frontend, not Route::ClusterId");
         };
         assert_eq!(rc.cluster_id.as_deref(), Some("api"));
@@ -8251,6 +8677,294 @@ mod tests {
         }
 
         TestResult::passed()
+    }
+
+    /// Request headers for a header-predicate lookup: first occurrence,
+    /// names compared case-insensitively — the contract
+    /// `FrontRequestHeaders` (`lib/src/protocol/mux/router.rs`) implements
+    /// over a real request.
+    struct TestHeaders<'a>(&'a [(&'a str, &'a str)]);
+
+    impl RequestHeaders for TestHeaders<'_> {
+        fn header(&self, name: &[u8]) -> Option<&[u8]> {
+            self.0
+                .iter()
+                .find(|(key, _)| key.as_bytes().eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_bytes())
+        }
+    }
+
+    fn predicate(name: &str, kind: HeaderMatchKind, value: Option<&str>) -> HeaderPredicate {
+        HeaderPredicate {
+            name: name.to_owned(),
+            kind: kind as i32,
+            value: value.map(str::to_owned),
+        }
+    }
+
+    fn routed_by_headers(router: &Router, path: &str, headers: &[(&str, &str)]) -> Option<String> {
+        router
+            .lookup_with_headers("example.com", path, &Method::Get, &TestHeaders(headers))
+            .ok()
+            .and_then(|route| route.cluster_id)
+            .map(|id| id.to_string())
+    }
+
+    /// sozu-proxy/sozu#1253: a canary frontend that differs from its base
+    /// only by a header predicate serves exactly the requests carrying the
+    /// header, whichever of the two was declared first and in every rule
+    /// position. Before predicates were a routing input, the two frontends
+    /// had one identity, so the second addition was refused.
+    #[test]
+    fn a_header_predicate_canary_outranks_its_base_in_any_declaration_order() {
+        let canary_predicates = vec![predicate(
+            "X-Canary",
+            HeaderMatchKind::Exact,
+            Some("always"),
+        )];
+        for position in [RulePosition::Tree, RulePosition::Pre, RulePosition::Post] {
+            for path in [
+                CommandPathRule::prefix("/api".to_owned()),
+                CommandPathRule::equals("/api".to_owned()),
+            ] {
+                for canary_first in [false, true] {
+                    let base = HttpFrontend {
+                        cluster_id: Some("stable".into()),
+                        path: path.clone(),
+                        position,
+                        ..test_http_frontend()
+                    };
+                    let canary = HttpFrontend {
+                        cluster_id: Some("canary".into()),
+                        header_predicates: canary_predicates.clone(),
+                        ..base.clone()
+                    };
+                    let mut router = Router::new();
+                    let order = if canary_first {
+                        [&canary, &base]
+                    } else {
+                        [&base, &canary]
+                    };
+                    for front in order {
+                        router
+                            .add_http_front(front)
+                            .expect("a canary and its base must coexist");
+                    }
+
+                    let context = format!("{position:?} {path:?} canary_first={canary_first}");
+                    assert_eq!(
+                        routed_by_headers(&router, "/api", &[("x-canary", "always")]).as_deref(),
+                        Some("canary"),
+                        "{context}: a request carrying the header must reach the canary",
+                    );
+                    assert_eq!(
+                        routed_by_headers(&router, "/api", &[]).as_deref(),
+                        Some("stable"),
+                        "{context}: a request without the header must reach the base",
+                    );
+                    assert_eq!(
+                        routed_by_headers(&router, "/api", &[("X-Canary", "Always")]).as_deref(),
+                        Some("stable"),
+                        "{context}: an exact value is compared byte for byte",
+                    );
+                    assert_eq!(
+                        router
+                            .lookup("example.com", "/api", &Method::Get)
+                            .ok()
+                            .and_then(|route| route.cluster_id)
+                            .as_deref(),
+                        Some("stable"),
+                        "{context}: a header-less lookup never matches a predicated rule",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Predicates are a conjunction; names match case-insensitively; the
+    /// first occurrence of a header answers; a `regex` value matches the
+    /// WHOLE value, like a `REGEX` path rule; `present` accepts any value,
+    /// the empty one included.
+    #[test]
+    fn header_predicates_hold_together_with_their_documented_semantics() {
+        let mut router = Router::new();
+        let front = HttpFrontend {
+            cluster_id: Some("eu-beta".into()),
+            header_predicates: vec![
+                predicate("x-region", HeaderMatchKind::Regex, Some("eu-.*")),
+                predicate("X-BETA", HeaderMatchKind::Present, None),
+            ],
+            ..test_http_frontend()
+        };
+        router.add_http_front(&front).expect("valid predicates");
+        router
+            .add_http_front(&test_http_frontend())
+            .expect("the base frontend");
+
+        let route = |headers: &[(&str, &str)]| routed_by_headers(&router, "/", headers);
+        assert_eq!(
+            route(&[("X-Region", "eu-west"), ("x-beta", "")]).as_deref(),
+            Some("eu-beta")
+        );
+        assert_eq!(
+            route(&[("X-Region", "eu-west")]).as_deref(),
+            Some("cluster"),
+            "every predicate must hold",
+        );
+        assert_eq!(
+            route(&[("X-Region", "us-eu-west"), ("x-beta", "1")]).as_deref(),
+            Some("cluster"),
+            "a regex is anchored at the start of the value",
+        );
+        assert_eq!(
+            route(&[
+                ("X-Region", "us-east"),
+                ("X-Region", "eu-west"),
+                ("x-beta", "1")
+            ])
+            .as_deref(),
+            Some("cluster"),
+            "only the first occurrence of a header answers",
+        );
+    }
+
+    /// Removing a frontend removes the rule of exactly its predicates: the
+    /// base survives the canary's removal and the reverse, and a removal
+    /// that spells the same conjunction in another order or case finds it.
+    #[test]
+    fn removing_a_predicated_frontend_leaves_its_base_and_the_reverse() {
+        for position in [RulePosition::Tree, RulePosition::Pre, RulePosition::Post] {
+            let base = HttpFrontend {
+                cluster_id: Some("stable".into()),
+                position,
+                ..test_http_frontend()
+            };
+            let canary = HttpFrontend {
+                cluster_id: Some("canary".into()),
+                header_predicates: vec![
+                    predicate("X-Canary", HeaderMatchKind::Present, None),
+                    predicate("X-Tenant", HeaderMatchKind::Exact, Some("acme")),
+                ],
+                ..base.clone()
+            };
+            let canary_respelled = HttpFrontend {
+                header_predicates: vec![
+                    predicate("x-tenant", HeaderMatchKind::Exact, Some("acme")),
+                    predicate("x-canary", HeaderMatchKind::Present, None),
+                ],
+                ..canary.clone()
+            };
+            let canary_headers = [("X-Canary", "1"), ("X-Tenant", "acme")];
+
+            let mut router = Router::new();
+            router.add_http_front(&base).expect("base");
+            router.add_http_front(&canary).expect("canary");
+            assert!(
+                router.add_http_front(&canary_respelled).is_err(),
+                "{position:?}: a respelled conjunction is the same rule",
+            );
+            router
+                .remove_http_front(&canary_respelled)
+                .expect("a respelled removal must find the canary");
+            assert_eq!(
+                routed_by_headers(&router, "/", &canary_headers).as_deref(),
+                Some("stable"),
+                "{position:?}: the base must survive the canary's removal",
+            );
+
+            router.add_http_front(&canary).expect("canary again");
+            router.remove_http_front(&base).expect("base removal");
+            assert_eq!(
+                routed_by_headers(&router, "/", &canary_headers).as_deref(),
+                Some("canary"),
+                "{position:?}: the canary must survive the base's removal",
+            );
+            assert_eq!(
+                routed_by_headers(&router, "/", &[]),
+                None,
+                "{position:?}: without its base, a request lacking the header has no route",
+            );
+        }
+    }
+
+    /// A hostname whose only rules are predicated, none holding, hands the
+    /// request to the next hostname candidate instead of ending the lookup
+    /// (the sozu#1351 shape): the trie's acceptance predicate sees headers.
+    #[test]
+    fn an_unsatisfied_predicated_hostname_falls_through_to_the_wildcard() {
+        let mut router = Router::new();
+        router
+            .add_http_front(&HttpFrontend {
+                cluster_id: Some("wildcard".into()),
+                hostname: "*.example.com".to_owned(),
+                ..test_http_frontend()
+            })
+            .expect("wildcard");
+        router
+            .add_http_front(&HttpFrontend {
+                cluster_id: Some("exact".into()),
+                hostname: "www.example.com".to_owned(),
+                header_predicates: vec![predicate("X-Canary", HeaderMatchKind::Present, None)],
+                ..test_http_frontend()
+            })
+            .expect("predicated exact host");
+
+        let route = |headers: &[(&str, &str)]| {
+            router
+                .lookup_with_headers("www.example.com", "/", &Method::Get, &TestHeaders(headers))
+                .ok()
+                .and_then(|route| route.cluster_id)
+                .map(|id| id.to_string())
+        };
+        assert_eq!(route(&[("x-canary", "")]).as_deref(), Some("exact"));
+        assert_eq!(route(&[]).as_deref(), Some("wildcard"));
+    }
+
+    /// A predicate no request could satisfy, or that cannot be compiled, is
+    /// refused at frontend addition — which `validate_frontend_request`
+    /// (`bin/src/command/requests.rs`) also runs in the main process — and
+    /// the error carries the predicate's index, never its name or value.
+    #[test]
+    fn unusable_header_predicates_are_refused_without_echoing_them() {
+        let refused = [
+            predicate("Host", HeaderMatchKind::Exact, Some("example.com")),
+            predicate("cookie", HeaderMatchKind::Present, None),
+            predicate("X Bad", HeaderMatchKind::Present, None),
+            predicate("", HeaderMatchKind::Present, None),
+            predicate("X-Debug", HeaderMatchKind::Present, Some("1")),
+            predicate("X-Tenant", HeaderMatchKind::Exact, None),
+            predicate("X-Tenant", HeaderMatchKind::Regex, None),
+            predicate("X-Tenant", HeaderMatchKind::Exact, Some("a\r\nb")),
+            predicate("X-Tenant", HeaderMatchKind::Regex, Some("a)(b")),
+            HeaderPredicate {
+                name: "X-Tenant".to_owned(),
+                kind: 42,
+                value: None,
+            },
+        ];
+        for bad in refused {
+            let mut router = Router::new();
+            let front = HttpFrontend {
+                header_predicates: vec![
+                    predicate("X-Valid", HeaderMatchKind::Present, None),
+                    bad.clone(),
+                ],
+                ..test_http_frontend()
+            };
+            let error = router
+                .add_http_front(&front)
+                .expect_err("an unusable predicate must be refused");
+            assert!(
+                matches!(error, RouterError::InvalidHeaderPredicate { index: 1, .. }),
+                "{bad:?}: unexpected {error}",
+            );
+            let message = error.to_string();
+            assert!(
+                !message.contains("X-Tenant") && !message.contains("example.com"),
+                "the error must not echo the predicate: {message}",
+            );
+            assert!(router.tree.is_empty(), "a refused frontend adds no rule");
+        }
     }
 
     quickcheck! {

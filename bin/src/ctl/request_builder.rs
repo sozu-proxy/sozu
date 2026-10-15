@@ -623,7 +623,7 @@ impl CommandManager {
         match cmd {
             HttpFrontendCmd::Add { .. } => {
                 let frontend = build_http_frontend_add(cmd)?;
-                self.send_request(RequestType::AddHttpFrontend(frontend).into())
+                self.send_request(RequestType::add_http_frontend(frontend).into())
             }
             HttpFrontendCmd::Remove {
                 hostname,
@@ -633,17 +633,22 @@ impl CommandManager {
                 address,
                 method,
                 cluster_id: route,
-            } => self.send_request(
-                RequestType::RemoveHttpFrontend(RequestHttpFrontend {
-                    cluster_id: route.into(),
-                    address: address.into(),
-                    hostname,
-                    path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
-                    method,
-                    ..Default::default()
-                })
-                .into(),
-            ),
+                match_header,
+            } => {
+                let header_predicates = parse_match_headers(&match_header)?;
+                self.send_request(
+                    RequestType::remove_http_frontend(RequestHttpFrontend {
+                        cluster_id: route.into(),
+                        address: address.into(),
+                        hostname,
+                        path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
+                        method,
+                        header_predicates,
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+            }
         }
     }
 
@@ -651,7 +656,7 @@ impl CommandManager {
         match cmd {
             HttpFrontendCmd::Add { .. } => {
                 let frontend = build_http_frontend_add(cmd)?;
-                self.send_request(RequestType::AddHttpsFrontend(frontend).into())
+                self.send_request(RequestType::add_https_frontend(frontend).into())
             }
             HttpFrontendCmd::Remove {
                 hostname,
@@ -661,17 +666,22 @@ impl CommandManager {
                 address,
                 method,
                 cluster_id: route,
-            } => self.send_request(
-                RequestType::RemoveHttpsFrontend(RequestHttpFrontend {
-                    cluster_id: route.into(),
-                    address: address.into(),
-                    hostname,
-                    path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
-                    method,
-                    ..Default::default()
-                })
-                .into(),
-            ),
+                match_header,
+            } => {
+                let header_predicates = parse_match_headers(&match_header)?;
+                self.send_request(
+                    RequestType::remove_https_frontend(RequestHttpFrontend {
+                        cluster_id: route.into(),
+                        address: address.into(),
+                        hostname,
+                        path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
+                        method,
+                        header_predicates,
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+            }
         }
     }
 
@@ -1733,6 +1743,7 @@ fn build_http_frontend_add(cmd: HttpFrontendCmd) -> Result<RequestHttpFrontend, 
         rewrite_port,
         required_auth,
         header,
+        match_header,
         hsts_max_age,
         hsts_include_subdomains,
         hsts_preload,
@@ -1854,6 +1865,8 @@ fn build_http_frontend_add(cmd: HttpFrontendCmd) -> Result<RequestHttpFrontend, 
         });
     }
 
+    let header_predicates = parse_match_headers(&match_header)?;
+
     // Build the typed HSTS block from the four `--hsts-*` flags. Layering:
     // - `--hsts-disabled` is mutually exclusive with the enabling flags;
     //   if combined we error rather than silently picking one (operator
@@ -1889,7 +1902,58 @@ fn build_http_frontend_add(cmd: HttpFrontendCmd) -> Result<RequestHttpFrontend, 
         required_auth: if required_auth { Some(true) } else { None },
         headers: headers_proto,
         hsts: hsts_proto,
+        header_predicates,
     })
+}
+
+/// Parse the repeatable `--match-header <match>=<name>[=<value>]` flag of
+/// `frontend {http,https} {add,remove}` into header predicates
+/// (sozu-proxy/sozu#1253). The value is everything after the second `=`, so
+/// it may itself carry `=`. Each predicate is then held to
+/// `validate_header_predicate`, the rule the main process and the workers
+/// apply, so a bad one is refused here with the reason.
+fn parse_match_headers(
+    raw_predicates: &[String],
+) -> Result<Vec<sozu_command_lib::proto::command::HeaderPredicate>, CtlError> {
+    use sozu_command_lib::proto::command::{HeaderMatchKind, HeaderPredicate};
+
+    let mut predicates = Vec::with_capacity(raw_predicates.len());
+    for (index, raw) in raw_predicates.iter().enumerate() {
+        let (kind, rest) = raw.split_once('=').ok_or_else(|| {
+            CtlError::ArgsNeeded(
+                "<match>=<name>[=<value>]".to_owned(),
+                format!("--match-header[{index}] = {raw:?} (missing first `=`)"),
+            )
+        })?;
+        let kind = match kind.to_ascii_lowercase().as_str() {
+            "exact" => HeaderMatchKind::Exact,
+            "regex" => HeaderMatchKind::Regex,
+            "present" => HeaderMatchKind::Present,
+            other => {
+                return Err(CtlError::ArgsNeeded(
+                    "header match in {exact, regex, present}".to_owned(),
+                    format!("--match-header[{index}] match={other:?}"),
+                ));
+            }
+        };
+        let (name, value) = match rest.split_once('=') {
+            Some((name, value)) => (name, Some(value.to_owned())),
+            None => (rest, None),
+        };
+        let predicate = HeaderPredicate {
+            name: name.to_owned(),
+            kind: kind as i32,
+            value,
+        };
+        sozu_command_lib::config::validate_header_predicate(&predicate).map_err(|reason| {
+            CtlError::ArgsNeeded(
+                "a valid header predicate".to_owned(),
+                format!("--match-header[{index}]: {reason}"),
+            )
+        })?;
+        predicates.push(predicate);
+    }
+    Ok(predicates)
 }
 
 /// Combine the four `--hsts-*` CLI flags into an `Option<HstsConfig>`.
@@ -2506,6 +2570,65 @@ mod tests {
             new_reply.udp_frontends.len(),
         ] {
             assert_eq!(count, 1, "one frontend of `wanted` per protocol");
+        }
+    }
+}
+
+#[cfg(test)]
+mod match_header_cli_tests {
+    use super::*;
+    use sozu_command_lib::proto::command::{HeaderMatchKind, HeaderPredicate};
+
+    fn parse(raw: &[&str]) -> Result<Vec<HeaderPredicate>, CtlError> {
+        parse_match_headers(&raw.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
+    }
+
+    /// sozu-proxy/sozu#1253: `--match-header <match>=<name>[=<value>]`,
+    /// the value keeping any further `=`.
+    #[test]
+    fn match_header_flags_parse_into_predicates() {
+        let predicates = parse(&[
+            "exact=X-Canary=a=b",
+            "REGEX=X-Region=eu-.*",
+            "present=X-Beta",
+        ])
+        .expect("valid flags must parse");
+        assert_eq!(
+            predicates,
+            vec![
+                HeaderPredicate {
+                    name: "X-Canary".to_owned(),
+                    kind: HeaderMatchKind::Exact as i32,
+                    value: Some("a=b".to_owned()),
+                },
+                HeaderPredicate {
+                    name: "X-Region".to_owned(),
+                    kind: HeaderMatchKind::Regex as i32,
+                    value: Some("eu-.*".to_owned()),
+                },
+                HeaderPredicate {
+                    name: "X-Beta".to_owned(),
+                    kind: HeaderMatchKind::Present as i32,
+                    value: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unusable_match_header_flags_are_refused() {
+        for raw in [
+            "X-Canary",
+            "equals=X-Canary=1",
+            "exact=X-Canary",
+            "present=X-Canary=1",
+            "exact=Host=example.com",
+            "present=cookie",
+        ] {
+            assert!(
+                matches!(parse(&[raw]), Err(CtlError::ArgsNeeded(..))),
+                "{raw} must be refused"
+            );
         }
     }
 }

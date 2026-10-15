@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### Added
+
+- HTTP and HTTPS frontends can route on request headers
+  ([#1253](https://github.com/sozu-proxy/sozu/issues/1253)). The new
+  `header_predicates` list of a frontend (`RequestHttpFrontend` field 17, TOML
+  `header_predicates = [{ name, match, value }]`, CLI `--match-header
+  <match>=<name>[=<value>]`) holds conditions that must all be true: `exact`
+  (byte-equal value), `regex` (anchored at both ends) or `present`. Names are
+  case-insensitive; `Host` and `Cookie` are refused. For one hostname, a
+  frontend whose predicates hold outranks every frontend without predicates,
+  so a canary and its base can share a hostname and path in any declaration
+  order. Predicates are part of the frontend's identity, so a removal names
+  them too. Frontends without predicates route as before, and the command
+  schema change is additive: saved states without the field load unchanged.
+  A frontend with predicates travels on dedicated request verbs
+  (`AddHttpFrontendWithHeaderPredicates` & co) that a worker predating the
+  feature cannot decode, so it fails the request instead of installing the
+  route without its guard; frontends without predicates keep the historical
+  verbs.
 ### Fixed
 
 - Re-adding the last HTTP, HTTPS, TCP or UDP listener removed from an address
