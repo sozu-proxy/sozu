@@ -3266,7 +3266,9 @@ impl FileBackendConfig {
     /// components that is not a valid IP literal (`010.0.0.1`, `1.2.3`,
     /// `0x7f.1`) is refused before the resolver: getaddrinfo reads such
     /// strings as legacy `inet_aton` shorthand (`8.0.0.1`, `1.2.0.3`,
-    /// `127.0.0.1`), which the socket-address parser always rejected.
+    /// `127.0.0.1`), which the socket-address parser always rejected. An
+    /// unbracketed IPv6 literal (`::1:8080`) is refused the same way:
+    /// getaddrinfo would split it on the last colon.
     pub fn resolve(
         &self,
         cluster_id: &str,
@@ -3292,13 +3294,17 @@ impl FileBackendConfig {
             address: self.address.clone(),
             reason,
         };
-        if let Some((host, _port)) = self.address.rsplit_once(':')
-            && !host.is_empty()
-            && is_legacy_numeric_host(host)
-        {
-            return Err(error(format!(
-                "{host:?} is not a valid IP address literal and numeric shorthand is not accepted"
-            )));
+        if let Some((host, _port)) = self.address.rsplit_once(':') {
+            if host.contains(':') {
+                return Err(error(format!(
+                    "{host:?} is an unbracketed IPv6 literal, IPv6 literals must use [address]:port"
+                )));
+            }
+            if !host.is_empty() && is_legacy_numeric_host(host) {
+                return Err(error(format!(
+                    "{host:?} is not a valid IP address literal and numeric shorthand is not accepted"
+                )));
+            }
         }
         let addresses = resolver(&self.address).map_err(|io_error| error(io_error.to_string()))?;
         self.expand(cluster_id, addresses)
@@ -6298,6 +6304,61 @@ mod tests {
             assert_eq!(cluster_id, "cluster");
             assert_eq!(entry_address, address);
         }
+    }
+
+    /// #347: an IPv6 literal must be bracketed (`[addr]:port`); the
+    /// unbracketed forms are refused before the resolver, which splits on
+    /// the last colon and would accept them numerically. The bracketed form
+    /// still parses directly.
+    #[test]
+    fn unbracketed_ipv6_backend_hosts_never_reach_the_resolver() {
+        let unreachable = |address: &str| -> std::io::Result<Vec<SocketAddr>> {
+            panic!("{address}: must not reach the resolver")
+        };
+        for address in ["::1:8080", "2001:db8::1:8080", "fe80::1%eth0:80"] {
+            let entry = FileBackendConfig {
+                address: address.to_owned(),
+                weight: None,
+                sticky_id: None,
+                backup: None,
+                backend_id: None,
+            };
+            let error = entry
+                .resolve("cluster", 0, &unreachable)
+                .expect_err("an unbracketed IPv6 literal must be refused");
+            let ConfigError::BackendAddressResolution {
+                cluster_id,
+                address: entry_address,
+                reason,
+            } = &error
+            else {
+                panic!("{address}: unexpected error {error:?}");
+            };
+            assert_eq!(cluster_id, "cluster");
+            assert_eq!(entry_address, address);
+            assert!(reason.contains("[address]:port"), "{address}: {reason}");
+        }
+
+        let entry = FileBackendConfig {
+            address: "[2001:db8::1]:8080".to_owned(),
+            weight: Some(3),
+            sticky_id: Some("sticky".to_owned()),
+            backup: Some(true),
+            backend_id: None,
+        };
+        let backends = entry
+            .resolve("cluster", 2, &unreachable)
+            .expect("a bracketed IPv6 literal parses directly");
+        let address: SocketAddr = "[2001:db8::1]:8080".parse().unwrap();
+        assert_eq!(backends.len(), 1);
+        assert_eq!(backends[0].address, address);
+        assert_eq!(backends[0].weight, Some(3));
+        assert_eq!(backends[0].sticky_id.as_deref(), Some("sticky"));
+        assert_eq!(backends[0].backup, Some(true));
+        assert_eq!(
+            backends[0].backend_id.as_deref(),
+            Some("cluster-2-[2001:db8::1]:8080")
+        );
     }
 
     /// #347: names that merely contain digits or hex-looking labels still
