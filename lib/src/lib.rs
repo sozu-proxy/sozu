@@ -820,6 +820,11 @@ pub enum RetrieveClusterError {
     RetrieveFrontend(FrontendFromRequestError),
     #[error("HTTPS redirect required")]
     HttpsRedirect,
+    /// The frontend's `RedirectPolicy::SilentClose` asks for no response at
+    /// all (sozu-proxy/sozu#767): the H1 connection is closed, the H2 stream
+    /// reset.
+    #[error("silent close requested by the frontend")]
+    SilentClose,
     /// The HTTP `:authority` / `Host` host does not match the TLS SNI that was
     /// negotiated for this connection, which would cross the TLS trust boundary.
     /// Maps to HTTP 421 Misdirected Request (RFC 9110 §15.5.20).

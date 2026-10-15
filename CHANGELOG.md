@@ -4,6 +4,31 @@
 
 ### Added
 
+- **`feat(mux)`: `redirect = "silent_close"` refuses a request without any
+  response** ([#767](https://github.com/sozu-proxy/sozu/issues/767)), the
+  equivalent of nginx's `return 444`. A new `RedirectPolicy::SILENT_CLOSE = 5`
+  (appended to the protobuf enum; TOML `redirect = "silent_close"`, CLI
+  `--redirect silent_close`) makes an HTTP/1.x frontend close the connection
+  without writing a byte and an HTTP/2 frontend reset only the refused stream
+  with `RST_STREAM(CANCEL)`, leaving the connection's other streams running. The
+  backend is never contacted, whether or not the frontend names a cluster, and
+  the policy wins over the frontend's other redirect, rewrite and authentication
+  settings. The access log records status `444` with message `silent_close`; the
+  line is not an error (`http.errors` is not incremented) and counts in
+  `http.status.4xx`. The main sends a `silent_close` add as
+  `AddHttpFrontendWithSilentClose` (field 70) or
+  `AddHttpsFrontendWithSilentClose` (field 71); other frontends keep the legacy
+  verbs. A worker older than 2.3.2 cannot decode these requests and fails them,
+  so it never installs an unguarded forwarding route.
+
+<!-- changelog-slot:header-routing -->
+
+<!-- changelog-slot:unix-backends -->
+
+<!-- changelog-slot:backend-dns -->
+
+<!-- changelog-slot:close-sessions -->
+
 - `sozu cluster close-sessions --id <cluster> [--backend-id <id>] [--address <ip:port>]`
   closes, on every worker, the HTTP, HTTPS, TCP and WebSocket sessions holding a backend
   connection to a cluster, or to one of its backends (#123). Sessions close the way a soft
@@ -17,12 +42,30 @@
   it and closes nothing; it does not answer, so the request fails once the command times out.
   The main process and every worker must run this release before it is used.
 
-### Changed
+### 🔄 Changed
 
+- **`feat(load-balancing)`: every policy honours `weight`
+  ([#676](https://github.com/sozu-proxy/sozu/issues/676)).** `ROUND_ROBIN`,
+  `LEAST_LOADED` and `POWER_OF_TWO` ignored a backend's `weight`; only
+  `RANDOM`, `HRW` and `MAGLEV` read it. `ROUND_ROBIN` now runs smooth weighted
+  round robin (nginx's scheme): over every `Σw` selections a backend of weight
+  `w` is picked exactly `w` times, interleaved (`5, 1, 1` selects
+  `a a b a c a a`). `LEAST_LOADED` and `POWER_OF_TWO` compare each candidate's
+  load divided by its weight, exactly (cross-multiplied in integers for the
+  connection and request counts). With no client key, `HRW` and `MAGLEV` fall
+  back to the weighted round robin. A `0` or negative weight counts as `1`, as
+  under `HRW` and `MAGLEV`; `RANDOM` keeps reading the raw value. **Behaviour
+  change:** a cluster that sets unequal weights under one of these three
+  policies now spreads its traffic by them. A cluster whose backends all
+  carry the same weight (the default, 100, when unset) selects exactly the
+  same sequence as before. No command, configuration or state format changes.
 - A soft stop, like `cluster close-sessions`, now marks an HTTP/1.1 request still waiting for
   its response as the last one of its connection: the response carries `Connection: close`
   when its headers are not sent yet, and the connection closes as soon as it is sent. A
   client no longer has to discover the close after a response that announced keep-alive.
+
+<!-- changelog-slot:backend-ownership -->
+
 ### Fixed
 
 - Re-adding the last HTTP, HTTPS, TCP or UDP listener removed from an address

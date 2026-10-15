@@ -66,6 +66,14 @@ impl std::fmt::Debug for command::request::RequestType {
             RequestType::AddHttpFrontend(value) => {
                 f.debug_tuple("AddHttpFrontend").field(value).finish()
             }
+            RequestType::AddHttpFrontendWithSilentClose(value) => f
+                .debug_tuple("AddHttpFrontendWithSilentClose")
+                .field(value)
+                .finish(),
+            RequestType::AddHttpsFrontendWithSilentClose(value) => f
+                .debug_tuple("AddHttpsFrontendWithSilentClose")
+                .field(value)
+                .finish(),
             RequestType::RemoveHttpFrontend(value) => {
                 f.debug_tuple("RemoveHttpFrontend").field(value).finish()
             }
@@ -1458,6 +1466,43 @@ mod tests {
             "WorkerRequest Debug omitted the bounded request-id length: {}",
             outputs[3].1
         );
+    }
+
+    #[test]
+    fn silent_close_frontend_request_debug_keeps_redacted_payload() {
+        const HOSTNAME_SECRET: &str = "SILENT_CLOSE_HOSTNAME_SECRET_SENTINEL";
+
+        let frontend = RequestHttpFrontend {
+            hostname: HOSTNAME_SECRET.to_owned(),
+            path: PathRule {
+                value: "/".to_owned(),
+                kind: PathRuleKind::Prefix as i32,
+            },
+            position: RulePosition::Tree as i32,
+            redirect: Some(RedirectPolicy::SilentClose as i32),
+            ..Default::default()
+        };
+
+        for (name, request_type) in [
+            (
+                "AddHttpFrontendWithSilentClose",
+                RequestType::AddHttpFrontendWithSilentClose(frontend.clone()),
+            ),
+            (
+                "AddHttpsFrontendWithSilentClose",
+                RequestType::AddHttpsFrontendWithSilentClose(frontend.clone()),
+            ),
+        ] {
+            let output = format!("{request_type:?}");
+            assert!(
+                output.contains(&format!("hostname_len: {}", HOSTNAME_SECRET.len())),
+                "{name} Debug dropped the frontend payload: {output}"
+            );
+            assert!(
+                !output.contains(HOSTNAME_SECRET),
+                "{name} Debug leaked the hostname: {output}"
+            );
+        }
     }
 
     #[test]

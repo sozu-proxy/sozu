@@ -4,11 +4,14 @@
 //! per-stream kawa buffers, then flip the appropriate readiness bits so the
 //! response is flushed on the next writable pass.
 
+use std::{cell::RefCell, rc::Rc, time::Duration};
+
 use sozu_command::logging::ansi_palette;
 
-use super::{GenericHttpStream, H2Error, Readiness, Stream, StreamState};
+use super::{GenericHttpStream, H2Error, Readiness, Stream, StreamState, h2::MetricEvent};
 use crate::metrics::names;
 use crate::protocol::http::{DefaultAnswer, answers::HttpAnswers};
+use crate::{L7ListenerHandler, ListenerHandler};
 
 /// Module-level prefix used on every log line emitted from the mux
 /// answers helpers. The standalone helpers run before any per-stream
@@ -348,6 +351,63 @@ pub(crate) fn forcefully_terminate_answer(
     incr!(names::h2::SIGNAL_WRITABLE_REARMED_FORCEFULLY_TERMINATE_ANSWER);
 }
 
+/// Access-log status of a request refused by `RedirectPolicy::SilentClose`.
+/// nginx logs 444 for the same close-without-response; it never reaches the
+/// wire.
+pub(super) const SILENT_CLOSE_STATUS: u16 = 444;
+
+/// Access-log message of a request refused by `RedirectPolicy::SilentClose`.
+pub(super) const SILENT_CLOSE_MESSAGE: &str = "silent_close";
+
+/// Refuse a request without writing a single response byte
+/// (`RedirectPolicy::SilentClose`, sozu-proxy/sozu#767), and emit its access
+/// log. Returns the metric events the caller must record.
+///
+/// The response ends in error with `H2Error::Cancel` and nothing queued, via
+/// [`forcefully_terminate_answer`]: an H2 frontend turns that into a
+/// RST_STREAM(CANCEL) on this stream only, and an H1 frontend closes the
+/// connection without writing (the incomplete-response branch of
+/// `ConnectionH1::writable`, `lib/src/protocol/mux/h1.rs`).
+///
+/// The access log is emitted here, not left to the path that later retires
+/// the stream, because each of those paths (`Mux::close` in
+/// `lib/src/protocol/mux/mod.rs`, `ConnectionH2::try_recycle_server_stream`
+/// in `lib/src/protocol/mux/h2.rs`) passes its own message, which
+/// `Stream::generate_access_log` prefers over `access_log_message`. Resetting
+/// the metrics afterwards is what both of them read as "already logged". The
+/// line is not an error: the refusal is the frontend's configured policy, like
+/// a 401 or a redirect.
+#[must_use]
+pub(super) fn silent_close_answer<L>(
+    stream: &mut Stream,
+    readiness: &mut Readiness,
+    listener: Rc<RefCell<L>>,
+    client_rtt: Option<Duration>,
+) -> [Option<MetricEvent>; 2]
+where
+    L: ListenerHandler + L7ListenerHandler,
+{
+    stream.context.status = Some(SILENT_CLOSE_STATUS);
+    forcefully_terminate_answer(stream, readiness, H2Error::Cancel);
+    debug_assert!(
+        stream.back.is_error() && stream.back.is_completed(),
+        "a silent close must leave an errored response with nothing to write"
+    );
+    let events = stream.generate_access_log(
+        false,
+        Some(SILENT_CLOSE_MESSAGE),
+        listener,
+        client_rtt,
+        None,
+    );
+    stream.metrics.reset();
+    debug_assert!(
+        stream.metrics.start.is_none(),
+        "a logged silent close must read as already logged to every later path"
+    );
+    events
+}
+
 #[cfg(test)]
 mod tests {
     use std::{cell::RefCell, rc::Rc};
@@ -449,6 +509,80 @@ mod tests {
             readiness.event.is_writable(),
             "set_default_answer must pair the insert with signal_pending_write so \
              ET epoll sees WRITABLE on the event side: {readiness:?}"
+        );
+    }
+
+    /// A silent close (`RedirectPolicy::SilentClose`, sozu-proxy/sozu#767)
+    /// leaves nothing to write, ends the response in error with the code an
+    /// H2 frontend sends as RST_STREAM, and logs the request once, as 444
+    /// `silent_close`, marking it logged for every later path.
+    ///
+    /// To SEE THIS RED: in `silent_close_answer`
+    /// (`lib/src/protocol/mux/answers.rs`), delete the
+    /// `generate_access_log` call and the `metrics.reset()` that follows it,
+    /// leaving the log to the path that retires the stream, as the stream
+    /// is otherwise handled. No line is emitted here and `metrics.start`
+    /// stays set, so `Mux::close` later logs it as `session close`.
+    #[test]
+    fn a_silent_close_writes_nothing_and_logs_444_silent_close() {
+        let output = crate::capture_test_logs(|| {
+            let (_pool, mut stream) = make_stream();
+            stream.context.method = Some(crate::protocol::http::parser::Method::Get);
+            stream.context.authority = Some("blocked.example.com".to_owned());
+            stream.context.path = Some("/silent-767".to_owned());
+            stream.metrics.service_start();
+            let mut readiness = Readiness::new();
+
+            let _ = silent_close_answer(
+                &mut stream,
+                &mut readiness,
+                Rc::new(RefCell::new(
+                    crate::protocol::mux::test_support::TestListener::new(),
+                )),
+                None,
+            );
+
+            assert!(
+                stream.back.out.is_empty() && stream.back.blocks.is_empty(),
+                "a silent close must queue no response byte"
+            );
+            let code = match stream.back.parsing_phase {
+                kawa::ParsingPhase::Error {
+                    kind: kawa::ParsingErrorKind::Processing { message },
+                    ..
+                } => message.parse::<H2Error>().ok(),
+                _ => None,
+            };
+            assert_eq!(
+                code,
+                Some(H2Error::Cancel),
+                "an H2 frontend must reset the stream with CANCEL"
+            );
+            assert_eq!(stream.state, StreamState::Unlinked);
+            assert!(
+                readiness.interest.is_writable(),
+                "the writable pass must run to reset or close: {readiness:?}"
+            );
+            assert_eq!(stream.context.status, Some(SILENT_CLOSE_STATUS));
+            assert!(
+                stream.metrics.start.is_none(),
+                "the stream must read as already logged"
+            );
+        });
+
+        let lines: Vec<&str> = output
+            .lines()
+            .filter(|line| line.contains("/silent-767"))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "exactly one access-log line for the refused request, got: {output}"
+        );
+        assert!(
+            lines[0].contains(" 444 ") && lines[0].contains(SILENT_CLOSE_MESSAGE),
+            "the line must carry status 444 and `silent_close`, got: {}",
+            lines[0]
         );
     }
 }
