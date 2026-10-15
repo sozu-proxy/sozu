@@ -485,6 +485,7 @@ impl ConfigState {
         }
     }
 
+    #[cfg(any(debug_assertions, test))]
     fn normalized_certificate_metadata(&self) -> HashMap<SocketAddr, CertificateMetadataIndex> {
         self.certificates
             .keys()
