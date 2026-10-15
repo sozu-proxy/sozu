@@ -13,6 +13,7 @@ use std::{
 };
 
 use rustls::{
+    InconsistentKeys,
     pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
     server::{ClientHello, ResolvesServerCert},
     sign::CertifiedKey,
@@ -67,7 +68,7 @@ static DEFAULT_CERTIFICATE: LazyLock<Option<Arc<CertifiedKey>>> = LazyLock::new(
         address: SocketAddress::new_v4(0, 0, 0, 0, 8080), // not used anyway
         expired_at: None,
     };
-    CertifiedKeyWrapper::try_from(&add).ok().map(|c| c.inner)
+    build_validated_certificate(&add).ok().map(|c| c.inner)
 });
 
 #[derive(thiserror::Error, Debug)]
@@ -98,6 +99,10 @@ pub struct CertifiedKeyWrapper {
     names: Vec<String>,
     expiration: i64,
     fingerprint: Fingerprint,
+    /// Canonical source material identity used to distinguish a true retry
+    /// from a same-leaf replacement that changes chain, key, protocol
+    /// versions, or names. It is deliberately omitted from `Debug`.
+    material_digest: [u8; 32],
 }
 
 impl fmt::Debug for CertifiedKeyWrapper {
@@ -118,6 +123,34 @@ impl fmt::Debug for CertifiedKeyWrapper {
             .field("fingerprint_bytes", &self.fingerprint.0.len())
             .finish()
     }
+}
+
+fn update_digest_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn certificate_material_digest(
+    certificate: &CertificateAndKey,
+    canonical_names: &[String],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"sozu-certificate-material-v1");
+    update_digest_bytes(&mut hasher, certificate.certificate.as_bytes());
+    hasher.update((certificate.certificate_chain.len() as u64).to_be_bytes());
+    for chain_entry in &certificate.certificate_chain {
+        update_digest_bytes(&mut hasher, chain_entry.as_bytes());
+    }
+    update_digest_bytes(&mut hasher, certificate.key.as_bytes());
+    hasher.update((certificate.versions.len() as u64).to_be_bytes());
+    for version in &certificate.versions {
+        hasher.update(version.to_be_bytes());
+    }
+    hasher.update((canonical_names.len() as u64).to_be_bytes());
+    for name in canonical_names {
+        update_digest_bytes(&mut hasher, name.as_bytes());
+    }
+    hasher.finalize().into()
 }
 
 /// Convert an AddCertificate request into the Rustls format.
@@ -146,12 +179,13 @@ impl TryFrom<&AddCertificate> for CertifiedKeyWrapper {
         // no SNI at all and every handshake for it fell back to
         // `DEFAULT_CERTIFICATE`. DNS names compare case-insensitively
         // (RFC 4343), so normalising loses nothing.
-        let overriding_names = if add.certificate.names.is_empty() {
+        let canonical_names = if add.certificate.names.is_empty() {
             get_cn_and_san_attributes(&x509)
         } else {
             add.certificate.names.clone()
         };
-        let overriding_names: Vec<String> = overriding_names
+        let material_digest = certificate_material_digest(&cert, &canonical_names);
+        let overriding_names: Vec<String> = canonical_names
             .into_iter()
             .map(|mut name| {
                 name.make_ascii_lowercase();
@@ -237,6 +271,7 @@ impl TryFrom<&AddCertificate> for CertifiedKeyWrapper {
                     names: overriding_names,
                     expiration,
                     fingerprint,
+                    material_digest,
                 };
                 Ok(stored_certificate)
             }
@@ -245,6 +280,40 @@ impl TryFrom<&AddCertificate> for CertifiedKeyWrapper {
             )),
         }
     }
+}
+
+/// Build the exact certificate representation a worker resolver will store,
+/// without mutating a resolver or publishing metrics.
+///
+/// The main process calls this before committing certificate material to
+/// `ConfigState`, and [`CertificateResolver::add_certificate`] calls it before
+/// touching its indexes. Keeping key consistency and SNI-name admission here
+/// prevents the control-plane preflight from drifting from the worker runtime.
+pub fn build_validated_certificate(
+    add: &AddCertificate,
+) -> Result<CertifiedKeyWrapper, CertificateResolverError> {
+    let certificate = CertifiedKeyWrapper::try_from(add)?;
+
+    match certificate.inner.keys_match() {
+        Ok(()) | Err(rustls::Error::InconsistentKeys(InconsistentKeys::Unknown)) => {}
+        Err(error) => {
+            return Err(CertificateResolverError::InvalidPrivateKey(
+                error.to_string(),
+            ));
+        }
+    }
+
+    let mut scratch: TrieNode<()> = TrieNode::root();
+    for name in &certificate.names {
+        if name.len() > MAX_HOSTNAME_LENGTH
+            || name.contains('/')
+            || scratch.domain_insert(name.to_owned().into_bytes(), ()) == InsertResult::Failed
+        {
+            return Err(CertificateResolverError::InvalidName(name.to_owned()));
+        }
+    }
+
+    Ok(certificate)
 }
 
 /// Parses and stores TLS certificates, makes them available to Rustls for TLS handshakes
@@ -318,13 +387,94 @@ impl CertificateResolver {
         gauge!(names::tls::CERT_MIN_EXPIRES_AT_SECONDS, clamped);
     }
 
+    /// Insert one already validated wrapper without publishing metrics.
+    /// Callers perform every fallible step before mutating the resolver.
+    fn insert_validated_certificate(&mut self, certificate: CertifiedKeyWrapper) {
+        for name in &certificate.names {
+            let fingerprints_for_this_name = self
+                .name_fingerprint_idx
+                .entry(name.to_owned())
+                .or_default();
+            fingerprints_for_this_name
+                .push((certificate.fingerprint.to_owned(), certificate.expiration));
+            fingerprints_for_this_name.sort_by_key(|(_, expiration)| *expiration);
+
+            let longest_lived_cert = fingerprints_for_this_name
+                .last()
+                .expect("inserting a certificate must leave its name index non-empty");
+            self.domains.remove(&name.to_owned().into_bytes());
+            let insert_result = self.domains.insert(
+                name.to_owned().into_bytes(),
+                longest_lived_cert.0.to_owned(),
+            );
+            debug_assert_ne!(
+                insert_result,
+                InsertResult::Failed,
+                "validated certificate names must remain insertable"
+            );
+            if insert_result == InsertResult::Failed {
+                error!(
+                    "{} the SNI trie rejected a certificate name despite passing \
+                     the shared preflight validation, name_bytes={}",
+                    log_module_context!(),
+                    name.len(),
+                );
+            }
+        }
+
+        self.certificates
+            .insert(certificate.fingerprint.to_owned(), certificate);
+    }
+
+    /// Remove one wrapper and all of its indexes without publishing metrics.
+    /// Returns whether the fingerprint was present.
+    fn remove_certificate_without_publishing(&mut self, fingerprint: &Fingerprint) -> bool {
+        let Some(certificate_to_remove) = self.certificates.get(fingerprint).cloned() else {
+            return false;
+        };
+
+        for name in certificate_to_remove.names {
+            self.domains.domain_remove(&name.as_bytes().to_vec());
+
+            if let std::collections::hash_map::Entry::Occupied(mut entry) =
+                self.name_fingerprint_idx.entry(name.to_owned())
+            {
+                entry.get_mut().retain(|(stored, _)| stored != fingerprint);
+                if let Some((longest_lived, _)) = entry.get().last() {
+                    let insert_result = self
+                        .domains
+                        .insert(name.as_bytes().to_vec(), longest_lived.to_owned());
+                    debug_assert_ne!(
+                        insert_result,
+                        InsertResult::Failed,
+                        "validated certificate names must remain insertable"
+                    );
+                    if insert_result == InsertResult::Failed {
+                        error!(
+                            "{} the SNI trie rejected a re-inserted certificate name \
+                             that was validated on add, name_bytes={}",
+                            log_module_context!(),
+                            name.len(),
+                        );
+                    }
+                }
+                if entry.get().is_empty() {
+                    entry.remove();
+                }
+            }
+        }
+
+        self.certificates.remove(fingerprint);
+        true
+    }
+
     /// persist a certificate, after ensuring validity, and checking if it can replace another certificate.
     /// return the certificate fingerprint regardless of having inserted it or not
     pub fn add_certificate(
         &mut self,
         add: &AddCertificate,
     ) -> Result<Fingerprint, CertificateResolverError> {
-        let cert_to_add = CertifiedKeyWrapper::try_from(add)?;
+        let cert_to_add = build_validated_certificate(add)?;
 
         trace!(
             "{} adding certificate {:?}",
@@ -334,44 +484,6 @@ impl CertificateResolver {
 
         if self.certificates.contains_key(&cert_to_add.fingerprint) {
             return Ok(cert_to_add.fingerprint);
-        }
-
-        // Reject a certificate whose name the SNI route table cannot host
-        // BEFORE mutating any state, by dry-running every name against a
-        // scratch trie (the grammar reasons are the same as in
-        // `router::Router::add_tree_rule`). `TrieNode::insert` reports
-        // such a name as a graceful `InsertResult::Failed`; discarding
-        // that result below would register the certificate while
-        // `self.domains` never learns the name -- a dead SNI route
-        // failing every handshake with no diagnostic. The length bound
-        // mirrors the router's: the trie recurses once per label.
-        //
-        // A name carrying `/` is refused on its BYTES, not on whether it
-        // inserts. `self.domains` is the router's
-        // `pattern_trie::TrieNode`, which compiles a label wrapped in
-        // `/.../` into a REGEX segment, so such a name INSERTS happily
-        // and then binds one certificate to an open-ended class of SNI
-        // values: `/te.*/.example.com` was served for both
-        // `test.example.com` and `tenant.example.com` (#1378). The
-        // dry-run alone can never see it. `/` cannot occur in a DNS
-        // name, so nothing legitimate is lost, and this is the rule
-        // `config::validate_sni_pattern` already applies to every path
-        // into the TCP SNI route table -- the certificate trie was the
-        // one SNI table still open. Removal is unaffected: it re-inserts
-        // the names a certificate already carries and never re-validates
-        // them, so no certificate accepted by an earlier build becomes
-        // un-removable.
-        {
-            let mut scratch: TrieNode<()> = TrieNode::root();
-            for name in &cert_to_add.names {
-                if name.len() > MAX_HOSTNAME_LENGTH
-                    || name.contains('/')
-                    || scratch.domain_insert(name.to_owned().into_bytes(), ())
-                        == InsertResult::Failed
-                {
-                    return Err(CertificateResolverError::InvalidName(name.to_owned()));
-                }
-            }
         }
 
         // Past the duplicate guard the fingerprint is genuinely new, so the
@@ -385,55 +497,7 @@ impl CertificateResolver {
             "add_certificate past the dedup guard must be inserting a new fingerprint"
         );
 
-        for new_name in &cert_to_add.names {
-            let fingerprints_for_this_name = self
-                .name_fingerprint_idx
-                .entry(new_name.to_owned())
-                .or_default();
-
-            fingerprints_for_this_name
-                .push((cert_to_add.fingerprint.clone(), cert_to_add.expiration));
-
-            // sort expiration ascending (longest-lived to the right)
-            fingerprints_for_this_name.sort_by_key(|t| t.1);
-
-            let longest_lived_cert = match fingerprints_for_this_name.last() {
-                Some(cert) => cert,
-                None => {
-                    error!(
-                        "{} no fingerprint for this name, this should not happen",
-                        log_module_context!()
-                    );
-                    continue;
-                }
-            };
-
-            // update the longest lived certificate in the TriNode
-            self.domains.remove(&new_name.to_owned().into_bytes());
-            let insert_result = self.domains.insert(
-                new_name.to_owned().into_bytes(),
-                longest_lived_cert.0.to_owned(),
-            );
-            // Canary in the same shape as `tcp.rs::insert_sni_route`: the
-            // dry-run above already validated every name, so a `Failed`
-            // here is an internal bug, not a control-plane input error.
-            debug_assert_ne!(
-                insert_result,
-                InsertResult::Failed,
-                "add_certificate's names must already be validated by its dry-run"
-            );
-            if insert_result == InsertResult::Failed {
-                error!(
-                    "{} the SNI trie rejected a certificate name despite passing \
-                     the dry-run validation, name_bytes={}",
-                    log_module_context!(),
-                    new_name.len(),
-                );
-            }
-        }
-
-        self.certificates
-            .insert(cert_to_add.fingerprint.to_owned(), cert_to_add.clone());
+        self.insert_validated_certificate(cert_to_add.to_owned());
         self.publish_min_expiration_gauge();
 
         // Postconditions: the new fingerprint is now stored, the store grew by
@@ -474,53 +538,13 @@ impl CertificateResolver {
         // it compiles in release and the optimizer drops it.
         let certificates_before = self.certificates.len();
         let was_present = self.certificates.contains_key(fingerprint);
-
-        if let Some(certificate_to_remove) = self.get_certificate(fingerprint) {
-            // Names snapshot used only by the index-cleanup postcondition.
-            // Gate BOTH the `let` and its assert with `#[cfg(debug_assertions)]`
-            // so the clone never runs (and never warns) in release.
-            #[cfg(debug_assertions)]
-            let removed_names = certificate_to_remove.names.clone();
-            for name in certificate_to_remove.names {
-                self.domains.domain_remove(&name.as_bytes().to_vec());
-
-                if let std::collections::hash_map::Entry::Occupied(mut entry) =
-                    self.name_fingerprint_idx.entry(name.to_owned())
-                {
-                    // remove fingerprints from the index for this name
-                    entry.get_mut().retain(|t| &t.0 != fingerprint);
-
-                    // reinsert the longest lived certificate in the TrieNode
-                    if let Some(longest_lived_cert) = entry.get().last() {
-                        let insert_result = self
-                            .domains
-                            .insert(name.as_bytes().to_vec(), longest_lived_cert.0.to_owned());
-                        // Same canary as in `add_certificate`: this name
-                        // was dry-run validated when its certificate was
-                        // added, so `Failed` cannot be an input error.
-                        debug_assert_ne!(
-                            insert_result,
-                            InsertResult::Failed,
-                            "remove_certificate re-inserts names that were validated on add"
-                        );
-                        if insert_result == InsertResult::Failed {
-                            error!(
-                                "{} the SNI trie rejected a re-inserted certificate name \
-                                 that was validated on add, name_bytes={}",
-                                log_module_context!(),
-                                name.len(),
-                            );
-                        }
-                    }
-
-                    // clean up empty index entries to avoid memory leaks
-                    if entry.get().is_empty() {
-                        entry.remove();
-                    }
-                }
-            }
-
-            self.certificates.remove(fingerprint);
+        #[cfg(debug_assertions)]
+        let removed_names = self
+            .certificates
+            .get(fingerprint)
+            .map(|certificate| certificate.names.to_owned());
+        let removed = self.remove_certificate_without_publishing(fingerprint);
+        if removed {
             self.publish_min_expiration_gauge();
 
             // Postconditions on the present-cert path: the fingerprint is
@@ -538,11 +562,15 @@ impl CertificateResolver {
             );
             #[cfg(debug_assertions)]
             debug_assert!(
-                removed_names.iter().all(|name| {
-                    self.name_fingerprint_idx
-                        .get(name)
-                        .is_none_or(|fps| fps.iter().all(|(fp, _)| fp != fingerprint))
-                }),
+                removed_names
+                    .as_ref()
+                    .is_some_and(|names| names.iter().all(|name| {
+                        self.name_fingerprint_idx
+                            .get(name)
+                            .is_none_or(|fingerprints| {
+                                fingerprints.iter().all(|(stored, _)| stored != fingerprint)
+                            })
+                    })),
                 "no name may still index the removed fingerprint"
             );
         } else {
@@ -562,9 +590,10 @@ impl CertificateResolver {
         Ok(())
     }
 
-    /// Add the new certificate first, then remove the old one.
-    /// This ordering ensures that the old certificate remains available
-    /// if adding the new one fails.
+    /// Validate the complete replacement before changing any resolver state,
+    /// then update the indexes and publish the aggregate gauge once.
+    /// A byte-for-byte effective retry keeps the existing wrapper in place so
+    /// it also preserves name-index ordering.
     pub fn replace_certificate(
         &mut self,
         replace: &ReplaceCertificate,
@@ -574,68 +603,65 @@ impl CertificateResolver {
             certificate: replace.new_certificate.to_owned(),
             expired_at: replace.new_expired_at.to_owned(),
         };
-
-        // ── Idempotent-replace short-circuit ──
-        //
-        // Compute the new fingerprint *before* mutating the resolver so we
-        // can compare it with the old one. When `add_certificate` is
-        // called with a fingerprint that already exists it early-returns
-        // (lib/src/tls.rs add_certificate path) without inserting; if we
-        // then unconditionally called `remove_certificate(old)` and old
-        // equalled new, we would delete the entry the caller intended to
-        // *retain*. An idempotent renewal — typical for retry loops, dead
-        // ACME polls, or operator-driven `ReplaceCertificate` requests
-        // that resubmit the same PEM — must therefore short-circuit here.
-        // Any failure to materialise the wrapper (parse, sign-key check)
-        // surfaces as `CertificateResolverError`, identical to the path
-        // through `add_certificate`.
-        let new_cert = CertifiedKeyWrapper::try_from(&add)?;
+        let new_cert = build_validated_certificate(&add)?;
         let new_fingerprint = new_cert.fingerprint.to_owned();
+        // `ConfigState` rejects an invalid hexadecimal old fingerprint before
+        // dispatching to a worker. Direct users of this public resolver method
+        // historically received `Ok(new_fingerprint)` after the replacement
+        // was stored, with a warning that the old entry could not be removed.
+        // Parse before mutation, but preserve that public 2.3.x contract and
+        // the existing `CertificateResolverError` variant set.
+        let old_fingerprint = Fingerprint::from_str(&replace.old_fingerprint);
+        let new_material_already_stored =
+            self.certificates
+                .get(&new_fingerprint)
+                .is_some_and(|stored| {
+                    stored.material_digest == new_cert.material_digest
+                        && stored.expiration == new_cert.expiration
+                });
 
-        if let Ok(old_fingerprint) = Fingerprint::from_str(&replace.old_fingerprint)
-            && old_fingerprint == new_fingerprint
+        if old_fingerprint
+            .as_ref()
+            .is_ok_and(|old| old == &new_fingerprint)
+            && new_material_already_stored
         {
-            // Idempotent replace: the new cert is byte-identical to the
-            // one already serving this name. Removing `old == new` would
-            // delete the entry the caller meant to keep, so we must NOT
-            // touch the store — assert it is untouched on this path.
-            let stored_before = self.certificates.contains_key(&new_fingerprint);
-            // Re-publish the expiration gauge so dashboards observe the
-            // replace request even when the certificate set is unchanged.
-            self.publish_min_expiration_gauge();
-            debug_assert_eq!(
-                self.certificates.contains_key(&new_fingerprint),
-                stored_before,
-                "idempotent replace must not change whether the cert is stored"
-            );
             return Ok(new_fingerprint);
         }
 
-        let new_fingerprint = self.add_certificate(&add)?;
+        let mut resolver_changed = false;
+        if !new_material_already_stored {
+            self.remove_certificate_without_publishing(&new_fingerprint);
+            self.insert_validated_certificate(new_cert);
+            resolver_changed = true;
+        }
+        if let Ok(old_fingerprint) = old_fingerprint.as_ref()
+            && old_fingerprint != &new_fingerprint
+        {
+            resolver_changed |= self.remove_certificate_without_publishing(old_fingerprint);
+        }
+        if resolver_changed {
+            self.publish_min_expiration_gauge();
+        }
 
-        // After a non-idempotent add the new certificate is in the store,
-        // ready to serve handshakes before the old one is torn down (the
-        // add-before-remove ordering that keeps the name continuously
-        // resolvable).
         debug_assert!(
             self.certificates.contains_key(&new_fingerprint),
-            "the replacement certificate must be stored before the old one is removed"
+            "replace_certificate must leave the replacement stored"
+        );
+        debug_assert!(
+            old_fingerprint.as_ref().is_err()
+                || old_fingerprint.as_ref().is_ok_and(|old| {
+                    old == &new_fingerprint || !self.certificates.contains_key(old)
+                }),
+            "replace_certificate must remove a distinct old fingerprint"
         );
 
-        match Fingerprint::from_str(&replace.old_fingerprint) {
-            Ok(old_fingerprint) => self.remove_certificate(&old_fingerprint)?,
-            Err(err) => {
-                // The new certificate was already added above. If we can't parse the old
-                // fingerprint, the old certificate remains in the resolver (leaked).
-                // We return Ok to indicate the new certificate is available, but warn
-                // that cleanup of the old one failed.
-                warn!(
-                    "{} new certificate added but could not remove old one: \
-                     failed to parse old fingerprint, {}",
-                    log_module_context!(),
-                    err
-                );
-            }
+        if let Err(error) = old_fingerprint {
+            warn!(
+                "{} new certificate stored but could not remove old one: \
+                 failed to parse old fingerprint, {}",
+                log_module_context!(),
+                error
+            );
         }
 
         Ok(new_fingerprint)
@@ -841,7 +867,7 @@ mod tests {
 
     use super::{
         CertificateResolver, CertificateResolverError, CertifiedKeyWrapper,
-        MutexCertificateResolver,
+        MutexCertificateResolver, build_validated_certificate,
     };
 
     fn drive_client_hello(resolver: Arc<MutexCertificateResolver>, server_name: String) {
@@ -910,6 +936,25 @@ mod tests {
                 "{name:?} was rejected but the SNI trie was mutated",
             );
         }
+    }
+
+    #[test]
+    fn shared_preflight_rejects_a_certificate_with_a_mismatched_private_key() {
+        let result = build_validated_certificate(&AddCertificate {
+            address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
+            certificate: CertificateAndKey {
+                certificate: include_str!("../assets/tests/certificate-1y.pem").to_owned(),
+                key: include_str!("../assets/tests/key-2y.pem").to_owned(),
+                names: vec!["mismatch.example.com".to_owned()],
+                ..Default::default()
+            },
+            expired_at: None,
+        });
+
+        assert!(
+            matches!(result, Err(CertificateResolverError::InvalidPrivateKey(_))),
+            "a mismatched certificate/private-key pair must be refused, got {result:?}"
+        );
     }
 
     // Asserts on `trace!` output: gate on the same condition that compiles it in.
@@ -1473,6 +1518,43 @@ mod tests {
         Ok(())
     }
 
+    /// Direct resolver callers historically receive success when the old
+    /// fingerprint is malformed: the validated replacement is stored, the
+    /// unaddressable old entry is retained, and the cleanup failure is logged.
+    /// `ConfigState` rejects this input before worker dispatch, but the public
+    /// resolver API must retain its 2.3.x behavior.
+    #[test]
+    fn replace_certificate_with_invalid_old_fingerprint_keeps_compatibility()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8080);
+        let mut resolver = CertificateResolver::default();
+        let old_fingerprint = resolver.add_certificate(&AddCertificate {
+            address,
+            certificate: CertificateAndKey {
+                certificate: include_str!("../assets/tests/certificate-1y.pem").to_owned(),
+                key: include_str!("../assets/tests/key-1y.pem").to_owned(),
+                ..Default::default()
+            },
+            expired_at: None,
+        })?;
+
+        let new_fingerprint = resolver.replace_certificate(&ReplaceCertificate {
+            address,
+            new_certificate: CertificateAndKey {
+                certificate: include_str!("../assets/tests/certificate-2y.pem").to_owned(),
+                key: include_str!("../assets/tests/key-2y.pem").to_owned(),
+                ..Default::default()
+            },
+            old_fingerprint: "not-a-hex-fingerprint".to_owned(),
+            new_expired_at: None,
+        })?;
+
+        assert!(resolver.certificates.contains_key(&old_fingerprint));
+        assert!(resolver.certificates.contains_key(&new_fingerprint));
+
+        Ok(())
+    }
+
     /// When `ReplaceCertificate` carries the same certificate / fingerprint
     /// as the existing entry, the previous implementation called
     /// `add_certificate` (which early-returns on duplicate fingerprint
@@ -1524,6 +1606,85 @@ mod tests {
             resolved.1, initial_fingerprint,
             "resolver should still hand back the original fingerprint"
         );
+
+        Ok(())
+    }
+
+    /// A strict retry must keep the exact stored wrapper and the stable
+    /// tie-break between certificates that cover the same name with the same
+    /// expiration. Rebuilding the wrapper is observably different even when
+    /// the winner happens to stay the same after the stable index sort.
+    #[test]
+    fn strict_same_fingerprint_retry_preserves_tie_break_and_wrapper()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8080);
+        let mut resolver = CertificateResolver::default();
+        let shared_expiration = 2_000_000_000;
+
+        let other_certificate = CertificateAndKey {
+            certificate: include_str!("../assets/tests/certificate-2y.pem").to_owned(),
+            key: include_str!("../assets/tests/key-2y.pem").to_owned(),
+            names: vec!["tie.example.com".to_owned()],
+            ..Default::default()
+        };
+        resolver.add_certificate(&AddCertificate {
+            address,
+            certificate: other_certificate,
+            expired_at: Some(shared_expiration),
+        })?;
+
+        let target_certificate = CertificateAndKey {
+            certificate: include_str!("../assets/tests/certificate-1y.pem").to_owned(),
+            key: include_str!("../assets/tests/key-1y.pem").to_owned(),
+            names: vec!["tie.example.com".to_owned()],
+            ..Default::default()
+        };
+        let target_fingerprint = resolver.add_certificate(&AddCertificate {
+            address,
+            certificate: target_certificate.to_owned(),
+            expired_at: Some(shared_expiration),
+        })?;
+
+        let index_before = resolver.name_fingerprint_idx.to_owned();
+        let domains_before = format!("{:?}", resolver.domains);
+        let winner_before = resolver
+            .domain_lookup(b"tie.example.com", true)
+            .expect("the tied certificates must have a selected winner")
+            .1
+            .to_owned();
+        let wrapper_before = resolver
+            .certificates
+            .get(&target_fingerprint)
+            .expect("the target certificate must be stored")
+            .inner
+            .to_owned();
+
+        let returned_fingerprint = resolver.replace_certificate(&ReplaceCertificate {
+            address,
+            new_certificate: target_certificate,
+            old_fingerprint: target_fingerprint.to_string(),
+            new_expired_at: Some(shared_expiration),
+        })?;
+
+        assert_eq!(returned_fingerprint, target_fingerprint);
+        assert_eq!(winner_before, target_fingerprint);
+        assert_eq!(resolver.name_fingerprint_idx, index_before);
+        assert_eq!(format!("{:?}", resolver.domains), domains_before);
+        assert_eq!(
+            resolver
+                .domain_lookup(b"tie.example.com", true)
+                .expect("the strict retry must preserve the selected winner")
+                .1,
+            target_fingerprint,
+        );
+        assert!(Arc::ptr_eq(
+            &wrapper_before,
+            &resolver
+                .certificates
+                .get(&target_fingerprint)
+                .expect("the strict retry must preserve the stored certificate")
+                .inner,
+        ));
 
         Ok(())
     }
@@ -1774,11 +1935,10 @@ mod tests {
     /// which already rejects `/` on every path into the TCP SNI route
     /// table; the certificate trie was the one SNI table left open.
     ///
-    /// To SEE THIS RED: in `add_certificate`'s pre-mutation dry-run
-    /// block, delete the `|| name.contains('/')` disjunct from the
-    /// rejection condition. The certificate then loads and `expect_err`
-    /// panics on the returned `Ok(fingerprint)`, so the test fails at its
-    /// very first statement.
+    /// To SEE THIS RED: in `build_validated_certificate`'s pre-mutation
+    /// dry-run, delete the `|| name.contains('/')` disjunct from the rejection
+    /// condition. The certificate then loads and `expect_err` panics on the
+    /// returned `Ok(fingerprint)`, so the test fails at its first statement.
     #[test]
     fn a_certificate_name_carrying_a_regex_segment_is_refused() {
         const REGEX_NAME: &str = "/te.*/.example.com";
