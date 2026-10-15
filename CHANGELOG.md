@@ -8,8 +8,9 @@
   closes, on every worker, the HTTP, HTTPS, TCP and WebSocket sessions holding a backend
   connection to a cluster, or to one of its backends (#123). Sessions close the way a soft
   stop closes them: idle HTTP/1.1, TCP and WebSocket sessions at once, an HTTP/1.1 request in
-  flight answered with `Connection: close` first, an HTTP/2 session after a GOAWAY and at the
-  latest at its graceful-shutdown deadline. The answer counts, per worker, the sessions closed
+  flight answered with `Connection: close` first when the backend response headers are not
+  parsed yet, an HTTP/2 session after a GOAWAY, bounded by its graceful-shutdown deadline when
+  that is nonzero (`0` drains without bound, as on a soft stop). The answer counts, per worker, the sessions closed
   and those still draining. The new `Request.close_sessions` (field 65) and
   `ResponseContent.closed_sessions` (field 19) are additive; the request is never saved in the
   state nor replayed by `load_state` or an upgrade. A worker that predates it cannot decode

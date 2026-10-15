@@ -204,10 +204,11 @@ Each session closes the way a soft stop closes it, without waiting for the rest:
 - an HTTP/1.1 session with no request in flight, a TCP session and a WebSocket session close
   at once;
 - an HTTP/1.1 session with a request in flight finishes it: the response carries
-  `Connection: close` if its headers are not sent yet, and the connection closes once it is
-  sent;
-- an HTTP/2 session receives a GOAWAY, finishes its open streams and closes, at the latest when
-  the listener's `h2_graceful_shutdown_deadline_seconds` elapses.
+  `Connection: close` only if the backend response headers are not parsed yet (once parsed,
+  they go out as received), and the connection closes once it is sent;
+- an HTTP/2 session receives a GOAWAY, finishes its open streams and closes. The listener's
+  `h2_graceful_shutdown_deadline_seconds` bounds the wait only when it is nonzero; with `0`
+  the session drains without bound, as it does on a soft stop.
 
 A session counts as one of the cluster's while it holds a backend connection to it. An HTTP/2
 session multiplexing several clusters is closed by a request naming any of them; a keep-alive

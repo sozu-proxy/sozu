@@ -54,9 +54,9 @@ use hyper_util::{
 use sozu_command_lib::{
     config::{FileConfig, ListenerBuilder},
     proto::command::{
-        ActivateListener, AddCertificate, CertificateAndKey, ListenerType, PathRule,
-        QueryMetricsOptions, RequestHttpFrontend, ResponseStatus, SocketAddress, filtered_metrics,
-        request::RequestType, response_content::ContentType,
+        ActivateListener, AddCertificate, CertificateAndKey, ClosedSessions, ListenerType,
+        PathRule, QueryMetricsOptions, RequestHttpFrontend, ResponseStatus, SocketAddress,
+        filtered_metrics, request::RequestType, response_content::ContentType,
     },
     scm_socket::Listeners,
     state::ConfigState,
@@ -7594,6 +7594,159 @@ fn test_h2_repeated_client_goaway_is_bounded() {
             3,
             "H2: repeated client GOAWAY frames trip the glitch budget",
             try_h2_repeated_client_goaway_is_bounded
+        ),
+        State::Success
+    );
+}
+
+/// The final GOAWAY is the last frame on the wire, behind the advisory
+/// `2^31-1` one.
+fn closed_with_final_goaway(frames: &[(u8, u8, u32, Vec<u8>)], last_stream_id: u32) -> bool {
+    goaways(frames)
+        == vec![
+            (0x7FFF_FFFF, H2_ERROR_NO_ERROR),
+            (last_stream_id, H2_ERROR_NO_ERROR),
+        ]
+        && frames
+            .last()
+            .is_some_and(|(ft, _, _, _)| *ft == H2_FRAME_GOAWAY)
+}
+
+/// `CloseSessions` on a frontend H2 connection whose stream the backend never
+/// answers: the worker reports it draining, sends the double GOAWAY, and the
+/// positive `h2_graceful_shutdown_deadline_seconds` closes the connection,
+/// while the worker itself keeps running (this is not a stop). A deadline of
+/// 0 would leave it draining unbounded, as a soft stop does.
+fn try_h2_close_sessions_is_bounded_by_the_graceful_deadline() -> State {
+    let test_name = "H2 CloseSessions deadline";
+    let (mut worker, front_port, request_seen, release_response, mut backend) =
+        start_h2_graceful_deadline_fixture("H2-CLOSE-SESSIONS-DEADLINE", 1);
+
+    let Some(mut tls) =
+        h2_raw_request_held_by_backend(front_port, &request_seen, "/api/close-deadline")
+    else {
+        println!("{test_name} - request never reached backend");
+        release_response.store(true, Ordering::Relaxed);
+        let _ = soft_stop_in_background(worker).recv_timeout(Duration::from_secs(30));
+        let _ = backend.stop_and_get_aggregator();
+        return State::Fail;
+    };
+
+    let started = Instant::now();
+    let ordered = super::close_sessions_tests::close_sessions(&mut worker, None, None);
+    // `read_all_available` returns once the proxy closes the connection.
+    let data = read_all_available(&mut tls, Duration::from_secs(6));
+    let elapsed = started.elapsed();
+    let frames = parse_h2_frames(&data);
+    log_frames(test_name, &frames);
+
+    // The backend is still holding the stream: only the deadline ended it.
+    release_response.store(true, Ordering::Relaxed);
+    let stopped = soft_stop_in_background(worker)
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap_or(false);
+    let _ = backend.stop_and_get_aggregator();
+
+    println!(
+        "{test_name} - ordered={ordered:?} goaways={:?} elapsed={elapsed:?} stopped={stopped}",
+        goaways(&frames)
+    );
+    if ordered
+        == Some(ClosedSessions {
+            closed: 0,
+            draining: 1,
+        })
+        && closed_with_final_goaway(&frames, 1)
+        && elapsed >= Duration::from_millis(500)
+        && elapsed < Duration::from_secs(4)
+        && stopped
+    {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_close_sessions_is_bounded_by_the_graceful_deadline() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: CloseSessions drains a held stream, the graceful deadline closes it",
+            try_h2_close_sessions_is_bounded_by_the_graceful_deadline
+        ),
+        State::Success
+    );
+}
+
+/// `CloseSessions` on an H2 connection whose stream completes inside the
+/// graceful deadline: the response is served in full, then the connection
+/// closes behind the final GOAWAY, well before the (long) deadline.
+fn try_h2_close_sessions_lets_a_stream_finish() -> State {
+    let test_name = "H2 CloseSessions graceful completion";
+    let (mut worker, front_port, request_seen, release_response, mut backend) =
+        start_h2_graceful_deadline_fixture("H2-CLOSE-SESSIONS-GRACEFUL", 30);
+
+    let Some(mut tls) =
+        h2_raw_request_held_by_backend(front_port, &request_seen, "/api/close-graceful")
+    else {
+        println!("{test_name} - request never reached backend");
+        release_response.store(true, Ordering::Relaxed);
+        let _ = soft_stop_in_background(worker).recv_timeout(Duration::from_secs(30));
+        let _ = backend.stop_and_get_aggregator();
+        return State::Fail;
+    };
+
+    let ordered = super::close_sessions_tests::close_sessions(&mut worker, None, None);
+    let released = Instant::now();
+    release_response.store(true, Ordering::Relaxed);
+    let data = read_all_available(&mut tls, Duration::from_secs(10));
+    let elapsed = released.elapsed();
+    let frames = parse_h2_frames(&data);
+    log_frames(test_name, &frames);
+
+    let stopped = soft_stop_in_background(worker)
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap_or(false);
+    let _ = backend.stop_and_get_aggregator();
+
+    let stream_one: Vec<_> = frames
+        .iter()
+        .filter(|(_, _, sid, _)| *sid == 1)
+        .cloned()
+        .collect();
+    let served = headers_status_matches(&stream_one, b"200")
+        && stream_one.iter().any(|(ft, flags, _, _)| {
+            *ft == super::h2_utils::H2_FRAME_DATA && flags & H2_FLAG_END_STREAM != 0
+        });
+    println!(
+        "{test_name} - ordered={ordered:?} served={served} goaways={:?} elapsed={elapsed:?} \
+         stopped={stopped}",
+        goaways(&frames)
+    );
+    if ordered
+        == Some(ClosedSessions {
+            closed: 0,
+            draining: 1,
+        })
+        && served
+        && closed_with_final_goaway(&frames, 1)
+        && elapsed < Duration::from_secs(10)
+        && stopped
+    {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_close_sessions_lets_a_stream_finish() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: CloseSessions lets an in-flight stream finish before the close",
+            try_h2_close_sessions_lets_a_stream_finish
         ),
         State::Success
     );

@@ -42,7 +42,7 @@ fn stop(worker: Worker) -> bool {
 
 /// Send `CloseSessions` and return the worker's `ClosedSessions`, or `None`
 /// when it failed or answered something else.
-fn close_sessions(
+pub(super) fn close_sessions(
     worker: &mut Worker,
     backend_id: Option<&str>,
     address: Option<SocketAddr>,
@@ -352,6 +352,98 @@ fn test_close_sessions_closes_a_tcp_session() {
             3,
             "CloseSessions: an established TCP session of the backend closes at once",
             try_close_tcp_session,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// WebSocket: an upgraded session closes at once
+// =========================================================================
+
+/// Read from `stream` until `needle` has arrived or `ANSWER_BUDGET` elapses.
+fn read_until_contains(stream: &mut TcpStream, needle: &str) -> bool {
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("could not set a read timeout");
+    let started = Instant::now();
+    let mut received = Vec::new();
+    let mut buf = [0u8; 256];
+    while started.elapsed() < ANSWER_BUDGET {
+        match stream.read(&mut buf) {
+            Ok(0) => return false,
+            Ok(n) => received.extend_from_slice(&buf[..n]),
+            Err(_) => {}
+        }
+        if String::from_utf8_lossy(&received).contains(needle) {
+            return true;
+        }
+    }
+    false
+}
+
+fn try_close_websocket_session() -> State {
+    const UPGRADE_REQUEST: &str = "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    const UPGRADE_RESPONSE: &str =
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+
+    let front_address = create_local_address();
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_sync_test(
+        "CLOSE-SESSIONS-WEBSOCKET",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+    let mut backend = backends.pop().expect("setup_sync_test returns one backend");
+    backend.set_response(UPGRADE_RESPONSE);
+    backend.connect();
+
+    let mut client = Client::new("WEBSOCKET", front_address, UPGRADE_REQUEST);
+    client.connect();
+    client.send();
+    backend.accept(0);
+    let upgraded = backend.receive(0).is_some() && backend.send(0).is_some() && {
+        let stream = client.stream.as_mut().expect("the client is connected");
+        read_until_contains(stream, "101 Switching Protocols")
+    };
+    if !upgraded {
+        println!("the premise failed, the session did not upgrade");
+        stop(worker);
+        return State::Undecided;
+    }
+
+    // An upgraded session has no response to finish: it closes at once.
+    let ordered = close_sessions(&mut worker, None, None);
+    let stream = client.stream.as_mut().expect("the client is connected");
+    let closed = closed_by_proxy(stream);
+    println!("ordered: {ordered:?}, closed: {closed}");
+
+    let stopped = stop(worker);
+    if ordered
+        == Some(ClosedSessions {
+            closed: 1,
+            draining: 0,
+        })
+        && closed
+        && stopped
+    {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_close_sessions_closes_a_websocket_session() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "CloseSessions: an upgraded WebSocket session closes at once",
+            try_close_websocket_session,
         ),
         State::Success,
     );

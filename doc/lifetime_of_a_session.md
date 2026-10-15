@@ -892,8 +892,9 @@ and its siblings) deregisters and drops its listener sockets — then calls
   returned to `StreamState::Idle`, closes on the next call
   (`Mux::shutting_down_inner` waits only for `Linked` and non-quiesced
   `Unlinked` streams). The linked stream is marked `closing`, so its response
-  announces `Connection: close` when its headers are not sent yet
-  (`HttpContext::on_response_headers`), and `ConnectionH1::writable` closes the
+  announces `Connection: close` only while the backend response headers are
+  not parsed yet (`HttpContext::on_response_headers`; once parsed they are
+  forwarded as received), and `ConnectionH1::writable` closes the
   frontend once that response is sent.
 - **Targeted close.** A `CloseSessions` request applies the same
   `ProxySession::shutting_down` to the sessions holding a backend connection to

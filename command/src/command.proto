@@ -1687,9 +1687,10 @@ message ClosedSessions {
     // sessions closed right away: idle ones, TCP and WebSocket ones
     required uint64 closed = 1;
     // sessions finishing their in-flight HTTP work before they close: an
-    // HTTP/1.1 response is sent with `Connection: close`, an HTTP/2 session
-    // receives a GOAWAY and is closed by its graceful-shutdown deadline at
-    // the latest
+    // HTTP/1.1 response gets `Connection: close` while its backend headers
+    // are not parsed yet, an HTTP/2 session receives a GOAWAY and is closed
+    // by its graceful-shutdown deadline when that is nonzero (`0` drains
+    // without bound)
     required uint64 draining = 2;
 }
 

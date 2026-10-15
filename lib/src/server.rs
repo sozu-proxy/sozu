@@ -5131,6 +5131,131 @@ mod event_owner_tests {
         );
     }
 }
+/// A session a `CloseSessions` request left draining can close on its own
+/// before `Server::drive_closing_sessions` revisits it, and another session
+/// then takes its slab key. The watcher must leave the new tenant alone.
+#[cfg(test)]
+mod closing_sessions_tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    /// A session whose `shutting_down` answer is scripted and whose `close`
+    /// is counted.
+    struct ScriptedSession {
+        frontend: Token,
+        can_close_now: bool,
+        closed: Rc<Cell<bool>>,
+    }
+
+    impl ProxySession for ScriptedSession {
+        fn protocol(&self) -> Protocol {
+            Protocol::HTTP
+        }
+        fn ready(&mut self, _session: Rc<RefCell<dyn ProxySession>>) -> SessionIsToBeClosed {
+            false
+        }
+        fn shutting_down(&mut self) -> SessionIsToBeClosed {
+            self.can_close_now
+        }
+        fn update_readiness(&mut self, _token: Token, _events: Ready) {}
+        fn close(&mut self) {
+            self.closed.set(true);
+        }
+        fn timeout(&mut self, _token: Token) -> SessionIsToBeClosed {
+            false
+        }
+        fn last_event(&self) -> Instant {
+            Instant::now()
+        }
+        fn print_session(&self) {}
+        fn frontend_token(&self) -> Token {
+            self.frontend
+        }
+    }
+
+    fn insert_scripted(
+        server: &Server,
+        can_close_now: bool,
+    ) -> (Token, Rc<RefCell<dyn ProxySession>>, Rc<Cell<bool>>) {
+        let closed = Rc::new(Cell::new(false));
+        let mut sessions = server.sessions.borrow_mut();
+        let entry = sessions.slab.vacant_entry();
+        let token = Token(entry.key());
+        let session: Rc<RefCell<dyn ProxySession>> = Rc::new(RefCell::new(ScriptedSession {
+            frontend: token,
+            can_close_now,
+            closed: closed.clone(),
+        }));
+        entry.insert(session.clone());
+        sessions.incr();
+        (token, session, closed)
+    }
+
+    /// The draining session (closable by now) leaves the slab (its `Rc` is
+    /// still held, so its `Weak` still upgrades) and an unrelated session
+    /// takes the same key. Draining must not close it.
+    ///
+    /// To SEE THIS RED: drop the `still_there` check from
+    /// `Server::drive_closing_sessions`, so a live `Weak` alone selects the
+    /// token -- the unrelated session is then closed and removed.
+    #[test]
+    fn a_draining_sessions_reused_slab_key_is_not_closed() {
+        let (mut server, _listen_token, _address) =
+            super::accept_ready_tests::server_with_tcp_listener();
+
+        let (token, draining, draining_closed) = insert_scripted(&server, true);
+        server
+            .closing_sessions
+            .push((token, Rc::downgrade(&draining)));
+
+        // The draining session closed by itself; an unrelated one reuses its key.
+        server.sessions.borrow_mut().slab.remove(token.0);
+        let (reused, unrelated, unrelated_closed) = insert_scripted(&server, true);
+        assert_eq!(reused, token, "precondition: the slab must reuse the key");
+        assert!(
+            !Rc::ptr_eq(&draining, &unrelated),
+            "precondition: the two sessions are distinct"
+        );
+
+        server.drive_closing_sessions();
+
+        assert!(
+            server.sessions.borrow().slab.contains(token.0),
+            "the unrelated session that reused the key must stay in the slab"
+        );
+        assert!(
+            !unrelated_closed.get() && !draining_closed.get(),
+            "neither session may be closed by the stale watch"
+        );
+        assert!(
+            server.closing_sessions.is_empty(),
+            "the stale watch must be dropped, not kept"
+        );
+    }
+
+    /// Positive twin: the same session still in its slot, once able to close,
+    /// is closed and unwatched.
+    #[test]
+    fn a_draining_session_still_in_its_slot_is_closed_when_ready() {
+        let (mut server, _listen_token, _address) =
+            super::accept_ready_tests::server_with_tcp_listener();
+
+        let (token, session, closed) = insert_scripted(&server, true);
+        server
+            .closing_sessions
+            .push((token, Rc::downgrade(&session)));
+
+        server.drive_closing_sessions();
+
+        assert!(
+            closed.get(),
+            "a still-owned closable session must be closed"
+        );
+        assert!(!server.sessions.borrow().slab.contains(token.0));
+        assert!(server.closing_sessions.is_empty());
+    }
+}
 /// The listener slab slot is reserved for a listener's whole `AddListener` ->
 /// `RemoveListener` lifetime. These tests pin both ends of that lifetime and
 /// the deactivate/reactivate cycle in between; see `reserve_listen_token` for

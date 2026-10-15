@@ -1351,45 +1351,132 @@ impl GatheringTask for CloseSessionsTask {
         client: &mut OptionalClient,
         timed_out: bool,
     ) {
-        let mut failures = Vec::new();
-        let mut worker_responses = BTreeMap::new();
-        for (worker_id, response) in self.gatherer.responses {
-            match ResponseStatus::try_from(response.status) {
-                Ok(ResponseStatus::Ok) => {
-                    if let Some(content) = response.content {
-                        worker_responses.insert(worker_id.to_string(), content);
-                    }
-                }
-                Ok(ResponseStatus::Failure) | Ok(ResponseStatus::Processing) | Err(_) => {
-                    failures.push(format!("{worker_id}: {}", response.message));
-                }
-            }
-        }
-        if timed_out {
-            failures.push("timed out waiting for every worker".to_owned());
-        }
-
-        if failures.is_empty() {
-            client.finish_ok_with_content(
+        match close_sessions_outcome(self.gatherer.responses, timed_out) {
+            Ok(worker_responses) => client.finish_ok_with_content(
                 ContentType::WorkerResponses(WorkerResponses {
                     map: worker_responses,
                 })
                 .into(),
                 "Closed the selected sessions on every worker",
-            );
-        } else {
-            // The counts of the workers that answered still matter: their
-            // sessions are closed or closing, whatever the others did.
-            for (worker_id, content) in worker_responses {
-                if let Some(ContentType::ClosedSessions(closed)) = content.content_type {
-                    failures.push(format!(
-                        "{worker_id}: {} sessions closed, {} draining",
-                        closed.closed, closed.draining
-                    ));
+            ),
+            Err(message) => client.finish_failure(message),
+        }
+    }
+}
+
+/// Success only when every worker answered `Ok` before the timeout. A failure
+/// message keeps the counts of the workers that did answer: their sessions are
+/// closed or closing, whatever the others did.
+fn close_sessions_outcome(
+    responses: Vec<(WorkerId, WorkerResponse)>,
+    timed_out: bool,
+) -> Result<BTreeMap<String, ResponseContent>, String> {
+    let mut failures = Vec::new();
+    let mut worker_responses = BTreeMap::new();
+    for (worker_id, response) in responses {
+        match ResponseStatus::try_from(response.status) {
+            Ok(ResponseStatus::Ok) => {
+                if let Some(content) = response.content {
+                    worker_responses.insert(worker_id.to_string(), content);
                 }
             }
-            client.finish_failure(failures.join(", "));
+            Ok(ResponseStatus::Failure) | Ok(ResponseStatus::Processing) | Err(_) => {
+                failures.push(format!("{worker_id}: {}", response.message));
+            }
         }
+    }
+    if timed_out {
+        failures.push("timed out waiting for every worker".to_owned());
+    }
+
+    if failures.is_empty() {
+        return Ok(worker_responses);
+    }
+    for (worker_id, content) in worker_responses {
+        if let Some(ContentType::ClosedSessions(closed)) = content.content_type {
+            failures.push(format!(
+                "{worker_id}: {} sessions closed, {} draining",
+                closed.closed, closed.draining
+            ));
+        }
+    }
+    Err(failures.join(", "))
+}
+
+#[cfg(test)]
+mod close_sessions_outcome_tests {
+    use sozu_command_lib::proto::command::ClosedSessions;
+
+    use super::*;
+
+    fn answered(closed: u64, draining: u64) -> WorkerResponse {
+        WorkerResponse {
+            id: "test".to_owned(),
+            status: ResponseStatus::Ok as i32,
+            message: String::new(),
+            content: Some(ContentType::ClosedSessions(ClosedSessions { closed, draining }).into()),
+        }
+    }
+
+    fn failed(status: ResponseStatus, message: &str) -> WorkerResponse {
+        WorkerResponse {
+            id: "test".to_owned(),
+            status: status as i32,
+            message: message.to_owned(),
+            content: None,
+        }
+    }
+
+    #[test]
+    fn every_worker_ok_is_a_success_carrying_each_worker_counts() {
+        let map = close_sessions_outcome(vec![(0, answered(2, 1)), (1, answered(0, 3))], false)
+            .expect("every worker answered Ok");
+        assert_eq!(map.len(), 2, "one entry per worker: {map:?}");
+        assert!(map.contains_key("0") && map.contains_key("1"));
+    }
+
+    /// To SEE THIS RED: make `close_sessions_outcome` return `Ok` whenever
+    /// one worker answered `Ok` -- the failing worker is then reported as a
+    /// success.
+    #[test]
+    fn one_failed_worker_fails_the_request_and_keeps_the_partial_counts() {
+        let message = close_sessions_outcome(
+            vec![
+                (0, answered(4, 2)),
+                (1, failed(ResponseStatus::Failure, "boom")),
+            ],
+            false,
+        )
+        .expect_err("a worker failure must never be reported as success");
+        assert!(message.contains("1: boom"), "{message}");
+        assert!(
+            message.contains("0: 4 sessions closed, 2 draining"),
+            "the counts of the worker that answered must survive: {message}"
+        );
+    }
+
+    /// A worker still `Processing` when the gatherer ends has not answered
+    /// successfully, and a timeout alone fails the request even when every
+    /// received answer was `Ok`.
+    #[test]
+    fn a_timeout_fails_the_request_even_when_every_answer_was_ok() {
+        let message = close_sessions_outcome(vec![(0, answered(1, 0))], true)
+            .expect_err("a timeout must never be reported as success");
+        assert!(
+            message.contains("timed out waiting for every worker"),
+            "{message}"
+        );
+        assert!(
+            message.contains("0: 1 sessions closed, 0 draining"),
+            "{message}"
+        );
+
+        let message = close_sessions_outcome(
+            vec![(0, failed(ResponseStatus::Processing, "still working"))],
+            false,
+        )
+        .expect_err("a Processing worker has not succeeded");
+        assert!(message.contains("0: still working"), "{message}");
     }
 }
 
