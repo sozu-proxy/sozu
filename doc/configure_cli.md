@@ -190,6 +190,48 @@ frontends or backends either; this key belongs to cluster my_cluster, left in pl
 To remove that route, send the removal again with `id <cluster>` for the cluster it names, or
 with `deny` for a route with no cluster.
 
+## Close the sessions of a cluster or of a backend
+
+```bash
+sozu --config /etc/sozu/config.toml cluster close-sessions --id <my_cluster_id>
+sozu --config /etc/sozu/config.toml cluster close-sessions --id <my_cluster_id> --backend-id <my_backend_id>
+sozu --config /etc/sozu/config.toml cluster close-sessions --id <my_cluster_id> --address 10.0.0.12:8080
+```
+
+Every worker closes the sessions that hold a backend connection to the cluster, connecting or
+connected. `--backend-id` and `--address` narrow it to one backend; given together, a backend
+must match both. The configuration does not change: the cluster and its backends keep
+routing, so a client that reconnects is served again, by whichever backend the load balancer
+picks. To stop routing to a backend, remove it first, then close its sessions.
+
+Each session closes the way a soft stop closes it, without waiting for the rest:
+
+- an HTTP/1.1 session with no request in flight, a TCP session and a WebSocket session close
+  at once;
+- an HTTP/1.1 session with a request in flight finishes it: the response carries
+  `Connection: close` only if the backend response headers are not parsed yet (once parsed,
+  they go out as received), and the connection closes once it is sent;
+- an HTTP/2 session receives a GOAWAY, finishes its open streams and closes. The listener's
+  `h2_graceful_shutdown_deadline_seconds` bounds the wait only when it is nonzero; with `0`
+  the session drains without bound, as it does on a soft stop.
+
+A session counts as one of the cluster's while it holds a backend connection to it. An HTTP/2
+session multiplexing several clusters is closed by a request naming any of them; a keep-alive
+session whose backend connection already closed is not selected. UDP flows are not closed.
+
+The answer gives, per worker, how many sessions closed at once and how many are draining:
+
+```text
+Success: Closed the selected sessions on every worker
+Worker 0
+3 sessions closed, 1 draining
+```
+
+The request is an action, not configuration: it is neither saved by `state save` nor replayed
+by `state load` or an upgrade, and a session opened after it is not affected. The main process
+and every worker must run a release that knows it: a worker that predates it closes nothing
+and does not answer, so the command fails when it times out.
+
 ## Check the status of sozu
 
 It shows a list of workers and show information about their statuses.

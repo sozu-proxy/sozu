@@ -739,6 +739,10 @@ impl ProxySession for HttpSession {
         self.state.shutting_down()
     }
 
+    fn targets(&self, target: &crate::SessionTarget) -> bool {
+        self.state.targets(target)
+    }
+
     fn last_event(&self) -> Instant {
         self.last_event
     }

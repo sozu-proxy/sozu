@@ -891,7 +891,17 @@ and its siblings) deregisters and drops its listener sockets — then calls
   connection, whose stream the keep-alive branch of `ConnectionH1::writable`
   returned to `StreamState::Idle`, closes on the next call
   (`Mux::shutting_down_inner` waits only for `Linked` and non-quiesced
-  `Unlinked` streams).
+  `Unlinked` streams). The linked stream is marked `closing`, so its response
+  announces `Connection: close` only while the backend response headers are
+  not parsed yet (`HttpContext::on_response_headers`; once parsed they are
+  forwarded as received), and `ConnectionH1::writable` closes the
+  frontend once that response is sent.
+- **Targeted close.** A `CloseSessions` request applies the same
+  `ProxySession::shutting_down` to the sessions holding a backend connection to
+  one cluster or backend (`Server::close_sessions`), and
+  `Server::drive_closing_sessions` asks those still draining again on every
+  100 ms tick, as `Server::shut_down_sessions` does for a soft stop. The worker
+  keeps serving everything else.
 - **TCP.** `TcpSession::shutting_down` answers `true`, as it has since
   `be5dd44b` (2020-01-10): a TCP session is closed on the first
   `shut_down_sessions` pass after the soft stop, whatever it still has in

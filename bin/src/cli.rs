@@ -688,6 +688,29 @@ pub enum ClusterCmd {
         #[clap(subcommand)]
         cmd: ClusterConnectionAttemptsCmd,
     },
+    /// Close, on every worker, the sessions holding a backend connection to
+    /// the cluster, or to one of its backends. Idle, TCP and WebSocket
+    /// sessions close at once; a session with HTTP work in flight finishes it
+    /// first (HTTP/1.1 `Connection: close`, HTTP/2 GOAWAY). Not saved.
+    #[clap(
+        name = "close-sessions",
+        about = "Close the sessions of a cluster, or of one of its backends, on every worker"
+    )]
+    CloseSessions {
+        #[clap(short = 'i', long = "id", help = "cluster id")]
+        id: String,
+        #[clap(
+            long = "backend-id",
+            help = "only the sessions connected to this backend"
+        )]
+        backend_id: Option<String>,
+        #[clap(
+            short = 'a',
+            long = "address",
+            help = "only the sessions connected to the backend at this address, format: IP:port"
+        )]
+        address: Option<SocketAddr>,
+    },
 }
 
 #[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
