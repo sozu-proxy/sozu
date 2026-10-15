@@ -3226,21 +3226,32 @@ impl FileBackendConfig {
     ///
     /// A socket-address literal never reaches the resolver and keeps its
     /// configured `backend_id`, or the positional default id
-    /// [`HttpClusterConfig::generate_requests`] derives. A `host:port`
+    /// `<cluster_id>-<index>-<address>`, where `index` is the entry's position
+    /// in the file's `backends` list, so it does not move when a name before
+    /// it resolves to more or fewer addresses. A `host:port`
     /// yields one backend per distinct resolved address, sorted so the
     /// result does not depend on the resolver's answer order, each with a
     /// deterministic id: `<backend_id>-<address>` when `backend_id` is set,
     /// `<cluster_id>-<host:port>-<address>` otherwise. When the name
-    /// resolves to more than one address, a configured `sticky_id` is
-    /// suffixed with `-<address>` too, so it stays unique in the cluster.
-    pub fn resolve(&self, cluster_id: &str) -> Result<Vec<BackendConfig>, ConfigError> {
+    /// resolves, a configured `sticky_id` is suffixed with `-<address>` too,
+    /// so it stays unique in the cluster and does not change when the answer
+    /// grows or shrinks.
+    pub fn resolve(
+        &self,
+        cluster_id: &str,
+        index: usize,
+    ) -> Result<Vec<BackendConfig>, ConfigError> {
         if let Ok(address) = self.address.parse::<SocketAddr>() {
             return Ok(vec![BackendConfig {
                 address,
                 weight: self.weight,
                 sticky_id: self.sticky_id.clone(),
                 backup: self.backup,
-                backend_id: self.backend_id.clone(),
+                backend_id: Some(
+                    self.backend_id
+                        .to_owned()
+                        .unwrap_or_else(|| format!("{cluster_id}-{index}-{address}")),
+                ),
             }]);
         }
 
@@ -3276,19 +3287,15 @@ impl FileBackendConfig {
             });
         }
 
-        let multiple = addresses.len() > 1;
         let backends: Vec<BackendConfig> = addresses
             .iter()
             .map(|address| BackendConfig {
                 address: *address,
                 weight: self.weight,
-                sticky_id: self.sticky_id.as_ref().map(|sticky_id| {
-                    if multiple {
-                        format!("{sticky_id}-{address}")
-                    } else {
-                        sticky_id.to_owned()
-                    }
-                }),
+                sticky_id: self
+                    .sticky_id
+                    .as_ref()
+                    .map(|sticky_id| format!("{sticky_id}-{address}")),
                 backup: self.backup,
                 backend_id: Some(match &self.backend_id {
                     Some(backend_id) => format!("{backend_id}-{address}"),
@@ -3350,8 +3357,8 @@ impl FileClusterConfig {
             })?;
         }
         let mut backends = Vec::with_capacity(self.backends.len());
-        for backend in &self.backends {
-            backends.extend(backend.resolve(cluster_id)?);
+        for (index, backend) in self.backends.iter().enumerate() {
+            backends.extend(backend.resolve(cluster_id, index)?);
         }
         // POST: every file entry yields at least one backend.
         debug_assert!(backends.len() >= self.backends.len());
@@ -6101,7 +6108,7 @@ mod tests {
                     weight: None,
                     sticky_id: None,
                     backup: None,
-                    backend_id: None,
+                    backend_id: Some("cluster-0-127.0.0.1:8080".to_owned()),
                 },
                 BackendConfig {
                     address: "[::1]:8081".parse().unwrap(),
@@ -6112,6 +6119,47 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// #347: a literal keeps the id of its position in the file, whatever
+    /// the number of addresses a name before it resolved to, on the HTTP and
+    /// the TCP path alike.
+    #[test]
+    fn a_literal_after_a_name_keeps_its_file_position_id() {
+        let http = http_cluster_from_backends(
+            r#"{ address = "localhost:8080" }, { address = "127.0.0.1:9000" }"#,
+        )
+        .expect("the cluster must build");
+        assert_eq!(
+            http.backends.last().and_then(|b| b.backend_id.as_deref()),
+            Some("cluster-1-127.0.0.1:9000")
+        );
+
+        let file: FileClusterConfig = toml::from_str(
+            "protocol = \"tcp\"\nfrontends = []\n\
+             backends = [{ address = \"localhost:8080\" }, { address = \"127.0.0.1:9000\" }]\n",
+        )
+        .expect("the cluster must parse");
+        let ClusterConfig::Tcp(tcp) = file
+            .to_cluster_config("cluster", &HashSet::new())
+            .expect("the tcp cluster must build")
+        else {
+            panic!("a tcp cluster must build as one");
+        };
+        assert_eq!(
+            tcp.backends.last().and_then(|b| b.backend_id.as_deref()),
+            Some("cluster-1-127.0.0.1:9000")
+        );
+        let error = toml::from_str::<FileClusterConfig>(
+            "protocol = \"tcp\"\nfrontends = []\nbackends = [{ address = \"localhost\" }]\n",
+        )
+        .expect("the cluster must parse")
+        .to_cluster_config("cluster", &HashSet::new())
+        .expect_err("a missing port refuses the tcp cluster");
+        assert!(matches!(
+            error,
+            ConfigError::BackendAddressResolution { .. }
+        ));
     }
 
     /// #347: an address that is neither a socket address nor a resolvable
@@ -6173,8 +6221,9 @@ mod tests {
             ]
         );
 
+        // The sticky id does not depend on how many addresses came back.
         let single = entry.expand("cluster", vec![v4]).expect("one address");
-        assert_eq!(single[0].sticky_id.as_deref(), Some("pinned"));
+        assert_eq!(single[0].sticky_id, Some(format!("pinned-{v4}")));
         assert!(matches!(
             entry.expand("cluster", Vec::new()),
             Err(ConfigError::BackendAddressResolution { .. })
