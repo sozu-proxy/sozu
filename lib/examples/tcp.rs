@@ -10,8 +10,8 @@ use sozu_command_lib::{
     channel::Channel,
     logging::setup_default_logging,
     proto::command::{
-        AddBackend, LoadBalancingParams, RequestTcpFrontend, SocketAddress, TcpListenerConfig,
-        WorkerRequest, request::RequestType,
+        AddBackend, Cluster, LoadBalancingParams, RequestTcpFrontend, SocketAddress,
+        TcpListenerConfig, WorkerRequest, request::RequestType,
     },
 };
 
@@ -36,6 +36,10 @@ fn main() -> anyhow::Result<()> {
         sozu_lib::tcp::testing::start_tcp_worker(listener, max_buffers, buffer_size, channel);
     });
 
+    let cluster = Cluster {
+        cluster_id: String::from("test"),
+        ..Default::default()
+    };
     let tcp_front = RequestTcpFrontend {
         cluster_id: String::from("test"),
         address: SocketAddress::new_v4(127, 0, 0, 1, 8080),
@@ -51,6 +55,12 @@ fn main() -> anyhow::Result<()> {
         unix_path: None,
     };
 
+    // a backend belongs to its cluster: the worker refuses one of an unknown cluster
+    command.write_message(&WorkerRequest {
+        id: String::from("ID_CLUSTER"),
+        content: RequestType::AddCluster(cluster).into(),
+    });
+
     command.write_message(&WorkerRequest {
         id: String::from("ID_ABCD"),
         content: RequestType::AddTcpFrontend(tcp_front).into(),
@@ -61,8 +71,9 @@ fn main() -> anyhow::Result<()> {
         content: RequestType::AddBackend(tcp_backend).into(),
     });
 
-    info!("TCP -> {:?}", command.read_message());
-    info!("TCP -> {:?}", command.read_message());
+    println!("TCP -> {:?}", command.read_message());
+    println!("TCP -> {:?}", command.read_message());
+    println!("TCP -> {:?}", command.read_message());
 
     let _ = jg.join();
     info!("good bye");

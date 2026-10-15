@@ -128,6 +128,19 @@ fn an_ip_backend_stays_actionable_for_an_old_worker() {
     assert!(old_worker_adds(&request).is_some());
 }
 
+/// A backend belongs to an existing cluster, so each scenario adds it first.
+fn add_cluster(state: &mut ConfigState, cluster_id: &str) {
+    state
+        .dispatch(
+            &RequestType::AddCluster(Cluster {
+                cluster_id: cluster_id.to_owned(),
+                ..Default::default()
+            })
+            .into(),
+        )
+        .expect("the cluster must be added");
+}
+
 /// A UDP cluster relays datagrams over UDP sockets, so it refuses a UNIX
 /// backend, whichever of the cluster, its frontend or the backend came first,
 /// and on whichever verb the backend arrives.
@@ -142,6 +155,7 @@ fn a_udp_cluster_refuses_a_unix_backend_in_every_order() {
     for order in unix_backend_orders(unix_backend("dns")) {
         // frontend first, then the backend
         let mut state = ConfigState::new();
+        add_cluster(&mut state, "dns");
         state
             .dispatch(&RequestType::AddUdpFrontend(udp_frontend.clone()).into())
             .expect("the frontend must be added");
@@ -153,6 +167,7 @@ fn a_udp_cluster_refuses_a_unix_backend_in_every_order() {
 
         // backend first, then the frontend
         let mut state = ConfigState::new();
+        add_cluster(&mut state, "dns");
         state
             .dispatch(&order)
             .expect("a unix backend on a cluster with no UDP frontend yet is admitted");
@@ -166,6 +181,7 @@ fn a_udp_cluster_refuses_a_unix_backend_in_every_order() {
 
         // backend first, then the cluster turns UDP
         let mut state = ConfigState::new();
+        add_cluster(&mut state, "dns");
         state.dispatch(&order).expect("the backend must be added");
         assert!(
             state
@@ -241,6 +257,7 @@ fn the_unix_backend_verb_is_request_field_72_with_the_same_state() {
 #[test]
 fn a_udp_cluster_keeps_its_ip_backends() {
     let mut state = ConfigState::new();
+    add_cluster(&mut state, "dns");
     state
         .dispatch(
             &RequestType::AddUdpFrontend(RequestUdpFrontend {

@@ -75,7 +75,8 @@ message Request {
     RequestTcpFrontend add_tcp_frontend = 22;
     // remove a TCP frontend
     RequestTcpFrontend remove_tcp_frontend = 23;
-    // add a backend
+    // add a backend to an existing cluster: a backend naming a cluster that
+    // was never added, or was removed, is refused
     AddBackend add_backend = 24;
     // remove a backend
     RemoveBackend remove_backend = 25;
@@ -1582,7 +1583,8 @@ enum LoadMetric {
     CONNECTION_TIME = 2;
 }
 
-// add a backend
+// add a backend to the cluster `cluster_id` names, which must exist: the
+// backend belongs to it and is removed with it
 message AddBackend {
     required string cluster_id = 1;
     required string backend_id = 2;
