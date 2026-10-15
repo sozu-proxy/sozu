@@ -2871,6 +2871,80 @@ mod test {
         }
     }
 
+    /// Equal weights keep the exact sequence the cursor-only `RoundRobin` of
+    /// `origin/main` (588c4e2f5) produced, across candidate membership
+    /// transitions. That `RoundRobin` picks view index `next_backend % len` and
+    /// then stores `(next_backend + 1) % len`; the expected literals below are
+    /// worked by hand from those two lines, not captured from this
+    /// implementation. Positions are list positions of a four-backend list:
+    ///
+    /// - view `[0, 1, 2, 3]`, six picks: `0 1 2 3 0 1`, cursor `2`;
+    /// - backend 1 leaves the view (`[0, 2, 3]`): `2 % 3 = 2` is list
+    ///   position 3, then `0 1 2 0` in view order: list `3 0 2 3 0`, cursor `1`;
+    /// - backend 1 re-enters (`[0, 1, 2, 3]`): `1 2 3 0 1`, cursor `2`;
+    /// - the view shrinks to `[0, 3]`: `2 % 2 = 0`, then `1 0 1`: list `0 3 0 3`.
+    ///
+    /// TO SEE THIS RED: let equal weights fall through to `smooth_weighted`;
+    /// its running weights ignore the cursor, so the removal leg moves.
+    #[test]
+    fn round_robin_equal_weights_match_the_origin_main_sequence_across_membership_changes() {
+        for weights in [
+            [None; 4],
+            [Some(50); 4],
+            [Some(DEFAULT_WEIGHT); 4],
+            [Some(0), Some(1), Some(-3), Some(1)],
+        ] {
+            for rebuild_on_change in [false, true] {
+                let backends = weighted_backends(&weights);
+                let mut policy = RoundRobin::new();
+                let now = Instant::now();
+                let positions = |policy: &mut RoundRobin, view: &[usize], count: usize| {
+                    (0..count)
+                        .map(|_| {
+                            let picked = policy
+                                .next_available_backend(None, Candidates::new(&backends, view, now))
+                                .expect("a non-empty view selects");
+                            backends
+                                .iter()
+                                .position(|backend| Rc::ptr_eq(backend, &picked))
+                                .expect("the pick is one of the candidates")
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let change = |policy: &mut RoundRobin| {
+                    if rebuild_on_change {
+                        policy.rebuild(&backends);
+                    }
+                };
+                let label = format!("{weights:?} rebuild={rebuild_on_change}");
+
+                assert_eq!(
+                    positions(&mut policy, &[0, 1, 2, 3], 6),
+                    [0, 1, 2, 3, 0, 1],
+                    "{label}"
+                );
+                change(&mut policy);
+                assert_eq!(
+                    positions(&mut policy, &[0, 2, 3], 5),
+                    [3, 0, 2, 3, 0],
+                    "{label} after a removal"
+                );
+                change(&mut policy);
+                assert_eq!(
+                    positions(&mut policy, &[0, 1, 2, 3], 5),
+                    [1, 2, 3, 0, 1],
+                    "{label} after a re-add"
+                );
+                change(&mut policy);
+                assert_eq!(
+                    positions(&mut policy, &[0, 3], 4),
+                    [0, 3, 0, 3],
+                    "{label} after shrinking to two"
+                );
+            }
+        }
+    }
+
     /// With no client key, `HRW` and `MAGLEV` fall back to round robin, now
     /// weighted like it.
     #[test]

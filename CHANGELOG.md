@@ -19,6 +19,7 @@
   policies now spreads its traffic by them. A cluster whose backends all
   carry the same weight (the default, 100, when unset) selects exactly the
   same sequence as before. No command, configuration or state format changes.
+
 ### Fixed
 
 - Re-adding the last HTTP, HTTPS, TCP or UDP listener removed from an address
