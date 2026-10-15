@@ -3721,6 +3721,17 @@ mod tests {
                 backup: None,
             };
 
+            // A backend belongs to its cluster: add the cluster first.
+            command
+                .write_message(&WorkerRequest {
+                    id: "ID_YOLO0".to_owned(),
+                    content: RequestType::AddCluster(sozu_command::proto::command::Cluster {
+                        cluster_id: "yolo".to_owned(),
+                        ..Default::default()
+                    })
+                    .into(),
+                })
+                .expect("could not send AddCluster");
             command
                 .write_message(&WorkerRequest {
                     id: "ID_YOLO1".to_owned(),
@@ -3762,7 +3773,7 @@ mod tests {
                 .expect("could not send AddBackend for front2");
         }
 
-        for _ in 0..4 {
+        for _ in 0..5 {
             println!(
                 "read_message: {:?}",
                 command

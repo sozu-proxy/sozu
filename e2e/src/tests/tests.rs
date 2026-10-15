@@ -2231,6 +2231,9 @@ fn try_http_behaviors() -> State {
 
     let back_address = create_local_address();
 
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
     worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
         "cluster_0",
         "cluster_0-0".to_string(),

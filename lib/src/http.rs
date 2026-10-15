@@ -2294,6 +2294,17 @@ mod tests {
                 path: PathRule::prefix("/".to_owned()),
                 ..Default::default()
             };
+            // A backend belongs to its cluster: add the cluster first.
+            command
+                .write_message(&WorkerRequest {
+                    id: "ID_CLUSTER".to_owned(),
+                    content: RequestType::AddCluster(Cluster {
+                        cluster_id: "cluster_1".to_owned(),
+                        ..Default::default()
+                    })
+                    .into(),
+                })
+                .expect("could not send AddCluster");
             command
                 .write_message(&WorkerRequest {
                     id: "ID_ABCD".to_owned(),
@@ -2315,6 +2326,7 @@ mod tests {
                 })
                 .expect("could not send AddBackend");
 
+            println!("test received: {:?}", command.read_message());
             println!("test received: {:?}", command.read_message());
             println!("test received: {:?}", command.read_message());
 
@@ -2414,6 +2426,17 @@ mod tests {
                 cluster_id: Some("cluster_1".to_owned()),
                 ..Default::default()
             };
+            // A backend belongs to its cluster: add the cluster first.
+            command
+                .write_message(&WorkerRequest {
+                    id: "ID_CLUSTER".to_owned(),
+                    content: RequestType::AddCluster(Cluster {
+                        cluster_id: "cluster_1".to_owned(),
+                        ..Default::default()
+                    })
+                    .into(),
+                })
+                .expect("could not send AddCluster");
             command
                 .write_message(&WorkerRequest {
                     id: "ID_ABCD".to_owned(),
@@ -2435,6 +2458,7 @@ mod tests {
                 })
                 .expect("could not send AddBackend");
 
+            println!("test received: {:?}", command.read_message());
             println!("test received: {:?}", command.read_message());
             println!("test received: {:?}", command.read_message());
 
