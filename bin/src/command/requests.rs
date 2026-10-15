@@ -29,12 +29,13 @@ use sozu_command_lib::{
     parser::parse_several_requests,
     proto::command::{
         AggregatedMetrics, AvailableMetrics, CertificateAndKey, CertificatesWithFingerprints,
-        ClusterHashes, ClusterInformations, Event, EventKind, FilteredMetrics, FrontendFilters,
-        HardStop, MetricDetail, MetricDetailStatus, MetricsConfiguration, QueryCertificatesFilters,
-        QueryHealthChecks, QueryMetricsOptions, Request, ResponseContent, ResponseStatus, RunState,
-        SetMetricDetail, SoftStop, Status, UpdateHttpListenerConfig, UpdateHttpsListenerConfig,
-        UpdateTcpListenerConfig, UpdateUdpListenerConfig, WorkerInfo, WorkerInfos, WorkerRequest,
-        WorkerResponse, WorkerResponses, request::RequestType, response_content::ContentType,
+        CloseSessions, ClusterHashes, ClusterInformations, Event, EventKind, FilteredMetrics,
+        FrontendFilters, HardStop, MetricDetail, MetricDetailStatus, MetricsConfiguration,
+        QueryCertificatesFilters, QueryHealthChecks, QueryMetricsOptions, Request, ResponseContent,
+        ResponseStatus, RunState, SetMetricDetail, SoftStop, Status, UpdateHttpListenerConfig,
+        UpdateHttpsListenerConfig, UpdateTcpListenerConfig, UpdateUdpListenerConfig, WorkerInfo,
+        WorkerInfos, WorkerRequest, WorkerResponse, WorkerResponses, request::RequestType,
+        response_content::ContentType,
     },
     proto::display::forwarded_headers_label,
     sd_notify,
@@ -193,6 +194,10 @@ pub(crate) enum RequestTaskSnapshot {
         gatherer: DefaultGatherer,
         main_process_response: Option<ResponseContent>,
     },
+    CloseSessions {
+        client_token: usize,
+        gatherer: DefaultGatherer,
+    },
     LoadStaticConfig {
         gatherer: PerEntryGatherer,
         client_token: Option<usize>,
@@ -267,6 +272,13 @@ impl RequestTaskSnapshot {
                 client_token: Token(client_token),
                 gatherer,
                 main_process_response,
+            }),
+            Self::CloseSessions {
+                client_token,
+                gatherer,
+            } => Box::new(CloseSessionsTask {
+                client_token: Token(client_token),
+                gatherer,
             }),
             Self::LoadStaticConfig {
                 gatherer,
@@ -537,6 +549,9 @@ macro_rules! audit_log_context {
 /// for the verb still flows through the special-case inline emission
 /// (`EventKind::MetricDetailChanged`, proto tag 30) so SOC visibility
 /// is preserved without flapping the unit state.
+///
+/// `CloseSessions` is excluded too: it closes live sessions and changes
+/// neither the configuration nor the fleet.
 fn is_mutating_verb(req: &RequestType) -> bool {
     matches!(
         req,
@@ -782,6 +797,7 @@ impl Server {
             RequestType::SetMetricDetail(req) => {
                 set_metric_detail_request(self, client, req);
             }
+            RequestType::CloseSessions(request) => close_sessions(self, client, request),
         }
 
         if mutating && let Err(e) = sd_notify::notify(sd_notify::STATE_READY) {
@@ -1248,6 +1264,103 @@ impl GatheringTask for QueryClustersTask {
             .into(),
             "Successfully queried clusters",
         );
+    }
+}
+
+//===============================================
+// Close sessions
+
+/// Gathers each worker's `ClosedSessions` for a `CloseSessions` request.
+#[derive(Debug)]
+pub struct CloseSessionsTask {
+    pub client_token: Token,
+    pub gatherer: DefaultGatherer,
+}
+
+/// Fan a `CloseSessions` request out to every worker. Nothing touches the
+/// main process state: the request acts on live sessions only, so it is
+/// neither saved nor replayed by `load_state` or an upgrade.
+pub fn close_sessions(server: &mut Server, client: &mut ClientSession, request: CloseSessions) {
+    info!(
+        "closing the sessions of cluster {} (backend id {:?}, address {:?})",
+        request.cluster_id, request.backend_id, request.address
+    );
+    client.return_processing("Closing sessions...");
+
+    server.scatter(
+        RequestType::CloseSessions(request).into(),
+        Box::new(CloseSessionsTask {
+            client_token: client.token,
+            gatherer: DefaultGatherer::default(),
+        }),
+        Timeout::Default,
+        None,
+    )
+}
+
+impl GatheringTask for CloseSessionsTask {
+    fn client_token(&self) -> Option<Token> {
+        Some(self.client_token)
+    }
+
+    fn get_gatherer(&mut self) -> &mut dyn Gatherer {
+        &mut self.gatherer
+    }
+
+    fn snapshot(&self, _timing: TaskSnapshotTiming) -> Result<TaskSnapshot, TaskSnapshotError> {
+        Ok(TaskSnapshot::Request(Box::new(
+            RequestTaskSnapshot::CloseSessions {
+                client_token: self.client_token.0,
+                gatherer: self.gatherer.clone(),
+            },
+        )))
+    }
+
+    fn on_finish(
+        self: Box<Self>,
+        _server: &mut Server,
+        client: &mut OptionalClient,
+        timed_out: bool,
+    ) {
+        let mut failures = Vec::new();
+        let mut worker_responses = BTreeMap::new();
+        for (worker_id, response) in self.gatherer.responses {
+            match ResponseStatus::try_from(response.status) {
+                Ok(ResponseStatus::Ok) => {
+                    if let Some(content) = response.content {
+                        worker_responses.insert(worker_id.to_string(), content);
+                    }
+                }
+                Ok(ResponseStatus::Failure) | Ok(ResponseStatus::Processing) | Err(_) => {
+                    failures.push(format!("{worker_id}: {}", response.message));
+                }
+            }
+        }
+        if timed_out {
+            failures.push("timed out waiting for every worker".to_owned());
+        }
+
+        if failures.is_empty() {
+            client.finish_ok_with_content(
+                ContentType::WorkerResponses(WorkerResponses {
+                    map: worker_responses,
+                })
+                .into(),
+                "Closed the selected sessions on every worker",
+            );
+        } else {
+            // The counts of the workers that answered still matter: their
+            // sessions are closed or closing, whatever the others did.
+            for (worker_id, content) in worker_responses {
+                if let Some(ContentType::ClosedSessions(closed)) = content.content_type {
+                    failures.push(format!(
+                        "{worker_id}: {} sessions closed, {} draining",
+                        closed.closed, closed.draining
+                    ));
+                }
+            }
+            client.finish_failure(failures.join(", "));
+        }
     }
 }
 

@@ -27,6 +27,7 @@
 
 mod affinity_key_tests;
 mod backend_failover_tests;
+mod close_sessions_tests;
 mod cluster_ip_limit_tests;
 mod command_channel_security_tests;
 mod eviction_tests;

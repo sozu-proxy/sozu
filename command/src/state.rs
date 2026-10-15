@@ -446,6 +446,8 @@ impl ConfigState {
             | RequestType::SetMaxConnectionsPerSubnet(_)
             | RequestType::QueryMaxConnectionsPerSubnet(_)
             | RequestType::SetMaxConnectionAttempts(_)
+            // an action on live sessions: never saved, never replayed
+            | RequestType::CloseSessions(_)
             | RequestType::HardStop(_) => Ok(()),
 
             _other_request => Err(StateError::UndispatchableRequest),
@@ -4012,9 +4014,10 @@ mod tests {
 
     use super::*;
     use crate::proto::command::{
-        ClientAuthMode, CustomHttpAnswers, Header, HeaderPosition, HstsConfig, LoadBalancingParams,
-        PathRuleKind, RedirectPolicy, RedirectScheme, RequestHttpFrontend, RequestTcpFrontend,
-        RequestUdpFrontend, RulePosition, UdpListenerConfig, UpdateUdpListenerConfig,
+        ClientAuthMode, CloseSessions, CustomHttpAnswers, Header, HeaderPosition, HstsConfig,
+        LoadBalancingParams, PathRuleKind, RedirectPolicy, RedirectScheme, RequestHttpFrontend,
+        RequestTcpFrontend, RequestUdpFrontend, RulePosition, UdpListenerConfig,
+        UpdateUdpListenerConfig,
     };
 
     fn capture_test_logs(run: impl FnOnce() + Send + 'static) -> String {
@@ -9213,5 +9216,56 @@ mod tests {
             state.list_listeners(),
             "a refused patch must leave the listeners untouched"
         );
+    }
+
+    /// `CloseSessions` acts on live sessions only: the state accepts it,
+    /// stores nothing, and neither `generate_requests` (what `save_state`
+    /// writes and `load_state` / an upgrade replay) nor the cluster hashes
+    /// change.
+    #[test]
+    fn close_sessions_is_never_saved_nor_replayed() {
+        let mut state: ConfigState = Default::default();
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("cluster_1"),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        state
+            .dispatch(
+                &RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-0"),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        let requests_before = state.generate_requests();
+        let hashes_before = state.hash_state();
+
+        state
+            .dispatch(
+                &RequestType::CloseSessions(CloseSessions {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: Some(String::from("cluster_1-0")),
+                    address: Some(SocketAddress::new_v4(127, 0, 0, 1, 1026)),
+                })
+                .into(),
+            )
+            .expect("CloseSessions must be accepted by the state");
+
+        let requests_after = state.generate_requests();
+        assert_eq!(requests_after, requests_before);
+        assert!(
+            !requests_after
+                .iter()
+                .any(|request| matches!(request.request_type, Some(RequestType::CloseSessions(_))))
+        );
+        assert_eq!(state.hash_state(), hashes_before);
     }
 }

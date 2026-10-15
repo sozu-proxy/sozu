@@ -504,6 +504,7 @@ fn content_type_name(ct: Option<&ContentType>) -> &'static str {
         Some(ContentType::HealthChecksList(_)) => "HealthChecksList",
         Some(ContentType::MetricDetailStatus(_)) => "MetricDetailStatus",
         Some(ContentType::WorkerMetricDetailStatus(_)) => "WorkerMetricDetailStatus",
+        Some(ContentType::ClosedSessions(_)) => "ClosedSessions",
     }
 }
 
