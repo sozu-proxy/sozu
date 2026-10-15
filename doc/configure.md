@@ -1186,6 +1186,42 @@ steps over that address's own ids (about `g²/2` in practice) — never a cost
 growing with the square of the cluster — and allocates nothing. Relinking on
 a change costs the same: linear in the cluster plus `g²` per shared address.
 
+#### UNIX domain socket backends
+
+An HTTP, HTTPS or TCP backend can be reached over a UNIX domain stream socket
+instead of TCP ([#152](https://github.com/sozu-proxy/sozu/issues/152)): set
+`unix_path` to an absolute filesystem path, or to `@name` for a socket in the
+Linux abstract namespace (no file on disk; refused on other platforms).
+
+```toml
+backends = [
+  { address = "127.0.0.1:10001", unix_path = "/run/app/http.sock" },
+  { address = "127.0.0.1:10002", unix_path = "@app-http" },
+]
+```
+
+`address` stays mandatory: sozu keeps identifying a backend by it (removal,
+retry exclusion, `HRW`/`MAGLEV`/shard placement, the "one address is one
+share" rule above, events and the `Host` of an HTTP health probe), but never
+dials it when `unix_path` is set. Give each unix backend an address used by
+no other backend of the cluster; the configuration loader refuses a shared one.
+At runtime the same field is `AddBackend.unix_path`, and
+`sozu backend add --unix-path <path>` sets it. The main process and every
+worker refuse a `unix_path` that is not absolute, does not fit a
+`sockaddr_un` (107 bytes) or holds a NUL byte. UDP is not supported:
+datagrams are relayed over UDP sockets only. The configuration file refuses
+`unix_path` on a UDP cluster, but an `AddBackend` order is not checked against
+its cluster's protocol, and a UDP cluster given one relays to `address`.
+
+The socket is dialed nonblocking like a TCP backend, so a missing socket file
+or a full accept queue counts as a failed connection (below), and health
+checks probe it over the same socket. Every HTTP, HTTPS and TCP backend
+connection goes through that one dial, so HTTP/2 backends, WebSocket upgrades
+and `send_proxy` take the same path; the end-to-end tests cover HTTP/1.1 and
+TCP passthrough. Logs render the backend's `address`, and a failed dial's
+error names the socket path; `TCP_NODELAY` is not set and the RTT gauges stay
+empty for these connections, since a UNIX socket has neither.
+
 #### Backend connection failover
 
 A backend connection that fails to establish is retried on another backend

@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Added
+
+- Backends reachable over UNIX domain sockets
+  ([#152](https://github.com/sozu-proxy/sozu/issues/152)). A backend's new
+  `unix_path` (configuration file, `AddBackend.unix_path` in the protocol,
+  `sozu backend add --unix-path`) takes an absolute path or a Linux
+  abstract-namespace `@name`; HTTP, HTTPS and TCP clusters dial it instead of
+  `address`, which stays the backend's identity and must be unique in its
+  cluster. Health checks probe the same socket. UDP is not supported: the
+  configuration file refuses it there, the command channel does not. The
+  protocol change is additive: a worker that predates it ignores the field and
+  dials `address`, so upgrade every process before declaring one.
+
 ## 2.3.1 - 2026-10-14
 
 ### Fixed

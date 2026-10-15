@@ -1550,6 +1550,15 @@ message AddBackend {
     optional string sticky_id = 4;
     optional LoadBalancingParams load_balancing_parameters = 5;
     optional bool backup = 6;
+    // when set, sozu dials this UNIX domain stream socket instead of `address`:
+    // a filesystem path, or `@name` for a Linux abstract-namespace socket.
+    // `address` stays the backend's identity within its cluster (removal,
+    // retry exclusion, sticky and hash routing, events) and is never dialed,
+    // so it must be unique among the cluster's backends.
+    // Applies to HTTP, HTTPS and TCP clusters. The configuration file refuses
+    // it on a UDP cluster; this order is not checked against the cluster's
+    // protocol, and a UDP cluster would relay datagrams to `address`.
+    optional string unix_path = 7;
 }
 
 // remove an existing backend

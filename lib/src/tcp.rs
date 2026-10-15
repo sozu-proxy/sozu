@@ -1841,7 +1841,10 @@ impl TcpSession {
             .backend_from_cluster_id(&cluster_id, affinity_key, Instant::now())
             .map_err(BackendConnectionError::Backend)?;
 
-        if let Err(e) = stream.set_nodelay(true) {
+        // A `unix_path` backend has no TCP layer to set TCP_NODELAY on.
+        if backend.borrow().unix_path.is_none()
+            && let Err(e) = stream.set_nodelay(true)
+        {
             error!(
                 "{} Error setting nodelay on back socket({:?}): {:?}",
                 log_context!(self),
@@ -3688,6 +3691,7 @@ mod tests {
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
                 sticky_id: None,
                 backup: None,
+                unix_path: None,
             };
 
             command
@@ -3716,6 +3720,7 @@ mod tests {
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
                 sticky_id: None,
                 backup: None,
+                unix_path: None,
             };
             command
                 .write_message(&WorkerRequest {

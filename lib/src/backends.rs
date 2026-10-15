@@ -172,6 +172,44 @@ pub struct Backend {
     pub backup: bool,
     pub connection_time: PeakEWMA,
     pub health: HealthState,
+    /// UNIX domain socket dialed instead of `address`, already checked by
+    /// `sozu_command::config::parse_backend_unix_path`. `address` still
+    /// identifies the backend.
+    pub unix_path: Option<String>,
+}
+
+/// Open a nonblocking stream connection to a backend: TCP to `address`, or a
+/// UNIX domain connect to `unix_path` when it is set (an absolute path, or
+/// `@name` for the Linux abstract namespace).
+///
+/// A UNIX stream comes back as the descriptor of a `mio::net::TcpStream`, so
+/// the H1, H2 and TCP pipelines take it unchanged. Everything they do on a
+/// backend socket is a socket call that answers the same way on both
+/// families: `read(2)`, `write(2)`, `writev(2)`, `shutdown(2)`, `SO_ERROR`,
+/// `getpeername(2)` through `socket2` (std's `peer_addr` rejects a non-INET
+/// family), and epoll registration. The TCP-only options are skipped by the
+/// callers (`TCP_NODELAY`) or already optional (`TCP_INFO` in
+/// `socket::stats::socket_rtt` answers `None`), and the peer the logs render
+/// is the identity `address` cached in `SessionTcpStream`.
+pub fn connect_backend(address: SocketAddr, unix_path: Option<&str>) -> std::io::Result<TcpStream> {
+    let Some(unix_path) = unix_path else {
+        return TcpStream::connect(address);
+    };
+    let unix_address = sozu_command::config::parse_backend_unix_path(unix_path)
+        .map_err(|reason| std::io::Error::new(std::io::ErrorKind::InvalidInput, reason))?;
+    // The error names the socket: `address` is all the failure logs carry.
+    let stream = mio::net::UnixStream::connect_addr(&unix_address)
+        .map_err(|error| std::io::Error::new(error.kind(), format!("{unix_path}: {error}")))?;
+    let stream = TcpStream::from_std(std::net::TcpStream::from(std::os::fd::OwnedFd::from(
+        stream,
+    )));
+    // POST: the descriptor is the UNIX socket just dialed, not a TCP one.
+    debug_assert_eq!(
+        socket2::SockRef::from(&stream).domain().ok(),
+        Some(socket2::Domain::UNIX),
+        "a unix_path backend dials a UNIX domain socket"
+    );
+    Ok(stream)
 }
 
 impl Backend {
@@ -221,7 +259,20 @@ impl Backend {
             backup: backup.unwrap_or(false),
             connection_time: PeakEWMA::new(now),
             health: HealthState::default(),
+            unix_path: None,
         }
+    }
+
+    /// This backend, dialed over the UNIX domain socket `unix_path` instead
+    /// of `address` when it is set.
+    pub fn with_unix_path(mut self, unix_path: Option<String>) -> Backend {
+        self.unix_path = unix_path;
+        self
+    }
+
+    /// Open a nonblocking connection to this backend, see [`connect_backend`].
+    pub fn connect_socket(&self) -> std::io::Result<TcpStream> {
+        connect_backend(self.address, self.unix_path.as_deref())
     }
 
     pub fn set_closing(&mut self) {
@@ -405,7 +456,7 @@ impl Backend {
         let failures_before = self.failures;
         let connections_before = self.active_connections;
 
-        match mio::net::TcpStream::connect(self.address) {
+        match self.connect_socket() {
             Ok(tcp_stream) => {
                 //self.retry_policy.succeed();
                 self.inc_connections();
@@ -1394,7 +1445,8 @@ impl BackendList {
                 backend.sticky_id.clone(),
                 backend.load_balancing_parameters,
                 backend.backup,
-            );
+            )
+            .with_unix_path(backend.unix_path.clone());
             list.add_backend(backend);
         }
 
@@ -1424,6 +1476,7 @@ impl BackendList {
                 b.load_balancing_parameters
                     .clone_from(&backend.load_balancing_parameters);
                 b.backup = backend.backup;
+                b.unix_path.clone_from(&backend.unix_path);
             }
         }
         // Insert grows the list by exactly one and bumps `next_id`; an update
@@ -2665,6 +2718,7 @@ mod backends_test {
                 sticky_id: None,
                 load_balancing_parameters: None,
                 backup: None,
+                unix_path: None,
             }],
         );
         map.import_configuration_state(&input);
@@ -2877,6 +2931,7 @@ mod backends_test {
                         sticky_id: None,
                         load_balancing_parameters: None,
                         backup: None,
+                        unix_path: None,
                     })
                     .collect();
                 state.insert(cluster_id, backends);
@@ -3978,5 +4033,109 @@ mod same_address_tests {
                 "{policy:?}: 256 selections made {allocated} allocations"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod unix_path_tests {
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixListener,
+        path::PathBuf,
+        time::Instant,
+    };
+
+    use super::*;
+
+    /// A filesystem socket path unique to this test process and `tag`.
+    fn socket_path(tag: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("sozu-lib-{tag}-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    /// Wait for the nonblocking `stream` to finish connecting, then echo a
+    /// payload through `listener` and back.
+    fn assert_round_trip(stream: TcpStream, listener: &UnixListener) {
+        let (mut accepted, _) = listener.accept().expect("the dial reaches the listener");
+        let mut stream = std::net::TcpStream::from(std::os::fd::OwnedFd::from(stream));
+        stream.set_nonblocking(false).unwrap();
+        stream.write_all(b"ping").unwrap();
+        let mut received = [0u8; 4];
+        accepted.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"ping");
+        accepted.write_all(b"pong").unwrap();
+        stream.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"pong");
+    }
+
+    #[test]
+    fn a_unix_path_backend_dials_its_socket_not_its_address() {
+        let path = socket_path("dial");
+        let listener = UnixListener::bind(&path).unwrap();
+        // Nothing listens on this port: a TCP dial would be refused.
+        let unused: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let stream = connect_backend(unused, path.to_str()).expect("dial the unix socket");
+        assert_eq!(
+            socket2::SockRef::from(&stream).domain().unwrap(),
+            socket2::Domain::UNIX
+        );
+        assert_round_trip(stream, &listener);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_abstract_unix_path_backend_dials_the_abstract_namespace() {
+        use std::os::linux::net::SocketAddrExt;
+        let name = format!("sozu-lib-abstract-{}", std::process::id());
+        let address = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let listener = UnixListener::bind_addr(&address).unwrap();
+        let unused: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let stream = connect_backend(unused, Some(&format!("@{name}"))).unwrap();
+        assert_round_trip(stream, &listener);
+    }
+
+    #[test]
+    fn a_missing_unix_socket_is_a_failed_connect() {
+        let mut backend = Backend::new("b", "127.0.0.1:1".parse().unwrap(), None, None, None)
+            .with_unix_path(Some(socket_path("missing").to_str().unwrap().to_owned()));
+        let mut rng = StdRng::seed_from_u64(0);
+        let error = backend
+            .try_connect(Instant::now(), &mut rng)
+            .expect_err("no socket file means no connection");
+        assert!(matches!(error, BackendError::MioConnection(_)));
+        assert_eq!(backend.failures, 1);
+        assert_eq!(backend.active_connections, 0);
+    }
+
+    #[test]
+    fn a_unix_backend_connects_through_try_connect() {
+        let path = socket_path("try-connect");
+        let listener = UnixListener::bind(&path).unwrap();
+        let mut backend = Backend::new("b", "127.0.0.1:1".parse().unwrap(), None, None, None)
+            .with_unix_path(Some(path.to_str().unwrap().to_owned()));
+        let mut rng = StdRng::seed_from_u64(0);
+        let stream = backend.try_connect(Instant::now(), &mut rng).unwrap();
+        assert_eq!(backend.active_connections, 1);
+        assert_eq!(backend.failures, 0);
+        assert_round_trip(stream, &listener);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn re_adding_a_backend_updates_its_unix_path() {
+        let address: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut list = BackendList::new();
+        list.add_backend(Backend::new("b", address, None, None, None));
+        list.add_backend(
+            Backend::new("b", address, None, None, None)
+                .with_unix_path(Some("/run/b.sock".to_owned())),
+        );
+        assert_eq!(list.backends.len(), 1);
+        assert_eq!(
+            list.backends[0].borrow().unix_path.as_deref(),
+            Some("/run/b.sock")
+        );
     }
 }

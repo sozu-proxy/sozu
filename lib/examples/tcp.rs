@@ -48,6 +48,7 @@ fn main() -> anyhow::Result<()> {
         load_balancing_parameters: Some(LoadBalancingParams::default()),
         sticky_id: None,
         backup: None,
+        unix_path: None,
     };
 
     command.write_message(&WorkerRequest {

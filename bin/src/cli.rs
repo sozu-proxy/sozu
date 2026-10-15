@@ -816,6 +816,13 @@ pub enum BackendCmd {
         sticky_id: Option<String>,
         #[clap(short = 'b', long = "backup", help = "set backend as a backup backend")]
         backup: Option<bool>,
+        #[clap(
+            long = "unix-path",
+            help = "dial this UNIX domain socket instead of the address: an absolute path, \
+                    or @name for a Linux abstract socket; the address then only identifies \
+                    the backend and must be unique in the cluster"
+        )]
+        unix_path: Option<String>,
     },
 }
 

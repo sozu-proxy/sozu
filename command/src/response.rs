@@ -174,6 +174,7 @@ impl From<Backend> for AddBackend {
             sticky_id: val.sticky_id,
             load_balancing_parameters: val.load_balancing_parameters,
             backup: val.backup,
+            unix_path: val.unix_path,
         };
 
         // POST: backend identity (cluster + backend id) and the wire address
@@ -395,6 +396,11 @@ pub struct Backend {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backup: Option<bool>,
+    /// UNIX domain socket dialed instead of `address`, see
+    /// `AddBackend::unix_path` (`command/src/command.proto`).
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unix_path: Option<String>,
 }
 
 impl Ord for Backend {
@@ -409,6 +415,7 @@ impl Ord for Backend {
             && self.sticky_id == o.sticky_id
             && self.load_balancing_parameters == o.load_balancing_parameters
             && self.backup == o.backup
+            && self.unix_path == o.unix_path
             && self.address == o.address;
 
         let ordering = self
@@ -421,6 +428,7 @@ impl Ord for Backend {
                     .cmp(&o.load_balancing_parameters),
             )
             .then(self.backup.cmp(&o.backup))
+            .then(self.unix_path.cmp(&o.unix_path))
             .then(socketaddr_cmp(&self.address, &o.address));
 
         debug_assert_eq!(
@@ -449,6 +457,7 @@ impl Backend {
             backend_id: self.backend_id,
             load_balancing_parameters: self.load_balancing_parameters,
             backup: self.backup,
+            unix_path: self.unix_path,
         };
 
         // POST: identity (backend id) and wire address are preserved — same

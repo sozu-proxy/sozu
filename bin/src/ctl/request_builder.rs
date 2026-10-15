@@ -147,6 +147,7 @@ impl CommandManager {
                 address,
                 sticky_id,
                 backup,
+                unix_path,
             } => self.send_request(
                 RequestType::AddBackend(AddBackend {
                     cluster_id: id,
@@ -155,6 +156,7 @@ impl CommandManager {
                     load_balancing_parameters: Some(LoadBalancingParams::default()),
                     sticky_id,
                     backup,
+                    unix_path,
                 })
                 .into(),
             ),

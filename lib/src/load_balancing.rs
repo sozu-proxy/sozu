@@ -1477,6 +1477,7 @@ mod test {
             backup: false,
             connection_time: PeakEWMA::new(Instant::now()),
             health: HealthState::default(),
+            unix_path: None,
         }
     }
 

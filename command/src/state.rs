@@ -2329,6 +2329,14 @@ impl ConfigState {
     }
 
     fn add_backend(&mut self, add_backend: &AddBackend) -> Result<(), StateError> {
+        if let Some(unix_path) = add_backend.unix_path.as_deref() {
+            crate::config::parse_backend_unix_path(unix_path).map_err(|reason| {
+                StateError::InvalidValue {
+                    field: "unix_path",
+                    reason,
+                }
+            })?;
+        }
         let backend = Backend {
             address: add_backend.address.into(),
             cluster_id: add_backend.cluster_id.as_str().into(),
@@ -2336,6 +2344,7 @@ impl ConfigState {
             sticky_id: add_backend.sticky_id.clone(),
             load_balancing_parameters: add_backend.load_balancing_parameters,
             backup: add_backend.backup,
+            unix_path: add_backend.unix_path.clone(),
         };
         let backends = self.backends.entry(backend.cluster_id.clone()).or_default();
         let backend_id = backend.backend_id.clone();
@@ -5447,6 +5456,7 @@ mod tests {
             load_balancing_parameters: Some(LoadBalancingParams::default()),
             sticky_id: Some("sticky".to_string()),
             backup: None,
+            unix_path: None,
         };
 
         state
@@ -5454,6 +5464,67 @@ mod tests {
             .expect("Could not execute order");
 
         assert_eq!(state.backends.get("cluster_1").unwrap(), &vec![b]);
+    }
+
+    /// #152: a backend's `unix_path` survives into the state and back out of
+    /// the orders it replays to a new worker, so a restart or an upgrade does
+    /// not turn a unix backend into a TCP one.
+    #[test]
+    fn a_unix_path_backend_round_trips_through_the_state() {
+        let mut state: ConfigState = Default::default();
+        let add = AddBackend {
+            cluster_id: String::from("cluster_1"),
+            backend_id: String::from("cluster_1-unix"),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 1),
+            unix_path: Some(String::from("/run/app.sock")),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::AddBackend(add.clone()).into())
+            .expect("a valid unix_path is accepted");
+        assert_eq!(
+            state.backends["cluster_1"][0].unix_path.as_deref(),
+            Some("/run/app.sock")
+        );
+        let replayed: Vec<AddBackend> = state
+            .generate_requests()
+            .into_iter()
+            .filter_map(|request| match request.request_type {
+                Some(RequestType::AddBackend(backend)) => Some(backend),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(replayed, vec![add]);
+    }
+
+    /// #152: the main process refuses a `unix_path` no worker could dial,
+    /// before it reaches the state.
+    #[test]
+    fn an_invalid_unix_path_is_refused() {
+        let mut state: ConfigState = Default::default();
+        for refused in ["", "relative.sock", "@"] {
+            let result = state.dispatch(
+                &RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-unix"),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 1),
+                    unix_path: Some(refused.to_owned()),
+                    ..Default::default()
+                })
+                .into(),
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(StateError::InvalidValue {
+                        field: "unix_path",
+                        ..
+                    })
+                ),
+                "{refused:?} must be refused"
+            );
+        }
+        assert!(state.backends.is_empty());
     }
 
     #[test]

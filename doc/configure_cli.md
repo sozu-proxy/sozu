@@ -63,6 +63,15 @@ instance): `backend remove --id <cluster_id> --backend-id <id> --address <addres
 the backend with that id at that address, from the saved state and from the
 workers alike, and the other one keeps taking traffic.
 
+A backend listening on a UNIX domain socket takes `--unix-path` with an
+absolute path, or `@name` for a Linux abstract socket. `--address` is then
+only its identity, unique in the cluster, and is never dialed (see "UNIX
+domain socket backends" in `doc/configure.md`):
+
+```bash
+sozu --config /etc/sozu/config.toml backend add --address 127.0.0.1:10001 --unix-path /run/app/http.sock --backend-id <my_backend_id> --id <my_cluster_id>
+```
+
 ### Add http frontend
 
 And an http listener:
