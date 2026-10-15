@@ -691,7 +691,7 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   never an `Rc<RefCell<Backend>>`, and then dials `BackendId::address` itself
   ([#1684](https://github.com/sozu-proxy/sozu/issues/1684)). It is a
   capability rather than a data view like `RoutingView` because selection
-  mutates — the round-robin cursor, the fail-open latch, `PeakEWMA`, the
+  mutates — the round-robin cursor and running weights, the fail-open latch, `PeakEWMA`, the
   Maglev table, the availability latch — and a snapshot of N backends each
   behind its own `RefCell` cannot be lent without allocating. Selecting
   reserves under the same borrow as the choice, and a failed `connect(2)`
