@@ -1304,13 +1304,16 @@ request, `AddUnixBackend` (`Request` field 72), and
 picks the verb: a backend with a `unix_path` is `AddUnixBackend`, any other
 stays `AddBackend`, and the main process rewrites every request it fans out to
 the workers to that verb, so an `AddBackend` that carries a `unix_path` never
-reaches a worker. A process that predates UNIX backends skips the unknown
-`unix_path` tag of `AddBackend` but still registers it, and would dial
-`address` over TCP; it cannot decode field 72 at all, so it never registers the
-backend, and the request fails instead. Between `sozu upgrade` and the
-replacement of the last old worker, a UNIX backend is therefore served only by
-the upgraded workers, and each old worker is counted as failed once
-`worker_timeout` expires, since it does not answer a request it cannot decode.
+reaches a worker. A process that predates UNIX backends cannot decode field
+72: it reads the request as empty, so it never registers the backend and never
+dials `address` over TCP. An old main process logs `empty request sent by
+client` and sends the client no answer. An old worker logs `Could not execute
+order on config state` and routes the request to no proxy, so it sends no
+response either. This guarantee covers the request the CLI and
+`RequestType::add_backend` build; a third-party client that puts `unix_path` on the historical
+`AddBackend` is outside it, since an older decoder drops that field. Between
+`sozu upgrade` and the replacement of the last old worker, a UNIX backend is
+therefore served only by the upgraded workers.
 Backends without `unix_path` keep `AddBackend` and work across versions as
 before. **Rolling back** to a version that predates UNIX backends: such a
 version stops reading a saved state file at the first `AddUnixBackend` record,

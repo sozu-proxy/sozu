@@ -209,9 +209,10 @@ message Request {
     // unknown `unix_path` tag, so it would register the backend and dial its
     // identity `address` over TCP: traffic meant for a local socket reaching
     // whatever listens on that address, or nothing. It cannot decode this
-    // verb at all, so it never registers the backend: the request fails
-    // instead of degrading to an IP endpoint. This matters while the fleet is
-    // mixed, between `UpgradeMain` and the replacement of every worker.
+    // verb at all (it sees no known request), so it never registers the
+    // backend and never degrades it to an IP endpoint; it sends no response
+    // for it. This matters while the fleet is mixed, between `UpgradeMain`
+    // and the replacement of every worker.
     //
     // Emitters pick the verb with `RequestType::add_backend`, and the main
     // process rewrites every request it fans out to workers to that canonical

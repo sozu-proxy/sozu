@@ -14,8 +14,10 @@
   configuration file and the main process's state both refuse it there.
   A UNIX backend travels on a new `AddUnixBackend` request
   (`RequestType::add_backend` picks the verb, and the main process rewrites
-  every fan-out to it), so a worker or main process that predates it fails the
-  request instead of dialing `address` over TCP. Protobuf: `AddBackend` field 7
+  every fan-out to it): a main process or worker that predates it cannot decode
+  that request, so it never registers the backend or dials `address` over TCP.
+  A client that sends `unix_path` on the historical `AddBackend` instead is
+  outside this guarantee: an older decoder drops the field. Protobuf: `AddBackend` field 7
   (`unix_path`) and `Request` field 72 (`AddUnixBackend`). Covered by
   `command/tests/unix_backend_verb.rs` and the `test_*unix*` e2e tests
   (`e2e/src/tests/unix_backend_tests.rs`).

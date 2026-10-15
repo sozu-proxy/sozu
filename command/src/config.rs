@@ -468,8 +468,6 @@ pub enum ConfigError {
         value: u32,
         reason: &'static str,
     },
-    /// A cluster's `health_check` block has an unparsable `accepted_statuses`
-    /// entry or breaks [`validate_health_check_config`].
     /// A backend's `unix_path` breaks [`parse_backend_unix_path`], shares its
     /// identity `address` with another backend of the cluster, or sits in a
     /// UDP cluster.
@@ -479,6 +477,8 @@ pub enum ConfigError {
         address: SocketAddr,
         reason: &'static str,
     },
+    /// A cluster's `health_check` block has an unparsable `accepted_statuses`
+    /// entry or breaks [`validate_health_check_config`].
     #[error("cluster {cluster_id}: {reason}")]
     InvalidHealthCheck {
         cluster_id: String,

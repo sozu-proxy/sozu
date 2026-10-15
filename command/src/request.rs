@@ -257,9 +257,10 @@ impl RequestType {
     /// The request that adds this backend, on the verb its endpoint calls for.
     ///
     /// A backend with a `unix_path` goes out as `AddUnixBackend`, which a
-    /// worker or main process that predates UNIX backends cannot decode, so
-    /// it fails the request instead of registering the backend under its
-    /// identity `address` and dialing that over TCP. Any other backend keeps
+    /// worker or main process that predates UNIX backends cannot decode: it
+    /// sees no known request, so it never registers the backend under its
+    /// identity `address` nor dials that over TCP, and it sends no response.
+    /// Any other backend keeps
     /// `AddBackend`, which every version understands.
     pub fn add_backend(backend: AddBackend) -> Self {
         if backend.unix_path.is_some() {
