@@ -44,7 +44,32 @@
 
 <!-- changelog-slot:backend-dns -->
 
+- A backend `address` in the configuration file may be a `host:port` as well
+  as a socket address (#347). The name is resolved once, with the system
+  resolver, when the file is loaded (at startup or by `sozu reload --file`);
+  it is never re-resolved while running. Each distinct resolved address
+  becomes a backend with a deterministic id, `<backend_id>-<address>` or
+  `<cluster_id>-<host:port>-<address>`; a configured `sticky_id` is
+  suffixed with `-<address>` so each resolved backend keeps its own sticky
+  session, whatever the number of addresses. A name that does not resolve refuses
+  the file with an error naming the cluster and the entry. A file without a
+  host name loads exactly as before; the command schema and the workers are
+  unchanged.
+
 <!-- changelog-slot:close-sessions -->
+
+- `sozu cluster close-sessions --id <cluster> [--backend-id <id>] [--address <ip:port>]`
+  closes, on every worker, the HTTP, HTTPS, TCP and WebSocket sessions holding a backend
+  connection to a cluster, or to one of its backends (#123). Sessions close the way a soft
+  stop closes them: idle HTTP/1.1, TCP and WebSocket sessions at once, an HTTP/1.1 request in
+  flight answered with `Connection: close` first when the backend response headers are not
+  parsed yet, an HTTP/2 session after a GOAWAY, bounded by its graceful-shutdown deadline when
+  that is nonzero (`0` drains without bound, as on a soft stop). The answer counts, per worker, the sessions closed
+  and those still draining. The new `Request.close_sessions` (field 65) and
+  `ResponseContent.closed_sessions` (field 19) are additive; the request is never saved in the
+  state nor replayed by `load_state` or an upgrade. A worker that predates it cannot decode
+  it and closes nothing; it does not answer, so the request fails once the command times out.
+  The main process and every worker must run this release before it is used.
 
 ### 🔄 Changed
 
@@ -63,6 +88,10 @@
   policies now spreads its traffic by them. A cluster whose backends all
   carry the same weight (the default, 100, when unset) selects exactly the
   same sequence as before. No command, configuration or state format changes.
+- A soft stop, like `cluster close-sessions`, now marks an HTTP/1.1 request still waiting for
+  its response as the last one of its connection: the response carries `Connection: close`
+  when its headers are not sent yet, and the connection closes as soon as it is sent. A
+  client no longer has to discover the close after a response that announced keep-alive.
 
 <!-- changelog-slot:backend-ownership -->
 

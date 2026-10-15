@@ -135,6 +135,7 @@ pub fn format_request_type(request_type: &RequestType) -> &str {
         RequestType::RemoveHealthCheck(_) => "RemoveHealthCheck",
         RequestType::QueryHealthChecks(_) => "QueryHealthChecks",
         RequestType::SetMetricDetail(_) => "SetMetricDetail",
+        RequestType::CloseSessions(_) => "CloseSessions",
     }
 }
 
@@ -252,6 +253,13 @@ impl ResponseContent {
             // exhaustive without surfacing internal IPC payloads on
             // the operator's terminal.
             ContentType::WorkerMetricDetailStatus(_) => Ok(()),
+            ContentType::ClosedSessions(closed) => {
+                println!(
+                    "{} sessions closed, {} draining",
+                    closed.closed, closed.draining
+                );
+                Ok(())
+            }
         }
     }
 }

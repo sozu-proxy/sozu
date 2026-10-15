@@ -7,13 +7,16 @@
 use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
-    os::unix::net::UnixListener,
+    os::unix::net::{UnixListener, UnixStream},
     path::PathBuf,
     thread::{self, JoinHandle},
     time::Duration,
 };
 
-use sozu_command_lib::proto::command::{AddBackend, request::RequestType};
+use sozu_command_lib::{
+    config::Config,
+    proto::command::{AddBackend, request::RequestType},
+};
 
 use crate::{
     http_utils::{http_ok_response, http_request},
@@ -212,6 +215,89 @@ fn test_tcp_unix_path_backend() {
             3,
             "TCP over a filesystem UNIX backend",
             try_tcp_unix_backend
+        ),
+        State::Success
+    );
+}
+
+/// A `host:port` backend with a `unix_path`, loaded through the real file
+/// configuration path, keeps its `unix_path` on the resolved backend the
+/// worker selects and dials the UNIX socket, never the TCP identity. That
+/// every expanded address keeps `unix_path` is covered by the focused unit
+/// tests in `command/src/config.rs`, not by this test.
+fn try_file_config_dns_unix_backend() -> State {
+    let path = SocketPath::new("dns");
+    let listener = UnixListener::bind(&path.0).expect("bind the backend socket");
+    let front_address = create_unbound_local_address();
+    let identity_port = create_unbound_local_address().port();
+
+    let directory = tempfile::tempdir().expect("create the configuration directory");
+    let config_path = directory.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+[[listeners]]
+protocol = "http"
+address = "{front_address}"
+
+[clusters.cluster_0]
+protocol = "http"
+frontends = [{{ address = "{front_address}", hostname = "localhost" }}]
+backends = [{{ address = "localhost:{identity_port}", unix_path = {unix_path:?} }}]
+"#,
+            unix_path = path.0.to_str().unwrap()
+        ),
+    )
+    .expect("write the configuration file");
+
+    let config = Config::load_from_path(config_path.to_str().unwrap())
+        .expect("the file configuration loads");
+    let messages = config
+        .generate_config_messages()
+        .expect("the configuration yields worker requests");
+
+    let (server_config, listeners, state) = Worker::empty_config();
+    let mut worker =
+        Worker::start_new_worker_owned("UNIX-DNS-FILE-CONFIG", server_config, listeners, state);
+    for message in messages {
+        worker.send_proxy_request(message.content);
+    }
+    worker.read_to_last();
+
+    let backend = serve_one_http(listener, http_ok_response("pong-unix-dns"));
+    let mut client = Client::new(
+        "client",
+        front_address,
+        http_request("GET", "/api", "ping", "localhost"),
+    );
+    client.connect();
+    client.send();
+    let response = client.receive_response(DEADLINE);
+    // A proxy that never dials the socket leaves the backend in `accept`:
+    // wake it so the failure is reported instead of hanging the join.
+    let _ = UnixStream::connect(&path.0);
+    let request = backend.join().unwrap_or_default();
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    println!("backend read: {request:?}, client read: {response:?}");
+    match response {
+        Some(response) if response.contains("pong-unix-dns") && request.starts_with("GET /api") => {
+            State::Success
+        }
+        _ => State::Fail,
+    }
+}
+
+#[test]
+fn test_file_config_dns_expanded_unix_path_backend() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "file-configured DNS backend over a filesystem UNIX socket",
+            try_file_config_dns_unix_backend
         ),
         State::Success
     );

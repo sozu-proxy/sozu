@@ -2126,6 +2126,13 @@ impl ProxySession for TcpSession {
         true
     }
 
+    /// A TCP session is targeted by the backend it dialled last.
+    fn targets(&self, target: &crate::SessionTarget) -> bool {
+        self.cluster_id.as_deref().is_some_and(|cluster_id| {
+            target.matches(cluster_id, self.backend_id.as_deref(), self.backend_address)
+        })
+    }
+
     fn last_event(&self) -> Instant {
         self.last_event
     }

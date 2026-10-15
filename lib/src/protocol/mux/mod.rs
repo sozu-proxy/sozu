@@ -2448,6 +2448,21 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         self.reschedule();
         result
     }
+
+    /// A mux session is targeted when one of its backend connections,
+    /// connecting or connected, is: an H2 frontend multiplexing several
+    /// clusters is targeted by each of them.
+    fn targets(&self, target: &crate::SessionTarget) -> bool {
+        self.router
+            .backends
+            .iter()
+            .any(|(_, connection)| match connection.position() {
+                Position::Client(cluster_id, backend, _) => {
+                    target.matches(cluster_id, Some(&backend.backend_id), Some(backend.address))
+                }
+                Position::Server => false,
+            })
+    }
 }
 
 /// The bodies the `SessionState` wrappers above drive. They are inherent
@@ -4561,6 +4576,14 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         for stream in &mut self.context.streams {
             match stream.state {
                 StreamState::Linked(_) => {
+                    // An HTTP/1.1 response still to come announces the close
+                    // (`Connection: close`, in `HttpContext::on_response_headers`
+                    // of `lib/src/protocol/kawa_h1/editor.rs`), and the
+                    // frontend closes once it is sent instead of waiting for
+                    // the next pass. HTTP/2 announces it with the GOAWAY.
+                    if !front_is_h2 {
+                        stream.context.closing = true;
+                    }
                     can_stop = false;
                 }
                 StreamState::Link if front_is_h2 => {
