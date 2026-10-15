@@ -1037,27 +1037,45 @@ impl PowerOfTwo {
         }
     }
 
-    /// Read ONE backend's load under the configured metric.
+    /// Read the load of the candidates at `first` and `second` under the
+    /// configured metric and order them by load per unit of weight, `first`
+    /// against `second`. `None` only for a NaN connection time.
     ///
-    /// Called exactly twice per selection, whatever the cluster size — that
-    /// call count is the algorithm, not an implementation detail of it. The
-    /// `ConnectionTime` arm needs `borrow_mut` because `peak_ewma_connection`
-    /// decays the EWMA, to the selection's instant `now`, as it reads it.
+    /// Each backend is read exactly once, `first` then `second`, whatever the
+    /// cluster size — that call count is the algorithm, not an implementation
+    /// detail of it. The `ConnectionTime` arm needs `borrow_mut` because
+    /// `peak_ewma_connection` decays the EWMA, to the selection's instant
+    /// `now`, as it reads it.
     ///
     /// A count metric reads the load of the candidate's whole address, the
-    /// sum over its ids (`address_count`). The load comes back with the
-    /// candidate's [`backend_weight`], which the caller divides it by.
-    fn measure(&self, backends: Candidates<'_>, index: usize) -> (f64, u32) {
-        let load = match self.metric {
-            LoadMetric::Connections => {
-                address_count(backends, index, |b| b.active_connections) as f64
-            }
-            LoadMetric::Requests => address_count(backends, index, |b| b.active_requests) as f64,
-            LoadMetric::ConnectionTime => backends[index]
-                .borrow_mut()
-                .peak_ewma_connection(backends.now()),
+    /// sum over its ids (`address_count`), and compares the two counts as
+    /// integers ([`cmp_count_per_weight`]): converting a count to `f64` would
+    /// round it above 2^53 and could order two different loads as equal.
+    fn compare(&self, backends: Candidates<'_>, first: usize, second: usize) -> Option<Ordering> {
+        let weight = |index: usize| backend_weight(&backends[index].borrow());
+        let counts = |metric: fn(&Backend) -> usize| {
+            let first_load = address_count(backends, first, metric);
+            let second_load = address_count(backends, second, metric);
+            Some(cmp_count_per_weight(
+                first_load,
+                weight(first),
+                second_load,
+                weight(second),
+            ))
         };
-        (load, backend_weight(&backends[index].borrow()))
+        match self.metric {
+            LoadMetric::Connections => counts(|b| b.active_connections),
+            LoadMetric::Requests => counts(|b| b.active_requests),
+            LoadMetric::ConnectionTime => {
+                let first_load = backends[first]
+                    .borrow_mut()
+                    .peak_ewma_connection(backends.now());
+                let second_load = backends[second]
+                    .borrow_mut()
+                    .peak_ewma_connection(backends.now());
+                cmp_cost_per_weight(first_load, weight(first), second_load, weight(second))
+            }
+        }
     }
 }
 
@@ -1096,10 +1114,8 @@ impl LoadBalancingAlgorithm for PowerOfTwo {
             "the shifted second index must stay inside the candidate set"
         );
 
-        let (first_load, first_weight) = self.measure(backends, first);
-        let (second_load, second_weight) = self.measure(backends, second);
         // Load per unit of weight: with equal weights, the raw loads.
-        let order = cmp_cost_per_weight(first_load, first_weight, second_load, second_weight);
+        let order = self.compare(backends, first, second);
 
         // Keep the lighter of the two samples. An exact tie is broken by a
         // coin flip rather than by index order: ties are the common case
@@ -2964,6 +2980,31 @@ mod test {
             assert_eq!(
                 sequence(&mut policy, &backends, 64),
                 vec![0; 64],
+                "{metric:?}"
+            );
+        }
+    }
+
+    /// `POWER_OF_TWO` orders count loads as integers: two loads that differ by
+    /// one above 2^53 (where `f64` cannot tell them apart) still select the
+    /// lighter, every time, instead of falling to the coin flip.
+    ///
+    /// TO SEE THIS RED: convert the counts to `f64` in `PowerOfTwo::compare`;
+    /// both loads then round to the same value and the tie is a coin flip.
+    #[test]
+    fn power_of_two_orders_large_counts_exactly() {
+        let big = (1usize << 53) + 1;
+        for metric in [LoadMetric::Connections, LoadMetric::Requests] {
+            let backends = weighted_backends(&[None, None]);
+            for (backend, load) in backends.iter().zip([big, big - 1]) {
+                let mut backend = backend.borrow_mut();
+                backend.active_connections = load;
+                backend.active_requests = load;
+            }
+            let mut policy = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, metric);
+            assert_eq!(
+                sequence(&mut policy, &backends, 64),
+                vec![1; 64],
                 "{metric:?}"
             );
         }

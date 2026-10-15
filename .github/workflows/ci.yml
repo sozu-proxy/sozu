@@ -163,6 +163,39 @@ jobs:
           toolchain: ${{ matrix.toolchain }}
           components: clippy
 
+      # This one gate crosses an immutable historical binary boundary rather
+      # than comparing two builds of the current checkout. Pin both the
+      # published archive and the extracted executable: a moved/repacked
+      # release asset must fail before it can certify compatibility. Other
+      # provider cells still exercise candidate-to-candidate persistence; the
+      # release binary itself is the crypto-ring build, so this cell owns the
+      # first 2.3.1 -> candidate upgrade.
+      - name: Fetch verified Sōzu 2.3.1 compatibility binary
+        if: matrix.cell == 'crypto-ring'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/sozu-2.3.1-x86_64-unknown-linux-gnu-crypto-ring.tar.gz"
+          extracted="$RUNNER_TEMP/sozu-compat-2.3.1"
+          curl --fail --location --retry 3 --retry-all-errors \
+            --connect-timeout 10 --max-time 120 \
+            --output "$archive" \
+            https://github.com/sozu-proxy/sozu/releases/download/2.3.1/sozu-2.3.1-x86_64-unknown-linux-gnu-crypto-ring.tar.gz
+          printf '%s  %s\n' \
+            58aa97856d81622f906efea2ba206bc39c0269138e1ba981b6eecd3a4e10787f \
+            "$archive" | sha256sum --check --strict -
+          mkdir -p "$extracted"
+          tar --extract --gzip --file "$archive" --directory "$extracted"
+          legacy="$extracted/sozu-2.3.1-x86_64-unknown-linux-gnu-crypto-ring/sozu"
+          printf '%s  %s\n' \
+            5ea1452b3a2053cdc9936dc50ce25d50e3ad30122c7f49fcc606863cd93b2281 \
+            "$legacy" | sha256sum --check --strict -
+          version_file="$extracted/sozu-2.3.1.version"
+          "$legacy" --version > "$version_file"
+          IFS= read -r version < "$version_file"
+          test "$version" = 'sozu 2.3.1 (1cc9bf2 HEAD)'
+          echo "SOZU_CERTIFICATE_METADATA_LEGACY=$legacy" >> "$GITHUB_ENV"
+
       # rustfmt.toml uses the unstable `ignore = [...]` key, so the
       # format check must run on nightly. Only the msrv-full cell
       # hosts the fmt step (provider-agnostic, single run is enough).
@@ -383,6 +416,15 @@ jobs:
           cargo test -p sozu --locked ${{ matrix.flags }} --test soft_stop_waits_for_drain_e2e -- --ignored
           cargo test -p sozu --locked ${{ matrix.flags }} --test upgrade_pid_file_failure_e2e -- --ignored
           cargo test -p sozu --locked ${{ matrix.flags }} --test command_socket_mode_e2e -- --ignored
+          cargo test -p sozu --locked ${{ matrix.flags }} --test mutable_commands_runtime_e2e -- --ignored --test-threads=1 --skip published_2_3_1_certificate_metadata_loss_is_bounded_to_the_first_upgrade
+
+      - name: Test Sōzu 2.3.1 certificate-metadata upgrade boundary
+        if: matrix.cell == 'crypto-ring'
+        run: >-
+          cargo test -p sozu --locked ${{ matrix.flags }}
+          --test mutable_commands_runtime_e2e
+          published_2_3_1_certificate_metadata_loss_is_bounded_to_the_first_upgrade
+          -- --ignored --exact --nocapture --test-threads=1
 
       # `sozu_top_e2e` adds the `tui` feature, so it runs on the `msrv-full`
       # cell only: that cell already resolves `tui` for `cargo doc
