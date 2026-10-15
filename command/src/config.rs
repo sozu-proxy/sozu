@@ -609,10 +609,10 @@ pub enum ConfigError {
         minimum: u64,
     },
     /// `redirect = "<value>"` on a frontend used a value the parser doesn't
-    /// recognise. Accepted values are `forward`, `permanent`, `unauthorized`
-    /// (case-insensitive).
+    /// recognise. Accepted values are `forward`, `permanent`, `unauthorized`,
+    /// `silent_close` (case-insensitive).
     #[error(
-        "invalid redirect policy '{0}'. Valid values: \"forward\", \"permanent\", \"unauthorized\""
+        "invalid redirect policy '{0}'. Valid values: \"forward\", \"permanent\", \"unauthorized\", \"silent_close\""
     )]
     InvalidRedirectPolicy(String),
     /// `redirect_scheme = "<value>"` on a frontend used a value the parser
@@ -2614,6 +2614,7 @@ pub(crate) fn parse_redirect_policy(value: &str) -> Result<RedirectPolicy, Confi
         "forward" => Ok(RedirectPolicy::Forward),
         "permanent" => Ok(RedirectPolicy::Permanent),
         "unauthorized" => Ok(RedirectPolicy::Unauthorized),
+        "silent_close" => Ok(RedirectPolicy::SilentClose),
         _ => Err(ConfigError::InvalidRedirectPolicy(value.to_owned())),
     }
 }
@@ -3619,7 +3620,7 @@ impl HttpFrontendConfig {
             );
 
             v.push(
-                RequestType::AddHttpsFrontend(RequestHttpFrontend {
+                RequestType::add_https_frontend(RequestHttpFrontend {
                     cluster_id: Some(cluster_id.to_string()),
                     address: self.address.into(),
                     hostname: self.hostname.clone(),
@@ -3642,7 +3643,7 @@ impl HttpFrontendConfig {
         } else {
             //create the front both for HTTP and HTTPS if possible
             v.push(
-                RequestType::AddHttpFrontend(RequestHttpFrontend {
+                RequestType::add_http_frontend(RequestHttpFrontend {
                     cluster_id: Some(cluster_id.to_string()),
                     address: self.address.into(),
                     hostname: self.hostname.clone(),
@@ -5503,6 +5504,24 @@ mod tests {
     use toml::to_string;
 
     use super::*;
+
+    /// `redirect = "silent_close"` parses, in any case, to
+    /// `RedirectPolicy::SilentClose` (sozu-proxy/sozu#767); the hyphenated
+    /// spelling is not an alias and is refused like any unknown policy.
+    #[test]
+    fn silent_close_redirect_policy_parses_case_insensitively() {
+        for spelling in ["silent_close", "SILENT_CLOSE", "Silent_Close"] {
+            assert_eq!(
+                parse_redirect_policy(spelling).ok(),
+                Some(RedirectPolicy::SilentClose),
+                "{spelling} must parse to SilentClose"
+            );
+        }
+        assert!(matches!(
+            parse_redirect_policy("silent-close"),
+            Err(ConfigError::InvalidRedirectPolicy(value)) if value == "silent-close"
+        ));
+    }
 
     #[test]
     fn http_frontend_debug_redacts_pem_material() {

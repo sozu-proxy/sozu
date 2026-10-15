@@ -89,8 +89,14 @@ pub fn rollback_request(request: &RequestType) -> Option<Request> {
             address: config.address,
             proxy: ListenerType::Udp.into(),
         }),
-        RequestType::AddHttpFrontend(front) => RequestType::RemoveHttpFrontend(front.clone()),
-        RequestType::AddHttpsFrontend(front) => RequestType::RemoveHttpsFrontend(front.clone()),
+        RequestType::AddHttpFrontend(front)
+        | RequestType::AddHttpFrontendWithSilentClose(front) => {
+            RequestType::RemoveHttpFrontend(front.clone())
+        }
+        RequestType::AddHttpsFrontend(front)
+        | RequestType::AddHttpsFrontendWithSilentClose(front) => {
+            RequestType::RemoveHttpsFrontend(front.clone())
+        }
         RequestType::AddTcpFrontend(front) => RequestType::RemoveTcpFrontend(front.clone()),
         RequestType::AddUdpFrontend(front) => RequestType::RemoveUdpFrontend(front.clone()),
         _ => return None,
@@ -543,14 +549,14 @@ impl ConfigState {
                 .filter(|stored| stored.cluster_id.as_deref() == selector.cluster_id.as_deref())
                 .cloned()
                 .map(RequestHttpFrontend::from)
-                .map(RequestType::AddHttpFrontend),
+                .map(RequestType::add_http_frontend),
             RequestType::RemoveHttpsFrontend(selector) => self
                 .https_fronts
                 .get(&selector.to_string())
                 .filter(|stored| stored.cluster_id.as_deref() == selector.cluster_id.as_deref())
                 .cloned()
                 .map(RequestHttpFrontend::from)
-                .map(RequestType::AddHttpsFrontend),
+                .map(RequestType::add_https_frontend),
             RequestType::RemoveTcpFrontend(selector) => {
                 let address: SocketAddr = selector.address.into();
                 let sni = selector.sni.as_deref().map(str::to_ascii_lowercase);
@@ -636,12 +642,14 @@ impl ConfigState {
             RequestType::RemoveListener(remove) => self.remove_listener(remove),
             RequestType::ActivateListener(activate) => self.activate_listener(activate),
             RequestType::DeactivateListener(deactivate) => self.deactivate_listener(deactivate),
-            RequestType::AddHttpFrontend(front) => self.add_http_frontend(front),
+            RequestType::AddHttpFrontend(front)
+            | RequestType::AddHttpFrontendWithSilentClose(front) => self.add_http_frontend(front),
             RequestType::RemoveHttpFrontend(front) => self.remove_http_frontend(front),
             RequestType::AddCertificate(add) => self.add_certificate(add),
             RequestType::RemoveCertificate(remove) => self.remove_certificate(remove),
             RequestType::ReplaceCertificate(replace) => self.replace_certificate(replace),
-            RequestType::AddHttpsFrontend(front) => self.add_https_frontend(front),
+            RequestType::AddHttpsFrontend(front)
+            | RequestType::AddHttpsFrontendWithSilentClose(front) => self.add_https_frontend(front),
             RequestType::RemoveHttpsFrontend(front) => self.remove_https_frontend(front),
             RequestType::AddTcpFrontend(front) => self.add_tcp_frontend(front),
             RequestType::RemoveTcpFrontend(front) => self.remove_tcp_frontend(front),
@@ -2894,7 +2902,7 @@ impl ConfigState {
         }
 
         for front in self.http_fronts.values() {
-            v.push(RequestType::AddHttpFrontend(front.clone().into()).into());
+            v.push(RequestType::add_http_frontend(front.clone().into()).into());
         }
 
         for add in self.certificate_add_requests() {
@@ -2902,7 +2910,7 @@ impl ConfigState {
         }
 
         for front in self.https_fronts.values() {
-            v.push(RequestType::AddHttpsFrontend(front.clone().into()).into());
+            v.push(RequestType::add_https_frontend(front.clone().into()).into());
         }
 
         for front_list in self.tcp_fronts.values() {
@@ -3536,7 +3544,7 @@ impl ConfigState {
         }
 
         for &(_, front) in added_http_fronts {
-            v.push(RequestType::AddHttpFrontend(front.clone().into()).into());
+            v.push(RequestType::add_http_frontend(front.clone().into()).into());
         }
 
         let mut my_https_fronts: HashSet<(&String, &HttpFrontend)> = HashSet::new();
@@ -3555,7 +3563,7 @@ impl ConfigState {
         }
 
         for &(_, front) in added_https_fronts {
-            v.push(RequestType::AddHttpsFrontend(front.clone().into()).into());
+            v.push(RequestType::add_https_frontend(front.clone().into()).into());
         }
 
         let mut my_tcp_fronts: HashSet<(&ClusterId, &TcpFrontend)> = HashSet::new();

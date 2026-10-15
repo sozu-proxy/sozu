@@ -1495,10 +1495,11 @@ impl BackendList {
             self.has_backend(&address),
             "add_backend must leave the backend present in the list"
         );
-        // Refresh table-based policies (Maglev) off the datapath whenever the
-        // full backend set or a weight changes. This is the ONLY place the
-        // table is rebuilt on mutation; selection never rebuilds. The default
-        // `rebuild` is a no-op for the stateless policies.
+        // Refresh table-based policies (Maglev) and the running weights of
+        // round robin off the datapath whenever the full backend set or a
+        // weight changes. This is the ONLY place the table is rebuilt on
+        // mutation; selection never rebuilds. The default `rebuild` is a
+        // no-op for the stateless policies.
         self.load_balancing.rebuild(&self.backends);
         // Size the candidate buffer for the whole list here, on the control
         // plane, so no selection ever grows it.
@@ -1762,9 +1763,9 @@ impl BackendList {
                 .is_none(),
             "remove_backend must evict the backend it names"
         );
-        // Rebuild table-based policies (Maglev) off the datapath after the set
-        // shrinks, only when something was actually removed. No-op for the
-        // stateless policies.
+        // Rebuild table-based policies (Maglev) and reset round robin's
+        // running weights off the datapath after the set shrinks, only when
+        // something was actually removed. No-op for the stateless policies.
         if removed {
             self.load_balancing.rebuild(&self.backends);
             self.refresh_siblings();
@@ -2145,7 +2146,11 @@ impl BackendList {
     ) {
         match load_balancing_policy {
             LoadBalancingAlgorithms::RoundRobin => {
-                self.load_balancing = Box::new(RoundRobin::new())
+                let mut round_robin = RoundRobin::new();
+                // Size the running weights now, off the datapath, so no
+                // selection allocates them.
+                round_robin.rebuild(&self.backends);
+                self.load_balancing = Box::new(round_robin)
             }
             LoadBalancingAlgorithms::Random => {
                 self.load_balancing = Box::new(Random::with_seed(seed))
@@ -2164,12 +2169,18 @@ impl BackendList {
             // Affinity policies. They consult the client key every datapath
             // derives (UDP affinity key; HTTP/HTTPS/TCP source IP, header or
             // cookie); with `None` they fall back to round-robin.
-            LoadBalancingAlgorithms::Hrw => self.load_balancing = Box::new(Rendezvous::new()),
+            LoadBalancingAlgorithms::Hrw => {
+                let mut rendezvous = Rendezvous::new();
+                // Size the round-robin fallback's running weights now.
+                rendezvous.rebuild(&self.backends);
+                self.load_balancing = Box::new(rendezvous)
+            }
             LoadBalancingAlgorithms::Maglev => {
                 let mut maglev = Maglev::new();
                 // Seed the lookup table from the currently-known backends so
-                // selection is correct before the first control-plane rebuild.
-                maglev.rebuild(&self.backends);
+                // selection is correct before the first control-plane rebuild,
+                // and size the round-robin fallback's running weights.
+                LoadBalancingAlgorithm::rebuild(&mut maglev, &self.backends);
                 self.load_balancing = Box::new(maglev);
             }
         }
