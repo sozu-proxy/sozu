@@ -24,6 +24,72 @@
   itself lists every cluster before its backends.
 - A worker of this release refuses such a backend even from an older main
   process, which may still hold it in its own state.
+### Fixed
+
+- Re-adding the last HTTP, HTTPS, TCP or UDP listener removed from an address
+  now restores the frontends retained in worker configuration state; HTTPS also
+  restores the retained certificates. The worker completes this reconstruction
+  before acknowledging the listener add and discards only the new listener if
+  reconstruction fails. Existing same-address interface siblings keep their
+  current routes and certificate resolver without duplicate replay.
+- `AddCertificate` and `ReplaceCertificate` now reject malformed private keys,
+  demonstrably mismatched certificate/key pairs and names the SNI table cannot
+  host before mutating main-process state. Workers use the same validator before
+  touching the resolver, so a refusal preserves the saved state and the
+  certificate already serving traffic. A crypto provider that cannot expose
+  the key material returns rustls' `InconsistentKeys::Unknown`; Sōzu keeps
+  accepting that result under rustls' `CertifiedKey::from_der` contract.
+- `ReplaceCertificate` now resolves an empty `names` list from the certificate's
+  SAN/CN before recording the replacement, matching `AddCertificate` and making
+  saved-state replay stable. Replacements with the same leaf fingerprint update
+  the resolver when their canonical certificate material or effective
+  expiration differs. A strict retry with identical material and expiration
+  preserves the existing wrapper, SNI tie ordering and expiration gauge.
+- `ConfigState` now persists each TLS certificate's effective `expired_at`
+  override and insertion order. `SaveState`, `LoadState`, main-process handoff,
+  worker bootstrap and worker upgrade therefore preserve both expiration-based
+  selection and the insertion-order tie break. The new public
+  `ConfigState::certificate_metadata` sidecar is a Rust source compatibility
+  change for downstream exhaustive struct literals; the certificate map and
+  command protobufs are unchanged. Old JSON without the field remains readable
+  and malformed partial metadata is normalized deterministically on the first
+  state-changing certificate command. Direct in-memory writes to the still
+  public `certificates` map bypass that invariant and remain unsupported.
+- Certificate-state reconciliation now compares material, expiration and
+  insertion order. When only order differs, it retains the longest usable
+  target prefix and moves only the required suffix with `RemoveCertificate`
+  followed by `AddCertificate`; a replay after an interrupted pair converges.
+  Canonical additions append in `O(1)`; each removal or effective replacement
+  compacts one address's ordinals in `O(N)`, so a reconciliation moving `N`
+  certificates can take `O(N²)` state work.
+  This sequence is not atomic: a name carried only by the certificate being
+  moved can temporarily fall back or become unavailable. Set replacement can
+  also pass through an empty resolver.
+- The first hot upgrade from 2.3.1 cannot recover expiration overrides or
+  resolver insertion order that the 2.3.1 main process never stored. The new
+  main accepts that legacy state and assigns deterministic fallback order with
+  no overrides. Until each old worker is upgraded, its retained runtime
+  resolver can select a different certificate from the new main. Worker
+  replacement converges to the new main and may change the served certificate;
+  later saves, replays and upgrades preserve that normalized state. Re-emit
+  `ReplaceCertificate` commands from the authoritative certificate source
+  before replacing workers when the lost overrides must remain effective. A
+  2.3.1 SaveState file is a separate boundary: it emits certificates in one
+  concrete but arbitrary `HashMap` iteration order, and loading that request
+  stream records the order it contains rather than reconstructing history.
+- A listener activation refused by the runtime now restores an inactive flag in
+  both main and worker configuration state. Activating a listener that was
+  already active creates no deactivation inverse. A fan-out timeout remains an
+  indeterminate transport result: even when no acknowledgement arrived and the
+  main state was restored, a late worker success can still have bound a socket,
+  so the operator must restart or reconcile workers before retrying.
+- `AddCluster` now parses its per-cluster HTTP answer templates in the main
+  process before replacing configuration state. Initial additions, upserts and
+  state replay use the worker runtime's precedence (`answers["503"]` overrides
+  the legacy `answer_503` field), so a malformed answer is refused while the
+  prior cluster state and live answer remain in place. This gate prevents new
+  invalid mutations; it does not repair state already persisted by an older
+  version.
 
 ## 2.3.1 - 2026-10-14
 

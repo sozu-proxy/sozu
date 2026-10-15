@@ -952,6 +952,23 @@ fn certificate() -> CertificateAndKey {
     }
 }
 
+fn tied_certificates() -> (CertificateAndKey, CertificateAndKey) {
+    (
+        CertificateAndKey {
+            certificate: include_str!("../../lib/assets/tests/certificate-1y.pem").to_owned(),
+            key: include_str!("../../lib/assets/tests/key-1y.pem").to_owned(),
+            names: vec!["tie.example.test".to_owned()],
+            ..Default::default()
+        },
+        CertificateAndKey {
+            certificate: include_str!("../../lib/assets/tests/certificate-2y.pem").to_owned(),
+            key: include_str!("../../lib/assets/tests/key-2y.pem").to_owned(),
+            names: vec!["tie.example.test".to_owned()],
+            ..Default::default()
+        },
+    )
+}
+
 fn listener_at<T>(
     listeners: &BTreeMap<sozu_command_lib::listener_key::ListenerKey, T>,
     address: SocketAddress,
@@ -1053,6 +1070,115 @@ fn mutable_commands_fixed_scenario_covers_every_persisted_mutator() {
     let record = run(0x2301, 0, false);
     assert_eq!(record.accepted.len(), MutationKind::ALL.len());
     assert!(record.refused.len() >= 5, "fixed refusal branches ran");
+}
+
+#[test]
+fn certificate_expiration_and_tie_order_survive_diff_and_partial_recovery() {
+    let listener = address(HTTPS_PORT);
+    let socket_address: SocketAddr = listener.into();
+    let (certificate_a, certificate_b) = tied_certificates();
+    let fingerprint_a = certificate_a.fingerprint().expect("fingerprint A");
+    let fingerprint_b = certificate_b.fingerprint().expect("fingerprint B");
+    let expiration = Some(2_100_000_000);
+
+    let build = |certificates: [CertificateAndKey; 2]| {
+        let mut state = ConfigState::new();
+        for certificate in certificates {
+            state
+                .dispatch(
+                    &RequestType::AddCertificate(AddCertificate {
+                        address: listener,
+                        certificate,
+                        expired_at: expiration,
+                    })
+                    .into(),
+                )
+                .expect("certificate accepted by the model");
+        }
+        state
+    };
+    let source = build([certificate_a.to_owned(), certificate_b.to_owned()]);
+    let target = build([certificate_b, certificate_a]);
+
+    let source_entries = source.ordered_certificate_entries(socket_address);
+    assert_eq!(
+        source_entries
+            .iter()
+            .map(|(fingerprint, _, metadata)| {
+                (
+                    fingerprint.to_owned(),
+                    metadata.expired_at,
+                    metadata.insertion_order,
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            (fingerprint_a.to_owned(), expiration, 0),
+            (fingerprint_b.to_owned(), expiration, 1)
+        ],
+        "the source model must carry a non-empty equal-expiration tie and its insertion order"
+    );
+    assert_eq!(
+        source_entries.last().map(|(fingerprint, _, _)| fingerprint),
+        Some(&fingerprint_b),
+        "workers choose the later insertion when expiration ties"
+    );
+    assert_eq!(
+        source
+            .certificate_add_requests_for_address(socket_address)
+            .into_iter()
+            .map(|add| add.expired_at)
+            .collect::<Vec<_>>(),
+        vec![expiration, expiration],
+        "the persisted request stream must carry both non-empty expiration overrides"
+    );
+
+    let sequence = source.diff(&target);
+    assert_eq!(
+        sequence.len(),
+        2,
+        "A,B -> B,A must move only A with one Remove/Add pair: {sequence:?}"
+    );
+    assert!(
+        matches!(
+            &sequence[0].request_type,
+            Some(RequestType::RemoveCertificate(remove))
+                if remove.fingerprint == fingerprint_a.to_string()
+        ) && matches!(
+            &sequence[1].request_type,
+            Some(RequestType::AddCertificate(add))
+                if add.certificate.fingerprint().ok().as_ref() == Some(&fingerprint_a)
+        ),
+        "the minimal order-only sequence must move only certificate A: {sequence:?}"
+    );
+    let mut interrupted = source.to_owned();
+    for request in sequence.iter().take(1) {
+        interrupted
+            .dispatch(request)
+            .expect("the first order-convergence request applies");
+    }
+    assert_ne!(
+        business_state(&interrupted),
+        business_state(&target),
+        "the interrupted sequence must expose a real partial state"
+    );
+
+    for request in interrupted.diff(&target) {
+        interrupted
+            .dispatch(&request)
+            .expect("replaying from a partial sequence converges");
+    }
+    assert_eq!(
+        business_state(&interrupted),
+        business_state(&target),
+        "a fresh diff must recover payload, expiry and order after interruption"
+    );
+    let target_entries = interrupted.ordered_certificate_entries(socket_address);
+    assert_eq!(
+        target_entries.last().map(|(fingerprint, _, _)| fingerprint),
+        Some(&fingerprint_a),
+        "recovery must restore the target worker winner, not only metadata cardinality"
+    );
 }
 
 #[test]

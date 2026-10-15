@@ -8,7 +8,6 @@ use std::{
     fs::File,
     hash::{Hash, Hasher},
     io::Write,
-    iter::repeat,
     net::SocketAddr,
 };
 
@@ -251,6 +250,46 @@ fn certificate_error_kind(error: &CertificateError) -> &'static str {
 const TCP_CLUSTER_AFFINITY_KEY: &str = "a TCP frontend always keys on the client source IP: \
     affinity_header and affinity_cookie apply to HTTP/HTTPS clusters only";
 
+/// Runtime selection metadata attached to one stored TLS certificate.
+///
+/// The certificate material remains in [`ConfigState::certificates`] so its
+/// public map type and every command protobuf stay unchanged. This sidecar is
+/// serialized with `ConfigState`: SaveState request generation, main-process
+/// upgrades and worker bootstrap can therefore retain an operator-provided
+/// expiration and the insertion order used to break equal-expiration ties.
+///
+/// Adding this public type and [`ConfigState::certificate_metadata`] is a Rust
+/// source compatibility change for downstream exhaustive `ConfigState`
+/// literals. Serialized states written before the field existed remain
+/// readable because the sidecar defaults to empty.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CertificateMetadata {
+    pub expired_at: Option<i64>,
+    pub insertion_order: u64,
+}
+
+/// Metadata for every certificate on one listener address.
+///
+/// The serialized representation is transparently the fingerprint map. The
+/// private `next_order` cache is never trusted across deserialization; the
+/// first state-changing certificate mutation normalizes a legacy/partial
+/// index, then ordinary replay appends subsequent certificates in O(1).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CertificateMetadataIndex {
+    entries: HashMap<Fingerprint, CertificateMetadata>,
+    #[serde(skip)]
+    next_order: Option<u64>,
+}
+
+impl PartialEq for CertificateMetadataIndex {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+    }
+}
+
+impl Eq for CertificateMetadataIndex {}
+
 /// The `ConfigState` represents the state of Sōzu's business, which is to forward traffic
 /// from frontends to backends. Hence, it contains all details about:
 ///
@@ -278,7 +317,23 @@ pub struct ConfigState {
     pub https_fronts: BTreeMap<String, HttpFrontend>,
     pub tcp_fronts: HashMap<ClusterId, Vec<TcpFrontend>>,
     pub udp_fronts: HashMap<ClusterId, Vec<UdpFrontend>>,
+    /// TLS certificate material by listener address and leaf fingerprint.
+    ///
+    /// Mutations must go through [`Self::dispatch`] so
+    /// [`Self::certificate_metadata`] remains coherent. The map stays public
+    /// for compatibility, but replacing entries directly in memory can
+    /// invalidate the sidecar without changing either map's cardinality; that
+    /// shape cannot be detected by the O(1) mutation fast path. Deserialized
+    /// state is treated as untrusted and normalized on its first successful
+    /// certificate mutation.
     pub certificates: HashMap<SocketAddr, HashMap<Fingerprint, CertificateAndKey>>,
+    /// Selection metadata for entries in `certificates`, keyed identically.
+    ///
+    /// A missing or partial sidecar is a valid legacy state. Read paths derive
+    /// a deterministic total order and certificate mutations normalize the
+    /// affected address only after all fallible validation has succeeded.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub certificate_metadata: HashMap<SocketAddr, CertificateMetadataIndex>,
     /// A census of requests that were received. Name of the request -> number of occurences
     pub request_counts: BTreeMap<String, i32>,
 }
@@ -322,6 +377,10 @@ impl std::fmt::Debug for ConfigState {
             .field("udp_frontends_count", &udp_frontends_count)
             .field("certificate_addresses_count", &self.certificates.len())
             .field("certificates_count", &certificates_count)
+            .field(
+                "certificate_metadata_addresses_count",
+                &self.certificate_metadata.len(),
+            )
             .field("request_counts_count", &self.request_counts.len())
             .finish_non_exhaustive()
     }
@@ -332,13 +391,157 @@ impl ConfigState {
         Self::default()
     }
 
+    /// Certificates at `address` in their effective runtime insertion order.
+    ///
+    /// Legacy or externally deserialized states may have missing, duplicate or
+    /// gapped ordinals. They remain readable: entries without metadata sort
+    /// first by fingerprint; metadata-bearing entries follow by ordinal and
+    /// then fingerprint. The returned ordinals are always normalized to the
+    /// contiguous range `0..len`, without mutating `self`.
+    pub fn ordered_certificate_entries(
+        &self,
+        address: SocketAddr,
+    ) -> Vec<(Fingerprint, &CertificateAndKey, CertificateMetadata)> {
+        let Some(certificates) = self.certificates.get(&address) else {
+            return Vec::new();
+        };
+        let metadata = self.certificate_metadata.get(&address);
+        let mut fingerprints: Vec<Fingerprint> =
+            certificates.keys().map(ToOwned::to_owned).collect();
+        fingerprints.sort_by(|left, right| {
+            match (
+                metadata.and_then(|index| index.entries.get(left)),
+                metadata.and_then(|index| index.entries.get(right)),
+            ) {
+                (None, None) => left.cmp(right),
+                (None, Some(_)) => std::cmp::Ordering::Less,
+                (Some(_), None) => std::cmp::Ordering::Greater,
+                (Some(left_metadata), Some(right_metadata)) => left_metadata
+                    .insertion_order
+                    .cmp(&right_metadata.insertion_order)
+                    .then_with(|| left.cmp(right)),
+            }
+        });
+
+        fingerprints
+            .into_iter()
+            .enumerate()
+            .filter_map(|(insertion_order, fingerprint)| {
+                let certificate = certificates.get(&fingerprint)?;
+                let expired_at = metadata
+                    .and_then(|index| index.entries.get(&fingerprint))
+                    .and_then(|entry| entry.expired_at);
+                Some((
+                    fingerprint,
+                    certificate,
+                    CertificateMetadata {
+                        expired_at,
+                        insertion_order: insertion_order as u64,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// Replay requests for one listener, ordered exactly as its resolver was
+    /// populated and carrying every retained expiration override.
+    pub fn certificate_add_requests_for_address(&self, address: SocketAddr) -> Vec<AddCertificate> {
+        self.ordered_certificate_entries(address)
+            .into_iter()
+            .map(|(_, certificate, metadata)| AddCertificate {
+                address: SocketAddress::from(address),
+                certificate: certificate.to_owned(),
+                expired_at: metadata.expired_at,
+            })
+            .collect()
+    }
+
+    fn normalized_certificate_metadata_for_address(
+        &self,
+        address: SocketAddr,
+    ) -> CertificateMetadataIndex {
+        let entries: HashMap<Fingerprint, CertificateMetadata> = self
+            .ordered_certificate_entries(address)
+            .into_iter()
+            .map(|(fingerprint, _, metadata)| (fingerprint, metadata))
+            .collect();
+        CertificateMetadataIndex {
+            next_order: Some(entries.len() as u64),
+            entries,
+        }
+    }
+
+    fn certificate_metadata_is_trusted(&self, address: SocketAddr) -> bool {
+        let certificate_count = self.certificates.get(&address).map_or(0, HashMap::len);
+        self.certificate_metadata
+            .get(&address)
+            .is_some_and(|metadata| {
+                metadata.next_order == Some(certificate_count as u64)
+                    && metadata.entries.len() == certificate_count
+            })
+    }
+
+    /// Take the canonical metadata index for an already-validated mutation.
+    ///
+    /// State built by this process carries a trusted `next_order` cache and
+    /// can be reused directly. Deserialized or partial state has no trusted
+    /// cache and pays the sorting cost once before the mutation commits.
+    fn take_certificate_metadata_for_state_change(
+        &mut self,
+        address: SocketAddr,
+    ) -> CertificateMetadataIndex {
+        if self.certificate_metadata_is_trusted(address) {
+            self.certificate_metadata
+                .remove(&address)
+                .expect("trusted metadata index must remain present")
+        } else {
+            self.normalized_certificate_metadata_for_address(address)
+        }
+    }
+
+    #[cfg(any(debug_assertions, test))]
+    fn normalized_certificate_metadata(&self) -> HashMap<SocketAddr, CertificateMetadataIndex> {
+        self.certificates
+            .keys()
+            .filter_map(|address| {
+                let metadata = self.normalized_certificate_metadata_for_address(*address);
+                (!metadata.entries.is_empty()).then_some((*address, metadata))
+            })
+            .collect()
+    }
+
+    fn remove_certificate_metadata(
+        metadata: &mut CertificateMetadataIndex,
+        fingerprint: &Fingerprint,
+    ) -> Option<CertificateMetadata> {
+        let removed = metadata.entries.remove(fingerprint)?;
+        for entry in metadata.entries.values_mut() {
+            if entry.insertion_order > removed.insertion_order {
+                entry.insertion_order -= 1;
+            }
+        }
+        metadata.next_order = Some(metadata.entries.len() as u64);
+        Some(removed)
+    }
+
+    fn certificate_add_requests(&self) -> Vec<AddCertificate> {
+        let mut addresses: Vec<SocketAddr> = self.certificates.keys().copied().collect();
+        addresses.sort_unstable();
+        addresses
+            .into_iter()
+            .flat_map(|address| self.certificate_add_requests_for_address(address))
+            .collect()
+    }
+
     /// Capture the compensating request that restores this exact state if
     /// `request` is accepted here but refused by the runtime afterwards.
     ///
     /// Additions whose inverse is independent of prior state use
     /// [`rollback_request`]. Frontend removals instead snapshot the stored
     /// frontend before dispatch: their wire request is only a selector and
-    /// can omit metadata that an `Add` must restore.
+    /// can omit metadata that an `Add` must restore. Listener activation also
+    /// snapshots the stored active flag so a refused activation only undoes
+    /// the transition from inactive to active.
     pub fn rollback_for(&self, request: &RequestType) -> Option<Request> {
         if let Some(rollback) = rollback_request(request) {
             return Some(rollback);
@@ -386,6 +589,36 @@ impl ConfigState {
                     .cloned()
                     .map(RequestUdpFrontend::from)
                     .map(RequestType::AddUdpFrontend)
+            }
+            RequestType::ActivateListener(activate) => {
+                let key = activate.listener_key();
+                let was_inactive = match ListenerType::try_from(activate.proxy).ok()? {
+                    ListenerType::Http => self
+                        .http_listeners
+                        .get(&key)
+                        .map(|listener| !listener.active),
+                    ListenerType::Https => self
+                        .https_listeners
+                        .get(&key)
+                        .map(|listener| !listener.active),
+                    ListenerType::Tcp => self
+                        .tcp_listeners
+                        .get(&key)
+                        .map(|listener| !listener.active),
+                    ListenerType::Udp => self
+                        .udp_listeners
+                        .get(&key)
+                        .map(|listener| !listener.active),
+                }?;
+
+                was_inactive.then(|| {
+                    RequestType::DeactivateListener(DeactivateListener {
+                        address: activate.address,
+                        proxy: activate.proxy,
+                        to_scm: false,
+                        interface: activate.interface.to_owned(),
+                    })
+                })
             }
             _ => None,
         };
@@ -594,6 +827,46 @@ impl ConfigState {
             debug_assert!(
                 !certs.is_empty(),
                 "certificate bucket for address {address} must never be empty (sozu-proxy/sozu#1404)"
+            );
+        }
+        // A trusted sidecar is produced only by successful certificate
+        // mutations in this module. Deserialization clears `next_order`, so
+        // legacy, partial and externally authored sidecars stay readable and
+        // are deliberately excluded until the next successful mutation
+        // normalizes that address.
+        for (address, metadata) in &self.certificate_metadata {
+            let Some(next_order) = metadata.next_order else {
+                continue;
+            };
+            let certificates = self
+                .certificates
+                .get(address)
+                .expect("trusted certificate metadata must have a certificate bucket");
+            debug_assert_eq!(
+                metadata.entries.len(),
+                certificates.len(),
+                "trusted certificate metadata must cover every stored fingerprint"
+            );
+            debug_assert_eq!(
+                next_order,
+                metadata.entries.len() as u64,
+                "trusted certificate metadata next ordinal must equal its length"
+            );
+            let ordinals: BTreeSet<u64> = metadata
+                .entries
+                .iter()
+                .map(|(fingerprint, entry)| {
+                    debug_assert!(
+                        certificates.contains_key(fingerprint),
+                        "trusted certificate metadata cannot retain an orphan fingerprint"
+                    );
+                    entry.insertion_order
+                })
+                .collect();
+            debug_assert_eq!(
+                ordinals,
+                (0..next_order).collect(),
+                "trusted certificate ordinals must be unique and contiguous"
             );
         }
 
@@ -1783,25 +2056,16 @@ impl ConfigState {
             .certificate
             .fingerprint()
             .map_err(StateError::AddCertificate)?;
+        let address: SocketAddr = add.address.into();
 
-        // Both fallible steps (`fingerprint()` above, `apply_overriding_names`
-        // below -- the latter re-parses as X.509 when `names` is empty, so
-        // well-formed PEM armor around invalid DER content still fails here)
-        // run BEFORE `self.certificates` is touched. `entry(..).or_default()`
-        // unconditionally materialises a bucket for the address, including a
-        // brand-new one; ordering it after either fallible step used to leave
-        // a dangling empty bucket for a previously-absent address on a
-        // rejected add -- the same "mutate before the fallible step" defect
-        // class as sozu-proxy/sozu#1404's `replace_certificate`, found while
-        // adding certificate coverage to `check_invariants` for that issue.
-        let mut add = add.clone();
-        add.certificate
-            .apply_overriding_names()
-            .map_err(StateError::AddCertificate)?;
-
-        let entry = self.certificates.entry(add.address.into()).or_default();
-
-        if entry.contains_key(&fingerprint) {
+        // Duplicate AddCertificate is historically a complete no-op keyed by
+        // leaf fingerprint. In particular it must not rewrite material,
+        // expiration metadata or selection order from a differing retry.
+        if self
+            .certificates
+            .get(&address)
+            .is_some_and(|entries| entries.contains_key(&fingerprint))
+        {
             let names_bytes = add
                 .certificate
                 .names
@@ -1817,8 +2081,62 @@ impl ConfigState {
             return Ok(());
         }
 
+        // Both fallible steps (`fingerprint()` above, `apply_overriding_names`
+        // below -- the latter re-parses as X.509 when `names` is empty, so
+        // well-formed PEM armor around invalid DER content still fails here)
+        // run BEFORE `self.certificates` is touched. `entry(..).or_default()`
+        // unconditionally materialises a bucket for the address, including a
+        // brand-new one; ordering it after either fallible step used to leave
+        // a dangling empty bucket for a previously-absent address on a
+        // rejected add -- the same "mutate before the fallible step" defect
+        // class as sozu-proxy/sozu#1404's `replace_certificate`, found while
+        // adding certificate coverage to `check_invariants` for that issue.
+        let mut add = add.clone();
+        add.certificate
+            .apply_overriding_names()
+            .map_err(StateError::AddCertificate)?;
+        let trusted_next_order = self.certificate_metadata_is_trusted(address).then(|| {
+            self.certificate_metadata
+                .get(&address)
+                .and_then(|index| index.next_order)
+                .expect("trusted metadata index must carry its next ordinal")
+        });
+        let normalized_metadata = trusted_next_order
+            .is_none()
+            .then(|| self.normalized_certificate_metadata_for_address(address));
+        let entry = self.certificates.entry(address).or_default();
         let before = entry.len();
         entry.insert(fingerprint.clone(), add.certificate);
+        if let Some(insertion_order) = trusted_next_order {
+            let metadata = self
+                .certificate_metadata
+                .get_mut(&address)
+                .expect("trusted metadata index must remain present");
+            metadata.entries.insert(
+                fingerprint.clone(),
+                CertificateMetadata {
+                    expired_at: add.expired_at,
+                    insertion_order,
+                },
+            );
+            metadata.next_order = Some(insertion_order + 1);
+        } else {
+            // The existing index came from a legacy or externally
+            // deserialized state. Validation above has completed, so it is
+            // now safe to normalize once and commit the new entry.
+            let mut metadata =
+                normalized_metadata.expect("untrusted metadata must have a normalized candidate");
+            let insertion_order = metadata.entries.len() as u64;
+            metadata.entries.insert(
+                fingerprint.clone(),
+                CertificateMetadata {
+                    expired_at: add.expired_at,
+                    insertion_order,
+                },
+            );
+            metadata.next_order = Some(insertion_order + 1);
+            self.certificate_metadata.insert(address, metadata);
+        }
         debug_assert!(
             entry.contains_key(&fingerprint),
             "add_certificate must insert the fingerprint under its address"
@@ -1837,6 +2155,17 @@ impl ConfigState {
                 .map_err(|decode_error| StateError::RemoveCertificate(decode_error.to_string()))?,
         );
         let address = remove.address.into();
+
+        if self
+            .certificates
+            .get(&address)
+            .is_none_or(|entries| !entries.contains_key(&fingerprint))
+        {
+            return Ok(());
+        }
+
+        let mut metadata = self.take_certificate_metadata_for_state_change(address);
+        Self::remove_certificate_metadata(&mut metadata, &fingerprint);
 
         let became_empty = if let Some(index) = self.certificates.get_mut(&address) {
             index.remove(&fingerprint);
@@ -1862,6 +2191,9 @@ impl ConfigState {
         // sozu-proxy/sozu#1404.
         if became_empty {
             self.certificates.remove(&address);
+            self.certificate_metadata.remove(&address);
+        } else {
+            self.certificate_metadata.insert(address, metadata);
         }
 
         Ok(())
@@ -1898,44 +2230,73 @@ impl ConfigState {
             });
         }
 
+        let mut new_certificate = replace.new_certificate.to_owned();
+        new_certificate
+            .apply_overriding_names()
+            .map_err(|error| StateError::ReplaceCertificate(error.to_string()))?;
         let new_fingerprint = Fingerprint(
-            calculate_fingerprint(replace.new_certificate.certificate.as_bytes()).map_err(
+            calculate_fingerprint(new_certificate.certificate.as_bytes()).map_err(
                 |fingerprint_err| StateError::ReplaceCertificate(fingerprint_err.to_string()),
             )?,
         );
-
-        self.certificates
-            .get_mut(&replace_address)
-            .ok_or(StateError::ReplaceCertificate(
-                "Unlikely error. This entry in the certificate hashmap should be present"
-                    .to_string(),
-            ))?
-            .insert(new_fingerprint.clone(), replace.new_certificate.clone());
-
-        if !self
+        let stored_material_matches = self
             .certificates
             .get(&replace_address)
-            .ok_or(StateError::ReplaceCertificate(
-                "Unlikely error. This entry in the certificate hashmap should be present"
-                    .to_string(),
-            ))?
-            .contains_key(&new_fingerprint)
+            .and_then(|entries| entries.get(&new_fingerprint))
+            .is_some_and(|stored| stored == &new_certificate);
+        let stored_expiration_matches = self
+            .certificate_metadata
+            .get(&replace_address)
+            .and_then(|metadata| metadata.entries.get(&new_fingerprint))
+            .and_then(|metadata| metadata.expired_at)
+            == replace.new_expired_at;
+
+        // A byte-for-byte effective self-replace is a complete no-op. Return
+        // before normalizing legacy metadata so successful no-op commands keep
+        // their historical behavior and cost.
+        if old_fingerprint == new_fingerprint
+            && stored_material_matches
+            && stored_expiration_matches
         {
-            return Err(StateError::ReplaceCertificate(format!(
-                "Failed to insert the new certificate for address {}",
-                replace.address
-            )));
+            return Ok(());
         }
 
-        // Idempotent-replace short-circuit: when old == new, the entry
-        // just (re-)inserted above IS the certificate the caller meant to
-        // keep. Removing `old_fingerprint` now would delete it again
-        // immediately.
-        if new_fingerprint != old_fingerprint {
+        let mut metadata = self.take_certificate_metadata_for_state_change(replace_address);
+        let new_material_already_stored = stored_material_matches
+            && metadata
+                .entries
+                .get(&new_fingerprint)
+                .is_some_and(|stored| stored.expired_at == replace.new_expired_at);
+
+        let certificates =
             self.certificates
                 .get_mut(&replace_address)
-                .map(|certs| certs.remove(&old_fingerprint));
+                .ok_or(StateError::ReplaceCertificate(
+                    "Unlikely error. This entry in the certificate hashmap should be present"
+                        .to_owned(),
+                ))?;
+
+        if !new_material_already_stored {
+            certificates.remove(&new_fingerprint);
+            Self::remove_certificate_metadata(&mut metadata, &new_fingerprint);
         }
+        if old_fingerprint != new_fingerprint {
+            certificates.remove(&old_fingerprint);
+            Self::remove_certificate_metadata(&mut metadata, &old_fingerprint);
+        }
+        if !new_material_already_stored {
+            let insertion_order = metadata.entries.len() as u64;
+            certificates.insert(new_fingerprint.clone(), new_certificate);
+            metadata.entries.insert(
+                new_fingerprint.clone(),
+                CertificateMetadata {
+                    expired_at: replace.new_expired_at,
+                    insertion_order,
+                },
+            );
+            metadata.next_order = Some(insertion_order + 1);
+        }
+        self.certificate_metadata.insert(replace_address, metadata);
 
         // Postcondition: the new fingerprint is keyed under the address, and
         // (unless old and new collide, e.g. a self-replace) the old one is gone.
@@ -2512,17 +2873,8 @@ impl ConfigState {
             v.push(RequestType::AddHttpFrontend(front.clone().into()).into());
         }
 
-        for (front, certs) in self.certificates.iter() {
-            for certificate_and_key in certs.values() {
-                v.push(
-                    RequestType::AddCertificate(AddCertificate {
-                        address: SocketAddress::from(*front),
-                        certificate: certificate_and_key.clone(),
-                        expired_at: None,
-                    })
-                    .into(),
-                );
-            }
+        for add in self.certificate_add_requests() {
+            v.push(RequestType::AddCertificate(add).into());
         }
 
         for front in self.https_fronts.values() {
@@ -2570,7 +2922,8 @@ impl ConfigState {
                     && replayed.http_fronts == self.http_fronts
                     && replayed.https_fronts == self.https_fronts
                     && replayed.tcp_fronts == self.tcp_fronts
-                    && replayed.certificates == self.certificates,
+                    && replayed.certificates == self.certificates
+                    && replayed.certificate_metadata == self.normalized_certificate_metadata(),
                 "replaying generate_requests into a fresh state must reproduce self"
             );
         }
@@ -3229,47 +3582,184 @@ impl ConfigState {
             v.push(RequestType::AddUdpFrontend(front.clone().into()).into());
         }
 
-        //pub certificates:    HashMap<SocketAddr, HashMap<CertificateFingerprint, (CertificateAndKey, Vec<String>)>>,
-        let my_certificates: HashSet<(SocketAddr, &Fingerprint)> = HashSet::from_iter(
-            self.certificates
+        // Certificates have two observable dimensions beyond their map key:
+        // the payload/expiration stored under a common fingerprint, and the
+        // insertion order used to break equal-expiration name collisions.
+        // Build this part of the diff against a certificate-only shadow and
+        // apply every emitted request to it. That makes combined payload,
+        // expiry and order changes converge by construction.
+        let mut certificate_shadow = ConfigState {
+            certificates: self.certificates.to_owned(),
+            certificate_metadata: self.certificate_metadata.to_owned(),
+            ..Default::default()
+        };
+        let certificate_addresses: BTreeSet<SocketAddr> = self
+            .certificates
+            .keys()
+            .chain(other.certificates.keys())
+            .copied()
+            .collect();
+
+        for address in certificate_addresses {
+            // `certificate_shadow` may originate from a legacy or externally
+            // deserialized state. Normalize this address once before the
+            // loop: every dispatch below then maintains the canonical index
+            // in O(1) for Add rather than sorting the full address once per
+            // target certificate.
+            let normalized_metadata =
+                certificate_shadow.normalized_certificate_metadata_for_address(address);
+            if normalized_metadata.entries.is_empty() {
+                certificate_shadow.certificate_metadata.remove(&address);
+            } else {
+                certificate_shadow
+                    .certificate_metadata
+                    .insert(address, normalized_metadata);
+            }
+            let target: Vec<(Fingerprint, AddCertificate)> = other
+                .ordered_certificate_entries(address)
+                .into_iter()
+                .map(|(fingerprint, certificate, metadata)| {
+                    (
+                        fingerprint,
+                        AddCertificate {
+                            address: SocketAddress::from(address),
+                            certificate: certificate.to_owned(),
+                            expired_at: metadata.expired_at,
+                        },
+                    )
+                })
+                .collect();
+            let target_fingerprints: BTreeSet<Fingerprint> = target
                 .iter()
-                .flat_map(|(addr, certs)| repeat(*addr).zip(certs.keys())),
-        );
-        let their_certificates: HashSet<(SocketAddr, &Fingerprint)> = HashSet::from_iter(
-            other
+                .map(|(fingerprint, _)| fingerprint.to_owned())
+                .collect();
+            let current_fingerprints: BTreeSet<Fingerprint> = certificate_shadow
                 .certificates
-                .iter()
-                .flat_map(|(addr, certs)| repeat(*addr).zip(certs.keys())),
-        );
+                .get(&address)
+                .into_iter()
+                .flat_map(HashMap::keys)
+                .map(ToOwned::to_owned)
+                .collect();
 
-        let removed_certificates = my_certificates.difference(&their_certificates);
-        let added_certificates = their_certificates.difference(&my_certificates);
-
-        for &(address, fingerprint) in removed_certificates {
-            v.push(
-                RequestType::RemoveCertificate(RemoveCertificate {
+            for fingerprint in current_fingerprints.difference(&target_fingerprints) {
+                let request: Request = RequestType::RemoveCertificate(RemoveCertificate {
                     address: SocketAddress::from(address),
                     fingerprint: fingerprint.to_string(),
                 })
-                .into(),
-            );
-        }
-
-        for &(address, fingerprint) in added_certificates {
-            if let Some(certificate_and_key) = other
-                .certificates
-                .get(&address)
-                .and_then(|certs| certs.get(fingerprint))
-            {
-                v.push(
-                    RequestType::AddCertificate(AddCertificate {
-                        address: SocketAddress::from(address),
-                        certificate: certificate_and_key.clone(),
-                        expired_at: None,
-                    })
-                    .into(),
+                .into();
+                let result = certificate_shadow.dispatch(&request);
+                debug_assert!(
+                    result.is_ok(),
+                    "certificate removal diff must replay: {result:?}"
                 );
+                v.push(request);
             }
+
+            for (fingerprint, add) in &target {
+                let current_certificate = certificate_shadow
+                    .certificates
+                    .get(&address)
+                    .and_then(|entries| entries.get(fingerprint));
+                let current_expired_at = certificate_shadow
+                    .certificate_metadata
+                    .get(&address)
+                    .and_then(|index| index.entries.get(fingerprint))
+                    .and_then(|metadata| metadata.expired_at);
+
+                let request_type = match current_certificate {
+                    // Missing target certificates are inserted by the order
+                    // convergence pass below. Adding them here can put them
+                    // ahead of retained entries and then needlessly remove
+                    // and re-add the same fresh certificate.
+                    None => None,
+                    Some(current)
+                        if current != &add.certificate || current_expired_at != add.expired_at =>
+                    {
+                        Some(RequestType::ReplaceCertificate(ReplaceCertificate {
+                            address: SocketAddress::from(address),
+                            new_certificate: add.certificate.to_owned(),
+                            old_fingerprint: fingerprint.to_string(),
+                            new_expired_at: add.expired_at,
+                        }))
+                    }
+                    Some(_) => None,
+                };
+
+                if let Some(request_type) = request_type {
+                    let request: Request = request_type.into();
+                    let result = certificate_shadow.dispatch(&request);
+                    debug_assert!(
+                        result.is_ok(),
+                        "certificate update diff must replay: {result:?}"
+                    );
+                    v.push(request);
+                }
+            }
+
+            let target_order: Vec<Fingerprint> = target
+                .iter()
+                .map(|(fingerprint, _)| fingerprint.to_owned())
+                .collect();
+            let shadow_order: Vec<Fingerprint> = certificate_shadow
+                .ordered_certificate_entries(address)
+                .into_iter()
+                .map(|(fingerprint, _, _)| fingerprint)
+                .collect();
+            if shadow_order != target_order {
+                // Keep the longest prefix of the target that already appears
+                // as a subsequence of the current order. Moving only the
+                // remaining suffix to the end, in target order, converges
+                // this order-only pass without moving the retained prefix.
+                // For A,B,C -> B,C,A this retains B,C and moves only A. When
+                // source and target have the same set and at least two
+                // certificates, one remains globally throughout this pass;
+                // set changes handled above can still pass through zero. A
+                // domain carried only by a certificate being moved can also
+                // briefly fall back or become unavailable. This sequence is
+                // convergent, not atomic or interruption-free.
+                let mut shadow_cursor = 0usize;
+                let mut retained_prefix_len = 0usize;
+                for fingerprint in &target_order {
+                    let Some(offset) = shadow_order[shadow_cursor..]
+                        .iter()
+                        .position(|candidate| candidate == fingerprint)
+                    else {
+                        break;
+                    };
+                    shadow_cursor += offset + 1;
+                    retained_prefix_len += 1;
+                }
+
+                for (fingerprint, add) in target.iter().skip(retained_prefix_len) {
+                    let already_present = certificate_shadow
+                        .certificates
+                        .get(&address)
+                        .is_some_and(|certificates| certificates.contains_key(fingerprint));
+                    let mut request_types = Vec::with_capacity(usize::from(already_present) + 1);
+                    if already_present {
+                        request_types.push(RequestType::RemoveCertificate(RemoveCertificate {
+                            address: SocketAddress::from(address),
+                            fingerprint: fingerprint.to_string(),
+                        }));
+                    }
+                    request_types.push(RequestType::AddCertificate(add.to_owned()));
+                    for request_type in request_types {
+                        let request: Request = request_type.into();
+                        let result = certificate_shadow.dispatch(&request);
+                        debug_assert!(
+                            result.is_ok(),
+                            "certificate order diff must replay: {result:?}"
+                        );
+                        v.push(request);
+                    }
+                }
+            }
+
+            debug_assert_eq!(
+                certificate_shadow.certificate_add_requests_for_address(address),
+                other.certificate_add_requests_for_address(address),
+                "certificate diff must converge payload, expiration and insertion order"
+            );
         }
 
         for address in added_tcp_listeners {
@@ -3343,6 +3833,7 @@ impl ConfigState {
                     && replayed.https_fronts == other.https_fronts
                     && nonempty_tcp(&replayed.tcp_fronts) == nonempty_tcp(&other.tcp_fronts)
                     && replayed.certificates == other.certificates
+                    && replayed.certificate_metadata == other.normalized_certificate_metadata()
                     && replayed.http_listeners == other.http_listeners
                     && replayed.https_listeners == other.https_listeners
                     && replayed.tcp_listeners == other.tcp_listeners
@@ -4275,6 +4766,660 @@ mod tests {
             certificates_for_address.len(),
             1,
             "an idempotent replace must not change the number of stored certificates"
+        );
+    }
+
+    /// `AddCertificate` resolves empty name overrides from the certificate's
+    /// SAN/CN before storing the payload. `ReplaceCertificate` must preserve
+    /// the same canonical form so SaveState and worker-upgrade replay rebuild
+    /// exactly the state main accepted.
+    #[test]
+    fn replace_certificate_with_empty_names_round_trips_through_saved_state() {
+        let certificate = CertificateAndKey {
+            certificate: include_str!("../assets/certificate.pem").to_owned(),
+            key: include_str!("../assets/key.pem").to_owned(),
+            certificate_chain: Vec::new(),
+            versions: Vec::new(),
+            names: Vec::new(),
+        };
+        let fingerprint = certificate
+            .fingerprint()
+            .expect("test certificate fingerprint must be computable");
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let mut state = ConfigState::default();
+        state
+            .add_certificate(&AddCertificate {
+                address,
+                certificate: certificate.to_owned(),
+                expired_at: None,
+            })
+            .expect("initial certificate insertion must succeed");
+        assert!(
+            !state.certificates[&SocketAddr::from(address)][&fingerprint]
+                .names
+                .is_empty(),
+            "the fixture must expose at least one SAN or CN"
+        );
+
+        state
+            .replace_certificate(&ReplaceCertificate {
+                address,
+                new_certificate: certificate,
+                old_fingerprint: fingerprint.to_string(),
+                new_expired_at: None,
+            })
+            .expect("same-fingerprint replacement must succeed");
+
+        let requests = state.generate_requests();
+        let mut replayed = ConfigState::default();
+        for request in &requests {
+            replayed
+                .dispatch(request)
+                .unwrap_or_else(|error| panic!("could not replay {request:?}: {error}"));
+        }
+        assert_eq!(
+            replayed.certificates, state.certificates,
+            "saved-state replay must preserve canonical certificate names"
+        );
+    }
+
+    fn ordered_saved_certificates(state: &ConfigState) -> Vec<(Fingerprint, Option<i64>)> {
+        state
+            .generate_requests()
+            .into_iter()
+            .filter_map(|request| match request.request_type {
+                Some(RequestType::AddCertificate(add)) => Some((
+                    add.certificate
+                        .fingerprint()
+                        .expect("saved certificate fingerprint"),
+                    add.expired_at,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn distinct_test_certificates() -> (CertificateAndKey, CertificateAndKey) {
+        (
+            CertificateAndKey {
+                certificate: include_str!("../../lib/assets/tests/certificate-1y.pem").to_owned(),
+                key: include_str!("../../lib/assets/tests/key-1y.pem").to_owned(),
+                names: vec!["shared.example.test".to_owned()],
+                ..Default::default()
+            },
+            CertificateAndKey {
+                certificate: include_str!("../../lib/assets/tests/certificate-2y.pem").to_owned(),
+                key: include_str!("../../lib/assets/tests/key-2y.pem").to_owned(),
+                names: vec!["shared.example.test".to_owned()],
+                ..Default::default()
+            },
+        )
+    }
+
+    fn third_test_certificate() -> CertificateAndKey {
+        CertificateAndKey {
+            certificate: include_str!("../../lib/assets/tests/certificate-3.pem").to_owned(),
+            key: include_str!("../../lib/assets/tests/key.pem").to_owned(),
+            names: vec!["shared.example.test".to_owned()],
+            ..Default::default()
+        }
+    }
+
+    fn ordered_fingerprints(state: &ConfigState, address: SocketAddress) -> Vec<Fingerprint> {
+        state
+            .ordered_certificate_entries(address.into())
+            .into_iter()
+            .map(|(fingerprint, _, _)| fingerprint)
+            .collect()
+    }
+
+    /// SaveState, worker bootstrap and worker upgrade all consume
+    /// `generate_requests`. The request stream must retain both the explicit
+    /// expiration override and the insertion order that breaks ties between
+    /// certificates serving the same name.
+    #[test]
+    fn saved_certificate_requests_preserve_expiration_and_insertion_order() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let (certificate_a, certificate_b) = distinct_test_certificates();
+        let fingerprint_a = certificate_a.fingerprint().expect("fingerprint A");
+        let fingerprint_b = certificate_b.fingerprint().expect("fingerprint B");
+        let mut state = ConfigState::new();
+        for (certificate, expired_at) in [
+            (certificate_a, Some(2_100_000_000)),
+            (certificate_b, Some(2_200_000_000)),
+        ] {
+            state
+                .dispatch(
+                    &RequestType::AddCertificate(AddCertificate {
+                        address,
+                        certificate,
+                        expired_at,
+                    })
+                    .into(),
+                )
+                .expect("add certificate with expiration override");
+        }
+
+        assert_eq!(
+            ordered_saved_certificates(&state),
+            vec![
+                (fingerprint_a, Some(2_100_000_000)),
+                (fingerprint_b, Some(2_200_000_000)),
+            ],
+            "saved-state requests must preserve certificate order and expiration overrides"
+        );
+
+        use std::io::{Read, Seek, SeekFrom};
+
+        let mut file = tempfile::tempfile().expect("create SaveState file");
+        state
+            .write_requests_to_file(&mut file)
+            .expect("serialize SaveState request stream");
+        file.seek(SeekFrom::Start(0))
+            .expect("rewind SaveState file");
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).expect("read SaveState file");
+        let (remaining, requests) = crate::parser::parse_several_requests::<WorkerRequest>(&bytes)
+            .expect("parse LoadState request stream");
+        assert!(remaining.is_empty(), "LoadState parser left trailing bytes");
+        let mut replayed = ConfigState::new();
+        for request in requests {
+            replayed
+                .dispatch(&request.content)
+                .expect("LoadState request dispatch");
+        }
+        assert_eq!(
+            replayed, state,
+            "SaveState file parsing and LoadState dispatch must preserve all certificate metadata"
+        );
+    }
+
+    /// A same-fingerprint replacement can change names, key material or the
+    /// explicit expiration without changing the leaf certificate fingerprint.
+    /// `diff` must emit the replacement instead of treating the common map key
+    /// as unchanged.
+    #[test]
+    fn certificate_diff_replays_same_fingerprint_payload_and_expiration_changes() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let (mut certificate, _) = distinct_test_certificates();
+        certificate.names = vec!["before.example.test".to_owned()];
+        let fingerprint = certificate.fingerprint().expect("fingerprint certificate");
+        let mut before = ConfigState::new();
+        before
+            .dispatch(
+                &RequestType::AddCertificate(AddCertificate {
+                    address,
+                    certificate: certificate.to_owned(),
+                    expired_at: Some(2_100_000_000),
+                })
+                .into(),
+            )
+            .expect("add original certificate");
+        let mut after = before.to_owned();
+        certificate.names = vec!["after.example.test".to_owned()];
+        after
+            .dispatch(
+                &RequestType::ReplaceCertificate(ReplaceCertificate {
+                    address,
+                    new_certificate: certificate,
+                    old_fingerprint: fingerprint.to_string(),
+                    new_expired_at: Some(2_200_000_000),
+                })
+                .into(),
+            )
+            .expect("replace same-fingerprint certificate payload");
+
+        let diff = before.diff(&after);
+        assert!(
+            diff.iter().any(|request| matches!(
+                request.request_type,
+                Some(RequestType::ReplaceCertificate(_))
+            )),
+            "same-fingerprint payload/expiration changes must emit ReplaceCertificate: {diff:?}"
+        );
+    }
+
+    /// Equal-expiration certificate selection uses insertion order. Two states
+    /// with identical payload maps but opposite insertion order therefore need
+    /// a non-empty diff that replays the target order.
+    #[test]
+    fn certificate_diff_replays_order_only_changes() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let (certificate_a, certificate_b) = distinct_test_certificates();
+        let fingerprint_a = certificate_a.fingerprint().expect("fingerprint A");
+        let mut before = ConfigState::new();
+        let mut after = ConfigState::new();
+        for certificate in [certificate_a.to_owned(), certificate_b.to_owned()] {
+            before
+                .dispatch(
+                    &RequestType::AddCertificate(AddCertificate {
+                        address,
+                        certificate,
+                        expired_at: Some(2_100_000_000),
+                    })
+                    .into(),
+                )
+                .expect("add before certificate");
+        }
+        for certificate in [certificate_b, certificate_a] {
+            after
+                .dispatch(
+                    &RequestType::AddCertificate(AddCertificate {
+                        address,
+                        certificate,
+                        expired_at: Some(2_100_000_000),
+                    })
+                    .into(),
+                )
+                .expect("add after certificate");
+        }
+
+        let diff = before.diff(&after);
+        assert_eq!(
+            diff.len(),
+            2,
+            "A,B -> B,A needs only Remove(A), Add(A), not churn for B: {diff:?}"
+        );
+        assert!(
+            matches!(
+                &diff[0].request_type,
+                Some(RequestType::RemoveCertificate(remove))
+                    if remove.fingerprint == fingerprint_a.to_string()
+            ) && matches!(
+                &diff[1].request_type,
+                Some(RequestType::AddCertificate(add))
+                    if add.certificate.fingerprint().ok().as_ref() == Some(&fingerprint_a)
+            ),
+            "the minimal order-only sequence must move only certificate A to the end: {diff:?}"
+        );
+    }
+
+    #[test]
+    fn certificate_diff_rotates_three_entries_by_moving_only_the_suffix() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let (certificate_a, certificate_b) = distinct_test_certificates();
+        let certificate_c = third_test_certificate();
+        let fingerprint_a = certificate_a.fingerprint().expect("fingerprint A");
+        let fingerprint_b = certificate_b.fingerprint().expect("fingerprint B");
+        let fingerprint_c = certificate_c.fingerprint().expect("fingerprint C");
+        let build = |certificates: Vec<CertificateAndKey>| {
+            let mut state = ConfigState::new();
+            for certificate in certificates {
+                state
+                    .dispatch(
+                        &RequestType::AddCertificate(AddCertificate {
+                            address,
+                            certificate,
+                            expired_at: Some(2_100_000_000),
+                        })
+                        .into(),
+                    )
+                    .expect("add certificate");
+            }
+            state
+        };
+        let before = build(vec![
+            certificate_a.to_owned(),
+            certificate_b.to_owned(),
+            certificate_c.to_owned(),
+        ]);
+        let after = build(vec![certificate_b, certificate_c, certificate_a]);
+
+        let diff = before.diff(&after);
+        assert_eq!(
+            diff.len(),
+            2,
+            "A,B,C -> B,C,A needs only Remove(A), Add(A): {diff:?}"
+        );
+        assert!(
+            matches!(
+                &diff[0].request_type,
+                Some(RequestType::RemoveCertificate(remove))
+                    if remove.fingerprint == fingerprint_a.to_string()
+            ) && matches!(
+                &diff[1].request_type,
+                Some(RequestType::AddCertificate(add))
+                    if add.certificate.fingerprint().ok().as_ref() == Some(&fingerprint_a)
+            ),
+            "the rotation must leave B and C in place: {diff:?}"
+        );
+        assert!(
+            diff.iter().all(|request| !matches!(
+                &request.request_type,
+                Some(RequestType::RemoveCertificate(remove))
+                    if remove.fingerprint == fingerprint_b.to_string()
+                        || remove.fingerprint == fingerprint_c.to_string()
+            )),
+            "B and C are the retained target prefix and must not be removed: {diff:?}"
+        );
+
+        let mut interrupted = before.to_owned();
+        interrupted
+            .dispatch(&diff[0])
+            .expect("apply the minimal sequence's remove boundary");
+        assert_ne!(
+            ordered_fingerprints(&interrupted, address),
+            ordered_fingerprints(&after, address),
+            "the interruption point must expose a real partial state"
+        );
+        for request in interrupted.diff(&after) {
+            interrupted
+                .dispatch(&request)
+                .expect("fresh diff recovers the interrupted rotation");
+        }
+        assert_eq!(
+            ordered_fingerprints(&interrupted, address),
+            vec![fingerprint_b, fingerprint_c, fingerprint_a],
+            "recovery must converge on the target order and its final winner"
+        );
+    }
+
+    #[test]
+    fn certificate_diff_inserts_around_a_retained_entry_without_readding_new_suffix() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let (certificate_a, certificate_b) = distinct_test_certificates();
+        let certificate_c = third_test_certificate();
+        let fingerprint_a = certificate_a.fingerprint().expect("fingerprint A");
+        let fingerprint_b = certificate_b.fingerprint().expect("fingerprint B");
+        let fingerprint_c = certificate_c.fingerprint().expect("fingerprint C");
+        let build = |certificates: Vec<CertificateAndKey>| {
+            let mut state = ConfigState::new();
+            for certificate in certificates {
+                state
+                    .dispatch(
+                        &RequestType::AddCertificate(AddCertificate {
+                            address,
+                            certificate,
+                            expired_at: Some(2_100_000_000),
+                        })
+                        .into(),
+                    )
+                    .expect("add certificate");
+            }
+            state
+        };
+        let before = build(vec![certificate_b.to_owned()]);
+        let after = build(vec![certificate_a, certificate_b, certificate_c]);
+
+        let diff = before.diff(&after);
+        assert_eq!(
+            diff.len(),
+            4,
+            "B -> A,B,C needs Add(A), Remove(B), Add(B), Add(C): {diff:?}"
+        );
+        assert!(
+            matches!(
+                &diff[0].request_type,
+                Some(RequestType::AddCertificate(add))
+                    if add.certificate.fingerprint().ok().as_ref() == Some(&fingerprint_a)
+            ) && matches!(
+                &diff[1].request_type,
+                Some(RequestType::RemoveCertificate(remove))
+                    if remove.fingerprint == fingerprint_b.to_string()
+            ) && matches!(
+                &diff[2].request_type,
+                Some(RequestType::AddCertificate(add))
+                    if add.certificate.fingerprint().ok().as_ref() == Some(&fingerprint_b)
+            ) && matches!(
+                &diff[3].request_type,
+                Some(RequestType::AddCertificate(add))
+                    if add.certificate.fingerprint().ok().as_ref() == Some(&fingerprint_c)
+            ),
+            "new certificate C must never be removed after insertion: {diff:?}"
+        );
+        assert!(
+            diff.iter().all(|request| !matches!(
+                &request.request_type,
+                Some(RequestType::RemoveCertificate(remove))
+                    if remove.fingerprint == fingerprint_c.to_string()
+            )),
+            "the missing target suffix C is added once and never churned: {diff:?}"
+        );
+
+        let mut interrupted = before.to_owned();
+        interrupted
+            .dispatch(&diff[0])
+            .expect("apply the inserted target prefix before interruption");
+        assert_ne!(
+            ordered_fingerprints(&interrupted, address),
+            ordered_fingerprints(&after, address),
+            "the prefix interruption must expose a real partial state"
+        );
+        for request in interrupted.diff(&after) {
+            interrupted
+                .dispatch(&request)
+                .expect("fresh diff recovers the interrupted insertion sequence");
+        }
+        assert_eq!(
+            ordered_fingerprints(&interrupted, address),
+            vec![fingerprint_a, fingerprint_b, fingerprint_c],
+            "recovery must converge on the target order and final winner"
+        );
+    }
+
+    #[test]
+    fn duplicate_certificate_add_keeps_payload_expiration_and_order() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let (certificate, _) = distinct_test_certificates();
+        let mut state = ConfigState::new();
+        state
+            .add_certificate(&AddCertificate {
+                address,
+                certificate: certificate.to_owned(),
+                expired_at: Some(2_100_000_000),
+            })
+            .expect("initial certificate");
+        let before = state.to_owned();
+        let mut differing_retry = certificate;
+        differing_retry.names = vec!["different.example.test".to_owned()];
+
+        state
+            .add_certificate(&AddCertificate {
+                address,
+                certificate: differing_retry,
+                expired_at: Some(2_200_000_000),
+            })
+            .expect("duplicate fingerprint stays an accepted no-op");
+
+        assert_eq!(
+            state, before,
+            "duplicate AddCertificate must be a total no-op"
+        );
+    }
+
+    #[test]
+    fn replacing_with_an_existing_identical_target_preserves_its_ordinal() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let (certificate_a, certificate_b) = distinct_test_certificates();
+        let certificate_c = third_test_certificate();
+        let fingerprint_a = certificate_a.fingerprint().expect("fingerprint A");
+        let fingerprint_b = certificate_b.fingerprint().expect("fingerprint B");
+        let fingerprint_c = certificate_c.fingerprint().expect("fingerprint C");
+        let mut state = ConfigState::new();
+        for certificate in [certificate_a, certificate_b.to_owned(), certificate_c] {
+            state
+                .add_certificate(&AddCertificate {
+                    address,
+                    certificate,
+                    expired_at: Some(2_100_000_000),
+                })
+                .expect("initial certificate");
+        }
+
+        state
+            .replace_certificate(&ReplaceCertificate {
+                address,
+                new_certificate: certificate_b,
+                old_fingerprint: fingerprint_a.to_string(),
+                new_expired_at: Some(2_100_000_000),
+            })
+            .expect("replace A with already-stored B");
+
+        assert_eq!(
+            ordered_fingerprints(&state, address),
+            vec![fingerprint_b, fingerprint_c],
+            "an already-stored replacement keeps B in place while removing A"
+        );
+    }
+
+    #[test]
+    fn legacy_metadata_normalizes_once_and_the_second_replay_is_stable() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let (certificate_a, certificate_b) = distinct_test_certificates();
+        let mut current = ConfigState::new();
+        for (certificate, expired_at) in [
+            (certificate_a, Some(2_100_000_000)),
+            (certificate_b, Some(2_200_000_000)),
+        ] {
+            current
+                .add_certificate(&AddCertificate {
+                    address,
+                    certificate,
+                    expired_at,
+                })
+                .expect("current certificate");
+        }
+        let mut legacy_json = serde_json::to_value(&current).expect("serialize current state");
+        legacy_json
+            .as_object_mut()
+            .expect("ConfigState JSON object")
+            .remove("certificate_metadata")
+            .expect("current state writes certificate metadata");
+        let legacy: ConfigState =
+            serde_json::from_value(legacy_json).expect("legacy state without sidecar");
+        assert!(legacy.certificate_metadata.is_empty());
+
+        let mut first_replay = ConfigState::new();
+        for request in legacy.generate_requests() {
+            first_replay
+                .dispatch(&request)
+                .expect("legacy request stream replays");
+        }
+        assert_eq!(
+            first_replay.certificate_metadata,
+            legacy.normalized_certificate_metadata(),
+            "the first replay records deterministic fallback ordinals"
+        );
+        assert_ne!(
+            first_replay, legacy,
+            "normalization is semantic state and must not be hidden from PartialEq"
+        );
+
+        let mut second_replay = ConfigState::new();
+        for request in first_replay.generate_requests() {
+            second_replay
+                .dispatch(&request)
+                .expect("normalized request stream replays");
+        }
+        assert_eq!(
+            second_replay, first_replay,
+            "a second replay of normalized metadata must be byte/PartialEq stable"
+        );
+        assert_eq!(
+            serde_json::to_value(&second_replay).expect("serialize second replay"),
+            serde_json::to_value(&first_replay).expect("serialize first replay"),
+            "the derived next-order cache must not affect serialized state"
+        );
+    }
+
+    #[test]
+    fn legacy_reader_ignores_current_certificate_metadata_but_keeps_material() {
+        #[derive(serde::Deserialize)]
+        struct LegacyConfigStateMirror {
+            certificates: HashMap<SocketAddr, HashMap<Fingerprint, CertificateAndKey>>,
+        }
+
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let socket_address: SocketAddr = address.into();
+        let (certificate, _) = distinct_test_certificates();
+        let fingerprint = certificate.fingerprint().expect("fingerprint");
+        let mut current = ConfigState::new();
+        current
+            .add_certificate(&AddCertificate {
+                address,
+                certificate: certificate.to_owned(),
+                expired_at: Some(2_100_000_000),
+            })
+            .expect("current certificate");
+
+        let legacy: LegacyConfigStateMirror = serde_json::from_value(
+            serde_json::to_value(&current).expect("serialize current ConfigState"),
+        )
+        .expect("an old serde reader must ignore the unknown metadata field");
+
+        assert_eq!(
+            legacy.certificates[&socket_address][&fingerprint], certificate,
+            "new-to-old JSON remains syntactically readable, with metadata intentionally lost"
+        );
+    }
+
+    #[test]
+    fn malformed_legacy_metadata_is_unchanged_on_refusal_then_normalized_on_success() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let socket_address: SocketAddr = address.into();
+        let (certificate_a, certificate_b) = distinct_test_certificates();
+        let fingerprint_a = certificate_a.fingerprint().expect("fingerprint A");
+        let fingerprint_b = certificate_b.fingerprint().expect("fingerprint B");
+        let mut state = ConfigState::new();
+        state.certificates.insert(
+            socket_address,
+            HashMap::from([(fingerprint_a.to_owned(), certificate_a)]),
+        );
+        state.certificate_metadata.insert(
+            socket_address,
+            CertificateMetadataIndex {
+                entries: HashMap::from([
+                    (
+                        fingerprint_a,
+                        CertificateMetadata {
+                            expired_at: Some(2_100_000_000),
+                            insertion_order: 7,
+                        },
+                    ),
+                    (
+                        Fingerprint(vec![0xff]),
+                        CertificateMetadata {
+                            expired_at: Some(9),
+                            insertion_order: 7,
+                        },
+                    ),
+                ]),
+                next_order: None,
+            },
+        );
+        let before = state.to_owned();
+
+        let error = state.add_certificate(&AddCertificate {
+            address,
+            certificate: CertificateAndKey {
+                certificate: "not PEM".to_owned(),
+                ..Default::default()
+            },
+            expired_at: None,
+        });
+        assert!(error.is_err(), "malformed certificate must be refused");
+        assert_eq!(
+            state, before,
+            "a refusal must not normalize or mutate legacy state"
+        );
+
+        state
+            .add_certificate(&AddCertificate {
+                address,
+                certificate: certificate_b,
+                expired_at: Some(2_200_000_000),
+            })
+            .expect("valid mutation normalizes legacy metadata");
+        let metadata = &state.certificate_metadata[&socket_address].entries;
+        assert_eq!(metadata.len(), 2, "orphan metadata must be pruned");
+        assert_eq!(metadata[&fingerprint_b].insertion_order, 1);
+        assert_eq!(
+            metadata
+                .values()
+                .map(|entry| entry.insertion_order)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([0, 1]),
+            "normalized ordinals must be unique and contiguous"
         );
     }
 
@@ -6385,6 +7530,79 @@ mod tests {
             max_rx_datagram_size: 1500,
             max_flows: 0,
             active,
+        }
+    }
+
+    /// Runtime refusal must restore an activation only when the request would
+    /// have changed the stored flag. This keeps the inverse scoped to the
+    /// exact `(protocol, address, interface)` listener and prevents a repeated
+    /// activation failure from deactivating an already-live listener.
+    #[test]
+    fn activation_rollback_restores_the_prior_flag_for_every_listener_type() {
+        let mut state = ConfigState::new();
+        let cases = [
+            (ListenerType::Http, 8200),
+            (ListenerType::Https, 8201),
+            (ListenerType::Tcp, 8202),
+            (ListenerType::Udp, 8203),
+        ];
+
+        for (listener_type, port) in cases {
+            let address = SocketAddress::new_v4(127, 0, 0, 1, port);
+            let interface = Some(format!("test-{port}"));
+            let proxy: i32 = listener_type.into();
+            let add = match listener_type {
+                ListenerType::Http => RequestType::AddHttpListener(with_interface(
+                    make_http_listener(address),
+                    |listener| listener.interface = interface.to_owned(),
+                )),
+                ListenerType::Https => RequestType::AddHttpsListener(with_interface(
+                    make_https_listener(address),
+                    |listener| listener.interface = interface.to_owned(),
+                )),
+                ListenerType::Tcp => RequestType::AddTcpListener(with_interface(
+                    make_tcp_listener(address),
+                    |listener| listener.interface = interface.to_owned(),
+                )),
+                ListenerType::Udp => RequestType::AddUdpListener(with_interface(
+                    make_udp_listener(address, false),
+                    |listener| listener.interface = interface.to_owned(),
+                )),
+            };
+            state
+                .dispatch(&add.into())
+                .expect("the inactive listener must be recorded");
+
+            let activate = ActivateListener {
+                address,
+                proxy,
+                from_scm: false,
+                interface: interface.to_owned(),
+            };
+            let rollback = state
+                .rollback_for(&RequestType::ActivateListener(activate.to_owned()))
+                .expect("an inactive listener must receive an activation rollback");
+            assert!(matches!(
+                rollback.request_type,
+                Some(RequestType::DeactivateListener(DeactivateListener {
+                    address: rollback_address,
+                    proxy,
+                    to_scm: false,
+                    interface: rollback_interface,
+                })) if rollback_address == address
+                    && proxy == activate.proxy
+                    && rollback_interface == interface
+            ));
+
+            state
+                .dispatch(&RequestType::ActivateListener(activate.to_owned()).into())
+                .expect("the listener must become active in the stored state");
+            assert!(
+                state
+                    .rollback_for(&RequestType::ActivateListener(activate))
+                    .is_none(),
+                "repeating activation for an already-active {listener_type:?} listener must not create a deactivation rollback"
+            );
         }
     }
 
