@@ -1056,6 +1056,36 @@ impl HttpProxy {
         }
     }
 
+    /// Add one listener and restore routes retained in the worker state when
+    /// no live sibling can provide them.
+    ///
+    /// A sibling already carries the address-wide routes and `add_listener`
+    /// clones them. When the last listener on an address was removed, the
+    /// control-plane state deliberately kept its frontends; replay them onto
+    /// the new listener before the server commits its session slot. Any
+    /// failure drops only that new listener.
+    pub(crate) fn add_listener_with_retained_frontends(
+        &mut self,
+        config: HttpListenerConfig,
+        token: Token,
+        retained_frontends: Vec<RequestHttpFrontend>,
+    ) -> Result<Token, ProxyError> {
+        let address = config.address.into();
+        let had_sibling = self.listeners_at(address).is_ok();
+        self.add_listener(config, token)?;
+
+        if !had_sibling {
+            for frontend in retained_frontends {
+                if let Err(error) = self.add_http_frontend(frontend) {
+                    self.listeners.remove(&token);
+                    return Err(error);
+                }
+            }
+        }
+
+        Ok(token)
+    }
+
     pub fn get_listener(&self, token: &Token) -> Option<Rc<RefCell<HttpListener>>> {
         self.listeners.get(token).cloned()
     }
@@ -3046,7 +3076,7 @@ mod tests {
 mod listener_sibling_tests {
     use sozu_command::{
         config::ListenerBuilder,
-        proto::command::{PathRule, RequestHttpFrontend, RulePosition, SocketAddress},
+        proto::command::{HstsConfig, PathRule, RequestHttpFrontend, RulePosition, SocketAddress},
     };
 
     use super::*;
@@ -3117,6 +3147,57 @@ mod listener_sibling_tests {
             .expect("remove the frontend");
         assert!(!routes(&proxy, 0));
         assert!(!routes(&proxy, 1));
+    }
+
+    #[test]
+    fn retained_frontends_are_not_replayed_when_a_sibling_already_has_them() {
+        let mut proxy = proxy();
+        let address = SocketAddress::new_v4(0, 0, 0, 0, provide_port());
+        add(&mut proxy, address, None, 0);
+        proxy
+            .add_http_frontend(front(address))
+            .expect("add the frontend");
+        let sibling = ListenerBuilder::new_http(address)
+            .with_interface(Some("lo"))
+            .to_http(None)
+            .expect("build sibling listener config");
+
+        proxy
+            .add_listener_with_retained_frontends(sibling, Token(1), vec![front(address)])
+            .expect("the sibling must clone routes without replaying duplicates");
+
+        assert!(routes(&proxy, 0));
+        assert!(routes(&proxy, 1));
+    }
+
+    #[test]
+    fn failed_retained_frontend_replay_discards_only_the_new_listener() {
+        let mut proxy = proxy();
+        let kept_address = SocketAddress::new_v4(0, 0, 0, 0, provide_port());
+        let rejected_address = SocketAddress::new_v4(0, 0, 0, 0, provide_port());
+        add(&mut proxy, kept_address, None, 0);
+        let rejected = ListenerBuilder::new_http(rejected_address)
+            .to_http(None)
+            .expect("build rejected listener config");
+        let invalid_plaintext_hsts = RequestHttpFrontend {
+            hsts: Some(HstsConfig {
+                enabled: Some(true),
+                ..Default::default()
+            }),
+            ..front(rejected_address)
+        };
+
+        assert!(
+            proxy
+                .add_listener_with_retained_frontends(
+                    rejected,
+                    Token(1),
+                    vec![invalid_plaintext_hsts],
+                )
+                .is_err()
+        );
+        assert!(proxy.listeners.contains_key(&Token(0)));
+        assert!(!proxy.listeners.contains_key(&Token(1)));
     }
 
     /// Removing a frontend reaches every listener on the address even when one

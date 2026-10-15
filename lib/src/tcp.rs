@@ -2924,6 +2924,37 @@ impl TcpProxy {
         }
     }
 
+    /// Add one listener and restore routes retained in the worker state when
+    /// no live sibling can provide them.
+    ///
+    /// The targeted replay happens only when this is the sole live listener
+    /// on its address, so the normal address-wide frontend fan-out reaches
+    /// only the newly inserted listener. Any failure removes that listener and
+    /// every global frontend-token entry created for it.
+    pub(crate) fn add_listener_with_retained_frontends(
+        &mut self,
+        config: TcpListenerConfig,
+        token: Token,
+        retained_frontends: Vec<RequestTcpFrontend>,
+    ) -> Result<Token, ProxyError> {
+        let address = config.address.into();
+        let had_sibling = self.listeners_at(address).is_ok();
+        self.add_listener(config, token)?;
+
+        if !had_sibling {
+            for frontend in retained_frontends {
+                if let Err(error) = self.add_tcp_front(frontend) {
+                    self.listeners.remove(&token);
+                    self.fronts
+                        .retain(|_, listener_token| *listener_token != token);
+                    return Err(error);
+                }
+            }
+        }
+
+        Ok(token)
+    }
+
     pub fn remove_listener(&mut self, address: &ListenerKey) -> SessionIsToBeClosed {
         let len = self.listeners.len();
 
