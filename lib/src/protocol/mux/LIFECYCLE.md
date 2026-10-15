@@ -1081,6 +1081,21 @@ re-validates every delivery and puts an early one back — §7.6.
   503 arm in `StreamState::Link` (no backend resolved yet) is not a timeout and
   leaves `access_log_message = None`. See `doc/configure.md` § "Access log
   message field" for the full vocabulary.
+- Silent close (sozu-proxy/sozu#767): a `RedirectPolicy::SilentClose`
+  frontend makes `Router::route_from_request` (`router.rs`) answer
+  `RetrieveClusterError::SilentClose` before any other policy, and the
+  routing-error arm of the link loop in `Mux::ready_inner` (`mod.rs`) calls
+  `silent_close_answer` (`answers.rs`). It ends the response through
+  `forcefully_terminate_answer(Cancel)` with nothing queued — an H2 frontend
+  resets that stream alone, an H1 frontend closes without writing — and emits
+  the access log itself, status 444 and message `silent_close`, then resets
+  the stream's metrics. It does not go through `access_log_message`: every
+  later emission site passes its own message, which `Stream::generate_access_log`
+  prefers, and the reset metrics are what `Mux::close` and
+  `ConnectionH2::try_recycle_server_stream` read as "already logged". Pinned
+  by `a_silent_close_writes_nothing_and_logs_444_silent_close` (`answers.rs`)
+  and `a_silent_close_frontend_refuses_without_an_answer_bound_or_clusterless`
+  (`router.rs`).
 
 ### 7.2 Per-stream reap guards (slow-multiplex + window-stall)
 

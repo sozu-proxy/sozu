@@ -2972,7 +2972,7 @@ Three top-level knobs drive different policies:
 address  = "0.0.0.0:80"
 hostname = "old.example.com"
 # Force a permanent 301 to the canonical name on a different port.
-redirect        = "permanent"      # forward (default) | permanent | found | permanent_redirect | unauthorized
+redirect        = "permanent"      # forward (default) | permanent | found | permanent_redirect | unauthorized | silent_close
 redirect_scheme = "use-https"      # use-same (default) | use-http | use-https
 rewrite_host    = "new.example.com"
 rewrite_port    = 8443             # paired with `cluster.https_redirect_port`
@@ -2991,6 +2991,18 @@ e.g. an API endpoint relocation. Pick `found` (302) for short-lived forwards
 (login flows, A/B-testing gates). `redirect = "unauthorized"` returns 401
 unconditionally — useful for blanket deny-by-default frontends that still want
 to surface a login prompt with the cluster's `www_authenticate` realm.
+
+`redirect = "silent_close"` refuses the request without sending any response,
+the equivalent of nginx's `return 444`: on an HTTP/1.x frontend Sōzu closes the
+connection without writing a byte, and on an HTTP/2 frontend it resets only that
+stream with `RST_STREAM(CANCEL)`, so the connection's other streams carry on. The
+backend is never contacted, with or without a `cluster_id`, and the policy wins
+over every other redirect, rewrite or authentication setting of the frontend. The
+access log records the request with status `444` and message `silent_close`, not
+as an error (`http.errors` is not incremented); the status counts in
+`http.status.4xx`. Use it for traffic that should get no answer at all, such as
+scanners hitting a blocked path. The CLI spelling is
+`sozu frontend http add ... --redirect silent_close`.
 
 `rewrite_host` and `rewrite_path` accept a small template grammar: `$HOST[n]`
 references the n-th host capture (0 is the full hostname; 1+ are regex /
@@ -3335,7 +3347,10 @@ closed (operator-visible API once shipped):
 
 Non-timeout default-answer paths (e.g. 503 from `Router::route_from_request`,
 401 from auth, 301 from redirects) leave the field as `None` and the access log
-emits `message: None` exactly as before. Sessions that complete normally are
+emits `message: None` exactly as before. One non-timeout outcome carries its own token: a request
+refused by a `redirect = "silent_close"` frontend is logged with message
+`silent_close` and status `444`, a status that never reaches the wire (the
+client gets a closed connection or an `RST_STREAM(CANCEL)`). Sessions that complete normally are
 also unaffected.
 
 #### Backend health checks

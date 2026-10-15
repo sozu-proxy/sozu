@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Added
+
+- **`feat(mux)`: `redirect = "silent_close"` refuses a request without any
+  response** ([#767](https://github.com/sozu-proxy/sozu/issues/767)), the
+  equivalent of nginx's `return 444`. A new `RedirectPolicy::SILENT_CLOSE = 5`
+  (appended to the protobuf enum; TOML `redirect = "silent_close"`, CLI
+  `--redirect silent_close`) makes an HTTP/1.x frontend close the connection
+  without writing a byte and an HTTP/2 frontend reset only the refused stream
+  with `RST_STREAM(CANCEL)`, leaving the connection's other streams running. The
+  backend is never contacted, whether or not the frontend names a cluster, and
+  the policy wins over the frontend's other redirect, rewrite and authentication
+  settings. The access log records status `444` with message `silent_close`; the
+  line is not an error (`http.errors` is not incremented) and counts in
+  `http.status.4xx`. Workers that predate this version decode the new value as
+  an unknown enum and treat the frontend as `forward` (a clusterless one answers
+  401), so upgrade every worker before adding a `silent_close` frontend.
+
 ## 2.3.1 - 2026-10-14
 
 ### Fixed

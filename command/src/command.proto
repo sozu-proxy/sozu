@@ -1034,12 +1034,17 @@ message ListenersList {
 // UNAUTHORIZED returns 401 with `WWW-Authenticate: Basic realm=...`
 // using `cluster.www_authenticate`; suitable for blanket deny-by-default
 // routes that still want to surface a login prompt.
+// SILENT_CLOSE sends no response at all, like nginx's `return 444`: an H1
+// frontend connection is closed, an H2 frontend stream is reset with
+// RST_STREAM(CANCEL) while the connection's other streams continue. The
+// backend is never contacted; the access log records status 444.
 enum RedirectPolicy {
     FORWARD = 0;
     PERMANENT = 1;
     UNAUTHORIZED = 2;
     FOUND = 3;
     PERMANENT_REDIRECT = 4;
+    SILENT_CLOSE = 5;
 }
 
 // Scheme to use when building the `Location` header for a permanent redirect.
