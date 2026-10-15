@@ -98,6 +98,9 @@ pub fn rollback_request(request: &RequestType) -> Option<Request> {
     Some(inverse.into())
 }
 
+/// Why a UDP cluster and a backend with a `unix_path` never meet in the state.
+const UDP_UNIX_BACKEND_REFUSED: &str = "a UDP cluster cannot use unix_path backends";
+
 #[derive(thiserror::Error)]
 pub enum StateError {
     #[error("Request came in empty")]
@@ -644,7 +647,9 @@ impl ConfigState {
             RequestType::RemoveTcpFrontend(front) => self.remove_tcp_frontend(front),
             RequestType::AddUdpFrontend(front) => self.add_udp_frontend(front),
             RequestType::RemoveUdpFrontend(front) => self.remove_udp_frontend(front),
-            RequestType::AddBackend(add_backend) => self.add_backend(add_backend),
+            RequestType::AddBackend(add_backend) | RequestType::AddUnixBackend(add_backend) => {
+                self.add_backend(add_backend)
+            }
             RequestType::RemoveBackend(backend) => self.remove_backend(backend),
             RequestType::UpdateHttpListener(patch) => self.update_http_listener(patch),
             RequestType::UpdateHttpsListener(patch)
@@ -950,6 +955,19 @@ impl ConfigState {
             return Err(StateError::InvalidValue {
                 field: "health_check",
                 reason,
+            });
+        }
+        // A cluster that turns UDP cannot keep a backend dialed over a UNIX
+        // stream socket (see `add_backend`).
+        if cluster.udp.is_some()
+            && self
+                .backends
+                .get(cluster.cluster_id.as_str())
+                .is_some_and(|backends| backends.iter().any(|b| b.unix_path.is_some()))
+        {
+            return Err(StateError::InvalidValue {
+                field: "unix_path",
+                reason: UDP_UNIX_BACKEND_REFUSED,
             });
         }
         // Same gate for the client affinity key: a name no request can carry,
@@ -2577,6 +2595,17 @@ impl ConfigState {
             tags: front.tags.clone(),
         };
 
+        if self
+            .backends
+            .get(front.cluster_id.as_str())
+            .is_some_and(|backends| backends.iter().any(|b| b.unix_path.is_some()))
+        {
+            return Err(StateError::InvalidValue {
+                field: "unix_path",
+                reason: UDP_UNIX_BACKEND_REFUSED,
+            });
+        }
+
         let total_before = self.count_udp_frontends_raw();
 
         // Listener-wide scan across ALL clusters' buckets at this address, as
@@ -2689,6 +2718,18 @@ impl ConfigState {
         Ok(())
     }
 
+    /// Whether datagrams, not streams, reach this cluster: it has a UDP
+    /// frontend or carries UDP-specific settings.
+    fn is_udp_cluster(&self, cluster_id: &str) -> bool {
+        self.udp_fronts
+            .get(cluster_id)
+            .is_some_and(|fronts| !fronts.is_empty())
+            || self
+                .clusters
+                .get(cluster_id)
+                .is_some_and(|cluster| cluster.udp.is_some())
+    }
+
     fn add_backend(&mut self, add_backend: &AddBackend) -> Result<(), StateError> {
         if let Some(unix_path) = add_backend.unix_path.as_deref() {
             crate::config::parse_backend_unix_path(unix_path).map_err(|reason| {
@@ -2697,6 +2738,17 @@ impl ConfigState {
                     reason,
                 }
             })?;
+            // A UDP cluster relays datagrams over UDP sockets: a UNIX stream
+            // endpoint cannot carry them, and the datapath would relay to the
+            // identity `address` instead. The frontend that makes the cluster
+            // UDP may land after the backend; `add_udp_frontend` refuses that
+            // order.
+            if self.is_udp_cluster(&add_backend.cluster_id) {
+                return Err(StateError::InvalidValue {
+                    field: "unix_path",
+                    reason: UDP_UNIX_BACKEND_REFUSED,
+                });
+            }
         }
         let backend = Backend {
             address: add_backend.address.into(),
@@ -2867,7 +2919,7 @@ impl ConfigState {
 
         for backend_list in self.backends.values() {
             for backend in backend_list {
-                v.push(RequestType::AddBackend(backend.clone().to_add_backend()).into());
+                v.push(RequestType::add_backend(backend.clone().to_add_backend()).into());
             }
         }
 
@@ -3423,7 +3475,7 @@ impl ConfigState {
                         .get(cluster_id)
                         .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
-                    v.push(RequestType::AddBackend(backend.clone().to_add_backend()).into());
+                    v.push(RequestType::add_backend(backend.clone().to_add_backend()).into());
                 }
                 DiffResult::Removed => {
                     let backend = base
@@ -3462,7 +3514,7 @@ impl ConfigState {
                         .get(cluster_id)
                         .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
-                    v.push(RequestType::AddBackend(backend.clone().to_add_backend()).into());
+                    v.push(RequestType::add_backend(backend.clone().to_add_backend()).into());
                 }
             }
         }
@@ -6209,7 +6261,9 @@ mod tests {
             RequestType::AddUdpFrontend(front) | RequestType::RemoveUdpFrontend(front) => {
                 Some(&front.cluster_id)
             }
-            RequestType::AddBackend(backend) => Some(&backend.cluster_id),
+            RequestType::AddBackend(backend) | RequestType::AddUnixBackend(backend) => {
+                Some(&backend.cluster_id)
+            }
             RequestType::RemoveBackend(backend) => Some(&backend.cluster_id),
             _ => None,
         }
@@ -6635,7 +6689,7 @@ mod tests {
             .generate_requests()
             .into_iter()
             .filter_map(|request| match request.request_type {
-                Some(RequestType::AddBackend(backend)) => Some(backend),
+                Some(RequestType::AddUnixBackend(backend)) => Some(backend),
                 _ => None,
             })
             .collect();

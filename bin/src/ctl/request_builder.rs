@@ -149,7 +149,7 @@ impl CommandManager {
                 backup,
                 unix_path,
             } => self.send_request(
-                RequestType::AddBackend(AddBackend {
+                RequestType::add_backend(AddBackend {
                     cluster_id: id,
                     address: address.into(),
                     backend_id,

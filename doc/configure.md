@@ -1298,13 +1298,30 @@ retry exclusion, `HRW`/`MAGLEV`/shard placement, the "one address is one
 share" rule above, events and the `Host` of an HTTP health probe), but never
 dials it when `unix_path` is set. Give each unix backend an address used by
 no other backend of the cluster; the configuration loader refuses a shared one.
-At runtime the same field is `AddBackend.unix_path`, and
-`sozu backend add --unix-path <path>` sets it. The main process and every
-worker refuse a `unix_path` that is not absolute, does not fit a
-`sockaddr_un` (107 bytes) or holds a NUL byte. UDP is not supported:
-datagrams are relayed over UDP sockets only. The configuration file refuses
-`unix_path` on a UDP cluster, but an `AddBackend` order is not checked against
-its cluster's protocol, and a UDP cluster given one relays to `address`.
+At runtime the same field is `AddBackend.unix_path`, carried by its own
+request, `AddUnixBackend` (`Request` field 72), and
+`sozu backend add --unix-path <path>` sets it. `RequestType::add_backend`
+picks the verb: a backend with a `unix_path` is `AddUnixBackend`, any other
+stays `AddBackend`, and the main process rewrites every request it fans out to
+the workers to that verb, so an `AddBackend` that carries a `unix_path` never
+reaches a worker. A process that predates UNIX backends skips the unknown
+`unix_path` tag of `AddBackend` but still registers it, and would dial
+`address` over TCP; it cannot decode field 72 at all, so it never registers the
+backend, and the request fails instead. Between `sozu upgrade` and the
+replacement of the last old worker, a UNIX backend is therefore served only by
+the upgraded workers, and each old worker is counted as failed once
+`worker_timeout` expires, since it does not answer a request it cannot decode.
+Backends without `unix_path` keep `AddBackend` and work across versions as
+before. **Rolling back** to a version that predates UNIX backends: such a
+version stops reading a saved state file at the first `AddUnixBackend` record,
+and every record after it is lost, so remove the UNIX backends (and their
+configuration keys, which an older version refuses), then save the state
+again. The main process and every worker refuse a `unix_path` that is not
+absolute, does not fit a `sockaddr_un` (107 bytes) or holds a NUL byte. UDP is
+not supported: datagrams are relayed over UDP sockets only. The configuration
+file and the main process's state both refuse a `unix_path` backend on a UDP
+cluster (a cluster with a UDP frontend or UDP settings), whichever order the
+backend and the cluster's UDP frontend arrive in.
 
 The socket is dialed nonblocking like a TCP backend, so a missing socket file
 or a full accept queue counts as a failed connection (below), and health

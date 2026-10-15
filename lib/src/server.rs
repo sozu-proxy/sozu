@@ -2778,7 +2778,8 @@ impl Server {
                 push_queue(WorkerResponse::ok(req_id));
                 return;
             }
-            Some(RequestType::AddBackend(ref backend)) => {
+            Some(RequestType::AddBackend(ref backend))
+            | Some(RequestType::AddUnixBackend(ref backend)) => {
                 push_queue(self.add_backend(&req_id, backend));
                 return;
             }

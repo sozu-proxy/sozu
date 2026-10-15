@@ -202,6 +202,26 @@ message Request {
     // `RequestType::into_canonical` picks the verb, and the main process
     // applies it to every request it fans out to workers.
     UpdateHttpsListenerConfig update_https_listener_with_client_auth = 64;
+    // add a backend that sozu dials over a UNIX domain stream socket
+    // (`AddBackend.unix_path` set), with the same payload and the same
+    // semantics as `add_backend`, distinct verb on purpose. A worker or main
+    // process that predates UNIX backends decodes `add_backend` but skips the
+    // unknown `unix_path` tag, so it would register the backend and dial its
+    // identity `address` over TCP: traffic meant for a local socket reaching
+    // whatever listens on that address, or nothing. It cannot decode this
+    // verb at all, so it never registers the backend: the request fails
+    // instead of degrading to an IP endpoint. This matters while the fleet is
+    // mixed, between `UpgradeMain` and the replacement of every worker.
+    //
+    // Emitters pick the verb with `RequestType::add_backend`, and the main
+    // process rewrites every request it fans out to workers to that canonical
+    // verb, so an `add_backend` that carries a `unix_path` never reaches a
+    // worker. A backend without `unix_path` keeps `add_backend`, which every
+    // worker version understands.
+    //
+    // Tags 65-71 are taken by other verbs (close sessions, header routing,
+    // silent frontend close): 72 is this verb's, and must not be renumbered.
+    AddBackend add_unix_backend = 72;
   }
 }
 
@@ -1555,9 +1575,11 @@ message AddBackend {
     // `address` stays the backend's identity within its cluster (removal,
     // retry exclusion, sticky and hash routing, events) and is never dialed,
     // so it must be unique among the cluster's backends.
-    // Applies to HTTP, HTTPS and TCP clusters. The configuration file refuses
-    // it on a UDP cluster; this order is not checked against the cluster's
-    // protocol, and a UDP cluster would relay datagrams to `address`.
+    // Applies to HTTP, HTTPS and TCP clusters. A UDP cluster refuses it, in
+    // the configuration file and in the main process's state alike: datagrams
+    // cannot travel over a stream socket.
+    // A backend with `unix_path` is carried by `Request.add_unix_backend`,
+    // never by `Request.add_backend` (see there).
     optional string unix_path = 7;
 }
 

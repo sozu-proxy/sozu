@@ -3778,7 +3778,7 @@ impl HttpClusterConfig {
             });
 
             v.push(
-                RequestType::AddBackend(AddBackend {
+                RequestType::add_backend(AddBackend {
                     cluster_id: self.cluster_id.clone(),
                     backend_id: backend.backend_id.clone().unwrap_or_else(|| {
                         format!("{}-{}-{}", self.cluster_id, backend_count, backend.address)
@@ -3806,7 +3806,10 @@ impl HttpClusterConfig {
         );
         debug_assert_eq!(
             v.iter()
-                .filter(|r| matches!(r.request_type, Some(RequestType::AddBackend(_))))
+                .filter(|r| matches!(
+                    r.request_type,
+                    Some(RequestType::AddBackend(_)) | Some(RequestType::AddUnixBackend(_))
+                ))
                 .count(),
             self.backends.len(),
             "one AddBackend order per configured backend"
@@ -3963,7 +3966,7 @@ impl TcpClusterConfig {
             });
 
             v.push(
-                RequestType::AddBackend(AddBackend {
+                RequestType::add_backend(AddBackend {
                     cluster_id: self.cluster_id.clone(),
                     backend_id: backend.backend_id.clone().unwrap_or_else(|| {
                         format!("{}-{}-{}", self.cluster_id, backend_count, backend.address)
@@ -4000,7 +4003,10 @@ impl TcpClusterConfig {
         );
         debug_assert_eq!(
             v.iter()
-                .filter(|r| matches!(r.request_type, Some(RequestType::AddBackend(_))))
+                .filter(|r| matches!(
+                    r.request_type,
+                    Some(RequestType::AddBackend(_)) | Some(RequestType::AddUnixBackend(_))
+                ))
                 .count(),
             self.backends.len(),
             "one AddBackend order per configured backend"
@@ -6044,9 +6050,10 @@ mod tests {
     }
 
     /// #152: a backend's `unix_path` travels from the TOML file to the
-    /// `AddBackend` order, next to the identity `address`.
+    /// `AddUnixBackend` order, next to the identity `address`; a backend
+    /// without one keeps `AddBackend`.
     #[test]
-    fn a_unix_path_backend_reaches_the_add_backend_order() {
+    fn a_unix_path_backend_reaches_the_add_unix_backend_order() {
         let file: FileClusterConfig = toml::from_str(
             r#"
             protocol = "http"
@@ -6069,11 +6076,20 @@ mod tests {
             .expect("the orders must build")
             .into_iter()
             .filter_map(|order| match order.request_type {
-                Some(RequestType::AddBackend(backend)) => Some(backend.unix_path),
+                Some(RequestType::AddUnixBackend(backend)) => {
+                    Some(("AddUnixBackend", backend.unix_path))
+                }
+                Some(RequestType::AddBackend(backend)) => Some(("AddBackend", backend.unix_path)),
                 _ => None,
             })
             .collect();
-        assert_eq!(unix_paths, vec![Some("/run/app.sock".to_owned()), None]);
+        assert_eq!(
+            unix_paths,
+            vec![
+                ("AddUnixBackend", Some("/run/app.sock".to_owned())),
+                ("AddBackend", None)
+            ]
+        );
     }
 
     /// #152: sozu tells backends apart by address, so a unix backend's

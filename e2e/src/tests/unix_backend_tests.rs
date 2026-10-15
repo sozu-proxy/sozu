@@ -120,7 +120,7 @@ fn try_http_unix_backend(name: &str, listener: UnixListener, unix_path: String) 
     let front_address = create_local_address();
     let (config, listeners, state) = Worker::empty_config();
     let (mut worker, _) = setup_test(name, config, listeners, state, front_address, 0, false);
-    worker.send_proxy_request_type(RequestType::AddBackend(unix_backend(
+    worker.send_proxy_request_type(RequestType::add_backend(unix_backend(
         create_unbound_local_address(),
         unix_path,
     )));
@@ -179,7 +179,7 @@ fn try_tcp_unix_backend() -> State {
     let path = SocketPath::new("tcp");
     let listener = UnixListener::bind(&path.0).expect("bind the backend socket");
     let (mut worker, _, front_address) = setup_tcp_test("UNIX-TCP", 0);
-    worker.send_proxy_request_type(RequestType::AddBackend(unix_backend(
+    worker.send_proxy_request_type(RequestType::add_backend(unix_backend(
         create_unbound_local_address(),
         path.0.to_str().unwrap().to_owned(),
     )));

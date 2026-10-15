@@ -11,9 +11,15 @@
   abstract-namespace `@name`; HTTP, HTTPS and TCP clusters dial it instead of
   `address`, which stays the backend's identity and must be unique in its
   cluster. Health checks probe the same socket. UDP is not supported: the
-  configuration file refuses it there, the command channel does not. The
-  protocol change is additive: a worker that predates it ignores the field and
-  dials `address`, so upgrade every process before declaring one.
+  configuration file and the main process's state both refuse it there.
+  A UNIX backend travels on a new `AddUnixBackend` request
+  (`RequestType::add_backend` picks the verb, and the main process rewrites
+  every fan-out to it), so a worker or main process that predates it fails the
+  request instead of dialing `address` over TCP. Protobuf: `AddBackend` field 7
+  (`unix_path`) and `Request` field 72 (`AddUnixBackend`). Covered by
+  `command/tests/unix_backend_verb.rs` and the `test_*unix*` e2e tests
+  (`e2e/src/tests/unix_backend_tests.rs`).
+
 ### Fixed
 
 - Re-adding the last HTTP, HTTPS, TCP or UDP listener removed from an address
