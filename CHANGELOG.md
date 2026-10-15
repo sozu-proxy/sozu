@@ -21,6 +21,24 @@
   verbs. A worker older than 2.3.2 cannot decode these requests and fails them,
   so it never installs an unguarded forwarding route.
 
+### 🔄 Changed
+
+- **`feat(load-balancing)`: every policy honours `weight`
+  ([#676](https://github.com/sozu-proxy/sozu/issues/676)).** `ROUND_ROBIN`,
+  `LEAST_LOADED` and `POWER_OF_TWO` ignored a backend's `weight`; only
+  `RANDOM`, `HRW` and `MAGLEV` read it. `ROUND_ROBIN` now runs smooth weighted
+  round robin (nginx's scheme): over every `Σw` selections a backend of weight
+  `w` is picked exactly `w` times, interleaved (`5, 1, 1` selects
+  `a a b a c a a`). `LEAST_LOADED` and `POWER_OF_TWO` compare each candidate's
+  load divided by its weight, exactly (cross-multiplied in integers for the
+  connection and request counts). With no client key, `HRW` and `MAGLEV` fall
+  back to the weighted round robin. A `0` or negative weight counts as `1`, as
+  under `HRW` and `MAGLEV`; `RANDOM` keeps reading the raw value. **Behaviour
+  change:** a cluster that sets unequal weights under one of these three
+  policies now spreads its traffic by them. A cluster whose backends all
+  carry the same weight (the default, 100, when unset) selects exactly the
+  same sequence as before. No command, configuration or state format changes.
+
 ### Fixed
 
 - Re-adding the last HTTP, HTTPS, TCP or UDP listener removed from an address

@@ -290,7 +290,7 @@ const PINNED: &[(Tier, Policy, [usize; 12])] = &[
     (
         Tier::Primary,
         Policy::RoundRobin,
-        [0, 1, 3, 6, 8, 9, 0, 1, 3, 6, 8, 9],
+        [9, 8, 6, 3, 9, 8, 1, 6, 9, 8, 0, 9],
     ),
     (
         Tier::Primary,
@@ -310,27 +310,27 @@ const PINNED: &[(Tier, Policy, [usize; 12])] = &[
     (
         Tier::Primary,
         Policy::PowerOfTwo(LoadMetric::Connections),
-        [9, 9, 6, 9, 3, 1, 3, 9, 9, 9, 1, 6],
+        [9, 9, 6, 9, 3, 6, 8, 8, 3, 9, 9, 9],
     ),
     (
         Tier::Primary,
         Policy::PowerOfTwo(LoadMetric::Requests),
-        [9, 6, 6, 0, 6, 8, 0, 1, 6, 6, 8, 6],
+        [9, 9, 6, 6, 3, 6, 8, 8, 3, 9, 6, 6],
     ),
     (
         Tier::Primary,
         Policy::Hrw,
-        [0, 8, 1, 9, 3, 9, 6, 9, 8, 6, 9, 1],
+        [9, 8, 8, 9, 6, 9, 3, 9, 9, 6, 8, 1],
     ),
     (
         Tier::Primary,
         Policy::Maglev,
-        [0, 9, 1, 3, 3, 0, 6, 6, 8, 6, 9, 9],
+        [9, 9, 8, 3, 6, 0, 3, 6, 9, 6, 8, 9],
     ),
     (
         Tier::Backup,
         Policy::RoundRobin,
-        [1, 5, 7, 9, 1, 5, 7, 9, 1, 5, 7, 9],
+        [9, 7, 5, 9, 7, 1, 9, 5, 7, 9, 5, 7],
     ),
     (
         Tier::Backup,
@@ -345,32 +345,32 @@ const PINNED: &[(Tier, Policy, [usize; 12])] = &[
     (
         Tier::Backup,
         Policy::LeastLoaded(LoadMetric::Requests),
-        [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9],
     ),
     (
         Tier::Backup,
         Policy::PowerOfTwo(LoadMetric::Connections),
-        [9, 9, 7, 7, 1, 7, 9, 9, 1, 9, 9, 7],
+        [9, 9, 7, 7, 5, 7, 9, 9, 5, 9, 9, 7],
     ),
     (
         Tier::Backup,
         Policy::PowerOfTwo(LoadMetric::Requests),
-        [9, 5, 9, 1, 9, 5, 5, 5, 5, 9, 9, 1],
+        [9, 9, 5, 9, 5, 7, 9, 9, 5, 9, 9, 9],
     ),
     (
         Tier::Backup,
         Policy::Hrw,
-        [1, 7, 5, 9, 7, 5, 9, 9, 1, 5, 5, 7],
+        [9, 7, 7, 9, 5, 5, 9, 9, 7, 5, 1, 7],
     ),
     (
         Tier::Backup,
         Policy::Maglev,
-        [1, 9, 5, 9, 7, 7, 9, 7, 1, 5, 5, 9],
+        [9, 9, 7, 9, 5, 7, 9, 7, 7, 5, 1, 9],
     ),
     (
         Tier::FailOpen,
         Policy::RoundRobin,
-        [0, 2, 3, 4, 5, 7, 8, 9, 0, 2, 3, 4],
+        [9, 8, 7, 5, 4, 3, 2, 9, 8, 7, 5, 9],
     ),
     (
         Tier::FailOpen,
@@ -380,32 +380,32 @@ const PINNED: &[(Tier, Policy, [usize; 12])] = &[
     (
         Tier::FailOpen,
         Policy::LeastLoaded(LoadMetric::Connections),
-        [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+        [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7],
     ),
     (
         Tier::FailOpen,
         Policy::LeastLoaded(LoadMetric::Requests),
-        [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+        [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9],
     ),
     (
         Tier::FailOpen,
         Policy::PowerOfTwo(LoadMetric::Connections),
-        [9, 4, 9, 3, 2, 4, 3, 9, 9, 7, 3, 7],
+        [9, 9, 4, 9, 3, 7, 2, 4, 3, 9, 9, 7],
     ),
     (
         Tier::FailOpen,
         Policy::PowerOfTwo(LoadMetric::Requests),
-        [9, 9, 5, 5, 2, 2, 4, 9, 5, 5, 3, 9],
+        [9, 9, 5, 9, 3, 2, 2, 8, 3, 9, 9, 9],
     ),
     (
         Tier::FailOpen,
         Policy::Hrw,
-        [0, 7, 2, 9, 3, 5, 4, 9, 5, 3, 7, 7],
+        [9, 7, 8, 9, 7, 5, 5, 9, 4, 3, 3, 7],
     ),
     (
         Tier::FailOpen,
         Policy::Maglev,
-        [0, 9, 2, 3, 3, 2, 4, 3, 5, 8, 7, 9],
+        [9, 9, 8, 3, 7, 2, 5, 3, 4, 8, 3, 9],
     ),
 ];
 
