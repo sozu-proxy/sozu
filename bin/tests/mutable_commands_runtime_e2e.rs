@@ -45,7 +45,7 @@ use std::{
 
 use nix::{
     sys::signal::{Signal, kill},
-    unistd::Pid,
+    unistd::{Pid, getpgid},
 };
 use sozu_command_lib::{
     channel::Channel,
@@ -246,42 +246,68 @@ fn spawn_udp_backend() -> (u16, BackendThread) {
 struct MainProcess {
     child: Child,
     process_group: u32,
+    process_group_start_time: u64,
     stopped_worker: Option<(u32, u64)>,
+}
+
+fn process_parent_and_start_time(pid: u32) -> Result<(u32, u64), String> {
+    let raw = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map_err(|error| format!("read /proc/{pid}/stat: {error}"))?;
+    let closing_parenthesis = raw
+        .rfind(')')
+        .ok_or_else(|| format!("parse /proc/{pid}/stat command"))?;
+    let fields: Vec<&str> = raw[closing_parenthesis + 2..].split_whitespace().collect();
+    let parent = fields
+        .get(1)
+        .ok_or_else(|| format!("missing PPID in /proc/{pid}/stat"))?
+        .parse()
+        .map_err(|error| format!("parse process {pid} PPID: {error}"))?;
+    let start_time = fields
+        .get(19)
+        .ok_or_else(|| format!("missing start time in /proc/{pid}/stat"))?
+        .parse()
+        .map_err(|error| format!("parse process {pid} start time: {error}"))?;
+    Ok((parent, start_time))
 }
 
 impl MainProcess {
     fn direct_child_start_time(&self, pid: u32) -> Result<u64, String> {
-        let raw = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-            .map_err(|error| format!("read /proc/{pid}/stat: {error}"))?;
-        let closing_parenthesis = raw
-            .rfind(')')
-            .ok_or_else(|| format!("parse /proc/{pid}/stat command"))?;
-        let fields: Vec<&str> = raw[closing_parenthesis + 2..].split_whitespace().collect();
-        let parent: u32 = fields
-            .get(1)
-            .ok_or_else(|| format!("missing PPID in /proc/{pid}/stat"))?
-            .parse()
-            .map_err(|error| format!("parse worker {pid} PPID: {error}"))?;
+        let (_, main_start_time_before) = process_parent_and_start_time(self.process_group)?;
+        if main_start_time_before != self.process_group_start_time {
+            return Err(format!(
+                "owned main PID {} was reused before signalling worker {pid}",
+                self.process_group
+            ));
+        }
+        let main_process_group = getpgid(Some(Pid::from_raw(self.process_group as i32)))
+            .map_err(|error| format!("read owned main process group: {error}"))?;
+        if main_process_group.as_raw() != self.process_group as i32 {
+            return Err(format!(
+                "owned main {} moved to process group {main_process_group}",
+                self.process_group,
+            ));
+        }
+
+        let (parent, start_time) = process_parent_and_start_time(pid)?;
         if parent != self.process_group {
             return Err(format!(
                 "PPID {parent} is not owned main {}",
                 self.process_group
             ));
         }
-        let start_time: u64 = fields
-            .get(19)
-            .ok_or_else(|| format!("missing start time in /proc/{pid}/stat"))?
-            .parse()
-            .map_err(|error| format!("parse worker {pid} start time: {error}"))?;
-        let children =
-            std::fs::read_to_string(format!("/proc/{0}/task/{0}/children", self.process_group))
-                .map_err(|error| format!("read owned main children: {error}"))?;
-        if !children
-            .split_whitespace()
-            .any(|child| child == pid.to_string())
-        {
+        let process_group = getpgid(Some(Pid::from_raw(pid as i32)))
+            .map_err(|error| format!("read worker {pid} process group: {error}"))?;
+        if process_group.as_raw() != self.process_group as i32 {
             return Err(format!(
-                "PID {pid} is not a direct child of owned main {}",
+                "worker {pid} process group {process_group} is not owned group {}",
+                self.process_group,
+            ));
+        }
+
+        let (_, main_start_time_after) = process_parent_and_start_time(self.process_group)?;
+        if main_start_time_after != self.process_group_start_time {
+            return Err(format!(
+                "owned main PID {} changed while proving worker {pid}",
                 self.process_group
             ));
         }
@@ -402,9 +428,12 @@ activate_listeners = false
             .process_group(0);
         let child = command.spawn().expect("spawn real Sōzu main");
         let process_group = child.id();
+        let (_, process_group_start_time) = process_parent_and_start_time(process_group)
+            .expect("record owned main process identity");
         let main = MainProcess {
             child,
             process_group,
+            process_group_start_time,
             stopped_worker: None,
         };
 
