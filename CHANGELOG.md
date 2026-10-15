@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## 2.3.2 - 2026-10-15
+
 ### Fixed
 
 - Re-adding the last HTTP, HTTPS, TCP or UDP listener removed from an address
@@ -68,6 +70,8 @@
   prior cluster state and live answer remain in place. This gate prevents new
   invalid mutations; it does not repair state already persisted by an older
   version.
+
+[Compare 2.3.1 with 2.3.2](https://github.com/sozu-proxy/sozu/compare/2.3.1...2.3.2).
 
 ## 2.3.1 - 2026-10-14
 
