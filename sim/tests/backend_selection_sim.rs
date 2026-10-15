@@ -11,10 +11,12 @@
 //! harness owns that selector. It wraps a real `BackendMap` built with
 //! `BackendMap::with_seed`, mints ids with `BackendId::new` from its own slot
 //! table, and plays the embedder's half of the contract: it decides whether
-//! each dial connects, releases a failed dial's reservation with
+//! each reserved dial connects, releases a failed dial's reservation with
 //! `Backend::release_failed_dial`, records a connect's latency and success,
-//! and closes connections it opened. Every load-balancing policy runs its real
-//! code, including `LoadMetric::ConnectionTime` over `PeakEWMA`.
+//! and closes connections it opened. Reservation and resolution are separate
+//! steps, so the harness can remove, re-add and upsert backends while a dial or
+//! connection still holds the old `Rc`. Every load-balancing policy runs its
+//! real code, including `LoadMetric::ConnectionTime` over `PeakEWMA`.
 //!
 //! # What makes it deterministic
 //!
@@ -30,10 +32,11 @@
 //!
 //! The trace records what a selection decided — the cluster, the backend, the
 //! `BackendId` slot in minting order, the sticky cookie answered — and every
-//! reservation, release and close. It holds no instant and no duration, so two
-//! runs of one seed must produce the same bytes. `backend_selection_simulation_is_deterministic`
-//! checks exactly that, and also checks absolute values, so a trace that is
-//! equal only because it is empty cannot pass.
+//! reservation, release, close, add, remove and in-place upsert. It holds no
+//! instant and no duration, so two runs of one seed must produce the same
+//! bytes. `backend_selection_simulation_is_deterministic` checks exactly that,
+//! and also checks absolute values, so a trace that is equal only because it
+//! is empty cannot pass.
 //!
 //! # Why `run` never awaits
 //!
@@ -48,8 +51,20 @@
 //! After every step, each backend's `active_connections` equals the shadow
 //! count this harness keeps: `+1` per reservation, `-1` per failed-dial release
 //! and per close. That is LIFECYCLE §9 invariant 14's "selection reserves,
-//! failure releases" rule, observed from outside the core. Closing every
-//! connection at the end must bring every backend back to zero.
+//! failure releases" rule, observed from outside the core. Removing a backend
+//! with a pending reservation or live connection moves that exact allocation
+//! from `Closing` to `Closed` only after its count drains to zero; a replacement
+//! with the same `(backend_id, address)` is a distinct allocation and receives
+//! every later selection. An upsert of a still-live identity preserves its
+//! allocation and count. Closing every connection at the end must bring every
+//! backend incarnation back to zero.
+//!
+//! Every run proves those two pending/active scenarios first, with exactly two
+//! adds, removes, upserts and retired drains. The seeded phase then weights
+//! reservation, delayed resolution, close, add/re-add, in-place upsert, remove
+//! and virtual-time advance as separate actions. Its counters make membership
+//! coverage non-vacuous in the determinism campaign; a replay prints the exact
+//! action trace.
 //!
 //! # Replay / sweep
 //!
@@ -77,7 +92,7 @@ use rusty_ulid::Ulid;
 use sozu_command_lib::proto::command::{LoadBalancingAlgorithms, LoadMetric};
 use sozu_lib::{
     Protocol,
-    backends::{Backend, BackendError, BackendMap},
+    backends::{Backend, BackendError, BackendMap, BackendStatus},
     protocol::{
         kawa_h1::editor::HttpContext,
         mux::{
@@ -116,6 +131,8 @@ const POLICIES: [(LoadBalancingAlgorithms, LoadMetric); 7] = [
 struct SimSelector<'a> {
     map: &'a mut BackendMap,
     slots: &'a mut Vec<Rc<RefCell<Backend>>>,
+    retired: &'a [Rc<RefCell<Backend>>],
+    selected_slot: &'a mut Option<usize>,
     now: Instant,
 }
 
@@ -159,6 +176,14 @@ impl BackendSelector for SimSelector<'_> {
                 self.slots.len() - 1
             }
         };
+        assert!(
+            self.retired
+                .iter()
+                .all(|retired| !Rc::ptr_eq(retired, &self.slots[slot])),
+            "seed={:#x}: a retired backend allocation was selected again",
+            current_sim_seed()
+        );
+        *self.selected_slot = Some(slot);
         Ok(SelectedBackend {
             backend: BackendId::new(slot, Rc::from(backend_id.as_str()), address),
             sticky_session,
@@ -174,6 +199,16 @@ struct RunRecord {
     failed_dials: usize,
     closes: usize,
     sticky_answers: usize,
+    backend_adds: usize,
+    backend_removes: usize,
+    backend_upserts: usize,
+    retired_drains: usize,
+    random_reservations: usize,
+    random_resolutions: usize,
+    random_backend_adds: usize,
+    random_backend_readds: usize,
+    random_backend_removes: usize,
+    random_backend_upserts: usize,
     /// Clusters whose policy draws from the map's generator (`Random`,
     /// `PowerOfTwo`), so the guard can require that the map's seed was
     /// exercised and not only the workload's.
@@ -188,6 +223,20 @@ struct BackendSelectionWorkload {
     sink: Option<RecordSink>,
 }
 
+#[derive(Clone, Debug)]
+struct BackendIdentity {
+    cluster_id: Arc<str>,
+    backend_id: String,
+    address: SocketAddr,
+    sticky_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DialOutcome {
+    Failed,
+    Connected(Duration),
+}
+
 /// The state one run drives. Built and dropped inside `run`, never held across
 /// a yield point (see the module docs).
 struct Harness {
@@ -199,6 +248,15 @@ struct Harness {
     /// Slots of the connections this harness dialled successfully and has
     /// not closed yet, in dial order.
     open: Vec<usize>,
+    /// Slots reserved by selection whose dial has not resolved yet.
+    pending: Vec<usize>,
+    /// Allocations removed from the live map while a pending dial or open
+    /// connection still owns them.
+    retired: Vec<Rc<RefCell<Backend>>>,
+    /// Exact identities removed by the seeded workload and available for a
+    /// later re-add as a distinct allocation.
+    removed_identities: Vec<BackendIdentity>,
+    next_dynamic_backend: u16,
     base: Instant,
     offset: Duration,
     record: RunRecord,
@@ -246,6 +304,10 @@ impl Harness {
             router: Router::new(Duration::from_secs(10), Duration::from_secs(10)),
             shadow: HashMap::new(),
             open: Vec::new(),
+            pending: Vec::new(),
+            retired: Vec::new(),
+            removed_identities: Vec::new(),
+            next_dynamic_backend: 0,
             base,
             offset: Duration::ZERO,
             record,
@@ -261,19 +323,13 @@ impl Harness {
         self.record.trace.push(b'\n');
     }
 
-    /// One request of a random cluster selects a backend, and its dial
-    /// connects or fails.
-    fn select_and_dial(&mut self, ctx: &SimContext) {
-        let cluster = CLUSTERS[ctx.random().random_range(0..CLUSTERS.len())];
-        let sticks = ctx.random().random_bool(0.4);
-        let cookie = match ctx.random().random_range(0..3u8) {
-            0 => None,
-            1 => Some(format!(
-                "{cluster}-sticky-{}",
-                2 * ctx.random().random_range(0..BACKENDS_PER_CLUSTER / 2)
-            )),
-            _ => Some("no-such-backend".to_owned()),
-        };
+    /// Reserve one request through the real router and leave its dial pending.
+    fn reserve_request(
+        &mut self,
+        cluster: &str,
+        sticks: bool,
+        cookie: Option<String>,
+    ) -> Option<usize> {
         let mut context = HttpContext::new(
             Ulid::from(0u128),
             Ulid::from(0u128),
@@ -288,28 +344,29 @@ impl Harness {
         context.sticky_session_found = cookie.clone();
 
         let now = self.now();
-        let mut selector = SimSelector {
-            map: &mut self.map,
-            slots: &mut self.slots,
-            now,
-        };
-        let selected =
+        let mut selected_slot = None;
+        let selected = {
+            let mut selector = SimSelector {
+                map: &mut self.map,
+                slots: &mut self.slots,
+                retired: &self.retired,
+                selected_slot: &mut selected_slot,
+                now,
+            };
             self.router
-                .backend_from_request(cluster, sticks, &mut context, &mut selector);
+                .backend_from_request(cluster, sticks, &mut context, &mut selector)
+        };
         let backend = match selected {
             Ok(backend) => backend,
             Err(_) => {
                 self.trace(format_args!(
                     "select {cluster} stick={sticks} cookie={cookie:?} -> none"
                 ));
-                return;
+                return None;
             }
         };
-        let slot = self
-            .slots
-            .iter()
-            .position(|known| known.borrow().address == backend.address)
-            .expect("a selected backend has a slot");
+        let slot = selected_slot.expect("the selector records the slot it minted");
+        self.pending.push(slot);
         *self.shadow.entry(slot).or_default() += 1;
         self.record.selections += 1;
         if context.sticky_session.is_some() {
@@ -331,39 +388,397 @@ impl Harness {
             "select {cluster} stick={sticks} cookie={cookie:?} -> slot={slot} backend={} sticky={:?}",
             backend.backend_id, context.sticky_session
         ));
+        Some(slot)
+    }
 
-        // The embedder's half: the dial connects, or `connect(2)` fails and
-        // the reservation is released with the failure recorded.
-        if ctx.random().random_bool(0.2) {
-            let handle = Rc::clone(&self.slots[slot]);
-            handle.borrow_mut().release_failed_dial(now, self.map.rng());
-            *self.shadow.get_mut(&slot).expect("reserved above") -= 1;
-            self.record.failed_dials += 1;
-            self.trace(format_args!("dial slot={slot} -> failed, released"));
-        } else {
-            let latency = Duration::from_millis(ctx.random().random_range(1..200));
-            {
-                let mut connected = self.slots[slot].borrow_mut();
-                connected.set_connection_time(latency, now);
-                connected.retry_policy.succeed(now);
-                connected.failures = 0;
+    /// Resolve one pending dial. A connected dial keeps the reservation until
+    /// the matching connection closes; a failed dial releases it immediately.
+    fn resolve_pending(&mut self, slot: usize, outcome: DialOutcome) {
+        let pending_index = self
+            .pending
+            .iter()
+            .position(|pending| *pending == slot)
+            .expect("the dial being resolved is pending");
+        self.pending.swap_remove(pending_index);
+        let now = self.now();
+
+        match outcome {
+            DialOutcome::Failed => {
+                let handle = Rc::clone(&self.slots[slot]);
+                handle.borrow_mut().release_failed_dial(now, self.map.rng());
+                *self.shadow.get_mut(&slot).expect("reserved above") -= 1;
+                self.record.failed_dials += 1;
+                self.trace(format_args!("dial slot={slot} -> failed, released"));
             }
-            self.open.push(slot);
-            self.trace(format_args!(
-                "dial slot={slot} -> connected in {}ms",
-                latency.as_millis()
-            ));
+            DialOutcome::Connected(latency) => {
+                {
+                    let mut connected = self.slots[slot].borrow_mut();
+                    connected.set_connection_time(latency, now);
+                    connected.retry_policy.succeed(now);
+                    connected.failures = 0;
+                }
+                self.open.push(slot);
+                self.trace(format_args!(
+                    "dial slot={slot} -> connected in {}ms",
+                    latency.as_millis()
+                ));
+            }
         }
     }
 
-    /// Close one of the open connections, releasing its count.
-    fn close_one(&mut self, ctx: &SimContext) {
-        if self.open.is_empty() {
+    /// One request of a random cluster selects a backend, and its dial
+    /// connects or fails.
+    fn select_and_dial(&mut self, ctx: &SimContext) {
+        let Some(slot) = self.reserve_random_request(ctx) else {
+            return;
+        };
+        let outcome = if ctx.random().random_bool(0.2) {
+            DialOutcome::Failed
+        } else {
+            DialOutcome::Connected(Duration::from_millis(ctx.random().random_range(1..200)))
+        };
+        self.resolve_pending(slot, outcome);
+    }
+
+    fn reserve_random_request(&mut self, ctx: &SimContext) -> Option<usize> {
+        let cluster = CLUSTERS[ctx.random().random_range(0..CLUSTERS.len())];
+        let sticks = ctx.random().random_bool(0.4);
+        let cookie = match ctx.random().random_range(0..3u8) {
+            0 => None,
+            1 => Some(format!(
+                "{cluster}-sticky-{}",
+                2 * ctx.random().random_range(0..BACKENDS_PER_CLUSTER / 2)
+            )),
+            _ => Some("no-such-backend".to_owned()),
+        };
+        self.reserve_request(cluster, sticks, cookie)
+    }
+
+    fn live_identity_for_slot(&self, slot: usize) -> BackendIdentity {
+        let handle = &self.slots[slot];
+        for (cluster_id, list) in &self.map.backends {
+            if let Some(live) = list.backends().iter().find(|live| Rc::ptr_eq(live, handle)) {
+                let backend = live.borrow();
+                return BackendIdentity {
+                    cluster_id: cluster_id.clone(),
+                    backend_id: backend.backend_id.clone(),
+                    address: backend.address,
+                    sticky_id: backend.sticky_id.clone(),
+                };
+            }
+        }
+        panic!("slot {slot} is not in the live backend map");
+    }
+
+    fn live_backend(&self, identity: &BackendIdentity) -> Option<Rc<RefCell<Backend>>> {
+        self.map
+            .backends
+            .get(identity.cluster_id.as_ref())
+            .and_then(|list| list.find_backend_by_identity(&identity.backend_id, &identity.address))
+            .cloned()
+    }
+
+    /// Update one live backend in place and prove its allocation and count did
+    /// not change. Only the exact `(backend_id, address)` identity is used.
+    fn upsert_slot(&mut self, slot: usize, sticky_id: String) -> BackendIdentity {
+        let identity = self.live_identity_for_slot(slot);
+        let before = Rc::clone(&self.slots[slot]);
+        let (connections, status) = {
+            let backend = before.borrow();
+            (backend.active_connections, backend.status.clone())
+        };
+        self.map.add_backend(
+            &identity.cluster_id,
+            Backend::new_at(
+                &identity.backend_id,
+                identity.address,
+                Some(sticky_id.clone()),
+                None,
+                None,
+                self.now(),
+            ),
+        );
+        let updated_identity = BackendIdentity {
+            sticky_id: Some(sticky_id.clone()),
+            ..identity
+        };
+        let after = self
+            .live_backend(&updated_identity)
+            .expect("an upsert keeps the backend live");
+        assert!(
+            Rc::ptr_eq(&before, &after),
+            "seed={:#x}: upsert must keep the live backend allocation",
+            current_sim_seed()
+        );
+        let after = after.borrow();
+        assert_eq!(after.active_connections, connections);
+        assert_eq!(after.status, status);
+        assert_eq!(after.sticky_id.as_deref(), Some(sticky_id.as_str()));
+        drop(after);
+        self.record.backend_upserts += 1;
+        self.trace(format_args!(
+            "upsert {} {} -> slot={slot} count={connections}",
+            updated_identity.cluster_id, updated_identity.backend_id
+        ));
+        updated_identity
+    }
+
+    /// Remove the live allocation of `identity`, keeping the session-owned
+    /// `Rc` so its drain can be observed independently of a replacement.
+    fn remove_slot(&mut self, slot: usize, identity: &BackendIdentity) -> Rc<RefCell<Backend>> {
+        let handle = self
+            .live_backend(identity)
+            .expect("the backend being removed is live");
+        assert!(Rc::ptr_eq(&handle, &self.slots[slot]));
+        let connections = handle.borrow().active_connections;
+        assert!(
+            connections > 0,
+            "seed={:#x}: removal coverage must hold a reservation or connection",
+            current_sim_seed()
+        );
+        assert!(self.map.remove_backend(
+            &identity.cluster_id,
+            &identity.backend_id,
+            &identity.address
+        ));
+        {
+            let removed = handle.borrow();
+            assert_eq!(removed.status, BackendStatus::Closing);
+            assert_eq!(removed.active_connections, connections);
+        }
+        self.retired.push(Rc::clone(&handle));
+        self.record.backend_removes += 1;
+        self.trace(format_args!(
+            "remove {} {} -> slot={slot} closing count={connections}",
+            identity.cluster_id, identity.backend_id
+        ));
+        handle
+    }
+
+    fn readd_backend(&mut self, identity: &BackendIdentity) -> Rc<RefCell<Backend>> {
+        self.map.add_backend(
+            &identity.cluster_id,
+            Backend::new_at(
+                &identity.backend_id,
+                identity.address,
+                identity.sticky_id.clone(),
+                None,
+                None,
+                self.now(),
+            ),
+        );
+        let replacement = self
+            .live_backend(identity)
+            .expect("the re-added backend is live");
+        assert!(
+            self.retired
+                .iter()
+                .all(|retired| !Rc::ptr_eq(retired, &replacement)),
+            "seed={:#x}: re-add must create a new backend allocation",
+            current_sim_seed()
+        );
+        {
+            let replacement = replacement.borrow();
+            assert_eq!(replacement.status, BackendStatus::Normal);
+            assert_eq!(replacement.active_connections, 0);
+        }
+        self.record.backend_adds += 1;
+        self.trace(format_args!(
+            "add {} {} -> allocation",
+            identity.cluster_id, identity.backend_id
+        ));
+        replacement
+    }
+
+    fn assert_retired_drained(&mut self, handle: &Rc<RefCell<Backend>>, slot: usize) {
+        {
+            let backend = handle.borrow();
+            assert_eq!(backend.status, BackendStatus::Closed);
+            assert_eq!(backend.active_connections, 0);
+        }
+        self.record.retired_drains += 1;
+        self.trace(format_args!("retired slot={slot} -> closed count=0"));
+    }
+
+    /// Deterministic membership coverage around one real backend identity.
+    /// It holds a pending reservation across the first remove/re-add, then a
+    /// connected session across the second, while every replacement selection
+    /// still travels through `Router::backend_from_request`.
+    fn exercise_membership_mutations(&mut self) {
+        let pending_slot = self
+            .reserve_request("cluster-a", true, Some("cluster-a-sticky-0".to_owned()))
+            .expect("the initial sticky backend is selectable");
+        let pending_identity =
+            self.upsert_slot(pending_slot, "cluster-a-sticky-0-pending-upsert".to_owned());
+        let retired_pending = self.remove_slot(pending_slot, &pending_identity);
+        let first_replacement = self.readd_backend(&pending_identity);
+        assert!(!Rc::ptr_eq(&retired_pending, &first_replacement));
+        let replacement_slot = self
+            .reserve_request(
+                &pending_identity.cluster_id,
+                true,
+                pending_identity.sticky_id.clone(),
+            )
+            .expect("the replacement backend is selectable");
+        assert!(!Rc::ptr_eq(&retired_pending, &self.slots[replacement_slot]));
+        assert!(Rc::ptr_eq(
+            &first_replacement,
+            &self.slots[replacement_slot]
+        ));
+
+        self.resolve_pending(pending_slot, DialOutcome::Failed);
+        self.assert_retired_drained(&retired_pending, pending_slot);
+        self.resolve_pending(
+            replacement_slot,
+            DialOutcome::Connected(Duration::from_millis(7)),
+        );
+
+        let active_identity = self.upsert_slot(
+            replacement_slot,
+            "cluster-a-sticky-0-active-upsert".to_owned(),
+        );
+        let retired_active = self.remove_slot(replacement_slot, &active_identity);
+        let second_replacement = self.readd_backend(&active_identity);
+        assert!(!Rc::ptr_eq(&retired_active, &second_replacement));
+        let second_replacement_slot = self
+            .reserve_request(
+                &active_identity.cluster_id,
+                true,
+                active_identity.sticky_id.clone(),
+            )
+            .expect("the second replacement backend is selectable");
+        assert!(!Rc::ptr_eq(
+            &retired_active,
+            &self.slots[second_replacement_slot]
+        ));
+        assert!(Rc::ptr_eq(
+            &second_replacement,
+            &self.slots[second_replacement_slot]
+        ));
+        self.resolve_pending(second_replacement_slot, DialOutcome::Failed);
+        self.close_slot(replacement_slot);
+        self.assert_retired_drained(&retired_active, replacement_slot);
+    }
+
+    fn live_active_slots(&self) -> Vec<usize> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, handle)| {
+                let is_live = self
+                    .map
+                    .backends
+                    .values()
+                    .any(|list| list.backends().iter().any(|live| Rc::ptr_eq(live, handle)));
+                (is_live && handle.borrow().active_connections > 0).then_some(slot)
+            })
+            .collect()
+    }
+
+    fn resolve_random_pending(&mut self, ctx: &SimContext) {
+        if self.pending.is_empty() {
+            if self.reserve_random_request(ctx).is_some() {
+                self.record.random_reservations += 1;
+            }
             return;
         }
-        let slot = self
+        let slot = self.pending[ctx.random().random_range(0..self.pending.len())];
+        let outcome = if ctx.random().random_bool(0.25) {
+            DialOutcome::Failed
+        } else {
+            DialOutcome::Connected(Duration::from_millis(ctx.random().random_range(1..200)))
+        };
+        self.resolve_pending(slot, outcome);
+        self.record.random_resolutions += 1;
+    }
+
+    fn upsert_random_live_backend(&mut self, ctx: &SimContext, step: usize) {
+        let candidates = self.live_active_slots();
+        if candidates.is_empty() {
+            if self.reserve_random_request(ctx).is_some() {
+                self.record.random_reservations += 1;
+            }
+            return;
+        }
+        let slot = candidates[ctx.random().random_range(0..candidates.len())];
+        self.upsert_slot(slot, format!("random-upsert-{}-{step}", current_sim_seed()));
+        self.record.random_backend_upserts += 1;
+    }
+
+    fn remove_random_live_backend(&mut self, ctx: &SimContext) {
+        let candidates = self.live_active_slots();
+        if candidates.is_empty() {
+            if self.reserve_random_request(ctx).is_some() {
+                self.record.random_reservations += 1;
+            }
+            return;
+        }
+        let slot = candidates[ctx.random().random_range(0..candidates.len())];
+        let identity = self.live_identity_for_slot(slot);
+        self.remove_slot(slot, &identity);
+        self.removed_identities.push(identity);
+        self.record.random_backend_removes += 1;
+    }
+
+    fn add_random_backend(&mut self, ctx: &SimContext) {
+        let readd = !self.removed_identities.is_empty() && ctx.random().random_bool(0.75);
+        let identity = if readd {
+            let index = ctx.random().random_range(0..self.removed_identities.len());
+            self.removed_identities.swap_remove(index)
+        } else {
+            let ordinal = self.next_dynamic_backend;
+            self.next_dynamic_backend = self
+                .next_dynamic_backend
+                .checked_add(1)
+                .expect("the bounded simulation cannot exhaust backend ordinals");
+            let cluster_id: Arc<str> =
+                Arc::from(CLUSTERS[ctx.random().random_range(0..CLUSTERS.len())]);
+            BackendIdentity {
+                cluster_id,
+                backend_id: format!("dynamic-{ordinal}"),
+                address: SocketAddr::from(([10, 1, (ordinal >> 8) as u8, ordinal as u8], 30_000)),
+                sticky_id: Some(format!("dynamic-sticky-{ordinal}")),
+            }
+        };
+        self.readd_backend(&identity);
+        self.record.random_backend_adds += 1;
+        self.record.random_backend_readds += readd as usize;
+    }
+
+    fn seeded_step(&mut self, ctx: &SimContext, step: usize) {
+        match ctx.random().random_range(0..16u8) {
+            0..6 => {
+                if self.reserve_random_request(ctx).is_some() {
+                    self.record.random_reservations += 1;
+                }
+            }
+            6..8 => self.resolve_random_pending(ctx),
+            8..10 => self.close_one(ctx),
+            10 => self.upsert_random_live_backend(ctx, step),
+            11 => self.remove_random_live_backend(ctx),
+            12 => self.add_random_backend(ctx),
+            13 => self.select_and_dial(ctx),
+            _ => {
+                // Advance the harness's clock: sometimes within a backoff
+                // window, sometimes past the longest one.
+                let millis = if ctx.random().random_bool(0.2) {
+                    ctx.random().random_range(1_000..70_000)
+                } else {
+                    ctx.random().random_range(1..500)
+                };
+                self.offset += Duration::from_millis(millis);
+                self.trace(format_args!("advance {millis}ms"));
+            }
+        }
+    }
+
+    fn close_slot(&mut self, slot: usize) {
+        let open_index = self
             .open
-            .swap_remove(ctx.random().random_range(0..self.open.len()));
+            .iter()
+            .position(|open| *open == slot)
+            .expect("the connection being closed is open");
+        self.open.swap_remove(open_index);
         self.slots[slot].borrow_mut().dec_connections();
         *self
             .shadow
@@ -371,6 +786,15 @@ impl Harness {
             .expect("an open connection was reserved") -= 1;
         self.record.closes += 1;
         self.trace(format_args!("close slot={slot}"));
+    }
+
+    /// Close one of the open connections, releasing its count.
+    fn close_one(&mut self, ctx: &SimContext) {
+        if self.open.is_empty() {
+            return;
+        }
+        let slot = self.open[ctx.random().random_range(0..self.open.len())];
+        self.close_slot(slot);
     }
 
     /// Every backend holds exactly the connections the shadow says it does.
@@ -408,28 +832,23 @@ impl Workload for BackendSelectionWorkload {
 
     async fn run(&mut self, ctx: &SimContext) -> SimulationResult<()> {
         let mut harness = Harness::new(ctx);
+        harness.exercise_membership_mutations();
+        assert_eq!(harness.record.backend_adds, 2);
+        assert_eq!(harness.record.backend_removes, 2);
+        assert_eq!(harness.record.backend_upserts, 2);
+        assert_eq!(harness.record.retired_drains, 2);
+        harness.check(0);
         for step in 0..self.steps {
-            match ctx.random().random_range(0..10u8) {
-                0..6 => harness.select_and_dial(ctx),
-                6..9 => harness.close_one(ctx),
-                _ => {
-                    // Advance the harness's clock: sometimes within a backoff
-                    // window, sometimes past the longest one.
-                    let millis = if ctx.random().random_bool(0.2) {
-                        ctx.random().random_range(1_000..70_000)
-                    } else {
-                        ctx.random().random_range(1..500)
-                    };
-                    harness.offset += Duration::from_millis(millis);
-                    harness.trace(format_args!("advance {millis}ms"));
-                }
-            }
+            harness.seeded_step(ctx, step);
             harness.check(step);
         }
 
-        // Drain: every connection closes, so every count returns to zero.
-        while !harness.open.is_empty() {
-            let slot = harness.open.pop().expect("checked non-empty");
+        // Drain every unresolved reservation, then every open connection, so
+        // every live and retired incarnation returns to zero.
+        while let Some(slot) = harness.pending.last().copied() {
+            harness.resolve_pending(slot, DialOutcome::Failed);
+        }
+        while let Some(slot) = harness.open.pop() {
             harness.slots[slot].borrow_mut().dec_connections();
             *harness.shadow.get_mut(&slot).expect("reserved") -= 1;
             harness.record.closes += 1;
@@ -470,6 +889,16 @@ impl Workload for BackendSelectionWorkload {
                 current_sim_seed()
             );
         }
+        for retired in &harness.retired {
+            let retired = retired.borrow();
+            assert_eq!(retired.status, BackendStatus::Closed);
+            assert_eq!(retired.active_connections, 0);
+        }
+        assert_eq!(
+            harness.retired.len(),
+            2 + harness.record.random_backend_removes,
+            "every seeded removal must preserve its retired allocation for the drain oracle"
+        );
 
         if self.verbose {
             eprintln!("{}", String::from_utf8_lossy(&harness.record.trace));
@@ -620,6 +1049,37 @@ fn backend_selection_simulation_is_deterministic() {
         assert!(
             first.sticky_answers > 0,
             "seed={seed:#x}: some selections must answer a sticky cookie"
+        );
+        assert_eq!(first.backend_adds, 2 + first.random_backend_adds);
+        assert_eq!(first.backend_removes, 2 + first.random_backend_removes);
+        assert_eq!(first.backend_upserts, 2 + first.random_backend_upserts);
+        assert_eq!(
+            first.retired_drains, 2,
+            "seed={seed:#x}: both retired backend incarnations must drain to zero"
+        );
+        assert!(
+            first.random_reservations > 0,
+            "seed={seed:#x}: the seeded workload must leave dials pending"
+        );
+        assert!(
+            first.random_resolutions > 0,
+            "seed={seed:#x}: the seeded workload must resolve pending dials"
+        );
+        assert!(
+            first.random_backend_adds > 0,
+            "seed={seed:#x}: the seeded workload must add backend incarnations"
+        );
+        assert!(
+            first.random_backend_readds > 0,
+            "seed={seed:#x}: the seeded workload must re-add a removed identity"
+        );
+        assert!(
+            first.random_backend_removes > 0,
+            "seed={seed:#x}: the seeded workload must remove live backend incarnations"
+        );
+        assert!(
+            first.random_backend_upserts > 0,
+            "seed={seed:#x}: the seeded workload must upsert live backend incarnations"
         );
         seeded_policies += first.seeded_policies;
         runs.push(first.trace);
