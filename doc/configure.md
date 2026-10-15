@@ -1133,6 +1133,12 @@ serves it), a new connection on its TCP listeners is closed, and a session
 already established drains on the backend connection it holds. A frontend with no cluster (a deny or answer
 route) is not removed. See "Remove a cluster" in `doc/configure_cli.md`.
 
+A backend belongs to its cluster, while a frontend does not: an `AddBackend`
+order (`sozu backend add`) naming a cluster that was never added, or was
+removed, is refused by the main process and by every worker, so no backend
+outlives its cluster. The configuration file always adds a cluster before its
+backends, and so does a saved state written by `SaveState`.
+
 The load balancing policies differ in what they select and in how much of the
 backend set they read on every request:
 

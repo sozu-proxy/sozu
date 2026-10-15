@@ -57,6 +57,11 @@ Then you need to add a backend:
 sozu --config /etc/sozu/config.toml backend add --address 127.0.0.1:3000 --backend-id <my_backend_id> --id <my_cluster_id>
 ```
 
+The cluster must exist first: a backend belongs to its cluster, and adding one
+to a cluster that was never added, or was removed, is refused with
+`Backend names a cluster that does not exist (cluster_id_bytes=<n>); add the cluster first`.
+A frontend may still be added before its cluster.
+
 A backend is identified by its backend id and address together. Two backends
 of a cluster may share an address under distinct ids (an A/B variant, for
 instance): `backend remove --id <cluster_id> --backend-id <id> --address <address>` removes only

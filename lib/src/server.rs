@@ -2698,6 +2698,18 @@ impl Server {
                 ));
                 return;
             }
+            if matches!(e, StateError::ClusterNotFound { .. }) {
+                // A backend belongs to its cluster
+                // (`ConfigState::add_backend`, `command/src/state.rs`): the
+                // state refused one of a cluster it does not hold, never
+                // added or already removed. Refuse it without adding it to
+                // the `BackendMap`, where it would outlive its cluster.
+                push_queue(WorkerResponse::error(
+                    request.id,
+                    format!("Could not execute order on config state: {e}"),
+                ));
+                return;
+            }
             error!("Could not execute order on config state: {}", e);
         } else {
             rollback = rollback_candidate;
@@ -5259,6 +5271,15 @@ mod listener_lifecycle_tests {
         server: &mut Server,
         address: SocketAddress,
     ) -> (StdUdpSocket, StdUdpSocket) {
+        // A backend belongs to its cluster: add the cluster first.
+        server.notify_proxys(WorkerRequest {
+            id: "test-add-udp-cluster".to_owned(),
+            content: RequestType::AddCluster(Cluster {
+                cluster_id: UDP_FLOW_CLUSTER.to_owned(),
+                ..Default::default()
+            })
+            .into(),
+        });
         server.notify_proxys(WorkerRequest {
             id: "test-add-udp-front".to_owned(),
             content: RequestType::AddUdpFrontend(RequestUdpFrontend {
@@ -5773,6 +5794,18 @@ mod add_cluster_validation_tests {
     #[test]
     fn an_add_cluster_with_an_invalid_shard_percent_is_refused_and_unsharded() {
         let mut server = bare_server();
+        // The cluster exists unsharded before the refused update: a backend
+        // belongs to its cluster, and one of a cluster the worker does not
+        // hold is refused (`ConfigState::add_backend`).
+        server.notify_proxys(WorkerRequest {
+            id: "test-add-unsharded-cluster".to_owned(),
+            content: RequestType::AddCluster(Cluster {
+                cluster_id: CLUSTER.to_owned(),
+                load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
+                ..Default::default()
+            })
+            .into(),
+        });
         server.notify_proxys(WorkerRequest {
             id: ADD_CLUSTER_ID.to_owned(),
             content: RequestType::AddCluster(Cluster {
@@ -6544,6 +6577,53 @@ mod remove_cluster_cascade_tests {
                 "a removal the cascade already performed must answer ok: {responses:?}"
             );
         }
+    }
+
+    /// A backend belongs to its cluster: the worker refuses an `AddBackend`
+    /// for a cluster it does not hold, never added or already removed, and
+    /// never adds it to its `BackendMap`, where it would outlive its cluster.
+    #[test]
+    fn a_backend_of_an_unknown_cluster_is_refused_by_the_worker() {
+        const ORPHAN: &str = "orphan";
+        let mut server = bare_server();
+        let assert_refused = |server: &mut Server, id: &str, port: u16| {
+            let responses = send(server, id, RequestType::AddBackend(backend(ORPHAN, port)));
+            assert!(
+                !responses.is_empty()
+                    && responses
+                        .iter()
+                        .all(|r| r.status == ResponseStatus::Failure as i32),
+                "a backend of an unknown cluster must be refused: {responses:?}"
+            );
+            assert!(
+                !server.backends.borrow().backends.contains_key(ORPHAN),
+                "a refused backend must not reach the BackendMap"
+            );
+        };
+
+        assert_refused(&mut server, "never-added", 1026);
+
+        for (index, request) in [
+            RequestType::AddCluster(Cluster {
+                cluster_id: ORPHAN.to_owned(),
+                ..Default::default()
+            }),
+            RequestType::AddBackend(backend(ORPHAN, 1026)),
+            RequestType::RemoveCluster(ORPHAN.to_owned()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for response in send(&mut server, &format!("step-{index}"), request) {
+                assert_eq!(
+                    response.status,
+                    ResponseStatus::Ok as i32,
+                    "step must succeed: {response:?}"
+                );
+            }
+        }
+
+        assert_refused(&mut server, "removed", 1027);
     }
 
     /// The route key names no cluster, so cluster B can take the key cluster

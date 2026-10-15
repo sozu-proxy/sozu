@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+### Changed
+
+- A backend belongs to its cluster (#996). `AddBackend` (`sozu backend add`)
+  naming a cluster the state does not hold, never added or already removed,
+  is now refused with `ClusterNotFound` by the main process and by every
+  worker, instead of storing a backend no cluster owns. `RemoveCluster`
+  already removes the cluster's backends (#1729), so no backend outlives its
+  cluster. Frontends stay independent: one may still be added before its
+  cluster. The configuration file, `SaveState` and `ConfigState::diff` all
+  emit a cluster before its backends and are unaffected.
+
+### Upgrade notes
+
+- Tooling that sends `AddBackend` before the `AddCluster` of the same cluster
+  now gets an error for each such backend and must add the cluster first.
+- A saved state file written by hand, or by tooling, with a backend before
+  its cluster or with a backend of a cluster it never adds: `LoadState` skips
+  that backend with a `warn!` log and counts it in
+  `config.load_skipped_invalid`, so it is not loaded. A state saved by Sōzu
+  itself lists every cluster before its backends.
+- A worker of this release refuses such a backend even from an older main
+  process, which may still hold it in its own state.
+
 ## 2.3.1 - 2026-10-14
 
 ### Fixed
