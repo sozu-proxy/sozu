@@ -552,8 +552,10 @@ fn is_mutating_verb(req: &RequestType) -> bool {
             | RequestType::AddBackend(_)
             | RequestType::AddCertificate(_)
             | RequestType::AddHttpFrontend(_)
+            | RequestType::AddHttpFrontendWithSilentClose(_)
             | RequestType::AddHttpListener(_)
             | RequestType::AddHttpsFrontend(_)
+            | RequestType::AddHttpsFrontendWithSilentClose(_)
             | RequestType::AddHttpsListener(_)
             | RequestType::AddHttpsListenerWithClientAuth(_)
             | RequestType::AddTcpFrontend(_)
@@ -711,8 +713,10 @@ impl Server {
             | RequestType::AddBackend(_)
             | RequestType::AddCertificate(_)
             | RequestType::AddHttpFrontend(_)
+            | RequestType::AddHttpFrontendWithSilentClose(_)
             | RequestType::AddHttpListener(_)
             | RequestType::AddHttpsFrontend(_)
+            | RequestType::AddHttpsFrontendWithSilentClose(_)
             | RequestType::AddHttpsListener(_)
             | RequestType::AddHttpsListenerWithClientAuth(_)
             | RequestType::AddTcpFrontend(_)
@@ -1835,7 +1839,8 @@ fn audit_entry_for(
                 extras: AuditExtras::default(),
             })
         }
-        RequestType::AddHttpFrontend(frontend) => {
+        RequestType::AddHttpFrontend(frontend)
+        | RequestType::AddHttpFrontendWithSilentClose(frontend) => {
             let (verb, counter) = audit_verb!("http_frontend_added");
             Some(AuditEntry {
                 kind: EventKind::FrontendAdded,
@@ -1848,7 +1853,8 @@ fn audit_entry_for(
                 extras: AuditExtras::default(),
             })
         }
-        RequestType::AddHttpsFrontend(frontend) => {
+        RequestType::AddHttpsFrontend(frontend)
+        | RequestType::AddHttpsFrontendWithSilentClose(frontend) => {
             let (verb, counter) = audit_verb!("https_frontend_added");
             Some(AuditEntry {
                 kind: EventKind::FrontendAdded,
@@ -2724,7 +2730,10 @@ fn validate_listener_request(request: &RequestType) -> Result<(), String> {
 /// key) carries the hostname in clear.
 fn validate_frontend_request(request: &RequestType) -> Result<(), String> {
     let front = match request {
-        RequestType::AddHttpFrontend(front) | RequestType::AddHttpsFrontend(front) => front,
+        RequestType::AddHttpFrontend(front)
+        | RequestType::AddHttpFrontendWithSilentClose(front)
+        | RequestType::AddHttpsFrontend(front)
+        | RequestType::AddHttpsFrontendWithSilentClose(front) => front,
         _ => return Ok(()),
     };
     let front = front

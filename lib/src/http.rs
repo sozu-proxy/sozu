@@ -1801,7 +1801,8 @@ impl ProxyConfiguration for HttpProxy {
                 );
                 self.remove_cluster(&cluster_id)
             }
-            Some(RequestType::AddHttpFrontend(front)) => {
+            Some(RequestType::AddHttpFrontend(front))
+            | Some(RequestType::AddHttpFrontendWithSilentClose(front)) => {
                 debug!(
                     "{} {} add front {:?}",
                     log_module_context!(),
