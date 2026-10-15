@@ -689,6 +689,12 @@ jobs:
       - name: Backend selection simulation sweep (debug, asserts live)
         run: cargo test -p sozu-sim --locked --test backend_selection_sim -- --nocapture
 
+      - name: Mutable command simulation sweep (debug, asserts live)
+        env:
+          SOZU_MUTABLE_COMMANDS_SIM_SEEDS: '16'
+          SOZU_MUTABLE_COMMANDS_SIM_STEPS: '100'
+        run: cargo test -p sozu-sim --locked --test mutable_commands_simulation -- --nocapture
+
   # ┌──────────────────────────────────────────────────────────────┐
   # │ Group D — Bombardier load benches (folded from benchmark.yml) │
   # └──────────────────────────────────────────────────────────────┘
