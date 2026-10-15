@@ -3069,6 +3069,16 @@ impl Server {
     ) -> WorkerResponse {
         debug!("{} add http listener {:?}", req_id, listener);
 
+        let address: SocketAddr = listener.address.into();
+        let retained_frontends = self
+            .config_state
+            .http_fronts
+            .values()
+            .filter(|frontend| frontend.address == address)
+            .cloned()
+            .map(Into::into)
+            .collect();
+
         if self.sessions.borrow().at_capacity() {
             return worker_response_error(req_id, "session list is full, cannot add a listener");
         }
@@ -3085,7 +3095,11 @@ impl Server {
         let entry = session_manager.slab.vacant_entry();
         let token = Token(entry.key());
 
-        match self.http.borrow_mut().add_listener(listener, token) {
+        match self.http.borrow_mut().add_listener_with_retained_frontends(
+            listener,
+            token,
+            retained_frontends,
+        ) {
             Ok(_token) => {
                 entry.insert(Rc::new(RefCell::new(ListenSession {
                     protocol: Protocol::HTTPListen,
@@ -3115,6 +3129,20 @@ impl Server {
     ) -> WorkerResponse {
         debug!("{} add https listener {:?}", req_id, listener);
 
+        let wire_address = listener.address;
+        let address: SocketAddr = wire_address.into();
+        let retained_frontends = self
+            .config_state
+            .https_fronts
+            .values()
+            .filter(|frontend| frontend.address == address)
+            .cloned()
+            .map(Into::into)
+            .collect();
+        let retained_certificates = self
+            .config_state
+            .certificate_add_requests_for_address(address);
+
         if self.sessions.borrow().at_capacity() {
             return worker_response_error(req_id, "session list is full, cannot add a listener");
         }
@@ -3130,11 +3158,12 @@ impl Server {
         let entry = session_manager.slab.vacant_entry();
         let token = Token(entry.key());
 
-        match self
-            .https
-            .borrow_mut()
-            .add_listener(listener.clone(), token)
-        {
+        match self.https.borrow_mut().add_listener_with_retained_state(
+            listener.clone(),
+            token,
+            retained_frontends,
+            retained_certificates,
+        ) {
             Ok(_token) => {
                 entry.insert(Rc::new(RefCell::new(ListenSession {
                     protocol: Protocol::HTTPSListen,
@@ -3162,6 +3191,17 @@ impl Server {
     ) -> WorkerResponse {
         debug!("{} add tcp listener {:?}", req_id, listener);
 
+        let address: SocketAddr = listener.address.into();
+        let retained_frontends = self
+            .config_state
+            .tcp_fronts
+            .values()
+            .flatten()
+            .filter(|frontend| frontend.address == address)
+            .cloned()
+            .map(Into::into)
+            .collect();
+
         if self.sessions.borrow().at_capacity() {
             return worker_response_error(req_id, "session list is full, cannot add a listener");
         }
@@ -3177,7 +3217,11 @@ impl Server {
         let entry = session_manager.slab.vacant_entry();
         let token = Token(entry.key());
 
-        match self.tcp.borrow_mut().add_listener(listener, token) {
+        match self.tcp.borrow_mut().add_listener_with_retained_frontends(
+            listener,
+            token,
+            retained_frontends,
+        ) {
             Ok(_token) => {
                 entry.insert(Rc::new(RefCell::new(ListenSession {
                     protocol: Protocol::TCPListen,
@@ -3205,6 +3249,17 @@ impl Server {
     ) -> WorkerResponse {
         debug!("{} add udp listener {:?}", req_id, listener);
 
+        let address: SocketAddr = listener.address.into();
+        let retained_frontends = self
+            .config_state
+            .udp_fronts
+            .values()
+            .flatten()
+            .filter(|frontend| frontend.address == address)
+            .cloned()
+            .map(Into::into)
+            .collect();
+
         if self.sessions.borrow().at_capacity() {
             return worker_response_error(req_id, "session list is full, cannot add a listener");
         }
@@ -3213,7 +3268,11 @@ impl Server {
         let entry = session_manager.slab.vacant_entry();
         let token = Token(entry.key());
 
-        match self.udp.borrow_mut().add_listener(listener, token) {
+        match self.udp.borrow_mut().add_listener_with_retained_frontends(
+            listener,
+            token,
+            retained_frontends,
+        ) {
             Ok(_token) => {
                 entry.insert(Rc::new(RefCell::new(ListenSession {
                     protocol: Protocol::UDPListen,

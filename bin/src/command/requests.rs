@@ -23,18 +23,19 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sozu_command_lib::{
     buffer::fixed::Buffer,
-    certificate::Fingerprint,
+    certificate::{Fingerprint, parse_pem, parse_x509},
     config::Config,
     logging,
     parser::parse_several_requests,
     proto::command::{
-        AggregatedMetrics, AvailableMetrics, CertificateAndKey, CertificatesWithFingerprints,
-        ClusterHashes, ClusterInformations, Event, EventKind, FilteredMetrics, FrontendFilters,
-        HardStop, MetricDetail, MetricDetailStatus, MetricsConfiguration, QueryCertificatesFilters,
-        QueryHealthChecks, QueryMetricsOptions, Request, ResponseContent, ResponseStatus, RunState,
-        SetMetricDetail, SoftStop, Status, UpdateHttpListenerConfig, UpdateHttpsListenerConfig,
-        UpdateTcpListenerConfig, UpdateUdpListenerConfig, WorkerInfo, WorkerInfos, WorkerRequest,
-        WorkerResponse, WorkerResponses, request::RequestType, response_content::ContentType,
+        AddCertificate, AggregatedMetrics, AvailableMetrics, CertificateAndKey,
+        CertificatesWithFingerprints, ClusterHashes, ClusterInformations, Event, EventKind,
+        FilteredMetrics, FrontendFilters, HardStop, MetricDetail, MetricDetailStatus,
+        MetricsConfiguration, QueryCertificatesFilters, QueryHealthChecks, QueryMetricsOptions,
+        Request, ResponseContent, ResponseStatus, RunState, SetMetricDetail, SoftStop, Status,
+        UpdateHttpListenerConfig, UpdateHttpsListenerConfig, UpdateTcpListenerConfig,
+        UpdateUdpListenerConfig, WorkerInfo, WorkerInfos, WorkerRequest, WorkerResponse,
+        WorkerResponses, request::RequestType, response_content::ContentType,
     },
     proto::display::forwarded_headers_label,
     sd_notify,
@@ -45,6 +46,7 @@ use sozu_lib::{
     metrics::METRICS,
     protocol::kawa_h1::answers::HttpAnswers,
     router::{MAX_HOSTNAME_LENGTH, pattern_trie::TrieNode},
+    tls::build_validated_certificate,
 };
 
 use crate::command::{
@@ -550,8 +552,10 @@ fn is_mutating_verb(req: &RequestType) -> bool {
             | RequestType::AddBackend(_)
             | RequestType::AddCertificate(_)
             | RequestType::AddHttpFrontend(_)
+            | RequestType::AddHttpFrontendWithSilentClose(_)
             | RequestType::AddHttpListener(_)
             | RequestType::AddHttpsFrontend(_)
+            | RequestType::AddHttpsFrontendWithSilentClose(_)
             | RequestType::AddHttpsListener(_)
             | RequestType::AddHttpsListenerWithClientAuth(_)
             | RequestType::AddTcpFrontend(_)
@@ -709,8 +713,10 @@ impl Server {
             | RequestType::AddBackend(_)
             | RequestType::AddCertificate(_)
             | RequestType::AddHttpFrontend(_)
+            | RequestType::AddHttpFrontendWithSilentClose(_)
             | RequestType::AddHttpListener(_)
             | RequestType::AddHttpsFrontend(_)
+            | RequestType::AddHttpsFrontendWithSilentClose(_)
             | RequestType::AddHttpsListener(_)
             | RequestType::AddHttpsListenerWithClientAuth(_)
             | RequestType::AddTcpFrontend(_)
@@ -909,18 +915,43 @@ fn certificates_serving_domain(
     let queried = domain.to_ascii_lowercase();
     let mut serving = BTreeMap::new();
 
-    for certificates in state.certificates.values() {
+    for address in state.certificates.keys() {
         let mut domains: TrieNode<Fingerprint> = TrieNode::root();
 
-        // Iterate in fingerprint order, not `HashMap` order. `domain_insert`
-        // keeps the incumbent on a collision, so two certificates carrying the
-        // same name on one listener would otherwise make the answer vary from
-        // run to run. `ConfigState` does not retain `AddCertificate::expired_at`
-        // and so cannot reproduce the resolver's longest-lived tie-break;
-        // ordering by fingerprint at least makes this answer reproducible, and
-        // `sozu certificate list --domain <host> --workers` reports the choice
-        // the worker's resolver actually made.
-        for (fingerprint, certificate) in certificates.iter().collect::<BTreeMap<_, _>>() {
+        // `domain_insert` keeps the incumbent on a collision. Insert the
+        // worker's winner first: highest effective expiration, then latest
+        // insertion ordinal for an equal-expiration tie. A malformed legacy
+        // certificate is skipped because no worker resolver can serve it.
+        let mut certificates: Vec<_> = state
+            .ordered_certificate_entries(*address)
+            .into_iter()
+            .filter_map(|(fingerprint, certificate, metadata)| {
+                // Parse first even when an explicit override exists. The
+                // worker cannot load malformed certificate material, so an
+                // override must never make an unservable legacy entry appear
+                // in the main-process answer.
+                let pem = parse_pem(certificate.certificate.as_bytes()).ok()?;
+                let x509 = parse_x509(&pem.contents).ok()?;
+                let expiration = metadata
+                    .expired_at
+                    .unwrap_or_else(|| x509.validity().not_after.timestamp());
+                Some((
+                    fingerprint,
+                    certificate,
+                    metadata.insertion_order,
+                    expiration,
+                ))
+            })
+            .collect();
+        certificates.sort_by(|left, right| {
+            right
+                .3
+                .cmp(&left.3)
+                .then_with(|| right.2.cmp(&left.2))
+                .then_with(|| left.0.cmp(&right.0))
+        });
+
+        for (fingerprint, certificate, _, _) in certificates {
             for name in &certificate.names {
                 // `CertificateResolver::add_certificate` bounds every name the
                 // same way, because the trie recurses once per label, and
@@ -941,7 +972,10 @@ fn certificates_serving_domain(
         }
 
         if let Some((_, fingerprint)) = domains.domain_lookup(queried.as_bytes(), true)
-            && let Some(certificate) = certificates.get(fingerprint)
+            && let Some(certificate) = state
+                .certificates
+                .get(address)
+                .and_then(|certificates| certificates.get(fingerprint))
         {
             serving.insert(fingerprint.to_string(), certificate.to_owned());
         }
@@ -1805,7 +1839,8 @@ fn audit_entry_for(
                 extras: AuditExtras::default(),
             })
         }
-        RequestType::AddHttpFrontend(frontend) => {
+        RequestType::AddHttpFrontend(frontend)
+        | RequestType::AddHttpFrontendWithSilentClose(frontend) => {
             let (verb, counter) = audit_verb!("http_frontend_added");
             Some(AuditEntry {
                 kind: EventKind::FrontendAdded,
@@ -1818,7 +1853,8 @@ fn audit_entry_for(
                 extras: AuditExtras::default(),
             })
         }
-        RequestType::AddHttpsFrontend(frontend) => {
+        RequestType::AddHttpsFrontend(frontend)
+        | RequestType::AddHttpsFrontendWithSilentClose(frontend) => {
             let (verb, counter) = audit_verb!("https_frontend_added");
             Some(AuditEntry {
                 kind: EventKind::FrontendAdded,
@@ -2694,7 +2730,10 @@ fn validate_listener_request(request: &RequestType) -> Result<(), String> {
 /// key) carries the hostname in clear.
 fn validate_frontend_request(request: &RequestType) -> Result<(), String> {
     let front = match request {
-        RequestType::AddHttpFrontend(front) | RequestType::AddHttpsFrontend(front) => front,
+        RequestType::AddHttpFrontend(front)
+        | RequestType::AddHttpFrontendWithSilentClose(front)
+        | RequestType::AddHttpsFrontend(front)
+        | RequestType::AddHttpsFrontendWithSilentClose(front) => front,
         _ => return Ok(()),
     };
     let front = front
@@ -2742,18 +2781,73 @@ fn validate_h2_knob_floors(request: &RequestType) -> Result<(), String> {
     .map_err(|state_error| state_error.to_string())
 }
 
+/// Validate the full certificate and its private key before the main process
+/// commits the request to `ConfigState`.
+///
+/// `ConfigState` intentionally stores the PEM material and does not build a
+/// signing key. The worker resolver does. Without this shared preflight, an
+/// `AddCertificate` or `ReplaceCertificate` with a valid certificate and an
+/// invalid private key is committed by the main process, rejected by every
+/// worker, and then persisted by `SaveState`. Running the same conversion the
+/// resolver uses keeps authored commands and state replay on one buildability
+/// contract without duplicating certificate parsing or key-provider policy.
+fn validate_certificate_request(request: &RequestType) -> Result<(), String> {
+    let validate = |certificate: &AddCertificate| {
+        build_validated_certificate(certificate)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    };
+
+    match request {
+        RequestType::AddCertificate(certificate) => validate(certificate),
+        RequestType::ReplaceCertificate(replacement) => validate(&AddCertificate {
+            address: replacement.address,
+            certificate: replacement.new_certificate.to_owned(),
+            expired_at: replacement.new_expired_at,
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// Parse every per-cluster HTTP answer before an `AddCluster` reaches
+/// `ConfigState`.
+///
+/// The HTTP and HTTPS workers merge the legacy `answer_503` field into the
+/// `answers` map, with the map winning on a `503` collision, immediately
+/// before publishing the templates in their live registries. Keep that exact
+/// precedence here and compile the result with the same [`HttpAnswers`]
+/// builder. Otherwise a rejected cluster upsert has already replaced the
+/// cluster in main and worker configuration state when the runtime discovers
+/// the malformed template.
+fn validate_cluster_request(request: &RequestType) -> Result<(), String> {
+    let RequestType::AddCluster(cluster) = request else {
+        return Ok(());
+    };
+
+    let mut answers = cluster.answers.to_owned();
+    if let Some(answer_503) = cluster.answer_503.as_ref() {
+        answers
+            .entry("503".to_owned())
+            .or_insert_with(|| answer_503.to_owned());
+    }
+    HttpAnswers::templates(&answers)
+        .map(|_| ())
+        .map_err(|(name, error)| ListenerError::TemplateParse(name, error).to_string())
+}
+
 /// sozu#1301 + sozu#1313 + sozu#1418: the single pre-dispatch validation every
 /// master apply path — [`worker_request`], [`load_state`] and
 /// [`load_static_config`] — runs before mutating `ConfigState`.
 ///
 /// [`validate_h2_knob_floors`] runs only for [`RequestOrigin::Authored`], and
-/// that asymmetry is deliberate. The other two gates reject configurations
-/// that CANNOT function: an answer template that will not parse, a hostname
-/// the router refuses. An H2 threshold of `0` is a perfectly buildable
-/// listener that the workers clamp to the floor and then serve from. Applying
-/// the same skip to a replayed entry would turn degraded-but-serving into
-/// absent — on an HTTPS listener, a full outage for every frontend behind it,
-/// at upgrade time, to prevent a single silently-corrected threshold.
+/// that asymmetry is deliberate. The other gates reject configurations that
+/// CANNOT function: an answer template that will not parse, a hostname the
+/// router refuses, or a certificate the active crypto provider cannot build.
+/// An H2 threshold of `0` is a perfectly buildable listener that the workers
+/// clamp to the floor and then serve from. Applying the same skip to a replayed
+/// entry would turn degraded-but-serving into absent — on an HTTPS listener, a
+/// full outage for every frontend behind it, at upgrade time, to prevent a
+/// single silently-corrected threshold.
 ///
 /// Be exact about what the clamp does, because it does NOT tighten anything:
 /// `check_flood`'s `flag` is `count > threshold`, so a threshold of `0` trips
@@ -2765,7 +2859,9 @@ fn validate_h2_knob_floors(request: &RequestType) -> Result<(), String> {
 /// one event back. `load_state` therefore admits the entry and warns, loudly,
 /// with the key to fix.
 fn validate_request(request: &RequestType, origin: RequestOrigin) -> Result<(), String> {
+    validate_cluster_request(request)?;
     validate_listener_request(request)?;
+    validate_certificate_request(request)?;
     if origin == RequestOrigin::Authored {
         validate_h2_knob_floors(request)?;
         validate_client_crls_current(request, unix_now())?;
@@ -5577,13 +5673,14 @@ mod listener_validation_tests {
     //! process committed listener configs without validating them. The
     //! `is_err()` assertions below then fail.
     use super::{
-        RequestOrigin, validate_h2_knob_floors, validate_listener_request, validate_request,
+        RequestOrigin, validate_cluster_request, validate_h2_knob_floors,
+        validate_listener_request, validate_request,
     };
     use sozu_command_lib::{
         config::ListenerBuilder,
         proto::command::{
-            CertificateAndKey, HttpsListenerConfig, ReplaceCertificate, RequestTcpFrontend,
-            RequestUdpFrontend, SocketAddress, request::RequestType,
+            CertificateAndKey, Cluster, HttpsListenerConfig, ReplaceCertificate,
+            RequestTcpFrontend, RequestUdpFrontend, SocketAddress, request::RequestType,
         },
         state::{ConfigState, StateError},
     };
@@ -5891,6 +5988,49 @@ mod listener_validation_tests {
         assert!(
             validate_listener_request(&request).is_err(),
             "an unbuildable HTTP listener must be rejected before commit"
+        );
+    }
+
+    #[test]
+    fn cluster_answers_use_worker_precedence_and_are_rejected_before_commit() {
+        let invalid = "not a valid HTTP response template";
+        let valid = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+
+        let map_wins = RequestType::AddCluster(Cluster {
+            cluster_id: "map-wins".to_owned(),
+            answer_503: Some(invalid.to_owned()),
+            answers: BTreeMap::from([("503".to_owned(), valid.to_owned())]),
+            ..Default::default()
+        });
+        assert!(
+            validate_cluster_request(&map_wins).is_ok(),
+            "the answers map must shadow the legacy answer_503 like worker runtime does"
+        );
+
+        let invalid_legacy = RequestType::AddCluster(Cluster {
+            cluster_id: "invalid-legacy".to_owned(),
+            answer_503: Some(invalid.to_owned()),
+            ..Default::default()
+        });
+        let invalid_map = RequestType::AddCluster(Cluster {
+            cluster_id: "invalid-map".to_owned(),
+            answer_503: Some(valid.to_owned()),
+            answers: BTreeMap::from([("503".to_owned(), invalid.to_owned())]),
+            ..Default::default()
+        });
+        for request in [&invalid_legacy, &invalid_map] {
+            assert!(validate_cluster_request(request).is_err());
+            assert!(validate_request(request, RequestOrigin::Authored).is_err());
+            assert!(validate_request(request, RequestOrigin::Replayed).is_err());
+        }
+
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&invalid_map.to_owned().into())
+            .expect("ConfigState alone accepts an unbuildable cluster answer");
+        assert!(
+            validate_request(&invalid_map, RequestOrigin::Authored).is_err(),
+            "the pre-dispatch gate must stop both initial adds and upserts before state mutation"
         );
     }
 
@@ -7499,7 +7639,9 @@ mod certificate_domain_filter_tests {
     use std::{collections::HashMap, net::SocketAddr};
 
     use sozu_command_lib::{
-        certificate::Fingerprint, proto::command::CertificateAndKey, state::ConfigState,
+        certificate::Fingerprint,
+        proto::command::{AddCertificate, CertificateAndKey, SocketAddress, request::RequestType},
+        state::ConfigState,
     };
 
     use super::{MAX_HOSTNAME_LENGTH, certificates_serving_domain};
@@ -7532,7 +7674,12 @@ mod certificate_domain_filter_tests {
             let address: SocketAddr = address.parse().expect("test listener address must parse");
             let certificates: HashMap<Fingerprint, CertificateAndKey> = entries
                 .iter()
-                .map(|(tag, names)| (Fingerprint(vec![*tag]), certificate(names)))
+                .map(|(tag, names)| {
+                    let mut certificate = certificate(names);
+                    certificate.certificate =
+                        include_str!("../../../lib/assets/tests/certificate-1y.pem").to_owned();
+                    (Fingerprint(vec![*tag]), certificate)
+                })
                 .collect();
             state.certificates.insert(address, certificates);
         }
@@ -7629,10 +7776,9 @@ mod certificate_domain_filter_tests {
     fn one_listener_answers_with_exactly_one_certificate() {
         // A trie lookup resolves to one entry, so a listener carrying the same
         // name on two certificates answers with one of them — where the
-        // exact-equality filter answered with both. `ConfigState` does not
-        // retain `AddCertificate::expired_at`, so it cannot reproduce the
-        // resolver's longest-lived tie-break; the contract is only that the
-        // answer is reproducible rather than `HashMap`-order dependent.
+        // exact-equality filter answered with both. This legacy-shaped fixture
+        // has no certificate sidecar, so the deterministic fingerprint
+        // fallback supplies its otherwise-unrecoverable historical order.
         for _ in 0..16 {
             let state = state_with(&[(
                 "127.0.0.1:8443",
@@ -7641,10 +7787,87 @@ mod certificate_domain_filter_tests {
 
             assert_eq!(
                 fingerprints_for(&state, "foo.example.com"),
-                vec!["01".to_owned()],
+                vec!["02".to_owned()],
                 "a name carried twice on one listener must resolve to one reproducible answer"
             );
         }
+    }
+
+    #[test]
+    fn the_query_uses_the_same_expiration_winner_as_workers() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let certificate_a = CertificateAndKey {
+            certificate: include_str!("../../../lib/assets/tests/certificate-1y.pem").to_owned(),
+            key: include_str!("../../../lib/assets/tests/key-1y.pem").to_owned(),
+            names: vec!["*.example.com".to_owned()],
+            ..Default::default()
+        };
+        let certificate_b = CertificateAndKey {
+            certificate: include_str!("../../../lib/assets/tests/certificate-2y.pem").to_owned(),
+            key: include_str!("../../../lib/assets/tests/key-2y.pem").to_owned(),
+            names: vec!["*.example.com".to_owned()],
+            ..Default::default()
+        };
+        let winner = certificate_b
+            .fingerprint()
+            .expect("winner fingerprint")
+            .to_string();
+        let mut state = ConfigState::new();
+        for (certificate, expired_at) in [
+            (certificate_a, Some(2_100_000_000)),
+            (certificate_b, Some(2_200_000_000)),
+        ] {
+            state
+                .dispatch(
+                    &RequestType::AddCertificate(AddCertificate {
+                        address,
+                        certificate,
+                        expired_at,
+                    })
+                    .into(),
+                )
+                .expect("certificate accepted by main state");
+        }
+
+        assert_eq!(
+            fingerprints_for(&state, "foo.example.com"),
+            vec![winner],
+            "main must report the certificate workers select by effective expiration"
+        );
+    }
+
+    #[test]
+    fn an_expiration_override_does_not_make_malformed_material_servable() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let certificate = CertificateAndKey {
+            certificate: include_str!("../../../lib/assets/tests/certificate-1y.pem").to_owned(),
+            key: include_str!("../../../lib/assets/tests/key-1y.pem").to_owned(),
+            names: vec!["*.example.com".to_owned()],
+            ..Default::default()
+        };
+        let fingerprint = certificate.fingerprint().expect("valid fingerprint");
+        let mut state = ConfigState::new();
+        state
+            .dispatch(
+                &RequestType::AddCertificate(AddCertificate {
+                    address,
+                    certificate,
+                    expired_at: Some(2_200_000_000),
+                })
+                .into(),
+            )
+            .expect("valid certificate accepted before legacy corruption");
+        state
+            .certificates
+            .get_mut(&SocketAddr::from(address))
+            .and_then(|certificates| certificates.get_mut(&fingerprint))
+            .expect("stored certificate")
+            .certificate = "not a PEM certificate".to_owned();
+
+        assert!(
+            fingerprints_for(&state, "foo.example.com").is_empty(),
+            "an override cannot bypass the PEM/X.509 validation workers require"
+        );
     }
 
     #[test]

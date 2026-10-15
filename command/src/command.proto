@@ -202,6 +202,22 @@ message Request {
     // `RequestType::into_canonical` picks the verb, and the main process
     // applies it to every request it fans out to workers.
     UpdateHttpsListenerConfig update_https_listener_with_client_auth = 64;
+    // Tags 66-69 are reserved, in order, for the header-predicate AddHttp,
+    // RemoveHttp, AddHttps and RemoveHttps verbs, and tag 72 for a UDS
+    // AddBackend: do not allocate them here.
+    //
+    // add an HTTP frontend whose `redirect` is `SILENT_CLOSE`. Same payload as
+    // `add_http_frontend`, distinct verb for the reason given on
+    // `add_https_listener_with_client_auth`: a worker that predates
+    // `SILENT_CLOSE` decodes the unknown enum value, resolves it to
+    // `FORWARD` and installs a route that forwards the traffic the operator
+    // asked to drop. It cannot decode this verb, so the request fails.
+    // `RequestType::add_http_frontend` / `RequestType::into_canonical` pick
+    // the verb, and the main process applies it to every request it fans out.
+    RequestHttpFrontend add_http_frontend_with_silent_close = 70;
+    // add an HTTPS frontend whose `redirect` is `SILENT_CLOSE`. See
+    // `add_http_frontend_with_silent_close`.
+    RequestHttpFrontend add_https_frontend_with_silent_close = 71;
   }
 }
 

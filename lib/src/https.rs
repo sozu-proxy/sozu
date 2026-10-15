@@ -2379,6 +2379,42 @@ impl HttpsProxy {
         }
     }
 
+    /// Add one listener and restore routes and certificates retained in the
+    /// worker state when no live sibling can provide them.
+    ///
+    /// A sibling already carries the address-wide state and `add_listener`
+    /// clones it. When the last listener on an address was removed, replay the
+    /// retained objects onto the new listener before the server commits its
+    /// session slot. Any failure drops only that new listener and its resolver.
+    pub(crate) fn add_listener_with_retained_state(
+        &mut self,
+        config: HttpsListenerConfig,
+        token: Token,
+        retained_frontends: Vec<RequestHttpFrontend>,
+        retained_certificates: Vec<AddCertificate>,
+    ) -> Result<Token, ProxyError> {
+        let address = config.address.into();
+        let had_sibling = self.listeners_at(address).is_ok();
+        self.add_listener(config, token)?;
+
+        if !had_sibling {
+            for frontend in retained_frontends {
+                if let Err(error) = self.add_https_frontend(frontend) {
+                    self.listeners.remove(&token);
+                    return Err(error);
+                }
+            }
+            for certificate in retained_certificates {
+                if let Err(error) = self.add_certificate(certificate) {
+                    self.listeners.remove(&token);
+                    return Err(error);
+                }
+            }
+        }
+
+        Ok(token)
+    }
+
     pub fn remove_listener(
         &mut self,
         remove: RemoveListener,
@@ -3028,7 +3064,8 @@ impl ProxyConfiguration for HttpsProxy {
                 );
                 self.remove_cluster(&cluster_id)
             }
-            RequestType::AddHttpsFrontend(front) => {
+            RequestType::AddHttpsFrontend(front)
+            | RequestType::AddHttpsFrontendWithSilentClose(front) => {
                 debug!(
                     "{} {} add https front {:?}",
                     log_module_context!(),

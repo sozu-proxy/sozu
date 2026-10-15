@@ -557,6 +557,47 @@ impl UdpProxy {
         }
     }
 
+    /// Add one listener and restore the route retained in the worker state
+    /// when no live sibling can provide it.
+    ///
+    /// Any replay failure removes only the newly inserted listener, its flow
+    /// manager, and the global frontend-token entry created for it.
+    pub(crate) fn add_listener_with_retained_frontends(
+        &mut self,
+        config: UdpListenerConfig,
+        token: Token,
+        retained_frontends: Vec<RequestUdpFrontend>,
+    ) -> Result<Token, ProxyError> {
+        let address = config.address.into();
+        let had_sibling = self.listener_tokens_at(address).is_ok();
+        self.add_listener(config, token)?;
+
+        if !had_sibling {
+            for frontend in retained_frontends {
+                if let Err(error) = self.add_udp_front(frontend) {
+                    self.discard_uncommitted_listener(token);
+                    return Err(error);
+                }
+            }
+        }
+
+        Ok(token)
+    }
+
+    /// Drop a listener whose add has not been committed to the server's
+    /// session slab. This is deliberately token-scoped: a sibling on the same
+    /// address must survive a failed reconstruction of the new listener.
+    fn discard_uncommitted_listener(&mut self, token: Token) {
+        self.listeners.remove(&token);
+        self.cluster_for_listener.remove(&token);
+        if let Some(session) = self.listener_sessions.remove(&token) {
+            session.borrow_mut().close_all_flows(Instant::now());
+        }
+        self.managers.remove(&token);
+        self.fronts
+            .retain(|_, listener_token| *listener_token != token);
+    }
+
     /// A UDP frontend names its listener by address alone, so a listener
     /// added next to one already on its address (on another interface) takes
     /// over the cluster that one routes to, in its own state and in its flow
