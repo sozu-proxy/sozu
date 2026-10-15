@@ -621,6 +621,10 @@ impl Harness {
             )
             .expect("the replacement backend is selectable");
         assert!(!Rc::ptr_eq(&retired_pending, &self.slots[replacement_slot]));
+        assert!(Rc::ptr_eq(
+            &first_replacement,
+            &self.slots[replacement_slot]
+        ));
 
         self.resolve_pending(pending_slot, DialOutcome::Failed);
         self.assert_retired_drained(&retired_pending, pending_slot);
@@ -645,6 +649,10 @@ impl Harness {
             .expect("the second replacement backend is selectable");
         assert!(!Rc::ptr_eq(
             &retired_active,
+            &self.slots[second_replacement_slot]
+        ));
+        assert!(Rc::ptr_eq(
+            &second_replacement,
             &self.slots[second_replacement_slot]
         ));
         self.resolve_pending(second_replacement_slot, DialOutcome::Failed);
