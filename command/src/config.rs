@@ -52,7 +52,7 @@ use std::{
     env, fmt,
     fs::{File, create_dir_all, metadata},
     io::{ErrorKind, Read},
-    net::SocketAddr,
+    net::{SocketAddr, ToSocketAddrs},
     ops::Range,
     path::PathBuf,
 };
@@ -733,6 +733,19 @@ pub enum ConfigError {
         address: SocketAddr,
         sni_preread_max_bytes: u32,
         minimum: u32,
+    },
+    /// A backend `address` of the configuration file is neither a socket
+    /// address nor a `host:port` that resolves to at least one address
+    /// (sozu-proxy/sozu#347). Names are resolved once, when the file is
+    /// loaded at startup or by `sozu reload --file`.
+    #[error(
+        "cluster {cluster_id}: cannot resolve backend address {address:?}: {reason}. \
+         Expected an IP:port socket address or a resolvable host:port"
+    )]
+    BackendAddressResolution {
+        cluster_id: String,
+        address: String,
+        reason: String,
     },
 }
 
@@ -3010,7 +3023,7 @@ pub fn validate_health_check_config(cfg: &HealthCheckConfig) -> Result<(), &'sta
 #[serde(deny_unknown_fields)]
 pub struct FileClusterConfig {
     pub frontends: Vec<FileClusterFrontendConfig>,
-    pub backends: Vec<BackendConfig>,
+    pub backends: Vec<FileBackendConfig>,
     pub protocol: FileClusterProtocolConfig,
     pub sticky_session: Option<bool>,
     pub https_redirect: Option<bool>,
@@ -3193,11 +3206,182 @@ pub struct BackendConfig {
     pub backend_id: Option<String>,
 }
 
+/// Turns a `host:port` string into socket addresses.
+pub type BackendResolver<'a> = dyn Fn(&str) -> std::io::Result<Vec<SocketAddr>> + 'a;
+
+/// The system resolver (`std::net::ToSocketAddrs`).
+pub fn system_resolver(address: &str) -> std::io::Result<Vec<SocketAddr>> {
+    address.to_socket_addrs().map(Iterator::collect)
+}
+
+/// A backend as written in the configuration file. `address` is either a
+/// socket address (`"127.0.0.1:8080"`, `"[::1]:8080"`) or a `host:port`
+/// (`"ingress:8080"`) that [`FileBackendConfig::resolve`] turns into one
+/// [`BackendConfig`] per resolved address when the file is loaded
+/// (sozu-proxy/sozu#347). Workers only ever receive socket addresses.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileBackendConfig {
+    pub address: String,
+    pub weight: Option<u8>,
+    pub sticky_id: Option<String>,
+    pub backup: Option<bool>,
+    pub backend_id: Option<String>,
+}
+
+/// Whether `host` is spelled like a legacy `inet_aton` address: every
+/// dot-separated component is non-empty and either all decimal/octal digits
+/// or `0x`/`0X` followed by ASCII hex digits. Ordinary names (`dead.beef`,
+/// `123.example.com`) have a non-numeric component and do not match.
+fn is_legacy_numeric_host(host: &str) -> bool {
+    host.split('.').all(|component| {
+        !component.is_empty()
+            && match component
+                .strip_prefix("0x")
+                .or_else(|| component.strip_prefix("0X"))
+            {
+                Some(hex) => hex.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                None => component.bytes().all(|byte| byte.is_ascii_digit()),
+            }
+    })
+}
+
+impl FileBackendConfig {
+    /// Resolves this entry into backends, once, through `resolver`
+    /// ([`system_resolver`] outside tests).
+    ///
+    /// A socket-address literal never reaches the resolver and keeps its
+    /// configured `backend_id`, or the positional default id
+    /// `<cluster_id>-<index>-<address>`, where `index` is the entry's position
+    /// in the file's `backends` list, so it does not move when a name before
+    /// it resolves to more or fewer addresses. A `host:port`
+    /// yields one backend per distinct resolved address, sorted so the
+    /// result does not depend on the resolver's answer order, each with a
+    /// deterministic id: `<backend_id>-<address>` when `backend_id` is set,
+    /// `<cluster_id>-<host:port>-<address>` otherwise. When the name
+    /// resolves, a configured `sticky_id` is suffixed with `-<address>` too,
+    /// so it stays unique in the cluster and does not change when the answer
+    /// grows or shrinks.
+    ///
+    /// A host made only of dot-separated decimal, octal or `0x` hexadecimal
+    /// components that is not a valid IP literal (`010.0.0.1`, `1.2.3`,
+    /// `0x7f.1`) is refused before the resolver: getaddrinfo reads such
+    /// strings as legacy `inet_aton` shorthand (`8.0.0.1`, `1.2.0.3`,
+    /// `127.0.0.1`), which the socket-address parser always rejected. An
+    /// unbracketed IPv6 literal (`::1:8080`) is refused the same way:
+    /// getaddrinfo would split it on the last colon.
+    pub fn resolve(
+        &self,
+        cluster_id: &str,
+        index: usize,
+        resolver: &BackendResolver<'_>,
+    ) -> Result<Vec<BackendConfig>, ConfigError> {
+        if let Ok(address) = self.address.parse::<SocketAddr>() {
+            return Ok(vec![BackendConfig {
+                address,
+                weight: self.weight,
+                sticky_id: self.sticky_id.clone(),
+                backup: self.backup,
+                backend_id: Some(
+                    self.backend_id
+                        .to_owned()
+                        .unwrap_or_else(|| format!("{cluster_id}-{index}-{address}")),
+                ),
+            }]);
+        }
+
+        let error = |reason: String| ConfigError::BackendAddressResolution {
+            cluster_id: cluster_id.to_owned(),
+            address: self.address.clone(),
+            reason,
+        };
+        if let Some((host, _port)) = self.address.rsplit_once(':') {
+            if host.contains(':') {
+                return Err(error(format!(
+                    "{host:?} is an unbracketed IPv6 literal, IPv6 literals must use [address]:port"
+                )));
+            }
+            if !host.is_empty() && is_legacy_numeric_host(host) {
+                return Err(error(format!(
+                    "{host:?} is not a valid IP address literal and numeric shorthand is not accepted"
+                )));
+            }
+        }
+        let addresses = resolver(&self.address).map_err(|io_error| error(io_error.to_string()))?;
+        self.expand(cluster_id, addresses)
+    }
+
+    /// Turns the addresses a `host:port` entry resolved to into backends:
+    /// the naming half of [`FileBackendConfig::resolve`], kept apart from
+    /// the resolver so it can be exercised with any set of addresses.
+    fn expand(
+        &self,
+        cluster_id: &str,
+        mut addresses: Vec<SocketAddr>,
+    ) -> Result<Vec<BackendConfig>, ConfigError> {
+        addresses.sort_unstable();
+        addresses.dedup();
+        if addresses.is_empty() {
+            return Err(ConfigError::BackendAddressResolution {
+                cluster_id: cluster_id.to_owned(),
+                address: self.address.clone(),
+                reason: "the name resolved to no address".to_owned(),
+            });
+        }
+
+        let backends: Vec<BackendConfig> = addresses
+            .iter()
+            .map(|address| BackendConfig {
+                address: *address,
+                weight: self.weight,
+                sticky_id: self
+                    .sticky_id
+                    .as_ref()
+                    .map(|sticky_id| format!("{sticky_id}-{address}")),
+                backup: self.backup,
+                backend_id: Some(match &self.backend_id {
+                    Some(backend_id) => format!("{backend_id}-{address}"),
+                    None => format!("{cluster_id}-{}-{address}", self.address),
+                }),
+            })
+            .collect();
+
+        // POST: one backend per distinct resolved address, every one carrying
+        // a distinct id. Downstream state keys backends by `(backend_id,
+        // address)`, so the address alone already keeps them apart; the
+        // address-suffixed id keeps logs, metrics and removals unambiguous.
+        debug_assert_eq!(backends.len(), addresses.len());
+        debug_assert!(
+            backends
+                .iter()
+                .map(|backend| backend.backend_id.as_deref())
+                .collect::<HashSet<_>>()
+                .len()
+                == backends.len(),
+            "resolved backends must carry distinct ids"
+        );
+        Ok(backends)
+    }
+}
+
 impl FileClusterConfig {
     pub fn to_cluster_config(
         self,
         cluster_id: &str,
         expect_proxy: &HashSet<SocketAddr>,
+    ) -> Result<ClusterConfig, ConfigError> {
+        self.to_cluster_config_with(cluster_id, expect_proxy, Some(&system_resolver))
+    }
+
+    /// [`FileClusterConfig::to_cluster_config`] with the backend resolver
+    /// chosen by the caller. `None` leaves every `host:port` entry out and
+    /// keeps only socket-address literals: a control command reads the
+    /// configuration for its scalar settings and must not depend on DNS.
+    pub fn to_cluster_config_with(
+        self,
+        cluster_id: &str,
+        expect_proxy: &HashSet<SocketAddr>,
+        resolver: Option<&BackendResolver<'_>>,
     ) -> Result<ClusterConfig, ConfigError> {
         // PRE: every frontend that converts cleanly must survive into the built
         // cluster — no frontend is silently dropped during conversion.
@@ -3228,6 +3412,18 @@ impl FileClusterConfig {
                 }
             })?;
         }
+        let mut backends = Vec::with_capacity(self.backends.len());
+        for (index, backend) in self.backends.iter().enumerate() {
+            match resolver {
+                Some(resolver) => backends.extend(backend.resolve(cluster_id, index, resolver)?),
+                None if backend.address.parse::<SocketAddr>().is_ok() => {
+                    backends.extend(backend.resolve(cluster_id, index, &system_resolver)?)
+                }
+                None => {}
+            }
+        }
+        // POST: every file entry yields at least one backend when resolving.
+        debug_assert!(resolver.is_none() || backends.len() >= self.backends.len());
         let health_check = self
             .health_check
             .as_ref()
@@ -3320,7 +3516,7 @@ impl FileClusterConfig {
                 Ok(ClusterConfig::Tcp(TcpClusterConfig {
                     cluster_id: cluster_id.to_string(),
                     frontends,
-                    backends: self.backends,
+                    backends,
                     proxy_protocol,
                     load_balancing: self.load_balancing,
                     load_metric: self.load_metric,
@@ -3372,7 +3568,7 @@ impl FileClusterConfig {
                 Ok(ClusterConfig::Http(HttpClusterConfig {
                     cluster_id: cluster_id.to_string(),
                     frontends,
-                    backends: self.backends,
+                    backends,
                     sticky_session: self.sticky_session.unwrap_or(false),
                     https_redirect: self.https_redirect.unwrap_or(false),
                     load_balancing: self.load_balancing,
@@ -4129,6 +4325,9 @@ pub struct ConfigBuilder {
     file: FileConfig,
     known_addresses: HashMap<SocketAddr, ListenerProtocol>,
     expect_proxy_addresses: HashSet<SocketAddr>,
+    /// `false` skips the resolution of `host:port` backends, see
+    /// [`ConfigBuilder::without_backend_resolution`]
+    resolve_backends: bool,
     built: Config,
 }
 
@@ -4255,6 +4454,7 @@ impl ConfigBuilder {
             file: file_config,
             known_addresses: HashMap::new(),
             expect_proxy_addresses: HashSet::new(),
+            resolve_backends: true,
             built,
         }
     }
@@ -4339,8 +4539,13 @@ impl ConfigBuilder {
         mut file_cluster_configs: HashMap<String, FileClusterConfig>,
     ) -> Result<(), ConfigError> {
         for (id, file_cluster_config) in file_cluster_configs.drain() {
-            let mut cluster_config =
-                file_cluster_config.to_cluster_config(id.as_str(), &self.expect_proxy_addresses)?;
+            let resolver: Option<&BackendResolver<'_>> =
+                self.resolve_backends.then_some(&system_resolver);
+            let mut cluster_config = file_cluster_config.to_cluster_config_with(
+                id.as_str(),
+                &self.expect_proxy_addresses,
+                resolver,
+            )?;
 
             match cluster_config {
                 ClusterConfig::Http(ref mut http) => {
@@ -4446,6 +4651,14 @@ impl ConfigBuilder {
             self.built.clusters.insert(id, cluster_config);
         }
         Ok(())
+    }
+
+    /// Builds the [`Config`] without resolving `host:port` backends, for a
+    /// caller that only reads its scalar settings (the control commands).
+    /// Everything else is validated as usual.
+    pub fn without_backend_resolution(mut self) -> Self {
+        self.resolve_backends = false;
+        self
     }
 
     /// Builds a [`Config`], populated with listeners and clusters
@@ -4959,6 +5172,20 @@ impl Config {
         let mut config = ConfigBuilder::new(file_config, path).into_config()?;
 
         // replace saved_state with a verified path
+        config.saved_state = config.saved_state_path()?;
+
+        Ok(config)
+    }
+
+    /// Like [`Config::load_from_path`], but `host:port` backends are not
+    /// resolved: for the control commands, which read the scalar settings and
+    /// must not depend on DNS. The rest of the file is validated as usual.
+    pub fn load_from_path_for_control(path: &str) -> Result<Config, ConfigError> {
+        let file_config = FileConfig::load_from_path(path)?;
+
+        let mut config = ConfigBuilder::new(file_config, path)
+            .without_backend_resolution()
+            .into_config()?;
         config.saved_state = config.saved_state_path()?;
 
         Ok(config)
@@ -5916,6 +6143,371 @@ mod tests {
 
         assert!(https_proxy.expect_proxy);
         assert!(!https_direct.expect_proxy);
+    }
+
+    /// #347: builds the HTTP cluster `cluster` from a TOML backend list.
+    fn http_cluster_from_backends(backends: &str) -> Result<HttpClusterConfig, ConfigError> {
+        let file: FileClusterConfig = toml::from_str(&format!(
+            "protocol = \"http\"\nfrontends = []\nbackends = [{backends}]\n"
+        ))
+        .expect("the cluster must parse");
+        match file.to_cluster_config("cluster", &HashSet::new())? {
+            ClusterConfig::Http(http) => Ok(http),
+            ClusterConfig::Tcp(_) => panic!("an http cluster must build as one"),
+        }
+    }
+
+    /// #347: a `host:port` backend address is resolved when the file is
+    /// loaded, into loopback backends with ids derived from the entry and
+    /// the address, and the same file always yields the same backends.
+    #[test]
+    fn a_backend_hostname_resolves_when_the_file_is_loaded() {
+        let backends = r#"{ address = "localhost:8080", weight = 50 }"#;
+        let http = http_cluster_from_backends(backends).expect("localhost must resolve");
+
+        assert!(
+            !http.backends.is_empty(),
+            "localhost resolves to an address"
+        );
+        let mut ids = HashSet::new();
+        for backend in &http.backends {
+            assert!(backend.address.ip().is_loopback(), "{backend:?}");
+            assert_eq!(backend.address.port(), 8080);
+            assert_eq!(backend.weight, Some(50));
+            assert_eq!(
+                backend.backend_id.as_deref(),
+                Some(format!("cluster-localhost:8080-{}", backend.address).as_str())
+            );
+            assert!(ids.insert(backend.backend_id.clone()), "ids are distinct");
+        }
+        assert_eq!(
+            http_cluster_from_backends(backends)
+                .expect("localhost must resolve")
+                .backends,
+            http.backends,
+            "the same file yields the same backends"
+        );
+
+        let orders = http.generate_requests().expect("the orders must build");
+        let added: Vec<&AddBackend> = orders
+            .iter()
+            .filter_map(|order| match order.request_type.as_ref() {
+                Some(RequestType::AddBackend(add)) => Some(add),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(added.len(), http.backends.len());
+        for (add, backend) in added.iter().zip(&http.backends) {
+            assert_eq!(Some(&add.backend_id), backend.backend_id.as_ref());
+            assert_eq!(SocketAddr::from(add.address), backend.address);
+        }
+    }
+
+    /// #347: a socket-address literal never reaches the resolver and keeps
+    /// the positional default id, so existing files load unchanged.
+    #[test]
+    fn a_literal_backend_address_keeps_its_positional_id() {
+        let http = http_cluster_from_backends(
+            r#"{ address = "127.0.0.1:8080" }, { address = "[::1]:8081", backend_id = "six" }"#,
+        )
+        .expect("literals must build");
+        assert_eq!(
+            http.backends,
+            vec![
+                BackendConfig {
+                    address: "127.0.0.1:8080".parse().unwrap(),
+                    weight: None,
+                    sticky_id: None,
+                    backup: None,
+                    backend_id: Some("cluster-0-127.0.0.1:8080".to_owned()),
+                },
+                BackendConfig {
+                    address: "[::1]:8081".parse().unwrap(),
+                    weight: None,
+                    sticky_id: None,
+                    backup: None,
+                    backend_id: Some("six".to_owned()),
+                },
+            ]
+        );
+    }
+
+    /// #347: a literal keeps the id of its position in the file, whatever
+    /// the number of addresses a name before it resolved to, on the HTTP and
+    /// the TCP path alike. The resolver is injected, so the answer size does
+    /// not depend on the host.
+    #[test]
+    fn a_literal_after_a_name_keeps_its_file_position_id() {
+        let one: SocketAddr = "10.0.0.2:8080".parse().unwrap();
+        let two: SocketAddr = "10.0.0.3:8080".parse().unwrap();
+        let answer = |addresses: Vec<SocketAddr>| {
+            move |_: &str| -> std::io::Result<Vec<SocketAddr>> { Ok(addresses.clone()) }
+        };
+
+        for (protocol, addresses) in [
+            ("http", vec![one]),
+            ("http", vec![one, two]),
+            ("tcp", vec![one]),
+            ("tcp", vec![one, two]),
+        ] {
+            let resolver = answer(addresses.clone());
+            let file: FileClusterConfig = toml::from_str(&format!(
+                "protocol = \"{protocol}\"\nfrontends = []\n\
+                 backends = [{{ address = \"name:8080\" }}, {{ address = \"127.0.0.1:9000\" }}]\n"
+            ))
+            .expect("the cluster must parse");
+            let backends = match file
+                .to_cluster_config_with("cluster", &HashSet::new(), Some(&resolver))
+                .expect("the cluster must build")
+            {
+                ClusterConfig::Http(http) => http.backends,
+                ClusterConfig::Tcp(tcp) => tcp.backends,
+            };
+            assert_eq!(backends.len(), addresses.len() + 1, "{protocol}");
+            assert_eq!(
+                backends.last().and_then(|b| b.backend_id.as_deref()),
+                Some("cluster-1-127.0.0.1:9000"),
+                "{protocol} with {} resolved address(es)",
+                addresses.len()
+            );
+        }
+
+        let error = toml::from_str::<FileClusterConfig>(
+            "protocol = \"tcp\"\nfrontends = []\nbackends = [{ address = \"localhost\" }]\n",
+        )
+        .expect("the cluster must parse")
+        .to_cluster_config("cluster", &HashSet::new())
+        .expect_err("a missing port refuses the tcp cluster");
+        assert!(matches!(
+            error,
+            ConfigError::BackendAddressResolution { .. }
+        ));
+    }
+
+    /// #347: digit-and-dot hosts that are not an IP literal are refused
+    /// before the resolver, which would read them as legacy numeric
+    /// shorthand (`010.0.0.1` as `8.0.0.1`, `1.2.3` as `1.2.0.3`).
+    #[test]
+    fn numeric_shorthand_backend_hosts_never_reach_the_resolver() {
+        let shorthand = |_: &str| -> std::io::Result<Vec<SocketAddr>> {
+            Ok(vec!["8.0.0.1:8080".parse().unwrap()])
+        };
+        for address in [
+            "010.0.0.1:8080",
+            "1.2.3:8080",
+            "2130706433:8080",
+            "0x7f000001:8080",
+            "0x7f.1:8080",
+            "0X7F.0.0.1:8080",
+            "0177.1:8080",
+            "0x7f.0177.1:8080",
+        ] {
+            let entry = FileBackendConfig {
+                address: address.to_owned(),
+                weight: None,
+                sticky_id: None,
+                backup: None,
+                backend_id: None,
+            };
+            let error = entry
+                .resolve("cluster", 0, &shorthand)
+                .expect_err("numeric shorthand must be refused");
+            let ConfigError::BackendAddressResolution {
+                cluster_id,
+                address: entry_address,
+                ..
+            } = &error
+            else {
+                panic!("{address}: unexpected error {error:?}");
+            };
+            assert_eq!(cluster_id, "cluster");
+            assert_eq!(entry_address, address);
+        }
+    }
+
+    /// #347: an IPv6 literal must be bracketed (`[addr]:port`); the
+    /// unbracketed forms are refused before the resolver, which splits on
+    /// the last colon and would accept them numerically. The bracketed form
+    /// still parses directly.
+    #[test]
+    fn unbracketed_ipv6_backend_hosts_never_reach_the_resolver() {
+        let unreachable = |address: &str| -> std::io::Result<Vec<SocketAddr>> {
+            panic!("{address}: must not reach the resolver")
+        };
+        for address in ["::1:8080", "2001:db8::1:8080", "fe80::1%eth0:80"] {
+            let entry = FileBackendConfig {
+                address: address.to_owned(),
+                weight: None,
+                sticky_id: None,
+                backup: None,
+                backend_id: None,
+            };
+            let error = entry
+                .resolve("cluster", 0, &unreachable)
+                .expect_err("an unbracketed IPv6 literal must be refused");
+            let ConfigError::BackendAddressResolution {
+                cluster_id,
+                address: entry_address,
+                reason,
+            } = &error
+            else {
+                panic!("{address}: unexpected error {error:?}");
+            };
+            assert_eq!(cluster_id, "cluster");
+            assert_eq!(entry_address, address);
+            assert!(reason.contains("[address]:port"), "{address}: {reason}");
+        }
+
+        let entry = FileBackendConfig {
+            address: "[2001:db8::1]:8080".to_owned(),
+            weight: Some(3),
+            sticky_id: Some("sticky".to_owned()),
+            backup: Some(true),
+            backend_id: None,
+        };
+        let backends = entry
+            .resolve("cluster", 2, &unreachable)
+            .expect("a bracketed IPv6 literal parses directly");
+        let address: SocketAddr = "[2001:db8::1]:8080".parse().unwrap();
+        assert_eq!(backends.len(), 1);
+        assert_eq!(backends[0].address, address);
+        assert_eq!(backends[0].weight, Some(3));
+        assert_eq!(backends[0].sticky_id.as_deref(), Some("sticky"));
+        assert_eq!(backends[0].backup, Some(true));
+        assert_eq!(
+            backends[0].backend_id.as_deref(),
+            Some("cluster-2-[2001:db8::1]:8080")
+        );
+    }
+
+    /// #347: names that merely contain digits or hex-looking labels still
+    /// reach the resolver.
+    #[test]
+    fn benign_backend_hostnames_are_not_numeric_shorthand() {
+        let resolved = "10.0.0.2:8080".parse::<SocketAddr>().unwrap();
+        let resolver = |_: &str| -> std::io::Result<Vec<SocketAddr>> { Ok(vec![resolved]) };
+        for address in [
+            "123.example.com:8080",
+            "dead.beef:8080",
+            "0x.example.com:8080",
+            "1.2.3.example:8080",
+            "localhost:8080",
+        ] {
+            let entry = FileBackendConfig {
+                address: address.to_owned(),
+                weight: None,
+                sticky_id: None,
+                backup: None,
+                backend_id: None,
+            };
+            let backends = entry
+                .resolve("cluster", 0, &resolver)
+                .unwrap_or_else(|error| panic!("{address}: {error:?}"));
+            assert_eq!(backends.len(), 1, "{address}");
+        }
+        assert!(!is_legacy_numeric_host("dead.beef"));
+        assert!(!is_legacy_numeric_host("1..2"));
+        assert!(is_legacy_numeric_host("0x7f.1"));
+    }
+
+    /// #347: the control commands load the file without resolving backend
+    /// names; the startup and `config check` load still refuses it. `1.2.3`
+    /// is refused before any DNS query, so the test needs no network.
+    #[test]
+    fn a_control_load_does_not_resolve_backend_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "command_socket = \"/tmp/sozu_test.sock\"\n\
+             ctl_command_timeout = 4242\n\
+             [clusters.app]\n\
+             protocol = \"http\"\n\
+             frontends = [{ address = \"127.0.0.1:8080\", hostname = \"example.org\" }]\n\
+             backends = [{ address = \"1.2.3:8080\" }, { address = \"127.0.0.1:9000\" }]\n",
+        )
+        .expect("write config");
+        let path = path.to_str().expect("utf-8 path");
+
+        assert!(matches!(
+            Config::load_from_path(path),
+            Err(ConfigError::BackendAddressResolution { .. })
+        ));
+
+        let config = Config::load_from_path_for_control(path).expect("control load");
+        assert_eq!(config.ctl_command_timeout, 4242);
+        let Some(ClusterConfig::Http(app)) = config.clusters.get("app") else {
+            panic!("the cluster must still be validated and built");
+        };
+        assert_eq!(app.backends.len(), 1, "only the literal is kept");
+    }
+
+    /// #347: an address that is neither a socket address nor a resolvable
+    /// `host:port` refuses the file with an error naming the cluster and the
+    /// entry.
+    #[test]
+    fn an_unresolvable_backend_address_is_a_config_error() {
+        for address in ["localhost", "localhost:notaport"] {
+            let error = http_cluster_from_backends(&format!(r#"{{ address = "{address}" }}"#))
+                .expect_err("the address must not resolve");
+            let ConfigError::BackendAddressResolution {
+                cluster_id,
+                address: entry,
+                ..
+            } = &error
+            else {
+                panic!("{address}: unexpected error {error:?}");
+            };
+            assert_eq!(cluster_id, "cluster");
+            assert_eq!(entry, address);
+            assert!(error.to_string().contains(address), "{error}");
+        }
+    }
+
+    /// #347: a name resolving to several addresses yields one backend per
+    /// distinct address, sorted, each with a distinct id and, when one is
+    /// configured, a distinct sticky id.
+    #[test]
+    fn a_name_with_several_addresses_expands_into_distinct_backends() {
+        let entry = FileBackendConfig {
+            address: "ingress:8080".to_owned(),
+            weight: None,
+            sticky_id: Some("pinned".to_owned()),
+            backup: Some(true),
+            backend_id: Some("ingress".to_owned()),
+        };
+        let v4: SocketAddr = "10.0.0.2:8080".parse().unwrap();
+        let v6: SocketAddr = "[fd00::1]:8080".parse().unwrap();
+        let backends = entry
+            .expand("cluster", vec![v6, v4, v6])
+            .expect("two addresses expand");
+        assert_eq!(
+            backends,
+            vec![
+                BackendConfig {
+                    address: v4,
+                    weight: None,
+                    sticky_id: Some(format!("pinned-{v4}")),
+                    backup: Some(true),
+                    backend_id: Some(format!("ingress-{v4}")),
+                },
+                BackendConfig {
+                    address: v6,
+                    weight: None,
+                    sticky_id: Some(format!("pinned-{v6}")),
+                    backup: Some(true),
+                    backend_id: Some(format!("ingress-{v6}")),
+                },
+            ]
+        );
+
+        // The sticky id does not depend on how many addresses came back.
+        let single = entry.expand("cluster", vec![v4]).expect("one address");
+        assert_eq!(single[0].sticky_id, Some(format!("pinned-{v4}")));
+        assert!(matches!(
+            entry.expand("cluster", Vec::new()),
+            Err(ConfigError::BackendAddressResolution { .. })
+        ));
     }
 
     /// #524: `affinity_header` travels from the TOML file to the

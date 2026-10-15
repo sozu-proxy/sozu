@@ -27,6 +27,18 @@
 
 <!-- changelog-slot:backend-dns -->
 
+- A backend `address` in the configuration file may be a `host:port` as well
+  as a socket address (#347). The name is resolved once, with the system
+  resolver, when the file is loaded (at startup or by `sozu reload --file`);
+  it is never re-resolved while running. Each distinct resolved address
+  becomes a backend with a deterministic id, `<backend_id>-<address>` or
+  `<cluster_id>-<host:port>-<address>`; a configured `sticky_id` is
+  suffixed with `-<address>` so each resolved backend keeps its own sticky
+  session, whatever the number of addresses. A name that does not resolve refuses
+  the file with an error naming the cluster and the entry. A file without a
+  host name loads exactly as before; the command schema and the workers are
+  unchanged.
+
 <!-- changelog-slot:close-sessions -->
 
 - `sozu cluster close-sessions --id <cluster> [--backend-id <id>] [--address <ip:port>]`
