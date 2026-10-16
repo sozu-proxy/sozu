@@ -231,6 +231,14 @@
 
 ### Fixed
 
+- 2.3.2 accepts a legacy 2.3.1 saved state that has no `certificate_metadata`
+  when a state diff changes a listener or removes unrelated frontends or
+  backends while retaining certificates. The debug-build replay check in
+  `ConfigState::diff` used to compare the replayed state's empty sidecar with
+  the target's normalized one and panicked on semantically identical
+  certificates; both sides are now normalized the same way. Explicit
+  `expired_at` and insertion-order differences still produce certificate
+  operations.
 - Re-adding the last HTTP, HTTPS, TCP or UDP listener removed from an address
   now restores the frontends retained in worker configuration state; HTTPS also
   restores the retained certificates. The worker completes this reconstruction
