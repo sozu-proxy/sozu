@@ -72,6 +72,7 @@ pub fn main() {
         .field_attribute("Cluster.answers", "#[serde(default)]")
         .field_attribute("Cluster.authorized_hashes", "#[serde(default)]")
         .field_attribute("RequestHttpFrontend.headers", "#[serde(default)]")
+        .field_attribute("RequestHttpFrontend.header_predicates", "#[serde(default)]")
         .field_attribute("HttpListenerConfig.answers", "#[serde(default)]")
         .field_attribute("HttpsListenerConfig.alpn_protocols", "#[serde(default)]")
         .field_attribute("HttpsListenerConfig.answers", "#[serde(default)]")
@@ -100,6 +101,7 @@ pub fn main() {
             "CertificatesWithFingerprints",
             "Cluster",
             "Header",
+            "HeaderPredicate",
             "RequestHttpFrontend",
             "HttpListenerConfig",
             "HttpsListenerConfig",

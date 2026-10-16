@@ -3022,6 +3022,98 @@ the route table unchanged.
 Captured segments are addressable from `rewrite_host` / `rewrite_path` as
 `$HOST[n]` — see the redirect and rewrite section below.
 
+### Header predicates — routing on request headers
+
+A frontend can require request headers, on top of its hostname, path and
+method ([#1253](https://github.com/sozu-proxy/sozu/issues/1253)). Each entry of
+`header_predicates` names one header and how to test it; the frontend matches
+only when **every** predicate holds. A frontend without `header_predicates`
+behaves exactly as before.
+
+| `match`   | `value`  | holds when the request's header…                                   |
+|-----------|----------|--------------------------------------------------------------------|
+| `exact`   | required | equals `value`, byte for byte (case-sensitive)                     |
+| `regex`   | required | matches `value`, anchored at both ends like a `REGEX` path         |
+| `present` | refused  | is carried, whatever its value (the empty one included)            |
+
+The canonical use is a canary by header: the same hostname and path served by
+two clusters, the canary reached only by requests that ask for it.
+
+```toml
+[clusters.api-stable]
+protocol = "http"
+frontends = [
+  { address = "0.0.0.0:80", hostname = "api.example.com" },
+]
+backends = [ { address = "127.0.0.1:8001" } ]
+
+[clusters.api-canary]
+protocol = "http"
+frontends = [
+  { address = "0.0.0.0:80", hostname = "api.example.com", header_predicates = [
+    { name = "X-Canary", match = "exact", value = "always" },
+  ] },
+]
+backends = [ { address = "127.0.0.1:8101" } ]
+```
+
+`curl -H 'X-Canary: always' http://api.example.com/` reaches `api-canary`;
+every other request, `X-Canary: never` included, reaches `api-stable`. The same
+pair from the command line:
+
+```bash
+sozu frontend http add --address 0.0.0.0:80 --hostname api.example.com id api-stable
+sozu frontend http add --address 0.0.0.0:80 --hostname api.example.com \
+  --match-header exact=X-Canary=always id api-canary
+```
+
+`--match-header` takes `<match>=<name>[=<value>]` and repeats, one flag per
+predicate: `--match-header regex=X-Region=eu-.* --match-header present=X-Beta`.
+
+The rules:
+
+- **Names** compare case-insensitively (RFC 9110 §5.1) and must be an RFC 9110
+  token. `Host` and `Cookie` are refused: H1 folds `Host` into the request
+  authority and H2 sends `:authority`, and both parsers move cookies into a
+  jar, so neither is a header Sōzu could test — route on the hostname instead.
+- **Only the first occurrence** of a header is tested, raw as the client sent
+  it. A value is not split on commas.
+- **A `regex` value is anchored at both ends**: `eu-.*` matches `eu-west` and
+  not `us-eu-west`. It follows the same grammar as a `REGEX` path, so a value
+  that does not compile, or only compiles once wrapped, is refused when the
+  frontend is added.
+- **Precedence.** For one hostname, a frontend whose predicates all hold
+  outranks every frontend without predicates, whatever their paths and
+  declaration order; among frontends of one kind the path and method
+  precedence above applies unchanged. A frontend whose predicates do not all
+  hold is skipped, like one whose method does not match, so a hostname whose
+  only frontends are unsatisfied predicated ones hands the request to the next
+  hostname candidate (a wildcard, for instance). `PRE` and `POST` lists apply
+  the same rule: the first satisfied predicated rule in declaration order, else
+  the first rule without predicates (`Router::lookup_with_headers`).
+- **Identity.** Predicates are part of a frontend's identity, next to address,
+  hostname, path and method: a canary and its base coexist, and removing a
+  frontend — `sozu frontend http remove … --match-header …` — must name the
+  same predicates. Order and header-name case do not matter, and a predicate
+  repeated verbatim counts once. Removing one leaves the other.
+- **HTTP and HTTPS only.** `header_predicates` is valid on `http` and `https`
+  frontends. A `tcp` cluster frontend that sets it is refused at configuration
+  load, never silently discarded.
+- **Mixed versions.** A frontend with predicates is sent to the workers as
+  `AddHttpFrontendWithHeaderPredicates` / `AddHttpsFrontendWithHeaderPredicates`
+  (and removed with the matching `Remove…` verbs), not as the historical
+  `AddHttpFrontend` & co. A worker that predates header routing would skip the
+  unknown predicate field and install the route without its guard, sending
+  every request for the host to the canary cluster; it cannot decode the new
+  verbs, so it fails the request instead, and is counted as failed once
+  `worker_timeout` expires. Frontends without predicates keep the historical
+  verbs and work across versions as before.
+- **Visibility.** The predicate values appear in clear in the saved state and
+  in the main process's state key, exactly as hostnames and paths already do;
+  `Debug` logs carry only their count and lengths. The human-readable frontend
+  and cluster listing tables show only the number of predicates, not their
+  values. Do not put a secret in an `exact` value.
+
 ### Regex limitations — no look-around
 
 Sōzu uses the standard Rust [`regex`](https://docs.rs/regex/) crate which does

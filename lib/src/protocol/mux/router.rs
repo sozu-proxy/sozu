@@ -117,7 +117,7 @@ use crate::{
         editor::{HeaderEditMode, HeaderEditSnapshot, HttpContext, emits_x_forwarded},
         parser::compare_no_case,
     },
-    router::{HeaderEdit, RouteResult},
+    router::{HeaderEdit, RequestHeaders, RouteResult},
     socket::SessionTcpStream,
 };
 
@@ -1173,7 +1173,10 @@ impl Router {
             }
         }
 
-        let route_result = listener.borrow().frontend_from_request(host, uri, method);
+        let route_result =
+            listener
+                .borrow()
+                .frontend_from_request(host, uri, method, &FrontRequestHeaders(front));
 
         let route = match route_result {
             Ok(route) => route,
@@ -1633,6 +1636,32 @@ pub(super) fn affinity_key(
         "a request with a source address must always be keyed"
     );
     key
+}
+
+/// The request headers of a front stream, as a router lookup reads them to
+/// evaluate a frontend's header predicates (sozu-proxy/sozu#1253).
+///
+/// Same idiom as [`affinity_key`]: the header blocks are read where they
+/// lie in the request buffer, an elided block is skipped, names compare
+/// case-insensitively, and the first occurrence answers, raw as sent. No
+/// copy, no allocation — and nothing at all for a lookup that meets no
+/// predicate, which never calls it. Pseudo-headers and cookies are not
+/// header blocks, which is why `validate_header_predicate`
+/// (`command/src/config.rs`) refuses `Host` and `Cookie`.
+struct FrontRequestHeaders<'a>(&'a GenericHttpStream);
+
+impl RequestHeaders for FrontRequestHeaders<'_> {
+    fn header(&self, name: &[u8]) -> Option<&[u8]> {
+        let buf = self.0.storage.buffer();
+        self.0.blocks.iter().find_map(|block| match block {
+            Block::Header(header)
+                if !header.is_elided() && compare_no_case(header.key.data(buf), name) =>
+            {
+                Some(header.val.data(buf))
+            }
+            _ => None,
+        })
+    }
 }
 
 /// The listener's sticky-session cookie as the request arrived with it: its

@@ -90,6 +90,20 @@ To route only a sub-path of a hostname to this cluster, add `--path-prefix`
 sozu --config /etc/sozu/config.toml frontend http add --address 0.0.0.0:80 --hostname <my_cluster_hostname> --path-prefix /api id <my_cluster_id>
 ```
 
+To route only the requests that carry a header to a cluster — a canary by
+header, for instance — add one `--match-header <match>=<name>[=<value>]` per
+predicate, where `<match>` is `exact`, `regex` (anchored at both ends) or
+`present` (no value). Every predicate must hold, and the frontend outranks the
+predicate-free ones of its hostname:
+
+```bash
+sozu --config /etc/sozu/config.toml frontend http add --address 0.0.0.0:80 --hostname <my_cluster_hostname> --match-header exact=X-Canary=always id <my_canary_cluster_id>
+```
+
+Predicates are part of the frontend's identity, so `frontend http remove` takes
+the same `--match-header` flags. See "Header predicates" in
+[`configure.md`](./configure.md) for the full rules.
+
 ### Add https frontend
 
 And an https listener:

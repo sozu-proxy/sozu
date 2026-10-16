@@ -64,14 +64,15 @@ use crate::{
     logging::AccessLogFormat,
     proto::command::{
         ActivateListener, AddBackend, AddCertificate, CertificateAndKey, ClientAuthMode, Cluster,
-        CustomHttpAnswers, ForwardedHeaders, Header, HeaderPosition, HealthCheckConfig,
-        HealthCheckMode, HstsConfig, HttpListenerConfig, HttpStatusRange, HttpsListenerConfig,
-        ListenerType, LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, MetricDetail,
-        MetricsConfiguration, PathRule, ProtobufAccessLogFormat, ProxyProtocolConfig,
-        RedirectPolicy, RedirectScheme, Request, RequestHttpFrontend, RequestTcpFrontend,
-        RequestUdpFrontend, RulePosition, ServerConfig, ServerMetricsConfig, ShardMode,
-        SocketAddress, TcpListenerConfig, TlsVersion, UdpAffinityKey, UdpClusterConfig,
-        UdpHealthConfig, UdpHealthMode, UdpListenerConfig, WorkerRequest, request::RequestType,
+        CustomHttpAnswers, ForwardedHeaders, Header, HeaderMatchKind, HeaderPosition,
+        HeaderPredicate, HealthCheckConfig, HealthCheckMode, HstsConfig, HttpListenerConfig,
+        HttpStatusRange, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
+        LoadBalancingParams, LoadMetric, MetricDetail, MetricsConfiguration, PathRule,
+        ProtobufAccessLogFormat, ProxyProtocolConfig, RedirectPolicy, RedirectScheme, Request,
+        RequestHttpFrontend, RequestTcpFrontend, RequestUdpFrontend, RulePosition, ServerConfig,
+        ServerMetricsConfig, ShardMode, SocketAddress, TcpListenerConfig, TlsVersion,
+        UdpAffinityKey, UdpClusterConfig, UdpHealthConfig, UdpHealthMode, UdpListenerConfig,
+        WorkerRequest, request::RequestType,
     },
 };
 
@@ -574,6 +575,12 @@ pub enum ConfigError {
          (NUL / CR / LF / other C0) are forbidden in header keys and values"
     )]
     InvalidHeaderBytes { index: usize, field: &'static str },
+    /// A `header_predicates` entry on a frontend is not a usable routing
+    /// condition (sozu-proxy/sozu#1253); `reason` names what is wrong. The
+    /// regex grammar of a `regex` predicate is checked later, by the
+    /// router, exactly as a `path_type = "regex"` path is.
+    #[error("invalid header predicate at header_predicates[{index}]: {reason}")]
+    InvalidHeaderPredicate { index: usize, reason: &'static str },
     /// An `[hsts]` block populated `max_age`, `include_subdomains`, or
     /// `preload` but did not set `enabled`. The TOML representation requires
     /// `enabled` to be present whenever the block is — that single field
@@ -2167,6 +2174,25 @@ pub struct FileClusterFrontendConfig {
     /// to suppress an inherited listener default. Per RFC 6797 §7.2,
     /// HSTS is rejected on plain-HTTP frontends at config-load time.
     pub hsts: Option<FileHstsConfig>,
+    /// Header predicates the request must all satisfy for this frontend to
+    /// match (sozu-proxy/sozu#1253). See [`HeaderPredicateConfig`].
+    pub header_predicates: Option<Vec<HeaderPredicateConfig>>,
+}
+
+/// A routing condition on one request header, as serialised under
+/// `clusters.<id>.frontends.header_predicates` (sozu-proxy/sozu#1253).
+/// Maps to the proto [`HeaderPredicate`] at request-build time.
+///
+/// `match` accepts `exact`, `regex`, or `present` (case-insensitive).
+/// `value` is required for `exact` and `regex` and forbidden for
+/// `present`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderPredicateConfig {
+    pub name: String,
+    #[serde(rename = "match")]
+    pub kind: String,
+    pub value: Option<String>,
 }
 
 /// A single header mutation as serialised under
@@ -2325,6 +2351,12 @@ impl FileClusterFrontendConfig {
             ));
         }
 
+        if self.header_predicates.is_some() {
+            return Err(ConfigError::InvalidFrontendConfig(
+                "header_predicates".to_string(),
+            ));
+        }
+
         // `hostname` maps to the TCP frontend's `sni` (sozu-proxy/sozu#1279):
         // an SNI-scoped frontend reads the same TOML key HTTP frontends use
         // for their routing hostname, validated for the TCP-specific
@@ -2448,6 +2480,15 @@ impl FileClusterFrontendConfig {
         // `HttpFrontendConfig::generate_requests`, so HSTS configured
         // there would silently target an HTTP frontend. Reject at
         // config-load before the cert-presence branch can consume it.
+        let header_predicates = match self.header_predicates.as_ref() {
+            Some(entries) => entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| parse_header_predicate(index, entry))
+                .collect::<Result<Vec<_>, _>>()?,
+            None => Vec::new(),
+        };
+
         let frontend_serves_https = key_opt.is_some() && certificate_opt.is_some();
         let hsts = match self.hsts.as_ref() {
             Some(h) => {
@@ -2481,6 +2522,7 @@ impl FileClusterFrontendConfig {
             required_auth: self.required_auth,
             headers,
             hsts,
+            header_predicates,
         })
     }
 }
@@ -2628,6 +2670,83 @@ pub(crate) fn parse_header_edit(
         "an emitted header value must be free of forbidden control bytes"
     );
     Ok(header)
+}
+
+/// Parse one `header_predicates` entry of a frontend into the proto
+/// [`HeaderPredicate`] (sozu-proxy/sozu#1253), then hold it to
+/// [`validate_header_predicate`].
+pub(crate) fn parse_header_predicate(
+    index: usize,
+    entry: &HeaderPredicateConfig,
+) -> Result<HeaderPredicate, ConfigError> {
+    let kind = match entry.kind.to_ascii_lowercase().as_str() {
+        "exact" => HeaderMatchKind::Exact,
+        "regex" => HeaderMatchKind::Regex,
+        "present" => HeaderMatchKind::Present,
+        _ => {
+            return Err(ConfigError::InvalidHeaderPredicate {
+                index,
+                reason: "match must be \"exact\", \"regex\" or \"present\"",
+            });
+        }
+    };
+    let predicate = HeaderPredicate {
+        name: entry.name.to_owned(),
+        kind: kind as i32,
+        value: entry.value.to_owned(),
+    };
+    validate_header_predicate(&predicate)
+        .map_err(|reason| ConfigError::InvalidHeaderPredicate { index, reason })?;
+    Ok(predicate)
+}
+
+/// Validate one frontend header predicate (sozu-proxy/sozu#1253).
+///
+/// The name must be an RFC 9110 `token`, and neither `Host` nor `Cookie`:
+/// like an `affinity_header` ([`validate_affinity_key`]), a predicate on
+/// either could never find its header among the request's — H1 folds `Host`
+/// into the request authority (H2 sends `:authority`) and both parsers move
+/// cookies into a jar — so it would silently never match. `exact` and `regex`
+/// need a `value`, `present` refuses one, and an `exact` value carrying a
+/// control byte no parsed header value can hold is refused rather than left
+/// to never match. A `regex` value's grammar is the router's to check, where
+/// it is compiled.
+///
+/// Called at config load and by the worker's router on every frontend
+/// addition, which the main process also runs before accepting one
+/// (`validate_frontend_request` in `bin/src/command/requests.rs`), so a TOML
+/// load, a saved state and a direct API request are held to the same rule.
+pub fn validate_header_predicate(predicate: &HeaderPredicate) -> Result<(), &'static str> {
+    let name = predicate.name.as_str();
+    if !header_name_is_valid_token(name.as_bytes()) {
+        return Err("name must be a non-empty RFC 9110 token (a header field name)");
+    }
+    if name.eq_ignore_ascii_case("host") {
+        return Err(
+            "name cannot be Host: the request authority is not a header Sōzu keeps \
+             (H1 folds Host into it, H2 sends :authority); route on the hostname instead",
+        );
+    }
+    if name.eq_ignore_ascii_case("cookie") {
+        return Err("name cannot be Cookie: cookies are parsed into a jar, not kept as a header");
+    }
+    match (
+        HeaderMatchKind::try_from(predicate.kind),
+        predicate.value.as_deref(),
+    ) {
+        (Err(_), _) => Err("unknown match kind"),
+        (Ok(HeaderMatchKind::Present), Some(_)) => Err("a present predicate takes no value"),
+        (Ok(HeaderMatchKind::Present), None) => Ok(()),
+        (Ok(HeaderMatchKind::Exact | HeaderMatchKind::Regex), None) => {
+            Err("an exact or regex predicate requires a value")
+        }
+        (Ok(HeaderMatchKind::Exact), Some(value))
+            if header_value_contains_forbidden_controls(value.as_bytes()) =>
+        {
+            Err("an exact value cannot carry a control character no header value can hold")
+        }
+        (Ok(HeaderMatchKind::Exact | HeaderMatchKind::Regex), Some(_)) => Ok(()),
+    }
 }
 
 /// Field names follow the RFC 9110 §5.1 `token` grammar: non-empty,
@@ -3635,6 +3754,10 @@ pub struct HttpFrontendConfig {
     /// the listener default at frontend-add time in the worker.
     #[serde(default)]
     pub hsts: Option<HstsConfig>,
+    /// Header predicates the request must all satisfy for this frontend to
+    /// match (sozu-proxy/sozu#1253). Empty by default.
+    #[serde(default)]
+    pub header_predicates: Vec<HeaderPredicate>,
 }
 
 impl fmt::Debug for HttpFrontendConfig {
@@ -3684,6 +3807,7 @@ impl fmt::Debug for HttpFrontendConfig {
             .field("required_auth", &self.required_auth)
             .field("headers_count", &self.headers.len())
             .field("hsts", &self.hsts)
+            .field("header_predicates_count", &self.header_predicates.len())
             .finish()
     }
 }
@@ -3732,6 +3856,7 @@ impl HttpFrontendConfig {
                     rewrite_port: self.rewrite_port,
                     headers: self.headers.clone(),
                     hsts: self.hsts,
+                    header_predicates: self.header_predicates.clone(),
                 })
                 .into(),
             );
@@ -3755,6 +3880,7 @@ impl HttpFrontendConfig {
                     rewrite_port: self.rewrite_port,
                     headers: self.headers.clone(),
                     hsts: self.hsts,
+                    header_predicates: self.header_predicates.clone(),
                 })
                 .into(),
             );
@@ -5684,6 +5810,7 @@ mod tests {
                 val: long_value(HEADER_SECRET),
             }],
             hsts: None,
+            header_predicates: Vec::new(),
         };
 
         let output = format!("{frontend:?}");
@@ -6010,6 +6137,7 @@ mod tests {
                 preload: None,
                 force_replace_backend: None,
             }),
+            header_predicates: None,
         };
         match frontend.to_http_front("api").unwrap_err() {
             ConfigError::HstsOnPlainHttp(scope) => {
@@ -6538,6 +6666,85 @@ mod tests {
         };
         assert_eq!(cluster.affinity_header.as_deref(), Some("X-Tenant"));
         assert_eq!(cluster.affinity_cookie, None);
+    }
+
+    /// #1253: `header_predicates` travel from the TOML file to the
+    /// `AddHttpFrontend` order, `match` parsed case-insensitively.
+    #[test]
+    fn header_predicates_reach_the_add_http_frontend_order() {
+        let file: FileClusterConfig = toml::from_str(
+            r#"
+            protocol = "http"
+            frontends = [
+              { address = "0.0.0.0:80", hostname = "api.example.com", header_predicates = [
+                { name = "X-Canary", match = "EXACT", value = "always" },
+                { name = "X-Region", match = "regex", value = "eu-.*" },
+                { name = "X-Beta", match = "present" },
+              ] },
+            ]
+            backends = []
+            "#,
+        )
+        .expect("the cluster must parse");
+        let ClusterConfig::Http(http) = file
+            .to_cluster_config("canary", &HashSet::new())
+            .expect("the cluster must build")
+        else {
+            panic!("an http cluster must build as one");
+        };
+        let orders = http.generate_requests().expect("the orders must build");
+        let front = orders
+            .iter()
+            .find_map(|order| match order.request_type.as_ref() {
+                Some(RequestType::AddHttpFrontendWithHeaderPredicates(front)) => Some(front),
+                _ => None,
+            })
+            .expect("the orders must add the frontend");
+        let predicate = |name: &str, kind: HeaderMatchKind, value: Option<&str>| HeaderPredicate {
+            name: name.to_owned(),
+            kind: kind as i32,
+            value: value.map(str::to_owned),
+        };
+        assert_eq!(
+            front.header_predicates,
+            vec![
+                predicate("X-Canary", HeaderMatchKind::Exact, Some("always")),
+                predicate("X-Region", HeaderMatchKind::Regex, Some("eu-.*")),
+                predicate("X-Beta", HeaderMatchKind::Present, None),
+            ]
+        );
+    }
+
+    /// #1253: a predicate no request could satisfy is refused at config
+    /// load with its index, never left to silently match nothing.
+    #[test]
+    fn unusable_header_predicates_are_refused_at_config_load() {
+        for entry in [
+            r#"{ name = "X-Canary", match = "equals", value = "1" }"#,
+            r#"{ name = "Host", match = "exact", value = "example.com" }"#,
+            r#"{ name = "Cookie", match = "present" }"#,
+            r#"{ name = "X-Canary", match = "present", value = "1" }"#,
+            r#"{ name = "X-Canary", match = "exact" }"#,
+            r#"{ name = "X Canary", match = "present" }"#,
+        ] {
+            let file: FileClusterConfig = toml::from_str(&format!(
+                r#"
+                protocol = "http"
+                frontends = [
+                  {{ address = "0.0.0.0:80", hostname = "api.example.com", header_predicates = [
+                    {{ name = "X-Valid", match = "present" }},
+                    {entry},
+                  ] }},
+                ]
+                backends = []
+                "#
+            ))
+            .expect("the cluster must parse");
+            match file.to_cluster_config("canary", &HashSet::new()) {
+                Err(ConfigError::InvalidHeaderPredicate { index: 1, .. }) => {}
+                other => panic!("{entry}: expected InvalidHeaderPredicate at 1, got {other:?}"),
+            }
+        }
     }
 
     /// #524: a TCP cluster has no request to read a header or a cookie
@@ -7870,6 +8077,7 @@ mod tests {
                 required_auth: None,
                 headers: None,
                 hsts: None,
+                header_predicates: None,
             };
             match frontend.to_tcp_front() {
                 Err(ConfigError::InvalidSniPattern { sni }) => assert_eq!(sni, invalid),
@@ -7908,6 +8116,7 @@ mod tests {
                 required_auth: None,
                 headers: None,
                 hsts: None,
+                header_predicates: None,
             };
             match frontend.to_tcp_front() {
                 Err(ConfigError::NonAsciiSniPattern { sni }) => assert_eq!(sni, non_ascii),
@@ -7965,10 +8174,47 @@ mod tests {
             required_auth: None,
             headers: None,
             hsts: None,
+            header_predicates: None,
         };
         match frontend.to_http_front("api") {
             Err(ConfigError::InvalidFrontendConfig(field)) => assert_eq!(field, "alpn"),
             other => panic!("expected InvalidFrontendConfig(\"alpn\"), got {other:?}"),
+        }
+    }
+
+    /// `header_predicates` is an HTTP-only guard; a TCP frontend that sets it
+    /// is rejected instead of silently routing unconditionally.
+    #[test]
+    fn header_predicates_rejected_on_tcp_frontend() {
+        let frontend = FileClusterFrontendConfig {
+            address: "127.0.0.1:8080".parse().unwrap(),
+            hostname: None,
+            alpn: vec![],
+            path: None,
+            path_type: None,
+            method: None,
+            certificate: None,
+            key: None,
+            certificate_chain: None,
+            tls_versions: vec![],
+            position: RulePosition::Tree,
+            tags: None,
+            redirect: None,
+            redirect_scheme: None,
+            redirect_template: None,
+            rewrite_host: None,
+            rewrite_path: None,
+            rewrite_port: None,
+            required_auth: None,
+            headers: None,
+            hsts: None,
+            header_predicates: Some(vec![]),
+        };
+        match frontend.to_tcp_front() {
+            Err(ConfigError::InvalidFrontendConfig(field)) => {
+                assert_eq!(field, "header_predicates")
+            }
+            other => panic!("expected InvalidFrontendConfig(\"header_predicates\"), got {other:?}"),
         }
     }
 
