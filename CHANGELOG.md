@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+<!-- changelog-slot:header-routing -->
+
+<!-- changelog-slot:unix-backends -->
+
+<!-- changelog-slot:backend-dns -->
+
+<!-- changelog-slot:close-sessions -->
+
+<!-- changelog-slot:backend-ownership -->
+
+## 2.3.2 - 2026-10-16
+
 ### Added
 
 - **BREAKING (library API) — `feat(health-check)`: probe port.** `HealthCheckConfig` gains an
@@ -17,11 +29,13 @@
   backend of the cluster has a `unix_path`, in either order and in the TOML loader (DNS-expanded
   entries included), the master state and the worker; a `unix_path` backend without `port` is
   probed through its UNIX socket. Library API: `HealthCheckConfig` and `FileHealthCheckConfig` gain the public field
-  `port`, so a struct literal must name it or use `..Default::default()`. A message or saved
+  `port`, so a struct literal must name it (only the protobuf `HealthCheckConfig` also accepts `..Default::default()`). A message or saved
   state without the field decodes as before. `port` is an additive field 9 on the existing
   `AddCluster` and `SetHealthCheck` messages, so it is **not** fail-closed: a worker older
   than 2.3.2 decodes the message, ignores the unknown field and probes the data port. Upgrade
-  the main process and every worker to 2.3.2 before enabling `port`.
+  the main process and every worker to 2.3.2 before enabling `port`. Rust source: an
+  exhaustive `HealthCheckConfig` or `FileHealthCheckConfig` literal must name `port`
+  (`Option<u32>` in both).
 
   **Before enabling it.** Upgrade the main process and every worker, and use the new CLI,
   before setting `port`: an older worker ignores field 9 and probes the data port, which in
@@ -66,6 +80,25 @@
   verbs. Repeated identical predicates canonicalize to one identity, a TCP
   frontend rejects `header_predicates` instead of ignoring them, and frontend
   listings show a redacted predicate count rather than names or values.
+  Protobuf: `RequestHttpFrontend` field 17 and `Request` fields 66-69
+  (`AddHttpFrontendWithHeaderPredicates`, `RemoveHttpFrontendWithHeaderPredicates`,
+  `AddHttpsFrontendWithHeaderPredicates`, `RemoveHttpsFrontendWithHeaderPredicates`).
+  Rust source: `RequestHttpFrontend`, `HttpFrontendConfig` and
+  `FileClusterFrontendConfig` gain the public field `header_predicates`, so an
+  exhaustive struct literal must name it (the protobuf `RequestHttpFrontend` also accepts `..Default::default()`);
+  `request::RequestType` gains the four verbs above, so an exhaustive `match`
+  must handle them; `ConfigError::InvalidHeaderPredicate { index, reason }` is
+  new, so an exhaustive `match` on `ConfigError` must handle it.
+  `command::response::HttpFrontend` also gains the public field
+  `header_predicates: Vec<HeaderPredicate>`;
+  `FileClusterFrontendConfig::header_predicates` is an
+  `Option<Vec<HeaderPredicateConfig>>`, and `HeaderPredicateConfig` is a new
+  public type (`sozu_command_lib::config`).
+  `sozu_lib::router::Router::tree` now holds
+  `(PathRule, MethodRule, HeaderRules, Route)` tuples instead of
+  `(PathRule, MethodRule, Route)`, and `sozu_lib::router::RouterError` gains
+  `InvalidHeaderPredicate { index, reason }`, so an exhaustive `match` on it
+  must handle it.
 - **`feat(mux)`: `redirect = "silent_close"` refuses a request without any
   response** ([#767](https://github.com/sozu-proxy/sozu/issues/767)), the
   equivalent of nginx's `return 444`. A new `RedirectPolicy::SILENT_CLOSE = 5`
@@ -81,11 +114,12 @@
   `AddHttpFrontendWithSilentClose` (field 70) or
   `AddHttpsFrontendWithSilentClose` (field 71); other frontends keep the legacy
   verbs. A worker older than 2.3.2 cannot decode these requests and fails them,
-  so it never installs an unguarded forwarding route.
+  so it never installs an unguarded forwarding route. Rust source:
+  `RedirectPolicy` gains `SilentClose`, `request::RequestType` gains
+  `AddHttpFrontendWithSilentClose` and `AddHttpsFrontendWithSilentClose`, and
+  `sozu_lib::RetrieveClusterError` gains `SilentClose`, so an exhaustive `match`
+  on any of them must handle the new variants.
 
-<!-- changelog-slot:header-routing -->
-
-<!-- changelog-slot:unix-backends -->
 - Backends reachable over UNIX domain sockets
   ([#152](https://github.com/sozu-proxy/sozu/issues/152)). A backend's new
   `unix_path` (configuration file, `AddBackend.unix_path` in the protocol,
@@ -102,9 +136,15 @@
   outside this guarantee: an older decoder drops the field. Protobuf: `AddBackend` field 7
   (`unix_path`) and `Request` field 72 (`AddUnixBackend`). Covered by
   `command/tests/unix_backend_verb.rs` and the `test_*unix*` e2e tests
-  (`e2e/src/tests/unix_backend_tests.rs`).
-
-<!-- changelog-slot:backend-dns -->
+  (`e2e/src/tests/unix_backend_tests.rs`). Rust source: `AddBackend` and
+  `BackendConfig` gain the public field `unix_path` (as does the new `FileBackendConfig`), so
+  an exhaustive struct literal must name it (the protobuf `AddBackend` also accepts `..Default::default()`);
+  `request::RequestType` gains `AddUnixBackend`, so an exhaustive `match` must
+  handle it; `ConfigError::InvalidBackendUnixPath { cluster_id, address, reason }`
+  is new, so an exhaustive `match` on `ConfigError` must handle it.
+  `command::response::Backend` and `sozu_lib::backends::Backend` also gain the
+  public field `unix_path: Option<String>`, which an exhaustive struct literal
+  must name.
 
 - A backend `address` in the configuration file may be a `host:port` as well
   as a socket address (#347). The name is resolved once, with the system
@@ -115,10 +155,17 @@
   suffixed with `-<address>` so each resolved backend keeps its own sticky
   session, whatever the number of addresses. A name that does not resolve refuses
   the file with an error naming the cluster and the entry. A file without a
-  host name loads exactly as before; the command schema and the workers are
-  unchanged.
-
-<!-- changelog-slot:close-sessions -->
+  host name loads exactly as before; this sub-change adds no protobuf message,
+  field or verb and needs no worker change (the resolved backends reach workers
+  as ordinary `AddBackend` requests). Rust source: `FileClusterConfig::backends`
+  is now `Vec<FileBackendConfig>` instead of `Vec<BackendConfig>`; the new
+  public `FileBackendConfig` (`address: String`, `weight`, `sticky_id`,
+  `backup`, `backend_id`, `unix_path`) holds the unresolved entry, and
+  `BackendConfig` keeps a resolved `SocketAddr`. Code that builds or reads a
+  `FileClusterConfig` literal must use `FileBackendConfig`. The new
+  `ConfigError::BackendAddressResolution { cluster_id, address, reason }`
+  variant is returned for a name that does not resolve, so an exhaustive
+  `match` on `ConfigError` must handle it.
 
 - `sozu cluster close-sessions --id <cluster> [--backend-id <id>] [--address <ip:port>]`
   closes, on every worker, the HTTP, HTTPS, TCP and WebSocket sessions holding a backend
@@ -132,6 +179,9 @@
   state nor replayed by `load_state` or an upgrade. A worker that predates it cannot decode
   it and closes nothing; it does not answer, so the request fails once the command times out.
   The main process and every worker must run this release before it is used.
+  Rust source: the generated `request::RequestType` oneof gains `CloseSessions` and
+  `response_content::ContentType` gains `ClosedSessions`, so an exhaustive `match` on either
+  must handle the new variant.
 
 ### 🔄 Changed
 
@@ -155,8 +205,6 @@
   when its headers are not sent yet, and the connection closes as soon as it is sent. A
   client no longer has to discover the close after a response that announced keep-alive.
 
-<!-- changelog-slot:backend-ownership -->
-
 - A backend belongs to its cluster (#996). `AddBackend` (`sozu backend add`)
   naming a cluster the state does not hold, never added or already removed,
   is now refused with `ClusterNotFound` by the main process and by every
@@ -164,7 +212,10 @@
   already removes the cluster's backends (#1729), so no backend outlives its
   cluster. Frontends stay independent: one may still be added before its
   cluster. The configuration file, `SaveState` and `ConfigState::diff` all
-  emit a cluster before its backends and are unaffected.
+  emit a cluster before its backends and are unaffected. Rust source:
+  `StateError` (`sozu_command_lib::state`) gains
+  `ClusterNotFound { kind, cluster_id }`, so an exhaustive `match` on it must
+  handle it.
 
 ### Upgrade notes
 
@@ -204,7 +255,8 @@
   worker bootstrap and worker upgrade therefore preserve both expiration-based
   selection and the insertion-order tie break. The new public
   `ConfigState::certificate_metadata` sidecar is a Rust source compatibility
-  change for downstream exhaustive struct literals; the certificate map and
+  change for downstream exhaustive `ConfigState` struct literals, which must
+  name `certificate_metadata`; for this sub-change only, the certificate map and
   command protobufs are unchanged. Old JSON without the field remains readable
   and malformed partial metadata is normalized deterministically on the first
   state-changing certificate command. Direct in-memory writes to the still
