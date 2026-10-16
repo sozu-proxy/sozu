@@ -74,6 +74,7 @@ mod tcp_tests;
 mod tests;
 mod tls_tests;
 mod udp_tests;
+mod unix_backend_tests;
 
 use std::{io::stdin, net::SocketAddr};
 

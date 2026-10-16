@@ -52,6 +52,7 @@ fn main() -> anyhow::Result<()> {
         load_balancing_parameters: Some(LoadBalancingParams::default()),
         sticky_id: None,
         backup: None,
+        unix_path: None,
     };
 
     // a backend belongs to its cluster: the worker refuses one of an unknown cluster

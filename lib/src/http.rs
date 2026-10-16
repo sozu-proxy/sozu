@@ -2332,6 +2332,7 @@ mod tests {
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
                 sticky_id: None,
                 backup: None,
+                unix_path: None,
             };
             command
                 .write_message(&WorkerRequest {
@@ -2464,6 +2465,7 @@ mod tests {
                 cluster_id: "cluster_1".into(),
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
                 sticky_id: None,
+                unix_path: None,
             };
             command
                 .write_message(&WorkerRequest {

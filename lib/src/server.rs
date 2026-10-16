@@ -2901,7 +2901,8 @@ impl Server {
                 push_queue(WorkerResponse::ok(req_id));
                 return;
             }
-            Some(RequestType::AddBackend(ref backend)) => {
+            Some(RequestType::AddBackend(ref backend))
+            | Some(RequestType::AddUnixBackend(ref backend)) => {
                 push_queue(self.add_backend(&req_id, backend));
                 return;
             }
@@ -3079,13 +3080,21 @@ impl Server {
     }
 
     fn add_backend(&mut self, req_id: &str, add_backend: &AddBackend) -> WorkerResponse {
+        if let Some(Err(reason)) = add_backend
+            .unix_path
+            .as_deref()
+            .map(sozu_command::config::parse_backend_unix_path)
+        {
+            return WorkerResponse::error(req_id, format!("invalid unix_path: {reason}"));
+        }
         let new_backend = Backend::new(
             &add_backend.backend_id,
             add_backend.address.into(),
             add_backend.sticky_id.clone(),
             add_backend.load_balancing_parameters,
             add_backend.backup,
-        );
+        )
+        .with_unix_path(add_backend.unix_path.clone());
         self.backends
             .borrow_mut()
             .add_backend(&add_backend.cluster_id, new_backend);
@@ -5607,6 +5616,7 @@ mod listener_lifecycle_tests {
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
                 sticky_id: None,
                 backup: None,
+                unix_path: None,
             })
             .into(),
         });
@@ -6145,6 +6155,7 @@ mod add_cluster_validation_tests {
                     load_balancing_parameters: Some(LoadBalancingParams::default()),
                     sticky_id: None,
                     backup: None,
+                    unix_path: None,
                 })
                 .into(),
             });
@@ -6211,6 +6222,7 @@ mod remove_health_check_tests {
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
                 sticky_id: None,
                 backup: None,
+                unix_path: None,
             })
             .into(),
         });

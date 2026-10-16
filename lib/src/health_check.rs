@@ -325,7 +325,14 @@ impl HealthChecker {
             };
 
             for (backend_id, address, incarnation) in backends_to_check {
-                match TcpStream::connect(address) {
+                // Dialed like traffic is (`Backend::connect_socket`), so a
+                // `unix_path` backend is probed over its UNIX socket. A
+                // backend removed since the list was taken is not probed.
+                let dialed = match incarnation.upgrade() {
+                    Some(backend) => backend.borrow().connect_socket(),
+                    None => Err(std::io::ErrorKind::NotFound.into()),
+                };
+                match dialed {
                     Ok(mut stream) => {
                         let Some(token) = self.allocate_token() else {
                             // Token table exhausted — record the probe as failed
@@ -865,7 +872,9 @@ fn tcp_connect_outcome(stream: &TcpStream) -> Option<bool> {
         Ok(None) => {}
         Ok(Some(_)) | Err(_) => return Some(false),
     }
-    match stream.peer_addr() {
+    // `socket2` rather than std's `peer_addr`, which refuses the AF_UNIX
+    // address of a `unix_path` backend (`backends::connect_backend`).
+    match socket2::SockRef::from(stream).peer_addr() {
         Ok(_) => Some(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotConnected => None,
         Err(_) => Some(false),
@@ -1343,6 +1352,27 @@ mod tests {
             try_parse_h2c_status(&buf, &status_config(0, &[(100, 199)])),
             Some(false)
         );
+    }
+
+    /// A connect-only probe of a `unix_path` backend passes once its socket
+    /// accepted the dial, although std's `peer_addr` refuses its AF_UNIX peer.
+    #[test]
+    fn tcp_connect_outcome_passes_a_listening_unix_backend() {
+        let path =
+            std::env::temp_dir().join(format!("sozu-health-unix-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let stream =
+            crate::backends::connect_backend("127.0.0.1:1".parse().unwrap(), path.to_str())
+                .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut outcome = tcp_connect_outcome(&stream);
+        while outcome.is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            outcome = tcp_connect_outcome(&stream);
+        }
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(outcome, Some(true), "a listening unix backend must pass");
     }
 
     #[test]

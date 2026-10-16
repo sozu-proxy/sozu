@@ -43,6 +43,23 @@
 <!-- changelog-slot:header-routing -->
 
 <!-- changelog-slot:unix-backends -->
+- Backends reachable over UNIX domain sockets
+  ([#152](https://github.com/sozu-proxy/sozu/issues/152)). A backend's new
+  `unix_path` (configuration file, `AddBackend.unix_path` in the protocol,
+  `sozu backend add --unix-path`) takes an absolute path or a Linux
+  abstract-namespace `@name`; HTTP, HTTPS and TCP clusters dial it instead of
+  `address`, which stays the backend's identity and must be unique in its
+  cluster. Health checks probe the same socket. UDP is not supported: the
+  configuration file and the main process's state both refuse it there.
+  A UNIX backend travels on a new `AddUnixBackend` request
+  (`RequestType::add_backend` picks the verb, and the main process rewrites
+  every fan-out to it): a main process or worker that predates it cannot decode
+  that request, so it never registers the backend or dials `address` over TCP.
+  A client that sends `unix_path` on the historical `AddBackend` instead is
+  outside this guarantee: an older decoder drops the field. Protobuf: `AddBackend` field 7
+  (`unix_path`) and `Request` field 72 (`AddUnixBackend`). Covered by
+  `command/tests/unix_backend_verb.rs` and the `test_*unix*` e2e tests
+  (`e2e/src/tests/unix_backend_tests.rs`).
 
 <!-- changelog-slot:backend-dns -->
 

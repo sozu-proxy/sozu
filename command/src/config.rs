@@ -299,6 +299,63 @@ pub fn validate_max_connection_attempts(attempts: u32) -> Result<(), &'static st
     }
 }
 
+/// Parse a backend's `unix_path` into the socket address sozu dials: an
+/// absolute filesystem path, or `@name` for a Linux abstract-namespace
+/// socket. Called at config load, on every `AddBackend` the main process
+/// accepts and on every `AddBackend` a worker applies, so all three refuse
+/// the same values.
+pub fn parse_backend_unix_path(
+    unix_path: &str,
+) -> Result<std::os::unix::net::SocketAddr, &'static str> {
+    const TOO_LONG: &str = "unix_path does not fit a sockaddr_un (107 bytes at most)";
+    if unix_path.as_bytes().contains(&0) {
+        return Err("unix_path must not contain a NUL byte");
+    }
+    let address = if let Some(name) = unix_path.strip_prefix('@') {
+        if name.is_empty() {
+            return Err("an abstract unix_path needs a name after '@'");
+        }
+        parse_abstract_unix_name(name.as_bytes())
+            .map_err(|unsupported| unsupported.unwrap_or(TOO_LONG))?
+    } else if unix_path.starts_with('/') {
+        std::os::unix::net::SocketAddr::from_pathname(unix_path).map_err(|_| TOO_LONG)?
+    } else {
+        return Err("unix_path must be an absolute path or an @abstract name");
+    };
+    // POST: a pathname parses to a pathname address and `@name` to an
+    // abstract one, never the unnamed address that dials nothing.
+    debug_assert!(
+        !address.is_unnamed(),
+        "a parsed unix_path never yields an unnamed address"
+    );
+    debug_assert_eq!(
+        address.as_pathname().is_some(),
+        !unix_path.starts_with('@'),
+        "only a path without '@' parses to a pathname address"
+    );
+    Ok(address)
+}
+
+/// `Err(None)` when `name` is too long, `Err(Some(reason))` when the platform
+/// has no abstract namespace.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn parse_abstract_unix_name(
+    name: &[u8],
+) -> Result<std::os::unix::net::SocketAddr, Option<&'static str>> {
+    #[cfg(target_os = "android")]
+    use std::os::android::net::SocketAddrExt;
+    #[cfg(target_os = "linux")]
+    use std::os::linux::net::SocketAddrExt;
+    std::os::unix::net::SocketAddr::from_abstract_name(name).map_err(|_| None)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn parse_abstract_unix_name(
+    _name: &[u8],
+) -> Result<std::os::unix::net::SocketAddr, Option<&'static str>> {
+    Err(Some("an @abstract unix_path needs Linux"))
+}
+
 /// Default IPv4 prefix length (bits) used to derive the subnet key. 32
 /// masks nothing, so enabling only `max_connections_per_subnet` yields a
 /// per-address counter rather than a surprising aggregation. `/24` is the
@@ -410,6 +467,15 @@ pub enum ConfigError {
     InvalidMaxConnectionAttempts {
         cluster_id: Option<String>,
         value: u32,
+        reason: &'static str,
+    },
+    /// A backend's `unix_path` breaks [`parse_backend_unix_path`], shares its
+    /// identity `address` with another backend of the cluster, or sits in a
+    /// UDP cluster.
+    #[error("cluster {cluster_id}, backend {address}: {reason}")]
+    InvalidBackendUnixPath {
+        cluster_id: String,
+        address: SocketAddr,
         reason: &'static str,
     },
     /// A cluster's `health_check` block has an unparsable `accepted_statuses`
@@ -3323,6 +3389,40 @@ pub struct BackendConfig {
     pub sticky_id: Option<String>,
     pub backup: Option<bool>,
     pub backend_id: Option<String>,
+    /// Dial this UNIX domain socket (absolute path, or `@name` for the Linux
+    /// abstract namespace) instead of `address`, which then only identifies
+    /// the backend within its cluster and must be unique there.
+    pub unix_path: Option<String>,
+}
+
+/// Check the `unix_path` of a cluster's backends: each parses, and each unix
+/// backend's identity `address` is used by no other backend of the cluster,
+/// since sozu tells backends apart by address.
+fn validate_backend_unix_paths(
+    cluster_id: &str,
+    backends: &[BackendConfig],
+) -> Result<(), ConfigError> {
+    for (index, backend) in backends.iter().enumerate() {
+        let Some(unix_path) = backend.unix_path.as_deref() else {
+            continue;
+        };
+        let invalid = |reason| ConfigError::InvalidBackendUnixPath {
+            cluster_id: cluster_id.to_owned(),
+            address: backend.address,
+            reason,
+        };
+        parse_backend_unix_path(unix_path).map_err(invalid)?;
+        if backends
+            .iter()
+            .enumerate()
+            .any(|(other, b)| other != index && b.address == backend.address)
+        {
+            return Err(invalid(
+                "a unix backend's address is its identity and must be unique in the cluster",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Turns a `host:port` string into socket addresses.
@@ -3346,6 +3446,9 @@ pub struct FileBackendConfig {
     pub sticky_id: Option<String>,
     pub backup: Option<bool>,
     pub backend_id: Option<String>,
+    /// Carried unchanged onto every backend this entry resolves to; see
+    /// [`BackendConfig::unix_path`].
+    pub unix_path: Option<String>,
 }
 
 /// Whether `host` is spelled like a legacy `inet_aton` address: every
@@ -3406,6 +3509,7 @@ impl FileBackendConfig {
                         .to_owned()
                         .unwrap_or_else(|| format!("{cluster_id}-{index}-{address}")),
                 ),
+                unix_path: self.unix_path.clone(),
             }]);
         }
 
@@ -3462,6 +3566,7 @@ impl FileBackendConfig {
                     Some(backend_id) => format!("{backend_id}-{address}"),
                     None => format!("{cluster_id}-{}-{address}", self.address),
                 }),
+                unix_path: self.unix_path.clone(),
             })
             .collect();
 
@@ -3552,6 +3657,7 @@ impl FileClusterConfig {
                 cluster_id: cluster_id.to_owned(),
                 reason,
             })?;
+        validate_backend_unix_paths(cluster_id, &backends)?;
         match self.protocol {
             FileClusterProtocolConfig::Tcp => {
                 // A TCP cluster has no request to read a header or a cookie
@@ -4000,7 +4106,7 @@ impl HttpClusterConfig {
             });
 
             v.push(
-                RequestType::AddBackend(AddBackend {
+                RequestType::add_backend(AddBackend {
                     cluster_id: self.cluster_id.clone(),
                     backend_id: backend.backend_id.clone().unwrap_or_else(|| {
                         format!("{}-{}-{}", self.cluster_id, backend_count, backend.address)
@@ -4009,6 +4115,7 @@ impl HttpClusterConfig {
                     load_balancing_parameters,
                     sticky_id: backend.sticky_id.clone(),
                     backup: backend.backup,
+                    unix_path: backend.unix_path.clone(),
                 })
                 .into(),
             );
@@ -4027,7 +4134,10 @@ impl HttpClusterConfig {
         );
         debug_assert_eq!(
             v.iter()
-                .filter(|r| matches!(r.request_type, Some(RequestType::AddBackend(_))))
+                .filter(|r| matches!(
+                    r.request_type,
+                    Some(RequestType::AddBackend(_)) | Some(RequestType::AddUnixBackend(_))
+                ))
                 .count(),
             self.backends.len(),
             "one AddBackend order per configured backend"
@@ -4184,7 +4294,7 @@ impl TcpClusterConfig {
             });
 
             v.push(
-                RequestType::AddBackend(AddBackend {
+                RequestType::add_backend(AddBackend {
                     cluster_id: self.cluster_id.clone(),
                     backend_id: backend.backend_id.clone().unwrap_or_else(|| {
                         format!("{}-{}-{}", self.cluster_id, backend_count, backend.address)
@@ -4193,6 +4303,7 @@ impl TcpClusterConfig {
                     load_balancing_parameters,
                     sticky_id: backend.sticky_id.clone(),
                     backup: backend.backup,
+                    unix_path: backend.unix_path.clone(),
                 })
                 .into(),
             );
@@ -4220,7 +4331,10 @@ impl TcpClusterConfig {
         );
         debug_assert_eq!(
             v.iter()
-                .filter(|r| matches!(r.request_type, Some(RequestType::AddBackend(_))))
+                .filter(|r| matches!(
+                    r.request_type,
+                    Some(RequestType::AddBackend(_)) | Some(RequestType::AddUnixBackend(_))
+                ))
                 .count(),
             self.backends.len(),
             "one AddBackend order per configured backend"
@@ -4758,6 +4872,17 @@ impl ConfigBuilder {
                                 // `[clusters.<id>.udp]`). Mark the frontend so
                                 // `generate_requests` emits `AddUdpFrontend`.
                                 frontend.udp = true;
+                                // Datagrams are relayed over UDP sockets: a
+                                // UNIX stream backend cannot carry them.
+                                if let Some(backend) =
+                                    tcp.backends.iter().find(|b| b.unix_path.is_some())
+                                {
+                                    return Err(ConfigError::InvalidBackendUnixPath {
+                                        cluster_id: tcp.cluster_id.to_owned(),
+                                        address: backend.address,
+                                        reason: "a UDP cluster cannot use unix_path backends",
+                                    });
+                                }
                             }
                             Some(ListenerProtocol::Tcp) => {}
                             None => {
@@ -6348,6 +6473,7 @@ mod tests {
                     sticky_id: None,
                     backup: None,
                     backend_id: Some("cluster-0-127.0.0.1:8080".to_owned()),
+                    unix_path: None,
                 },
                 BackendConfig {
                     address: "[::1]:8081".parse().unwrap(),
@@ -6355,6 +6481,7 @@ mod tests {
                     sticky_id: None,
                     backup: None,
                     backend_id: Some("six".to_owned()),
+                    unix_path: None,
                 },
             ]
         );
@@ -6436,6 +6563,7 @@ mod tests {
                 sticky_id: None,
                 backup: None,
                 backend_id: None,
+                unix_path: None,
             };
             let error = entry
                 .resolve("cluster", 0, &shorthand)
@@ -6469,6 +6597,7 @@ mod tests {
                 sticky_id: None,
                 backup: None,
                 backend_id: None,
+                unix_path: None,
             };
             let error = entry
                 .resolve("cluster", 0, &unreachable)
@@ -6492,6 +6621,7 @@ mod tests {
             sticky_id: Some("sticky".to_owned()),
             backup: Some(true),
             backend_id: None,
+            unix_path: None,
         };
         let backends = entry
             .resolve("cluster", 2, &unreachable)
@@ -6527,6 +6657,7 @@ mod tests {
                 sticky_id: None,
                 backup: None,
                 backend_id: None,
+                unix_path: None,
             };
             let backends = entry
                 .resolve("cluster", 0, &resolver)
@@ -6592,6 +6723,36 @@ mod tests {
         }
     }
 
+    /// #152 + #347: every address a name expands to, and a socket-address
+    /// literal, keeps the entry's `unix_path`.
+    #[test]
+    fn every_expanded_backend_keeps_its_unix_path() {
+        let entry = |address: &str| FileBackendConfig {
+            address: address.to_owned(),
+            weight: None,
+            sticky_id: None,
+            backup: None,
+            backend_id: None,
+            unix_path: Some("/run/app.sock".to_owned()),
+        };
+        let v4: SocketAddr = "10.0.0.2:8080".parse().unwrap();
+        let v6: SocketAddr = "[fd00::1]:8080".parse().unwrap();
+        let expanded = entry("ingress:8080")
+            .expand("cluster", vec![v4, v6])
+            .expect("two addresses expand");
+        assert_eq!(expanded.len(), 2);
+        assert!(
+            expanded
+                .iter()
+                .all(|backend| backend.unix_path.as_deref() == Some("/run/app.sock"))
+        );
+
+        let literal = entry("127.0.0.1:8080")
+            .resolve("cluster", 0, &system_resolver)
+            .expect("a literal resolves");
+        assert_eq!(literal[0].unix_path.as_deref(), Some("/run/app.sock"));
+    }
+
     /// #347: a name resolving to several addresses yields one backend per
     /// distinct address, sorted, each with a distinct id and, when one is
     /// configured, a distinct sticky id.
@@ -6603,6 +6764,7 @@ mod tests {
             sticky_id: Some("pinned".to_owned()),
             backup: Some(true),
             backend_id: Some("ingress".to_owned()),
+            unix_path: None,
         };
         let v4: SocketAddr = "10.0.0.2:8080".parse().unwrap();
         let v6: SocketAddr = "[fd00::1]:8080".parse().unwrap();
@@ -6618,6 +6780,7 @@ mod tests {
                     sticky_id: Some(format!("pinned-{v4}")),
                     backup: Some(true),
                     backend_id: Some(format!("ingress-{v4}")),
+                    unix_path: None,
                 },
                 BackendConfig {
                     address: v6,
@@ -6625,6 +6788,7 @@ mod tests {
                     sticky_id: Some(format!("pinned-{v6}")),
                     backup: Some(true),
                     backend_id: Some(format!("ingress-{v6}")),
+                    unix_path: None,
                 },
             ]
         );
@@ -6666,6 +6830,94 @@ mod tests {
         };
         assert_eq!(cluster.affinity_header.as_deref(), Some("X-Tenant"));
         assert_eq!(cluster.affinity_cookie, None);
+    }
+
+    /// #152: a backend's `unix_path` travels from the TOML file to the
+    /// `AddUnixBackend` order, next to the identity `address`; a backend
+    /// without one keeps `AddBackend`.
+    #[test]
+    fn a_unix_path_backend_reaches_the_add_unix_backend_order() {
+        let file: FileClusterConfig = toml::from_str(
+            r#"
+            protocol = "http"
+            frontends = []
+            backends = [
+                { address = "127.0.0.1:1", unix_path = "/run/app.sock" },
+                { address = "127.0.0.1:2" },
+            ]
+            "#,
+        )
+        .expect("the cluster must parse");
+        let ClusterConfig::Http(http) = file
+            .to_cluster_config("app", &HashSet::new())
+            .expect("the cluster must build")
+        else {
+            panic!("an http cluster must build as one");
+        };
+        let unix_paths: Vec<_> = http
+            .generate_requests()
+            .expect("the orders must build")
+            .into_iter()
+            .filter_map(|order| match order.request_type {
+                Some(RequestType::AddUnixBackend(backend)) => {
+                    Some(("AddUnixBackend", backend.unix_path))
+                }
+                Some(RequestType::AddBackend(backend)) => Some(("AddBackend", backend.unix_path)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            unix_paths,
+            vec![
+                ("AddUnixBackend", Some("/run/app.sock".to_owned())),
+                ("AddBackend", None)
+            ]
+        );
+    }
+
+    /// #152: sozu tells backends apart by address, so a unix backend's
+    /// identity address may not be shared with another backend.
+    #[test]
+    fn a_unix_path_backend_needs_a_unique_address() {
+        for protocol in ["http", "tcp"] {
+            let file: FileClusterConfig = toml::from_str(&format!(
+                "protocol = \"{protocol}\"\nfrontends = []\nbackends = [\n\
+                 {{ address = \"127.0.0.1:1\", unix_path = \"/run/a.sock\" }},\n\
+                 {{ address = \"127.0.0.1:1\", unix_path = \"/run/b.sock\" }},\n]\n"
+            ))
+            .expect("the cluster must parse");
+            assert!(
+                matches!(
+                    file.to_cluster_config("app", &HashSet::new()),
+                    Err(ConfigError::InvalidBackendUnixPath { .. })
+                ),
+                "a {protocol} cluster must refuse a shared unix backend address"
+            );
+        }
+    }
+
+    /// #152: what `parse_backend_unix_path` accepts and refuses.
+    #[test]
+    fn parse_backend_unix_path_accepts_absolute_and_abstract_names_only() {
+        let path = parse_backend_unix_path("/run/app.sock").expect("an absolute path parses");
+        assert_eq!(
+            path.as_pathname(),
+            Some(std::path::Path::new("/run/app.sock"))
+        );
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::linux::net::SocketAddrExt;
+            let named = parse_backend_unix_path("@app").expect("an abstract name parses");
+            assert_eq!(named.as_abstract_name(), Some(&b"app"[..]));
+            assert_eq!(named.as_pathname(), None);
+        }
+        let too_long = format!("/{}", "a".repeat(200));
+        for refused in ["", "run/app.sock", "@", "/run/a\0b", too_long.as_str()] {
+            assert!(
+                parse_backend_unix_path(refused).is_err(),
+                "{refused:?} must be refused"
+            );
+        }
     }
 
     /// #1253: `header_predicates` travel from the TOML file to the

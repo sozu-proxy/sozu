@@ -62,6 +62,7 @@ fn main() -> anyhow::Result<()> {
         address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
         load_balancing_parameters: Some(LoadBalancingParams::default()),
         backup: None,
+        unix_path: None,
     };
 
     // a backend belongs to its cluster: the worker refuses one of an unknown cluster
@@ -152,6 +153,7 @@ fn main() -> anyhow::Result<()> {
         address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
         load_balancing_parameters: Some(LoadBalancingParams::default()),
         backup: None,
+        unix_path: None,
     };
 
     command2.write_message(&WorkerRequest {
@@ -209,6 +211,7 @@ fn main() -> anyhow::Result<()> {
         address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
         load_balancing_parameters: Some(LoadBalancingParams::default()),
         backup: None,
+        unix_path: None,
     };
 
     command2.write_message(&WorkerRequest {

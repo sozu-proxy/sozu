@@ -1638,6 +1638,21 @@ mod connect_outcome_tests {
         );
     }
 
+    /// A `unix_path` backend's socket carries an AF_UNIX peer, which std's
+    /// `peer_addr` refuses: the outcome must still read Connected.
+    #[test]
+    fn an_accepted_unix_dial_is_connected() {
+        let path =
+            std::env::temp_dir().join(format!("sozu-connect-outcome-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let unused: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let socket = crate::backends::connect_backend(unused, path.to_str()).unwrap();
+        let outcome = settle(&socket, Duration::from_secs(2));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(outcome, ConnectOutcome::Connected);
+    }
+
     #[test]
     fn a_refused_dial_failed() {
         let address: SocketAddr = {
@@ -1714,7 +1729,9 @@ fn connect_outcome(socket: &TcpStream) -> ConnectOutcome {
             return ConnectOutcome::Failed;
         }
     }
-    match socket.peer_addr() {
+    // `socket2` rather than std's `peer_addr`, which refuses the AF_UNIX
+    // address of a `unix_path` backend (`backends::connect_backend`).
+    match socket2::SockRef::from(socket).peer_addr() {
         Ok(_) => ConnectOutcome::Connected,
         Err(error) if error.kind() == ErrorKind::NotConnected => ConnectOutcome::Pending,
         Err(_) => ConnectOutcome::Failed,
@@ -2789,7 +2806,17 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         // records the failure through the ledger, which the drain before the
         // next selection applies — the backend is then exactly where a failed
         // `Backend::try_connect` used to leave it.
-        let socket = match mio::net::TcpStream::connect(backend.address) {
+        // A backend with a `unix_path` is dialed over that UNIX socket, and
+        // TCP_NODELAY means nothing there. An id without a registry handle
+        // (an embedder's own selector) names a TCP backend.
+        let (dialed, nodelay) = match backend_registry.handle(&backend) {
+            Some(handle) => {
+                let handle = handle.borrow();
+                (handle.connect_socket(), handle.unix_path.is_none())
+            }
+            None => (mio::net::TcpStream::connect(backend.address), true),
+        };
+        let socket = match dialed {
             Ok(socket) => socket,
             Err(io_error) => {
                 context.backend_deltas.push(BackendDelta {
@@ -2826,7 +2853,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         // and backoff would steer traffic away from a healthy backend.
         let slot = backend.slot();
         let attached = Self::attach_dialed(
-            router, stream_id, context, session, proxy, cluster_id, h2, backend, socket,
+            router, stream_id, context, session, proxy, cluster_id, h2, backend, socket, nodelay,
         );
         if attached.is_err() {
             context.backend_deltas.push(BackendDelta {
@@ -2870,8 +2897,9 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         h2: bool,
         backend: BackendId,
         socket: mio::net::TcpStream,
+        nodelay: bool,
     ) -> Result<(), BackendConnectionError> {
-        if let Err(e) = socket.set_nodelay(true) {
+        if nodelay && let Err(e) = socket.set_nodelay(true) {
             error!(
                 "{} error setting nodelay on back socket({:?}): {:?}",
                 log_module_context!(context.http_context(stream_id)),

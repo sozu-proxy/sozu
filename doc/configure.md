@@ -1247,6 +1247,14 @@ socket-address literal is never resolved and keeps its configured
 `<index>` is its position in the cluster's `backends` list as written in the
 file, so a name's answer size never moves it.
 
+When the entry sets `unix_path`, every resolved address carries it too (see
+[UNIX domain socket backends](#unix-domain-socket-backends)). A name that
+resolves to N addresses therefore makes N backends, each with its own identity
+and its own load-balancing share, that all dial the same UNIX socket.
+Uniqueness of a unix backend's address is checked after resolution: a resolved
+address that collides with another backend of the cluster refuses the whole
+file, and a `sozu reload --file <path>` of it is rejected.
+
 A name that does not resolve, or an address with no port, refuses the whole
 file with an error naming the cluster and the entry, for example
 `cluster MyCluster: cannot resolve backend address "ingress.internal:1026": …`.
@@ -1337,6 +1345,66 @@ pass over the candidates plus, for each shared address of `g` ids, at most `g²`
 steps over that address's own ids (about `g²/2` in practice) — never a cost
 growing with the square of the cluster — and allocates nothing. Relinking on
 a change costs the same: linear in the cluster plus `g²` per shared address.
+
+#### UNIX domain socket backends
+
+An HTTP, HTTPS or TCP backend can be reached over a UNIX domain stream socket
+instead of TCP ([#152](https://github.com/sozu-proxy/sozu/issues/152)): set
+`unix_path` to an absolute filesystem path, or to `@name` for a socket in the
+Linux abstract namespace (no file on disk; refused on other platforms).
+
+```toml
+backends = [
+  { address = "127.0.0.1:10001", unix_path = "/run/app/http.sock" },
+  { address = "127.0.0.1:10002", unix_path = "@app-http" },
+]
+```
+
+`address` stays mandatory: sozu keeps identifying a backend by it (removal,
+retry exclusion, `HRW`/`MAGLEV`/shard placement, the "one address is one
+share" rule above, events and the `Host` of an HTTP health probe), but never
+dials it when `unix_path` is set. Give each unix backend an address used by
+no other backend of the cluster; the configuration loader refuses a shared one.
+In a file, that identity may also be a `host:port` name: `unix_path` is then
+carried by every address the name resolves to, as described with the DNS
+resolution semantics above, and the uniqueness check runs on the resolved
+addresses.
+At runtime the same field is `AddBackend.unix_path`, carried by its own
+request, `AddUnixBackend` (`Request` field 72), and
+`sozu backend add --unix-path <path>` sets it. `RequestType::add_backend`
+picks the verb: a backend with a `unix_path` is `AddUnixBackend`, any other
+stays `AddBackend`, and the main process rewrites every request it fans out to
+the workers to that verb, so an `AddBackend` that carries a `unix_path` never
+reaches a worker. A process that predates UNIX backends cannot decode field
+72: it reads the request as empty, so it never registers the backend and never
+dials `address` over TCP. An old main process logs `empty request sent by
+client` and sends the client no answer. An old worker logs `Could not execute
+order on config state` and routes the request to no proxy, so it sends no
+response either. This guarantee covers the request the CLI and
+`RequestType::add_backend` build; a third-party client that puts `unix_path` on the historical
+`AddBackend` is outside it, since an older decoder drops that field. Between
+`sozu upgrade` and the replacement of the last old worker, a UNIX backend is
+therefore served only by the upgraded workers.
+Backends without `unix_path` keep `AddBackend` and work across versions as
+before. **Rolling back** to a version that predates UNIX backends: such a
+version stops reading a saved state file at the first `AddUnixBackend` record,
+and every record after it is lost, so remove the UNIX backends (and their
+configuration keys, which an older version refuses), then save the state
+again. The main process and every worker refuse a `unix_path` that is not
+absolute, does not fit a `sockaddr_un` (107 bytes) or holds a NUL byte. UDP is
+not supported: datagrams are relayed over UDP sockets only. The configuration
+file and the main process's state both refuse a `unix_path` backend on a UDP
+cluster (a cluster with a UDP frontend or UDP settings), whichever order the
+backend and the cluster's UDP frontend arrive in.
+
+The socket is dialed nonblocking like a TCP backend, so a missing socket file
+or a full accept queue counts as a failed connection (below), and health
+checks probe it over the same socket. Every HTTP, HTTPS and TCP backend
+connection goes through that one dial, so HTTP/2 backends, WebSocket upgrades
+and `send_proxy` take the same path; the end-to-end tests cover HTTP/1.1 and
+TCP passthrough. Logs render the backend's `address`, and a failed dial's
+error names the socket path; `TCP_NODELAY` is not set and the RTT gauges stay
+empty for these connections, since a UNIX socket has neither.
 
 #### Backend connection failover
 

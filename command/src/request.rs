@@ -13,10 +13,10 @@ use rusty_ulid::Ulid;
 use crate::{
     proto::{
         command::{
-            ClientAuthMode, ClientAuthPolicy, HttpsListenerConfig, InitialState, IpAddress,
-            LoadBalancingAlgorithms, PathRuleKind, RedirectPolicy, Request, RequestHttpFrontend,
-            RulePosition, SocketAddress, Uint128, UpdateHttpsListenerConfig, WorkerRequest,
-            ip_address, request::RequestType,
+            AddBackend, ClientAuthMode, ClientAuthPolicy, HttpsListenerConfig, InitialState,
+            IpAddress, LoadBalancingAlgorithms, PathRuleKind, RedirectPolicy, Request,
+            RequestHttpFrontend, RulePosition, SocketAddress, Uint128, UpdateHttpsListenerConfig,
+            WorkerRequest, ip_address, request::RequestType,
         },
         display::format_request_type,
     },
@@ -77,6 +77,7 @@ impl Request {
 
             RequestType::AddCluster(_)
             | RequestType::AddBackend(_)
+            | RequestType::AddUnixBackend(_)
             | RequestType::RemoveCluster(_)
             | RequestType::RemoveBackend(_)
             | RequestType::SetHealthCheck(_)
@@ -154,6 +155,7 @@ impl Request {
                     Some(
                         RequestType::AddCluster(_)
                             | RequestType::AddBackend(_)
+                            | RequestType::AddUnixBackend(_)
                             | RequestType::RemoveCluster(_)
                             | RequestType::RemoveBackend(_)
                             | RequestType::SetHealthCheck(_)
@@ -260,18 +262,40 @@ impl RequestType {
         }
     }
 
-    /// The same request, with an HTTPS listener addition or patch moved to
-    /// the verb [`RequestType::add_https_listener`] or
-    /// [`RequestType::update_https_listener`] picks for it, and an HTTP(S)
-    /// frontend addition moved to the verb [`RequestType::add_http_frontend`]
-    /// or [`RequestType::add_https_frontend`] picks for it. Every other
+    /// The request that adds this backend, on the verb its endpoint calls for.
+    ///
+    /// A backend with a `unix_path` goes out as `AddUnixBackend`, which a
+    /// worker or main process that predates UNIX backends cannot decode: it
+    /// sees no known request, so it never registers the backend under its
+    /// identity `address` nor dials that over TCP, and it sends no response.
+    /// Any other backend keeps `AddBackend`, which every version understands.
+    pub fn add_backend(backend: AddBackend) -> Self {
+        if backend.unix_path.is_some() {
+            RequestType::AddUnixBackend(backend)
+        } else {
+            RequestType::AddBackend(backend)
+        }
+    }
+
+    /// The same request, with a backend addition, an HTTPS listener addition
+    /// or patch, or an HTTP(S) frontend addition or removal moved to the verb
+    /// [`RequestType::add_backend`], [`RequestType::add_https_listener`],
+    /// [`RequestType::update_https_listener`],
+    /// [`RequestType::add_http_frontend`],
+    /// [`RequestType::remove_http_frontend`],
+    /// [`RequestType::add_https_frontend`] or
+    /// [`RequestType::remove_https_frontend`] picks for it. Every other
     /// request is returned unchanged.
     ///
     /// The main process applies this to every request it fans out to the
-    /// workers, so a client that sends client authentication on a historical
-    /// verb cannot get it silently dropped by a worker that predates it.
+    /// workers, so a client that sends client authentication or a `unix_path`
+    /// on a historical verb cannot get it silently dropped by a worker that
+    /// predates it.
     pub fn into_canonical(self) -> Self {
         match self {
+            RequestType::AddBackend(backend) | RequestType::AddUnixBackend(backend) => {
+                RequestType::add_backend(backend)
+            }
             RequestType::AddHttpsListener(listener)
             | RequestType::AddHttpsListenerWithClientAuth(listener) => {
                 RequestType::add_https_listener(listener)
@@ -757,8 +781,8 @@ mod tests {
         }
     }
 
-    /// The silent-close verbs sit on tags 70 and 71. Tags 66-69 are reserved
-    /// for the header-predicate verbs and 72 for a UDS `AddBackend`, and a
+    /// The silent-close verbs sit on tags 70 and 71. Tags 66-69 belong to
+    /// the header-predicate verbs and 72 to `AddUnixBackend`, and a
     /// worker that predates these tags sees an unknown `oneof` member, so the
     /// request carries no route there instead of a forwarding one.
     #[test]
