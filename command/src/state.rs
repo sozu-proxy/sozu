@@ -4004,7 +4004,11 @@ impl ConfigState {
                     && replayed.https_fronts == other.https_fronts
                     && nonempty_tcp(&replayed.tcp_fronts) == nonempty_tcp(&other.tcp_fronts)
                     && replayed.certificates == other.certificates
-                    && replayed.certificate_metadata == other.normalized_certificate_metadata()
+                    // A legacy `self` has no sidecar and replaying leaves the
+                    // retained certificates' metadata empty: compare both sides
+                    // after the same legacy normalization.
+                    && replayed.normalized_certificate_metadata()
+                        == other.normalized_certificate_metadata()
                     && replayed.http_listeners == other.http_listeners
                     && replayed.https_listeners == other.https_listeners
                     && replayed.tcp_listeners == other.tcp_listeners
@@ -5492,6 +5496,231 @@ mod tests {
             serde_json::to_value(&first_replay).expect("serialize first replay"),
             "the derived next-order cache must not affect serialized state"
         );
+    }
+
+    /// A 2.3.1 state: HTTPS listener, two clusters with frontends and backends,
+    /// two certificates with explicit expirations, and no serialized
+    /// `certificate_metadata` sidecar.
+    fn legacy_state_with_certificates() -> (ConfigState, SocketAddress) {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let (certificate_a, certificate_b) = distinct_test_certificates();
+        let mut current = ConfigState::new();
+        current
+            .dispatch(&RequestType::AddHttpsListener(make_https_listener(address)).into())
+            .expect("https listener");
+        for cluster_id in ["cluster_1", "cluster_2"] {
+            current
+                .dispatch(
+                    &RequestType::AddCluster(Cluster {
+                        cluster_id: cluster_id.to_owned(),
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect("cluster");
+            current
+                .dispatch(
+                    &RequestType::AddBackend(AddBackend {
+                        cluster_id: cluster_id.to_owned(),
+                        backend_id: format!("{cluster_id}-0"),
+                        address: SocketAddress::new_v4(127, 0, 0, 1, 9000),
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect("backend");
+            current
+                .dispatch(
+                    &RequestType::AddHttpsFrontend(RequestHttpFrontend {
+                        cluster_id: Some(cluster_id.to_owned()),
+                        hostname: format!("{cluster_id}.example.test"),
+                        path: PathRule::prefix(String::from("/")),
+                        address,
+                        position: RulePosition::Tree.into(),
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect("frontend");
+        }
+        for (certificate, expired_at) in [
+            (certificate_a, Some(2_100_000_000)),
+            (certificate_b, Some(2_200_000_000)),
+        ] {
+            current
+                .add_certificate(&AddCertificate {
+                    address,
+                    certificate,
+                    expired_at,
+                })
+                .expect("certificate");
+        }
+        let mut json = serde_json::to_value(&current).expect("serialize current state");
+        json.as_object_mut()
+            .expect("ConfigState JSON object")
+            .remove("certificate_metadata")
+            .expect("current state writes certificate metadata");
+        let legacy: ConfigState = serde_json::from_value(json).expect("legacy state");
+        assert!(legacy.certificate_metadata.is_empty());
+        (legacy, address)
+    }
+
+    fn replay_diff(from: &ConfigState, requests: &[Request]) -> ConfigState {
+        let mut replayed = from.clone();
+        for request in requests {
+            replayed.dispatch(request).expect("diff request replays");
+        }
+        replayed
+    }
+
+    #[test]
+    fn diff_of_legacy_state_without_metadata_tolerates_a_listener_change() {
+        let (legacy, address) = legacy_state_with_certificates();
+        let mut desired = legacy.clone();
+        desired
+            .https_listeners
+            .get_mut(&ListenerKey::from(address))
+            .expect("listener")
+            .front_timeout = 61;
+
+        let requests = legacy.diff(&desired);
+
+        assert!(!requests.is_empty(), "a listener change emits requests");
+        assert!(
+            requests.iter().all(|request| !matches!(
+                request.request_type,
+                Some(
+                    RequestType::AddCertificate(_)
+                        | RequestType::RemoveCertificate(_)
+                        | RequestType::ReplaceCertificate(_)
+                )
+            )),
+            "retained certificates are not re-sent"
+        );
+        let replayed = replay_diff(&legacy, &requests);
+        assert_eq!(replayed.https_listeners, desired.https_listeners);
+        assert_eq!(replayed.certificates, desired.certificates);
+        assert_eq!(replayed.https_fronts, legacy.https_fronts);
+        assert_eq!(replayed.backends, legacy.backends);
+        assert_eq!(
+            replayed.normalized_certificate_metadata(),
+            desired.normalized_certificate_metadata()
+        );
+    }
+
+    #[test]
+    fn diff_of_legacy_state_without_metadata_tolerates_unrelated_removals() {
+        let (legacy, address) = legacy_state_with_certificates();
+        let mut desired = legacy.clone();
+        desired
+            .dispatch(
+                &RequestType::RemoveBackend(RemoveBackend {
+                    cluster_id: "cluster_2".to_owned(),
+                    backend_id: "cluster_2-0".to_owned(),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 9000),
+                })
+                .into(),
+            )
+            .expect("remove backend");
+        desired
+            .dispatch(
+                &RequestType::RemoveHttpsFrontend(RequestHttpFrontend {
+                    cluster_id: Some("cluster_2".to_owned()),
+                    hostname: "cluster_2.example.test".to_owned(),
+                    path: PathRule::prefix(String::from("/")),
+                    address,
+                    position: RulePosition::Tree.into(),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("remove frontend");
+
+        let requests = legacy.diff(&desired);
+
+        assert_eq!(requests.len(), 2, "exactly the two removals: {requests:?}");
+        let replayed = replay_diff(&legacy, &requests);
+        assert_eq!(replayed.certificates, legacy.certificates);
+        assert_eq!(replayed.https_fronts, desired.https_fronts);
+        assert_eq!(
+            replayed.backends.get("cluster_1"),
+            legacy.backends.get("cluster_1"),
+            "the unaffected cluster keeps its backend"
+        );
+        assert!(
+            replayed
+                .backends
+                .get("cluster_2")
+                .is_none_or(|backends| backends.is_empty())
+        );
+        assert_eq!(
+            replayed.normalized_certificate_metadata(),
+            desired.normalized_certificate_metadata()
+        );
+    }
+
+    /// Normalizing a legacy sidecar must not hide explicit differences: a
+    /// different `expired_at` or insertion order is still a certificate
+    /// operation.
+    #[test]
+    fn diff_still_reports_explicit_metadata_differences() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let (certificate_a, certificate_b) = distinct_test_certificates();
+        let build = |first: (&CertificateAndKey, u64), second: (&CertificateAndKey, u64)| {
+            let mut state = ConfigState::new();
+            for (certificate, expired_at) in [first, second] {
+                state
+                    .add_certificate(&AddCertificate {
+                        address,
+                        certificate: certificate.clone(),
+                        expired_at: Some(expired_at as i64),
+                    })
+                    .expect("certificate");
+            }
+            state
+        };
+        let base = build(
+            (&certificate_a, 2_100_000_000),
+            (&certificate_b, 2_200_000_000),
+        );
+        let other_expiry = build(
+            (&certificate_a, 2_100_000_000),
+            (&certificate_b, 2_300_000_000),
+        );
+        let other_order = build(
+            (&certificate_b, 2_200_000_000),
+            (&certificate_a, 2_100_000_000),
+        );
+
+        assert_ne!(
+            base.normalized_certificate_metadata(),
+            other_expiry.normalized_certificate_metadata(),
+            "expired_at survives normalization"
+        );
+        assert_ne!(
+            base.normalized_certificate_metadata(),
+            other_order.normalized_certificate_metadata(),
+            "insertion order survives normalization"
+        );
+        for other in [&other_expiry, &other_order] {
+            let requests = base.diff(other);
+            assert!(
+                requests.iter().any(|request| matches!(
+                    request.request_type,
+                    Some(
+                        RequestType::AddCertificate(_)
+                            | RequestType::RemoveCertificate(_)
+                            | RequestType::ReplaceCertificate(_)
+                    )
+                )),
+                "an explicit metadata difference yields certificate operations"
+            );
+            let replayed = replay_diff(&base, &requests);
+            assert_eq!(
+                replayed.normalized_certificate_metadata(),
+                other.normalized_certificate_metadata()
+            );
+        }
     }
 
     #[test]
