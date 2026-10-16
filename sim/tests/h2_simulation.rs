@@ -259,7 +259,7 @@ use sozu_lib::{
             Position, StreamState, h2_transmit,
         },
     },
-    router::RouteResult,
+    router::{RequestHeaders, RouteResult},
     socket::SocketResult,
     testing::Token,
 };
@@ -623,6 +623,7 @@ impl L7ListenerHandler for SimListener {
         _host: &str,
         _uri: &str,
         _method: &Method,
+        _headers: &dyn RequestHeaders,
     ) -> Result<RouteResult, FrontendFromRequestError> {
         // Routing lives in `Router::plan_connect`, which only `Mux::ready_inner`
         // drives — never `ConnectionH2::readable`. Nothing in this harness can

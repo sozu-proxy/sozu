@@ -90,12 +90,14 @@ pub fn rollback_request(request: &RequestType) -> Option<Request> {
             proxy: ListenerType::Udp.into(),
         }),
         RequestType::AddHttpFrontend(front)
-        | RequestType::AddHttpFrontendWithSilentClose(front) => {
-            RequestType::RemoveHttpFrontend(front.clone())
+        | RequestType::AddHttpFrontendWithSilentClose(front)
+        | RequestType::AddHttpFrontendWithHeaderPredicates(front) => {
+            RequestType::remove_http_frontend(front.clone())
         }
         RequestType::AddHttpsFrontend(front)
-        | RequestType::AddHttpsFrontendWithSilentClose(front) => {
-            RequestType::RemoveHttpsFrontend(front.clone())
+        | RequestType::AddHttpsFrontendWithSilentClose(front)
+        | RequestType::AddHttpsFrontendWithHeaderPredicates(front) => {
+            RequestType::remove_https_frontend(front.clone())
         }
         RequestType::AddTcpFrontend(front) => RequestType::RemoveTcpFrontend(front.clone()),
         RequestType::AddUdpFrontend(front) => RequestType::RemoveUdpFrontend(front.clone()),
@@ -119,6 +121,20 @@ pub enum StateError {
         .id.len()
     )]
     Exists { kind: ObjectKind, id: String },
+    /// The object belongs to a cluster the state does not hold, never added
+    /// or already removed. A backend belongs to its cluster
+    /// (`ConfigState::add_backend`), so it is refused rather than stored
+    /// without one. Per `doc/observability.md` a cluster identifier is
+    /// protected material in error text: `Display`/`Debug` render only its
+    /// length, and the raw field stays lossless for callers.
+    #[error(
+        "{kind:?} names a cluster that does not exist (cluster_id_bytes={}); add the cluster first",
+        .cluster_id.len()
+    )]
+    ClusterNotFound {
+        kind: ObjectKind,
+        cluster_id: String,
+    },
     #[error("Wrong field value: {0}")]
     WrongFieldValue(UnknownEnumValue),
     #[error("Could not add certificate: error_kind={}", certificate_error_kind(.0))]
@@ -540,14 +556,16 @@ impl ConfigState {
         }
 
         let inverse = match request {
-            RequestType::RemoveHttpFrontend(selector) => self
+            RequestType::RemoveHttpFrontend(selector)
+            | RequestType::RemoveHttpFrontendWithHeaderPredicates(selector) => self
                 .http_fronts
                 .get(&selector.to_string())
                 .filter(|stored| stored.cluster_id.as_deref() == selector.cluster_id.as_deref())
                 .cloned()
                 .map(RequestHttpFrontend::from)
                 .map(RequestType::add_http_frontend),
-            RequestType::RemoveHttpsFrontend(selector) => self
+            RequestType::RemoveHttpsFrontend(selector)
+            | RequestType::RemoveHttpsFrontendWithHeaderPredicates(selector) => self
                 .https_fronts
                 .get(&selector.to_string())
                 .filter(|stored| stored.cluster_id.as_deref() == selector.cluster_id.as_deref())
@@ -640,14 +658,26 @@ impl ConfigState {
             RequestType::ActivateListener(activate) => self.activate_listener(activate),
             RequestType::DeactivateListener(deactivate) => self.deactivate_listener(deactivate),
             RequestType::AddHttpFrontend(front)
-            | RequestType::AddHttpFrontendWithSilentClose(front) => self.add_http_frontend(front),
-            RequestType::RemoveHttpFrontend(front) => self.remove_http_frontend(front),
+            | RequestType::AddHttpFrontendWithSilentClose(front)
+            | RequestType::AddHttpFrontendWithHeaderPredicates(front) => {
+                self.add_http_frontend(front)
+            }
+            RequestType::RemoveHttpFrontend(front)
+            | RequestType::RemoveHttpFrontendWithHeaderPredicates(front) => {
+                self.remove_http_frontend(front)
+            }
             RequestType::AddCertificate(add) => self.add_certificate(add),
             RequestType::RemoveCertificate(remove) => self.remove_certificate(remove),
             RequestType::ReplaceCertificate(replace) => self.replace_certificate(replace),
             RequestType::AddHttpsFrontend(front)
-            | RequestType::AddHttpsFrontendWithSilentClose(front) => self.add_https_frontend(front),
-            RequestType::RemoveHttpsFrontend(front) => self.remove_https_frontend(front),
+            | RequestType::AddHttpsFrontendWithSilentClose(front)
+            | RequestType::AddHttpsFrontendWithHeaderPredicates(front) => {
+                self.add_https_frontend(front)
+            }
+            RequestType::RemoveHttpsFrontend(front)
+            | RequestType::RemoveHttpsFrontendWithHeaderPredicates(front) => {
+                self.remove_https_frontend(front)
+            }
             RequestType::AddTcpFrontend(front) => self.add_tcp_frontend(front),
             RequestType::RemoveTcpFrontend(front) => self.remove_tcp_frontend(front),
             RequestType::AddUdpFrontend(front) => self.add_udp_frontend(front),
@@ -687,6 +717,8 @@ impl ConfigState {
             | RequestType::SetMaxConnectionsPerSubnet(_)
             | RequestType::QueryMaxConnectionsPerSubnet(_)
             | RequestType::SetMaxConnectionAttempts(_)
+            // an action on live sessions: never saved, never replayed
+            | RequestType::CloseSessions(_)
             | RequestType::HardStop(_) => Ok(()),
 
             _other_request => Err(StateError::UndispatchableRequest),
@@ -755,6 +787,12 @@ impl ConfigState {
         // the per-cluster Vec must stay deduplicated on (backend_id, address) —
         // `add_backend` upserts, so duplicates would mean lost state.
         for (cluster_id, backends) in &self.backends {
+            // A backend belongs to its cluster: `add_backend` refuses one of
+            // an unknown cluster and `remove_cluster` removes the bucket.
+            debug_assert!(
+                backends.is_empty() || self.clusters.contains_key(cluster_id),
+                "a backend bucket must belong to an existing cluster"
+            );
             for backend in backends {
                 debug_assert_eq!(
                     &backend.cluster_id, cluster_id,
@@ -1097,13 +1135,13 @@ impl ConfigState {
             self.http_fronts
                 .values()
                 .filter(owned)
-                .map(|front| RequestType::RemoveHttpFrontend(front.clone().into()).into()),
+                .map(|front| RequestType::remove_http_frontend(front.clone().into()).into()),
         );
         requests.extend(
             self.https_fronts
                 .values()
                 .filter(owned)
-                .map(|front| RequestType::RemoveHttpsFrontend(front.clone().into()).into()),
+                .map(|front| RequestType::remove_https_frontend(front.clone().into()).into()),
         );
         requests.extend(
             self.tcp_fronts
@@ -1159,7 +1197,10 @@ impl ConfigState {
         }
         let cluster_id = match &request.request_type {
             Some(
-                RequestType::RemoveHttpFrontend(front) | RequestType::RemoveHttpsFrontend(front),
+                RequestType::RemoveHttpFrontend(front)
+                | RequestType::RemoveHttpFrontendWithHeaderPredicates(front)
+                | RequestType::RemoveHttpsFrontend(front)
+                | RequestType::RemoveHttpsFrontendWithHeaderPredicates(front),
             ) => front.cluster_id.as_deref(),
             Some(RequestType::RemoveTcpFrontend(front)) => Some(front.cluster_id.as_str()),
             Some(RequestType::RemoveUdpFrontend(front)) => Some(front.cluster_id.as_str()),
@@ -1176,13 +1217,19 @@ impl ConfigState {
     /// address, which one: that object is not removed.
     pub fn removed_with_its_cluster_message(&self, request: &Request) -> String {
         let (cluster_id, owner) = match &request.request_type {
-            Some(RequestType::RemoveHttpFrontend(front)) => (
+            Some(
+                RequestType::RemoveHttpFrontend(front)
+                | RequestType::RemoveHttpFrontendWithHeaderPredicates(front),
+            ) => (
                 front.cluster_id.clone(),
                 self.http_fronts
                     .get(&front.to_string())
                     .map(|stored| stored.cluster_id.as_deref().map(str::to_owned)),
             ),
-            Some(RequestType::RemoveHttpsFrontend(front)) => (
+            Some(
+                RequestType::RemoveHttpsFrontend(front)
+                | RequestType::RemoveHttpsFrontendWithHeaderPredicates(front),
+            ) => (
                 front.cluster_id.clone(),
                 self.https_fronts
                     .get(&front.to_string())
@@ -2697,7 +2744,24 @@ impl ConfigState {
         Ok(())
     }
 
+    /// Add or update a backend of an existing cluster. A backend belongs to
+    /// its cluster: one naming a cluster the state does not hold, never added
+    /// or already removed (`Self::remove_cluster` removes its backends), is
+    /// refused with `ClusterNotFound` and the state is left untouched.
+    /// Frontends stay independent of their cluster's presence.
     fn add_backend(&mut self, add_backend: &AddBackend) -> Result<(), StateError> {
+        if !self.clusters.contains_key(add_backend.cluster_id.as_str()) {
+            debug_assert!(
+                self.backends
+                    .get(add_backend.cluster_id.as_str())
+                    .is_none_or(Vec::is_empty),
+                "no backend may outlive its cluster"
+            );
+            return Err(StateError::ClusterNotFound {
+                kind: ObjectKind::Backend,
+                cluster_id: add_backend.cluster_id.to_owned(),
+            });
+        }
         let backend = Backend {
             address: add_backend.address.into(),
             cluster_id: add_backend.cluster_id.as_str().into(),
@@ -3479,7 +3543,7 @@ impl ConfigState {
         let added_http_fronts = their_http_fronts.difference(&my_http_fronts);
 
         for &(_, front) in removed_http_fronts {
-            v.push(RequestType::RemoveHttpFrontend(front.clone().into()).into());
+            v.push(RequestType::remove_http_frontend(front.clone().into()).into());
         }
 
         for &(_, front) in added_http_fronts {
@@ -3498,7 +3562,7 @@ impl ConfigState {
         let added_https_fronts = their_https_fronts.difference(&my_https_fronts);
 
         for &(_, front) in removed_https_fronts {
-            v.push(RequestType::RemoveHttpsFrontend(front.clone().into()).into());
+            v.push(RequestType::remove_https_frontend(front.clone().into()).into());
         }
 
         for &(_, front) in added_https_fronts {
@@ -4511,9 +4575,10 @@ mod tests {
 
     use super::*;
     use crate::proto::command::{
-        ClientAuthMode, CustomHttpAnswers, Header, HeaderPosition, HstsConfig, LoadBalancingParams,
-        PathRuleKind, RedirectPolicy, RedirectScheme, RequestHttpFrontend, RequestTcpFrontend,
-        RequestUdpFrontend, RulePosition, UdpListenerConfig, UpdateUdpListenerConfig,
+        ClientAuthMode, CloseSessions, CustomHttpAnswers, Header, HeaderPosition, HstsConfig,
+        LoadBalancingParams, PathRuleKind, RedirectPolicy, RedirectScheme, RequestHttpFrontend,
+        RequestTcpFrontend, RequestUdpFrontend, RulePosition, UdpListenerConfig,
+        UpdateUdpListenerConfig,
     };
 
     fn capture_test_logs(run: impl FnOnce() + Send + 'static) -> String {
@@ -5532,6 +5597,7 @@ mod tests {
             required_auth: None,
             headers: Vec::new(),
             hsts: None,
+            header_predicates: Vec::new(),
         };
         let mut state = ConfigState::default();
         state
@@ -5594,6 +5660,10 @@ mod tests {
             StateError::Exists {
                 kind: ObjectKind::Cluster,
                 id: long_value(),
+            },
+            StateError::ClusterNotFound {
+                kind: ObjectKind::Backend,
+                cluster_id: long_value(),
             },
             StateError::AddCertificate(CertificateError::ParsePEMCertificate(long_value())),
             StateError::RemoveCertificate(long_value()),
@@ -5719,6 +5789,7 @@ mod tests {
                 preload: Some(false),
                 force_replace_backend: Some(true),
             }),
+            header_predicates: Vec::new(),
         };
         let retained = request
             .clone()
@@ -5830,9 +5901,26 @@ mod tests {
         }
     }
 
+    /// A backend belongs to its cluster (`ConfigState::add_backend`): add
+    /// the clusters a test's backends name before them.
+    fn add_clusters(state: &mut ConfigState, cluster_ids: &[&str]) {
+        for cluster_id in cluster_ids {
+            state
+                .dispatch(
+                    &RequestType::AddCluster(Cluster {
+                        cluster_id: cluster_id.to_string(),
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect("Could not add the test cluster");
+        }
+    }
+
     #[test]
     fn serialize() {
         let mut state: ConfigState = Default::default();
+        add_clusters(&mut state, &["cluster_1", "cluster_2"]);
         state
             .dispatch(
                 &RequestType::AddHttpFrontend(RequestHttpFrontend {
@@ -5928,6 +6016,7 @@ mod tests {
     #[test]
     fn diff() {
         let mut state: ConfigState = Default::default();
+        add_clusters(&mut state, &["cluster_1", "cluster_2"]);
         state
             .dispatch(
                 &RequestType::AddHttpFrontend(RequestHttpFrontend {
@@ -6002,6 +6091,7 @@ mod tests {
             .expect("Could not execute request");
 
         let mut state2: ConfigState = Default::default();
+        add_clusters(&mut state2, &["cluster_1"]);
         state2
             .dispatch(
                 &RequestType::AddHttpFrontend(RequestHttpFrontend {
@@ -6501,6 +6591,122 @@ mod tests {
         assert_same_routing(&replayed, &state, "replaying generate_requests");
     }
 
+    fn add_backend_to(cluster_id: &str, port: u16) -> Request {
+        RequestType::AddBackend(AddBackend {
+            cluster_id: cluster_id.to_owned(),
+            backend_id: format!("{cluster_id}-{port}"),
+            address: SocketAddress::new_v4(127, 0, 0, 1, port),
+            ..Default::default()
+        })
+        .into()
+    }
+
+    /// A backend belongs to its cluster: an `AddBackend` naming a cluster the
+    /// state does not hold, never added or already removed, is refused and
+    /// leaves the state untouched, not even an empty bucket for that cluster.
+    #[test]
+    fn add_backend_for_an_unknown_cluster_is_refused() {
+        let mut state = ConfigState::new();
+
+        let refused = state.dispatch(&add_backend_to("orphan", 1026));
+        assert!(
+            matches!(refused, Err(StateError::ClusterNotFound { .. })),
+            "a backend of a cluster never added must be refused, got {refused:?}"
+        );
+        assert!(
+            state.backends.is_empty(),
+            "a refused AddBackend must not leave a bucket behind: {:?}",
+            state.backends
+        );
+
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("orphan"),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("adding the cluster must succeed");
+        state
+            .dispatch(&add_backend_to("orphan", 1026))
+            .expect("a backend of an existing cluster must be added");
+        assert_eq!(state.count_backends(), 1);
+
+        state
+            .dispatch(&RequestType::RemoveCluster(String::from("orphan")).into())
+            .expect("removing an existing cluster must succeed");
+        assert!(
+            state.backends.is_empty(),
+            "RemoveCluster must remove the cluster's backends"
+        );
+        let refused = state.dispatch(&add_backend_to("orphan", 1027));
+        assert!(
+            matches!(refused, Err(StateError::ClusterNotFound { .. })),
+            "a backend of a removed cluster must be refused, got {refused:?}"
+        );
+        assert!(
+            state.backends.is_empty(),
+            "a backend must never outlive its cluster: {:?}",
+            state.backends
+        );
+    }
+
+    /// The refusal leaves the error text bounded: a cluster id is protected
+    /// material (`doc/observability.md`), so `Display` names only its length.
+    #[test]
+    fn unknown_cluster_error_names_the_object_without_the_cluster_id() {
+        let mut state = ConfigState::new();
+        let error = state
+            .dispatch(&add_backend_to("secret-cluster-id", 1026))
+            .expect_err("a backend of an unknown cluster must be refused");
+        let message = error.to_string();
+        assert!(
+            !message.contains("secret-cluster-id"),
+            "the error must not echo the cluster id: {message}"
+        );
+        assert!(
+            message.contains("Backend") && message.contains("add the cluster first"),
+            "the error must say what to do: {message}"
+        );
+    }
+
+    /// The configuration file emits each cluster's `AddCluster` before its
+    /// backends, so a TOML load still adds every backend.
+    #[test]
+    fn a_configuration_file_adds_each_cluster_before_its_backends() {
+        let config = crate::config::Config::load_from_path("assets/config.toml")
+            .expect("the test configuration must load");
+        let mut state = ConfigState::new();
+        for message in config
+            .generate_config_messages()
+            .expect("the test configuration must generate its orders")
+        {
+            let result = state.dispatch(&message.content);
+            if let Some(RequestType::AddBackend(_) | RequestType::AddCluster(_)) =
+                &message.content.request_type
+            {
+                result.unwrap_or_else(|e| panic!("could not apply {message:?}: {e}"));
+            }
+        }
+        assert_eq!(state.clusters.len(), 3);
+        assert_eq!(state.count_backends(), 5);
+    }
+
+    /// `diff` towards a state with a new cluster emits its `AddCluster`
+    /// before its `AddBackend`s, so the orders replay onto `self`.
+    #[test]
+    fn diff_adds_a_cluster_before_its_backends() {
+        let target = state_with_clusters_owning_every_object_kind(&["cascade_a", "cascade_b"]);
+        let mut state = ConfigState::new();
+        for request in state.diff(&target) {
+            state
+                .dispatch(&request)
+                .unwrap_or_else(|e| panic!("could not replay {request:?}: {e}"));
+        }
+        assert_same_routing(&state, &target, "replaying diff(empty, target)");
+    }
+
     #[test]
     fn cluster_ids_by_domain() {
         let mut config = ConfigState::new();
@@ -6580,6 +6786,7 @@ mod tests {
     #[test]
     fn duplicate_backends() {
         let mut state: ConfigState = Default::default();
+        add_clusters(&mut state, &["cluster_1"]);
         state
             .dispatch(
                 &RequestType::AddBackend(AddBackend {
@@ -6973,6 +7180,7 @@ mod tests {
     #[test]
     fn count_backends_across_clusters() {
         let mut state: ConfigState = Default::default();
+        add_clusters(&mut state, &["cluster_1", "cluster_2"]);
 
         assert_eq!(state.count_backends(), 0);
 
@@ -10499,5 +10707,183 @@ mod tests {
             state.list_listeners(),
             "a refused patch must leave the listeners untouched"
         );
+    }
+
+    /// sozu-proxy/sozu#1253: header predicates are part of a frontend's
+    /// state key. A canary that differs from its base only by a predicate
+    /// is stored beside it, a respelling of the same conjunction (other
+    /// order, other name case) is the same key, removing the canary leaves
+    /// the base, and a frontend without predicates keeps its historical key.
+    #[test]
+    fn header_predicates_are_part_of_the_frontend_state_key() {
+        use crate::proto::command::{HeaderMatchKind, HeaderPredicate};
+
+        let predicate = |name: &str, kind: HeaderMatchKind, value: Option<&str>| HeaderPredicate {
+            name: name.to_owned(),
+            kind: kind as i32,
+            value: value.map(str::to_owned),
+        };
+        let base = RequestHttpFrontend {
+            cluster_id: Some("stable".to_owned()),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 8080),
+            hostname: "api.example.com".to_owned(),
+            path: PathRule::prefix("/".to_owned()),
+            ..Default::default()
+        };
+        let canary = RequestHttpFrontend {
+            cluster_id: Some("canary".to_owned()),
+            header_predicates: vec![
+                predicate("X-Canary", HeaderMatchKind::Exact, Some("always")),
+                predicate("X-Beta", HeaderMatchKind::Present, None),
+            ],
+            ..base.clone()
+        };
+        let canary_respelled = RequestHttpFrontend {
+            header_predicates: vec![
+                predicate("x-beta", HeaderMatchKind::Present, None),
+                predicate("x-canary", HeaderMatchKind::Exact, Some("always")),
+            ],
+            ..canary.clone()
+        };
+
+        assert_eq!(
+            base.to_string(),
+            "127.0.0.1:8080;api.example.com;P/",
+            "a frontend without predicates keeps its historical key"
+        );
+        assert_eq!(canary.to_string(), canary_respelled.to_string());
+
+        // The worker deduplicates repeated predicates, so a repeated
+        // predicate (even under another name case) shares the single key.
+        let single = RequestHttpFrontend {
+            header_predicates: vec![predicate("X-Beta", HeaderMatchKind::Present, None)],
+            ..base.clone()
+        };
+        let repeated = RequestHttpFrontend {
+            header_predicates: vec![
+                predicate("X-Beta", HeaderMatchKind::Present, None),
+                predicate("x-beta", HeaderMatchKind::Present, None),
+            ],
+            ..base.clone()
+        };
+        assert_eq!(single.to_string(), repeated.to_string());
+
+        let mut state = ConfigState::default();
+        state.add_http_frontend(&base).expect("base");
+        state
+            .add_http_frontend(&canary)
+            .expect("a canary must coexist with its base");
+        assert!(matches!(
+            state.add_http_frontend(&canary_respelled),
+            Err(StateError::Exists { .. })
+        ));
+        assert_eq!(state.http_fronts.len(), 2);
+
+        // A replay of the saved orders rebuilds the same state, predicates
+        // included.
+        let mut replayed = ConfigState::default();
+        for request in state.generate_requests() {
+            replayed.dispatch(&request).expect("replay must succeed");
+        }
+        assert_eq!(replayed.http_fronts, state.http_fronts);
+
+        // The replay (and any worker bound to it) sees the predicated
+        // frontend on its dedicated verb only, so an older worker refuses it
+        // instead of dropping the guard; the base keeps the historical one.
+        let replay_types: Vec<_> = state
+            .generate_requests()
+            .into_iter()
+            .filter_map(|request| request.request_type)
+            .collect();
+        assert!(replay_types.contains(&RequestType::AddHttpFrontend(base.clone())));
+        assert!(
+            replay_types.contains(&RequestType::AddHttpFrontendWithHeaderPredicates(
+                canary.clone()
+            ))
+        );
+        assert!(!replay_types.contains(&RequestType::AddHttpFrontend(canary.clone())));
+
+        // Rolling back a predicated addition removes that route only, on the
+        // matching verb, in either spelling of the add.
+        for add in [
+            RequestType::AddHttpFrontend(canary.clone()),
+            RequestType::AddHttpFrontendWithHeaderPredicates(canary.clone()),
+        ] {
+            assert_eq!(
+                rollback_request(&add).and_then(|request| request.request_type),
+                Some(RequestType::RemoveHttpFrontendWithHeaderPredicates(
+                    canary.clone()
+                ))
+            );
+        }
+        assert_eq!(
+            rollback_request(&RequestType::AddHttpFrontend(base.clone()))
+                .and_then(|request| request.request_type),
+            Some(RequestType::RemoveHttpFrontend(base.clone()))
+        );
+
+        state
+            .remove_http_frontend(&canary_respelled)
+            .expect("a respelled removal must find the canary");
+        assert_eq!(
+            state
+                .http_fronts
+                .values()
+                .map(|front| front.cluster_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("stable")],
+            "removing the canary must leave its base"
+        );
+    }
+
+    /// `CloseSessions` acts on live sessions only: the state accepts it,
+    /// stores nothing, and neither `generate_requests` (what `save_state`
+    /// writes and `load_state` / an upgrade replay) nor the cluster hashes
+    /// change.
+    #[test]
+    fn close_sessions_is_never_saved_nor_replayed() {
+        let mut state: ConfigState = Default::default();
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("cluster_1"),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        state
+            .dispatch(
+                &RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-0"),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        let requests_before = state.generate_requests();
+        let hashes_before = state.hash_state();
+
+        state
+            .dispatch(
+                &RequestType::CloseSessions(CloseSessions {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: Some(String::from("cluster_1-0")),
+                    address: Some(SocketAddress::new_v4(127, 0, 0, 1, 1026)),
+                })
+                .into(),
+            )
+            .expect("CloseSessions must be accepted by the state");
+
+        let requests_after = state.generate_requests();
+        assert_eq!(requests_after, requests_before);
+        assert!(
+            !requests_after
+                .iter()
+                .any(|request| matches!(request.request_type, Some(RequestType::CloseSessions(_))))
+        );
+        assert_eq!(state.hash_state(), hashes_before);
     }
 }

@@ -67,4 +67,9 @@ pub trait SessionState {
     fn shutting_down(&mut self) -> SessionIsToBeClosed {
         true
     }
+    /// Whether this state holds a backend connection `target` names; see
+    /// `ProxySession::targets` (`lib/src/lib.rs`).
+    fn targets(&self, _target: &crate::SessionTarget) -> bool {
+        false
+    }
 }

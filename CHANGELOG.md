@@ -31,6 +31,25 @@
   `probe_address_replaces_only_the_port_when_one_is_set` (`lib/src/health_check.rs`),
   `set_health_check_out_of_range_port_rejected` (`command/src/state.rs`), plus unit tests in
   `command/src/config.rs` and `bin/src/cli.rs`.
+- HTTP and HTTPS frontends can route on request headers
+  ([#1253](https://github.com/sozu-proxy/sozu/issues/1253)). The new
+  `header_predicates` list of a frontend (`RequestHttpFrontend` field 17, TOML
+  `header_predicates = [{ name, match, value }]`, CLI `--match-header
+  <match>=<name>[=<value>]`) holds conditions that must all be true: `exact`
+  (byte-equal value), `regex` (anchored at both ends) or `present`. Names are
+  case-insensitive; `Host` and `Cookie` are refused. For one hostname, a
+  frontend whose predicates hold outranks every frontend without predicates,
+  so a canary and its base can share a hostname and path in any declaration
+  order. Predicates are part of the frontend's identity, so a removal names
+  them too. Frontends without predicates route as before, and the command
+  schema change is additive: saved states without the field load unchanged.
+  A frontend with predicates travels on dedicated request verbs
+  (`AddHttpFrontendWithHeaderPredicates` & co) that a worker predating the
+  feature cannot decode, so it fails the request instead of installing the
+  route without its guard; frontends without predicates keep the historical
+  verbs. Repeated identical predicates canonicalize to one identity, a TCP
+  frontend rejects `header_predicates` instead of ignoring them, and frontend
+  listings show a redacted predicate count rather than names or values.
 - **`feat(mux)`: `redirect = "silent_close"` refuses a request without any
   response** ([#767](https://github.com/sozu-proxy/sozu/issues/767)), the
   equivalent of nginx's `return 444`. A new `RedirectPolicy::SILENT_CLOSE = 5`
@@ -54,7 +73,32 @@
 
 <!-- changelog-slot:backend-dns -->
 
+- A backend `address` in the configuration file may be a `host:port` as well
+  as a socket address (#347). The name is resolved once, with the system
+  resolver, when the file is loaded (at startup or by `sozu reload --file`);
+  it is never re-resolved while running. Each distinct resolved address
+  becomes a backend with a deterministic id, `<backend_id>-<address>` or
+  `<cluster_id>-<host:port>-<address>`; a configured `sticky_id` is
+  suffixed with `-<address>` so each resolved backend keeps its own sticky
+  session, whatever the number of addresses. A name that does not resolve refuses
+  the file with an error naming the cluster and the entry. A file without a
+  host name loads exactly as before; the command schema and the workers are
+  unchanged.
+
 <!-- changelog-slot:close-sessions -->
+
+- `sozu cluster close-sessions --id <cluster> [--backend-id <id>] [--address <ip:port>]`
+  closes, on every worker, the HTTP, HTTPS, TCP and WebSocket sessions holding a backend
+  connection to a cluster, or to one of its backends (#123). Sessions close the way a soft
+  stop closes them: idle HTTP/1.1, TCP and WebSocket sessions at once, an HTTP/1.1 request in
+  flight answered with `Connection: close` first when the backend response headers are not
+  parsed yet, an HTTP/2 session after a GOAWAY, bounded by its graceful-shutdown deadline when
+  that is nonzero (`0` drains without bound, as on a soft stop). The answer counts, per worker, the sessions closed
+  and those still draining. The new `Request.close_sessions` (field 65) and
+  `ResponseContent.closed_sessions` (field 19) are additive; the request is never saved in the
+  state nor replayed by `load_state` or an upgrade. A worker that predates it cannot decode
+  it and closes nothing; it does not answer, so the request fails once the command times out.
+  The main process and every worker must run this release before it is used.
 
 ### 🔄 Changed
 
@@ -73,8 +117,33 @@
   policies now spreads its traffic by them. A cluster whose backends all
   carry the same weight (the default, 100, when unset) selects exactly the
   same sequence as before. No command, configuration or state format changes.
+- A soft stop, like `cluster close-sessions`, now marks an HTTP/1.1 request still waiting for
+  its response as the last one of its connection: the response carries `Connection: close`
+  when its headers are not sent yet, and the connection closes as soon as it is sent. A
+  client no longer has to discover the close after a response that announced keep-alive.
 
 <!-- changelog-slot:backend-ownership -->
+
+- A backend belongs to its cluster (#996). `AddBackend` (`sozu backend add`)
+  naming a cluster the state does not hold, never added or already removed,
+  is now refused with `ClusterNotFound` by the main process and by every
+  worker, instead of storing a backend no cluster owns. `RemoveCluster`
+  already removes the cluster's backends (#1729), so no backend outlives its
+  cluster. Frontends stay independent: one may still be added before its
+  cluster. The configuration file, `SaveState` and `ConfigState::diff` all
+  emit a cluster before its backends and are unaffected.
+
+### Upgrade notes
+
+- Tooling that sends `AddBackend` before the `AddCluster` of the same cluster
+  now gets an error for each such backend and must add the cluster first.
+- A saved state file written by hand, or by tooling, with a backend before
+  its cluster or with a backend of a cluster it never adds: `LoadState` skips
+  that backend with a `warn!` log and counts it in
+  `config.load_skipped_invalid`, so it is not loaded. A state saved by Sōzu
+  itself lists every cluster before its backends.
+- A worker of this release refuses such a backend even from an older main
+  process, which may still hold it in its own state.
 
 ### Fixed
 

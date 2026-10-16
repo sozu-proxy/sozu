@@ -1215,7 +1215,43 @@ frontends = [
 backends  = [
   { address = "127.0.0.1:1026" }
 ]
+# additional options for backends: weight, sticky_id, backup, backend_id
 ```
+
+A backend `address` is either a socket address (`"127.0.0.1:1026"`,
+`"[::1]:1026"`) or a `host:port` such as `"ingress.internal:1026"`
+([#347](https://github.com/sozu-proxy/sozu/issues/347)). A name is resolved
+**once, when the configuration file is loaded** — at startup, and when
+`sozu reload --file <path>` reads a file — with the system resolver
+(`/etc/hosts`, then DNS, as `getaddrinfo` does). Sōzu does not re-resolve it
+while running, and a plain `sozu reload` replays the configuration loaded at
+startup without reading the file again, so it does not re-resolve either: a
+DNS change reaches the proxy only through `sozu reload --file <path>` or a
+restart. Workers and the command channel only ever see socket addresses;
+`sozu backend add` still takes one. The other `sozu` control commands (status,
+shutdown, `backend remove`, …) read the file for their own settings only and
+never resolve its backend names; `sozu config check` does. A host made only of
+digits and dots must be a valid IP literal: `010.0.0.1:80` and `1.2.3:80` are
+refused rather than read as `8.0.0.1` and `1.2.0.3`.
+
+Each distinct address the name resolves to becomes its own backend, in sorted
+address order, carrying the entry's `weight` and `backup`. Its id is derived
+from the entry and the address, so the same answer always yields the same ids:
+`<backend_id>-<address>` when the entry sets `backend_id`,
+`<cluster_id>-<host:port>-<address>` otherwise (for example
+`MyCluster-ingress.internal:1026-10.0.0.2:1026`). A configured `sticky_id` is
+suffixed with `-<address>` as well, so each resolved backend keeps a sticky id
+of its own that does not change when the answer grows or shrinks. A
+socket-address literal is never resolved and keeps its configured
+`backend_id`, or the positional default `<cluster_id>-<index>-<address>`, where
+`<index>` is its position in the cluster's `backends` list as written in the
+file, so a name's answer size never moves it.
+
+A name that does not resolve, or an address with no port, refuses the whole
+file with an error naming the cluster and the entry, for example
+`cluster MyCluster: cannot resolve backend address "ingress.internal:1026": …`.
+A `sozu reload --file <path>` of such a file is rejected and the running
+configuration stays in place.
 
 A cluster owns the frontends and backends declared under it. Removing the
 cluster at runtime (`sozu cluster remove`, the `RemoveCluster` order) removes
@@ -1225,6 +1261,12 @@ cluster's wildcard or catch-all route also covers the hostname, which then
 serves it), a new connection on its TCP listeners is closed, and a session
 already established drains on the backend connection it holds. A frontend with no cluster (a deny or answer
 route) is not removed. See "Remove a cluster" in `doc/configure_cli.md`.
+
+A backend belongs to its cluster, while a frontend does not: an `AddBackend`
+order (`sozu backend add`) naming a cluster that was never added, or was
+removed, is refused by the main process and by every worker, so no backend
+outlives its cluster. The configuration file always adds a cluster before its
+backends, and so does a saved state written by `SaveState`.
 
 The load balancing policies differ in what they select and in how much of the
 backend set they read on every request:
@@ -1925,7 +1967,7 @@ per-listener with safe compile-time defaults:
 | `h2_stream_idle_timeout_seconds`        | `max(30, back_timeout)` | Per-stream idle timeout in seconds. An open H2 stream that receives no meaningful application data (non-empty DATA or HEADERS) for this duration is cancelled (`RST_STREAM` / `CANCEL`) to defend against slow-multiplex Slowloris. When unset the listener inherits `back_timeout` (floored at 30 s) so streams are not cancelled before the backend socket budget elapses; set explicitly to cap the per-stream deadline below `back_timeout` when under a slow-multiplex attack. Active uploads that trickle DATA frames reset the timer on each frame. The same deadline also governs a second, independent guard: a stream whose buffered response cannot drain because the peer keeps its receive window exhausted (HTTP/2 window-stall / `WINDOW_UPDATE`-drip) is reaped too. That flow-control-stall guard is NOT refreshed by inbound activity, so neither an inbound DATA drip nor a `WINDOW_UPDATE(+1)` drip can keep a window-stalled stream alive: the deadline clears only on a genuinely open send window or once cumulative outbound progress reaches one max DATA frame (16 KiB), so a trickle below that floor ages out and is reaped, while legitimate slow-but-steady transfers (sustaining more than ~0.5 KiB/s at the 30 s default) are unaffected. The guard is bidirectional — it also reaps a stalled request **upload** to a slow H2 backend (returning the client a 502), so raise this timeout if you proxy large uploads to slow H2 backends. A continuously window-blocked peer sustaining less than ~0.5 KiB/s for a full timeout is the one disclosed residual (raise the timeout to tolerate it). |
 | `h2_max_header_table_size`              | 65536                   | Maximum HPACK dynamic table size (`SETTINGS_HEADER_TABLE_SIZE`) accepted from the peer. Caps the peer-advertised value to prevent unbounded HPACK encoder memory growth.                                                                                                                                                                                                                                                                                                                                                                                   |
 | `h2_max_header_fields`                  | 128                     | Maximum number of materialized header fields, enforced per HEADERS block and (independently) per trailers block — HPACK fields plus expanded cookie crumbs (RFC 9113 §8.2.3). Bounds the HPACK indexed-reference "header bomb", where 1-byte indexed references amplify into per-entry bookkeeping; cookie crumbs are counted individually (cf. Apache CVE-2026-49975). The same value bounds the trailer section of an HTTP/1.1 chunked request, where one field more is answered 400 (#1701). Minimum: 1. |
-| `h2_graceful_shutdown_deadline_seconds` | 5                       | Maximum wall-clock seconds to wait for in-flight H2 streams after `GOAWAY(NO_ERROR)` has been sent during soft-stop. This includes a request whose header block is still arriving when the soft-stop lands. Once the deadline elapses the connection is forcibly closed, after a final `GOAWAY(NO_ERROR)` whose `last_stream_id` excludes a stream whose header block never completed. Set to `0` to disable the forced close entirely — shutdown then waits for every stream to drain naturally (use with caution: a long-running request can delay the whole soft-stop indefinitely).                                                                                                                                                                         |
+| `h2_graceful_shutdown_deadline_seconds` | 5                       | Maximum wall-clock seconds to wait for in-flight H2 streams after `GOAWAY(NO_ERROR)` has been sent during soft-stop. This includes a request whose header block is still arriving when the soft-stop lands. Once the deadline elapses the connection is forcibly closed, after a final `GOAWAY(NO_ERROR)` whose `last_stream_id` excludes a stream whose header block never completed. It also bounds the HTTP/2 sessions drained by `sozu cluster close-sessions`. Set to `0` to disable the forced close entirely — shutdown (or that drain) then waits for every stream to drain naturally (use with caution: a long-running request can delay the whole soft-stop indefinitely).                                                                                                                                                                         |
 
 _Configuration example:_
 
@@ -2979,6 +3021,98 @@ the route table unchanged.
 
 Captured segments are addressable from `rewrite_host` / `rewrite_path` as
 `$HOST[n]` — see the redirect and rewrite section below.
+
+### Header predicates — routing on request headers
+
+A frontend can require request headers, on top of its hostname, path and
+method ([#1253](https://github.com/sozu-proxy/sozu/issues/1253)). Each entry of
+`header_predicates` names one header and how to test it; the frontend matches
+only when **every** predicate holds. A frontend without `header_predicates`
+behaves exactly as before.
+
+| `match`   | `value`  | holds when the request's header…                                   |
+|-----------|----------|--------------------------------------------------------------------|
+| `exact`   | required | equals `value`, byte for byte (case-sensitive)                     |
+| `regex`   | required | matches `value`, anchored at both ends like a `REGEX` path         |
+| `present` | refused  | is carried, whatever its value (the empty one included)            |
+
+The canonical use is a canary by header: the same hostname and path served by
+two clusters, the canary reached only by requests that ask for it.
+
+```toml
+[clusters.api-stable]
+protocol = "http"
+frontends = [
+  { address = "0.0.0.0:80", hostname = "api.example.com" },
+]
+backends = [ { address = "127.0.0.1:8001" } ]
+
+[clusters.api-canary]
+protocol = "http"
+frontends = [
+  { address = "0.0.0.0:80", hostname = "api.example.com", header_predicates = [
+    { name = "X-Canary", match = "exact", value = "always" },
+  ] },
+]
+backends = [ { address = "127.0.0.1:8101" } ]
+```
+
+`curl -H 'X-Canary: always' http://api.example.com/` reaches `api-canary`;
+every other request, `X-Canary: never` included, reaches `api-stable`. The same
+pair from the command line:
+
+```bash
+sozu frontend http add --address 0.0.0.0:80 --hostname api.example.com id api-stable
+sozu frontend http add --address 0.0.0.0:80 --hostname api.example.com \
+  --match-header exact=X-Canary=always id api-canary
+```
+
+`--match-header` takes `<match>=<name>[=<value>]` and repeats, one flag per
+predicate: `--match-header regex=X-Region=eu-.* --match-header present=X-Beta`.
+
+The rules:
+
+- **Names** compare case-insensitively (RFC 9110 §5.1) and must be an RFC 9110
+  token. `Host` and `Cookie` are refused: H1 folds `Host` into the request
+  authority and H2 sends `:authority`, and both parsers move cookies into a
+  jar, so neither is a header Sōzu could test — route on the hostname instead.
+- **Only the first occurrence** of a header is tested, raw as the client sent
+  it. A value is not split on commas.
+- **A `regex` value is anchored at both ends**: `eu-.*` matches `eu-west` and
+  not `us-eu-west`. It follows the same grammar as a `REGEX` path, so a value
+  that does not compile, or only compiles once wrapped, is refused when the
+  frontend is added.
+- **Precedence.** For one hostname, a frontend whose predicates all hold
+  outranks every frontend without predicates, whatever their paths and
+  declaration order; among frontends of one kind the path and method
+  precedence above applies unchanged. A frontend whose predicates do not all
+  hold is skipped, like one whose method does not match, so a hostname whose
+  only frontends are unsatisfied predicated ones hands the request to the next
+  hostname candidate (a wildcard, for instance). `PRE` and `POST` lists apply
+  the same rule: the first satisfied predicated rule in declaration order, else
+  the first rule without predicates (`Router::lookup_with_headers`).
+- **Identity.** Predicates are part of a frontend's identity, next to address,
+  hostname, path and method: a canary and its base coexist, and removing a
+  frontend — `sozu frontend http remove … --match-header …` — must name the
+  same predicates. Order and header-name case do not matter, and a predicate
+  repeated verbatim counts once. Removing one leaves the other.
+- **HTTP and HTTPS only.** `header_predicates` is valid on `http` and `https`
+  frontends. A `tcp` cluster frontend that sets it is refused at configuration
+  load, never silently discarded.
+- **Mixed versions.** A frontend with predicates is sent to the workers as
+  `AddHttpFrontendWithHeaderPredicates` / `AddHttpsFrontendWithHeaderPredicates`
+  (and removed with the matching `Remove…` verbs), not as the historical
+  `AddHttpFrontend` & co. A worker that predates header routing would skip the
+  unknown predicate field and install the route without its guard, sending
+  every request for the host to the canary cluster; it cannot decode the new
+  verbs, so it fails the request instead, and is counted as failed once
+  `worker_timeout` expires. Frontends without predicates keep the historical
+  verbs and work across versions as before.
+- **Visibility.** The predicate values appear in clear in the saved state and
+  in the main process's state key, exactly as hostnames and paths already do;
+  `Debug` logs carry only their count and lengths. The human-readable frontend
+  and cluster listing tables show only the number of predicates, not their
+  values. Do not put a secret in an `exact` value.
 
 ### Regex limitations — no look-around
 

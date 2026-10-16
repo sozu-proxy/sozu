@@ -86,6 +86,7 @@ fn replaying_a_poisoned_state_file_does_not_re_persist_the_frontend() {
             required_auth: None,
             headers: Vec::new(),
             hsts: None,
+            header_predicates: Vec::new(),
         };
         state
             .dispatch(&RequestType::AddHttpFrontend(front).into())

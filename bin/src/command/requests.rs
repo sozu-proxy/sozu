@@ -29,8 +29,8 @@ use sozu_command_lib::{
     parser::parse_several_requests,
     proto::command::{
         AddCertificate, AggregatedMetrics, AvailableMetrics, CertificateAndKey,
-        CertificatesWithFingerprints, ClusterHashes, ClusterInformations, Event, EventKind,
-        FilteredMetrics, FrontendFilters, HardStop, MetricDetail, MetricDetailStatus,
+        CertificatesWithFingerprints, CloseSessions, ClusterHashes, ClusterInformations, Event,
+        EventKind, FilteredMetrics, FrontendFilters, HardStop, MetricDetail, MetricDetailStatus,
         MetricsConfiguration, QueryCertificatesFilters, QueryHealthChecks, QueryMetricsOptions,
         Request, ResponseContent, ResponseStatus, RunState, SetMetricDetail, SoftStop, Status,
         UpdateHttpListenerConfig, UpdateHttpsListenerConfig, UpdateTcpListenerConfig,
@@ -195,6 +195,10 @@ pub(crate) enum RequestTaskSnapshot {
         gatherer: DefaultGatherer,
         main_process_response: Option<ResponseContent>,
     },
+    CloseSessions {
+        client_token: usize,
+        gatherer: DefaultGatherer,
+    },
     LoadStaticConfig {
         gatherer: PerEntryGatherer,
         client_token: Option<usize>,
@@ -269,6 +273,13 @@ impl RequestTaskSnapshot {
                 client_token: Token(client_token),
                 gatherer,
                 main_process_response,
+            }),
+            Self::CloseSessions {
+                client_token,
+                gatherer,
+            } => Box::new(CloseSessionsTask {
+                client_token: Token(client_token),
+                gatherer,
             }),
             Self::LoadStaticConfig {
                 gatherer,
@@ -539,6 +550,9 @@ macro_rules! audit_log_context {
 /// for the verb still flows through the special-case inline emission
 /// (`EventKind::MetricDetailChanged`, proto tag 30) so SOC visibility
 /// is preserved without flapping the unit state.
+///
+/// `CloseSessions` is excluded too: it closes live sessions and changes
+/// neither the configuration nor the fleet.
 fn is_mutating_verb(req: &RequestType) -> bool {
     matches!(
         req,
@@ -552,6 +566,10 @@ fn is_mutating_verb(req: &RequestType) -> bool {
             | RequestType::AddBackend(_)
             | RequestType::AddCertificate(_)
             | RequestType::AddHttpFrontend(_)
+            | RequestType::AddHttpFrontendWithHeaderPredicates(_)
+            | RequestType::AddHttpsFrontendWithHeaderPredicates(_)
+            | RequestType::RemoveHttpFrontendWithHeaderPredicates(_)
+            | RequestType::RemoveHttpsFrontendWithHeaderPredicates(_)
             | RequestType::AddHttpFrontendWithSilentClose(_)
             | RequestType::AddHttpListener(_)
             | RequestType::AddHttpsFrontend(_)
@@ -713,6 +731,10 @@ impl Server {
             | RequestType::AddBackend(_)
             | RequestType::AddCertificate(_)
             | RequestType::AddHttpFrontend(_)
+            | RequestType::AddHttpFrontendWithHeaderPredicates(_)
+            | RequestType::AddHttpsFrontendWithHeaderPredicates(_)
+            | RequestType::RemoveHttpFrontendWithHeaderPredicates(_)
+            | RequestType::RemoveHttpsFrontendWithHeaderPredicates(_)
             | RequestType::AddHttpFrontendWithSilentClose(_)
             | RequestType::AddHttpListener(_)
             | RequestType::AddHttpsFrontend(_)
@@ -788,6 +810,7 @@ impl Server {
             RequestType::SetMetricDetail(req) => {
                 set_metric_detail_request(self, client, req);
             }
+            RequestType::CloseSessions(request) => close_sessions(self, client, request),
         }
 
         if mutating && let Err(e) = sd_notify::notify(sd_notify::STATE_READY) {
@@ -1282,6 +1305,190 @@ impl GatheringTask for QueryClustersTask {
             .into(),
             "Successfully queried clusters",
         );
+    }
+}
+
+//===============================================
+// Close sessions
+
+/// Gathers each worker's `ClosedSessions` for a `CloseSessions` request.
+#[derive(Debug)]
+pub struct CloseSessionsTask {
+    pub client_token: Token,
+    pub gatherer: DefaultGatherer,
+}
+
+/// Fan a `CloseSessions` request out to every worker. Nothing touches the
+/// main process state: the request acts on live sessions only, so it is
+/// neither saved nor replayed by `load_state` or an upgrade.
+pub fn close_sessions(server: &mut Server, client: &mut ClientSession, request: CloseSessions) {
+    info!(
+        "closing the sessions of cluster {} (backend id {:?}, address {:?})",
+        request.cluster_id, request.backend_id, request.address
+    );
+    client.return_processing("Closing sessions...");
+
+    server.scatter(
+        RequestType::CloseSessions(request).into(),
+        Box::new(CloseSessionsTask {
+            client_token: client.token,
+            gatherer: DefaultGatherer::default(),
+        }),
+        Timeout::Default,
+        None,
+    )
+}
+
+impl GatheringTask for CloseSessionsTask {
+    fn client_token(&self) -> Option<Token> {
+        Some(self.client_token)
+    }
+
+    fn get_gatherer(&mut self) -> &mut dyn Gatherer {
+        &mut self.gatherer
+    }
+
+    fn snapshot(&self, _timing: TaskSnapshotTiming) -> Result<TaskSnapshot, TaskSnapshotError> {
+        Ok(TaskSnapshot::Request(Box::new(
+            RequestTaskSnapshot::CloseSessions {
+                client_token: self.client_token.0,
+                gatherer: self.gatherer.clone(),
+            },
+        )))
+    }
+
+    fn on_finish(
+        self: Box<Self>,
+        _server: &mut Server,
+        client: &mut OptionalClient,
+        timed_out: bool,
+    ) {
+        match close_sessions_outcome(self.gatherer.responses, timed_out) {
+            Ok(worker_responses) => client.finish_ok_with_content(
+                ContentType::WorkerResponses(WorkerResponses {
+                    map: worker_responses,
+                })
+                .into(),
+                "Closed the selected sessions on every worker",
+            ),
+            Err(message) => client.finish_failure(message),
+        }
+    }
+}
+
+/// Success only when every worker answered `Ok` before the timeout. A failure
+/// message keeps the counts of the workers that did answer: their sessions are
+/// closed or closing, whatever the others did.
+fn close_sessions_outcome(
+    responses: Vec<(WorkerId, WorkerResponse)>,
+    timed_out: bool,
+) -> Result<BTreeMap<String, ResponseContent>, String> {
+    let mut failures = Vec::new();
+    let mut worker_responses = BTreeMap::new();
+    for (worker_id, response) in responses {
+        match ResponseStatus::try_from(response.status) {
+            Ok(ResponseStatus::Ok) => {
+                if let Some(content) = response.content {
+                    worker_responses.insert(worker_id.to_string(), content);
+                }
+            }
+            Ok(ResponseStatus::Failure) | Ok(ResponseStatus::Processing) | Err(_) => {
+                failures.push(format!("{worker_id}: {}", response.message));
+            }
+        }
+    }
+    if timed_out {
+        failures.push("timed out waiting for every worker".to_owned());
+    }
+
+    if failures.is_empty() {
+        return Ok(worker_responses);
+    }
+    for (worker_id, content) in worker_responses {
+        if let Some(ContentType::ClosedSessions(closed)) = content.content_type {
+            failures.push(format!(
+                "{worker_id}: {} sessions closed, {} draining",
+                closed.closed, closed.draining
+            ));
+        }
+    }
+    Err(failures.join(", "))
+}
+
+#[cfg(test)]
+mod close_sessions_outcome_tests {
+    use sozu_command_lib::proto::command::ClosedSessions;
+
+    use super::*;
+
+    fn answered(closed: u64, draining: u64) -> WorkerResponse {
+        WorkerResponse {
+            id: "test".to_owned(),
+            status: ResponseStatus::Ok as i32,
+            message: String::new(),
+            content: Some(ContentType::ClosedSessions(ClosedSessions { closed, draining }).into()),
+        }
+    }
+
+    fn failed(status: ResponseStatus, message: &str) -> WorkerResponse {
+        WorkerResponse {
+            id: "test".to_owned(),
+            status: status as i32,
+            message: message.to_owned(),
+            content: None,
+        }
+    }
+
+    #[test]
+    fn every_worker_ok_is_a_success_carrying_each_worker_counts() {
+        let map = close_sessions_outcome(vec![(0, answered(2, 1)), (1, answered(0, 3))], false)
+            .expect("every worker answered Ok");
+        assert_eq!(map.len(), 2, "one entry per worker: {map:?}");
+        assert!(map.contains_key("0") && map.contains_key("1"));
+    }
+
+    /// To SEE THIS RED: make `close_sessions_outcome` return `Ok` whenever
+    /// one worker answered `Ok` -- the failing worker is then reported as a
+    /// success.
+    #[test]
+    fn one_failed_worker_fails_the_request_and_keeps_the_partial_counts() {
+        let message = close_sessions_outcome(
+            vec![
+                (0, answered(4, 2)),
+                (1, failed(ResponseStatus::Failure, "boom")),
+            ],
+            false,
+        )
+        .expect_err("a worker failure must never be reported as success");
+        assert!(message.contains("1: boom"), "{message}");
+        assert!(
+            message.contains("0: 4 sessions closed, 2 draining"),
+            "the counts of the worker that answered must survive: {message}"
+        );
+    }
+
+    /// A worker still `Processing` when the gatherer ends has not answered
+    /// successfully, and a timeout alone fails the request even when every
+    /// received answer was `Ok`.
+    #[test]
+    fn a_timeout_fails_the_request_even_when_every_answer_was_ok() {
+        let message = close_sessions_outcome(vec![(0, answered(1, 0))], true)
+            .expect_err("a timeout must never be reported as success");
+        assert!(
+            message.contains("timed out waiting for every worker"),
+            "{message}"
+        );
+        assert!(
+            message.contains("0: 1 sessions closed, 0 draining"),
+            "{message}"
+        );
+
+        let message = close_sessions_outcome(
+            vec![(0, failed(ResponseStatus::Processing, "still working"))],
+            false,
+        )
+        .expect_err("a Processing worker has not succeeded");
+        assert!(message.contains("0: still working"), "{message}");
     }
 }
 
@@ -1840,7 +2047,8 @@ fn audit_entry_for(
             })
         }
         RequestType::AddHttpFrontend(frontend)
-        | RequestType::AddHttpFrontendWithSilentClose(frontend) => {
+        | RequestType::AddHttpFrontendWithSilentClose(frontend)
+        | RequestType::AddHttpFrontendWithHeaderPredicates(frontend) => {
             let (verb, counter) = audit_verb!("http_frontend_added");
             Some(AuditEntry {
                 kind: EventKind::FrontendAdded,
@@ -1854,7 +2062,8 @@ fn audit_entry_for(
             })
         }
         RequestType::AddHttpsFrontend(frontend)
-        | RequestType::AddHttpsFrontendWithSilentClose(frontend) => {
+        | RequestType::AddHttpsFrontendWithSilentClose(frontend)
+        | RequestType::AddHttpsFrontendWithHeaderPredicates(frontend) => {
             let (verb, counter) = audit_verb!("https_frontend_added");
             Some(AuditEntry {
                 kind: EventKind::FrontendAdded,
@@ -1880,7 +2089,8 @@ fn audit_entry_for(
                 extras: AuditExtras::default(),
             })
         }
-        RequestType::RemoveHttpFrontend(frontend) => {
+        RequestType::RemoveHttpFrontend(frontend)
+        | RequestType::RemoveHttpFrontendWithHeaderPredicates(frontend) => {
             let (verb, counter) = audit_verb!("http_frontend_removed");
             Some(AuditEntry {
                 kind: EventKind::FrontendRemoved,
@@ -1893,7 +2103,8 @@ fn audit_entry_for(
                 extras: AuditExtras::default(),
             })
         }
-        RequestType::RemoveHttpsFrontend(frontend) => {
+        RequestType::RemoveHttpsFrontend(frontend)
+        | RequestType::RemoveHttpsFrontendWithHeaderPredicates(frontend) => {
             let (verb, counter) = audit_verb!("https_frontend_removed");
             Some(AuditEntry {
                 kind: EventKind::FrontendRemoved,
@@ -2732,8 +2943,10 @@ fn validate_frontend_request(request: &RequestType) -> Result<(), String> {
     let front = match request {
         RequestType::AddHttpFrontend(front)
         | RequestType::AddHttpFrontendWithSilentClose(front)
+        | RequestType::AddHttpFrontendWithHeaderPredicates(front)
         | RequestType::AddHttpsFrontend(front)
-        | RequestType::AddHttpsFrontendWithSilentClose(front) => front,
+        | RequestType::AddHttpsFrontendWithSilentClose(front)
+        | RequestType::AddHttpsFrontendWithHeaderPredicates(front) => front,
         _ => return Ok(()),
     };
     let front = front
@@ -6438,6 +6651,7 @@ mod frontend_validation_tests {
             required_auth: None,
             headers: Vec::new(),
             hsts: None,
+            header_predicates: Vec::new(),
         }
     }
 
@@ -6703,6 +6917,7 @@ mod load_state_rollback_tests {
             required_auth: None,
             headers: Vec::new(),
             hsts: None,
+            header_predicates: Vec::new(),
         }
     }
 

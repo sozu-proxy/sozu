@@ -6,7 +6,7 @@ use std::{
     io::Error as IoError,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     os::unix::io::{AsRawFd, FromRawFd, RawFd},
-    rc::Rc,
+    rc::{Rc, Weak},
     str::FromStr,
     sync::LazyLock,
     time::{Duration, Instant},
@@ -23,14 +23,15 @@ use sozu_command::{
     listener_key::ListenerKey,
     logging,
     proto::command::{
-        ActivateListener, AddBackend, CertificatesWithFingerprints, Cluster, ClusterHashes,
-        ClusterInformations, DeactivateListener, Event, EventKind, HttpListenerConfig,
-        HttpsListenerConfig, InitialState, ListenerType, LoadBalancingAlgorithms, LoadMetric,
-        MetricDetail, MetricsConfiguration, RemoveBackend, Request, ResponseContent,
-        ResponseStatus, ServerConfig, TcpListenerConfig as CommandTcpListener,
-        UdpListenerConfig as CommandUdpListener, UpdateHttpListenerConfig,
-        UpdateHttpsListenerConfig, UpdateTcpListenerConfig, UpdateUdpListenerConfig, WorkerRequest,
-        WorkerResponse, request::RequestType, response_content::ContentType,
+        ActivateListener, AddBackend, CertificatesWithFingerprints, ClosedSessions, Cluster,
+        ClusterHashes, ClusterInformations, DeactivateListener, Event, EventKind,
+        HttpListenerConfig, HttpsListenerConfig, InitialState, ListenerType,
+        LoadBalancingAlgorithms, LoadMetric, MetricDetail, MetricsConfiguration, RemoveBackend,
+        Request, ResponseContent, ResponseStatus, ServerConfig,
+        TcpListenerConfig as CommandTcpListener, UdpListenerConfig as CommandUdpListener,
+        UpdateHttpListenerConfig, UpdateHttpsListenerConfig, UpdateTcpListenerConfig,
+        UpdateUdpListenerConfig, WorkerRequest, WorkerResponse, request::RequestType,
+        response_content::ContentType,
     },
     ready::Ready,
     scm_socket::{Listeners, ScmSocket, ScmSocketError},
@@ -39,7 +40,7 @@ use sozu_command::{
 
 use crate::metrics::names;
 use crate::{
-    AcceptError, Protocol, ProxyConfiguration, ProxySession, SessionIsToBeClosed,
+    AcceptError, Protocol, ProxyConfiguration, ProxySession, SessionIsToBeClosed, SessionTarget,
     backends::{Backend, BackendMap},
     features::FEATURES,
     health_check::HealthChecker,
@@ -145,7 +146,9 @@ fn is_frontend_removal(request: &Request) -> bool {
         request.request_type,
         Some(
             RequestType::RemoveHttpFrontend(_)
+                | RequestType::RemoveHttpFrontendWithHeaderPredicates(_)
                 | RequestType::RemoveHttpsFrontend(_)
+                | RequestType::RemoveHttpsFrontendWithHeaderPredicates(_)
                 | RequestType::RemoveTcpFrontend(_)
                 | RequestType::RemoveUdpFrontend(_)
         )
@@ -1278,6 +1281,14 @@ pub struct Server {
     sessions: Rc<RefCell<SessionManager>>,
     should_poll_at: Option<Instant>,
     shutting_down: Option<String>,
+    /// Sessions a `CloseSessions` request ordered to close that are still
+    /// finishing their in-flight HTTP work, keyed by frontend token.
+    ///
+    /// The `Weak` is what makes the token safe to hold: a session that closes
+    /// on its own frees its slab key, which a new session can take, and
+    /// `Server::drive_closing_sessions` only acts on a token whose slab entry
+    /// is still this very session.
+    closing_sessions: Vec<(Token, Weak<RefCell<dyn ProxySession>>)>,
     tcp: Rc<RefCell<tcp::TcpProxy>>,
     udp: Rc<RefCell<udp::UdpProxy>>,
     zombie_check_interval: Duration,
@@ -1523,6 +1534,7 @@ impl Server {
             sessions,
             should_poll_at: None,
             shutting_down: None,
+            closing_sessions: Vec::new(),
             tcp,
             udp,
             zombie_check_interval: Duration::from_secs(u64::from(
@@ -1832,6 +1844,9 @@ impl Server {
             if self.shutting_down.is_some() && self.shut_down_sessions() {
                 return;
             }
+            if !self.closing_sessions.is_empty() {
+                self.drive_closing_sessions();
+            }
         }
     }
 
@@ -1876,7 +1891,10 @@ impl Server {
             }
         };
 
-        if self.shutting_down.is_some() {
+        // A session ordered to close is re-asked every tick, during a soft stop
+        // or after a `CloseSessions` request, because nothing else wakes the
+        // loop when its in-flight work completes.
+        if self.shutting_down.is_some() || !self.closing_sessions.is_empty() {
             let shutdown_tick = Duration::from_millis(100);
             timeout = match timeout {
                 None => Some(shutdown_tick),
@@ -2134,6 +2152,86 @@ impl Server {
         }
 
         false
+    }
+
+    /// Order every session `target` selects to close, the way a soft stop
+    /// orders all of them: `ProxySession::shutting_down` closes it now when it
+    /// is idle (or TCP, or WebSocket), and otherwise lets it finish its
+    /// in-flight HTTP work, which `Server::drive_closing_sessions` then
+    /// watches.
+    fn close_sessions(&mut self, target: &SessionTarget) -> ClosedSessions {
+        // One slab entry per token: a session appears under its frontend
+        // token and under each backend token, so deduplicate by frontend.
+        let mut targeted: HashMap<Token, Rc<RefCell<dyn ProxySession>>> = HashMap::new();
+        for (_key, session) in &self.sessions.borrow().slab {
+            let borrowed = session.borrow();
+            if borrowed.targets(target) {
+                targeted
+                    .entry(borrowed.frontend_token())
+                    .or_insert_with(|| session.clone());
+            }
+        }
+
+        let mut to_close = HashSet::new();
+        let mut draining = 0u64;
+        for (token, session) in targeted {
+            if session.borrow_mut().shutting_down() {
+                to_close.insert(token);
+            } else {
+                draining += 1;
+                let already_closing = self.closing_sessions.iter().any(|(_, pending)| {
+                    pending.upgrade().is_some_and(|p| Rc::ptr_eq(&p, &session))
+                });
+                if !already_closing {
+                    self.closing_sessions.push((token, Rc::downgrade(&session)));
+                }
+            }
+        }
+        let closed = to_close.len() as u64;
+        self.shut_down_sessions_by_frontend_tokens(to_close);
+
+        // Post: every session left draining is tracked for the next ticks.
+        debug_assert!(
+            self.closing_sessions.len() as u64 >= draining,
+            "every draining session must be watched by drive_closing_sessions"
+        );
+        ClosedSessions { closed, draining }
+    }
+
+    /// Re-ask every session a `CloseSessions` request left draining whether it
+    /// can close now, and close those that can. Run once per loop tick while
+    /// any is left.
+    fn drive_closing_sessions(&mut self) {
+        let pending = std::mem::take(&mut self.closing_sessions);
+        let mut to_close = HashSet::new();
+        for (token, weak) in pending {
+            let Some(session) = weak.upgrade() else {
+                continue;
+            };
+            // The session may have closed on its own and its key been reused.
+            let still_there = self
+                .sessions
+                .borrow()
+                .slab
+                .get(token.0)
+                .is_some_and(|entry| Rc::ptr_eq(entry, &session));
+            if !still_there {
+                continue;
+            }
+            if session.borrow_mut().shutting_down() {
+                to_close.insert(token);
+            } else {
+                self.closing_sessions.push((token, weak));
+            }
+        }
+        // Post: a session is either closed now or still watched, never both.
+        debug_assert!(
+            self.closing_sessions
+                .iter()
+                .all(|(token, _)| !to_close.contains(token)),
+            "a session closed this tick must not stay watched"
+        );
+        self.shut_down_sessions_by_frontend_tokens(to_close);
     }
 
     fn kill_session(&self, session: Rc<RefCell<dyn ProxySession>>) {
@@ -2571,6 +2669,19 @@ impl Server {
                 push_queue(WorkerResponse::ok(message.id));
                 return;
             }
+            Some(RequestType::CloseSessions(request)) => {
+                let target = SessionTarget::from(request);
+                let closed = self.close_sessions(&target);
+                info!(
+                    "{} CloseSessions on {:?}: {} sessions closed, {} draining",
+                    message.id, target, closed.closed, closed.draining
+                );
+                push_queue(WorkerResponse::ok_with_content(
+                    message.id,
+                    ContentType::ClosedSessions(closed).into(),
+                ));
+                return;
+            }
             Some(RequestType::QueryMaxConnectionsPerSubnet(_)) => {
                 let sessions = self.sessions.borrow();
                 let limit = sessions.max_connections_per_subnet;
@@ -2692,6 +2803,18 @@ impl Server {
                 // whatever cluster owns it: applying the removal to them
                 // could evict another cluster's route or listener mapping.
                 // Refuse it without touching them.
+                push_queue(WorkerResponse::error(
+                    request.id,
+                    format!("Could not execute order on config state: {e}"),
+                ));
+                return;
+            }
+            if matches!(e, StateError::ClusterNotFound { .. }) {
+                // A backend belongs to its cluster
+                // (`ConfigState::add_backend`, `command/src/state.rs`): the
+                // state refused one of a cluster it does not hold, never
+                // added or already removed. Refuse it without adding it to
+                // the `BackendMap`, where it would outlive its cluster.
                 push_queue(WorkerResponse::error(
                     request.id,
                     format!("Could not execute order on config state: {e}"),
@@ -2984,10 +3107,14 @@ impl Server {
     fn remove_cluster_objects(&mut self, req_id: &str, cluster_id: &str, requests: Vec<Request>) {
         for request in requests {
             let result = match request.request_type {
-                Some(RequestType::RemoveHttpFrontend(front)) => {
-                    self.http.borrow_mut().remove_http_frontend(front)
-                }
-                Some(RequestType::RemoveHttpsFrontend(front)) => self
+                Some(
+                    RequestType::RemoveHttpFrontend(front)
+                    | RequestType::RemoveHttpFrontendWithHeaderPredicates(front),
+                ) => self.http.borrow_mut().remove_http_frontend(front),
+                Some(
+                    RequestType::RemoveHttpsFrontend(front)
+                    | RequestType::RemoveHttpsFrontendWithHeaderPredicates(front),
+                ) => self
                     .https
                     .borrow_mut()
                     .remove_https_frontend(front)
@@ -5022,6 +5149,131 @@ mod event_owner_tests {
         );
     }
 }
+/// A session a `CloseSessions` request left draining can close on its own
+/// before `Server::drive_closing_sessions` revisits it, and another session
+/// then takes its slab key. The watcher must leave the new tenant alone.
+#[cfg(test)]
+mod closing_sessions_tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    /// A session whose `shutting_down` answer is scripted and whose `close`
+    /// is counted.
+    struct ScriptedSession {
+        frontend: Token,
+        can_close_now: bool,
+        closed: Rc<Cell<bool>>,
+    }
+
+    impl ProxySession for ScriptedSession {
+        fn protocol(&self) -> Protocol {
+            Protocol::HTTP
+        }
+        fn ready(&mut self, _session: Rc<RefCell<dyn ProxySession>>) -> SessionIsToBeClosed {
+            false
+        }
+        fn shutting_down(&mut self) -> SessionIsToBeClosed {
+            self.can_close_now
+        }
+        fn update_readiness(&mut self, _token: Token, _events: Ready) {}
+        fn close(&mut self) {
+            self.closed.set(true);
+        }
+        fn timeout(&mut self, _token: Token) -> SessionIsToBeClosed {
+            false
+        }
+        fn last_event(&self) -> Instant {
+            Instant::now()
+        }
+        fn print_session(&self) {}
+        fn frontend_token(&self) -> Token {
+            self.frontend
+        }
+    }
+
+    fn insert_scripted(
+        server: &Server,
+        can_close_now: bool,
+    ) -> (Token, Rc<RefCell<dyn ProxySession>>, Rc<Cell<bool>>) {
+        let closed = Rc::new(Cell::new(false));
+        let mut sessions = server.sessions.borrow_mut();
+        let entry = sessions.slab.vacant_entry();
+        let token = Token(entry.key());
+        let session: Rc<RefCell<dyn ProxySession>> = Rc::new(RefCell::new(ScriptedSession {
+            frontend: token,
+            can_close_now,
+            closed: closed.clone(),
+        }));
+        entry.insert(session.clone());
+        sessions.incr();
+        (token, session, closed)
+    }
+
+    /// The draining session (closable by now) leaves the slab (its `Rc` is
+    /// still held, so its `Weak` still upgrades) and an unrelated session
+    /// takes the same key. Draining must not close it.
+    ///
+    /// To SEE THIS RED: drop the `still_there` check from
+    /// `Server::drive_closing_sessions`, so a live `Weak` alone selects the
+    /// token -- the unrelated session is then closed and removed.
+    #[test]
+    fn a_draining_sessions_reused_slab_key_is_not_closed() {
+        let (mut server, _listen_token, _address) =
+            super::accept_ready_tests::server_with_tcp_listener();
+
+        let (token, draining, draining_closed) = insert_scripted(&server, true);
+        server
+            .closing_sessions
+            .push((token, Rc::downgrade(&draining)));
+
+        // The draining session closed by itself; an unrelated one reuses its key.
+        server.sessions.borrow_mut().slab.remove(token.0);
+        let (reused, unrelated, unrelated_closed) = insert_scripted(&server, true);
+        assert_eq!(reused, token, "precondition: the slab must reuse the key");
+        assert!(
+            !Rc::ptr_eq(&draining, &unrelated),
+            "precondition: the two sessions are distinct"
+        );
+
+        server.drive_closing_sessions();
+
+        assert!(
+            server.sessions.borrow().slab.contains(token.0),
+            "the unrelated session that reused the key must stay in the slab"
+        );
+        assert!(
+            !unrelated_closed.get() && !draining_closed.get(),
+            "neither session may be closed by the stale watch"
+        );
+        assert!(
+            server.closing_sessions.is_empty(),
+            "the stale watch must be dropped, not kept"
+        );
+    }
+
+    /// Positive twin: the same session still in its slot, once able to close,
+    /// is closed and unwatched.
+    #[test]
+    fn a_draining_session_still_in_its_slot_is_closed_when_ready() {
+        let (mut server, _listen_token, _address) =
+            super::accept_ready_tests::server_with_tcp_listener();
+
+        let (token, session, closed) = insert_scripted(&server, true);
+        server
+            .closing_sessions
+            .push((token, Rc::downgrade(&session)));
+
+        server.drive_closing_sessions();
+
+        assert!(
+            closed.get(),
+            "a still-owned closable session must be closed"
+        );
+        assert!(!server.sessions.borrow().slab.contains(token.0));
+        assert!(server.closing_sessions.is_empty());
+    }
+}
 /// The listener slab slot is reserved for a listener's whole `AddListener` ->
 /// `RemoveListener` lifetime. These tests pin both ends of that lifetime and
 /// the deactivate/reactivate cycle in between; see `reserve_listen_token` for
@@ -5318,6 +5570,15 @@ mod listener_lifecycle_tests {
         server: &mut Server,
         address: SocketAddress,
     ) -> (StdUdpSocket, StdUdpSocket) {
+        // A backend belongs to its cluster: add the cluster first.
+        server.notify_proxys(WorkerRequest {
+            id: "test-add-udp-cluster".to_owned(),
+            content: RequestType::AddCluster(Cluster {
+                cluster_id: UDP_FLOW_CLUSTER.to_owned(),
+                ..Default::default()
+            })
+            .into(),
+        });
         server.notify_proxys(WorkerRequest {
             id: "test-add-udp-front".to_owned(),
             content: RequestType::AddUdpFrontend(RequestUdpFrontend {
@@ -5832,6 +6093,18 @@ mod add_cluster_validation_tests {
     #[test]
     fn an_add_cluster_with_an_invalid_shard_percent_is_refused_and_unsharded() {
         let mut server = bare_server();
+        // The cluster exists unsharded before the refused update: a backend
+        // belongs to its cluster, and one of a cluster the worker does not
+        // hold is refused (`ConfigState::add_backend`).
+        server.notify_proxys(WorkerRequest {
+            id: "test-add-unsharded-cluster".to_owned(),
+            content: RequestType::AddCluster(Cluster {
+                cluster_id: CLUSTER.to_owned(),
+                load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
+                ..Default::default()
+            })
+            .into(),
+        });
         server.notify_proxys(WorkerRequest {
             id: ADD_CLUSTER_ID.to_owned(),
             content: RequestType::AddCluster(Cluster {
@@ -6467,7 +6740,7 @@ mod remove_cluster_cascade_tests {
             .expect("the test HTTP listener must exist");
         listener
             .borrow()
-            .frontend_from_request(hostname, path, &Method::Get)
+            .frontend_from_request(hostname, path, &Method::Get, &crate::router::NoHeaders)
             .ok()
             .map(|route| route.cluster_id.map(|id| id.to_string()))
     }
@@ -6603,6 +6876,53 @@ mod remove_cluster_cascade_tests {
                 "a removal the cascade already performed must answer ok: {responses:?}"
             );
         }
+    }
+
+    /// A backend belongs to its cluster: the worker refuses an `AddBackend`
+    /// for a cluster it does not hold, never added or already removed, and
+    /// never adds it to its `BackendMap`, where it would outlive its cluster.
+    #[test]
+    fn a_backend_of_an_unknown_cluster_is_refused_by_the_worker() {
+        const ORPHAN: &str = "orphan";
+        let mut server = bare_server();
+        let assert_refused = |server: &mut Server, id: &str, port: u16| {
+            let responses = send(server, id, RequestType::AddBackend(backend(ORPHAN, port)));
+            assert!(
+                !responses.is_empty()
+                    && responses
+                        .iter()
+                        .all(|r| r.status == ResponseStatus::Failure as i32),
+                "a backend of an unknown cluster must be refused: {responses:?}"
+            );
+            assert!(
+                !server.backends.borrow().backends.contains_key(ORPHAN),
+                "a refused backend must not reach the BackendMap"
+            );
+        };
+
+        assert_refused(&mut server, "never-added", 1026);
+
+        for (index, request) in [
+            RequestType::AddCluster(Cluster {
+                cluster_id: ORPHAN.to_owned(),
+                ..Default::default()
+            }),
+            RequestType::AddBackend(backend(ORPHAN, 1026)),
+            RequestType::RemoveCluster(ORPHAN.to_owned()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for response in send(&mut server, &format!("step-{index}"), request) {
+                assert_eq!(
+                    response.status,
+                    ResponseStatus::Ok as i32,
+                    "step must succeed: {response:?}"
+                );
+            }
+        }
+
+        assert_refused(&mut server, "removed", 1027);
     }
 
     /// The route key names no cluster, so cluster B can take the key cluster

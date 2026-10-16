@@ -27,6 +27,7 @@
 
 mod affinity_key_tests;
 mod backend_failover_tests;
+mod close_sessions_tests;
 mod cluster_ip_limit_tests;
 mod command_channel_security_tests;
 mod eviction_tests;
@@ -48,6 +49,7 @@ mod h2_security_tests;
 mod h2_tests;
 pub(crate) mod h2_utils;
 mod h2_window_update_tests;
+mod header_routing_tests;
 mod health_check_mode_tests;
 mod hsts_tests;
 mod lb_weight_tests;
