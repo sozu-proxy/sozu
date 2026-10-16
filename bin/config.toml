@@ -718,6 +718,9 @@ backends = [
 # accepted_statuses = ["200-399"] # HTTP mode: codes ("404"), ranges ("200-399"),
 #                        # classes ("2xx") or "any"; replaces expected_status,
 #                        # which must then stay 0
+# port = 9090            # both modes: probe this port on the backend's IP
+#                        # address, 1-65535 (default: the backend's data port);
+#                        # refused for a cluster with a `unix_path` backend
 
 # this is an example of a routing configuration for the TCP proxy
 [clusters.TcpTest]

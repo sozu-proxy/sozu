@@ -72,7 +72,8 @@ const HEALTH_CHECK_TOKEN_CAPACITY: usize = 1 << 16;
 /// `h2c` mirrors `cluster.http2` (the same backend-capability hint the
 /// mux router uses) so the probe wire format matches what the proxy
 /// will actually use to reach those backends. Each backend to check is
-/// `(backend_id, address, incarnation)`.
+/// `(backend_id, address, incarnation)`, where `address` is the one the
+/// probe dials ([`probe_address`]).
 type PendingChecks = Vec<(
     ClusterId,
     HealthCheckConfig,
@@ -87,6 +88,8 @@ struct InFlightCheck {
     token: Token,
     cluster_id: ClusterId,
     backend_id: String,
+    /// The probed address: the backend's, or its IP with the health check's
+    /// probe `port`. Logs only; the result goes to `backend`.
     address: SocketAddr,
     /// The backend incarnation this probe was launched for. The result
     /// applies to it only while it is still in the cluster's list, so a
@@ -193,6 +196,12 @@ impl HealthChecker {
         None
     }
 
+    /// Number of probes in flight, for tests that must prove none started.
+    #[cfg(test)]
+    pub(crate) fn in_flight_len(&self) -> usize {
+        self.in_flight.len()
+    }
+
     /// Returns true iff `token` falls in the bounded range reserved for
     /// health-check sockets. Critically, the upper bound prevents this
     /// helper from falsely claiming the mux GOAWAY sentinel
@@ -281,7 +290,9 @@ impl HealthChecker {
                             let backend = b.borrow();
                             (
                                 backend.backend_id.to_owned(),
-                                backend.address,
+                                // The dial, the HTTP `Host` and the logs
+                                // all name the probed address.
+                                probe_address(backend.address, config.port),
                                 Rc::downgrade(b),
                             )
                         })
@@ -325,11 +336,17 @@ impl HealthChecker {
             };
 
             for (backend_id, address, incarnation) in backends_to_check {
-                // Dialed like traffic is (`Backend::connect_socket`), so a
-                // `unix_path` backend is probed over its UNIX socket. A
+                // Dialed like traffic is (`connect_backend`), so a `unix_path`
+                // backend is probed over its UNIX socket; `address` is the
+                // probed one, which `Backend::connect_socket` would lose. A
                 // backend removed since the list was taken is not probed.
+                // `health_check.port` and `unix_path` never meet in a cluster
+                // (`HEALTH_CHECK_PORT_UNIX_REFUSED`).
                 let dialed = match incarnation.upgrade() {
-                    Some(backend) => backend.borrow().connect_socket(),
+                    Some(backend) => crate::backends::connect_backend(
+                        address,
+                        backend.borrow().unix_path.as_deref(),
+                    ),
                     None => Err(std::io::ErrorKind::NotFound.into()),
                 };
                 match dialed {
@@ -860,6 +877,32 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+/// The address a probe dials: the backend's `address`, with its port
+/// replaced by the health check's probe `port` when one is set. The HTTP
+/// probe names this address in its `Host` (h2c `:authority`), since it is
+/// the one probed.
+fn probe_address(address: SocketAddr, port: Option<u32>) -> SocketAddr {
+    // PRE: the worker `SetHealthCheck` handler ran
+    // `sozu_command::config::validate_health_check_config`, which bounds
+    // the probe port to 1..=65535.
+    debug_assert!(
+        port.is_none_or(|port| port != 0 && u16::try_from(port).is_ok()),
+        "a validated probe port is a non-zero 16-bit port, got {port:?}"
+    );
+    let Some(port) = port else {
+        return address;
+    };
+    // `set_port` keeps an IPv6 scope id, which a link-local backend needs.
+    // An out-of-range port cannot pass validation; should one get here, port
+    // 0 makes the dial fail, so the probe fails rather than silently probing
+    // the data port.
+    let mut probed = address;
+    probed.set_port(u16::try_from(port).unwrap_or(0));
+    // POST: only the port moves; the probe targets the backend's own IP.
+    debug_assert_eq!(probed.ip(), address.ip(), "the probe keeps the backend IP");
+    probed
 }
 
 /// Outcome of a connect-only probe on a readiness event: `Some(true)` once
@@ -1410,6 +1453,34 @@ mod tests {
         assert_eq!(outcome, Some(false), "a refused connection must fail");
     }
 
+    /// An unset probe port keeps the backend's data port; a set one
+    /// replaces the port alone, on IPv4 and IPv6.
+    #[test]
+    fn probe_address_replaces_only_the_port_when_one_is_set() {
+        for address in ["192.0.2.10:8080", "[2001:db8::10]:8080"] {
+            let address: SocketAddr = address.parse().unwrap();
+            assert_eq!(
+                probe_address(address, None),
+                address,
+                "an unset probe port keeps the data port"
+            );
+            for port in [1, 9090, 65535] {
+                let probed = probe_address(address, Some(port));
+                assert_eq!(probed.ip(), address.ip(), "the probe keeps the backend IP");
+                assert_eq!(
+                    u32::from(probed.port()),
+                    port,
+                    "the probe dials its own port"
+                );
+            }
+        }
+        assert_eq!(
+            probe_address("[2001:db8::10]:8080".parse().unwrap(), Some(9090)).to_string(),
+            "[2001:db8::10]:9090",
+            "an IPv6 probe address renders bracketed, as the Host header needs"
+        );
+    }
+
     #[test]
     fn test_try_parse_status_line() {
         let config = HealthCheckConfig {
@@ -1421,6 +1492,7 @@ mod tests {
             expected_status: 0,
             mode: HealthCheckMode::Http as i32,
             accepted_statuses: Vec::new(),
+            port: None,
         };
 
         let buf = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
@@ -1563,6 +1635,116 @@ mod tests {
         );
     }
 
+    /// A probe `port` moves the dial off the data port: the probe reaches
+    /// the listener on the probe port, none on the data port, and keeps the
+    /// exact backend incarnation it was launched for.
+    #[test]
+    fn probe_dials_the_probe_port_not_the_data_port() {
+        const CLUSTER: &str = "probe-port-cluster";
+        let data = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        data.set_nonblocking(true).unwrap();
+        probe.set_nonblocking(true).unwrap();
+        let address = data.local_addr().unwrap();
+        let poll = mio::Poll::new().unwrap();
+        let mut backend_map = BackendMap::new();
+        backend_map.add_backend(CLUSTER, Backend::new("b", address, None, None, None));
+        backend_map.health_check_configs.insert(
+            CLUSTER.into(),
+            HealthCheckConfig {
+                mode: HealthCheckMode::Tcp as i32,
+                port: Some(u32::from(probe.local_addr().unwrap().port())),
+                ..h2c_config(0)
+            },
+        );
+        let backends = Rc::new(RefCell::new(backend_map));
+        let mut checker = HealthChecker::new();
+
+        checker.initiate_checks(&backends, poll.registry());
+
+        assert_eq!(checker.in_flight.len(), 1);
+        assert_eq!(
+            checker.in_flight[0].address,
+            probe.local_addr().unwrap(),
+            "the probe names the address it dials"
+        );
+        assert!(
+            std::ptr::eq(
+                checker.in_flight[0].backend.as_ptr(),
+                Rc::as_ptr(&backends.borrow().backends[CLUSTER].backends[0])
+            ),
+            "the probe keeps the incarnation it was launched for"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let accepted = loop {
+            match probe.accept() {
+                Ok(_) => break true,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("accept on the probe port failed: {e}"),
+            }
+        };
+        assert!(accepted, "the probe port listener must receive the dial");
+        assert!(
+            matches!(data.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "the data port must not be dialed"
+        );
+    }
+
+    /// A `unix_path` backend whose cluster sets no probe `port` is probed
+    /// through its UNIX socket, with the exact incarnation retained; its
+    /// identity `address` is never dialed.
+    #[test]
+    fn unix_backend_without_probe_port_is_probed_through_its_socket() {
+        const CLUSTER: &str = "unix-probe-cluster";
+        let path =
+            std::env::temp_dir().join(format!("sozu-health-init-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let poll = mio::Poll::new().unwrap();
+        // Nothing listens on this identity address.
+        let address: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut backend_map = BackendMap::new();
+        backend_map.add_backend(
+            CLUSTER,
+            Backend::new("u", address, None, None, None)
+                .with_unix_path(path.to_str().map(ToOwned::to_owned)),
+        );
+        backend_map.health_check_configs.insert(
+            CLUSTER.into(),
+            HealthCheckConfig {
+                mode: HealthCheckMode::Tcp as i32,
+                ..h2c_config(0)
+            },
+        );
+        let backends = Rc::new(RefCell::new(backend_map));
+        let mut checker = HealthChecker::new();
+
+        checker.initiate_checks(&backends, poll.registry());
+
+        assert_eq!(checker.in_flight.len(), 1);
+        assert_eq!(
+            socket2::SockRef::from(&checker.in_flight[0].stream)
+                .domain()
+                .unwrap(),
+            socket2::Domain::UNIX,
+            "a unix_path backend is probed over its UNIX socket"
+        );
+        assert!(
+            std::ptr::eq(
+                checker.in_flight[0].backend.as_ptr(),
+                Rc::as_ptr(&backends.borrow().backends[CLUSTER].backends[0])
+            ),
+            "the probe keeps the incarnation it was launched for"
+        );
+        listener.accept().expect("the socket receives the dial");
+        std::fs::remove_file(&path).unwrap();
+    }
+
     /// #1821: two ids may share an address; a probe result updates the id
     /// that was probed, never the first sibling at that address.
     #[test]
@@ -1602,6 +1784,7 @@ mod tests {
             expected_status: expected,
             mode: HealthCheckMode::Http as i32,
             accepted_statuses: Vec::new(),
+            port: None,
         }
     }
 

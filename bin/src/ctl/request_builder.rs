@@ -530,6 +530,7 @@ impl CommandManager {
                 unhealthy_threshold,
                 expected_status,
                 accepted_statuses,
+                port,
             } => {
                 let accepted_statuses = accepted_statuses
                     .iter()
@@ -545,6 +546,7 @@ impl CommandManager {
                     expected_status,
                     mode: HealthCheckMode::from(mode) as i32,
                     accepted_statuses,
+                    port,
                 };
                 if let Err(reason) = validate_health_check_config(&config) {
                     return Err(CtlError::Failure(reason.to_owned()));

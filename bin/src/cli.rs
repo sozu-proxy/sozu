@@ -787,6 +787,11 @@ pub enum HealthCheckCmd {
             help = "HTTP statuses counted as healthy, comma-separated codes, ranges, classes or any (e.g. 200-399,404 or 2xx or any)"
         )]
         accepted_statuses: Vec<String>,
+        #[clap(
+            long = "port",
+            help = "port the probe dials on the backend's IP address, 1-65535 (default: the backend's data port)"
+        )]
+        port: Option<u32>,
     },
     #[clap(name = "remove", about = "Remove the health check from a cluster")]
     Remove {
@@ -2441,6 +2446,33 @@ mod tests {
             panic!("expected HealthCheckCmd::Set");
         };
         assert_eq!(accepted_statuses, vec!["200-399", "404"]);
+    }
+
+    /// `sozu cluster health-check set` leaves the probe port unset by
+    /// default, so the probe dials the data port, and takes `--port`.
+    #[test]
+    fn cluster_health_check_set_parses_probe_port() {
+        use super::*;
+
+        let port = |extra: &[&str]| -> Option<u32> {
+            let mut argv = vec!["sozu", "cluster", "health-check", "set", "--id", "app"];
+            argv.extend_from_slice(extra);
+            match Args::try_parse_from(argv)
+                .expect("clap should accept the health-check flags")
+                .cmd
+            {
+                SubCmd::Cluster {
+                    cmd:
+                        ClusterCmd::HealthCheck {
+                            cmd: HealthCheckCmd::Set { port, .. },
+                        },
+                } => port,
+                other => panic!("expected cluster health-check set, got {other:?}"),
+            }
+        };
+
+        assert_eq!(port(&[]), None);
+        assert_eq!(port(&["--mode", "tcp", "--port", "8081"]), Some(8081));
     }
 
     #[test]

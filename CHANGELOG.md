@@ -4,6 +4,49 @@
 
 ### Added
 
+- **BREAKING (library API) — `feat(health-check)`: probe port.** `HealthCheckConfig` gains an
+  optional `port` (proto field 9): when set, both `HTTP` and `TCP` probes connect to the
+  backend's IP address on that port instead of its data port, and the HTTP probe's `Host`
+  (h2c `:authority`) names that `ip:port`. Unset, the probe dials the data port as before. It
+  serves backends whose health endpoint or companion listener lives on another port, as
+  `UdpHealthConfig.tcp_port` already does for UDP clusters. `validate_health_check_config`
+  refuses a port outside `1..=65535` at the CLI, the TOML loader, the master state and the
+  worker. New TOML key `port` in `[clusters.<id>.health_check]` and `sozu cluster health-check
+  set` flag `--port`; `sozu cluster health-check list` gains a `port` column (`data` when
+  unset). `port` targets a backend IP address: it is refused, with a stable error, when a
+  backend of the cluster has a `unix_path`, in either order and in the TOML loader (DNS-expanded
+  entries included), the master state and the worker; a `unix_path` backend without `port` is
+  probed through its UNIX socket. Library API: `HealthCheckConfig` and `FileHealthCheckConfig` gain the public field
+  `port`, so a struct literal must name it or use `..Default::default()`. A message or saved
+  state without the field decodes as before. `port` is an additive field 9 on the existing
+  `AddCluster` and `SetHealthCheck` messages, so it is **not** fail-closed: a worker older
+  than 2.3.2 decodes the message, ignores the unknown field and probes the data port. Upgrade
+  the main process and every worker to 2.3.2 before enabling `port`.
+
+  **Before enabling it.** Upgrade the main process and every worker, and use the new CLI,
+  before setting `port`: an older worker ignores field 9 and probes the data port, which in
+  `TCP` mode passes every backend accepting connections there; an older `sozu` CLI that
+  patches a cluster by read-modify-write (`sozu cluster h2 enable|disable`) drops it, and so
+  does an older binary loading the saved state. Documented in `doc/health_checks.md`,
+  `doc/configure.md` and `doc/configure_cli.md`; covered by
+  `test_health_check_tcp_mode_probe_port_closed_marks_serving_backend_down`,
+  `test_health_check_http_mode_probe_port_closed_marks_serving_backend_down`,
+  `test_health_check_tcp_mode_probe_port_answering_keeps_backend_up` and
+  `test_health_check_http_mode_probe_port_answering_keeps_backend_up`
+  (`e2e/src/tests/health_check_mode_tests.rs`),
+  `probe_address_replaces_only_the_port_when_one_is_set` (`lib/src/health_check.rs`),
+  `set_health_check_out_of_range_port_rejected` and
+  `a_health_check_port_and_a_unix_backend_never_share_a_cluster` (`command/src/state.rs`),
+  `a_health_check_port_and_a_unix_path_backend_never_share_a_file_cluster`
+  (`command/src/config.rs`), `probe_dials_the_probe_port_not_the_data_port`,
+  `unix_backend_without_probe_port_is_probed_through_its_socket` (`lib/src/health_check.rs`) and
+  `a_probe_port_already_set_refuses_a_unix_backend` and
+  `a_unix_backend_already_there_refuses_a_probe_port` (`lib/src/server.rs`),
+  `diff_converges_when_a_probe_port_and_a_unix_backend_swap` (`command/src/state.rs`),
+  `a_static_reload_converges_when_a_probe_port_and_a_unix_backend_swap` and
+  `a_load_state_converges_when_a_probe_port_and_a_unix_backend_swap`
+  (`bin/src/command/requests.rs`), plus unit tests in
+  `command/src/config.rs` and `bin/src/cli.rs`.
 - HTTP and HTTPS frontends can route on request headers
   ([#1253](https://github.com/sozu-proxy/sozu/issues/1253)). The new
   `header_predicates` list of a frontend (`RequestHttpFrontend` field 17, TOML

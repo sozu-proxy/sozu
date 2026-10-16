@@ -12,6 +12,10 @@
 //!
 //! - Removing the health check (`RemoveHealthCheck`) puts a backend a probe
 //!   had marked down back in rotation (sozu-proxy/sozu#1811).
+//! - A probe `port` moves the probe off the data port, in both modes: a
+//!   backend serving on its data port but closed on the probe port is marked
+//!   down, and one refusing its data port but answering on the probe port
+//!   stays up, with the HTTP `Host` naming the probed address.
 //!
 //! The mode switch itself is guarded by
 //! `test_health_check_tcp_mode_keeps_500_and_404_backends_up`: an HTTP probe
@@ -69,6 +73,7 @@ fn fast_health_check(mode: HealthCheckMode) -> HealthCheckConfig {
         expected_status: 0,
         mode: mode as i32,
         accepted_statuses: Vec::new(),
+        port: None,
     }
 }
 
@@ -756,6 +761,179 @@ fn test_remove_health_check_restores_down_backend() {
             2,
             "RemoveHealthCheck puts a backend marked down back in rotation",
             try_remove_health_check_restores_down_backend,
+        ),
+        State::Success
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Probe port
+// ---------------------------------------------------------------------------
+
+/// A backend answering 200 when the request's `Host` names `address`, the
+/// address it listens on, and 400 otherwise.
+fn spawn_host_checking_backend(name: &str, address: SocketAddr) -> AsyncBackend<SimpleAggregator> {
+    let host_line = format!("\r\nHost: {address}\r\n");
+    AsyncBackend::spawn_detached_backend(
+        name,
+        address,
+        SimpleAggregator {
+            requests_received: 0,
+            responses_sent: 0,
+        },
+        Box::new(move |mut stream: &TcpStream, _name: &str, mut aggregator| {
+            let mut buf = [0u8; 4096];
+            let n = match stream.read(&mut buf) {
+                Ok(n) if n > 0 => n,
+                _ => return aggregator,
+            };
+            aggregator.requests_received += 1;
+            let host_matches = buf[..n]
+                .windows(host_line.len())
+                .any(|window| window == host_line.as_bytes());
+            let status_line = if host_matches {
+                "200 OK"
+            } else {
+                "400 Bad Request"
+            };
+            let response =
+                format!("HTTP/1.1 {status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            if stream.write_all(response.as_bytes()).is_ok() {
+                aggregator.responses_sent += 1;
+            }
+            aggregator
+        }),
+    )
+}
+
+/// A backend serving 200 on its data port, whose probe `port` is closed, is
+/// marked down: the probe dials the probe port, not the data port, which
+/// receives no probe request.
+fn try_probe_port_closed_marks_serving_backend_down(name: &str, mode: HealthCheckMode) -> State {
+    let front_address = create_local_address();
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, _) = setup_async_test(name, config, listeners, state, front_address, 0, false);
+
+    let data_address = create_local_address();
+    let mut backend = spawn_status_backend("HC_DATA", data_address, "200 OK");
+    add_backend(&mut worker, "cluster_0-data", data_address);
+    let closed_port = create_unbound_local_address().port();
+    set_health_check(
+        &mut worker,
+        HealthCheckConfig {
+            port: Some(u32::from(closed_port)),
+            ..fast_health_check(mode)
+        },
+    );
+
+    let (success, failure, down) =
+        wait_for_counters(&mut worker, |success, _, down| down >= 1 || success > 0);
+    stop(worker);
+    let probed_data_port = backend
+        .stop_and_get_aggregator()
+        .map_or(0, |aggregator| aggregator.requests_received);
+
+    if down >= 1 && success == 0 && probed_data_port == 0 {
+        State::Success
+    } else {
+        println!(
+            "expected the backend DOWN through its closed probe port {closed_port}, got \
+             success={success} failure={failure} down={down} data-port \
+             requests={probed_data_port}"
+        );
+        State::Fail
+    }
+}
+
+/// A backend refusing its data port, whose probe `port` answers, stays up.
+/// In HTTP mode the probe backend answers 200 only when `Host` names the
+/// probed `ip:port`.
+fn try_probe_port_answering_keeps_backend_up(name: &str, mode: HealthCheckMode) -> State {
+    let front_address = create_local_address();
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, _) = setup_async_test(name, config, listeners, state, front_address, 0, false);
+
+    let data_address = create_unbound_local_address();
+    let probe_address = create_local_address();
+    let mut backend = spawn_host_checking_backend("HC_PROBE", probe_address);
+    add_backend(&mut worker, "cluster_0-probe", data_address);
+    set_health_check(
+        &mut worker,
+        HealthCheckConfig {
+            port: Some(u32::from(probe_address.port())),
+            ..fast_health_check(mode)
+        },
+    );
+
+    // Three cycles: a failing probe would have flipped the backend DOWN
+    // (unhealthy_threshold = 1) well before that.
+    let (success, failure, down) = wait_for_counters(&mut worker, |success, failure, _| {
+        success >= 3 || failure > 0
+    });
+    stop(worker);
+    backend.stop_and_get_aggregator();
+
+    if success >= 3 && failure == 0 && down == 0 {
+        State::Success
+    } else {
+        println!(
+            "expected only passing probes on probe port {}, got success={success} \
+             failure={failure} down={down}",
+            probe_address.port()
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_health_check_tcp_mode_probe_port_closed_marks_serving_backend_down() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "TCP-mode health check marks a serving backend down when its probe port is closed",
+            || try_probe_port_closed_marks_serving_backend_down(
+                "HC-TCP-PORT-DOWN",
+                HealthCheckMode::Tcp
+            ),
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_health_check_tcp_mode_probe_port_answering_keeps_backend_up() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "TCP-mode health check keeps a backend up when its probe port answers",
+            || try_probe_port_answering_keeps_backend_up("HC-TCP-PORT-UP", HealthCheckMode::Tcp),
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_health_check_http_mode_probe_port_closed_marks_serving_backend_down() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "HTTP-mode health check marks a serving backend down when its probe port is closed",
+            || try_probe_port_closed_marks_serving_backend_down(
+                "HC-HTTP-PORT-DOWN",
+                HealthCheckMode::Http
+            ),
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_health_check_http_mode_probe_port_answering_keeps_backend_up() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "HTTP-mode health check keeps a backend up when its probe port answers for its Host",
+            || try_probe_port_answering_keeps_backend_up("HC-HTTP-PORT-UP", HealthCheckMode::Http),
         ),
         State::Success
     );

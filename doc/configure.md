@@ -3673,7 +3673,8 @@ probe (the default) or a TCP connect probe. See
 [health_checks.md](./health_checks.md) for full details. Upgrade the main
 process and every worker, and use the new `sozu` CLI, before setting
 `mode = "TCP"` or `accepted_statuses`: an older Sōzu ignores both and probes
-`GET <uri>` accepting only 2xx.
+`GET <uri>` accepting only 2xx. The same holds for `port`: an older Sōzu
+ignores it and probes the backend's data port.
 
 ```toml
 [clusters.NameOfYourCluster.health_check]
@@ -3685,6 +3686,8 @@ healthy_threshold = 3
 unhealthy_threshold = 3
 expected_status = 0       # 0 = any 2xx; exclusive with accepted_statuses
 # accepted_statuses = ["200-399", "404"]  # codes, ranges, "2xx" classes or "any"
+# port = 9090             # probe this port on the backend's IP (default: the data port);
+#                         # refused when a backend of the cluster has a `unix_path`
 ```
 
 ## Metrics

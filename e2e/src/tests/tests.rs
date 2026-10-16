@@ -59,6 +59,7 @@ fn default_health_check_config() -> HealthCheckConfig {
         expected_status: 0,
         mode: HealthCheckMode::Http as i32,
         accepted_statuses: Vec::new(),
+        port: None,
     }
 }
 
