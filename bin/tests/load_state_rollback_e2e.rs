@@ -311,6 +311,7 @@ fn frontend(cluster_id: &str, hostname: &str, address: SocketAddr) -> RequestHtt
         required_auth: None,
         headers: Vec::new(),
         hsts: None,
+        header_predicates: Vec::new(),
     }
 }
 

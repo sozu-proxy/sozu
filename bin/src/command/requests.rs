@@ -567,6 +567,10 @@ fn is_mutating_verb(req: &RequestType) -> bool {
             | RequestType::AddUnixBackend(_)
             | RequestType::AddCertificate(_)
             | RequestType::AddHttpFrontend(_)
+            | RequestType::AddHttpFrontendWithHeaderPredicates(_)
+            | RequestType::AddHttpsFrontendWithHeaderPredicates(_)
+            | RequestType::RemoveHttpFrontendWithHeaderPredicates(_)
+            | RequestType::RemoveHttpsFrontendWithHeaderPredicates(_)
             | RequestType::AddHttpFrontendWithSilentClose(_)
             | RequestType::AddHttpListener(_)
             | RequestType::AddHttpsFrontend(_)
@@ -729,6 +733,10 @@ impl Server {
             | RequestType::AddUnixBackend(_)
             | RequestType::AddCertificate(_)
             | RequestType::AddHttpFrontend(_)
+            | RequestType::AddHttpFrontendWithHeaderPredicates(_)
+            | RequestType::AddHttpsFrontendWithHeaderPredicates(_)
+            | RequestType::RemoveHttpFrontendWithHeaderPredicates(_)
+            | RequestType::RemoveHttpsFrontendWithHeaderPredicates(_)
             | RequestType::AddHttpFrontendWithSilentClose(_)
             | RequestType::AddHttpListener(_)
             | RequestType::AddHttpsFrontend(_)
@@ -2041,7 +2049,8 @@ fn audit_entry_for(
             })
         }
         RequestType::AddHttpFrontend(frontend)
-        | RequestType::AddHttpFrontendWithSilentClose(frontend) => {
+        | RequestType::AddHttpFrontendWithSilentClose(frontend)
+        | RequestType::AddHttpFrontendWithHeaderPredicates(frontend) => {
             let (verb, counter) = audit_verb!("http_frontend_added");
             Some(AuditEntry {
                 kind: EventKind::FrontendAdded,
@@ -2055,7 +2064,8 @@ fn audit_entry_for(
             })
         }
         RequestType::AddHttpsFrontend(frontend)
-        | RequestType::AddHttpsFrontendWithSilentClose(frontend) => {
+        | RequestType::AddHttpsFrontendWithSilentClose(frontend)
+        | RequestType::AddHttpsFrontendWithHeaderPredicates(frontend) => {
             let (verb, counter) = audit_verb!("https_frontend_added");
             Some(AuditEntry {
                 kind: EventKind::FrontendAdded,
@@ -2081,7 +2091,8 @@ fn audit_entry_for(
                 extras: AuditExtras::default(),
             })
         }
-        RequestType::RemoveHttpFrontend(frontend) => {
+        RequestType::RemoveHttpFrontend(frontend)
+        | RequestType::RemoveHttpFrontendWithHeaderPredicates(frontend) => {
             let (verb, counter) = audit_verb!("http_frontend_removed");
             Some(AuditEntry {
                 kind: EventKind::FrontendRemoved,
@@ -2094,7 +2105,8 @@ fn audit_entry_for(
                 extras: AuditExtras::default(),
             })
         }
-        RequestType::RemoveHttpsFrontend(frontend) => {
+        RequestType::RemoveHttpsFrontend(frontend)
+        | RequestType::RemoveHttpsFrontendWithHeaderPredicates(frontend) => {
             let (verb, counter) = audit_verb!("https_frontend_removed");
             Some(AuditEntry {
                 kind: EventKind::FrontendRemoved,
@@ -2933,8 +2945,10 @@ fn validate_frontend_request(request: &RequestType) -> Result<(), String> {
     let front = match request {
         RequestType::AddHttpFrontend(front)
         | RequestType::AddHttpFrontendWithSilentClose(front)
+        | RequestType::AddHttpFrontendWithHeaderPredicates(front)
         | RequestType::AddHttpsFrontend(front)
-        | RequestType::AddHttpsFrontendWithSilentClose(front) => front,
+        | RequestType::AddHttpsFrontendWithSilentClose(front)
+        | RequestType::AddHttpsFrontendWithHeaderPredicates(front) => front,
         _ => return Ok(()),
     };
     let front = front
@@ -6639,6 +6653,7 @@ mod frontend_validation_tests {
             required_auth: None,
             headers: Vec::new(),
             hsts: None,
+            header_predicates: Vec::new(),
         }
     }
 
@@ -6904,6 +6919,7 @@ mod load_state_rollback_tests {
             required_auth: None,
             headers: Vec::new(),
             hsts: None,
+            header_predicates: Vec::new(),
         }
     }
 

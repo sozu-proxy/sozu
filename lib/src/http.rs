@@ -46,7 +46,7 @@ use crate::{
         mux::{self, Mux, MuxClear},
         proxy_protocol::expect::ExpectProxyProtocol,
     },
-    router::{RouteResult, Router},
+    router::{RequestHeaders, RouteResult, Router},
     server::{ListenToken, SessionManager},
     socket::server_bind,
     timer::TimeoutContainer,
@@ -870,6 +870,7 @@ impl L7ListenerHandler for HttpListener {
         host: &str,
         uri: &str,
         method: &Method,
+        headers: &dyn RequestHeaders,
     ) -> Result<RouteResult, FrontendFromRequestError> {
         let start = Instant::now();
         let (remaining_input, (hostname, _)) = match hostname_and_port(host.as_bytes()) {
@@ -904,10 +905,13 @@ impl L7ListenerHandler for HttpListener {
         // bytes are ASCII (≤ 0x7F), so the slice is valid single-byte UTF-8.
         let host = unsafe { from_utf8_unchecked(hostname) };
 
-        let route = self.fronts.lookup(host, uri, method).map_err(|e| {
-            incr!(names::http::FAILED_BACKEND_MATCHING);
-            FrontendFromRequestError::NoClusterFound(e)
-        })?;
+        let route = self
+            .fronts
+            .lookup_with_headers(host, uri, method, headers)
+            .map_err(|e| {
+                incr!(names::http::FAILED_BACKEND_MATCHING);
+                FrontendFromRequestError::NoClusterFound(e)
+            })?;
 
         let now = Instant::now();
 
@@ -1805,8 +1809,11 @@ impl ProxyConfiguration for HttpProxy {
                 );
                 self.remove_cluster(&cluster_id)
             }
-            Some(RequestType::AddHttpFrontend(front))
-            | Some(RequestType::AddHttpFrontendWithSilentClose(front)) => {
+            Some(
+                RequestType::AddHttpFrontend(front)
+                | RequestType::AddHttpFrontendWithSilentClose(front)
+                | RequestType::AddHttpFrontendWithHeaderPredicates(front),
+            ) => {
                 debug!(
                     "{} {} add front {:?}",
                     log_module_context!(),
@@ -1815,7 +1822,10 @@ impl ProxyConfiguration for HttpProxy {
                 );
                 self.add_http_frontend(front)
             }
-            Some(RequestType::RemoveHttpFrontend(front)) => {
+            Some(
+                RequestType::RemoveHttpFrontend(front)
+                | RequestType::RemoveHttpFrontendWithHeaderPredicates(front),
+            ) => {
                 debug!(
                     "{} {} remove front {:?}",
                     log_module_context!(),
@@ -2605,6 +2615,7 @@ mod tests {
                 required_auth: None,
                 headers: Vec::new(),
                 hsts: None,
+                header_predicates: Vec::new(),
             })
             .expect("Could not add http frontend");
         fronts
@@ -2625,6 +2636,7 @@ mod tests {
                 required_auth: None,
                 headers: Vec::new(),
                 hsts: None,
+                header_predicates: Vec::new(),
             })
             .expect("Could not add http frontend");
         fronts
@@ -2645,6 +2657,7 @@ mod tests {
                 required_auth: None,
                 headers: Vec::new(),
                 hsts: None,
+                header_predicates: Vec::new(),
             })
             .expect("Could not add http frontend");
         fronts
@@ -2665,6 +2678,7 @@ mod tests {
                 required_auth: None,
                 headers: Vec::new(),
                 hsts: None,
+                header_predicates: Vec::new(),
             })
             .expect("Could not add http frontend");
 
@@ -2687,11 +2701,32 @@ mod tests {
             tags: BTreeMap::new(),
         };
 
-        let frontend1 = listener.frontend_from_request("lolcatho.st", "/", &Method::Get);
-        let frontend2 = listener.frontend_from_request("lolcatho.st", "/test", &Method::Get);
-        let frontend3 = listener.frontend_from_request("lolcatho.st", "/yolo/test", &Method::Get);
-        let frontend4 = listener.frontend_from_request("lolcatho.st", "/yolo/swag", &Method::Get);
-        let frontend5 = listener.frontend_from_request("domain", "/", &Method::Get);
+        let frontend1 = listener.frontend_from_request(
+            "lolcatho.st",
+            "/",
+            &Method::Get,
+            &crate::router::NoHeaders,
+        );
+        let frontend2 = listener.frontend_from_request(
+            "lolcatho.st",
+            "/test",
+            &Method::Get,
+            &crate::router::NoHeaders,
+        );
+        let frontend3 = listener.frontend_from_request(
+            "lolcatho.st",
+            "/yolo/test",
+            &Method::Get,
+            &crate::router::NoHeaders,
+        );
+        let frontend4 = listener.frontend_from_request(
+            "lolcatho.st",
+            "/yolo/swag",
+            &Method::Get,
+            &crate::router::NoHeaders,
+        );
+        let frontend5 =
+            listener.frontend_from_request("domain", "/", &Method::Get, &crate::router::NoHeaders);
         assert_eq!(
             frontend1
                 .expect("should find frontend")

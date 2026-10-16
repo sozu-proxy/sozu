@@ -146,7 +146,9 @@ fn is_frontend_removal(request: &Request) -> bool {
         request.request_type,
         Some(
             RequestType::RemoveHttpFrontend(_)
+                | RequestType::RemoveHttpFrontendWithHeaderPredicates(_)
                 | RequestType::RemoveHttpsFrontend(_)
+                | RequestType::RemoveHttpsFrontendWithHeaderPredicates(_)
                 | RequestType::RemoveTcpFrontend(_)
                 | RequestType::RemoveUdpFrontend(_)
         )
@@ -3114,10 +3116,14 @@ impl Server {
     fn remove_cluster_objects(&mut self, req_id: &str, cluster_id: &str, requests: Vec<Request>) {
         for request in requests {
             let result = match request.request_type {
-                Some(RequestType::RemoveHttpFrontend(front)) => {
-                    self.http.borrow_mut().remove_http_frontend(front)
-                }
-                Some(RequestType::RemoveHttpsFrontend(front)) => self
+                Some(
+                    RequestType::RemoveHttpFrontend(front)
+                    | RequestType::RemoveHttpFrontendWithHeaderPredicates(front),
+                ) => self.http.borrow_mut().remove_http_frontend(front),
+                Some(
+                    RequestType::RemoveHttpsFrontend(front)
+                    | RequestType::RemoveHttpsFrontendWithHeaderPredicates(front),
+                ) => self
                     .https
                     .borrow_mut()
                     .remove_https_frontend(front)
@@ -6746,7 +6752,7 @@ mod remove_cluster_cascade_tests {
             .expect("the test HTTP listener must exist");
         listener
             .borrow()
-            .frontend_from_request(hostname, path, &Method::Get)
+            .frontend_from_request(hostname, path, &Method::Get, &crate::router::NoHeaders)
             .ok()
             .map(|route| route.cluster_id.map(|id| id.to_string()))
     }

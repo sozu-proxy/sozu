@@ -2,9 +2,9 @@ use std::{cmp::Ordering, collections::BTreeMap, fmt, net::SocketAddr};
 
 use crate::{
     proto::command::{
-        AddBackend, FilteredTimeSerie, Header, HstsConfig, LoadBalancingParams, PathRule,
-        PathRuleKind, RequestHttpFrontend, RequestTcpFrontend, RequestUdpFrontend, Response,
-        ResponseContent, ResponseStatus, RulePosition, RunState, WorkerResponse,
+        AddBackend, FilteredTimeSerie, Header, HeaderPredicate, HstsConfig, LoadBalancingParams,
+        PathRule, PathRuleKind, RequestHttpFrontend, RequestTcpFrontend, RequestUdpFrontend,
+        Response, ResponseContent, ResponseStatus, RulePosition, RunState, WorkerResponse,
     },
     state::ClusterId,
 };
@@ -73,6 +73,11 @@ pub struct HttpFrontend {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hsts: Option<HstsConfig>,
+    /// Header predicates the request must all satisfy for this frontend to
+    /// match (sozu-proxy/sozu#1253). Part of the frontend's identity.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub header_predicates: Vec<HeaderPredicate>,
 }
 
 impl fmt::Debug for HttpFrontend {
@@ -118,6 +123,7 @@ impl fmt::Debug for HttpFrontend {
             .field("headers_count", &self.headers.len())
             .field("headers_len", &headers_len)
             .field("hsts", &self.hsts)
+            .field("header_predicates_count", &self.header_predicates.len())
             .finish_non_exhaustive()
     }
 }
@@ -143,6 +149,7 @@ impl From<HttpFrontend> for RequestHttpFrontend {
             required_auth: val.required_auth,
             headers: val.headers,
             hsts: val.hsts,
+            header_predicates: val.header_predicates,
         };
 
         // POST: the proto-encoded address decodes back to the source SocketAddr
