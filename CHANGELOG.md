@@ -13,9 +13,15 @@
   refuses a port outside `1..=65535` at the CLI, the TOML loader, the master state and the
   worker. New TOML key `port` in `[clusters.<id>.health_check]` and `sozu cluster health-check
   set` flag `--port`; `sozu cluster health-check list` gains a `port` column (`data` when
-  unset). Library API: `HealthCheckConfig` and `FileHealthCheckConfig` gain the public field
+  unset). `port` targets a backend IP address: it is refused, with a stable error, when a
+  backend of the cluster has a `unix_path`, in either order and in the TOML loader (DNS-expanded
+  entries included), the master state and the worker; a `unix_path` backend without `port` is
+  probed through its UNIX socket. Library API: `HealthCheckConfig` and `FileHealthCheckConfig` gain the public field
   `port`, so a struct literal must name it or use `..Default::default()`. A message or saved
-  state without the field decodes as before.
+  state without the field decodes as before. `port` is an additive field 9 on the existing
+  `AddCluster` and `SetHealthCheck` messages, so it is **not** fail-closed: a worker older
+  than 2.3.2 decodes the message, ignores the unknown field and probes the data port. Upgrade
+  the main process and every worker to 2.3.2 before enabling `port`.
 
   **Before enabling it.** Upgrade the main process and every worker, and use the new CLI,
   before setting `port`: an older worker ignores field 9 and probes the data port, which in
@@ -29,7 +35,17 @@
   `test_health_check_http_mode_probe_port_answering_keeps_backend_up`
   (`e2e/src/tests/health_check_mode_tests.rs`),
   `probe_address_replaces_only_the_port_when_one_is_set` (`lib/src/health_check.rs`),
-  `set_health_check_out_of_range_port_rejected` (`command/src/state.rs`), plus unit tests in
+  `set_health_check_out_of_range_port_rejected` and
+  `a_health_check_port_and_a_unix_backend_never_share_a_cluster` (`command/src/state.rs`),
+  `a_health_check_port_and_a_unix_path_backend_never_share_a_file_cluster`
+  (`command/src/config.rs`), `probe_dials_the_probe_port_not_the_data_port`,
+  `unix_backend_without_probe_port_is_probed_through_its_socket` (`lib/src/health_check.rs`) and
+  `a_probe_port_already_set_refuses_a_unix_backend` and
+  `a_unix_backend_already_there_refuses_a_probe_port` (`lib/src/server.rs`),
+  `diff_converges_when_a_probe_port_and_a_unix_backend_swap` (`command/src/state.rs`),
+  `a_static_reload_converges_when_a_probe_port_and_a_unix_backend_swap` and
+  `a_load_state_converges_when_a_probe_port_and_a_unix_backend_swap`
+  (`bin/src/command/requests.rs`), plus unit tests in
   `command/src/config.rs` and `bin/src/cli.rs`.
 - HTTP and HTTPS frontends can route on request headers
   ([#1253](https://github.com/sozu-proxy/sozu/issues/1253)). The new
@@ -70,6 +86,23 @@
 <!-- changelog-slot:header-routing -->
 
 <!-- changelog-slot:unix-backends -->
+- Backends reachable over UNIX domain sockets
+  ([#152](https://github.com/sozu-proxy/sozu/issues/152)). A backend's new
+  `unix_path` (configuration file, `AddBackend.unix_path` in the protocol,
+  `sozu backend add --unix-path`) takes an absolute path or a Linux
+  abstract-namespace `@name`; HTTP, HTTPS and TCP clusters dial it instead of
+  `address`, which stays the backend's identity and must be unique in its
+  cluster. Health checks probe the same socket. UDP is not supported: the
+  configuration file and the main process's state both refuse it there.
+  A UNIX backend travels on a new `AddUnixBackend` request
+  (`RequestType::add_backend` picks the verb, and the main process rewrites
+  every fan-out to it): a main process or worker that predates it cannot decode
+  that request, so it never registers the backend or dials `address` over TCP.
+  A client that sends `unix_path` on the historical `AddBackend` instead is
+  outside this guarantee: an older decoder drops the field. Protobuf: `AddBackend` field 7
+  (`unix_path`) and `Request` field 72 (`AddUnixBackend`). Covered by
+  `command/tests/unix_backend_verb.rs` and the `test_*unix*` e2e tests
+  (`e2e/src/tests/unix_backend_tests.rs`).
 
 <!-- changelog-slot:backend-dns -->
 

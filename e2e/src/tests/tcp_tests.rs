@@ -43,7 +43,10 @@ const BUFFER_SIZE: usize = 4096;
 
 /// Set up a Sozu worker with a single TCP listener, cluster, frontend, and
 /// the given number of backends. Returns (worker, backend_addresses).
-fn setup_tcp_test(name: &str, nb_backends: usize) -> (Worker, Vec<SocketAddr>, SocketAddr) {
+pub(super) fn setup_tcp_test(
+    name: &str,
+    nb_backends: usize,
+) -> (Worker, Vec<SocketAddr>, SocketAddr) {
     let front_address = create_local_address();
     let (config, listeners, state) = Worker::empty_tcp_config(front_address);
     let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);

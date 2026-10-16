@@ -68,6 +68,15 @@ instance): `backend remove --id <cluster_id> --backend-id <id> --address <addres
 the backend with that id at that address, from the saved state and from the
 workers alike, and the other one keeps taking traffic.
 
+A backend listening on a UNIX domain socket takes `--unix-path` with an
+absolute path, or `@name` for a Linux abstract socket. `--address` is then
+only its identity, unique in the cluster, and is never dialed (see "UNIX
+domain socket backends" in `doc/configure.md`):
+
+```bash
+sozu --config /etc/sozu/config.toml backend add --address 127.0.0.1:10001 --unix-path /run/app/http.sock --backend-id <my_backend_id> --id <my_cluster_id>
+```
+
 ### Add http frontend
 
 And an http listener:
@@ -170,7 +179,9 @@ sozu --config /etc/sozu/config.toml cluster health-check remove --id <my_cluster
 
 `--mode` is `http` (the default) or `tcp`, which only checks that a TCP connection is
 established. `--port` probes that port on each backend's IP address instead of its data
-port. The probe timeout is `--probe-timeout` (seconds); `--timeout` is the global
+port, and is refused for a cluster with a `unix_path` backend (a UNIX socket has no IP
+address or port to probe; without `--port` it is probed through its socket). The probe
+timeout is `--probe-timeout` (seconds); `--timeout` is the global
 command timeout in milliseconds. See `doc/health_checks.md` for every flag and default.
 
 ## Remove a cluster

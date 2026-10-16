@@ -111,6 +111,7 @@ pub fn format_request_type(request_type: &RequestType) -> &str {
         RequestType::AddTcpFrontend(_) => "AddTcpFrontend",
         RequestType::RemoveTcpFrontend(_) => "RemoveTcpFrontend",
         RequestType::AddBackend(_) => "AddBackend",
+        RequestType::AddUnixBackend(_) => "AddUnixBackend",
         RequestType::RemoveBackend(_) => "RemoveBackend",
         RequestType::AddHttpListener(_) => "AddHttpListener",
         RequestType::AddHttpsListener(_) => "AddHttpsListener",

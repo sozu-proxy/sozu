@@ -224,9 +224,8 @@ message Request {
     // `RequestType::into_canonical`. A frontend without predicates keeps the
     // historical verbs, which every worker version understands.
     //
-    // Tags 65 (`close_sessions`) and 70-71 (silent-close add HTTP/HTTPS) are
-    // allocated to other verbs, and tag 72 is reserved for a UDS AddBackend:
-    // do not reuse them.
+    // Tags 65 (`close_sessions`), 70-71 (silent-close add HTTP/HTTPS) and 72
+    // (`add_unix_backend`) are allocated to other verbs: do not reuse them.
     RequestHttpFrontend add_http_frontend_with_header_predicates = 66;
     RequestHttpFrontend remove_http_frontend_with_header_predicates = 67;
     RequestHttpFrontend add_https_frontend_with_header_predicates = 68;
@@ -244,6 +243,27 @@ message Request {
     // add an HTTPS frontend whose `redirect` is `SILENT_CLOSE`. See
     // `add_http_frontend_with_silent_close`.
     RequestHttpFrontend add_https_frontend_with_silent_close = 71;
+    // add a backend that sozu dials over a UNIX domain stream socket
+    // (`AddBackend.unix_path` set), with the same payload and the same
+    // semantics as `add_backend`, distinct verb on purpose. A worker or main
+    // process that predates UNIX backends decodes `add_backend` but skips the
+    // unknown `unix_path` tag, so it would register the backend and dial its
+    // identity `address` over TCP: traffic meant for a local socket reaching
+    // whatever listens on that address, or nothing. It cannot decode this
+    // verb at all (it sees no known request), so it never registers the
+    // backend and never degrades it to an IP endpoint; it sends no response
+    // for it. This matters while the fleet is mixed, between `UpgradeMain`
+    // and the replacement of every worker.
+    //
+    // Emitters pick the verb with `RequestType::add_backend`, and the main
+    // process rewrites every request it fans out to workers to that canonical
+    // verb, so an `add_backend` that carries a `unix_path` never reaches a
+    // worker. A backend without `unix_path` keeps `add_backend`, which every
+    // worker version understands.
+    //
+    // Tags 65-71 are taken by other verbs (close sessions, header routing,
+    // silent frontend close): 72 is this verb's, and must not be renumbered.
+    AddBackend add_unix_backend = 72;
   }
 }
 
@@ -1648,6 +1668,17 @@ message AddBackend {
     optional string sticky_id = 4;
     optional LoadBalancingParams load_balancing_parameters = 5;
     optional bool backup = 6;
+    // when set, sozu dials this UNIX domain stream socket instead of `address`:
+    // a filesystem path, or `@name` for a Linux abstract-namespace socket.
+    // `address` stays the backend's identity within its cluster (removal,
+    // retry exclusion, sticky and hash routing, events) and is never dialed,
+    // so it must be unique among the cluster's backends.
+    // Applies to HTTP, HTTPS and TCP clusters. A UDP cluster refuses it, in
+    // the configuration file and in the main process's state alike: datagrams
+    // cannot travel over a stream socket.
+    // A backend with `unix_path` is carried by `Request.add_unix_backend`,
+    // never by `Request.add_backend` (see there).
+    optional string unix_path = 7;
 }
 
 // remove an existing backend

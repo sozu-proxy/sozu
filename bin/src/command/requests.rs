@@ -564,6 +564,7 @@ fn is_mutating_verb(req: &RequestType) -> bool {
             | RequestType::AddCluster(_)
             | RequestType::ActivateListener(_)
             | RequestType::AddBackend(_)
+            | RequestType::AddUnixBackend(_)
             | RequestType::AddCertificate(_)
             | RequestType::AddHttpFrontend(_)
             | RequestType::AddHttpFrontendWithHeaderPredicates(_)
@@ -729,6 +730,7 @@ impl Server {
             RequestType::AddCluster(_)
             | RequestType::ActivateListener(_)
             | RequestType::AddBackend(_)
+            | RequestType::AddUnixBackend(_)
             | RequestType::AddCertificate(_)
             | RequestType::AddHttpFrontend(_)
             | RequestType::AddHttpFrontendWithHeaderPredicates(_)
@@ -1415,6 +1417,36 @@ fn close_sessions_outcome(
     Err(failures.join(", "))
 }
 
+/// `AddCluster` requests a live `ConfigState` refuses for now because the
+/// cluster still owns a UNIX backend that a later request in the same batch
+/// replaces with an IP backend: a health check `port` and a UNIX backend never
+/// coexist, so such a cluster is applied after the batch's backends.
+#[derive(Default)]
+struct PortConflictDeferral {
+    held: Vec<Request>,
+}
+
+impl PortConflictDeferral {
+    /// The request to apply now, or `None` once it is held back.
+    fn admit(&mut self, state: &ConfigState, request: Request) -> Option<Request> {
+        let refused_for_now = matches!(request.request_type, Some(RequestType::AddCluster(_)))
+            && request.request_type.as_ref().is_some_and(|request_type| {
+                state
+                    .health_check_port_unix_conflict(request_type)
+                    .is_some()
+            });
+        if refused_for_now {
+            self.held.push(request);
+            return None;
+        }
+        Some(request)
+    }
+
+    fn into_held(self) -> Vec<Request> {
+        self.held
+    }
+}
+
 #[cfg(test)]
 mod close_sessions_outcome_tests {
     use sozu_command_lib::proto::command::ClosedSessions;
@@ -1594,8 +1626,33 @@ pub fn load_static_config(server: &mut Server, mut client: OptionalClient, path:
         timeout,
     );
 
-    for (request_index, message) in config_messages.into_iter().enumerate() {
-        let mut request = message.content;
+    // Requests the loop applies, in order, then the clusters it held back.
+    let mut deferral = PortConflictDeferral::default();
+    let mut next_request_index = config_messages.len();
+    let mut pending: std::collections::VecDeque<(usize, Request)> = config_messages
+        .into_iter()
+        .enumerate()
+        .map(|(request_index, message)| (request_index, message.content))
+        .collect();
+    let mut released = false;
+    loop {
+        let Some((request_index, mut request)) = pending.pop_front() else {
+            if released {
+                break;
+            }
+            released = true;
+            for held in std::mem::take(&mut deferral).into_held() {
+                pending.push_back((next_request_index, held));
+                next_request_index += 1;
+            }
+            continue;
+        };
+        if !released {
+            match deferral.admit(&server.state, request) {
+                Some(admitted) => request = admitted,
+                None => continue,
+            }
+        }
         // A listener the state already holds is refused below as existing,
         // which leaves every other change to it unapplied. Its client
         // authentication policy is the exception: a CRL or CA bundle must be
@@ -4679,6 +4736,7 @@ pub fn load_state(server: &mut Server, mut client: OptionalClient, path: &str) {
     // the tally only needs to reach the operator, which the `return_processing`
     // below does.
     let mut skipped_invalid = 0usize;
+    let mut deferral = PortConflictDeferral::default();
 
     let status = loop {
         let previous = buffer.available_data();
@@ -4749,33 +4807,19 @@ pub fn load_state(server: &mut Server, mut client: OptionalClient, path: &str) {
                             count!("config.load_h2_knob_clamped", 1);
                         }
                     }
-                    if let Err(error) = server.state.dispatch(&request.content) {
-                        // The entry never enters ConfigState and is never
-                        // scattered; say so, because at startup there is no
-                        // client to carry the reason.
-                        warn!("load_state: skipping an entry the state refused: {}", error);
-                        count!("config.load_skipped_invalid", 1);
-                        // The tally the operator is shown below covers BOTH skip
-                        // branches: an entry the state refused is just as absent
-                        // from the loaded state as one validation refused.
-                        skipped_invalid += 1;
-                    } else {
-                        // INVARIANT: the scatter request_id advances by
-                        // exactly one per dispatched request. `scatter_on`
-                        // embeds it in the per-worker request id, so a stale
-                        // or repeated counter would collide two in-flight ids
-                        // and silently drop a worker's response, hanging the
-                        // task. Snapshot is read only inside the assert →
-                        // ungated for the release (E0425) build.
-                        let counter_before = scatter_request_counter;
-                        scatter_request_counter += 1;
-                        debug_assert_eq!(
-                            scatter_request_counter,
-                            counter_before + 1,
-                            "load_state must advance the scatter request_id by exactly one per dispatch"
-                        );
-                        server.scatter_on(request.content, task_id, scatter_request_counter, None);
-                    }
+                    // A cluster gaining a probe port while the state still
+                    // holds its unix backend waits for the backends that
+                    // replace it, applied once the whole file is read.
+                    let Some(request) = deferral.admit(&server.state, request.content) else {
+                        continue;
+                    };
+                    apply_saved_entry(
+                        server,
+                        request,
+                        task_id,
+                        &mut scatter_request_counter,
+                        &mut skipped_invalid,
+                    );
                 }
             }
             Err(nom::Err::Incomplete(_)) => {
@@ -4792,6 +4836,18 @@ pub fn load_state(server: &mut Server, mut client: OptionalClient, path: &str) {
         }
         buffer.consume(offset);
     };
+
+    if status.is_ok() {
+        for request in deferral.into_held() {
+            apply_saved_entry(
+                server,
+                request,
+                task_id,
+                &mut scatter_request_counter,
+                &mut skipped_invalid,
+            );
+        }
+    }
 
     match status {
         Ok(()) => {
@@ -4832,6 +4888,41 @@ pub fn load_state(server: &mut Server, mut client: OptionalClient, path: &str) {
             client.finish_failure(message);
             server.cancel_task(task_id);
         }
+    }
+}
+
+/// Applies one entry of a saved state to the main state, then scatters it to
+/// the workers; an entry the state refuses never enters `ConfigState` and is
+/// never scattered.
+fn apply_saved_entry(
+    server: &mut Server,
+    request: Request,
+    task_id: usize,
+    scatter_request_counter: &mut usize,
+    skipped_invalid: &mut usize,
+) {
+    if let Err(error) = server.state.dispatch(&request) {
+        // Say so, because at startup there is no client to carry the reason.
+        warn!("load_state: skipping an entry the state refused: {}", error);
+        count!("config.load_skipped_invalid", 1);
+        // The tally the operator is shown covers BOTH skip branches: an entry
+        // the state refused is just as absent from the loaded state as one
+        // validation refused.
+        *skipped_invalid += 1;
+    } else {
+        // INVARIANT: the scatter request_id advances by exactly one per
+        // dispatched request. `scatter_on` embeds it in the per-worker request
+        // id, so a stale or repeated counter would collide two in-flight ids
+        // and silently drop a worker's response, hanging the task. Snapshot is
+        // read only inside the assert → ungated for the release (E0425) build.
+        let counter_before = *scatter_request_counter;
+        *scatter_request_counter += 1;
+        debug_assert_eq!(
+            *scatter_request_counter,
+            counter_before + 1,
+            "load_state must advance the scatter request_id by exactly one per dispatch"
+        );
+        server.scatter_on(request, task_id, *scatter_request_counter, None);
     }
 }
 
@@ -8250,5 +8341,186 @@ mod upgrade_task_snapshot_tests {
             );
             assert_eq!(restored.client_token(), task.client_token());
         }
+    }
+}
+
+#[cfg(test)]
+mod health_check_port_transition_tests {
+    //! A cluster that gains a health check port while its backend identity
+    //! turns from a UNIX backend into an IP backend (and the reverse) must
+    //! converge through each producer that applies requests to a live state:
+    //! `ConfigState::diff` (tested in `sozu_command_lib::state`), the static
+    //! file reload, and `LoadState`.
+
+    use super::*;
+
+    fn config_with(health_check: &str, backend: &str) -> Config {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "command_socket = \"/tmp/sozu_transition_test.sock\"\n\
+                 [clusters.app]\n\
+                 protocol = \"http\"\n\
+                 frontends = [{{ address = \"127.0.0.1:8080\", hostname = \"example.org\" }}]\n\
+                 backends = [{{ address = \"127.0.0.1:9000\", backend_id = \"app-0\"{backend} }}]\n\
+                 [clusters.app.health_check]\n\
+                 mode = \"TCP\"\n\
+                 {health_check}"
+            ),
+        )
+        .expect("write config");
+        Config::load_from_path(path.to_str().expect("utf-8 path")).expect("the config must load")
+    }
+
+    /// Dispatch `requests` the way `load_static_config` and `load_state` do:
+    /// every request goes through the deferral, then the held ones follow.
+    /// Returns the cluster and backend requests the state refused.
+    fn replay(state: &mut ConfigState, requests: Vec<Request>) -> Vec<String> {
+        let mut refused = Vec::new();
+        let mut deferral = PortConflictDeferral::default();
+        let mut apply = |state: &mut ConfigState, request: Request| {
+            if let Err(error) = state.dispatch(&request)
+                && let Some(
+                    RequestType::AddCluster(_)
+                    | RequestType::AddBackend(_)
+                    | RequestType::AddUnixBackend(_),
+                ) = &request.request_type
+            {
+                refused.push(format!("{request:?}: {error}"));
+            }
+        };
+        for request in requests {
+            if let Some(request) = deferral.admit(state, request) {
+                apply(state, request);
+            }
+        }
+        for request in deferral.into_held() {
+            apply(state, request);
+        }
+        refused
+    }
+
+    fn requests_of(config: &Config) -> Vec<Request> {
+        config
+            .generate_config_messages()
+            .expect("the config must generate its orders")
+            .into_iter()
+            .map(|message| message.content)
+            .collect()
+    }
+
+    fn assert_app_probes(state: &ConfigState, port: Option<u32>, unix: bool) {
+        let cluster = &state.clusters["app"];
+        assert_eq!(cluster.health_check.as_ref().and_then(|h| h.port), port);
+        let backends = &state.backends["app"];
+        assert_eq!(backends.len(), 1, "one backend identity: {backends:?}");
+        assert_eq!(backends[0].unix_path.is_some(), unix, "{backends:?}");
+    }
+
+    const UNIX: &str = ", unix_path = \"/run/app.sock\"";
+
+    #[test]
+    fn a_static_reload_converges_when_a_probe_port_and_a_unix_backend_swap() {
+        let unix = config_with("", UNIX);
+        let ip = config_with("port = 8081\n", "");
+        for (from, to, port, unix_after) in
+            [(&unix, &ip, Some(8081), false), (&ip, &unix, None, true)]
+        {
+            let mut state = ConfigState::new();
+            assert!(replay(&mut state, requests_of(from)).is_empty());
+            let refused = replay(&mut state, requests_of(to));
+            assert!(refused.is_empty(), "the reload was refused: {refused:?}");
+            assert_app_probes(&state, port, unix_after);
+        }
+    }
+
+    #[test]
+    fn a_load_state_converges_when_a_probe_port_and_a_unix_backend_swap() {
+        let unix = config_with("", UNIX);
+        let ip = config_with("port = 8081\n", "");
+        let saved = |config: &Config| {
+            let mut state = ConfigState::new();
+            assert!(replay(&mut state, requests_of(config)).is_empty());
+            // The bytes `SaveState` writes, parsed the way `load_state` does.
+            let mut file = tempfile::tempfile().expect("tempfile");
+            state.write_requests_to_file(&mut file).expect("save");
+            let mut bytes = Vec::new();
+            std::io::Seek::rewind(&mut file).expect("rewind");
+            std::io::Read::read_to_end(&mut file, &mut bytes).expect("read");
+            let (rest, requests) =
+                parse_several_requests::<WorkerRequest>(&bytes).expect("the file must parse");
+            assert!(rest.is_empty());
+            requests.into_iter().map(|r| r.content).collect::<Vec<_>>()
+        };
+        for (from, to, port, unix_after) in
+            [(&unix, &ip, Some(8081), false), (&ip, &unix, None, true)]
+        {
+            let mut state = ConfigState::new();
+            assert!(replay(&mut state, requests_of(from)).is_empty());
+            let refused = replay(&mut state, saved(to));
+            assert!(refused.is_empty(), "the load was refused: {refused:?}");
+            assert_app_probes(&state, port, unix_after);
+        }
+    }
+
+    /// Replaying the config of an already-valid IP backend with a probe port
+    /// neither holds nor rewrites any request: the worker receives each
+    /// `AddCluster` as generated, health check included.
+    #[test]
+    fn the_deferral_passes_an_idempotent_reload_through_untouched() {
+        let ip = config_with("port = 8081\n", "");
+        let mut state = ConfigState::new();
+        assert!(replay(&mut state, requests_of(&ip)).is_empty());
+
+        let mut deferral = PortConflictDeferral::default();
+        for request in requests_of(&ip) {
+            let admitted = deferral
+                .admit(&state, request.clone())
+                .expect("an idempotent request must not be held");
+            assert_eq!(admitted, request, "the request must not be rewritten");
+            if let Some(RequestType::AddCluster(cluster)) = &admitted.request_type {
+                assert_eq!(
+                    cluster.health_check.as_ref().and_then(|h| h.port),
+                    Some(8081),
+                    "the AddCluster must keep its health check"
+                );
+            }
+        }
+        assert!(deferral.into_held().is_empty());
+    }
+
+    /// A brand-new cluster still gets its `AddCluster` before its backends,
+    /// and a port next to a UNIX backend stays refused.
+    #[test]
+    fn the_deferral_only_holds_a_cluster_the_state_would_refuse() {
+        let fresh = config_with("port = 8081\n", "");
+        let mut state = ConfigState::new();
+        let mut deferral = PortConflictDeferral::default();
+        for request in requests_of(&fresh) {
+            assert!(deferral.admit(&state, request.clone()).is_some());
+            let _ = state.dispatch(&request);
+        }
+        assert!(deferral.into_held().is_empty());
+        assert_app_probes(&state, Some(8081), false);
+
+        let mut state = ConfigState::new();
+        assert!(replay(&mut state, requests_of(&config_with("", UNIX))).is_empty());
+        let conflicting = state.dispatch(
+            &RequestType::SetHealthCheck(sozu_command_lib::proto::command::SetHealthCheck {
+                cluster_id: "app".to_owned(),
+                config: sozu_command_lib::proto::command::HealthCheckConfig {
+                    interval: 10,
+                    timeout: 5,
+                    healthy_threshold: 3,
+                    unhealthy_threshold: 3,
+                    port: Some(8081),
+                    ..Default::default()
+                },
+            })
+            .into(),
+        );
+        assert!(conflicting.is_err(), "the state guard must stay in force");
     }
 }

@@ -196,6 +196,12 @@ impl HealthChecker {
         None
     }
 
+    /// Number of probes in flight, for tests that must prove none started.
+    #[cfg(test)]
+    pub(crate) fn in_flight_len(&self) -> usize {
+        self.in_flight.len()
+    }
+
     /// Returns true iff `token` falls in the bounded range reserved for
     /// health-check sockets. Critically, the upper bound prevents this
     /// helper from falsely claiming the mux GOAWAY sentinel
@@ -330,7 +336,20 @@ impl HealthChecker {
             };
 
             for (backend_id, address, incarnation) in backends_to_check {
-                match TcpStream::connect(address) {
+                // Dialed like traffic is (`connect_backend`), so a `unix_path`
+                // backend is probed over its UNIX socket; `address` is the
+                // probed one, which `Backend::connect_socket` would lose. A
+                // backend removed since the list was taken is not probed.
+                // `health_check.port` and `unix_path` never meet in a cluster
+                // (`HEALTH_CHECK_PORT_UNIX_REFUSED`).
+                let dialed = match incarnation.upgrade() {
+                    Some(backend) => crate::backends::connect_backend(
+                        address,
+                        backend.borrow().unix_path.as_deref(),
+                    ),
+                    None => Err(std::io::ErrorKind::NotFound.into()),
+                };
+                match dialed {
                     Ok(mut stream) => {
                         let Some(token) = self.allocate_token() else {
                             // Token table exhausted — record the probe as failed
@@ -896,7 +915,9 @@ fn tcp_connect_outcome(stream: &TcpStream) -> Option<bool> {
         Ok(None) => {}
         Ok(Some(_)) | Err(_) => return Some(false),
     }
-    match stream.peer_addr() {
+    // `socket2` rather than std's `peer_addr`, which refuses the AF_UNIX
+    // address of a `unix_path` backend (`backends::connect_backend`).
+    match socket2::SockRef::from(stream).peer_addr() {
         Ok(_) => Some(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotConnected => None,
         Err(_) => Some(false),
@@ -1376,6 +1397,27 @@ mod tests {
         );
     }
 
+    /// A connect-only probe of a `unix_path` backend passes once its socket
+    /// accepted the dial, although std's `peer_addr` refuses its AF_UNIX peer.
+    #[test]
+    fn tcp_connect_outcome_passes_a_listening_unix_backend() {
+        let path =
+            std::env::temp_dir().join(format!("sozu-health-unix-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let stream =
+            crate::backends::connect_backend("127.0.0.1:1".parse().unwrap(), path.to_str())
+                .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut outcome = tcp_connect_outcome(&stream);
+        while outcome.is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            outcome = tcp_connect_outcome(&stream);
+        }
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(outcome, Some(true), "a listening unix backend must pass");
+    }
+
     #[test]
     fn tcp_connect_outcome_reports_established_and_refused() {
         // Established: a listener completes the handshake in the kernel
@@ -1591,6 +1633,116 @@ mod tests {
             ),
             "the new probe targets the replacement incarnation"
         );
+    }
+
+    /// A probe `port` moves the dial off the data port: the probe reaches
+    /// the listener on the probe port, none on the data port, and keeps the
+    /// exact backend incarnation it was launched for.
+    #[test]
+    fn probe_dials_the_probe_port_not_the_data_port() {
+        const CLUSTER: &str = "probe-port-cluster";
+        let data = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        data.set_nonblocking(true).unwrap();
+        probe.set_nonblocking(true).unwrap();
+        let address = data.local_addr().unwrap();
+        let poll = mio::Poll::new().unwrap();
+        let mut backend_map = BackendMap::new();
+        backend_map.add_backend(CLUSTER, Backend::new("b", address, None, None, None));
+        backend_map.health_check_configs.insert(
+            CLUSTER.into(),
+            HealthCheckConfig {
+                mode: HealthCheckMode::Tcp as i32,
+                port: Some(u32::from(probe.local_addr().unwrap().port())),
+                ..h2c_config(0)
+            },
+        );
+        let backends = Rc::new(RefCell::new(backend_map));
+        let mut checker = HealthChecker::new();
+
+        checker.initiate_checks(&backends, poll.registry());
+
+        assert_eq!(checker.in_flight.len(), 1);
+        assert_eq!(
+            checker.in_flight[0].address,
+            probe.local_addr().unwrap(),
+            "the probe names the address it dials"
+        );
+        assert!(
+            std::ptr::eq(
+                checker.in_flight[0].backend.as_ptr(),
+                Rc::as_ptr(&backends.borrow().backends[CLUSTER].backends[0])
+            ),
+            "the probe keeps the incarnation it was launched for"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let accepted = loop {
+            match probe.accept() {
+                Ok(_) => break true,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("accept on the probe port failed: {e}"),
+            }
+        };
+        assert!(accepted, "the probe port listener must receive the dial");
+        assert!(
+            matches!(data.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "the data port must not be dialed"
+        );
+    }
+
+    /// A `unix_path` backend whose cluster sets no probe `port` is probed
+    /// through its UNIX socket, with the exact incarnation retained; its
+    /// identity `address` is never dialed.
+    #[test]
+    fn unix_backend_without_probe_port_is_probed_through_its_socket() {
+        const CLUSTER: &str = "unix-probe-cluster";
+        let path =
+            std::env::temp_dir().join(format!("sozu-health-init-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let poll = mio::Poll::new().unwrap();
+        // Nothing listens on this identity address.
+        let address: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut backend_map = BackendMap::new();
+        backend_map.add_backend(
+            CLUSTER,
+            Backend::new("u", address, None, None, None)
+                .with_unix_path(path.to_str().map(ToOwned::to_owned)),
+        );
+        backend_map.health_check_configs.insert(
+            CLUSTER.into(),
+            HealthCheckConfig {
+                mode: HealthCheckMode::Tcp as i32,
+                ..h2c_config(0)
+            },
+        );
+        let backends = Rc::new(RefCell::new(backend_map));
+        let mut checker = HealthChecker::new();
+
+        checker.initiate_checks(&backends, poll.registry());
+
+        assert_eq!(checker.in_flight.len(), 1);
+        assert_eq!(
+            socket2::SockRef::from(&checker.in_flight[0].stream)
+                .domain()
+                .unwrap(),
+            socket2::Domain::UNIX,
+            "a unix_path backend is probed over its UNIX socket"
+        );
+        assert!(
+            std::ptr::eq(
+                checker.in_flight[0].backend.as_ptr(),
+                Rc::as_ptr(&backends.borrow().backends[CLUSTER].backends[0])
+            ),
+            "the probe keeps the incarnation it was launched for"
+        );
+        listener.accept().expect("the socket receives the dial");
+        std::fs::remove_file(&path).unwrap();
     }
 
     /// #1821: two ids may share an address; a probe result updates the id

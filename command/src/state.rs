@@ -106,6 +106,9 @@ pub fn rollback_request(request: &RequestType) -> Option<Request> {
     Some(inverse.into())
 }
 
+/// Why a UDP cluster and a backend with a `unix_path` never meet in the state.
+const UDP_UNIX_BACKEND_REFUSED: &str = "a UDP cluster cannot use unix_path backends";
+
 #[derive(thiserror::Error)]
 pub enum StateError {
     #[error("Request came in empty")]
@@ -644,6 +647,13 @@ impl ConfigState {
 
         self.increment_request_count(request);
 
+        if let Some(reason) = self.health_check_port_unix_conflict(request_type) {
+            return Err(StateError::InvalidValue {
+                field: "health_check.port",
+                reason,
+            });
+        }
+
         let result = match request_type {
             RequestType::AddCluster(cluster) => self.add_cluster(cluster),
             RequestType::RemoveCluster(cluster_id) => self.remove_cluster(cluster_id),
@@ -682,7 +692,9 @@ impl ConfigState {
             RequestType::RemoveTcpFrontend(front) => self.remove_tcp_frontend(front),
             RequestType::AddUdpFrontend(front) => self.add_udp_frontend(front),
             RequestType::RemoveUdpFrontend(front) => self.remove_udp_frontend(front),
-            RequestType::AddBackend(add_backend) => self.add_backend(add_backend),
+            RequestType::AddBackend(add_backend) | RequestType::AddUnixBackend(add_backend) => {
+                self.add_backend(add_backend)
+            }
             RequestType::RemoveBackend(backend) => self.remove_backend(backend),
             RequestType::UpdateHttpListener(patch) => self.update_http_listener(patch),
             RequestType::UpdateHttpsListener(patch)
@@ -996,6 +1008,19 @@ impl ConfigState {
             return Err(StateError::InvalidValue {
                 field: "health_check",
                 reason,
+            });
+        }
+        // A cluster that turns UDP cannot keep a backend dialed over a UNIX
+        // stream socket (see `add_backend`).
+        if cluster.udp.is_some()
+            && self
+                .backends
+                .get(cluster.cluster_id.as_str())
+                .is_some_and(|backends| backends.iter().any(|b| b.unix_path.is_some()))
+        {
+            return Err(StateError::InvalidValue {
+                field: "unix_path",
+                reason: UDP_UNIX_BACKEND_REFUSED,
             });
         }
         // Same gate for the client affinity key: a name no request can carry,
@@ -2632,6 +2657,17 @@ impl ConfigState {
             tags: front.tags.clone(),
         };
 
+        if self
+            .backends
+            .get(front.cluster_id.as_str())
+            .is_some_and(|backends| backends.iter().any(|b| b.unix_path.is_some()))
+        {
+            return Err(StateError::InvalidValue {
+                field: "unix_path",
+                reason: UDP_UNIX_BACKEND_REFUSED,
+            });
+        }
+
         let total_before = self.count_udp_frontends_raw();
 
         // Listener-wide scan across ALL clusters' buckets at this address, as
@@ -2744,10 +2780,74 @@ impl ConfigState {
         Ok(())
     }
 
+    /// Why `request` would put a health check `port` next to a backend with a
+    /// `unix_path` in one cluster, which
+    /// `sozu_command::config::HEALTH_CHECK_PORT_UNIX_REFUSED` forbids, in either order of arrival: the port set on a cluster that
+    /// holds a unix backend (`AddCluster`, `SetHealthCheck`), or a unix backend
+    /// added to a cluster whose health check sets a port.
+    ///
+    /// `None` for every other request, and for one a more specific refusal
+    /// already covers (an unknown cluster, an invalid health check, a UDP
+    /// cluster, a `unix_path` that does not parse), so those diagnostics keep
+    /// their precedence. The worker asks this before dispatching, because it
+    /// must not touch its proxies for a request the state refuses.
+    pub fn health_check_port_unix_conflict(&self, request: &RequestType) -> Option<&'static str> {
+        let holds_unix_backend = |cluster_id: &str| {
+            self.backends
+                .get(cluster_id)
+                .is_some_and(|backends| backends.iter().any(|b| b.unix_path.is_some()))
+        };
+        let port_conflicts = |config: &crate::proto::command::HealthCheckConfig,
+                              cluster_id: &str| {
+            config.port.is_some()
+                && crate::config::validate_health_check_config(config).is_ok()
+                && holds_unix_backend(cluster_id)
+        };
+        let conflict = match request {
+            RequestType::AddCluster(cluster) => {
+                cluster.udp.is_none()
+                    && cluster
+                        .health_check
+                        .as_ref()
+                        .is_some_and(|config| port_conflicts(config, &cluster.cluster_id))
+            }
+            RequestType::SetHealthCheck(set) => {
+                self.clusters.contains_key(set.cluster_id.as_str())
+                    && port_conflicts(&set.config, &set.cluster_id)
+            }
+            RequestType::AddBackend(add) | RequestType::AddUnixBackend(add) => {
+                add.unix_path.as_deref().is_some_and(|unix_path| {
+                    crate::config::parse_backend_unix_path(unix_path).is_ok()
+                        && !self.is_udp_cluster(&add.cluster_id)
+                        && self
+                            .clusters
+                            .get(add.cluster_id.as_str())
+                            .and_then(|cluster| cluster.health_check.as_ref())
+                            .is_some_and(|config| config.port.is_some())
+                })
+            }
+            _ => false,
+        };
+        conflict.then_some(crate::config::HEALTH_CHECK_PORT_UNIX_REFUSED)
+    }
+
+    /// Whether datagrams, not streams, reach this cluster: it has a UDP
+    /// frontend or carries UDP-specific settings.
+    fn is_udp_cluster(&self, cluster_id: &str) -> bool {
+        self.udp_fronts
+            .get(cluster_id)
+            .is_some_and(|fronts| !fronts.is_empty())
+            || self
+                .clusters
+                .get(cluster_id)
+                .is_some_and(|cluster| cluster.udp.is_some())
+    }
+
     /// Add or update a backend of an existing cluster. A backend belongs to
     /// its cluster: one naming a cluster the state does not hold, never added
     /// or already removed (`Self::remove_cluster` removes its backends), is
-    /// refused with `ClusterNotFound` and the state is left untouched.
+    /// refused with `ClusterNotFound` and the state is left untouched, before
+    /// any `unix_path` or UDP validation.
     /// Frontends stay independent of their cluster's presence.
     fn add_backend(&mut self, add_backend: &AddBackend) -> Result<(), StateError> {
         if !self.clusters.contains_key(add_backend.cluster_id.as_str()) {
@@ -2762,6 +2862,25 @@ impl ConfigState {
                 cluster_id: add_backend.cluster_id.to_owned(),
             });
         }
+        if let Some(unix_path) = add_backend.unix_path.as_deref() {
+            crate::config::parse_backend_unix_path(unix_path).map_err(|reason| {
+                StateError::InvalidValue {
+                    field: "unix_path",
+                    reason,
+                }
+            })?;
+            // A UDP cluster relays datagrams over UDP sockets: a UNIX stream
+            // endpoint cannot carry them, and the datapath would relay to the
+            // identity `address` instead. The frontend that makes the cluster
+            // UDP may land after the backend; `add_udp_frontend` refuses that
+            // order.
+            if self.is_udp_cluster(&add_backend.cluster_id) {
+                return Err(StateError::InvalidValue {
+                    field: "unix_path",
+                    reason: UDP_UNIX_BACKEND_REFUSED,
+                });
+            }
+        }
         let backend = Backend {
             address: add_backend.address.into(),
             cluster_id: add_backend.cluster_id.as_str().into(),
@@ -2769,6 +2888,7 @@ impl ConfigState {
             sticky_id: add_backend.sticky_id.clone(),
             load_balancing_parameters: add_backend.load_balancing_parameters,
             backup: add_backend.backup,
+            unix_path: add_backend.unix_path.clone(),
         };
         let backends = self.backends.entry(backend.cluster_id.clone()).or_default();
         let backend_id = backend.backend_id.clone();
@@ -2930,7 +3050,7 @@ impl ConfigState {
 
         for backend_list in self.backends.values() {
             for backend in backend_list {
-                v.push(RequestType::AddBackend(backend.clone().to_add_backend()).into());
+                v.push(RequestType::add_backend(backend.clone().to_add_backend()).into());
             }
         }
 
@@ -3437,11 +3557,25 @@ impl ConfigState {
         }
 
         let mut removed_clusters: Vec<&ClusterId> = Vec::new();
+        // A cluster that gains a health check port while `self` still holds a
+        // unix backend for it is refused until that backend is replaced
+        // (`Self::health_check_port_unix_conflict`): its `AddCluster` follows
+        // the backend orders below.
+        let mut deferred_clusters: Vec<Request> = Vec::new();
         for (cluster_id, res) in diff_map(self.clusters.iter(), other.clusters.iter()) {
             match res {
-                DiffResult::Added | DiffResult::Changed => v.push(
-                    RequestType::AddCluster(other.clusters.get(cluster_id).unwrap().clone()).into(),
-                ),
+                DiffResult::Added | DiffResult::Changed => {
+                    let add: Request =
+                        RequestType::AddCluster(other.clusters.get(cluster_id).unwrap().clone())
+                            .into();
+                    if add.request_type.as_ref().is_some_and(|request| {
+                        self.health_check_port_unix_conflict(request).is_some()
+                    }) {
+                        deferred_clusters.push(add);
+                    } else {
+                        v.push(add);
+                    }
+                }
                 DiffResult::Removed => {
                     removed_clusters.push(cluster_id);
                     v.push(RequestType::RemoveCluster(cluster_id.to_string()).into())
@@ -3486,7 +3620,7 @@ impl ConfigState {
                         .get(cluster_id)
                         .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
-                    v.push(RequestType::AddBackend(backend.clone().to_add_backend()).into());
+                    v.push(RequestType::add_backend(backend.clone().to_add_backend()).into());
                 }
                 DiffResult::Removed => {
                     let backend = base
@@ -3525,10 +3659,12 @@ impl ConfigState {
                         .get(cluster_id)
                         .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
-                    v.push(RequestType::AddBackend(backend.clone().to_add_backend()).into());
+                    v.push(RequestType::add_backend(backend.clone().to_add_backend()).into());
                 }
             }
         }
+
+        v.append(&mut deferred_clusters);
 
         let mut my_http_fronts: HashSet<(&str, &HttpFrontend)> = HashSet::new();
         for (route, front) in base.http_fronts.iter() {
@@ -6298,7 +6434,9 @@ mod tests {
             RequestType::AddUdpFrontend(front) | RequestType::RemoveUdpFrontend(front) => {
                 Some(&front.cluster_id)
             }
-            RequestType::AddBackend(backend) => Some(&backend.cluster_id),
+            RequestType::AddBackend(backend) | RequestType::AddUnixBackend(backend) => {
+                Some(&backend.cluster_id)
+            }
             RequestType::RemoveBackend(backend) => Some(&backend.cluster_id),
             _ => None,
         }
@@ -6652,6 +6790,36 @@ mod tests {
         );
     }
 
+    /// `AddUnixBackend` obeys the same ownership contract as `AddBackend`, and
+    /// the guard runs before `unix_path` validation: an unknown cluster is
+    /// `ClusterNotFound` even for an invalid path, and nothing is stored.
+    #[test]
+    fn add_unix_backend_for_an_unknown_cluster_is_refused() {
+        let mut state = ConfigState::new();
+        for unix_path in ["/run/app.sock", "relative.sock"] {
+            let refused = state.dispatch(
+                &RequestType::AddUnixBackend(AddBackend {
+                    cluster_id: String::from("orphan"),
+                    backend_id: String::from("orphan-unix"),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 1),
+                    unix_path: Some(unix_path.to_owned()),
+                    ..Default::default()
+                })
+                .into(),
+            );
+            assert!(
+                matches!(refused, Err(StateError::ClusterNotFound { .. })),
+                "{unix_path:?}: an unknown cluster must be refused first, got {refused:?}"
+            );
+            assert!(
+                state.backends.is_empty(),
+                "a refused AddUnixBackend must not leave a bucket behind: {:?}",
+                state.backends
+            );
+        }
+        assert!(state.clusters.is_empty());
+    }
+
     /// The refusal leaves the error text bounded: a cluster id is protected
     /// material (`doc/observability.md`), so `Display` names only its length.
     #[test]
@@ -6705,6 +6873,67 @@ mod tests {
                 .unwrap_or_else(|e| panic!("could not replay {request:?}: {e}"));
         }
         assert_same_routing(&state, &target, "replaying diff(empty, target)");
+    }
+
+    /// A cluster `app` with one backend of fixed identity, either a UNIX
+    /// backend probed through its socket, or an IP backend probed on `port`.
+    fn app_cluster_probing(port: Option<u32>, unix_path: Option<&str>) -> ConfigState {
+        let mut state = ConfigState::new();
+        let health_check = crate::proto::command::HealthCheckConfig {
+            interval: 10,
+            timeout: 5,
+            healthy_threshold: 3,
+            unhealthy_threshold: 3,
+            mode: crate::proto::command::HealthCheckMode::Tcp as i32,
+            port,
+            ..Default::default()
+        };
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("app"),
+                    health_check: Some(health_check),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("the cluster must be accepted");
+        state
+            .dispatch(
+                &RequestType::add_backend(AddBackend {
+                    cluster_id: String::from("app"),
+                    backend_id: String::from("app-0"),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 9000),
+                    unix_path: unix_path.map(ToOwned::to_owned),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("the backend must be accepted");
+        state
+    }
+
+    /// `diff` between a cluster without a probe port owning a UNIX backend and
+    /// the same cluster with a probe port owning the same backend identity as
+    /// an IP backend (and the reverse) must converge: the port is only
+    /// accepted once the UNIX backend is gone, and a UNIX backend only once
+    /// the port is gone.
+    #[test]
+    fn diff_converges_when_a_probe_port_and_a_unix_backend_swap() {
+        let unix = app_cluster_probing(None, Some("/run/app.sock"));
+        let ip = app_cluster_probing(Some(8081), None);
+        for (from, to, direction) in [
+            (&unix, &ip, "unix -> ip+port"),
+            (&ip, &unix, "ip+port -> unix"),
+        ] {
+            let mut state = from.clone();
+            for request in from.diff(to) {
+                state
+                    .dispatch(&request)
+                    .unwrap_or_else(|e| panic!("{direction}: could not apply {request:?}: {e}"));
+            }
+            assert_same_routing(&state, to, direction);
+        }
     }
 
     #[test]
@@ -6807,6 +7036,7 @@ mod tests {
             load_balancing_parameters: Some(LoadBalancingParams::default()),
             sticky_id: Some("sticky".to_string()),
             backup: None,
+            unix_path: None,
         };
 
         state
@@ -6814,6 +7044,69 @@ mod tests {
             .expect("Could not execute order");
 
         assert_eq!(state.backends.get("cluster_1").unwrap(), &vec![b]);
+    }
+
+    /// #152: a backend's `unix_path` survives into the state and back out of
+    /// the orders it replays to a new worker, so a restart or an upgrade does
+    /// not turn a unix backend into a TCP one.
+    #[test]
+    fn a_unix_path_backend_round_trips_through_the_state() {
+        let mut state: ConfigState = Default::default();
+        add_clusters(&mut state, &["cluster_1"]);
+        let add = AddBackend {
+            cluster_id: String::from("cluster_1"),
+            backend_id: String::from("cluster_1-unix"),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 1),
+            unix_path: Some(String::from("/run/app.sock")),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::AddBackend(add.clone()).into())
+            .expect("a valid unix_path is accepted");
+        assert_eq!(
+            state.backends["cluster_1"][0].unix_path.as_deref(),
+            Some("/run/app.sock")
+        );
+        let replayed: Vec<AddBackend> = state
+            .generate_requests()
+            .into_iter()
+            .filter_map(|request| match request.request_type {
+                Some(RequestType::AddUnixBackend(backend)) => Some(backend),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(replayed, vec![add]);
+    }
+
+    /// #152: the main process refuses a `unix_path` no worker could dial,
+    /// before it reaches the state.
+    #[test]
+    fn an_invalid_unix_path_is_refused() {
+        let mut state: ConfigState = Default::default();
+        add_clusters(&mut state, &["cluster_1"]);
+        for refused in ["", "relative.sock", "@"] {
+            let result = state.dispatch(
+                &RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-unix"),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 1),
+                    unix_path: Some(refused.to_owned()),
+                    ..Default::default()
+                })
+                .into(),
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(StateError::InvalidValue {
+                        field: "unix_path",
+                        ..
+                    })
+                ),
+                "{refused:?} must be refused"
+            );
+        }
+        assert!(state.backends.is_empty());
     }
 
     #[test]
@@ -9033,6 +9326,97 @@ mod tests {
             .dispatch(&set(probe.clone()))
             .expect("a probe port within 1..=65535 is accepted");
         assert_eq!(state.clusters["app"].health_check, Some(probe));
+    }
+
+    /// A probe `port` targets a backend IP, a `unix_path` backend has none:
+    /// whichever arrives second is refused, and the cluster, its health check
+    /// and its backends stay as they were.
+    #[test]
+    fn a_health_check_port_and_a_unix_backend_never_share_a_cluster() {
+        use crate::proto::command::{HealthCheckConfig, HealthCheckMode, SetHealthCheck};
+
+        let probe = |port| HealthCheckConfig {
+            interval: 10,
+            timeout: 5,
+            healthy_threshold: 3,
+            unhealthy_threshold: 3,
+            mode: HealthCheckMode::Tcp as i32,
+            port,
+            ..Default::default()
+        };
+        let cluster = |health_check| -> Request {
+            RequestType::AddCluster(Cluster {
+                cluster_id: String::from("app"),
+                health_check,
+                ..Default::default()
+            })
+            .into()
+        };
+        let backend = |unix_path: Option<&str>| AddBackend {
+            cluster_id: String::from("app"),
+            backend_id: String::from("app-0"),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 1),
+            unix_path: unix_path.map(ToOwned::to_owned),
+            ..Default::default()
+        };
+        let add_unix: Request = RequestType::AddUnixBackend(backend(Some("/run/app.sock"))).into();
+        let set = |port| -> Request {
+            RequestType::SetHealthCheck(SetHealthCheck {
+                cluster_id: String::from("app"),
+                config: probe(port),
+            })
+            .into()
+        };
+        let refused = |state: &mut ConfigState, request: &Request| {
+            let before = (state.clusters.clone(), state.backends.clone());
+            let error = state.dispatch(request).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    StateError::InvalidValue {
+                        field: "health_check.port",
+                        reason: crate::config::HEALTH_CHECK_PORT_UNIX_REFUSED,
+                    }
+                ),
+                "expected the probe port / unix_path refusal, got: {error}"
+            );
+            assert_eq!(before, (state.clusters.clone(), state.backends.clone()));
+        };
+
+        // The probe port is there first.
+        let mut state = ConfigState::new();
+        state.dispatch(&cluster(Some(probe(Some(8081))))).unwrap();
+        refused(&mut state, &add_unix);
+        assert!(state.backends.get("app").is_none_or(Vec::is_empty));
+        state
+            .dispatch(&RequestType::AddBackend(backend(None)).into())
+            .expect("an IP backend takes the probe port");
+
+        // The unix backend is there first, through `SetHealthCheck`, then an
+        // `AddCluster` upsert.
+        let mut state = ConfigState::new();
+        state.dispatch(&cluster(Some(probe(None)))).unwrap();
+        state.dispatch(&add_unix).unwrap();
+        refused(&mut state, &set(Some(8081)));
+        refused(&mut state, &cluster(Some(probe(Some(8081)))));
+        assert_eq!(state.clusters["app"].health_check, Some(probe(None)));
+        state
+            .dispatch(&set(None))
+            .expect("a unix backend is probed through its socket");
+        state
+            .dispatch(&cluster(None))
+            .expect("an upsert without a health check keeps the unix backend");
+
+        // An unknown cluster keeps its own diagnostic.
+        let mut state = ConfigState::new();
+        assert!(matches!(
+            state.dispatch(&set(Some(8081))).unwrap_err(),
+            StateError::NotFound { .. }
+        ));
+        assert!(matches!(
+            state.dispatch(&add_unix).unwrap_err(),
+            StateError::ClusterNotFound { .. }
+        ));
     }
 
     /// ALPN validation: reject unknown ALPN values.

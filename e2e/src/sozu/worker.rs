@@ -496,6 +496,7 @@ impl Worker {
             load_balancing_parameters: Some(LoadBalancingParams::default()),
             sticky_id,
             backup: None,
+            unix_path: None,
         }
     }
 }

@@ -22,7 +22,10 @@ Two probe modes exist (`mode`):
 
 Both modes dial each backend's address, unless `port` is set: the probe then
 connects to the backend's IP address on that port, for a backend whose health
-endpoint or companion listener lives beside its data port.
+endpoint or companion listener lives beside its data port. `port` is refused in a
+cluster with a backend carrying `unix_path`, in either order and on every ingress (file,
+CLI, command socket, worker): a UNIX socket has no IP address, so the probe endpoint
+would be ambiguous. Without `port`, a `unix_path` backend is probed through its socket.
 
 > **Before enabling `TCP` mode or `accepted_statuses`, upgrade the main process
 > and every worker, and use the new `sozu` CLI.** Both are new protocol fields
@@ -37,11 +40,14 @@ endpoint or companion listener lives beside its data port.
 > on every worker; and with an older binary loading a saved state written by a
 > newer one. Downgrading while a cluster uses either field is not supported.
 
-> **Before setting `port`, upgrade the main process and every worker, and use
-> the new `sozu` CLI**, for the same reasons: `port` is `HealthCheckConfig`
-> field 9, which an older Sōzu ignores, so it probes the backend's data port
-> instead — and in `TCP` mode passes every backend that accepts connections
-> there, whatever the probe port would have answered.
+> **Before setting `port`, upgrade the main process and every worker to 2.3.2,
+> and use the new `sozu` CLI.** `port` is `HealthCheckConfig` field 9, an
+> additive field on the existing `AddCluster` and `SetHealthCheck` messages, so
+> it is **not** fail-closed: an older worker decodes the message, ignores the
+> unknown field and probes the backend's data port instead — and in `TCP` mode
+> passes every backend that accepts connections there, whatever the probe port
+> would have answered. Only the new `unix_path`, header-routing and
+> `silent_close` request verbs are refused by an older worker.
 
 ## How it works
 
@@ -185,7 +191,7 @@ port = 9090
 | `unhealthy_threshold` | u32      | `3`      | Consecutive failures required to transition from healthy to unhealthy.                                          |
 | `expected_status`     | u32      | `0`      | `HTTP` mode, when `accepted_statuses` is empty: `0` accepts any 2xx, any other value exactly that status. Must stay `0` in `TCP` mode. |
 | `accepted_statuses`   | [string] | `[]`     | `HTTP` mode: the accepted statuses (see below). Exclusive with a non-zero `expected_status`; refused in `TCP` mode. |
-| `port`                | u32      | —        | Port the probe dials on the backend's IP address, in `1-65535`, in both modes. Unset = the backend's data port. |
+| `port`                | u32      | —        | Port the probe dials on the backend's IP address, in `1-65535`, in both modes. Unset = the backend's data port. Refused with a `unix_path` backend in the cluster. |
 
 Each `accepted_statuses` entry is one of:
 
@@ -277,7 +283,7 @@ the two flags collided and every `health-check set` invocation panicked.
 | `--unhealthy-threshold` | no       | `3`     | Consecutive failures to mark a backend DOWN.                                               |
 | `--expected-status`     | no       | `0`     | Expected HTTP status code (`0` = any 2xx). Exclusive with `--accepted-statuses`.           |
 | `--accepted-statuses`   | no       | —       | Comma-separated accepted statuses: codes, ranges, classes or `any` (e.g. `200-399,404`).   |
-| `--port`                | no       | —       | Port the probe dials on the backend's IP address, `1-65535`. Unset = the data port.        |
+| `--port`                | no       | —       | Port the probe dials on the backend's IP address, `1-65535`. Unset = the data port. Refused with `unix_path`. |
 
 #### List health check configurations
 

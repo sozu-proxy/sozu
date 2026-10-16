@@ -2758,6 +2758,24 @@ impl Server {
     }
 
     pub fn notify_proxys(&mut self, request: WorkerRequest) {
+        // A health check `port` and a `unix_path` backend never share a
+        // cluster. The state refuses the pair, but a refusal other than
+        // `ClusterNotFound` does not stop the worker below, so ask first and
+        // leave the state, the `BackendMap` and the `HealthChecker` as they
+        // are.
+        if let Some(reason) = request
+            .content
+            .request_type
+            .as_ref()
+            .and_then(|request_type| {
+                self.config_state
+                    .health_check_port_unix_conflict(request_type)
+            })
+        {
+            push_queue(worker_response_error(request.id, reason));
+            return;
+        }
+
         // Read before the dispatch below: `ConfigState::remove_cluster`
         // (`command/src/state.rs`) removes these objects from the state, and
         // the `RemoveCluster` arm removes them from the proxies.
@@ -2901,7 +2919,8 @@ impl Server {
                 push_queue(WorkerResponse::ok(req_id));
                 return;
             }
-            Some(RequestType::AddBackend(ref backend)) => {
+            Some(RequestType::AddBackend(ref backend))
+            | Some(RequestType::AddUnixBackend(ref backend)) => {
                 push_queue(self.add_backend(&req_id, backend));
                 return;
             }
@@ -3079,13 +3098,21 @@ impl Server {
     }
 
     fn add_backend(&mut self, req_id: &str, add_backend: &AddBackend) -> WorkerResponse {
+        if let Some(Err(reason)) = add_backend
+            .unix_path
+            .as_deref()
+            .map(sozu_command::config::parse_backend_unix_path)
+        {
+            return WorkerResponse::error(req_id, format!("invalid unix_path: {reason}"));
+        }
         let new_backend = Backend::new(
             &add_backend.backend_id,
             add_backend.address.into(),
             add_backend.sticky_id.clone(),
             add_backend.load_balancing_parameters,
             add_backend.backup,
-        );
+        )
+        .with_unix_path(add_backend.unix_path.clone());
         self.backends
             .borrow_mut()
             .add_backend(&add_backend.cluster_id, new_backend);
@@ -5607,6 +5634,7 @@ mod listener_lifecycle_tests {
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
                 sticky_id: None,
                 backup: None,
+                unix_path: None,
             })
             .into(),
         });
@@ -6145,6 +6173,7 @@ mod add_cluster_validation_tests {
                     load_balancing_parameters: Some(LoadBalancingParams::default()),
                     sticky_id: None,
                     backup: None,
+                    unix_path: None,
                 })
                 .into(),
             });
@@ -6159,6 +6188,134 @@ mod add_cluster_validation_tests {
             list.select_with_key(Some(key), Instant::now()).1,
             ShardOutcome::Unsharded,
             "a refused AddCluster must not arm a shard"
+        );
+    }
+}
+
+/// A health check `port` targets a backend IP and a `unix_path` backend has
+/// none: the worker refuses the pair in either order before its state, its
+/// `BackendMap` or its `HealthChecker` change.
+#[cfg(test)]
+mod health_check_port_unix_tests {
+    use sozu_command::{
+        config::HEALTH_CHECK_PORT_UNIX_REFUSED,
+        proto::command::{HealthCheckConfig, HealthCheckMode, SetHealthCheck, SocketAddress},
+    };
+
+    use super::listener_lifecycle_tests::bare_server;
+    use super::*;
+
+    const CLUSTER: &str = "port-unix-cluster";
+
+    fn probe(port: Option<u32>) -> HealthCheckConfig {
+        HealthCheckConfig {
+            interval: 10,
+            timeout: 5,
+            healthy_threshold: 3,
+            unhealthy_threshold: 3,
+            mode: HealthCheckMode::Tcp as i32,
+            port,
+            ..Default::default()
+        }
+    }
+
+    fn cluster(health_check: Option<HealthCheckConfig>) -> RequestType {
+        RequestType::AddCluster(Cluster {
+            cluster_id: CLUSTER.to_owned(),
+            health_check,
+            ..Default::default()
+        })
+    }
+
+    fn unix_backend() -> RequestType {
+        RequestType::AddUnixBackend(AddBackend {
+            cluster_id: CLUSTER.to_owned(),
+            backend_id: format!("{CLUSTER}-0"),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 1),
+            unix_path: Some("/run/app.sock".to_owned()),
+            ..Default::default()
+        })
+    }
+
+    fn send(server: &mut Server, request: RequestType) -> Vec<WorkerResponse> {
+        server.notify_proxys(WorkerRequest {
+            id: "test-request".to_owned(),
+            content: request.into(),
+        });
+        QUEUE.with(|queue| {
+            queue
+                .borrow_mut()
+                .drain(..)
+                .filter(|response| response.id != "EVENT")
+                .collect()
+        })
+    }
+
+    /// What the refusal must leave alone: the persisted state, the
+    /// `BackendMap` (backend incarnations by allocation, probe configs) and
+    /// the probes in flight.
+    fn snapshot(server: &Server) -> (String, Vec<*const RefCell<Backend>>, Vec<String>, usize) {
+        let backends = server.backends.borrow();
+        (
+            format!(
+                "{:?}{:?}",
+                server.config_state.clusters, server.config_state.backends
+            ),
+            backends
+                .backends
+                .get(CLUSTER)
+                .map(|list| list.backends.iter().map(Rc::as_ptr).collect())
+                .unwrap_or_default(),
+            backends
+                .health_check_configs
+                .values()
+                .map(|config| format!("{config:?}"))
+                .collect(),
+            server.health_checker.in_flight_len(),
+        )
+    }
+
+    fn assert_refused(server: &mut Server, request: RequestType) {
+        let before = snapshot(server);
+        let responses = send(server, request);
+        assert_eq!(responses.len(), 1, "one answer expected: {responses:?}");
+        assert_eq!(responses[0].status, ResponseStatus::Failure as i32);
+        assert!(
+            responses[0]
+                .message
+                .contains(HEALTH_CHECK_PORT_UNIX_REFUSED),
+            "the answer names the refusal: {responses:?}"
+        );
+        assert_eq!(before, snapshot(server), "a refusal changes nothing");
+    }
+
+    #[test]
+    fn a_probe_port_already_set_refuses_a_unix_backend() {
+        let mut server = bare_server();
+        send(&mut server, cluster(Some(probe(Some(8081)))));
+        assert_refused(&mut server, unix_backend());
+        assert!(snapshot(&server).1.is_empty(), "no backend was added");
+    }
+
+    #[test]
+    fn a_unix_backend_already_there_refuses_a_probe_port() {
+        let mut server = bare_server();
+        send(&mut server, cluster(Some(probe(None))));
+        send(&mut server, unix_backend());
+        assert_eq!(snapshot(&server).1.len(), 1, "test setup: the unix backend");
+
+        assert_refused(
+            &mut server,
+            RequestType::SetHealthCheck(SetHealthCheck {
+                cluster_id: CLUSTER.to_owned(),
+                config: probe(Some(8081)),
+            }),
+        );
+        assert_refused(&mut server, cluster(Some(probe(Some(8081)))));
+        assert_eq!(
+            server.backends.borrow().health_check_configs[CLUSTER].port,
+            None,
+            "the previous probe config stays"
         );
     }
 }
@@ -6211,6 +6368,7 @@ mod remove_health_check_tests {
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
                 sticky_id: None,
                 backup: None,
+                unix_path: None,
             })
             .into(),
         });
@@ -6273,6 +6431,66 @@ mod remove_health_check_tests {
         assert!(
             backend_is_healthy(&server),
             "an AddCluster without a health check must reset a backend marked DOWN"
+        );
+    }
+
+    /// An idempotent reload re-sends the same `AddCluster` (health check
+    /// `port` included) and the same `AddBackend`: the DOWN backend and its
+    /// failure counters must survive, only a `None` health check resets them.
+    ///
+    /// TO SEE THIS RED: make `Server::add_cluster` pass `None` to
+    /// `set_health_check_config`; the counters are cleared.
+    #[test]
+    fn an_idempotent_reload_keeps_a_backend_marked_down_and_its_counters() {
+        let ported = HealthCheckConfig {
+            port: Some(8081),
+            ..health_check()
+        };
+        let mut server = bare_server();
+        add_cluster(&mut server, Some(ported.clone()));
+        let add_backend = || WorkerRequest {
+            id: "test-add-backend".to_owned(),
+            content: RequestType::AddBackend(AddBackend {
+                cluster_id: CLUSTER.to_owned(),
+                backend_id: format!("{CLUSTER}-0"),
+                address: SocketAddr::from(([127, 0, 0, 1], 23_100)).into(),
+                load_balancing_parameters: Some(LoadBalancingParams::default()),
+                sticky_id: None,
+                backup: None,
+                unix_path: None,
+            })
+            .into(),
+        };
+        server.notify_proxys(add_backend());
+        {
+            let backends = server.backends.borrow();
+            let mut backend = backends.backends[CLUSTER].backends[0].borrow_mut();
+            // thresholds above the failure count keep the status stable; two
+            // failures leave a nonzero streak, the third marks it DOWN
+            for _ in 0..3 {
+                backend.health.record_failure(3);
+            }
+        }
+        let before = server.backends.borrow().backends[CLUSTER].backends[0]
+            .borrow()
+            .health
+            .clone();
+        assert!(!before.is_healthy(), "test setup: backend DOWN");
+        assert_eq!(before.consecutive_failures, 3, "test setup: counters");
+
+        // the order a reload sends: the cluster first, then its backend
+        add_cluster(&mut server, Some(ported.clone()));
+        server.notify_proxys(add_backend());
+
+        let after = server.backends.borrow().backends[CLUSTER].backends[0]
+            .borrow()
+            .health
+            .clone();
+        assert_eq!(after, before, "a reload must not reset the runtime health");
+        assert_eq!(
+            server.backends.borrow().health_check_configs[CLUSTER],
+            ported,
+            "the health check configuration stays"
         );
     }
 }
