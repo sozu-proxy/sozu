@@ -1,11 +1,13 @@
 //! Protected health-check header values and their keyed fingerprints.
 //!
 //! A health-check header value is a credential more often than not
-//! (`Authorization`). It lives in memory only, in a [`SecretValue`] that is
+//! (`Authorization`). It lives in memory only, in a [`SecretValue`](crate::secret::SecretValue) that is
 //! neither `Clone`, `Serialize`, `Display` nor value-revealing `Debug`, and
 //! whose buffer is zeroed when it drops. Anything that has to show or compare
-//! a value shows the header name plus a [`HeaderFingerprint`]: a keyed
-//! HMAC-SHA256 under a [`FingerprintKey`] the process generates for itself.
+//! a value shows the header name plus a
+//! [`HeaderFingerprint`](crate::secret::HeaderFingerprint): a keyed HMAC-SHA256
+//! under a [`FingerprintKey`](crate::secret::FingerprintKey) the process
+//! generates for itself.
 //!
 //! Zeroing on drop covers the buffer this module owns. It does not reach what
 //! the allocator, the kernel, a socket buffer or swap may already have copied.

@@ -27,9 +27,11 @@
 //! skipping it.
 //!
 //! `#[ignore]`d so a contributor's `cargo test` stays fast; CI runs the compiled
-//! test executable under `sudo unshare --user --map-current-user` in the
-//! `proc-observer-e2e` job of `.github/workflows/ci.yml`. Run it by hand as root
-//! of a user namespace, for example:
+//! test executable under `sudo setpriv … unshare --user --map-root-user`, which
+//! maps the normal runner owner UID/GID to namespace root, in the
+//! `proc-observer-e2e` job of
+//! `.github/workflows/ci.yml`. Run it by hand as root of a user namespace, for
+//! example:
 //!
 //! ```bash
 //! cargo test -p sozu --test upgrade_fd_inheritance_e2e --no-run

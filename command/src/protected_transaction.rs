@@ -1,12 +1,13 @@
 //! Two-phase coordination of the protected health-check headers of a cluster
 //! across the main process and every worker.
 //!
-//! The main-process SetProtectedHealthCheck task uses [Transaction], while each
-//! worker uses [WorkerStore] for its staged and committed versions. Their causal
+//! The main-process SetProtectedHealthCheck task uses [`Transaction`](crate::protected_transaction::Transaction), while each
+//! worker uses [`WorkerStore`](crate::protected_transaction::WorkerStore) for its staged and committed versions. Their causal
 //! rules are described below.
 //!
-//! Main side, [`Transaction`]: it proposes a [`ProtectedHeaderChange`] in the
-//! [`ProtectedHeaderJournal`] and walks every targeted worker through
+//! Main side, [`Transaction`](crate::protected_transaction::Transaction): it proposes a
+//! [`ProtectedHeaderChange`](crate::secret::ProtectedHeaderChange) in the
+//! [`ProtectedHeaderJournal`](crate::secret::ProtectedHeaderJournal) and walks every targeted worker through
 //! *prepare* (validate and stage), *commit* (apply) and, when anything fails,
 //! *abort* (drop the staged proposal, or undo the applied one). The journal
 //! confirms the proposal only when every worker acknowledged the commit; it
@@ -14,11 +15,12 @@
 //! worker that cannot be made coherent is reported, to be restarted: a
 //! restarted worker holds no value, which is coherent and probes nothing.
 //!
-//! A transaction carries a cluster id, a [`ProtectedHeaderVersion`], a phase
+//! A transaction carries a cluster id, a
+//! [`ProtectedHeaderVersion`](crate::secret::ProtectedHeaderVersion), a phase
 //! and per-worker acknowledgement flags. It never carries a value, a
 //! fingerprint key or an encoded order, so a task may persist it.
 //!
-//! Worker side, [`WorkerStore`]: it resolves only versions it holds, applies
+//! Worker side, [`WorkerStore`](crate::protected_transaction::WorkerStore): it resolves only versions it holds, applies
 //! them in version order whatever the order of arrival, and keeps the state
 //! before the applied version until it is released, so that an abort after a
 //! commit restores exactly that state.

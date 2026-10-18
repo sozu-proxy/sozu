@@ -445,9 +445,33 @@ jobs:
   # over the same nine cells as `pipeline` (one YAML anchor), and nowhere else.
   #
   # Cargo compiles as the runner user; only the compiled libtest ELFs run
-  # under `sudo unshare`, never Cargo. The privileged invocation is a private
-  # user namespace around the test process; no container capability, seccomp
-  # profile, sysctl or LSM setting is changed.
+  # through `sudo setpriv ... unshare`, never Cargo. Three stages:
+  #   1. Host root runs `setpriv`, which uses PR_SET_KEEPCAPS while switching
+  #      to the recorded runner UID/GID (`--reuid`, `--regid`,
+  #      `--clear-groups`) and temporarily retains root's permitted/effective
+  #      set internally. After it raises inheritable and ambient
+  #      `CAP_SYS_ADMIN` and execs `unshare`, that exec receives only
+  #      `CAP_SYS_ADMIN` as permitted, effective, inheritable and ambient,
+  #      with the bounding set untouched. Ubuntu's AppArmor user namespace
+  #      policy exempts an unconfined process holding that capability in its
+  #      current user namespace, which is why the runner identity may create
+  #      the namespace; `unshare` uses it for the outer namespace.
+  #   2. `unshare --user --map-root-user` creates a private user namespace and,
+  #      seeing the runner as its effective UID/GID, writes the simple
+  #      single-extent self-map of that runner identity to namespace root
+  #      itself; no `newuidmap`/`newgidmap` helper is involved. The checkout
+  #      and `target/`, owned by the runner, stay reachable. Creating the
+  #      namespace replaces the credentials and clears the ambient set, so no
+  #      `CAP_SYS_ADMIN` remains valid in the initial namespace.
+  #   3. The test ELF runs as namespace root and receives only capabilities
+  #      bound to that new child user namespace, such as `CAP_SYS_PTRACE`.
+  # The `Probe the observer user namespace boundary` step verifies this
+  # boundary on the hosted runner before any Cargo command and fails closed.
+  # `--map-current-user` under a bare `sudo` would map host root and leave the
+  # runner-owned path unreachable. The mutable-commands fixture's own nested
+  # `unshare --user --map-current-user` is a separate, unchanged step. No
+  # container capability, seccomp profile, sysctl, AppArmor or subordinate-ID
+  # setting is changed.
   proc-observer-e2e:
     name: proc-observer-${{ matrix.cell }}
     runs-on: ubuntu-latest
@@ -467,6 +491,51 @@ jobs:
 
       - name: Checkout sources
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      # The normal runner shell's IDs, read outside `sudo`, are what
+      # `setpriv` assumes and what `unshare` maps to namespace root below.
+      # Host root would map nothing useful.
+      - name: Record runner owner IDs for the observer namespace
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner_uid="$(id -u)"
+          owner_gid="$(id -g)"
+          test "$owner_uid" -ne 0
+          test "$owner_gid" -ne 0
+          echo "SOZU_PROC_OBSERVER_OWNER_UID=$owner_uid" >> "$GITHUB_ENV"
+          echo "SOZU_PROC_OBSERVER_OWNER_GID=$owner_gid" >> "$GITHUB_ENV"
+
+      # Fail-closed check of the exact boundary the observer steps use, before
+      # any Cargo command: through the same `sudo setpriv ... unshare` wrapper,
+      # a runner-owned executable in the checkout must run as namespace
+      # UID/GID 0 under a single-extent `0 <runner id> 1` map for each of the
+      # UID and GID, and must then create a nested `unshare --user
+      # --map-current-user` namespace in which it is again UID/GID 0. The
+      # temporary file is mode 0700, removed on every shell exit, and nothing
+      # falls back or is skipped on failure.
+      - name: Probe the observer user namespace boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          probe=""
+          trap 'rm -f -- "$probe"' EXIT
+          trap 'exit 1' HUP INT TERM
+          probe="$(mktemp "$PWD/.sozu-userns-probe.XXXXXX")"
+          cat > "$probe" <<'PROBE'
+          #!/bin/sh
+          set -eu
+          test "$(id -u)" = 0
+          test "$(id -g)" = 0
+          check_map() {
+            awk -v want="$2" 'NF != 3 || $1 != "0" || $2 != want || $3 != "1" { bad = 1 } END { exit ((NR == 1 && !bad) ? 0 : 1) }' "$1"
+          }
+          check_map /proc/self/uid_map "$1"
+          check_map /proc/self/gid_map "$2"
+          unshare --user --map-current-user -- sh -c 'test "$(id -u)" = 0 && test "$(id -g)" = 0'
+          PROBE
+          chmod 0700 "$probe"
+          sudo setpriv --reuid "$SOZU_PROC_OBSERVER_OWNER_UID" --regid "$SOZU_PROC_OBSERVER_OWNER_GID" --clear-groups --inh-caps +sys_admin --ambient-caps +sys_admin unshare --user --map-root-user -- "$probe" "$SOZU_PROC_OBSERVER_OWNER_UID" "$SOZU_PROC_OBSERVER_OWNER_GID"
 
       - name: Install rust ${{ matrix.toolchain }}
         uses: dtolnay/rust-toolchain@master
@@ -532,10 +601,10 @@ jobs:
           done
 
       - name: Test sozu (descriptor inheritance across upgrades)
-        run: sudo unshare --user --map-current-user -- "$UPGRADE_FD_INHERITANCE_E2E_EXE" --ignored --exact upgrades_leave_no_descriptor_shared_between_sozu_processes --nocapture --test-threads=1
+        run: sudo setpriv --reuid "$SOZU_PROC_OBSERVER_OWNER_UID" --regid "$SOZU_PROC_OBSERVER_OWNER_GID" --clear-groups --inh-caps +sys_admin --ambient-caps +sys_admin unshare --user --map-root-user -- "$UPGRADE_FD_INHERITANCE_E2E_EXE" --ignored --exact upgrades_leave_no_descriptor_shared_between_sozu_processes --nocapture --test-threads=1
 
       - name: Test sozu (mutable commands, process-level)
-        run: sudo unshare --user --map-current-user -- "$MUTABLE_COMMANDS_RUNTIME_E2E_EXE" --ignored --nocapture --test-threads=1 --skip published_2_3_1_certificate_metadata_loss_is_bounded_to_the_first_upgrade
+        run: sudo setpriv --reuid "$SOZU_PROC_OBSERVER_OWNER_UID" --regid "$SOZU_PROC_OBSERVER_OWNER_GID" --clear-groups --inh-caps +sys_admin --ambient-caps +sys_admin unshare --user --map-root-user -- "$MUTABLE_COMMANDS_RUNTIME_E2E_EXE" --ignored --nocapture --test-threads=1 --skip published_2_3_1_certificate_metadata_loss_is_bounded_to_the_first_upgrade
 
       # Every cell runs the public protected health-check case and the cold
       # restart case by exact name, serially: a header value read from a
@@ -544,22 +613,22 @@ jobs:
       # foreign metadata until the file is submitted again.
       - name: Test sozu (protected health-check header values, process-level)
         run: |
-          sudo unshare --user --map-current-user -- "$PROTECTED_HEALTH_CHECK_REFUSAL_E2E_EXE" public_protected_health_check_authenticates_probes_and_leaks_nothing --ignored --exact --nocapture --test-threads=1
-          sudo unshare --user --map-current-user -- "$PROTECTED_HEALTH_CHECK_REFUSAL_E2E_EXE" cold_toml_header_file_does_not_override_saved_foreign_metadata_after_restart --ignored --exact --nocapture --test-threads=1
+          sudo setpriv --reuid "$SOZU_PROC_OBSERVER_OWNER_UID" --regid "$SOZU_PROC_OBSERVER_OWNER_GID" --clear-groups --inh-caps +sys_admin --ambient-caps +sys_admin unshare --user --map-root-user -- "$PROTECTED_HEALTH_CHECK_REFUSAL_E2E_EXE" public_protected_health_check_authenticates_probes_and_leaks_nothing --ignored --exact --nocapture --test-threads=1
+          sudo setpriv --reuid "$SOZU_PROC_OBSERVER_OWNER_UID" --regid "$SOZU_PROC_OBSERVER_OWNER_GID" --clear-groups --inh-caps +sys_admin --ambient-caps +sys_admin unshare --user --map-root-user -- "$PROTECTED_HEALTH_CHECK_REFUSAL_E2E_EXE" cold_toml_header_file_does_not_override_saved_foreign_metadata_after_restart --ignored --exact --nocapture --test-threads=1
 
       # Generic cells skip the published-2.3.1 case visibly (it needs the
       # verified release binary); the crypto-ring cell runs it, serially, by
       # exact name. Only the variable naming that binary crosses `sudo`.
       - name: Test Sōzu 2.3.1 certificate-metadata upgrade boundary
         if: matrix.cell == 'crypto-ring'
-        run: sudo --preserve-env=SOZU_CERTIFICATE_METADATA_LEGACY unshare --user --map-current-user -- "$MUTABLE_COMMANDS_RUNTIME_E2E_EXE" published_2_3_1_certificate_metadata_loss_is_bounded_to_the_first_upgrade --ignored --exact --nocapture --test-threads=1
+        run: sudo --preserve-env=SOZU_CERTIFICATE_METADATA_LEGACY setpriv --reuid "$SOZU_PROC_OBSERVER_OWNER_UID" --regid "$SOZU_PROC_OBSERVER_OWNER_GID" --clear-groups --inh-caps +sys_admin --ambient-caps +sys_admin unshare --user --map-root-user -- "$MUTABLE_COMMANDS_RUNTIME_E2E_EXE" published_2_3_1_certificate_metadata_loss_is_bounded_to_the_first_upgrade --ignored --exact --nocapture --test-threads=1
 
       # The same verified public 2.3.1 binary must refuse the header-file set
       # request before any file I/O and keep no trace. Only the variable naming
       # that binary crosses `sudo`.
       - name: Test Sōzu 2.3.1 refusal of protected health-check header files
         if: matrix.cell == 'crypto-ring'
-        run: sudo --preserve-env=SOZU_CERTIFICATE_METADATA_LEGACY unshare --user --map-current-user -- "$PROTECTED_HEALTH_CHECK_REFUSAL_E2E_EXE" published_2_3_1_main_refuses_header_file_set_before_any_file_io_and_keeps_no_trace --ignored --exact --nocapture --test-threads=1
+        run: sudo --preserve-env=SOZU_CERTIFICATE_METADATA_LEGACY setpriv --reuid "$SOZU_PROC_OBSERVER_OWNER_UID" --regid "$SOZU_PROC_OBSERVER_OWNER_GID" --clear-groups --inh-caps +sys_admin --ambient-caps +sys_admin unshare --user --map-root-user -- "$PROTECTED_HEALTH_CHECK_REFUSAL_E2E_EXE" published_2_3_1_main_refuses_header_file_set_before_any_file_io_and_keeps_no_trace --ignored --exact --nocapture --test-threads=1
 
   # ┌──────────────────────────────────────────────────────────────┐
   # │ Group C — dedicated fuzz job (nightly toolchain, real fuzzing)│

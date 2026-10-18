@@ -2474,11 +2474,11 @@ impl Server {
     /// `NotAnswering` and queue a correlated headerless `Status` for it.
     ///
     /// The worker becomes `Running` only once that `Status` is answered `Ok`
-    /// (see [`WorkerReadinessTask`]). Until then it is a live child that
+    /// (see `WorkerReadinessTask`). Until then it is a live child that
     /// `workers_to_spawn` counts, so startup never double-spawns, and it is
     /// admitted to untargeted fan-out through `startup_workers` because the
     /// caller scatters the static configuration before the event loop runs
-    /// (see [`Self::begin_worker_initialization`]).
+    /// (see `Server::begin_worker_initialization`).
     pub fn launch_new_worker(
         &mut self,
         listeners: Option<Listeners>,
