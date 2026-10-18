@@ -369,6 +369,18 @@ fn sha256_file(path: &Path) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Real-main launcher: a same-UID observer cannot read `/proc/<pid>/exe` of
+/// the hardened (non-dumpable) main. `unshare --user --map-current-user` keeps
+/// the child PID and UID while making the owning observer able to read them.
+/// Absence or refusal of `unshare` fails the spawn visibly; there is no fallback.
+fn observable_main_command(binary: &Path) -> Command {
+    let mut command = Command::new("unshare");
+    command
+        .args(["--user", "--map-current-user", "--"])
+        .arg(binary);
+    command
+}
+
 fn sozu(binary: &Path, config_path: &Path, args: &[&str]) -> Output {
     Command::new(binary)
         .args([
@@ -658,7 +670,7 @@ backends = [ {{ address = "127.0.0.1:{backend_port}", backend_id = "held-backend
     );
     fs::write(&config_path, config).expect("write config");
 
-    let mut start = Command::new(&installed_binary);
+    let mut start = observable_main_command(&installed_binary);
     start
         .args([
             "start",
@@ -1071,7 +1083,7 @@ responses = 1
     );
     fs::write(&config_path, config).expect("write config");
 
-    let mut start = Command::new(&installed_binary);
+    let mut start = observable_main_command(&installed_binary);
     start
         .args([
             "start",
@@ -1370,7 +1382,7 @@ backends = [ {{ address = "127.0.0.1:{backend_port}", backend_id = "backend" }} 
     );
     fs::write(&config_path, config).expect("write config");
 
-    let mut start = Command::new(&installed_binary);
+    let mut start = observable_main_command(&installed_binary);
     start
         .args([
             "start",
@@ -1485,7 +1497,7 @@ backends = [ {{ address = "127.0.0.1:{backend_port}", backend_id = "backend" }} 
     );
     fs::write(&config_path, config).expect("write config");
 
-    let mut start = Command::new(&installed_binary);
+    let mut start = observable_main_command(&installed_binary);
     start
         .args([
             "start",

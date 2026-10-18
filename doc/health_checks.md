@@ -49,6 +49,11 @@ would be ambiguous. Without `port`, a `unix_path` backend is probed through its 
 > would have answered. Only the new `unix_path`, header-routing and
 > `silent_close` request verbs are refused by an older worker.
 
+> **Custom request headers** (`headers`, 2.3.2) carry credentials and follow
+> their own rules: values come from files or standard input, never from the
+> configuration, and they stay in memory. Read
+> [Custom request headers](#custom-request-headers) before using them.
+
 ## How it works
 
 Health checks run inside the main mio event loop using non-blocking TCP
@@ -68,7 +73,9 @@ every check cycle:
    (the default), or HTTP/2 prior-knowledge (connection preface + empty
    SETTINGS + HEADERS frame on stream 1 carrying `GET <uri>`) when
    `cluster.http2 = true`. Its `Host` (h2c `:authority`) is the `ip:port`
-   dialed, so it names the probe port when `port` is set
+   dialed, so it names the probe port when `port` is set. The custom
+   [request headers](#custom-request-headers) of the health check, if any, follow
+   in their declared order
 3. Reads the response: HTTP/1.1 status line for the default path, or HTTP/2
    frames until a HEADERS frame on stream 1 yields `:status` for h2c
 4. Compares the HTTP status code against the accepted statuses
@@ -179,6 +186,18 @@ uri = "/health"
 port = 9090
 ```
 
+A probe that sends an `Authorization` header whose value is read from a file
+(see [Custom request headers](#custom-request-headers)):
+
+```toml
+[clusters.my-cluster.health_check]
+uri = "/health"
+
+[[clusters.my-cluster.health_check.headers]]
+name = "Authorization"
+value_file = "/run/secrets/sozu-probe-authorization"
+```
+
 ### Configuration parameters
 
 | Parameter             | Type     | Default  | Description                                                                                                     |
@@ -192,6 +211,7 @@ port = 9090
 | `expected_status`     | u32      | `0`      | `HTTP` mode, when `accepted_statuses` is empty: `0` accepts any 2xx, any other value exactly that status. Must stay `0` in `TCP` mode. |
 | `accepted_statuses`   | [string] | `[]`     | `HTTP` mode: the accepted statuses (see below). Exclusive with a non-zero `expected_status`; refused in `TCP` mode. |
 | `port`                | u32      | —        | Port the probe dials on the backend's IP address, in `1-65535`, in both modes. Unset = the backend's data port. Refused with a `unix_path` backend in the cluster. |
+| `headers`             | [table]  | `[]`     | `HTTP` mode: extra request headers, each `{ name, value_file }`, sent in order (see [Custom request headers](#custom-request-headers)). Refused in `TCP` mode. |
 
 Each `accepted_statuses` entry is one of:
 
@@ -208,7 +228,9 @@ Every bound must lie in `100-599` (RFC 9110 §15). In the protocol
 `port` is the optional field 9, absent when unset;
 `uri` stays a required field on the wire and may be empty in `TCP` mode. A
 message without field 7 decodes as `HTTP`, so configurations written before
-the modes existed keep their meaning.
+the modes existed keep their meaning. `headers` is field 10, a list of
+`HealthCheckHeader { name, fingerprint }`: names and fingerprints only, never a
+value.
 
 In TOML, `mode` is written in upper case, `"HTTP"` or `"TCP"`, and the
 spelling is case-sensitive like every other protocol enum key (`shard_mode`,
@@ -245,6 +267,10 @@ sozu cluster health-check set --id my-cluster --uri /livez --accepted-statuses 2
 
 # TCP connect probe on port 9090 of each backend instead of its data port
 sozu cluster health-check set --id my-cluster --mode tcp --port 9090
+
+# HTTP probe sending an Authorization header whose value is read from a file
+sozu cluster health-check set --id my-cluster --uri /health \
+    --header-file Authorization=/run/secrets/sozu-probe-authorization
 ```
 
 Creates or replaces the health check configuration for the given cluster. Only
@@ -284,6 +310,7 @@ the two flags collided and every `health-check set` invocation panicked.
 | `--expected-status`     | no       | `0`     | Expected HTTP status code (`0` = any 2xx). Exclusive with `--accepted-statuses`.           |
 | `--accepted-statuses`   | no       | —       | Comma-separated accepted statuses: codes, ranges, classes or `any` (e.g. `200-399,404`).   |
 | `--port`                | no       | —       | Port the probe dials on the backend's IP address, `1-65535`. Unset = the data port. Refused with `unix_path`. |
+| `--header-file`         | no       | —       | `NAME=PATH`: send the header `NAME` on every HTTP probe, its value read from the file `PATH` (`-` reads standard input, at most once). Repeatable, up to 32. See [Custom request headers](#custom-request-headers). |
 
 #### List health check configurations
 
@@ -298,20 +325,26 @@ sozu cluster health-check list --id my-cluster
 Example output:
 
 ```
-┌────────────┬──────┬──────┬─────────┬──────────┬─────────┬───────────────────┬─────────────────────┬───────────────────┐
-│ cluster    │ mode │ port │ uri     │ interval │ timeout │ healthy threshold │ unhealthy threshold │ accepted statuses │
-├────────────┼──────┼──────┼─────────┼──────────┼─────────┼───────────────────┼─────────────────────┼───────────────────┤
-│ api        │ http │ data │ /ready  │ 5s       │ 3s      │ 2                 │ 5                   │ 200               │
-│ apps       │ tcp  │ 9090 │ -       │ 10s      │ 5s      │ 3                 │ 3                   │ -                 │
-│ my-cluster │ http │ data │ /health │ 10s      │ 5s      │ 3                 │ 3                   │ 2xx               │
-│ web        │ http │ data │ /livez  │ 10s      │ 5s      │ 3                 │ 3                   │ 200-399,404       │
-└────────────┴──────┴──────┴─────────┴──────────┴─────────┴───────────────────┴─────────────────────┴───────────────────┘
+┌────────────┬──────┬──────┬─────────┬──────────┬─────────┬───────────────────┬─────────────────────┬───────────────────┬───────────────────────────────────────────────────┐
+│ cluster    │ mode │ port │ uri     │ interval │ timeout │ healthy threshold │ unhealthy threshold │ accepted statuses │ headers                                           │
+├────────────┼──────┼──────┼─────────┼──────────┼─────────┼───────────────────┼─────────────────────┼───────────────────┼───────────────────────────────────────────────────┤
+│ api        │ http │ data │ /ready  │ 5s       │ 3s      │ 2                 │ 5                   │ 200               │ Authorization: sozu-hc-hmac-sha256:v1:3f9a…:c41e… │
+│            │      │      │         │          │         │                   │                     │                   │ X-Probe-Token: sozu-hc-hmac-sha256:v1:3f9a…:08d7… │
+│ apps       │ tcp  │ 9090 │ -       │ 10s      │ 5s      │ 3                 │ 3                   │ -                 │ -                                                 │
+│ my-cluster │ http │ data │ /health │ 10s      │ 5s      │ 3                 │ 3                   │ 2xx               │ -                                                 │
+│ web        │ http │ data │ /livez  │ 10s      │ 5s      │ 3                 │ 3                   │ 200-399,404       │ -                                                 │
+└────────────┴──────┴──────┴─────────┴──────────┴─────────┴───────────────────┴─────────────────────┴───────────────────┴───────────────────────────────────────────────────┘
 ```
 
 The `port` column shows the probe `port`, or `data` when the probe dials each
 backend's data port. The `accepted statuses` column uses the
 `--accepted-statuses` syntax; a legacy `expected_status` shows as `2xx` (for
-`0`) or as its code.
+`0`) or as its code. The `headers` column lists, in sending order, each custom
+header name with the fingerprint of its value, or `-` when there is none; a
+header named without any fingerprint, for example by the configuration file
+before its value was provided, shows as `<name>: (no fingerprint)`. It never
+shows a value (see
+[Custom request headers](#custom-request-headers)).
 
 When `--id` is provided, only the health check for that cluster is shown. When
 omitted, all clusters with a health check are listed. Clusters without a health
@@ -330,7 +363,267 @@ Stops health checking for the given cluster. All backends in the cluster are
 reset to healthy and resume receiving traffic immediately, including those a
 probe had marked DOWN; probes still in flight are dropped, so none can mark a
 backend DOWN after the reset. Adding the cluster again without a health check
-(`sozu cluster add` on the existing id) has the same effect.
+(`sozu cluster add` on the existing id) has the same effect. The protected
+header values held for the cluster are dropped with the health check.
+
+## Custom request headers
+
+An `HTTP` health check can send extra request headers on every probe, typically
+an `Authorization` header for a health endpoint that requires one. They apply to
+the HTTP/1.1 probe and to the h2c probe alike. `TCP` mode sends nothing, so a
+header is refused there.
+
+A header value is a credential. It is never written in the configuration, the
+saved state, a query result or a log: the configuration names the header and
+points at a file (`value_file`) or standard input, and Sōzu keeps the value in
+memory only. What you can see of a header is its name and a keyed fingerprint of
+its value.
+
+### Declare the headers
+
+In the configuration file, one `[[clusters.<id>.health_check.headers]]` table
+per header, in the order they must be sent:
+
+```toml
+[clusters.my-cluster.health_check]
+uri = "/health"
+
+[[clusters.my-cluster.health_check.headers]]
+name = "Authorization"
+value_file = "/run/secrets/sozu-probe-authorization"
+
+[[clusters.my-cluster.health_check.headers]]
+name = "X-Probe-Token"
+value_file = "/run/secrets/sozu-probe-token"
+```
+
+Each table takes exactly `name` and `value_file`; there is no inline `value`
+key, and an unknown key is refused. The configuration stores the `value_file`
+reference as written: parsing it validates the header names and performs no I/O
+on the file, and the diagnostics for a bad table are static, so they never echo
+a value or the content of a file. Write absolute paths; no relative-path
+resolution is defined for the reference. The file is opened only when the
+protected activation reads the value, and then with the operating system's
+ordinary behaviour (permissions, symbolic links). For `sozu cluster
+health-check set --header-file`, that is after the CLI's support and validation
+gates described below. For a `value_file` declared in the configuration, the
+hardened main process may read it into protected memory before it forks or
+launches the workers, and the activation then goes through the same
+acknowledged exchange with them; the main process does not run the typed
+capability query first.
+
+On the command line, repeat `--header-file NAME=PATH`:
+
+```bash
+sozu cluster health-check set --id my-cluster --uri /health \
+    --header-file Authorization=/run/secrets/sozu-probe-authorization \
+    --header-file X-Probe-Token=/run/secrets/sozu-probe-token
+
+# the value of one header from standard input: `-` as the path, at most once
+generate-probe-credential | sozu cluster health-check set --id my-cluster \
+    --header-file Authorization=-
+```
+
+`NAME=PATH` is split at the first `=`, so a path may contain one. `PATH=-`
+reads standard input, which can be the source of one header only. Opening a
+file follows the operating system's ordinary behaviour (permissions,
+symbolic links): Sōzu adds no restriction on the file type, owner or mode, so
+keep each file readable only by the account that runs the command.
+
+### What is accepted
+
+| Rule | Detail |
+| ---- | ------ |
+| Order | Headers are sent in declaration order: the order of the TOML tables, or of the `--header-file` flags. The order is kept in the state and in queries. |
+| Count | At most 32 headers. |
+| Names | A non-empty RFC 9110 token. Names are unique, compared case-insensitively. Refused: names that begin with `:` and `Host`, `Connection`, `Keep-Alive`, `Proxy-Connection`, `Transfer-Encoding`, `Content-Length`, `TE`, `Trailer`, `Upgrade`, `Expect`, which the probe owns or which change the framing. |
+| Mode | `HTTP` only. Headers in a `TCP` health check are refused. |
+| Values | Valid UTF-8, with no control byte (a horizontal tab inside the value is allowed), and no leading or trailing space or tab. |
+| Line ending | The reader removes one final `LF` and the `CR` right before it, when present, as an editor or `echo` adds them. It trims nothing else, and a lone final `CR` is not a line ending. A value that then starts or ends with a space or a tab, or holds a control byte, is refused, not rewritten. |
+
+Two size limits apply, and they are not interchangeable:
+
+- **Header size, 8192 bytes.** Every header counts its name, its value and 4
+  bytes (the `: ` and the line end of an HTTP/1.1 header line); the sum over all
+  headers must not exceed 8192. A single value is read up to that same
+  bound and refused beyond it.
+- **HTTP/2 header block, 16384 bytes.** The h2c probe sends its request in one
+  HEADERS frame, which is never split. The encoded block, made of the four
+  pseudo-headers (counted with the longest possible `:authority`), the URI and
+  the custom headers, must fit in 16384 bytes. It is checked whatever the
+  cluster's `http2` flag, so a configuration that is valid for HTTP/1.1 cannot
+  become invalid when `http2` is enabled later.
+
+A request that breaks a rule is refused as a whole, with a static message that
+never names a value. The CLI checks the names, their number and their order
+before it connects, and checks the values once it has read them; the main
+process and each worker check the whole request again.
+
+### Capability check before any value is read
+
+The typed capability query before any file or standard-input I/O is a guarantee
+of the CLI, not of the main process. `sozu cluster health-check set` with at
+least one `--header-file` is a two-step operation implemented by the CLI:
+
+1. It asks the main process whether protected health-check headers are
+   supported by the main process and by every worker. This query carries no
+   header and no cluster. The CLI waits for the positive answer for a fixed 5
+   seconds, even when the global `--timeout` is `0`; progress messages and
+   unrelated replies do not extend that deadline.
+2. Only after a positive answer does it open the files or read standard input,
+   validate the values, and send them in one request.
+
+A missing, malformed, negative or late answer means the CLI reads no file, reads
+no standard input and sends no value. This is what protects a rolling upgrade: a
+main process or worker older than 2.3.2 cannot answer, so no credential is ever
+sent to it. Without `--header-file`, the command is the ordinary `set` described
+above, with no capability query.
+
+The main process then applies the change on every worker as an acknowledged
+Prepare, Commit, Abort or Release exchange; a worker's acknowledgement gates
+each step. When a worker refuses, fails or goes silent before every Commit is
+acknowledged, the protected change is aborted, every worker is rolled back, and
+the previous health check, with the configuration and state it came from, is
+retained or restored. Once every Commit is acknowledged, Release only makes the
+workers forget the state the commit replaced: a Release that is refused or
+times out is a retention or cleanup failure, reported as such, and it cannot roll
+back a before-image that the workers already destroyed. A worker that is
+replaced, or respawned automatically, receives the protected values and
+acknowledges them before it is marked Running and before it sends any probe.
+While a protected change is in flight, other changes to the same cluster's
+health check are fenced off and refused: retry once it has finished. This
+transaction covers the protected health-check change only; it is not a global
+transaction and it does not make Sōzu commands in general transactional.
+
+Applications that talk to the command socket through `sozu-command-lib` instead
+of the CLI must run the same capability query before they read or send a value:
+the library types do not add that orchestration automatically (see
+[command/README.md](../command/README.md#protected-health-check-headers)).
+
+A plain `set` never carries a value. To change or renew protected headers, run
+`set` again with the complete `--header-file` list.
+
+### What is stored, shown and logged
+
+| Where | What it holds |
+| ----- | ------------- |
+| Configuration file | The ordered header name and `value_file` reference: the source of a value, never a literal value. |
+| Orders sent to the workers | The header names and fingerprints. The `value_file` references never reach a worker; the values reach it only in the protected change described above. |
+| Saved state, `sozu cluster health-check list`, other queries | The ordered header names and, for each, the fingerprint `sozu-hc-hmac-sha256:v1:<epoch>:<tag>`: the full HMAC-SHA256 of the header name and value under a key that only the main process holds, and the epoch (key identifier) it was made under. Never a value, never a source path. |
+| Logs, `Debug` output, error messages | Static text. A diagnostic can name a header, never a value or what a file contained. |
+| Memory of the main process, of the workers and of the CLI while it reads | The value, in carriers and buffers that refuse to be serialized or printed and that Sōzu zeroes when it releases them. |
+| The wire | The value, in clear, on the probe request itself. |
+
+The fingerprint lets you check that two health checks hold the same value, or
+that a value changed, without revealing it. Zeroing covers the buffers Sōzu owns;
+it cannot reach copies the allocator, the kernel, a socket buffer or swap may
+have made. In transit, a value crosses the command socket and the main-to-worker
+channels as part of a command message: restrict them with `command_socket_mode`
+and `command_allowed_uids`.
+
+Every `sozu` process (main, workers and CLI) sets `RLIMIT_CORE` to 0, soft and
+hard, and on Linux marks itself non-dumpable, before it reads any header value,
+so a crash leaves no core dump and a same-user `ptrace` or `/proc/<pid>/mem`
+access is refused without `CAP_SYS_PTRACE`. These are per-process hardenings,
+not host-wide isolation: root, swap and the hypervisor stay outside what Sōzu
+can promise.
+
+**The probe is not encrypted.** Protecting the control plane and the state does
+not protect the request that carries the header: the health check speaks plain
+HTTP/1.1 or h2c to the backend, and HTTPS probes are not implemented. Use a
+dedicated, least-privilege credential that is valid for the health endpoint
+only, and keep the probe on a private or otherwise protected network path to the
+backend.
+
+### After a cold restart
+
+The values are not saved, and a cold `SaveState` never restores clear values. A
+cold start of the main process generates a fresh key and a fresh epoch kept in
+memory only, so no fingerprint made before the restart can be verified by the
+new process; the saved state holds names and fingerprints, never a value.
+
+A saved state is authoritative for startup, for a reload and for `LoadState`,
+including `RemoveCluster`. For every cluster it adds, removes or rewrites the
+health check of, the same-name `value_file` intent of the configuration is
+dropped: a foreign or stale epoch cannot activate a value by carrying the same
+cluster name, and a configuration entry for the same name cannot resurrect a
+health check that the saved state removed.
+
+When the new TOML supplies `value_file` headers for an existing protected
+cluster, the generic `AddCluster` of the reload temporarily carries the existing
+complete health check A; only the acknowledged protected transaction publishes
+the new health check B. An authoritative reload whose health check has no
+headers or `value_file` is not that transition: it removes the old protected
+headers and aligns the in-memory journal with the resulting main and worker
+state. An explicit `RemoveHealthCheck` or `RemoveCluster` keeps its removal
+semantics. This is not a global transaction.
+
+When a saved state is restored and is authoritative for a health check, its
+header names and order are kept. If it carries fingerprints of a foreign epoch,
+a name alone never activates a value. While the exact ordered metadata lacks its
+values, the health check sends no probe, and the complete ordered header list
+must match the restored metadata, name for name and fingerprint for fingerprint,
+before it does. Each skipped probe is counted by `health_check.missing_secret`;
+it is neither a success nor a failure, and the backend routing is not changed by
+it. In `health-check list`, the epoch (the third colon-separated field of a
+fingerprint) of such a header differs from the one of headers provided since the
+start.
+
+There are two ways to provide the values again, and they differ. An operator or
+controller can explicitly re-inject the exact ordered headers with
+`sozu cluster health-check set ... --header-file ...`; a value is applied
+together with the complete health check it belongs to, never because a name
+happens to match, and that creates the key and epoch the fingerprints are made
+under. The `value_file` intent of the configuration, on the other hand, only
+applies to a cluster the saved state leaves alone, as described above. Neither
+way writes a value to the saved state.
+
+### Upgrades and rollback
+
+**Hot main upgrade (`sozu upgrade`).** A 2.3.2 main hands its protected state
+over to its replacement in upgrade protocol V3: the key with its epoch and the
+in-memory values travel with the rest of the handoff, so the fingerprints stay
+valid and probes continue with their headers. Nothing is read again from a
+`value_file` or from standard input to compensate. A 2.3.2 main writes V3 only;
+it never falls back to the V2 handoff of 2.3.1. The V3 handoff is a memory-only
+transport: the whole possibly-sensitive snapshot crosses a dedicated Unix socket
+as one bounded frame, with no tempfile and no memfd.
+
+A 2.3.2 main still reads the V2 handoff of an incoming 2.3.1 main, and the
+legacy handoff of 2.2.1 (the one without a protocol marker). Release 2.3.1 has
+no protected headers, so those handoffs hold none: once such an upgrade is
+complete, use `health-check set --header-file` to enable them. See
+[how_to_use.md](./how_to_use.md#hot-upgrade-protocols-and-compatibility) for the
+whole matrix.
+
+An in-flight protected health-check change, or a change fence or version still
+unresolved, makes the main refuse `sozu upgrade`: let it finish first, and check
+the result of the upgrade before you change protected headers again.
+
+**Mixed fleet.** Upgrade the main process and every worker to 2.3.2 before you
+use `--header-file`. The capability check refuses the change while any worker
+cannot take part, and no value leaves the CLI. A health check that only names
+headers (loaded from a saved state, or set without values) probes nothing until
+the values are provided.
+
+**Rollback to 2.3.1.** A 2.3.1 main cannot read a V3 handoff, so `sozu upgrade`
+is not a rollback path once 2.3.2 runs, and rolling back is not a hot handoff.
+Two different things go wrong, and both need cleanup before a controlled
+restart:
+
+- An older peer that decodes the protobuf state or a message ignores the unknown
+  `headers` field (10): it probes without the headers and drops them when it
+  writes the state back, so a backend that requires the credential may mark its
+  probes DOWN.
+- The 2.3.1 TOML parser does not understand the new
+  `[[clusters.<id>.health_check.headers]]` tables: its health-check table rejects
+  unknown keys, so a configuration that still holds them fails to load.
+
+Before going back, set the affected health checks again without `--header-file`
+(or remove them), delete the `[[clusters.<id>.health_check.headers]]` tables from
+the configuration file, then stop the service and start it on 2.3.1 from that
+configuration and its saved state. Provide the protected headers again when you
+return to 2.3.2.
 
 ## Metrics
 
@@ -340,6 +633,7 @@ Sōzu exposes the following health check metrics:
 | ------------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `health_check.success`          | counter | Total number of successful health check responses.                                                                                                                                                                                                                                                                                                  |
 | `health_check.failure`          | counter | Total number of failed health check attempts.                                                                                                                                                                                                                                                                                                       |
+| `health_check.missing_secret`   | counter | Probes not sent because the health check names [custom headers](#custom-request-headers) whose values this worker does not hold. Neither a success nor a failure.                                                                                                                                                                                   |
 | `health_check.up`               | counter | Number of healthy transitions (unhealthy → healthy).                                                                                                                                                                                                                                                                                                |
 | `health_check.down`             | counter | Number of unhealthy transitions (healthy → unhealthy).                                                                                                                                                                                                                                                                                              |
 | `health_check.healthy_backends` | gauge   | Healthy backends per cluster — labelled with `cluster_id`. Updated after every probe-result update for clusters with at least one configured backend (including `0` when all backends are unhealthy, so dashboards can detect universal-outage / fail-open). The label was missing in earlier releases and per-cluster values overwrote each other. |
@@ -423,4 +717,5 @@ identity is moot — the event is about the cluster as a whole).
   configuration today.
 - **No persistent state**: Health check state is held in memory. On worker
   restart, all backends start as healthy and must fail enough consecutive checks
-  to be marked down.
+  to be marked down. Protected header values are never saved either; see
+  [After a cold restart](#after-a-cold-restart).

@@ -17,6 +17,7 @@ use sozu_command_lib::{
         DisplayError,
         command::{Request, Response},
     },
+    secret::HeaderValueReadError,
 };
 
 use crate::{
@@ -62,6 +63,22 @@ pub enum CtlError {
     SetupLogging(LogError),
     #[error("could not resolve path for {0} : {1}")]
     ResolvePath(String, std::io::Error),
+    #[error(
+        "the main process did not confirm support for protected health check headers: nothing was read or sent"
+    )]
+    ProtectedHealthCheckUnsupported,
+    #[error("could not open the health check header file for `{name}`: {source}")]
+    OpenHeaderFile {
+        name: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("could not read the health check header value for `{name}`: {source}")]
+    ReadHeaderValue {
+        name: String,
+        #[source]
+        source: HeaderValueReadError,
+    },
     #[cfg(feature = "tui")]
     #[error("failed to spawn thread `{label}`: {source}")]
     SpawnFailed {
@@ -105,6 +122,19 @@ pub fn ctl(args: cli::Args) -> Result<(), CtlError> {
     {
         println!("Configuration file is valid");
         std::process::exit(0);
+    }
+
+    // A `--header-file` the CLI can refuse by itself is refused before it
+    // connects, opens a file or reads standard input.
+    if let SubCmd::Cluster {
+        cmd:
+            ClusterCmd::HealthCheck {
+                cmd: cmd @ HealthCheckCmd::Set { header_files, .. },
+            },
+    } = &args.cmd
+        && !header_files.is_empty()
+    {
+        request_builder::check_health_check_set(cmd)?;
     }
 
     let timeout = read_timeout(args.timeout.unwrap_or(config.ctl_command_timeout));

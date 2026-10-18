@@ -8,6 +8,51 @@ installs on every run: `protobuf-compiler`, `cmake`, h2spec `2.6.0`, and the fou
 all four and `rustfmt` on `nightly`). Baking these in removes that per-run install cost from
 every CI job that runs on the CKE-hosted runners.
 
+## What does not run on these runners
+
+Three process-level suites, `upgrade_fd_inheritance_e2e`, `mutable_commands_runtime_e2e`
+(including its published 2.3.1 case) and `protected_health_check_refusal_e2e` (including its
+published 2.3.1 refusal case), read `/proc/<main pid>/...` of the hardened (non-dumpable)
+main, which only a root of a user namespace can do. The protected health-check suite needs the
+same observer to prove that a header value read from a `value_file` leaves no trace in the
+output, logs, listings or saved state of the main and its workers. Each compiled test executable
+therefore runs as root of a private user namespace in the `proc-observer-e2e` job of
+`.github/workflows/ci.yml`, on GitHub-hosted `ubuntu-latest` VMs over the same nine cells as
+`pipeline`. Cargo and the checkout stay owned by the normal runner user. Each executable crosses
+three stages, `sudo setpriv --reuid <uid> --regid <gid> --clear-groups --inh-caps +sys_admin
+--ambient-caps +sys_admin unshare --user --map-root-user -- <ELF>`:
+
+1. Host root runs `setpriv`, which uses PR_SET_KEEPCAPS while switching to the recorded runner
+   UID and GID with no supplementary groups and temporarily retains root's permitted/effective set
+   internally. After it raises inheritable and ambient `CAP_SYS_ADMIN` and execs `unshare`, that
+   exec receives only `CAP_SYS_ADMIN` as permitted, effective, inheritable and ambient; the
+   bounding set is untouched. Ubuntu's AppArmor user namespace policy exempts an unconfined
+   process holding that capability in its current user namespace, so the runner identity may
+   create the namespace, and `unshare` uses it for the outer namespace.
+2. `unshare --user --map-root-user` creates a private user namespace and, seeing the runner
+   identity as its effective UID and GID, writes the simple single-extent self-map of that
+   identity to namespace `0:0` itself, so no `newuidmap`/`newgidmap` helper (Ubuntu `uidmap`) and
+   no subordinate-ID authorization is involved. The runner-owned executable stays reachable.
+   Creating the namespace replaces the credentials and clears the ambient set, so no
+   `CAP_SYS_ADMIN` remains valid in the initial namespace.
+3. The compiled ELF runs as namespace root and receives only capabilities bound to that new child
+   user namespace, such as `CAP_SYS_PTRACE`.
+
+A fail-closed `Probe the observer user namespace boundary` step verifies this boundary on the
+hosted runner before any Cargo command: a runner-owned temporary executable in the checkout must
+run through the same wrapper as namespace UID and GID `0` under exactly one `0 <runner id> 1`
+extent in each of `/proc/self/uid_map` and `/proc/self/gid_map`, then run a nested `unshare --user
+--map-current-user` whose shell must again be UID and GID `0`, and is removed on every exit. No host
+AppArmor, sysctl, seccomp, file capability, subordinate-ID setting, nor checkout or target ownership
+or mode is changed; the probe's temporary script is chmod 0700.
+`--map-current-user` under a bare `sudo` would map host root instead and leave
+the runner-owned path inaccessible. The FD fixture spawns the main directly, so its own test
+process is the observer; the mutable-commands fixture also launches its mains through its own
+nested `unshare --user --map-current-user`, which is distinct from the outer mapping and
+unchanged. The CKE pods' current environment refuses user namespace creation;
+which component of its kernel policy does so is not established, so none is named here. Every
+other suite stays on these runners.
+
 ## Image reference
 
 ```

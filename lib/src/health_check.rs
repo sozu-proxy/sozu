@@ -23,7 +23,9 @@ use std::{
 
 use mio::{Interest, Registry, Token, net::TcpStream};
 use sozu_command::{
+    config::HEALTH_CHECK_MAX_HPACK_BLOCK,
     proto::command::{Event, EventKind, HealthCheckConfig, HealthCheckMode},
+    secret::{ProtectedHeader, ProtectedHeaderSet, Zeroizing},
     state::ClusterId,
 };
 
@@ -31,6 +33,7 @@ use crate::metrics::names;
 use crate::{
     backends::{Backend, BackendMap},
     protocol::mux::{
+        hpack::Representation,
         parser::{
             FLAG_END_HEADERS, FLAG_PADDED, FLAG_PRIORITY, FRAME_HEADER_SIZE, FrameType,
             frame_header,
@@ -68,7 +71,10 @@ const HEALTH_CHECK_TOKEN_BASE: usize = 1 << 24;
 /// programmer error and emits an `error!` rather than silently colliding.
 const HEALTH_CHECK_TOKEN_CAPACITY: usize = 1 << 16;
 
-/// Each pending entry is `(cluster_id, config, h2c, backends_to_check)`.
+/// Each pending entry is `(cluster_id, config, headers, h2c, backends_to_check)`,
+/// where `headers` is the immutable set of header values the probes launched
+/// from this entry send: later updates replace the set in the `BackendMap`
+/// and leave this snapshot as it is.
 /// `h2c` mirrors `cluster.http2` (the same backend-capability hint the
 /// mux router uses) so the probe wire format matches what the proxy
 /// will actually use to reach those backends. Each backend to check is
@@ -77,12 +83,12 @@ const HEALTH_CHECK_TOKEN_CAPACITY: usize = 1 << 16;
 type PendingChecks = Vec<(
     ClusterId,
     HealthCheckConfig,
+    ProtectedHeaderSet,
     bool,
     Vec<(String, SocketAddr, Weak<RefCell<Backend>>)>,
 )>;
 
 /// Tracks an in-flight health check connection
-#[derive(Debug)]
 struct InFlightCheck {
     stream: TcpStream,
     token: Token,
@@ -98,7 +104,7 @@ struct InFlightCheck {
     backend: Weak<RefCell<Backend>>,
     started_at: Instant,
     timeout: Duration,
-    request_bytes: Option<Vec<u8>>,
+    request_bytes: Option<Zeroizing<Vec<u8>>>,
     write_offset: usize,
     response_buf: Vec<u8>,
     config: HealthCheckConfig,
@@ -112,6 +118,29 @@ struct InFlightCheck {
     /// established; nothing is written or read. Captured at probe-creation
     /// time for the same reason as `h2c`.
     tcp_connect_only: bool,
+}
+
+/// Metadata only: `request_bytes` and `config` carry configured header values
+/// (typically an `Authorization`), `response_buf` carries backend bytes.
+impl std::fmt::Debug for InFlightCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InFlightCheck")
+            .field("token", &self.token)
+            .field("cluster_id", &self.cluster_id)
+            .field("backend_id", &self.backend_id)
+            .field("address", &self.address)
+            .field("timeout", &self.timeout)
+            .field(
+                "request_len",
+                &self.request_bytes.as_ref().map(|bytes| bytes.len()),
+            )
+            .field("write_offset", &self.write_offset)
+            .field("response_len", &self.response_buf.len())
+            .field("header_count", &self.config.headers.len())
+            .field("h2c", &self.h2c)
+            .field("tcp_connect_only", &self.tcp_connect_only)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Manages health checks across all clusters and backends
@@ -271,6 +300,33 @@ impl HealthChecker {
                 continue;
             }
 
+            // A configuration that names headers is probed only with the values
+            // it was fingerprinted from. Without them (restored from a saved
+            // state, set through the legacy verb, or replaced behind the
+            // worker's back) no request is built: the backends keep the health
+            // they have, neither up nor down.
+            let headers = if config.headers.is_empty() {
+                ProtectedHeaderSet::new(Vec::new())
+            } else {
+                match backend_map
+                    .protected_health_check_headers
+                    .get(cluster_id)
+                    .filter(|held| held.satisfies(&config.headers))
+                {
+                    Some(held) => held.to_owned(),
+                    None => {
+                        self.last_check_time.insert(cluster_id.to_owned(), now);
+                        count!(names::health_check::MISSING_SECRET, 1);
+                        debug!(
+                            "{} cluster {} names health check headers whose values this worker does not hold: no probe sent",
+                            log_context!(),
+                            cluster_id
+                        );
+                        continue;
+                    }
+                }
+            };
+
             if let Some(backend_list) = backend_map.backends.get(cluster_id) {
                 // One probe in flight per backend incarnation: a probe still
                 // draining for a removed incarnation does not delay the
@@ -307,6 +363,7 @@ impl HealthChecker {
                     to_check.push((
                         cluster_id.to_owned(),
                         config.to_owned(),
+                        headers,
                         h2c,
                         backends_to_check,
                     ));
@@ -316,7 +373,7 @@ impl HealthChecker {
 
         drop(backend_map);
 
-        for (cluster_id, config, h2c, backends_to_check) in to_check {
+        for (cluster_id, config, headers, h2c, backends_to_check) in to_check {
             self.last_check_time.insert(cluster_id.to_owned(), now);
 
             // The URI was validated at the worker `SetHealthCheck`
@@ -392,27 +449,30 @@ impl HealthChecker {
                         let request_bytes = if tcp_connect_only {
                             None
                         } else if h2c {
-                            Some(build_h2c_probe_bytes(probe_uri, address))
+                            let Some(bytes) =
+                                build_h2c_probe_bytes(probe_uri, address, headers.headers())
+                            else {
+                                // Validation bounds the block; reaching this
+                                // is an invariant break. The probe fails
+                                // rather than send a truncated request.
+                                error!(
+                                    "{} h2c probe request for cluster {} exceeds the HEADERS frame limit",
+                                    log_context!(),
+                                    cluster_id
+                                );
+                                let _ = registry.deregister(&mut stream);
+                                Self::record_check_result(
+                                    backends,
+                                    &cluster_id,
+                                    &incarnation,
+                                    false,
+                                    &config,
+                                );
+                                continue;
+                            };
+                            Some(bytes)
                         } else {
-                            // RFC 9110 §7.2: `Host` MUST carry the
-                            // authority component, including the port
-                            // when it differs from the URI scheme's
-                            // default. SocketAddr's Display impl emits
-                            // `ip:port` (with brackets for IPv6), which
-                            // is unambiguous against any non-default
-                            // backend port. Backends that demand a
-                            // specific virtual-host name should expose
-                            // a non-vhost health endpoint (the same
-                            // pattern nginx/apache document) — adding
-                            // a per-cluster `host` field on
-                            // `HealthCheckConfig` is tracked as a
-                            // follow-up.
-                            Some(
-                                format!(
-                                    "GET {probe_uri} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
-                                )
-                                .into_bytes(),
-                            )
+                            Some(build_h1_probe_bytes(probe_uri, address, headers.headers()))
                         };
                         // A connect-only probe carries no request; every
                         // HTTP probe carries one.
@@ -960,6 +1020,40 @@ fn is_status_healthy(actual: u32, config: &HealthCheckConfig) -> bool {
     healthy
 }
 
+/// Compose the HTTP/1.1 probe request.
+///
+/// RFC 9110 §7.2: `Host` MUST carry the authority component, including the
+/// port when it differs from the URI scheme's default. SocketAddr's Display
+/// impl emits `ip:port` (with brackets for IPv6), which is unambiguous against
+/// any non-default backend port. Backends that demand a specific virtual-host
+/// name should expose a non-vhost health endpoint (the same pattern
+/// nginx/apache document). The configured `headers`, validated by
+/// `sozu_command::config::validate_health_check_config`, follow in order.
+fn build_h1_probe_bytes(
+    uri: &str,
+    address: SocketAddr,
+    headers: &[ProtectedHeader],
+) -> Zeroizing<Vec<u8>> {
+    let mut request = Zeroizing::new(
+        format!("GET {uri} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n").into_bytes(),
+    );
+    // The head is sized once so that appending the values never reallocates,
+    // which would leave an unwiped copy of the ones already written.
+    let extra: usize = headers
+        .iter()
+        .map(|header| header.name().len() + header.value().expose_secret_bytes().len() + 4)
+        .sum();
+    request.reserve_exact(extra + 2);
+    for header in headers {
+        request.extend_from_slice(header.name().as_bytes());
+        request.extend_from_slice(b": ");
+        request.extend_from_slice(header.value().expose_secret_bytes());
+        request.extend_from_slice(b"\r\n");
+    }
+    request.extend_from_slice(b"\r\n");
+    request
+}
+
 /// Compose a bare-minimum h2c (HTTP/2 over cleartext, prior-knowledge)
 /// probe: the 24-byte connection preface, an empty client SETTINGS
 /// frame (acknowledging the spec-mandated handshake), and a single
@@ -972,24 +1066,54 @@ fn is_status_healthy(actual: u32, config: &HealthCheckConfig) -> bool {
 /// static/dynamic-table behaviour the encoder picks. The connection
 /// preface comes from `serializer::H2_PRI` so the probe and the live
 /// mux stay in lockstep.
-fn build_h2c_probe_bytes(uri: &str, address: SocketAddr) -> Vec<u8> {
+///
+/// The custom `headers` follow the four pseudo-headers, names lowercased,
+/// each as a never-indexed literal so that a credential never enters an HPACK
+/// table. `None` when `headers` is not empty and the block exceeds one
+/// frame ([`HEALTH_CHECK_MAX_HPACK_BLOCK`]): nothing is truncated or dropped.
+/// A headerless probe is never refused, as before.
+fn build_h2c_probe_bytes(
+    uri: &str,
+    address: SocketAddr,
+    headers: &[ProtectedHeader],
+) -> Option<Zeroizing<Vec<u8>>> {
     let authority = address.to_string();
 
     // Build the HPACK header block first so we know its length for the
     // HEADERS frame header. A fresh encoder per probe keeps things
     // stateless — we never reuse the dynamic table across probes.
     let mut encoder = crate::protocol::mux::hpack::Encoder::new();
-    let mut hpack: Vec<u8> = Vec::new();
-    let headers: [(&[u8], &[u8]); 4] = [
+    // Sized for the largest block validation lets through, so that encoding a
+    // value never reallocates and leaves an unwiped copy behind.
+    let mut hpack: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(if headers.is_empty() {
+        0
+    } else {
+        HEALTH_CHECK_MAX_HPACK_BLOCK
+    }));
+    let pseudo_headers: [(&[u8], &[u8]); 4] = [
         (b":method", b"GET"),
         (b":scheme", b"http"),
         (b":path", uri.as_bytes()),
         (b":authority", authority.as_bytes()),
     ];
-    encoder.encode_into(headers, &mut hpack);
+    encoder.encode_into(pseudo_headers, &mut hpack);
+    for header in headers {
+        encoder.encode_field(
+            header.name().to_ascii_lowercase().as_bytes(),
+            header.value().expose_secret_bytes(),
+            Representation::NeverIndexed,
+            false,
+            &mut hpack,
+        );
+    }
+    if !headers.is_empty() && hpack.len() > HEALTH_CHECK_MAX_HPACK_BLOCK {
+        return None;
+    }
 
     // Pre-allocate: preface + SETTINGS (9) + HEADERS header (9) + block.
-    let mut out = Vec::with_capacity(H2_PRI.len() + FRAME_HEADER_SIZE * 2 + hpack.len());
+    let mut out = Zeroizing::new(Vec::with_capacity(
+        H2_PRI.len() + FRAME_HEADER_SIZE * 2 + hpack.len(),
+    ));
     out.extend_from_slice(H2_PRI.as_bytes());
 
     // Empty client SETTINGS frame: length=0, type=Settings(0x04), flags=0, sid=0.
@@ -1016,7 +1140,7 @@ fn build_h2c_probe_bytes(uri: &str, address: SocketAddr) -> Vec<u8> {
         H2_PRI.len() + FRAME_HEADER_SIZE * 2 + hpack.len(),
         "probe length must be preface + SETTINGS + HEADERS header + HPACK block"
     );
-    out
+    Some(out)
 }
 
 /// Walk the buffered H2 frames looking for a HEADERS frame (plus any
@@ -1493,6 +1617,7 @@ mod tests {
             mode: HealthCheckMode::Http as i32,
             accepted_statuses: Vec::new(),
             port: None,
+            headers: Vec::new(),
         };
 
         let buf = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
@@ -1785,6 +1910,7 @@ mod tests {
             mode: HealthCheckMode::Http as i32,
             accepted_statuses: Vec::new(),
             port: None,
+            headers: Vec::new(),
         }
     }
 
@@ -1817,7 +1943,8 @@ mod tests {
 
     #[test]
     fn build_h2c_probe_starts_with_preface_and_frames() {
-        let bytes = build_h2c_probe_bytes("/health", "127.0.0.1:8080".parse().unwrap());
+        let bytes = build_h2c_probe_bytes("/health", "127.0.0.1:8080".parse().unwrap(), &[])
+            .expect("a headerless probe is always built");
 
         // Connection preface (24 bytes).
         assert!(bytes.starts_with(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"));
@@ -1861,6 +1988,269 @@ mod tests {
         assert_eq!(scheme.as_deref(), Some(b"http" as &[u8]));
         assert_eq!(path.as_deref(), Some(b"/health" as &[u8]));
         assert_eq!(authority.as_deref(), Some(b"127.0.0.1:8080" as &[u8]));
+    }
+
+    fn header(name: &str, value: &str) -> ProtectedHeader {
+        let key =
+            sozu_command::secret::FingerprintKey::from_parts(Zeroizing::new([3; 32]), [4; 16]);
+        let mut carrier = sozu_command::proto::command::HealthCheckHeaderValue {
+            name: name.to_owned(),
+            value: value.as_bytes().to_vec(),
+        };
+        let value = sozu_command::secret::SecretValue::take_from_ingress(&mut carrier)
+            .expect("a valid test value");
+        ProtectedHeader::new(&key, name.to_owned(), value)
+    }
+
+    /// The configuration metadata that names the headers of a probe.
+    fn metadata(
+        headers: &[ProtectedHeader],
+    ) -> Vec<sozu_command::proto::command::HealthCheckHeader> {
+        headers
+            .iter()
+            .map(|header| sozu_command::proto::command::HealthCheckHeader {
+                name: header.name().to_owned(),
+                fingerprint: header.fingerprint().to_string(),
+            })
+            .collect()
+    }
+
+    const PROBE_ADDRESS: &str = "127.0.0.1:8080";
+
+    /// The HPACK block of a probe: its HEADERS payload.
+    fn h2c_block(uri: &str, headers: &[ProtectedHeader]) -> Vec<u8> {
+        let bytes = build_h2c_probe_bytes(uri, PROBE_ADDRESS.parse().unwrap(), headers)
+            .expect("the probe is built");
+        // preface + empty SETTINGS + HEADERS frame header.
+        bytes[H2_PRI.len() + FRAME_HEADER_SIZE * 2..].to_vec()
+    }
+
+    /// Read one HPACK string literal (RFC 7541 §5.2) that is not Huffman coded
+    /// and shorter than 127 bytes; return it and the rest of the block.
+    fn raw_string(block: &[u8]) -> (&[u8], &[u8]) {
+        assert_eq!(block[0] & 0x80, 0, "the string is not Huffman coded");
+        let len = usize::from(block[0] & 0x7f);
+        assert!(len < 127, "a one-byte length");
+        (&block[1..=len], &block[len + 1..])
+    }
+
+    #[test]
+    fn h1_probe_without_headers_is_byte_for_byte_the_legacy_request() {
+        let address: SocketAddr = PROBE_ADDRESS.parse().unwrap();
+        assert_eq!(
+            build_h1_probe_bytes("/health?a=b", address, &[]).as_slice(),
+            b"GET /health?a=b HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nConnection: close\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn h1_probe_keeps_custom_name_case_and_declared_order() {
+        let address: SocketAddr = PROBE_ADDRESS.parse().unwrap();
+        let bytes = build_h1_probe_bytes(
+            "/health",
+            address,
+            &[
+                header("X-Zeta", "last: value"),
+                header("Authorization", "Bearer abc"),
+                header("x-empty", ""),
+            ],
+        );
+        assert_eq!(
+            bytes.as_slice(),
+            b"GET /health HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nConnection: close\r\nX-Zeta: last: value\r\nAuthorization: Bearer abc\r\nx-empty: \r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn h2c_probe_without_headers_keeps_the_four_pseudo_headers_only() {
+        let block = h2c_block("/health", &[]);
+        let mut decoder = crate::protocol::mux::hpack::Decoder::new();
+        let mut fields = Vec::new();
+        decoder
+            .decode_with_cb(&block, |name, value| {
+                fields.push((name.to_vec(), value.to_vec()))
+            })
+            .expect("a headerless block decodes");
+        let expected: Vec<(Vec<u8>, Vec<u8>)> = [
+            (":method", "GET"),
+            (":scheme", "http"),
+            (":path", "/health"),
+            (":authority", PROBE_ADDRESS),
+        ]
+        .iter()
+        .map(|(name, value)| (name.as_bytes().to_vec(), value.as_bytes().to_vec()))
+        .collect();
+        assert_eq!(fields, expected);
+    }
+
+    #[test]
+    fn h2c_probe_sends_custom_fields_lowercase_ordered_and_never_indexed() {
+        let headers = [
+            header("Authorization", "Bearer Exact-Value"),
+            header("X-Custom-Name", "MiXeD Case"),
+            header("X-Empty", ""),
+        ];
+        let block = h2c_block("/health", &headers);
+        let pseudo_len = h2c_block("/health", &[]).len();
+
+        // Semantics: pseudo-headers first, then the fields in declared order,
+        // names lowercased, values untouched.
+        let mut decoder = crate::protocol::mux::hpack::Decoder::new();
+        let mut fields = Vec::new();
+        decoder
+            .decode_with_cb(&block, |name, value| {
+                fields.push((name.to_vec(), value.to_vec()))
+            })
+            .expect("the block decodes");
+        let names: Vec<&[u8]> = fields.iter().map(|(name, _)| name.as_slice()).collect();
+        assert_eq!(
+            names,
+            [
+                b":method" as &[u8],
+                b":scheme",
+                b":path",
+                b":authority",
+                b"authorization",
+                b"x-custom-name",
+                b"x-empty"
+            ]
+        );
+        assert_eq!(fields[4].1, b"Bearer Exact-Value");
+        assert_eq!(fields[5].1, b"MiXeD Case");
+        assert_eq!(fields[6].1, b"");
+
+        // Representation: every custom field starts with the 0001 pattern of
+        // RFC 7541 §6.2.3. `authorization` is a static-table name (index 23,
+        // which overflows the 4-bit prefix to `0x1f 0x08`), the others are new
+        // names (index 0, the name follows as a literal).
+        let rest = &block[pseudo_len..];
+        assert_eq!(&rest[..2], &[0x1f, 0x08], "static name, never indexed");
+        let (value, rest) = raw_string(&rest[2..]);
+        assert_eq!(value, b"Bearer Exact-Value");
+        assert_eq!(rest[0], 0x10, "new name, never indexed");
+        let (name, rest) = raw_string(&rest[1..]);
+        assert_eq!(name, b"x-custom-name");
+        let (value, rest) = raw_string(rest);
+        assert_eq!(value, b"MiXeD Case");
+        assert_eq!(rest[0], 0x10, "new name, never indexed");
+        let (name, rest) = raw_string(&rest[1..]);
+        assert_eq!(name, b"x-empty");
+        let (value, rest) = raw_string(rest);
+        assert_eq!(value, b"");
+        assert!(rest.is_empty(), "no trailing bytes");
+    }
+
+    /// Encoded block length of a probe whose single custom field carries a
+    /// `value_len`-byte value.
+    fn block_len_with_value(value_len: usize) -> usize {
+        h2c_block("/", &[header("x-pad", &"v".repeat(value_len))]).len()
+    }
+
+    #[test]
+    fn h2c_probe_guard_accepts_one_full_frame_and_refuses_one_byte_more() {
+        let limit = HEALTH_CHECK_MAX_HPACK_BLOCK;
+        assert_eq!(limit, 16384, "RFC 9113 §6.5.2 default max frame size");
+        // The block grows by one byte per value byte in this range.
+        let probe = 2000;
+        let value_len = probe + limit - block_len_with_value(probe);
+        assert_eq!(block_len_with_value(value_len), limit);
+        let address: SocketAddr = PROBE_ADDRESS.parse().unwrap();
+
+        let at = build_h2c_probe_bytes("/", address, &[header("x-pad", &"v".repeat(value_len))])
+            .expect("a block of exactly one frame is accepted");
+        let frame_len = (usize::from(at[H2_PRI.len() + FRAME_HEADER_SIZE]) << 16)
+            | (usize::from(at[H2_PRI.len() + FRAME_HEADER_SIZE + 1]) << 8)
+            | usize::from(at[H2_PRI.len() + FRAME_HEADER_SIZE + 2]);
+        assert_eq!(frame_len, limit);
+
+        assert!(
+            build_h2c_probe_bytes("/", address, &[header("x-pad", &"v".repeat(value_len + 1))])
+                .is_none(),
+            "one byte over the frame is refused, never truncated"
+        );
+    }
+
+    #[test]
+    fn h2c_probe_guard_never_refuses_a_headerless_legacy_configuration() {
+        let address: SocketAddr = PROBE_ADDRESS.parse().unwrap();
+        let long_uri = format!("/{}", "a".repeat(HEALTH_CHECK_MAX_HPACK_BLOCK + 100));
+        assert!(
+            build_h2c_probe_bytes(&long_uri, address, &[]).is_some(),
+            "no header, no new rejection"
+        );
+    }
+
+    #[test]
+    fn validator_bound_is_conservative_against_the_encoded_block() {
+        let headers = vec![
+            header("Authorization", "Bearer Exact-Value"),
+            header("X-Custom-Name", &"v".repeat(300)),
+        ];
+        let config = HealthCheckConfig {
+            headers: metadata(&headers),
+            ..h2c_config(0)
+        };
+        let actual = h2c_block(&config.uri, &headers).len();
+        let lens: Vec<usize> = headers
+            .iter()
+            .map(|header| header.value().expose_secret_bytes().len())
+            .collect();
+        let bound = sozu_command::config::health_check_hpack_upper_bound(&config, &lens);
+        assert!(bound >= actual, "bound {bound} < encoded {actual}");
+    }
+
+    #[test]
+    fn in_flight_check_debug_hides_request_response_and_config_bytes() {
+        const SENTINEL: &str = "SYNTHETIC-HC-WIRE-SENTINEL-9d1e";
+        let numeric = format!("{:?}", SENTINEL.as_bytes());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let stream = TcpStream::connect(address).unwrap();
+        let long = |fill: &str| {
+            let mut bytes = fill.repeat(4000).into_bytes();
+            bytes.extend_from_slice(SENTINEL.as_bytes());
+            bytes.extend_from_slice(fill.repeat(4000).as_bytes());
+            bytes
+        };
+        let request_bytes = long("r");
+        let response_buf = long("s");
+        let (request_len, response_len) = (request_bytes.len(), response_buf.len());
+        let check = InFlightCheck {
+            stream,
+            token: Token(7),
+            cluster_id: "debug-cluster".into(),
+            backend_id: "debug-backend".to_owned(),
+            address,
+            backend: Weak::new(),
+            started_at: Instant::now(),
+            timeout: Duration::from_secs(5),
+            request_bytes: Some(Zeroizing::new(request_bytes)),
+            write_offset: 3,
+            response_buf,
+            config: HealthCheckConfig {
+                headers: metadata(&[header("Authorization", SENTINEL)]),
+                ..h2c_config(0)
+            },
+            h2c: false,
+            tcp_connect_only: false,
+        };
+
+        for rendered in [format!("{check:?}"), format!("{check:#?}")] {
+            assert!(rendered.len() < 1024, "unbounded: {} bytes", rendered.len());
+            assert!(!rendered.contains(SENTINEL), "{rendered}");
+            // `Vec<u8>` prints as a list of numbers: a string search alone
+            // would not notice it.
+            assert!(!rendered.contains(&numeric), "{rendered}");
+            assert!(!rendered.contains("83, 89, 78, 84"), "{rendered}");
+            assert!(
+                rendered.contains(&format!("request_len: Some({request_len})"))
+                    || rendered.contains(&format!("Some(\n        {request_len},")),
+                "{rendered}"
+            );
+            assert!(rendered.contains(&response_len.to_string()), "{rendered}");
+            assert!(rendered.contains("header_count"), "{rendered}");
+            assert!(rendered.contains("debug-cluster"), "{rendered}");
+        }
     }
 
     #[test]

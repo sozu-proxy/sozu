@@ -13,6 +13,8 @@ use std::{
     fmt::Debug,
     io::{self, ErrorKind, Read, Write},
     marker::PhantomData,
+    mem,
+    ops::Deref,
     os::unix::{
         io::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
         net::UnixStream as StdUnixStream,
@@ -22,6 +24,7 @@ use std::{
 
 use mio::{event::Source, net::UnixStream as MioUnixStream};
 use prost::{DecodeError, Message as ProstMessage};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{buffer::growable::Buffer, ready::Ready};
 
@@ -87,8 +90,8 @@ pub enum ChannelError {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ChannelSnapshot {
     version: u16,
-    front: Vec<u8>,
-    back: Vec<u8>,
+    front: SnapshotBytes,
+    back: SnapshotBytes,
     initial_buffer_size: usize,
     max_buffer_size: usize,
     front_buffer_capacity: usize,
@@ -98,6 +101,102 @@ pub struct ChannelSnapshot {
     blocking: bool,
     front_high_watermark_logged: bool,
     back_high_watermark_logged: bool,
+}
+
+/// Owner of the unconsumed bytes a [`ChannelSnapshot`] carries.
+///
+/// Those bytes can be frames holding protected values, and a plain `Vec<u8>`
+/// leaves copies of them behind: serde grows it by `push`, so every
+/// reallocation frees the previous block unwiped, and a deserialization that
+/// fails after receiving some elements drops a half-built vector. This type
+/// wipes on drop (hence also the clone's own copy), wipes the previous block
+/// before a growth step releases it, and prints no bytes.
+///
+/// The wire form is the one `Vec<u8>` has, a sequence of unsigned integers, so
+/// serialized snapshots, and the partial frames they may carry, are unchanged.
+/// Only what lives in this process's memory is wiped: whatever buffer a
+/// serde format reads from or writes to is the caller's.
+#[derive(Clone, Eq, PartialEq)]
+struct SnapshotBytes(Vec<u8>);
+
+/// Capacity a deserialization starts from before doubling.
+const SNAPSHOT_BYTES_FLOOR: usize = 64;
+
+impl SnapshotBytes {
+    fn copy_of(bytes: &[u8]) -> Self {
+        SnapshotBytes(bytes.to_owned())
+    }
+
+    /// Append `byte`, widening into a fresh allocation and wiping the previous
+    /// one first when the current one is full.
+    fn push(&mut self, byte: u8) {
+        if self.0.len() == self.0.capacity() {
+            let wider = Vec::with_capacity(
+                self.0
+                    .capacity()
+                    .saturating_mul(2)
+                    .max(SNAPSHOT_BYTES_FLOOR),
+            );
+            let mut previous = mem::replace(&mut self.0, wider);
+            self.0.extend_from_slice(&previous);
+            previous.zeroize();
+        }
+        self.0.push(byte);
+    }
+}
+
+impl Deref for SnapshotBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for SnapshotBytes {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl Debug for SnapshotBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<{} bytes redacted>", self.0.len())
+    }
+}
+
+impl serde::Serialize for SnapshotBytes {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(&self.0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SnapshotBytes {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct BytesVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for BytesVisitor {
+            type Value = SnapshotBytes;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a sequence")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<SnapshotBytes, A::Error> {
+                // An early return drops `bytes`, which wipes what it received.
+                let mut bytes = SnapshotBytes(Vec::new());
+                while let Some(byte) = seq.next_element::<u8>()? {
+                    bytes.push(byte);
+                }
+                Ok(bytes)
+            }
+        }
+
+        deserializer.deserialize_seq(BytesVisitor)
+    }
 }
 
 #[derive(thiserror::Error, Debug, Eq, PartialEq)]
@@ -475,8 +574,8 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
 
         ChannelSnapshot {
             version: CHANNEL_SNAPSHOT_VERSION,
-            front: self.front_buf.data().to_owned(),
-            back: self.back_buf.data().to_owned(),
+            front: SnapshotBytes::copy_of(self.front_buf.data()),
+            back: SnapshotBytes::copy_of(self.back_buf.data()),
             initial_buffer_size: self.initial_buffer_size,
             max_buffer_size: self.max_buffer_size,
             front_buffer_capacity: self.front_buf.capacity(),
@@ -544,8 +643,16 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
 
         debug_assert_eq!(front_buf.capacity(), snapshot.front_buffer_capacity);
         debug_assert_eq!(back_buf.capacity(), snapshot.back_buffer_capacity);
-        debug_assert_eq!(front_buf.data(), snapshot.front);
-        debug_assert_eq!(back_buf.data(), snapshot.back);
+        // Not `debug_assert_eq!`: a failure would print both operands, and
+        // these bytes can be protected.
+        debug_assert!(
+            front_buf.data() == &*snapshot.front,
+            "restored front bytes must equal the snapshot's"
+        );
+        debug_assert!(
+            back_buf.data() == &*snapshot.back,
+            "restored back bytes must equal the snapshot's"
+        );
 
         Ok(PausedChannel {
             channel: Channel {
@@ -1316,7 +1423,11 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
     /// write a message on the back buffer, using our own delimiter (the delimiter of prost
     /// is not trustworthy since its size may change)
     pub fn write_delimited_message(&mut self, message: &Tx) -> Result<(), ChannelError> {
-        let payload = message.encode_to_vec();
+        // The encoded frame can hold protected values: wipe it on every exit,
+        // including the `MessageTooLarge` refusal below. `encode_to_vec`
+        // allocates `encoded_len()` bytes once, so no partial copy is left by a
+        // regrowth.
+        let payload = Zeroizing::new(message.encode_to_vec());
 
         let payload_len = payload.len() + delimiter_size();
 
@@ -1706,7 +1817,8 @@ mod tests {
         ));
 
         let (mut invalid_bytes, sock, _peer) = snapshot_and_socket();
-        invalid_bytes.front = vec![0; invalid_bytes.front_buffer_capacity + 1];
+        let over_capacity = vec![0; invalid_bytes.front_buffer_capacity + 1];
+        invalid_bytes.front = SnapshotBytes::copy_of(&over_capacity);
         assert!(matches!(
             Channel::<ProtobufMessage, ProtobufMessage>::restore_paused(sock, invalid_bytes, 8, 64,),
             Err(ChannelSnapshotError::BufferedDataExceedsCapacity { .. })

@@ -53,6 +53,8 @@ pub fn main() {
         // `SetHealthCheck` request that carries it.
         .message_attribute("HealthCheckConfig", "#[derive(Hash, Eq)]")
         .message_attribute("SetHealthCheck", "#[derive(Hash, Eq)]")
+        .message_attribute("SetProtectedHealthCheck", "#[derive(Hash, Eq)]")
+        .message_attribute("ProtectedHealthCheckOrder", "#[derive(Hash, Eq)]")
         // JSON state-file forward compat: `SaveState`/`LoadState` files are
         // JSON-encoded `WorkerRequest` records. Without `#[serde(default)]`,
         // serde rejects records that don't carry every `Vec`/`map` field — so
@@ -80,6 +82,18 @@ pub fn main() {
         .field_attribute("RequestUdpFrontend.tags", "#[serde(default)]")
         .field_attribute("RequestTcpFrontend.alpn", "#[serde(default)]")
         .field_attribute("HealthCheckConfig.accepted_statuses", "#[serde(default)]")
+        .field_attribute("HealthCheckConfig.headers", "#[serde(default)]")
+        // The ingress carrier holds a secret, and prost's generated decode
+        // replaces a populated `bytes` field with `clear`, `reserve`, `put`: a
+        // reallocation frees the old buffer before any `Drop` can wipe it.
+        // `crate::secret::HealthCheckHeaderValue` is hand-written with a
+        // `Message` impl that wipes first; it is the same wire message (same
+        // tags, same types) and is re-exported at the generated path. Its
+        // serde, `Debug` and derives live there, not in generated attributes.
+        .extern_path(
+            ".command.HealthCheckHeaderValue",
+            "crate::secret::HealthCheckHeaderValue",
+        )
         // `mode` is a required scalar added after the state format shipped:
         // a record written before it carries no `mode`, which must load as
         // `HTTP` (0), the only probe those records could describe.
@@ -102,6 +116,7 @@ pub fn main() {
             "Cluster",
             "Header",
             "HeaderPredicate",
+            "HealthCheckHeader",
             "RequestHttpFrontend",
             "HttpListenerConfig",
             "HttpsListenerConfig",

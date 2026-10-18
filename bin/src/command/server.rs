@@ -42,6 +42,7 @@ use sozu_command_lib::{
     },
     ready::Ready,
     scm_socket::{Listeners, ScmSocket},
+    secret::ProtectedTransfer,
     state::ConfigState,
 };
 
@@ -52,6 +53,7 @@ use super::upgrade::{
 };
 use crate::{
     command::{
+        protected::ProtectedRuntime,
         requests::{AuditExtras, AuditResult, ClientRequestOutcome, audit_emit_inline, begin_stop},
         sessions::{
             ClientResult, ClientSession, OptionalClient, PausedClientSession, PausedWorkerSession,
@@ -358,6 +360,10 @@ pub enum TaskSnapshotError {
     InstantOutOfRange,
     #[error("unknown audit tag pair {verb}/{counter}")]
     UnknownAuditTag { verb: String, counter: String },
+    #[error("a protected health check change is in flight and cannot be handed over")]
+    ProtectedTransactionInFlight,
+    #[error("a new worker has not confirmed it is ready and cannot be handed over")]
+    WorkerReadinessInFlight,
     #[error("test-only task {0} cannot be upgraded")]
     #[cfg_attr(not(test), allow(dead_code))]
     UnsupportedTestTask(&'static str),
@@ -644,6 +650,10 @@ pub struct CommandHub {
     /// Worker sessions inherited across this main handoff. Terminal entries
     /// are collected once no restored task or live route can still use them.
     restored_worker_tokens: HashSet<Token>,
+    /// Cold start only: the systemd `READY=1` is still owed. Armed by
+    /// [`CommandHub::arm_cold_ready`] once the initial workers and the static
+    /// and saved configuration are queued, disarmed by the one announcement.
+    cold_ready_pending: bool,
 }
 
 /// Fully validated and registered replacement Hub that cannot touch any
@@ -777,6 +787,7 @@ impl PausedCommandHub {
             restored_session_ticks: self.restored_session_ticks,
             pending_upgrade_completion: None,
             restored_worker_tokens: self.restored_worker_tokens,
+            cold_ready_pending: false,
         })
     }
 }
@@ -938,7 +949,7 @@ impl CommandHub {
     /// task sweep the replacement Hub runs after COMMIT, so restored queued
     /// tasks pass through the same callback path as pre-upgrade active tasks
     /// without replaying their original request.
-    fn finish_ready_tasks(&mut self, now: Instant) {
+    pub(crate) fn finish_ready_tasks(&mut self, now: Instant) {
         let mut tasks = std::mem::take(&mut self.tasks);
         let mut queued_tasks = std::mem::take(&mut self.server.queued_tasks);
         self.tasks = tasks
@@ -960,6 +971,47 @@ impl CommandHub {
             .collect();
     }
 
+    /// Owe systemd the cold-start `READY=1`, to be announced by
+    /// [`Self::announce_cold_ready`] once startup has settled.
+    pub(crate) fn arm_cold_ready(&mut self) {
+        self.cold_ready_pending = true;
+    }
+
+    /// Announce the cold-start `READY=1`, once, when startup has settled: no
+    /// task is queued or active, every configured worker answered its initial
+    /// `Status`, and no worker bootstrap or protected change is unresolved,
+    /// the file-backed health check headers of the configuration included.
+    /// Anything else leaves the gate armed for a later sweep; an automatic
+    /// restart can resolve a missing or fenced worker.
+    pub(crate) fn announce_cold_ready(&mut self) {
+        if !self.cold_ready_pending {
+            return;
+        }
+        let running = self
+            .server
+            .workers
+            .values()
+            .filter(|worker| worker.run_state == RunState::Running)
+            .count();
+        let quiet = self.tasks.is_empty()
+            && self.server.queued_tasks.is_empty()
+            && running >= usize::from(self.server.config.worker_count)
+            && self.server.startup_workers.is_empty()
+            && self.server.bootstrapping_workers.is_empty();
+        // The generic startup tasks are over: the file-backed headers follow,
+        // and the gate stays closed until they are decided.
+        if quiet {
+            super::protected::maybe_begin_cold_start(&mut self.server);
+        }
+        let settled = quiet
+            && self.server.queued_tasks.is_empty()
+            && self.server.protected.is_snapshot_safe(&self.server.state);
+        if settled {
+            self.cold_ready_pending = false;
+            super::requests::notify_ready();
+        }
+    }
+
     pub fn new(
         unix_listener: UnixListener,
         config: Config,
@@ -979,6 +1031,7 @@ impl CommandHub {
             restored_session_ticks: HashSet::new(),
             pending_upgrade_completion: None,
             restored_worker_tokens: HashSet::new(),
+            cold_ready_pending: false,
         })
     }
 
@@ -1039,7 +1092,7 @@ impl CommandHub {
         }
     }
 
-    fn register_client(&mut self, mut stream: UnixStream) {
+    pub(crate) fn register_client(&mut self, mut stream: UnixStream) {
         let token = self.next_session_token();
         // Previously the registration error was logged and we continued
         // anyway, inserting a session whose underlying stream
@@ -1138,10 +1191,41 @@ impl CommandHub {
         }
     }
 
-    fn get_client_mut(&mut self, token: &Token) -> Option<(&mut Server, &mut ClientSession)> {
+    pub(crate) fn get_client_mut(
+        &mut self,
+        token: &Token,
+    ) -> Option<(&mut Server, &mut ClientSession)> {
         self.clients
             .get_mut(token)
             .map(|client| (&mut self.server, client))
+    }
+
+    /// What every task, active or queued, answers when asked to snapshot.
+    #[cfg(test)]
+    pub(crate) fn task_snapshot_results(
+        &self,
+    ) -> Vec<Result<TaskContainerSnapshot, TaskSnapshotError>> {
+        let timing = TaskSnapshotTiming::now();
+        self.tasks
+            .values()
+            .chain(self.server.queued_tasks.values())
+            .map(|task| task.snapshot(timing))
+            .collect()
+    }
+
+    /// How many tasks are alive, active or queued.
+    #[cfg(test)]
+    pub(crate) fn live_task_count(&self) -> usize {
+        self.tasks.len() + self.server.queued_tasks.len()
+    }
+
+    /// The token of the only registered client, for tests that drive one.
+    #[cfg(test)]
+    pub(crate) fn only_client_token(&self) -> Token {
+        let mut tokens = self.clients.keys();
+        let token = *tokens.next().expect("a registered client");
+        assert!(tokens.next().is_none(), "exactly one registered client");
+        token
     }
 
     /// Recreate the descriptor-only Hub exported by Sōzu 2.2.1 without
@@ -1318,8 +1402,14 @@ impl CommandHub {
     /// The returned wrapper deliberately exposes no event loop or sessions.
     /// Registration validates descriptors during PREPARED; only `activate`
     /// crosses the COMMIT boundary and makes data I/O possible.
+    ///
+    /// `protected` is the confirmed protected health check state a protocol-3
+    /// hand-over carries; it is imported only once the snapshot's own
+    /// configuration names exactly what it holds. Protocol 2 and the legacy
+    /// reader carry none and start from an empty runtime.
     pub fn prepare_from_upgrade_data(
         upgrade_data: UpgradeData,
+        protected: Option<ProtectedTransfer>,
     ) -> Result<PausedCommandHub, HubError> {
         let UpgradeSnapshot {
             command_socket_fd,
@@ -1416,6 +1506,10 @@ impl CommandHub {
         let mut server =
             Server::new(unix_listener, config, executable_path).map_err(HubError::CreateServer)?;
 
+        if let Some(transfer) = protected {
+            server.protected = ProtectedRuntime::import_from_upgrade(transfer, &state)
+                .map_err(|error| HubError::InvalidUpgradeSnapshot(error.to_string()))?;
+        }
         server.state = state;
         server.run_state = ServerState::Running;
         server.next_client_id = next_client_id;
@@ -1635,6 +1729,7 @@ impl CommandHub {
             let now = Instant::now();
 
             self.finish_ready_tasks(now);
+            self.announce_cold_ready();
 
             // A restored Stopped worker can still hold an SCM socket needed
             // by UpgradeWorker phase one, or a buffered response with a live
@@ -1778,7 +1873,7 @@ impl CommandHub {
     /// `SoftStop` task has no deadline) that closes before answering must
     /// still fail its requests, or that task never finishes and its client is
     /// never answered.
-    fn on_worker_channel_closed(&mut self, token: &Token, worker_id: WorkerId) {
+    pub(crate) fn on_worker_channel_closed(&mut self, token: &Token, worker_id: WorkerId) {
         let first_close = self
             .workers
             .get(token)
@@ -1805,7 +1900,7 @@ impl CommandHub {
             .map(|deadline| deadline.saturating_duration_since(now))
     }
 
-    fn handle_worker_response(&mut self, worker_id: WorkerId, response: WorkerResponse) {
+    pub(crate) fn handle_worker_response(&mut self, worker_id: WorkerId, response: WorkerResponse) {
         // transmit backend events to subscribing clients
         if let Some(ResponseContent {
             content_type: Some(ContentType::Event(event)),
@@ -2059,6 +2154,158 @@ pub struct Server {
     /// The workers perform the whole business of proxying and must be
     /// synchronized at all times.
     pub workers: HashMap<Token, WorkerSession>,
+    /// Protected health-check values and the change in flight per cluster. Not
+    /// part of `state`, of any task snapshot or of the upgrade data.
+    pub(crate) protected: super::protected::ProtectedRuntime,
+    /// Workers (cold start, automatic restart, `upgrade --worker`) with no
+    /// protected value to receive, whose readiness task is still pending. They
+    /// are `NotAnswering`, yet admitted to untargeted fan-out: their headerless
+    /// `Status` is queued on the ordered worker channel ahead of every order
+    /// scattered after it, the static configuration and the saved state of a
+    /// cold start included. Empty once every readiness task has concluded;
+    /// never part of a snapshot, since a pending readiness task refuses one.
+    startup_workers: HashSet<WorkerId>,
+    /// Workers being given the confirmed protected health check values
+    /// (`protected::begin_worker_bootstrap`), and those whose fence did not
+    /// prove their process gone. A worker listed here accepts the exact
+    /// pre-run handshake only, so every mutating command waits until it is
+    /// `Running` or its process is proven stopped. Removed only by a
+    /// successful `NotAnswering` -> `Running` promotion
+    /// ([`Self::mark_worker_ready`]) or by a proven termination
+    /// ([`Self::close_worker`]): a `Stopped` routing state, an unconfirmed
+    /// kill or the end of the bootstrap task leave it held, and a main upgrade
+    /// is refused while it is not empty. Never part of a snapshot.
+    pub(crate) bootstrapping_workers: HashSet<WorkerId>,
+}
+
+/// What the answer to the initial `Status` of a new worker proves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InitialStatusVerdict {
+    /// Exact terminal `Ok` for the readiness request of the expected worker.
+    Ready,
+    /// Exact terminal `Failure` for that request.
+    Rejected,
+    /// Not an answer to that request (`Processing`, other sender, other id):
+    /// it proves nothing, and the task deadline stays the only way out.
+    Ignored,
+}
+
+/// Judge one response routed to a readiness task: only the worker the task was
+/// created for, answering the request `scatter_on` numbered `0`, can make it
+/// ready or rejected.
+pub(crate) fn judge_initial_status(
+    expected_worker: WorkerId,
+    from_worker: WorkerId,
+    response: &WorkerResponse,
+) -> InitialStatusVerdict {
+    let correlated = from_worker == expected_worker
+        && parse_scatter_request_id(&response.id)
+            .is_some_and(|(worker, _, request)| worker == expected_worker && request == 0);
+    if !correlated {
+        return InitialStatusVerdict::Ignored;
+    }
+    match ResponseStatus::try_from(response.status) {
+        Ok(ResponseStatus::Ok) => InitialStatusVerdict::Ready,
+        Ok(ResponseStatus::Failure) => InitialStatusVerdict::Rejected,
+        _ => InitialStatusVerdict::Ignored,
+    }
+}
+
+/// Readiness barrier of a worker nobody waits on a client for: cold start and
+/// automatic restart. Only an exact `Ok` promotes the session to `Running`;
+/// every other end (failure, deadline, closed channel) fences the child
+/// through the existing worker lifecycle.
+#[derive(Debug)]
+pub(crate) struct WorkerReadinessTask {
+    worker_id: WorkerId,
+    ok: usize,
+    errors: usize,
+    expected_responses: usize,
+}
+
+impl WorkerReadinessTask {
+    pub(crate) fn new(worker_id: WorkerId) -> Self {
+        Self {
+            worker_id,
+            ok: 0,
+            errors: 0,
+            expected_responses: 0,
+        }
+    }
+}
+
+impl Gatherer for WorkerReadinessTask {
+    fn inc_expected_responses(&mut self, count: usize) {
+        self.expected_responses += count;
+    }
+
+    fn has_finished(&self) -> bool {
+        self.ok + self.errors >= self.expected_responses
+    }
+
+    fn on_message(
+        &mut self,
+        server: &mut Server,
+        _client: &mut OptionalClient,
+        worker_id: WorkerId,
+        message: WorkerResponse,
+    ) {
+        match judge_initial_status(self.worker_id, worker_id, &message) {
+            InitialStatusVerdict::Ready => {
+                // A session closed since the request left is no longer
+                // `NotAnswering` and must not come back as `Running`.
+                if server.mark_worker_ready(self.worker_id) {
+                    self.ok += 1;
+                } else {
+                    self.errors += 1;
+                }
+            }
+            InitialStatusVerdict::Rejected => self.errors += 1,
+            InitialStatusVerdict::Ignored => {
+                debug!(
+                    "worker {}: ignoring response {} to the initial status of worker {}",
+                    worker_id, message.id, self.worker_id
+                );
+            }
+        }
+    }
+}
+
+impl GatheringTask for WorkerReadinessTask {
+    fn client_token(&self) -> Option<Token> {
+        None
+    }
+
+    fn get_gatherer(&mut self) -> &mut dyn Gatherer {
+        self
+    }
+
+    fn snapshot(&self, _timing: TaskSnapshotTiming) -> Result<TaskSnapshot, TaskSnapshotError> {
+        Err(TaskSnapshotError::WorkerReadinessInFlight)
+    }
+
+    fn on_finish(
+        self: Box<Self>,
+        server: &mut Server,
+        _client: &mut OptionalClient,
+        timed_out: bool,
+    ) {
+        server.startup_workers.remove(&self.worker_id);
+        if self.ok > 0 {
+            return;
+        }
+        error!(
+            "worker {} never confirmed it was ready ({}): fencing it",
+            self.worker_id,
+            if timed_out { "timeout" } else { "rejected" }
+        );
+        if !server.fence_worker(self.worker_id) {
+            error!(
+                "worker {} could not be proven stopped after failing its readiness check",
+                self.worker_id
+            );
+        }
+    }
 }
 
 impl Server {
@@ -2123,6 +2370,9 @@ impl Server {
             upgrading: false,
             unix_listener,
             workers: HashMap::new(),
+            protected: Default::default(),
+            startup_workers: HashSet::new(),
+            bootstrapping_workers: HashSet::new(),
         })
     }
 
@@ -2220,13 +2470,38 @@ fn open_audit_log_file(path: &str) -> Result<File, IoError> {
 }
 
 impl Server {
-    /// - fork the main process into a new worker
-    /// - register the worker in mio
-    /// - send a Status request to the new worker
+    /// Cold-start entry (`begin_main_process`): fork a worker, register it as
+    /// `NotAnswering` and queue a correlated headerless `Status` for it.
+    ///
+    /// The worker becomes `Running` only once that `Status` is answered `Ok`
+    /// (see `WorkerReadinessTask`). Until then it is a live child that
+    /// `workers_to_spawn` counts, so startup never double-spawns, and it is
+    /// admitted to untargeted fan-out through `startup_workers` because the
+    /// caller scatters the static configuration before the event loop runs
+    /// (see `Server::begin_worker_initialization`).
     pub fn launch_new_worker(
         &mut self,
         listeners: Option<Listeners>,
     ) -> Result<&mut WorkerSession, ServerError> {
+        let (_, token) = self.launch_worker_awaiting_status(listeners, |id| {
+            Box::new(WorkerReadinessTask::new(id))
+        })?;
+        self.workers
+            .get_mut(&token)
+            .ok_or(ServerError::WorkerNotFound)
+    }
+
+    /// - fork the main process into a new worker
+    /// - register the worker in mio, `NotAnswering`
+    /// - queue `make_task(worker_id)` and send it a correlated `Status`
+    ///
+    /// The task decides what the answer means; it must promote the session
+    /// through [`Self::mark_worker_ready`] on an exact `Ok` only.
+    pub(crate) fn launch_worker_awaiting_status(
+        &mut self,
+        listeners: Option<Listeners>,
+        make_task: impl FnOnce(WorkerId) -> Box<dyn GatheringTask>,
+    ) -> Result<(WorkerId, Token), ServerError> {
         let worker_id = self.next_worker_id();
         let (worker_pid, main_to_worker_channel, main_to_worker_scm) = fork_main_into_worker(
             &worker_id.to_string(),
@@ -2237,26 +2512,105 @@ impl Server {
         )
         .map_err(ServerError::ForkMain)?;
 
-        let worker_session = self.register_worker(
-            worker_id,
-            worker_pid,
-            main_to_worker_channel,
-            main_to_worker_scm,
-        )?;
+        let token = self
+            .register_worker(
+                worker_id,
+                worker_pid,
+                main_to_worker_channel,
+                main_to_worker_scm,
+            )?
+            .token;
 
-        // TODO: make sure the worker is registered as NotAnswering,
-        // and create a task that will pass it to Running when it respond OK to this request:
-        if let Err(send_error) = worker_session.send(&WorkerRequest {
-            id: format!("INITIAL-STATUS-{worker_id}"),
-            content: RequestType::Status(Status {}).into(),
-        }) {
-            error!(
-                "could not send the initial status request to worker {}: {}",
-                worker_id, send_error
-            );
+        self.begin_worker_initialization(worker_id, make_task(worker_id));
+        Ok((worker_id, token))
+    }
+
+    /// The post-fork half of [`Self::launch_worker_awaiting_status`] for the
+    /// registered `NotAnswering` worker `worker_id`, whose final `Status`
+    /// `job` judges.
+    ///
+    /// With no confirmed protected value the `Status` is queued at once and the
+    /// worker is admitted to untargeted fan-out, so every order scattered after
+    /// it follows it in the worker's FIFO. Otherwise the confirmed values
+    /// precede the `Status` (`protected::begin_worker_bootstrap`) and the
+    /// worker takes no ordinary order until it is ready.
+    pub(crate) fn begin_worker_initialization(
+        &mut self,
+        worker_id: WorkerId,
+        job: Box<dyn GatheringTask>,
+    ) {
+        match self.protected.bootstrap_plan(&self.state) {
+            Ok(None) => {
+                self.startup_workers.insert(worker_id);
+                self.queue_initial_status(worker_id, job);
+            }
+            Ok(Some(plan)) => super::protected::begin_worker_bootstrap(self, worker_id, plan, job),
+            Err(_) => super::protected::refuse_worker_bootstrap(self, worker_id, job),
         }
+    }
 
-        Ok(worker_session)
+    /// Queue the correlated headerless `Status` of the registered
+    /// `NotAnswering` worker `worker_id`, whose answer `job` judges.
+    pub(crate) fn queue_initial_status(
+        &mut self,
+        worker_id: WorkerId,
+        job: Box<dyn GatheringTask>,
+    ) {
+        let task_id = self.new_task(job, Timeout::Default);
+        // The only request an initializing worker is asked: a send failure is
+        // accounted by `scatter_on_matching` as a synthetic `Failure` for the
+        // task, never ignored.
+        self.scatter_on_matching(
+            RequestType::Status(Status {}).into(),
+            task_id,
+            0,
+            &|worker| worker.id == worker_id && worker.run_state == RunState::NotAnswering,
+        );
+    }
+
+    /// Promote `worker_id` from `NotAnswering` to `Running`. `true` only when a
+    /// session made that transition: a stopped or stopping one never returns.
+    /// Its startup and bootstrap membership is dropped only after that
+    /// transition: an answer for a session that did not make it clears
+    /// nothing.
+    pub(crate) fn mark_worker_ready(&mut self, worker_id: WorkerId) -> bool {
+        let mut promoted = false;
+        for worker in self
+            .workers
+            .values_mut()
+            .filter(|worker| worker.id == worker_id && worker.run_state == RunState::NotAnswering)
+        {
+            worker.run_state = RunState::Running;
+            promoted = true;
+        }
+        if promoted {
+            self.startup_workers.remove(&worker_id);
+            self.bootstrapping_workers.remove(&worker_id);
+        }
+        promoted
+    }
+
+    /// Whether a registered worker is still unresolved after its bootstrap
+    /// began: being given the confirmed protected values, or `Stopped` without
+    /// a proof that its process is gone. Until it is `Running` or proven
+    /// stopped it takes no ordinary order, so none may be accepted; the run
+    /// state alone does not say, since `Stopped` is routing state.
+    pub(crate) fn worker_bootstrap_in_flight(&self) -> bool {
+        self.workers
+            .values()
+            .any(|worker| self.bootstrapping_workers.contains(&worker.id))
+    }
+
+    /// How many `Stopped` sessions still hold an unresolved bootstrap: their
+    /// process may act, so their slot is not refilled.
+    fn unresolved_stopped_workers(&self) -> usize {
+        self.workers
+            .values()
+            .filter(|worker| {
+                worker.run_state == RunState::Stopped
+                    && self.bootstrapping_workers.contains(&worker.id)
+            })
+            .count()
     }
 
     /// count backends and frontends in the cache, update gauge metrics
@@ -2303,6 +2657,12 @@ impl Server {
             "client id counter must advance by exactly one"
         );
         id
+    }
+
+    /// The id the next task will receive.
+    #[cfg(test)]
+    pub(crate) fn peek_next_task_id(&self) -> TaskId {
+        self.next_task_id
     }
 
     fn next_task_id(&mut self) -> TaskId {
@@ -2449,12 +2809,86 @@ impl Server {
         self.scatter_on(request, task_id, 0, target);
     }
 
+    /// Scatter `request` to `target`, or to every worker that may take an
+    /// ordinary order.
+    ///
+    /// Untargeted, a `NotAnswering` worker is left out: it has not proven it
+    /// answers. The exceptions are a stop order, which must reach every child,
+    /// and a cold-start worker (`startup_workers`). A targeted request keeps
+    /// reaching any worker that is not `Stopped`.
     pub fn scatter_on(
         &mut self,
         request: Request,
         task_id: TaskId,
         request_id: usize,
         target: Option<WorkerId>,
+    ) {
+        let is_stop = matches!(
+            request.request_type,
+            Some(RequestType::SoftStop(_) | RequestType::HardStop(_))
+        );
+        let startup_workers = self.startup_workers.clone();
+        self.scatter_on_matching(request, task_id, request_id, &|worker| match target {
+            Some(id) => id == worker.id && worker.run_state != RunState::Stopped,
+            None => match worker.run_state {
+                RunState::Running | RunState::Stopping => true,
+                RunState::NotAnswering => is_stop || startup_workers.contains(&worker.id),
+                RunState::Stopped => false,
+            },
+        });
+    }
+
+    /// Scatter one request to exactly these workers (a stopped one is skipped,
+    /// as everywhere): the fixed target set of a multi-phase order.
+    pub(crate) fn scatter_to(
+        &mut self,
+        request: Request,
+        job: Box<dyn GatheringTask>,
+        timeout: Timeout,
+        workers: &[WorkerId],
+    ) {
+        let task_id = self.new_task(job, timeout);
+        self.scatter_on_matching(request, task_id, 0, &|worker| {
+            workers.contains(&worker.id) && worker.run_state != RunState::Stopped
+        });
+    }
+
+    /// Whether `worker_id` is registered and not stopped: a worker a request
+    /// can still be queued on.
+    pub(crate) fn is_worker_reachable(&self, worker_id: WorkerId) -> bool {
+        self.workers
+            .values()
+            .any(|worker| worker.id == worker_id && worker.run_state != RunState::Stopped)
+    }
+
+    /// Stop `worker_id` through the existing worker lifecycle, so no later
+    /// order can find it healthy. It is restarted from the main state when
+    /// automatic restart is on.
+    ///
+    /// `true` only when the process of every session of `worker_id` is proven
+    /// unable to act ([`WorkerTermination::is_proven`]); a worker that is not
+    /// registered, or whose `SIGKILL` failed, is not fenced.
+    #[must_use]
+    pub(crate) fn fence_worker(&mut self, worker_id: WorkerId) -> bool {
+        let tokens: Vec<Token> = self
+            .workers
+            .iter()
+            .filter(|(_, worker)| worker.id == worker_id)
+            .map(|(token, _)| *token)
+            .collect();
+        let mut fenced = !tokens.is_empty();
+        for token in tokens {
+            fenced &= self.close_worker(&token).is_proven();
+        }
+        fenced
+    }
+
+    fn scatter_on_matching(
+        &mut self,
+        request: Request,
+        task_id: TaskId,
+        request_id: usize,
+        matches: &dyn Fn(&WorkerSession) -> bool,
     ) {
         if !self.queued_tasks.contains_key(&task_id) {
             error!("no task found with id {}", task_id);
@@ -2488,11 +2922,7 @@ impl Server {
         // never an absolute total.
         let in_flight_before = self.in_flight.len();
 
-        for worker in self.workers.values_mut().filter(|w| {
-            target
-                .map(|id| id == w.id && w.run_state != RunState::Stopped)
-                .unwrap_or(w.run_state != RunState::Stopped)
-        }) {
+        for worker in self.workers.values_mut().filter(|w| matches(w)) {
             worker_count += 1;
             worker_request.id = format!("{}-{}-{}", worker.id, task_id, request_id);
             debug!("scattering to worker {}: {:?}", worker.id, worker_request);
@@ -2589,11 +3019,27 @@ impl Server {
     }
 
     /// returns how many workers should be started to reach config count
+    ///
+    /// A `NotAnswering` child is alive for this count (`WorkerSession::is_active`):
+    /// a worker still awaiting its readiness answer is not replaced a second
+    /// time. Only a fenced (`Stopped`) one leaves a slot to refill, and not one
+    /// whose process was never proven gone and whose bootstrap is unresolved
+    /// (`bootstrapping_workers`): it may still act, so it keeps its slot.
     pub fn workers_to_spawn(&self) -> u16 {
         if self.config.worker_automatic_restart && self.run_state == ServerState::Running {
-            self.config
+            let unresolved = u16::try_from(self.unresolved_stopped_workers()).unwrap_or(u16::MAX);
+            let missing = self
+                .config
                 .worker_count
                 .saturating_sub(self.alive_workers() as u16)
+                .saturating_sub(unresolved);
+            // A worker that cannot be given the confirmed protected values
+            // (a change in flight, a fence, state that does not match them)
+            // would diverge from main: none is forked until they can.
+            if missing > 0 && self.protected.bootstrap_plan(&self.state).is_err() {
+                return 0;
+            }
+            missing
         } else {
             0
         }
@@ -2607,7 +3053,13 @@ impl Server {
 
         info!("Automatically restarting {} workers", count);
         for _ in 0..count {
-            if let Err(err) = self.launch_new_worker(None) {
+            // A restarted worker is `NotAnswering`, hence counted by
+            // `alive_workers`, until its `Status` is answered. Its
+            // initialization admits it to the orders queued after that
+            // `Status`, or gives it the confirmed protected values first.
+            if let Err(err) = self
+                .launch_worker_awaiting_status(None, |id| Box::new(WorkerReadinessTask::new(id)))
+            {
                 error!("could not launch new worker: {}", err);
             }
         }
@@ -2621,29 +3073,63 @@ impl Server {
     }
 
     /// kill the worker process
-    pub fn close_worker(&mut self, token: &Token) {
-        self.close_worker_with(token, |pid| {
-            kill(Pid::from_raw(pid), Signal::SIGKILL).is_ok()
-        });
+    ///
+    /// The bootstrap membership of the worker survives a termination that is
+    /// not proven ([`WorkerTermination::is_proven`]).
+    pub fn close_worker(&mut self, token: &Token) -> WorkerTermination {
+        self.close_worker_with(token, kill_worker_process)
     }
 
-    fn close_worker_with(&mut self, token: &Token, mut terminate: impl FnMut(pid_t) -> bool) {
+    pub(crate) fn close_worker_with(
+        &mut self,
+        token: &Token,
+        mut terminate: impl FnMut(pid_t) -> Result<(), Errno>,
+    ) -> WorkerTermination {
         let worker = match self.workers.get_mut(token) {
             Some(w) => w,
             None => {
                 error!("No worker exists with token {:?}", token);
-                return;
+                return WorkerTermination::NoSuchWorker;
             }
         };
 
-        if worker.run_state != RunState::Stopped {
-            if terminate(worker.pid) {
-                info!("Worker {} was successfully killed", worker.id);
+        let termination = if worker.run_state == RunState::Stopped {
+            // The saved pid may name another process by now: never signal it,
+            // and never read `Stopped` as a proof of death.
+            if worker.process_stop_proven {
+                WorkerTermination::AlreadyGone
             } else {
-                info!("worker {} was already dead", worker.id);
+                WorkerTermination::StoppedUnproven
             }
-        }
+        } else {
+            match terminate(worker.pid) {
+                Ok(()) => {
+                    info!("Worker {} was successfully killed", worker.id);
+                    worker.process_stop_proven = true;
+                    WorkerTermination::Killed
+                }
+                Err(Errno::ESRCH) => {
+                    info!("worker {} was already dead", worker.id);
+                    worker.process_stop_proven = true;
+                    WorkerTermination::AlreadyGone
+                }
+                Err(errno) => {
+                    error!(
+                        "worker {} (pid {}) could not be killed: {}",
+                        worker.id, worker.pid, errno
+                    );
+                    WorkerTermination::Unconfirmed(errno)
+                }
+            }
+        };
         worker.run_state = RunState::Stopped;
+        let closed_id = worker.id;
+        self.startup_workers.remove(&closed_id);
+        // `Stopped` is routing state, not a proof of death: only a proven
+        // termination resolves the bootstrap barrier.
+        if termination.is_proven() {
+            self.bootstrapping_workers.remove(&closed_id);
+        }
         // POST-CONDITION: a closed worker is terminal — `Stopped` excludes it
         // from `is_active`/`alive_workers`/`scatter_on` targeting, so no later
         // request can be fanned out to a killed process.
@@ -2659,7 +3145,49 @@ impl Server {
                 .is_some_and(WorkerSession::is_active),
             "a closed worker must not report as active"
         );
+        termination
     }
+}
+
+/// How `Server::close_worker` left the process of a worker. The session is
+/// `Stopped` and receives no further order whatever the outcome; only
+/// `Killed` and `AlreadyGone` prove that the process cannot act any more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerTermination {
+    /// `SIGKILL` was delivered.
+    Killed,
+    /// The process no longer existed, or this very session earlier got a
+    /// delivered `SIGKILL` or an `ESRCH`.
+    AlreadyGone,
+    /// `SIGKILL` could not be delivered: the process may still be running.
+    Unconfirmed(Errno),
+    /// The session is `Stopped` without a proof that its process is gone
+    /// (an earlier kill failed, or it was restored by a main upgrade). Its
+    /// saved pid is not signalled again, so nothing is proven.
+    StoppedUnproven,
+    /// No session is registered under that token.
+    NoSuchWorker,
+}
+
+impl WorkerTermination {
+    /// Whether the worker process is known to be unable to act any more.
+    pub fn is_proven(self) -> bool {
+        matches!(self, Self::Killed | Self::AlreadyGone)
+    }
+}
+
+/// `SIGKILL` exactly the process `pid`. A pid that is not strictly positive
+/// names a process group (`0`, `-n`) or every process (`-1`) to `kill(2)`, so
+/// it is refused without signalling anything.
+fn kill_worker_process(pid: pid_t) -> Result<(), Errno> {
+    kill(signal_target(pid)?, Signal::SIGKILL)
+}
+
+fn signal_target(pid: pid_t) -> Result<Pid, Errno> {
+    if pid <= 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(Pid::from_raw(pid))
 }
 
 impl CommandHub {
@@ -2712,6 +3240,16 @@ impl CommandHub {
     /// cleared, once a main upgrade failed and this Hub keeps running.
     pub fn enable_cloexec_after_upgrade(&mut self) -> Result<(), ServerError> {
         enable_cloexec_on(self.upgrade_fds())
+    }
+
+    /// The confirmed protected health check state the replacement main takes
+    /// over beside the snapshot. It shares the held values by `Arc` and leaves
+    /// the key, the journal and every counter of this Hub unchanged.
+    pub(crate) fn export_protected_for_upgrade(&self) -> Result<ProtectedTransfer, HubError> {
+        self.server
+            .protected
+            .export_for_upgrade(&self.server.state)
+            .map_err(|error| HubError::InvalidUpgradeSnapshot(error.to_string()))
     }
 
     /// Capture the complete control-plane continuation without consuming it.
@@ -2771,6 +3309,26 @@ impl CommandHub {
         {
             return Err(HubError::InvalidUpgradeSnapshot(
                 "cannot upgrade while a stop task is dispatched".to_owned(),
+            ));
+        }
+        // A task still owning a change was refused above, as retryable. What
+        // remains here outlived its task: a fence a failed rollback left up,
+        // an unresolved version, or confirmed header values the configuration
+        // does not name exactly. None can be handed over, and no retry makes
+        // them so. Confirmed values that can be (`export_protected_for_upgrade`)
+        // never enter the snapshot: they travel beside it.
+        if !self.server.protected.is_snapshot_safe(&self.server.state) {
+            return Err(HubError::InvalidUpgradeSnapshot(
+                super::protected::PROTECTED_STATE_NOT_SNAPSHOTTABLE.to_owned(),
+            ));
+        }
+        // A bootstrap still in flight was refused above through its task. What
+        // remains outlived it: a worker whose process was never proven gone
+        // cannot be handed over, and no retry makes it so.
+        if self.server.worker_bootstrap_in_flight() {
+            return Err(HubError::InvalidUpgradeSnapshot(
+                "a worker bootstrap is unresolved: reconciliation or controlled restart required"
+                    .to_owned(),
             ));
         }
         let boot_generation = self.server.boot_generation.checked_add(1).ok_or_else(|| {
@@ -3105,12 +3663,13 @@ mod tests {
             // by the snapshot; the old Hub must not close them as well.
             std::mem::forget(hub);
 
-            let paused = CommandHub::prepare_from_upgrade_data(data).unwrap_or_else(|error| {
-                panic!(
-                    "max_command_buffer_size={max_command_buffer_size}: a clamped client \
+            let paused =
+                CommandHub::prepare_from_upgrade_data(data, None).unwrap_or_else(|error| {
+                    panic!(
+                        "max_command_buffer_size={max_command_buffer_size}: a clamped client \
                      channel must restore, got {error}"
-                )
-            });
+                    )
+                });
             assert_eq!(paused.clients.len(), 1);
         }
     }
@@ -3401,6 +3960,10 @@ mod tests {
         let mut hub = create_test_hub();
         hub.server.config.command_buffer_size = DEFAULT_COMMAND_BUFFER_SIZE;
         hub.server.config.max_command_buffer_size = DEFAULT_MAX_COMMAND_BUFFER_SIZE;
+        // `Config::default()` has a zero worker timeout: a readiness task would
+        // expire in the same synthetic sweep. One second gives the manually
+        // driven ACK a positive deadline.
+        hub.server.config.worker_timeout = 1;
         let dir = tempfile::tempdir().expect("could not create fake worker directory");
         let executable = dir.path().join("fake-sozu-worker");
         std::fs::write(&executable, "#!/bin/sh\nexec sleep 30\n")
@@ -3430,6 +3993,13 @@ mod tests {
             .iter()
             .find_map(|(token, worker)| (worker.id == 7).then_some(*token))
             .expect("old worker token");
+        // The fixture models a worker that already answered its initial
+        // `Status`: sessions are registered `NotAnswering`.
+        hub.server
+            .workers
+            .get_mut(&old_worker_token)
+            .expect("old worker session")
+            .run_state = RunState::Running;
         peer_scm
             .send_listeners(&Listeners::default())
             .expect("old worker should return its empty listener set");
@@ -3477,23 +4047,119 @@ mod tests {
         assert_eq!(hub.server.workers.len(), 2);
         assert_eq!(hub.server.queued_tasks.len(), 1);
         assert_eq!(hub.tasks.len(), 0);
+        // The replacement has not confirmed readiness: the old worker keeps
+        // serving, the new one is NotAnswering, and the client has no terminal
+        // success. An in-flight readiness task must refuse an upgrade snapshot.
+        assert_eq!(
+            hub.server.workers[&old_worker_token].run_state,
+            RunState::Running,
+            "the old worker must not stop before the replacement is ready"
+        );
+        let pending_new_state = hub
+            .server
+            .workers
+            .values()
+            .find(|worker| worker.id == 8)
+            .map(|worker| worker.run_state);
+        assert_eq!(pending_new_state, Some(RunState::NotAnswering));
+        flush_client_responses(&mut hub, client_token, &mut client_peer);
+        let launched = client_peer
+            .read_message()
+            .expect("phase one should report the launched worker");
+        assert!(launched.message.contains("Launched a new worker with id 8"));
+        assert!(
+            client_peer.read_message().is_err(),
+            "no drain message nor terminal success before readiness is confirmed"
+        );
+        let snapshot_error = hub
+            .generate_upgrade_data(client_token)
+            .expect_err("a pending readiness task must refuse to snapshot");
+        assert!(
+            snapshot_error
+                .to_string()
+                .contains("has not confirmed it is ready"),
+            "unexpected snapshot refusal: {snapshot_error}"
+        );
+        assert!(
+            hub.server.in_flight.keys().all(|id| !id.starts_with("7-")),
+            "no SoftStop may be in flight for the old worker before readiness"
+        );
+        let readiness_id = hub
+            .server
+            .in_flight
+            .keys()
+            .find(|id| id.starts_with("8-"))
+            .cloned()
+            .expect("the initial Status of the replacement should be in flight");
+        assert!(readiness_id.ends_with("-0"), "unexpected id {readiness_id}");
+
+        // A Processing answer, or a terminal answer to another request, is not
+        // the readiness proof.
+        for (status, id) in [
+            (ResponseStatus::Processing, readiness_id.clone()),
+            (ResponseStatus::Ok, "8-999-0".to_owned()),
+        ] {
+            hub.handle_worker_response(
+                8,
+                WorkerResponse {
+                    id,
+                    status: status.into(),
+                    message: String::new(),
+                    content: None,
+                },
+            );
+        }
+        hub.finish_ready_tasks(Instant::now());
+        assert_eq!(
+            hub.server.workers[&old_worker_token].run_state,
+            RunState::Running
+        );
+        assert_eq!(
+            hub.server
+                .workers
+                .values()
+                .find(|worker| worker.id == 8)
+                .map(|worker| worker.run_state),
+            Some(RunState::NotAnswering),
+            "an uncorrelated answer must not promote the replacement"
+        );
+
+        hub.handle_worker_response(
+            8,
+            WorkerResponse {
+                id: readiness_id,
+                status: ResponseStatus::Ok.into(),
+                message: String::new(),
+                content: None,
+            },
+        );
         hub.finish_ready_tasks(Instant::now());
         assert_eq!(
             hub.server.next_worker_id, 9,
             "a later task sweep must not launch the replacement worker twice"
         );
         assert_eq!(hub.server.workers.len(), 2);
+        assert_eq!(
+            hub.server
+                .workers
+                .values()
+                .find(|worker| worker.id == 8)
+                .map(|worker| worker.run_state),
+            Some(RunState::Running)
+        );
+        assert_eq!(
+            hub.server.workers[&old_worker_token].run_state,
+            RunState::Stopping,
+            "the old worker stops only after the replacement is Running"
+        );
+        hub.finish_ready_tasks(Instant::now());
         assert_eq!(hub.tasks.len(), 1, "phase two should now be active");
         assert!(hub.server.queued_tasks.is_empty());
 
         flush_client_responses(&mut hub, client_token, &mut client_peer);
-        let first = client_peer
-            .read_message()
-            .expect("phase one should report the launched worker");
         let second = client_peer
             .read_message()
-            .expect("phase one should report the old worker drain");
-        assert!(first.message.contains("Launched a new worker with id 8"));
+            .expect("phase two should report the old worker drain");
         assert!(second.message.contains("Soft stopping worker with id 7"));
         assert!(
             client_peer.read_message().is_err(),
@@ -3516,6 +4182,491 @@ mod tests {
         worker
             .close_restored_descriptors()
             .expect("replacement worker descriptors should close");
+    }
+
+    /// Everything the master queued for a test worker, in order.
+    fn drain_worker_requests(
+        server: &mut Server,
+        worker_side: &mut Channel<WorkerResponse, WorkerRequest>,
+    ) -> Vec<WorkerRequest> {
+        for worker in server.workers.values_mut() {
+            worker.update_readiness(Ready::WRITABLE);
+            let _ = worker.ready();
+        }
+        worker_side.handle_events(Ready::READABLE);
+        crate::command::sessions::extract_messages(worker_side)
+    }
+
+    fn worker_state(server: &Server, worker_id: WorkerId) -> Option<RunState> {
+        server
+            .workers
+            .values()
+            .find(|worker| worker.id == worker_id)
+            .map(|worker| worker.run_state)
+    }
+
+    fn status_answer(id: &str, status: ResponseStatus) -> WorkerResponse {
+        WorkerResponse {
+            id: id.to_owned(),
+            status: status.into(),
+            message: String::new(),
+            content: None,
+        }
+    }
+
+    /// `upgrade --worker` at its readiness stage: worker 7 serves (a positive
+    /// owned child), worker 8 is the `NotAnswering` replacement (another owned
+    /// child, so a fence has a real target), worker 9 is an unrelated
+    /// `NotAnswering` one. No PID 0 reaches a fence.
+    struct UpgradeReadinessFixture {
+        hub: CommandHub,
+        client_token: Token,
+        client_peer: Channel<Request, Response>,
+        old_token: Token,
+        readiness_id: String,
+        old_side: Channel<WorkerResponse, WorkerRequest>,
+        old_child: OwnedChild,
+        new_child: OwnedChild,
+        _scm: Vec<std::os::unix::net::UnixStream>,
+        _other_side: Channel<WorkerResponse, WorkerRequest>,
+        _new_side: Channel<WorkerResponse, WorkerRequest>,
+    }
+
+    fn upgrade_readiness_fixture() -> UpgradeReadinessFixture {
+        let mut hub = create_test_hub();
+        // `Config::default()` is zero and would expire in the same synthetic
+        // sweep; one second gives the manually driven ACK a positive deadline.
+        hub.server.config.worker_timeout = 1;
+        let (client_token, client_peer) = register_observable_client(&mut hub);
+        let spawn = || {
+            OwnedChild(
+                std::process::Command::new("sleep")
+                    .arg("120")
+                    .spawn()
+                    .expect("could not spawn the stand-in worker process"),
+            )
+        };
+        let (old_child, new_child) = (spawn(), spawn());
+
+        let (old_side, old_scm) = register_test_worker(&mut hub.server, 7, 4096, 65536);
+        let (new_side, new_scm) = register_test_worker(&mut hub.server, 8, 4096, 65536);
+        let (other_side, other_scm) = register_test_worker(&mut hub.server, 9, 4096, 65536);
+        let old_token = hub
+            .server
+            .workers
+            .iter()
+            .find_map(|(token, worker)| (worker.id == 7).then_some(*token))
+            .expect("old worker token");
+        for worker in hub.server.workers.values_mut() {
+            match worker.id {
+                // The old worker already answered its own initial `Status`.
+                7 => {
+                    worker.run_state = RunState::Running;
+                    worker.pid = old_child.0.id() as pid_t;
+                }
+                8 => worker.pid = new_child.0.id() as pid_t,
+                _ => {}
+            }
+        }
+
+        let task_id = hub.server.new_task(
+            crate::command::upgrade::awaiting_readiness_task(client_token, old_token, 7, 8),
+            Timeout::Default,
+        );
+        hub.server.scatter_on_matching(
+            RequestType::Status(Status {}).into(),
+            task_id,
+            0,
+            &|worker| worker.id == 8 && worker.run_state == RunState::NotAnswering,
+        );
+        let readiness_id = hub
+            .server
+            .in_flight
+            .keys()
+            .next()
+            .cloned()
+            .expect("the initial Status of the replacement is in flight");
+        assert_eq!(hub.server.in_flight.len(), 1);
+        assert!(readiness_id.starts_with("8-") && readiness_id.ends_with("-0"));
+
+        UpgradeReadinessFixture {
+            hub,
+            client_token,
+            client_peer,
+            old_token,
+            readiness_id,
+            old_side,
+            old_child,
+            new_child,
+            _scm: vec![old_scm, new_scm, other_scm],
+            _other_side: other_side,
+            _new_side: new_side,
+        }
+    }
+
+    impl UpgradeReadinessFixture {
+        /// The upgrade is refused: the replacement never ran and was
+        /// terminated, the old worker still serves and was never told to
+        /// stop, and the client got exactly one terminal failure.
+        fn assert_refused(&mut self) {
+            // bounded and nonblocking: an unfenced replacement fails here
+            // at once, the `OwnedChild` guards reap both children on unwind
+            let new_status = self
+                .new_child
+                .observe_exit(1_000_000)
+                .expect("the fenced replacement must have exited");
+            assert!(!new_status.success(), "the replacement was killed");
+            assert_eq!(worker_state(&self.hub.server, 8), Some(RunState::Stopped));
+            assert_eq!(
+                self.hub.server.workers[&self.old_token].run_state,
+                RunState::Running
+            );
+            assert!(
+                self.old_child.0.try_wait().expect("try_wait").is_none(),
+                "the old worker process must be untouched"
+            );
+            assert!(
+                drain_worker_requests(&mut self.hub.server, &mut self.old_side).is_empty(),
+                "no SoftStop nor activation may reach the old worker"
+            );
+            assert!(self.hub.server.in_flight.is_empty());
+            assert!(self.hub.tasks.is_empty() && self.hub.server.queued_tasks.is_empty());
+            flush_client_responses(&mut self.hub, self.client_token, &mut self.client_peer);
+            let response = self
+                .client_peer
+                .read_message()
+                .expect("the client must get a terminal answer");
+            assert_eq!(
+                response.status,
+                ResponseStatus::Failure as i32,
+                "{response:?}"
+            );
+            assert!(response.message.contains("keeps serving"), "{response:?}");
+            assert!(self.client_peer.read_message().is_err());
+        }
+    }
+
+    #[test]
+    fn upgrade_readiness_failure_fences_the_replacement_and_keeps_the_old_worker() {
+        let mut fixture = upgrade_readiness_fixture();
+        let id = fixture.readiness_id.clone();
+        fixture
+            .hub
+            .handle_worker_response(8, status_answer(&id, ResponseStatus::Failure));
+        assert_ne!(
+            worker_state(&fixture.hub.server, 8),
+            Some(RunState::Running)
+        );
+        fixture.hub.finish_ready_tasks(Instant::now());
+        fixture.assert_refused();
+    }
+
+    #[test]
+    fn upgrade_readiness_timeout_fences_the_replacement_and_keeps_the_old_worker() {
+        let mut fixture = upgrade_readiness_fixture();
+        fixture.hub.finish_ready_tasks(Instant::now());
+        assert_eq!(
+            worker_state(&fixture.hub.server, 8),
+            Some(RunState::NotAnswering),
+            "no answer and no deadline yet: nothing is decided"
+        );
+        fixture
+            .hub
+            .finish_ready_tasks(Instant::now() + Duration::from_secs(60));
+        fixture.assert_refused();
+    }
+
+    #[test]
+    fn upgrade_readiness_eof_fences_the_replacement_and_keeps_the_old_worker() {
+        let mut fixture = upgrade_readiness_fixture();
+        fixture.hub.fail_in_flight_requests_of_worker(8);
+        assert_ne!(
+            worker_state(&fixture.hub.server, 8),
+            Some(RunState::Running)
+        );
+        fixture.hub.finish_ready_tasks(Instant::now());
+        fixture.assert_refused();
+    }
+
+    #[test]
+    fn upgrade_readiness_ignores_answers_that_are_not_the_exact_initial_status_ok() {
+        let mut fixture = upgrade_readiness_fixture();
+        let id = fixture.readiness_id.clone();
+        let other_phase = id.replace("-0", "-1");
+        let other_worker = id.replacen("8-", "9-", 1);
+        for (from, response) in [
+            (8, status_answer(&id, ResponseStatus::Processing)),
+            (8, status_answer(&other_phase, ResponseStatus::Ok)),
+            (8, status_answer(&other_worker, ResponseStatus::Ok)),
+            (9, status_answer(&id, ResponseStatus::Ok)),
+        ] {
+            fixture.hub.handle_worker_response(from, response);
+            fixture.hub.finish_ready_tasks(Instant::now());
+            assert_eq!(
+                worker_state(&fixture.hub.server, 8),
+                Some(RunState::NotAnswering)
+            );
+            assert_eq!(
+                fixture.hub.server.workers[&fixture.old_token].run_state,
+                RunState::Running
+            );
+        }
+        assert_eq!(
+            worker_state(&fixture.hub.server, 9),
+            Some(RunState::NotAnswering)
+        );
+        flush_client_responses(
+            &mut fixture.hub,
+            fixture.client_token,
+            &mut fixture.client_peer,
+        );
+        assert!(
+            fixture.client_peer.read_message().is_err(),
+            "an answer that proves nothing must not answer the client"
+        );
+    }
+
+    #[test]
+    fn upgrade_readiness_ok_promotes_only_the_replacement_then_stops_the_old_worker() {
+        let mut fixture = upgrade_readiness_fixture();
+        let id = fixture.readiness_id.clone();
+        fixture
+            .hub
+            .handle_worker_response(8, status_answer(&id, ResponseStatus::Ok));
+        fixture.hub.finish_ready_tasks(Instant::now());
+
+        assert_eq!(
+            worker_state(&fixture.hub.server, 8),
+            Some(RunState::Running)
+        );
+        assert_eq!(
+            worker_state(&fixture.hub.server, 9),
+            Some(RunState::NotAnswering),
+            "only the replacement is promoted"
+        );
+        assert_eq!(
+            fixture.hub.server.workers[&fixture.old_token].run_state,
+            RunState::Stopping
+        );
+        let to_old = drain_worker_requests(&mut fixture.hub.server, &mut fixture.old_side);
+        assert!(
+            matches!(
+                to_old.as_slice(),
+                [WorkerRequest {
+                    content: Request {
+                        request_type: Some(RequestType::SoftStop(_))
+                    },
+                    ..
+                }]
+            ),
+            "exactly one SoftStop for the old worker: {to_old:?}"
+        );
+        flush_client_responses(
+            &mut fixture.hub,
+            fixture.client_token,
+            &mut fixture.client_peer,
+        );
+        let processing = fixture
+            .client_peer
+            .read_message()
+            .expect("the drain is reported");
+        assert!(
+            processing
+                .message
+                .contains("Soft stopping worker with id 7")
+        );
+        assert!(fixture.client_peer.read_message().is_err());
+        assert!(fixture.new_child.0.try_wait().expect("try_wait").is_none());
+    }
+
+    fn cold_ready_notifications() -> usize {
+        crate::command::requests::READY_NOTIFICATIONS.with(|count| count.get())
+    }
+
+    /// One event-loop sweep, as `CommandHub::run` runs it.
+    fn cold_ready_sweep(hub: &mut CommandHub) {
+        hub.finish_ready_tasks(Instant::now());
+        hub.announce_cold_ready();
+    }
+
+    /// The cold `READY=1` is the end of startup, not the end of queueing it:
+    /// every worker must have answered its initial `Status` and every startup
+    /// task must be terminal, and it is announced once.
+    #[test]
+    fn cold_ready_waits_for_every_worker_and_startup_task_then_fires_once() {
+        let mut hub = create_test_hub();
+        // `Config::default()` is zero and would expire the readiness tasks in
+        // the first synthetic sweep, fencing a stand-in worker with PID 0.
+        hub.server.config.worker_timeout = 60;
+        hub.server.config.worker_count = 2;
+        let (_side_1, _scm_1) = register_test_worker(&mut hub.server, 1, 4096, 65536);
+        let (_side_2, _scm_2) = register_test_worker(&mut hub.server, 2, 4096, 65536);
+        for worker_id in [1, 2] {
+            hub.server.begin_worker_initialization(
+                worker_id,
+                Box::new(WorkerReadinessTask::new(worker_id)),
+            );
+        }
+        let status_id = |hub: &CommandHub, worker_id: WorkerId| {
+            let prefix = format!("{worker_id}-");
+            hub.server
+                .in_flight
+                .keys()
+                .find(|id| id.starts_with(&prefix) && id.ends_with("-0"))
+                .cloned()
+                .expect("the initial Status of the worker is in flight")
+        };
+        let (id_1, id_2) = (status_id(&hub, 1), status_id(&hub, 2));
+        assert_eq!(cold_ready_notifications(), 0);
+
+        hub.arm_cold_ready();
+        cold_ready_sweep(&mut hub);
+        assert_eq!(
+            cold_ready_notifications(),
+            0,
+            "pending readiness tasks and NotAnswering workers"
+        );
+
+        hub.handle_worker_response(1, status_answer(&id_1, ResponseStatus::Ok));
+        cold_ready_sweep(&mut hub);
+        assert_eq!(worker_state(&hub.server, 1), Some(RunState::Running));
+        assert_eq!(worker_state(&hub.server, 2), Some(RunState::NotAnswering));
+        assert_eq!(cold_ready_notifications(), 0, "worker 2 never answered");
+
+        hub.handle_worker_response(2, status_answer(&id_2, ResponseStatus::Ok));
+        assert_eq!(
+            cold_ready_notifications(),
+            0,
+            "the task is not terminal until the sweep"
+        );
+        cold_ready_sweep(&mut hub);
+        assert_eq!(worker_state(&hub.server, 2), Some(RunState::Running));
+        assert_eq!(cold_ready_notifications(), 1);
+
+        cold_ready_sweep(&mut hub);
+        cold_ready_sweep(&mut hub);
+        assert_eq!(cold_ready_notifications(), 1, "the gate is one-shot");
+    }
+
+    #[test]
+    fn cold_ready_stays_zero_for_a_missing_worker_or_an_unresolved_protected_bootstrap() {
+        let mut hub = create_test_hub();
+        hub.server.config.worker_count = 2;
+        let (_side_1, _scm_1) = register_test_worker(&mut hub.server, 1, 4096, 65536);
+        for worker in hub.server.workers.values_mut() {
+            worker.run_state = RunState::Running;
+        }
+        assert_eq!(cold_ready_notifications(), 0);
+
+        hub.arm_cold_ready();
+        cold_ready_sweep(&mut hub);
+        assert_eq!(
+            cold_ready_notifications(),
+            0,
+            "one of the two configured workers is missing"
+        );
+
+        let (_side_2, _scm_2) = register_test_worker(&mut hub.server, 2, 4096, 65536);
+        for worker in hub.server.workers.values_mut() {
+            worker.run_state = RunState::Running;
+        }
+        hub.server.bootstrapping_workers.insert(2);
+        cold_ready_sweep(&mut hub);
+        assert_eq!(
+            cold_ready_notifications(),
+            0,
+            "a protected bootstrap or fence is unresolved"
+        );
+
+        hub.server.bootstrapping_workers.clear();
+        cold_ready_sweep(&mut hub);
+        assert_eq!(cold_ready_notifications(), 1);
+    }
+
+    /// Cold start: the initial `Status` is queued on the ordered channel of a
+    /// `startup_workers` child before the static configuration. A restarted
+    /// child is not admitted, a `Running` one always is.
+    #[test]
+    fn cold_start_worker_gets_config_behind_its_status_but_a_restarted_one_does_not() {
+        let mut server = create_test_server();
+        let (mut cold_side, _cold_scm) = register_test_worker(&mut server, 1, 4096, 65536);
+        let (mut restarted_side, _restarted_scm) =
+            register_test_worker(&mut server, 2, 4096, 65536);
+        let (mut running_side, _running_scm) = register_test_worker(&mut server, 3, 4096, 65536);
+        for worker in server.workers.values_mut() {
+            if worker.id == 3 {
+                // Modelled as already confirmed ready.
+                worker.run_state = RunState::Running;
+            }
+        }
+        server.startup_workers.insert(1);
+        for worker_id in [1, 2] {
+            let task_id = server.new_task(
+                Box::new(WorkerReadinessTask::new(worker_id)),
+                Timeout::Default,
+            );
+            server.scatter_on_matching(RequestType::Status(Status {}).into(), task_id, 0, &|w| {
+                w.id == worker_id && w.run_state == RunState::NotAnswering
+            });
+        }
+
+        let config_task = server.new_task(Box::new(WorkerReadinessTask::new(99)), Timeout::None);
+        server.scatter_on(
+            RequestType::AddCluster(Cluster {
+                cluster_id: "cold-cluster".to_owned(),
+                ..Default::default()
+            })
+            .into(),
+            config_task,
+            1,
+            None,
+        );
+
+        let kinds = |requests: Vec<WorkerRequest>| {
+            requests
+                .into_iter()
+                .map(|request| match request.content.request_type {
+                    Some(RequestType::Status(_)) => "Status",
+                    Some(RequestType::AddCluster(_)) => "AddCluster",
+                    _ => "other",
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            kinds(drain_worker_requests(&mut server, &mut cold_side)),
+            ["Status", "AddCluster"],
+            "FIFO: the initial Status precedes the cold-start configuration"
+        );
+        assert_eq!(
+            kinds(drain_worker_requests(&mut server, &mut restarted_side)),
+            ["Status"],
+            "a restarted NotAnswering worker gets no ordinary fan-out"
+        );
+        assert_eq!(
+            kinds(drain_worker_requests(&mut server, &mut running_side)),
+            ["AddCluster"]
+        );
+    }
+
+    #[test]
+    fn a_not_answering_worker_counts_toward_workers_to_spawn() {
+        let mut server = create_test_server();
+        server.config.worker_automatic_restart = true;
+        server.config.worker_count = 1;
+        assert_eq!(server.workers_to_spawn(), 1);
+
+        let (_side, _scm) = register_test_worker(&mut server, 1, 4096, 65536);
+        assert_eq!(worker_state(&server, 1), Some(RunState::NotAnswering));
+        assert_eq!(
+            server.workers_to_spawn(),
+            0,
+            "a worker awaiting its readiness answer is not replaced a second time"
+        );
+
+        for worker in server.workers.values_mut() {
+            worker.run_state = RunState::Stopped;
+        }
+        assert_eq!(server.workers_to_spawn(), 1, "a fenced worker is refilled");
     }
 
     /// Regression (sozu#1430): the command-socket client channel is sized at
@@ -3889,6 +5040,82 @@ mod tests {
         (worker_side, scm_main)
     }
 
+    /// `register_test_worker` for a fixture that models a worker which already
+    /// answered its initial `Status`: a session is registered `NotAnswering`,
+    /// and an ordinary fan-out skips it.
+    fn register_ready_test_worker(
+        server: &mut Server,
+        worker_id: WorkerId,
+        buffer_size: u64,
+        max_buffer_size: u64,
+    ) -> (
+        Channel<WorkerResponse, WorkerRequest>,
+        std::os::unix::net::UnixStream,
+    ) {
+        let registered = register_test_worker(server, worker_id, buffer_size, max_buffer_size);
+        for worker in server.workers.values_mut().filter(|w| w.id == worker_id) {
+            worker.run_state = RunState::Running;
+        }
+        registered
+    }
+
+    /// `close_worker` reports whether the process is proven unable to act: a
+    /// failed `SIGKILL` other than `ESRCH` must not read as a stopped worker,
+    /// while the session stays out of every later fan-out.
+    #[test]
+    fn close_worker_classifies_the_kill_outcome() {
+        for (outcome, expected) in [
+            (Ok(()), WorkerTermination::Killed),
+            (Err(Errno::ESRCH), WorkerTermination::AlreadyGone),
+            (
+                Err(Errno::EPERM),
+                WorkerTermination::Unconfirmed(Errno::EPERM),
+            ),
+        ] {
+            let mut server = create_test_server();
+            let (_worker_side, _scm_owner) = register_test_worker(&mut server, 3, 4096, 65536);
+            let token = *server.workers.keys().next().expect("a registered worker");
+            server.workers.get_mut(&token).expect("worker").pid = 4242;
+            let mut signalled = Vec::new();
+
+            let termination = server.close_worker_with(&token, |pid| {
+                signalled.push(pid);
+                outcome
+            });
+
+            assert_eq!(termination, expected);
+            assert_eq!(
+                signalled,
+                vec![4242],
+                "exactly the worker's pid is signalled"
+            );
+            assert_eq!(
+                termination.is_proven(),
+                !matches!(expected, WorkerTermination::Unconfirmed(_))
+            );
+            assert_eq!(server.workers[&token].run_state, RunState::Stopped);
+        }
+        let mut server = create_test_server();
+        assert_eq!(
+            server.close_worker_with(&Token(9999), |_| unreachable!("no session, no signal")),
+            WorkerTermination::NoSuchWorker
+        );
+        assert!(
+            !server.fence_worker(77),
+            "an unregistered worker is not fenced"
+        );
+    }
+
+    /// A pid that is not strictly positive addresses a process group or every
+    /// process to `kill(2)`: it never becomes a signal target.
+    #[test]
+    fn a_worker_pid_that_names_a_process_group_is_never_a_signal_target() {
+        for pid in [0, -1, -4242, pid_t::MIN] {
+            assert_eq!(signal_target(pid), Err(Errno::EINVAL), "pid {pid}");
+        }
+        assert_eq!(signal_target(4242), Ok(Pid::from_raw(4242)));
+    }
+
     #[test]
     fn closing_an_already_stopped_worker_never_signals_its_saved_pid_again() {
         let mut server = create_test_server();
@@ -3908,7 +5135,7 @@ mod tests {
 
         server.close_worker_with(&token, |pid| {
             signalled.push(pid);
-            true
+            Ok(())
         });
 
         assert!(
@@ -3916,6 +5143,103 @@ mod tests {
             "a restored Stopped session must not signal a PID that may have been reused"
         );
         assert_eq!(server.workers[&token].run_state, RunState::Stopped);
+    }
+
+    /// A child the test owns, killed and reaped when the guard drops, also
+    /// when an assertion failed first.
+    struct OwnedChild(std::process::Child);
+
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    impl OwnedChild {
+        /// Look for the child's exit at most `polls + 1` times, yielding the
+        /// thread in between, and never block: `None` means still running.
+        fn observe_exit(&mut self, polls: u32) -> Option<std::process::ExitStatus> {
+            for _ in 0..polls {
+                if let Some(status) = self.0.try_wait().expect("try_wait") {
+                    return Some(status);
+                }
+                std::thread::yield_now();
+            }
+            self.0.try_wait().expect("try_wait")
+        }
+    }
+
+    #[test]
+    fn an_owned_child_observation_never_blocks_on_a_live_child() {
+        let mut child = OwnedChild(
+            std::process::Command::new("sleep")
+                .arg("120")
+                .spawn()
+                .expect("could not spawn the stand-in worker process"),
+        );
+        assert!(
+            child.observe_exit(0).is_none(),
+            "a live child is reported as still running at once"
+        );
+    }
+
+    /// A kill that could not be delivered leaves the session `Stopped` for
+    /// routing, but the process may still run: fencing it again must neither
+    /// read the `Stopped` state as a proof of death nor signal the saved pid a
+    /// second time, which may have been reused.
+    ///
+    /// To SEE THIS RED: let `close_worker_with` answer `AlreadyGone` for any
+    /// `Stopped` session again — the second fence reports a proof while the
+    /// owned child is alive.
+    #[test]
+    fn an_unconfirmed_kill_is_not_proven_by_fencing_the_stopped_session_again() {
+        let mut server = create_test_server();
+        let (_worker_side, _scm_owner) = register_test_worker(&mut server, 5, 4096, 65536);
+        let mut child = OwnedChild(
+            std::process::Command::new("sleep")
+                .arg("120")
+                .spawn()
+                .expect("could not spawn the stand-in worker process"),
+        );
+        let pid = child.0.id() as pid_t;
+        assert!(pid > 0, "the signalled pid is a single process");
+        let token = *server.workers.keys().next().expect("a registered worker");
+        server.workers.get_mut(&token).expect("worker").pid = pid;
+        let alive = |child: &mut OwnedChild| child.0.try_wait().expect("try_wait").is_none();
+
+        let mut signalled = Vec::new();
+        let first = server.close_worker_with(&token, |pid| {
+            signalled.push(pid);
+            Err(Errno::EPERM)
+        });
+        assert_eq!(first, WorkerTermination::Unconfirmed(Errno::EPERM));
+        assert!(!first.is_proven());
+        assert_eq!(server.workers[&token].run_state, RunState::Stopped);
+        assert!(!server.is_worker_reachable(5), "stopped for routing");
+        assert!(alive(&mut child), "nothing was delivered to the child");
+
+        assert!(
+            !server.fence_worker(5),
+            "a stopped session whose kill was never proven is not fenced"
+        );
+        assert!(alive(&mut child), "fencing again signalled the saved pid");
+
+        let second = server.close_worker_with(&token, |pid| {
+            signalled.push(pid);
+            Ok(())
+        });
+        assert!(
+            !second.is_proven(),
+            "a repeated close proved nothing: {second:?}"
+        );
+        assert_eq!(
+            signalled,
+            vec![pid],
+            "the saved pid is never signalled again"
+        );
+        assert_eq!(server.workers[&token].run_state, RunState::Stopped);
+        assert!(alive(&mut child), "the child outlives every fence attempt");
     }
 
     #[test]
@@ -4098,7 +5422,7 @@ mod tests {
     /// whose connected channel remains open but never answers.
     fn run_silent_deadline_probe(deadlines: &[(Duration, bool)]) -> (Duration, usize, usize) {
         let mut hub = create_test_hub();
-        let (_silent_worker, _scm) = register_test_worker(&mut hub.server, 0, 4096, 65536);
+        let (_silent_worker, _scm) = register_ready_test_worker(&mut hub.server, 0, 4096, 65536);
         let started_at = Instant::now();
         let finished_at = std::rc::Rc::new(std::cell::Cell::new(None));
 
@@ -4217,7 +5541,7 @@ mod tests {
         let mut hub = create_test_hub();
         // An 8-byte ceiling cannot hold even the length prefix plus payload of
         // the smallest request, at any time.
-        let (_worker_side, _scm) = register_test_worker(&mut hub.server, 0, 8, 8);
+        let (_worker_side, _scm) = register_ready_test_worker(&mut hub.server, 0, 8, 8);
 
         let seen = std::rc::Rc::new(std::cell::Cell::new((0, 0, 0)));
         let task_id = hub.server.new_task(
@@ -4266,8 +5590,8 @@ mod tests {
     #[test]
     fn closing_a_worker_only_fails_its_unanswered_requests() {
         let mut hub = create_test_hub();
-        let (_worker_0, _scm_0) = register_test_worker(&mut hub.server, 0, 4096, 65536);
-        let (_worker_1, _scm_1) = register_test_worker(&mut hub.server, 1, 4096, 65536);
+        let (_worker_0, _scm_0) = register_ready_test_worker(&mut hub.server, 0, 4096, 65536);
+        let (_worker_1, _scm_1) = register_ready_test_worker(&mut hub.server, 1, 4096, 65536);
 
         let seen = std::rc::Rc::new(std::cell::Cell::new((0, 0, 0)));
         let task_id = hub.server.new_task(
@@ -4342,7 +5666,7 @@ mod tests {
         let mut hub = create_test_hub();
         // 4 KiB ceiling: 500 queued requests overflow it many times over,
         // exactly as a large state file overflows the 2 MB default.
-        let (mut worker_side, _scm) = register_test_worker(&mut hub.server, 0, 512, 4096);
+        let (mut worker_side, _scm) = register_ready_test_worker(&mut hub.server, 0, 512, 4096);
 
         let seen = std::rc::Rc::new(std::cell::Cell::new((0, 0, 0)));
         let task_id = hub.server.new_task(
@@ -4407,7 +5731,7 @@ mod tests {
     #[test]
     fn poll_wakes_up_for_the_earliest_task_deadline() {
         let mut hub = create_test_hub();
-        let (_silent_worker, _scm) = register_test_worker(&mut hub.server, 0, 4096, 65536);
+        let (_silent_worker, _scm) = register_ready_test_worker(&mut hub.server, 0, 4096, 65536);
 
         let early = Duration::from_millis(50);
         let late = Duration::from_secs(60);
@@ -4458,8 +5782,8 @@ mod tests {
     #[test]
     fn cancelling_a_task_retires_only_its_response_routes() {
         let mut hub = create_test_hub();
-        let (_worker_0, _scm_0) = register_test_worker(&mut hub.server, 0, 4096, 65536);
-        let (_worker_1, _scm_1) = register_test_worker(&mut hub.server, 1, 4096, 65536);
+        let (_worker_0, _scm_0) = register_ready_test_worker(&mut hub.server, 0, 4096, 65536);
+        let (_worker_1, _scm_1) = register_ready_test_worker(&mut hub.server, 1, 4096, 65536);
 
         let new_tally_task = |hub: &mut CommandHub, seen| {
             hub.server.new_task(
@@ -4561,7 +5885,7 @@ mod tests {
     #[test]
     fn a_stopping_worker_closing_finishes_its_pending_task() {
         let mut hub = create_test_hub();
-        let (_worker_0, _scm_0) = register_test_worker(&mut hub.server, 0, 4096, 65536);
+        let (_worker_0, _scm_0) = register_ready_test_worker(&mut hub.server, 0, 4096, 65536);
         let mut child = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
@@ -4877,7 +6201,7 @@ mod tests {
     #[test]
     fn scatter_sends_client_auth_listeners_on_the_mtls_verb() {
         let mut hub = create_test_hub();
-        let (mut worker_side, _scm) = register_test_worker(&mut hub.server, 0, 4096, 65536);
+        let (mut worker_side, _scm) = register_ready_test_worker(&mut hub.server, 0, 4096, 65536);
 
         let listener = |port: u16, client_auth: Option<ClientAuthMode>| HttpsListenerConfig {
             address: SocketAddress::new_v4(127, 0, 0, 1, port),

@@ -40,17 +40,20 @@ prepare and activate:
 sozu -c config.toml -t 30000 upgrade
 ```
 
-Main-upgrade protocol v2 transfers the command socket clients, worker sessions,
-active and queued commands, worker-response correlations, buffered IPC data and
-their existing monotonic deadlines to the replacement main. Commands are
-continued from their saved state; they are not replayed. The initiating CLI
-keeps its original connection and waits for one terminal response from the new
-main.
+Main-upgrade protocol v3, which 2.3.2 writes, transfers the command socket
+clients, worker sessions, active and queued commands, worker-response
+correlations, buffered IPC data and their existing monotonic deadlines to the
+replacement main, as protocol v2 of 2.3.1 did, and adds the protected
+health-check state (see
+[Hot upgrade protocols and compatibility](#hot-upgrade-protocols-and-compatibility)).
+Commands are continued from their saved state; they are not replayed. The
+initiating CLI keeps its original connection and waits for one terminal response
+from the new main.
 
 The running main first probes the installed candidate. If the candidate does
-not support protocol v2, the upgrade is rejected before the current main gives
-up ownership. A running 2.2.1 main uses a separate legacy import path described
-below; it cannot transfer pending control commands.
+not support the protocol the running main writes, the upgrade is rejected before
+the current main gives up ownership. A running 2.2.1 main uses a separate legacy
+import path described below; it cannot transfer pending control commands.
 
 Before the handoff commits, a candidate failure is rolled back: the candidate
 is reaped and the old main resumes. Once commit transmission starts, ownership
@@ -112,6 +115,78 @@ proves that the replacement activated; verify its PID and worker results.
 already draining or stopped. A worker failure makes the command exit nonzero
 after collecting all worker results. This is a partial upgrade, not a rollback
 of the main: inspect the reported worker IDs and retry or recover those workers.
+
+### Hot upgrade protocols and compatibility
+
+The handoff a running main sends to its replacement comes in three forms, and
+the replacement is the process that has to understand it:
+
+- **Legacy** (2.2.1): a flat snapshot with no protocol marker. A 2.3.2
+  replacement reads it, under the idle-control-plane preconditions above.
+- **Protocol v2** (written by 2.3.1): a 2.3.2 replacement reads it with its
+  retained v2 reader.
+- **Protocol v3** (written by 2.3.2): a 2.3.2 replacement reads it. A 2.3.2 main
+  writes v3 only and never falls back to a v2 handoff, so a 2.3.1 replacement
+  cannot read what it sends.
+
+An absent protocol marker always means the 2.2.1 legacy form. Release 2.3.1 has
+no protected health-check headers, so a v2 or legacy handoff holds none.
+
+Protocol v3 transfers the protected health-check state of the main process: the
+key that fingerprints header values and its epoch, and the values held in memory.
+A 2.3.2 writer sends the complete possibly-sensitive snapshot over a dedicated
+Unix socket as one bounded frame: no tempfile and no memfd, and it never falls
+back to the v2 file transport. A 2.3.2 reader still accepts the v2 file input of
+2.3.1 and the unmarked 2.2.1 legacy input. The fingerprints stay valid and the
+probes keep their headers across the upgrade. The replacement does not read the `value_file` paths or standard input
+again to compensate for the handoff. The key and the values live in the memory
+of the running main, and a change to protected headers still in flight when you
+upgrade must finish first: the main refuses the upgrade while a change fence or
+an unresolved version exists.
+
+What this means in practice:
+
+- Finish and verify the 2.3.2 upgrade (main and every worker) before enabling
+  `--header-file`; see
+  [health_checks.md § Upgrades and rollback](./health_checks.md#upgrades-and-rollback).
+- `sozu upgrade` is not a rollback to 2.3.1 once 2.3.2 runs: a 2.3.1 main cannot
+  consume a v3 handoff, and a rollback is not transparent. Use a controlled
+  restart from the configuration and saved state, after setting the protected
+  health checks again without `--header-file` (or removing them) and removing
+  their `headers` tables from the configuration file. A 2.3.1 peer ignores the
+  unknown protobuf `headers` field and would probe without the headers, and the
+  2.3.1 TOML parser does not understand the tables, so a configuration that
+  still holds them fails to load.
+
+### Cold restart and protected health-check headers
+
+A cold start (a service restart, not a hot upgrade) does not carry the protected
+values over: they are never written to the saved state, which holds only the
+header names and fingerprints made under the previous key; the configuration
+file holds the `value_file` references. The main process generates a fresh,
+memory-only key and epoch. A saved state is authoritative for startup, reload and
+`LoadState`, `RemoveCluster` included: a foreign or stale epoch cannot activate a
+value by carrying the same cluster name, and the same-name `value_file` entry of
+the configuration cannot resurrect a removal. If a restored saved state is
+authoritative for a health check and carries fingerprints of another epoch, the
+exact ordered metadata lacks its values: until they are provided again and the
+complete ordered header list matches that state, the health check sends no probe
+and counts `health_check.missing_secret`. A cluster the saved state leaves alone
+starts from the configuration, and its `value_file` references are read as
+described in `doc/health_checks.md`.
+
+In the restored-state case, an operator or controller must explicitly re-inject
+the exact ordered protected values:
+
+```bash
+sozu -c config.toml cluster health-check set --id my-cluster --uri /health \
+    --header-file Authorization=/run/secrets/sozu-probe-authorization
+```
+
+Include this step in the restart procedure of any cluster whose restored health
+check sends headers, and check `sozu cluster health-check list` afterwards: the
+epoch in the fingerprints must be the new one. See
+[health_checks.md § After a cold restart](./health_checks.md#after-a-cold-restart).
 
 ## Run it with Docker
 

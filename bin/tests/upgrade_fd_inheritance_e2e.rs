@@ -19,22 +19,67 @@
 //! --json status`) and fails when a socket inode is held by two sozu processes,
 //! twice by one process, or when a process holds a deleted file. Linux-only.
 //!
-//! `#[ignore]`d so a contributor's `cargo test` stays fast; CI runs it from its
-//! process-level e2e step (`.github/workflows/ci.yml`). Run it by hand with:
+//! The main is hardened (non-dumpable), so its `/proc/<pid>/fd` is owned by
+//! root of its user namespace. The fixture spawns it directly: this test
+//! executable must itself run as root of a user namespace (`unshare --user
+//! --map-root-user`) to list the main's descriptors. Run directly as an
+//! ordinary user, the test fails naming the process, pid and path instead of
+//! skipping it.
+//!
+//! `#[ignore]`d so a contributor's `cargo test` stays fast; CI runs the compiled
+//! test executable under `sudo setpriv … unshare --user --map-root-user`, which
+//! maps the normal runner owner UID/GID to namespace root, in the
+//! `proc-observer-e2e` job of
+//! `.github/workflows/ci.yml`. Run it by hand as root of a user namespace, for
+//! example:
 //!
 //! ```bash
-//! cargo test -p sozu --test upgrade_fd_inheritance_e2e -- --ignored
+//! cargo test -p sozu --test upgrade_fd_inheritance_e2e --no-run
+//! unshare --user --map-root-user -- target/debug/deps/upgrade_fd_inheritance_e2e-<hash> \
+//!   --ignored --exact upgrades_leave_no_descriptor_shared_between_sozu_processes \
+//!   --nocapture --test-threads=1
 //! ```
 #![cfg(target_os = "linux")]
 
 use std::{
     collections::BTreeMap,
     net::TcpListener,
+    os::unix::process::CommandExt,
     path::Path,
-    process::{Child, Command},
+    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
+
+/// Owns the private process group of the spawned main, so a panic anywhere in
+/// the test still reaches the main, its workers and any upgrade candidate.
+struct ProcessGuard {
+    process_group: u32,
+    leader: Child,
+}
+
+impl ProcessGuard {
+    fn new(leader: Child) -> Self {
+        Self {
+            process_group: leader.id(),
+            leader,
+        }
+    }
+}
+
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {
+        // The leader is reaped only after this signal, so its PID cannot be
+        // reused while it names the process group this test created. The
+        // group is killed even when the leader already exited: workers or the
+        // upgraded main may still be members of it.
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-(self.process_group as i32)),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = self.leader.wait();
+    }
+}
 
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
@@ -103,23 +148,32 @@ fn wait_for_workers(config_path: &Path, before: &[u32]) -> Vec<u32> {
 }
 
 /// Every socket inode and deleted file each process holds beyond its standard
-/// streams, as `(process label, fd, target)`. A process that exited in between
-/// is skipped.
-fn descriptors(processes: &[(String, u32)]) -> Vec<(String, String, String)> {
+/// streams, as `(process label, fd, target)`. Every process listed here was
+/// settled before this call, so a descriptor that cannot be observed (the
+/// directory, an entry or a link) fails the test with its context instead of
+/// being skipped: an unobserved process proves nothing about leaks.
+fn descriptors(step: &str, processes: &[(String, u32)]) -> Vec<(String, String, String)> {
     let mut found = Vec::new();
     for (label, pid) in processes {
-        let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
-            continue;
-        };
-        for entry in entries.flatten() {
+        let fd_dir = format!("/proc/{pid}/fd");
+        let entries = std::fs::read_dir(&fd_dir).unwrap_or_else(|error| {
+            panic!("{step}: {label} (pid {pid}): read_dir {fd_dir}: {error}")
+        });
+        for entry in entries {
+            let entry = entry.unwrap_or_else(|error| {
+                panic!("{step}: {label} (pid {pid}): read entry of {fd_dir}: {error}")
+            });
             let fd = entry.file_name().to_string_lossy().into_owned();
             // Standard input, output and error are inherited by design.
             if matches!(fd.as_str(), "0" | "1" | "2") {
                 continue;
             }
-            let Ok(target) = std::fs::read_link(entry.path()) else {
-                continue;
-            };
+            let target = std::fs::read_link(entry.path()).unwrap_or_else(|error| {
+                panic!(
+                    "{step}: {label} (pid {pid}): read_link {} (fd {fd}): {error}",
+                    entry.path().display()
+                )
+            });
             let target = target.to_string_lossy().into_owned();
             if target.starts_with("socket:[") || target.ends_with(" (deleted)") {
                 found.push((label.to_owned(), fd, target));
@@ -132,7 +186,7 @@ fn descriptors(processes: &[(String, u32)]) -> Vec<(String, String, String)> {
 /// The violations after `step`: a socket inode held twice, anywhere, and any
 /// deleted file still open.
 fn violations(step: &str, processes: &[(String, u32)]) -> Vec<String> {
-    let found = descriptors(processes);
+    let found = descriptors(step, processes);
     let mut by_socket: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     let mut problems = Vec::new();
     for (label, fd, target) in &found {
@@ -163,17 +217,16 @@ fn processes(pid_file: &Path, workers: &[u32]) -> Vec<(String, u32)> {
     processes
 }
 
-fn stop(config_path: &Path, master: &mut Child) {
+/// Ask the current main to shut down and give it time to go. The
+/// [`ProcessGuard`] is the backstop, and the original leader is never reaped
+/// here.
+fn stop(config_path: &Path, pid_file: &Path) {
+    let main = main_pid(pid_file);
     let _ = sozu(config_path, &["shutdown"]);
     let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline {
-        if master.try_wait().ok().flatten().is_some() {
-            return;
-        }
+    while Instant::now() < deadline && main.is_some_and(|pid| !is_gone(pid)) {
         thread::sleep(Duration::from_millis(50));
     }
-    let _ = master.kill();
-    let _ = master.wait();
 }
 
 #[test]
@@ -213,10 +266,13 @@ address = "127.0.0.1:{http_port}"
     );
     std::fs::write(&config_path, &config).expect("write config");
 
-    let mut master = Command::new(env!("CARGO_BIN_EXE_sozu"))
-        .args(["start", "-c", config_path.to_str().unwrap()])
-        .spawn()
-        .expect("spawn sozu start");
+    let guard = ProcessGuard::new(
+        Command::new(env!("CARGO_BIN_EXE_sozu"))
+            .args(["start", "-c", config_path.to_str().unwrap()])
+            .process_group(0)
+            .spawn()
+            .expect("spawn sozu start"),
+    );
 
     let mut problems = Vec::new();
     let workers = wait_for_workers(&config_path, &[]);
@@ -248,7 +304,6 @@ address = "127.0.0.1:{http_port}"
     let deadline = Instant::now() + Duration::from_secs(30);
     while main_pid(&pid_file) == Some(old_main) || !is_gone(old_main) {
         assert!(Instant::now() < deadline, "the old main never handed over");
-        let _ = master.try_wait();
         thread::sleep(Duration::from_millis(100));
     }
     let current = wait_for_workers(&config_path, &current);
@@ -257,19 +312,73 @@ address = "127.0.0.1:{http_port}"
         &processes(&pid_file, &current),
     ));
 
-    stop(&config_path, &mut master);
-    if let Some(new_main) = main_pid(&pid_file)
-        && !is_gone(new_main)
-    {
-        let _ = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(new_main as i32),
-            nix::sys::signal::Signal::SIGKILL,
-        );
-    }
+    stop(&config_path, &pid_file);
+    drop(guard);
 
     assert!(
         problems.is_empty(),
         "descriptors leaked between sozu processes:\n{}",
         problems.join("\n")
+    );
+}
+
+#[test]
+fn process_guard_kills_owned_group_descendant_when_the_test_panics() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let descendant_pid_file = temp.path().join("descendant.pid");
+    // The guard owns the group from the instant the leader exists, so a panic
+    // in any later setup step still unwinds through it.
+    let guard = ProcessGuard::new(
+        Command::new("/bin/sh")
+            .args([
+                "-c",
+                "sleep 60 & printf '%s\\n' \"$!\" > \"$1\"; exit 0",
+                "owned-process-group",
+                descendant_pid_file.to_str().expect("UTF-8 path"),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn process-group leader"),
+    );
+    let process_group = guard.process_group;
+
+    // The leader exits after publishing the descendant; it stays an unreaped
+    // zombie, so its PID cannot be reused while it names the group.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !is_gone(process_group) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(is_gone(process_group), "the leader never exited");
+    let descendant: u32 = std::fs::read_to_string(&descendant_pid_file)
+        .expect("the leader publishes the descendant pid")
+        .trim()
+        .parse()
+        .expect("numeric descendant pid");
+    assert!(!is_gone(descendant), "the descendant must be live");
+
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = guard;
+        panic!("simulated assertion failure while the guard is scoped");
+    }));
+    assert!(unwound.is_err());
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !is_gone(descendant) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(25));
+    }
+    let survived = !is_gone(descendant);
+    // Keep a red run self-cleaning: the group stays alive, so its id is not
+    // reusable, while any member is live.
+    if survived {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-(process_group as i32)),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    assert!(
+        !survived,
+        "the guard left a descendant of its process group alive"
     );
 }

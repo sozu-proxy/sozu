@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use libc::pid_t;
@@ -27,13 +27,16 @@ use crate::{
     command::{
         requests::{AuditExtras, AuditResult, audit_emit_inline},
         server::{
-            ClientId, CommandHub, Gatherer, GatheringTask, MessageClient, RequestId, Server,
-            ServerState, SessionId, TaskContainerSnapshot, TaskId, TaskSnapshot, TaskSnapshotError,
-            TaskSnapshotTiming, Timeout, WorkerId,
+            ClientId, CommandHub, Gatherer, GatheringTask, InitialStatusVerdict, MessageClient,
+            RequestId, Server, ServerState, SessionId, TaskContainerSnapshot, TaskId, TaskSnapshot,
+            TaskSnapshotError, TaskSnapshotTiming, Timeout, WorkerId, judge_initial_status,
         },
         sessions::{ClientSession, ClientSessionSnapshot, OptionalClient, WorkerSessionSnapshot},
     },
-    upgrade::{fork_main_into_new_main, probe_main_upgrade_candidate},
+    upgrade::{
+        UpgradePayload, fork_main_into_new_main, probe_main_upgrade_candidate,
+        send_upgrade_transfer,
+    },
 };
 use sozu_command_lib::proto::command::EventKind;
 
@@ -45,8 +48,15 @@ enum UpgradeWorkerProgress {
         old_worker_token: Token,
         old_worker_id: WorkerId,
     },
-    /// 3. soft stop the old worker
-    /// 4. activate the listeners of the new worker
+    /// 3. wait for the new worker to answer its initial `Status`; the old
+    ///    worker keeps serving, untouched, until that answer is `Ok`
+    AwaitingReadiness {
+        old_worker_token: Token,
+        old_worker_id: WorkerId,
+        new_worker_id: WorkerId,
+    },
+    /// 4. soft stop the old worker
+    /// 5. activate the listeners of the new worker
     StopOldActivateNew {
         old_worker_id: WorkerId,
         new_worker_id: WorkerId,
@@ -199,21 +209,50 @@ impl UpgradeWorkerTask {
             }
         };
 
-        old_worker.run_state = RunState::Stopping;
+        // The old worker stays `Running` and keeps serving until the new one
+        // has proven it is ready (`AwaitingReadiness`).
+        let client_token = self.client_token;
+        let (new_worker_id, _) =
+            match server.launch_worker_awaiting_status(Some(listeners), |new_worker_id| {
+                Box::new(UpgradeWorkerTask {
+                    client_token,
+                    progress: UpgradeWorkerProgress::AwaitingReadiness {
+                        old_worker_token,
+                        old_worker_id,
+                        new_worker_id,
+                    },
+                    ok: 0,
+                    errors: 0,
+                    responses: Vec::new(),
+                    expected_responses: 0,
+                })
+            }) {
+                Ok(launched) => launched,
+                Err(worker_err) => {
+                    return client
+                        .finish_failure(format!("could not launch new worker: {worker_err}"));
+                }
+            };
+        client.return_processing(format!("Launched a new worker with id {new_worker_id}"));
+    }
 
-        // lauch new worker
-        let new_worker = match server.launch_new_worker(Some(listeners)) {
-            Ok(worker) => worker,
-            Err(worker_err) => {
-                return client.finish_failure(format!("could not launch new worker: {worker_err}"));
-            }
-        };
-        client.return_processing(format!("Launched a new worker with id {}", new_worker.id));
-        let new_worker_id = new_worker.id;
+    /// The new worker answered its initial `Status` with `Ok`: only now does
+    /// the old worker stop, and the new one activate its listeners.
+    fn stop_old_activate_new(
+        client_token: Token,
+        server: &mut Server,
+        client: &mut OptionalClient,
+        old_worker_token: Token,
+        old_worker_id: WorkerId,
+        new_worker_id: WorkerId,
+    ) {
+        if let Some(old_worker) = server.workers.get_mut(&old_worker_token) {
+            old_worker.run_state = RunState::Stopping;
+        }
 
         let finish_task = server.new_task(
             Box::new(UpgradeWorkerTask {
-                client_token: self.client_token,
+                client_token,
                 progress: UpgradeWorkerProgress::StopOldActivateNew {
                     old_worker_id,
                     new_worker_id,
@@ -248,6 +287,29 @@ impl UpgradeWorkerTask {
     }
 }
 
+/// The readiness stage of `upgrade --worker`, for the fixtures of
+/// `command::server` whose `UpgradeWorkerTask` cannot be named.
+#[cfg(test)]
+pub(crate) fn awaiting_readiness_task(
+    client_token: Token,
+    old_worker_token: Token,
+    old_worker_id: WorkerId,
+    new_worker_id: WorkerId,
+) -> Box<dyn GatheringTask> {
+    Box::new(UpgradeWorkerTask {
+        client_token,
+        progress: UpgradeWorkerProgress::AwaitingReadiness {
+            old_worker_token,
+            old_worker_id,
+            new_worker_id,
+        },
+        ok: 0,
+        errors: 0,
+        responses: Vec::new(),
+        expected_responses: 0,
+    })
+}
+
 impl GatheringTask for UpgradeWorkerTask {
     fn client_token(&self) -> Option<Token> {
         Some(self.client_token)
@@ -259,6 +321,9 @@ impl GatheringTask for UpgradeWorkerTask {
 
     fn snapshot(&self, _timing: TaskSnapshotTiming) -> Result<TaskSnapshot, TaskSnapshotError> {
         let progress = match self.progress {
+            UpgradeWorkerProgress::AwaitingReadiness { .. } => {
+                return Err(TaskSnapshotError::WorkerReadinessInFlight);
+            }
             UpgradeWorkerProgress::RequestingListenSockets {
                 old_worker_token,
                 old_worker_id,
@@ -288,6 +353,9 @@ impl GatheringTask for UpgradeWorkerTask {
         match self.progress {
             UpgradeWorkerProgress::RequestingListenSockets {
                 old_worker_token, ..
+            }
+            | UpgradeWorkerProgress::AwaitingReadiness {
+                old_worker_token, ..
             } => Some(old_worker_token),
             UpgradeWorkerProgress::StopOldActivateNew { .. } => None,
         }
@@ -297,7 +365,7 @@ impl GatheringTask for UpgradeWorkerTask {
         self: Box<Self>,
         server: &mut Server,
         client: &mut OptionalClient,
-        _timed_out: bool,
+        timed_out: bool,
     ) {
         match self.progress {
             UpgradeWorkerProgress::RequestingListenSockets {
@@ -312,6 +380,35 @@ impl GatheringTask for UpgradeWorkerTask {
                         self.responses
                     ));
                 }
+            }
+            UpgradeWorkerProgress::AwaitingReadiness {
+                old_worker_token,
+                old_worker_id,
+                new_worker_id,
+            } => {
+                if self.ok > 0 {
+                    Self::stop_old_activate_new(
+                        self.client_token,
+                        server,
+                        client,
+                        old_worker_token,
+                        old_worker_id,
+                        new_worker_id,
+                    );
+                    return;
+                }
+                // Never `Running`: fence the child so it cannot serve, and
+                // leave the old worker untouched.
+                let fenced = server.fence_worker(new_worker_id);
+                client.finish_failure(format!(
+                    "Upgrade of worker {old_worker_id} aborted: new worker {new_worker_id} never confirmed it was ready ({}), {}; worker {old_worker_id} keeps serving",
+                    if timed_out { "timeout" } else { "rejected" },
+                    if fenced {
+                        "it was stopped"
+                    } else {
+                        "it could not be proven stopped"
+                    },
+                ));
             }
             UpgradeWorkerProgress::StopOldActivateNew {
                 old_worker_id,
@@ -387,16 +484,40 @@ impl Gatherer for UpgradeWorkerTask {
 
     fn on_message(
         &mut self,
-        _server: &mut Server,
+        server: &mut Server,
         client: &mut OptionalClient,
         worker_id: WorkerId,
         message: WorkerResponse,
     ) {
+        if let UpgradeWorkerProgress::AwaitingReadiness { new_worker_id, .. } = self.progress {
+            // Only the exact terminal answer to the initial `Status` of the
+            // new worker counts; anything else waits for the deadline.
+            match judge_initial_status(new_worker_id, worker_id, &message) {
+                InitialStatusVerdict::Ready => {
+                    if server.mark_worker_ready(new_worker_id) {
+                        self.ok += 1;
+                    } else {
+                        self.errors += 1;
+                    }
+                }
+                InitialStatusVerdict::Rejected => self.errors += 1,
+                InitialStatusVerdict::Ignored => {
+                    debug!(
+                        "worker {}: ignoring response {} to the initial status of worker {}",
+                        worker_id, message.id, new_worker_id
+                    );
+                    return;
+                }
+            }
+            self.responses.push((worker_id, message));
+            return;
+        }
         match ResponseStatus::try_from(message.status) {
             Ok(ResponseStatus::Ok) => {
                 self.ok += 1;
                 match self.progress {
-                    UpgradeWorkerProgress::RequestingListenSockets { .. } => {}
+                    UpgradeWorkerProgress::RequestingListenSockets { .. }
+                    | UpgradeWorkerProgress::AwaitingReadiness { .. } => {}
                     UpgradeWorkerProgress::StopOldActivateNew { .. } => {
                         client.return_processing(format!(
                             "Worker {worker_id} answered OK to {}. {}",
@@ -419,7 +540,19 @@ impl Gatherer for UpgradeWorkerTask {
 //===============================================
 // Upgrade the main process
 
+/// Protocol 2: the 2.3.1 tempfile transport of a JSON [`UpgradeData`]. It is
+/// only ever read by this binary; the outgoing side uses protocol 3.
 pub const UPGRADE_PROTOCOL_V2: u16 = 2;
+
+/// Protocol 3: the 2.3.2 transport. The same JSON [`UpgradeData`] (its own
+/// envelope stays at protocol 2) and the confirmed protected health check
+/// state cross a dedicated Unix socket as one bounded frame, never a file.
+pub const UPGRADE_PROTOCOL_V3: u16 = 3;
+
+/// Whether this binary can receive a main upgrade handed over with `protocol`.
+pub const fn supports_upgrade_protocol(protocol: u16) -> bool {
+    matches!(protocol, UPGRADE_PROTOCOL_V2 | UPGRADE_PROTOCOL_V3)
+}
 
 /// Exact descriptor-only worker shape emitted by Sōzu 2.2.1.
 #[derive(Debug, Deserialize)]
@@ -489,10 +622,10 @@ pub struct UpgradeHandshake {
 }
 
 impl UpgradeHandshake {
-    pub fn new(stage: UpgradeStage) -> Self {
+    pub fn new(stage: UpgradeStage, protocol: u16) -> Self {
         Self {
             stage: stage as i32,
-            protocol: u32::from(UPGRADE_PROTOCOL_V2),
+            protocol: u32::from(protocol),
             clients: 0,
             workers: 0,
             tasks: 0,
@@ -502,10 +635,10 @@ impl UpgradeHandshake {
         }
     }
 
-    pub fn prepared(counts: UpgradeCounts) -> Self {
+    pub fn prepared(counts: UpgradeCounts, protocol: u16) -> Self {
         Self {
             stage: UpgradeStage::Prepared as i32,
-            protocol: u32::from(UPGRADE_PROTOCOL_V2),
+            protocol: u32::from(protocol),
             clients: counts.clients,
             workers: counts.workers,
             tasks: counts.tasks,
@@ -686,9 +819,10 @@ fn reap_failed_child(pid: i32) {
 fn validate_prepared(
     message: &UpgradeHandshake,
     expected_counts: UpgradeCounts,
+    protocol: u16,
 ) -> Result<(), String> {
     if message.stage() != UpgradeStage::Prepared
-        || message.protocol != u32::from(UPGRADE_PROTOCOL_V2)
+        || message.protocol != u32::from(protocol)
         || message.counts() != expected_counts
     {
         return Err(format!(
@@ -706,19 +840,18 @@ fn commit_and_wait_for_activation(
     hub: &mut CommandHub,
     channel: &mut sozu_command_lib::channel::Channel<UpgradeHandshake, UpgradeHandshake>,
     timeout: Duration,
+    protocol: u16,
 ) -> Result<(), String> {
     hub.server.run_state = ServerState::Stopping;
     hub.server.upgrading = true;
     channel
-        .write_message(&UpgradeHandshake::new(UpgradeStage::Commit))
+        .write_message(&UpgradeHandshake::new(UpgradeStage::Commit, protocol))
         .map_err(|error| format!("failed to send irreversible main-upgrade commit: {error}"))?;
 
     let message = channel
         .read_message_blocking_timeout(Some(timeout))
         .map_err(|error| format!("replacement main failed after commit: {error}"))?;
-    if message.stage() != UpgradeStage::Activated
-        || message.protocol != u32::from(UPGRADE_PROTOCOL_V2)
-    {
+    if message.stage() != UpgradeStage::Activated || message.protocol != u32::from(protocol) {
         return Err(format!(
             "replacement main returned unexpected post-commit message: {message:?}"
         ));
@@ -726,12 +859,44 @@ fn commit_and_wait_for_activation(
     Ok(())
 }
 
+/// Close and reap the candidate, restore the old Hub's descriptors and answer
+/// the initiating client. Only valid before the first attempt to send COMMIT.
+fn abort_before_commit(
+    hub: &mut CommandHub,
+    client_token: Token,
+    confirmation: sozu_command_lib::channel::Channel<UpgradeHandshake, UpgradeHandshake>,
+    new_main_pid: i32,
+    message: String,
+) {
+    drop(confirmation);
+    reap_failed_child(new_main_pid);
+    restore_cloexec_after_failed_upgrade(hub);
+    close_reload_window_after_failed_upgrade();
+    hub.fail_upgrade(client_token, message);
+}
+
+/// Time left before `deadline`, or `None` once it has passed.
+fn time_left(deadline: Instant) -> Option<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|left| !left.is_zero())
+}
+
 pub fn upgrade_main(hub: &mut CommandHub, client_token: Token) {
+    // A candidate that cannot receive protocol 3 is refused here, before any
+    // descriptor, key, journal or Hub state changes: there is no fallback to an
+    // older transport, since a partial frame in a channel buffer may already
+    // hold a protected value.
     if let Err(error) = probe_main_upgrade_candidate(&hub.server.executable_path) {
         hub.fail_upgrade(client_token, error.to_string());
         return;
     }
     hub.notify_upgrade_processing(client_token);
+
+    // One absolute deadline covers the payload write and read, PREPARED,
+    // COMMIT and ACTIVATED.
+    let handoff_timeout = Duration::from_secs(hub.server.config.worker_timeout.max(1) as u64);
+    let deadline = Instant::now() + handoff_timeout;
 
     let upgrade_data = match hub.generate_upgrade_data(client_token) {
         Ok(data) => data,
@@ -741,7 +906,18 @@ pub fn upgrade_main(hub: &mut CommandHub, client_token: Token) {
         }
     };
     let expected_counts = upgrade_data.counts();
-    let handoff_timeout = Duration::from_secs(hub.server.config.worker_timeout.max(1) as u64);
+    let mut payload = match hub
+        .export_protected_for_upgrade()
+        .map_err(|error| error.to_string())
+        .and_then(|protected| {
+            UpgradePayload::encode(&upgrade_data, &protected).map_err(|error| error.to_string())
+        }) {
+        Ok(payload) => payload,
+        Err(error) => {
+            hub.fail_upgrade(client_token, error);
+            return;
+        }
+    };
 
     if let Err(error) = hub.disable_cloexec_before_upgrade() {
         hub.fail_upgrade(client_token, error.to_string());
@@ -754,9 +930,9 @@ pub fn upgrade_main(hub: &mut CommandHub, client_token: Token) {
         );
     }
 
-    let (new_main_pid, mut fork_confirmation_channel) =
-        match fork_main_into_new_main(hub.server.executable_path.clone(), upgrade_data) {
-            Ok(tuple) => tuple,
+    let mut new_main =
+        match fork_main_into_new_main(hub.server.executable_path.clone(), &upgrade_data) {
+            Ok(new_main) => new_main,
             Err(fork_error) => {
                 restore_cloexec_after_failed_upgrade(hub);
                 close_reload_window_after_failed_upgrade();
@@ -767,26 +943,56 @@ pub fn upgrade_main(hub: &mut CommandHub, client_token: Token) {
                 return;
             }
         };
+    // The candidate is running: only the payload carries the snapshot now.
+    drop(upgrade_data);
+    let new_main_pid = new_main.pid;
 
-    match fork_confirmation_channel.read_message_blocking_timeout(Some(handoff_timeout)) {
-        Ok(message) if validate_prepared(&message, expected_counts).is_ok() => {}
+    let sent = send_upgrade_transfer(&mut new_main.transfer, &mut payload, deadline);
+    drop(payload);
+    drop(new_main.transfer);
+    if let Err(error) = sent {
+        abort_before_commit(
+            hub,
+            client_token,
+            new_main.confirmation,
+            new_main_pid,
+            format!("Upgrade of main process failed before commit: {error}"),
+        );
+        return;
+    }
+    let mut fork_confirmation_channel = new_main.confirmation;
+
+    let Some(wait) = time_left(deadline) else {
+        abort_before_commit(
+            hub,
+            client_token,
+            fork_confirmation_channel,
+            new_main_pid,
+            "Upgrade of main process failed before commit: handoff deadline exceeded".to_owned(),
+        );
+        return;
+    };
+    match fork_confirmation_channel.read_message_blocking_timeout(Some(wait)) {
+        Ok(message)
+            if validate_prepared(&message, expected_counts, UPGRADE_PROTOCOL_V3).is_ok() => {}
         Ok(message) => {
-            drop(fork_confirmation_channel);
-            reap_failed_child(new_main_pid);
-            restore_cloexec_after_failed_upgrade(hub);
-            close_reload_window_after_failed_upgrade();
-            hub.fail_upgrade(client_token, format!(
-                "Upgrade of main process failed before commit: unexpected child message {message:?}"
-            ));
+            abort_before_commit(
+                hub,
+                client_token,
+                fork_confirmation_channel,
+                new_main_pid,
+                format!(
+                    "Upgrade of main process failed before commit: unexpected child message {message:?}"
+                ),
+            );
             return;
         }
         Err(error) => {
-            drop(fork_confirmation_channel);
-            reap_failed_child(new_main_pid);
-            restore_cloexec_after_failed_upgrade(hub);
-            close_reload_window_after_failed_upgrade();
-            hub.fail_upgrade(
+            abort_before_commit(
+                hub,
                 client_token,
+                fork_confirmation_channel,
+                new_main_pid,
                 format!("Upgrade of main process failed before commit: {error}"),
             );
             return;
@@ -796,30 +1002,43 @@ pub fn upgrade_main(hub: &mut CommandHub, client_token: Token) {
     match hub.sigterm_pending() {
         Ok(false) => {}
         Ok(true) => {
-            drop(fork_confirmation_channel);
-            reap_failed_child(new_main_pid);
-            restore_cloexec_after_failed_upgrade(hub);
-            close_reload_window_after_failed_upgrade();
-            hub.fail_upgrade(
+            abort_before_commit(
+                hub,
                 client_token,
+                fork_confirmation_channel,
+                new_main_pid,
                 "Main upgrade aborted before commit because SIGTERM is pending".to_owned(),
             );
             return;
         }
         Err(error) => {
-            drop(fork_confirmation_channel);
-            reap_failed_child(new_main_pid);
-            restore_cloexec_after_failed_upgrade(hub);
-            close_reload_window_after_failed_upgrade();
-            hub.fail_upgrade(
+            abort_before_commit(
+                hub,
                 client_token,
+                fork_confirmation_channel,
+                new_main_pid,
                 format!("Main upgrade aborted before commit: could not inspect SIGTERM: {error}"),
             );
             return;
         }
     }
 
-    match commit_and_wait_for_activation(hub, &mut fork_confirmation_channel, handoff_timeout) {
+    let Some(wait) = time_left(deadline) else {
+        abort_before_commit(
+            hub,
+            client_token,
+            fork_confirmation_channel,
+            new_main_pid,
+            "Main upgrade aborted before commit: handoff deadline exceeded".to_owned(),
+        );
+        return;
+    };
+    match commit_and_wait_for_activation(
+        hub,
+        &mut fork_confirmation_channel,
+        wait,
+        UPGRADE_PROTOCOL_V3,
+    ) {
         Ok(()) => info!(
             "replacement main {} activated; old main will exit without touching transferred descriptors",
             new_main_pid
@@ -829,7 +1048,7 @@ pub fn upgrade_main(hub: &mut CommandHub, client_token: Token) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         collections::{HashMap, VecDeque},
         sync::mpsc,
@@ -862,7 +1081,7 @@ mod tests {
         ready::Ready,
     };
 
-    fn sample_upgrade_data() -> UpgradeData {
+    pub(crate) fn sample_upgrade_data() -> UpgradeData {
         UpgradeData::new(UpgradeSnapshot {
             command_socket_fd: 11,
             config: Config::default(),
@@ -932,16 +1151,16 @@ mod tests {
             buffered_bytes: 5,
             pending_requests: 6,
         };
-        let prepared = UpgradeHandshake::prepared(counts);
-        assert!(validate_prepared(&prepared, counts).is_ok());
+        let prepared = UpgradeHandshake::prepared(counts, UPGRADE_PROTOCOL_V2);
+        assert!(validate_prepared(&prepared, counts, UPGRADE_PROTOCOL_V2).is_ok());
 
         let mut wrong_stage = prepared.clone();
         wrong_stage.stage = UpgradeStage::Activated as i32;
-        assert!(validate_prepared(&wrong_stage, counts).is_err());
+        assert!(validate_prepared(&wrong_stage, counts, UPGRADE_PROTOCOL_V2).is_err());
 
         let mut wrong_protocol = prepared.clone();
         wrong_protocol.protocol += 1;
-        assert!(validate_prepared(&wrong_protocol, counts).is_err());
+        assert!(validate_prepared(&wrong_protocol, counts, UPGRADE_PROTOCOL_V2).is_err());
 
         for field in 0..6 {
             let mut wrong_counts = prepared.clone();
@@ -955,7 +1174,7 @@ mod tests {
                 _ => unreachable!(),
             }
             assert!(
-                validate_prepared(&wrong_counts, counts).is_err(),
+                validate_prepared(&wrong_counts, counts, UPGRADE_PROTOCOL_V2).is_err(),
                 "PREPARED count field {field} was not validated"
             );
         }
@@ -981,6 +1200,7 @@ mod tests {
             &mut hub,
             &mut parent,
             std::time::Duration::from_millis(10),
+            UPGRADE_PROTOCOL_V2,
         );
 
         assert!(result.is_err(), "closed peer must reject COMMIT");
@@ -1007,6 +1227,7 @@ mod tests {
             &mut hub,
             &mut parent,
             std::time::Duration::from_secs(1),
+            UPGRADE_PROTOCOL_V2,
         );
         child.join().expect("child handshake witness");
 
@@ -1036,6 +1257,7 @@ mod tests {
             &mut hub,
             &mut parent,
             std::time::Duration::from_millis(20),
+            UPGRADE_PROTOCOL_V2,
         );
         commit_seen_rx
             .recv()
@@ -1064,7 +1286,7 @@ mod tests {
             UpgradeStage::Commit,
             UpgradeStage::Activated,
         ] {
-            let encoded = UpgradeHandshake::new(stage).encode_to_vec();
+            let encoded = UpgradeHandshake::new(stage, UPGRADE_PROTOCOL_V2).encode_to_vec();
             let decoded = UpgradeHandshake::decode(encoded.as_slice()).unwrap();
             assert_eq!(decoded.stage(), stage);
             assert_eq!(decoded.protocol, u32::from(UPGRADE_PROTOCOL_V2));

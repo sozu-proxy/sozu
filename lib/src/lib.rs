@@ -303,6 +303,25 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! # Protected health-check headers
+//!
+//! An `HTTP` health check may send custom request headers whose values are
+//! credentials. The ordinary `SetHealthCheck` order does not carry a value: it
+//! names the headers with a keyed fingerprint, and a health check that names
+//! headers whose values the worker does not hold sends no probe. Each skipped
+//! probe is counted by the `health_check.missing_secret` metric; it is neither a
+//! success nor a failure and does not change the health of a backend.
+//!
+//! The values reach a worker only through the protected transaction of
+//! [`protected_health_check`]: a `Prepare` order, the single carrier of the clear
+//! values, then `Commit`, `Abort` or `Release`, each acknowledged. An embedder
+//! that drives a worker directly, as in the example above, is that boundary: it
+//! must ask the worker whether it supports the protocol before it hands it a
+//! value. The values live in memory only, in buffers that Sōzu zeroizes when it
+//! releases them; this does not reach copies the allocator, the kernel, a socket
+//! buffer or swap may hold. They never appear in the configuration, the state, a
+//! query response, a log line or `Debug` output.
 
 #[macro_use]
 extern crate sozu_command_lib as sozu_command;
@@ -319,6 +338,7 @@ pub mod health_check;
 pub mod http;
 pub mod load_balancing;
 pub mod pool;
+pub mod protected_health_check;
 pub mod protocol;
 pub mod retry;
 pub mod router;

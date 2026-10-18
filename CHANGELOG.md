@@ -12,7 +12,7 @@
 
 <!-- changelog-slot:backend-ownership -->
 
-## 2.3.2 - 2026-10-16
+## 2.3.2 - 2026-10-18
 
 ### Added
 
@@ -183,6 +183,64 @@
   `response_content::ContentType` gains `ClosedSessions`, so an exhaustive `match` on either
   must handle the new variant.
 
+- **`feat(health-check)`: protected custom request headers.** An `HTTP` health check, on
+  its HTTP/1.1 and h2c probe alike, can send custom request headers such as `Authorization`
+  whose values are credentials kept out of the configuration, the saved state, queries,
+  logs and `Debug` output. `TCP` mode refuses them. In TOML, repeat
+  `[[clusters.<id>.health_check.headers]]` with exactly `name` and `value_file` (no inline
+  value; an absolute path is expected); the configuration stores ordered references only,
+  and parsing keeps the reference as written and opens no file. On the command line, repeat `sozu cluster health-check set --header-file NAME=PATH`,
+  split at the first `=`, where `PATH=-` reads standard input for at most one header. The
+  reader removes one final `LF` and a `CR` right before it, and nothing else. Headers are
+  ordered, at most 32, with unique (case-insensitive) RFC 9110 token names; `Host`,
+  `Connection`, `Keep-Alive`, `Proxy-Connection`, `Transfer-Encoding`, `Content-Length`,
+  `TE`, `Trailer`, `Upgrade`, `Expect` and names starting with `:` are reserved. The sum of
+  `name + value + 4` bytes is at most 8192 and the h2c HPACK block at most 16384 bytes; an
+  invalid value is refused before any effect.
+
+  The protobuf adds `HealthCheckConfig.headers` (field 10, `HealthCheckHeader { name,
+  fingerprint }`), `HealthCheckHeaderValue`, `SetProtectedHealthCheck` and
+  `QueryProtectedHealthCheckSupport`. The state and the queries hold the ordered names and
+  fingerprints `sozu-hc-hmac-sha256:v1:<32 lowercase hex epoch>:<64 lowercase hex tag>`
+  under a memory-only key of the main process; the `value_file` references live in the
+  configuration only and never reach a worker. A change goes through an acknowledged
+  `Prepare`, `Commit`, `Abort` and `Release` exchange with the workers, with the other
+  changes to the same cluster fenced meanwhile; this describes the protected health-check
+  change only, not a global transaction. An error before every `Commit` is acknowledged
+  retains or restores the previous configuration; after every `Commit` acknowledgement, a
+  refused or timed-out `Release` is a retention or cleanup failure and cannot roll back a
+  before-image the workers already destroyed. A replaced or respawned worker receives and
+  acknowledges the values before it is Running or probes. A saved state is authoritative at
+  startup, on reload and for `LoadState`, `RemoveCluster` included: a foreign or stale epoch
+  cannot activate a value by carrying the same cluster name, and a same-name configuration
+  entry cannot resurrect a saved removal. A reload that supplies `value_file` headers
+  for an existing protected cluster retains the old health check A through the generic
+  `AddCluster` phase until the acknowledged protected transaction publishes B; an
+  authoritative reload without headers invalidates A and aligns the journal with the
+  resulting state, and an explicit `RemoveHealthCheck` or `RemoveCluster` stays a
+  removal. A probe whose header values are absent is not sent and is
+  counted by the new `health_check.missing_secret` counter, which is neither a success nor a
+  failure and leaves the backend health unchanged. Every `sozu` process sets `RLIMIT_CORE` to
+  zero (soft and hard) and, on Linux, `PR_SET_DUMPABLE` to zero as its first action, a
+  per-process protection only. Owned buffers holding a value are zeroized; the allocator, the
+  kernel, socket buffers and swap are out of reach. The probe itself is plaintext HTTP/h2c:
+  use a dedicated least-privilege probe-only credential and a protected network path to the
+  backend. Documented in `doc/health_checks.md`, `doc/configure.md`, `doc/how_to_use.md`,
+  `bin/config.toml`, `command/README.md` and the `sozu-lib` crate documentation.
+
+  **Before enabling it.** Upgrade the main process and every worker to 2.3.2. With
+  `--header-file`, the CLI first requires an exact positive typed capability answer from the
+  main process and every worker within a fixed five seconds (also with `--timeout 0`), and
+  opens no file and reads no standard input before it; without `--header-file` the ordinary
+  `SetHealthCheck` path is unchanged. Field 10 is additive, so a peer older than 2.3.2
+  ignores it rather than failing: this preflight is the only guard, and a generic
+  `sozu-command-lib` integrator must implement it before reading or sending a value, as the
+  library types do not add it; the hardened main may read the `value_file` references of
+  its configuration into protected memory before it launches the workers, without that
+  query. Rust source: an exhaustive `HealthCheckConfig` or
+  `FileHealthCheckConfig` literal must name `headers`, and an exhaustive `match` on
+  `request::RequestType` or `response_content::ContentType` must handle the new variants.
+
 ### 🔄 Changed
 
 - **`feat(load-balancing)`: every policy honours `weight`
@@ -219,6 +277,21 @@
 
 ### Upgrade notes
 
+- Protected health-check headers (operator summary). Upgrade the main process and every
+  worker to 2.3.2, then enable `--header-file`; the CLI refuses to read a secret otherwise.
+  After a cold start the main process holds a fresh memory-only key and epoch. If a restored
+  saved state is authoritative for a health check and carries fingerprints of another epoch,
+  that health check sends no probe, and counts `health_check.missing_secret`, until you
+  re-inject the exact same ordered headers with `--header-file`; a name alone never activates
+  a value, and a cold `SaveState` never restores clear values. A hot `sozu upgrade` between
+  2.3.2 mains uses upgrade protocol V3, a memory-only transport of the complete snapshot with
+  no tempfile and no memfd, which carries the key, epoch and values without rereading a
+  file; 2.3.2 writes V3 only and never falls back to V2, while it still reads an incoming
+  2.3.1 (V2) file handoff, and an absent protocol marker is the 2.2.1 legacy form. Rolling back to 2.3.1 is not a hot handoff: reset
+  the affected health checks without `--header-file`, delete their `headers` tables from the
+  configuration, and restart from that configuration and state. A 2.3.1 peer ignores the
+  unknown protobuf field 10 and would probe without the headers, and the 2.3.1 TOML parser
+  does not understand the new tables, so it refuses a configuration that still holds them.
 - Tooling that sends `AddBackend` before the `AddCluster` of the same cluster
   now gets an error for each such backend and must add the cluster first.
 - A saved state file written by hand, or by tooling, with a backend before

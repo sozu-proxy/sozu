@@ -36,6 +36,10 @@ pub enum UtilError {
     OsString(PathBuf, OsString),
     #[error("could not read file {0}: {1}")]
     Read(String, IoError),
+    #[error("could not disable core dumps (RLIMIT_CORE): {0}")]
+    DisableCoreDumps(IoError),
+    #[error("could not make the process non-dumpable (PR_SET_DUMPABLE): {0}")]
+    DisableDumpable(IoError),
     #[error("failed to retrieve current executable path: {0}")]
     CurrentExe(IoError),
     #[error("could not setup metrics: {0}")]
@@ -83,6 +87,43 @@ pub fn disable_close_on_exec(raw_fd: RawFd) -> Result<i32, UtilError> {
     new_flags.remove(FdFlag::FD_CLOEXEC);
 
     fcntl(fd, FcntlArg::F_SETFD(new_flags)).map_err(|err_no| UtilError::SetFlags(raw_fd, err_no))
+}
+
+/// Keep the memory of this process out of core dumps and away from same-user
+/// inspection, before it reads or decodes any health check header value.
+///
+/// The core limit is dropped to zero, soft and hard, so a crash leaves no dump
+/// and the process cannot raise it back. On Linux and Android the process also
+/// becomes non-dumpable: a same-user `ptrace`, `/proc/<pid>/mem` or
+/// `/proc/<pid>/exe` access is then refused without `CAP_SYS_PTRACE`. The
+/// setting is per process and does not survive an `exec`, so every `sozu`
+/// process applies it again as its first action.
+pub fn harden_process() -> Result<(), UtilError> {
+    let no_core = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `setrlimit` only reads the `rlimit` it is given, which lives for
+    // the whole call.
+    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) } != 0 {
+        return Err(UtilError::DisableCoreDumps(IoError::last_os_error()));
+    }
+    disable_dumpable()
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn disable_dumpable() -> Result<(), UtilError> {
+    // SAFETY: `PR_SET_DUMPABLE` takes plain integers and no pointer.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        return Err(UtilError::DisableDumpable(IoError::last_os_error()));
+    }
+    Ok(())
+}
+
+/// Other platforms have no `PR_SET_DUMPABLE`; the zero core limit still holds.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn disable_dumpable() -> Result<(), UtilError> {
+    Ok(())
 }
 
 pub fn setup_metrics(config: &Config) -> Result<(), UtilError> {
@@ -668,5 +709,150 @@ mod tests {
                 .expect("read pid file"),
             std::process::id().to_string()
         );
+    }
+
+    /// What a hardened (or not) forked child reports about itself.
+    #[cfg(target_os = "linux")]
+    #[derive(Debug)]
+    struct ChildHardening {
+        core_soft: u64,
+        core_hard: u64,
+        dumpable: i32,
+    }
+
+    /// An owned forked child, killed and reaped on every exit from a test.
+    #[cfg(target_os = "linux")]
+    struct ForkedChild {
+        pid: libc::pid_t,
+        reported: std::fs::File,
+        /// The child exits when this write end closes or is dropped.
+        release: Option<std::fs::File>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ForkedChild {
+        fn drop(&mut self) {
+            drop(self.release.take());
+            // SAFETY: `pid` is a child this fixture forked and has not yet
+            // reaped; `kill` and `waitpid` take no pointer but a status slot.
+            unsafe {
+                libc::kill(self.pid, libc::SIGKILL);
+                let mut status = 0;
+                libc::waitpid(self.pid, &mut status, 0);
+            }
+        }
+    }
+
+    /// Fork a child that optionally runs `harden_process`, reports its core
+    /// limits and dumpable flag on a pipe, then blocks until the parent closes
+    /// the release pipe. The parent process is never hardened.
+    ///
+    /// The child only makes async-signal-safe calls after the fork (the
+    /// helper under test, `getrlimit`, `prctl`, `read`, `write`, `_exit`).
+    #[cfg(target_os = "linux")]
+    fn fork_child(harden: bool) -> (ForkedChild, ChildHardening) {
+        use std::{io::Read, os::fd::FromRawFd};
+
+        let mut report = [0 as libc::c_int; 2];
+        let mut release = [0 as libc::c_int; 2];
+        // SAFETY: both arrays hold the two descriptors `pipe` writes.
+        unsafe {
+            assert_eq!(libc::pipe(report.as_mut_ptr()), 0);
+            assert_eq!(libc::pipe(release.as_mut_ptr()), 0);
+        }
+        // SAFETY: the child below calls only async-signal-safe functions and
+        // leaves through `_exit`, never returning into the test harness.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            // SAFETY: see above; descriptors belong to this child's copy.
+            unsafe {
+                libc::close(report[0]);
+                libc::close(release[1]);
+                if harden && harden_process().is_err() {
+                    libc::_exit(2);
+                }
+                let mut limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                libc::getrlimit(libc::RLIMIT_CORE, &mut limit);
+                let dumpable = libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0);
+                let mut message = [0u8; 20];
+                message[..8].copy_from_slice(&limit.rlim_cur.to_le_bytes());
+                message[8..16].copy_from_slice(&limit.rlim_max.to_le_bytes());
+                message[16..].copy_from_slice(&dumpable.to_le_bytes());
+                libc::write(report[1], message.as_ptr().cast(), message.len());
+                let mut byte = 0u8;
+                libc::read(release[0], (&mut byte as *mut u8).cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        // SAFETY: the parent owns these descriptors and wraps each once.
+        let (mut reported, release) = unsafe {
+            libc::close(report[1]);
+            libc::close(release[0]);
+            (
+                std::fs::File::from_raw_fd(report[0]),
+                std::fs::File::from_raw_fd(release[1]),
+            )
+        };
+        let mut child = ForkedChild {
+            pid,
+            reported: reported.try_clone().expect("clone the report pipe"),
+            release: Some(release),
+        };
+        let mut message = [0u8; 20];
+        // Blocks on the pipe: the child reports once it is (or is not) hardened.
+        reported
+            .read_exact(&mut message)
+            .expect("the forked child reports its hardening");
+        child.reported = reported;
+        let report = ChildHardening {
+            core_soft: u64::from_le_bytes(message[..8].try_into().unwrap()),
+            core_hard: u64::from_le_bytes(message[8..16].try_into().unwrap()),
+            dumpable: i32::from_le_bytes(message[16..].try_into().unwrap()),
+        };
+        (child, report)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hardened_child_has_no_core_dump_and_is_not_dumpable() {
+        let (child, report) = fork_child(true);
+        assert_eq!(
+            (report.core_soft, report.core_hard, report.dumpable),
+            (0, 0, 0),
+            "{report:?}"
+        );
+        drop(child);
+    }
+
+    /// The same-user view of a non-dumpable process: its `exe` link is not
+    /// readable by its parent. The un-hardened control proves the denial comes
+    /// from the hardening, not from the environment.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hardened_child_hides_its_exe_link_from_its_parent() {
+        let (control, control_report) = fork_child(false);
+        assert_eq!(control_report.dumpable, 1, "{control_report:?}");
+        read_link(format!("/proc/{}/exe", control.pid))
+            .expect("an un-hardened same-user child exposes /proc/<pid>/exe");
+        drop(control);
+
+        let (hardened, _) = fork_child(true);
+        let denied = read_link(format!("/proc/{}/exe", hardened.pid))
+            .expect_err("a hardened child must hide /proc/<pid>/exe");
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+        drop(hardened);
+    }
+
+    /// The parent test process stays as it was: nothing above hardened it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_test_process_itself_is_never_hardened() {
+        // SAFETY: `PR_GET_DUMPABLE` reads a flag and takes no pointer.
+        let dumpable = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) };
+        assert_eq!(dumpable, 1);
     }
 }

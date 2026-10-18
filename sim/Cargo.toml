@@ -46,3 +46,5 @@ sozu-lib = { workspace = true, features = ["crypto-ring"] }
 # MetricDetailLevel for tests/metrics_lease_sim.rs, which drives sozu-lib's
 # metrics::Aggregator directly and inspects its query() output.
 sozu-command-lib = { workspace = true }
+# Writes the SaveState file `tests/mutable_commands_simulation.rs` replays.
+tempfile = { workspace = true }

@@ -27,7 +27,9 @@ include = [
 ]
 
 [dependencies]
+getrandom = { workspace = true }
 hex = { workspace = true }
+hmac = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
 time = { workspace = true }
@@ -47,6 +49,7 @@ pool = { workspace = true }
 poule = { workspace = true }
 thiserror = { workspace = true }
 x509-parser = { workspace = true }
+zeroize = { workspace = true }
 
 [features]
 unstable = []

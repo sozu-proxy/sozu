@@ -141,7 +141,10 @@ pub enum SubCmd {
     Main {
         #[clap(long = "fd", help = "IPC file descriptor")]
         fd: i32,
-        #[clap(long = "upgrade-fd", help = "upgrade data file descriptor")]
+        #[clap(
+            long = "upgrade-fd",
+            help = "upgrade data descriptor: a file for the legacy and protocol 2 readers, a socket for protocol 3"
+        )]
         upgrade_fd: i32,
         #[clap(long = "upgrade-protocol", help = "main-upgrade protocol version")]
         upgrade_protocol: Option<u16>,
@@ -792,6 +795,12 @@ pub enum HealthCheckCmd {
             help = "port the probe dials on the backend's IP address, 1-65535 (default: the backend's data port)"
         )]
         port: Option<u32>,
+        #[clap(
+            long = "header-file",
+            value_name = "NAME=PATH",
+            help = "send the header NAME on every HTTP probe, with its value read from the file PATH (`-` reads standard input, at most once); one final line ending is removed. Repeatable, up to 32. Needs a main process that supports protected health check headers"
+        )]
+        header_files: Vec<String>,
     },
     #[clap(name = "remove", about = "Remove the health check from a cluster")]
     Remove {

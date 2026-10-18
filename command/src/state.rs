@@ -22,11 +22,11 @@ use crate::{
         command::{
             ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
             ClusterInformation, CustomHttpAnswers, DeactivateListener, ForwardedHeaders,
-            FrontendFilters, HealthChecksList, HstsConfig, HttpListenerConfig, HttpsListenerConfig,
-            InitialState, ListedFrontends, ListenerType, ListenersList, PathRule,
-            QueryCertificatesFilters, RemoveBackend, RemoveCertificate, RemoveListener,
+            FrontendFilters, HealthCheckConfig, HealthChecksList, HstsConfig, HttpListenerConfig,
+            HttpsListenerConfig, InitialState, ListedFrontends, ListenerType, ListenersList,
+            PathRule, QueryCertificatesFilters, RemoveBackend, RemoveCertificate, RemoveListener,
             ReplaceCertificate, Request, RequestCounts, RequestHttpFrontend, RequestTcpFrontend,
-            RequestUdpFrontend, SetHealthCheck, SocketAddress, TcpListenerConfig,
+            RequestUdpFrontend, SetProtectedHealthCheck, SocketAddress, TcpListenerConfig,
             UdpListenerConfig, UpdateHttpListenerConfig, UpdateHttpsListenerConfig,
             UpdateTcpListenerConfig, UpdateUdpListenerConfig, WorkerRequest, request::RequestType,
         },
@@ -703,7 +703,10 @@ impl ConfigState {
             }
             RequestType::UpdateTcpListener(patch) => self.update_tcp_listener(patch),
             RequestType::UpdateUdpListener(patch) => self.update_udp_listener(patch),
-            RequestType::SetHealthCheck(set) => self.set_health_check(set),
+            RequestType::SetHealthCheck(set) => {
+                self.set_health_check(&set.cluster_id, &set.config)
+            }
+            RequestType::SetProtectedHealthCheck(set) => self.set_protected_health_check(set),
             RequestType::RemoveHealthCheck(cluster_id) => self.remove_health_check(cluster_id),
 
             // This is to avoid the error message. These request types are
@@ -1304,27 +1307,51 @@ impl ConfigState {
         message
     }
 
-    fn set_health_check(&mut self, set: &SetHealthCheck) -> Result<(), StateError> {
+    /// The metadata half of a protected order, whose values the state never
+    /// holds. The order must be the main process's own: every header carries a
+    /// fingerprint, and the carriers match the headers one for one. The state
+    /// keeps names and fingerprints only.
+    fn set_protected_health_check(
+        &mut self,
+        set: &SetProtectedHealthCheck,
+    ) -> Result<(), StateError> {
+        let invalid = |reason| StateError::InvalidValue {
+            field: "health_check",
+            reason,
+        };
+        if set.config.headers.iter().any(|h| h.fingerprint.is_empty()) {
+            return Err(invalid("health check header fingerprint is missing"));
+        }
+        crate::config::validate_health_check_header_values(&set.config, &set.values)
+            .map_err(invalid)?;
+        self.set_health_check(&set.cluster_id, &set.config)
+    }
+
+    fn set_health_check(
+        &mut self,
+        cluster_id: &str,
+        config: &HealthCheckConfig,
+    ) -> Result<(), StateError> {
         // Validate before mutating state so an invalid config (zero
         // thresholds, missing leading `/`, CR/LF/NUL/C0 in URI) cannot
         // round-trip through SaveState/LoadState. The worker also
         // validates at the SetHealthCheck handler — this is the
         // master-side mirror so off-channel TOML reload paths don't
         // bypass the policy.
-        if let Err(reason) = crate::config::validate_health_check_config(&set.config) {
+        if let Err(reason) = crate::config::validate_health_check_config(config) {
             return Err(StateError::InvalidValue {
                 field: "health_check",
                 reason,
             });
         }
-        match self.clusters.get_mut(set.cluster_id.as_str()) {
+        match self.clusters.get_mut(cluster_id) {
             Some(cluster) => {
-                cluster.health_check = Some(set.config.to_owned());
+                cluster.health_check = Some(config.to_owned());
                 Ok(())
             }
             None => Err(StateError::NotFound {
                 kind: ObjectKind::Cluster,
-                id: set.cluster_id.to_owned(),
+                id: cluster_id.to_owned(),
             }),
         }
     }
@@ -2812,6 +2839,10 @@ impl ConfigState {
                         .is_some_and(|config| port_conflicts(config, &cluster.cluster_id))
             }
             RequestType::SetHealthCheck(set) => {
+                self.clusters.contains_key(set.cluster_id.as_str())
+                    && port_conflicts(&set.config, &set.cluster_id)
+            }
+            RequestType::SetProtectedHealthCheck(set) => {
                 self.clusters.contains_key(set.cluster_id.as_str())
                     && port_conflicts(&set.config, &set.cluster_id)
             }
@@ -9555,6 +9586,254 @@ mod tests {
             .dispatch(&set(probe.clone()))
             .expect("a probe port within 1..=65535 is accepted");
         assert_eq!(state.clusters["app"].health_check, Some(probe));
+    }
+
+    /// Custom health-check headers: validation runs before any mutation, and
+    /// the exact ordered values survive query, diff, the saved-state file and
+    /// a generated replay.
+    #[test]
+    fn health_check_headers_validate_before_mutation_and_survive_replay() {
+        use std::io::Read;
+
+        use crate::{
+            parser::parse_several_requests,
+            proto::command::{
+                HealthCheckConfig, HealthCheckHeader, HealthCheckMode, SetHealthCheck,
+            },
+        };
+
+        // Metadata only: the fingerprint stands for a value the state never holds.
+        let header = |name: &str, tag: &str| HealthCheckHeader {
+            name: name.to_owned(),
+            fingerprint: format!("sozu-hc-hmac-sha256:v1:{:032x}:{:064x}", 7, tag.len()),
+        };
+        let probe = |headers: Vec<HealthCheckHeader>| HealthCheckConfig {
+            uri: "/health".to_owned(),
+            interval: 10,
+            timeout: 5,
+            healthy_threshold: 3,
+            unhealthy_threshold: 3,
+            mode: HealthCheckMode::Http as i32,
+            headers,
+            ..Default::default()
+        };
+        let ordered = vec![
+            header("Z-Last", "1"),
+            header("Authorization", "Bearer"),
+            header("A-First", ""),
+        ];
+        let set = |config: HealthCheckConfig| -> Request {
+            RequestType::SetHealthCheck(SetHealthCheck {
+                cluster_id: String::from("app"),
+                config,
+            })
+            .into()
+        };
+        // A reserved name: refused by validation, not by the type.
+        let invalid = probe(vec![header("Host", "1")]);
+
+        // AddCluster with an invalid inline health check leaves no cluster.
+        let mut state = ConfigState::new();
+        let err = state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("app"),
+                    health_check: Some(invalid.clone()),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StateError::InvalidValue {
+                    field: "health_check",
+                    ..
+                }
+            ),
+            "got {err}"
+        );
+        assert!(state.clusters.is_empty(), "no cluster may be inserted");
+
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("app"),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("the cluster is added");
+        state
+            .dispatch(&set(probe(ordered.clone())))
+            .expect("a valid header list is accepted");
+
+        // A refused SetHealthCheck keeps the previous list, byte for byte.
+        let before = state.clone();
+        let err = state.dispatch(&set(invalid)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StateError::InvalidValue {
+                    field: "health_check",
+                    ..
+                }
+            ),
+            "got {err}"
+        );
+        // `request_counts` is a census of dispatched orders, not configuration.
+        let logical = |s: &ConfigState| {
+            let mut c = s.clone();
+            c.request_counts.clear();
+            c
+        };
+        assert_eq!(
+            logical(&state),
+            logical(&before),
+            "a refused order must not mutate the state"
+        );
+        assert_eq!(
+            state.clusters["app"].health_check.as_ref().unwrap().headers,
+            ordered
+        );
+
+        // Query: cluster state and the health-check listing.
+        let queried = state.cluster_state("app").expect("cluster exists");
+        assert_eq!(
+            queried.configuration.unwrap().health_check.unwrap().headers,
+            ordered
+        );
+        assert_eq!(
+            state.list_health_checks(Some("app")).map["app"].headers,
+            ordered
+        );
+
+        // Diff from an empty state, and from a state with other headers.
+        let adds = ConfigState::new().diff(&state);
+        let carried = adds.iter().any(|request| {
+            matches!(
+                &request.request_type,
+                Some(RequestType::AddCluster(cluster))
+                    if cluster.health_check.as_ref().is_some_and(|hc| hc.headers == ordered)
+            )
+        });
+        assert!(carried, "the diff must carry the ordered headers: {adds:?}");
+        let mut reordered = state.clone();
+        reordered
+            .dispatch(&set(probe(ordered.iter().rev().cloned().collect())))
+            .expect("a reordered list is valid");
+        assert!(
+            !state.diff(&reordered).is_empty(),
+            "a header reorder is a cluster change"
+        );
+        assert!(state.diff(&state.clone()).is_empty());
+
+        // Saved-state file: write, parse back, replay.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("headers.state");
+        let mut file = File::create(&path).expect("creatable");
+        let written = state.write_requests_to_file(&mut file).expect("saves");
+        drop(file);
+        let mut saved = Vec::new();
+        File::open(&path)
+            .expect("readable")
+            .read_to_end(&mut saved)
+            .expect("readable");
+        let (remainder, requests) =
+            parse_several_requests::<WorkerRequest>(&saved).expect("the file parses");
+        assert!(remainder.is_empty());
+        assert_eq!(requests.len(), written);
+        let mut loaded = ConfigState::new();
+        for request in &requests {
+            loaded.dispatch(&request.content).expect("replays");
+        }
+
+        // Generated replay.
+        let mut replayed = ConfigState::new();
+        for request in state.generate_requests() {
+            replayed.dispatch(&request).expect("replays");
+        }
+
+        for (name, other) in [("loaded", &loaded), ("replayed", &replayed)] {
+            assert_eq!(
+                other.clusters["app"].health_check.as_ref().unwrap().headers,
+                ordered,
+                "{name} state must keep the exact ordered headers"
+            );
+        }
+    }
+
+    /// A protected order reaches the state as metadata: names and the main
+    /// process's fingerprints only, validated before any mutation. An order
+    /// with a header lacking its fingerprint, or whose carriers do not follow
+    /// its headers, is refused and the previous configuration stays.
+    #[test]
+    fn protected_health_check_order_stores_metadata_only_and_refuses_before_mutation() {
+        use crate::proto::command::{
+            HealthCheckConfig, HealthCheckHeader, HealthCheckHeaderValue, HealthCheckMode,
+            SetProtectedHealthCheck,
+        };
+
+        const SECRET: &str = "SYNTHETIC-STATE-SECRET-77c1";
+        let fingerprint = format!("sozu-hc-hmac-sha256:v1:{:032x}:{:064x}", 1, 2);
+        let order = |fingerprint: &str, carrier_name: &str| {
+            RequestType::SetProtectedHealthCheck(SetProtectedHealthCheck {
+                cluster_id: String::from("app"),
+                config: HealthCheckConfig {
+                    uri: "/health".to_owned(),
+                    interval: 10,
+                    timeout: 5,
+                    healthy_threshold: 3,
+                    unhealthy_threshold: 3,
+                    mode: HealthCheckMode::Http as i32,
+                    headers: vec![HealthCheckHeader {
+                        name: "Authorization".to_owned(),
+                        fingerprint: fingerprint.to_owned(),
+                    }],
+                    ..Default::default()
+                },
+                values: vec![HealthCheckHeaderValue {
+                    name: carrier_name.to_owned(),
+                    value: SECRET.as_bytes().to_vec(),
+                }],
+            })
+            .into()
+        };
+        let mut state = ConfigState::new();
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("app"),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("the cluster is added");
+        let logical = |s: &ConfigState| {
+            let mut c = s.clone();
+            c.request_counts.clear();
+            c
+        };
+
+        let before = logical(&state);
+        for (what, refused) in [
+            ("no fingerprint", order("", "Authorization")),
+            ("another carrier", order(&fingerprint, "X-Other")),
+        ] {
+            assert!(state.dispatch(&refused).is_err(), "{what}");
+            assert_eq!(logical(&state), before, "{what}: no mutation");
+        }
+
+        state
+            .dispatch(&order(&fingerprint, "Authorization"))
+            .expect("a fingerprinted order with its carrier is accepted");
+        let stored = state.clusters["app"].health_check.as_ref().expect("set");
+        assert_eq!(stored.headers[0].fingerprint, fingerprint);
+        let rendered = format!("{state:?}{:?}", state.generate_requests());
+        assert!(!rendered.contains(SECRET), "the state holds no value");
+        let json = serde_json::to_string(&state.generate_requests()).expect("serializes");
+        assert!(!json.contains(SECRET), "a replay holds no value");
     }
 
     /// A probe `port` targets a backend IP, a `unix_path` backend has none:

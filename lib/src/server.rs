@@ -18,7 +18,7 @@ use mio::{
 };
 use slab::Slab;
 use sozu_command::{
-    channel::Channel,
+    channel::{Channel, ChannelError},
     config::MetricDetailLevel,
     listener_key::ListenerKey,
     logging,
@@ -26,12 +26,12 @@ use sozu_command::{
         ActivateListener, AddBackend, CertificatesWithFingerprints, ClosedSessions, Cluster,
         ClusterHashes, ClusterInformations, DeactivateListener, Event, EventKind,
         HttpListenerConfig, HttpsListenerConfig, InitialState, ListenerType,
-        LoadBalancingAlgorithms, LoadMetric, MetricDetail, MetricsConfiguration, RemoveBackend,
-        Request, ResponseContent, ResponseStatus, ServerConfig,
-        TcpListenerConfig as CommandTcpListener, UdpListenerConfig as CommandUdpListener,
-        UpdateHttpListenerConfig, UpdateHttpsListenerConfig, UpdateTcpListenerConfig,
-        UpdateUdpListenerConfig, WorkerRequest, WorkerResponse, request::RequestType,
-        response_content::ContentType,
+        LoadBalancingAlgorithms, LoadMetric, MetricDetail, MetricsConfiguration,
+        ProtectedHealthCheckPhase, RemoveBackend, Request, ResponseContent, ResponseStatus,
+        ServerConfig, TcpListenerConfig as CommandTcpListener,
+        UdpListenerConfig as CommandUdpListener, UpdateHttpListenerConfig,
+        UpdateHttpsListenerConfig, UpdateTcpListenerConfig, UpdateUdpListenerConfig, WorkerRequest,
+        WorkerResponse, request::RequestType, response_content::ContentType,
     },
     ready::Ready,
     scm_socket::{Listeners, ScmSocket, ScmSocketError},
@@ -48,6 +48,7 @@ use crate::{
     load_balancing::ShuffleSharding,
     metrics::METRICS,
     pool::Pool,
+    protected_health_check::ProtectedWorker,
     tcp,
     timer::Timer,
     udp,
@@ -1214,6 +1215,115 @@ pub enum ServerError {
         msg: String,
         scm_err: ScmSocketError,
     },
+    #[error("could not read the initial message of the main process: {0}")]
+    ReadInitialMessage(ChannelError),
+    #[error("could not answer the initial message of the main process: {0}")]
+    WriteInitialAnswer(ChannelError),
+}
+
+/// Where the blocking handshake before `Server::run` stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BootstrapStage {
+    /// Nothing received: a direct `Status` or the capability query.
+    Start,
+    /// The capability is confirmed: a `Prepare`, or the closing `Status`.
+    Ready,
+    /// A version is staged: its `Commit` or `Abort`.
+    Prepared { cluster: String, version: u64 },
+    /// A version is applied: its `Release` or `Abort`.
+    Committed { cluster: String, version: u64 },
+}
+
+/// What a worker answers to the one request the handshake expects next, and
+/// the stage an exact answer leads to.
+struct BootstrapStep {
+    phase: ProtectedHealthCheckPhase,
+    cluster: String,
+    version: u64,
+    next: BootstrapStage,
+}
+
+impl BootstrapStage {
+    /// The step `request` is, when this stage accepts it. `Status` is not a
+    /// step: `Server::await_initial_status` ends the handshake with it.
+    fn step(&self, request: &RequestType) -> Option<BootstrapStep> {
+        use ProtectedHealthCheckPhase as Phase;
+        match request {
+            RequestType::QueryProtectedHealthCheckSupport(_) if *self == Self::Start => {
+                Some(BootstrapStep {
+                    phase: Phase::ProtectedHealthCheckCapability,
+                    cluster: String::new(),
+                    version: 0,
+                    next: Self::Ready,
+                })
+            }
+            RequestType::ProtectedHealthCheckOrder(order) => {
+                let phase = Phase::try_from(order.phase).ok()?;
+                let (cluster, version) = (order.cluster_id.to_owned(), order.version);
+                let outstanding = match self {
+                    Self::Prepared {
+                        cluster: held,
+                        version: staged,
+                    }
+                    | Self::Committed {
+                        cluster: held,
+                        version: staged,
+                    } => *held == cluster && *staged == version,
+                    _ => false,
+                };
+                let next = match (self, phase) {
+                    (Self::Ready, Phase::ProtectedHealthCheckPrepare) => Self::Prepared {
+                        cluster: cluster.to_owned(),
+                        version,
+                    },
+                    (Self::Prepared { .. }, Phase::ProtectedHealthCheckCommit) if outstanding => {
+                        Self::Committed {
+                            cluster: cluster.to_owned(),
+                            version,
+                        }
+                    }
+                    (Self::Committed { .. }, Phase::ProtectedHealthCheckRelease) if outstanding => {
+                        Self::Ready
+                    }
+                    (
+                        Self::Prepared { .. } | Self::Committed { .. },
+                        Phase::ProtectedHealthCheckAbort,
+                    ) if outstanding => Self::Ready,
+                    _ => return None,
+                };
+                Some(BootstrapStep {
+                    phase,
+                    cluster,
+                    version,
+                    next,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the headerless `Status` may end the handshake: nothing is
+    /// prepared, committed or left to release.
+    fn accepts_status(&self) -> bool {
+        matches!(self, Self::Start | Self::Ready)
+    }
+}
+
+impl BootstrapStep {
+    /// Whether `response` is the positive typed reply to this very step.
+    fn is_answered_by(&self, response: &WorkerResponse) -> bool {
+        response.status == ResponseStatus::Ok as i32
+            && matches!(
+                response
+                    .content
+                    .as_ref()
+                    .and_then(|content| content.content_type.as_ref()),
+                Some(ContentType::ProtectedHealthCheckReply(reply))
+                    if reply.phase == self.phase as i32
+                        && reply.cluster_id == self.cluster
+                        && reply.version == self.version
+            )
+    }
 }
 
 /// `Server` handles the event loop, the listeners, the sessions and
@@ -1275,6 +1385,8 @@ pub struct Server {
     /// snapshot.
     pool: Rc<RefCell<Pool>>,
     pub poll: Poll,
+    /// Protected health-check headers staged, applied or kept for an abort.
+    protected_health_check: ProtectedWorker,
     poll_timeout: Option<Duration>, // TODO: make this configurable? this defaults to 1000 milliseconds for now
     scm_listeners: Option<Listeners>,
     scm: ScmSocket,
@@ -1535,6 +1647,7 @@ impl Server {
             should_poll_at: None,
             shutting_down: None,
             closing_sessions: Vec::new(),
+            protected_health_check: ProtectedWorker::default(),
             tcp,
             udp,
             zombie_check_interval: Duration::from_secs(u64::from(
@@ -1605,31 +1718,81 @@ impl Server {
 
         if expects_initial_status {
             // the main process sends a Status message, so we can notify it
-            // when the initial state is loaded
+            // when the initial state is loaded; a protected health check
+            // bootstrap may come first, see `Server::await_initial_status`
             server.block_channel();
-            let msg = server.channel.read_message();
-            debug!("got message: {:?}", msg);
-
-            if let Ok(WorkerRequest {
-                id,
-                content:
-                    Request {
-                        request_type: Some(RequestType::Status(_)),
-                    },
-            }) = msg
-            {
-                if let Err(e) = server.channel.write_message(&WorkerResponse::ok(id)) {
-                    error!("Could not send an ok to the main process: {}", e);
-                }
-            } else {
-                panic!(
-                    "plz give me a status request first when I start, you sent me this instead: {msg:?}"
-                );
-            }
+            server.await_initial_status()?;
             server.unblock_channel();
         }
 
         Ok(server)
+    }
+
+    /// Answer the main process on the blocking channel until its `Status`
+    /// ends the handshake, before `Server::run` can start any probe.
+    ///
+    /// A worker that is sent protected health checks first gets the capability
+    /// query, then any number of prepare, commit and release cycles (or an
+    /// abort), each answered by `ProtectedWorker::handle` straight on the
+    /// channel. `BootstrapStage` admits one request at a time and moves on
+    /// only when the handler returned the exact typed reply; anything else
+    /// gets a static refusal and the loop keeps waiting. There is no timer
+    /// here: the loop ends with a valid `Status` or a channel error, and the
+    /// main process owns the deadline.
+    fn await_initial_status(&mut self) -> Result<(), ServerError> {
+        let mut stage = BootstrapStage::Start;
+        loop {
+            let WorkerRequest { id, mut content } = self
+                .channel
+                .read_message()
+                .map_err(ServerError::ReadInitialMessage)?;
+            // the request is never logged: a prepare order carries clear values
+            debug!("got initial message {}", id);
+
+            let Some(request_type) = content.request_type.as_mut() else {
+                self.answer_initial(worker_response_error(id, REFUSED_INITIAL_REQUEST))?;
+                continue;
+            };
+
+            if matches!(request_type, RequestType::Status(_)) {
+                if !stage.accepts_status() {
+                    self.answer_initial(worker_response_error(id, REFUSED_INITIAL_REQUEST))?;
+                    continue;
+                }
+                self.answer_initial(WorkerResponse::ok(id))?;
+                return Ok(());
+            }
+
+            let Some(step) = stage.step(request_type) else {
+                self.answer_initial(worker_response_error(id, REFUSED_INITIAL_REQUEST))?;
+                continue;
+            };
+            let response = self.protected_health_check.handle(
+                &id,
+                request_type,
+                &mut self.config_state,
+                &mut self.backends.borrow_mut(),
+            );
+            match response {
+                Some(response) if step.is_answered_by(&response) => {
+                    stage = step.next;
+                    self.answer_initial(response)?;
+                }
+                // a refusal of the handler is forwarded as it is
+                Some(response) if response.status != ResponseStatus::Ok as i32 => {
+                    self.answer_initial(response)?;
+                }
+                _ => {
+                    self.answer_initial(worker_response_error(id, REFUSED_INITIAL_REQUEST))?;
+                }
+            }
+        }
+    }
+
+    fn answer_initial(&mut self, response: WorkerResponse) -> Result<(), ServerError> {
+        self.channel
+            .write_message(&response)
+            .map_err(ServerError::WriteInitialAnswer)
     }
 
     /// The server runs in a loop until a shutdown is ordered
@@ -2757,7 +2920,32 @@ impl Server {
         self.notify_proxys(message);
     }
 
-    pub fn notify_proxys(&mut self, request: WorkerRequest) {
+    pub fn notify_proxys(&mut self, mut request: WorkerRequest) {
+        // The public protected verb carries the clear values to the main
+        // process only. A worker never applies it as one step: the main
+        // process drives the prepare, commit, abort and release orders below.
+        if matches!(
+            request.content.request_type,
+            Some(RequestType::SetProtectedHealthCheck(_))
+        ) {
+            push_queue(worker_response_error(
+                request.id,
+                "SetProtectedHealthCheck is not a worker order",
+            ));
+            return;
+        }
+        if let Some(request_type) = request.content.request_type.as_mut()
+            && let Some(response) = self.protected_health_check.handle(
+                &request.id,
+                request_type,
+                &mut self.config_state,
+                &mut self.backends.borrow_mut(),
+            )
+        {
+            push_queue(response);
+            return;
+        }
+
         // A health check `port` and a `unix_path` backend never share a
         // cluster. The state refuses the pair, but a refusal other than
         // `ClusterNotFound` does not stop the worker below, so ask first and
@@ -2878,6 +3066,8 @@ impl Server {
                     push_queue(worker_response_error(req_id, reason));
                     return;
                 }
+                self.protected_health_check
+                    .forget_cluster(&cluster.cluster_id);
                 self.add_cluster(cluster);
                 // An upsert without a health check clears it like
                 // `RemoveHealthCheck`: `add_cluster` already reset the
@@ -2895,6 +3085,7 @@ impl Server {
                 //not returning because the message must still be handled by each proxy
             }
             Some(RequestType::RemoveCluster(ref cluster_id)) => {
+                self.protected_health_check.forget_cluster(cluster_id);
                 self.remove_cluster_objects(&req_id, cluster_id, cluster_objects);
                 self.remove_health_check_state(cluster_id);
                 METRICS.with(|metrics| {
@@ -2908,6 +3099,7 @@ impl Server {
                     push_queue(worker_response_error(req_id, reason));
                     return;
                 }
+                self.protected_health_check.forget_cluster(&set.cluster_id);
                 self.backends
                     .borrow_mut()
                     .set_health_check_config(&set.cluster_id, Some(set.config.to_owned()));
@@ -3188,6 +3380,7 @@ impl Server {
     /// no probe will ever mark them UP again (#1811). Dropping the probes first
     /// keeps one already in flight from marking a backend DOWN after the reset.
     fn remove_health_check_state(&mut self, cluster_id: &str) {
+        self.protected_health_check.forget_cluster(cluster_id);
         self.health_checker.remove_cluster(cluster_id);
         self.backends
             .borrow_mut()
@@ -4664,6 +4857,9 @@ fn discard_inherited_socket<T: FromRawFd>(
     // built only to be dropped: `Drop` is what performs the close.
     drop(unsafe { T::from_raw_fd(fd) });
 }
+
+/// The refusal of a request the initial handshake does not admit now.
+const REFUSED_INITIAL_REQUEST: &str = "unexpected request before the initial status";
 
 /// log the error together with the request id
 /// create a WorkerResponse
@@ -8463,6 +8659,524 @@ mod tests {
         assert!(
             subnet_key(&genuine, 24, 56).is_ipv6(),
             "a genuine IPv6 source must keep an IPv6 subnet key"
+        );
+    }
+}
+
+#[cfg(test)]
+mod initial_protected_bootstrap_tests {
+    use std::thread;
+
+    use sozu_command::{
+        channel::Channel,
+        proto::command::{
+            CountRequests, HealthCheckConfig, HealthCheckHeader, HealthCheckHeaderValue,
+            InitialState, ProtectedHealthCheckOrder, ProtectedHealthCheckPhase,
+            QueryProtectedHealthCheckSupport, SetProtectedHealthCheck, Status,
+        },
+        secret::{FingerprintKey, ProtectedHeader, SecretValue, Zeroizing},
+    };
+
+    use super::*;
+    use crate::testing::{ServerParts, prebuild_server};
+
+    const CLUSTER: &str = "bootstrap-cluster";
+    const HEADER: &str = "X-Synthetic-Bootstrap";
+    const SECRET: &[u8] = b"synthetic-bootstrap-secret";
+    const DEADLINE: Duration = Duration::from_secs(20);
+
+    type Phase = ProtectedHealthCheckPhase;
+
+    fn request(id: &str, request_type: RequestType) -> WorkerRequest {
+        WorkerRequest {
+            id: id.to_owned(),
+            content: request_type.into(),
+        }
+    }
+
+    fn capability(id: &str) -> WorkerRequest {
+        request(
+            id,
+            RequestType::QueryProtectedHealthCheckSupport(QueryProtectedHealthCheckSupport {}),
+        )
+    }
+
+    fn status(id: &str) -> WorkerRequest {
+        request(id, RequestType::Status(Status {}))
+    }
+
+    fn foreign(id: &str) -> WorkerRequest {
+        request(id, RequestType::CountRequests(CountRequests {}))
+    }
+
+    fn payload(cluster: &str) -> SetProtectedHealthCheck {
+        let key = FingerprintKey::from_parts(Zeroizing::new([7u8; 32]), [9u8; 16]);
+        let mut carrier = HealthCheckHeaderValue {
+            name: HEADER.to_owned(),
+            value: SECRET.to_vec(),
+        };
+        let secret = SecretValue::take_from_ingress(&mut carrier).expect("a valid value");
+        let header = ProtectedHeader::new(&key, HEADER.to_owned(), secret);
+        SetProtectedHealthCheck {
+            cluster_id: cluster.to_owned(),
+            config: HealthCheckConfig {
+                uri: "/".to_owned(),
+                interval: 10,
+                timeout: 5,
+                healthy_threshold: 3,
+                unhealthy_threshold: 3,
+                headers: vec![HealthCheckHeader {
+                    name: HEADER.to_owned(),
+                    fingerprint: header.fingerprint().to_string(),
+                }],
+                ..Default::default()
+            },
+            values: vec![HealthCheckHeaderValue {
+                name: HEADER.to_owned(),
+                value: SECRET.to_vec(),
+            }],
+        }
+    }
+
+    fn order(id: &str, phase: Phase, cluster: &str, version: u64) -> WorkerRequest {
+        let prepare = (phase == Phase::ProtectedHealthCheckPrepare).then(|| payload(cluster));
+        request(
+            id,
+            RequestType::ProtectedHealthCheckOrder(ProtectedHealthCheckOrder {
+                phase: phase as i32,
+                cluster_id: cluster.to_owned(),
+                version,
+                prepare,
+            }),
+        )
+    }
+
+    fn prepare(id: &str, version: u64) -> WorkerRequest {
+        order(id, Phase::ProtectedHealthCheckPrepare, CLUSTER, version)
+    }
+
+    fn commit(id: &str, version: u64) -> WorkerRequest {
+        order(id, Phase::ProtectedHealthCheckCommit, CLUSTER, version)
+    }
+
+    fn release(id: &str, version: u64) -> WorkerRequest {
+        order(id, Phase::ProtectedHealthCheckRelease, CLUSTER, version)
+    }
+
+    fn abort(id: &str, version: u64) -> WorkerRequest {
+        order(id, Phase::ProtectedHealthCheckAbort, CLUSTER, version)
+    }
+
+    fn assert_reply(response: &WorkerResponse, phase: Phase, cluster: &str, version: u64) {
+        assert_eq!(response.status, ResponseStatus::Ok as i32, "{response:?}");
+        let Some(ContentType::ProtectedHealthCheckReply(reply)) = response
+            .content
+            .as_ref()
+            .and_then(|content| content.content_type.as_ref())
+        else {
+            panic!("the answer must be a typed protected reply: {response:?}");
+        };
+        assert_eq!(reply.phase, phase as i32);
+        assert_eq!(reply.cluster_id, cluster);
+        assert_eq!(reply.version, version);
+    }
+
+    fn assert_refused(response: &WorkerResponse, id: &str) {
+        assert_eq!(response.id, id);
+        assert_eq!(
+            response.status,
+            ResponseStatus::Failure as i32,
+            "{response:?}"
+        );
+        assert!(response.content.is_none(), "{response:?}");
+    }
+
+    fn assert_no_secret(responses: &[WorkerResponse]) {
+        let shown = format!("{responses:?}");
+        assert!(!shown.contains(HEADER), "{shown}");
+        assert!(!shown.contains("synthetic-bootstrap-secret"), "{shown}");
+    }
+
+    /// Run `Server::new` on this thread against a blocking peer that plays
+    /// `script`, one request at a time, and returns every answer. The script
+    /// ends with a valid `Status`, the only message that may release the
+    /// constructor; a constructor that returned earlier leaves the peer
+    /// unanswered and the read deadline reports it.
+    fn bootstrap(
+        script: Vec<WorkerRequest>,
+    ) -> (Server, Rc<RefCell<BackendMap>>, Vec<WorkerResponse>) {
+        let ServerParts {
+            event_loop,
+            sessions,
+            pool,
+            backends,
+            server_scm_socket,
+            server_config,
+            ..
+        } = prebuild_server(16, 16384, true).expect("could not prebuild a test server");
+        let (mut peer, proxy_channel) =
+            Channel::generate(1000, 10000).expect("could not generate a test channel");
+        let initial_state = InitialState {
+            requests: vec![request(
+                "initial",
+                RequestType::AddCluster(Cluster {
+                    cluster_id: CLUSTER.to_owned(),
+                    ..Default::default()
+                }),
+            )],
+        };
+
+        let driver = thread::spawn(move || {
+            let mut answers = Vec::with_capacity(script.len());
+            for message in script {
+                peer.write_message(&message)
+                    .map_err(|error| format!("peer write: {error}"))?;
+                answers.push(
+                    peer.read_message_blocking_timeout(Some(DEADLINE))
+                        .map_err(|error| format!("peer read: {error}"))?,
+                );
+            }
+            Ok::<_, String>(answers)
+        });
+
+        let held = backends.to_owned();
+        let server = Server::new(
+            event_loop,
+            proxy_channel,
+            server_scm_socket,
+            sessions,
+            pool,
+            backends,
+            None,
+            None,
+            None,
+            server_config,
+            Some(initial_state),
+            true,
+        )
+        .expect("the constructor must return once the Status arrives");
+        let answers = driver
+            .join()
+            .expect("the peer must not panic")
+            .expect("every request must be answered");
+        (server, held, answers)
+    }
+
+    fn assert_holds_the_values(backends: &Rc<RefCell<BackendMap>>) {
+        let backends = backends.borrow();
+        let config = backends
+            .health_check_configs
+            .get(CLUSTER)
+            .expect("the commit must have installed the metadata");
+        assert_eq!(config.headers.len(), 1);
+        assert_eq!(config.headers[0].name, HEADER);
+        let set = backends
+            .protected_health_check_headers
+            .get(CLUSTER)
+            .expect("the commit must have installed the values");
+        assert_eq!(set.len(), 1);
+        assert_eq!(set.headers()[0].name(), HEADER);
+        assert_eq!(set.headers()[0].value().expose_secret_bytes(), SECRET);
+    }
+
+    fn assert_holds_nothing(backends: &Rc<RefCell<BackendMap>>) {
+        let backends = backends.borrow();
+        assert!(
+            !backends
+                .protected_health_check_headers
+                .contains_key(CLUSTER)
+        );
+        assert!(!backends.health_check_configs.contains_key(CLUSTER));
+    }
+
+    /// The valid cycle that closes every scenario below.
+    fn finish(mut script: Vec<WorkerRequest>, version: u64) -> Vec<WorkerRequest> {
+        script.extend([
+            prepare("p", version),
+            commit("c", version),
+            release("r", version),
+            status("s"),
+        ]);
+        script
+    }
+
+    #[test]
+    fn initial_protected_bootstrap_installs_the_values_before_the_constructor_returns() {
+        let (_server, backends, answers) = bootstrap(vec![
+            capability("cap"),
+            prepare("prep", 1),
+            commit("com", 1),
+            release("rel", 1),
+            status("st"),
+        ]);
+        assert_reply(&answers[0], Phase::ProtectedHealthCheckCapability, "", 0);
+        assert_reply(&answers[1], Phase::ProtectedHealthCheckPrepare, CLUSTER, 1);
+        assert_reply(&answers[2], Phase::ProtectedHealthCheckCommit, CLUSTER, 1);
+        assert_reply(&answers[3], Phase::ProtectedHealthCheckRelease, CLUSTER, 1);
+        assert_eq!(answers[4], WorkerResponse::ok("st"));
+        assert_eq!(answers.len(), 5);
+        assert_holds_the_values(&backends);
+        assert_no_secret(&answers);
+    }
+
+    #[test]
+    fn initial_protected_bootstrap_still_accepts_a_direct_status() {
+        let (_server, backends, answers) = bootstrap(vec![status("st")]);
+        assert_eq!(answers, vec![WorkerResponse::ok("st")]);
+        assert_holds_nothing(&backends);
+    }
+
+    #[test]
+    fn initial_protected_bootstrap_refuses_every_out_of_order_request() {
+        // each script holds exactly one request named `bad`, which must be
+        // refused, and ends with a valid cycle and `Status`
+        let cases: Vec<(&str, Vec<WorkerRequest>)> = vec![
+            (
+                "prepare before the capability",
+                finish(vec![prepare("bad", 1), capability("cap")], 1),
+            ),
+            (
+                "commit before the capability",
+                finish(vec![commit("bad", 1), capability("cap")], 1),
+            ),
+            (
+                "commit before prepare",
+                finish(vec![capability("cap"), commit("bad", 1)], 1),
+            ),
+            (
+                "release before commit",
+                finish(vec![capability("cap"), release("bad", 1)], 1),
+            ),
+            (
+                "foreign request after the capability",
+                finish(vec![capability("cap"), foreign("bad")], 1),
+            ),
+            (
+                "foreign request before the capability",
+                finish(vec![foreign("bad"), capability("cap")], 1),
+            ),
+            (
+                "repeated capability",
+                finish(vec![capability("cap"), capability("bad")], 1),
+            ),
+            (
+                "abort without a started cycle",
+                finish(vec![capability("cap"), abort("bad", 1)], 1),
+            ),
+            ("commit of the wrong version", {
+                let mut script = vec![capability("cap"), prepare("prep", 1)];
+                script.push(commit("bad", 2));
+                script.extend([commit("com", 1), release("rel", 1), status("st")]);
+                script
+            }),
+            ("commit of the wrong cluster", {
+                let mut script = vec![capability("cap"), prepare("prep", 1)];
+                script.push(order(
+                    "bad",
+                    Phase::ProtectedHealthCheckCommit,
+                    "other-cluster",
+                    1,
+                ));
+                script.extend([commit("com", 1), release("rel", 1), status("st")]);
+                script
+            }),
+            ("second prepare while one is staged", {
+                let mut script = vec![capability("cap"), prepare("prep", 1)];
+                script.push(prepare("bad", 2));
+                script.extend([commit("com", 1), release("rel", 1), status("st")]);
+                script
+            }),
+            ("repeated commit", {
+                let mut script = vec![capability("cap"), prepare("prep", 1), commit("com", 1)];
+                script.push(commit("bad", 1));
+                script.extend([release("rel", 1), status("st")]);
+                script
+            }),
+            ("release of the wrong version", {
+                let mut script = vec![capability("cap"), prepare("prep", 1), commit("com", 1)];
+                script.push(release("bad", 2));
+                script.extend([release("rel", 1), status("st")]);
+                script
+            }),
+            ("status while a prepare is outstanding", {
+                let mut script = vec![capability("cap"), prepare("prep", 1)];
+                script.push(status("bad"));
+                script.extend([commit("com", 1), release("rel", 1), status("st")]);
+                script
+            }),
+            ("status while a commit is outstanding", {
+                let mut script = vec![capability("cap"), prepare("prep", 1), commit("com", 1)];
+                script.push(status("bad"));
+                script.extend([release("rel", 1), status("st")]);
+                script
+            }),
+            ("stale prepare after a released cycle", {
+                let mut script = vec![
+                    capability("cap"),
+                    prepare("prep", 2),
+                    commit("com", 2),
+                    release("rel", 2),
+                ];
+                script.push(prepare("bad", 1));
+                script.push(status("st"));
+                script
+            }),
+        ];
+        for (name, script) in cases {
+            let refused: Vec<usize> = script
+                .iter()
+                .enumerate()
+                .filter(|(_, message)| message.id == "bad")
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(refused.len(), 1, "{name}: exactly one refused request");
+            let (_server, backends, answers) = bootstrap(script);
+            assert_refused(&answers[refused[0]], "bad");
+            assert!(
+                answers
+                    .iter()
+                    .enumerate()
+                    .all(|(index, answer)| index == refused[0]
+                        || answer.status == ResponseStatus::Ok as i32),
+                "{name}: only the refused request fails: {answers:?}"
+            );
+            assert_holds_the_values(&backends);
+            assert_no_secret(&answers);
+        }
+    }
+
+    #[test]
+    fn initial_protected_bootstrap_forwards_a_handler_refusal_and_stays_blocked() {
+        let unknown = order(
+            "bad",
+            Phase::ProtectedHealthCheckPrepare,
+            "unknown-cluster",
+            1,
+        );
+        let (_server, backends, answers) = bootstrap(finish(vec![capability("cap"), unknown], 1));
+        assert_refused(&answers[1], "bad");
+        assert_eq!(
+            answers[1].message,
+            "the cluster is not known to this worker"
+        );
+        assert_holds_the_values(&backends);
+        assert_no_secret(&answers);
+    }
+
+    #[test]
+    fn initial_protected_bootstrap_abort_drops_the_staged_change() {
+        let (_server, backends, answers) = bootstrap(vec![
+            capability("cap"),
+            prepare("prep", 1),
+            abort("abort", 1),
+            status("st"),
+        ]);
+        assert_reply(&answers[2], Phase::ProtectedHealthCheckAbort, CLUSTER, 1);
+        assert_eq!(answers[3], WorkerResponse::ok("st"));
+        assert_holds_nothing(&backends);
+        assert_no_secret(&answers);
+    }
+
+    #[test]
+    fn initial_protected_bootstrap_abort_restores_an_applied_change() {
+        let (_server, backends, answers) = bootstrap(vec![
+            capability("cap"),
+            prepare("prep", 1),
+            commit("com", 1),
+            abort("abort", 1),
+            status("st"),
+        ]);
+        assert_reply(&answers[3], Phase::ProtectedHealthCheckAbort, CLUSTER, 1);
+        assert_holds_nothing(&backends);
+        assert_no_secret(&answers);
+    }
+
+    #[test]
+    fn initial_protected_bootstrap_refuses_a_mismatched_abort_then_completes() {
+        let mut script = vec![capability("cap"), prepare("prep", 1)];
+        script.push(abort("bad", 9));
+        script.extend([abort("abort", 1), prepare("again", 2)]);
+        script.extend([commit("com", 2), release("rel", 2), status("st")]);
+        let (_server, backends, answers) = bootstrap(script);
+        assert_refused(&answers[2], "bad");
+        assert_reply(&answers[3], Phase::ProtectedHealthCheckAbort, CLUSTER, 1);
+        assert_reply(&answers[6], Phase::ProtectedHealthCheckRelease, CLUSTER, 2);
+        assert_holds_the_values(&backends);
+        assert_no_secret(&answers);
+    }
+
+    #[test]
+    fn initial_protected_bootstrap_returns_an_error_when_the_channel_closes() {
+        let ServerParts {
+            event_loop,
+            sessions,
+            pool,
+            backends,
+            server_scm_socket,
+            server_config,
+            ..
+        } = prebuild_server(16, 16384, true).expect("could not prebuild a test server");
+        let (peer, proxy_channel) =
+            Channel::generate(1000, 10000).expect("could not generate a test channel");
+        drop(peer);
+        let result = Server::new(
+            event_loop,
+            proxy_channel,
+            server_scm_socket,
+            sessions,
+            pool,
+            backends,
+            None,
+            None,
+            None,
+            server_config,
+            None,
+            true,
+        );
+        let Err(error) = result else {
+            panic!("a closed channel must not release the constructor");
+        };
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn initial_status_ack_failure_fails_the_constructor() {
+        let ServerParts {
+            event_loop,
+            sessions,
+            pool,
+            backends,
+            server_scm_socket,
+            server_config,
+            ..
+        } = prebuild_server(16, 16384, true).expect("could not prebuild a test server");
+        let (mut peer, proxy_channel) =
+            Channel::generate(1000, 10000).expect("could not generate a test channel");
+        // the Status is queued, then the peer goes away: the worker reads it
+        // but can no longer deliver the ACK
+        peer.write_message(&status("st"))
+            .expect("the peer must queue the Status");
+        drop(peer);
+        let result = Server::new(
+            event_loop,
+            proxy_channel,
+            server_scm_socket,
+            sessions,
+            pool,
+            backends,
+            None,
+            None,
+            None,
+            server_config,
+            None,
+            true,
+        );
+        let Err(error) = result else {
+            panic!("a lost final ACK must not release the constructor");
+        };
+        assert!(
+            matches!(error, ServerError::WriteInitialAnswer(_)),
+            "{error:?}"
         );
     }
 }

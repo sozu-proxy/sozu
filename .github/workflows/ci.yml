@@ -68,7 +68,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
+        include: &pipeline-cells
           # `msrv-full` cell: full feature matrix (opentelemetry + splice
           # + simd on top of default jemallocator). Hosts the
           # workspace-wide fmt + doc steps; no bench. `msrv-bare` below
@@ -162,39 +162,6 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
           components: clippy
-
-      # This one gate crosses an immutable historical binary boundary rather
-      # than comparing two builds of the current checkout. Pin both the
-      # published archive and the extracted executable: a moved/repacked
-      # release asset must fail before it can certify compatibility. Other
-      # provider cells still exercise candidate-to-candidate persistence; the
-      # release binary itself is the crypto-ring build, so this cell owns the
-      # first 2.3.1 -> candidate upgrade.
-      - name: Fetch verified Sōzu 2.3.1 compatibility binary
-        if: matrix.cell == 'crypto-ring'
-        shell: bash
-        run: |
-          set -euo pipefail
-          archive="$RUNNER_TEMP/sozu-2.3.1-x86_64-unknown-linux-gnu-crypto-ring.tar.gz"
-          extracted="$RUNNER_TEMP/sozu-compat-2.3.1"
-          curl --fail --location --retry 3 --retry-all-errors \
-            --connect-timeout 10 --max-time 120 \
-            --output "$archive" \
-            https://github.com/sozu-proxy/sozu/releases/download/2.3.1/sozu-2.3.1-x86_64-unknown-linux-gnu-crypto-ring.tar.gz
-          printf '%s  %s\n' \
-            58aa97856d81622f906efea2ba206bc39c0269138e1ba981b6eecd3a4e10787f \
-            "$archive" | sha256sum --check --strict -
-          mkdir -p "$extracted"
-          tar --extract --gzip --file "$archive" --directory "$extracted"
-          legacy="$extracted/sozu-2.3.1-x86_64-unknown-linux-gnu-crypto-ring/sozu"
-          printf '%s  %s\n' \
-            5ea1452b3a2053cdc9936dc50ce25d50e3ad30122c7f49fcc606863cd93b2281 \
-            "$legacy" | sha256sum --check --strict -
-          version_file="$extracted/sozu-2.3.1.version"
-          "$legacy" --version > "$version_file"
-          IFS= read -r version < "$version_file"
-          test "$version" = 'sozu 2.3.1 (1cc9bf2 HEAD)'
-          echo "SOZU_CERTIFICATE_METADATA_LEGACY=$legacy" >> "$GITHUB_ENV"
 
       # rustfmt.toml uses the unstable `ignore = [...]` key, so the
       # format check must run on nightly. Only the msrv-full cell
@@ -397,34 +364,32 @@ jobs:
 
       # The `bin/tests/*_e2e.rs` process-level tests spawn a real master (and
       # for the replay suite a real worker) over a unix socket in a temp dir,
-      # and bind ephemeral loopback ports. No root, no fixed port, no TTY — a
-      # GitHub runner serves them fine. They stay `#[ignore]`d so a
-      # contributor's `cargo test` stays fast, and this step is what runs them;
-      # before it existed they never ran anywhere. `sozu_top_e2e` is absent
-      # here: it is `#![cfg(feature = "tui")]`, `bin/Cargo.toml` declares it with
-      # `required-features = ["tui"]`, and no matrix cell's flags enable that
-      # feature, so Cargo leaves the target out. The next step runs it.
+      # and bind ephemeral loopback ports. No root, no fixed port, no TTY. They
+      # stay `#[ignore]`d so a contributor's `cargo test` stays fast, and this
+      # step is what runs them; before it existed they never ran anywhere.
+      # `sozu_top_e2e` is absent here: it is `#![cfg(feature = "tui")]`,
+      # `bin/Cargo.toml` declares it with `required-features = ["tui"]`, and no
+      # matrix cell's flags enable that feature, so Cargo leaves the target out.
+      # The next step runs it.
+      #
+      # `upgrade_fd_inheritance_e2e`, `mutable_commands_runtime_e2e` and
+      # `protected_health_check_refusal_e2e` are absent too, and
+      # `main_upgrade_compatibility_matrix_e2e` is run by no job. The first
+      # three observe `/proc/<main pid>/...` of the hardened (non-dumpable)
+      # main, which needs a user namespace that the observer owns; the CKE
+      # runner pods refuse user namespace creation, so `proc-observer-e2e`
+      # below runs all three on GitHub-hosted VMs (see ci/runners/README.md).
       - name: Test sozu (process-level e2e)
         run: |
           cargo test -p sozu --locked ${{ matrix.flags }} --test load_state_rollback_e2e -- --ignored
           cargo test -p sozu --locked ${{ matrix.flags }} --test frontend_validate_before_commit_e2e -- --ignored
           cargo test -p sozu --locked ${{ matrix.flags }} --test listener_validate_before_commit_e2e -- --ignored
           cargo test -p sozu --locked ${{ matrix.flags }} --test sigterm_soft_stop_e2e -- --ignored
-          cargo test -p sozu --locked ${{ matrix.flags }} --test upgrade_fd_inheritance_e2e -- --ignored
           cargo test -p sozu --locked ${{ matrix.flags }} --test upgrade_keeps_draining_worker_e2e -- --ignored
           cargo test -p sozu --locked ${{ matrix.flags }} --test main_upgrade_transfer_rejection_e2e -- --ignored
           cargo test -p sozu --locked ${{ matrix.flags }} --test soft_stop_waits_for_drain_e2e -- --ignored
           cargo test -p sozu --locked ${{ matrix.flags }} --test upgrade_pid_file_failure_e2e -- --ignored
           cargo test -p sozu --locked ${{ matrix.flags }} --test command_socket_mode_e2e -- --ignored
-          cargo test -p sozu --locked ${{ matrix.flags }} --test mutable_commands_runtime_e2e -- --ignored --test-threads=1 --skip published_2_3_1_certificate_metadata_loss_is_bounded_to_the_first_upgrade
-
-      - name: Test Sōzu 2.3.1 certificate-metadata upgrade boundary
-        if: matrix.cell == 'crypto-ring'
-        run: >-
-          cargo test -p sozu --locked ${{ matrix.flags }}
-          --test mutable_commands_runtime_e2e
-          published_2_3_1_certificate_metadata_loss_is_bounded_to_the_first_upgrade
-          -- --ignored --exact --nocapture --test-threads=1
 
       # `sozu_top_e2e` adds the `tui` feature, so it runs on the `msrv-full`
       # cell only: that cell already resolves `tui` for `cargo doc
@@ -458,6 +423,212 @@ jobs:
           name: criterion-${{ matrix.cell }}
           path: target/criterion
           retention-days: 14
+
+  # ┌──────────────────────────────────────────────────────────────┐
+  # │ Group B' — /proc observers on GitHub-hosted VMs               │
+  # └──────────────────────────────────────────────────────────────┘
+  # `upgrade_fd_inheritance_e2e`, `mutable_commands_runtime_e2e` and
+  # `protected_health_check_refusal_e2e` observe the hardened (non-dumpable)
+  # main through `/proc/<pid>/...`, whose
+  # `/proc/<pid>/fd` is owned by root of its user namespace. Only an observer
+  # that is root of a user namespace can read it, so each compiled test
+  # executable runs as root of a private user namespace. The FD fixture spawns
+  # the main directly, so its test process owns the observer namespace; the
+  # mutable-commands fixture additionally launches its mains through `unshare
+  # --user --map-current-user` as exact-executable observers. The protected
+  # health-check suite needs the same observer to prove, from `/proc` and the
+  # filesystem, that a protected header value appears in no output, log,
+  # listing or saved state of the non-dumpable main and its workers.
+  # The CKE runner pods refuse user namespace creation; which component of
+  # their kernel policy does so is UNVERIFIED. The three suites therefore run
+  # here, on an ordinary VM,
+  # over the same nine cells as `pipeline` (one YAML anchor), and nowhere else.
+  #
+  # Cargo compiles as the runner user; only the compiled libtest ELFs run
+  # through `sudo setpriv ... unshare`, never Cargo. Three stages:
+  #   1. Host root runs `setpriv`, which uses PR_SET_KEEPCAPS while switching
+  #      to the recorded runner UID/GID (`--reuid`, `--regid`,
+  #      `--clear-groups`) and temporarily retains root's permitted/effective
+  #      set internally. After it raises inheritable and ambient
+  #      `CAP_SYS_ADMIN` and execs `unshare`, that exec receives only
+  #      `CAP_SYS_ADMIN` as permitted, effective, inheritable and ambient,
+  #      with the bounding set untouched. Ubuntu's AppArmor user namespace
+  #      policy exempts an unconfined process holding that capability in its
+  #      current user namespace, which is why the runner identity may create
+  #      the namespace; `unshare` uses it for the outer namespace.
+  #   2. `unshare --user --map-root-user` creates a private user namespace and,
+  #      seeing the runner as its effective UID/GID, writes the simple
+  #      single-extent self-map of that runner identity to namespace root
+  #      itself; no `newuidmap`/`newgidmap` helper is involved. The checkout
+  #      and `target/`, owned by the runner, stay reachable. Creating the
+  #      namespace replaces the credentials and clears the ambient set, so no
+  #      `CAP_SYS_ADMIN` remains valid in the initial namespace.
+  #   3. The test ELF runs as namespace root and receives only capabilities
+  #      bound to that new child user namespace, such as `CAP_SYS_PTRACE`.
+  # The `Probe the observer user namespace boundary` step verifies this
+  # boundary on the hosted runner before any Cargo command and fails closed.
+  # `--map-current-user` under a bare `sudo` would map host root and leave the
+  # runner-owned path unreachable. The mutable-commands fixture's own nested
+  # `unshare --user --map-current-user` is a separate, unchanged step. No
+  # container capability, seccomp profile, sysctl, AppArmor or subordinate-ID
+  # setting is changed.
+  proc-observer-e2e:
+    name: proc-observer-${{ matrix.cell }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: *pipeline-cells
+    steps:
+      # The prerequisites the `pipeline` cells find baked into the runner image
+      # (ci/runners/Dockerfile) and that a hosted VM may lack: `protoc` for
+      # `command/build.rs`, `cmake` for aws-lc, OpenSSL headers for
+      # `crypto-openssl`. No target needs h2spec.
+      - name: Install build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake libssl-dev pkg-config
+
+      - name: Checkout sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      # The normal runner shell's IDs, read outside `sudo`, are what
+      # `setpriv` assumes and what `unshare` maps to namespace root below.
+      # Host root would map nothing useful.
+      - name: Record runner owner IDs for the observer namespace
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner_uid="$(id -u)"
+          owner_gid="$(id -g)"
+          test "$owner_uid" -ne 0
+          test "$owner_gid" -ne 0
+          echo "SOZU_PROC_OBSERVER_OWNER_UID=$owner_uid" >> "$GITHUB_ENV"
+          echo "SOZU_PROC_OBSERVER_OWNER_GID=$owner_gid" >> "$GITHUB_ENV"
+
+      # Fail-closed check of the exact boundary the observer steps use, before
+      # any Cargo command: through the same `sudo setpriv ... unshare` wrapper,
+      # a runner-owned executable in the checkout must run as namespace
+      # UID/GID 0 under a single-extent `0 <runner id> 1` map for each of the
+      # UID and GID, and must then create a nested `unshare --user
+      # --map-current-user` namespace in which it is again UID/GID 0. The
+      # temporary file is mode 0700, removed on every shell exit, and nothing
+      # falls back or is skipped on failure.
+      - name: Probe the observer user namespace boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          probe=""
+          trap 'rm -f -- "$probe"' EXIT
+          trap 'exit 1' HUP INT TERM
+          probe="$(mktemp "$PWD/.sozu-userns-probe.XXXXXX")"
+          cat > "$probe" <<'PROBE'
+          #!/bin/sh
+          set -eu
+          test "$(id -u)" = 0
+          test "$(id -g)" = 0
+          check_map() {
+            awk -v want="$2" 'NF != 3 || $1 != "0" || $2 != want || $3 != "1" { bad = 1 } END { exit ((NR == 1 && !bad) ? 0 : 1) }' "$1"
+          }
+          check_map /proc/self/uid_map "$1"
+          check_map /proc/self/gid_map "$2"
+          unshare --user --map-current-user -- sh -c 'test "$(id -u)" = 0 && test "$(id -g)" = 0'
+          PROBE
+          chmod 0700 "$probe"
+          sudo setpriv --reuid "$SOZU_PROC_OBSERVER_OWNER_UID" --regid "$SOZU_PROC_OBSERVER_OWNER_GID" --clear-groups --inh-caps +sys_admin --ambient-caps +sys_admin unshare --user --map-root-user -- "$probe" "$SOZU_PROC_OBSERVER_OWNER_UID" "$SOZU_PROC_OBSERVER_OWNER_GID"
+
+      - name: Install rust ${{ matrix.toolchain }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+
+      # This one gate crosses an immutable historical binary boundary rather
+      # than comparing two builds of the current checkout. Pin both the
+      # published archive and the extracted executable: a moved/repacked
+      # release asset must fail before it can certify compatibility. Other
+      # provider cells still exercise candidate-to-candidate persistence; the
+      # release binary itself is the crypto-ring build, so this cell owns the
+      # first 2.3.1 -> candidate upgrade.
+      - name: Fetch verified Sōzu 2.3.1 compatibility binary
+        if: matrix.cell == 'crypto-ring'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/sozu-2.3.1-x86_64-unknown-linux-gnu-crypto-ring.tar.gz"
+          extracted="$RUNNER_TEMP/sozu-compat-2.3.1"
+          curl --fail --location --retry 3 --retry-all-errors \
+            --connect-timeout 10 --max-time 120 \
+            --output "$archive" \
+            https://github.com/sozu-proxy/sozu/releases/download/2.3.1/sozu-2.3.1-x86_64-unknown-linux-gnu-crypto-ring.tar.gz
+          printf '%s  %s\n' \
+            58aa97856d81622f906efea2ba206bc39c0269138e1ba981b6eecd3a4e10787f \
+            "$archive" | sha256sum --check --strict -
+          mkdir -p "$extracted"
+          tar --extract --gzip --file "$archive" --directory "$extracted"
+          legacy="$extracted/sozu-2.3.1-x86_64-unknown-linux-gnu-crypto-ring/sozu"
+          printf '%s  %s\n' \
+            5ea1452b3a2053cdc9936dc50ce25d50e3ad30122c7f49fcc606863cd93b2281 \
+            "$legacy" | sha256sum --check --strict -
+          version_file="$extracted/sozu-2.3.1.version"
+          "$legacy" --version > "$version_file"
+          IFS= read -r version < "$version_file"
+          test "$version" = 'sozu 2.3.1 (1cc9bf2 HEAD)'
+          echo "SOZU_CERTIFICATE_METADATA_LEGACY=$legacy" >> "$GITHUB_ENV"
+
+      - name: Cache cargo target
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
+        with:
+          cache-all-crates: true
+          prefix-key: ci-proc-observer-${{ matrix.cell }}
+
+      # One Cargo invocation compiles the three suites as the runner user. Its JSON
+      # goes outside `target/`; each executable is selected by exact target
+      # name and must be unique and executable, so zero or several matches
+      # fail the job instead of running a stale or wrong binary.
+      - name: Build /proc observer test executables
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_json="$RUNNER_TEMP/proc-observer-build.json"
+          cargo test -p sozu --locked ${{ matrix.flags }} --no-run --message-format=json --test upgrade_fd_inheritance_e2e --test mutable_commands_runtime_e2e --test protected_health_check_refusal_e2e > "$build_json"
+          for target in upgrade_fd_inheritance_e2e mutable_commands_runtime_e2e protected_health_check_refusal_e2e; do
+            list="$RUNNER_TEMP/$target.executables"
+            jq -r --arg target "$target" 'select(.reason == "compiler-artifact" and .target.name == $target and .executable != null) | .executable' "$build_json" | sort -u > "$list"
+            mapfile -t executables < "$list"
+            test "${#executables[@]}" -eq 1
+            test -x "${executables[0]}"
+            printf '%s=%s\n' "${target^^}_EXE" "${executables[0]}" >> "$GITHUB_ENV"
+          done
+
+      - name: Test sozu (descriptor inheritance across upgrades)
+        run: sudo setpriv --reuid "$SOZU_PROC_OBSERVER_OWNER_UID" --regid "$SOZU_PROC_OBSERVER_OWNER_GID" --clear-groups --inh-caps +sys_admin --ambient-caps +sys_admin unshare --user --map-root-user -- "$UPGRADE_FD_INHERITANCE_E2E_EXE" --ignored --exact upgrades_leave_no_descriptor_shared_between_sozu_processes --nocapture --test-threads=1
+
+      - name: Test sozu (mutable commands, process-level)
+        run: sudo setpriv --reuid "$SOZU_PROC_OBSERVER_OWNER_UID" --regid "$SOZU_PROC_OBSERVER_OWNER_GID" --clear-groups --inh-caps +sys_admin --ambient-caps +sys_admin unshare --user --map-root-user -- "$MUTABLE_COMMANDS_RUNTIME_E2E_EXE" --ignored --nocapture --test-threads=1 --skip published_2_3_1_certificate_metadata_loss_is_bounded_to_the_first_upgrade
+
+      # Every cell runs the public protected health-check case and the cold
+      # restart case by exact name, serially: a header value read from a
+      # `value_file` authenticates the probe and leaves no trace outside
+      # protected memory, and a restart over a saved state keeps that state's
+      # foreign metadata until the file is submitted again.
+      - name: Test sozu (protected health-check header values, process-level)
+        run: |
+          sudo setpriv --reuid "$SOZU_PROC_OBSERVER_OWNER_UID" --regid "$SOZU_PROC_OBSERVER_OWNER_GID" --clear-groups --inh-caps +sys_admin --ambient-caps +sys_admin unshare --user --map-root-user -- "$PROTECTED_HEALTH_CHECK_REFUSAL_E2E_EXE" public_protected_health_check_authenticates_probes_and_leaks_nothing --ignored --exact --nocapture --test-threads=1
+          sudo setpriv --reuid "$SOZU_PROC_OBSERVER_OWNER_UID" --regid "$SOZU_PROC_OBSERVER_OWNER_GID" --clear-groups --inh-caps +sys_admin --ambient-caps +sys_admin unshare --user --map-root-user -- "$PROTECTED_HEALTH_CHECK_REFUSAL_E2E_EXE" cold_toml_header_file_does_not_override_saved_foreign_metadata_after_restart --ignored --exact --nocapture --test-threads=1
+
+      # Generic cells skip the published-2.3.1 case visibly (it needs the
+      # verified release binary); the crypto-ring cell runs it, serially, by
+      # exact name. Only the variable naming that binary crosses `sudo`.
+      - name: Test Sōzu 2.3.1 certificate-metadata upgrade boundary
+        if: matrix.cell == 'crypto-ring'
+        run: sudo --preserve-env=SOZU_CERTIFICATE_METADATA_LEGACY setpriv --reuid "$SOZU_PROC_OBSERVER_OWNER_UID" --regid "$SOZU_PROC_OBSERVER_OWNER_GID" --clear-groups --inh-caps +sys_admin --ambient-caps +sys_admin unshare --user --map-root-user -- "$MUTABLE_COMMANDS_RUNTIME_E2E_EXE" published_2_3_1_certificate_metadata_loss_is_bounded_to_the_first_upgrade --ignored --exact --nocapture --test-threads=1
+
+      # The same verified public 2.3.1 binary must refuse the header-file set
+      # request before any file I/O and keep no trace. Only the variable naming
+      # that binary crosses `sudo`.
+      - name: Test Sōzu 2.3.1 refusal of protected health-check header files
+        if: matrix.cell == 'crypto-ring'
+        run: sudo --preserve-env=SOZU_CERTIFICATE_METADATA_LEGACY setpriv --reuid "$SOZU_PROC_OBSERVER_OWNER_UID" --regid "$SOZU_PROC_OBSERVER_OWNER_GID" --clear-groups --inh-caps +sys_admin --ambient-caps +sys_admin unshare --user --map-root-user -- "$PROTECTED_HEALTH_CHECK_REFUSAL_E2E_EXE" published_2_3_1_main_refuses_header_file_set_before_any_file_io_and_keeps_no_trace --ignored --exact --nocapture --test-threads=1
 
   # ┌──────────────────────────────────────────────────────────────┐
   # │ Group C — dedicated fuzz job (nightly toolchain, real fuzzing)│
