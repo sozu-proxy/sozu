@@ -16,6 +16,7 @@ use sozu_command::{
         Event, EventKind, HealthCheckConfig, LoadBalancingAlgorithms, LoadBalancingParams,
         LoadMetric, ShardMode,
     },
+    secret::ProtectedHeaderSet,
     state::ClusterId,
 };
 
@@ -517,6 +518,11 @@ impl std::ops::Drop for Backend {
 pub struct BackendMap {
     pub backends: HashMap<ClusterId, BackendList>,
     pub health_check_configs: HashMap<ClusterId, HealthCheckConfig>,
+    /// The values behind the headers of a health check, in memory only. An
+    /// entry is replaced together with its configuration and dropped with it:
+    /// a configuration that names headers without a set satisfying them sends
+    /// no probe.
+    pub protected_health_check_headers: HashMap<ClusterId, ProtectedHeaderSet>,
     /// Whether the cluster's backends speak HTTP/2 (cluster.http2 = true).
     /// Mirrors the same backend-capability hint the mux router reads at
     /// `protocol/mux/router.rs::Router::plan_connect`. The health checker uses
@@ -563,6 +569,7 @@ impl BackendMap {
         BackendMap {
             backends: HashMap::new(),
             health_check_configs: HashMap::new(),
+            protected_health_check_headers: HashMap::new(),
             cluster_http2: HashMap::new(),
             rng,
         }
@@ -694,6 +701,7 @@ impl BackendMap {
             }
         }
         self.health_check_configs.remove(cluster_id);
+        self.protected_health_check_headers.remove(cluster_id);
         self.cluster_http2.remove(cluster_id);
         debug_assert!(
             !self.backends.contains_key(cluster_id)
@@ -715,7 +723,65 @@ impl BackendMap {
         }
     }
 
+    /// Replace the configuration and the values behind its headers as one
+    /// step: both change or neither does. A probe already in flight composed
+    /// its request from the previous set and is not affected.
+    pub fn set_protected_health_check(
+        &mut self,
+        cluster_id: &str,
+        config: HealthCheckConfig,
+        headers: ProtectedHeaderSet,
+    ) {
+        self.health_check_configs.insert(cluster_id.into(), config);
+        self.protected_health_check_headers
+            .insert(cluster_id.into(), headers);
+    }
+
+    /// Put back exactly what a protected health check replaced: the
+    /// configuration and the values behind its headers, each present or absent
+    /// as it was.
+    pub fn restore_health_check(
+        &mut self,
+        cluster_id: &str,
+        config: Option<HealthCheckConfig>,
+        headers: Option<ProtectedHeaderSet>,
+    ) {
+        match config {
+            Some(config) => {
+                self.health_check_configs.insert(cluster_id.into(), config);
+            }
+            None => {
+                self.health_check_configs.remove(cluster_id);
+            }
+        }
+        match headers {
+            Some(headers) => {
+                self.protected_health_check_headers
+                    .insert(cluster_id.into(), headers);
+            }
+            None => {
+                self.protected_health_check_headers.remove(cluster_id);
+            }
+        }
+    }
+
     pub fn set_health_check_config(&mut self, cluster_id: &str, config: Option<HealthCheckConfig>) {
+        // The values kept for the previous configuration survive only when the
+        // new one names exactly the same headers: same count, order, names and
+        // full fingerprints (`ProtectedHeaderSet::satisfies`). A threshold or
+        // load-balancing update therefore keeps its probes; a cleared, reordered,
+        // foreign-epoch, malformed or merely same-named list drops the values, so
+        // a stale credential is never sent under new metadata.
+        let keeps_values = config.as_ref().is_some_and(|new| {
+            !new.headers.is_empty()
+                && self
+                    .protected_health_check_headers
+                    .get(cluster_id)
+                    .is_some_and(|held| held.satisfies(&new.headers))
+        });
+        if !keeps_values {
+            self.protected_health_check_headers.remove(cluster_id);
+        }
         match config {
             Some(c) => {
                 self.health_check_configs.insert(cluster_id.into(), c);
@@ -2794,6 +2860,142 @@ mod backends_test {
             "set_health_check_config(None) must re-emit the rollup after \
              resetting backend health, otherwise dashboards stay stuck at AllDown"
         );
+    }
+
+    // ----- protected health-check headers survive only an exact metadata match -----
+
+    /// A configuration whose headers name `names` with the fingerprints of
+    /// `held`, and the matching held set, all issued by one key.
+    fn held_with_config(
+        key: &sozu_command::secret::FingerprintKey,
+        values: &[(&str, &[u8])],
+    ) -> (HealthCheckConfig, ProtectedHeaderSet) {
+        let headers: Vec<_> = values
+            .iter()
+            .map(|(name, value)| {
+                let mut carrier = sozu_command::proto::command::HealthCheckHeaderValue {
+                    name: (*name).to_owned(),
+                    value: value.to_vec(),
+                };
+                let secret = sozu_command::secret::SecretValue::take_from_ingress(&mut carrier)
+                    .expect("a valid value");
+                sozu_command::secret::ProtectedHeader::new(key, (*name).to_owned(), secret)
+            })
+            .collect();
+        let config = HealthCheckConfig {
+            uri: "/".to_owned(),
+            interval: 10,
+            timeout: 5,
+            healthy_threshold: 3,
+            unhealthy_threshold: 3,
+            headers: headers
+                .iter()
+                .map(|h| sozu_command::proto::command::HealthCheckHeader {
+                    name: h.name().to_owned(),
+                    fingerprint: h.fingerprint().to_string(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        (config, ProtectedHeaderSet::new(headers))
+    }
+
+    fn test_key(byte: u8, epoch: u8) -> sozu_command::secret::FingerprintKey {
+        sozu_command::secret::FingerprintKey::from_parts(
+            sozu_command::secret::Zeroizing::new([byte; 32]),
+            [epoch; 16],
+        )
+    }
+
+    fn map_holding(config: &HealthCheckConfig, held: &ProtectedHeaderSet) -> BackendMap {
+        let mut map = BackendMap::new();
+        map.set_protected_health_check("app", config.to_owned(), held.to_owned());
+        map
+    }
+
+    #[test]
+    fn a_config_update_with_identical_header_metadata_keeps_the_values() {
+        let key = test_key(1, 2);
+        let (config, held) =
+            held_with_config(&key, &[("Authorization", b"s1"), ("X-Token", b"s2")]);
+        let mut map = map_holding(&config, &held);
+
+        // Threshold and interval changed, headers metadata untouched.
+        let mut updated = config.to_owned();
+        updated.unhealthy_threshold = 7;
+        updated.interval = 20;
+        map.set_health_check_config("app", Some(updated.to_owned()));
+
+        assert_eq!(map.health_check_configs["app"], updated);
+        assert!(
+            map.protected_health_check_headers["app"].ptr_eq(&held),
+            "the very same set stays, bytes untouched"
+        );
+    }
+
+    #[test]
+    fn a_config_update_that_changes_header_metadata_drops_the_values() {
+        let key = test_key(1, 2);
+        let (config, held) =
+            held_with_config(&key, &[("Authorization", b"s1"), ("X-Token", b"s2")]);
+
+        let mut cases: Vec<(&str, Vec<sozu_command::proto::command::HealthCheckHeader>)> =
+            Vec::new();
+        // The headers are cleared.
+        cases.push(("clear", Vec::new()));
+        // Same names, order swapped.
+        let mut swapped = config.headers.to_owned();
+        swapped.reverse();
+        cases.push(("order", swapped));
+        // Names alone match: one fingerprint belongs to a different value.
+        let (other, _) = held_with_config(&key, &[("Authorization", b"other"), ("X-Token", b"s2")]);
+        cases.push(("fingerprint", other.headers));
+        // A fingerprint issued under a foreign key epoch.
+        let (foreign, _) = held_with_config(
+            &test_key(1, 9),
+            &[("Authorization", b"s1"), ("X-Token", b"s2")],
+        );
+        cases.push(("foreign-epoch", foreign.headers));
+        // A fingerprint that does not parse, an empty one, and a shorter list.
+        let mut malformed = config.headers.to_owned();
+        malformed[0].fingerprint = "not-a-fingerprint".to_owned();
+        cases.push(("malformed", malformed));
+        let mut empty = config.headers.to_owned();
+        empty[1].fingerprint = String::new();
+        cases.push(("empty-fingerprint", empty));
+        cases.push(("count", config.headers[..1].to_vec()));
+
+        for (label, headers) in cases {
+            let mut map = map_holding(&config, &held);
+            let mut updated = config.to_owned();
+            updated.headers = headers;
+            map.set_health_check_config("app", Some(updated.to_owned()));
+            assert_eq!(map.health_check_configs["app"], updated, "{label}");
+            assert!(
+                !map.protected_health_check_headers.contains_key("app"),
+                "{label}: the values are dropped, never kept by names alone"
+            );
+        }
+    }
+
+    #[test]
+    fn a_config_update_without_a_held_set_stays_missing() {
+        let key = test_key(1, 2);
+        let (config, _) = held_with_config(&key, &[("Authorization", b"s1")]);
+        let mut map = BackendMap::new();
+        map.set_health_check_config("app", Some(config.to_owned()));
+        assert_eq!(map.health_check_configs["app"], config);
+        assert!(!map.protected_health_check_headers.contains_key("app"));
+    }
+
+    #[test]
+    fn removing_the_health_check_drops_the_values() {
+        let key = test_key(1, 2);
+        let (config, held) = held_with_config(&key, &[("Authorization", b"s1")]);
+        let mut map = map_holding(&config, &held);
+        map.set_health_check_config("app", None);
+        assert!(!map.health_check_configs.contains_key("app"));
+        assert!(!map.protected_health_check_headers.contains_key("app"));
     }
 
     // ----- #1684: selection reads neither the wall clock nor an ambient RNG -----

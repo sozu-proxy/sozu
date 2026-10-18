@@ -81,6 +81,7 @@ impl Request {
             | RequestType::RemoveCluster(_)
             | RequestType::RemoveBackend(_)
             | RequestType::SetHealthCheck(_)
+            | RequestType::SetProtectedHealthCheck(_)
             | RequestType::RemoveHealthCheck(_)
             | RequestType::SoftStop(_)
             | RequestType::HardStop(_)
@@ -104,7 +105,11 @@ impl Request {
             | RequestType::SetMaxConnectionsPerSubnet(_)
             | RequestType::QueryMaxConnectionsPerSubnet(_)
             | RequestType::SetMaxConnectionAttempts(_)
-            | RequestType::CloseSessions(_) => {}
+            | RequestType::CloseSessions(_)
+            // handled by the worker's protected health check protocol before
+            // this call, which only a proxy-bound order reaches
+            | RequestType::QueryProtectedHealthCheckSupport(_)
+            | RequestType::ProtectedHealthCheckOrder(_) => {}
 
             // the Add***Listener / Update***Listener and other Listener orders will be
             // handled separately by the notify_proxys function, so we don't give them
@@ -159,6 +164,7 @@ impl Request {
                             | RequestType::RemoveCluster(_)
                             | RequestType::RemoveBackend(_)
                             | RequestType::SetHealthCheck(_)
+                            | RequestType::SetProtectedHealthCheck(_)
                             | RequestType::RemoveHealthCheck(_)
                             | RequestType::SoftStop(_)
                             | RequestType::HardStop(_)

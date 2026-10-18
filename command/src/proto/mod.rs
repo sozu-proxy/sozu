@@ -9,6 +9,10 @@ use prost::UnknownEnumValue;
 /// Contains all types received by and sent from Sōzu
 pub mod command {
     include!(concat!(env!("OUT_DIR"), "/command.rs"));
+
+    /// Hand-written in `crate::secret` so that decoding wipes a secret before
+    /// its buffer can be released; `command/build.rs` maps the message to it.
+    pub use crate::secret::HealthCheckHeaderValue;
 }
 
 /// Implementation of fmt::Display for the protobuf types, used in the CLI
@@ -243,6 +247,46 @@ impl std::fmt::Debug for command::Header {
             .field("key_len", &self.key.len())
             .field("val_len", &self.val.len())
             .finish_non_exhaustive()
+    }
+}
+
+/// Longest header name, in bytes, [`command::HealthCheckHeader`]'s `Debug` prints.
+const HEALTH_CHECK_HEADER_DEBUG_NAME_MAX: usize = 64;
+
+/// `name` cut to [`HEALTH_CHECK_HEADER_DEBUG_NAME_MAX`] bytes on a char
+/// boundary, and whether it was cut.
+fn bounded_health_check_header_name(name: &str) -> (&str, bool) {
+    let mut end = name.len().min(HEALTH_CHECK_HEADER_DEBUG_NAME_MAX);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&name[..end], end < name.len())
+}
+
+/// A health-check header is public metadata: `Debug` prints a bounded name and
+/// the keyed fingerprint of the value, never the value, which this type does
+/// not carry.
+impl std::fmt::Debug for command::HealthCheckHeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (name, truncated) = bounded_health_check_header_name(&self.name);
+        f.debug_struct("HealthCheckHeader")
+            .field("name", &name)
+            .field("name_truncated", &truncated)
+            .field("fingerprint", &self.fingerprint)
+            .finish()
+    }
+}
+
+/// The ingress value is a secret: `Debug` prints a bounded name and a fixed
+/// placeholder, never the bytes and never their length.
+impl std::fmt::Debug for command::HealthCheckHeaderValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (name, truncated) = bounded_health_check_header_name(&self.name);
+        f.debug_struct("HealthCheckHeaderValue")
+            .field("name", &name)
+            .field("name_truncated", &truncated)
+            .field("value", &format_args!("<protected>"))
+            .finish()
     }
 }
 
@@ -745,6 +789,7 @@ fn response_content_kind(content: Option<&command::ResponseContent>) -> Option<&
             ContentType::MetricDetailStatus(_) => "metric_detail_status",
             ContentType::WorkerMetricDetailStatus(_) => "worker_metric_detail_status",
             ContentType::ClosedSessions(_) => "closed_sessions",
+            ContentType::ProtectedHealthCheckReply(_) => "protected_health_check_reply",
         })
 }
 
@@ -2143,5 +2188,90 @@ mod tests {
         };
 
         assert_eq!(histogram_a, merged_histogram);
+    }
+
+    const HEALTH_CHECK_SECRET: &str = "SYNTHETIC-DEBUG-HC-SECRET-a91d";
+    const HEALTH_CHECK_FINGERPRINT: &str = "sozu-hc-hmac-sha256:v1:00112233445566778899aabbccddeeff:0000000000000000000000000000000000000000000000000000000000000000";
+
+    fn fingerprinted_health_check() -> super::command::HealthCheckConfig {
+        use super::command::{HealthCheckConfig, HealthCheckHeader};
+        HealthCheckConfig {
+            uri: "/".to_owned(),
+            interval: 10,
+            timeout: 5,
+            healthy_threshold: 3,
+            unhealthy_threshold: 3,
+            headers: vec![HealthCheckHeader {
+                name: "Authorization".to_owned(),
+                fingerprint: HEALTH_CHECK_FINGERPRINT.to_owned(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// `Debug` of a header prints a bounded name and its fingerprint, and the
+    /// ingress carrier prints a placeholder instead of the bytes or their
+    /// length, alone or inside a request.
+    #[test]
+    fn health_check_header_debug_shows_metadata_and_never_the_ingress_value() {
+        use super::command::{
+            HealthCheckHeader, HealthCheckHeaderValue, SetHealthCheck, SetProtectedHealthCheck,
+        };
+
+        let long_name = format!("X-{}", "n".repeat(200));
+        let alone = format!(
+            "{:?}",
+            HealthCheckHeader {
+                name: long_name.clone(),
+                fingerprint: HEALTH_CHECK_FINGERPRINT.to_owned(),
+            }
+        );
+        assert!(!alone.contains(&long_name), "the name is bounded: {alone}");
+        assert!(alone.contains("name_truncated: true"), "{alone}");
+        assert!(alone.contains(HEALTH_CHECK_FINGERPRINT), "{alone}");
+        // A multi-byte name is cut on a char boundary, never mid-character.
+        let wide = format!(
+            "{:?}",
+            HealthCheckHeader {
+                name: "\u{e9}".repeat(100),
+                fingerprint: String::new(),
+            }
+        );
+        assert!(wide.contains("name_truncated: true"), "{wide}");
+
+        let config = fingerprinted_health_check();
+        let carrier = HealthCheckHeaderValue {
+            name: "Authorization".to_owned(),
+            value: HEALTH_CHECK_SECRET.as_bytes().to_vec(),
+        };
+        let protected = Request::from(RequestType::SetProtectedHealthCheck(
+            SetProtectedHealthCheck {
+                cluster_id: "app".to_owned(),
+                config: config.to_owned(),
+                values: vec![carrier.to_owned()],
+            },
+        ));
+        let worker_request = WorkerRequest::new("id".to_owned(), protected.to_owned());
+        let legacy = Request::from(RequestType::SetHealthCheck(SetHealthCheck {
+            cluster_id: "app".to_owned(),
+            config,
+        }));
+        let numeric = format!("{:?}", HEALTH_CHECK_SECRET.as_bytes());
+        for (what, rendered) in [
+            ("carrier", format!("{carrier:?}")),
+            ("carrier pretty", format!("{carrier:#?}")),
+            ("protected request", format!("{protected:?}")),
+            ("protected request pretty", format!("{protected:#?}")),
+            ("worker request", format!("{worker_request:?}")),
+            ("legacy request", format!("{legacy:?}")),
+        ] {
+            assert!(
+                !rendered.contains(HEALTH_CHECK_SECRET) && !rendered.contains(&numeric),
+                "{what} Debug leaked a header value: {rendered}"
+            );
+            if what.starts_with("carrier") {
+                assert!(rendered.contains("<protected>"), "{what}: {rendered}");
+            }
+        }
     }
 }

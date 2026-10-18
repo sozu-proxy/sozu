@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
     io::Read as IoRead,
+    os::fd::AsFd,
     path::PathBuf,
 };
 
@@ -10,23 +11,25 @@ use sozu_command_lib::{
         decode_fingerprint, get_fingerprint_from_certificate_path, load_full_certificate,
     },
     config::{
-        ForwardedHeadersMode, ListenerBuilder, parse_http_status_range,
-        validate_health_check_config,
+        ForwardedHeadersMode, HEALTH_CHECK_MAX_HEADER_BYTES, ListenerBuilder,
+        parse_http_status_range, validate_health_check_config, validate_health_check_header_values,
     },
     proto::command::{
         ActivateListener, AddBackend, AddCertificate, AlpnProtocols, CloseSessions, Cluster,
         CountRequests, CustomHttpAnswers, DeactivateListener, ForwardedHeaders, FrontendFilters,
-        HardStop, HealthCheckConfig, HealthCheckMode, ListListeners, ListedFrontends, ListenerType,
-        LoadBalancingParams, MetricsConfiguration, PathRule, ProxyProtocolConfig,
-        QueryCertificatesFilters, QueryClusterByDomain, QueryClustersHashes, QueryHealthChecks,
-        QueryMaxConnectionsPerIp, QueryMaxConnectionsPerSubnet, RemoveBackend, RemoveCertificate,
-        RemoveListener, ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend,
-        RequestUdpFrontend, ResponseContent, RulePosition, SetHealthCheck, ShardMode,
+        HardStop, HealthCheckConfig, HealthCheckHeader, HealthCheckHeaderValue, HealthCheckMode,
+        ListListeners, ListedFrontends, ListenerType, LoadBalancingParams, MetricsConfiguration,
+        PathRule, ProxyProtocolConfig, QueryCertificatesFilters, QueryClusterByDomain,
+        QueryClustersHashes, QueryHealthChecks, QueryMaxConnectionsPerIp,
+        QueryMaxConnectionsPerSubnet, RemoveBackend, RemoveCertificate, RemoveListener,
+        ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend, RequestUdpFrontend,
+        ResponseContent, RulePosition, SetHealthCheck, SetProtectedHealthCheck, ShardMode,
         SocketAddress, SoftStop, Status, SubscribeEvents, TlsVersion, UpdateHttpListenerConfig,
         UpdateHttpsListenerConfig, UpdateTcpListenerConfig, UpdateUdpListenerConfig,
         request::RequestType, response_content::ContentType,
     },
     proto::display::print_json_response,
+    secret::read_header_value,
 };
 
 use super::CtlError;
@@ -39,6 +42,147 @@ use crate::{
     },
     ctl::CommandManager,
 };
+
+/// Where the value of one `--header-file NAME=PATH` is read from.
+enum HeaderSource {
+    Stdin,
+    Path(PathBuf),
+}
+
+/// What `health-check set` asks for. The configuration names its headers in
+/// declared order and carries no fingerprint, which the main process computes;
+/// `header_files` holds the source of each value, in the same order.
+struct HealthCheckSet {
+    cluster_id: String,
+    config: HealthCheckConfig,
+    header_files: Vec<(String, HeaderSource)>,
+}
+
+impl TryFrom<HealthCheckCmd> for HealthCheckSet {
+    type Error = CtlError;
+
+    /// Validate every part of a `health-check set` the CLI can judge alone,
+    /// before any file is opened, standard input read, or request sent. The
+    /// diagnostics never echo a specification, which may hold a path typed in
+    /// place of a name.
+    fn try_from(cmd: HealthCheckCmd) -> Result<Self, CtlError> {
+        let HealthCheckCmd::Set {
+            id,
+            mode,
+            uri,
+            interval,
+            timeout,
+            healthy_threshold,
+            unhealthy_threshold,
+            expected_status,
+            accepted_statuses,
+            port,
+            header_files,
+        } = cmd
+        else {
+            return Err(CtlError::Failure(
+                "only `health-check set` carries a configuration".to_owned(),
+            ));
+        };
+        let accepted_statuses = accepted_statuses
+            .iter()
+            .map(|spec| parse_http_status_range(spec))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|reason| CtlError::Failure(reason.to_owned()))?;
+        let header_files = header_files
+            .iter()
+            .map(|spec| parse_header_file(spec))
+            .collect::<Result<Vec<_>, _>>()?;
+        let config = HealthCheckConfig {
+            uri,
+            interval,
+            timeout,
+            healthy_threshold,
+            unhealthy_threshold,
+            expected_status,
+            mode: HealthCheckMode::from(mode) as i32,
+            accepted_statuses,
+            port,
+            headers: header_files
+                .iter()
+                .map(|(name, _)| HealthCheckHeader {
+                    name: name.to_owned(),
+                    fingerprint: String::new(),
+                })
+                .collect(),
+        };
+        if let Err(reason) = validate_health_check_config(&config) {
+            return Err(CtlError::Failure(reason.to_owned()));
+        }
+        let from_stdin = header_files
+            .iter()
+            .filter(|(_, source)| matches!(source, HeaderSource::Stdin))
+            .count();
+        if from_stdin > 1 {
+            return Err(CtlError::Failure(
+                "standard input can be the source of one header only: give `-` once".to_owned(),
+            ));
+        }
+        Ok(Self {
+            cluster_id: id,
+            config,
+            header_files,
+        })
+    }
+}
+
+/// Split a `--header-file NAME=PATH` at its first `=`, which a header name
+/// cannot contain. The name is validated with the whole configuration.
+fn parse_header_file(spec: &str) -> Result<(String, HeaderSource), CtlError> {
+    match spec.split_once('=') {
+        Some((name, path)) if !path.is_empty() => {
+            let source = if path == "-" {
+                HeaderSource::Stdin
+            } else {
+                HeaderSource::Path(PathBuf::from(path))
+            };
+            Ok((name.to_owned(), source))
+        }
+        _ => Err(CtlError::Failure(
+            "--header-file expects NAME=PATH: a header name and the file holding its value"
+                .to_owned(),
+        )),
+    }
+}
+
+/// Refuse, before the CLI connects, a `health-check set --header-file` that
+/// the main process is not needed to judge.
+pub(super) fn check_health_check_set(cmd: &HealthCheckCmd) -> Result<(), CtlError> {
+    HealthCheckSet::try_from(cmd.to_owned()).map(|_| ())
+}
+
+/// Read every header value, in declared order, from its file or from standard
+/// input. The bytes are kept exactly but for one final line ending, and only
+/// the protected reader holds them: no diagnostic shows one.
+fn read_header_values(
+    header_files: Vec<(String, HeaderSource)>,
+) -> Result<Vec<HealthCheckHeaderValue>, CtlError> {
+    header_files
+        .into_iter()
+        .map(|(name, source)| {
+            let opened = match source {
+                // A duplicate of the descriptor, read unbuffered: `Stdin` would
+                // keep a copy of the value in a buffer nothing wipes.
+                HeaderSource::Stdin => std::io::stdin()
+                    .as_fd()
+                    .try_clone_to_owned()
+                    .map(File::from),
+                HeaderSource::Path(path) => File::open(path),
+            }
+            .map_err(|source| CtlError::OpenHeaderFile {
+                name: name.to_owned(),
+                source,
+            })?;
+            read_header_value(name.to_owned(), opened, HEALTH_CHECK_MAX_HEADER_BYTES)
+                .map_err(|source| CtlError::ReadHeaderValue { name, source })
+        })
+        .collect()
+}
 
 impl CommandManager {
     pub fn save_state(&mut self, path: String) -> Result<(), CtlError> {
@@ -520,50 +664,8 @@ impl CommandManager {
 
     pub fn health_check_command(&mut self, cmd: HealthCheckCmd) -> Result<(), CtlError> {
         match cmd {
-            HealthCheckCmd::Set {
-                id,
-                mode,
-                uri,
-                interval,
-                timeout,
-                healthy_threshold,
-                unhealthy_threshold,
-                expected_status,
-                accepted_statuses,
-                port,
-            } => {
-                let accepted_statuses = accepted_statuses
-                    .iter()
-                    .map(|spec| parse_http_status_range(spec))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|reason| CtlError::Failure(reason.to_owned()))?;
-                let config = HealthCheckConfig {
-                    uri,
-                    interval,
-                    timeout,
-                    healthy_threshold,
-                    unhealthy_threshold,
-                    expected_status,
-                    mode: HealthCheckMode::from(mode) as i32,
-                    accepted_statuses,
-                    port,
-                };
-                if let Err(reason) = validate_health_check_config(&config) {
-                    return Err(CtlError::Failure(reason.to_owned()));
-                }
-                if config.timeout >= config.interval {
-                    warn!(
-                        "health check timeout ({}s) >= interval ({}s), checks may overlap",
-                        config.timeout, config.interval
-                    );
-                }
-                self.send_request(
-                    RequestType::SetHealthCheck(SetHealthCheck {
-                        cluster_id: id,
-                        config,
-                    })
-                    .into(),
-                )
+            set @ HealthCheckCmd::Set { .. } => {
+                self.set_health_check(HealthCheckSet::try_from(set)?)
             }
             HealthCheckCmd::Remove { id } => {
                 self.send_request(RequestType::RemoveHealthCheck(id).into())
@@ -572,6 +674,41 @@ impl CommandManager {
                 RequestType::QueryHealthChecks(QueryHealthChecks { cluster_id: id }).into(),
             ),
         }
+    }
+
+    /// Send a validated `health-check set`. Without `--header-file` it is the
+    /// ordinary `SetHealthCheck`, with no capability query. With some, nothing
+    /// is read until the main process confirmed the protected protocol, and
+    /// the values then travel in one `SetProtectedHealthCheck`.
+    fn set_health_check(&mut self, set: HealthCheckSet) -> Result<(), CtlError> {
+        let HealthCheckSet {
+            cluster_id,
+            config,
+            header_files,
+        } = set;
+        if config.timeout >= config.interval {
+            warn!(
+                "health check timeout ({}s) >= interval ({}s), checks may overlap",
+                config.timeout, config.interval
+            );
+        }
+        if header_files.is_empty() {
+            return self.send_request(
+                RequestType::SetHealthCheck(SetHealthCheck { cluster_id, config }).into(),
+            );
+        }
+        self.require_protected_health_check_support()?;
+        let values = read_header_values(header_files)?;
+        validate_health_check_header_values(&config, &values)
+            .map_err(|reason| CtlError::Failure(reason.to_owned()))?;
+        self.send_request(
+            RequestType::SetProtectedHealthCheck(SetProtectedHealthCheck {
+                cluster_id,
+                config,
+                values,
+            })
+            .into(),
+        )
     }
 
     pub fn tcp_frontend_command(&mut self, cmd: TcpFrontendCmd) -> Result<(), CtlError> {

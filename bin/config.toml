@@ -721,6 +721,29 @@ backends = [
 # port = 9090            # both modes: probe this port on the backend's IP
 #                        # address, 1-65535 (default: the backend's data port);
 #                        # refused for a cluster with a `unix_path` backend
+#
+# HTTP mode only (refused with mode = "TCP"): custom request headers, sent in
+# this order, at most 32. Each table takes `name` and `value_file` and nothing
+# else: there is no inline value. The configuration keeps the reference as
+# written, parsing it opens no file, so write an absolute path. The value is
+# read only by the protected activation, which may happen in the hardened main
+# process before it launches the workers, and then stays in protected memory:
+# the saved state and `sozu cluster health-check list` show the ordered header
+# names and keyed fingerprints only. A saved state is authoritative for the
+# clusters it adds, removes or rewrites: a foreign or stale epoch never
+# activates a value by name, and this table cannot resurrect a removal. Such a
+# health check sends no probe until `sozu cluster health-check set ...
+# --header-file NAME=PATH` re-injects the same ordered headers. Release 2.3.1
+# refuses a configuration that holds these tables.
+# The probe is plain HTTP/1.1 or h2c, not encrypted: use a dedicated,
+# least-privilege, probe-only credential and a protected network path to the
+# backend. See doc/health_checks.md#custom-request-headers.
+# [[clusters.MyCluster.health_check.headers]]
+# name = "Authorization"
+# value_file = "/run/secrets/sozu-probe-authorization"
+# [[clusters.MyCluster.health_check.headers]]
+# name = "X-Probe-Token"
+# value_file = "/run/secrets/sozu-probe-token"
 
 # this is an example of a routing configuration for the TCP proxy
 [clusters.TcpTest]

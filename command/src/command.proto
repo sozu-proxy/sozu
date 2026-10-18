@@ -264,6 +264,23 @@ message Request {
     // Tags 65-71 are taken by other verbs (close sessions, header routing,
     // silent frontend close): 72 is this verb's, and must not be renumbered.
     AddBackend add_unix_backend = 72;
+    // Protected variant of `set_health_check`: the same order plus the clear
+    // bytes of the custom header values, which no other verb may carry. It is
+    // a distinct verb, not a field of `SetHealthCheck`, so that a main process
+    // which predates it decodes no verb at all and refuses the request instead
+    // of configuring a probe without its credentials and answering success.
+    //
+    // Tags 65-72 are taken by other verbs: 73 is this verb's.
+    SetProtectedHealthCheck set_protected_health_check = 73;
+    // Internal main-to-worker verbs of the all-worker acknowledged protected
+    // health check path. A client never sends them: the main process refuses
+    // them on the command socket. A worker that predates them decodes no verb
+    // and never answers with `protected_health_check_reply`, which is how the
+    // main process learns it must not be sent a value.
+    //
+    // Tags 65-73 are taken by other verbs: 74 and 75 are these verbs'.
+    QueryProtectedHealthCheckSupport query_protected_health_check_support = 74;
+    ProtectedHealthCheckOrder protected_health_check_order = 75;
   }
 }
 
@@ -284,6 +301,55 @@ message QueryHealthChecks {
 message SetHealthCheck {
     required string cluster_id = 1;
     required HealthCheckConfig config = 2;
+}
+
+// Sets the health check of a cluster together with the clear values of its
+// custom headers. As received from an operator `config.headers` names the
+// headers in order and carries no fingerprint; `values` holds one carrier per
+// header, in the same order. The main process validates all of it, recomputes
+// every fingerprint with its own key and forwards the same verb to the workers
+// with the trusted fingerprints in place. Never persisted, never serialized to
+// JSON: the carriers refuse serde.
+message SetProtectedHealthCheck {
+    required string cluster_id = 1;
+    required HealthCheckConfig config = 2;
+    repeated HealthCheckHeaderValue values = 3;
+}
+
+// Asks a worker whether it implements the protected health check protocol.
+// Carries nothing: no cluster, no value.
+message QueryProtectedHealthCheckSupport {}
+
+// Where a protected health check change stands for one worker.
+enum ProtectedHealthCheckPhase {
+    // Positive answer to `QueryProtectedHealthCheckSupport`.
+    PROTECTED_HEALTH_CHECK_CAPABILITY = 0;
+    // Validate and stage `prepare` without applying it.
+    PROTECTED_HEALTH_CHECK_PREPARE = 1;
+    // Apply the staged `version`, configuration and values together.
+    PROTECTED_HEALTH_CHECK_COMMIT = 2;
+    // Drop the staged `version`, or restore the state that preceded it.
+    PROTECTED_HEALTH_CHECK_ABORT = 3;
+    // The change succeeded everywhere: forget the state that preceded it.
+    PROTECTED_HEALTH_CHECK_RELEASE = 4;
+}
+
+// One internal order of the protected health check protocol. Only `PREPARE`
+// carries `prepare`, which holds the clear header values: it is the single
+// main-to-worker carrier of them, and lives in the channel buffers only.
+message ProtectedHealthCheckOrder {
+    required ProtectedHealthCheckPhase phase = 1;
+    required string cluster_id = 2;
+    required uint64 version = 3;
+    optional SetProtectedHealthCheck prepare = 4;
+}
+
+// A worker's positive answer to a protected health check order: its phase,
+// the cluster and the version it acted on, never a header name or value.
+message ProtectedHealthCheckReply {
+    required ProtectedHealthCheckPhase phase = 1;
+    required string cluster_id = 2;
+    required uint64 version = 3;
 }
 
 message ListWorkers {}
@@ -1592,6 +1658,29 @@ message HttpStatusRange {
     required uint32 end = 2;
 }
 
+// Public metadata of one custom request header field of a health-check probe:
+// its name and the keyed fingerprint of its value. The value itself is never
+// part of the configuration, the state, a query or a log: it travels once in a
+// `HealthCheckHeaderValue` and lives in memory only.
+message HealthCheckHeader {
+    required string name = 1;
+    // Value 2 carried the clear value in an unreleased draft. Never reuse it.
+    reserved 2;
+    // `sozu-hc-hmac-sha256:v1:<epoch>:<tag>` under the main process key; empty
+    // in an operator order, which the main process fills in.
+    required string fingerprint = 3;
+}
+
+// Protected ingress/IPC carrier of one health-check header value: the clear
+// bytes travel in `SetProtectedHealthCheck` from the operator to the main
+// process, and are moved out into a memory-only secret at once. It is never
+// part of the state, a query response or a generic worker order, and neither
+// its `Debug` nor its serde output ever shows the value.
+message HealthCheckHeaderValue {
+    required string name = 1;
+    required bytes value = 2;
+}
+
 message HealthCheckConfig {
     // Request target of the HTTP probe; must start with `/`. Ignored in
     // `TCP` mode. Kept `required` on the wire for compatibility with
@@ -1616,6 +1705,24 @@ message HealthCheckConfig {
     // address. A peer that predates this field ignores it and probes the
     // data port.
     optional uint32 port = 9;
+    // Extra request header fields of the HTTP probe (typically
+    // `Authorization`), in the order they are sent. Refused in `TCP` mode, with
+    // more than 32 entries, with a duplicate name (compared case-insensitively),
+    // with a name that is not an RFC 9110 `token` or that begins with `:` or is
+    // one of `host`, `connection`, `keep-alive`, `proxy-connection`,
+    // `transfer-encoding`, `content-length`, `te`, `trailer`, `upgrade`,
+    // `expect`, with a value holding a control byte other than HTAB or beginning or ending
+    // with SP or HTAB (RFC 9113 section 8.2.1; protobuf
+    // and TOML keep exact bytes and are refused), or when
+    // the sum of `name + value + 4` bytes exceeds 8192 or the HTTP/2 probe's
+    // HPACK block (four pseudo-headers included) may exceed 16384 bytes.
+    // Only names and fingerprints live here; the values travel in
+    // `SetProtectedHealthCheck`. A configuration that names headers whose
+    // values the process does not hold (restored from a saved state, or set
+    // through `SetHealthCheck`) sends no probe until they are provided again.
+    // A peer that predates this field ignores it, probes without the headers,
+    // and drops them when it re-emits the state.
+    repeated HealthCheckHeader headers = 10;
     // The probe wire format is derived from `Cluster.http2` (the same
     // backend-capability hint the mux router reads). When the cluster
     // sets `http2 = true`, the probe sends the HTTP/2 connection
@@ -1791,6 +1898,8 @@ message ResponseContent {
         MaxConnectionsPerSubnetLimit max_connections_per_subnet_limit = 18;
         // one worker's outcome of `Request.close_sessions`
         ClosedSessions closed_sessions = 19;
+        // a worker's positive answer to a protected health check order
+        ProtectedHealthCheckReply protected_health_check_reply = 20;
     }
 }
 

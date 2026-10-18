@@ -7,6 +7,7 @@
 //! request state), `requests` (verb dispatch + audit), `upgrade` (binary
 //! reload). Long-form lifecycle: `bin/src/command/LIFECYCLE.md`.
 
+mod protected;
 mod requests;
 pub mod server;
 pub mod sessions;
@@ -139,13 +140,9 @@ pub fn begin_main_process(args: &Args) -> Result<(), StartError> {
         requests::load_state(&mut command_hub.server, None, &path);
     }
 
-    // #228: tell systemd the master is ready (Type=notify). No-op when
-    // `$NOTIFY_SOCKET` is unset (not running under systemd).
-    match sd_notify::notify(sd_notify::STATE_READY) {
-        Ok(true) => debug!("notified systemd: READY=1"),
-        Ok(false) => {}
-        Err(e) => warn!("could not notify systemd READY=1: {}", e),
-    }
+    // #228: systemd is told the master is ready (Type=notify) by the event
+    // loop, once the workers and the queued startup tasks have settled.
+    command_hub.arm_cold_ready();
 
     let upgrading = command_hub.run();
 

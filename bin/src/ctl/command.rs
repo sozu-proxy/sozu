@@ -1,14 +1,33 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sozu_command_lib::{
     logging::setup_logging_with_config,
     proto::command::{
-        ListWorkers, QueryMetricsOptions, Request, Response, ResponseContent, ResponseStatus,
+        ListWorkers, ProtectedHealthCheckPhase, QueryMetricsOptions,
+        QueryProtectedHealthCheckSupport, Request, Response, ResponseContent, ResponseStatus,
         RunState, UpgradeMain, request::RequestType, response_content::ContentType,
     },
 };
 
 use crate::ctl::{CommandManager, CtlError, create_channel};
+
+/// Total time the main process has to confirm the protected health check
+/// protocol. It is its own budget: the global command timeout, which `0`
+/// disables, does not apply, and progress reports do not extend it.
+const PROTECTED_CAPABILITY_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Whether `response` is exactly the capability reply of the protected health
+/// check protocol: no cluster, version 0, and no other content.
+fn confirms_protected_health_check_support(response: &Response) -> bool {
+    matches!(
+        &response.content,
+        Some(ResponseContent {
+            content_type: Some(ContentType::ProtectedHealthCheckReply(reply)),
+        }) if reply.phase == ProtectedHealthCheckPhase::ProtectedHealthCheckCapability as i32
+            && reply.cluster_id.is_empty()
+            && reply.version == 0
+    )
+}
 
 impl CommandManager {
     fn write_request_on_channel(&mut self, request: Request) -> Result<(), CtlError> {
@@ -55,6 +74,37 @@ impl CommandManager {
                 }
                 ResponseStatus::Failure => return Err(CtlError::Failure(response.message)),
                 ResponseStatus::Ok => return Ok(response),
+            }
+        }
+    }
+
+    /// Ask the main process whether every worker supports protected health
+    /// check headers, within [`PROTECTED_CAPABILITY_DEADLINE`] counted from the
+    /// request. Only an `Ok` carrying exactly the capability reply is a yes:
+    /// a failure, any other answer, silence, a closed channel or the deadline
+    /// refuse, and the caller then reads and sends nothing.
+    pub(super) fn require_protected_health_check_support(&mut self) -> Result<(), CtlError> {
+        let deadline = Instant::now() + PROTECTED_CAPABILITY_DEADLINE;
+        self.write_request_on_channel(
+            RequestType::QueryProtectedHealthCheckSupport(QueryProtectedHealthCheckSupport {})
+                .into(),
+        )?;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let response = self
+                .channel
+                .read_message_blocking_timeout(Some(remaining))
+                .map_err(|error| {
+                    debug!("protected health check capability query: {}", error);
+                    CtlError::ProtectedHealthCheckUnsupported
+                })?;
+            match response.status() {
+                ResponseStatus::Processing => {}
+                ResponseStatus::Failure => return Err(CtlError::Failure(response.message)),
+                ResponseStatus::Ok if confirms_protected_health_check_support(&response) => {
+                    return Ok(());
+                }
+                ResponseStatus::Ok => return Err(CtlError::ProtectedHealthCheckUnsupported),
             }
         }
     }

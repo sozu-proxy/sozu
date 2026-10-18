@@ -5,21 +5,47 @@
 //! insert / replace operations use overlapping-safe `std::ptr::copy`
 //! (NOT `copy_nonoverlapping`) with bounds checked against
 //! `self.capacity()`.
+//!
+//! The buffer carries command-channel frames, some of which hold protected
+//! values, so it keeps one invariant: every byte of `memory` outside the
+//! pending window `position..end` is zero. Consuming, reading, resetting,
+//! shifting, deleting or replacing erases the bytes that stop being pending,
+//! and growing or shrinking copies the pending window into a fresh zeroed
+//! allocation and erases the old one before releasing it, instead of letting
+//! `Vec::resize` / `Vec::shrink_to_fit` free it unwiped. `Drop` erases what is
+//! still pending, and `Debug` prints offsets only.
 
 use std::{
-    cmp,
+    cmp, fmt,
     io::{self, Read, Write},
-    ptr,
+    mem, ptr,
 };
 
 use pool::Reset;
+use zeroize::Zeroize;
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(PartialEq, Eq, Clone)]
 pub struct Buffer {
     memory: Vec<u8>,
     capacity: usize,
     position: usize,
     end: usize,
+}
+
+impl fmt::Debug for Buffer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Buffer")
+            .field("capacity", &self.capacity)
+            .field("position", &self.position)
+            .field("end", &self.end)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        self.memory.zeroize();
+    }
 }
 
 impl Buffer {
@@ -46,7 +72,7 @@ impl Buffer {
             return false;
         }
 
-        self.memory.resize(new_size, 0);
+        self.reallocate(new_size);
         self.capacity = new_size;
         true
     }
@@ -61,10 +87,40 @@ impl Buffer {
         if self.end > target_size {
             return false;
         }
-        self.memory.truncate(target_size);
-        self.memory.shrink_to_fit();
+        self.reallocate(target_size);
         self.capacity = target_size;
         true
+    }
+
+    /// Move the pending window `position..end` to a fresh zeroed allocation of
+    /// `size` bytes, at the same offsets, and erase the old allocation before
+    /// it is released.
+    ///
+    /// `Vec::resize` and `Vec::shrink_to_fit` may free the old block with the
+    /// pending bytes still in it, and nothing can erase a block that is gone.
+    fn reallocate(&mut self, size: usize) {
+        debug_assert!(
+            self.end <= size,
+            "the pending window must fit the new allocation"
+        );
+        debug_assert!(
+            self.position <= self.end,
+            "the pending window must not be inverted"
+        );
+        let mut destination = vec![0; size];
+        destination[self.position..self.end].copy_from_slice(&self.memory[self.position..self.end]);
+        let mut previous = mem::replace(&mut self.memory, destination);
+        previous.zeroize();
+    }
+
+    /// Erase `memory[from..to]`, which has just stopped being pending.
+    fn erase(&mut self, from: usize, to: usize) {
+        debug_assert!(from <= to, "the erased range must not be inverted");
+        debug_assert!(
+            to <= self.memory.len(),
+            "the erased range must be in bounds"
+        );
+        self.memory[from..to].zeroize();
     }
 
     pub fn available_data(&self) -> usize {
@@ -85,6 +141,7 @@ impl Buffer {
 
     pub fn consume(&mut self, count: usize) -> usize {
         let cnt = cmp::min(count, self.available_data());
+        self.erase(self.position, self.position + cnt);
         self.position += cnt;
         if self.position > self.capacity / 2 {
             //trace!("consume shift: pos {}, end {}", self.position, self.end);
@@ -106,6 +163,7 @@ impl Buffer {
     }
 
     pub fn reset(&mut self) {
+        self.erase(self.position, self.end);
         self.position = 0;
         self.end = 0;
     }
@@ -120,6 +178,7 @@ impl Buffer {
 
     pub fn shift(&mut self) {
         if self.position > 0 {
+            let previous_end = self.end;
             // SAFETY: src and dst point into `self.memory` (same
             // allocation); the slice indexing above bounds-checks both
             // ranges (`position..end` and `..length`) against the live
@@ -134,6 +193,9 @@ impl Buffer {
                 self.position = 0;
                 self.end = length;
             }
+            // The window moved down; what it used to cover above its new end
+            // is a stale copy.
+            self.erase(self.end, previous_end);
         }
     }
 
@@ -142,6 +204,7 @@ impl Buffer {
             return None;
         }
 
+        let previous_end = self.end;
         // SAFETY: src and dst point into `self.memory` (same allocation).
         // The early-return above guarantees `start + length < available_data`,
         // and slice indexing bounds-checks both `begin+length..end` and
@@ -157,6 +220,9 @@ impl Buffer {
             );
             self.end = next_end;
         }
+        // The tail moved down over the deleted bytes; its old position above
+        // the new end is a stale copy.
+        self.erase(self.end, previous_end);
         Some(self.available_data())
     }
 
@@ -168,6 +234,7 @@ impl Buffer {
             return None;
         }
 
+        let previous_end = self.end;
         // SAFETY: every `ptr::copy` below moves bytes inside `self.memory`
         // (same allocation) or copies from the caller's `data` slice into
         // it. The two early-return checks above bound the affected ranges
@@ -205,6 +272,11 @@ impl Buffer {
                 );
                 self.end += data_len - length;
             }
+        }
+        // A reduced window leaves its old tail above the new end; a grown one
+        // has nothing to erase (`previous_end <= end`).
+        if self.end < previous_end {
+            self.erase(self.end, previous_end);
         }
         Some(self.available_data())
     }
@@ -269,8 +341,10 @@ impl Read for Buffer {
                 buf.as_mut_ptr(),
                 len,
             );
-            self.position += len;
         }
+        // The caller owns the copy now; the buffer keeps none of it.
+        self.erase(self.position, self.position + len);
+        self.position += len;
         Ok(len)
     }
 }

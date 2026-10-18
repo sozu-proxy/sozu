@@ -33,21 +33,33 @@ use std::{
     io::{ErrorKind, Read, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     os::fd::AsRawFd,
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
 
-use sozu_command_lib::proto::command::{
-    HealthCheckConfig, HealthCheckMode, HttpStatusRange, QueryMetricsOptions, ResponseStatus,
-    SetHealthCheck, WorkerResponse, filtered_metrics, request::RequestType,
-    response_content::ContentType,
+use sozu_command_lib::{
+    proto::command::{
+        HealthCheckConfig, HealthCheckHeader, HealthCheckHeaderValue, HealthCheckMode,
+        HttpStatusRange, ProtectedHealthCheckOrder, ProtectedHealthCheckPhase, QueryMetricsOptions,
+        ResponseStatus, SetHealthCheck, SetProtectedHealthCheck, WorkerResponse, filtered_metrics,
+        request::RequestType, response_content::ContentType,
+    },
+    secret::{FingerprintKey, ProtectedHealthCheck},
 };
-use sozu_lib::metrics::names::health_check::{DOWN, FAILURE, SUCCESS};
+use sozu_lib::{
+    metrics::names::health_check::{DOWN, FAILURE, SUCCESS, UP},
+    protocol::mux::hpack::{Decoder, Encoder},
+};
 
 use crate::{
     http_utils::http_request,
     mock::{
         aggregator::SimpleAggregator, async_backend::BackendHandle as AsyncBackend, client::Client,
+        h2_backend::H2Backend,
     },
     sozu::worker::Worker,
     tests::{
@@ -74,6 +86,7 @@ fn fast_health_check(mode: HealthCheckMode) -> HealthCheckConfig {
         mode: mode as i32,
         accepted_statuses: Vec::new(),
         port: None,
+        headers: Vec::new(),
     }
 }
 
@@ -208,17 +221,31 @@ fn read_probe_request(stream: &mut TcpStream) -> Vec<u8> {
 
 /// Read the worker's `health_check.*` counters as `(success, failure, down)`;
 /// an absent counter reads as 0.
+fn query_counters(worker: &mut Worker) -> (i64, i64, i64) {
+    let [success, failure, down, _] = query_health_counters(worker);
+    (success, failure, down)
+}
+
+/// Read the worker's `health_check.*` counters as
+/// `[success, failure, down, up]`; an absent counter reads as 0. `down` and
+/// `up` count the backend's health-state transitions, `success` and `failure`
+/// every probe result.
 ///
 /// The health checker queues `HealthCheckUnhealthy` / `NoAvailableBackends`
 /// events on the command channel as soon as a backend goes down, so the
 /// responses are read up to the one answering this query rather than
 /// trusting the next message to be it.
-fn query_counters(worker: &mut Worker) -> (i64, i64, i64) {
+fn query_health_counters(worker: &mut Worker) -> [i64; 4] {
     worker.send_proxy_request_type(RequestType::QueryMetrics(QueryMetricsOptions {
         list: false,
         cluster_ids: vec![],
         backend_ids: vec![],
-        metric_names: vec![SUCCESS.to_owned(), FAILURE.to_owned(), DOWN.to_owned()],
+        metric_names: vec![
+            SUCCESS.to_owned(),
+            FAILURE.to_owned(),
+            DOWN.to_owned(),
+            UP.to_owned(),
+        ],
         no_clusters: true,
         workers: false,
     }));
@@ -239,7 +266,7 @@ fn query_counters(worker: &mut Worker) -> (i64, i64, i64) {
         Some(filtered_metrics::Inner::Count(value)) => *value,
         _ => 0,
     };
-    (count(SUCCESS), count(FAILURE), count(DOWN))
+    [count(SUCCESS), count(FAILURE), count(DOWN), count(UP)]
 }
 
 /// Poll the worker's counters until `done` holds or the budget runs out;
@@ -252,6 +279,21 @@ fn wait_for_counters(
     loop {
         let sample = query_counters(worker);
         if done(sample.0, sample.1, sample.2) || Instant::now() >= deadline {
+            return sample;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Like [`wait_for_counters`], over `[success, failure, down, up]`.
+fn wait_for_health_counters(
+    worker: &mut Worker,
+    mut done: impl FnMut([i64; 4]) -> bool,
+) -> [i64; 4] {
+    let deadline = Instant::now() + VERDICT_BUDGET;
+    loop {
+        let sample = query_health_counters(worker);
+        if done(sample) || Instant::now() >= deadline {
             return sample;
         }
         thread::sleep(Duration::from_millis(200));
@@ -937,4 +979,583 @@ fn test_health_check_http_mode_probe_port_answering_keeps_backend_up() {
         ),
         State::Success
     );
+}
+
+// ---------------------------------------------------------------------------
+// Custom probe headers
+// ---------------------------------------------------------------------------
+
+/// Synthetic credentials: the exact value the probe backend demands, and a
+/// wrong one.
+const PROBE_AUTHORIZATION: &str = "Bearer SYNTHETIC-HC-PROBE-TOKEN-5a2c";
+const WRONG_AUTHORIZATION: &str = "Bearer SYNTHETIC-HC-WRONG-TOKEN-77d0";
+
+/// The key every protected order of this process is fingerprinted under: one
+/// per process, never one per phase or per call.
+fn fixture_key() -> &'static FingerprintKey {
+    static KEY: OnceLock<FingerprintKey> = OnceLock::new();
+    KEY.get_or_init(|| FingerprintKey::generate().expect("the OS random generator is available"))
+}
+
+/// Upper bound of the versions this process issues: far above what the suite
+/// needs, so exhausting it is a bug of the suite and not a wrap-around.
+const LAST_PROTECTED_VERSION: u64 = 1 << 16;
+
+/// The next protected header version of this process. Strictly increasing, so
+/// no worker fixture is ever staged the same version twice, and `0`, which no
+/// transaction uses, is never issued.
+fn next_protected_version() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |version| {
+        (version <= LAST_PROTECTED_VERSION).then_some(version + 1)
+    })
+    .expect("the protected header versions of the suite are exhausted")
+}
+
+/// Send one `ProtectedHealthCheckOrder` and wait for its answer, which must be
+/// a positive `ProtectedHealthCheckReply` naming exactly this phase, cluster and
+/// version. `prepare` is only carried by the prepare phase.
+fn protected_health_check_phase(
+    worker: &mut Worker,
+    phase: ProtectedHealthCheckPhase,
+    cluster_id: &str,
+    version: u64,
+    prepare: Option<SetProtectedHealthCheck>,
+) -> WorkerResponse {
+    assert_eq!(
+        prepare.is_some(),
+        phase == ProtectedHealthCheckPhase::ProtectedHealthCheckPrepare,
+        "only the prepare phase carries a health check"
+    );
+    worker.send_proxy_request_type(RequestType::ProtectedHealthCheckOrder(
+        ProtectedHealthCheckOrder {
+            phase: phase as i32,
+            cluster_id: cluster_id.to_owned(),
+            version,
+            prepare,
+        },
+    ));
+    let response = loop {
+        let response = worker
+            .read_proxy_response()
+            .expect("the worker answers ProtectedHealthCheckOrder");
+        if response.id == worker.command_id.last {
+            break response;
+        }
+    };
+    assert_eq!(
+        response.status,
+        ResponseStatus::Ok as i32,
+        "{phase:?} of version {version} was refused: {}",
+        response.message
+    );
+    let Some(ContentType::ProtectedHealthCheckReply(reply)) = response
+        .content
+        .as_ref()
+        .and_then(|content| content.content_type.as_ref())
+    else {
+        panic!("{phase:?} of version {version} must answer with a ProtectedHealthCheckReply");
+    };
+    assert_eq!(
+        (
+            ProtectedHealthCheckPhase::try_from(reply.phase),
+            reply.cluster_id.as_str(),
+            reply.version
+        ),
+        (Ok(phase), cluster_id, version),
+        "the reply must name the phase, the cluster and the version it acted on"
+    );
+    response
+}
+
+/// Set `config` on the worker with `headers` as its ordered `(name, value)`
+/// probe headers, through the protocol a worker actually speaks: prepare,
+/// commit, release. The values reach the worker the one way they can, in the
+/// prepare order built from the in-memory protected primitives and
+/// fingerprinted under [`fixture_key`], never through `config`. An empty
+/// `headers` is a protected clear: the cluster keeps its health check and
+/// loses its headers. Returns the answer to the release.
+fn set_protected_health_check(
+    worker: &mut Worker,
+    mut config: HealthCheckConfig,
+    headers: &[(&str, &str)],
+) -> WorkerResponse {
+    const CLUSTER: &str = "cluster_0";
+    config.headers = headers
+        .iter()
+        .map(|(name, _)| HealthCheckHeader {
+            name: (*name).to_owned(),
+            fingerprint: String::new(),
+        })
+        .collect();
+    let mut order = SetProtectedHealthCheck {
+        cluster_id: CLUSTER.to_owned(),
+        config,
+        values: headers
+            .iter()
+            .map(|(name, value)| HealthCheckHeaderValue {
+                name: (*name).to_owned(),
+                value: value.as_bytes().to_vec(),
+            })
+            .collect(),
+    };
+    let protected = ProtectedHealthCheck::from_ingress(fixture_key(), &mut order)
+        .expect("the synthetic headers are valid");
+    let version = next_protected_version();
+    let phase = |worker: &mut Worker, phase, prepare| {
+        protected_health_check_phase(worker, phase, CLUSTER, version, prepare)
+    };
+    phase(
+        worker,
+        ProtectedHealthCheckPhase::ProtectedHealthCheckPrepare,
+        Some(protected.to_order()),
+    );
+    phase(
+        worker,
+        ProtectedHealthCheckPhase::ProtectedHealthCheckCommit,
+        None,
+    );
+    phase(
+        worker,
+        ProtectedHealthCheckPhase::ProtectedHealthCheckRelease,
+        None,
+    )
+}
+
+/// Set `config` on the worker with `headers` as its ordered `(name, value)`
+/// probe headers: a protected transaction when there is any, the ordinary
+/// `SetHealthCheck` when there is none.
+fn set_health_check_with_headers(
+    worker: &mut Worker,
+    config: HealthCheckConfig,
+    headers: &[(&str, &str)],
+) -> WorkerResponse {
+    if headers.is_empty() {
+        return set_health_check(worker, config);
+    }
+    set_protected_health_check(worker, config, headers)
+}
+
+/// The `Authorization` value of each request a probe backend received, `None`
+/// for a request without one.
+type SeenAuthorizations = Arc<Mutex<Vec<Option<Vec<u8>>>>>;
+
+/// A probe backend answering 200 to the exact `PROBE_AUTHORIZATION` and 401
+/// to any other request, recording the `Authorization` it saw: HTTP/1.1, or
+/// cleartext HTTP/2 when `h2c`.
+enum AuthorizationServer {
+    H1(AsyncBackend<SimpleAggregator>, SeenAuthorizations),
+    H2(H2Backend),
+}
+
+impl AuthorizationServer {
+    fn start(h2c: bool, address: SocketAddr) -> Self {
+        if h2c {
+            return Self::H2(H2Backend::start_requiring_authorization(
+                "HC_AUTH_H2",
+                address,
+                "ok",
+                PROBE_AUTHORIZATION,
+            ));
+        }
+        let seen = SeenAuthorizations::default();
+        let recorded = Arc::clone(&seen);
+        let backend = AsyncBackend::spawn_detached_backend(
+            "HC_AUTH_H1",
+            address,
+            SimpleAggregator {
+                requests_received: 0,
+                responses_sent: 0,
+            },
+            Box::new(move |mut stream: &TcpStream, _name: &str, mut aggregator| {
+                let mut buf = [0u8; 4096];
+                let n = match stream.read(&mut buf) {
+                    Ok(n) if n > 0 => n,
+                    _ => return aggregator,
+                };
+                aggregator.requests_received += 1;
+                let authorization = buf[..n]
+                    .split(|byte| *byte == b'\n')
+                    .find_map(|line| line.strip_prefix(b"Authorization: "))
+                    .map(|value| value.strip_suffix(b"\r").unwrap_or(value).to_vec());
+                let status_line =
+                    if authorization.as_deref() == Some(PROBE_AUTHORIZATION.as_bytes()) {
+                        "200 OK"
+                    } else {
+                        "401 Unauthorized"
+                    };
+                recorded
+                    .lock()
+                    .expect("the authorization log is not poisoned")
+                    .push(authorization);
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                if stream.write_all(response.as_bytes()).is_ok() {
+                    aggregator.responses_sent += 1;
+                }
+                aggregator
+            }),
+        );
+        Self::H1(backend, seen)
+    }
+
+    fn seen(&self) -> Vec<Option<Vec<u8>>> {
+        match self {
+            Self::H1(_, seen) => seen
+                .lock()
+                .expect("the authorization log is not poisoned")
+                .clone(),
+            Self::H2(backend) => backend
+                .recorded_requests()
+                .into_iter()
+                .map(|request| {
+                    request
+                        .headers
+                        .into_iter()
+                        .find(|(name, _)| name == "authorization")
+                        .map(|(_, value)| value)
+                })
+                .collect(),
+        }
+    }
+
+    /// Wait until a request satisfying `wanted` was seen.
+    fn wait_until_seen(&self, wanted: impl Fn(&Option<Vec<u8>>) -> bool) -> bool {
+        let deadline = Instant::now() + VERDICT_BUDGET;
+        while Instant::now() < deadline {
+            if self.seen().iter().any(&wanted) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+
+    fn stop(self) {
+        match self {
+            Self::H1(mut backend, _) => {
+                backend.stop_and_get_aggregator();
+            }
+            Self::H2(mut backend) => backend.stop(),
+        }
+    }
+}
+
+/// A backend whose probe port demands an `Authorization`, away from its
+/// (closed) data port, is marked DOWN while the probe sends none or a wrong
+/// one, and UP once it sends the exact value. The verdict is read from the
+/// worker's health counters: a request through the frontend would not tell,
+/// since an all-down cluster fails open.
+fn authorization_gates_health_state(name: &str, h2c: bool) {
+    let front_address = create_local_address();
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, _) = setup_async_test(name, config, listeners, state, front_address, 0, false);
+    if h2c {
+        let mut cluster = Worker::default_cluster("cluster_0");
+        cluster.http2 = Some(true);
+        worker.send_proxy_request_type(RequestType::AddCluster(cluster));
+        worker.read_to_last();
+    }
+
+    let data_address = create_unbound_local_address();
+    let probe_address = create_local_address();
+    assert_ne!(data_address.port(), probe_address.port());
+    let server = AuthorizationServer::start(h2c, probe_address);
+    add_backend(&mut worker, "cluster_0-auth", data_address);
+    let probe_config = || HealthCheckConfig {
+        port: Some(u32::from(probe_address.port())),
+        ..fast_health_check(HealthCheckMode::Http)
+    };
+
+    // No header: 401, the backend goes DOWN, never UP.
+    assert_eq!(
+        set_health_check_with_headers(&mut worker, probe_config(), &[]).status,
+        ResponseStatus::Ok as i32
+    );
+    let [success, failure, down, up] =
+        wait_for_health_counters(&mut worker, |[_, failure, down, _]| {
+            failure >= 1 && down >= 1
+        });
+    assert_eq!(
+        (success, down, up),
+        (0, 1, 0),
+        "a probe without the credential must fail: failure={failure}"
+    );
+    assert!(
+        server.seen().iter().all(Option::is_none),
+        "no probe carried an Authorization yet: {:?}",
+        server.seen()
+    );
+
+    // A wrong value is refused too: the backend stays DOWN, and the server
+    // saw that very value.
+    assert_eq!(
+        set_health_check_with_headers(
+            &mut worker,
+            probe_config(),
+            &[("Authorization", WRONG_AUTHORIZATION)]
+        )
+        .status,
+        ResponseStatus::Ok as i32
+    );
+    assert!(
+        server.wait_until_seen(|value| value.as_deref() == Some(WRONG_AUTHORIZATION.as_bytes())),
+        "a probe must carry the configured value: {:?}",
+        server.seen()
+    );
+    let failures_before = query_health_counters(&mut worker)[1];
+    let [success, failure, down, up] =
+        wait_for_health_counters(&mut worker, |[_, failure, ..]| failure > failures_before);
+    assert_eq!(
+        (success, down, up),
+        (0, 1, 0),
+        "a wrong credential must keep the backend DOWN: failure={failure}"
+    );
+
+    // The exact value: 200, and the backend comes back UP.
+    assert_eq!(
+        set_health_check_with_headers(
+            &mut worker,
+            probe_config(),
+            &[("Authorization", PROBE_AUTHORIZATION)]
+        )
+        .status,
+        ResponseStatus::Ok as i32
+    );
+    let [success, _, down, up] =
+        wait_for_health_counters(&mut worker, |[success, _, _, up]| success >= 1 && up >= 1);
+    assert_eq!(
+        (success >= 1, down, up),
+        (true, 1, 1),
+        "the exact credential must mark the backend UP (success={success})"
+    );
+    assert!(
+        server
+            .seen()
+            .contains(&Some(PROBE_AUTHORIZATION.as_bytes().to_vec())),
+        "the exact credential reached the backend: {:?}",
+        server.seen()
+    );
+
+    stop(worker);
+    server.stop();
+}
+
+#[test]
+fn test_health_check_http_authorization_header_gates_health_state_h1() {
+    authorization_gates_health_state("HC-AUTH-H1", false);
+}
+
+#[test]
+fn test_health_check_http_authorization_header_gates_health_state_h2c() {
+    authorization_gates_health_state("HC-AUTH-H2C", true);
+}
+
+/// The custom fields of one probe, in wire order: HTTP/1.1 field lines, or the
+/// HPACK-decoded fields of the HEADERS frame, minus the probe-owned ones.
+fn read_probe_fields(stream: &mut TcpStream, h2c: bool) -> Vec<(String, Vec<u8>)> {
+    if !h2c {
+        let request = read_probe_request(stream);
+        let text = String::from_utf8(request).expect("the probe is UTF-8");
+        let mut fields = Vec::new();
+        for line in text.split("\r\n").skip(1).filter(|line| !line.is_empty()) {
+            let (name, value) = line.split_once(": ").expect("a field line");
+            if !["Host", "Connection"].contains(&name) {
+                fields.push((name.to_owned(), value.as_bytes().to_vec()));
+            }
+        }
+        return fields;
+    }
+    const PREFACE_AND_SETTINGS: usize = 24 + 9;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 512];
+    let block = loop {
+        if buf.len() >= PREFACE_AND_SETTINGS + 9 {
+            let frame = &buf[PREFACE_AND_SETTINGS..];
+            let len = (usize::from(frame[0]) << 16)
+                | (usize::from(frame[1]) << 8)
+                | usize::from(frame[2]);
+            assert_eq!(
+                frame[3], 0x01,
+                "the probe's first frame after SETTINGS is HEADERS"
+            );
+            if frame.len() >= 9 + len {
+                break frame[9..9 + len].to_vec();
+            }
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => panic!("h2c probe closed before its HEADERS frame completed"),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(error) => panic!("could not read the h2c probe: {error}"),
+        }
+    };
+    let mut fields = Vec::new();
+    Decoder::new()
+        .decode_with_cb(&block, |name, value| {
+            if !name.starts_with(b":") {
+                fields.push((
+                    String::from_utf8(name.to_vec()).expect("an ASCII name"),
+                    value.to_vec(),
+                ));
+            }
+        })
+        .expect("the probe HPACK block decodes");
+    fields
+}
+
+/// Answer a probe read by [`read_probe_fields`] with a bare 200 and close.
+fn finish_probe(mut stream: TcpStream, h2c: bool) {
+    let response = if h2c {
+        let mut block = Vec::new();
+        Encoder::new().encode_into([(b":status".as_slice(), b"200".as_slice())], &mut block);
+        let mut frames = vec![0, 0, 0, 0x04, 0, 0, 0, 0, 0];
+        let len = block.len();
+        frames.extend_from_slice(&[(len >> 16) as u8, (len >> 8) as u8, len as u8, 0x01, 0x05]);
+        frames.extend_from_slice(&1u32.to_be_bytes());
+        frames.extend_from_slice(&block);
+        frames
+    } else {
+        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+    };
+    stream
+        .write_all(&response)
+        .expect("could not answer the probe");
+    stream
+        .shutdown(Shutdown::Write)
+        .expect("could not close the probe response");
+}
+
+/// A header set change applies to the next probe only: a probe whose
+/// connection is still being established when the set is replaced sends the
+/// headers it was launched with, never the replacement; later probes send the
+/// replacement, then none.
+///
+/// The first probe dials a backend whose accept queue is full, so its
+/// request is not written until the test drains the queue, after both
+/// replacements were acknowledged: a probe that read the live configuration
+/// when it writes, not when it is launched, would send the last set.
+fn in_flight_probe_keeps_its_headers_then_later_probes_use_the_new_set(name: &str, h2c: bool) {
+    let front_address = create_local_address();
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, _) = setup_async_test(name, config, listeners, state, front_address, 0, false);
+    if h2c {
+        let mut cluster = Worker::default_cluster("cluster_0");
+        cluster.http2 = Some(true);
+        worker.send_proxy_request_type(RequestType::AddCluster(cluster));
+        worker.read_to_last();
+    }
+    // HTTP/2 names are lowercase on the wire.
+    let wire = |name: &str| {
+        if h2c {
+            name.to_ascii_lowercase()
+        } else {
+            name.to_owned()
+        }
+    };
+    let fields = |headers: &[(&str, &str)]| -> Vec<(String, Vec<u8>)> {
+        headers
+            .iter()
+            .map(|(name, value)| (wire(name), value.as_bytes().to_vec()))
+            .collect()
+    };
+
+    let first = [
+        ("Authorization", "Bearer SYNTHETIC-HC-FIRST-1f00"),
+        ("X-Zeta", "z"),
+        ("x-Alpha", "a"),
+    ];
+    let second = [
+        ("X-Second", "2"),
+        ("Authorization", "Bearer SYNTHETIC-HC-SECOND-8e11"),
+    ];
+
+    let blackhole = Blackhole::new();
+    let queued = blackhole._queued.len();
+    add_backend(&mut worker, "cluster_0-snapshot", blackhole.address);
+    // Probes are judged by a 200; a long timeout keeps the blackholed one alive.
+    let with_interval = |interval: u32| HealthCheckConfig {
+        interval,
+        timeout: 10,
+        ..fast_health_check(HealthCheckMode::Http)
+    };
+
+    // Launches the probe: its SYN is dropped by the full accept queue.
+    assert_eq!(
+        set_health_check_with_headers(&mut worker, with_interval(30), &first).status,
+        ResponseStatus::Ok as i32
+    );
+    assert_eq!(
+        set_health_check_with_headers(&mut worker, with_interval(1), &second).status,
+        ResponseStatus::Ok as i32,
+        "SetHealthCheck must acknowledge the new headers while a probe is launching"
+    );
+    assert_eq!(
+        query_counters(&mut worker),
+        (0, 0, 0),
+        "replacing the headers must not complete the probe"
+    );
+
+    // Free the queue: the probe's SYN retransmission completes the handshake.
+    blackhole
+        ._listener
+        .set_nonblocking(true)
+        .expect("could not make the listener nonblocking");
+    for _ in 0..queued {
+        accept_probe(&blackhole._listener);
+    }
+    let mut probe = accept_probe(&blackhole._listener);
+    assert_eq!(
+        read_probe_fields(&mut probe, h2c),
+        fields(&first),
+        "the probe launched before the replacement keeps the headers it was launched with"
+    );
+    finish_probe(probe, h2c);
+    let results = wait_for_counters(&mut worker, |success, _, _| success >= 1);
+    assert_eq!(results, (1, 0, 0), "the first probe passes");
+
+    // The next probe, launched after the replacement, sends the new set; it
+    // is held in flight while the set is removed.
+    let mut probe = accept_probe(&blackhole._listener);
+    assert_eq!(
+        read_probe_fields(&mut probe, h2c),
+        fields(&second),
+        "the next probe sends the replacement headers, in order"
+    );
+    assert_eq!(
+        set_protected_health_check(&mut worker, with_interval(1), &[]).status,
+        ResponseStatus::Ok as i32
+    );
+    assert_eq!(
+        query_counters(&mut worker),
+        (1, 0, 0),
+        "removing the headers must not complete the probe in flight"
+    );
+    finish_probe(probe, h2c);
+    wait_for_counters(&mut worker, |success, _, _| success >= 2);
+
+    let mut probe = accept_probe(&blackhole._listener);
+    assert_eq!(
+        read_probe_fields(&mut probe, h2c),
+        Vec::<(String, Vec<u8>)>::new(),
+        "once removed, a probe sends no custom header"
+    );
+    finish_probe(probe, h2c);
+    let results = wait_for_counters(&mut worker, |success, _, _| success >= 3);
+    assert!(
+        results.0 >= 3 && results.1 == 0 && results.2 == 0,
+        "every probe passed: {results:?}"
+    );
+
+    stop(worker);
+}
+
+#[test]
+fn test_health_check_in_flight_probe_keeps_its_headers_h1() {
+    in_flight_probe_keeps_its_headers_then_later_probes_use_the_new_set("HC-HDR-CUTOVER-H1", false);
+}
+
+#[test]
+fn test_health_check_in_flight_probe_keeps_its_headers_h2c() {
+    in_flight_probe_keeps_its_headers_then_later_probes_use_the_new_set("HC-HDR-CUTOVER-H2C", true);
 }

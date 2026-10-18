@@ -190,6 +190,9 @@ pub mod health_check {
     pub const SUCCESS: &str = "health_check.success";
     pub const FAILURE: &str = "health_check.failure";
     pub const HEALTHY_BACKENDS: &str = "health_check.healthy_backends";
+    /// Probes not sent because the configuration names headers whose values
+    /// this worker does not hold. Neither a success nor a failure.
+    pub const MISSING_SECRET: &str = "health_check.missing_secret";
 }
 
 /// H1 protocol counters.

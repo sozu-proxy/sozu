@@ -12,7 +12,9 @@
 //! or worker-replay recovery path before claiming convergence.
 //!
 //! Linux process signals and a real Sōzu binary make this an ignored test;
-//! `.github/workflows/ci.yml` runs it explicitly in every provider cell.
+//! the `proc-observer-e2e` job of `.github/workflows/ci.yml` runs it in every
+//! provider cell, on a GitHub-hosted VM as root of a user namespace, because
+//! it observes the hardened main through `/proc/<pid>/...`.
 //! The published-2.3.1 upgrade boundary additionally needs the frozen release
 //! binary named by `SOZU_CERTIFICATE_METADATA_LEGACY`. Generic CI provider
 //! runs omit that external-artifact case; a mandatory crypto-ring step executes
@@ -75,6 +77,18 @@ const TLS_MIN_EXPIRY_METRIC: &str = "tls.cert.min_expires_at_seconds";
 
 fn sozu_bin() -> &'static str {
     env!("CARGO_BIN_EXE_sozu")
+}
+
+/// Real-main launcher: a same-UID observer cannot read `/proc/<pid>/exe` of
+/// the hardened (non-dumpable) main. `unshare --user --map-current-user` keeps
+/// the child PID and UID while making the owning observer able to read them.
+/// Absence or refusal of `unshare` fails the spawn visibly; there is no fallback.
+fn observable_main_command(binary: &Path) -> Command {
+    let mut command = Command::new("unshare");
+    command
+        .args(["--user", "--map-current-user", "--"])
+        .arg(binary);
+    command
 }
 
 fn free_tcp_port() -> u16 {
@@ -415,7 +429,7 @@ activate_listeners = false
         )
         .expect("write runtime config");
 
-        let mut command = Command::new(&installed_binary);
+        let mut command = observable_main_command(&installed_binary);
         command
             .args([
                 "start",

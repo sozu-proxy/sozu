@@ -623,6 +623,11 @@ pub struct WorkerSession {
     pending: VecDeque<WorkerRequest>,
     pub pid: pid_t,
     pub run_state: RunState,
+    /// Whether this very session got a delivered `SIGKILL` or an `ESRCH`, so
+    /// that its process is proven unable to act. `Stopped` alone proves
+    /// nothing: a kill that failed also leaves the session `Stopped`. Never
+    /// carried across a main upgrade, so a restored session is unproven.
+    pub(crate) process_stop_proven: bool,
     /// meant to send listeners to the worker upon start
     pub scm_socket: ScmSocket,
     pub token: Token,
@@ -761,6 +766,7 @@ impl PausedWorkerSession {
             pending: self.pending,
             pid: self.pid,
             run_state: self.run_state,
+            process_stop_proven: false,
             scm_socket,
             token: self.token,
         })
@@ -820,7 +826,10 @@ impl WorkerSession {
             id,
             pending: VecDeque::new(),
             pid,
-            run_state: RunState::Running,
+            // A fresh child has proven nothing yet: it becomes `Running` only
+            // when the correlated initial `Status` is answered `Ok`.
+            run_state: RunState::NotAnswering,
+            process_stop_proven: false,
             scm_socket,
             token,
         }
@@ -2162,6 +2171,23 @@ mod tests {
             error,
             SessionSnapshotError::NonblockingLegacyScmDescriptor(fd) if fd == received_scm_fd
         ));
+    }
+
+    #[test]
+    fn new_worker_session_starts_not_answering_until_readiness_is_confirmed() {
+        let (channel, _peer): (
+            Channel<WorkerRequest, WorkerResponse>,
+            Channel<WorkerResponse, WorkerRequest>,
+        ) = Channel::generate_nonblocking(64, 512).expect("could not generate worker channels");
+        let (scm_owner, _scm_peer) = StdUnixStream::pair().expect("could not create SCM pair");
+        let scm_socket =
+            ScmSocket::new(scm_owner.as_raw_fd()).expect("could not create SCM socket");
+
+        let worker = WorkerSession::new(channel, 17, 4242, Token(91), scm_socket);
+
+        assert_eq!(worker.run_state, RunState::NotAnswering);
+        assert_ne!(worker.run_state, RunState::Running);
+        assert!(worker.is_active(), "an initializing child is still alive");
     }
 
     #[test]

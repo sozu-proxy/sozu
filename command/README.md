@@ -66,6 +66,47 @@ new connections but keeps the active ones and exits when they are no longer
 active. Once all connections are done, a worker will send an answer
 with the same id and the `Ok` status.
 
+## Protected health-check headers
+
+An `HTTP` health check can carry custom request headers whose values are
+credentials. `HealthCheckConfig.headers` (field 10) holds metadata only:
+`HealthCheckHeader { name, fingerprint }`, with a fingerprint of the form
+`sozu-hc-hmac-sha256:v1:<32 lowercase hex epoch>:<64 lowercase hex tag>`. The
+clear values travel in `HealthCheckHeaderValue` inside
+`SetProtectedHealthCheck`, a request distinct from `SetHealthCheck`, which never
+carries a value. The carriers refuse to serialize or print a value, and the
+values stay in memory, never in the saved state or a query.
+
+A generic integrator of this library must do the orchestration itself; the
+library types do not add it:
+
+1. Send `QueryProtectedHealthCheckSupport` first, and read no secret source and
+   send no value until the main process answers with exactly the positive
+   `ProtectedHealthCheckReply` capability reply. The `sozu` CLI waits for it for
+   a fixed five seconds, unaffected by its generic timeout. Treat a failure, a
+   late answer, silence or any other reply as a refusal. The query before file
+   or standard-input I/O is a guarantee of the CLI; the hardened main may read
+   `value_file` references of its configuration into protected memory before it
+   launches the workers, without that query.
+2. Validate the headers with `validate_health_check_config` and the values with
+   `validate_health_check_header_values`, then send one
+   `SetProtectedHealthCheck`. `secret::read_header_value` is the reader the CLI
+   uses: it removes one final `LF` and the `CR` right before it, nothing else.
+3. The main process applies the change on the workers with the acknowledged
+   `Prepare`, `Commit`, `Abort` and `Release` exchange of
+   `ProtectedHealthCheckOrder`, and fences other changes to the same cluster in
+   the meantime. An error before every `Commit` is acknowledged retains or
+   restores the previous configuration; after every `Commit` acknowledgement, a
+   refused or timed-out `Release` is a retention or cleanup failure and cannot
+   roll back a before-image the workers already destroyed. A replacement or
+   respawned worker receives and acknowledges the values before it is Running or
+   probes. This applies to this change only; it is not a global transaction.
+
+Peers older than 2.3.2 ignore the unknown field 10 instead of failing, so the
+capability query is the only protection against sending a credential to one.
+See `doc/health_checks.md#custom-request-headers` for the limits, the cold
+restart and the upgrade behaviour.
+
 ## Control-plane audit log
 
 Every privileged mutation accepted by the unix command socket is mirrored to a

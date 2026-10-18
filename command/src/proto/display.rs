@@ -85,6 +85,8 @@ pub fn format_request_type(request_type: &RequestType) -> &str {
         RequestType::SubscribeEvents(_) => "SubscribeEvents",
         RequestType::ReloadConfiguration(_) => "ReloadConfiguration",
         RequestType::Status(_) => "Status",
+        RequestType::QueryProtectedHealthCheckSupport(_) => "QueryProtectedHealthCheckSupport",
+        RequestType::ProtectedHealthCheckOrder(_) => "ProtectedHealthCheckOrder",
         RequestType::AddCluster(_) => "AddCluster",
         RequestType::RemoveCluster(_) => "RemoveCluster",
         RequestType::AddHttpFrontend(_) => "AddHttpFrontend",
@@ -145,6 +147,7 @@ pub fn format_request_type(request_type: &RequestType) -> &str {
         RequestType::SetMaxConnectionAttempts(_) => "SetMaxConnectionAttempts",
         RequestType::QueryMaxConnectionsPerSubnet(_) => "QueryMaxConnectionsPerSubnet",
         RequestType::SetHealthCheck(_) => "SetHealthCheck",
+        RequestType::SetProtectedHealthCheck(_) => "SetProtectedHealthCheck",
         RequestType::RemoveHealthCheck(_) => "RemoveHealthCheck",
         RequestType::QueryHealthChecks(_) => "QueryHealthChecks",
         RequestType::SetMetricDetail(_) => "SetMetricDetail",
@@ -224,6 +227,7 @@ impl ResponseContent {
                     print_responses_by_worker(worker_responses, json)
                 }
             }
+            ContentType::ProtectedHealthCheckReply(_) => Ok(()), // internal acknowledgement
             ContentType::Clusters(_) | ContentType::ClusterHashes(_) => Ok(()), // not displayed directly, see print_cluster_responses
             ContentType::CertificatesByAddress(certs) => print_certificates_by_address(certs),
             ContentType::MetricDetailStatus(status) => print_metric_detail_status(status),
@@ -1146,7 +1150,8 @@ fn print_health_checks(list: &HealthChecksList) -> Result<(), DisplayError> {
         "timeout",
         "healthy threshold",
         "unhealthy threshold",
-        "accepted statuses"
+        "accepted statuses",
+        "headers"
     ]);
 
     let mut entries: Vec<_> = list.map.iter().collect();
@@ -1172,11 +1177,32 @@ fn print_health_checks(list: &HealthChecksList) -> Result<(), DisplayError> {
             format!("{}s", config.timeout),
             config.healthy_threshold,
             config.unhealthy_threshold,
-            accepted
+            accepted,
+            header_names(config)
         ]);
     }
     table.printstd();
     Ok(())
+}
+
+/// The custom header names of a probe with their fingerprints, in the order
+/// they are sent. A config holds no value, so none can reach the terminal.
+fn header_names(config: &HealthCheckConfig) -> String {
+    if config.headers.is_empty() {
+        return "-".to_owned();
+    }
+    config
+        .headers
+        .iter()
+        .map(|header| {
+            if header.fingerprint.is_empty() {
+                format!("{}: (no fingerprint)", header.name)
+            } else {
+                format!("{}: {}", header.name, header.fingerprint)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The statuses an HTTP-mode probe accepts, in the syntax

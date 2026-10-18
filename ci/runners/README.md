@@ -8,6 +8,22 @@ installs on every run: `protobuf-compiler`, `cmake`, h2spec `2.6.0`, and the fou
 all four and `rustfmt` on `nightly`). Baking these in removes that per-run install cost from
 every CI job that runs on the CKE-hosted runners.
 
+## What does not run on these runners
+
+Three process-level suites, `upgrade_fd_inheritance_e2e`, `mutable_commands_runtime_e2e`
+(including its published 2.3.1 case) and `protected_health_check_refusal_e2e` (including its
+published 2.3.1 refusal case), read `/proc/<main pid>/...` of the hardened (non-dumpable)
+main, which only a root of a user namespace can do. The protected health-check suite needs the
+same observer to prove that a header value read from a `value_file` leaves no trace in the
+output, logs, listings or saved state of the main and its workers. Each compiled test executable
+therefore runs as root of a private user namespace (`sudo unshare --user --map-current-user`) in
+the `proc-observer-e2e` job of `.github/workflows/ci.yml`, on GitHub-hosted `ubuntu-latest` VMs
+over the same nine cells as `pipeline`. The FD fixture spawns the main directly, so its own test
+process is the observer; the mutable-commands fixture also launches its mains through `unshare
+--user --map-current-user`. The CKE pods' current environment refuses user namespace creation;
+which component of its kernel policy does so is not established, so none is named here. Every
+other suite stays on these runners.
+
 ## Image reference
 
 ```

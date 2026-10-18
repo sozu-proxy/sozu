@@ -57,7 +57,19 @@ pub struct H2Backend {
 
 impl H2Backend {
     pub fn start(name: impl Into<String>, address: SocketAddr, body: impl Into<String>) -> Self {
-        Self::start_inner(name, address, body, false, None)
+        Self::start_inner(name, address, body, false, None, None)
+    }
+
+    /// Like [`H2Backend::start`], but answer 401 to every request whose
+    /// `authorization` header is not exactly `expected`, and 200 otherwise.
+    /// What a health-check probe with a configured credential must satisfy.
+    pub fn start_requiring_authorization(
+        name: impl Into<String>,
+        address: SocketAddr,
+        body: impl Into<String>,
+        expected: impl Into<String>,
+    ) -> Self {
+        Self::start_inner(name, address, body, false, None, Some(expected.into()))
     }
 
     /// Like [`H2Backend::start`], but read each request body to its end
@@ -69,7 +81,7 @@ impl H2Backend {
         address: SocketAddr,
         body: impl Into<String>,
     ) -> Self {
-        Self::start_inner(name, address, body, true, None)
+        Self::start_inner(name, address, body, true, None, None)
     }
 
     /// Like [`H2Backend::start_recording_trailers`], reading each request
@@ -82,7 +94,7 @@ impl H2Backend {
         body: impl Into<String>,
         window: u32,
     ) -> Self {
-        Self::start_inner(name, address, body, true, Some(window))
+        Self::start_inner(name, address, body, true, Some(window), None)
     }
 
     fn start_inner(
@@ -91,8 +103,10 @@ impl H2Backend {
         body: impl Into<String>,
         record_trailers: bool,
         initial_stream_window: Option<u32>,
+        required_authorization: Option<String>,
     ) -> Self {
         let name = name.into();
+        let required_authorization: Option<Bytes> = required_authorization.map(Bytes::from);
         let body: Bytes = Bytes::from(body.into());
         let stop = Arc::new(AtomicBool::new(false));
         let requests_received = Arc::new(AtomicUsize::new(0));
@@ -154,6 +168,7 @@ impl H2Backend {
                     let resp_count = resp_count.clone();
                     let req_log = req_log.clone();
                     let name = thread_name.clone();
+                    let required_authorization = required_authorization.clone();
 
                     tokio::spawn(async move {
                         let io = TokioIo::new(stream);
@@ -163,6 +178,7 @@ impl H2Backend {
                             let resp_count = resp_count.clone();
                             let req_log = req_log.clone();
                             let name = name.clone();
+                            let required_authorization = required_authorization.clone();
                             async move {
                                 req_count.fetch_add(1, Ordering::Relaxed);
                                 println!(
@@ -214,12 +230,22 @@ impl H2Backend {
                                         }
                                     }
                                 }
+                                let status = match &required_authorization {
+                                    Some(expected)
+                                        if !recorded.headers.iter().any(|(name, value)| {
+                                            name == "authorization" && value == expected.as_ref()
+                                        }) =>
+                                    {
+                                        401
+                                    }
+                                    _ => 200,
+                                };
                                 if let Ok(mut log) = req_log.lock() {
                                     log.push(recorded);
                                 }
 
                                 let response = Response::builder()
-                                    .status(200)
+                                    .status(status)
                                     .header("content-type", "text/plain")
                                     .body(Full::new(body))
                                     .unwrap();

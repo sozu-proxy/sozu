@@ -287,6 +287,8 @@ impl RequestTaskSnapshot {
             } => Box::new(LoadStaticConfigTask {
                 gatherer,
                 client_token: client_token.map(Token),
+                reload: None,
+                notify_ready: false,
             }),
             Self::Worker(snapshot) => {
                 let WorkerTaskSnapshot {
@@ -534,6 +536,11 @@ macro_rules! audit_log_context {
     }};
 }
 
+/// Fail-closed response used when `PROTECTED_HEALTH_CHECK_PUBLIC` disables the
+/// public verb. Static: it never echoes a header name or value.
+pub(crate) const PROTECTED_HEALTH_CHECK_REFUSAL: &str =
+    "SetProtectedHealthCheck is disabled in this main process; nothing was applied or kept";
+
 /// Operator-issued verbs that change cluster / listener / certificate
 /// state, the saved state file, or the master/worker fleet topology.
 /// `true` here brackets the dispatch with `RELOADING=1` / `READY=1`
@@ -553,7 +560,7 @@ macro_rules! audit_log_context {
 ///
 /// `CloseSessions` is excluded too: it closes live sessions and changes
 /// neither the configuration nor the fleet.
-fn is_mutating_verb(req: &RequestType) -> bool {
+pub(crate) fn is_mutating_verb(req: &RequestType) -> bool {
     matches!(
         req,
         RequestType::SaveState(_)
@@ -652,6 +659,12 @@ impl Server {
             return ClientRequestOutcome::UpgradeMain;
         }
 
+        // A protected health check change in flight owns its cluster: no
+        // direct order may rewrite it, and no bulk replay may race it.
+        if super::protected::refuse_while_busy(self, client, &request_type) {
+            return ClientRequestOutcome::Continue;
+        }
+
         // #228: bracket every operator-issued command with
         // `RELOADING=1` / `READY=1`. Mutating verbs (LoadState,
         // ReloadConfiguration, AddCluster / Backend / Certificate /
@@ -714,6 +727,10 @@ impl Server {
             warn!("could not notify systemd RELOADING=1: {}", e);
         }
 
+        // A configuration reload answers, and closes its systemd window, when
+        // its protected header changes are decided, not when it is dispatched.
+        let mut ready_deferred = false;
+
         match request_type {
             RequestType::SaveState(path) => save_state(self, client, &path),
             RequestType::LoadState(path) => load_state(self, Some(client), &path),
@@ -724,7 +741,7 @@ impl Server {
             RequestType::UpgradeWorker(worker_id) => upgrade_worker(self, client, worker_id),
             RequestType::SubscribeEvents(_) => subscribe_client_to_events(self, client),
             RequestType::ReloadConfiguration(path) => {
-                load_static_config(self, Some(client), Some(&path))
+                ready_deferred = load_static_config(self, Some(client), Some(&path));
             }
             RequestType::Status(_) => status(self, client),
             RequestType::AddCluster(_)
@@ -782,6 +799,34 @@ impl Server {
             }
             RequestType::CountRequests(_) => count_requests(self, client),
             RequestType::QueryHealthChecks(query) => list_health_checks(self, client, query),
+            // INVARIANT: `PROTECTED_HEALTH_CHECK_PUBLIC` is the one gate for
+            // this verb and the capability query. While it is true the order
+            // enters the acknowledged path (`protected.rs`): it is validated
+            // before any mutation and succeeds only once every worker
+            // acknowledged it. Were it false, the order would be refused and
+            // dropped unread, with no `ConfigState` dispatch, journal,
+            // counter, worker scatter, encode or clone of the value carriers.
+            RequestType::SetProtectedHealthCheck(order) => {
+                if super::protected::PROTECTED_HEALTH_CHECK_PUBLIC {
+                    super::protected::begin_protected_health_check(self, client, order);
+                } else {
+                    client.finish_failure(PROTECTED_HEALTH_CHECK_REFUSAL);
+                }
+            }
+            // The read-only capability query is gated by the very constant
+            // that gates the order: it is positive only when every worker
+            // acknowledged it, and it changes nothing. Were the constant
+            // false, both verbs would answer alike and no worker be asked.
+            RequestType::QueryProtectedHealthCheckSupport(_) => {
+                if super::protected::PROTECTED_HEALTH_CHECK_PUBLIC {
+                    super::protected::begin_capability_query(self, client);
+                } else {
+                    client.finish_failure(PROTECTED_HEALTH_CHECK_REFUSAL);
+                }
+            }
+            RequestType::ProtectedHealthCheckOrder(_) => {
+                super::protected::refuse_internal_verb(client);
+            }
 
             RequestType::LaunchWorker(_) => {} // not yet implemented, nor used, anywhere
             RequestType::ReturnListenSockets(_) => {} // This is only implemented by workers,
@@ -815,8 +860,8 @@ impl Server {
             RequestType::CloseSessions(request) => close_sessions(self, client, request),
         }
 
-        if mutating && let Err(e) = sd_notify::notify(sd_notify::STATE_READY) {
-            warn!("could not notify systemd READY=1: {}", e);
+        if mutating && !ready_deferred {
+            notify_ready();
         }
         ClientRequestOutcome::Continue
     }
@@ -1533,9 +1578,61 @@ struct LoadStaticConfigTask {
     /// reverted instead of staying in the main-process state.
     gatherer: PerEntryGatherer,
     client_token: Option<Token>,
+    /// The protected header changes to make once the generic part succeeded.
+    reload: Option<Box<super::protected::ReloadProtected>>,
+    /// Whether this task owes systemd the `READY=1` that closes the window the
+    /// reload opened.
+    notify_ready: bool,
 }
 
-pub fn load_static_config(server: &mut Server, mut client: OptionalClient, path: Option<&str>) {
+#[cfg(test)]
+thread_local! {
+    /// How many `READY=1` this thread asked for, which a test cannot read from
+    /// a `NOTIFY_SOCKET` without racing every other test.
+    pub(crate) static READY_NOTIFICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Tell systemd the reload window opened by a mutating verb is closed.
+pub(crate) fn notify_ready() {
+    #[cfg(test)]
+    READY_NOTIFICATIONS.with(|count| count.set(count.get() + 1));
+    if let Err(e) = sd_notify::notify(sd_notify::STATE_READY) {
+        warn!("could not notify systemd READY=1: {}", e);
+    }
+}
+
+/// `config` without the health check headers that come from files. A cold
+/// start also drops the health check of those clusters: no probe may exist
+/// before the protected change gives it its metadata and its values together.
+fn without_header_files(config: &Config, cold: bool) -> Config {
+    let mut stripped = config.clone();
+    for cluster in stripped.clusters.values_mut() {
+        let (health_check, files) = match cluster {
+            sozu_command_lib::config::ClusterConfig::Http(http) => {
+                (&mut http.health_check, &mut http.health_check_header_files)
+            }
+            sozu_command_lib::config::ClusterConfig::Tcp(tcp) => {
+                (&mut tcp.health_check, &mut tcp.health_check_header_files)
+            }
+        };
+        if cold && !files.is_empty() {
+            *health_check = None;
+        }
+        files.clear();
+    }
+    stripped
+}
+
+/// Reload the static configuration, from `path` or from the one in use.
+///
+/// Returns whether a task now owns the answer: the client, and the systemd
+/// `READY=1` of a client-driven reload, are then answered when it finishes.
+/// `false` means everything was answered before returning.
+pub fn load_static_config(
+    server: &mut Server,
+    mut client: OptionalClient,
+    path: Option<&str>,
+) -> bool {
     let new_config;
 
     let config = match path {
@@ -1569,7 +1666,7 @@ pub fn load_static_config(server: &mut Server, mut client: OptionalClient, path:
                         );
                     }
                     client.finish_failure(reason);
-                    return;
+                    return false;
                 }
             }
         }
@@ -1586,7 +1683,76 @@ pub fn load_static_config(server: &mut Server, mut client: OptionalClient, path:
 
     let audit_target = format!("config:{}", config.config_path);
 
-    let config_messages = match config.generate_config_messages() {
+    // A configuration may name `value_file` headers: their values are read
+    // now, before anything is applied, and sent only by the protected path once
+    // every worker acknowledged the capability query. A client-driven reload
+    // runs that path as soon as its generic part succeeded. A cold start
+    // (`client == None`) keeps the values in the protected runtime until the
+    // startup tasks are over; the saved state may take a cluster over before.
+    let cold = client.is_none();
+    let mut reload_protected = None;
+    let mut value_free_config = None;
+    match super::protected::read_reload_orders(config) {
+        Ok(orders) if orders.is_empty() => {}
+        Ok(orders) => {
+            reload_protected = Some(orders);
+            value_free_config = Some(without_header_files(config, cold));
+        }
+        Err(reason) if cold => {
+            // Nothing secret-bearing is sent, the cold `READY=1` never fires,
+            // and the rest of the configuration applies as a headerless start.
+            error!(
+                "could not read the health check header values, startup cannot become ready: {}",
+                reason
+            );
+            server.protected.fail_cold_start();
+            value_free_config = Some(without_header_files(config, cold));
+        }
+        Err(reason) => {
+            if let Some(client_ref) = client.as_deref() {
+                let (verb, counter) = audit_verb!("configuration_reloaded");
+                audit_emit_inline(
+                    server,
+                    client_ref,
+                    EventKind::ConfigurationReloaded,
+                    verb,
+                    counter,
+                    audit_target.clone(),
+                    AuditResult::Err,
+                    AuditExtras::default(),
+                );
+            }
+            client.finish_failure(format!(
+                "could not read the health check header values: {reason}"
+            ));
+            return false;
+        }
+    }
+    let file_backed: std::collections::HashSet<String> = reload_protected
+        .iter()
+        .flatten()
+        .map(|order| order.cluster_id.to_owned())
+        .collect();
+    // A client-driven reload carries its orders in the task that applies the
+    // generic part; a cold start hands them to the protected runtime.
+    let mut reload = None;
+    match (reload_protected, client.as_ref().map(|c| c.token)) {
+        (Some(orders), Some(token)) => {
+            reload = Some(Box::new(super::protected::ReloadProtected::new(
+                token,
+                orders,
+                config.clone(),
+            )));
+        }
+        (Some(orders), None) => server.protected.hold_cold_orders(orders),
+        (None, _) => {}
+    }
+
+    let config_messages = match value_free_config
+        .as_ref()
+        .unwrap_or(config)
+        .generate_config_messages()
+    {
         Ok(messages) => messages,
         Err(config_err) => {
             // No task is created before this point on purpose: a task created
@@ -1610,7 +1776,7 @@ pub fn load_static_config(server: &mut Server, mut client: OptionalClient, path:
                 );
             }
             client.finish_failure(format!("could not generate new config: {config_err}"));
-            return;
+            return false;
         }
     };
 
@@ -1622,6 +1788,8 @@ pub fn load_static_config(server: &mut Server, mut client: OptionalClient, path:
         Box::new(LoadStaticConfigTask {
             gatherer: PerEntryGatherer::default(),
             client_token: client.as_ref().map(|c| c.token),
+            reload,
+            notify_ready: client.is_some(),
         }),
         timeout,
     );
@@ -1647,6 +1815,18 @@ pub fn load_static_config(server: &mut Server, mut client: OptionalClient, path:
             }
             continue;
         };
+        // The probes and the held values of a cluster whose headers come from
+        // files stay what they are, whole, until its protected change is
+        // confirmed; the new headers never travel in a generic order.
+        if let Some(RequestType::AddCluster(cluster)) = request.request_type.as_mut()
+            && file_backed.contains(cluster.cluster_id.as_str())
+        {
+            cluster.health_check = server
+                .state
+                .clusters
+                .get(cluster.cluster_id.as_str())
+                .and_then(|current| current.health_check.to_owned());
+        }
         if !released {
             match deferral.admit(&server.state, request) {
                 Some(admitted) => request = admitted,
@@ -1693,6 +1873,9 @@ pub fn load_static_config(server: &mut Server, mut client: OptionalClient, path:
             client.return_processing(format!("Could not execute request on state: {error:#}"));
             continue;
         }
+        // The values held for a cluster follow the metadata the state now
+        // holds, exactly as for a live order.
+        align_protected_journal(server, &request);
 
         if let &Some(RequestType::AddCertificate(_)) = &request.request_type {
             debug!("config generated AddCertificate( ... )");
@@ -1716,6 +1899,7 @@ pub fn load_static_config(server: &mut Server, mut client: OptionalClient, path:
             AuditExtras::default(),
         );
     }
+    true
 }
 
 impl GatheringTask for LoadStaticConfigTask {
@@ -1728,6 +1912,10 @@ impl GatheringTask for LoadStaticConfigTask {
     }
 
     fn snapshot(&self, _timing: TaskSnapshotTiming) -> Result<TaskSnapshot, TaskSnapshotError> {
+        // The clear values of a reload have no wire form: a main upgrade waits.
+        if self.reload.is_some() {
+            return Err(TaskSnapshotError::ProtectedTransactionInFlight);
+        }
         Ok(TaskSnapshot::Request(Box::new(
             RequestTaskSnapshot::LoadStaticConfig {
                 gatherer: self.gatherer.clone(),
@@ -1737,7 +1925,7 @@ impl GatheringTask for LoadStaticConfigTask {
     }
 
     fn on_finish(
-        self: Box<Self>,
+        mut self: Box<Self>,
         server: &mut Server,
         client: &mut OptionalClient,
         timed_out: bool,
@@ -1792,13 +1980,25 @@ impl GatheringTask for LoadStaticConfigTask {
                 messages.join("\n- ")
             ));
         } else {
-            client.finish_ok(format!(
-                "Successfully loaded the config: {} ok, {} errors",
+            let tally = format!(
+                "{} ok, {} errors",
                 self.gatherer.inner.ok, self.gatherer.inner.errors,
-            ));
+            );
+            if let Some(mut reload) = self.reload.take() {
+                // The client and systemd hear nothing until every protected
+                // change is decided.
+                reload.set_summary(tally);
+                server.update_counts();
+                super::protected::begin_reload_protected(server, client, reload);
+                return;
+            }
+            client.finish_ok(format!("Successfully loaded the config: {tally}"));
         }
 
         server.update_counts();
+        if self.notify_ready {
+            notify_ready();
+        }
     }
 }
 
@@ -3368,7 +3568,10 @@ impl PerEntryGatherer {
             // Counts only, never request content: a `RequestHttpFrontend`
             // rendering carries the operator-supplied hostname.
             match server.state.dispatch(rollback) {
-                Ok(()) => reverted += 1,
+                Ok(()) => {
+                    reverted += 1;
+                    align_protected_journal(server, rollback);
+                }
                 Err(revert_error) => error!(
                     "sozu#1313 rollback: could not revert an unacknowledged replay entry \
                      (ok=0, errors={}, expected={}, timed_out={}): {}",
@@ -3818,6 +4021,11 @@ pub fn worker_request(
     // `sozu metrics` snapshot taken right after `sozu metrics clear` would
     // report `config.metrics_configured = 1`.
     let clear_master_metrics_on_finish = metrics_configuration == Some(MetricsConfiguration::Clear);
+
+    // The values the main process holds follow the same rule as the workers':
+    // an ordinary rewrite of the health check keeps them only for the exact
+    // headers they were issued for.
+    align_protected_journal(server, &request);
 
     client.return_processing("Processing worker request...");
 
@@ -4891,6 +5099,20 @@ pub fn load_state(server: &mut Server, mut client: OptionalClient, path: &str) {
     }
 }
 
+/// Align the protected journal with a request the main state has just
+/// accepted (or an inverse it has just applied): the held values survive an
+/// ordinary rewrite of a cluster's health check only for the exact headers
+/// they were issued for. Requests that touch no health check change nothing.
+fn align_protected_journal(server: &mut Server, request: &Request) {
+    if let Some((cluster, headers)) = request
+        .request_type
+        .as_ref()
+        .and_then(super::protected::ordinary_health_check_change)
+    {
+        server.protected.ordinary_change(cluster, headers);
+    }
+}
+
 /// Applies one entry of a saved state to the main state, then scatters it to
 /// the workers; an entry the state refuses never enters `ConfigState` and is
 /// never scattered.
@@ -4910,6 +5132,15 @@ fn apply_saved_entry(
         // validation refused.
         *skipped_invalid += 1;
     } else {
+        // The state file decides the clusters it adds, removes or rewrites the
+        // health check of: a file-backed order of a cold start never replaces
+        // them.
+        if let Some(request_type) = &request.request_type {
+            server.protected.saved_entry_dispatched(request_type);
+        }
+        // The values held for a cluster follow the metadata the state now
+        // holds, exactly as for a live order.
+        align_protected_journal(server, &request);
         // INVARIANT: the scatter request_id advances by exactly one per
         // dispatched request. `scatter_on` embeds it in the per-worker request
         // id, so a stale or repeated counter would collide two in-flight ids
@@ -7663,6 +7894,8 @@ mod load_state_rollback_tests {
 
         let task = LoadStaticConfigTask {
             client_token: None,
+            reload: None,
+            notify_ready: false,
             gatherer: fan_out(
                 &mut hub.server,
                 vec![Fanout {
@@ -8240,6 +8473,8 @@ mod upgrade_task_snapshot_tests {
                 Box::new(LoadStaticConfigTask {
                     gatherer: PerEntryGatherer::default(),
                     client_token: Some(Token(12)),
+                    reload: None,
+                    notify_ready: false,
                 }),
             ),
             (

@@ -65,14 +65,14 @@ use crate::{
     proto::command::{
         ActivateListener, AddBackend, AddCertificate, CertificateAndKey, ClientAuthMode, Cluster,
         CustomHttpAnswers, ForwardedHeaders, Header, HeaderMatchKind, HeaderPosition,
-        HeaderPredicate, HealthCheckConfig, HealthCheckMode, HstsConfig, HttpListenerConfig,
-        HttpStatusRange, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
-        LoadBalancingParams, LoadMetric, MetricDetail, MetricsConfiguration, PathRule,
-        ProtobufAccessLogFormat, ProxyProtocolConfig, RedirectPolicy, RedirectScheme, Request,
-        RequestHttpFrontend, RequestTcpFrontend, RequestUdpFrontend, RulePosition, ServerConfig,
-        ServerMetricsConfig, ShardMode, SocketAddress, TcpListenerConfig, TlsVersion,
-        UdpAffinityKey, UdpClusterConfig, UdpHealthConfig, UdpHealthMode, UdpListenerConfig,
-        WorkerRequest, request::RequestType,
+        HeaderPredicate, HealthCheckConfig, HealthCheckHeader, HealthCheckHeaderValue,
+        HealthCheckMode, HstsConfig, HttpListenerConfig, HttpStatusRange, HttpsListenerConfig,
+        ListenerType, LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, MetricDetail,
+        MetricsConfiguration, PathRule, ProtobufAccessLogFormat, ProxyProtocolConfig,
+        RedirectPolicy, RedirectScheme, Request, RequestHttpFrontend, RequestTcpFrontend,
+        RequestUdpFrontend, RulePosition, ServerConfig, ServerMetricsConfig, ShardMode,
+        SocketAddress, TcpListenerConfig, TlsVersion, UdpAffinityKey, UdpClusterConfig,
+        UdpHealthConfig, UdpHealthMode, UdpListenerConfig, WorkerRequest, request::RequestType,
     },
 };
 
@@ -298,6 +298,10 @@ pub fn validate_max_connection_attempts(attempts: u32) -> Result<(), &'static st
         Err("max_connection_attempts must lie in 1..=255")
     }
 }
+
+/// Why a cluster whose health-check header values live in files yields no
+/// order: the protected activation that reads them does not exist yet.
+pub const HEALTH_CHECK_VALUE_FILE_UNSUPPORTED: &str = "health check header value_file references cannot be applied yet: the protected activation of their values is not available";
 
 /// Why a health check `port` and a backend with a `unix_path` never meet in
 /// one cluster: `port` names a TCP port on a backend IP, which a UNIX socket
@@ -2928,6 +2932,32 @@ pub struct FileHealthCheckConfig {
     /// Unset probes the backend's data port.
     #[serde(default)]
     pub port: Option<u32>,
+    /// Extra request header fields of the HTTP probe, as an ordered array of
+    /// `{ name, value_file }` tables. A value is never written in the
+    /// configuration: `value_file` names the file the value is read from when
+    /// the probe is set up, and parsing never opens it.
+    #[serde(default)]
+    pub headers: Vec<FileHealthCheckHeader>,
+}
+
+/// One `[[clusters.<id>.health_check.headers]]` entry: a header name and the
+/// file holding its value. Also the reference kept by [`HttpClusterConfig`]
+/// and [`TcpClusterConfig`], so a path is stored exactly as written; resolving
+/// a relative one is left to the code that reads the file.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileHealthCheckHeader {
+    pub name: String,
+    pub value_file: String,
+}
+
+impl std::fmt::Debug for FileHealthCheckHeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileHealthCheckHeader")
+            .field("name_len", &self.name.len())
+            .field("value_file", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl FileHealthCheckConfig {
@@ -2935,6 +2965,23 @@ impl FileHealthCheckConfig {
     /// [`validate_health_check_config`] so a bad block is refused at load
     /// time with the cluster it belongs to.
     pub fn to_proto(&self) -> Result<HealthCheckConfig, &'static str> {
+        // A proto config names its headers without a value, so a probe built
+        // from it alone could never fill them in: keep the references too, via
+        // [`Self::to_parts`].
+        if !self.headers.is_empty() {
+            return Err(
+                "health check headers from the configuration file are not available yet: their values need the protected channel",
+            );
+        }
+        self.to_parts().map(|(config, _)| config)
+    }
+
+    /// The health check as metadata plus the ordered `value_file` references
+    /// of its headers. The metadata names the headers and leaves every
+    /// fingerprint empty; names are validated, the files are not touched.
+    pub fn to_parts(
+        &self,
+    ) -> Result<(HealthCheckConfig, Vec<FileHealthCheckHeader>), &'static str> {
         let accepted_statuses = self
             .accepted_statuses
             .iter()
@@ -2950,6 +2997,14 @@ impl FileHealthCheckConfig {
             mode: self.mode.unwrap_or(HealthCheckMode::Http) as i32,
             accepted_statuses,
             port: self.port,
+            headers: self
+                .headers
+                .iter()
+                .map(|header| HealthCheckHeader {
+                    name: header.name.to_owned(),
+                    fingerprint: String::new(),
+                })
+                .collect(),
         };
         // POST: the proto mirrors the file config exactly — the URI and all
         // timing knobs are carried through verbatim (no clamping or defaulting
@@ -2971,8 +3026,13 @@ impl FileHealthCheckConfig {
             self.accepted_statuses.len(),
             "every accepted status spec must map to exactly one range"
         );
+        debug_assert_eq!(
+            proto.headers.len(),
+            self.headers.len(),
+            "every configured header must map to exactly one proto header"
+        );
         validate_health_check_config(&proto)?;
-        Ok(proto)
+        Ok((proto, self.headers.clone()))
     }
 }
 
@@ -3127,6 +3187,175 @@ pub fn validate_shuffle_sharding(
     Ok(())
 }
 
+/// Most custom request headers a health check may carry.
+pub const HEALTH_CHECK_MAX_HEADERS: usize = 32;
+/// Most `name + value + 4` bytes (the `: ` and CRLF an HTTP/1.1 line adds)
+/// the custom headers of a health check may sum to.
+pub const HEALTH_CHECK_MAX_HEADER_BYTES: usize = 8192;
+/// Largest HPACK block the h2c probe may send: one HEADERS frame, which the
+/// probe never splits, whose payload stays within the default
+/// `SETTINGS_MAX_FRAME_SIZE` of 16384 bytes (RFC 9113 §6.5.2).
+pub const HEALTH_CHECK_MAX_HPACK_BLOCK: usize = 16384;
+/// Longest `:authority` the h2c probe can name: a [`std::net::SocketAddr`]
+/// `Display` is at most `[` + 39 IPv6 digits + `%4294967295` + `]` + `:65535`.
+pub const HEALTH_CHECK_MAX_AUTHORITY_LEN: usize = 1 + 39 + 11 + 1 + 6;
+
+/// Header names the probe owns or that would change the connection framing.
+const HEALTH_CHECK_FORBIDDEN_HEADERS: [&str; 10] = [
+    "host",
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "transfer-encoding",
+    "content-length",
+    "te",
+    "trailer",
+    "upgrade",
+    "expect",
+];
+
+/// Bytes of an HPACK integer with a 7-bit prefix (RFC 7541 §5.1).
+fn hpack_string_length_bytes(length: usize) -> usize {
+    if length < 127 {
+        return 1;
+    }
+    let mut rest = length - 127;
+    let mut bytes = 1;
+    loop {
+        bytes += 1;
+        rest >>= 7;
+        if rest == 0 {
+            return bytes;
+        }
+    }
+}
+
+/// Upper bound of the HPACK block the h2c probe encodes for `cfg`: the
+/// four pseudo-headers with the longest possible `:authority`, then every
+/// custom field as a literal with a new name (flag byte, the two string
+/// lengths, name, value), none Huffman coded.
+pub fn health_check_hpack_upper_bound(cfg: &HealthCheckConfig, value_lens: &[usize]) -> usize {
+    // `:method GET` and `:scheme http` are static-table entries, one byte each.
+    let mut bound = 2;
+    // `:path`: an indexed name, or the whole `/` entry, plus the literal URI.
+    bound += 1 + hpack_string_length_bytes(cfg.uri.len()) + cfg.uri.len();
+    // `:authority`: an indexed name plus the literal address.
+    bound += 1
+        + hpack_string_length_bytes(HEALTH_CHECK_MAX_AUTHORITY_LEN)
+        + HEALTH_CHECK_MAX_AUTHORITY_LEN;
+    for (header, value_len) in cfg.headers.iter().zip(value_lens) {
+        bound += 1
+            + hpack_string_length_bytes(header.name.len())
+            + header.name.len()
+            + hpack_string_length_bytes(*value_len)
+            + value_len;
+    }
+    bound
+}
+
+/// The per-value rules of a health-check header: no forbidden control byte,
+/// and no leading or trailing SP or HTAB. Single source for
+/// [`validate_health_check_headers`] and for the protected ingress value
+/// (`crate::secret::SecretValue`); the diagnostics are static, they never
+/// echo the value.
+pub(crate) fn check_health_check_header_value(value: &str) -> Result<(), &'static str> {
+    if header_value_contains_forbidden_controls(value.as_bytes()) {
+        return Err("health check header value must not contain control bytes");
+    }
+    // RFC 9113 §8.2.1: a field value must not begin or end with SP or HTAB
+    // (an HTTP/2 peer treats such a request as malformed). Protobuf and TOML
+    // values keep their exact bytes, so they are refused instead of being
+    // silently rewritten.
+    if value.starts_with([' ', '\t']) || value.ends_with([' ', '\t']) {
+        return Err("health check header value must not begin or end with a space or a tab");
+    }
+    Ok(())
+}
+
+/// Validate the names of the custom `headers` of a health check, which is all
+/// a configuration holds of them. Diagnostics are static: they never echo a
+/// configured name.
+fn validate_health_check_headers(
+    cfg: &HealthCheckConfig,
+    mode: HealthCheckMode,
+) -> Result<(), &'static str> {
+    if cfg.headers.is_empty() {
+        return Ok(());
+    }
+    if mode == HealthCheckMode::Tcp {
+        return Err("health check headers apply to HTTP mode only: leave them unset with mode TCP");
+    }
+    if cfg.headers.len() > HEALTH_CHECK_MAX_HEADERS {
+        return Err("health check carries more than 32 headers");
+    }
+    for (index, header) in cfg.headers.iter().enumerate() {
+        if header.name.starts_with(':')
+            || HEALTH_CHECK_FORBIDDEN_HEADERS
+                .iter()
+                .any(|forbidden| header.name.eq_ignore_ascii_case(forbidden))
+        {
+            return Err("health check header name is reserved for the probe or its framing");
+        }
+        if !header_name_is_valid_token(header.name.as_bytes()) {
+            return Err("health check header name must be a non-empty RFC 9110 token");
+        }
+        if cfg.headers[..index]
+            .iter()
+            .any(|earlier| earlier.name.eq_ignore_ascii_case(&header.name))
+        {
+            return Err("health check header names must be unique, compared case-insensitively");
+        }
+        // Empty is an operator order the main process has yet to fingerprint;
+        // anything else must be a fingerprint, or it is not metadata at all.
+        if !header.fingerprint.is_empty()
+            && header
+                .fingerprint
+                .parse::<crate::secret::HeaderFingerprint>()
+                .is_err()
+        {
+            return Err("health check header fingerprint is malformed");
+        }
+    }
+    Ok(())
+}
+
+/// Validate the clear `values` of the custom headers of `cfg`, whose names
+/// [`validate_health_check_config`] validates: one value per header in the
+/// same order and under the same name, each meeting the per-value rules,
+/// within the 8192-byte wire sum and the one-frame HTTP/2 block. Diagnostics
+/// are static: they never echo a name or a value, nor any length of a value.
+pub fn validate_health_check_header_values(
+    cfg: &HealthCheckConfig,
+    values: &[HealthCheckHeaderValue],
+) -> Result<(), &'static str> {
+    if values.len() != cfg.headers.len() {
+        return Err("health check carries a header value count different from its header count");
+    }
+    let mut wire_bytes = 0usize;
+    for (header, carrier) in cfg.headers.iter().zip(values) {
+        if header.name != carrier.name {
+            return Err(
+                "health check header values must follow the order and names of the headers",
+            );
+        }
+        let text = std::str::from_utf8(&carrier.value)
+            .map_err(|_| "health check header value must be valid UTF-8")?;
+        check_health_check_header_value(text)?;
+        wire_bytes = wire_bytes
+            .saturating_add(header.name.len())
+            .saturating_add(carrier.value.len())
+            .saturating_add(4);
+    }
+    if wire_bytes > HEALTH_CHECK_MAX_HEADER_BYTES {
+        return Err("health check headers exceed 8192 bytes (name + value + 4 per header)");
+    }
+    let value_lens: Vec<usize> = values.iter().map(|carrier| carrier.value.len()).collect();
+    if health_check_hpack_upper_bound(cfg, &value_lens) > HEALTH_CHECK_MAX_HPACK_BLOCK {
+        return Err("health check URI and headers may exceed the 16384-byte HTTP/2 probe block");
+    }
+    Ok(())
+}
+
 /// Validate a [`HealthCheckConfig`] for the rules every layer relies on:
 /// a known probe mode, strict positive thresholds, a URI that cannot
 /// smuggle a second HTTP message on the wire (RFC 9110 §5.1 —
@@ -3198,6 +3427,7 @@ pub fn validate_health_check_config(cfg: &HealthCheckConfig) -> Result<(), &'sta
     {
         return Err("health check port must lie in 1..=65535");
     }
+    validate_health_check_headers(cfg, mode)?;
     // POST: a validated config has strictly-positive timing knobs (a zero
     // interval/timeout/threshold would make the health-check loop spin or
     // never converge) and a request-target the worker can splice into an HTTP
@@ -3675,15 +3905,18 @@ impl FileClusterConfig {
         }
         // POST: every file entry yields at least one backend when resolving.
         debug_assert!(resolver.is_none() || backends.len() >= self.backends.len());
-        let health_check = self
+        let (health_check, health_check_header_files) = match self
             .health_check
             .as_ref()
-            .map(FileHealthCheckConfig::to_proto)
+            .map(FileHealthCheckConfig::to_parts)
             .transpose()
             .map_err(|reason| ConfigError::InvalidHealthCheck {
                 cluster_id: cluster_id.to_owned(),
                 reason,
-            })?;
+            })? {
+            Some((config, files)) => (Some(config), files),
+            None => (None, Vec::new()),
+        };
         validate_backend_unix_paths(cluster_id, &backends)?;
         // The file entries, not only the expanded backends: an entry DNS did
         // not expand (no resolver) still names a `unix_path`.
@@ -3790,6 +4023,7 @@ impl FileClusterConfig {
                     max_connections_per_subnet: self.max_connections_per_subnet,
                     retry_after: self.retry_after,
                     health_check,
+                    health_check_header_files,
                     udp,
                     shard_percent: self.shard_percent,
                     shard_min_backends: self.shard_min_backends,
@@ -3845,6 +4079,7 @@ impl FileClusterConfig {
                     max_connections_per_subnet: self.max_connections_per_subnet,
                     retry_after: self.retry_after,
                     health_check,
+                    health_check_header_files,
                     udp,
                     affinity_header: self.affinity_header,
                     affinity_cookie: self.affinity_cookie,
@@ -4074,6 +4309,11 @@ pub struct HttpClusterConfig {
     /// (h2c) when true.
     #[serde(default)]
     pub health_check: Option<HealthCheckConfig>,
+    /// Where each header named by `health_check` reads its value from, in the
+    /// same order. References, never values: they are kept for the protected
+    /// activation and never copied into an `AddCluster` order.
+    #[serde(default)]
+    pub health_check_header_files: Vec<FileHealthCheckHeader>,
     /// Optional UDP-specific cluster configuration. Always `None` for HTTP
     /// clusters; carried for shape uniformity with the proto [`Cluster`].
     #[serde(default)]
@@ -4103,6 +4343,15 @@ pub struct HttpClusterConfig {
 
 impl HttpClusterConfig {
     pub fn generate_requests(&self) -> Result<Vec<Request>, ConfigError> {
+        // A header name without its value must not reach a worker, and the
+        // value-file references do not either: until the protected activation
+        // exists, refuse before any order is built.
+        if !self.health_check_header_files.is_empty() {
+            return Err(ConfigError::InvalidHealthCheck {
+                cluster_id: self.cluster_id.clone(),
+                reason: HEALTH_CHECK_VALUE_FILE_UNSUPPORTED,
+            });
+        }
         let mut v: Vec<Request> = vec![
             RequestType::AddCluster(Cluster {
                 cluster_id: self.cluster_id.clone(),
@@ -4246,6 +4495,11 @@ pub struct TcpClusterConfig {
     /// HTTP/1.1 only and TCP-only backends should leave this absent.
     #[serde(default)]
     pub health_check: Option<HealthCheckConfig>,
+    /// Where each header named by `health_check` reads its value from, in the
+    /// same order. References, never values: they are kept for the protected
+    /// activation and never copied into an `AddCluster` order.
+    #[serde(default)]
+    pub health_check_header_files: Vec<FileHealthCheckHeader>,
     /// Optional UDP-specific cluster configuration, parsed from a
     /// `[clusters.<id>.udp]` block on this cluster.
     #[serde(default)]
@@ -4267,6 +4521,15 @@ pub struct TcpClusterConfig {
 
 impl TcpClusterConfig {
     pub fn generate_requests(&self) -> Result<Vec<Request>, ConfigError> {
+        // A header name without its value must not reach a worker, and the
+        // value-file references do not either: until the protected activation
+        // exists, refuse before any order is built.
+        if !self.health_check_header_files.is_empty() {
+            return Err(ConfigError::InvalidHealthCheck {
+                cluster_id: self.cluster_id.clone(),
+                reason: HEALTH_CHECK_VALUE_FILE_UNSUPPORTED,
+            });
+        }
         let mut v: Vec<Request> = vec![
             RequestType::AddCluster(Cluster {
                 cluster_id: self.cluster_id.clone(),
@@ -4555,8 +4818,9 @@ impl FileConfig {
         let config: FileConfig = match toml::from_str(&data) {
             Ok(config) => config,
             Err(e) => {
-                display_toml_error(&data, &e);
-                return Err(ConfigError::DeserializeToml(e.to_string()));
+                return Err(ConfigError::DeserializeToml(toml_error_diagnostic(
+                    path, &e,
+                )));
             }
         };
 
@@ -5765,10 +6029,20 @@ impl fmt::Debug for Config {
     }
 }
 
-fn display_toml_error(file: &str, error: &toml::de::Error) {
-    println!("error parsing the configuration file '{file}': {error}");
-    if let Some(Range { start, end }) = error.span() {
-        print!("error parsing the configuration file '{file}' at position: {start}, {end}");
+/// The diagnostic of a configuration file that does not parse: its path and,
+/// when known, the byte range of the offence.
+///
+/// Neither the source nor `toml::de::Error`'s `Display` is used: the latter
+/// quotes the offending line, and a serde type error quotes the offending
+/// value, which may be a health-check header credential.
+fn toml_error_diagnostic(path: &str, error: &toml::de::Error) -> String {
+    match error.span() {
+        Some(Range { start, end }) => format!(
+            "error parsing the configuration file '{path}' at bytes {start}..{end}: invalid TOML syntax or unexpected value (the offending text is not shown)"
+        ),
+        None => format!(
+            "error parsing the configuration file '{path}': invalid TOML syntax or unexpected value (the offending text is not shown)"
+        ),
     }
 }
 
@@ -7225,6 +7499,7 @@ mod tests {
             mode: HealthCheckMode::Http as i32,
             accepted_statuses: Vec::new(),
             port: None,
+            headers: Vec::new(),
         };
         assert_eq!(validate_health_check_config(&http), Ok(()));
 
@@ -7433,6 +7708,536 @@ mod tests {
                 "{bad:?} must be refused"
             );
         }
+    }
+
+    /// A valid HTTP health check carrying `headers`, for the header tests.
+    fn health_check_with_headers(headers: &[(&str, &str)]) -> HealthCheckConfig {
+        HealthCheckConfig {
+            uri: "/".to_owned(),
+            interval: 10,
+            timeout: 5,
+            healthy_threshold: 3,
+            unhealthy_threshold: 3,
+            expected_status: 0,
+            mode: HealthCheckMode::Http as i32,
+            accepted_statuses: Vec::new(),
+            port: None,
+            headers: headers
+                .iter()
+                .map(|(name, _)| HealthCheckHeader {
+                    name: (*name).to_owned(),
+                    fingerprint: String::new(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Names, then values, through both validators a protected order meets.
+    fn check_headers(headers: &[(&str, &str)]) -> Result<(), &'static str> {
+        let config = health_check_with_headers(headers);
+        validate_health_check_config(&config)?;
+        let values: Vec<HealthCheckHeaderValue> = headers
+            .iter()
+            .map(|(name, value)| HealthCheckHeaderValue {
+                name: (*name).to_owned(),
+                value: value.as_bytes().to_vec(),
+            })
+            .collect();
+        validate_health_check_header_values(&config, &values)
+    }
+
+    /// RFC 9113 §8.2.1: a field value must not begin or end with SP or HTAB.
+    /// Direct protobuf and TOML values keep their exact bytes, so a value
+    /// that would need trimming is refused rather than silently changed; an
+    /// empty value and inner whitespace stay valid.
+    #[test]
+    fn health_check_header_value_refuses_leading_and_trailing_ows() {
+        for value in [" v", "v ", "\tv", "v\t", " ", "\t", " v ", "a b \t"] {
+            assert_eq!(
+                check_headers(&[("x-a", value)]),
+                Err("health check header value must not begin or end with a space or a tab"),
+                "{value:?} must be refused"
+            );
+        }
+        for value in ["", "v", "a b", "a\tb", "é ü", "\u{a0}v"] {
+            assert_eq!(
+                check_headers(&[("x-a", value)]),
+                Ok(()),
+                "{value:?} must be accepted"
+            );
+        }
+    }
+
+    /// Every refusal class of the custom health-check headers, and the edge
+    /// each bound accepts.
+    #[test]
+    fn health_check_header_validation_covers_every_class() {
+        let refused = |headers: &[(&str, &str)], reason: &str| {
+            assert_eq!(
+                check_headers(headers),
+                Err(reason),
+                "{headers:?} must be refused"
+            );
+        };
+
+        // Accepted shapes: ordered, mixed case, empty value, tab inside,
+        // obs-text (valid UTF-8 above 0x7F).
+        assert_eq!(
+            check_headers(&[
+                ("Authorization", "Bearer t"),
+                ("X-Empty", ""),
+                ("x-tab", "a\tb"),
+                ("x-utf8", "caf\u{e9} \u{1F600}"),
+            ]),
+            Ok(())
+        );
+
+        // TCP mode sends no request.
+        let mut tcp = health_check_with_headers(&[("x-a", "1")]);
+        tcp.mode = HealthCheckMode::Tcp as i32;
+        assert_eq!(
+            validate_health_check_config(&tcp),
+            Err("health check headers apply to HTTP mode only: leave them unset with mode TCP")
+        );
+
+        // Count: 32 pass, 33 do not.
+        let names: Vec<String> = (0..33).map(|i| format!("x-{i}")).collect();
+        let many = |count: usize| -> Vec<(&str, &str)> {
+            names[..count].iter().map(|n| (n.as_str(), "v")).collect()
+        };
+        assert_eq!(check_headers(&many(32)), Ok(()));
+        refused(&many(33), "health check carries more than 32 headers");
+
+        // Reserved names, whatever the case, and pseudo-header names.
+        for name in [
+            ":authority",
+            ":x",
+            "Host",
+            "HOST",
+            "connection",
+            "Keep-Alive",
+            "proxy-connection",
+            "Transfer-Encoding",
+            "content-length",
+            "TE",
+            "trailer",
+            "upgrade",
+            "Expect",
+        ] {
+            refused(
+                &[(name, "v")],
+                "health check header name is reserved for the probe or its framing",
+            );
+        }
+
+        // Names that are not an RFC 9110 token.
+        for name in [
+            "",
+            " x",
+            "x ",
+            "a b",
+            "a:b",
+            "caf\u{e9}",
+            "a\r",
+            "a\"b",
+            "a(b",
+        ] {
+            refused(
+                &[(name, "v")],
+                "health check header name must be a non-empty RFC 9110 token",
+            );
+        }
+
+        // Control bytes: CR, LF, NUL, other C0 except HTAB, DEL.
+        for value in [
+            "a\rb", "a\nb", "a\0b", "a\x01b", "a\x08b", "a\x0bb", "a\x1fb", "a\x7fb",
+        ] {
+            refused(
+                &[("x-a", value)],
+                "health check header value must not contain control bytes",
+            );
+        }
+
+        // Duplicate names compare case-insensitively.
+        refused(
+            &[("X-Token", "1"), ("x-token", "2")],
+            "health check header names must be unique, compared case-insensitively",
+        );
+
+        // The 8192-byte wire sum is name + value + 4 per header.
+        let value_fits = "v".repeat(8192 - 1 - 4);
+        assert_eq!(check_headers(&[("x", &value_fits)]), Ok(()));
+        let value_over = "v".repeat(8192 - 1 - 4 + 1);
+        refused(
+            &[("x", &value_over)],
+            "health check headers exceed 8192 bytes (name + value + 4 per header)",
+        );
+
+        // The HTTP/2 block bound counts the URI as well: the URI alone, or the
+        // headers alone, pass; together they may exceed one HEADERS frame.
+        let mut long_uri = health_check_with_headers(&[]);
+        long_uri.uri = format!("/{}", "a".repeat(9000));
+        assert_eq!(validate_health_check_config(&long_uri), Ok(()));
+        long_uri.headers = vec![HealthCheckHeader {
+            name: "x".to_owned(),
+            fingerprint: String::new(),
+        }];
+        assert_eq!(validate_health_check_config(&long_uri), Ok(()));
+        let carrier = HealthCheckHeaderValue {
+            name: "x".to_owned(),
+            value: "v".repeat(8000).into_bytes(),
+        };
+        assert_eq!(
+            validate_health_check_header_values(&long_uri, &[carrier]),
+            Err("health check URI and headers may exceed the 16384-byte HTTP/2 probe block")
+        );
+
+        // A value that does not follow its header's name, count or order is
+        // refused, and so is one that is not UTF-8, without echoing either.
+        let one = health_check_with_headers(&[("x-a", ""), ("x-b", "")]);
+        let carrier = |name: &str, value: &[u8]| HealthCheckHeaderValue {
+            name: name.to_owned(),
+            value: value.to_vec(),
+        };
+        assert_eq!(
+            validate_health_check_header_values(&one, &[carrier("x-a", b"1")]),
+            Err("health check carries a header value count different from its header count")
+        );
+        assert_eq!(
+            validate_health_check_header_values(
+                &one,
+                &[carrier("x-b", b"1"), carrier("x-a", b"2")]
+            ),
+            Err("health check header values must follow the order and names of the headers")
+        );
+        assert_eq!(
+            validate_health_check_header_values(
+                &one,
+                &[carrier("x-a", b"1"), carrier("x-b", &[0xff])]
+            ),
+            Err("health check header value must be valid UTF-8")
+        );
+        // A fingerprint that is not one is no metadata.
+        let mut spoofed = health_check_with_headers(&[("x-a", "")]);
+        spoofed.headers[0].fingerprint = "not a fingerprint".to_owned();
+        assert_eq!(
+            validate_health_check_config(&spoofed),
+            Err("health check header fingerprint is malformed")
+        );
+    }
+
+    /// An older state record or peer carries no `headers`: it loads as an empty
+    /// list. A list survives JSON (state file) and protobuf (command socket)
+    /// round trips with its order and exact bytes.
+    #[test]
+    fn health_check_headers_default_empty_and_round_trip_in_order() {
+        use prost::Message;
+
+        let config = health_check_with_headers(&[
+            ("Z-Last-Alphabetically", "1"),
+            ("authorization", "Bearer \u{e9}\tx"),
+            ("A-First-Alphabetically", ""),
+        ]);
+
+        // JSON without the key.
+        let mut value = serde_json::to_value(&config).expect("serialize");
+        value
+            .as_object_mut()
+            .expect("an object")
+            .remove("headers")
+            .expect("the key is serialized");
+        let legacy: HealthCheckConfig = serde_json::from_value(value).expect("legacy record loads");
+        assert!(legacy.headers.is_empty());
+
+        // JSON round trip.
+        let json = serde_json::to_string(&config).expect("serialize");
+        let back: HealthCheckConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, config);
+        assert_eq!(
+            back.headers
+                .iter()
+                .map(|h| h.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Z-Last-Alphabetically",
+                "authorization",
+                "A-First-Alphabetically"
+            ]
+        );
+
+        // Protobuf: a message without field 10 decodes to an empty list, and
+        // the list round-trips in order.
+        let headerless = HealthCheckConfig {
+            headers: Vec::new(),
+            ..config.clone()
+        };
+        let decoded =
+            HealthCheckConfig::decode(headerless.encode_to_vec().as_slice()).expect("decodes");
+        assert!(decoded.headers.is_empty());
+        let decoded =
+            HealthCheckConfig::decode(config.encode_to_vec().as_slice()).expect("decodes");
+        assert_eq!(decoded, config);
+    }
+
+    /// `[[clusters.<id>.health_check.headers]]` keeps array order down to the
+    /// metadata and the `value_file` references, is held to the name
+    /// validator, and is refused where it would become a bare `AddCluster`
+    /// name with no value.
+    ///
+    /// Contract change: this test used to give each header a literal `value`
+    /// and read the clear values back from `to_protected_parts`, whose exact
+    /// bytes and OWS rules it checked here. A configuration now holds no value,
+    /// only a `value_file` reference that is stored unread, so the order, the
+    /// empty fingerprints, the bare-conversion refusal, the name and mode
+    /// refusals and the unknown-key refusal are asserted on `to_parts`; the
+    /// byte-exact value rules stay covered by `check_headers` and move to the
+    /// moment the file is read.
+    #[test]
+    fn health_check_toml_headers_split_into_metadata_and_ordered_references() {
+        let parse = |block: &str| {
+            toml::from_str::<FileHealthCheckConfig>(&format!("uri = \"/health\"\n{block}"))
+                .expect("the table parses")
+        };
+
+        let file = parse(
+            "[[headers]]\nname = \"Z-Second\"\nvalue_file = \"/missing/z\"\n\
+             [[headers]]\nname = \"Authorization\"\nvalue_file = \"rel/a\"\n\
+             [[headers]]\nname = \"X-Empty\"\nvalue_file = \"/missing/e\"\n",
+        );
+        let (config, files) = file.to_parts().expect("a valid list builds");
+        assert_eq!(
+            config
+                .headers
+                .iter()
+                .map(|h| (h.name.as_str(), h.fingerprint.as_str()))
+                .collect::<Vec<_>>(),
+            [("Z-Second", ""), ("Authorization", ""), ("X-Empty", "")],
+            "metadata names the headers and carries no value or fingerprint"
+        );
+        assert_eq!(
+            files
+                .iter()
+                .map(|f| (f.name.as_str(), f.value_file.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("Z-Second", "/missing/z"),
+                ("Authorization", "rel/a"),
+                ("X-Empty", "/missing/e")
+            ]
+        );
+        // The bare conversion would leave names no probe could fill in.
+        assert_eq!(
+            file.to_proto(),
+            Err(
+                "health check headers from the configuration file are not available yet: their values need the protected channel"
+            )
+        );
+
+        // No `headers` key: the bare conversion still works.
+        let bare = parse("");
+        assert!(bare.to_proto().expect("builds").headers.is_empty());
+        assert!(bare.to_parts().expect("builds").1.is_empty());
+
+        // Refusals: TCP mode, reserved name, duplicate name.
+        for bad in [
+            "mode = \"TCP\"\n[[headers]]\nname = \"x\"\nvalue_file = \"/v\"\n",
+            "[[headers]]\nname = \"Host\"\nvalue_file = \"/v\"\n",
+            "[[headers]]\nname = \"x\"\nvalue_file = \"/v\"\n\
+             [[headers]]\nname = \"X\"\nvalue_file = \"/w\"\n",
+        ] {
+            assert!(parse(bad).to_parts().is_err(), "{bad:?} must be refused");
+        }
+        // An unknown table key is a parse error.
+        assert!(
+            toml::from_str::<FileHealthCheckConfig>(
+                "uri = \"/\"\n[[headers]]\nname = \"x\"\nvalue_file = \"/v\"\nextra = 1\n"
+            )
+            .is_err()
+        );
+    }
+
+    /// Marker planted in every value the protected-header tests must never
+    /// see echoed back, and in the reference path that Debug must redact.
+    const HEADER_SENTINEL: &str = "SENTINEL-HEADER-VALUE-7f3a91";
+    const REF_SENTINEL: &str = "sentinel-ref-dir-9c1e42";
+
+    /// A file cluster of `protocol` whose health check carries `headers`
+    /// as `(name, value_file)` pairs, in order.
+    fn value_file_cluster(protocol: &str, headers: &[(&str, &str)]) -> FileClusterConfig {
+        let tables: String = headers
+            .iter()
+            .map(|(name, path)| {
+                format!("[[health_check.headers]]\nname = \"{name}\"\nvalue_file = \"{path}\"\n")
+            })
+            .collect();
+        toml::from_str(&format!(
+            "protocol = \"{protocol}\"\nfrontends = []\nbackends = []\n\
+             [health_check]\nuri = \"/health\"\n{tables}"
+        ))
+        .expect("a value_file reference parses")
+    }
+
+    /// The JSON view of a built cluster, for asserting on serialized
+    /// field names and order.
+    fn cluster_json(cluster: &ClusterConfig) -> serde_json::Value {
+        match cluster {
+            ClusterConfig::Http(http) => serde_json::to_value(http),
+            ClusterConfig::Tcp(tcp) => serde_json::to_value(tcp),
+        }
+        .expect("a cluster serializes")
+    }
+
+    /// `value_file` is a reference: it is kept unchanged and in order, never
+    /// opened (the paths below cannot exist), and reaches both cluster kinds
+    /// next to the name-only metadata, through a `Config` serde round trip.
+    #[test]
+    fn health_check_value_file_is_kept_unopened_in_order_for_http_and_tcp() {
+        let missing_a = format!("/{REF_SENTINEL}/missing/a.secret");
+        let missing_b = format!("relative/../{REF_SENTINEL}/b.secret");
+        let headers = [
+            ("Z-Second", missing_a.as_str()),
+            ("Authorization", &missing_b),
+        ];
+
+        for protocol in ["http", "tcp"] {
+            let file = value_file_cluster(protocol, &headers);
+            let cluster = file
+                .to_cluster_config("checked", &HashSet::new())
+                .expect("a reference to a missing file builds: nothing opens it");
+            let json = cluster_json(&cluster);
+
+            let metadata: Vec<(&str, &str)> = json["health_check"]["headers"]
+                .as_array()
+                .expect("the metadata lists the headers")
+                .iter()
+                .map(|h| {
+                    (
+                        h["name"].as_str().expect("a name"),
+                        h["fingerprint"].as_str().expect("a fingerprint"),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                metadata,
+                [("Z-Second", ""), ("Authorization", "")],
+                "{protocol}: ordered names, empty fingerprints"
+            );
+            assert_eq!(
+                json["health_check_header_files"],
+                serde_json::json!([
+                    { "name": "Z-Second", "value_file": missing_a },
+                    { "name": "Authorization", "value_file": missing_b },
+                ]),
+                "{protocol}: references are stored unchanged and in order"
+            );
+
+            let mut config = Config::default();
+            config
+                .clusters
+                .insert("checked".to_owned(), cluster.clone());
+            let text = serde_json::to_string(&config).expect("a Config serializes");
+            let back: Config = serde_json::from_str(&text).expect("a Config deserializes");
+            assert_eq!(
+                back.clusters.get("checked"),
+                Some(&cluster),
+                "{protocol}: references survive Config serde"
+            );
+        }
+
+        // A cluster without headers carries no reference.
+        let bare: FileClusterConfig = toml::from_str(
+            "protocol = \"http\"\nfrontends = []\nbackends = []\n[health_check]\nuri = \"/\"\n",
+        )
+        .expect("parses");
+        let built = bare
+            .to_cluster_config("bare", &HashSet::new())
+            .expect("builds");
+        assert_eq!(
+            cluster_json(&built)["health_check_header_files"],
+            serde_json::json!([])
+        );
+    }
+
+    /// The old `value = "<secret>"` key and every other shape but a
+    /// `value_file` reference are refused, and neither the parse diagnostic
+    /// nor Debug echoes a value or a reference path.
+    #[test]
+    fn health_check_header_refuses_a_literal_or_env_value_and_never_echoes() {
+        let parse = |table: &str| {
+            toml::from_str::<FileHealthCheckConfig>(&format!("uri = \"/\"\n[[headers]]\n{table}\n"))
+        };
+
+        for bad in [
+            format!("name = \"x\"\nvalue = \"{HEADER_SENTINEL}\""),
+            format!("name = \"x\"\nvalue_env = \"{HEADER_SENTINEL}\""),
+            "name = \"x\"".to_owned(),
+            "value_file = \"/p\"".to_owned(),
+            format!("name = \"x\"\nvalue_file = \"/p\"\nvalue = \"{HEADER_SENTINEL}\""),
+            format!("name = \"x\"\nvalue_file = \"/p\"\nvalue_env = \"{HEADER_SENTINEL}\""),
+            format!("name = \"x\"\nvalue_file = \"/p\"\nextra = \"{HEADER_SENTINEL}\""),
+            format!("name = \"x\"\nvalue_file = 12\nextra = \"{HEADER_SENTINEL}\""),
+        ] {
+            let error = parse(&bad).expect_err(&format!("{bad:?} must be refused"));
+            let diagnostic = toml_error_diagnostic("/etc/sozu.toml", &error);
+            assert!(
+                !diagnostic.contains(HEADER_SENTINEL),
+                "the diagnostic must not echo a value: {diagnostic}"
+            );
+        }
+
+        let accepted = parse(&format!("name = \"x\"\nvalue_file = \"/{REF_SENTINEL}/v\""))
+            .expect("a name and a value_file parse");
+        assert_eq!(accepted.headers.len(), 1);
+        let debug = format!("{accepted:?}");
+        assert!(
+            !debug.contains(REF_SENTINEL),
+            "Debug must redact the reference path: {debug}"
+        );
+    }
+
+    /// Until the protected activation exists, no `WorkerRequest` may leave a
+    /// cluster whose header values live in files: the refusal is static, comes
+    /// before any order is returned, and names no reference. A cluster without
+    /// headers keeps generating its orders.
+    #[test]
+    fn health_check_value_file_cluster_generates_no_worker_request() {
+        for protocol in ["http", "tcp"] {
+            let path = format!("/{REF_SENTINEL}/v");
+            let file = value_file_cluster(protocol, &[("x-token", &path)]);
+            let cluster = file
+                .to_cluster_config("guarded", &HashSet::new())
+                .expect("builds");
+
+            let direct = cluster
+                .generate_requests()
+                .expect_err("no order may carry a name without its value");
+            assert!(
+                matches!(direct, ConfigError::InvalidHealthCheck { .. }),
+                "{protocol}: {direct:?}"
+            );
+
+            let mut config = Config::default();
+            config.clusters.insert("guarded".to_owned(), cluster);
+            let error = config
+                .generate_config_messages()
+                .expect_err("the whole generation is refused before any order is returned");
+            let shown = format!("{error} {error:?}");
+            assert!(
+                matches!(error, ConfigError::InvalidHealthCheck { .. })
+                    && shown.contains("guarded")
+                    && !shown.contains(REF_SENTINEL),
+                "{protocol}: {shown}"
+            );
+        }
+
+        let headerless: FileClusterConfig = toml::from_str(
+            "protocol = \"http\"\nfrontends = []\nbackends = []\n[health_check]\nuri = \"/\"\n",
+        )
+        .expect("parses");
+        let cluster = headerless
+            .to_cluster_config("plain", &HashSet::new())
+            .expect("builds");
+        assert!(cluster.generate_requests().is_ok());
     }
 
     #[test]
@@ -7887,8 +8692,8 @@ mod tests {
         .expect("write config");
         match FileConfig::load_from_path(path.to_str().expect("utf-8 path")) {
             Err(ConfigError::DeserializeToml(message)) => assert!(
-                message.contains("invalid type: integer"),
-                "unexpected message: {message}"
+                message.contains("config.toml") && message.contains(" at bytes "),
+                "the diagnostic keeps the path and the byte range: {message}"
             ),
             other => panic!("an integer mode must fail as DeserializeToml, got {other:?}"),
         }

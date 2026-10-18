@@ -589,6 +589,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
+ "zeroize",
 ]
 
 [[package]]
@@ -1463,6 +1464,7 @@ dependencies = [
  "const-oid",
  "crypto-common 0.2.2",
  "ctutils",
+ "zeroize",
 ]
 
 [[package]]
@@ -5076,7 +5078,9 @@ dependencies = [
 name = "sozu-command-lib"
 version = "2.3.2"
 dependencies = [
+ "getrandom 0.4.3",
  "hex",
+ "hmac 0.13.0",
  "libc",
  "log",
  "memchr",
@@ -5099,6 +5103,7 @@ dependencies = [
  "time",
  "toml",
  "x509-parser",
+ "zeroize",
 ]
 
 [[package]]
@@ -5182,6 +5187,7 @@ dependencies = [
  "rusty_ulid",
  "sozu-command-lib",
  "sozu-lib",
+ "tempfile",
 ]
 
 [[package]]

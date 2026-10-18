@@ -7,11 +7,12 @@
 
 use std::{
     fs::File,
-    io::{Error as IoError, Read, Seek, Write},
+    io::{Error as IoError, ErrorKind, Read, Write},
     os::{
         fd::{OwnedFd, RawFd},
         unix::{
             io::{AsRawFd, FromRawFd},
+            net::UnixStream as StdUnixStream,
             process::CommandExt,
         },
     },
@@ -31,21 +32,22 @@ use sozu_command_lib::{
     channel::{Channel, ChannelError},
     logging::{LogError, setup_logging_with_config},
     sd_notify,
+    secret::{PROTECTED_TRANSFER_MAX_BYTES, ProtectedTransfer, TransferError, Zeroize, Zeroizing},
 };
-use tempfile::tempfile;
 
 use crate::{
     command::{
         server::{CommandHub, HubError, ServerError},
-        upgrade::{LegacyUpgradeData, UpgradeData, UpgradeHandshake, UpgradeStage},
+        upgrade::{
+            LegacyUpgradeData, UPGRADE_PROTOCOL_V2, UPGRADE_PROTOCOL_V3, UpgradeData,
+            UpgradeHandshake, UpgradeStage,
+        },
     },
     util::{self, UtilError},
 };
 
 #[derive(thiserror::Error, Debug)]
 pub enum UpgradeError {
-    #[error("could not create temporary state file for the upgrade: {0}")]
-    CreateUpgradeFile(IoError),
     #[error("could not disable cloexec on {fd_name}'s file descriptor: {util_err}")]
     DisableCloexec {
         fd_name: String,
@@ -53,16 +55,36 @@ pub enum UpgradeError {
     },
     #[error("could not create MIO pair of unix stream: {0}")]
     CreateUnixStream(IoError),
-    #[error("could not rewind the temporary upgrade file: {0}")]
-    Rewind(IoError),
-    #[error("could not write upgrade data to temporary file: {0}")]
-    SerdeWriteError(SerdeError),
-    #[error("could not write upgrade data to temporary file: {0}")]
-    WriteFile(IoError),
     #[error("could not read upgrade data from file: {0}")]
     ReadFile(IoError),
     #[error("could not read upgrade data to temporary file: {0}")]
     SerdeReadError(SerdeError),
+    #[error("could not encode the upgrade snapshot: {0}")]
+    EncodeSnapshot(SerdeError),
+    #[error("the upgrade snapshot changed while it was being encoded")]
+    SnapshotChanged,
+    #[error("main-upgrade transfer: unrecognized transfer header ({0})")]
+    TransferHeader(&'static str),
+    #[error("main-upgrade transfer: the {0} exceeds the maximum")]
+    TransferTooLarge(&'static str),
+    #[error("main-upgrade transfer: truncated payload")]
+    TransferTruncated,
+    #[error("main-upgrade transfer: trailing bytes after the payload")]
+    TransferTrailing,
+    #[error("main-upgrade transfer: handoff deadline exceeded")]
+    TransferDeadline,
+    #[error("main-upgrade transfer: socket failure: {0}")]
+    TransferIo(IoError),
+    #[error(
+        "main-upgrade transfer: malformed upgrade snapshot ({category:?} at line {line} column {column})"
+    )]
+    MalformedSnapshot {
+        category: serde_json::error::Category,
+        line: usize,
+        column: usize,
+    },
+    #[error("main-upgrade transfer: protected state refused: {0}")]
+    TransferProtected(TransferError),
     #[error("unix fork failed: {0}")]
     Fork(Errno),
     #[error("failed to set metrics on the new main process: {0}")]
@@ -90,7 +112,7 @@ pub enum UpgradeError {
     SetupLogging(LogError),
     #[error("could not start the main-upgrade protocol probe: {0}")]
     ProbeSpawn(IoError),
-    #[error("main-upgrade candidate rejected protocol v2 with status {0}")]
+    #[error("main-upgrade candidate rejected protocol v3 with status {0}")]
     ProbeRejected(std::process::ExitStatus),
     #[error("main-upgrade candidate did not answer the protocol probe within {0:?}")]
     ProbeTimeout(Duration),
@@ -120,14 +142,15 @@ pub enum UpgradeError {
 }
 
 /// Check protocol support before any live descriptor is made inheritable or
-/// the current Hub is frozen. An older binary rejects this unknown subcommand.
+/// the current Hub is frozen. An older binary rejects this unknown value, or
+/// the unknown subcommand.
 pub fn probe_main_upgrade_candidate(executable_path: &str) -> Result<(), UpgradeError> {
     const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
     let mut child = Command::new(executable_path)
         .arg("upgrade-probe")
         .arg("--protocol")
-        .arg(crate::command::upgrade::UPGRADE_PROTOCOL_V2.to_string())
+        .arg(UPGRADE_PROTOCOL_V3.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -151,117 +174,356 @@ pub fn probe_main_upgrade_candidate(executable_path: &str) -> Result<(), Upgrade
     }
 }
 
+// ---- Protocol 3 transfer frame -------------------------------------------
+//
+// One bounded frame on a dedicated Unix socket, all integers big-endian:
+//
+//   magic            8 bytes  "SOZUUPG3"
+//   frame version    u32      1
+//   handoff budget   u64      milliseconds left of the old main's deadline
+//   snapshot length  u64      JSON `UpgradeData`, at most TRANSFER_MAX_SNAPSHOT_BYTES
+//   protected length u64      `ProtectedTransfer`, at most PROTECTED_TRANSFER_MAX_BYTES
+//   snapshot bytes, protected bytes, then end-of-file
+//
+// The sender half-closes after the payload, so the receiver tells the end of
+// the frame from trailing bytes. Every read and write is bounded by one
+// absolute deadline that nothing renews on progress.
+
+const TRANSFER_MAGIC: &[u8; 8] = b"SOZUUPG3";
+const TRANSFER_FRAME_VERSION: u32 = 1;
+const TRANSFER_HEADER_LEN: usize = 8 + 4 + 8 + 8 + 8;
+/// Hard maximum of the JSON snapshot of a frame.
+pub(crate) const TRANSFER_MAX_SNAPSHOT_BYTES: usize = 1 << 30;
+/// Longest handoff budget a frame may carry.
+const TRANSFER_MAX_BUDGET: Duration = Duration::from_secs(24 * 60 * 60);
+/// How long the receiver waits for the fixed-size header, which the sender
+/// writes right after the fork.
+const TRANSFER_HEADER_WAIT: Duration = Duration::from_secs(5);
+/// Bytes handed to the kernel per call, so the deadline is re-read often.
+const TRANSFER_CHUNK: usize = 64 * 1024;
+
+/// Counts the bytes a serialization would produce, retaining none.
+struct CountingWriter(usize);
+
+impl Write for CountingWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .ok_or_else(|| IoError::from(ErrorKind::OutOfMemory))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Fills a zeroing buffer without ever growing it.
+struct ExactWriter<'a>(&'a mut Zeroizing<Vec<u8>>);
+
+impl Write for ExactWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.0.capacity() - self.0.len() < bytes.len() {
+            return Err(IoError::from(ErrorKind::WriteZero));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The two encoded sections of a protocol-3 frame. Both live in zeroing
+/// buffers allocated once at their exact size, and are wiped when sent or
+/// dropped.
+pub struct UpgradePayload {
+    snapshot: Zeroizing<Vec<u8>>,
+    protected: Zeroizing<Vec<u8>>,
+}
+
+impl UpgradePayload {
+    /// Count the snapshot's JSON first, allocate exactly that, then serialize
+    /// straight into it: nothing is reallocated, so no unwiped copy is left.
+    pub fn encode(
+        upgrade_data: &UpgradeData,
+        protected: &ProtectedTransfer,
+    ) -> Result<Self, UpgradeError> {
+        let mut counter = CountingWriter(0);
+        serde_json::to_writer(&mut counter, upgrade_data).map_err(UpgradeError::EncodeSnapshot)?;
+        if counter.0 > TRANSFER_MAX_SNAPSHOT_BYTES {
+            return Err(UpgradeError::TransferTooLarge("snapshot"));
+        }
+        let mut snapshot = Zeroizing::new(Vec::with_capacity(counter.0));
+        let (pointer, capacity) = (snapshot.as_ptr(), snapshot.capacity());
+        serde_json::to_writer(ExactWriter(&mut snapshot), upgrade_data)
+            .map_err(UpgradeError::EncodeSnapshot)?;
+        if snapshot.len() != counter.0
+            || snapshot.as_ptr() != pointer
+            || snapshot.capacity() != capacity
+        {
+            return Err(UpgradeError::SnapshotChanged);
+        }
+
+        let protected_len = protected
+            .encoded_len()
+            .map_err(UpgradeError::TransferProtected)?;
+        let mut encoded = Zeroizing::new(Vec::with_capacity(protected_len));
+        protected
+            .encode_into(&mut encoded)
+            .map_err(UpgradeError::TransferProtected)?;
+        Ok(Self {
+            snapshot,
+            protected: encoded,
+        })
+    }
+}
+
+/// Time left before `deadline`, or the deadline error.
+fn time_before(deadline: Instant) -> Result<Duration, UpgradeError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|left| !left.is_zero())
+        .ok_or(UpgradeError::TransferDeadline)
+}
+
+fn write_before(
+    socket: &StdUnixStream,
+    mut bytes: &[u8],
+    deadline: Instant,
+) -> Result<(), UpgradeError> {
+    while !bytes.is_empty() {
+        socket
+            .set_write_timeout(Some(time_before(deadline)?))
+            .map_err(UpgradeError::TransferIo)?;
+        let chunk = &bytes[..bytes.len().min(TRANSFER_CHUNK)];
+        match (&*socket).write(chunk) {
+            Ok(0) => return Err(UpgradeError::TransferIo(ErrorKind::WriteZero.into())),
+            Ok(written) => bytes = &bytes[written..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(UpgradeError::TransferIo(error)),
+        }
+    }
+    Ok(())
+}
+
+fn read_exact_before(
+    socket: &StdUnixStream,
+    mut buffer: &mut [u8],
+    deadline: Instant,
+) -> Result<(), UpgradeError> {
+    while !buffer.is_empty() {
+        socket
+            .set_read_timeout(Some(time_before(deadline)?))
+            .map_err(UpgradeError::TransferIo)?;
+        let chunk_len = buffer.len().min(TRANSFER_CHUNK);
+        match (&*socket).read(&mut buffer[..chunk_len]) {
+            Ok(0) => return Err(UpgradeError::TransferTruncated),
+            Ok(read) => buffer = &mut buffer[read..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(UpgradeError::TransferIo(error)),
+        }
+    }
+    Ok(())
+}
+
+/// Write the frame to the candidate, which was forked first, and half-close.
+/// The payload is wiped whatever the outcome.
+pub fn send_upgrade_transfer(
+    socket: &mut StdUnixStream,
+    payload: &mut UpgradePayload,
+    deadline: Instant,
+) -> Result<(), UpgradeError> {
+    let result = write_frame(socket, payload, deadline);
+    // Wipe at once: both buffers hold secret-bearing bytes.
+    let UpgradePayload {
+        snapshot,
+        protected,
+    } = payload;
+    zeroize_in_place(snapshot);
+    zeroize_in_place(protected);
+    result
+}
+
+fn zeroize_in_place(buffer: &mut Zeroizing<Vec<u8>>) {
+    buffer.zeroize();
+}
+
+fn write_frame(
+    socket: &StdUnixStream,
+    payload: &UpgradePayload,
+    deadline: Instant,
+) -> Result<(), UpgradeError> {
+    let budget = time_before(deadline)?;
+    let budget_millis = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX).max(1);
+    let length =
+        |len: usize| u64::try_from(len).map_err(|_| UpgradeError::TransferTooLarge("frame"));
+    let mut header = Vec::with_capacity(TRANSFER_HEADER_LEN);
+    header.extend_from_slice(TRANSFER_MAGIC);
+    header.extend_from_slice(&TRANSFER_FRAME_VERSION.to_be_bytes());
+    header.extend_from_slice(&budget_millis.to_be_bytes());
+    header.extend_from_slice(&length(payload.snapshot.len())?.to_be_bytes());
+    header.extend_from_slice(&length(payload.protected.len())?.to_be_bytes());
+    write_before(socket, &header, deadline)?;
+    write_before(socket, &payload.snapshot, deadline)?;
+    write_before(socket, &payload.protected, deadline)?;
+    socket
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(UpgradeError::TransferIo)
+}
+
+/// What a candidate reads from a frame, and the absolute deadline it carries.
+pub(crate) struct ReceivedTransfer {
+    pub(crate) upgrade_data: UpgradeData,
+    pub(crate) protected: ProtectedTransfer,
+    pub(crate) deadline: Instant,
+}
+
+/// Read one frame. Everything is bounded and validated before PREPARED: the
+/// header, both lengths, the exact payload, the end-of-file, then the content.
+/// `started` is when this process began receiving.
+pub(crate) fn receive_upgrade_transfer(
+    socket: &StdUnixStream,
+    started: Instant,
+) -> Result<ReceivedTransfer, UpgradeError> {
+    let mut header = [0u8; TRANSFER_HEADER_LEN];
+    read_exact_before(socket, &mut header, started + TRANSFER_HEADER_WAIT)?;
+    let (magic, rest) = header.split_at(8);
+    if magic != TRANSFER_MAGIC {
+        return Err(UpgradeError::TransferHeader("magic"));
+    }
+    let field = |at: usize| -> [u8; 8] {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&rest[at..at + 8]);
+        bytes
+    };
+    if rest[..4] != TRANSFER_FRAME_VERSION.to_be_bytes() {
+        return Err(UpgradeError::TransferHeader("frame version"));
+    }
+    let budget = Duration::from_millis(u64::from_be_bytes(field(4)));
+    if budget.is_zero() || budget > TRANSFER_MAX_BUDGET {
+        return Err(UpgradeError::TransferHeader("budget"));
+    }
+    let bounded = |raw: u64, maximum: usize, what: &'static str| {
+        usize::try_from(raw)
+            .ok()
+            .filter(|len| *len <= maximum)
+            .ok_or(UpgradeError::TransferTooLarge(what))
+    };
+    let snapshot_len = bounded(
+        u64::from_be_bytes(field(12)),
+        TRANSFER_MAX_SNAPSHOT_BYTES,
+        "snapshot",
+    )?;
+    let protected_len = bounded(
+        u64::from_be_bytes(field(20)),
+        PROTECTED_TRANSFER_MAX_BYTES,
+        "protected state",
+    )?;
+
+    let deadline = started + budget;
+    let mut snapshot = Zeroizing::new(vec![0u8; snapshot_len]);
+    read_exact_before(socket, &mut snapshot, deadline)?;
+    let mut protected_bytes = Zeroizing::new(vec![0u8; protected_len]);
+    read_exact_before(socket, &mut protected_bytes, deadline)?;
+
+    let mut extra = Zeroizing::new([0u8; 1]);
+    loop {
+        socket
+            .set_read_timeout(Some(time_before(deadline)?))
+            .map_err(UpgradeError::TransferIo)?;
+        match (&*socket).read(extra.as_mut_slice()) {
+            Ok(0) => break,
+            Ok(_) => return Err(UpgradeError::TransferTrailing),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(UpgradeError::TransferIo(error)),
+        }
+    }
+
+    // The snapshot is never echoed in an error: only its category and place.
+    let upgrade_data: UpgradeData =
+        serde_json::from_slice(&snapshot).map_err(|error| UpgradeError::MalformedSnapshot {
+            category: error.classify(),
+            line: error.line(),
+            column: error.column(),
+        })?;
+    let protected =
+        ProtectedTransfer::decode(&protected_bytes).map_err(UpgradeError::TransferProtected)?;
+    Ok(ReceivedTransfer {
+        upgrade_data,
+        protected,
+        deadline,
+    })
+}
+
+/// The replacement main as the old main sees it right after the fork.
+pub struct NewMain {
+    pub pid: pid_t,
+    /// PREPARED / COMMIT / ACTIVATED travel here, never the snapshot.
+    pub confirmation: Channel<UpgradeHandshake, UpgradeHandshake>,
+    /// The old main's end of the transfer socket.
+    pub transfer: StdUnixStream,
+}
+
 /// unix-forks the main process
 ///
 /// - Parent: meant to disappear after the child confirms it's alive
 /// - Child: calls Sōzu's executable path with `sozu main [...]`
 ///
-/// returns the pid of the new main, and a channel to get confirmation from the new main
+/// The candidate is forked and exec'd first; the snapshot is sent afterwards
+/// with [`send_upgrade_transfer`] over `transfer`, a socket pair of its own
+/// whose other end is the candidate's `--upgrade-fd`. Every endpoint this
+/// function created and does not return is closed on every path.
 pub fn fork_main_into_new_main(
     executable_path: String,
-    upgrade_data: UpgradeData,
-) -> Result<(pid_t, Channel<UpgradeHandshake, UpgradeHandshake>), UpgradeError> {
+    upgrade_data: &UpgradeData,
+) -> Result<NewMain, UpgradeError> {
     trace!("parent({})", std::process::id());
 
-    let mut upgrade_file = tempfile().map_err(UpgradeError::CreateUpgradeFile)?;
-
-    util::disable_close_on_exec(upgrade_file.as_raw_fd()).map_err(|util_err| {
-        UpgradeError::DisableCloexec {
-            fd_name: "upgrade-file".to_string(),
-            util_err,
-        }
-    })?;
-
-    // Snapshot the count of worker sessions being handed off BEFORE we move
-    // `upgrade_data` into serialization, so we can reconcile it against what
-    // the re-execed master will recover (round-trip below). Gated to debug:
-    // the snapshots are read only inside the `#[cfg(debug_assertions)]` block.
-    #[cfg(debug_assertions)]
-    let workers_to_handoff = upgrade_data.snapshot().workers.len();
-    #[cfg(debug_assertions)]
-    let boot_generation_handoff = upgrade_data.snapshot().boot_generation;
-
-    info!("Writing upgrade data to file");
-    let upgrade_data_string =
-        serde_json::to_string(&upgrade_data).map_err(UpgradeError::SerdeWriteError)?;
-
-    // The serialized payload must round-trip: deserializing what we are about
-    // to write back into `UpgradeData` and re-serializing must reproduce the
-    // same DOCUMENT — a mismatch would mean a (de)serialization bug that would
-    // silently corrupt the recovered master state on the other side of the
-    // re-exec. This is the cheap, in-process half of the write->read
-    // round-trip that `begin_new_main_process` completes after exec. (Guarded
-    // both let + assert: the re-parse only exists for the check, so it is dead
-    // code stripped in release.)
-    //
-    // Compared as parsed JSON, never byte-for-byte: `UpgradeData` owns a
-    // `ConfigState`, whose `tcp_fronts`, `udp_fronts` and `certificates` are
-    // `HashMap`s. Every `HashMap` instance gets its own `RandomState` keys, so
-    // the re-parsed maps iterate — and serialize — in a different order than
-    // the originals, and a byte comparison failed on a perfectly CORRECT
-    // upgrade as soon as one of those maps held more than one entry (measured:
-    // 18 of 20 rounds with four TCP frontends). `serde_json::Map` is
-    // BTreeMap-backed here (no `preserve_order` feature in the lockfile), so
-    // comparing `Value`s is key-order-insensitive while still catching every
-    // value-level corruption the check exists for.
-    #[cfg(debug_assertions)]
-    {
-        match serde_json::from_str::<UpgradeData>(&upgrade_data_string) {
-            Ok(reparsed) => {
-                debug_assert_eq!(
-                    reparsed.snapshot().workers.len(),
-                    workers_to_handoff,
-                    "round-tripped upgrade data must preserve the worker-session count"
-                );
-                debug_assert_eq!(
-                    reparsed.snapshot().boot_generation,
-                    boot_generation_handoff,
-                    "round-tripped upgrade data must preserve the boot generation"
-                );
-                let reserialized = serde_json::to_string(&reparsed)
-                    .expect("re-serializing already-parsed upgrade data cannot fail");
-                debug_assert_eq!(
-                    serde_json::from_str::<serde_json::Value>(&reserialized)
-                        .expect("re-serialized upgrade data is valid JSON"),
-                    serde_json::from_str::<serde_json::Value>(&upgrade_data_string)
-                        .expect("the upgrade data we just serialized is valid JSON"),
-                    "upgrade data must serialize->deserialize->serialize to the same document"
-                );
-            }
-            Err(e) => debug_assert!(
-                false,
-                "upgrade data we just serialized must deserialize back: {e}"
-            ),
-        }
-    }
-
-    upgrade_file
-        .write_all(upgrade_data_string.as_bytes())
-        .map_err(UpgradeError::WriteFile)?;
-    upgrade_file.rewind().map_err(UpgradeError::Rewind)?;
-
+    let (transfer, candidate_transfer) =
+        StdUnixStream::pair().map_err(UpgradeError::CreateUnixStream)?;
     let (old_to_new, new_to_old) = UnixStream::pair().map_err(UpgradeError::CreateUnixStream)?;
 
     // The descriptors the new binary inherits across the re-exec must be
     // distinct kernel objects — none handed off twice. Three are in play at
     // this site: the confirmation channel (`new_to_old`, passed as `--fd`),
-    // the upgrade-state file (passed as `--upgrade-fd`), and the unix command
+    // the transfer socket (passed as `--upgrade-fd`), and the unix command
     // listener carried inside `UpgradeData::snapshot` (`command_socket_fd`). A collision
     // would mean a single fd is being used for two roles after exec — an
     // fd-bookkeeping bug in the handoff.
     debug_assert!(
-        new_to_old.as_raw_fd() != upgrade_file.as_raw_fd(),
-        "confirmation-channel fd must not alias the upgrade-state file fd"
+        new_to_old.as_raw_fd() != candidate_transfer.as_raw_fd(),
+        "confirmation-channel fd must not alias the transfer socket fd"
     );
     debug_assert!(
         new_to_old.as_raw_fd() != upgrade_data.snapshot().command_socket_fd,
         "confirmation-channel fd must not alias the inherited command-socket fd"
     );
     debug_assert!(
-        upgrade_file.as_raw_fd() != upgrade_data.snapshot().command_socket_fd,
-        "upgrade-state file fd must not alias the inherited command-socket fd"
+        candidate_transfer.as_raw_fd() != upgrade_data.snapshot().command_socket_fd,
+        "transfer socket fd must not alias the inherited command-socket fd"
     );
 
+    util::disable_close_on_exec(candidate_transfer.as_raw_fd()).map_err(|util_err| {
+        UpgradeError::DisableCloexec {
+            fd_name: "upgrade-transfer-socket".to_string(),
+            util_err,
+        }
+    })?;
     util::disable_close_on_exec(new_to_old.as_raw_fd()).map_err(|util_err| {
         UpgradeError::DisableCloexec {
             fd_name: "new-main-to-old-main-channel".to_string(),
@@ -298,7 +560,13 @@ pub fn fork_main_into_new_main(
             );
             info!("new main launched, with pid {}", child);
 
-            Ok((child.into(), fork_confirmation_channel))
+            // `candidate_transfer` and `new_to_old` close here: the candidate
+            // owns its copies, and neither may leak into a later fork.
+            Ok(NewMain {
+                pid: child.into(),
+                confirmation: fork_confirmation_channel,
+                transfer,
+            })
         }
         ForkResult::Child => {
             trace!("child({}):\twill spawn a child", std::process::id());
@@ -316,9 +584,8 @@ pub fn fork_main_into_new_main(
             //
             // Operator-driven schema mismatch on `upgrade-main` (the new
             // binary's proto schema being incompatible with the running
-            // master's `UpgradeData` payload written via
-            // `serde_json::to_string` above) is a separate concern: the
-            // newly-execed master will fail to parse the inherited state
+            // master's `UpgradeData` payload) is a separate concern: the
+            // newly-execed master will fail to parse the received state
             // and the upgrade aborts cleanly. Operators must verify
             // proto compatibility before swapping the on-disk binary.
             let res = Command::new(executable_path)
@@ -326,9 +593,9 @@ pub fn fork_main_into_new_main(
                 .arg("--fd")
                 .arg(new_to_old.as_raw_fd().to_string())
                 .arg("--upgrade-fd")
-                .arg(upgrade_file.as_raw_fd().to_string())
+                .arg(candidate_transfer.as_raw_fd().to_string())
                 .arg("--upgrade-protocol")
-                .arg(crate::command::upgrade::UPGRADE_PROTOCOL_V2.to_string())
+                .arg(UPGRADE_PROTOCOL_V3.to_string())
                 .arg("--command-buffer-size")
                 .arg(
                     upgrade_data
@@ -365,7 +632,13 @@ pub fn begin_new_main_process(
     max_command_buffer_size: u64,
 ) -> Result<(), UpgradeError> {
     match upgrade_protocol {
-        Some(crate::command::upgrade::UPGRADE_PROTOCOL_V2) => begin_v2_main_process(
+        Some(UPGRADE_PROTOCOL_V3) => begin_v3_main_process(
+            new_to_old_channel_fd,
+            upgrade_file_fd,
+            command_buffer_size,
+            max_command_buffer_size,
+        ),
+        Some(UPGRADE_PROTOCOL_V2) => begin_v2_main_process(
             new_to_old_channel_fd,
             upgrade_file_fd,
             command_buffer_size,
@@ -457,6 +730,69 @@ fn begin_v2_main_process(
     let upgrade_data: UpgradeData =
         serde_json::from_str(&content).map_err(UpgradeError::SerdeReadError)?;
 
+    prepare_and_activate_main(
+        fork_confirmation_channel,
+        upgrade_data,
+        None,
+        UPGRADE_PROTOCOL_V2,
+        None,
+    )
+}
+
+/// Receive a protocol-3 hand-over: one bounded frame from a Unix socket, never
+/// a file, carrying the snapshot and the confirmed protected state.
+fn begin_v3_main_process(
+    new_to_old_channel_fd: i32,
+    transfer_fd: i32,
+    command_buffer_size: u64,
+    max_command_buffer_size: u64,
+) -> Result<(), UpgradeError> {
+    let started = Instant::now();
+    validate_inherited_fd("upgrade confirmation channel", new_to_old_channel_fd)?;
+    validate_inherited_fd("upgrade transfer socket", transfer_fd)?;
+    if new_to_old_channel_fd == transfer_fd {
+        return Err(UpgradeError::InvalidInheritedDescriptor {
+            name: "upgrade transfer socket",
+            fd: transfer_fd,
+        });
+    }
+    // SAFETY: both descriptors were inherited from the old main, validated
+    // above and are distinct; each has no other owner in this fresh process.
+    let mut fork_confirmation_channel: Channel<UpgradeHandshake, UpgradeHandshake> = Channel::new(
+        unsafe { UnixStream::from_raw_fd(new_to_old_channel_fd) },
+        command_buffer_size,
+        max_command_buffer_size,
+    );
+    // SAFETY: as above; ownership moves to the stream, which closes the socket
+    // once the frame is read, so no later fork inherits it.
+    let transfer = unsafe { StdUnixStream::from_raw_fd(transfer_fd) };
+    if let Err(e) = fork_confirmation_channel.blocking() {
+        error!("Could not block the fork confirmation channel: {}", e);
+    }
+
+    println!("reading upgrade data from the transfer socket");
+    let received = receive_upgrade_transfer(&transfer, started)?;
+    drop(transfer);
+
+    prepare_and_activate_main(
+        fork_confirmation_channel,
+        received.upgrade_data,
+        Some(received.protected),
+        UPGRADE_PROTOCOL_V3,
+        Some(received.deadline),
+    )
+}
+
+/// Everything after the snapshot is read: prepare the replacement Hub, answer
+/// PREPARED, wait for COMMIT, activate. `deadline` is the absolute handoff
+/// deadline of protocol 3; protocol 2 waits one `worker_timeout` for COMMIT.
+fn prepare_and_activate_main(
+    mut fork_confirmation_channel: Channel<UpgradeHandshake, UpgradeHandshake>,
+    upgrade_data: UpgradeData,
+    protected: Option<ProtectedTransfer>,
+    protocol: u16,
+    deadline: Option<Instant>,
+) -> Result<(), UpgradeError> {
     let config = upgrade_data.snapshot().config.clone();
     let upgrade_client_token = mio::Token(upgrade_data.snapshot().upgrade_client_token);
     let upgrade_counts = upgrade_data.counts();
@@ -466,8 +802,8 @@ fn begin_v2_main_process(
     setup_logging_with_config(&config, "MAIN").map_err(UpgradeError::SetupLogging)?;
     util::setup_metrics(&config).map_err(UpgradeError::SetupMetrics)?;
 
-    let mut paused_hub =
-        CommandHub::prepare_from_upgrade_data(upgrade_data).map_err(UpgradeError::CreateHub)?;
+    let mut paused_hub = CommandHub::prepare_from_upgrade_data(upgrade_data, protected)
+        .map_err(UpgradeError::CreateHub)?;
 
     // Every fallible preparation runs here, before PREPARED, where a failure
     // still makes the old main roll back and keep serving. After COMMIT the
@@ -487,17 +823,23 @@ fn begin_v2_main_process(
     let pid_file = util::open_pid_file(&config).map_err(UpgradeError::WritePidFile)?;
 
     fork_confirmation_channel
-        .write_message(&UpgradeHandshake::prepared(upgrade_counts))
+        .write_message(&UpgradeHandshake::prepared(upgrade_counts, protocol))
         .map_err(|channel_err| UpgradeError::SendConfirmation {
             result: "prepared".to_string(),
             channel_err,
         })?;
 
-    let handoff_timeout = Duration::from_secs(config.worker_timeout.max(1) as u64);
+    let handoff_timeout = match deadline {
+        None => Duration::from_secs(config.worker_timeout.max(1) as u64),
+        Some(deadline) => deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or(UpgradeError::TransferDeadline)?,
+    };
     match fork_confirmation_channel.read_message_blocking_timeout(Some(handoff_timeout)) {
         Ok(message)
             if message.stage() == UpgradeStage::Commit
-                && message.protocol == u32::from(crate::command::upgrade::UPGRADE_PROTOCOL_V2) => {}
+                && message.protocol == u32::from(protocol) => {}
         Ok(message) => {
             error!("unexpected pre-commit main-upgrade message: {:?}", message);
             return Ok(());
@@ -554,8 +896,8 @@ fn begin_v2_main_process(
     }
 
     // The old main stops whether or not this acknowledgement reaches it.
-    if let Err(error) =
-        fork_confirmation_channel.write_message(&UpgradeHandshake::new(UpgradeStage::Activated))
+    if let Err(error) = fork_confirmation_channel
+        .write_message(&UpgradeHandshake::new(UpgradeStage::Activated, protocol))
     {
         error!(
             "could not acknowledge activation to the old main, keeping the proxy running: {}",
@@ -822,11 +1164,13 @@ fn wait_for_parent_exit(pidfd: RawFd, parent_pid: pid_t, diagnostic_timeout: Dur
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
+        io::{Read, Write},
         os::fd::{AsRawFd, IntoRawFd},
         os::unix::net::UnixStream as StdUnixStream,
         sync::mpsc,
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     #[cfg(target_os = "linux")]
@@ -836,13 +1180,26 @@ mod tests {
 
     use sozu_command_lib::channel::Channel;
 
-    use super::{UpgradeError, begin_legacy_main_process, begin_new_main_process};
+    use super::{
+        TRANSFER_FRAME_VERSION, TRANSFER_MAGIC, UpgradeError, UpgradePayload,
+        begin_legacy_main_process, begin_new_main_process, receive_upgrade_transfer,
+        send_upgrade_transfer,
+    };
     #[cfg(target_os = "linux")]
     use super::{open_pidfd, wait_for_parent_exit};
+    use crate::command::upgrade::{UpgradeHandshake, tests::sample_upgrade_data};
+    use sozu_command_lib::{
+        proto::command::{HealthCheckHeader, HealthCheckHeaderValue},
+        secret::{
+            FingerprintKey, PROTECTED_TRANSFER_MAX_BYTES, ProtectedHeader, ProtectedHeaderChange,
+            ProtectedHeaderJournal, ProtectedHeaderSet, ProtectedTransfer, SecretValue,
+            TransferError, Zeroizing,
+        },
+    };
 
     #[test]
     fn explicit_legacy_or_unknown_protocol_is_rejected_before_fd_use() {
-        for protocol in [1, 3, u16::MAX] {
+        for protocol in [1, 4, u16::MAX] {
             let error = begin_new_main_process(-1, -1, Some(protocol), 64, 512)
                 .expect_err("an explicit non-v2 protocol must be rejected");
             assert!(
@@ -871,6 +1228,463 @@ mod tests {
                 .read_message()
                 .expect("the old main must receive its negative acknowledgement")
         );
+    }
+
+    /// A candidate that answers `upgrade-probe --protocol <accepted>` with
+    /// success and everything else with failure, recording what it was asked.
+    fn probe_candidate(directory: &std::path::Path, accepted: u16) -> (String, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let log = directory.join(format!("asked-{accepted}.log"));
+        let script = directory.join(format!("candidate-{accepted}.sh"));
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$1 $2 $3\" >> {}\n[ \"$1\" = upgrade-probe ] && [ \"$3\" = {accepted} ]\n",
+                log.display()
+            ),
+        )
+        .expect("write the probe candidate");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("make the probe candidate executable");
+        (script.to_string_lossy().into_owned(), log)
+    }
+
+    #[test]
+    fn the_probe_requests_protocol_three_and_accepts_a_candidate_that_supports_it() {
+        let directory = tempfile::tempdir().expect("probe directory");
+        let (candidate, log) = probe_candidate(directory.path(), 3);
+
+        super::probe_main_upgrade_candidate(&candidate)
+            .expect("a candidate that supports protocol 3 must be accepted");
+        assert_eq!(
+            std::fs::read_to_string(log).expect("candidate log"),
+            "upgrade-probe --protocol 3\n"
+        );
+    }
+
+    #[test]
+    fn the_probe_rejects_a_candidate_that_only_supports_protocol_two() {
+        let directory = tempfile::tempdir().expect("probe directory");
+        let (candidate, log) = probe_candidate(directory.path(), 2);
+
+        let error = super::probe_main_upgrade_candidate(&candidate)
+            .expect_err("a protocol-2-only candidate must not receive a V3 handoff");
+        assert!(matches!(error, UpgradeError::ProbeRejected(_)), "{error:?}");
+        assert_eq!(
+            std::fs::read_to_string(log).expect("candidate log"),
+            "upgrade-probe --protocol 3\n",
+            "the parent must ask for protocol 3 and never fall back to 2"
+        );
+    }
+
+    #[test]
+    fn protocol_three_reads_the_socket_and_stops_before_prepared_on_a_bad_frame() {
+        let (candidate_channel, mut old_main_channel): (
+            Channel<UpgradeHandshake, UpgradeHandshake>,
+            Channel<UpgradeHandshake, UpgradeHandshake>,
+        ) = Channel::generate_nonblocking(64, 512).expect("could not create handshake");
+        let candidate_fd = candidate_channel.sock.into_raw_fd();
+        old_main_channel
+            .blocking()
+            .expect("could not block old-main side of handshake");
+        let (mut sender, receiver) = StdUnixStream::pair().expect("transfer pair");
+        std::io::Write::write_all(&mut sender, b"not a frame").expect("write garbage");
+        drop(sender);
+
+        let error = begin_new_main_process(candidate_fd, receiver.into_raw_fd(), Some(3), 64, 512)
+            .expect_err("a malformed transfer must fail");
+        assert!(
+            !matches!(error, UpgradeError::UnsupportedProtocol(_)),
+            "protocol 3 must have a receiver: {error:?}"
+        );
+        assert!(
+            old_main_channel.read_message().is_err(),
+            "no PREPARED may precede a refused transfer"
+        );
+    }
+
+    // ---- protocol-3 frame: the real sender and receiver functions ----------
+    //
+    // These drive `send_upgrade_transfer` and `receive_upgrade_transfer` over a
+    // socket pair. The real-binary receiver tests in
+    // `bin/tests/main_upgrade_v3_memory_e2e.rs` cover the refusals that need a
+    // process; a successful handoff of a whole process needs the worker
+    // bootstrap, which is not part of this slice, so success stops at these
+    // functions and the PREPARED boundary is the one asserted by
+    // `protocol_three_reads_the_socket_and_stops_before_prepared_on_a_bad_frame`.
+
+    /// Synthetic secret: it must never appear in an error or a wiped buffer.
+    const HANDOFF_SENTINEL: &str = "Bearer SYNTHETIC-V3-HANDOFF-SECRET-5d2e";
+
+    type Metadata = HashMap<String, Vec<HealthCheckHeader>>;
+
+    struct Handoff {
+        transfer: ProtectedTransfer,
+        metadata: Metadata,
+        key: FingerprintKey,
+    }
+
+    fn fingerprint_key() -> FingerprintKey {
+        FingerprintKey::from_parts(Zeroizing::new([7u8; 32]), [9u8; 16])
+    }
+
+    /// Confirm `headers` for `cluster` and record the metadata naming them.
+    fn confirm(
+        key: &FingerprintKey,
+        journal: &mut ProtectedHeaderJournal,
+        metadata: &mut Metadata,
+        cluster: &str,
+        headers: Vec<(String, Vec<u8>)>,
+    ) {
+        let set = ProtectedHeaderSet::new(
+            headers
+                .into_iter()
+                .map(|(name, value)| {
+                    let mut carrier = HealthCheckHeaderValue {
+                        name: name.to_owned(),
+                        value,
+                    };
+                    let value = SecretValue::take_from_ingress(&mut carrier)
+                        .expect("a valid synthetic value");
+                    ProtectedHeader::new(key, name, value)
+                })
+                .collect(),
+        );
+        metadata.insert(
+            cluster.to_owned(),
+            set.headers()
+                .iter()
+                .map(|header| HealthCheckHeader {
+                    name: header.name().to_owned(),
+                    fingerprint: header.fingerprint().to_string(),
+                })
+                .collect(),
+        );
+        let version = journal
+            .propose(cluster, ProtectedHeaderChange::Replace(set))
+            .expect("a free version");
+        journal.accept(cluster, version);
+    }
+
+    fn lookup<'m>(metadata: &'m Metadata) -> impl Fn(&str) -> Option<&'m [HealthCheckHeader]> {
+        |cluster| metadata.get(cluster).map(Vec::as_slice)
+    }
+
+    /// Cluster `a` holds the ordered A/B pair, `empty` is an explicit empty
+    /// confirmed set, and `filler` further clusters of `headers` headers of
+    /// `value_len` bytes each make the protected block as large as asked.
+    fn handoff(filler: usize, headers: usize, value_len: usize) -> Handoff {
+        let key = fingerprint_key();
+        let mut journal = ProtectedHeaderJournal::default();
+        let mut metadata = Metadata::new();
+        confirm(
+            &key,
+            &mut journal,
+            &mut metadata,
+            "a",
+            vec![
+                ("X-B".to_owned(), b"second-by-name-first-by-order".to_vec()),
+                (
+                    "Authorization".to_owned(),
+                    HANDOFF_SENTINEL.as_bytes().to_vec(),
+                ),
+            ],
+        );
+        confirm(&key, &mut journal, &mut metadata, "empty", Vec::new());
+        for cluster in 0..filler {
+            let values = (0..headers)
+                .map(|index| (format!("X-Fill-{index}"), vec![b'x'; value_len]))
+                .collect();
+            confirm(
+                &key,
+                &mut journal,
+                &mut metadata,
+                &format!("f{cluster:02}"),
+                values,
+            );
+        }
+        let transfer = ProtectedTransfer::export(&journal, Some(&key), lookup(&metadata))
+            .expect("every confirmed set is named by its metadata");
+        Handoff {
+            transfer,
+            metadata,
+            key,
+        }
+    }
+
+    fn send_buffer_size(socket: &StdUnixStream) -> usize {
+        let mut size: libc::c_int = 0;
+        let mut length = size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `size` and `length` are live, correctly sized outputs for
+        // `SO_SNDBUF` on an open descriptor.
+        let result = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&raw mut size).cast(),
+                &raw mut length,
+            )
+        };
+        assert_eq!(result, 0, "could not read SO_SNDBUF");
+        usize::try_from(size).expect("a positive buffer size")
+    }
+
+    /// The bytes of a zeroing buffer's whole allocation, including the part a
+    /// wipe moved out of `len`.
+    ///
+    /// SAFETY contract: `pointer`/`capacity` were taken from a live
+    /// `Zeroizing<Vec<u8>>` that still owns the allocation, and the wipe
+    /// writes every byte of it, so all `capacity` bytes are initialised.
+    fn allocation<'a>(pointer: *const u8, capacity: usize) -> &'a [u8] {
+        // SAFETY: see above; the callers keep the owning payload alive.
+        unsafe { std::slice::from_raw_parts(pointer, capacity) }
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    /// Where a payload's two buffers live, to prove they were wiped in place.
+    struct Allocations {
+        snapshot: (*const u8, usize),
+        protected: (*const u8, usize),
+    }
+
+    fn allocations(payload: &UpgradePayload) -> Allocations {
+        Allocations {
+            snapshot: (payload.snapshot.as_ptr(), payload.snapshot.capacity()),
+            protected: (payload.protected.as_ptr(), payload.protected.capacity()),
+        }
+    }
+
+    fn assert_wiped_in_place(payload: &UpgradePayload, before: &Allocations) {
+        assert!(payload.snapshot.is_empty() && payload.protected.is_empty());
+        assert_eq!(
+            (payload.snapshot.as_ptr(), payload.snapshot.capacity()),
+            before.snapshot,
+            "the snapshot buffer was reallocated"
+        );
+        assert_eq!(
+            (payload.protected.as_ptr(), payload.protected.capacity()),
+            before.protected,
+            "the protected buffer was reallocated"
+        );
+        for (what, (pointer, capacity)) in [
+            ("snapshot", before.snapshot),
+            ("protected", before.protected),
+        ] {
+            assert!(
+                allocation(pointer, capacity).iter().all(|&byte| byte == 0),
+                "the {what} buffer was not wiped"
+            );
+        }
+    }
+
+    #[test]
+    fn a_frame_larger_than_the_socket_buffer_round_trips_and_the_sender_is_wiped() {
+        let Handoff {
+            transfer,
+            metadata,
+            key,
+        } = handoff(8, 32, 8000);
+        let upgrade_data = sample_upgrade_data();
+        let expected_snapshot = serde_json::to_string(&upgrade_data).expect("snapshot json");
+        let mut payload = UpgradePayload::encode(&upgrade_data, &transfer).expect("encode");
+
+        let (mut sender, receiver) = StdUnixStream::pair().expect("transfer pair");
+        assert!(
+            payload.protected.len() > 2 * send_buffer_size(&sender),
+            "the protected block must not fit the socket buffer"
+        );
+        assert!(
+            contains(&payload.protected, HANDOFF_SENTINEL.as_bytes()),
+            "the sender holds the value before sending"
+        );
+        let before = allocations(&payload);
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let writer = thread::spawn(move || {
+            let result = send_upgrade_transfer(&mut sender, &mut payload, deadline);
+            (result, payload)
+        });
+        let received = receive_upgrade_transfer(&receiver, Instant::now())
+            .expect("the frame must be received whole");
+        let (sent, payload) = writer.join().expect("the sender thread");
+        sent.expect("the frame must be sent whole");
+
+        assert_wiped_in_place(&payload, &before);
+        assert_eq!(
+            serde_json::to_string(&received.upgrade_data).expect("snapshot json"),
+            expected_snapshot
+        );
+        assert!(received.deadline > Instant::now(), "one absolute deadline");
+
+        let (restored_key, mut journal) = received
+            .protected
+            .restore(lookup(&metadata))
+            .expect("the receiver restores exactly what the sender exported");
+        let restored_key = restored_key.expect("the key travels");
+        let probe = SecretValue::take_from_ingress(&mut HealthCheckHeaderValue {
+            name: "x".to_owned(),
+            value: b"probe".to_vec(),
+        })
+        .expect("a probe value");
+        assert_eq!(
+            restored_key.fingerprint("x", &probe).to_string(),
+            key.fingerprint("x", &probe).to_string(),
+            "same key bytes and epoch"
+        );
+        let held = journal.effective("a").expect("cluster a is held");
+        let names: Vec<_> = held.headers().iter().map(ProtectedHeader::name).collect();
+        assert_eq!(names, ["X-B", "Authorization"], "A/B order is kept");
+        assert_eq!(
+            held.headers()[1].value().expose_secret_bytes(),
+            HANDOFF_SENTINEL.as_bytes()
+        );
+        assert!(journal.effective("empty").expect("kept").is_empty());
+        assert_eq!(journal.effective("f07").expect("last filler").len(), 32);
+        assert_eq!(
+            journal
+                .propose("a", ProtectedHeaderChange::Clear)
+                .expect("a next version")
+                .get(),
+            2 + 8 + 1,
+            "the counter continues after the versions the sender issued"
+        );
+    }
+
+    #[test]
+    fn a_forced_write_error_still_wipes_both_sender_buffers() {
+        let Handoff { transfer, .. } = handoff(8, 32, 8000);
+        let mut payload =
+            UpgradePayload::encode(&sample_upgrade_data(), &transfer).expect("encode");
+        let before = allocations(&payload);
+        let (mut sender, receiver) = StdUnixStream::pair().expect("transfer pair");
+
+        // The peer reads a little of the frame and goes away mid-payload.
+        let peer = thread::spawn(move || {
+            let mut some = vec![0u8; 100 * 1024];
+            (&receiver).read_exact(&mut some).expect("read a prefix");
+        });
+        let result = send_upgrade_transfer(
+            &mut sender,
+            &mut payload,
+            Instant::now() + Duration::from_secs(20),
+        );
+        peer.join().expect("the peer thread");
+
+        let error = result.expect_err("a vanished peer must fail the send");
+        assert!(matches!(error, UpgradeError::TransferIo(_)), "{error:?}");
+        assert!(
+            !format!("{error} {error:?}").contains("SYNTHETIC"),
+            "a diagnostic carries no value"
+        );
+        assert_wiped_in_place(&payload, &before);
+    }
+
+    /// The two encoded sections of a small payload.
+    fn frame_parts() -> (Vec<u8>, Vec<u8>) {
+        let Handoff { transfer, .. } = handoff(0, 0, 0);
+        let payload = UpgradePayload::encode(&sample_upgrade_data(), &transfer).expect("encode");
+        (payload.snapshot.to_vec(), payload.protected.to_vec())
+    }
+
+    fn frame(snapshot_len: u64, protected_len: u64, body: &[&[u8]]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(TRANSFER_MAGIC);
+        frame.extend_from_slice(&TRANSFER_FRAME_VERSION.to_be_bytes());
+        frame.extend_from_slice(&5_000u64.to_be_bytes());
+        frame.extend_from_slice(&snapshot_len.to_be_bytes());
+        frame.extend_from_slice(&protected_len.to_be_bytes());
+        for part in body {
+            frame.extend_from_slice(part);
+        }
+        frame
+    }
+
+    /// Receive `bytes` that the sender then half-closed.
+    fn receive_bytes(bytes: &[u8]) -> Result<(), UpgradeError> {
+        let (mut sender, receiver) = StdUnixStream::pair().expect("transfer pair");
+        sender
+            .write_all(bytes)
+            .expect("a small frame fits the buffer");
+        sender
+            .shutdown(std::net::Shutdown::Write)
+            .expect("half-close");
+        receive_upgrade_transfer(&receiver, Instant::now()).map(|_| ())
+    }
+
+    /// A named frame and the refusal it must provoke.
+    type RefusedFrame<'a> = (&'a str, Vec<u8>, fn(&UpgradeError) -> bool);
+
+    #[test]
+    fn malformed_truncated_trailing_and_oversized_frames_fail_without_a_value_in_the_error() {
+        let (snapshot, protected) = frame_parts();
+        let (snapshot_len, protected_len) = (snapshot.len() as u64, protected.len() as u64);
+        let whole = frame(snapshot_len, protected_len, &[&snapshot, &protected]);
+        assert!(receive_bytes(&whole).is_ok(), "the control frame is valid");
+
+        let mut flag = protected.clone();
+        flag[1] = 2;
+        let mut layout = protected.clone();
+        layout[0] = 9;
+        let cut = &protected[..protected.len() - 1];
+
+        let cases: Vec<RefusedFrame> = vec![
+            (
+                "truncated protected block",
+                frame(snapshot_len, protected_len, &[&snapshot, cut]),
+                |e| matches!(e, UpgradeError::TransferTruncated),
+            ),
+            (
+                "trailing byte",
+                frame(snapshot_len, protected_len, &[&snapshot, &protected, b"x"]),
+                |e| matches!(e, UpgradeError::TransferTrailing),
+            ),
+            (
+                "oversized protected length",
+                frame(
+                    snapshot_len,
+                    PROTECTED_TRANSFER_MAX_BYTES as u64 + 1,
+                    &[&snapshot, &protected],
+                ),
+                |e| matches!(e, UpgradeError::TransferTooLarge("protected state")),
+            ),
+            (
+                "oversized snapshot length",
+                frame(u64::MAX, protected_len, &[&snapshot, &protected]),
+                |e| matches!(e, UpgradeError::TransferTooLarge("snapshot")),
+            ),
+            (
+                "protected key flag",
+                frame(snapshot_len, protected_len, &[&snapshot, &flag]),
+                |e| matches!(e, UpgradeError::TransferProtected(TransferError::Malformed)),
+            ),
+            (
+                "protected layout version",
+                frame(snapshot_len, protected_len, &[&snapshot, &layout]),
+                |e| matches!(e, UpgradeError::TransferProtected(TransferError::Malformed)),
+            ),
+            (
+                "snapshot that is not json",
+                frame(
+                    snapshot_len,
+                    protected_len,
+                    &[&vec![b'!'; snapshot.len()], &protected],
+                ),
+                |e| matches!(e, UpgradeError::MalformedSnapshot { .. }),
+            ),
+        ];
+        for (what, bytes, expected) in &cases {
+            let error = receive_bytes(bytes).expect_err(what);
+            assert!(expected(&error), "{what}: {error:?}");
+            let shown = format!("{error} {error:?}");
+            assert!(!shown.contains("SYNTHETIC"), "{what}: a value in {shown}");
+        }
     }
 
     #[cfg(target_os = "linux")]

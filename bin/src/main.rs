@@ -65,6 +65,8 @@ use worker::WorkerError;
 
 #[derive(thiserror::Error, Debug)]
 enum MainError {
+    #[error("failed to harden the process: {0}")]
+    Harden(util::UtilError),
     #[error("failed to start Sōzu: {0}")]
     StartMain(StartError),
     #[error("failed to start new worker: {0}")]
@@ -87,6 +89,9 @@ impl From<std::io::Error> for MainError {
 
 #[paw::main]
 fn main(args: Args) -> Result<(), MainError> {
+    // First, before the panic hook, a command channel or a config: nothing that
+    // may hold a protected health check header value runs unhardened.
+    util::harden_process().map_err(MainError::Harden)?;
     register_panic_hook();
 
     let result = match args.cmd {
@@ -132,7 +137,7 @@ fn main(args: Args) -> Result<(), MainError> {
             .map_err(MainError::BeginNewMain)
         }
         cli::SubCmd::UpgradeProbe { protocol } => {
-            if protocol == command::upgrade::UPGRADE_PROTOCOL_V2 {
+            if command::upgrade::supports_upgrade_protocol(protocol) {
                 Ok(())
             } else {
                 Err(MainError::UnsupportedUpgradeProtocol(protocol))

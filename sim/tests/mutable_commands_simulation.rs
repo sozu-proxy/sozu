@@ -17,6 +17,8 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
+    fs::File,
+    io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{Arc, Mutex},
     time::Duration,
@@ -28,15 +30,16 @@ use moonpool_sim::{
     current_sim_seed,
 };
 use sozu_command_lib::{
+    parser::parse_several_requests,
     proto::command::{
         ActivateListener, AddBackend, AddCertificate, CertificateAndKey, ClientAuthMode,
-        ClientAuthPolicy, Cluster, DeactivateListener, HealthCheckConfig, HttpListenerConfig,
-        HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms, PathRule, RedirectPolicy,
-        RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate, Request,
-        RequestHttpFrontend, RequestTcpFrontend, RequestUdpFrontend, RulePosition, SetHealthCheck,
-        SocketAddress, TcpListenerConfig, UdpListenerConfig, UpdateHttpListenerConfig,
-        UpdateHttpsListenerConfig, UpdateTcpListenerConfig, UpdateUdpListenerConfig,
-        request::RequestType,
+        ClientAuthPolicy, Cluster, DeactivateListener, HealthCheckConfig, HealthCheckHeader,
+        HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms, PathRule,
+        RedirectPolicy, RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate,
+        Request, RequestHttpFrontend, RequestTcpFrontend, RequestUdpFrontend, RulePosition,
+        SetHealthCheck, SocketAddress, TcpListenerConfig, UdpListenerConfig,
+        UpdateHttpListenerConfig, UpdateHttpsListenerConfig, UpdateTcpListenerConfig,
+        UpdateUdpListenerConfig, WorkerRequest, request::RequestType,
     },
     state::ConfigState,
 };
@@ -1179,6 +1182,200 @@ fn certificate_expiration_and_tie_order_survive_diff_and_partial_recovery() {
         Some(&fingerprint_a),
         "recovery must restore the target worker winner, not only metadata cardinality"
     );
+}
+
+/// Write `state` with `ConfigState::write_requests_to_file`, read the exact
+/// bytes back, parse them and dispatch them into a fresh state.
+fn save_and_replay(state: &ConfigState) -> ConfigState {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("state.json");
+    let mut file = File::create(&path).expect("create the state file");
+    let written = state
+        .write_requests_to_file(&mut file)
+        .expect("SaveState writes the state");
+    drop(file);
+    let mut saved = Vec::new();
+    File::open(&path)
+        .expect("open the state file")
+        .read_to_end(&mut saved)
+        .expect("read the state file");
+    let (remainder, requests) =
+        parse_several_requests::<WorkerRequest>(&saved).expect("the state file parses");
+    assert!(remainder.is_empty(), "the whole state file must parse");
+    assert_eq!(requests.len(), written);
+    // Compare what the file carries, not only what replay rebuilds: a dropped
+    // or reordered health-check header must fail here, before dispatch.
+    let parsed_clusters: Vec<&Cluster> = requests
+        .iter()
+        .filter_map(|request| match &request.content.request_type {
+            Some(RequestType::AddCluster(cluster)) => Some(cluster),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        parsed_clusters.len(),
+        state.clusters.len(),
+        "the state file must carry exactly one AddCluster per source cluster"
+    );
+    assert_eq!(
+        parsed_clusters
+            .iter()
+            .map(|cluster| cluster.cluster_id.as_str())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        parsed_clusters.len(),
+        "the state file must not repeat an AddCluster"
+    );
+    for parsed in parsed_clusters {
+        match state.clusters.get(parsed.cluster_id.as_str()) {
+            Some(source) => assert_eq!(
+                parsed, source,
+                "the parsed AddCluster for {:?} differs from the source cluster \
+                 (health check and ordered headers included)",
+                parsed.cluster_id
+            ),
+            None => panic!(
+                "the state file carries an AddCluster for {:?} absent from the source",
+                parsed.cluster_id
+            ),
+        }
+    }
+    let mut replayed = ConfigState::new();
+    for request in &requests {
+        replayed
+            .dispatch(&request.content)
+            .unwrap_or_else(|error| panic!("replay refused {request:?}: {error}"));
+    }
+    replayed
+}
+
+/// Header metadata (name and main-process fingerprint, never a value) must
+/// reach the saved-state file in order and survive replay through add,
+/// removal and replacement of a cluster health check, without disturbing an
+/// unrelated listener, frontend and backend. Metadata and state replay only:
+/// no clear value, worker acknowledgement or protected verb is involved.
+#[test]
+fn health_check_header_metadata_survives_save_state_replay() {
+    let header = |name: &str, tag: u128| HealthCheckHeader {
+        name: name.to_owned(),
+        fingerprint: format!("sozu-hc-hmac-sha256:v1:{:032x}:{:064x}", 9, tag),
+    };
+    let probe = |headers: Vec<HealthCheckHeader>| HealthCheckConfig {
+        headers,
+        ..health_check("/probe")
+    };
+    let initial = vec![
+        header("Z-Last", 3),
+        header("Authorization", 1),
+        header("A-First", 2),
+    ];
+    let replacement = vec![header("X-Second", 5), header("B-First", 4)];
+    assert!(
+        initial.windows(2).any(|pair| pair[0].name > pair[1].name),
+        "the initial order must not be sorted"
+    );
+
+    let http = address(HTTP_PORT);
+    let backend_address = address(20_082);
+    let mut state = ConfigState::new();
+    let apply = |state: &mut ConfigState, request_type: RequestType| {
+        state
+            .dispatch(&request_type.into())
+            .unwrap_or_else(|error| panic!("the model refused a request: {error}"));
+    };
+    let headers_of = |state: &ConfigState| {
+        state.clusters["meta"]
+            .health_check
+            .as_ref()
+            .map(|config| config.headers.to_owned())
+    };
+    let unrelated = |state: &ConfigState| {
+        (
+            state.http_listeners.to_owned(),
+            state.http_fronts.to_owned(),
+            state.backends.to_owned(),
+        )
+    };
+    // Save, parse and replay `state`, then require the exact ordered header
+    // metadata and the exact unrelated listener, frontend and backend state.
+    let round_trip = |state: &ConfigState,
+                      expected: Option<Vec<HealthCheckHeader>>,
+                      stage: &str|
+     -> ConfigState {
+        let replayed = save_and_replay(state);
+        assert_eq!(
+            business_state(&replayed),
+            business_state(state),
+            "{stage}: replay must rebuild the saved state"
+        );
+        assert_eq!(
+            headers_of(&replayed),
+            expected,
+            "{stage}: ordered header metadata must survive replay"
+        );
+        assert_eq!(
+            unrelated(&replayed),
+            unrelated(state),
+            "{stage}: unrelated state must survive replay"
+        );
+        replayed
+    };
+
+    apply(
+        &mut state,
+        RequestType::AddCluster(Cluster {
+            health_check: Some(probe(initial.to_owned())),
+            ..cluster("meta", "unavailable", 3)
+        }),
+    );
+
+    apply(
+        &mut state,
+        RequestType::AddHttpListener(http_listener(http)),
+    );
+    assert_eq!(unrelated(&state).0.len(), 1);
+    round_trip(&state, Some(initial.to_owned()), "after AddHttpListener");
+
+    apply(
+        &mut state,
+        RequestType::AddHttpFrontend(http_front("meta", http, "meta.example", "/")),
+    );
+    assert_eq!(unrelated(&state).1.len(), 1);
+    round_trip(&state, Some(initial.to_owned()), "after AddHttpFrontend");
+
+    apply(
+        &mut state,
+        RequestType::AddBackend(AddBackend {
+            cluster_id: "meta".to_owned(),
+            backend_id: "meta-backend".to_owned(),
+            address: backend_address,
+            ..Default::default()
+        }),
+    );
+    let baseline = unrelated(&state);
+    assert_eq!(baseline.0.len(), 1);
+    assert_eq!(baseline.1.len(), 1);
+    assert_eq!(baseline.2["meta"].len(), 1);
+    let replayed = round_trip(&state, Some(initial.to_owned()), "after AddBackend");
+    assert_eq!(unrelated(&replayed), baseline);
+
+    apply(
+        &mut state,
+        RequestType::RemoveHealthCheck("meta".to_owned()),
+    );
+    let replayed = round_trip(&state, None, "after RemoveHealthCheck");
+    assert_eq!(replayed.clusters["meta"].health_check, None);
+    assert_eq!(unrelated(&replayed), baseline);
+
+    apply(
+        &mut state,
+        RequestType::SetHealthCheck(SetHealthCheck {
+            cluster_id: "meta".to_owned(),
+            config: probe(replacement.to_owned()),
+        }),
+    );
+    let replayed = round_trip(&state, Some(replacement), "after SetHealthCheck");
+    assert_eq!(unrelated(&replayed), baseline);
 }
 
 #[test]
