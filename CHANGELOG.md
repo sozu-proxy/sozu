@@ -12,13 +12,20 @@
 
 <!-- changelog-slot:backend-ownership -->
 
+## 2.3.3 - 2026-10-19
+
 ### Changed
 
 - Ordinary worker requests and `SetMetricDetail` no longer compute full-config invariant hash snapshots in non-debug release builds. Debug assertions still retain this coverage, and legitimate query hashes are unchanged.
+
 ### Fixed
 
 - Partial cluster and certificate-worker queries now answer `Failure` on timeout, refusal, incomplete or invalid worker responses, rather than a partial `Success`. This includes a certificate fingerprint query refused by a worker that does not hold the certificate.
 - The debug `ConfigState` diff postcondition now compares TCP frontend membership rather than `Vec` order. Storage and emission are unchanged.
+
+### Upgrade notes
+
+- The command schema, configuration and saved-state formats are unchanged from 2.3.2. Upgrade the main process and every worker; a main-only replacement does not qualify the transition. The release gate exercises the published 2.3.2 binary with two workers, saved state and HTTP/HTTPS/TCP/UDP traffic before, during and after replacement. Existing 2.2.1 and 2.3.1 compatibility cases remain separate.
 
 ## 2.3.2 - 2026-10-18
 

@@ -102,6 +102,17 @@ container server; it never turns a missing service into a skipped test.
 | `service-pulsar` | Pulsar standalone, Magnetar 1.7.2 producer/consumer acknowledgements and exact reconnect delivery |
 | `service-coredns` | CoreDNS authoritative A, AAAA, TXT and NXDOMAIN over raw UDP, flow expiry and listener reactivation |
 
+The MongoDB CI cell uses the hosted `ubuntu-22.04` runner with its Linux 6.8
+kernel; the other services use `ubuntu-latest`. MongoDB's TCMalloc startup
+check rejects Linux 6.19 through 7.0.13 and Ubuntu's `7.0.0-*` release strings,
+even when the distribution carries the upstream kernel fix
+([SERVER-136848](https://jira.mongodb.org/browse/SERVER-136848)). Containers share
+their host kernel, so changing the MongoDB container's base distribution does
+not remove this incompatibility. The pinned MongoDB image, readiness check and
+round-trip assertions stay unchanged. Use a compatible host kernel for local
+runs too; moving this cell to another runner requires that MongoDB's startup
+check accepts that runner's kernel without bypassing the check.
+
 Pulsar uses Magnetar with its `tokio` and `crypto-ring` features. This focused
 job validates that client/provider combination and does not claim coverage for
 the other Sōzu crypto-provider cells. Its container becomes ready only after the

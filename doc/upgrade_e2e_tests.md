@@ -352,6 +352,7 @@ cargo test -p sozu --test main_upgrade_transfer_rejection_e2e --locked \
 cargo test -p sozu --test upgrade_pid_file_failure_e2e --locked \
   -- --ignored --nocapture --test-threads=1
 
+SOZU_MATRIX_PREVIOUS=/path/to/verified-sozu-2.3.2 \
 SOZU_MATRIX_LEGACY=/path/to/legacy-sozu \
 SOZU_MATRIX_OPTION3=/path/to/replacement-sozu \
 cargo test -p sozu --test main_upgrade_compatibility_matrix_e2e --locked \
@@ -380,6 +381,30 @@ refusal policy, not a successful systemd supervision transfer.
 `legacy_2_2_1_preserves_authority_when_candidate_exits_nonzero` installs a
 candidate that exits before acknowledging; the CLI must fail while the old
 PID and its HTTP route remain available.
+
+`published_2_3_2_upgrades_to_current_and_drains_all_workers` is the stable
+release gate. It reuses the positive bridge scenario with **two** workers and
+requires the official 2.3.2 executable (`c4b00f9`). Before and after the full
+upgrade, each HTTP/TCP/UDP cluster query must contain exactly `main` and both
+running worker IDs, with identical state on every process. Both old workers
+must exit, both replacements must execute the candidate, saved routing state
+and certificate material must survive, and HTTP/HTTPS/TCP/UDP traffic must
+work before, during and after the held request drains. A completed CLI alone
+does not satisfy this gate.
+
+```bash
+SOZU_MATRIX_PREVIOUS=/path/to/verified-sozu-2.3.2 \
+cargo test -p sozu --test main_upgrade_compatibility_matrix_e2e --locked \
+  published_2_3_2_upgrades_to_current_and_drains_all_workers \
+  -- --ignored --exact --nocapture --test-threads=1
+```
+
+The candidate is Cargo's exact `sozu` binary from this checkout. The crypto-ring
+`proc-observer-e2e` CI cell downloads the official 2.3.2 archive and checks its
+SHA-256 (`687e8568d91b572930576b5a0997f96329c450034d33eab107ffe5a3172b0c2f`),
+the extracted executable (`d8433e1c6147a47cff7e6f0cba083e8ca243ffeaf3f592e0de35bc4016a596c0`)
+and the embedded revision before running the exact case. The existing 2.2.1
+bridge and 2.3.1 metadata/refusal cases retain their assertions and scope.
 
 The outgoing v2 sender must still reject a legacy candidate before exposing the
 live Hub, without advancing generation or audit, and reap the candidate. The
