@@ -125,6 +125,13 @@ Notes:
   swarm) is proposed but intentionally not added by the change that introduced
   this simulator — wiring CI is a separate decision. Run it manually with the
   command in "Targeted runs" until that decision is made.
+- **TCP frontend diff equality.** Equality is semantic set equality of
+  complete `TcpFrontend` records (cluster, address, tags, SNI and ALPN), so a
+  pure permutation of one cluster's frontends emits no orders from
+  `ConfigState::diff`. SaveState/LoadState and `generate_requests` keep the
+  faithful stored order of each bucket. The `BTreeSet<TcpFrontend>` projection
+  exists only in the debug replay postcondition of `diff`; it does not reorder
+  storage or request emission.
 - **Allocation budgets.** `sozu-lib`'s unit-test binary has exactly one
   counting global allocator, `test_allocations` in `lib/src/lib.rs`, and every
   unit test that pins a heap-allocation count uses it: take
@@ -880,6 +887,15 @@ skipping it produced a real flaky-test or papered-over-bug commit.
   (several worktrees, parallel CI jobs) share ports silently: `server_bind`
   and `udp_bind` set `SO_REUSEPORT`, so both bind the same address without
   error and the kernel splits connections and datagrams between them.
+- **Use pre-existing executable fixtures for upgrade probes.** A fork can
+  inherit a candidate's writable descriptor before the writing test closes
+  it, even with `FD_CLOEXEC`, causing `ETXTBSY` in another test's probe.
+  `probe_candidate` therefore links each temporary `candidate-<protocol>.sh`
+  to the tracked executable `bin/src/test-fixtures/upgrade-probe.sh`; it
+  never writes or copies the executable during the test. The fixture derives
+  its accepted protocol and temporary log path from its invocation path.
+  Keep its Git executable bit and the protocol-2/3 assertions intact so the
+  tests can run in parallel without an inherited writer for the fixture.
 - **Always drain with a `loop_read_*` helper when asserting on TCP responses.** A
   single `read()` sees one TCP segment under load — your assertion races the
   network. Use the looping readers (`Client::receive_until_eof`,
