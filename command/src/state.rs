@@ -4001,8 +4001,8 @@ impl ConfigState {
         // must converge on `other`. We verify it in debug by actually replaying;
         // `dispatch`'s own invariant sweep runs on every step.
         //
-        // One deliberate normalization: `backends`/`tcp_fronts` are compared
-        // after dropping empty buckets. `remove_backend`/`remove_tcp_frontend`
+        // Deliberate normalizations. Empty buckets: `backends`/`tcp_fronts` are
+        // compared after dropping them. `remove_backend`/`remove_tcp_frontend`
         // leave an empty `Vec` under a cluster key, whereas `other` may have no
         // key at all. An empty bucket emits no requests and is semantically
         // equivalent to an absent one, so we normalize it away before comparing.
@@ -4022,10 +4022,19 @@ impl ConfigState {
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect::<BTreeMap<_, _>>()
             };
+            // TCP diff equality is set equality of complete `TcpFrontend` records, so a
+            // pure permutation of one bucket emits no orders. Project each non-empty
+            // bucket to a set of full records for this postcondition only; storage and
+            // request emission are not reordered.
             let nonempty_tcp = |m: &HashMap<ClusterId, Vec<TcpFrontend>>| {
                 m.iter()
                     .filter(|(_, v)| !v.is_empty())
-                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .map(|(k, v)| {
+                        (
+                            k.clone(),
+                            v.iter().cloned().collect::<BTreeSet<TcpFrontend>>(),
+                        )
+                    })
                     .collect::<HashMap<_, _>>()
             };
             debug_assert!(
@@ -8489,6 +8498,322 @@ mod tests {
             .expect("cluster_sni_b bucket must survive");
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].sni, Some("other.example.com".to_string()));
+    }
+
+    const TCP_PERM_CLUSTER: &str = "tcp_perm";
+
+    /// A TCP frontend request whose `route` tag identifies it in order checks.
+    fn tcp_frontend_request(
+        cluster_id: &str,
+        address: SocketAddress,
+        sni: Option<&str>,
+        alpn: &[&str],
+        route: &str,
+    ) -> RequestTcpFrontend {
+        RequestTcpFrontend {
+            cluster_id: cluster_id.to_string(),
+            address,
+            tags: BTreeMap::from([("route".to_string(), route.to_string())]),
+            sni: sni.map(str::to_string),
+            alpn: alpn.iter().map(|protocol| protocol.to_string()).collect(),
+        }
+    }
+
+    /// Four admissible frontends of ONE cluster, already in canonical form
+    /// (lowercase sni, sorted alpn), tagged `A`..`D`.
+    fn tcp_permutation_fixture() -> [RequestTcpFrontend; 4] {
+        [
+            tcp_frontend_request(
+                TCP_PERM_CLUSTER,
+                SocketAddress::new_v4(127, 0, 0, 1, 7001),
+                None,
+                &[],
+                "A",
+            ),
+            tcp_frontend_request(
+                TCP_PERM_CLUSTER,
+                SocketAddress::new_v4(127, 0, 0, 1, 7002),
+                Some("b.example.com"),
+                &["h2"],
+                "B",
+            ),
+            tcp_frontend_request(
+                TCP_PERM_CLUSTER,
+                SocketAddress::new_v4(127, 0, 0, 1, 7002),
+                Some("b.example.com"),
+                &["http/1.1"],
+                "C",
+            ),
+            tcp_frontend_request(
+                TCP_PERM_CLUSTER,
+                SocketAddress::new_v4(127, 0, 0, 1, 7003),
+                Some("d.example.com"),
+                &[],
+                "D",
+            ),
+        ]
+    }
+
+    /// A state built by dispatching `AddTcpFrontend` in the given order, so the
+    /// stored per-cluster `Vec` order is exactly the dispatch order.
+    fn tcp_state(requests: &[RequestTcpFrontend]) -> ConfigState {
+        let mut state = ConfigState::default();
+        for request in requests {
+            state
+                .dispatch(&RequestType::AddTcpFrontend(request.clone()).into())
+                .expect("could not add the test tcp frontend");
+        }
+        state
+    }
+
+    /// The `route` tags of one cluster's stored TCP bucket, in stored order.
+    fn tcp_route_order(state: &ConfigState, cluster_id: &str) -> Vec<String> {
+        state
+            .tcp_fronts
+            .get(cluster_id)
+            .map(|bucket| {
+                bucket
+                    .iter()
+                    .map(|front| front.tags["route"].clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Per-cluster sets of complete TCP frontend records, empty buckets dropped.
+    fn tcp_semantic(state: &ConfigState) -> BTreeMap<String, BTreeSet<TcpFrontend>> {
+        state
+            .tcp_fronts
+            .iter()
+            .filter(|(_, bucket)| !bucket.is_empty())
+            .map(|(cluster_id, bucket)| (cluster_id.to_string(), bucket.iter().cloned().collect()))
+            .collect()
+    }
+
+    /// `from.diff(to)`, asserting neither input state was modified.
+    fn diff_leaving_inputs_unchanged(from: &ConfigState, to: &ConfigState) -> Vec<Request> {
+        let from_before = from.clone();
+        let to_before = to.clone();
+        let requests = from.diff(to);
+        assert!(
+            *from == from_before,
+            "diff must leave the source state unchanged"
+        );
+        assert!(
+            *to == to_before,
+            "diff must leave the target state unchanged"
+        );
+        assert_eq!(
+            from.tcp_fronts, from_before.tcp_fronts,
+            "diff must preserve the source stored tcp order"
+        );
+        assert_eq!(
+            to.tcp_fronts, to_before.tcp_fronts,
+            "diff must preserve the target stored tcp order"
+        );
+        requests
+    }
+
+    /// A pure permutation of complete TCP frontends within one cluster is not
+    /// a semantic change: no orders, and the debug replay postcondition holds.
+    #[test]
+    fn diff_tcp_pure_permutation_of_complete_frontends_emits_no_orders() {
+        let [a, b, c, d] = tcp_permutation_fixture();
+        let original = tcp_state(&[a.clone(), b.clone(), c.clone(), d.clone()]);
+        let permuted = tcp_state(&[d, c, a, b]);
+
+        assert_eq!(
+            tcp_route_order(&original, TCP_PERM_CLUSTER),
+            ["A", "B", "C", "D"]
+        );
+        assert_eq!(
+            tcp_route_order(&permuted, TCP_PERM_CLUSTER),
+            ["D", "C", "A", "B"]
+        );
+        assert_ne!(
+            original.tcp_fronts, permuted.tcp_fronts,
+            "the stored vectors must differ in order for this test to be meaningful"
+        );
+        assert_eq!(tcp_semantic(&original), tcp_semantic(&permuted));
+
+        assert!(
+            diff_leaving_inputs_unchanged(&original, &permuted).is_empty(),
+            "a pure permutation must emit no orders"
+        );
+        assert!(
+            diff_leaving_inputs_unchanged(&permuted, &original).is_empty(),
+            "the reverse permutation must emit no orders"
+        );
+    }
+
+    /// `[A] -> [C, A]` is exactly the semantic addition of `C`.
+    #[test]
+    fn diff_tcp_prepended_frontend_emits_only_the_semantic_addition() {
+        let [a, _, c, _] = tcp_permutation_fixture();
+        let from = tcp_state(std::slice::from_ref(&a));
+        let to = tcp_state(&[c.clone(), a.clone()]);
+        assert_eq!(tcp_route_order(&to, TCP_PERM_CLUSTER), ["C", "A"]);
+
+        let requests = diff_leaving_inputs_unchanged(&from, &to);
+        let expected: Request = RequestType::AddTcpFrontend(c.clone()).into();
+        assert_eq!(requests, vec![expected]);
+
+        let replayed = replay_diff(&from, &requests);
+        assert_eq!(
+            tcp_route_order(&replayed, TCP_PERM_CLUSTER),
+            ["A", "C"],
+            "replay appends the added frontend to the stored bucket"
+        );
+        assert_eq!(tcp_semantic(&replayed), tcp_semantic(&to));
+
+        let reverse = diff_leaving_inputs_unchanged(&to, &from);
+        let expected_removal: Request = RequestType::RemoveTcpFrontend(c).into();
+        assert_eq!(reverse, vec![expected_removal]);
+        let reverted = replay_diff(&to, &reverse);
+        assert_eq!(tcp_route_order(&reverted, TCP_PERM_CLUSTER), ["A"]);
+        assert_eq!(tcp_semantic(&reverted), tcp_semantic(&from));
+    }
+
+    /// Rebuilding several clusters' TCP frontends from an empty state replays
+    /// to the same per-cluster sets of complete records, with no empty bucket
+    /// introduced; tearing them down normalizes away the emptied buckets.
+    #[test]
+    fn diff_tcp_reconstruction_from_empty_replays_to_same_semantic_sets() {
+        let [a, b, c, _] = tcp_permutation_fixture();
+        let cluster_x = "tcp_x";
+        let cluster_y = "tcp_y";
+        let mut x_a = a;
+        let mut x_b = b;
+        let mut x_c = c;
+        x_a.cluster_id = cluster_x.to_string();
+        x_b.cluster_id = cluster_x.to_string();
+        x_c.cluster_id = cluster_x.to_string();
+        let y_d = tcp_frontend_request(
+            cluster_y,
+            SocketAddress::new_v4(127, 0, 0, 1, 7003),
+            Some("d.example.com"),
+            &[],
+            "D",
+        );
+        let y_e = tcp_frontend_request(
+            cluster_y,
+            SocketAddress::new_v4(127, 0, 0, 1, 7004),
+            None,
+            &[],
+            "E",
+        );
+
+        let empty = ConfigState::default();
+        let target = tcp_state(&[x_c, y_e, x_a, y_d, x_b]);
+        assert_eq!(tcp_route_order(&target, cluster_x), ["C", "A", "B"]);
+        assert_eq!(tcp_route_order(&target, cluster_y), ["E", "D"]);
+
+        let requests = diff_leaving_inputs_unchanged(&empty, &target);
+        assert_eq!(requests.len(), 5);
+        assert!(
+            requests.iter().all(|request| matches!(
+                request.request_type,
+                Some(RequestType::AddTcpFrontend(_))
+            )),
+            "reconstruction from empty must only add tcp frontends"
+        );
+
+        let replayed = replay_diff(&empty, &requests);
+        assert_eq!(tcp_semantic(&replayed), tcp_semantic(&target));
+        assert_eq!(replayed.tcp_fronts.len(), 2);
+        assert!(
+            replayed
+                .tcp_fronts
+                .values()
+                .all(|bucket| !bucket.is_empty()),
+            "replay must not introduce empty buckets"
+        );
+
+        let teardown = diff_leaving_inputs_unchanged(&target, &empty);
+        assert_eq!(teardown.len(), 5);
+        let torn_down = replay_diff(&target, &teardown);
+        assert!(tcp_semantic(&torn_down).is_empty());
+        assert_eq!(tcp_semantic(&torn_down), tcp_semantic(&empty));
+    }
+
+    /// `state.diff(&state)` is empty and, like every diff call, leaves the
+    /// exact stored per-cluster order untouched.
+    #[test]
+    fn diff_tcp_self_is_empty_and_preserves_stored_order() {
+        let [a, b, c, d] = tcp_permutation_fixture();
+        let state = tcp_state(&[d, a, c, b]);
+
+        let bucket = state
+            .tcp_fronts
+            .get(TCP_PERM_CLUSTER)
+            .expect("the test cluster bucket must exist");
+        assert!(
+            !bucket.windows(2).all(|pair| pair[0] <= pair[1]),
+            "the fixture bucket must be deliberately non-sorted"
+        );
+        assert_eq!(
+            tcp_route_order(&state, TCP_PERM_CLUSTER),
+            ["D", "A", "C", "B"]
+        );
+
+        let before = state.clone();
+        let stored_before = state.tcp_fronts.clone();
+        assert!(
+            diff_leaving_inputs_unchanged(&state, &state).is_empty(),
+            "a state diffed against itself must emit no orders"
+        );
+        assert!(state == before, "self-diff must not modify the state");
+        assert_eq!(state.tcp_fronts, stored_before);
+        assert_eq!(
+            tcp_route_order(&state, TCP_PERM_CLUSTER),
+            ["D", "A", "C", "B"]
+        );
+    }
+
+    /// Saved/self-generated request order stays faithful: replaying
+    /// `generate_requests` into an empty state reproduces a deliberately
+    /// non-sorted single-cluster TCP bucket exactly (full `Vec` equality).
+    #[test]
+    fn generate_requests_replay_preserves_non_sorted_tcp_bucket_order() {
+        let [a, b, c, d] = tcp_permutation_fixture();
+        let state = tcp_state(&[d, a, c, b]);
+
+        let bucket = state
+            .tcp_fronts
+            .get(TCP_PERM_CLUSTER)
+            .expect("the test cluster bucket must exist");
+        assert!(
+            !bucket.windows(2).all(|pair| pair[0] <= pair[1]),
+            "the fixture bucket must be deliberately non-sorted"
+        );
+
+        let mut replayed = ConfigState::default();
+        for request in state.generate_requests() {
+            replayed
+                .dispatch(&request)
+                .expect("could not replay generated request");
+        }
+
+        // `request_counts` is a runtime census side-effect of `dispatch`;
+        // clear only it, as the other strict roundtrip helpers do.
+        let logical = |s: &ConfigState| {
+            let mut c = s.clone();
+            c.request_counts.clear();
+            c
+        };
+        assert!(
+            logical(&state) == logical(&replayed),
+            "generate_requests -> replay must reproduce the state"
+        );
+        assert_eq!(
+            replayed.tcp_fronts.get(TCP_PERM_CLUSTER),
+            state.tcp_fronts.get(TCP_PERM_CLUSTER),
+            "the replayed bucket must equal the original Vec, order included"
+        );
+        assert_eq!(
+            tcp_route_order(&replayed, TCP_PERM_CLUSTER),
+            ["D", "A", "C", "B"]
+        );
     }
 
     // ── master-side TCP frontend admission parity (sozu-proxy/sozu#1290) ──────

@@ -1328,30 +1328,83 @@ impl GatheringTask for QueryClustersTask {
         self: Box<Self>,
         _server: &mut Server,
         client: &mut OptionalClient,
-        _timed_out: bool,
+        timed_out: bool,
     ) {
-        let mut worker_responses: BTreeMap<String, ResponseContent> = self
-            .gatherer
-            .responses
-            .into_iter()
-            .filter_map(|(worker_id, proxy_response)| {
-                proxy_response
-                    .content
-                    .map(|response_content| (worker_id.to_string(), response_content))
-            })
-            .collect();
+        // Success only when the deadline did not fire, no worker failed, every
+        // expected worker answered Ok with usable content, and the terminal
+        // accounting is complete. Processing replies are progress, not answers.
+        // The first concrete reason is reported; a failure never carries a
+        // partial payload. This checks response completeness only, not
+        // fleet-wide state atomicity.
+        let mut failure: Option<String> =
+            timed_out.then(|| "timed out waiting for every worker".to_owned());
+        let mut worker_responses: BTreeMap<String, ResponseContent> = BTreeMap::new();
 
-        if let Some(main_response) = self.main_process_response {
-            worker_responses.insert(String::from("main"), main_response);
+        for (worker_id, response) in self.gatherer.responses {
+            match ResponseStatus::try_from(response.status) {
+                Ok(ResponseStatus::Ok) => match response.content {
+                    Some(content) if content.content_type.is_some() => {
+                        if worker_responses
+                            .insert(worker_id.to_string(), content)
+                            .is_some()
+                        {
+                            failure.get_or_insert_with(|| {
+                                format!("worker {worker_id} answered more than once")
+                            });
+                        }
+                    }
+                    _ => {
+                        failure.get_or_insert_with(|| {
+                            format!("worker {worker_id} answered Ok without cluster content")
+                        });
+                    }
+                },
+                Ok(ResponseStatus::Failure) => {
+                    failure
+                        .get_or_insert_with(|| format!("worker {worker_id}: {}", response.message));
+                }
+                // Progress archived before the terminal replies; not an answer.
+                Ok(ResponseStatus::Processing) => {}
+                Err(_) => {
+                    failure.get_or_insert_with(|| {
+                        format!("worker {worker_id} sent an undecodable status")
+                    });
+                }
+            }
         }
 
-        client.finish_ok_with_content(
-            ContentType::WorkerResponses(WorkerResponses {
-                map: worker_responses,
-            })
-            .into(),
-            "Successfully queried clusters",
-        );
+        let errors = self.gatherer.errors;
+        if errors > 0 {
+            failure.get_or_insert_with(|| format!("{errors} worker(s) answered Failure"));
+        }
+
+        let ok = self.gatherer.ok;
+        let expected_responses = self.gatherer.expected_responses;
+        if ok != expected_responses {
+            failure.get_or_insert_with(|| {
+                format!("incomplete worker responses: {ok} ok of {expected_responses} expected")
+            });
+        }
+
+        // The main payload is optional: QueryCertificatesFromWorkers has none.
+        if let Some(main_response) = self.main_process_response
+            && worker_responses
+                .insert(String::from("main"), main_response)
+                .is_some()
+        {
+            failure.get_or_insert_with(|| "the worker map already holds a main entry".to_owned());
+        }
+
+        match failure {
+            Some(reason) => client.finish_failure(format!("Failed to query clusters: {reason}")),
+            None => client.finish_ok_with_content(
+                ContentType::WorkerResponses(WorkerResponses {
+                    map: worker_responses,
+                })
+                .into(),
+                "Successfully queried clusters",
+            ),
+        }
     }
 }
 
@@ -1489,6 +1542,248 @@ impl PortConflictDeferral {
 
     fn into_held(self) -> Vec<Request> {
         self.held
+    }
+}
+
+#[cfg(test)]
+mod query_clusters_completion_tests {
+    //! `QueryClustersTask::on_finish` must answer Success only for a complete,
+    //! usable set of worker payloads. Every case drives the production
+    //! `on_finish` and decodes the terminal client response.
+    //!
+    //! To SEE THESE RED: restore the pre-fix `on_finish` (ignore `timed_out`,
+    //! filter whatever arrived, insert `main`, always `finish_ok_with_content`).
+    //! The timeout, worker-failure, incomplete-accounting, no-content and
+    //! duplicate-worker cases then fail; the success cases keep passing.
+    use sozu_command_lib::proto::command::{ClusterInformation, Response};
+
+    use super::{
+        load_state_rollback_tests::{create_test_hub, queued_responses, test_client},
+        *,
+    };
+
+    fn cluster_payload() -> ResponseContent {
+        ContentType::Clusters(ClusterInformations {
+            vec: vec![ClusterInformation::default()],
+        })
+        .into()
+    }
+
+    fn empty_payload() -> ResponseContent {
+        ContentType::Clusters(ClusterInformations { vec: Vec::new() }).into()
+    }
+
+    fn reply(
+        status: ResponseStatus,
+        message: &str,
+        content: Option<ResponseContent>,
+    ) -> WorkerResponse {
+        WorkerResponse {
+            id: "test".to_owned(),
+            status: status as i32,
+            message: message.to_owned(),
+            content,
+        }
+    }
+
+    fn ok_reply(content: ResponseContent) -> WorkerResponse {
+        reply(ResponseStatus::Ok, "", Some(content))
+    }
+
+    /// Build the gatherer through the production `Gatherer` API, run the real
+    /// `on_finish`, and return the single terminal client response.
+    fn finish(
+        expected: usize,
+        replies: Vec<(WorkerId, WorkerResponse)>,
+        main: Option<ResponseContent>,
+        timed_out: bool,
+    ) -> Response {
+        let (mut hub, _dir) = create_test_hub();
+        let (mut client, _peer) = test_client();
+        let mut gatherer = DefaultGatherer::default();
+        gatherer.inc_expected_responses(expected);
+        for (worker_id, response) in replies {
+            gatherer.on_message(&mut hub.server, &mut None, worker_id, response);
+        }
+        let task = Box::new(QueryClustersTask {
+            client_token: client.token,
+            gatherer,
+            main_process_response: main,
+        });
+        task.on_finish(&mut hub.server, &mut Some(&mut client), timed_out);
+        let mut responses = queued_responses(&client);
+        assert_eq!(
+            responses.len(),
+            1,
+            "exactly one terminal client response: {responses:?}"
+        );
+        responses.remove(0)
+    }
+
+    fn success_keys(response: &Response) -> Vec<&str> {
+        assert_eq!(
+            response.status,
+            ResponseStatus::Ok as i32,
+            "expected Success, got {response:?}"
+        );
+        let Some(ContentType::WorkerResponses(processes)) = response
+            .content
+            .as_ref()
+            .and_then(|content| content.content_type.as_ref())
+        else {
+            panic!("a Success must carry WorkerResponses: {response:?}");
+        };
+        processes.map.keys().map(String::as_str).collect()
+    }
+
+    fn assert_failed(response: &Response, needle: &str) {
+        assert_eq!(
+            response.status,
+            ResponseStatus::Failure as i32,
+            "expected Failure, got {response:?}"
+        );
+        assert!(
+            response.content.is_none(),
+            "a Failure must not carry a partial payload: {response:?}"
+        );
+        assert!(
+            response.message.contains(needle),
+            "message must mention {needle:?}: {}",
+            response.message
+        );
+    }
+
+    #[test]
+    fn complete_two_worker_set_with_main_is_a_success_with_exact_keys() {
+        let response = finish(
+            2,
+            vec![
+                (0, ok_reply(cluster_payload())),
+                (1, ok_reply(cluster_payload())),
+            ],
+            Some(cluster_payload()),
+            false,
+        );
+        assert_eq!(success_keys(&response), ["0", "1", "main"]);
+    }
+
+    #[test]
+    fn zero_workers_with_cached_main_is_a_complete_success() {
+        let response = finish(0, vec![], Some(cluster_payload()), false);
+        assert_eq!(success_keys(&response), ["main"]);
+    }
+
+    #[test]
+    fn a_timeout_after_one_of_two_workers_answered_ok_is_a_failure() {
+        let response = finish(
+            2,
+            vec![(1, ok_reply(cluster_payload()))],
+            Some(cluster_payload()),
+            true,
+        );
+        assert_failed(&response, "timed out");
+    }
+
+    #[test]
+    fn a_worker_failure_is_a_failure() {
+        let response = finish(
+            2,
+            vec![
+                (0, ok_reply(cluster_payload())),
+                (1, reply(ResponseStatus::Failure, "boom", None)),
+            ],
+            Some(cluster_payload()),
+            false,
+        );
+        assert_failed(&response, "boom");
+    }
+
+    #[test]
+    fn incomplete_terminal_accounting_is_a_failure_without_a_timeout() {
+        let response = finish(
+            2,
+            vec![(0, ok_reply(cluster_payload()))],
+            Some(cluster_payload()),
+            false,
+        );
+        assert_failed(&response, "incomplete");
+    }
+
+    #[test]
+    fn ok_without_content_is_a_failure() {
+        let missing = finish(
+            1,
+            vec![(0, reply(ResponseStatus::Ok, "", None))],
+            Some(cluster_payload()),
+            false,
+        );
+        assert_failed(&missing, "without cluster content");
+
+        let typeless = finish(
+            1,
+            vec![(0, ok_reply(ResponseContent::default()))],
+            Some(cluster_payload()),
+            false,
+        );
+        assert_failed(&typeless, "without cluster content");
+    }
+
+    #[test]
+    fn a_worker_that_cannot_be_represented_twice_in_the_map_is_a_failure() {
+        let response = finish(
+            2,
+            vec![
+                (0, ok_reply(cluster_payload())),
+                (0, ok_reply(cluster_payload())),
+            ],
+            Some(cluster_payload()),
+            false,
+        );
+        assert_failed(&response, "more than once");
+    }
+
+    #[test]
+    fn absent_cluster_empty_payloads_from_main_and_every_worker_are_a_success() {
+        let response = finish(
+            2,
+            vec![
+                (0, ok_reply(empty_payload())),
+                (1, ok_reply(empty_payload())),
+            ],
+            Some(empty_payload()),
+            false,
+        );
+        assert_eq!(success_keys(&response), ["0", "1", "main"]);
+        let Some(ContentType::WorkerResponses(processes)) = response
+            .content
+            .as_ref()
+            .and_then(|content| content.content_type.as_ref())
+        else {
+            panic!("a Success must carry WorkerResponses");
+        };
+        for (process, content) in &processes.map {
+            let Some(ContentType::Clusters(clusters)) = content.content_type.as_ref() else {
+                panic!("{process} must return a Clusters payload");
+            };
+            assert!(clusters.vec.is_empty(), "{process} must stay empty");
+        }
+    }
+
+    #[test]
+    fn archived_processing_replies_do_not_reject_a_complete_terminal_set() {
+        let processing = || reply(ResponseStatus::Processing, "working", None);
+        let response = finish(
+            2,
+            vec![
+                (0, processing()),
+                (0, ok_reply(cluster_payload())),
+                (1, processing()),
+                (1, ok_reply(cluster_payload())),
+            ],
+            Some(cluster_payload()),
+            false,
+        );
+        assert_eq!(success_keys(&response), ["0", "1", "main"]);
     }
 }
 

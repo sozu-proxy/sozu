@@ -125,6 +125,13 @@ Notes:
   swarm) is proposed but intentionally not added by the change that introduced
   this simulator — wiring CI is a separate decision. Run it manually with the
   command in "Targeted runs" until that decision is made.
+- **TCP frontend diff equality.** Equality is semantic set equality of
+  complete `TcpFrontend` records (cluster, address, tags, SNI and ALPN), so a
+  pure permutation of one cluster's frontends emits no orders from
+  `ConfigState::diff`. SaveState/LoadState and `generate_requests` keep the
+  faithful stored order of each bucket. The `BTreeSet<TcpFrontend>` projection
+  exists only in the debug replay postcondition of `diff`; it does not reorder
+  storage or request emission.
 - **Allocation budgets.** `sozu-lib`'s unit-test binary has exactly one
   counting global allocator, `test_allocations` in `lib/src/lib.rs`, and every
   unit test that pins a heap-allocation count uses it: take
