@@ -20,7 +20,9 @@ concurrency:
 jobs:
   protocol-service:
     name: ${{ matrix.service }} through Sōzu
-    runs-on: ubuntu-latest
+    # MongoDB's TCMalloc guard rejects Ubuntu 7.0.0 kernel release strings
+    # (SERVER-136848). Keep its host on Ubuntu 22.04's compatible 6.8 kernel.
+    runs-on: ${{ matrix.service == 'mongodb' && 'ubuntu-22.04' || 'ubuntu-latest' }}
     timeout-minutes: 25
     strategy:
       fail-fast: false
