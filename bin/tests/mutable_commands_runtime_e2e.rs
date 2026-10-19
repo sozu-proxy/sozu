@@ -1548,6 +1548,52 @@ fn mixed_ack_timeout_converges_when_the_stopped_worker_processes_its_buffered_or
 }
 
 #[test]
+#[ignore = "process-level: stops one of two owned workers past the server worker deadline to prove QueryClusterById never reports a partial fleet as Success"]
+fn query_cluster_by_id_fails_when_a_stopped_worker_misses_the_deadline_then_recovers() {
+    let cluster_id = "query-timeout-partial";
+    let mut instance = Instance::start(2);
+    send_ok(
+        &mut instance,
+        RequestType::AddCluster(Cluster {
+            cluster_id: cluster_id.to_owned(),
+            ..Default::default()
+        }),
+    );
+    let initial = cluster_snapshots(&mut instance, cluster_id);
+    assert_eq!(
+        initial.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["0", "1", "main"],
+        "both workers and main must be queryable before the stop"
+    );
+
+    let workers = worker_records(&mut instance);
+    assert_eq!(workers.len(), 2, "the test needs exactly two workers");
+    let (_, stopped_pid) = workers[0];
+    instance.main.stop_worker(stopped_pid);
+
+    // COMMAND_TIMEOUT (15 s) exceeds the fixture's `worker_timeout = 1`, so the
+    // server deadline fires first and the client still receives a terminal reply.
+    let response = send_raw(
+        &mut instance.control,
+        RequestType::QueryClusterById(cluster_id.to_owned()),
+        COMMAND_TIMEOUT,
+    );
+    assert_failure("QueryClusterById with one stopped worker", &response);
+    assert!(
+        response.content.is_none(),
+        "a failed QueryClusterById must not return a partial payload"
+    );
+
+    instance.main.resume_worker();
+    let recovered = cluster_snapshots(&mut instance, cluster_id);
+    assert_eq!(
+        recovered.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["0", "1", "main"],
+        "after SIGCONT the same query must succeed with main and both workers"
+    );
+}
+
+#[test]
 #[ignore = "process-level: stops the only owned worker, observes a late success, then reconciles with UpgradeWorker"]
 fn zero_ack_timeout_rolls_back_main_state_and_worker_upgrade_reconciles_a_late_success() {
     let cluster_id = "zero-ack-timeout";
@@ -3117,6 +3163,167 @@ fn tcp_listener_readdition_restores_frontend_and_routing() {
     assert_roundtrip("TCP route after listener re-addition", payload, || {
         tcp_roundtrip(listener_address, payload)
     });
+}
+
+/// Non-regression contract guard, not the RED oracle for the debug-only diff
+/// postcondition: `LoadState` applies saved entries sequentially and production
+/// never calls `ConfigState::diff`. It certifies that a real main and worker
+/// keep saved frontend order, expose the same frontends, route traffic, and are
+/// unchanged by a refused duplicate.
+#[test]
+#[ignore = "process-level: loads a saved state into a real main and worker and drives real TCP traffic through two listeners"]
+fn tcp_load_state_preserves_frontend_order_routing_and_duplicate_refusal() {
+    let (backend_port, _backend) = spawn_tcp_backend();
+    // Hold both OS reservations at once so the kernel cannot hand out the same
+    // ephemeral port twice; they are released just before `load_state`.
+    let reservation_c = TcpListener::bind((HOST, 0)).expect("reserve TCP listener C");
+    let reservation_a = TcpListener::bind((HOST, 0)).expect("reserve TCP listener A");
+    let address_c: SocketAddr = reservation_c
+        .local_addr()
+        .expect("read reserved address for listener C");
+    let address_a: SocketAddr = reservation_a
+        .local_addr()
+        .expect("read reserved address for listener A");
+    assert_ne!(
+        address_c, address_a,
+        "the two listeners need distinct addresses"
+    );
+    let listener_c: SocketAddress = address_c.into();
+    let listener_a: SocketAddress = address_a.into();
+    let cluster_id = "mutable-tcp-load-order";
+    let frontend = |listener: SocketAddress, route: &str| RequestTcpFrontend {
+        cluster_id: cluster_id.to_owned(),
+        address: listener,
+        tags: BTreeMap::from([("route".to_owned(), route.to_owned())]),
+        sni: None,
+        alpn: Vec::new(),
+    };
+    let front_c = frontend(listener_c, "C");
+    let front_a = frontend(listener_a, "A");
+    let payload_c = b"load-order-c";
+    let payload_a = b"load-order-a";
+
+    let mut target = ConfigState::new();
+    {
+        let mut apply = |request_type: RequestType| {
+            target
+                .dispatch(&Request::from(request_type))
+                .expect("the model admits the LoadState fixture");
+        };
+        apply(RequestType::AddCluster(Cluster {
+            cluster_id: cluster_id.to_owned(),
+            ..Default::default()
+        }));
+        apply(RequestType::AddBackend(AddBackend {
+            cluster_id: cluster_id.to_owned(),
+            backend_id: "tcp-load-order".to_owned(),
+            address: SocketAddr::from(([127, 0, 0, 1], backend_port)).into(),
+            ..Default::default()
+        }));
+        for listener in [listener_c, listener_a] {
+            apply(RequestType::AddTcpListener(
+                ListenerBuilder::new_tcp(listener)
+                    .to_tcp(None)
+                    .expect("build TCP listener config"),
+            ));
+            apply(RequestType::ActivateListener(ActivateListener {
+                address: listener,
+                proxy: ListenerType::Tcp as i32,
+                from_scm: false,
+                interface: None,
+            }));
+        }
+        apply(RequestType::AddTcpFrontend(front_c.clone()));
+        apply(RequestType::AddTcpFrontend(front_a.clone()));
+    }
+    let target_routes: Vec<String> = target.tcp_fronts[cluster_id]
+        .iter()
+        .map(|front| front.tags["route"].clone())
+        .collect();
+    assert_eq!(
+        target_routes,
+        ["C", "A"],
+        "the fixture must store C before A"
+    );
+
+    let mut instance = Instance::start(1);
+    // Release both reservations immediately before Sozu must bind them.
+    drop(reservation_c);
+    drop(reservation_a);
+    instance.load_state(&target);
+
+    let saved_frontends = |instance: &mut Instance| -> Vec<RequestTcpFrontend> {
+        instance
+            .state_requests()
+            .into_iter()
+            .filter_map(|request| match request {
+                RequestType::AddTcpFrontend(frontend) => Some(frontend),
+                _ => None,
+            })
+            .collect()
+    };
+    let assert_frontends =
+        |instance: &mut Instance, expected: &[RequestTcpFrontend], stage: &str| {
+            assert_eq!(
+                saved_frontends(instance),
+                expected,
+                "{stage}: SaveState frontend order"
+            );
+            let snapshots = cluster_snapshots(instance, cluster_id);
+            assert!(!snapshots.is_empty(), "{stage}: no per-process snapshots");
+            for (process, cluster) in &snapshots {
+                assert_eq!(
+                    cluster.tcp_frontends, expected,
+                    "{stage}: {process} TCP frontends"
+                );
+            }
+        };
+    let assert_route = |address: SocketAddr, payload: &'static [u8], description: &str| {
+        assert_roundtrip(description, payload, || tcp_roundtrip(address, payload));
+    };
+
+    let loaded = [front_c.clone(), front_a.clone()];
+    assert_frontends(&mut instance, &loaded, "after LoadState");
+    assert_route(address_c, payload_c, "TCP route C after LoadState");
+    assert_route(address_a, payload_a, "TCP route A after LoadState");
+
+    // An exact duplicate is refused and changes neither state nor routing.
+    let saved_before = saved_frontends(&mut instance);
+    let snapshots_before = cluster_snapshots(&mut instance, cluster_id);
+    let response = send_raw(
+        &mut instance.control,
+        RequestType::AddTcpFrontend(front_a.clone()),
+        COMMAND_TIMEOUT,
+    );
+    assert_failure("duplicate AddTcpFrontend", &response);
+    assert_eq!(saved_frontends(&mut instance), saved_before);
+    assert_eq!(
+        cluster_snapshots(&mut instance, cluster_id),
+        snapshots_before,
+        "a refused duplicate must leave every process snapshot unchanged"
+    );
+    assert_frontends(&mut instance, &loaded, "after refused duplicate");
+    assert_route(address_c, payload_c, "TCP route C after refused duplicate");
+    assert_route(address_a, payload_a, "TCP route A after refused duplicate");
+
+    // Remove C: only A remains everywhere and A still routes.
+    send_ok(
+        &mut instance,
+        RequestType::RemoveTcpFrontend(front_c.clone()),
+    );
+    assert_frontends(
+        &mut instance,
+        std::slice::from_ref(&front_a),
+        "after removing C",
+    );
+    assert_route(address_a, payload_a, "TCP route A after removing C");
+
+    // Re-add C: the accepted path appends it, giving the deterministic [A, C].
+    send_ok(&mut instance, RequestType::AddTcpFrontend(front_c.clone()));
+    let readded = [front_a.clone(), front_c.clone()];
+    assert_frontends(&mut instance, &readded, "after re-adding C");
+    assert_route(address_a, payload_a, "TCP route A after re-adding C");
+    assert_route(address_c, payload_c, "TCP route C after re-adding C");
 }
 
 #[test]

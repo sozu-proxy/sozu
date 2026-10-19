@@ -1378,6 +1378,147 @@ fn health_check_header_metadata_survives_save_state_replay() {
     assert_eq!(unrelated(&replayed), baseline);
 }
 
+/// A TCP bucket is a set of complete frontend records for `ConfigState::diff`.
+/// Source `[A]` and target `[C, A]` differ only by the semantic addition of
+/// `C`; replaying that one order stores `[A, C]`, which is a different `Vec`
+/// order but the same set of records.
+#[test]
+fn tcp_frontend_diff_replay_treats_bucket_order_as_semantic_set() {
+    const CLUSTER: &str = "ordered-tcp";
+    let listener = address(TCP_PORT);
+    let frontend = |alpn: &str, route: &str| RequestTcpFrontend {
+        cluster_id: CLUSTER.to_owned(),
+        address: listener,
+        tags: [("route".to_owned(), route.to_owned())].into(),
+        sni: Some("ordered.example".to_owned()),
+        alpn: vec![alpn.to_owned()],
+    };
+    let front_a = frontend("h2", "A");
+    let front_c = frontend("http/1.1", "C");
+    assert_ne!(
+        front_a, front_c,
+        "A and C must be distinct complete records"
+    );
+
+    let build = |order: &[RequestTcpFrontend]| {
+        let mut state = ConfigState::new();
+        for front in order {
+            state
+                .dispatch(&Request::from(RequestType::AddTcpFrontend(
+                    front.to_owned(),
+                )))
+                .expect("the model admits the canonical TCP frontend fixture");
+        }
+        state
+    };
+    let routes = |state: &ConfigState| -> Vec<String> {
+        state.tcp_fronts[CLUSTER]
+            .iter()
+            .map(|front| front.tags["route"].clone())
+            .collect()
+    };
+    let semantic = |state: &ConfigState| {
+        state
+            .tcp_fronts
+            .iter()
+            .filter(|(_, bucket)| !bucket.is_empty())
+            .map(|(id, bucket)| {
+                (
+                    id.to_string(),
+                    bucket.iter().cloned().collect::<BTreeSet<_>>(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+
+    let source = build(&[front_a.to_owned()]);
+    let target = build(&[front_c.to_owned(), front_a.to_owned()]);
+    assert_eq!(routes(&source), ["A"], "source stored bucket order");
+    assert_eq!(routes(&target), ["C", "A"], "target stored bucket order");
+    assert_ne!(
+        source.tcp_fronts[CLUSTER].len(),
+        target.tcp_fronts[CLUSTER].len()
+    );
+
+    let source_before = source.to_owned();
+    let target_before = target.to_owned();
+
+    // Real diff: on the old debug postcondition this call panics because the
+    // replayed Vec [A, C] is compared against the target Vec [C, A].
+    let forward = source.diff(&target);
+    assert_eq!(
+        forward,
+        vec![Request::from(RequestType::AddTcpFrontend(
+            front_c.to_owned()
+        ))],
+        "[A] -> [C, A] must emit exactly the semantic addition of C"
+    );
+    assert_eq!(source, source_before, "diff must not modify the source");
+    assert_eq!(target, target_before, "diff must not modify the target");
+
+    let mut replayed = source.to_owned();
+    for request in &forward {
+        replayed
+            .dispatch(request)
+            .expect("the emitted request replays onto the source");
+    }
+    assert_eq!(routes(&replayed), ["A", "C"], "replay appends C");
+    assert_eq!(routes(&target), ["C", "A"], "target order is unchanged");
+    assert_ne!(
+        replayed.tcp_fronts, target.tcp_fronts,
+        "the stored Vec orders must differ for this test to be meaningful"
+    );
+    assert_eq!(
+        semantic(&replayed),
+        semantic(&target),
+        "replay and target must hold the same set of complete records"
+    );
+
+    let reverse = target.diff(&source);
+    assert_eq!(
+        reverse,
+        vec![Request::from(RequestType::RemoveTcpFrontend(
+            front_c.to_owned()
+        ))],
+        "[C, A] -> [A] must emit exactly the removal of C"
+    );
+    assert_eq!(
+        source, source_before,
+        "reverse diff must not modify the source"
+    );
+    assert_eq!(
+        target, target_before,
+        "reverse diff must not modify the target"
+    );
+    let mut recovered = target.to_owned();
+    for request in &reverse {
+        recovered
+            .dispatch(request)
+            .expect("the emitted removal replays onto the target");
+    }
+    assert_eq!(routes(&recovered), ["A"]);
+    assert_eq!(semantic(&recovered), semantic(&source));
+    assert_eq!(
+        business_state(&recovered),
+        business_state(&source),
+        "the removal must recover the source business state exactly"
+    );
+
+    // A duplicate insertion is refused and changes nothing replayable.
+    let before_duplicate = business_state(&replayed);
+    let tcp_before_duplicate = replayed.tcp_fronts.to_owned();
+    let refusal = replayed.dispatch(&Request::from(RequestType::AddTcpFrontend(
+        front_a.to_owned(),
+    )));
+    assert!(
+        refusal.is_err(),
+        "an exact duplicate TCP frontend must be refused"
+    );
+    assert_eq!(business_state(&replayed), before_duplicate);
+    assert_eq!(replayed.tcp_fronts, tcp_before_duplicate);
+    assert_eq!(routes(&replayed), ["A", "C"]);
+}
+
 #[test]
 fn mutable_commands_simulation_is_deterministic() {
     let first = run(0x2301_0001, DEFAULT_STEPS, false);

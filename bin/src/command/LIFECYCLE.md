@@ -194,6 +194,21 @@ a client sends a complete `Request` over the channel. Steps:
      `query_certificates_from_main` and gather worker responses through
      a `GatheringTask`.
 
+Completion contract of `QueryClustersTask::on_finish` (`requests.rs`): it
+answers Success only when the deadline did not fire, every scattered worker
+response is present and `Ok` with usable content (a set `content_type`), no
+worker identity answered twice, no worker answered `Failure`, and the terminal
+accounting is complete (`errors == 0` and `ok == expected_responses`).
+`Processing` replies are progress, not answers. A timeout, a failed or
+undecodable status, missing or malformed content, incomplete accounting or a
+duplicate worker identity yields a `Failure` carrying the first concrete
+reason, never a partial Success. The main payload is added to the worker map
+under `main` only where `query_main` returns `Some`;
+`QueryCertificatesFromWorkers` legitimately has no main payload, and a main
+entry colliding with an existing map key is also a `Failure`. The task checks
+response completeness only: it does not validate that worker and main contents
+are equal, and it changes no protocol. A certificate fingerprint query that a worker not holding the certificate intentionally refuses therefore fails the whole query with a `Failure`, not an empty `Success`.
+
 Maintainers note: `worker_request` and `set_metric_detail_request`
 (`bin/src/command/requests.rs`) take a `ConfigState::hash_state()` snapshot
 solely to feed their `debug_assert_eq!` invariant checks (a rejected validation
