@@ -12,6 +12,9 @@
 
 <!-- changelog-slot:backend-ownership -->
 
+### Changed
+
+- Ordinary worker requests and `SetMetricDetail` no longer compute full-config invariant hash snapshots in non-debug release builds. Debug assertions still retain this coverage, and legitimate query hashes are unchanged.
 ### Fixed
 
 - Partial cluster and certificate-worker queries now answer `Failure` on timeout, refusal, incomplete or invalid worker responses, rather than a partial `Success`. This includes a certificate fingerprint query refused by a worker that does not hold the certificate.

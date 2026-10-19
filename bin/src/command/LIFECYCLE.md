@@ -209,6 +209,15 @@ entry colliding with an existing map key is also a `Failure`. The task checks
 response completeness only: it does not validate that worker and main contents
 are equal, and it changes no protocol. A certificate fingerprint query that a worker not holding the certificate intentionally refuses therefore fails the whole query with a `Failure`, not an empty `Success`.
 
+Maintainers note: `worker_request` and `set_metric_detail_request`
+(`bin/src/command/requests.rs`) take a `ConfigState::hash_state()` snapshot
+solely to feed their `debug_assert_eq!` invariant checks (a rejected validation
+or dispatch must not mutate persisted state, and `SetMetricDetail` is a
+`ConfigState` no-op). The snapshot and its asserts are gated by
+`#[cfg(debug_assertions)]` and are compiled out together in non-debug release
+builds. Debug invariant coverage is unchanged. This does not remove hashing
+elsewhere: query hash generation still computes the hashes it actually needs.
+
 ### 3.2 Master state vs worker state
 
 `save_state` (`requests.rs`) and `load_state` (`requests.rs`)
