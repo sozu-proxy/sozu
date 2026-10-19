@@ -12,6 +12,10 @@
 
 <!-- changelog-slot:backend-ownership -->
 
+### Changed
+
+- Ordinary worker requests and `SetMetricDetail` no longer compute full-config invariant hash snapshots in non-debug release builds. Debug assertions still retain this coverage, and legitimate query hashes are unchanged.
+
 ## 2.3.2 - 2026-10-18
 
 ### Added

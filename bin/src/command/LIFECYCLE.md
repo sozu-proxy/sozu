@@ -194,6 +194,15 @@ a client sends a complete `Request` over the channel. Steps:
      `query_certificates_from_main` and gather worker responses through
      a `GatheringTask`.
 
+Maintainers note: `worker_request` and `set_metric_detail_request`
+(`bin/src/command/requests.rs`) take a `ConfigState::hash_state()` snapshot
+solely to feed their `debug_assert_eq!` invariant checks (a rejected validation
+or dispatch must not mutate persisted state, and `SetMetricDetail` is a
+`ConfigState` no-op). The snapshot and its asserts are gated by
+`#[cfg(debug_assertions)]` and are compiled out together in non-debug release
+builds. Debug invariant coverage is unchanged. This does not remove hashing
+elsewhere: query hash generation still computes the hashes it actually needs.
+
 ### 3.2 Master state vs worker state
 
 `save_state` (`requests.rs`) and `load_state` (`requests.rs`)

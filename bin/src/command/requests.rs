@@ -3804,9 +3804,11 @@ pub fn worker_request(
     // verbs (ConfigureMetrics, SetMetricDetail, SetMaxConnectionsPerIp,
     // Logging) are runtime/worker-only and `ConfigState::dispatch` is
     // `Ok(())` no-op on ConfigState for them (see its runtime-only `Ok(())`
-    // arm in `command/src/state.rs`). `hash_state()` is a cheap per-cluster
-    // map; the snapshot is read ONLY inside the debug_assert below, so it is
-    // dead code in release but must stay ungated (E0425).
+    // arm in `command/src/state.rs`). `hash_state()` scans the global state
+    // (every cluster), so it is not cheap; the snapshot and its matching
+    // debug_assert_eq! checks are debug-only and compiled out together in
+    // release builds.
+    #[cfg(debug_assertions)]
     let state_hash_before = server.state.hash_state();
 
     // sozu#1301 + sozu#1313: validate the request the way the worker will apply
@@ -3853,6 +3855,7 @@ pub fn worker_request(
         // INVARIANT: neither a rejected validation nor a rejected dispatch may
         // mutate persisted state — validation never touches it, and a rejected
         // dispatch is a guaranteed no-op (see ConfigState::dispatch).
+        #[cfg(debug_assertions)]
         debug_assert_eq!(
             server.state.hash_state(),
             state_hash_before,
@@ -3909,6 +3912,7 @@ pub fn worker_request(
         // Nothing to remove and nothing to fan out: the main process state
         // and every worker of this release already dropped the object with
         // its cluster.
+        #[cfg(debug_assertions)]
         debug_assert_eq!(
             server.state.hash_state(),
             state_hash_before,
@@ -4460,8 +4464,9 @@ pub fn set_metric_detail_request(
     // Snapshot the cluster-hash so we can confirm SetMetricDetail is a
     // ConfigState no-op (it is runtime-only — `ConfigState::dispatch`
     // returns `Ok(())` without touching persisted state; see its
-    // runtime-only `Ok(())` arm in `command/src/state.rs`). Read only inside
-    // the post-dispatch assert → ungated for the release build (E0425).
+    // runtime-only `Ok(())` arm in `command/src/state.rs`). The snapshot and
+    // its matching asserts are debug-only and compiled out together in release builds.
+    #[cfg(debug_assertions)]
     let state_hash_before = server.state.hash_state();
     let request: Request = RequestType::SetMetricDetail(req).into();
 
@@ -4469,6 +4474,7 @@ pub fn set_metric_detail_request(
     if let Err(error) = server.state.dispatch(&request) {
         // INVARIANT: a rejected runtime-only dispatch leaves ConfigState
         // untouched (it never mutates it in the first place).
+        #[cfg(debug_assertions)]
         debug_assert_eq!(
             server.state.hash_state(),
             state_hash_before,
@@ -4501,6 +4507,7 @@ pub fn set_metric_detail_request(
     // no-op — the runtime lease lives in each worker's `Aggregator`, never in
     // the master's persisted `ConfigState`. If the hash changed, a future
     // edit accidentally wired a runtime knob into persisted state.
+    #[cfg(debug_assertions)]
     debug_assert_eq!(
         server.state.hash_state(),
         state_hash_before,
