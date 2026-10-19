@@ -33,6 +33,14 @@ Launch sozu with `worker_automatic_restart` on, test a request, kill a worker, t
 
 For minor and patch releases, the upgrade process must always pass correctly.
 
+The previous stable release is a distinct immutable-artifact gate, not a second
+build of the candidate. The mandatory crypto-ring process-observer cell verifies
+the published archive and executable hashes and runs
+`published_2_3_2_upgrades_to_current_and_drains_all_workers` with two workers.
+It checks every replacement executable and process state, complete per-process
+cluster queries, saved routing state, and HTTP/HTTPS/TCP/UDP traffic. Retain the
+older 2.2.1 bridge and 2.3.1 certificate-metadata cases when advancing this gate.
+
 For the first transition from 2.2.1, use the exact published release and follow
 the [legacy upgrade preconditions](doc/how_to_use.md#first-hot-upgrade-from-221):
 quiesce the control plane, verify preserved traffic and state, and verify every

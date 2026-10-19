@@ -5037,7 +5037,7 @@ dependencies = [
 
 [[package]]
 name = "sozu"
-version = "2.3.2"
+version = "2.3.3"
 dependencies = [
  "clap",
  "color-eyre",
@@ -5076,7 +5076,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-command-lib"
-version = "2.3.2"
+version = "2.3.3"
 dependencies = [
  "getrandom 0.4.3",
  "hex",
@@ -5108,7 +5108,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-e2e"
-version = "2.3.2"
+version = "2.3.3"
 dependencies = [
  "base64 0.23.1",
  "flate2",
@@ -5144,7 +5144,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-lib"
-version = "2.3.2"
+version = "2.3.3"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -5179,7 +5179,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-sim"
-version = "2.3.2"
+version = "2.3.3"
 dependencies = [
  "async-trait",
  "moonpool-sim",

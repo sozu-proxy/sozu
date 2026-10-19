@@ -1259,7 +1259,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-command-lib"
-version = "2.3.2"
+version = "2.3.3"
 dependencies = [
  "getrandom 0.4.3",
  "hex",
@@ -1289,7 +1289,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-fuzz"
-version = "2.3.2"
+version = "2.3.3"
 dependencies = [
  "libfuzzer-sys",
  "sozu-command-lib",
@@ -1298,7 +1298,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-lib"
-version = "2.3.2"
+version = "2.3.3"
 dependencies = [
  "anyhow",
  "base64 0.23.1",

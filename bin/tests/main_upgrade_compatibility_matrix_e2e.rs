@@ -1,4 +1,4 @@
-//! Main-upgrade compatibility across the 2.2.1 / transactional-v2 boundary.
+//! Main-upgrade compatibility across the legacy bridge and previous stable release.
 //!
 //! The transactional-v2 -> 2.2.1 rejection case starts the sender from a
 //! private binary copy, holds a worker upgrade behind an observable backend
@@ -8,11 +8,13 @@
 //!
 //! The 2.2.1 -> current case exercises the supported bridge with the current
 //! CLI, all three plaintext protocols, saved routing state, and a draining
-//! legacy worker.
+//! legacy worker. The published 2.3.2 -> current case uses the same traffic
+//! and saved-state checks with two workers, plus exact per-process inventories.
 //!
 //! This is a Linux-only, ignored process test. Run it with:
 //!
 //! ```bash
+//! SOZU_MATRIX_PREVIOUS=/path/to/verified-sozu-2.3.2 \
 //! SOZU_MATRIX_LEGACY=/path/to/legacy SOZU_MATRIX_OPTION3=/path/to/option3 \
 //! cargo test -p sozu --test main_upgrade_compatibility_matrix_e2e --locked \
 //!   -- --ignored --exact --nocapture --test-threads=1
@@ -960,17 +962,115 @@ fn legacy_2_2_1_upgrades_to_current_and_drains_its_worker() {
     let (legacy_binary, candidate_binary) = Direction::LegacyToOption3
         .binaries()
         .expect("set SOZU_MATRIX_LEGACY and SOZU_MATRIX_OPTION3 to exact executable paths");
-    assert!(legacy_binary.is_file(), "legacy binary is missing");
-    assert!(candidate_binary.is_file(), "candidate binary is missing");
+    run_published_upgrade(
+        legacy_binary,
+        candidate_binary,
+        "sozu 2.2.1 (cd02310",
+        1,
+        true,
+    );
+}
 
-    let legacy_version = Command::new(&legacy_binary)
+#[test]
+#[ignore = "process-level release gate; requires verified SOZU_MATRIX_PREVIOUS 2.3.2 binary"]
+fn published_2_3_2_upgrades_to_current_and_drains_all_workers() {
+    let previous = std::env::var_os("SOZU_MATRIX_PREVIOUS")
+        .map(PathBuf::from)
+        .expect("set SOZU_MATRIX_PREVIOUS to the verified published 2.3.2 binary");
+    run_published_upgrade(
+        previous,
+        PathBuf::from(env!("CARGO_BIN_EXE_sozu")),
+        "sozu 2.3.2 (c4b00f9 HEAD)",
+        2,
+        false,
+    );
+}
+
+fn running_worker_pids(
+    binary: &Path,
+    config: &Path,
+    expected: &BTreeSet<u64>,
+) -> BTreeMap<u64, u32> {
+    use sozu_command_lib::proto::command::response_content::ContentType;
+    let output = sozu(binary, config, &["--json", "status"]);
+    assert!(output.status.success(), "status failed: {output:?}");
+    let ContentType::Workers(workers) =
+        serde_json::from_slice(&output.stdout).expect("typed status JSON")
+    else {
+        panic!("status did not return workers");
+    };
+    let mut pids = BTreeMap::new();
+    for worker in workers
+        .vec
+        .into_iter()
+        .filter(|worker| worker.run_state == 0)
+    {
+        assert!(
+            pids.insert(
+                u64::from(worker.id),
+                u32::try_from(worker.pid).expect("positive worker PID")
+            )
+            .is_none(),
+            "duplicate running worker ID"
+        );
+    }
+    assert_eq!(
+        &pids.keys().copied().collect::<BTreeSet<_>>(),
+        expected,
+        "incomplete running worker inventory"
+    );
+    pids
+}
+
+fn assert_worker_cluster_state(binary: &Path, config: &Path, workers: &BTreeSet<u64>) {
+    use sozu_command_lib::proto::command::response_content::ContentType;
+    let mut expected: BTreeSet<_> = workers.iter().map(ToString::to_string).collect();
+    expected.insert("main".to_owned());
+    for cluster in ["compatibility", "compatibility_tcp", "compatibility_udp"] {
+        let output = sozu(
+            binary,
+            config,
+            &["--json", "cluster", "list", "--id", cluster],
+        );
+        assert!(output.status.success(), "cluster query failed: {output:?}");
+        let ContentType::WorkerResponses(responses) =
+            serde_json::from_slice(&output.stdout).expect("typed cluster JSON")
+        else {
+            panic!("cluster query did not return worker responses");
+        };
+        assert_eq!(
+            responses.map.keys().cloned().collect::<BTreeSet<_>>(),
+            expected,
+            "cluster {cluster} omitted a process"
+        );
+        let main = responses.map.get("main").expect("main cluster state");
+        for (id, response) in &responses.map {
+            assert_eq!(response, main, "cluster {cluster} differs on process {id}");
+        }
+    }
+}
+
+fn run_published_upgrade(
+    legacy_binary: PathBuf,
+    candidate_binary: PathBuf,
+    expected_version: &str,
+    worker_count: u64,
+    legacy_handoff: bool,
+) {
+    assert!(legacy_binary.is_file(), "published binary is missing");
+    assert!(candidate_binary.is_file(), "candidate binary is missing");
+    let version = Command::new(&legacy_binary)
         .arg("--version")
         .output()
-        .expect("query legacy version");
-    let legacy_version = String::from_utf8_lossy(&legacy_version.stdout);
+        .expect("query published version");
+    assert!(version.status.success(), "published version query failed");
+    let version = String::from_utf8_lossy(&version.stdout);
     assert!(
-        legacy_version.contains("sozu 2.2.1 (cd02310"),
-        "legacy binary must be the cd023104 2.2.1 release, got {legacy_version:?}"
+        version
+            .lines()
+            .next()
+            .is_some_and(|line| line.starts_with(expected_version)),
+        "published binary must be {expected_version:?}, got {version:?}"
     );
 
     let temp = tempfile::tempdir().expect("test tempdir");
@@ -1026,7 +1126,7 @@ pid_file_path = "{pid_file}"
 audit_logs_json_target = "{audit}"
 command_buffer_size = 16384
 max_command_buffer_size = 163840
-worker_count = 1
+worker_count = {worker_count}
 worker_automatic_restart = false
 handle_process_affinity = false
 log_level = "info"
@@ -1094,8 +1194,9 @@ responses = 1
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .process_group(0);
-    let main = start.spawn().expect("spawn 2.2.1 main");
+    let main = start.spawn().expect("spawn published main");
     let original_main_pid = main.id();
+    eprintln!("upgrade owned process group: {original_main_pid}");
     let mut guard = ProcessGuard {
         config_path: config_path.clone(),
         client_binary: legacy_binary.clone(),
@@ -1108,16 +1209,28 @@ responses = 1
     while !get(front_port, "/ready", Duration::from_millis(250)).starts_with(b"HTTP/1.1 200") {
         assert!(
             Instant::now() < ready_deadline,
-            "2.2.1 proxy never became ready"
+            "published proxy never became ready"
         );
         thread::sleep(CONDITION_POLL);
     }
     assert_eq!(main_pid(&pid_file), Some(original_main_pid));
+    let mut initial_worker_ids = running_worker_ids(&legacy_binary, &config_path);
+    initial_worker_ids.sort_unstable();
     assert_eq!(
-        running_worker_ids(&legacy_binary, &config_path),
-        vec![0],
-        "2.2.1 must start exactly worker 0"
+        initial_worker_ids,
+        (0..worker_count).collect::<Vec<_>>(),
+        "published binary must start exactly the configured workers"
     );
+    let initial_workers = (!legacy_handoff).then(|| {
+        let workers =
+            running_worker_pids(&legacy_binary, &config_path, &(0..worker_count).collect());
+        assert_worker_cluster_state(
+            &legacy_binary,
+            &config_path,
+            &workers.keys().copied().collect(),
+        );
+        workers
+    });
     assert_http_route(front_port, "/before");
     assert_https_route(https_front_port, "/before");
     assert_tcp_route(tcp_front_port, b"tcp-before");
@@ -1135,7 +1248,7 @@ responses = 1
     );
     assert!(
         before_save.status.success(),
-        "2.2.1 state save failed: stdout={:?} stderr={:?}",
+        "published state save failed: stdout={:?} stderr={:?}",
         String::from_utf8_lossy(&before_save.stdout),
         String::from_utf8_lossy(&before_save.stderr)
     );
@@ -1156,7 +1269,7 @@ responses = 1
     ] {
         assert!(
             before_kinds.contains_key(expected),
-            "2.2.1 state lacks {expected}: {before_kinds:?}"
+            "published state lacks {expected}: {before_kinds:?}"
         );
     }
     let before_route_ids = state_route_ids(&before_state);
@@ -1170,13 +1283,13 @@ responses = 1
     ]);
     assert_eq!(
         before_route_ids, expected_route_ids,
-        "2.2.1 saved state must identify every exercised route"
+        "published saved state must identify every exercised route"
     );
     let before_certificates = state_certificate_material_digests(&before_state);
     assert_eq!(
         before_certificates.len(),
         1,
-        "2.2.1 saved state must carry the HTTPS certificate material"
+        "published saved state must carry the HTTPS certificate material"
     );
 
     let held = thread::spawn(move || get(front_port, "/held", Duration::from_secs(40)));
@@ -1189,9 +1302,8 @@ responses = 1
         .expect("make current candidate executable");
     fs::rename(&staged_candidate, &installed_binary).expect("atomically install current candidate");
 
-    // The current CLI asks the 2.2.1 main to upgrade itself. That old main
-    // supplies the flat legacy payload and old internal argv to the installed
-    // candidate; the current CLI then reports the aggregate worker result.
+    // The current CLI asks the published main to upgrade itself using that
+    // version's handoff protocol, then reports the aggregate worker result.
     let mut upgrade = Command::new(&candidate_binary)
         .args([
             "-c",
@@ -1215,10 +1327,22 @@ responses = 1
         }
         assert!(
             Instant::now() < main_deadline,
-            "2.2.1 main was not replaced by the current candidate"
+            "published main was not replaced by the current candidate"
         );
         thread::sleep(CONDITION_POLL);
     };
+    // Transactional COMMIT fences the old Hub before the replacement publishes
+    // its PID; that parent exits after ACTIVATED. The 2.2.1 bridge instead
+    // waits for parent exit before publishing, so retain its immediate check.
+    if !legacy_handoff {
+        while process_state(original_main_pid).is_some_and(|state| state != 'Z') {
+            assert!(
+                Instant::now() < main_deadline,
+                "transactional parent did not exit after activation"
+            );
+            thread::sleep(CONDITION_POLL);
+        }
+    }
     assert!(
         process_state(original_main_pid).is_none_or(|state| state == 'Z'),
         "candidate published pid {new_main_pid} while legacy parent {original_main_pid} was still alive"
@@ -1230,10 +1354,14 @@ responses = 1
     );
 
     let worker_deadline = Instant::now() + Duration::from_secs(20);
-    while !running_worker_ids(&candidate_binary, &config_path).contains(&1) {
+    let replacement_ids: BTreeSet<_> = (worker_count..2 * worker_count).collect();
+    while !running_worker_ids(&candidate_binary, &config_path)
+        .iter()
+        .any(|id| replacement_ids.contains(id))
+    {
         assert!(
             Instant::now() < worker_deadline,
-            "current main never replaced legacy worker 0 with worker 1"
+            "current main never started a replacement worker"
         );
         thread::sleep(CONDITION_POLL);
     }
@@ -1242,7 +1370,7 @@ responses = 1
             .try_wait()
             .expect("observe upgrade client")
             .is_none(),
-        "full upgrade completed before the held request let worker 0 drain"
+        "full upgrade completed before the held request let its worker drain"
     );
     assert_http_route(front_port, "/during");
     assert_https_route(https_front_port, "/during");
@@ -1276,16 +1404,37 @@ responses = 1
     );
     assert!(
         !upgrade_timed_out && upgrade_output.status.success(),
-        "2.2.1 -> current full upgrade failed: status={:?} stdout={:?} stderr={:?}",
+        "published -> current full upgrade failed: status={:?} stdout={:?} stderr={:?}",
         upgrade_output.status,
         String::from_utf8_lossy(&upgrade_output.stdout),
         String::from_utf8_lossy(&upgrade_output.stderr)
     );
+    let mut final_worker_ids = running_worker_ids(&candidate_binary, &config_path);
+    final_worker_ids.sort_unstable();
     assert_eq!(
-        running_worker_ids(&candidate_binary, &config_path),
-        vec![1],
-        "only replacement worker 1 must remain running"
+        final_worker_ids,
+        replacement_ids.iter().copied().collect::<Vec<_>>(),
+        "exactly all replacement workers must remain running"
     );
+
+    if let Some(initial_workers) = initial_workers {
+        let replacement_workers =
+            running_worker_pids(&candidate_binary, &config_path, &replacement_ids);
+        for pid in replacement_workers.values() {
+            assert_eq!(
+                sha256_file(Path::new(&format!("/proc/{pid}/exe"))),
+                sha256_file(&candidate_binary),
+                "replacement worker {pid} does not execute the supplied candidate"
+            );
+        }
+        for pid in initial_workers.values() {
+            assert!(
+                process_state(*pid).is_none_or(|state| state == 'Z'),
+                "old worker {pid} remains alive after the full upgrade"
+            );
+        }
+        assert_worker_cluster_state(&candidate_binary, &config_path, &replacement_ids);
+    }
 
     let after_save = sozu(
         &candidate_binary,
