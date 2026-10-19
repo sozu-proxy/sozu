@@ -887,6 +887,15 @@ skipping it produced a real flaky-test or papered-over-bug commit.
   (several worktrees, parallel CI jobs) share ports silently: `server_bind`
   and `udp_bind` set `SO_REUSEPORT`, so both bind the same address without
   error and the kernel splits connections and datagrams between them.
+- **Use pre-existing executable fixtures for upgrade probes.** A fork can
+  inherit a candidate's writable descriptor before the writing test closes
+  it, even with `FD_CLOEXEC`, causing `ETXTBSY` in another test's probe.
+  `probe_candidate` therefore links each temporary `candidate-<protocol>.sh`
+  to the tracked executable `bin/src/test-fixtures/upgrade-probe.sh`; it
+  never writes or copies the executable during the test. The fixture derives
+  its accepted protocol and temporary log path from its invocation path.
+  Keep its Git executable bit and the protocol-2/3 assertions intact so the
+  tests can run in parallel without an inherited writer for the fixture.
 - **Always drain with a `loop_read_*` helper when asserting on TCP responses.** A
   single `read()` sees one TCP segment under load — your assertion races the
   network. Use the looping readers (`Client::receive_until_eof`,

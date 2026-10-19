@@ -1233,20 +1233,12 @@ mod tests {
     /// A candidate that answers `upgrade-probe --protocol <accepted>` with
     /// success and everything else with failure, recording what it was asked.
     fn probe_candidate(directory: &std::path::Path, accepted: u16) -> (String, std::path::PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
-
         let log = directory.join(format!("asked-{accepted}.log"));
         let script = directory.join(format!("candidate-{accepted}.sh"));
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\necho \"$1 $2 $3\" >> {}\n[ \"$1\" = upgrade-probe ] && [ \"$3\" = {accepted} ]\n",
-                log.display()
-            ),
-        )
-        .expect("write the probe candidate");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .expect("make the probe candidate executable");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/test-fixtures/upgrade-probe.sh");
+        std::os::unix::fs::symlink(fixture, &script)
+            .expect("link the pre-existing probe candidate");
         (script.to_string_lossy().into_owned(), log)
     }
 
