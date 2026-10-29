@@ -99,7 +99,7 @@ container server; it never turns a missing service into a skipped test.
 | `service-mongodb` | MongoDB `insert_many`, update, sorted reconnect read, database removal |
 | `service-kafka` | One Kafka KRaft broker, keyed batch produce/fetch and exact offsets; no consumer-group coverage |
 | `service-rabbitmq` | RabbitMQ publisher confirms, fresh consumer connection, exact deliveries and acknowledgements |
-| `service-pulsar` | Pulsar standalone, Magnetar 1.7.2 producer/consumer acknowledgements and exact reconnect delivery |
+| `service-pulsar` | Pulsar standalone, Magnetar 1.7.4 producer/consumer acknowledgements and exact reconnect delivery |
 | `service-coredns` | CoreDNS authoritative A, AAAA, TXT and NXDOMAIN over raw UDP, flow expiry and listener reactivation |
 
 The MongoDB CI cell uses the hosted `ubuntu-22.04` runner with its Linux 6.8

@@ -53,7 +53,7 @@ Crypto-provider features live in `bin/Cargo.toml` + `lib/Cargo.toml`; CI exercis
 
 # Code style
 
-- **Edition 2024**, MSRV 1.91. Use 2024-only idioms freely.
+- **Edition 2024**, MSRV 1.93.1. Use 2024-only idioms freely.
 - **Errors**: `thiserror` for library error enums, `anyhow` at binary boundaries. Follow the nearest existing `thiserror::Error` enum; don't introduce new error crates.
 - **No panic on network-facing input.** In parser, socket, mux, TLS, command-channel, and config paths, convert invalid traffic into `SessionResult` / H2 `GOAWAY` / `RST_STREAM` / default HTTP answer + metric + contextual log. `unwrap`/`expect`/`panic!`/`unreachable!` are acceptable in tests and in hard internal invariants with useful messages.
 - **Ownership**: prefer `ToOwned::to_owned()` over `Clone::clone()` when going `&str → String` or `&[u8] → Vec<u8>` (clearer intent). Stick with `.clone()` when the type is already `Clone + !ToOwned`.
