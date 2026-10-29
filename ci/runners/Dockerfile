@@ -17,7 +17,7 @@ RUN curl -fsSL "https://github.com/summerwind/h2spec/releases/download/v${H2SPEC
 # building with --all-features, e.g. msrv-full's `cargo doc`) failed with "Could not find Go".
 # Exact version doesn't matter here (unlike Rust's MSRV pin) — any recent Go satisfies the CMake
 # check — so this floats loosely rather than being kept in lockstep with anything else.
-ARG GO_VERSION=1.24.0
+ARG GO_VERSION=1.27.3
 RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tar.gz \
     && tar -C /usr/local -xzf /tmp/go.tar.gz \
     && rm /tmp/go.tar.gz

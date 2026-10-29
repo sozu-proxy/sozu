@@ -1006,10 +1006,16 @@ const LAST_PROTECTED_VERSION: u64 = 1 << 16;
 /// transaction uses, is never issued.
 fn next_protected_version() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |version| {
-        (version <= LAST_PROTECTED_VERSION).then_some(version + 1)
-    })
-    .expect("the protected header versions of the suite are exhausted")
+    let mut version = NEXT.load(Ordering::SeqCst);
+    loop {
+        let incremented = (version <= LAST_PROTECTED_VERSION)
+            .then_some(version + 1)
+            .expect("the protected header versions of the suite are exhausted");
+        match NEXT.compare_exchange_weak(version, incremented, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return version,
+            Err(current) => version = current,
+        }
+    }
 }
 
 /// Send one `ProtectedHealthCheckOrder` and wait for its answer, which must be
