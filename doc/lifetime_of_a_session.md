@@ -636,7 +636,8 @@ the dead-backend sweep has yet to act on, such as the HUP sozu raises itself
 when it drops a backend that broke the protocol. A dead backend kept for the
 bytes it still has to deliver is not work: it waits for the client to drain
 them ([#1819](https://github.com/sozu-proxy/sozu/issues/1819)). A call that
-reaches the bound after forwarding a stream byte to either peer is a transfer
+reaches the bound after forwarding at least one stream byte per budgeted
+iteration to either peer is a transfer
 whose client and backend both keep up: it yields with its readiness intact,
 counted in `http.mux.loop_budget_yield`, and the server runs `ready` again
 after its next poll, which it does not block, so the other sessions are served

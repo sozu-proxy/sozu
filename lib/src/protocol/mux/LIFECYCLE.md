@@ -1223,8 +1223,10 @@ deadlines are compared against `ConnectionH2.now` (§7.5):
 6. Loop budget (`MAX_LOOP_ITERATIONS = 10_000`, `mod.rs`) is a hard backstop
    in `Mux::ready_inner`, whose `counter` is declared above BOTH of its loops,
    so the budget is shared across every outer iteration of one `ready()` call.
-   A call that reaches it after forwarding a stream byte
-   (`Context::stream_bytes_out` moved since the call began: stream bytes any
+   A call that reaches it after forwarding at least one stream byte per
+   budgeted iteration (`progressed_through_loop_budget`: `Context::stream_bytes_out`
+   moved that far since the call began, so a spin that trickles a few bytes
+   still takes the spin path; stream bytes any
    connection's write accepted, client or backend; H2 control frames
    excluded) is a transfer whose peers keep up, not a spin: it yields. It
    breaks out with every readiness bit left as it is, sets
@@ -2455,7 +2457,8 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
 12. **Loop budget.** Every inner loop in `Mux::ready` and
     `drive_frontend_shutdown_io` bounds iterations at
     `MAX_LOOP_ITERATIONS = 10_000` (`mod.rs`). A `Mux::ready` call that
-    reaches it after forwarding a stream byte yields to the event loop with
+    reaches it after forwarding at least one stream byte per budgeted
+    iteration yields to the event loop with
     its readiness intact, and the server resumes it after the next poll
     (§7.4, step 6; [#1906](https://github.com/sozu-proxy/sozu/issues/1906)).
     Reaching it in `Mux::ready` without forwarding does not drop output queued for a client that is still draining it: the

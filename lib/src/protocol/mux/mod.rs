@@ -216,6 +216,28 @@ pub use crate::protocol::mux::{
 /// session with output still queued for the client then waits for its next
 /// writable event; any other session is closed.
 const MAX_LOOP_ITERATIONS: i32 = 10_000;
+
+/// Whether a `Mux::ready_inner` call that reached `MAX_LOOP_ITERATIONS`
+/// moved enough stream bytes to be a transfer whose peers keep up, which
+/// yields to the event loop, rather than a spin, which the loop budget
+/// exists to catch (sozu-proxy/sozu#1906). A real transfer forwards up to a
+/// buffer per iteration; at least one byte per budgeted iteration on average
+/// is required, so a spin that trickles a few bytes still reaches
+/// `Mux::wait_for_client_at_loop_limit` instead of yielding forever.
+/// `Context::stream_bytes_out` wraps, hence the wrapping difference.
+fn progressed_through_loop_budget(bytes_out_at_entry: usize, bytes_out_now: usize) -> bool {
+    let moved = bytes_out_now.wrapping_sub(bytes_out_at_entry);
+    let progressed = moved >= MAX_LOOP_ITERATIONS as usize;
+    debug_assert!(
+        !progressed || moved > 0,
+        "a call judged as progressing must have moved bytes"
+    );
+    debug_assert!(
+        progressed || moved < MAX_LOOP_ITERATIONS as usize,
+        "a call that moved a byte per iteration must be judged as progressing"
+    );
+    progressed
+}
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Debug tripwire for the one-active-stream invariant that
@@ -1123,9 +1145,11 @@ pub struct Context<L: ListenerHandler + L7ListenerHandler> {
     /// `ConnectionH1::writable` and `H2Shell::write_streams` add every stream
     /// byte a write accepted, whatever the connection's position; H2 control
     /// frames are not stream bytes and do not count. When the inner loop of
-    /// `Mux::ready_inner` reaches `MAX_LOOP_ITERATIONS` and this moved during
-    /// the call, the session is progressing, not spinning: it yields to the
-    /// event loop instead of closing (sozu-proxy/sozu#1906).
+    /// `Mux::ready_inner` reaches `MAX_LOOP_ITERATIONS` and this moved by at
+    /// least one byte per budgeted iteration during the call
+    /// (`progressed_through_loop_budget`), the session is progressing, not
+    /// spinning: it yields to the event loop instead of closing
+    /// (sozu-proxy/sozu#1906).
     pub(super) stream_bytes_out: usize,
     /// Set when the last `Mux::ready_inner` call yielded at
     /// `MAX_LOOP_ITERATIONS` with its readiness left as it was. The session
@@ -3077,7 +3101,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         _metrics: &mut SessionMetrics,
     ) -> SessionResult {
         let mut counter = 0;
-        // Whether this call forwarded a stream byte, read at the loop budget:
+        // How far this call forwarded stream bytes, read at the loop budget:
         // a session that reaches `MAX_LOOP_ITERATIONS` while progressing
         // yields to the event loop instead of closing (sozu-proxy/sozu#1906).
         let bytes_out_at_entry = self.context.stream_bytes_out;
@@ -3718,7 +3742,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     if budget_spent {
                         break;
                     }
-                    // A call that forwarded bytes is a transfer whose peers
+                    // A call that forwarded at least a byte per budgeted
+                    // iteration is a transfer whose peers
                     // keep up, not a spin. Closing it cut a fast download or
                     // upload at a random offset with a clean close
                     // (sozu-proxy/sozu#1906); running on would hold the
@@ -3727,7 +3752,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     // `Server::resume_yielded_sessions` calls `ready` again
                     // after the next poll, which serves the other sessions
                     // first.
-                    if self.context.stream_bytes_out != bytes_out_at_entry {
+                    if progressed_through_loop_budget(
+                        bytes_out_at_entry,
+                        self.context.stream_bytes_out,
+                    ) {
                         incr!(names::http::MUX_LOOP_BUDGET_YIELD);
                         debug!(
                             "{} Mux loop reached {} iterations while forwarding, yielding: frontend={:?}",
@@ -8646,6 +8674,26 @@ mod tests {
             "the first pass must wait for the client, not close"
         );
         assert_eq!(received, expected, "the client must receive the whole body");
+    }
+
+    /// The loop budget yields only on real progress: at least one stream byte
+    /// per budgeted iteration. A spin that trickled a few bytes, which an
+    /// unconditional "any byte moved" rule would let yield forever, is left
+    /// to the spin path (sozu-proxy/sozu#1906 hardening).
+    #[test]
+    fn only_a_byte_per_budgeted_iteration_counts_as_progress_at_the_loop_budget() {
+        let budget = MAX_LOOP_ITERATIONS as usize;
+        assert!(!progressed_through_loop_budget(100, 100), "nothing moved");
+        assert!(
+            !progressed_through_loop_budget(100, 101),
+            "one byte is a trickle"
+        );
+        assert!(!progressed_through_loop_budget(0, budget - 1));
+        assert!(progressed_through_loop_budget(0, budget));
+        assert!(progressed_through_loop_budget(0, 512 * budget));
+        // `Context::stream_bytes_out` wraps.
+        assert!(progressed_through_loop_budget(usize::MAX - 10, budget));
+        assert!(!progressed_through_loop_budget(usize::MAX, 3));
     }
 
     /// A transfer that forwards bytes on every iteration of the inner loop of
