@@ -438,6 +438,7 @@ impl std::fmt::Debug for command::HttpListenerConfig {
             .field("elide_x_real_ip", &self.elide_x_real_ip)
             .field("send_x_real_ip", &self.send_x_real_ip)
             .field("forwarded_headers", &self.forwarded_headers)
+            .field("h2c_prior_knowledge", &self.h2c_prior_knowledge)
             .finish_non_exhaustive()
     }
 }
@@ -467,6 +468,7 @@ impl std::fmt::Debug for command::UpdateHttpListenerConfig {
             .field("answers_key_len", &answers_key_len)
             .field("answers_value_len", &answers_value_len)
             .field("forwarded_headers", &self.forwarded_headers)
+            .field("h2c_prior_knowledge", &self.h2c_prior_knowledge)
             .finish_non_exhaustive()
     }
 }

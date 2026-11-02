@@ -15,6 +15,13 @@ document captures **how to use it**, **where to apply it**, and the
 | `h2-h1`  | h2 + TLS (ALPN) | h1 cleartext  | `AsyncBackend::http_handler` | Covered by `try_tls_cardinality_h2_h1_*`.                                     |
 | `h2-h2c` | h2 + TLS (ALPN) | h2c cleartext | `H2Backend::start`           | Covered by `try_tls_cardinality_h2_h2_*`.                                     |
 
+A cleartext HTTP listener with `h2c_prior_knowledge = true` adds an h2c
+frontend (HTTP/2 by prior knowledge, no TLS) in front of the same two backend
+columns: `h2c-h1` is `test_h2c_prior_knowledge_to_h1_backend` and `h2c-h2c` is
+`test_h2c_prior_knowledge_to_h2_backend`
+(`e2e/src/tests/h2c_prior_knowledge_tests.rs`), beside the h1 control on the
+same listener and the knob-off `400`.
+
 Backend **TLS** (h1-over-TLS, h2-over-TLS) is **not** in the current
 release; the follow-up enhancement is tracked at
 [#1218](https://github.com/sozu-proxy/sozu/issues/1218). At that point

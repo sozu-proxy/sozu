@@ -39,6 +39,7 @@ use crate::{
     pool::Pool,
     protocol::{
         Pipe, SessionState,
+        h2c::{H2cPrefaceSniff, PrefaceVerdict},
         http::{
             answers::HttpAnswers,
             parser::{Method, hostname_and_port},
@@ -62,10 +63,12 @@ StateMachineBuilder! {
     /// The various Stages of an HTTP connection:
     ///
     /// 1. optional (ExpectProxyProtocol)
-    /// 2. HTTP (via Mux in H1 mode)
-    /// 3. WebSocket (passthrough)
+    /// 2. optional (H2cPrefaceSniff), only with `h2c_prior_knowledge`
+    /// 3. HTTP (via Mux in H1 mode, or H2 mode after an h2c preface)
+    /// 4. WebSocket (passthrough), only from HTTP/1.1
     enum HttpStateMachine impl SessionState {
         Expect(ExpectProxyProtocol<TcpStream>),
+        Sniff(H2cPrefaceSniff),
         Mux(MuxClear),
         WebSocket(Pipe<crate::socket::SessionTcpStream, HttpListener>),
     }
@@ -118,6 +121,9 @@ pub struct HttpSession {
     proxy: Rc<RefCell<HttpProxy>>,
     state: HttpStateMachine,
     has_been_closed: bool,
+    /// The listener's `h2c_prior_knowledge`, read once at accept: whether
+    /// the session sniffs for the HTTP/2 preface before building its mux.
+    h2c_prior_knowledge: bool,
 }
 
 impl HttpSession {
@@ -128,6 +134,7 @@ impl HttpSession {
         configured_frontend_timeout: Duration,
         configured_request_timeout: Duration,
         expect_proxy: bool,
+        h2c_prior_knowledge: bool,
         listener: Rc<RefCell<HttpListener>>,
         pool: Weak<RefCell<Pool>>,
         proxy: Rc<RefCell<HttpProxy>>,
@@ -150,6 +157,23 @@ impl HttpSession {
                 sock,
                 token,
                 request_id,
+            ))
+        } else if h2c_prior_knowledge {
+            trace!(
+                "{} starting in h2c preface sniff state",
+                log_module_context!()
+            );
+            // Counted as HTTP from accept: the sniff and the mux it becomes
+            // are one HTTP session, so `upgrade_sniff` moves no gauge.
+            gauge_add!(names::protocol::HTTP, 1);
+            HttpStateMachine::Sniff(H2cPrefaceSniff::new(
+                container_frontend_timeout,
+                sock,
+                token,
+                request_id,
+                Some(peer),
+                public_address,
+                Ready::EMPTY,
             ))
         } else {
             gauge_add!(names::protocol::HTTP, 1);
@@ -202,10 +226,12 @@ impl HttpSession {
             state.marker() as u8,
             if expect_proxy {
                 StateMarker::Expect as u8
+            } else if h2c_prior_knowledge {
+                StateMarker::Sniff as u8
             } else {
                 StateMarker::Mux as u8
             },
-            "constructed state must match the expect_proxy branch"
+            "constructed state must match the expect_proxy / h2c_prior_knowledge branch"
         );
         // The freshly-built state can never be a FailedUpgrade: that marker
         // only appears after a real upgrade attempt drains the state via
@@ -222,6 +248,7 @@ impl HttpSession {
             configured_frontend_timeout,
             frontend_token: token,
             has_been_closed: false,
+            h2c_prior_knowledge,
             last_event: Instant::now(),
             listener,
             metrics,
@@ -246,7 +273,7 @@ impl HttpSession {
     /// - once `close()` has run the state has been drained / cancelled, so the
     ///   session is terminal and must not be re-driven (callers gate on the
     ///   returned `SessionIsToBeClosed`);
-    /// - the live state marker is one of the three legal H1 stages — the
+    /// - the live state marker is one of the four legal stages — the
     ///   `FailedUpgrade` marker is only transient (between `take()` and the
     ///   `close()` that immediately follows a failed upgrade), so it is the
     ///   single tolerated exception on a still-open session.
@@ -256,9 +283,17 @@ impl HttpSession {
         debug_assert!(
             matches!(
                 marker,
-                StateMarker::Expect | StateMarker::Mux | StateMarker::WebSocket
+                StateMarker::Expect
+                    | StateMarker::Sniff
+                    | StateMarker::Mux
+                    | StateMarker::WebSocket
             ),
-            "session marker must be a legal H1 stage (Expect/Mux/WebSocket), got {marker:?}"
+            "session marker must be a legal stage (Expect/Sniff/Mux/WebSocket), got {marker:?}"
+        );
+        // The sniff stage exists only on an `h2c_prior_knowledge` session.
+        debug_assert!(
+            !matches!(marker, StateMarker::Sniff) || self.h2c_prior_knowledge,
+            "a session without h2c_prior_knowledge must never sniff"
         );
         // A failed state is only ever observed transiently between a failed
         // upgrade and the close() that reaps it; if it survives to a postcondition
@@ -280,6 +315,7 @@ impl HttpSession {
         let new_state = match self.state.take() {
             HttpStateMachine::Mux(mux) => self.upgrade_mux(mux),
             HttpStateMachine::Expect(expect) => self.upgrade_expect(expect),
+            HttpStateMachine::Sniff(sniff) => self.upgrade_sniff(sniff),
             HttpStateMachine::WebSocket(ws) => self.upgrade_websocket(ws),
             HttpStateMachine::FailedUpgrade(_) => {
                 // Reaching this arm means a prior upgrade already returned
@@ -295,13 +331,16 @@ impl HttpSession {
 
         match new_state {
             Some(state) => {
-                // Legal transitions only: Expect→Mux, Mux→WebSocket, or the
-                // WebSocket self-loop (upgrade_websocket is a no-op guard). Any
-                // other pair means a stage was skipped or reversed.
+                // Legal transitions only: Expect→Mux, Expect→Sniff, Sniff→Mux,
+                // Mux→WebSocket, or the WebSocket self-loop (upgrade_websocket
+                // is a no-op guard). Any other pair means a stage was skipped
+                // or reversed.
                 debug_assert!(
                     matches!(
                         (from_marker, state.marker()),
                         (StateMarker::Expect, StateMarker::Mux)
+                            | (StateMarker::Expect, StateMarker::Sniff)
+                            | (StateMarker::Sniff, StateMarker::Mux)
                             | (StateMarker::Mux, StateMarker::WebSocket)
                             | (StateMarker::WebSocket, StateMarker::WebSocket)
                     ),
@@ -341,6 +380,30 @@ impl HttpSession {
             .as_ref()
             .map(|add| (add.destination(), add.source()))
         {
+            Some((Some(public_address), Some(session_address))) if self.h2c_prior_knowledge => {
+                // The PROXY header was read to its exact length, so the
+                // client's first application byte is the next one in the
+                // socket: the sniff sees exactly what it would without PROXY.
+                let sniff = H2cPrefaceSniff::new(
+                    expect.container_frontend_timeout,
+                    expect.frontend,
+                    self.frontend_token,
+                    expect.request_id,
+                    Some(session_address),
+                    public_address,
+                    expect.frontend_readiness.event,
+                );
+                debug_assert_eq!(
+                    sniff.frontend_token, self.frontend_token,
+                    "expect upgrade must preserve the frontend token"
+                );
+                debug_assert!(sniff.verdict.is_none(), "a fresh sniff has not decided yet");
+                // Gauge pairing: leave PROXY_EXPECT, enter HTTP — the same
+                // pair as the Expect→Mux handoff below.
+                gauge_add!(names::protocol::PROXY_EXPECT, -1);
+                gauge_add!(names::protocol::HTTP, 1);
+                Some(HttpStateMachine::Sniff(sniff))
+            }
             Some((Some(public_address), Some(session_address))) => {
                 let session_ulid = rusty_ulid::Ulid::generate();
                 let frontend = mux::Connection::new_h1_server(
@@ -418,6 +481,126 @@ impl HttpSession {
                 None
             }
         }
+    }
+
+    /// Build the mux the preface sniff decided on: an H2 server frontend
+    /// for an h2c prior-knowledge connection, the usual H1 one otherwise.
+    ///
+    /// Mirrors the post-ALPN dispatch of `HttpsSession::upgrade_handshake`
+    /// (`lib/src/https.rs`): only the H1 branch creates its request stream
+    /// up front, the H2 server creates one per HEADERS frame, and the H2
+    /// knobs (flood thresholds, connection tuning, stream idle timeout,
+    /// graceful shutdown deadline) come from the same listener accessors.
+    /// No TLS metadata is stamped, so `tls_alpn` / `tls_server_name` stay
+    /// `None` and the context's protocol stays `Protocol::HTTP` (scheme,
+    /// `X-Forwarded-Proto` and `Forwarded: proto` all read `http`).
+    fn upgrade_sniff(&mut self, sniff: H2cPrefaceSniff) -> Option<HttpStateMachine> {
+        let verdict = sniff.verdict;
+        debug!(
+            "{} preface sniff decided {:?}, switching to the mux",
+            log_context!(self),
+            verdict
+        );
+        if !matches!(verdict, Some(PrefaceVerdict::H2 | PrefaceVerdict::Http1)) {
+            error!(
+                "{} upgrade_sniff: the sniff upgraded without a verdict ({:?}), closing",
+                log_context!(self),
+                verdict
+            );
+            return None;
+        }
+
+        let session_ulid = rusty_ulid::Ulid::generate();
+        let front_stream = crate::socket::SessionTcpStream::new(
+            sniff.frontend,
+            session_ulid,
+            sniff.session_address,
+        );
+        let router = mux::Router::new(
+            self.configured_backend_timeout,
+            self.configured_connect_timeout,
+        );
+        let mut context = mux::Context::new(
+            session_ulid,
+            self.pool.clone(),
+            self.listener.clone(),
+            sniff.session_address,
+            sniff.public_address,
+        );
+        let timeout_duration = sniff.container_frontend_timeout.duration();
+        let mut frontend = if verdict == Some(PrefaceVerdict::H2) {
+            let (flood_config, connection_config, stream_idle_timeout, graceful_shutdown_deadline) = {
+                let listener = self.listener.borrow();
+                (
+                    listener.get_h2_flood_config(),
+                    listener.get_h2_connection_config(),
+                    listener.get_h2_stream_idle_timeout(),
+                    listener.get_h2_graceful_shutdown_deadline(),
+                )
+            };
+            let Some(frontend) = mux::Connection::new_h2_server(
+                session_ulid,
+                front_stream,
+                &mut *context.buffers,
+                timeout_duration,
+                flood_config,
+                connection_config,
+                stream_idle_timeout,
+                graceful_shutdown_deadline,
+            ) else {
+                error!(
+                    "{} h2c upgrade failed: could not allocate the H2 connection buffers",
+                    log_context!(self)
+                );
+                return None;
+            };
+            frontend
+        } else {
+            if context.create_stream(sniff.request_id, 1 << 16).is_none() {
+                error!(
+                    "{} h2c sniff upgrade failed: could not create stream",
+                    log_context!(self)
+                );
+                return None;
+            }
+            mux::Connection::new_h1_server(session_ulid, front_stream, timeout_duration)
+        };
+        // The sniff only peeked: the bytes it decided on are still queued and
+        // raise no new edge, so the mux must start READABLE or it waits for a
+        // segment that may never come. WRITABLE because the H2 server owes
+        // its SETTINGS whatever the peer does next and the socket's first
+        // WRITABLE edge was delivered to the sniff — the same reasoning as
+        // `upgraded_frontend_events` (`lib/src/https.rs`). Everything else
+        // the sniff observed (HUP, WRITE_CLOSED) carries over unchanged.
+        frontend
+            .readiness_mut()
+            .event
+            .insert(sniff.frontend_readiness.event | Ready::READABLE | Ready::WRITABLE);
+        debug_assert!(
+            frontend.readiness_mut().event.is_readable()
+                && frontend.readiness_mut().event.is_writable(),
+            "the upgraded mux frontend must be armed READABLE and WRITABLE"
+        );
+        // Only the H1 branch owns a stream before the first request.
+        debug_assert_eq!(
+            context.streams.len(),
+            usize::from(verdict == Some(PrefaceVerdict::Http1)),
+            "the H1 mux owns exactly its request stream, the H2 mux none yet"
+        );
+
+        Some(HttpStateMachine::Mux(Mux {
+            configured_frontend_timeout: self.configured_frontend_timeout,
+            frontend_token: self.frontend_token,
+            frontend,
+            router,
+            context,
+            session_ulid,
+            // Carry the entry armed at accept: the request timeout that
+            // bounded the sniff keeps running for the first request.
+            timeouts: mux::MuxTimeouts::new(sniff.container_frontend_timeout),
+            backend_registry: mux::BackendRegistry::default(),
+            backends: Rc::clone(&self.proxy.borrow().backends),
+        }))
     }
 
     fn upgrade_mux(&mut self, mut mux: MuxClear) -> Option<HttpStateMachine> {
@@ -612,7 +795,7 @@ impl ProxySession for HttpSession {
         // Restore gauges
         match self.state.marker() {
             StateMarker::Expect => gauge_add!(names::protocol::PROXY_EXPECT, -1),
-            StateMarker::Mux => gauge_add!(names::protocol::HTTP, -1),
+            StateMarker::Sniff | StateMarker::Mux => gauge_add!(names::protocol::HTTP, -1),
             StateMarker::WebSocket => {
                 gauge_add!(names::protocol::WS, -1);
                 gauge_add!(names::websocket::ACTIVE_REQUESTS, -1);
@@ -622,6 +805,7 @@ impl ProxySession for HttpSession {
         if self.state.failed() {
             match self.state.marker() {
                 StateMarker::Expect => incr!(names::http::UPGRADE_EXPECT_FAILED),
+                StateMarker::Sniff => incr!(names::http::UPGRADE_H2C_FAILED),
                 StateMarker::Mux => incr!(names::http::UPGRADE_MUX_FAILED),
                 StateMarker::WebSocket => incr!(names::http::UPGRADE_WS_FAILED),
             }
@@ -759,27 +943,33 @@ impl ProxySession for HttpSession {
 
 pub type Hostname = String;
 
-/// Cleartext HTTP/1.x listener.
+/// Cleartext HTTP listener: HTTP/1.x, plus HTTP/2 by prior knowledge when
+/// `h2c_prior_knowledge` is set.
 ///
-/// # HTTP/2 over cleartext (h2c) is NOT supported
+/// # HTTP/2 over cleartext (h2c)
 ///
 /// RFC 7540 §3.2 specified an `Upgrade: h2c` mechanism to negotiate HTTP/2
 /// over a cleartext TCP connection, with a companion prior-knowledge
-/// variant in §3.4. Both paths are intentionally absent from this listener:
+/// variant in §3.4 (RFC 9113 §3.3 keeps only the latter):
 ///
-/// - No `Upgrade: h2c` handler: the HTTP/1.1 state machine forwards
+/// - No `Upgrade: h2c` handler, ever: the HTTP/1.1 state machine forwards
 ///   `Upgrade` headers to the backend but never responds `101 Switching
-///   Protocols` with an HTTP/2 connection preface.
-/// - No prior-knowledge detection: the listener does not sniff the
-///   24-byte `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n` magic string; a client
-///   that opens a TCP connection and immediately sends the preface will
-///   be interpreted as a malformed HTTP/1 request and rejected with 400.
+///   Protocols` with an HTTP/2 connection preface. RFC 9113 deprecates the
+///   mechanism.
+/// - Prior knowledge is opt-in per listener (`h2c_prior_knowledge`,
+///   default `false`, sozu-proxy/sozu#1911). When set, the session starts in
+///   `H2cPrefaceSniff` (`lib/src/protocol/h2c.rs`), which peeks at the first
+///   bytes without consuming them: the 24-byte
+///   `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n` preface makes the connection an
+///   HTTP/2 frontend, exactly as ALPN `h2` does on `HttpsListener`, and
+///   any diverging byte makes it HTTP/1.x. When unset — the default — no
+///   sniff runs at all, and a client that opens with the preface is
+///   interpreted as a malformed HTTP/1 request and rejected with 400.
 ///
-/// RFC 9113 (the current HTTP/2 RFC, obsoleting 7540) formally deprecates
-/// the `Upgrade: h2c` mechanism. Clients that want HTTP/2 MUST use the
-/// TLS ALPN path (`HttpsListener`, selector `h2`) instead. This is
-/// consistent with the industry consensus (nginx, envoy, cloudflare) and
-/// removes an entire class of cleartext-preface smuggling primitives.
+/// Keeping the knob off by default keeps cleartext HTTP/2, and the
+/// cleartext-preface smuggling primitives it can carry, away from listeners
+/// that never asked for it; clients that want HTTP/2 there use the TLS ALPN
+/// path (`HttpsListener`, selector `h2`).
 pub struct HttpListener {
     active: bool,
     address: SocketAddr,
@@ -1616,6 +1806,11 @@ impl HttpListener {
         if let Some(v) = patch.forwarded_headers {
             config.forwarded_headers = Some(v);
         }
+        // Read once per accepted connection by `HttpSession::new`, so the
+        // patch reaches new connections only.
+        if let Some(v) = patch.h2c_prior_knowledge {
+            config.h2c_prior_knowledge = Some(v);
+        }
 
         // H2 flood knobs
         if let Some(v) = patch.h2_max_rst_stream_per_window {
@@ -1975,6 +2170,7 @@ impl ProxyConfiguration for HttpProxy {
             Duration::from_secs(owned.config.front_timeout as u64),
             Duration::from_secs(owned.config.request_timeout as u64),
             owned.config.expect_proxy,
+            owned.config.h2c_prior_knowledge.unwrap_or(false),
             listener.clone(),
             Rc::downgrade(&self.pool),
             proxy,

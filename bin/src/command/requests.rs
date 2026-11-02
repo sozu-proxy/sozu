@@ -5873,6 +5873,7 @@ fn format_patch_diff_http(
             forwarded_headers_label(v)
         ));
     }
+    diff_opt_copy!(h2c_prior_knowledge);
     if parts.is_empty() {
         "(no-op)".to_owned()
     } else {

@@ -1269,6 +1269,11 @@ pub enum HttpListenerCmd {
             help = "forwarding header family added to every forwarded request (default: both)"
         )]
         forwarded_headers: Option<ForwardedHeadersArg>,
+        #[clap(
+            long = "h2c-prior-knowledge",
+            help = "serve cleartext HTTP/2 to clients that open with the HTTP/2 connection preface (prior knowledge); others stay HTTP/1.x"
+        )]
+        h2c_prior_knowledge: bool,
     },
     #[clap(name = "remove")]
     Remove {
@@ -1355,6 +1360,12 @@ pub enum HttpListenerCmd {
         #[clap(long = "no-expect-proxy", action = ArgAction::SetTrue, overrides_with = "expect_proxy",
                help = "Disable PROXY protocol header on the client socket")]
         no_expect_proxy: bool,
+        #[clap(long = "h2c-prior-knowledge", action = ArgAction::SetTrue, overrides_with = "no_h2c_prior_knowledge",
+               help = "Serve cleartext HTTP/2 to clients that open with the connection preface (new connections only)")]
+        h2c_prior_knowledge: bool,
+        #[clap(long = "no-h2c-prior-knowledge", action = ArgAction::SetTrue, overrides_with = "h2c_prior_knowledge",
+               help = "Stop serving cleartext HTTP/2; a connection preface is answered 400 (new connections only)")]
+        no_h2c_prior_knowledge: bool,
 
         // H2 flood knobs
         #[clap(

@@ -12,6 +12,12 @@
 
 <!-- changelog-slot:backend-ownership -->
 
+<!-- changelog-slot:h2c-prior-knowledge -->
+
+### Added
+
+- An HTTP listener can serve cleartext HTTP/2 by prior knowledge with the new opt-in `h2c_prior_knowledge` option (`HttpListenerConfig` field 38, `UpdateHttpListenerConfig` field 44; TOML `h2c_prior_knowledge = true`; CLI `sozu listener http add --h2c-prior-knowledge`, `sozu listener http update --h2c-prior-knowledge` / `--no-h2c-prior-knowledge`). A connection whose first 24 bytes are the HTTP/2 connection preface is served as an HTTP/2 frontend, as an HTTPS connection that negotiated `h2` through ALPN is, with the listener's H2 flood thresholds and tuning; every other connection stays HTTP/1.x. The first bytes are peeked, never consumed: a strict prefix of the preface waits for more bytes within `request_timeout`, and a diverging byte decides HTTP/1.x. A client that sends nothing, or only part of the preface, before `request_timeout` is closed without the `408` an HTTP/1-only listener answers. The scheme stays `http` (`:scheme`, `X-Forwarded-Proto`, `Forwarded: proto`), the option composes with `expect_proxy`, and `Upgrade: h2c` remains unsupported. Such a listener is held to the H2 minimum `buffer_size` (16393) at configuration load, like an HTTPS listener advertising `h2`. Off by default: without it a preface is answered `400 Bad Request` as before. The use case is cleartext gRPC, e.g. the Kubernetes Gateway API `GRPCRoute`. New metrics `http.h2c.prior_knowledge` (connections served as h2c) and `http.upgrade.h2c.failed`. A listener update applies to new connections only (#1911).
+
 ## 2.3.3 - 2026-10-19
 
 ### Changed

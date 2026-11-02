@@ -168,8 +168,15 @@ not enforced".
 
 ### 2.1 From accept to preface
 
-1. The server-level session (HttpsSession / HttpSession) accepts a TCP
-   connection, performs the TLS handshake, and upgrades to the mux protocol.
+1. The server-level session accepts a TCP connection and upgrades to the mux
+   protocol: `HttpsSession` after the TLS handshake negotiated ALPN `h2`
+   (`HttpsSession::upgrade_handshake`, `lib/src/https.rs`), `HttpSession` on
+   an `h2c_prior_knowledge` listener once `H2cPrefaceSniff`
+   (`lib/src/protocol/h2c.rs`) has peeked the 24-byte preface
+   (`HttpSession::upgrade_sniff`, `lib/src/http.rs`). The sniff consumes
+   nothing, so in both cases the preface is still unread and the steps below
+   are identical; the h2c mux frontend is armed READABLE and WRITABLE at the
+   upgrade because the peeked bytes raise no new edge.
 2. `Connection::new_h2_server` (`connection.rs`) constructs a `ConnectionH2`
    pre-seeded with:
    - `expect_read = Some((H2StreamId::Zero, CLIENT_PREFACE_SIZE))` — 24-byte

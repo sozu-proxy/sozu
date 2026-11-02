@@ -533,9 +533,11 @@ pub enum ConfigError {
     /// affected listeners' `alpn_protocols`.
     #[error(
         "buffer_size = {buffer_size} is below the H2 minimum of {minimum} but \
-         {listeners} HTTPS listener(s) advertise H2 ALPN. The H2 mux deadlocks \
-         on full-size frames with smaller buffers. Raise buffer_size to >= {minimum} \
-         or remove \"h2\" from those listeners' alpn_protocols."
+         {listeners} listener(s) serve HTTP/2 (an HTTPS listener advertising H2 \
+         ALPN, or an HTTP listener with h2c_prior_knowledge). The H2 mux deadlocks \
+         on full-size frames with smaller buffers. Raise buffer_size to >= {minimum}, \
+         or remove \"h2\" from those HTTPS listeners' alpn_protocols and turn \
+         h2c_prior_knowledge off on those HTTP listeners."
     )]
     BufferSizeTooSmallForH2 {
         buffer_size: u64,
@@ -1010,6 +1012,11 @@ pub struct ListenerBuilder {
     /// IP) is appended to every forwarded request. Independently combinable
     /// with `elide_x_real_ip`. Default: false.
     pub send_x_real_ip: Option<bool>,
+    /// When true, this HTTP listener serves cleartext HTTP/2 (h2c) to a
+    /// client whose first bytes are the HTTP/2 connection preface (RFC 9113
+    /// §3.3, prior knowledge); every other connection stays HTTP/1.x. Applies
+    /// to HTTP listeners only. Default: false.
+    pub h2c_prior_knowledge: Option<bool>,
     /// Which forwarding header family this listener adds to every forwarded
     /// request (see [`ForwardedHeadersMode`]). Independent of
     /// `elide_x_real_ip` and `send_x_real_ip`. Default: `both`.
@@ -1158,6 +1165,7 @@ impl ListenerBuilder {
             disable_http11: None,
             elide_x_real_ip: None,
             send_x_real_ip: None,
+            h2c_prior_knowledge: None,
             forwarded_headers: None,
             answers: None,
             hsts: None,
@@ -1253,6 +1261,14 @@ impl ListenerBuilder {
     /// Default: false.
     pub fn with_send_x_real_ip(&mut self, send_x_real_ip: bool) -> &mut Self {
         self.send_x_real_ip = Some(send_x_real_ip);
+        self
+    }
+
+    /// When true, serve cleartext HTTP/2 to a client that opens with the
+    /// HTTP/2 connection preface (prior knowledge). HTTP listeners only.
+    /// Default: false.
+    pub fn with_h2c_prior_knowledge(&mut self, h2c_prior_knowledge: bool) -> &mut Self {
+        self.h2c_prior_knowledge = Some(h2c_prior_knowledge);
         self
     }
 
@@ -1539,6 +1555,9 @@ impl ListenerBuilder {
             forwarded_headers: Some(ForwardedHeaders::from(
                 self.forwarded_headers.unwrap_or_default(),
             ) as i32),
+            // Passed through as-is: unset stays absent on the wire, so a
+            // listener that never names the key serializes exactly as before.
+            h2c_prior_knowledge: self.h2c_prior_knowledge,
             ..Default::default()
         };
 
@@ -5377,15 +5396,23 @@ impl ConfigBuilder {
         // kawa buffer. If any HTTPS listener advertises "h2" in its ALPN list
         // and the global buffer_size is below H2_MIN_BUFFER_SIZE, the mux
         // deadlocks on full-size DATA / HEADERS / CONTINUATION frames until
-        // the session timeout fires. Reject at config load so the failure
-        // mode surfaces at boot, not under traffic.
+        // the session timeout fires. An HTTP listener with
+        // `h2c_prior_knowledge` serves the same H2 mux over cleartext
+        // (sozu-proxy/sozu#1911), so it counts too. Reject at config load so
+        // the failure mode surfaces at boot, not under traffic.
         // Long-form rationale: `lib/src/protocol/mux/LIFECYCLE.md`.
         let h2_listeners = self
             .built
             .https_listeners
             .iter()
             .filter(|l| l.alpn_protocols.iter().any(|p| p == "h2"))
-            .count();
+            .count()
+            + self
+                .built
+                .http_listeners
+                .iter()
+                .filter(|l| l.h2c_prior_knowledge == Some(true))
+                .count();
         if h2_listeners > 0 && self.built.buffer_size < H2_MIN_BUFFER_SIZE {
             return Err(ConfigError::BufferSizeTooSmallForH2 {
                 buffer_size: self.built.buffer_size,
@@ -5478,7 +5505,8 @@ impl ConfigBuilder {
             config.min_buffers <= config.max_buffers,
             "min_buffers must not exceed max_buffers"
         );
-        // 2. If any HTTPS listener advertises h2 in its ALPN, the global
+        // 2. If any HTTPS listener advertises h2 in its ALPN, or any HTTP
+        //    listener serves h2c, the global
         //    buffer_size is at least the H2 minimum — otherwise the early
         //    return above would have produced a BufferSizeTooSmallForH2 error
         //    rather than this Ok. (Recomputed here so the assert is independent
@@ -5488,6 +5516,10 @@ impl ConfigBuilder {
                 .https_listeners
                 .iter()
                 .any(|l| l.alpn_protocols.iter().any(|p| p == "h2"))
+                && !config
+                    .http_listeners
+                    .iter()
+                    .any(|l| l.h2c_prior_knowledge == Some(true))
                 || config.buffer_size >= H2_MIN_BUFFER_SIZE,
             "an h2-advertising config must satisfy the H2 minimum buffer size"
         );
@@ -6707,6 +6739,46 @@ mod tests {
 
         assert!(https_proxy.expect_proxy);
         assert!(!https_direct.expect_proxy);
+    }
+
+    /// sozu-proxy/sozu#1911: `h2c_prior_knowledge` reaches the HTTP listener
+    /// from TOML, and a listener that does not name the key carries none on
+    /// the wire — exactly what it serialized to before the key existed.
+    #[test]
+    fn h2c_prior_knowledge_is_parsed_from_toml_and_absent_when_unset() {
+        let toml_content = r#"
+            [[listeners]]
+            protocol = "http"
+            address = "127.0.0.1:8080"
+            h2c_prior_knowledge = true
+
+            [[listeners]]
+            protocol = "http"
+            address = "127.0.0.1:8081"
+            h2c_prior_knowledge = false
+
+            [[listeners]]
+            protocol = "http"
+            address = "127.0.0.1:8082"
+        "#;
+
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let config = ConfigBuilder::new(file_config, "/tmp/test_config.toml")
+            .into_config()
+            .expect("Could not build config");
+
+        let knob = |address: &str| {
+            config
+                .http_listeners
+                .iter()
+                .find(|l| SocketAddr::from(l.address) == address.parse().unwrap())
+                .unwrap_or_else(|| panic!("listener on {address} not found"))
+                .h2c_prior_knowledge
+        };
+        assert_eq!(knob("127.0.0.1:8080"), Some(true));
+        assert_eq!(knob("127.0.0.1:8081"), Some(false));
+        assert_eq!(knob("127.0.0.1:8082"), None);
     }
 
     /// #347: builds the HTTP cluster `cluster` from a TOML backend list.
@@ -8620,6 +8692,43 @@ mod tests {
         assert!(
             result.is_ok(),
             "non-H2 HTTPS listener with sub-16393 buffer should be accepted: {result:?}"
+        );
+    }
+
+    /// An HTTP listener with `h2c_prior_knowledge` runs the H2 mux, so it is
+    /// held to the H2 minimum buffer size like an HTTPS listener advertising
+    /// `h2` (sozu-proxy/sozu#1911); without the flag the same buffer is fine.
+    #[test]
+    fn buffer_size_below_h2_minimum_rejected_for_an_h2c_http_listener() {
+        let parse = |h2c: bool| {
+            let toml_content = format!(
+                r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+            buffer_size = 8192
+
+            [[listeners]]
+            protocol = "http"
+            address = "127.0.0.1:8080"
+            h2c_prior_knowledge = {h2c}
+        "#
+            );
+            let file_config: FileConfig =
+                toml::from_str(&toml_content).expect("Could not parse TOML config");
+            ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config()
+        };
+        match parse(true) {
+            Err(ConfigError::BufferSizeTooSmallForH2 {
+                buffer_size: 8192,
+                minimum: 16_393,
+                listeners: 1,
+            }) => {}
+            other => panic!("expected BufferSizeTooSmallForH2, got {other:?}"),
+        }
+        let accepted = parse(false);
+        assert!(
+            accepted.is_ok(),
+            "an HTTP/1-only HTTP listener with a sub-16393 buffer must be accepted: {accepted:?}"
         );
     }
 

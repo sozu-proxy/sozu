@@ -365,6 +365,12 @@ address = "0.0.0.0:8080"
 # Independent of `elide_x_real_ip` and `send_x_real_ip`.
 # forwarded_headers = "both"
 
+# When true, serve cleartext HTTP/2 (h2c) to a client whose first bytes are the
+# HTTP/2 connection preface (prior knowledge, e.g. a cleartext gRPC client);
+# every other connection stays HTTP/1.x. `Upgrade: h2c` is never supported.
+# When false, the preface is answered 400. Default: false.
+# h2c_prior_knowledge = false
+
 # Example for a HTTPS listener
 [[listeners]]
 protocol = "https"

@@ -66,8 +66,9 @@ The Mux layer handles both HTTP/1.1 and HTTP/2 connections through a `Connection
    H2  ──────────▶  Mux  ──────────▶   H2        (end-to-end H2)
 ```
 
-The frontend protocol is determined by ALPN negotiation during TLS handshake (or H2 prior
-knowledge for cleartext). The backend protocol is controlled by the `cluster.http2` protobuf
+The frontend protocol is determined by ALPN negotiation during TLS handshake, or, on a
+cleartext HTTP listener with `h2c_prior_knowledge = true`, by whether the connection opens
+with the HTTP/2 preface (prior knowledge; off by default, never `Upgrade: h2c`). The backend protocol is controlled by the `cluster.http2` protobuf
 config flag.
 
 #### Mux session structure
@@ -403,7 +404,8 @@ system calls and allocations is in `doc/lifetime_of_a_session.md`, and how those
   the frontend listener protocol (HTTP or HTTPS), not the backend connection.
   `cluster.http2` is a backend-capability hint only — it does NOT gate frontend H2.
   Frontend H2 is driven by TLS ALPN negotiation on the listener (`alpn_protocols`
-  containing `"h2"`); a cluster with `http2 = false` can still serve H2 clients on
+  containing `"h2"`), or by prior knowledge on an HTTP listener with
+  `h2c_prior_knowledge = true`; a cluster with `http2 = false` can still serve H2 clients on
   the frontend, with H2 → H1 conversion at the backend boundary.
 - **RFC 9218 priorities**: The `Prioriser` struct (`h2_scheduler.rs`) tracks urgency
   (0-7) and incremental flags per stream from the `priority` header. Each write pass

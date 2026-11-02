@@ -1,7 +1,7 @@
 //! Protocol-state surface area.
 //!
 //! Defines the [`SessionState`] trait that every front-end protocol
-//! implementation (`mux`, `pipe`, `proxy_protocol`, `rustls`, `tcp_preread`)
+//! implementation (`h2c`, `mux`, `pipe`, `proxy_protocol`, `rustls`, `tcp_preread`)
 //! plugs into the mio worker loop. `kawa_h1` is no longer one of them: it
 //! keeps the H1 vocabulary (`DefaultAnswer`, `HttpContext`, `Method`) that
 //! `mux` builds on, and its own session state machine was removed on
@@ -9,6 +9,7 @@
 //! react to readiness events, manage timeouts, render their internal state
 //! for debugging, and signal whether the session can be torn down.
 
+pub mod h2c;
 pub mod kawa_h1;
 pub mod mux;
 pub mod pipe;

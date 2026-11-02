@@ -49,6 +49,7 @@ mod h2_security_tests;
 mod h2_tests;
 pub(crate) mod h2_utils;
 mod h2_window_update_tests;
+mod h2c_prior_knowledge_tests;
 mod header_routing_tests;
 mod health_check_mode_tests;
 mod hsts_tests;

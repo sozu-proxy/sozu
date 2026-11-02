@@ -356,6 +356,10 @@ pub mod http {
     pub const E2E_H2: &str = "http.e2e.h2";
     pub const E2E_HTTP11: &str = "http.e2e.http11";
     pub const EARLY_RESPONSE_CLOSE: &str = "http.early_response_close";
+    /// Cleartext connections an `h2c_prior_knowledge` HTTP listener served as
+    /// HTTP/2 because their first bytes were the connection preface — the
+    /// cleartext counterpart of [`ALPN_H2`].
+    pub const H2C_PRIOR_KNOWLEDGE: &str = "http.h2c.prior_knowledge";
     /// H1 client connections closed because a response completed before its
     /// request was received whole (a backend answering an upload early): the
     /// rest of the body is never read as a request (sozu-proxy/sozu#1721).
@@ -418,6 +422,9 @@ pub mod http {
     pub const TRUSTING_X_PROTO: &str = "http.trusting.x_proto";
     pub const TRUSTING_X_PROTO_DIFF: &str = "http.trusting.x_proto.diff";
     pub const UPGRADE_EXPECT_FAILED: &str = "http.upgrade.expect.failed";
+    /// The h2c preface sniff decided, but the mux could not be built (stream
+    /// or H2 buffer allocation failed).
+    pub const UPGRADE_H2C_FAILED: &str = "http.upgrade.h2c.failed";
     pub const UPGRADE_MUX_FAILED: &str = "http.upgrade.mux.failed";
     pub const UPGRADE_WS_FAILED: &str = "http.upgrade.ws.failed";
     pub const X_REQUEST_ID_GENERATED: &str = "http.x_request_id.generated";

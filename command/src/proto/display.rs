@@ -1411,6 +1411,9 @@ impl Display for HttpListenerConfig {
         if let Some(v) = self.forwarded_headers {
             table.add_row(row!["forwarded headers", forwarded_headers_label(v)]);
         }
+        if let Some(v) = self.h2c_prior_knowledge {
+            table.add_row(row!["h2c prior knowledge", v]);
+        }
         write!(f, "{table}")
     }
 }

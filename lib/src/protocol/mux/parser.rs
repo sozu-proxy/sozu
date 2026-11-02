@@ -249,8 +249,15 @@ impl<'a> From<(&'a [u8], ErrorKind)> for ParserError<'a> {
     }
 }
 
+/// The 24-byte HTTP/2 client connection preface magic (RFC 9113 §3.4).
+///
+/// Shared by [`preface`] and the cleartext prior-knowledge sniff
+/// `classify_preface` (`lib/src/protocol/h2c.rs`), so the two cannot
+/// disagree on the bytes that make a connection HTTP/2.
+pub const CLIENT_PREFACE_MAGIC: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
 pub fn preface(i: &[u8]) -> IResult<&[u8], &[u8]> {
-    tag(&b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"[..])(i)
+    tag(&CLIENT_PREFACE_MAGIC[..])(i)
 }
 
 /// `if !$cond { return FrameSizeError; }` wrapping macro for the seven

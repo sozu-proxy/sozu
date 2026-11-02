@@ -1636,6 +1636,9 @@ impl ConfigState {
         if let Some(v) = patch.send_x_real_ip {
             listener.send_x_real_ip = Some(v);
         }
+        if let Some(v) = patch.h2c_prior_knowledge {
+            listener.h2c_prior_knowledge = Some(v);
+        }
         if let Some(patch_answers) = patch.http_answers.as_ref() {
             merge_custom_http_answers(&mut listener.http_answers, patch_answers);
         }
@@ -10831,6 +10834,54 @@ mod tests {
         assert_eq!(listener.send_x_real_ip, Some(true));
         // untouched
         assert_eq!(listener.front_timeout, 60);
+    }
+
+    /// A hot patch of `h2c_prior_knowledge` on an HTTP listener is recorded in
+    /// the main state, and a patch that does not name it preserves it
+    /// (sozu-proxy/sozu#1911).
+    #[test]
+    fn update_http_listener_h2c_prior_knowledge_patch_applied_and_preserved() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8080);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpListener(make_http_listener(addr)).into())
+            .unwrap();
+        assert_eq!(
+            state
+                .http_listeners
+                .get(&ListenerKey::from(addr))
+                .unwrap()
+                .h2c_prior_knowledge,
+            None
+        );
+
+        let patch = UpdateHttpListenerConfig {
+            address: addr,
+            h2c_prior_knowledge: Some(true),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpListener(patch).into())
+            .expect("HTTP update must succeed");
+        let listener = state.http_listeners.get(&ListenerKey::from(addr)).unwrap();
+        assert_eq!(listener.h2c_prior_knowledge, Some(true));
+        // untouched
+        assert_eq!(listener.front_timeout, 60);
+
+        let patch = UpdateHttpListenerConfig {
+            address: addr,
+            send_x_real_ip: Some(true),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpListener(patch).into())
+            .expect("HTTP update must succeed");
+        let listener = state.http_listeners.get(&ListenerKey::from(addr)).unwrap();
+        assert_eq!(
+            listener.h2c_prior_knowledge,
+            Some(true),
+            "a patch that does not name h2c_prior_knowledge must preserve it"
+        );
     }
 
     /// An absent X-Real-IP field preserves the recorded value, and patching one

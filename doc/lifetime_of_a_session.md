@@ -523,7 +523,13 @@ frontend and no read that ends in `EAGAIN`.
 ## 7. HTTP/2 request lifecycle
 
 An `h2` ALPN makes the mux frontend a `ConnectionH2`, wrapped in an `H2Shell`
-that owns the socket (`lib/src/protocol/mux/h2.rs`). The shell holds the only
+that owns the socket (`lib/src/protocol/mux/h2.rs`). On an HTTP listener with
+`h2c_prior_knowledge`, the session first peeks at the connection's first bytes
+(`H2cPrefaceSniff`, `lib/src/protocol/h2c.rs`) — a `recvfrom(MSG_PEEK)` per
+readable event until it decides, consuming nothing — and the HTTP/2 preface
+builds the same `ConnectionH2` over the cleartext socket
+(`HttpSession::upgrade_sniff`, `lib/src/http.rs`); a byte that diverges from
+the preface builds the HTTP/1.1 frontend of §6. The shell holds the only
 OS handles; the connection core holds the wire state: HPACK encoder and decoder
 (the in-tree sans-io codec, `lib/src/protocol/mux/hpack/`), flow-control
 windows, the GOAWAY/drain state and the flood detector. A `Context`

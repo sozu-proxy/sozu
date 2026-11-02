@@ -36,6 +36,7 @@ reference, including defaults, mutability class, and metric impact:
 | `connect_timeout`                      | http, https, tcp | yes              | Seconds                                                     |
 | `request_timeout`                      | http, https     | yes              |                                                              |
 | `disable_http11`                       | https          | yes               | Affects new handshakes only                                 |
+| `h2c_prior_knowledge`                  | http           | yes               | Cleartext HTTP/2 by prior knowledge; new connections only   |
 | `alpn_protocols`                       | https          | yes               | Use `--reset-alpn` to restore `["h2", "http/1.1"]` default  |
 | `strict_sni_binding`                   | https          | yes               | `:authority` covered by served cert SANs (CWE-346 / CWE-444) |
 | `sozu_id_header`                       | http, https    | yes               | Rebranding the per-request correlation header               |
@@ -67,7 +68,7 @@ field controls:
   onto new values, it has to be re-established.
 - **From the next connection.** Anything that configures a connection rather
   than a request: the H2 flood thresholds and tuning knobs, `disable_http11`,
-  `alpn_protocols`, `h2_stream_shrink_ratio`, and the front/back/connect
+  `h2c_prior_knowledge`, `alpn_protocols`, `h2_stream_shrink_ratio`, and the front/back/connect
   timeouts. Connections already open keep what they negotiated.
 - **Immediately.** Routing: a frontend added or removed by
   `sozu frontend …` is visible to the very next request to be routed,

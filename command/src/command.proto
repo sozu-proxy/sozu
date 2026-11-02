@@ -459,6 +459,9 @@ message UpdateHttpListenerConfig {
     // Soft stream-refusal share of the pre-response RST_STREAM cap, in percent —
     // see HttpListenerConfig.
     optional uint32 h2_stream_refusal_percent       = 43;
+    // Serve cleartext HTTP/2 to clients that open with the connection preface
+    // (prior knowledge) — see HttpListenerConfig. Affects new connections only.
+    optional bool h2c_prior_knowledge               = 44;
 }
 
 // Partial-update patch for a running HTTPS listener.
@@ -766,6 +769,14 @@ message HttpListenerConfig {
     // ends the connection with GOAWAY(ENHANCE_YOUR_CALM). 0 disables the soft
     // state; 100 or more never engages it before the cap. Default: 50.
     optional uint32 h2_stream_refusal_percent = 37;
+    // When true, a connection whose first 24 bytes are the HTTP/2 connection
+    // preface (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`, RFC 9113 §3.3 "prior
+    // knowledge") is served as HTTP/2 over cleartext (h2c), exactly as an
+    // HTTPS connection that negotiated `h2` through ALPN; every other
+    // connection stays HTTP/1.x. The `Upgrade: h2c` mechanism is never
+    // supported. When false, a preface is rejected as a malformed HTTP/1.x
+    // request (400). Default: false.
+    optional bool h2c_prior_knowledge = 38 [default = false];
 }
 
 // details of an HTTPS listener
