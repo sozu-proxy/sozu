@@ -217,6 +217,33 @@ pub use crate::protocol::mux::{
 /// writable event; any other session is closed.
 const MAX_LOOP_ITERATIONS: i32 = 10_000;
 
+/// Whether a response in progress waits on the CLIENT rather than on its
+/// backend: Sōzu still holds response bytes for this stream that the client
+/// has not taken. `front_pending_write` is the frontend connection's own
+/// pending output (`Connection::has_pending_write`, a TLS record for
+/// instance); it is stream-specific only on an H1 frontend, so an H2
+/// frontend passes `false` and only the stream's own queued bytes count.
+///
+/// `back_timeout` and `front_timeout` bound the inactivity of one socket
+/// each (`doc/configure.md`). The two timeout arms of `Mux::timeout_inner`
+/// read this predicate with opposite polarity, so exactly one of the two
+/// timers can cut a response at any moment: a backend whose bytes Sōzu has
+/// stopped reading because a slow client left them queued is not inactive,
+/// and neither is a client waiting on a slow backend (sozu-proxy/sozu#1906).
+fn response_waits_on_client(stream: &Stream, front_pending_write: bool) -> bool {
+    let queued = !stream.back.out.is_empty() || !stream.back.blocks.is_empty();
+    debug_assert!(
+        stream.back.consumed,
+        "only a response in progress can wait on either peer"
+    );
+    debug_assert_eq!(
+        queued,
+        !stream.back.is_completed(),
+        "kawa's `is_completed` is exactly \"nothing queued\""
+    );
+    queued || front_pending_write
+}
+
 /// Whether a `Mux::ready_inner` call that reached `MAX_LOOP_ITERATIONS`
 /// moved enough stream bytes to be a transfer whose peers keep up, which
 /// yields to the event loop, rather than a spin, which the loop budget
@@ -4193,6 +4220,13 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             if self.frontend.has_pending_write() {
                 should_write = true;
             }
+            // Stream-specific on an H1 frontend only; see
+            // `response_waits_on_client`.
+            let front_pending_write = !front_is_h2 && self.frontend.has_pending_write();
+            // Streams whose response waits on their backend, not on the
+            // client: the frontend timeout leaves them linked, to their
+            // backend's timeout (sozu-proxy/sozu#1906).
+            let mut waiting_on_backend: Vec<GlobalStreamId> = Vec::new();
             let front_readiness = self.frontend.readiness_mut();
             for stream_id in 0..self.context.streams.len() {
                 match self.context.streams[stream_id].state {
@@ -4236,13 +4270,35 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 Some("client_timeout_during_response");
                             set_default_answer(stream, front_readiness, 504, &answers);
                             should_write = true;
-                        } else if self.context.streams[stream_id].back.is_completed() {
-                            // Response fully proxied, stream can be closed
+                        } else if self.context.streams[stream_id].back.is_completed()
+                            && (self.context.streams[stream_id].back.is_terminated()
+                                || self.context.streams[stream_id].back.is_error())
+                        {
+                            // Response fully proxied, stream can be closed.
+                            // kawa's `is_completed` only says nothing is queued:
+                            // without the terminated/error half, a response
+                            // still waiting on its backend took this arm and
+                            // was cut, silently (sozu-proxy/sozu#1906).
                         } else if self.context.streams[stream_id].back.is_terminated()
                             || self.context.streams[stream_id].back.is_error()
                         {
                             // Response is terminated/error but not fully written to frontend.
                             // Keep the session alive briefly to flush remaining data.
+                            should_close = false;
+                        } else if !response_waits_on_client(
+                            &self.context.streams[stream_id],
+                            front_pending_write,
+                        ) {
+                            // The client has taken every byte so far: the
+                            // response waits on its backend, whose own
+                            // timeout bounds that wait. Cutting it here
+                            // charged a slow backend to the client.
+                            trace!(
+                                "{} frontend timeout while stream {} waits on its backend, deferring to back_timeout",
+                                log_module_context!(),
+                                stream_id
+                            );
+                            waiting_on_backend.push(stream_id);
                             should_close = false;
                         } else {
                             // Partial response in progress — forcefully terminate
@@ -4282,7 +4338,9 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 .iter()
                 .enumerate()
                 .filter_map(|(id, stream)| {
-                    if let StreamState::Linked(back_token) = stream.state {
+                    if let StreamState::Linked(back_token) = stream.state
+                        && !waiting_on_backend.contains(&id)
+                    {
                         Some((id, back_token))
                     } else {
                         None
@@ -4334,6 +4392,13 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 backend.readiness_mut().event.insert(Ready::ERROR);
                 return StateResult::Continue;
             }
+            // Stream-specific on an H1 frontend only; see
+            // `response_waits_on_client`.
+            let front_pending_write = !front_is_h2 && self.frontend.has_pending_write();
+            // Set when a stream's response waits on the client: the backend
+            // timeout leaves it linked, to the frontend's timeout
+            // (sozu-proxy/sozu#1906).
+            let mut waiting_on_client = false;
             let front_readiness = self.frontend.readiness_mut();
             let linked_ids: Vec<GlobalStreamId> = self
                 .context
@@ -4366,6 +4431,23 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     stream.context.access_log_message = Some("backend_timeout");
                     set_default_answer(stream, front_readiness, 504, &answers);
                     should_write = true;
+                } else if response_waits_on_client(
+                    &self.context.streams[stream_id],
+                    front_pending_write,
+                ) {
+                    // Sōzu holds response bytes the client has not taken, so
+                    // it stopped reading this backend itself: the backend is
+                    // not inactive, the client is slow. The frontend timeout
+                    // bounds that; cutting here truncated a large download to
+                    // a client that paused longer than `back_timeout`.
+                    trace!(
+                        "{} backend timeout while stream {} waits on the client, deferring to front_timeout",
+                        log_module_context!(),
+                        stream_id
+                    );
+                    waiting_on_client = true;
+                    should_close = false;
+                    continue;
                 } else {
                     trace!(
                         "{} Stream waiting for end of response, forcefully terminate it",
@@ -4445,10 +4527,12 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             // than as an immortal backend in production.
             #[cfg(debug_assertions)]
             debug_assert!(
-                self.context
-                    .backend_streams
-                    .get(&token)
-                    .is_none_or(|ids| ids.is_empty()),
+                waiting_on_client
+                    || self
+                        .context
+                        .backend_streams
+                        .get(&token)
+                        .is_none_or(|ids| ids.is_empty()),
                 "backend {token:?} still holds linked streams {:?} after its \
                  timeout reaped them: on the should_close path nothing re-arms \
                  its container, so those streams would have no backend timer",
@@ -4456,6 +4540,12 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             );
             if !should_close {
                 backend.arm_timeout(now);
+            }
+            // A deferral must not reach the shared tail, which re-arms the
+            // FRONTEND timer: re-armed on every backend timeout, a client that
+            // stopped reading would never time out at all.
+            if waiting_on_client && !should_write {
+                return StateResult::Continue;
             }
         } else {
             // Session received a timeout for an unknown token, ignore it
@@ -7653,6 +7743,157 @@ mod tests {
             Some("backend_response_timeout"),
             "precondition: this is the partial-response arm, the one that \
              leaves should_close true and therefore skips the backend re-arm"
+        );
+    }
+
+    /// A frontend whose stream 0 is linked to a connected H1 backend, with a
+    /// response in progress (`back.consumed`, not terminated). `queued`
+    /// leaves response bytes waiting for the client; the two deadlines are
+    /// staged exactly. Shared by the sozu-proxy/sozu#1906 timeout tests.
+    fn mux_with_response_in_progress(
+        pool: &Rc<RefCell<Pool>>,
+        queued: bool,
+        frontend_deadline: Instant,
+        backend_deadline: Instant,
+    ) -> (
+        Mux<mio::net::TcpStream, test_support::TestListener>,
+        Token,
+        std::net::TcpStream,
+        std::net::TcpStream,
+    ) {
+        let (mut mux, peer) = h1_mux_with_idle_stream(pool, Duration::from_secs(60));
+        let backend_token = Token(1);
+        let (mut connection, backend_peer) =
+            test_backend_connection(&mut mux, Duration::from_secs(30));
+        let Connection::H1(h1) = &mut connection else {
+            unreachable!("new_h1_client builds an H1 connection")
+        };
+        h1.stream = Some(0);
+        mark_connected(h1);
+        park_backend_deadline(&mut connection, backend_deadline);
+        mux.router.backends.insert(backend_token, connection);
+        mux.context.link_stream(0, backend_token);
+        mux.context.streams[0].back.consumed = true;
+        if queued {
+            mux.context.streams[0]
+                .back
+                .out
+                .push_back(kawa::OutBlock::Store(kawa::Store::Static(b"pending")));
+        }
+        arm_frontend_at(&mut mux, Some(frontend_deadline));
+        (mux, backend_token, peer, backend_peer)
+    }
+
+    /// A backend timeout on a response whose bytes wait for a slow client
+    /// does not cut it: Sōzu stopped reading that backend itself, so the
+    /// backend is not inactive. The stream stays linked, the backend is
+    /// re-armed, and the FRONTEND deadline is left exactly where it was, so
+    /// a client that stopped reading still meets `front_timeout`
+    /// (sozu-proxy/sozu#1906).
+    ///
+    /// To SEE THIS RED: drop the `response_waits_on_client` arm of the
+    /// backend-timeout branch of `Mux::timeout_inner` — the stream is cut
+    /// with `backend_response_timeout` — or drop its early
+    /// `return StateResult::Continue`, and the frontend deadline moves.
+    #[test]
+    fn a_backend_timeout_defers_to_the_client_while_response_bytes_wait_for_it() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let frontend_deadline = Instant::now() + Duration::from_secs(45);
+        let (mut mux, backend_token, _peer, _backend_peer) = mux_with_response_in_progress(
+            &pool,
+            true,
+            frontend_deadline,
+            Instant::now() - Duration::from_secs(1),
+        );
+        mux.reschedule();
+        let mut metrics = SessionMetrics::new(None);
+
+        let before = Instant::now();
+        let result = mux.timeout(backend_token, &mut metrics);
+
+        assert_eq!(result, StateResult::Continue);
+        assert_eq!(
+            mux.context.streams[0].state,
+            StreamState::Linked(backend_token),
+            "a response waiting on the client must stay linked to its backend"
+        );
+        assert_eq!(mux.context.streams[0].context.access_log_message, None);
+        assert!(
+            mux.router
+                .backends
+                .get(&backend_token)
+                .and_then(|backend| backend.poll_timeout())
+                .is_some_and(|deadline| deadline > before),
+            "the deferred backend timer must be re-armed"
+        );
+        assert_eq!(
+            mux.frontend.poll_timeout(),
+            Some(frontend_deadline),
+            "a deferral must not push the frontend deadline out"
+        );
+    }
+
+    /// A frontend timeout on a response the client has fully taken does not
+    /// cut it: the response waits on its backend, and `back_timeout` bounds
+    /// that wait. The stream stays linked to its backend and the frontend is
+    /// re-armed (sozu-proxy/sozu#1906).
+    ///
+    /// To SEE THIS RED: drop the `!response_waits_on_client` arm of the
+    /// frontend-timeout branch of `Mux::timeout_inner`.
+    #[test]
+    fn a_frontend_timeout_defers_to_the_backend_while_the_client_waits_on_it() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut mux, backend_token, _peer, _backend_peer) = mux_with_response_in_progress(
+            &pool,
+            false,
+            Instant::now() - Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(20),
+        );
+        let mut metrics = SessionMetrics::new(None);
+
+        let before = Instant::now();
+        let result = mux.timeout(Token(0), &mut metrics);
+
+        assert_eq!(result, StateResult::Continue);
+        assert_eq!(
+            mux.context.streams[0].state,
+            StreamState::Linked(backend_token),
+            "a response waiting on its backend must stay linked"
+        );
+        assert_eq!(mux.context.streams[0].context.access_log_message, None);
+        assert!(
+            mux.frontend
+                .poll_timeout()
+                .is_some_and(|deadline| deadline > before),
+            "the deferred frontend timer must be re-armed"
+        );
+    }
+
+    /// The complement: a frontend timeout on a response whose bytes wait for
+    /// the client still cuts it, so a client that stopped reading cannot
+    /// hold the session through the backend-side deferral
+    /// (sozu-proxy/sozu#1906).
+    #[test]
+    fn a_frontend_timeout_still_cuts_a_response_waiting_on_the_client() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut mux, backend_token, _peer, _backend_peer) = mux_with_response_in_progress(
+            &pool,
+            true,
+            Instant::now() - Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(20),
+        );
+        let mut metrics = SessionMetrics::new(None);
+
+        let _ = mux.timeout(Token(0), &mut metrics);
+
+        assert_eq!(
+            mux.context.streams[0].context.access_log_message,
+            Some("client_timeout_during_response")
+        );
+        assert_ne!(
+            mux.context.streams[0].state,
+            StreamState::Linked(backend_token),
+            "the cut stream must be unlinked"
         );
     }
 

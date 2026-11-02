@@ -73,6 +73,11 @@ struct Scenario {
     backend_close: bool,
     /// The client pauses this long after every `.0` bytes it reads.
     client_pause: Option<(usize, Duration)>,
+    /// The backend pauses this long after every `.0` body bytes it writes.
+    backend_pause: Option<(usize, Duration)>,
+    /// The listener's `front_timeout` and `back_timeout`, in seconds.
+    front_timeout: Option<u32>,
+    back_timeout: Option<u32>,
 }
 
 impl Scenario {
@@ -82,6 +87,9 @@ impl Scenario {
             body_size,
             backend_close: false,
             client_pause: None,
+            backend_pause: None,
+            front_timeout: None,
+            back_timeout: None,
         }
     }
 }
@@ -96,6 +104,8 @@ fn start_worker(name: &str, scenario: &Scenario, back_address: SocketAddr) -> (W
             let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
             worker.send_proxy_request_type(RequestType::AddHttpListener(
                 ListenerBuilder::new_http(front_address.clone())
+                    .with_front_timeout(scenario.front_timeout)
+                    .with_back_timeout(scenario.back_timeout)
                     .to_http(None)
                     .unwrap(),
             ));
@@ -123,6 +133,8 @@ fn start_worker(name: &str, scenario: &Scenario, back_address: SocketAddr) -> (W
             worker.send_proxy_request_type(RequestType::AddHttpsListener(
                 ListenerBuilder::new_https(front_address.clone())
                     .with_alpn_protocols(alpn)
+                    .with_front_timeout(scenario.front_timeout)
+                    .with_back_timeout(scenario.back_timeout)
                     .to_tls(None)
                     .unwrap(),
             ));
@@ -209,12 +221,21 @@ fn spawn_backend(
         }
         let chunk: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
         let mut written = 0;
+        let mut since_pause = 0usize;
         while written < scenario.body_size {
             let len = chunk.len().min(scenario.body_size - written);
             if stream.write_all(&chunk[..len]).is_err() {
                 return written;
             }
             written += len;
+            since_pause += len;
+            if let Some((every, pause)) = scenario.backend_pause
+                && since_pause >= every
+                && written < scenario.body_size
+            {
+                since_pause = 0;
+                thread::sleep(pause);
+            }
         }
         if scenario.backend_close {
             let _ = stream.shutdown(Shutdown::Both);
@@ -448,6 +469,45 @@ fn test_large_download_bursty_client_backend_closes_plain() {
         Scenario {
             backend_close: true,
             ..bursty_client(Listener::Plain)
+        },
+    );
+}
+
+// ---- Pauses longer than the other side's timeout (sozu-proxy/sozu#1906) ----
+//
+// `back_timeout` and `front_timeout` bound the inactivity of one socket each.
+// A client that pauses longer than `back_timeout` leaves Sōzu holding bytes
+// for it, so Sōzu stops reading the backend itself: the backend is not
+// inactive. A backend that pauses longer than `front_timeout` leaves a client
+// that has taken every byte waiting: the client is not inactive. Both used to
+// cut the response mid-body (`backend_response_timeout`, then a silent close).
+
+/// A client that pauses 4 s, twice the 2 s `back_timeout`, within a 10 s
+/// `front_timeout`.
+#[test]
+fn test_large_download_client_pause_longer_than_back_timeout_plain() {
+    run(
+        "LARGE-CLIENT-PAUSE-PLAIN",
+        Scenario {
+            client_pause: Some((4 * MIB, Duration::from_secs(4))),
+            front_timeout: Some(10),
+            back_timeout: Some(2),
+            ..Scenario::new(Listener::Plain, 8 * MIB)
+        },
+    );
+}
+
+/// A backend that pauses 4 s, twice the 2 s `front_timeout`, within a 10 s
+/// `back_timeout`.
+#[test]
+fn test_large_download_backend_pause_longer_than_front_timeout_plain() {
+    run(
+        "LARGE-BACKEND-PAUSE-PLAIN",
+        Scenario {
+            backend_pause: Some((4 * MIB, Duration::from_secs(4))),
+            front_timeout: Some(2),
+            back_timeout: Some(10),
+            ..Scenario::new(Listener::Plain, 8 * MIB)
         },
     );
 }
