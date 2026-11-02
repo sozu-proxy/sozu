@@ -24,7 +24,7 @@ use std::{
     io::{IoSlice, Write},
     os::unix::io::{AsRawFd, IntoRawFd},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use mio::net::UnixStream;
@@ -32,7 +32,10 @@ use nix::sys::socket::{MsgFlags, sendmsg};
 use prost::Message;
 use sozu_command_lib::{
     channel::Channel,
-    proto::command::{InitialState, ListenersCount, ServerConfig, WorkerRequest, WorkerResponse},
+    proto::command::{
+        InitialState, ListenersCount, ServerConfig, Status, WorkerRequest, WorkerResponse,
+        request::RequestType,
+    },
     scm_socket::{ScmSocket, ScmSocketError},
 };
 use sozu_lib::server::{Server, ServerError};
@@ -90,6 +93,50 @@ fn channel_short_delimiter_does_not_panic_worker() {
         worker.wait_for_server_stop(),
         "worker did not exit cleanly after a SoftStop following the bogus frame — \
          the channel did not re-sync after rejecting MessageLengthUnderDelimiter",
+    );
+}
+
+/// A worker whose command channel the main process closes while the
+/// worker's answer is still unread must leave its event loop
+/// (sozu-proxy/sozu#1912).
+///
+/// The main end is closed with the worker's answer still in its receive
+/// queue, so the kernel resets the connection and the worker sees an
+/// error on the channel (`EPOLLERR`) rather than a plain hang-up. The
+/// error branch of `Server::run` (`lib/src/server.rs`) used to log and
+/// continue; with the channel registered edge-triggered no further event
+/// came, so the worker thread ran forever and a join on it never returned.
+#[test]
+fn worker_exits_when_command_channel_errors() {
+    let (config, listeners, state) = Worker::empty_config();
+    let mut worker = Worker::start_new_worker("CHANNEL-ERROR-EXIT", config, &listeners, state);
+
+    worker.send_proxy_request_type(RequestType::Status(Status {}));
+    worker.read_to_last();
+
+    // A second Status whose answer is never read: it lands in the main
+    // end's receive queue, so closing that end resets the connection.
+    worker.send_proxy_request_type(RequestType::Status(Status {}));
+    thread::sleep(Duration::from_millis(300));
+
+    let Worker {
+        command_channel,
+        server_job,
+        ..
+    } = worker;
+    drop(command_channel);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !server_job.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        server_job.is_finished(),
+        "worker still running 5 s after an error on its command channel",
+    );
+    assert!(
+        server_job.join().is_ok(),
+        "worker thread panicked after an error on its command channel",
     );
 }
 
