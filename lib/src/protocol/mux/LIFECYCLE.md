@@ -366,7 +366,9 @@ from `Mux::ready`. Termination may be triggered by:
 - `MuxResult::CloseSession` from any readable/writable path (the frontend
   readable and writable arms of `Mux::ready_inner`, etc.).
 - A loop-iteration budget overrun (`MAX_LOOP_ITERATIONS = 10_000`, `mod.rs`,
-  checked in the inner loop of `Mux::ready_inner`) with nothing queued for
+  checked in the inner loop of `Mux::ready_inner`) in a call that forwarded
+  no stream byte (a call that did yields instead, §7.4 step 6) with nothing
+  queued for
   the client, or reached again with no byte written to the client since the
   last time. Otherwise, with output still queued in the connection or in an
   open stream's response buffer, `Mux::wait_for_client_at_loop_limit` keeps
@@ -1221,6 +1223,26 @@ deadlines are compared against `ConnectionH2.now` (§7.5):
 6. Loop budget (`MAX_LOOP_ITERATIONS = 10_000`, `mod.rs`) is a hard backstop
    in `Mux::ready_inner`, whose `counter` is declared above BOTH of its loops,
    so the budget is shared across every outer iteration of one `ready()` call.
+   A call that reaches it after forwarding a stream byte
+   (`Context::stream_bytes_out` moved since the call began: stream bytes any
+   connection's write accepted, client or backend; H2 control frames
+   excluded) is a transfer whose peers keep up, not a spin: it yields. It
+   breaks out with every readiness bit left as it is, sets
+   `Context::loop_budget_yielded`, counts `http.mux.loop_budget_yield`, and
+   returns `Continue`. The session reports the flag through
+   `ProxySession::yielded`; `Server::ready` and `Server::timeout` queue it,
+   the next poll does not block, and `Server::resume_yielded_sessions` runs
+   `ready` again after that poll's events, with no new readiness merged in.
+   No epoll edge would come back for work the pass left, and the worker
+   serves every other descriptor between two budgets. Closing there instead
+   cut a fast transfer at a random offset with a clean close in the middle
+   of a `Content-Length` body, download or upload, once both peers kept up
+   for the whole budget in one call (about 160 MiB with 16 KiB buffers)
+   ([#1906](https://github.com/sozu-proxy/sozu/issues/1906)). A session
+   resumed on a turn where it also receives events gets one `ready` call more
+   than those events alone would give it. Only a call that forwarded nothing
+   takes the
+   `http.infinite_loop.error` path below.
    A frontend HUP never counts as work against it: the inner loop closes the
    session on one once no output is left to flush and no exchange is in
    flight (`Mux::frontend_exchange_in_flight`). A lingering frontend (§8.4)
@@ -2432,8 +2454,11 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     whole response ([#1779](https://github.com/sozu-proxy/sozu/issues/1779)).
 12. **Loop budget.** Every inner loop in `Mux::ready` and
     `drive_frontend_shutdown_io` bounds iterations at
-    `MAX_LOOP_ITERATIONS = 10_000` (`mod.rs`). Reaching it in `Mux::ready`
-    does not drop output queued for a client that is still draining it: the
+    `MAX_LOOP_ITERATIONS = 10_000` (`mod.rs`). A `Mux::ready` call that
+    reaches it after forwarding a stream byte yields to the event loop with
+    its readiness intact, and the server resumes it after the next poll
+    (§7.4, step 6; [#1906](https://github.com/sozu-proxy/sozu/issues/1906)).
+    Reaching it in `Mux::ready` without forwarding does not drop output queued for a client that is still draining it: the
     session then waits for its next writable event, and closes on a second
     time with no byte written since (§7.4, step 6;
     [#1819](https://github.com/sozu-proxy/sozu/issues/1819)). In `ConnectionH1::writable`

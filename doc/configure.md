@@ -4888,6 +4888,7 @@ guaranteed not to underflow on close / timeout / shed / error paths.
 | Metric                         | Type    | Scope            | Description                                                  |
 | ------------------------------ | ------- | ---------------- | ------------------------------------------------------------ |
 | `http.infinite_loop.error`     | counter | proxy            | HTTP event loop safety breaker triggered                     |
+| `http.mux.loop_budget_yield`   | counter | proxy            | HTTP session paused at its loop iteration budget while forwarding bytes; the event loop resumes it after the next poll (not an error) |
 | `http.failed_backend_matching` | counter | proxy            | Frontend matched but no backend could be selected            |
 | `http.early_response_close`    | counter | proxy            | Client closed before response was fully sent                 |
 | `http.close.request_incomplete` | counter | proxy          | H1 client connection closed because the response completed before the request was received whole (the rest of the body is never read as a request; it is drained and dropped for up to `request_timeout` and 4 MiB before the close) |

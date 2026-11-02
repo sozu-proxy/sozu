@@ -1401,6 +1401,12 @@ pub struct Server {
     /// `Server::drive_closing_sessions` only acts on a token whose slab entry
     /// is still this very session.
     closing_sessions: Vec<(Token, Weak<RefCell<dyn ProxySession>>)>,
+    /// Sessions whose last `ready` pass yielded at its iteration budget while
+    /// forwarding bytes (`ProxySession::yielded`), keyed by frontend token.
+    /// `Server::resume_yielded_sessions` runs them again after the next poll;
+    /// the `Weak` and the slab check guard against a session that closed and
+    /// whose key was reused in between, as for `closing_sessions`.
+    yielded_sessions: Vec<(Token, Weak<RefCell<dyn ProxySession>>)>,
     tcp: Rc<RefCell<tcp::TcpProxy>>,
     udp: Rc<RefCell<udp::UdpProxy>>,
     zombie_check_interval: Duration,
@@ -1647,6 +1653,7 @@ impl Server {
             should_poll_at: None,
             shutting_down: None,
             closing_sessions: Vec::new(),
+            yielded_sessions: Vec::new(),
             protected_health_check: ProtectedWorker::default(),
             tcp,
             udp,
@@ -1822,6 +1829,11 @@ impl Server {
                 }
             }
 
+            // Taken before this turn's events are dispatched, so a session
+            // that yields while serving them waits for the next poll instead
+            // of running another budget before any other descriptor is read.
+            let yielded = std::mem::take(&mut self.yielded_sessions);
+
             let after_epoll = Instant::now();
             time!(
                 names::event_loop::EPOLL_TIME,
@@ -1899,6 +1911,7 @@ impl Server {
                     token => self.ready_if_still_owned(token, Ready::from(event), owner),
                 }
             }
+            self.resume_yielded_sessions(yielded);
 
             if let Some(t) = self.should_poll_at.as_ref()
                 && *t <= Instant::now()
@@ -2063,6 +2076,13 @@ impl Server {
                 None => Some(shutdown_tick),
                 Some(current) => Some(current.min(shutdown_tick)),
             };
+        }
+
+        // A yielded session has work no socket event will announce: poll
+        // without blocking, so the other descriptors get their turn and the
+        // yielded session is resumed right after.
+        if !self.yielded_sessions.is_empty() {
+            timeout = Some(Duration::ZERO);
         }
 
         self.loop_start = now;
@@ -2395,6 +2415,59 @@ impl Server {
             "a session closed this tick must not stay watched"
         );
         self.shut_down_sessions_by_frontend_tokens(to_close);
+    }
+
+    /// Queue `session` for `Server::resume_yielded_sessions` when its last
+    /// `ready` pass yielded (`ProxySession::yielded`), once.
+    fn queue_if_yielded(&mut self, session: &Rc<RefCell<dyn ProxySession>>) {
+        if !session.borrow_mut().yielded() {
+            return;
+        }
+        let queued = self
+            .yielded_sessions
+            .iter()
+            .any(|(_, weak)| weak.upgrade().is_some_and(|q| Rc::ptr_eq(&q, session)));
+        if !queued {
+            let token = session.borrow().frontend_token();
+            self.yielded_sessions.push((token, Rc::downgrade(session)));
+        }
+    }
+
+    /// Run `ready` again for the sessions that yielded before this turn's
+    /// poll (`pending`, taken from `yielded_sessions` right after it), with
+    /// the readiness they kept: no new event is merged in. A session that
+    /// closed since, its key possibly taken by another session, is skipped,
+    /// as `Server::drive_closing_sessions` skips one. A session that yields
+    /// again is queued for the next turn (sozu-proxy/sozu#1906).
+    fn resume_yielded_sessions(&mut self, pending: Vec<(Token, Weak<RefCell<dyn ProxySession>>)>) {
+        for (token, weak) in pending {
+            let Some(session) = weak.upgrade() else {
+                continue;
+            };
+            let still_there = self
+                .sessions
+                .borrow()
+                .slab
+                .get(token.0)
+                .is_some_and(|entry| Rc::ptr_eq(entry, &session));
+            if !still_there {
+                trace!(
+                    "PROXY\t{:?} dropping the resumption of a yielded session that closed since",
+                    token
+                );
+                continue;
+            }
+            if session.borrow_mut().ready(session.clone()) {
+                debug!(
+                    "Server killing session from a resumed ready: token={:?}, protocol={:?}",
+                    token,
+                    session.borrow().protocol()
+                );
+                self.kill_session(session);
+            } else {
+                self.queue_if_yielded(&session);
+            }
+        }
     }
 
     fn kill_session(&self, session: Rc<RefCell<dyn ProxySession>>) {
@@ -4665,6 +4738,8 @@ impl Server {
                     token, protocol, events
                 );
                 self.kill_session(session);
+            } else {
+                self.queue_if_yielded(&session);
             }
         }
     }
@@ -4694,6 +4769,8 @@ impl Server {
                         session.borrow().protocol()
                     );
                     self.kill_session(session);
+                } else {
+                    self.queue_if_yielded(&session);
                 }
             }
         }
@@ -5495,6 +5572,174 @@ mod closing_sessions_tests {
         );
         assert!(!server.sessions.borrow().slab.contains(token.0));
         assert!(server.closing_sessions.is_empty());
+    }
+}
+/// A session whose `ready` pass yielded at its iteration budget is resumed
+/// after the next poll by `Server::resume_yielded_sessions`, unless it closed
+/// in between, possibly leaving its slab key to another session
+/// (sozu-proxy/sozu#1906).
+#[cfg(test)]
+mod yielded_sessions_tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    /// A session that yields on its first `yields` ready passes and counts
+    /// its `ready` and `update_readiness` calls.
+    struct YieldingSession {
+        frontend: Token,
+        yields: Rc<Cell<u32>>,
+        yielded: bool,
+        ready_calls: Rc<Cell<u32>>,
+        readiness_updates: Rc<Cell<u32>>,
+    }
+
+    impl ProxySession for YieldingSession {
+        fn protocol(&self) -> Protocol {
+            Protocol::HTTP
+        }
+        fn ready(&mut self, _session: Rc<RefCell<dyn ProxySession>>) -> SessionIsToBeClosed {
+            self.ready_calls.set(self.ready_calls.get() + 1);
+            self.yielded = self.yields.get() > 0;
+            if self.yielded {
+                self.yields.set(self.yields.get() - 1);
+            }
+            false
+        }
+        fn yielded(&mut self) -> bool {
+            std::mem::take(&mut self.yielded)
+        }
+        fn shutting_down(&mut self) -> SessionIsToBeClosed {
+            true
+        }
+        fn update_readiness(&mut self, _token: Token, _events: Ready) {
+            self.readiness_updates.set(self.readiness_updates.get() + 1);
+        }
+        fn close(&mut self) {}
+        fn timeout(&mut self, _token: Token) -> SessionIsToBeClosed {
+            false
+        }
+        fn last_event(&self) -> Instant {
+            Instant::now()
+        }
+        fn print_session(&self) {}
+        fn frontend_token(&self) -> Token {
+            self.frontend
+        }
+    }
+
+    struct Counters {
+        ready_calls: Rc<Cell<u32>>,
+        readiness_updates: Rc<Cell<u32>>,
+    }
+
+    fn insert_yielding(
+        server: &Server,
+        yields: u32,
+    ) -> (Token, Rc<RefCell<dyn ProxySession>>, Counters) {
+        let ready_calls = Rc::new(Cell::new(0));
+        let readiness_updates = Rc::new(Cell::new(0));
+        let mut sessions = server.sessions.borrow_mut();
+        let entry = sessions.slab.vacant_entry();
+        let token = Token(entry.key());
+        let session: Rc<RefCell<dyn ProxySession>> = Rc::new(RefCell::new(YieldingSession {
+            frontend: token,
+            yields: Rc::new(Cell::new(yields)),
+            yielded: false,
+            ready_calls: ready_calls.clone(),
+            readiness_updates: readiness_updates.clone(),
+        }));
+        entry.insert(session.clone());
+        sessions.incr();
+        (
+            token,
+            session,
+            Counters {
+                ready_calls,
+                readiness_updates,
+            },
+        )
+    }
+
+    /// A yielded session still in its slot is run again with no readiness
+    /// update, queued again while it keeps yielding, and dropped from the
+    /// queue once it does not.
+    #[test]
+    fn a_yielded_session_is_resumed_without_a_new_event_until_it_stops_yielding() {
+        let (mut server, _listen_token, _address) =
+            super::accept_ready_tests::server_with_tcp_listener();
+        let (token, _session, counters) = insert_yielding(&server, 2);
+
+        server.ready(token, Ready::READABLE);
+        assert_eq!(server.yielded_sessions.len(), 1, "the yield must be queued");
+        assert_eq!(
+            server.reset_loop_time_and_get_timeout(),
+            Some(Duration::ZERO),
+            "a queued yield must make the next poll non-blocking"
+        );
+
+        let pending = std::mem::take(&mut server.yielded_sessions);
+        server.resume_yielded_sessions(pending);
+        assert_eq!(counters.ready_calls.get(), 2, "the session must be resumed");
+        assert_eq!(
+            counters.readiness_updates.get(),
+            1,
+            "a resumption merges no new readiness"
+        );
+        assert_eq!(
+            server.yielded_sessions.len(),
+            1,
+            "a session that yields again is queued for the next turn"
+        );
+
+        let pending = std::mem::take(&mut server.yielded_sessions);
+        server.resume_yielded_sessions(pending);
+        assert_eq!(counters.ready_calls.get(), 3);
+        assert!(
+            server.yielded_sessions.is_empty(),
+            "a session that did not yield leaves the queue"
+        );
+        assert!(server.sessions.borrow().slab.contains(token.0));
+    }
+
+    /// The session yielded, then closed (a timeout) before its resumption,
+    /// and another session took its slab key. The resumption must reach
+    /// neither: no panic, no `ready` on a closed session, and none on the new
+    /// tenant, which has no work queued.
+    ///
+    /// To SEE THIS RED: drop the `still_there` check from
+    /// `Server::resume_yielded_sessions`. The closed session's `Weak` still
+    /// upgrades (this test holds its `Rc`), so its `ready` runs again.
+    #[test]
+    fn a_yielded_session_that_closed_before_its_resumption_is_not_resumed() {
+        let (mut server, _listen_token, _address) =
+            super::accept_ready_tests::server_with_tcp_listener();
+        let (token, yielded, yielded_counters) = insert_yielding(&server, 1);
+
+        server.ready(token, Ready::READABLE);
+        assert_eq!(server.yielded_sessions.len(), 1, "precondition: queued");
+
+        // Closed by a timeout before the next turn; a new session reuses the key.
+        server.sessions.borrow_mut().slab.remove(token.0);
+        let (reused, tenant, tenant_counters) = insert_yielding(&server, 0);
+        assert_eq!(reused, token, "precondition: the slab must reuse the key");
+        assert!(!Rc::ptr_eq(&yielded, &tenant));
+
+        let pending = std::mem::take(&mut server.yielded_sessions);
+        server.resume_yielded_sessions(pending);
+
+        assert_eq!(
+            yielded_counters.ready_calls.get(),
+            1,
+            "a closed session must not be resumed"
+        );
+        assert_eq!(
+            tenant_counters.ready_calls.get(),
+            0,
+            "the session that reused the key must not be run on the stale entry"
+        );
+        assert!(server.yielded_sessions.is_empty());
+        assert!(server.sessions.borrow().slab.contains(token.0));
     }
 }
 /// The listener slab slot is reserved for a listener's whole `AddListener` ->

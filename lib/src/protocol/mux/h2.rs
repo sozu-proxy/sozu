@@ -4141,6 +4141,7 @@ impl ConnectionH2 {
             if self.position.is_server() {
                 context.client_bytes_out = context.client_bytes_out.wrapping_add(committed);
             }
+            context.stream_bytes_out = context.stream_bytes_out.wrapping_add(committed);
             // LIFECYCLE §9 invariant 9, write side. Outbound APPLICATION data
             // is activity; an acknowledgement is not. Both halves of this
             // condition are load-bearing and neither is implied by reaching

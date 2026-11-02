@@ -12,6 +12,12 @@
 
 <!-- changelog-slot:backend-ownership -->
 
+<!-- changelog-slot:loop-budget-progress -->
+
+### Fixed
+
+- A fast HTTP transfer is no longer cut at a random offset. When the inner loop of `Mux::ready_inner` reached `MAX_LOOP_ITERATIONS` (10,000) in one `ready()` call, it closed the session unless output was still queued, even if every iteration had forwarded bytes. When the client and the backend both kept up for that many iterations (about 160 MiB with 16 KiB buffers), the client saw a clean close in the middle of a `Content-Length` body ("Premature end of Content-Length delimited message body"), with `http.infinite_loop.error` incremented and, before 2.3.0, no log at the default level. Downloads and uploads over plaintext and TLS HTTP/1.1 were measured exposed, and the listener's ALPN list played no part; HTTP/2 frontends run the same loop. A call that reaches the budget after forwarding a stream byte to either peer (`Context::stream_bytes_out`) now yields: it keeps its readiness, counts the new `http.mux.loop_budget_yield` counter, and the worker resumes it after its next poll, which does not block while a session is queued (`ProxySession::yielded`, `Server::resume_yielded_sessions`). A fast transfer neither is cut nor holds the single-threaded worker past one budget per turn. A call that forwarded nothing keeps the existing `http.infinite_loop.error` path. Reproduced deterministically by `a_transfer_progressing_at_the_loop_limit_yields_and_resumes_without_a_new_event`, and end to end in `large_response_tests.rs` (256 MiB over loopback: 4/40 plaintext and 5/60 TLS downloads, 10/20 TLS uploads cut on `main`). `ProxySession` gains a `yielded` method with a default `false`, so other implementors are unaffected (#1906).
+
 ## 2.3.3 - 2026-10-19
 
 ### Changed

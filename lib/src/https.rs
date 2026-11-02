@@ -1165,6 +1165,13 @@ impl ProxySession for HttpsSession {
         matches!(&self.state, HttpsStateMachine::Mux(mux) if mux.has_pending_backend_failure())
     }
 
+    fn yielded(&mut self) -> bool {
+        match &mut self.state {
+            HttpsStateMachine::Mux(mux) => mux.take_loop_budget_yield(),
+            _ => false,
+        }
+    }
+
     fn protocol(&self) -> Protocol {
         Protocol::HTTPS
     }
