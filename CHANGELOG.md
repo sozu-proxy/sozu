@@ -12,6 +12,12 @@
 
 <!-- changelog-slot:backend-ownership -->
 
+<!-- changelog-slot:regex-path -->
+
+### Added
+
+- `path_type = "REGEX_PATH"` (CLI `--path-regex-path`, `PathRuleKind::REGEX_PATH = 3`) matches a regex, anchored at both ends, against the request path up to its first `?` only, the Gateway API HTTPRoute `RegularExpression` path match. `REGEX` keeps matching the path together with its query string, so `/api/.+` matches `/api/?x=1` under `REGEX` but not `REGEX_PATH`, and `^/api/v2$` matches `/api/v2?x=1` only under `REGEX_PATH`. It ranks as `REGEX` does. With `rewrite_path`, its `$PATH[n]` captures come from the path alone and the original `?query` is appended to a rewritten path that has no `?` of its own; a redirect `Location` follows it. `REGEX`, `PREFIX` and `EQUALS` are unchanged. Library API: `PathRule::from_cli_options` (`sozu-command-lib`) takes a fourth `path_regex_path` argument, and `PathRule` (`sozu-lib`) and `PathRuleType` (`sozu-command-lib`) gain a `RegexPath` variant, which breaks exhaustive matches on them. A worker that predates the kind refuses such a frontend as an invalid path rule, so upgrade every worker before declaring one (#1909).
+
 ## 2.3.3 - 2026-10-19
 
 ### Changed

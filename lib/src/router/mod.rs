@@ -991,7 +991,7 @@ impl Router {
 /// Pick the rule a trie leaf serves `path`, `method` and `headers` with, or
 /// `None` when the leaf carries nothing for this request.
 ///
-/// An `EQUALS`/`REGEX` rule whose `method` matches exactly wins
+/// An `EQUALS`/`REGEX`/`REGEX_PATH` rule whose `method` matches exactly wins
 /// immediately; otherwise the longest matching `PREFIX` wins, with a
 /// method-less rule competing on equal footing. Rules whose `method` is
 /// set and does not match are skipped entirely — which is why a longer
@@ -1066,7 +1066,7 @@ fn select_tree_rule<'a>(
 struct TreeSelection<'a> {
     prefix_length: usize,
     matched: Option<(&'a PathRule, &'a Route)>,
-    /// An `EQUALS`/`REGEX` rule with an exactly matching method was taken:
+    /// An `EQUALS`/`REGEX`/`REGEX_PATH` rule with an exactly matching method was taken:
     /// the class is decided.
     exact: bool,
 }
@@ -1721,6 +1721,32 @@ pub enum PathRule {
     Prefix(String),
     Regex(Regex),
     Equals(String),
+    /// `REGEX_PATH` (sozu-proxy/sozu#1909): the same anchored regex as
+    /// [`PathRule::Regex`], tested against the request path up to its first
+    /// `?` only ([`split_query`]), the Gateway API `RegularExpression` path
+    /// match. It shares `Regex`'s precedence class ([`PathRuleResult::Regex`]).
+    RegexPath(Regex),
+}
+
+/// Split a request-target into its path and its query: everything before
+/// the first `?`, and the rest INCLUDING that `?` (empty when the target
+/// carries none). `?` is ASCII, so both halves stay on UTF-8 boundaries of
+/// a `&str` the bytes came from.
+fn split_query(target: &[u8]) -> (&[u8], &[u8]) {
+    let (path, query) = match target.iter().position(|&b| b == b'?') {
+        Some(at) => target.split_at(at),
+        None => (target, &target[target.len()..]),
+    };
+    debug_assert_eq!(
+        path.len() + query.len(),
+        target.len(),
+        "the path and query halves must cover the request-target exactly",
+    );
+    debug_assert!(
+        !path.contains(&b'?') && (query.is_empty() || query[0] == b'?'),
+        "the path half holds no `?` and a non-empty query half starts with one",
+    );
+    (path, query)
 }
 
 #[derive(PartialEq, Eq)]
@@ -1751,6 +1777,22 @@ impl PathRule {
             PathRule::Regex(regex) => {
                 let start = Instant::now();
                 let is_a_match = regex.is_match(path);
+                let now = Instant::now();
+                time!(
+                    names::event_loop::REGEX_MATCHING_TIME,
+                    (now - start).as_millis()
+                );
+
+                if is_a_match {
+                    PathRuleResult::Regex
+                } else {
+                    PathRuleResult::None
+                }
+            }
+            PathRule::RegexPath(regex) => {
+                let (path_only, _) = split_query(path);
+                let start = Instant::now();
+                let is_a_match = regex.is_match(path_only);
                 let now = Instant::now();
                 time!(
                     names::event_loop::REGEX_MATCHING_TIME,
@@ -1829,6 +1871,9 @@ impl PathRule {
             Ok(PathRuleKind::Prefix) => Some(PathRule::Prefix(rule.value)),
             Ok(PathRuleKind::Regex) => Self::anchored_regex(&rule.value).map(PathRule::Regex),
             Ok(PathRuleKind::Equals) => Some(PathRule::Equals(rule.value)),
+            Ok(PathRuleKind::RegexPath) => {
+                Self::anchored_regex(&rule.value).map(PathRule::RegexPath)
+            }
             Err(_) => None,
         }
     }
@@ -1855,6 +1900,7 @@ impl std::cmp::PartialEq for PathRule {
             (PathRule::Prefix(s1), PathRule::Prefix(s2)) => s1 == s2,
             (PathRule::Regex(r1), PathRule::Regex(r2)) => r1.as_str() == r2.as_str(),
             (PathRule::Equals(s1), PathRule::Equals(s2)) => s1 == s2,
+            (PathRule::RegexPath(r1), PathRule::RegexPath(r2)) => r1.as_str() == r2.as_str(),
             _ => false,
         }
     }
@@ -2413,6 +2459,7 @@ impl Frontend {
                     PathRule::Prefix(value) => ("prefix", value.len()),
                     PathRule::Regex(value) => ("regex", value.as_str().len()),
                     PathRule::Equals(value) => ("equals", value.len()),
+                    PathRule::RegexPath(value) => ("regex_path", value.as_str().len()),
                 };
                 warn!(
                     "{} Frontend[domain_kind={}, domain_bytes={}, path_kind={}, path_bytes={}]: forward on clusterless frontends are unauthorized",
@@ -2483,7 +2530,7 @@ impl Frontend {
         let mut capture_cap_path = match path_rule {
             PathRule::Equals(_) => 1,
             PathRule::Prefix(_) => 2,
-            PathRule::Regex(regex) => regex.captures_len(),
+            PathRule::Regex(regex) | PathRule::RegexPath(regex) => regex.captures_len(),
         };
         let mut used_capture_host = 0usize;
         let mut used_capture_path = 0usize;
@@ -2678,6 +2725,31 @@ impl Frontend {
     }
 }
 
+/// Carry a `REGEX_PATH` request's query string over to its rewritten path
+/// (sozu-proxy/sozu#1909). The rule matched, and its `$PATH[n]` captured,
+/// the path alone, so a template cannot reach the query: it is appended,
+/// `?` included, unless the rewritten path already carries a `?` of its
+/// own, in which case the template's query is kept as written and the
+/// original one is dropped. `original_query` is empty for every other rule
+/// kind and for a request without a query, and nothing is appended.
+fn append_original_query(mut rewritten: String, original_query: &[u8]) -> String {
+    debug_assert!(
+        original_query.is_empty() || original_query[0] == b'?',
+        "a non-empty original query starts with its `?`",
+    );
+    let had_own_query = rewritten.contains('?');
+    if !original_query.is_empty() && !had_own_query {
+        // The query half was split off the `&str` the router was handed, on
+        // the ASCII `?`, so it is valid UTF-8 and `from_utf8` never fails.
+        rewritten.push_str(from_utf8(original_query).unwrap_or_default());
+    }
+    debug_assert!(
+        had_own_query || rewritten.ends_with(from_utf8(original_query).unwrap_or_default()),
+        "absent a query of its own, the rewritten path must end with the original query",
+    );
+    rewritten
+}
+
 /// Routing decision returned by [`Router::lookup`] and consumed by the
 /// session layer.
 ///
@@ -2774,6 +2846,13 @@ impl RouteResult {
             };
         }
 
+        // A `REGEX_PATH` rule matched the path alone, so every `$PATH[n]`,
+        // index 0 included, is taken from the path alone too, and the query
+        // it never saw is carried over to the rewritten path below.
+        let (path, original_query) = match path_rule {
+            PathRule::RegexPath(_) => split_query(path),
+            _ => (path, &path[path.len()..]),
+        };
         let mut captures_path: Vec<&str> = Vec::with_capacity(frontend.capture_cap_path);
         if frontend.capture_cap_path > 0 {
             captures_path.push(from_utf8(path).unwrap_or_default());
@@ -2782,7 +2861,7 @@ impl RouteResult {
                     let tail_start = prefix.len().min(path.len());
                     captures_path.push(from_utf8(&path[tail_start..]).unwrap_or_default());
                 }
-                PathRule::Regex(regex) => {
+                PathRule::Regex(regex) | PathRule::RegexPath(regex) => {
                     if let Some(caps) = regex.captures(path) {
                         captures_path.extend(caps.iter().skip(1).map(|c| {
                             c.map(|m| from_utf8(m.as_bytes()).unwrap_or_default())
@@ -2803,10 +2882,9 @@ impl RouteResult {
                 .rewrite_host
                 .as_ref()
                 .map(|rewrite| rewrite.run(&captures_host, &captures_path)),
-            rewritten_path: frontend
-                .rewrite_path
-                .as_ref()
-                .map(|rewrite| rewrite.run(&captures_host, &captures_path)),
+            rewritten_path: frontend.rewrite_path.as_ref().map(|rewrite| {
+                append_original_query(rewrite.run(&captures_host, &captures_path), original_query)
+            }),
             rewritten_port: frontend.rewrite_port,
             headers_request: frontend.headers_request.clone(),
             headers_response: frontend.headers_response.clone(),
@@ -6053,6 +6131,188 @@ mod tests {
             "declared alone, it leaves the query-string request UNROUTED — it \
              is not a candidate any more",
         );
+    }
+
+    /// The `REGEX_PATH` twin of [`regex_rule_routes`]: one path-only regex
+    /// rule on `www.example.com`, then a `GET` for `path`.
+    fn regex_path_rule_routes(pattern: &str, path: &str) -> Option<String> {
+        let rule = PathRule::from_config(CommandPathRule::regex_path(pattern.to_owned()))
+            .unwrap_or_else(|| panic!("the path-only regex rule {pattern:?} must build"));
+        assert!(
+            matches!(rule, PathRule::RegexPath(_)),
+            "a REGEX_PATH config rule must build a RegexPath router rule",
+        );
+        let mut router = Router::new();
+        assert!(add_path_rule(&mut router, rule, GET, "REGEX_PATH"));
+        routed_cluster(&router, path)
+    }
+
+    /// `path_type = "REGEX_PATH"` matches the path up to its first `?` and
+    /// never the query string (sozu-proxy/sozu#1909), while `REGEX` on the
+    /// very same pattern and request keeps matching the path WITH its query.
+    /// Each row names the `REGEX` verdict beside the `REGEX_PATH` one, so the
+    /// table is also the proof that `REGEX` did not change.
+    ///
+    /// To SEE THIS RED: in `PathRule::matches`, make the `RegexPath` arm test
+    /// `path` instead of the `split_query` path half — every row whose two
+    /// verdicts differ flips.
+    #[test]
+    fn a_path_only_regex_ignores_the_query_string_and_regex_still_spans_it() {
+        // (pattern, request path, REGEX routes, REGEX_PATH routes)
+        let cases: &[(&str, &str, bool, bool)] = &[
+            // The issue's two examples.
+            ("/api/.+", "/api/?x=1", true, false),
+            ("^/api/v2$", "/api/v2?x=1", false, true),
+            // A path-only match ignores whatever query follows.
+            ("/api/.+", "/api/x?y", true, true),
+            ("/api/.+", "/api/x", true, true),
+            ("/api/.+", "/api/", false, false),
+            // An empty query still splits at its `?`.
+            ("^/api/v2$", "/api/v2?", false, true),
+            // Only the FIRST `?` splits: the rest is query, `?` included.
+            ("/a", "/a?b?c", false, true),
+            // A pattern spelling a query can never match path-only.
+            ("/a[?]x=1", "/a?x=1", true, false),
+            // Anchoring is unchanged: still the WHOLE path half.
+            ("/ab", "/abc?x=1", false, false),
+            ("bc", "/abc", false, false),
+        ];
+        for &(pattern, path, regex_routes, regex_path_routes) in cases {
+            assert_eq!(
+                regex_rule_routes(pattern, path).is_some(),
+                regex_routes,
+                "REGEX {pattern:?} against {path:?} must keep its historical verdict",
+            );
+            assert_eq!(
+                regex_path_rule_routes(pattern, path).is_some(),
+                regex_path_routes,
+                "REGEX_PATH {pattern:?} against {path:?}",
+            );
+        }
+    }
+
+    /// `PREFIX` and `EQUALS` still see the request path WITH its query string;
+    /// adding the path-only kind did not move them (sozu-proxy/sozu#1909).
+    #[test]
+    fn prefix_and_equals_still_match_against_the_query_string() {
+        let routes = |rule: CommandPathRule, path: &str| {
+            let rule = PathRule::from_config(rule).expect("the path rule must build");
+            let mut router = Router::new();
+            assert!(add_path_rule(&mut router, rule, GET, "RULE"));
+            routed_cluster(&router, path).is_some()
+        };
+        assert!(!routes(CommandPathRule::equals("/abc"), "/abc?x=1"));
+        assert!(routes(CommandPathRule::equals("/abc?x=1"), "/abc?x=1"));
+        assert!(routes(CommandPathRule::prefix("/abc?x"), "/abc?x=1"));
+        assert!(!routes(CommandPathRule::prefix("/abc?y"), "/abc?x=1"));
+    }
+
+    /// A `REGEX` and a `REGEX_PATH` rule on the same pattern are different
+    /// rules: they compare unequal, and both register on one leaf.
+    #[test]
+    fn a_path_only_regex_is_a_distinct_rule_from_the_same_regex() {
+        let regex = PathRule::from_config(CommandPathRule::regex("/a.*")).expect("REGEX builds");
+        let regex_path =
+            PathRule::from_config(CommandPathRule::regex_path("/a.*")).expect("REGEX_PATH builds");
+        assert_ne!(regex, regex_path);
+        assert_eq!(regex_path, regex_path.clone());
+        assert!(
+            PathRule::from_config(CommandPathRule::regex_path("a)(b")).is_none(),
+            "a pattern refused bare stays refused for the path-only kind too",
+        );
+    }
+
+    /// `rewrite_path` on a `REGEX_PATH` frontend: `$PATH[n]`, index 0
+    /// included, comes from the path-only match, and the request's original
+    /// `?query` is appended unless the rewritten path carries a `?` of its own
+    /// (sozu-proxy/sozu#1909). A `REGEX` frontend is untouched: its captures
+    /// still span the query, and nothing is appended. A permanent redirect
+    /// builds its `Location` from the same `rewritten_path`, so it follows.
+    ///
+    /// To SEE THIS RED: drop the `append_original_query` call in
+    /// `RouteResult::from_frontend` — the appended-query assertions fail.
+    #[test]
+    fn a_path_only_regex_rewrite_captures_the_path_and_carries_the_query_over() {
+        let rewritten =
+            |path_rule: CommandPathRule, rewrite: &str, redirect: RedirectPolicy, path: &str| {
+                let mut front = test_http_frontend();
+                front.hostname = "www.example.com".to_owned();
+                front.path = path_rule;
+                front.rewrite_path = Some(rewrite.to_owned());
+                front.redirect = Some(redirect as i32);
+                let mut router = Router::new();
+                router
+                    .add_http_front(&front)
+                    .expect("the rewriting frontend must register");
+                router
+                    .lookup("www.example.com", path, &Method::Get)
+                    .expect("the request must route")
+                    .rewritten_path
+            };
+        let regex_path = || CommandPathRule::regex_path("/api/(v[0-9]+)/(.*)");
+        for redirect in [RedirectPolicy::Forward, RedirectPolicy::Permanent] {
+            assert_eq!(
+                rewritten(
+                    regex_path(),
+                    "/$PATH[1]/$PATH[2]",
+                    redirect,
+                    "/api/v2/users?id=7"
+                )
+                .as_deref(),
+                Some("/v2/users?id=7"),
+                "{redirect:?}: captures stop at `?`, and the query is appended",
+            );
+            assert_eq!(
+                rewritten(regex_path(), "$PATH[0]", redirect, "/api/v2/users?id=7").as_deref(),
+                Some("/api/v2/users?id=7"),
+                "{redirect:?}: `$PATH[0]` is the path half, and the query follows it once",
+            );
+            assert_eq!(
+                rewritten(regex_path(), "/$PATH[2]", redirect, "/api/v2/users").as_deref(),
+                Some("/users"),
+                "{redirect:?}: without a query nothing is appended",
+            );
+            assert_eq!(
+                rewritten(regex_path(), "/$PATH[2]", redirect, "/api/v2/users?").as_deref(),
+                Some("/users?"),
+                "{redirect:?}: an empty query is carried over as written",
+            );
+            assert_eq!(
+                rewritten(
+                    regex_path(),
+                    "/$PATH[2]?src=v",
+                    redirect,
+                    "/api/v2/users?id=7"
+                )
+                .as_deref(),
+                Some("/users?src=v"),
+                "{redirect:?}: a rewritten path with a query of its own keeps it alone",
+            );
+            // `REGEX` unchanged: its last group swallows the query, nothing is
+            // appended, so the query appears exactly once.
+            assert_eq!(
+                rewritten(
+                    CommandPathRule::regex("/api/(v[0-9]+)/(.*)"),
+                    "/$PATH[2]",
+                    redirect,
+                    "/api/v2/users?id=7",
+                )
+                .as_deref(),
+                Some("/users?id=7"),
+                "{redirect:?}: a REGEX capture still spans the query string",
+            );
+            assert_eq!(
+                rewritten(
+                    CommandPathRule::regex("/api/(v[0-9]+)/(.*)"),
+                    "/$PATH[1]",
+                    redirect,
+                    "/api/v2/users?id=7",
+                )
+                .as_deref(),
+                Some("/v2"),
+                "{redirect:?}: a REGEX rewrite gains no query it did not capture",
+            );
+        }
     }
 
     /// Every branch of an alternation in a regex hostname SEGMENT is
