@@ -1723,7 +1723,7 @@ pub enum PathRule {
     Equals(String),
     /// `REGEX_PATH` (sozu-proxy/sozu#1909): the same anchored regex as
     /// [`PathRule::Regex`], tested against the request path up to its first
-    /// `?` only ([`split_query`]), the Gateway API `RegularExpression` path
+    /// `?` only (`split_query`), the Gateway API `RegularExpression` path
     /// match. It shares `Regex`'s precedence class ([`PathRuleResult::Regex`]).
     RegexPath(Regex),
 }
