@@ -545,7 +545,10 @@ pub fn try_rewrite_host_h1_h1() -> State {
     worker.wait_for_server_stop();
 
     let received_lc = received.to_ascii_lowercase();
-    let host_ok = received_lc.contains("host: backend.local");
+    // Exactly one `Host` line: the H1 converter writes the request
+    // authority as `Host`, so any extra Host header block duplicates it
+    // (sozu-proxy/sozu#1908).
+    let host_ok = host_header_values(&received) == ["backend.local"];
     // The original `:authority` (post-`hostname_and_port` strip of the
     // listener port) is captured into X-Forwarded-Host. We sent
     // `Host: localhost` — sozu's H1 path may also append the listener
@@ -566,6 +569,152 @@ pub fn try_rewrite_host_h1_h1() -> State {
 fn test_rewrite_host_h1_h1() {
     assert_eq!(
         repeat_until_error_or(2, "rewrite host H1↔H1", try_rewrite_host_h1_h1),
+        State::Success
+    );
+}
+
+/// Every `Host` header value in a raw H1 request head, in wire order.
+fn host_header_values(request: &str) -> Vec<String> {
+    request
+        .split("\r\n\r\n")
+        .next()
+        .unwrap_or_default()
+        .split("\r\n")
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.trim().eq_ignore_ascii_case("host"))
+        .map(|(_, value)| value.trim().to_owned())
+        .collect()
+}
+
+/// An operator `Host` request header edit replaces the request authority
+/// instead of adding a second `Host` line on the H1 backend wire
+/// (sozu-proxy/sozu#1908).
+pub fn try_request_header_host_h1_h1() -> State {
+    let front_address = create_local_address();
+    let back_address = create_local_address();
+    let mut worker = spawn_worker_with_http_listener("REQ-HOST-H1H1", front_address);
+    worker
+        .send_proxy_request(RequestType::AddCluster(Worker::default_cluster("rh_cluster")).into());
+    worker.send_proxy_request(
+        RequestType::AddHttpFrontend(RequestHttpFrontend {
+            headers: vec![Header {
+                position: HeaderPosition::Request as i32,
+                key: "Host".to_owned(),
+                val: "override.local".to_owned(),
+            }],
+            ..Worker::default_http_frontend("rh_cluster", front_address)
+        })
+        .into(),
+    );
+    add_backend(&mut worker, "rh_cluster", "rh_back_0", back_address);
+    let mut backend = SyncBackend::new(
+        "rh_back",
+        back_address,
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\npong",
+    );
+    backend.connect();
+    worker.read_to_last();
+
+    let mut client = Client::new(
+        "rh_client",
+        front_address,
+        http_request("GET", "/", "ping", "localhost"),
+    );
+    client.connect();
+    client.send();
+    accept_with_retry(&mut backend, 0, SYNC_BACKEND_ACCEPT_BUDGET_MS);
+    let received = backend.receive(0).expect("backend must receive request");
+    backend.send(0);
+    let _ = client.receive();
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    if host_header_values(&received) == ["override.local"] {
+        State::Success
+    } else {
+        eprintln!("expected a single Host: override.local, got:\n{received}");
+        State::Fail
+    }
+}
+
+#[test]
+fn test_request_header_host_h1_h1() {
+    assert_eq!(
+        repeat_until_error_or(2, "request Host edit H1↔H1", try_request_header_host_h1_h1),
+        State::Success
+    );
+}
+
+/// H2 frontend → H1 backend with `rewrite_host`: the backend sees a
+/// single `Host` carrying the rewritten authority (sozu-proxy/sozu#1908).
+pub fn try_rewrite_host_h2_h1() -> State {
+    use crate::mock::https_client::{build_h2_client, resolve_request};
+
+    let front_address = create_local_address();
+    let back_address = create_local_address();
+    let mut worker = spawn_worker_with_https_listener("REWRITE-H2H1", front_address);
+    worker.send_proxy_request(
+        RequestType::AddCluster(Worker::default_cluster("rwh_h2_cluster")).into(),
+    );
+    worker.send_proxy_request(
+        RequestType::AddHttpsFrontend(RequestHttpFrontend {
+            rewrite_host: Some("backend.local".to_owned()),
+            ..Worker::default_http_frontend("rwh_h2_cluster", front_address)
+        })
+        .into(),
+    );
+    add_backend(&mut worker, "rwh_h2_cluster", "rwh_h2_back_0", back_address);
+    let mut backend = SyncBackend::new(
+        "rwh_h2_back",
+        back_address,
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\npong",
+    );
+    backend.connect();
+    worker.read_to_last();
+
+    let uri: hyper::Uri = format!("https://localhost:{}/", front_address.port())
+        .parse()
+        .expect("H2 rewrite-host URI must parse");
+
+    let client = build_h2_client();
+    let backend_handle = std::thread::spawn(move || {
+        let mut received = None;
+        if accept_with_retry(&mut backend, 0, SYNC_BACKEND_TWO_SHOT_ACCEPT_BUDGET_MS) {
+            received = backend.receive(0);
+            backend.send(0);
+        }
+        (backend, received)
+    });
+    let outcome = resolve_request(&client, uri);
+    let (mut backend, received) = backend_handle
+        .join()
+        .expect("backend thread should not panic");
+    backend.disconnect();
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    let Some(received) = received else {
+        eprintln!("rewrite host H2↔H1: backend received nothing, outcome={outcome:?}");
+        return State::Fail;
+    };
+    if host_header_values(&received) != ["backend.local"] {
+        eprintln!("rewrite host H2↔H1: expected a single Host: backend.local, got:\n{received}");
+        return State::Fail;
+    }
+    match outcome {
+        Some((status, _)) if status.as_u16() == 200 => State::Success,
+        other => {
+            eprintln!("rewrite host H2↔H1: expected 200, got {other:?}");
+            State::Fail
+        }
+    }
+}
+
+#[test]
+fn test_rewrite_host_h2_h1() {
+    assert_eq!(
+        repeat_until_error_or(2, "rewrite host H2↔H1", try_rewrite_host_h2_h1),
         State::Success
     );
 }

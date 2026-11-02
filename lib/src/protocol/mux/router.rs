@@ -1699,10 +1699,9 @@ pub struct SelectedBackend {
 /// wire carries the rewritten shape:
 ///
 /// 1. If `rewritten_host` is set, replace the request-line authority
-///    with the rewritten value, replace any existing `Host` request
-///    header (so H1 backends see the same value the H2 `:authority`
-///    would carry), and inject `X-Forwarded-Host` carrying the
-///    pre-rewrite authority. The X-Forwarded-Host injection ONLY fires
+///    with the rewritten value, drop any existing `Host` request header
+///    block, and inject `X-Forwarded-Host` carrying the pre-rewrite
+///    authority. The X-Forwarded-Host injection ONLY fires
 ///    when `rewritten_host` is set — without a rewrite there is no host
 ///    swap to disclose, and HAProxy's `option forwardfor` style
 ///    headers (`X-Forwarded-For`, `X-Forwarded-Proto`) still flow from
@@ -1715,14 +1714,23 @@ pub struct SelectedBackend {
 ///    that family (`both`, `x_forwarded`); `rfc7239` and `none` convey no
 ///    pre-rewrite authority, and under `none` a client `X-Forwarded-Host`
 ///    passes through as sent.
-///    Dedup rule: the synthetic Host AND any pre-existing Host header
-///    are dropped in the retain pass below before the rewritten Host is
-///    appended, so the wire never carries two `Host:` headers.
+///    Host rule: the authority is the only carrier of the backend `Host`.
+///    The H1 converter (`kawa::protocol::h1::converter`) writes
+///    `Host: <authority>` right after the request line and the H2
+///    converter (`H2BlockConverter`, `lib/src/protocol/mux/converter.rs`)
+///    writes it as `:authority` and filters every `host` block, so a
+///    `Host` header block is never added here: on an H1 backend it would
+///    be a second `Host` line (sozu-proxy/sozu#1908).
 /// 2. If `rewritten_path` is set, replace both the abstract path
 ///    (consumed by H2 `:path`) and the request-line URI (consumed by
 ///    the H1 converter) so cardinality H1↔H1, H1↔H2, H2↔H1, H2↔H2 all
 ///    propagate the rewritten target.
-/// 3. For every `headers_request` edit:
+/// 3. A `headers_request` set-edit named `Host` replaces the authority
+///    (the last one wins) unless `rewritten_host` is set, which takes
+///    precedence; it adds no header block, for the reason above. A `Host`
+///    delete-edit drops header blocks only: the authority itself always
+///    reaches the backend.
+/// 4. For every other `headers_request` edit:
 ///    - empty `val` → remove every existing header with the matching
 ///      name from `kawa.blocks` (HAProxy `del-header` parity);
 ///    - non-empty `val` → append the header before the `end_header`
@@ -1760,7 +1768,16 @@ fn apply_request_rewrites_and_headers(
     // be mutated so an H1 frontend forwarding to an H1 backend AND an
     // H2 frontend forwarding to an H1 backend (or vice versa) see the
     // rewritten target on the wire.
-    if (rewritten_host.is_some() || rewritten_path.is_some())
+    // An operator `Host` set-edit names the backend authority; the last
+    // one wins, and `rewrite_host` wins over all of them.
+    let operator_host: Option<&[u8]> = headers_request
+        .iter()
+        .rev()
+        .find(|edit| !edit.val.is_empty() && edit.key.eq_ignore_ascii_case(b"host"))
+        .map(|edit| &edit.val[..]);
+    let new_authority: Option<&[u8]> = rewritten_host.map(str::as_bytes).or(operator_host);
+
+    if (new_authority.is_some() || rewritten_path.is_some())
         && let kawa::StatusLine::Request {
             authority,
             path,
@@ -1768,8 +1785,8 @@ fn apply_request_rewrites_and_headers(
             ..
         } = &mut kawa.detached.status_line
     {
-        if let Some(new_host) = rewritten_host {
-            *authority = Store::from_string(new_host.to_owned());
+        if let Some(new_authority) = new_authority {
+            *authority = Store::from_slice(new_authority);
         }
         if let Some(new_path) = rewritten_path {
             *path = Store::from_string(new_path.to_owned());
@@ -1792,12 +1809,12 @@ fn apply_request_rewrites_and_headers(
     let mut keys_to_drop: Vec<Vec<u8>> = Vec::with_capacity(headers_request.len() + 2);
     let mut to_insert: Vec<Block> = Vec::with_capacity(headers_request.len() + 2);
     // Track whether any operator-supplied edit names Host or
-    // X-Forwarded-Host so we always dedup the existing kawa Host header
-    // before inserting the operator's value. Without this, an operator
-    // who sets `--header request=Host=evil` on a frontend WITHOUT
-    // `--rewrite-host` lands TWO `Host:` headers on the backend wire —
-    // a request-smuggling primitive on backends that pick last-Host
-    // (CWE-444 cousin).
+    // X-Forwarded-Host so the existing header blocks of that name are
+    // dropped. A `Host` set-edit already moved into the authority above
+    // and is never inserted as a block: the converters emit the authority
+    // as the one `Host`, so a block would land a second, different `Host`
+    // line on an H1 backend — a request-smuggling primitive on backends
+    // that pick the last one (CWE-444 cousin, sozu-proxy/sozu#1908).
     let mut operator_overrides_host = false;
     let mut operator_overrides_xfh = false;
     for edit in headers_request {
@@ -1807,7 +1824,7 @@ fn apply_request_rewrites_and_headers(
         operator_overrides_xfh |= key_is_xfh;
         if edit.val.is_empty() {
             keys_to_drop.push(edit.key.iter().map(u8::to_ascii_lowercase).collect());
-        } else {
+        } else if !key_is_host {
             to_insert.push(Block::Header(Pair {
                 key: Store::from_slice(&edit.key),
                 val: Store::from_slice(&edit.val),
@@ -1852,21 +1869,15 @@ fn apply_request_rewrites_and_headers(
     }
 
     // ── insertion before the end-of-headers flag ──────────────────────
-    // Every header we add (rewritten Host, X-Forwarded-Host,
-    // operator-supplied set/append edits) must land before
-    // `Block::Flags { end_header: true }` so the converter emits them
-    // as part of the request header block. Synthetic Host/X-Forwarded-Host
-    // are prepended (they describe the rewrite, not an operator policy).
+    // Every header we add (X-Forwarded-Host, operator-supplied set/append
+    // edits) must land before `Block::Flags { end_header: true }` so the
+    // converter emits them as part of the request header block. A
+    // synthetic X-Forwarded-Host is prepended (it describes the rewrite,
+    // not an operator policy).
     let end_header_idx = super::shared::end_of_headers_index(kawa);
 
     if rewriting_host {
-        let mut synth: Vec<Block> = Vec::with_capacity(2);
-        if let Some(new_host) = rewritten_host {
-            synth.push(Block::Header(Pair {
-                key: Store::Static(b"Host"),
-                val: Store::from_string(new_host.to_owned()),
-            }));
-        }
+        let mut synth: Vec<Block> = Vec::with_capacity(1);
         if synthesises_xfh && let Some(orig) = original_authority.as_deref() {
             synth.push(Block::Header(Pair {
                 key: Store::Static(b"X-Forwarded-Host"),
