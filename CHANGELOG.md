@@ -12,6 +12,18 @@
 
 <!-- changelog-slot:backend-ownership -->
 
+<!-- changelog-slot:command-channel-error -->
+
+### Fixed
+
+- A worker now leaves its event loop when its command channel reports an error, as it already did on a hang-up. The main process closing the channel with a worker answer still unread resets the connection, which the worker used to log and ignore, so it kept running with nothing left to drive it and a caller joining its thread waited forever (#1912).
+
+<!-- changelog-slot:rewrite-host-duplicate -->
+
+### Fixed
+
+- An HTTP/1.1 backend now receives a single `Host` header when a frontend sets `rewrite_host`. The router added a `Host` header block on top of the rewritten authority, which the HTTP/1.1 converter already writes as `Host`, so the backend saw two, and servers that refuse a duplicate `Host` (Go's `net/http`) answered `400`. A frontend request header named `Host` now replaces the request authority instead of adding a second, different `Host` line; `rewrite_host` still takes precedence over it, and an HTTP/2 backend now receives that value as `:authority` where the header was previously dropped (#1908).
+
 <!-- changelog-slot:loop-budget-progress -->
 
 ### Fixed
