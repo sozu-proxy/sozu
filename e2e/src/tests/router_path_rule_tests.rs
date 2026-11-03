@@ -23,20 +23,22 @@
 //!
 //! ## Test list
 //! 1. [`test_path_equals_frontend_is_deduplicated_and_stops_routing_when_removed`]
+//! 2. [`test_path_only_regex_routes_on_the_path_and_carries_the_query_over`]
 
 use std::{net::SocketAddr, time::Duration};
 
 use sozu_command_lib::{
     config::ListenerBuilder,
     proto::command::{
-        ActivateListener, ListenerType, PathRule, RequestHttpFrontend, ResponseStatus,
-        request::RequestType,
+        ActivateListener, ListenerType, PathRule, RedirectPolicy, RequestHttpFrontend,
+        ResponseStatus, request::RequestType,
     },
 };
 
 use crate::{
     mock::{
         aggregator::SimpleAggregator, async_backend::BackendHandle as AsyncBackend, client::Client,
+        sync_backend::Backend as SyncBackend,
     },
     port_registry::attach_reserved_http_listener,
     sozu::worker::Worker,
@@ -193,6 +195,156 @@ fn test_path_equals_frontend_is_deduplicated_and_stops_routing_when_removed() {
             3,
             "router: a --path-equals frontend is refused on re-add and really stops routing once removed",
             try_path_equals_frontend_is_deduplicated_and_stops_routing_when_removed,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 2: a `REGEX_PATH` frontend routes on the path alone and carries the
+// query string over to its rewritten path and redirect `Location`
+// =========================================================================
+
+const REGEX_PATH_CLUSTER: &str = "path_only_regex_cluster";
+
+/// How long the sync backend waits for sozu to open the forwarded connection.
+const REGEX_PATH_ACCEPT_BUDGET: Duration = Duration::from_secs(3);
+
+/// sozu-proxy/sozu#1909 over the wire, through one worker carrying three
+/// `REGEX_PATH` frontends:
+///
+/// * `^/api/v2$` rewritten to `/v2` — `GET /api/v2?x=1` routes although the
+///   pattern spells no query (a `REGEX` would not), and the backend receives
+///   `GET /v2?x=1`: the query is appended to the rewritten path;
+/// * `/only/.+` — `GET /only/?x=1` gets the builtin 404, because the path
+///   `/only/` has nothing after the slash (a `REGEX` would match `?x=1`);
+/// * `/redir/(.+)` as a permanent redirect rewritten to `/new/$PATH[1]` —
+///   `GET /redir/a?y=2` answers 301 with `Location: http://localhost/new/a?y=2`:
+///   the capture stops at `?` and the redirect carries the query over too.
+///
+/// To SEE THIS RED: in `PathRule::matches` (`lib/src/router/mod.rs`) make the
+/// `RegexPath` arm test the whole request-target instead of its `split_query`
+/// path half: `GET /only/?x=1` is routed instead of answering 404, and
+/// `GET /api/v2?x=1` answers 404 instead of reaching the backend. The
+/// redirect leg stays green under that mutation (`(.+)` then captures the
+/// query itself); `RouteResult::from_frontend`'s query append is held by the
+/// router unit test
+/// `a_path_only_regex_rewrite_captures_the_path_and_carries_the_query_over`.
+fn try_path_only_regex_routes_on_the_path_and_carries_the_query_over() -> State {
+    let front_address = create_local_address();
+    let back_address = create_local_address();
+
+    let (config, mut listeners, state) = Worker::empty_config();
+    attach_reserved_http_listener(&mut listeners, front_address);
+    let mut worker = Worker::start_new_worker_owned("PATH-REGEX-PATH", config, listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpListener(
+        ListenerBuilder::new_http(front_address.into())
+            .to_http(None)
+            .expect("could not build the http listener config"),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
+        address: front_address.into(),
+        proxy: ListenerType::Http.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        REGEX_PATH_CLUSTER,
+    )));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        REGEX_PATH_CLUSTER,
+        format!("{REGEX_PATH_CLUSTER}-0"),
+        back_address,
+        None,
+    )));
+    for frontend in [
+        RequestHttpFrontend {
+            path: PathRule::regex_path("^/api/v2$"),
+            rewrite_path: Some("/v2".to_owned()),
+            ..Worker::default_http_frontend(REGEX_PATH_CLUSTER, front_address)
+        },
+        RequestHttpFrontend {
+            path: PathRule::regex_path("/only/.+"),
+            ..Worker::default_http_frontend(REGEX_PATH_CLUSTER, front_address)
+        },
+        RequestHttpFrontend {
+            path: PathRule::regex_path("/redir/(.+)"),
+            rewrite_path: Some("/new/$PATH[1]".to_owned()),
+            redirect: Some(RedirectPolicy::Permanent as i32),
+            ..Worker::default_http_frontend(REGEX_PATH_CLUSTER, front_address)
+        },
+    ] {
+        worker.send_proxy_request_type(RequestType::AddHttpFrontend(frontend));
+    }
+    worker.read_to_last();
+
+    let mut backend = SyncBackend::new(
+        "PATH-REGEX-PATH-BACKEND",
+        back_address,
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\npong",
+    );
+    backend.connect();
+
+    // The query must not take part in the match: `/only/` is the whole path.
+    let unrouted = request_path(front_address, "/only/?x=1", "regex-path-404")
+        .is_some_and(|response| response.starts_with("HTTP/1.1 404"));
+
+    // The redirect `Location` follows the rewrite, query included.
+    let redirected =
+        request_path(front_address, "/redir/a?y=2", "regex-path-301").is_some_and(|response| {
+            response.starts_with("HTTP/1.1 301")
+                && response
+                    .to_ascii_lowercase()
+                    .contains("location: http://localhost/new/a?y=2\r\n")
+        });
+
+    // Routed although `^/api/v2$` spells no query, rewritten with it appended.
+    let mut client = Client::new(
+        "PATH-regex-path-forward",
+        front_address,
+        "GET /api/v2?x=1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    client.connect();
+    client.send();
+    let deadline = std::time::Instant::now() + REGEX_PATH_ACCEPT_BUDGET;
+    let mut accepted = backend.accept(0);
+    while !accepted && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+        accepted = backend.accept(0);
+    }
+    let received = if accepted { backend.receive(0) } else { None };
+    if accepted {
+        backend.send(0);
+    }
+    let answered = client
+        .receive_until_eof(Duration::from_secs(3))
+        .is_some_and(|response| response.starts_with("HTTP/1.1 200"));
+    println!("PATH-REGEX-PATH: backend received {received:?}");
+    let forwarded_with_query = received
+        .as_deref()
+        .is_some_and(|request| request.starts_with("GET /v2?x=1 HTTP/1.1\r\n"));
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    println!(
+        "PATH-REGEX-PATH: unrouted={unrouted} redirected={redirected} forwarded_with_query={forwarded_with_query} answered={answered} stopped={stopped}"
+    );
+    if unrouted && redirected && forwarded_with_query && answered && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_path_only_regex_routes_on_the_path_and_carries_the_query_over() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "router: a REGEX_PATH frontend matches the path alone and carries the query over",
+            try_path_only_regex_routes_on_the_path_and_carries_the_query_over,
         ),
         State::Success,
     );

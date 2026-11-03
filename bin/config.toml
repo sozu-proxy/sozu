@@ -670,7 +670,8 @@ load_balancing = "ROUND_ROBIN"
 # - address: TCP listener
 # - hostname: host name of the cluster
 # - path = "/api" # optional. A routing rule for incoming requests. The path of the request must match it. Can be a prefix (default), a regex, or a strictly equal path.
-# - path_type = PREFIX | REGEX | EQUALS # defaults to PREFIX
+# - path_type = PREFIX | REGEX | EQUALS | REGEX_PATH # defaults to PREFIX. REGEX matches the path
+#   together with its query string; REGEX_PATH matches the path up to its first `?` only
 # - position = TREE | PRE | POST # defaults to TREE, upper case only. PRE rules are tried before the
 #   routing tree, POST rules after it. `hostname = "*"` with `position = "POST"` is a catch-all
 #   that answers every request no other frontend matched (IP literals and single-label hosts included)

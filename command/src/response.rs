@@ -240,6 +240,25 @@ impl PathRule {
         rule
     }
 
+    /// A `REGEX_PATH` rule (sozu-proxy/sozu#1909): `value` is matched,
+    /// anchored at both ends, against the request path up to its first `?`,
+    /// so the query string never takes part in the match.
+    pub fn regex_path<S>(value: S) -> Self
+    where
+        S: ToString,
+    {
+        let rule = Self {
+            kind: PathRuleKind::RegexPath.into(),
+            value: value.to_string(),
+        };
+        debug_assert_eq!(
+            PathRuleKind::try_from(rule.kind),
+            Ok(PathRuleKind::RegexPath),
+            "regex_path() must encode a RegexPath-kind rule"
+        );
+        rule
+    }
+
     pub fn equals<S>(value: S) -> Self
     where
         S: ToString,
@@ -260,24 +279,32 @@ impl PathRule {
         path_prefix: Option<String>,
         path_regex: Option<String>,
         path_equals: Option<String>,
+        path_regex_path: Option<String>,
     ) -> Self {
         // PRE: prefix takes precedence over regex, which takes precedence over
-        // equals. Capture which arms are populated so the post-condition can
-        // assert the precedence actually fired.
+        // equals, which takes precedence over the path-only regex. Capture
+        // which arms are populated so the post-condition can assert the
+        // precedence actually fired.
         let had_prefix = path_prefix.is_some();
         let had_regex = path_regex.is_some();
-        let rule = match (path_prefix, path_regex, path_equals) {
-            (Some(prefix), _, _) => PathRule {
+        let had_equals = path_equals.is_some();
+        let had_regex_path = path_regex_path.is_some();
+        let rule = match (path_prefix, path_regex, path_equals, path_regex_path) {
+            (Some(prefix), _, _, _) => PathRule {
                 kind: PathRuleKind::Prefix as i32,
                 value: prefix,
             },
-            (None, Some(regex), _) => PathRule {
+            (None, Some(regex), _, _) => PathRule {
                 kind: PathRuleKind::Regex as i32,
                 value: regex,
             },
-            (None, None, Some(equals)) => PathRule {
+            (None, None, Some(equals), _) => PathRule {
                 kind: PathRuleKind::Equals as i32,
                 value: equals,
+            },
+            (None, None, None, Some(regex_path)) => PathRule {
+                kind: PathRuleKind::RegexPath as i32,
+                value: regex_path,
             },
             _ => PathRule::default(),
         };
@@ -293,6 +320,18 @@ impl PathRule {
             had_prefix || !had_regex || rule.kind == PathRuleKind::Regex as i32,
             "absent a prefix, a regex must produce a Regex rule"
         );
+        debug_assert!(
+            had_prefix
+                || had_regex
+                || had_equals
+                || !had_regex_path
+                || rule.kind == PathRuleKind::RegexPath as i32,
+            "alone, a path-only regex must produce a RegexPath rule"
+        );
+        debug_assert!(
+            had_regex_path || rule.kind != PathRuleKind::RegexPath as i32,
+            "a RegexPath rule can only come from a path-only regex flag"
+        );
         rule
     }
 }
@@ -307,6 +346,7 @@ impl fmt::Display for PathRule {
             Ok(PathRuleKind::Prefix) => write!(f, "prefix '{}'", self.value),
             Ok(PathRuleKind::Regex) => write!(f, "regexp '{}'", self.value),
             Ok(PathRuleKind::Equals) => write!(f, "equals '{}'", self.value),
+            Ok(PathRuleKind::RegexPath) => write!(f, "path-only regexp '{}'", self.value),
             Err(_) => write!(f, ""),
         }
     }
@@ -609,7 +649,39 @@ mod tests {
     //! `&self.last_minute[0..10] … [50..60]` / `&self.last_hour[..]` fixed
     //! windows — the short-series expectation below then panics with
     //! `range end index 10 out of range for slice of length 3`.
-    use crate::proto::command::FilteredTimeSerie;
+    use crate::proto::command::{FilteredTimeSerie, PathRule, PathRuleKind};
+
+    /// `--path-regex-path` (sozu-proxy/sozu#1909) builds a `REGEX_PATH` rule
+    /// when it is the only path flag, and ranks below the three older flags.
+    #[test]
+    fn the_path_only_regex_cli_flag_builds_a_regex_path_rule_and_ranks_last() {
+        let some = |v: &str| Some(v.to_owned());
+        assert_eq!(
+            PathRule::from_cli_options(None, None, None, some("^/a$")),
+            PathRule::regex_path("^/a$"),
+        );
+        assert_eq!(
+            PathRule::from_cli_options(None, None, some("/e"), some("^/a$")),
+            PathRule::equals("/e"),
+        );
+        assert_eq!(
+            PathRule::from_cli_options(None, some("/r"), None, some("^/a$")),
+            PathRule::regex("/r"),
+        );
+        assert_eq!(
+            PathRule::from_cli_options(some("/p"), None, None, some("^/a$")),
+            PathRule::prefix("/p"),
+        );
+        assert_eq!(
+            PathRule::regex_path("/x").to_string(),
+            "path-only regexp '/x'",
+            "the frontend listing names the kind",
+        );
+        assert_eq!(
+            PathRuleKind::try_from(PathRule::regex_path("/x").kind),
+            Ok(PathRuleKind::RegexPath)
+        );
+    }
 
     #[test]
     fn a_series_shorter_than_sixty_samples_renders_instead_of_panicking() {

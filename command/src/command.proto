@@ -1354,7 +1354,7 @@ message FrontendFilters {
 message PathRule {
     // The kind of filter used for path rules
     required PathRuleKind kind = 1;
-    // the value of the given prefix, regex or equal pathrule
+    // the value of the given prefix, regex, equal or path-only regex pathrule
     required string value = 2;
 }
 
@@ -1366,6 +1366,14 @@ enum PathRuleKind {
     REGEX = 1;
     // filters paths that exactly match a pattern, no more, no less
     EQUALS = 2;
+    // filters paths that match a regex pattern, anchored at both ends like
+    // `REGEX`, but tested against the path ALONE: the request-target up to
+    // its first `?` (sozu-proxy/sozu#1909, Gateway API `RegularExpression`
+    // path match). `REGEX` keeps matching the path together with its query
+    // string. Its `$PATH[n]` rewrite captures come from that path-only
+    // match, and the request's original `?query` is appended to a rewritten
+    // path that carries no `?` of its own.
+    REGEX_PATH = 3;
 }
 
 // TODO: find a proper definition for this

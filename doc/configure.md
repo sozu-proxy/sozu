@@ -2615,6 +2615,52 @@ and not `/static/app.json`. That last point is not new — `\.js$` did not match
 `/static/app.js?v=2` before this release either. It also changes which rule
 wins in the whole-path case below.
 
+#### Matching the path alone: `REGEX_PATH`
+
+`path_type = "REGEX_PATH"` is a `REGEX` matched against the path **without** its
+query string: the request-target up to its first `?` (sozu-proxy/sozu#1909).
+This is the Gateway API HTTPRoute `RegularExpression` path match, Traefik's
+`PathRegexp` and Envoy's `safe_regex`. Everything else is `REGEX`'s: the pattern
+is anchored at both ends the same way, compiled and validated the same way, and
+takes the same place in the precedence above, so a `REGEX_PATH` and a `REGEX`
+rule rank exactly as two `REGEX` rules would. `REGEX` itself is unchanged and
+keeps matching the path together with its query — use it when the rule has to
+read the query.
+
+| pattern     | request path    | `REGEX` | `REGEX_PATH` |
+|-------------|-----------------|---------|--------------|
+| `/api/.+`   | `/api/?x=1`     | match   | no match — the path `/api/` has nothing after the slash |
+| `/api/.+`   | `/api/x?y`      | match   | match        |
+| `^/api/v2$` | `/api/v2?x=1`   | no match | match       |
+| `/a[?]x=1`  | `/a?x=1`        | match   | no match — a path-only pattern never sees the query |
+
+With `rewrite_path`, every `$PATH[n]` of a `REGEX_PATH` frontend comes from that
+path-only match — `$PATH[0]` is the path without its query — and the request's
+original query string, `?` included, is **appended** to the rewritten path,
+unless the rewritten path already carries a `?` of its own: then its query is
+kept as written and the original one is dropped. A request without a `?` gets
+nothing appended; a request ending in a bare `?` keeps it. The redirect
+`Location` of a `redirect = "permanent"` / `"found"` / `"permanent_redirect"`
+frontend is built from the same rewritten path, so it carries the query over
+too:
+
+```toml
+[[clusters.api.frontends]]
+address      = "0.0.0.0:80"
+hostname     = "example.com"
+path         = "/api/(v[0-9]+)/(.*)"
+path_type    = "REGEX_PATH"
+rewrite_path = "/$PATH[1]/$PATH[2]"
+# GET /api/v2/users?id=7 reaches the backend as GET /v2/users?id=7
+```
+
+A `REGEX` frontend gets no such append: its captures already span the query
+string, and the rewritten path holds whatever the template took from them.
+
+The CLI spelling is `--path-regex-path <pattern>`. `--path-prefix`,
+`--path-regex` and `--path-equals` take precedence over it when several are
+given.
+
 `method` is optional on a frontend, so tier 2 is the default shape unless you
 set one; declaration order is load-bearing in more cases than it looks. See
 "When declaration order decides" below.
@@ -3320,6 +3366,9 @@ scanners hitting a blocked path. The CLI spelling is
 `rewrite_host` and `rewrite_path` accept a small template grammar: `$HOST[n]`
 references the n-th host capture (0 is the full hostname; 1+ are regex /
 wildcard subgroups), and `$PATH[n]` references the n-th path capture.
+On a `path_type = "REGEX_PATH"` frontend the path captures exclude the query
+string, which is appended to the rewritten path instead — see "Matching the
+path alone: `REGEX_PATH`" above.
 Host captures are numbered left to right in the hostname, whatever the rule's
 `position`, and the groups of one regex label keep their order: in
 `/a([0-9]+)/./([a-z])([0-9])/.example.com`, `a1.x9.example.com` gives
