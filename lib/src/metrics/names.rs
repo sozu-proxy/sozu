@@ -386,6 +386,10 @@ pub mod http {
     pub const HSTS_SUPPRESSED_PLAINTEXT: &str = "http.hsts.suppressed_plaintext";
     pub const HSTS_UNRENDERED: &str = "http.hsts.unrendered";
     pub const INFINITE_LOOP_ERROR: &str = "http.infinite_loop.error";
+    /// `Mux::ready_inner` reached `MAX_LOOP_ITERATIONS` while forwarding
+    /// bytes and yielded to the event loop, which resumes it on its next turn
+    /// (sozu-proxy/sozu#1906). Not an error: a transfer whose peers keep up.
+    pub const MUX_LOOP_BUDGET_YIELD: &str = "http.mux.loop_budget_yield";
     pub const REDIRECT_TEMPLATE_COMPILE_ERROR: &str = "http.redirect_template.compile_error";
     pub const REQUESTS: &str = "http.requests";
     pub const SNI_AUTHORITY_MISMATCH: &str = "http.sni_authority_mismatch";

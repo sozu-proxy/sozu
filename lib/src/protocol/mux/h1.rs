@@ -1159,6 +1159,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         if self.position.is_server() {
             context.client_bytes_out = context.client_bytes_out.wrapping_add(size);
         }
+        context.stream_bytes_out = context.stream_bytes_out.wrapping_add(size);
         let should_yield = update_readiness_after_write(size, status, &mut self.readiness);
         if let Some(result) = self.client_write_failed(status) {
             return result;
