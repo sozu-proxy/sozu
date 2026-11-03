@@ -53,6 +53,7 @@ mod h2c_prior_knowledge_tests;
 mod header_routing_tests;
 mod health_check_mode_tests;
 mod hsts_tests;
+mod large_response_tests;
 mod lb_weight_tests;
 mod listener_reactivation_tests;
 mod listener_update_tests;

@@ -957,6 +957,11 @@ pub enum HttpFrontendCmd {
         )]
         path_equals: Option<String>,
         #[clap(
+            long = "path-regex-path",
+            help = "the frontend URL path, up to its first '?' (query string excluded), should match this regex, anchored at both ends; the original query string is appended to a --rewrite-path that carries no '?' of its own"
+        )]
+        path_regex_path: Option<String>,
+        #[clap(
             short = 'm',
             long = "method",
             help = "HTTP method, matched case-sensitively (RFC 9110 §9.1): write it in the exact case the client sends"
@@ -1060,6 +1065,11 @@ pub enum HttpFrontendCmd {
             help = "the frontend URL path should equal this regex"
         )]
         path_equals: Option<String>,
+        #[clap(
+            long = "path-regex-path",
+            help = "the frontend URL path, up to its first '?' (query string excluded), should match this regex, anchored at both ends; the original query string is appended to a --rewrite-path that carries no '?' of its own"
+        )]
+        path_regex_path: Option<String>,
         #[clap(
             short = 'm',
             long = "method",

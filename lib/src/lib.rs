@@ -463,6 +463,18 @@ pub trait ProxySession {
     fn needs_ready_pass(&self) -> bool {
         false
     }
+    /// Whether the last [`Self::ready`] pass stopped at its iteration budget
+    /// while still forwarding bytes, with work left that no socket event will
+    /// announce again. Reading it clears it.
+    ///
+    /// `Server::ready` and `Server::timeout` queue such a session, and
+    /// `Server::resume_yielded_sessions` runs its `ready` pass again after the
+    /// next poll, so a fast transfer neither holds the single-threaded worker
+    /// nor stalls (sozu-proxy/sozu#1906). Only the mux-backed HTTP and HTTPS
+    /// sessions yield.
+    fn yielded(&mut self) -> bool {
+        false
+    }
     /// Whether this session holds a backend connection `target` names, which
     /// makes it one of the sessions a `CloseSessions` request closes.
     ///

@@ -48,8 +48,8 @@ by the main process and workers (like the log level):
 | `command_allowed_uids`        | optional allowlist of POSIX UIDs permitted to invoke command-socket requests (PR #1209). Omitted or `None` lets every process the socket mode admits (`command_socket_mode`: the same UID by default, plus the socket's group or every account with a wider mode) send any request. When set, every request from a UID outside the list is rejected, reads included — e.g. `[<operator_uid>]` even when other same-UID daemons coexist (CI runners, monitoring scrapers). Rejected requests still appear in the audit trail.                                                                                                                                                                                                                                                                                                                                                          | TOML array of integers, e.g. `[1000]`     |
 | `ctl_command_timeout`         | maximum time the command line will wait for a command to complete, `0` disables it; a soft `shutdown` ignores it and waits for the drain                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |                                           |
 | `pid_file_path`               | stores the pid in a specific file location                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |                                           |
-| `front_timeout`               | maximum time of inactivity for a front socket (seconds). Defaults to `60`. On an HTTP/1.1 frontend it also bounds a request's whole backend connection failover; see "Backend connection failover"                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |                                           |
-| `back_timeout`                | maximum time of inactivity for a backend socket (seconds). Defaults to `30`. Can be overridden per listener.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | seconds                                   |
+| `front_timeout`               | maximum time of inactivity for a front socket (seconds). Defaults to `60`. On an HTTP/1.1 frontend it also bounds a request's whole backend connection failover; see "Backend connection failover". While a response is in progress and the client has taken every byte so far, the client is waiting on the backend: this timeout then leaves the response to `back_timeout` instead of cutting it (#1906)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |                                           |
+| `back_timeout`                | maximum time of inactivity for a backend socket (seconds). Defaults to `30`. Can be overridden per listener. While Sōzu still holds response bytes the client has not taken, it stops reading the backend itself: this timeout then leaves the response to `front_timeout` instead of cutting it, so a slow client is never charged to the backend (#1906).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | seconds                                   |
 | `connect_timeout`             | maximum time to establish a backend connection (seconds). Defaults to `3`; on expiry an HTTP request fails over to another backend while `max_connection_attempts` lasts, a TCP session is closed |                                           |
 | `max_connection_attempts`     | how many backend connections a request may try, the first included, before it is answered `503` (HTTP) or closed (TCP). A failed connection — refused, timed out on `connect_timeout`, or reporting a socket error — is counted against its backend and the request goes to another backend while attempts remain. Defaults to `5` (the hard-coded `CONN_RETRIES` of earlier versions allowed `3`). Must lie in `1`-`255`; a value outside it is rejected at config-load time. Each cluster may override it, and `sozu connection-attempts set` changes it on running workers. See "Backend connection failover". | integer (1-255, default 5)                |
 | `accept_queue_timeout`        | maximum time (in seconds) a TCP connection stays in sozu's accept queue before being dropped. Defaults to `60`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | seconds                                   |
@@ -2669,6 +2669,52 @@ and not `/static/app.json`. That last point is not new — `\.js$` did not match
 `/static/app.js?v=2` before this release either. It also changes which rule
 wins in the whole-path case below.
 
+#### Matching the path alone: `REGEX_PATH`
+
+`path_type = "REGEX_PATH"` is a `REGEX` matched against the path **without** its
+query string: the request-target up to its first `?` (sozu-proxy/sozu#1909).
+This is the Gateway API HTTPRoute `RegularExpression` path match, Traefik's
+`PathRegexp` and Envoy's `safe_regex`. Everything else is `REGEX`'s: the pattern
+is anchored at both ends the same way, compiled and validated the same way, and
+takes the same place in the precedence above, so a `REGEX_PATH` and a `REGEX`
+rule rank exactly as two `REGEX` rules would. `REGEX` itself is unchanged and
+keeps matching the path together with its query — use it when the rule has to
+read the query.
+
+| pattern     | request path    | `REGEX` | `REGEX_PATH` |
+|-------------|-----------------|---------|--------------|
+| `/api/.+`   | `/api/?x=1`     | match   | no match — the path `/api/` has nothing after the slash |
+| `/api/.+`   | `/api/x?y`      | match   | match        |
+| `^/api/v2$` | `/api/v2?x=1`   | no match | match       |
+| `/a[?]x=1`  | `/a?x=1`        | match   | no match — a path-only pattern never sees the query |
+
+With `rewrite_path`, every `$PATH[n]` of a `REGEX_PATH` frontend comes from that
+path-only match — `$PATH[0]` is the path without its query — and the request's
+original query string, `?` included, is **appended** to the rewritten path,
+unless the rewritten path already carries a `?` of its own: then its query is
+kept as written and the original one is dropped. A request without a `?` gets
+nothing appended; a request ending in a bare `?` keeps it. The redirect
+`Location` of a `redirect = "permanent"` / `"found"` / `"permanent_redirect"`
+frontend is built from the same rewritten path, so it carries the query over
+too:
+
+```toml
+[[clusters.api.frontends]]
+address      = "0.0.0.0:80"
+hostname     = "example.com"
+path         = "/api/(v[0-9]+)/(.*)"
+path_type    = "REGEX_PATH"
+rewrite_path = "/$PATH[1]/$PATH[2]"
+# GET /api/v2/users?id=7 reaches the backend as GET /v2/users?id=7
+```
+
+A `REGEX` frontend gets no such append: its captures already span the query
+string, and the rewritten path holds whatever the template took from them.
+
+The CLI spelling is `--path-regex-path <pattern>`. `--path-prefix`,
+`--path-regex` and `--path-equals` take precedence over it when several are
+given.
+
 `method` is optional on a frontend, so tier 2 is the default shape unless you
 set one; declaration order is load-bearing in more cases than it looks. See
 "When declaration order decides" below.
@@ -3374,6 +3420,9 @@ scanners hitting a blocked path. The CLI spelling is
 `rewrite_host` and `rewrite_path` accept a small template grammar: `$HOST[n]`
 references the n-th host capture (0 is the full hostname; 1+ are regex /
 wildcard subgroups), and `$PATH[n]` references the n-th path capture.
+On a `path_type = "REGEX_PATH"` frontend the path captures exclude the query
+string, which is appended to the rewritten path instead — see "Matching the
+path alone: `REGEX_PATH`" above.
 Host captures are numbered left to right in the hostname, whatever the rule's
 `position`, and the groups of one regex label keep their order: in
 `/a([0-9]+)/./([a-z])([0-9])/.example.com`, `a1.x9.example.com` gives
@@ -3397,6 +3446,13 @@ key      = "X-Cache-Backend"
 value    = ""                      # empty value DELETES the header by name
                                    # (HAProxy `del-header` parity)
 ```
+
+A request header named `Host` is not a header block: the backend's one `Host`
+(H1) or `:authority` (H2) is the request authority. A non-empty `Host` value
+therefore replaces that authority, the last such entry winning, unless the
+frontend also sets `rewrite_host`, which takes precedence; an empty `Host`
+value cannot remove the authority. The backend never receives two `Host`
+lines (#1908).
 
 HAProxy parallels: `http-request redirect` (permanent / scheme), `set-uri` and
 `set-path` (rewrite), `http-request set-header` and `http-request del-header`
@@ -4950,6 +5006,7 @@ guaranteed not to underflow on close / timeout / shed / error paths.
 | Metric                         | Type    | Scope            | Description                                                  |
 | ------------------------------ | ------- | ---------------- | ------------------------------------------------------------ |
 | `http.infinite_loop.error`     | counter | proxy            | HTTP event loop safety breaker triggered                     |
+| `http.mux.loop_budget_yield`   | counter | proxy            | HTTP session paused at its loop iteration budget while forwarding bytes; the event loop resumes it after the next poll (not an error) |
 | `http.failed_backend_matching` | counter | proxy            | Frontend matched but no backend could be selected            |
 | `http.early_response_close`    | counter | proxy            | Client closed before response was fully sent                 |
 | `http.close.request_incomplete` | counter | proxy          | H1 client connection closed because the response completed before the request was received whole (the rest of the body is never read as a request; it is drained and dropped for up to `request_timeout` and 4 MiB before the close) |

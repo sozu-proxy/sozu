@@ -481,6 +481,12 @@ impl Display for RequestHttpFrontend {
             Ok(PathRuleKind::Equals) => {
                 format!("{};{};={}", self.address, self.hostname, self.path.value)
             }
+            // Its own key letter: a `REGEX` and a `REGEX_PATH` frontend with
+            // the same pattern route differently and must not collide in
+            // `ConfigState` (sozu-proxy/sozu#1909).
+            Ok(PathRuleKind::RegexPath) => {
+                format!("{};{};Q{}", self.address, self.hostname, self.path.value)
+            }
             Err(e) => format!("Wrong variant of PathRuleKind: {e}"),
         };
 
@@ -710,7 +716,7 @@ mod tests {
     use prost::Message;
 
     use super::*;
-    use crate::proto::command::{HeaderMatchKind, HeaderPredicate};
+    use crate::proto::command::{HeaderMatchKind, HeaderPredicate, PathRule};
 
     fn https_listener(client_auth: Option<i32>) -> HttpsListenerConfig {
         HttpsListenerConfig {
@@ -1098,6 +1104,20 @@ mod tests {
             .content
             .expect("the envelope always carries a request")
             .request_type
+    }
+
+    /// A `REGEX` and a `REGEX_PATH` frontend on one pattern route differently,
+    /// so their `ConfigState` keys must differ (sozu-proxy/sozu#1909).
+    #[test]
+    fn a_path_only_regex_frontend_keys_apart_from_the_same_regex() {
+        let with_path = |path: PathRule| RequestHttpFrontend {
+            path,
+            ..frontend(false)
+        };
+        let regex = with_path(PathRule::regex("/a.*")).to_string();
+        let regex_path = with_path(PathRule::regex_path("/a.*")).to_string();
+        assert_ne!(regex, regex_path);
+        assert_eq!(regex_path, "127.0.0.1:8080;example.com;Q/a.*");
     }
 
     fn frontend(with_predicate: bool) -> RequestHttpFrontend {

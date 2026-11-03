@@ -2206,6 +2206,9 @@ pub enum PathRuleType {
     Prefix,
     Regex,
     Equals,
+    /// `REGEX_PATH`: a regex matched against the path up to its first `?`
+    /// only, never the query string (sozu-proxy/sozu#1909).
+    RegexPath,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -2224,7 +2227,8 @@ pub struct FileClusterFrontendConfig {
     pub alpn: Vec<String>,
     /// creates a path routing rule where the request URL path has to match this
     pub path: Option<String>,
-    /// declares whether the path rule is Prefix (default), Regex, or Equals
+    /// declares whether the path rule is Prefix (default), Regex, Equals, or
+    /// RegexPath (a regex over the path alone, query string excluded)
     pub path_type: Option<PathRuleType>,
     pub method: Option<String>,
     pub certificate: Option<String>,
@@ -2545,6 +2549,7 @@ impl FileClusterFrontendConfig {
             (Some(s), Some(PathRuleType::Prefix)) => PathRule::prefix(s.to_string()),
             (Some(s), Some(PathRuleType::Regex)) => PathRule::regex(s.to_string()),
             (Some(s), Some(PathRuleType::Equals)) => PathRule::equals(s.to_string()),
+            (Some(s), Some(PathRuleType::RegexPath)) => PathRule::regex_path(s.to_string()),
             (Some(s), None) => PathRule::prefix(s.clone()),
         };
 
@@ -6616,6 +6621,43 @@ mod tests {
             }
             other => panic!("expected HstsOnPlainHttp, got {other:?}"),
         }
+    }
+
+    /// `path_type = "REGEX_PATH"` (sozu-proxy/sozu#1909) parses to the
+    /// path-only regex kind, distinct from `"REGEX"`, and a spelling the
+    /// enum does not know is still refused.
+    #[test]
+    fn path_type_regex_path_parses_to_the_path_only_regex_kind() {
+        let parse = |path_type: &str| {
+            toml::from_str::<FileClusterFrontendConfig>(&format!(
+                "address = \"127.0.0.1:8080\"\n\
+                 hostname = \"example.com\"\n\
+                 path = \"^/api/v2$\"\n\
+                 path_type = \"{path_type}\"\n"
+            ))
+        };
+        let frontend = parse("REGEX_PATH").expect("REGEX_PATH must parse");
+        assert_eq!(frontend.path_type, Some(PathRuleType::RegexPath));
+        let http = frontend
+            .to_http_front("api")
+            .expect("a REGEX_PATH frontend must convert");
+        assert_eq!(http.path, PathRule::regex_path("^/api/v2$"));
+        assert_eq!(
+            crate::proto::command::PathRuleKind::try_from(http.path.kind),
+            Ok(crate::proto::command::PathRuleKind::RegexPath)
+        );
+        assert_ne!(
+            http.path,
+            PathRule::regex("^/api/v2$"),
+            "REGEX_PATH must not collapse into REGEX"
+        );
+
+        let regex = parse("REGEX").expect("REGEX must still parse");
+        assert_eq!(regex.path_type, Some(PathRuleType::Regex));
+        assert!(
+            parse("PATH_REGEX").is_err(),
+            "an unknown path_type is refused"
+        );
     }
 
     #[test]
