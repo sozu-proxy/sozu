@@ -1839,9 +1839,16 @@ impl Server {
                 match event.token() {
                     // this is the command channel
                     Token(0) => {
+                        // An error is a close too: the main process resets
+                        // the channel when it closes its end with our
+                        // answer still unread. The channel is registered
+                        // edge-triggered, so no later event would come and
+                        // nothing could drive the worker any more.
                         if event.is_error() {
-                            error!("error reading from command channel");
-                            continue;
+                            error!(
+                                "error on command channel, the main process can no longer reach this worker"
+                            );
+                            return;
                         }
                         if event.is_read_closed() || event.is_write_closed() {
                             error!("command channel was closed");

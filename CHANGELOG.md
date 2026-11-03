@@ -12,6 +12,12 @@
 
 <!-- changelog-slot:backend-ownership -->
 
+<!-- changelog-slot:command-channel-error -->
+
+### Fixed
+
+- A worker now leaves its event loop when its command channel reports an error, as it already did on a hang-up. The main process closing the channel with a worker answer still unread resets the connection, which the worker used to log and ignore, so it kept running with nothing left to drive it and a caller joining its thread waited forever (#1912).
+
 <!-- changelog-slot:rewrite-host-duplicate -->
 
 ### Fixed
