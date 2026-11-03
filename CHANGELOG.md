@@ -12,6 +12,26 @@
 
 <!-- changelog-slot:backend-ownership -->
 
+<!-- changelog-slot:command-channel-error -->
+
+### Fixed
+
+- A worker now leaves its event loop when its command channel reports an error, as it already did on a hang-up. The main process closing the channel with a worker answer still unread resets the connection, which the worker used to log and ignore, so it kept running with nothing left to drive it and a caller joining its thread waited forever (#1912).
+
+<!-- changelog-slot:rewrite-host-duplicate -->
+
+### Fixed
+
+- An HTTP/1.1 backend now receives a single `Host` header when a frontend sets `rewrite_host`. The router added a `Host` header block on top of the rewritten authority, which the HTTP/1.1 converter already writes as `Host`, so the backend saw two, and servers that refuse a duplicate `Host` (Go's `net/http`) answered `400`. A frontend request header named `Host` now replaces the request authority instead of adding a second, different `Host` line; `rewrite_host` still takes precedence over it, and an HTTP/2 backend now receives that value as `:authority` where the header was previously dropped (#1908).
+
+<!-- changelog-slot:loop-budget-progress -->
+
+### Fixed
+
+- A fast HTTP transfer is no longer cut at a random offset. When the inner loop of `Mux::ready_inner` reached `MAX_LOOP_ITERATIONS` (10,000) in one `ready()` call, it closed the session unless output was still queued, even if every iteration had forwarded bytes. When the client and the backend both kept up for that many iterations (about 160 MiB with 16 KiB buffers), the client saw a clean close in the middle of a `Content-Length` body ("Premature end of Content-Length delimited message body"), with `http.infinite_loop.error` incremented and, before 2.3.0, no log at the default level. Downloads and uploads over plaintext and TLS HTTP/1.1 were measured exposed, and the listener's ALPN list played no part; HTTP/2 frontends run the same loop. A call that reaches the budget after forwarding at least one stream byte per budgeted iteration to either peer (`Context::stream_bytes_out`) now yields: it keeps its readiness, counts the new `http.mux.loop_budget_yield` counter, and the worker resumes it after its next poll, which does not block while a session is queued (`ProxySession::yielded`, `Server::resume_yielded_sessions`). A fast transfer neither is cut nor holds the single-threaded worker past one budget per turn. A call that forwarded nothing keeps the existing `http.infinite_loop.error` path. Reproduced deterministically by `a_transfer_progressing_at_the_loop_limit_yields_and_resumes_without_a_new_event`, and end to end in `large_response_tests.rs` (256 MiB over loopback: 4/40 plaintext and 5/60 TLS downloads, 10/20 TLS uploads cut on `main`). `ProxySession` gains a `yielded` method with a default `false`, so other implementors are unaffected (#1906).
+
+- A response in progress is no longer cut by the timeout of the peer that is not holding it up. `back_timeout` fired while Sōzu itself had stopped reading the backend because a slow client left response bytes queued, and cut the response (`backend_response_timeout`); `front_timeout` fired while a client that had taken every byte waited on a slow backend, and closed the session silently, because kawa's `is_completed` (nothing queued) was read as "response fully proxied". Each timeout now defers to the other while the response waits on the other peer (`response_waits_on_client`); the two conditions are complementary, so a client that stops reading still meets `front_timeout` and a silent backend still meets `back_timeout`. Reproduced end to end with 4 s pauses against 2 s timeouts, cut at 4.0 and 6.0 of 8 MiB before the fix (#1906).
+
 <!-- changelog-slot:regex-path -->
 
 ### Added

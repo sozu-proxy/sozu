@@ -635,8 +635,15 @@ work: READABLE or WRITABLE interest with a matching event, or a HUP or ERROR
 the dead-backend sweep has yet to act on, such as the HUP sozu raises itself
 when it drops a backend that broke the protocol. A dead backend kept for the
 bytes it still has to deliver is not work: it waits for the client to drain
-them ([#1819](https://github.com/sozu-proxy/sozu/issues/1819)). Reaching the
-bound is a bug, counted in `http.infinite_loop.error` and logged as a warning:
+them ([#1819](https://github.com/sozu-proxy/sozu/issues/1819)). A call that
+reaches the bound after forwarding at least one stream byte per budgeted
+iteration to either peer is a transfer
+whose client and backend both keep up: it yields with its readiness intact,
+counted in `http.mux.loop_budget_yield`, and the server runs `ready` again
+after its next poll, which it does not block, so the other sessions are served
+between two budgets and the transfer is not cut
+([#1906](https://github.com/sozu-proxy/sozu/issues/1906)). Reaching the bound
+without forwarding is a bug, counted in `http.infinite_loop.error` and logged as a warning:
 the session waits for its next writable event while output is queued for the
 client, and is closed otherwise, or when the bound is reached again with no
 byte written to the client since. A frontend HUP is not work the loop can progress: each
