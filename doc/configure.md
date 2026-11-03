@@ -3344,6 +3344,13 @@ value    = ""                      # empty value DELETES the header by name
                                    # (HAProxy `del-header` parity)
 ```
 
+A request header named `Host` is not a header block: the backend's one `Host`
+(H1) or `:authority` (H2) is the request authority. A non-empty `Host` value
+therefore replaces that authority, the last such entry winning, unless the
+frontend also sets `rewrite_host`, which takes precedence; an empty `Host`
+value cannot remove the authority. The backend never receives two `Host`
+lines (#1908).
+
 HAProxy parallels: `http-request redirect` (permanent / scheme), `set-uri` and
 `set-path` (rewrite), `http-request set-header` and `http-request del-header`
 (custom headers).
