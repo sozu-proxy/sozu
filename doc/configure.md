@@ -283,6 +283,56 @@ level.
 sticky_name = "SOZUBALANCEID"
 ```
 
+#### Options specific to HTTP listeners
+
+##### HTTP/2 over cleartext (h2c) by prior knowledge
+
+An HTTP listener speaks HTTP/1.x. With `h2c_prior_knowledge = true` it also
+serves HTTP/2 to a client that opens the connection with the 24-byte HTTP/2
+connection preface `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n` (RFC 9113 §3.3, "prior
+knowledge"): cleartext gRPC clients, `curl --http2-prior-knowledge`, and the
+Kubernetes Gateway API `GRPCRoute` conformance suite connect this way. Such a
+connection gets an HTTP/2 frontend, exactly as an HTTPS connection that
+negotiated `h2` through ALPN: the same H2 flood thresholds, connection tuning,
+stream idle timeout and graceful-shutdown deadline apply, from this listener's
+`h2_*` keys. Every other connection stays HTTP/1.x.
+
+```toml
+[[listeners]]
+protocol = "http"
+address = "0.0.0.0:8080"
+# Serve cleartext HTTP/2 to clients that open with the connection preface.
+# Default: false.
+h2c_prior_knowledge = true
+```
+
+- **Detection** peeks at the first bytes of the connection without consuming
+  them (`H2cPrefaceSniff`, `lib/src/protocol/h2c.rs`). The preface makes the
+  connection HTTP/2; the first byte that differs from it makes the connection
+  HTTP/1.x; a strict prefix of it waits for more bytes, bounded by
+  `request_timeout`. A connection that sends nothing, or only a strict prefix
+  of the preface, before `request_timeout` is closed without an answer: its
+  protocol is still unknown, so the `408` an HTTP/1.x-only listener sends a
+  silent client is not sent here. With `expect_proxy = true` the sniff runs
+  on the bytes that follow the PROXY header.
+- **Scheme**: the listener is still cleartext, so the request scheme stays
+  `http` — `:scheme` towards an HTTP/2 backend, `X-Forwarded-Proto: http` and
+  `Forwarded: proto=http`. The TLS-only routing rules (`strict_sni_binding`,
+  connection coalescing) never apply: there is no SNI.
+- **No `Upgrade: h2c`.** The HTTP/1.1 `Upgrade: h2c` mechanism, which RFC 9113
+  deprecates, is not supported with or without this option.
+- **Off by default.** With `h2c_prior_knowledge` unset or `false`, no sniff
+  runs and a client that sends the preface gets `400 Bad Request`, as on every
+  release before the option existed.
+- **Backends** are independent: the cluster's `http2` flag alone decides
+  whether the request travels to the backend over HTTP/2 or HTTP/1.1.
+
+The option is patchable with `sozu listener http update
+--h2c-prior-knowledge` / `--no-h2c-prior-knowledge` and applies to connections
+accepted after the patch. `sozu listener http add --h2c-prior-knowledge` sets
+it on a new listener. Each connection served as HTTP/2 this way increments
+`http.h2c.prior_knowledge`.
+
 #### Options specific to HTTPS listeners
 
 > **Crypto provider**: The cryptographic backend used by Rustls is a
@@ -1760,9 +1810,11 @@ servers).
 
 > **Important:** `http2` is a **backend-capability hint** — it tells Sōzu
 > whether the backend speaks H2, nothing more. It does **not** gate H2
-> acceptance at the frontend. Frontend H2 is negotiated entirely via TLS ALPN
-> (the `alpn_protocols` listener option) and is independent of per-cluster
-> configuration. A cluster with `http2 = false` (or omitted) can still receive
+> acceptance at the frontend. Frontend H2 is negotiated via TLS ALPN (the
+> `alpn_protocols` listener option) on HTTPS listeners, and by prior knowledge
+> on an HTTP listener with `h2c_prior_knowledge = true` (see "HTTP/2 over
+> cleartext (h2c) by prior knowledge"); either way it is independent of
+> per-cluster configuration. A cluster with `http2 = false` (or omitted) can still receive
 > H2 requests from clients; Sōzu will translate them to H1 before forwarding to
 > the backend. See `FileClusterConfig::http2` (`command/src/config.rs`) for
 > the field definition.
@@ -1900,8 +1952,10 @@ This is also the default — no action is needed unless an operator explicitly
 lowers `buffer_size`. **As of
 [PR #1209](https://github.com/sozu-proxy/sozu/pull/1209) Sōzu rejects start-up
 if `buffer_size < 16393` and any HTTPS listener advertises `h2` in its ALPN
-list**, with a `BufferSizeTooSmallForH2` error pointing at the conflicting
-listeners. The previous behaviour (silently accept the typo, then deadlock H2
+list**, or any HTTP listener sets `h2c_prior_knowledge = true` (#1911), with a
+`BufferSizeTooSmallForH2` error pointing at the conflicting listeners. Like the
+ALPN list, a `listener update` that turns `h2c_prior_knowledge` on at runtime
+is not checked against `buffer_size`. The previous behaviour (silently accept the typo, then deadlock H2
 mux on full-size frames) is gone.
 
 To run with a smaller buffer, remove `h2` from the listeners' `alpn_protocols`:
@@ -3600,6 +3654,12 @@ immediately after the patch is acknowledged.
 | `h2_stream_idle_timeout_seconds`          | `u32`           | per-connection setup | `max(30, back_timeout)` | Per-stream idle timeout (slow-multiplex Slowloris defence). When unset, inherits `back_timeout` floored at 30 s; set explicitly to cap below `back_timeout`. |
 | `h2_graceful_shutdown_deadline_seconds`   | `u32`           | per-connection setup | `5`                     | Forced-close deadline after `GOAWAY(NO_ERROR)` on soft-stop. `0` = wait forever.                                                                             |
 
+#### HTTP-only fields
+
+| Field                 | Type   | Mutability class  | Default | Notes                                                                                                                                                  |
+| --------------------- | ------ | ----------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `h2c_prior_knowledge` | `bool` | session-at-accept | `false` | Serve cleartext HTTP/2 to connections that open with the HTTP/2 preface (see "HTTP/2 over cleartext (h2c) by prior knowledge"); `false` answers it 400. |
+
 #### HTTPS-only fields
 
 | Field                | Type       | Mutability class | Default             | Notes                                                                                                                                     |
@@ -4471,6 +4531,7 @@ every request that reports both.
 | ------------------------------------- | ------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `http.alpn.h2`                        | counter | proxy | TLS connections where client negotiated HTTP/2 via ALPN                                                                                                                                                                  |
 | `http.alpn.http11`                    | counter | proxy | TLS connections where client negotiated HTTP/1.1 via ALPN (or no ALPN)                                                                                                                                                   |
+| `http.h2c.prior_knowledge`            | counter | proxy | Cleartext connections an HTTP listener with `h2c_prior_knowledge = true` served as HTTP/2 because they opened with the connection preface — the cleartext counterpart of `http.alpn.h2`                                 |
 | `https.alpn.rejected.http11_disabled` | counter | proxy | TLS connection refused on an H2-only listener because the peer offered `http/1.1` or no ALPN value                                                                                                                       |
 | `https.alpn.rejected.unsupported`     | counter | proxy | TLS connection refused because the peer negotiated an ALPN protocol Sōzu does not recognise (anything other than `h2`, `http/1.1`, or absent ALPN). Add to the same SOC bucket as `https.alpn.rejected.http11_disabled`. |
 
@@ -4832,6 +4893,7 @@ Incremented when a session fails to transition between protocol phases:
 | Metric                           | Type    | Scope | Description                                                |
 | -------------------------------- | ------- | ----- | ---------------------------------------------------------- |
 | `http.upgrade.expect.failed`     | counter | proxy | HTTP: PROXY protocol expect → mux transition failed        |
+| `http.upgrade.h2c.failed`        | counter | proxy | HTTP: h2c preface sniff → mux transition failed (stream or H2 buffer allocation) |
 | `http.upgrade.mux.failed`        | counter | proxy | HTTP: mux protocol upgrade failed                          |
 | `http.upgrade.ws.failed`         | counter | proxy | HTTP: WebSocket upgrade failed                             |
 | `https.upgrade.expect.failed`    | counter | proxy | HTTPS: PROXY protocol expect → handshake transition failed |

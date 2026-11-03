@@ -1024,10 +1024,16 @@ impl CommandManager {
                 request_timeout,
                 connect_timeout,
                 forwarded_headers,
+                h2c_prior_knowledge,
             } => {
                 let mut builder = ListenerBuilder::new_http(address.into());
                 if let Some(mode) = forwarded_headers {
                     builder.with_forwarded_headers(mode.into());
+                }
+                // Only an explicit flag reaches the wire: an unset key stays
+                // absent, exactly as before the knob existed.
+                if h2c_prior_knowledge {
+                    builder.with_h2c_prior_knowledge(true);
                 }
                 let http_listener = builder
                     .with_interface(interface)
@@ -1064,6 +1070,8 @@ impl CommandManager {
                 request_timeout,
                 expect_proxy,
                 no_expect_proxy,
+                h2c_prior_knowledge,
+                no_h2c_prior_knowledge,
                 h2_max_rst_stream_per_window,
                 h2_max_ping_per_window,
                 h2_max_settings_per_window,
@@ -1106,6 +1114,8 @@ impl CommandManager {
                 request_timeout,
                 expect_proxy,
                 no_expect_proxy,
+                h2c_prior_knowledge,
+                no_h2c_prior_knowledge,
                 h2_max_rst_stream_per_window,
                 h2_max_ping_per_window,
                 h2_max_settings_per_window,
@@ -1272,6 +1282,8 @@ impl CommandManager {
         request_timeout: Option<u32>,
         expect_proxy_flag: bool,
         no_expect_proxy_flag: bool,
+        h2c_prior_knowledge_flag: bool,
+        no_h2c_prior_knowledge_flag: bool,
         h2_max_rst_stream_per_window: Option<u32>,
         h2_max_ping_per_window: Option<u32>,
         h2_max_settings_per_window: Option<u32>,
@@ -1308,6 +1320,14 @@ impl CommandManager {
         let expect_proxy = if expect_proxy_flag {
             Some(true)
         } else if no_expect_proxy_flag {
+            Some(false)
+        } else {
+            None
+        };
+
+        let h2c_prior_knowledge = if h2c_prior_knowledge_flag {
+            Some(true)
+        } else if no_h2c_prior_knowledge_flag {
             Some(false)
         } else {
             None
@@ -1350,6 +1370,7 @@ impl CommandManager {
             sozu_id_header,
             forwarded_headers: forwarded_headers
                 .map(|mode| ForwardedHeaders::from(ForwardedHeadersMode::from(mode)) as i32),
+            h2c_prior_knowledge,
             ..Default::default()
         };
         self.send_request(RequestType::UpdateHttpListener(patch).into())

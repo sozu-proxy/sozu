@@ -316,9 +316,11 @@ Structured prefixes via per-protocol `log_context!` / `log_module_context!` /
   PROXY-protocol frontend it is the source the PROXY header advertised, so it
   names the client and agrees with the `HTTP`/`HTTPS` line for the same
   request id rather than naming the load balancer. (A `MUX-H2` frontend line
-  only ever exists on a TLS frontend: `Connection::new_h2_server` is called
-  once, from the ALPN branch of `https.rs`, and h2c is unimplemented on the
-  cleartext listener. A `MUX-H1` frontend line exists on both listeners.)
+  exists on a TLS frontend, where `Connection::new_h2_server` is called from
+  the ALPN branch of `HttpsSession::upgrade_handshake` (`lib/src/https.rs`),
+  and on a cleartext listener only with `h2c_prior_knowledge`, from
+  `HttpSession::upgrade_sniff` (`lib/src/http.rs`). A `MUX-H1` frontend line
+  exists on both listeners.)
   Third — and with no `MUX-H2` counterpart, because only `ConnectionH1` is
   built by both `Connection::new_h1_server` and `Connection::new_h1_client` —
   a backend `MUX-H1` line names the cluster-configured backend address. The

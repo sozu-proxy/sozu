@@ -41,7 +41,8 @@ removed. Three constraints came with it:
 - `curl` as the client, `N = 20` requests: one per connection, all on one
   keep-alive connection, or 20 H2 streams multiplexed on one connection. H2 runs
   over an HTTPS listener with `command/assets/{certificate,key}.pem`, since the
-  cleartext listener does not serve h2c.
+  cleartext listener did not serve h2c when these were measured (the opt-in
+  `h2c_prior_knowledge` came later, sozu-proxy/sozu#1911).
 - Only the worker is traced — the main process serves no traffic — and only
   the window between the first `accept4` and the last `close` of the load.
 
