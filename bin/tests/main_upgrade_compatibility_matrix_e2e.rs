@@ -8,13 +8,13 @@
 //!
 //! The 2.2.1 -> current case exercises the supported bridge with the current
 //! CLI, all three plaintext protocols, saved routing state, and a draining
-//! legacy worker. The published 2.3.2 -> current case uses the same traffic
+//! legacy worker. The published 2.3.3 -> current case uses the same traffic
 //! and saved-state checks with two workers, plus exact per-process inventories.
 //!
 //! This is a Linux-only, ignored process test. Run it with:
 //!
 //! ```bash
-//! SOZU_MATRIX_PREVIOUS=/path/to/verified-sozu-2.3.2 \
+//! SOZU_MATRIX_PREVIOUS=/path/to/verified-sozu-2.3.3 \
 //! SOZU_MATRIX_LEGACY=/path/to/legacy SOZU_MATRIX_OPTION3=/path/to/option3 \
 //! cargo test -p sozu --test main_upgrade_compatibility_matrix_e2e --locked \
 //!   -- --ignored --exact --nocapture --test-threads=1
@@ -972,15 +972,15 @@ fn legacy_2_2_1_upgrades_to_current_and_drains_its_worker() {
 }
 
 #[test]
-#[ignore = "process-level release gate; requires verified SOZU_MATRIX_PREVIOUS 2.3.2 binary"]
-fn published_2_3_2_upgrades_to_current_and_drains_all_workers() {
+#[ignore = "process-level release gate; requires verified SOZU_MATRIX_PREVIOUS 2.3.3 binary"]
+fn published_2_3_3_upgrades_to_current_and_drains_all_workers() {
     let previous = std::env::var_os("SOZU_MATRIX_PREVIOUS")
         .map(PathBuf::from)
-        .expect("set SOZU_MATRIX_PREVIOUS to the verified published 2.3.2 binary");
+        .expect("set SOZU_MATRIX_PREVIOUS to the verified published 2.3.3 binary");
     run_published_upgrade(
         previous,
         PathBuf::from(env!("CARGO_BIN_EXE_sozu")),
-        "sozu 2.3.2 (c4b00f9 HEAD)",
+        "sozu 2.3.3 (6c983b6 HEAD)",
         2,
         false,
     );

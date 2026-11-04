@@ -577,30 +577,30 @@ jobs:
 
       # Keep the historical 2.3.1 boundaries above and add the immediately
       # preceding stable release to the full two-worker upgrade gate.
-      - name: Fetch verified Sōzu 2.3.2 compatibility binary
+      - name: Fetch verified Sōzu 2.3.3 compatibility binary
         if: matrix.cell == 'crypto-ring'
         shell: bash
         run: |
           set -euo pipefail
-          archive="$RUNNER_TEMP/sozu-2.3.2-x86_64-unknown-linux-gnu-crypto-ring.tar.gz"
-          extracted="$RUNNER_TEMP/sozu-compat-2.3.2"
+          archive="$RUNNER_TEMP/sozu-2.3.3-x86_64-unknown-linux-gnu-crypto-ring.tar.gz"
+          extracted="$RUNNER_TEMP/sozu-compat-2.3.3"
           curl --fail --location --retry 3 --retry-all-errors \
             --connect-timeout 10 --max-time 120 \
             --output "$archive" \
-            https://github.com/sozu-proxy/sozu/releases/download/2.3.2/sozu-2.3.2-x86_64-unknown-linux-gnu-crypto-ring.tar.gz
+            https://github.com/sozu-proxy/sozu/releases/download/2.3.3/sozu-2.3.3-x86_64-unknown-linux-gnu-crypto-ring.tar.gz
           printf '%s  %s\n' \
-            687e8568d91b572930576b5a0997f96329c450034d33eab107ffe5a3172b0c2f \
+            9ca17e97d8e898ac5fd51315a170fb6507ac0ba4cc6773b61f38d136d99c0971 \
             "$archive" | sha256sum --check --strict -
           mkdir -p "$extracted"
           tar --extract --gzip --file "$archive" --directory "$extracted"
-          previous="$extracted/sozu-2.3.2-x86_64-unknown-linux-gnu-crypto-ring/sozu"
+          previous="$extracted/sozu-2.3.3-x86_64-unknown-linux-gnu-crypto-ring/sozu"
           printf '%s  %s\n' \
-            d8433e1c6147a47cff7e6f0cba083e8ca243ffeaf3f592e0de35bc4016a596c0 \
+            5fe3b59dfae919ead1b62c3250dcb2c5ddc7aaa799c1e639d0fcef66f7a8acdb \
             "$previous" | sha256sum --check --strict -
-          version_file="$extracted/sozu-2.3.2.version"
+          version_file="$extracted/sozu-2.3.3.version"
           "$previous" --version > "$version_file"
           IFS= read -r version < "$version_file"
-          test "$version" = 'sozu 2.3.2 (c4b00f9 HEAD)'
+          test "$version" = 'sozu 2.3.3 (6c983b6 HEAD)'
           echo "SOZU_MATRIX_PREVIOUS=$previous" >> "$GITHUB_ENV"
 
       - name: Cache cargo target
@@ -628,9 +628,9 @@ jobs:
             printf '%s=%s\n' "${target^^}_EXE" "${executables[0]}" >> "$GITHUB_ENV"
           done
 
-      - name: Test published Sōzu 2.3.2 full upgrade with two workers
+      - name: Test published Sōzu 2.3.3 full upgrade with two workers
         if: matrix.cell == 'crypto-ring'
-        run: sudo --preserve-env=SOZU_MATRIX_PREVIOUS setpriv --reuid "$SOZU_PROC_OBSERVER_OWNER_UID" --regid "$SOZU_PROC_OBSERVER_OWNER_GID" --clear-groups --inh-caps +sys_admin --ambient-caps +sys_admin unshare --user --map-root-user -- "$MAIN_UPGRADE_COMPATIBILITY_MATRIX_E2E_EXE" published_2_3_2_upgrades_to_current_and_drains_all_workers --ignored --exact --nocapture --test-threads=1
+        run: sudo --preserve-env=SOZU_MATRIX_PREVIOUS setpriv --reuid "$SOZU_PROC_OBSERVER_OWNER_UID" --regid "$SOZU_PROC_OBSERVER_OWNER_GID" --clear-groups --inh-caps +sys_admin --ambient-caps +sys_admin unshare --user --map-root-user -- "$MAIN_UPGRADE_COMPATIBILITY_MATRIX_E2E_EXE" published_2_3_3_upgrades_to_current_and_drains_all_workers --ignored --exact --nocapture --test-threads=1
 
       - name: Test sozu (descriptor inheritance across upgrades)
         run: sudo setpriv --reuid "$SOZU_PROC_OBSERVER_OWNER_UID" --regid "$SOZU_PROC_OBSERVER_OWNER_GID" --clear-groups --inh-caps +sys_admin --ambient-caps +sys_admin unshare --user --map-root-user -- "$UPGRADE_FD_INHERITANCE_E2E_EXE" --ignored --exact upgrades_leave_no_descriptor_shared_between_sozu_processes --nocapture --test-threads=1
