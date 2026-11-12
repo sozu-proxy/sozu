@@ -12962,10 +12962,18 @@ pub(super) mod tests {
     /// TO SEE THIS RED: in `ConnectionH2::handle_write`, replace
     /// `self.output.adopt_tail(kawa, tail);` by `let _ = (kawa, tail);`, so
     /// the rest of the cut frame stays with its stream. Every test on this
-    /// fixture then fails: this one and the other #1601 tests on
-    /// `frame_tail`'s `a frame runs past the gathered bytes` debug assertion
-    /// (the stream's `kawa.out` no longer starts on a frame boundary), the
-    /// three #1604 tests below on their wire assertion. Verified 2026-09-27.
+    /// fixture then fails on the `an H2 stream queues whole frames only`
+    /// debug assertion of `h2_transmit::queued_data_payload`
+    /// (`lib/src/protocol/mux/h2_transmit.rs`, #1646): the stream's
+    /// `kawa.out` no longer tiles into whole frames. That is the
+    /// first assertion to fire, so no test reaches `frame_tail`'s `a frame
+    /// runs past the gathered bytes` or its own wire assertion. With debug
+    /// assertions off (`CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=false cargo
+    /// test`) the same mutation reaches the wire assertions instead, this
+    /// test failing on `left: Err("frame type 0x64 announces 6579300 bytes, 8
+    /// remain")`, and
+    /// `a_deferred_ack_does_not_strand_reads_when_its_parked_stream_is_removed`
+    /// then passes. Verified 2026-11-12.
     /// Before #1604 the equivalent mutation was in `queue_zero_output` and
     /// failed with `left: Err("frame type 0x64 announces 6579300 bytes, 8
     /// remain")` (verified 2026-09-26).
@@ -13088,7 +13096,9 @@ pub(super) mod tests {
     ///
     /// TO SEE THIS RED: the `adopt_tail` mutation described on
     /// `a_ping_during_a_half_written_frame_is_acknowledged_after_it` fails it
-    /// on `a frame runs past the gathered bytes`. Verified 2026-09-27. Before
+    /// on `an H2 stream queues whole frames only`, and, with debug assertions
+    /// off, on `left: Err("frame type 0x64 announces 6579300 bytes, 25
+    /// remain")`. Verified 2026-11-12. Before
     /// #1604, deleting the `zero_holds_output()` block of `poll_read_target`
     /// failed it on `no output may be pending in zero when a frame header is
     /// read` (verified 2026-09-27).
@@ -13185,7 +13195,10 @@ pub(super) mod tests {
     /// 28 remain")`: the peer reads the next frame's bytes as the rest of the
     /// truncated one. On this tree, the `adopt_tail` mutation described on
     /// `a_ping_during_a_half_written_frame_is_acknowledged_after_it` fails
-    /// all three with the same messages. Verified 2026-09-27.
+    /// all three on `an H2 stream queues whole frames only` first (#1646),
+    /// and with debug assertions off
+    /// (`CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=false cargo test`) with the same
+    /// three messages. Verified 2026-11-12.
     #[test]
     fn a_removed_half_written_stream_still_completes_its_frame() {
         let connection =

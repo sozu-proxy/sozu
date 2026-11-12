@@ -3401,9 +3401,14 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
       only ever owns frames the wire has not started, and removing it (peer
       RST, `end_stream`, expiry, `prune_inactive_streams_while_closing`, any
       `remove_dead_stream` caller) drops whole unsent frames, never the
-      second half of one the peer is already parsing. `frame_tail`'s debug
-      assertion (`a frame runs past the gathered bytes`) is where a
-      violation surfaces first.
+      second half of one the peer is already parsing. A violation surfaces
+      first in `h2_transmit::queued_data_payload`'s debug assertion (`an H2
+      stream queues whole frames only`, `h2_transmit.rs`); `frame_tail_walk`,
+      which `frame_tail` wraps, asserts `a frame runs past the gathered
+      bytes` for a frame that outruns what was gathered. With debug
+      assertions off, the wire assertions of the half-written-frame tests are
+      what catch it — see the `TO SEE THIS RED` recipe of
+      `a_ping_during_a_half_written_frame_is_acknowledged_after_it` (`h2.rs`).
     - **A header block encoded and dropped unsent resets the HPACK encoder's
       table before the next block is encoded (sozu-proxy/sozu#1627).** The
       framing guarantee above does not cover HPACK: an unsent
