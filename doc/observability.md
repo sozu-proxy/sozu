@@ -637,12 +637,14 @@ front buffer, borrowed, so this adds no allocation either:
 `Version::V20` request line and marks the front in error, and
 `rejected_request_line` reads them back.
 
-The line is still emitted when the session closes, with message
-`session close` at `ERROR` level, not when the stream is reset:
-`ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs`) only logs a stream
-that reached routing, and a refused one never did. Its timings therefore run to
-the end of the connection. A refusal that closes the whole connection with
-`GOAWAY` (an HPACK decoding error) logs no line at all.
+The line is emitted when the stream is reset, with message `H2::Reset` at
+`ERROR` level: `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs`) logs
+every stream it resets whose request no line has logged yet, routed or not,
+before it recycles the stream's slot. Its timings therefore end at the reset.
+It used to be emitted when the session closed, with message `session close`,
+because the reset logged only a stream that had reached routing. A refusal that
+closes the whole connection with `GOAWAY` (an HPACK decoding error) logs no
+line at all.
 
 ### When the RTT cells are sampled
 

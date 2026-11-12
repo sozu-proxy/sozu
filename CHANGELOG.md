@@ -12,6 +12,12 @@
 
 <!-- changelog-slot:backend-ownership -->
 
+<!-- changelog-slot:h2-reset-slot-recycle -->
+
+### Security
+
+- A frontend HTTP/2 stream that Sōzu resets now gives its stream slot back at once. A stream error the client provokes (a malformed request such as a `:path` carrying a fragment, a body that does not match its `content-length`, a zero-increment or overflowing `WINDOW_UPDATE`, a stream made to depend on itself, `DATA` or `HEADERS` on a half-closed stream) is answered with `RST_STREAM`. The stream left the connection's stream table but kept its slot and its two pool buffers until the connection closed. With the default `max_buffers = 1000`, about 499 such resets on one connection emptied the worker's buffer pool. From then on the worker refused new streams with `REFUSED_STREAM` for want of buffers, on that connection and on a new connection alike, until the connection closed. The reset now logs the request and recycles its slot, whatever state the stream was in. Access-log timing changes with it: each provoked reset of a request not yet logged now writes its access-log line when the reset happens, so a request rejected at its `HEADERS` (a malformed `:path`), or reset after a default answer, is logged `H2::Reset` at once, where it used to be logged `session close` when its connection closed. A request reset while waiting for or linked to a backend was already logged `H2::Reset`, and still is, once. Debug builds now assert after every frame and every read and write pass that no frontend slot is left out of the stream table without being recycled.
+
 ## 2.3.4 - 2026-11-04
 
 ### Added

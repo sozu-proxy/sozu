@@ -995,11 +995,12 @@ struct RejectedRequestLine<'a> {
 /// very field that was missing. The authority is `:authority`, and only
 /// when it was validated — `record_rejected_request`'s caller empties it
 /// when it was refused, repeated, or disputed by a `host` field — never a
-/// `host` field. Borrowing is sound for the same reason as in H1: the
-/// stream is out of the connection's stream table once reset, so nothing
-/// writes its front again, and a slot is reused only through
-/// `Context::create_stream` (`lib/src/protocol/mux/mod.rs`), which clears
-/// `front` and `front.storage` together.
+/// `host` field. Borrowing is sound: the reset that refuses such a request
+/// logs it on the spot (`ConnectionH2::tear_down_reset_stream`,
+/// `lib/src/protocol/mux/h2.rs`), before it recycles the slot, and a slot is
+/// reused only through `Context::create_stream`
+/// (`lib/src/protocol/mux/mod.rs`), which clears `front` and `front.storage`
+/// together.
 fn rejected_request_line(front: &GenericHttpStream) -> Option<RejectedRequestLine<'_>> {
     if !front.is_error() {
         return None;
@@ -1629,9 +1630,9 @@ mod tests {
     /// `pkawa::handle_header` (`lib/src/protocol/mux/pkawa.rs`) on a real
     /// `Stream`'s front, with the stream's own `HttpContext` as the
     /// callbacks, exactly as `ConnectionH2` does for an initial HEADERS; then
-    /// emit the access log the way the session-close sweep in
-    /// `Mux::close` (`lib/src/protocol/mux/mod.rs`) does for the reset
-    /// stream. Returns every log line the run produced.
+    /// emit the access log the way `ConnectionH2::tear_down_reset_stream`
+    /// (`lib/src/protocol/mux/h2.rs`) does for the stream it resets.
+    /// Returns every log line the run produced.
     fn access_log_of_a_rejected_h2_request(
         headers: &'static [(&'static [u8], &'static [u8])],
     ) -> String {
@@ -1668,7 +1669,7 @@ mod tests {
             );
             let _ = stream.generate_access_log(
                 true,
-                Some("session close"),
+                Some("H2::Reset"),
                 Rc::new(RefCell::new(TestListener::new())),
                 None,
                 None,
@@ -1686,7 +1687,7 @@ mod tests {
 
     fn assert_h2_line(output: &str, expected: &str, why: &str) {
         assert!(
-            output.contains(&format!(" {expected} - | session close")),
+            output.contains(&format!(" {expected} - | H2::Reset")),
             "{why}: expected `{expected}`, got: {output}"
         );
     }

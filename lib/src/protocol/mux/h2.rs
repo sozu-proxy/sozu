@@ -5063,7 +5063,11 @@ impl ConnectionH2 {
         match self.position {
             Position::Client(..) => None,
             Position::Server => {
-                // Already logged by a reset path; retire the stream after its RST is flushed.
+                // Already logged — by `silent_close_answer`
+                // (`lib/src/protocol/mux/answers.rs`), the one path that logs
+                // a frontend stream and leaves it in the stream table;
+                // `Self::reset_stream` recycles its slot itself. Retire the
+                // stream once its RST is flushed.
                 if stream.metrics.start.is_none() {
                     let state = std::mem::replace(&mut stream.state, StreamState::Recycle);
                     return match state {
@@ -6467,11 +6471,15 @@ impl ConnectionH2 {
     /// 5. **Drain/state coupling**: a terminal `GoAway`/`Error` state implies the
     ///    connection is draining (`goaway()` sets both); the converse need not
     ///    hold (graceful drain stays in a live state).
+    /// 6. **Slot ownership** (frontend only): see [`Self::check_slot_ownership`].
     #[cfg(debug_assertions)]
     fn check_invariants<L>(&self, context: &Context<L>)
     where
         L: ListenerHandler + L7ListenerHandler,
     {
+        // (6) No frontend slot is orphaned.
+        self.check_slot_ownership(context);
+
         // (1) Watermark parity and bound.
         debug_assert!(
             self.last_stream_id & 1 == 0,
@@ -6507,6 +6515,60 @@ impl ConnectionH2 {
             !matches!(self.state, H2State::GoAway | H2State::Error) || self.drain.draining(),
             "GoAway/Error state must imply the connection is draining"
         );
+    }
+
+    /// Slot ownership on a frontend connection (`Position::Server`): every
+    /// slot of `context.streams` that is not `StreamState::Recycle` is named
+    /// by this connection's stream table.
+    ///
+    /// An H2 frontend owns every slot of its session: `Context::create_stream`
+    /// (`lib/src/protocol/mux/mod.rs`) is reached only through
+    /// [`Self::create_stream`], which registers the wire id before it returns
+    /// (an H1 frontend's slot never meets an H2 frontend: `lib/src/http.rs` and
+    /// `lib/src/https.rs` create it only for an H1 one). Every path that
+    /// recycles a slot while the connection lives reaches it through the
+    /// stream table, so a slot that leaves the table un-recycled is never
+    /// reused and pins its two pool buffers until the session closes — the
+    /// leak [`Self::reset_stream`] had. The converse needs no exemption here:
+    /// a `Recycle` slot may still be named by the table for the rest of a
+    /// write pass (`completed_streams`), or after `Mux::close` and the error
+    /// linger recycled it (§4.3 invariant 2 in `LIFECYCLE.md`).
+    ///
+    /// Run by [`Self::check_invariants`] after every frame, and by the shell
+    /// at the end of each read and write pass, which also covers the exits
+    /// that do not go through [`Self::handle_frame`] (`Self::handle_header_state`,
+    /// `Self::handle_continuation_header_state`). A backend connection
+    /// (`Position::Client`) owns no slot and is not checked.
+    #[cfg(debug_assertions)]
+    fn check_slot_ownership<L>(&self, context: &Context<L>)
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        if !self.position.is_server() {
+            return;
+        }
+        let mut on_table = vec![false; context.streams.len()];
+        for &gid in self.stream_table.streams().values() {
+            // Pair: the table names only slots that exist (invariant 2).
+            debug_assert!(
+                gid < on_table.len(),
+                "stream table names slot {gid} past the {} slots of the session",
+                on_table.len()
+            );
+            if let Some(named) = on_table.get_mut(gid) {
+                // Pair: no slot is named by two wire ids.
+                debug_assert!(!*named, "frontend slot {gid} is named by two wire ids");
+                *named = true;
+            }
+        }
+        for (gid, stream) in context.streams.iter().enumerate() {
+            debug_assert!(
+                stream.state == StreamState::Recycle || on_table[gid],
+                "frontend slot {gid} is {:?} but no wire id names it: an orphaned slot is \
+                 never reused and pins its two buffers until the session closes",
+                stream.state
+            );
+        }
     }
 
     fn handle_frame<E, L>(
@@ -8173,8 +8235,8 @@ impl ConnectionH2 {
         }
     }
 
-    /// Reset a stream: tear down kawa state, emit `RST_STREAM` on the wire,
-    /// and record MadeYouReset accounting.
+    /// Reset a stream: tear it down (`Self::tear_down_reset_stream`), emit
+    /// `RST_STREAM` on the wire, and record MadeYouReset accounting.
     ///
     /// `wire_stream_id` is the on-wire `StreamId`; `stream_id` is the internal
     /// `GlobalStreamId` slot. Callers already carry both so we pass them
@@ -8182,18 +8244,73 @@ impl ConnectionH2 {
     /// into `Self::enqueue_rst` which queues the frame for serialisation in
     /// `Self::flush_pending_control_frames` on the next writable tick —
     /// independent of whether the caller immediately evicts the slot via
-    /// `remove_dead_stream` (which they usually do). This is what guarantees
+    /// `remove_dead_stream` (which every caller does). This is what guarantees
     /// the RST reaches the peer for malformed HEADERS / flow-control /
     /// content-length violations flagged by h2spec 2.0.
+    ///
+    /// On `Position::Server` the slot leaves this function
+    /// `StreamState::Recycle`, its request logged: the caller drops the wire
+    /// id next, and every other path that recycles a frontend slot while the
+    /// connection lives reaches it through the stream table. A slot left
+    /// `Unlinked` here kept its two pool buffers until the session closed.
     pub fn reset_stream<E, L>(
         &mut self,
         wire_stream_id: StreamId,
         stream_id: GlobalStreamId,
         context: &mut Context<L>,
-        mut endpoint: E,
+        endpoint: E,
         error: H2Error,
     ) -> MuxResult
     where
+        E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        self.tear_down_reset_stream(stream_id, context, endpoint, error);
+        // Queue the RST for wire emission. Independent of the owning stream
+        // remaining in `self.streams` — callers typically follow this with
+        // `remove_dead_stream`, which would otherwise evict the slot before
+        // `write_streams` could run `kawa.prepare` against the converter.
+        //
+        // `enqueue_rst` performs every accounting side-effect at queue
+        // time (per-error counter, global tx counter, CVE-2025-8671
+        // MadeYouReset cap). Every caller of `reset_stream` answers a frame
+        // the peer sent (Content-Length mismatch, header parse error,
+        // PRIORITY self-dependency, zero-increment or overflowing
+        // WINDOW_UPDATE), so the reset is `RstOrigin::PeerProvoked`; a
+        // `NoError` reset is still exempt inside the accounting helper.
+        if let Some(result) = self.enqueue_rst(wire_stream_id, error, RstOrigin::PeerProvoked) {
+            return result;
+        }
+        MuxResult::Continue
+    }
+
+    /// Everything [`Self::reset_stream`] does to the stream, short of queueing
+    /// its `RST_STREAM`: unlink it, end the request in error with `error`, end
+    /// the backend stream it was linked to, and, on `Position::Server`, log
+    /// its request and recycle the slot. The caller drops the wire id
+    /// ([`Self::remove_dead_stream`]) right after, and tells the peer itself.
+    ///
+    /// On `Position::Server` the slot ends `StreamState::Recycle` whatever its
+    /// state was — `Idle`, `Link`, `Linked` or `Unlinked` — as
+    /// [`Self::handle_rst_stream_frame`] and [`Self::cancel_timed_out_streams`]
+    /// leave it. `Context::create_stream` (`lib/src/protocol/mux/mod.rs`)
+    /// reuses a `Recycle` slot as one whose request was logged and un-counted,
+    /// so the request is logged here whenever it was not yet:
+    /// `SessionMetrics::start` is `Some` until a log resets it, and a counted
+    /// request (`Stream::request_counted`) always has one. A request a
+    /// [`silent_close_answer`](super::answers::silent_close_answer) already
+    /// logged is not logged twice.
+    ///
+    /// On `Position::Client` the slot belongs to the frontend stream, which
+    /// still owes its client an answer: it stays `Unlinked` (or whatever the
+    /// frontend's `end_stream` makes of it), and the frontend logs it.
+    fn tear_down_reset_stream<E, L>(
+        &mut self,
+        stream_id: GlobalStreamId,
+        context: &mut Context<L>,
+        mut endpoint: E,
+        error: H2Error,
+    ) where
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
@@ -8214,43 +8331,66 @@ impl ConnectionH2 {
         } else {
             None
         };
+        // Pre: the reverse index no longer names the stream, so neither the
+        // backend's `end_stream` below nor a later dead-backend sweep can
+        // reach the slot through it once it is recycled. Only a `Linked`
+        // slot has a backend stream to end here. A slot in any other state
+        // reaches the recycle below with no backend call, as it does in
+        // `ConnectionH2::handle_rst_stream_frame`,
+        // `ConnectionH2::cancel_timed_out_streams` and
+        // `ConnectionH2::try_recycle_server_stream`, which recycle a
+        // frontend slot whatever its state.
+        debug_assert!(
+            linked_token.is_none_or(|token| context
+                .backend_streams
+                .get(&token)
+                .is_none_or(|ids| !ids.contains(&stream_id))),
+            "a reset stream must be out of the backend reverse index"
+        );
         let (client_rtt, server_rtt) = self.snapshot_rtts(&endpoint, linked_token);
         if let Some(token) = linked_token {
             endpoint.end_stream(token, stream_id, context);
         }
-        // Emit access log for server-side resets on streams that had active requests
-        if self.position.is_server()
-            && matches!(old_state, StreamState::Link | StreamState::Linked(_))
-        {
+        if self.position.is_server() {
             let stream = &mut context.streams[stream_id];
-            self.distribute_overhead(&mut stream.metrics, reset_byte_totals);
-            stream.metrics.backend_stop();
-            let events = stream.generate_access_log(
-                true,
-                Some("H2::Reset"),
-                context.listener.clone(),
-                client_rtt,
-                server_rtt,
+            // Logged once: a request a previous log already reset reads
+            // `start == None`, and is not logged again.
+            if stream.metrics.start.is_some() {
+                self.distribute_overhead(&mut stream.metrics, reset_byte_totals);
+                stream.metrics.backend_stop();
+                let events = stream.generate_access_log(
+                    true,
+                    Some("H2::Reset"),
+                    context.listener.clone(),
+                    client_rtt,
+                    server_rtt,
+                );
+                self.metric_events.extend(events.into_iter().flatten());
+                stream.metrics.reset();
+            }
+            // Recycled after the backend's `end_stream`, which writes
+            // `Unlinked` over any state but `Recycle`: the slot leaves here
+            // reusable however it was linked.
+            stream.state = StreamState::Recycle;
+            // Post: what `Context::create_stream` assumes of a `Recycle`
+            // slot — logged (`SessionMetrics::start` reset by the log) and
+            // un-counted, the half the `Recycle` arm of
+            // `Stream::check_invariants` checks.
+            debug_assert!(
+                stream.state == StreamState::Recycle
+                    && !stream.request_counted
+                    && stream.metrics.start.is_none(),
+                "a frontend stream reset leaves its slot Recycle, its request logged and \
+                 un-counted"
             );
-            self.metric_events.extend(events.into_iter().flatten());
-            stream.metrics.reset();
+        } else {
+            // Post: a backend reset never recycles the frontend's slot.
+            debug_assert!(
+                old_state == StreamState::Recycle
+                    || context.streams[stream_id].state != StreamState::Recycle,
+                "a backend stream reset must leave the frontend-owned slot to the frontend"
+            );
         }
-        // Queue the RST for wire emission. Independent of the owning stream
-        // remaining in `self.streams` — callers typically follow this with
-        // `remove_dead_stream`, which would otherwise evict the slot before
-        // `write_streams` could run `kawa.prepare` against the converter.
-        //
-        // `enqueue_rst` performs every accounting side-effect at queue
-        // time (per-error counter, global tx counter, CVE-2025-8671
-        // MadeYouReset cap). Every caller of `reset_stream` answers a frame
-        // the peer sent (Content-Length mismatch, header parse error,
-        // PRIORITY self-dependency, zero-increment or overflowing
-        // WINDOW_UPDATE), so the reset is `RstOrigin::PeerProvoked`; a
-        // `NoError` reset is still exempt inside the accounting helper.
-        if let Some(result) = self.enqueue_rst(wire_stream_id, error, RstOrigin::PeerProvoked) {
-            return result;
-        }
-        MuxResult::Continue
     }
 
     pub fn end_stream<L>(&mut self, stream_gid: GlobalStreamId, context: &mut Context<L>)
@@ -9455,6 +9595,9 @@ impl<Front: SocketHandler> H2Shell<Front> {
             return self.drain_linger(context.now);
         }
         let result = self.readable_inner(context, endpoint);
+        // Post: the pass orphaned no frontend slot, whichever exit it took.
+        #[cfg(debug_assertions)]
+        self.core.check_slot_ownership(context);
         self.settled(result)
     }
 
@@ -9637,6 +9780,9 @@ impl<Front: SocketHandler> H2Shell<Front> {
         // `GoAway` to `Error` (`ConnectionH2::force_disconnect`).
         let after_final_goaway = self.core.lingers_instead_of_closing();
         let result = self.writable_inner(context, endpoint);
+        // Post: the pass orphaned no frontend slot, whichever exit it took.
+        #[cfg(debug_assertions)]
+        self.core.check_slot_ownership(context);
         if self.write_failed {
             // The client is gone or its socket can never be flushed: close
             // at once, as an H1 frontend does (`ConnectionH1::writable`).
@@ -12907,7 +13053,11 @@ pub(super) mod tests {
     #[test]
     fn a_deferred_ack_does_not_strand_reads_when_its_parked_stream_is_removed() {
         let connection =
-            ack_after_half_written_frame(HALF_WRITTEN_PING, |connection, _, _, gid| {
+            ack_after_half_written_frame(HALF_WRITTEN_PING, |connection, context, _, gid| {
+                // Recycled before its wire id goes, as every frontend caller of
+                // `ConnectionH2::remove_dead_stream` leaves it
+                // (`ConnectionH2::tear_down_reset_stream`).
+                context.streams[gid].state = StreamState::Recycle;
                 connection
                     .core
                     .remove_dead_stream(REGISTERED_STREAM_ID, gid);
@@ -13072,7 +13222,11 @@ pub(super) mod tests {
     #[test]
     fn a_removed_half_written_stream_still_completes_its_frame() {
         let connection =
-            ack_after_half_written_frame(HALF_WRITTEN_PING, |connection, _, _, gid| {
+            ack_after_half_written_frame(HALF_WRITTEN_PING, |connection, context, _, gid| {
+                // Recycled before its wire id goes, as every frontend caller of
+                // `ConnectionH2::remove_dead_stream` leaves it
+                // (`ConnectionH2::tear_down_reset_stream`).
+                context.streams[gid].state = StreamState::Recycle;
                 connection
                     .core
                     .remove_dead_stream(REGISTERED_STREAM_ID, gid);
@@ -13103,6 +13257,10 @@ pub(super) mod tests {
         const NEXT_PAYLOAD: &[u8] = b"next";
         let connection =
             ack_after_half_written_frame(HALF_WRITTEN_PING, |connection, context, _, gid| {
+                // Recycled before its wire id goes, as every frontend caller of
+                // `ConnectionH2::remove_dead_stream` leaves it
+                // (`ConnectionH2::tear_down_reset_stream`).
+                context.streams[gid].state = StreamState::Recycle;
                 connection
                     .core
                     .remove_dead_stream(REGISTERED_STREAM_ID, gid);
@@ -16049,6 +16207,1022 @@ pub(super) mod tests {
         );
     }
 
+    // ── a peer-provoked reset must give its stream slot back ────────────
+    //
+    // Every caller of `ConnectionH2::reset_stream` follows it with
+    // `ConnectionH2::remove_dead_stream`, which drops the wire id from the
+    // stream table, and every other production site that turns a server slot
+    // into `StreamState::Recycle` while the connection lives reaches it
+    // through that table: the reset must recycle the slot itself
+    // (`ConnectionH2::tear_down_reset_stream`). It used to leave it
+    // `StreamState::Unlinked`, out of reach until the session closed. The
+    // tests below drive a server connection the way `Mux` does —
+    // `writable()` and `readable()`, raw frames in, every byte out — and
+    // check that the slot and its two pool buffers come back.
+    //
+    // TO SEE THEM RED: in `ConnectionH2::tear_down_reset_stream`, log only a
+    // stream reset while `Link` or `Linked` and drop the `Recycle`
+    // assignment: `ConnectionH2::check_slot_ownership` then fires on the
+    // first reset, `frontend slot 0 is Unlinked but no wire id names it`;
+    // with that assertion silenced too, `peer_provoked_reset_recycles_stream_slot`
+    // fails on `499 of 499 slots do, pinning 998 pool buffers`. Verified
+    // 2026-11-12.
+
+    /// A pool with a worker's default limits (`DEFAULT_MIN_BUFFERS`,
+    /// `DEFAULT_MAX_BUFFERS`, `DEFAULT_BUFFER_SIZE`,
+    /// `command/src/config.rs`).
+    fn default_limits_pool() -> Rc<RefCell<Pool>> {
+        Rc::new(RefCell::new(Pool::with_capacity(
+            sozu_command_lib::config::DEFAULT_MIN_BUFFERS as usize,
+            sozu_command_lib::config::DEFAULT_MAX_BUFFERS as usize,
+            sozu_command_lib::config::DEFAULT_BUFFER_SIZE as usize,
+        )))
+    }
+
+    /// A server connection past its preface, waiting on a frame header, on a
+    /// [`PacedSocket`] that takes every byte. The returned peer keeps the
+    /// underlying loopback socket connected.
+    fn slot_recycle_fixture(
+        pool: &Rc<RefCell<Pool>>,
+    ) -> (
+        H2Shell<PacedSocket>,
+        Context<TestListener>,
+        Router,
+        std::net::TcpStream,
+    ) {
+        let (socket, peer) = connected_socket();
+        let mut connection = H2Shell::new(
+            Ulid::generate(),
+            PacedSocket {
+                stream: socket,
+                budget: usize::MAX,
+                wire: Vec::new(),
+                inbound: std::collections::VecDeque::new(),
+            },
+            Position::Server,
+            &mut PoolBufferSource::new(Rc::downgrade(pool)),
+            H2FloodConfig::default(),
+            H2ConnectionConfig::default(),
+            Duration::from_secs(30),
+            None,
+            Duration::from_secs(30),
+            Some((H2StreamId::Zero, 9)),
+            Ready::READABLE | Ready::HUP | Ready::ERROR,
+        )
+        .expect("a pool with free buffers must yield an H2 connection");
+        connection.core.state = H2State::Header;
+        let context = test_context(pool);
+        let router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        (connection, context, router, peer)
+    }
+
+    /// Hand `bytes` to the connection's socket and drive it the way `Mux`
+    /// does — `writable()` then `readable()` whenever the filtered readiness
+    /// allows them — until every byte is read, the connection waits on the
+    /// next frame header and nothing is left queued to write. Returns whether
+    /// it got there; a terminal state (`GoAway`, `Error`) also stops it.
+    fn feed_and_drive(
+        connection: &mut H2Shell<PacedSocket>,
+        context: &mut Context<TestListener>,
+        router: &mut Router,
+        bytes: &[u8],
+    ) -> bool {
+        connection.socket.inbound.extend(bytes);
+        for _ in 0..256 {
+            connection.core.readiness.event.insert(Ready::WRITABLE);
+            if connection.core.readiness.filter_interest().is_writable() {
+                connection.writable(context, EndpointClient(router));
+            }
+            connection.core.readiness.event.insert(Ready::READABLE);
+            if connection.core.readiness.filter_interest().is_readable() {
+                connection.readable(context, EndpointClient(router));
+            }
+            if matches!(connection.core.state, H2State::GoAway | H2State::Error) {
+                return true;
+            }
+            if connection.socket.inbound.is_empty()
+                && matches!(connection.core.state, H2State::Header)
+                && connection.core.stream_table.expect_read() == Some((H2StreamId::Zero, 9))
+                && connection.core.control_tx.pending().is_empty()
+                && connection.core.output.is_empty()
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// RST_STREAM error code of every RST_STREAM frame on `wire`, keyed by
+    /// stream id, plus the GOAWAY count. Panics on a wire the peer could not
+    /// split into whole frames.
+    fn rst_codes_and_goaways(wire: &[u8]) -> (HashMap<u32, Vec<u32>>, usize) {
+        let frames = peer_frames(wire).expect("the peer must read whole frames");
+        let mut rst = HashMap::<u32, Vec<u32>>::new();
+        let mut goaway = 0;
+        for (kind, _, stream_id, payload) in frames {
+            match kind {
+                3 => {
+                    let code = u32::from_be_bytes(
+                        payload[..4]
+                            .try_into()
+                            .expect("an RST_STREAM payload is four bytes"),
+                    );
+                    rst.entry(stream_id).or_default().push(code);
+                }
+                7 => goaway += 1,
+                _ => {}
+            }
+        }
+        (rst, goaway)
+    }
+
+    /// Slot census of `context` against the connection's stream table:
+    /// `(table_len, streams_len, unlinked, recycle, off_table_unlinked)`,
+    /// where `off_table_unlinked` counts the `Unlinked` slots no wire id of
+    /// the stream table names any more.
+    fn slot_census(
+        connection: &H2Shell<PacedSocket>,
+        context: &Context<TestListener>,
+    ) -> (usize, usize, usize, usize, usize) {
+        let on_table: std::collections::HashSet<GlobalStreamId> = connection
+            .core
+            .stream_table
+            .streams()
+            .values()
+            .copied()
+            .collect();
+        let unlinked = context
+            .streams
+            .iter()
+            .filter(|s| s.state == StreamState::Unlinked)
+            .count();
+        let recycle = context
+            .streams
+            .iter()
+            .filter(|s| s.state == StreamState::Recycle)
+            .count();
+        let off_table_unlinked = context
+            .streams
+            .iter()
+            .enumerate()
+            .filter(|(gid, s)| s.state == StreamState::Unlinked && !on_table.contains(gid))
+            .count();
+        (
+            connection.core.stream_table.len(),
+            context.streams.len(),
+            unlinked,
+            recycle,
+            off_table_unlinked,
+        )
+    }
+
+    /// Slots a correct connection may keep around between sequential
+    /// requests: a `Recycle` slot keeps its two buffers for reuse, so the
+    /// pool may hold `2 * SLOT_SLACK` more than before, and no more,
+    /// whatever the number of requests.
+    const SLOT_SLACK: usize = 4;
+
+    /// RST_STREAM error codes (RFC 9113 §7).
+    const PROTOCOL_ERROR_CODE: u32 = 0x1;
+    const REFUSED_STREAM_CODE: u32 = 0x7;
+
+    /// A HEADERS frame the proxy answers with RST_STREAM(PROTOCOL_ERROR)
+    /// must give the stream slot it created back: N such frames on one
+    /// connection, one at a time, must leave the buffer pool and
+    /// `context.streams` bounded by a constant, with no `Unlinked` slot
+    /// outside the stream table, and the next valid request must still be
+    /// accepted.
+    ///
+    /// `:path /a#b` is malformed (RFC 9112 §3.2, `pkawa::handle_header`),
+    /// a stream error, so `ConnectionH2::handle_headers_frame` calls
+    /// `ConnectionH2::reset_stream` then `ConnectionH2::remove_dead_stream`.
+    /// The pool has the default limits, so if every reset slot keeps its two
+    /// buffers the pool runs dry near stream 500 and the streams after it
+    /// are refused with REFUSED_STREAM instead.
+    #[test]
+    fn peer_provoked_reset_recycles_stream_slot() {
+        const N: u32 = 600;
+        let pool = default_limits_pool();
+        let (mut connection, mut context, mut router, _peer) = slot_recycle_fixture(&pool);
+        let pool_used_before = pool.borrow().used();
+
+        // `:method GET`, then `:path /a#b` as a literal without indexing
+        // (static name index 4), `:scheme https`, and `:authority
+        // localhost` as a literal without indexing: no HPACK dynamic table
+        // state on either side.
+        let mut block = vec![0x82, 0x04, 0x04];
+        block.extend_from_slice(b"/a#b");
+        block.extend_from_slice(&[0x87, 0x01, 0x09]);
+        block.extend_from_slice(b"localhost");
+
+        let mut stalled_at = None;
+        let mut terminal_at = None;
+        // (index, pool used, `refuses_new_streams`) at the first stream
+        // answered with REFUSED_STREAM instead of PROTOCOL_ERROR.
+        let mut first_refused = None;
+        for i in 0..N {
+            let stream_id = 2 * i + 1;
+            let wire_before = connection.socket.wire.len();
+            let frame = orphan_frame(
+                1,
+                parser::FLAG_END_HEADERS | parser::FLAG_END_STREAM,
+                stream_id,
+                block.len() as u32,
+                &block,
+            );
+            if !feed_and_drive(&mut connection, &mut context, &mut router, &frame) {
+                stalled_at = Some(i);
+                break;
+            }
+            if first_refused.is_none() {
+                let (rst, _) = rst_codes_and_goaways(&connection.socket.wire[wire_before..]);
+                if rst
+                    .get(&stream_id)
+                    .is_some_and(|codes| codes.contains(&REFUSED_STREAM_CODE))
+                {
+                    first_refused = Some((
+                        i,
+                        pool.borrow().used(),
+                        connection
+                            .core
+                            .flood_detector
+                            .refuses_new_streams(connection.core.now),
+                    ));
+                }
+            }
+            if matches!(connection.core.state, H2State::GoAway | H2State::Error) {
+                terminal_at = Some(i);
+                break;
+            }
+        }
+
+        let (rst, goaway) = rst_codes_and_goaways(&connection.socket.wire);
+        let rst_total: usize = rst.values().map(Vec::len).sum();
+        let count_code = |code| rst.values().flatten().filter(|&&c| c == code).count();
+        let rst_protocol_error = count_code(PROTOCOL_ERROR_CODE);
+        let rst_refused_stream = count_code(REFUSED_STREAM_CODE);
+        let (table_len, streams_len, unlinked, recycle, off_table_unlinked) =
+            slot_census(&connection, &context);
+        let pool_used_after = pool.borrow().used();
+
+        // One valid request after the N resets: `:path /`.
+        let mut valid = vec![0x82, 0x84, 0x87, 0x01, 0x09];
+        valid.extend_from_slice(b"localhost");
+        let valid_id = 2 * N + 1;
+        let wire_before = connection.socket.wire.len();
+        let valid_driven = feed_and_drive(
+            &mut connection,
+            &mut context,
+            &mut router,
+            &orphan_frame(
+                1,
+                parser::FLAG_END_HEADERS | parser::FLAG_END_STREAM,
+                valid_id,
+                valid.len() as u32,
+                &valid,
+            ),
+        );
+        let valid_registered = connection.core.stream_table.get(valid_id).is_some();
+        let (valid_rst, _) = rst_codes_and_goaways(&connection.socket.wire[wire_before..]);
+
+        eprintln!(
+            "peer_provoked_reset_recycles_stream_slot: n={N} rst={rst_total} \
+             rst_protocol_error={rst_protocol_error} rst_refused_stream={rst_refused_stream} \
+             goaway={goaway} table_len={table_len} streams_len={streams_len} \
+             unlinked={unlinked} recycle={recycle} off_table_unlinked={off_table_unlinked} \
+             pool_used_before={pool_used_before} pool_used_after={pool_used_after} \
+             first_refused(i,pool_used,refuses_new_streams)={first_refused:?} \
+             stalled_at={stalled_at:?} terminal_at={terminal_at:?} state={:?} \
+             valid_driven={valid_driven} valid_registered={valid_registered} \
+             valid_rst={:?}",
+            connection.core.state,
+            valid_rst.get(&valid_id),
+        );
+
+        // Premises: the harness drove every frame, no flood guard ended the
+        // connection, and every stream got exactly one RST_STREAM.
+        assert_eq!(
+            stalled_at, None,
+            "the driver must settle after each HEADERS"
+        );
+        assert_eq!(
+            (goaway, terminal_at),
+            (0, None),
+            "no GOAWAY may end the connection within {N} provoked resets, state={:?}",
+            connection.core.state
+        );
+        assert!(
+            (0..N).all(|i| rst.get(&(2 * i + 1)).is_some_and(|codes| codes.len() == 1)),
+            "every one of the {N} streams must get exactly one RST_STREAM, got {rst_total}"
+        );
+
+        // The invariant: a reset slot is given back.
+        assert_eq!(
+            off_table_unlinked,
+            0,
+            "a reset stream's slot must not stay Unlinked once its wire id left the stream \
+             table: {off_table_unlinked} of {streams_len} slots do, pinning {} pool buffers",
+            2 * off_table_unlinked
+        );
+        assert!(
+            streams_len <= SLOT_SLACK && pool_used_after <= pool_used_before + 2 * SLOT_SLACK,
+            "{N} sequential resets must leave context.streams and the pool bounded by a \
+             constant: streams_len={streams_len}, pool used {pool_used_before} -> \
+             {pool_used_after}"
+        );
+        assert_eq!(
+            (rst_protocol_error, rst_refused_stream),
+            (N as usize, 0),
+            "every malformed HEADERS must be answered PROTOCOL_ERROR, none refused for \
+             want of buffers; first refusal (index, pool used, refuses_new_streams) = \
+             {first_refused:?}"
+        );
+        assert!(
+            valid_driven && valid_registered && valid_rst.is_empty(),
+            "a valid HEADERS after {N} resets must still open a stream, got rst={:?}",
+            valid_rst.get(&valid_id)
+        );
+    }
+
+    /// The same for a stream that got further: a valid request announcing
+    /// `content-length: 5` opens it (the stream reaches `StreamState::Link`;
+    /// no `Mux` runs here to link it to a backend, so it never becomes
+    /// `Linked`), then a 3-byte DATA with END_STREAM is a Content-Length
+    /// mismatch the proxy answers with RST_STREAM(PROTOCOL_ERROR)
+    /// (`ConnectionH2::handle_data_frame`). Repeated, the slots must stay
+    /// bounded.
+    #[test]
+    fn content_length_reset_recycles_stream_slot() {
+        const N: u32 = 50;
+        let pool = default_limits_pool();
+        let (mut connection, mut context, mut router, _peer) = slot_recycle_fixture(&pool);
+        let pool_used_before = pool.borrow().used();
+
+        // `:method POST`, `:path /`, `:scheme https`, `:authority localhost`
+        // as a literal without indexing, `content-length: 5` as a literal
+        // without indexing (static name index 28).
+        let mut block = vec![0x83, 0x84, 0x87, 0x01, 0x09];
+        block.extend_from_slice(b"localhost");
+        block.extend_from_slice(&[0x0f, 0x0d, 0x01, b'5']);
+
+        let mut stalled_at = None;
+        let mut terminal_at = None;
+        let mut not_link_before_data = Vec::new();
+        for i in 0..N {
+            let stream_id = 2 * i + 1;
+            let headers = orphan_frame(
+                1,
+                parser::FLAG_END_HEADERS,
+                stream_id,
+                block.len() as u32,
+                &block,
+            );
+            if !feed_and_drive(&mut connection, &mut context, &mut router, &headers) {
+                stalled_at = Some(i);
+                break;
+            }
+            match connection.core.stream_table.get(stream_id) {
+                Some(gid) if context.streams[gid].state == StreamState::Link => {}
+                other => {
+                    not_link_before_data.push((i, other.map(|gid| context.streams[gid].state)))
+                }
+            }
+            let data = orphan_frame(0, parser::FLAG_END_STREAM, stream_id, 3, b"abc");
+            if !feed_and_drive(&mut connection, &mut context, &mut router, &data) {
+                stalled_at = Some(i);
+                break;
+            }
+            if matches!(connection.core.state, H2State::GoAway | H2State::Error) {
+                terminal_at = Some(i);
+                break;
+            }
+        }
+
+        let (rst, goaway) = rst_codes_and_goaways(&connection.socket.wire);
+        let rst_total: usize = rst.values().map(Vec::len).sum();
+        let rst_protocol_error = rst
+            .values()
+            .flatten()
+            .filter(|&&c| c == PROTOCOL_ERROR_CODE)
+            .count();
+        let (table_len, streams_len, unlinked, recycle, off_table_unlinked) =
+            slot_census(&connection, &context);
+        let pool_used_after = pool.borrow().used();
+        eprintln!(
+            "content_length_reset_recycles_stream_slot: n={N} rst={rst_total} \
+             rst_protocol_error={rst_protocol_error} goaway={goaway} table_len={table_len} \
+             streams_len={streams_len} unlinked={unlinked} recycle={recycle} \
+             off_table_unlinked={off_table_unlinked} pool_used_before={pool_used_before} \
+             pool_used_after={pool_used_after} not_link_before_data={not_link_before_data:?} \
+             pending_links={} stalled_at={stalled_at:?} terminal_at={terminal_at:?} state={:?}",
+            context.pending_links.len(),
+            connection.core.state,
+        );
+
+        assert_eq!(stalled_at, None, "the driver must settle after each frame");
+        assert_eq!(
+            (goaway, terminal_at),
+            (0, None),
+            "no GOAWAY may end the connection within {N} provoked resets"
+        );
+        assert!(
+            not_link_before_data.is_empty(),
+            "premise: each request must reach StreamState::Link before its DATA, got \
+             {not_link_before_data:?}"
+        );
+        assert_eq!(
+            rst_protocol_error, N as usize,
+            "premise: every Content-Length mismatch must be answered PROTOCOL_ERROR"
+        );
+        assert_eq!(
+            off_table_unlinked,
+            0,
+            "a reset stream's slot must not stay Unlinked once its wire id left the stream \
+             table: {off_table_unlinked} of {streams_len} slots do, pinning {} pool buffers",
+            2 * off_table_unlinked
+        );
+        assert!(
+            streams_len <= SLOT_SLACK && pool_used_after <= pool_used_before + 2 * SLOT_SLACK,
+            "{N} sequential resets must leave context.streams and the pool bounded by a \
+             constant: streams_len={streams_len}, pool used {pool_used_before} -> \
+             {pool_used_after}"
+        );
+    }
+
+    /// A stream already `StreamState::Unlinked` that the peer then provokes a
+    /// reset on must give its slot back too, and log its request once.
+    ///
+    /// A request whose body is still coming (HEADERS without END_STREAM) is
+    /// answered with a default answer, as a routing error answers it: the
+    /// slot goes `Unlinked`, the answer is written, and
+    /// `ConnectionH2::try_recycle_server_stream` keeps the stream in the
+    /// stream table because the client has not ended its request. The peer
+    /// then sends a frame that is a stream error on it — a zero-increment
+    /// WINDOW_UPDATE (RFC 9113 §6.9) or a PRIORITY frame making it depend on
+    /// itself (RFC 7540 §5.3.1) — and `ConnectionH2::reset_stream` answers
+    /// RST_STREAM(PROTOCOL_ERROR), then the caller drops the wire id. Nothing
+    /// reached through the stream table can recycle the slot any more, and
+    /// its request, counted in `http.active_requests` when its HEADERS
+    /// arrived, would stay counted until the session closes.
+    #[test]
+    fn reset_of_an_unlinked_stream_recycles_its_slot() {
+        // `:method POST`, `:path /`, `:scheme https`, `:authority localhost`
+        // and `content-length: 5`, as in
+        // `content_length_reset_recycles_stream_slot`.
+        let mut block = vec![0x83, 0x84, 0x87, 0x01, 0x09];
+        block.extend_from_slice(b"localhost");
+        block.extend_from_slice(&[0x0f, 0x0d, 0x01, b'5']);
+        let triggers: [(&str, Vec<u8>); 2] = [
+            ("zero-increment WINDOW_UPDATE", window_update_frame(1, 0)),
+            (
+                "self-dependent PRIORITY",
+                orphan_frame(2, 0, 1, 5, &[0, 0, 0, 1, 15]),
+            ),
+        ];
+        for (trigger, frame) in triggers {
+            let pool = default_limits_pool();
+            let (mut connection, mut context, mut router, _peer) = slot_recycle_fixture(&pool);
+            let headers = orphan_frame(1, parser::FLAG_END_HEADERS, 1, block.len() as u32, &block);
+            assert!(
+                feed_and_drive(&mut connection, &mut context, &mut router, &headers),
+                "{trigger}: the driver must settle after the HEADERS"
+            );
+            let gid = connection
+                .core
+                .stream_table
+                .get(1)
+                .expect("premise: the request opened stream 1");
+            assert_eq!(
+                context.streams[gid].state,
+                StreamState::Link,
+                "{trigger}: premise: the request waits for a backend"
+            );
+            let answers = context.streams[gid].answers.clone();
+            crate::protocol::mux::answers::set_default_answer(
+                &mut context.streams[gid],
+                &mut connection.core.readiness,
+                404,
+                &answers.borrow(),
+            );
+            let wire_before_answer = connection.socket.wire.len();
+            assert!(
+                feed_and_drive(&mut connection, &mut context, &mut router, &[]),
+                "{trigger}: the driver must settle after the answer"
+            );
+            let answered = peer_frames(&connection.socket.wire[wire_before_answer..])
+                .expect("the peer must read whole frames");
+            assert!(
+                answered
+                    .iter()
+                    .any(|(kind, flags, id, _)| *kind == 1 && *id == 1 && flags & 0x4 != 0),
+                "{trigger}: premise: the 404 HEADERS left on stream 1, got {answered:?}"
+            );
+            assert_eq!(
+                (
+                    connection.core.stream_table.get(1),
+                    context.streams[gid].state,
+                    context.streams[gid].request_counted,
+                ),
+                (Some(gid), StreamState::Unlinked, true),
+                "{trigger}: premise: the answered stream stays in the table, Unlinked, its \
+                 request counted, while the client is still sending"
+            );
+
+            let wire_before_reset = connection.socket.wire.len();
+            assert!(
+                feed_and_drive(&mut connection, &mut context, &mut router, &frame),
+                "{trigger}: the driver must settle after the frame"
+            );
+            let (rst, goaway) = rst_codes_and_goaways(&connection.socket.wire[wire_before_reset..]);
+            assert_eq!(
+                (rst.get(&1).cloned(), goaway),
+                (Some(vec![PROTOCOL_ERROR_CODE]), 0),
+                "{trigger}: premise: stream 1 is reset with PROTOCOL_ERROR, the connection \
+                 stays up"
+            );
+            assert!(
+                connection.core.stream_table.get(1).is_none(),
+                "{trigger}: premise: the reset stream left the stream table"
+            );
+
+            let stream = &context.streams[gid];
+            eprintln!(
+                "reset_of_an_unlinked_stream_recycles_its_slot[{trigger}]: state={:?} \
+                 request_counted={} start={:?}",
+                stream.state,
+                stream.request_counted,
+                stream.metrics.start.is_some(),
+            );
+            assert_eq!(
+                stream.state,
+                StreamState::Recycle,
+                "{trigger}: a reset stream's slot must be Recycle once its wire id left the \
+                 stream table, or nothing ever gives its two buffers back"
+            );
+            assert!(
+                !stream.request_counted && stream.metrics.start.is_none(),
+                "{trigger}: the reset must log the request, once: request_counted={}, \
+                 start={:?}",
+                stream.request_counted,
+                stream.metrics.start
+            );
+        }
+    }
+
+    // ── a frontend reset logs its request once, when it happens ─────────
+
+    /// A frontend H2 connection over a loopback socket, past its preface and
+    /// waiting on a frame header, with its context and router.
+    fn reset_log_fixture(
+        pool: &Rc<RefCell<Pool>>,
+    ) -> (
+        H2Shell<mio::net::TcpStream>,
+        std::net::TcpStream,
+        Context<TestListener>,
+        Router,
+    ) {
+        let (mut connection, peer) = test_h2_connection(pool, None);
+        connection.core.state = H2State::Header;
+        connection
+            .core
+            .stream_table
+            .set_expect_read(Some((H2StreamId::Zero, 9)));
+        let context = test_context(pool);
+        let router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        (connection, peer, context, router)
+    }
+
+    /// Run the session-close sweep `Mux::close` runs first,
+    /// `Mux::log_and_recycle_open_streams` (`lib/src/protocol/mux/mod.rs`),
+    /// over `connection` and `context`.
+    fn sweep_as_the_session_closes(
+        connection: H2Shell<mio::net::TcpStream>,
+        context: Context<TestListener>,
+        router: Router,
+    ) {
+        let mut mux = crate::protocol::mux::Mux {
+            configured_frontend_timeout: Duration::from_secs(10),
+            frontend_token: mio::Token(0),
+            frontend: Connection::H2(connection),
+            router,
+            context,
+            session_ulid: Ulid::generate(),
+            timeouts: crate::protocol::mux::MuxTimeouts::new(
+                crate::timer::TimeoutContainer::new_empty(Duration::from_secs(10)),
+            ),
+            backend_registry: crate::protocol::mux::BackendRegistry::default(),
+            backends: Rc::default(),
+        };
+        mux.log_and_recycle_open_streams();
+    }
+
+    /// The access-log lines of `output` whose request line carries `path`.
+    fn access_lines_for<'a>(output: &'a str, path: &str) -> Vec<&'a str> {
+        output
+            .lines()
+            .filter(|line| line.contains("ACCESS") && line.contains(path))
+            .collect()
+    }
+
+    /// A request rejected at its HEADERS — its slot still `Idle` — is logged
+    /// once, `H2::Reset`, when Sōzu resets it, with the request line its
+    /// pseudo-headers carried, and the sweep of the closing session logs
+    /// nothing more for it. It used to be logged only by that sweep, as
+    /// `session close`.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::tear_down_reset_stream`, log only a
+    /// stream reset while `Link` or `Linked` and drop the `Recycle`
+    /// assignment, with `ConnectionH2::check_slot_ownership` silenced: the
+    /// only line is the sweep's `session close`. Verified 2026-11-12.
+    #[test]
+    fn a_stream_rejected_at_its_headers_is_logged_once_when_it_is_reset() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let output = crate::capture_test_logs(move || {
+            use std::io::Write;
+
+            let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+            let (mut connection, mut peer, mut context, mut router) = reset_log_fixture(&pool);
+            // Every pseudo-header, then a connection-specific field the
+            // decoder refuses (RFC 9113 §8.2.2): a stream error.
+            let block = crate::protocol::mux::hpack::Encoder::new().encode([
+                (&b":method"[..], &b"GET"[..]),
+                (&b":scheme"[..], &b"https"[..]),
+                (&b":authority"[..], &b"localhost"[..]),
+                (&b":path"[..], &b"/rejected-at-headers"[..]),
+                (&b"connection"[..], &b"close"[..]),
+            ]);
+            peer.write_all(&orphan_frame(
+                1,
+                parser::FLAG_END_HEADERS | parser::FLAG_END_STREAM,
+                1,
+                block.len() as u32,
+                &block,
+            ))
+            .expect("loopback write must complete");
+            let reset =
+                drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+            let reset_codes: Vec<Vec<u8>> = peer_frames(&reset)
+                .expect("whole frames")
+                .into_iter()
+                .filter(|(kind, _, id, _)| *kind == 3 && *id == 1)
+                .map(|(_, _, _, payload)| payload)
+                .collect();
+            let slot_state = context.streams.first().map(|stream| stream.state);
+            sweep_as_the_session_closes(connection, context, router);
+            sender
+                .send((reset_codes, slot_state))
+                .expect("the test thread must receive the outcome");
+        });
+        let (reset_codes, slot_state) = receiver.recv().expect("the run must report");
+        assert_eq!(
+            reset_codes,
+            vec![PROTOCOL_ERROR_CODE.to_be_bytes().to_vec()],
+            "premise: stream 1 is reset with PROTOCOL_ERROR"
+        );
+        let lines = access_lines_for(&output, "/rejected-at-headers");
+        assert_eq!(
+            lines.len(),
+            1,
+            "exactly one access-log line for the rejected request, got: {output}"
+        );
+        assert!(
+            lines[0].contains(" localhost GET /rejected-at-headers - | H2::Reset"),
+            "the line is the reset's, with the request line the pseudo-headers carried, \
+             got: {}",
+            lines[0]
+        );
+        assert!(
+            !output.contains("session close"),
+            "the closing session's sweep must log nothing more for it, got: {output}"
+        );
+        assert_eq!(
+            slot_state,
+            Some(StreamState::Recycle),
+            "the reset recycles the slot it logged"
+        );
+    }
+
+    /// A request `silent_close_answer` (`lib/src/protocol/mux/answers.rs`)
+    /// already logged, which the client then provokes a reset on before the
+    /// write pass sent the silent close's own RST_STREAM, is not logged a
+    /// second time, and its slot is recycled.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::tear_down_reset_stream`, log
+    /// whether or not `SessionMetrics::start` is set: the request gets a
+    /// second line, `H2::Reset`. Verified 2026-11-12.
+    #[test]
+    fn a_reset_after_a_silent_close_does_not_log_the_request_again() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let output = crate::capture_test_logs(move || {
+            use std::io::Write;
+
+            let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+            let (mut connection, mut peer, mut context, mut router) = reset_log_fixture(&pool);
+            // A request whose body is still to come: its stream stays open.
+            let block = crate::protocol::mux::hpack::Encoder::new().encode([
+                (&b":method"[..], &b"POST"[..]),
+                (&b":scheme"[..], &b"https"[..]),
+                (&b":authority"[..], &b"localhost"[..]),
+                (&b":path"[..], &b"/silently-closed"[..]),
+                (&b"content-length"[..], &b"5"[..]),
+            ]);
+            peer.write_all(&orphan_frame(
+                1,
+                parser::FLAG_END_HEADERS,
+                1,
+                block.len() as u32,
+                &block,
+            ))
+            .expect("loopback write must complete");
+            drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+            let gid = connection
+                .core
+                .stream_table
+                .get(1)
+                .expect("premise: the request opened stream 1");
+            // The answer a `silent_close` frontend gives: logged at once,
+            // nothing to write but a RST_STREAM(CANCEL).
+            let listener = context.listener.clone();
+            let _ = crate::protocol::mux::answers::silent_close_answer(
+                &mut context.streams[gid],
+                &mut connection.core.readiness,
+                listener,
+                None,
+            );
+            let premise = (
+                context.streams[gid].state,
+                context.streams[gid].metrics.start.is_none(),
+            );
+            // The client's zero-increment WINDOW_UPDATE is read before any
+            // write pass retires the stream: read passes only.
+            peer.write_all(&window_update_frame(1, 0))
+                .expect("loopback write must complete");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while connection.core.stream_table.get(1).is_some() && Instant::now() < deadline {
+                connection.core.readiness.event.insert(Ready::READABLE);
+                if connection.core.readiness.filter_interest().is_readable() {
+                    connection.readable(&mut context, EndpointClient(&mut router));
+                }
+                std::thread::yield_now();
+            }
+            let outcome = (
+                premise,
+                connection.core.stream_table.get(1),
+                context.streams[gid].state,
+            );
+            sweep_as_the_session_closes(connection, context, router);
+            sender
+                .send(outcome)
+                .expect("the test thread must receive the outcome");
+        });
+        let (premise, on_table, slot_state) = receiver.recv().expect("the run must report");
+        assert_eq!(
+            premise,
+            (StreamState::Unlinked, true),
+            "premise: the silent close logged the request and left the stream open"
+        );
+        assert_eq!(
+            (on_table, slot_state),
+            (None, StreamState::Recycle),
+            "the provoked reset retires the stream and recycles its slot"
+        );
+        let lines = access_lines_for(&output, "/silently-closed");
+        assert_eq!(
+            lines.len(),
+            1,
+            "exactly one access-log line for the silently closed request, got: {output}"
+        );
+        assert!(
+            lines[0].contains("| silent_close"),
+            "the one line is the silent close's, got: {}",
+            lines[0]
+        );
+    }
+
+    // ── an oversized header block ends the connection ───────────────────
+    //
+    // `ConnectionH2::handle_continuation_header_state` holds a branch that
+    // refuses a header block whose CONTINUATION frames carry it past
+    // `max_header_list_size` (CVE-2024-27316) with
+    // RST_STREAM(REFUSED_STREAM), after dropping the stream's wire id and
+    // leaving the slot as it was. It is never reached: the
+    // `check_flood_or_return!` right before it flags the same
+    // `accumulated_header_size > max_header_list_size` first, and the
+    // connection ends with GOAWAY(ENHANCE_YOUR_CALM). The test below pins
+    // that outcome, so a change that makes the branch reachable — and its
+    // slot an orphan — goes red here first.
+
+    /// A HEADERS frame of 16 000 octets of field block on `stream_id`, with
+    /// `flags` and without END_HEADERS, then four CONTINUATION frames of
+    /// 12 500 octets, the last one with END_HEADERS: 66 000 octets, past the
+    /// 65 536 of `MAX_HEADER_LIST_SIZE` only with the fourth CONTINUATION,
+    /// every frame within the 16 384-octet frame size and the zero buffer.
+    /// The block is `0x88` repeated, an indexed field the discard decodes
+    /// without touching the HPACK dynamic table.
+    fn oversized_header_block(stream_id: u32, flags: u8) -> Vec<u8> {
+        debug_assert_eq!(
+            flags & parser::FLAG_END_HEADERS,
+            0,
+            "the block must continue on CONTINUATION frames"
+        );
+        let first = vec![0x88; 16_000];
+        let mut wire = orphan_frame(1, flags, stream_id, first.len() as u32, &first);
+        let rest = vec![0x88; 12_500];
+        for i in 0..4 {
+            let end_headers = if i == 3 { parser::FLAG_END_HEADERS } else { 0 };
+            wire.extend(orphan_frame(
+                9,
+                end_headers,
+                stream_id,
+                rest.len() as u32,
+                &rest,
+            ));
+        }
+        const {
+            assert!(
+                16_000 + 4 * 12_500 > MAX_HEADER_LIST_SIZE
+                    && 16_000 + 3 * 12_500 <= MAX_HEADER_LIST_SIZE,
+                "only the last CONTINUATION carries the block past the limit"
+            );
+        }
+        wire
+    }
+
+    /// RST_STREAM(REFUSED_STREAM) frames on `stream_id`, and the error code of
+    /// every GOAWAY, in the frames of `wire`.
+    fn refusals_and_goaway_codes(wire: &[u8], stream_id: u32) -> (usize, Vec<u32>) {
+        let frames = peer_frames(wire).expect("the peer must read whole frames");
+        let refusals = frames
+            .iter()
+            .filter(|(kind, _, id, payload)| {
+                *kind == 3 && *id == stream_id && payload[..] == REFUSED_STREAM_CODE.to_be_bytes()
+            })
+            .count();
+        let goaway_codes = frames
+            .iter()
+            .filter(|(kind, _, _, _)| *kind == 7)
+            .map(|(_, _, _, payload)| {
+                u32::from_be_bytes(
+                    payload[4..8]
+                        .try_into()
+                        .expect("a GOAWAY payload carries its error code"),
+                )
+            })
+            .collect();
+        (refusals, goaway_codes)
+    }
+
+    /// An oversized header block — the initial block of a request, a request
+    /// trailer block, a backend's response block — ends the connection with
+    /// GOAWAY(ENHANCE_YOUR_CALM) and is never refused stream by stream, and
+    /// on a frontend connection no slot is left off the stream table without
+    /// being recycled once the next write pass ran.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::handle_continuation_header_state`,
+    /// delete the `check_flood_or_return!` after `record_continuation_frame`:
+    /// the refusal branch runs (`CONTINUATION accumulated header size 66000
+    /// exceeds 65536`) and drops the initial block's wire id with its slot
+    /// still `Idle`, and `ConnectionH2::check_slot_ownership` fails on
+    /// `frontend slot 0 is Idle but no wire id names it` before the
+    /// connection's GOAWAY is read. Verified 2026-11-12.
+    #[test]
+    fn an_oversized_header_block_ends_the_connection_before_its_refusal() {
+        use std::io::Write;
+
+        const ENHANCE_YOUR_CALM_CODE: u32 = 0xb;
+        // `:method POST`, `:path /`, `:scheme https`, `:authority localhost`
+        // and `content-length: 5`, as in
+        // `content_length_reset_recycles_stream_slot`.
+        let mut post = vec![0x83, 0x84, 0x87, 0x01, 0x09];
+        post.extend_from_slice(b"localhost");
+        post.extend_from_slice(&[0x0f, 0x0d, 0x01, b'5']);
+
+        // Frontend: the initial block of stream 1 (its slot `Idle`), and a
+        // trailer block on an open stream 1 in its body phase (`Link`).
+        for trailer in [false, true] {
+            let pool = default_limits_pool();
+            let (mut connection, mut context, mut router, _peer) = slot_recycle_fixture(&pool);
+            if trailer {
+                let mut opening =
+                    orphan_frame(1, parser::FLAG_END_HEADERS, 1, post.len() as u32, &post);
+                opening.extend(orphan_frame(0, 0, 1, 5, b"hello"));
+                assert!(
+                    feed_and_drive(&mut connection, &mut context, &mut router, &opening),
+                    "trailer={trailer}: the driver must settle after the request and its body"
+                );
+                let gid = connection
+                    .core
+                    .stream_table
+                    .get(1)
+                    .expect("premise: the request opened stream 1");
+                assert!(
+                    context.streams[gid].front.is_main_phase()
+                        && context.streams[gid].state == StreamState::Link,
+                    "trailer={trailer}: premise: an open request in its body phase"
+                );
+            }
+            feed_and_drive(
+                &mut connection,
+                &mut context,
+                &mut router,
+                &oversized_header_block(1, parser::FLAG_END_STREAM),
+            );
+            assert!(
+                matches!(connection.core.state, H2State::GoAway),
+                "trailer={trailer}: the oversized block must end the connection, got {:?}",
+                connection.core.state
+            );
+            // The write pass that flushes the GOAWAY also prunes the streams
+            // that never opened (`ConnectionH2::prune_inactive_streams_while_closing`).
+            connection.core.readiness.event.insert(Ready::WRITABLE);
+            connection.writable(&mut context, EndpointClient(&mut router));
+            let (refusals, goaway_codes) = refusals_and_goaway_codes(&connection.socket.wire, 1);
+            assert_eq!(
+                (refusals, goaway_codes),
+                (0, vec![ENHANCE_YOUR_CALM_CODE]),
+                "trailer={trailer}: one GOAWAY(ENHANCE_YOUR_CALM), and stream 1 never refused \
+                 on its own"
+            );
+            let on_table: std::collections::HashSet<GlobalStreamId> = connection
+                .core
+                .stream_table
+                .streams()
+                .values()
+                .copied()
+                .collect();
+            let orphans: Vec<(GlobalStreamId, StreamState)> = context
+                .streams
+                .iter()
+                .enumerate()
+                .filter(|(gid, s)| s.state != StreamState::Recycle && !on_table.contains(gid))
+                .map(|(gid, s)| (gid, s.state))
+                .collect();
+            assert!(
+                orphans.is_empty(),
+                "trailer={trailer}: no slot may stay off the stream table un-recycled, got \
+                 {orphans:?}"
+            );
+        }
+
+        // Backend: a response block on stream 1, whose slot is the
+        // frontend's `Linked` stream.
+        let LinkedBackend {
+            _pool,
+            mut connection,
+            mut peer,
+            mut context,
+            mut router,
+            gid,
+        } = backend_with_a_linked_stream(
+            H2State::Header,
+            BackendStatus::Connected,
+            Ready::READABLE | Ready::HUP | Ready::ERROR,
+        );
+        queue_request(&mut context, gid);
+        context.link_stream(gid, mio::Token(4242));
+        let request = drive_and_read_backend(&mut connection, &mut peer, &mut context, &mut router);
+        assert!(
+            peer_frames(&request)
+                .expect("whole frames")
+                .iter()
+                .any(|(kind, _, id, _)| *kind == 1 && *id == 1),
+            "premise: the request went out on stream 1, got {request:?}"
+        );
+        let wire = oversized_header_block(1, 0);
+        // The peer cannot write it all before the connection reads, so write
+        // it from a thread while the connection is driven, until the
+        // connection answers with a GOAWAY or a RST_STREAM.
+        let mut writer = peer.try_clone().expect("the peer socket must clone");
+        let sender = std::thread::spawn(move || writer.write_all(&wire));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut received = Vec::new();
+        while Instant::now() < deadline {
+            received.extend(drive_and_read_backend(
+                &mut connection,
+                &mut peer,
+                &mut context,
+                &mut router,
+            ));
+            if peer_frames(&received).is_ok_and(|frames| {
+                frames
+                    .iter()
+                    .any(|(kind, _, _, _)| *kind == 7 || *kind == 3)
+            }) {
+                break;
+            }
+        }
+        let outcome = refusals_and_goaway_codes(&received, 1);
+        // The connection stops reading at its GOAWAY, so the writer may be
+        // blocked on a full socket: closing the connection's end ends its
+        // write, with an error this test does not care about.
+        drop(connection);
+        let _ = sender.join().expect("the writer thread must not panic");
+        assert_eq!(
+            outcome,
+            (0, vec![ENHANCE_YOUR_CALM_CODE]),
+            "backend: one GOAWAY(ENHANCE_YOUR_CALM), and stream 1 never refused on its own"
+        );
+    }
     // ── forcefully_terminate_answer arms WRITABLE for ET epoll ───────────
     //
     // Gap A in the h2spec diagnosis: the pre-fix code set `interest` but
@@ -17838,6 +19012,41 @@ pub(super) mod tests {
             "premise: stream 1 is reset with PROTOCOL_ERROR, got {reset:?}"
         );
         linked
+    }
+
+    /// A reset on a backend connection (`Position::Client`) must leave the
+    /// slot to the frontend stream that owns it: the frontend still owes its
+    /// client an answer (a 502, a RST_STREAM, a retry) and logs the request
+    /// itself. Only a frontend reset recycles the slot
+    /// (`ConnectionH2::tear_down_reset_stream`).
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::tear_down_reset_stream`, drop the
+    /// `self.position.is_server()` gate around the log-and-recycle block, so
+    /// a backend reset recycles too. Verified 2026-11-12.
+    #[test]
+    fn a_backend_stream_reset_leaves_the_frontend_slot_to_the_frontend() {
+        let LinkedBackend {
+            _pool,
+            connection,
+            context,
+            gid,
+            ..
+        } = backend_stream_reset_for_its_content_length();
+        assert!(
+            connection.core.stream_table.get(1).is_none(),
+            "premise: the reset backend stream left the backend's stream table"
+        );
+        let stream = &context.streams[gid];
+        assert_eq!(
+            (
+                stream.state,
+                stream.back.is_error(),
+                stream.metrics.start.is_some()
+            ),
+            (StreamState::Unlinked, true, true),
+            "a backend reset must leave the frontend's slot Unlinked, its response in error \
+             and its request unlogged, for the frontend to answer and log, never Recycle"
+        );
     }
 
     /// The trailer block adding `x-dyn: one` to the HPACK dynamic table
