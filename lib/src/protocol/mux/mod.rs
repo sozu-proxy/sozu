@@ -1401,10 +1401,16 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             stream.back_data_received = 0;
             // The ONE place `request_counted` is cleared without emitting the
             // paired `http.active_requests` decrement, and it must stay the
-            // only one. A slot reaches `StreamState::Recycle` only through
-            // `Stream::generate_access_log`, which already emitted the `-1`
-            // and cleared the flag, so this is re-initialisation of an
-            // already-false field rather than a decrement that went missing.
+            // only one. A slot reaches `StreamState::Recycle` only after
+            // `Stream::generate_access_log` emitted the `-1` and cleared the
+            // flag — a frontend stream Sōzu resets included:
+            // `ConnectionH2::tear_down_reset_stream`
+            // (`lib/src/protocol/mux/h2.rs`) logs every request no log has
+            // reached yet, whatever the slot's state, before it recycles —
+            // or with the flag never set, as an `Idle` slot
+            // `ConnectionH2::prune_inactive_streams_while_closing` recycles.
+            // Either way this is re-initialisation of an already-false field
+            // rather than a decrement that went missing.
             // `Stream::new` asserts the same invariant for a fresh slot
             // ("new stream must not have a counted request"); this is its
             // reuse-path counterpart. A future site that clears this flag
@@ -5419,9 +5425,12 @@ mod tests {
         );
 
         let mut context = test_context(pool);
-        context
+        let stream_id = context
             .create_stream(Ulid::generate(), 1 << 16)
             .expect("test context must create a stream");
+        // A frontend slot is named by its wire id, as
+        // `ConnectionH2::create_stream` (`lib/src/protocol/mux/h2.rs`) leaves it.
+        h2.core.__test_insert_wire_mapping_only(1, stream_id);
         let mut mux = Mux {
             configured_frontend_timeout: Duration::from_secs(10),
             frontend_token: Token(0),

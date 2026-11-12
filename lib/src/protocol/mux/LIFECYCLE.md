@@ -519,20 +519,31 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   to the client. Transitions: `set_default_answer_with_retry_after` and
   `forcefully_terminate_answer` (`answers.rs`), the `StreamState::Unlinked`
   assignments of `ConnectionH1::end_stream` (`h1.rs`), and in
-  `h2.rs` the `StreamState::Unlinked` assignments of `ConnectionH2::reset_stream`
-  and `ConnectionH2::end_stream` (the client-side retirement plus the
+  `h2.rs` the `StreamState::Unlinked` assignments of
+  `ConnectionH2::tear_down_reset_stream` (which `ConnectionH2::reset_stream`
+  runs) and `ConnectionH2::end_stream` (the client-side retirement plus the
   `ForwardTerminated` and `CloseDelimited` arms of the server side). By symbol,
   not line: those four assignments move together whenever either function is
   edited, and a `/`-separated number group rots one element at a time — the
   reader then follows the surviving numbers into unrelated code. Do not convert
-  it back.
+  it back. A reset leaves a slot `Unlinked` only on a backend connection
+  (`Position::Client`), where the slot is the frontend stream's: on a frontend
+  connection `ConnectionH2::tear_down_reset_stream` goes on to `Recycle`.
 - `Recycle` — slot fully finalized; reusable by `Context::create_stream`.
   Transitions: `Mux::close` (`mod.rs`);
   `ConnectionH2::prune_inactive_streams_while_closing`,
-  `ConnectionH2::cancel_timed_out_streams` and
-  `ConnectionH2::handle_rst_stream_frame` (`h2.rs`). Four sites; the reviewer
-  check is `grep -rn 'state = StreamState::Recycle;' lib/src/protocol/mux/`.
+  `ConnectionH2::cancel_timed_out_streams`,
+  `ConnectionH2::handle_rst_stream_frame` and
+  `ConnectionH2::tear_down_reset_stream` (`h2.rs`). Five sites; the reviewer
+  check is `grep -rn 'state = StreamState::Recycle;' lib/src/protocol/mux/`,
+  whose other hits are tests. The write path's
+  `ConnectionH2::try_recycle_server_stream` and
+  `ConnectionH2::complete_server_stream` reach it through `std::mem::replace`,
+  which that grep does not match.
   Symbols rather than line numbers, for the reason given under `Link` above.
+  Every `h2.rs` site recycles a frontend slot before, or as, its wire id
+  leaves the stream table, because nothing reaches the slot through the table
+  afterwards: §4.3 invariant 4, §9 invariant 33.
 
 `StreamState::is_open()` returns true for everything except `Idle` and `Recycle`
 (`stream.rs`).
@@ -734,12 +745,40 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
 - **Backend detach.** `Context::unlink_stream` (`mod.rs`) — called from the four
   timeout arms of `Mux::timeout_inner` (`mod.rs`), from H1 EOF
   (`ConnectionH1::end_stream`, `h1.rs`),
-  and from `ConnectionH2::reset_stream` and `ConnectionH2::end_stream`
+  and from `ConnectionH2::tear_down_reset_stream` and `ConnectionH2::end_stream`
   (`h2.rs`), each of which opens with it. By symbol, not line, for the same
   reason as the `Unlinked` bullet above. Do not convert it back.
 - **Recycle.** The H2 write path recycles a server stream once both the front
   request and back response are `is_terminated() && is_completed()` — see
-  `try_recycle_server_stream` flow in `h2.rs`.
+  `try_recycle_server_stream` flow in `h2.rs`. A frontend stream that ends
+  before that is recycled on the spot, by the path that drops its wire id: a
+  reset Sōzu sends (`ConnectionH2::reset_stream`, through
+  `ConnectionH2::tear_down_reset_stream`), one the client sends
+  (`ConnectionH2::handle_rst_stream_frame`), and the idle reaper
+  (`ConnectionH2::cancel_timed_out_streams`). Each logs the request before
+  it recycles, because `Context::create_stream` takes a `Recycle` slot for one
+  whose request was logged and un-counted: the last two unconditionally, the
+  reset only when no log has reached the request yet (`SessionMetrics::start`
+  is still `Some`). Before this, `reset_stream` left the slot
+  `Unlinked`, its callers dropped the wire id, and the slot pinned its two
+  pool buffers until the session closed: about 499 provoked resets on one
+  connection emptied a worker's default 1000-buffer pool, and the worker
+  refused every new stream. Pinned by `peer_provoked_reset_recycles_stream_slot`,
+  `content_length_reset_recycles_stream_slot`,
+  `reset_of_an_unlinked_stream_recycles_its_slot` (`h2.rs`),
+  `test_h2_malformed_requests_release_their_stream_slots` and
+  `test_h2_content_length_resets_release_their_stream_slots`
+  (`e2e/src/tests/h2_stream_slot_tests.rs`). A recycled `Link` slot may
+  still have its id queued in `context.pending_links`. The drain in
+  `Mux::ready_inner` skips every entry whose slot is not `Link`, so the
+  stale entry is skipped while the slot is `Recycle` or `Idle`. When the slot
+  was meanwhile reused for a new request that reached `Link`, the queue holds
+  its id twice. Each entry popped while the slot is `Link` takes one routing
+  decision, and only a failed `connect(2)` leaves it `Link` and queues it
+  again; every attempt counts against the stream's one `Stream::attempts`
+  budget, which `Router::plan_connect` caps. Once the stream leaves `Link`
+  (linked, answered, or out of attempts) the remaining entry is skipped: the
+  duplicate adds neither an attempt nor a second link.
 
 ### 3.3 What "Recycle" means and when slots are popped
 
@@ -802,10 +841,22 @@ runs — see §6.
    in-bounds index into `context.streams`.
 2. The `Stream` at that index is not in `StreamState::Recycle` — or, if it is,
    the caller is in the middle of a teardown pass that is about to remove the
-   wire-id entry (never a public surface).
+   wire-id entry (never a public surface). `ConnectionH2::reset_stream` is
+   such a teardown on a frontend connection: it leaves the slot `Recycle`, and
+   its caller removes the entry with `ConnectionH2::remove_dead_stream` next.
 3. A `StreamState::Linked(token)` must have a matching entry in
    `context.backend_streams[token]`. This is asserted in debug builds at
    the end of `Mux::ready_inner`, after every `ready()` pass.
+4. Conversely, on the frontend connection (`Position::Server`), every slot of
+   `context.streams` that is not `StreamState::Recycle` is named by an entry
+   of its wire map. An H2 frontend creates every slot of its session through
+   `ConnectionH2::create_stream`, which registers the entry, and every path
+   that recycles a slot while the connection lives finds it through the map,
+   so a slot dropped from the map un-recycled is never reused. Asserted in
+   debug builds by `ConnectionH2::check_slot_ownership` (`h2.rs`), from
+   `ConnectionH2::check_invariants` after every frame and from the shell at the
+   end of every read and write pass (§9 invariant 33). A backend connection
+   owns no slot and is not checked.
 
 The H1 side keeps its single `stream: Option<GlobalStreamId>` in `ConnectionH1`
 — there is no hashmap because H1 multiplexing is limited to request pipelining
@@ -1654,10 +1705,21 @@ Three directions:
   purges the wire-id via `H2StreamTable::remove`). Also runs flood counters
   (CVE-2023-44487 Rapid Reset).
 - **Proxy-initiated, error response** — `reset_stream` (`h2.rs`).
-  Transitions to `Unlinked`, calls `forcefully_terminate_answer` for kawa
-  cleanup, queues the outgoing RST via
+  Tears the stream down in `ConnectionH2::tear_down_reset_stream`: unlinks
+  it, ends its response in error with `forcefully_terminate_answer`, and ends
+  the backend stream it was linked to. On a frontend connection it then logs
+  the request (`H2::Reset`) unless a log already did (`SessionMetrics::start`
+  is `None` after one, as after a `silent_close_answer`), whatever the slot's
+  state — `Idle`, `Link`, `Linked` or `Unlinked` — and recycles the slot
+  (§3.2). On a backend connection the slot stays `Unlinked` for the frontend
+  stream that owns it, which answers and logs. It then queues the outgoing RST via
   [`enqueue_rst`](#proxy-rst-emission-path), and counts against
   `record_rst_emitted` (CVE-2025-8671 MadeYouReset) unless `NoError`.
+  A request rejected at its HEADERS (a malformed `:path`) is therefore
+  logged `H2::Reset` when it is reset, where it used to be logged
+  `session close` when its connection closed. Pinned by
+  `a_backend_stream_reset_leaves_the_frontend_slot_to_the_frontend` and
+  the tests §3.2 lists.
 - **Never for a backend stream still idle** — on `Position::Client` a stream id
   is allocated by `ConnectionH2::start_stream` when the router links the
   request, but its HEADERS leave with a later write pass, possibly never (the
@@ -3530,6 +3592,20 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     (`pkawa.rs`) and `test_h2_request_trailers_follow_last_chunk_h1_backend`
     (`e2e/src/tests/h2_security_header_injection.rs`), all red before the
     change.
+33. **No frontend slot leaves the wire map un-recycled.** On an H2 frontend,
+    every slot of `context.streams` that is not `StreamState::Recycle` is
+    named by the connection's wire map (§4.3 invariant 4): a path that drops a
+    frontend stream's wire id recycles its slot first, logging its request if
+    no log has yet. `ConnectionH2::check_slot_ownership` (`h2.rs`) asserts it
+    after every frame and at the end of every read and write pass of the
+    frontend shell, so the whole unit and e2e suites hunt for an orphaning
+    path. `ConnectionH2::reset_stream` was one: it left the slot `Unlinked`
+    while every caller dropped the wire id, so the slot and its two pool
+    buffers stayed out of reach until the session closed (§3.2). With that
+    fix reverted, the assertion fires on the first provoked reset in
+    `peer_provoked_reset_recycles_stream_slot`,
+    `content_length_reset_recycles_stream_slot` and
+    `reset_of_an_unlinked_stream_recycles_its_slot` (`h2.rs`).
 
 ---
 
