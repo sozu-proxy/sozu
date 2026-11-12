@@ -745,7 +745,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:5085-5098
+```rust lib/src/protocol/mux/h2.rs:5089-5102
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -771,7 +771,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:5136-5142
+```rust lib/src/protocol/mux/h2.rs:5140-5146
 let events = stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -791,7 +791,15 @@ The other three sites take the `&mut self` wrapper
 - `ConnectionH2::handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs`) uses
   `H2::ResetFrame`.
 - `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs`) uses
-  `H2::Reset`.
+  `H2::Reset`, from `ConnectionH2::tear_down_reset_stream`, on a frontend
+  connection only. It logs every reset whose request no log has reached yet
+  (`SessionMetrics::start` still `Some`), whatever the slot's state, then
+  recycles the slot. It used to log only a stream reset while `Link` or
+  `Linked`, and leave every slot `Unlinked` and off the stream table: a
+  request reset at its HEADERS (`Idle`, a malformed `:path`) or after a
+  default answer (`Unlinked`) was logged `session close` when its connection
+  closed, and its slot held two pool buffers until then
+  (`lib/src/protocol/mux/LIFECYCLE.md` §3.2).
 
 Only the last two are reset paths; the first is the idle/stall sweep.
 
@@ -1156,7 +1164,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9444-9448
+```rust lib/src/protocol/mux/h2.rs:9584-9588
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1334,7 +1342,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9623-9627
+```rust lib/src/protocol/mux/h2.rs:9766-9770
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1809,7 +1817,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:8945
+```rust lib/src/protocol/mux/h2.rs:9085
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -2053,7 +2061,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:7475-7477
+```rust lib/src/protocol/mux/h2.rs:7537-7539
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -2061,7 +2069,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:7489-7495
+```rust lib/src/protocol/mux/h2.rs:7551-7557
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.

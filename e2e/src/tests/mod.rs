@@ -46,6 +46,7 @@ mod h2_security_parser;
 mod h2_security_session;
 mod h2_security_sni;
 mod h2_security_tests;
+mod h2_stream_slot_tests;
 mod h2_tests;
 pub(crate) mod h2_utils;
 mod h2_window_update_tests;
