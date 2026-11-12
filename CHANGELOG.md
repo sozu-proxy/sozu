@@ -12,6 +12,12 @@
 
 <!-- changelog-slot:backend-ownership -->
 
+<!-- changelog-slot:mux-timeout-backend-detach -->
+
+### Security
+
+- A request answered `504` by a timeout no longer leaves its backend connection able to answer another request. On an HTTP/2 frontend the connection outlives the `504`, and the client's next request could receive the late response of the request that timed out. Two paths led there, both with an HTTP/1.1 backend that had received the whole request and not answered yet. When `back_timeout` fired first (the default order, 30 s against a `front_timeout` of 60 s), the backend connection was returned to the session's keep-alive pool with that request still unanswered on it, so the next request of the session for that backend was written behind it and read its response. When `front_timeout` fired first (a `back_timeout` longer than `front_timeout`), the backend connection, HTTP/1.1 or HTTP/2, stayed attached to the stream slot: the next request reused the slot and received whatever the backend sent later, and a late read or close on a slot the session had since dropped indexed past the stream table and panicked. The mix-up stays inside one client connection, so it crosses users only where an intermediary multiplexes several of them onto it. Both timeout branches of `Mux::timeout_inner` now end the request on its backend before they install the answer: the HTTP/1.1 connection is closed instead of pooled or left attached, and an HTTP/2 backend stream is reset. A backend that had answered whole is still pooled. An HTTP/1.1 frontend closes after the default `504` (`Connection: close`) and was not affected with the default answers.
+
 ## 2.3.4 - 2026-11-04
 
 ### Added
