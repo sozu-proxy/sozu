@@ -217,9 +217,10 @@ Notes:
   `ConnectionH2` is a private, stateful type needing a real socket/`Pool`/
   `Router` that the out-of-workspace fuzz crate cannot reach without exposing
   internals it has no other reason to expose, whereas `#[cfg(test)] mod tests`
-  inside `h2.rs` already has all of it. CONTINUATION-flood abort and the
-  CVE-2024-27316 refusal path are intentionally not folded into this
-  property — see its own doc comment for why — and stay covered by
+  inside `h2.rs` already has all of it. CONTINUATION-flood abort (a
+  connection GOAWAY) and the discard of a refused stream's header block are
+  intentionally not folded into this property — see its own doc comment for
+  why — and the discard stays covered by
   `a_refused_stream_keeps_the_hpack_decoder_in_sync` and
   `a_refused_padded_prioritized_stream_keeps_the_hpack_decoder_in_sync`.
 - **The H2 write pass's HPACK encoder is unit-tested with `quickcheck`**
