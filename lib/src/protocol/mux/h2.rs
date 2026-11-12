@@ -882,9 +882,9 @@ pub struct ConnectionH2 {
     /// writable preamble so it cannot conflict with `zero.storage`'s use for
     /// frame-payload discard.
     control_tx: h2_control_tx::H2ControlTx,
-    /// Set by [`Self::refuse_stream_and_discard`], consumed once by the
+    /// Set by [`Self::discard_field_block`], consumed once by the
     /// `H2State::Discard` arm of [`Self::handle_read`]. Carries enough of the
-    /// refused frame's shape to still hand the connection-level HPACK
+    /// discarded frame's shape to still hand the connection-level HPACK
     /// decoder a complete field block before its bytes are dropped — RFC
     /// 9113 §4.3: field-compression state is scoped to the connection, not
     /// the stream. See `LIFECYCLE.md`'s Discard section.
@@ -1781,29 +1781,30 @@ fn read_space<'a>(
         .space()[..amount]
 }
 
-/// What [`ConnectionH2::refuse_stream_and_discard`] hands the `H2State::Discard`
-/// arm of [`ConnectionH2::handle_read`] to locate a refused stream's HPACK field
-/// block, so the connection decoder can still be advanced before the bytes are
-/// dropped (RFC 9113 §4.3).
+/// What [`ConnectionH2::discard_field_block`] stashes for the `H2State::Discard`
+/// arm of [`ConnectionH2::handle_read`] to locate a discarded frame's HPACK
+/// field block, so the connection decoder can still be advanced before the
+/// bytes are dropped (RFC 9113 §4.3).
 ///
 /// RFC 9113 §6.10: only a HEADERS frame carries PADDED/PRIORITY — a
 /// CONTINUATION never does. `New` therefore keeps the whole flag byte so the
 /// fragment can be located inside the raw payload the same way
 /// [`parser::headers_frame`] would. `Continuation` already knows everything
-/// accumulated from every *prior* frame in the block (copied out eagerly,
-/// see the call site in `handle_continuation_header_state` for why it cannot
-/// be a byte offset into `zero.storage` instead) and only needs this frame's
-/// own END_HEADERS bit.
+/// accumulated from every *prior* frame in the block (the owned bytes of
+/// [`ConnectionH2::pending_discarded_block`], not a byte offset into
+/// `zero.storage`, which is cleared after every frame) and only needs this
+/// frame's own END_HEADERS bit.
 #[derive(Debug)]
 enum DiscardedFieldBlock {
     /// A brand-new stream's initiating HEADERS frame was refused whole
     /// (drain, MAX_CONCURRENT_STREAMS, or buffer-pool exhaustion).
     New { flags: u8 },
-    /// A later CONTINUATION frame in an in-progress header block was refused
-    /// (CVE-2024-27316 flood mitigation). `prior_fragment` is every field-block
-    /// byte accumulated before this (about to be refused) frame's own payload,
-    /// which is still unread at capture time and gets appended once it lands
-    /// in `zero.storage` at Discard time.
+    /// A later CONTINUATION frame of a header block that is already being
+    /// discarded because its stream was refused or reset, dropped with that
+    /// block (`ConnectionH2::handle_header_state`). `prior_fragment` is every
+    /// field-block byte accumulated before this frame's own payload, which is
+    /// still unread at capture time and gets appended once it lands in
+    /// `zero.storage` at Discard time.
     Continuation {
         prior_fragment: Vec<u8>,
         end_headers: bool,
@@ -2646,52 +2647,22 @@ impl ConnectionH2 {
                 // CVE-2024-27316: track CONTINUATION frame count and accumulated size
                 self.flood_detector.record_continuation_frame(payload_len);
                 check_flood_or_return!(self);
-                // RFC 9113 §10.5.1: reject header blocks that cannot be
-                // buffered. Previously we silently removed READABLE interest
-                // when amount > available_space, stalling the connection.
-                // If the payload still fits in our zero buffer we can refuse
-                // just this stream (RST_STREAM + drain); if not, the
-                // connection can no longer decode header blocks safely and we
-                // escalate to GOAWAY(EnhanceYourCalm).
-                if self.flood_detector.accumulated_header_size()
-                    > self.flood_detector.config().max_header_list_size()
-                {
-                    error!(
-                        "{} CONTINUATION accumulated header size {} exceeds {}",
-                        log_context!(self),
-                        self.flood_detector.accumulated_header_size(),
-                        self.flood_detector.config().max_header_list_size()
-                    );
-                    if (payload_len as usize) > self.zero.storage.available_space() {
-                        return self.goaway(H2Error::EnhanceYourCalm);
-                    }
-                    // Remove the already-created stream slot before refusing,
-                    // so it does not leak against MAX_CONCURRENT_STREAMS. Route
-                    // through `remove_dead_stream` so the expect_write/read
-                    // invariant (§LIFECYCLE.md 5.4) holds on this path too.
-                    if let Some(global_stream_id) = self.stream_table.get(stream_id) {
-                        self.remove_dead_stream(stream_id, global_stream_id);
-                    }
-                    // The field-block bytes accumulated by every *prior*
-                    // frame in this block already live in
-                    // `self.header_reassembly`, decoupled from
-                    // `zero.storage`'s own bookkeeping — no eager copy is
-                    // needed here the way the old single-buffer design
-                    // required (the buffer this comment used to warn about
-                    // reuse of is `zero.storage`; that reuse now targets an
-                    // empty, unrelated scratch region, not this fragment).
-                    let prior_fragment = self.header_reassembly.finish();
-                    return self.refuse_stream_and_discard(
-                        stream_id,
-                        H2Error::RefusedStream,
-                        RstOrigin::PeerProvoked,
-                        payload_len,
-                        DiscardedFieldBlock::Continuation {
-                            prior_fragment,
-                            end_headers: flags & parser::FLAG_END_HEADERS != 0,
-                        },
-                    );
-                }
+                // An accumulated header block above `max_header_list_size`
+                // ends the connection, not the stream: `check_flood_or_return!`
+                // above answers GOAWAY(ENHANCE_YOUR_CALM) when
+                // `H2FloodDetector::check_flood`
+                // (`lib/src/protocol/mux/h2_flood_detector.rs`) finds
+                // `accumulated_header_size` strictly above that limit, so
+                // a frame that got past it is within the limit.
+                debug_assert!(
+                    self.flood_detector.accumulated_header_size()
+                        <= self.flood_detector.config().max_header_list_size(),
+                    "the flood check ends the connection on an accumulated header size above \
+                     max_header_list_size, so a CONTINUATION it let through is within it"
+                );
+                // RFC 9113 §10.5.1: a payload that cannot be buffered whole
+                // cannot be decoded, so the connection ends. Removing READABLE
+                // interest instead would stall it.
                 if (payload_len as usize) > self.zero.storage.available_space() {
                     error!(
                         "{} CONTINUATION payload {} exceeds buffer space {}",
@@ -2967,8 +2938,8 @@ impl ConnectionH2 {
                 // RFC 9113 §4.3: HPACK field-compression state is scoped to
                 // the connection, not the stream. `i` is this refused
                 // frame's own just-read payload; decode it (folding in any
-                // earlier frames' bytes for a CONTINUATION refusal — see
-                // `DiscardedFieldBlock`) before it is dropped, so our
+                // earlier frames' bytes for a CONTINUATION of a discarded
+                // block — see `DiscardedFieldBlock`) before it is dropped, so our
                 // decoder does not fall behind the peer's encoder.
                 //
                 // Without a field block this is an orphaned DATA remainder
@@ -6992,11 +6963,7 @@ impl ConnectionH2 {
                 // `header_block_fragment` is network-facing-derived — the
                 // parser computes it correctly by construction, so this
                 // should never actually be out of bounds, but "no panic on
-                // network-facing input" (CLAUDE.md) applies regardless, and
-                // the CVE-2024-27316 abort path below this one used to make
-                // exactly this check before this step replaced its own
-                // buffer access with `HeaderBlockAccumulator::finish()`
-                // (owned bytes, no slicing left to bound-check there).
+                // network-facing input" (CLAUDE.md) applies regardless.
                 let Some(fragment) = headers
                     .header_block_fragment
                     .data_opt(self.zero.storage.buffer())
@@ -12995,10 +12962,18 @@ pub(super) mod tests {
     /// TO SEE THIS RED: in `ConnectionH2::handle_write`, replace
     /// `self.output.adopt_tail(kawa, tail);` by `let _ = (kawa, tail);`, so
     /// the rest of the cut frame stays with its stream. Every test on this
-    /// fixture then fails: this one and the other #1601 tests on
-    /// `frame_tail`'s `a frame runs past the gathered bytes` debug assertion
-    /// (the stream's `kawa.out` no longer starts on a frame boundary), the
-    /// three #1604 tests below on their wire assertion. Verified 2026-09-27.
+    /// fixture then fails on the `an H2 stream queues whole frames only`
+    /// debug assertion of `h2_transmit::queued_data_payload`
+    /// (`lib/src/protocol/mux/h2_transmit.rs`, #1646): the stream's
+    /// `kawa.out` no longer tiles into whole frames. That is the
+    /// first assertion to fire, so no test reaches `frame_tail`'s `a frame
+    /// runs past the gathered bytes` or its own wire assertion. With debug
+    /// assertions off (`CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=false cargo
+    /// test`) the same mutation reaches the wire assertions instead, this
+    /// test failing on `left: Err("frame type 0x64 announces 6579300 bytes, 8
+    /// remain")`, and
+    /// `a_deferred_ack_does_not_strand_reads_when_its_parked_stream_is_removed`
+    /// then passes. Verified 2026-11-12.
     /// Before #1604 the equivalent mutation was in `queue_zero_output` and
     /// failed with `left: Err("frame type 0x64 announces 6579300 bytes, 8
     /// remain")` (verified 2026-09-26).
@@ -13121,7 +13096,9 @@ pub(super) mod tests {
     ///
     /// TO SEE THIS RED: the `adopt_tail` mutation described on
     /// `a_ping_during_a_half_written_frame_is_acknowledged_after_it` fails it
-    /// on `a frame runs past the gathered bytes`. Verified 2026-09-27. Before
+    /// on `an H2 stream queues whole frames only`, and, with debug assertions
+    /// off, on `left: Err("frame type 0x64 announces 6579300 bytes, 25
+    /// remain")`. Verified 2026-11-12. Before
     /// #1604, deleting the `zero_holds_output()` block of `poll_read_target`
     /// failed it on `no output may be pending in zero when a frame header is
     /// read` (verified 2026-09-27).
@@ -13218,7 +13195,10 @@ pub(super) mod tests {
     /// 28 remain")`: the peer reads the next frame's bytes as the rest of the
     /// truncated one. On this tree, the `adopt_tail` mutation described on
     /// `a_ping_during_a_half_written_frame_is_acknowledged_after_it` fails
-    /// all three with the same messages. Verified 2026-09-27.
+    /// all three on `an H2 stream queues whole frames only` first (#1646),
+    /// and with debug assertions off
+    /// (`CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=false cargo test`) with the same
+    /// three messages. Verified 2026-11-12.
     #[test]
     fn a_removed_half_written_stream_still_completes_its_frame() {
         let connection =
@@ -17001,16 +16981,18 @@ pub(super) mod tests {
 
     // ── an oversized header block ends the connection ───────────────────
     //
-    // `ConnectionH2::handle_continuation_header_state` holds a branch that
-    // refuses a header block whose CONTINUATION frames carry it past
-    // `max_header_list_size` (CVE-2024-27316) with
-    // RST_STREAM(REFUSED_STREAM), after dropping the stream's wire id and
-    // leaving the slot as it was. It is never reached: the
-    // `check_flood_or_return!` right before it flags the same
-    // `accumulated_header_size > max_header_list_size` first, and the
-    // connection ends with GOAWAY(ENHANCE_YOUR_CALM). The test below pins
-    // that outcome, so a change that makes the branch reachable — and its
-    // slot an orphan — goes red here first.
+    // A header block whose CONTINUATION frames carry it past
+    // `max_header_list_size` (CVE-2024-27316) ends the connection with
+    // GOAWAY(ENHANCE_YOUR_CALM): `ConnectionH2::handle_continuation_header_state`
+    // runs `check_flood_or_return!` on every CONTINUATION frame, and
+    // `H2FloodDetector::check_flood`
+    // (`lib/src/protocol/mux/h2_flood_detector.rs`) flags
+    // `accumulated_header_size > max_header_list_size`. Nothing refuses such
+    // a block stream by stream with RST_STREAM(REFUSED_STREAM), which would
+    // drop the stream's wire id and leave its slot as it was, an orphan that
+    // `ConnectionH2::check_slot_ownership` forbids. The test below pins the
+    // GOAWAY, so a change that lets the block past the flood check goes red
+    // here first.
 
     /// A HEADERS frame of 16 000 octets of field block on `stream_id`, with
     /// `flags` and without END_HEADERS, then four CONTINUATION frames of
@@ -17079,14 +17061,15 @@ pub(super) mod tests {
     /// being recycled once the next write pass ran.
     ///
     /// TO SEE THIS RED: in `ConnectionH2::handle_continuation_header_state`,
-    /// delete the `check_flood_or_return!` after `record_continuation_frame`:
-    /// the refusal branch runs (`CONTINUATION accumulated header size 66000
-    /// exceeds 65536`) and drops the initial block's wire id with its slot
-    /// still `Idle`, and `ConnectionH2::check_slot_ownership` fails on
-    /// `frontend slot 0 is Idle but no wire id names it` before the
-    /// connection's GOAWAY is read. Verified 2026-11-12.
+    /// delete the `check_flood_or_return!` after `record_continuation_frame`.
+    /// The `debug_assert!` that follows it fails first with `the flood check
+    /// ends the connection on an accumulated header size above
+    /// max_header_list_size, so a CONTINUATION it let through is within it`.
+    /// With that `debug_assert!` deleted as well, the connection keeps
+    /// reading and the test fails on `trailer=false: the oversized block must
+    /// end the connection, got Header`. Verified 2026-11-12.
     #[test]
-    fn an_oversized_header_block_ends_the_connection_before_its_refusal() {
+    fn an_oversized_header_block_ends_the_connection_without_refusing_its_stream() {
         use std::io::Write;
 
         const ENHANCE_YOUR_CALM_CODE: u32 = 0xb;
@@ -21767,11 +21750,12 @@ pub(super) mod tests {
     //
     // Any out-of-bounds read or other panic inside `drive()` fails the
     // `quickcheck` run directly — there is no separate assertion for it.
-    // CONTINUATION-flood abort and the CVE-2024-27316 refusal path are
-    // deliberately NOT folded into this property: they end the block in a
-    // *different* terminal state (refused, not decoded), which would split
-    // this property's single pass/fail oracle in two. That path already has
-    // dedicated deterministic coverage —
+    // CONTINUATION-flood abort (a connection GOAWAY) and the discard of a
+    // refused stream's header block are deliberately NOT folded into this
+    // property: they end the block in a *different* terminal state (dropped,
+    // not decoded), which would split this property's single pass/fail
+    // oracle in two. The discard already has dedicated deterministic
+    // coverage —
     // `a_refused_stream_keeps_the_hpack_decoder_in_sync` and
     // `a_refused_padded_prioritized_stream_keeps_the_hpack_decoder_in_sync`
     // above.

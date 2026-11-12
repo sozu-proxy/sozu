@@ -272,20 +272,21 @@ Declared in `h2.rs` (`pub enum H2State`):
   stashed for it (see `DiscardedFieldBlock`, `h2.rs`). A brand-new stream's
   whole HEADERS payload still carries its own PADDED/PRIORITY prefix
   (RFC 9113 §6.2), which is stripped by re-running `parser::headers_frame`
-  before decoding; a CONTINUATION frame refused mid-block (CVE-2024-27316
-  flood mitigation) gets its prior frames' bytes from
-  `HeaderBlockAccumulator::finish` (`h2_header_reassembly.rs`) — they have
-  lived in the owned `ConnectionH2::header_reassembly` accumulator since
-  each prior frame was read, not in `zero.storage`, so there is nothing to
-  copy out of `zero.storage` at refusal time; `enqueue_rst` still arms
-  WRITABLE and the same event-loop pass's `writable()` preamble
-  (`flush_pending_control_frames`) serialises the RST_STREAM before the next
-  `readable()` pass reads this frame's own payload, into the separate output
-  queue, which shares nothing with `zero` (#1604) — see invariants 24 and 28. When END_HEADERS was not set on the refused frame, decoding
-  is skipped rather than attempted: a refused
-  multi-frame block cannot legally continue (`handle_header_state` treats a
-  standalone CONTINUATION as PROTOCOL_ERROR), so there is nothing complete
-  to decode. A genuine decode failure of a complete block is reported as
+  before decoding; a CONTINUATION frame of a block already being discarded
+  gets its prior frames' bytes from `ConnectionH2::pending_discarded_block`
+  (`h2.rs`) — the fragment the `H2State::Discard` arm kept when it read
+  the previous frame without END_HEADERS, owned bytes rather than a window
+  into `zero.storage`, which is cleared after every frame. At a refusal,
+  `enqueue_rst` still arms WRITABLE and the same event-loop pass's
+  `writable()` preamble (`flush_pending_control_frames`) serialises the
+  RST_STREAM before the next `readable()` pass reads the refused frame's own
+  payload, into the separate output queue, which shares nothing with `zero`
+  (#1604) — see invariants 24 and 28. When END_HEADERS was not set on the
+  discarded frame, its fragment waits in `pending_discarded_block` and the
+  block is decoded whole once the CONTINUATION frames that complete it have
+  been discarded, since a fragment can end mid-integer or mid-Huffman-string;
+  any other frame in between is a connection error (`handle_header_state`).
+  A genuine decode failure of a complete block is reported as
   `GOAWAY(COMPRESSION_ERROR)` per RFC 9113 §4.3.
 - **A non-refused `Continuation*` block must not be flushed out from under
   itself.** An accepted, in-progress header block accumulates in
@@ -990,8 +991,6 @@ one block inside a method that does several unrelated things:
 - `ConnectionH2::prune_inactive_streams_while_closing` (`h2.rs`).
 - `ConnectionH2::handle_window_update_frame` zero-increment path (`h2.rs`).
 - `ConnectionH2::cancel_timed_out_streams` slow-multiplex guard (`h2.rs`).
-- `ConnectionH2::handle_continuation_header_state` CONTINUATION oversize
-  (`h2.rs`).
 - `ConnectionH2::handle_rst_stream_frame` peer RST (`h2.rs`).
 - `ConnectionH2::handle_goaway_frame` retry loop (`h2.rs`), `Position::Client`
   only: on a frontend connection `last_stream_id` bounds server-initiated
@@ -3006,9 +3005,9 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
       (the match arm in `ConnectionH2::handle_read`) — before `handle_frame`
       is even re-entered.
     - The block is retired via `HeaderBlockAccumulator::finish`, either
-      decoded (`handle_headers_frame`'s `END_HEADERS` branch) or handed
-      unread to `DiscardedFieldBlock::Continuation` on a CVE-2024-27316
-      refusal (`handle_continuation_header_state`) — the single exit point
+      decoded (`handle_headers_frame`'s `END_HEADERS` branch) or dropped
+      unread by an early return of `handle_headers_frame` (the PRIORITY
+      self-dependency reset) — the single exit point
       matching the single entry point `begin`. **Every early-return path in
       `handle_headers_frame` between the `!end_headers` check and the
       normal `finish()` call must retire an in-progress accumulator before
@@ -3402,9 +3401,14 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
       only ever owns frames the wire has not started, and removing it (peer
       RST, `end_stream`, expiry, `prune_inactive_streams_while_closing`, any
       `remove_dead_stream` caller) drops whole unsent frames, never the
-      second half of one the peer is already parsing. `frame_tail`'s debug
-      assertion (`a frame runs past the gathered bytes`) is where a
-      violation surfaces first.
+      second half of one the peer is already parsing. A violation surfaces
+      first in `h2_transmit::queued_data_payload`'s debug assertion (`an H2
+      stream queues whole frames only`, `h2_transmit.rs`); `frame_tail_walk`,
+      which `frame_tail` wraps, asserts `a frame runs past the gathered
+      bytes` for a frame that outruns what was gathered. With debug
+      assertions off, the wire assertions of the half-written-frame tests are
+      what catch it — see the `TO SEE THIS RED` recipe of
+      `a_ping_during_a_half_written_frame_is_acknowledged_after_it` (`h2.rs`).
     - **A header block encoded and dropped unsent resets the HPACK encoder's
       table before the next block is encoded (sozu-proxy/sozu#1627).** The
       framing guarantee above does not cover HPACK: an unsent

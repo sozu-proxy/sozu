@@ -325,14 +325,12 @@ reset (RFC 9113 §5.1): request trailers, and DATA, which is still credited to
 the connection window, within the same per-stream allowances, past which each
 frame counts one glitch. This holds for every refusal — flood pressure,
 draining (whose drain still ends with `NO_ERROR`),
-`SETTINGS_MAX_CONCURRENT_STREAMS`, buffer-pool exhaustion, and the oversized
-CONTINUATION block refused after its stream was removed. Refused ids share the
-ring's bound and eviction with reset streams. The refusals keep their own
-accounting: the flood-pressure, draining and `SETTINGS_MAX_CONCURRENT_STREAMS`
-refusals each count one glitch once the client acknowledged Sōzu's SETTINGS,
-and none before (bounded by `SETTINGS_ACK_TIMEOUT`, 5 s, past which the
-connection ends); the oversized CONTINUATION refusal is a provoked reset
-(`RstOrigin::PeerProvoked`, one glitch and the emitted-RST cap); a buffer-pool
+`SETTINGS_MAX_CONCURRENT_STREAMS`, and buffer-pool exhaustion. Refused ids
+share the ring's bound and eviction with reset streams. The refusals keep
+their own accounting: the flood-pressure, draining and
+`SETTINGS_MAX_CONCURRENT_STREAMS` refusals each count one glitch once the
+client acknowledged Sōzu's SETTINGS, and none before (bounded by
+`SETTINGS_ACK_TIMEOUT`, 5 s, past which the connection ends); a buffer-pool
 refusal counts nothing. Where a refusal counts a glitch, a client opening
 refused streams to spend their allowances meets the glitch budget first;
 where it does not, each refused HEADERS buys at most two more header blocks
@@ -745,7 +743,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:5089-5102
+```rust lib/src/protocol/mux/h2.rs:5060-5073
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -771,7 +769,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:5140-5146
+```rust lib/src/protocol/mux/h2.rs:5111-5117
 let events = stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -811,7 +809,7 @@ taken at the top of `H2WritePhase::Flush`'s post-flush tail
 (`ConnectionH2::poll_write_target`, `lib/src/protocol/mux/h2.rs`) and passes `stream.linked_token()` straight
 out of it:
 
-```rust lib/src/protocol/mux/h2.rs:3837-3838
+```rust lib/src/protocol/mux/h2.rs:3808-3809
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 ```
@@ -1164,7 +1162,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9584-9588
+```rust lib/src/protocol/mux/h2.rs:9551-9555
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1309,9 +1307,9 @@ Key decisions in this method:
   own stream concurrency too, not by the emitted-RST cap, which the CANCEL
   `ConnectionH2::end_stream` sends for a client that went away does not feed.
   The ring also holds the ids of refused streams
-  (`H2StreamTable::remember_refused`), which are never tracked: on a frontend
-  connection every refusal records them, and on either side the oversized
-  CONTINUATION refusal does. WINDOW_UPDATE, PRIORITY and
+  (`H2StreamTable::remember_refused`), which are never tracked: only a
+  frontend connection refuses a stream, and every refusal records it.
+  WINDOW_UPDATE, PRIORITY and
   RST_STREAM keep their own handling, and so does every other frame type (a
   PUSH_PROMISE is still a connection error). A stream closed by END_STREAM in
   both directions keeps the connection error STREAM_CLOSED for HEADERS, and
@@ -1342,7 +1340,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9766-9770
+```rust lib/src/protocol/mux/h2.rs:9733-9737
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1817,7 +1815,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:9085
+```rust lib/src/protocol/mux/h2.rs:9052
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -2061,7 +2059,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:7537-7539
+```rust lib/src/protocol/mux/h2.rs:7504-7506
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -2069,7 +2067,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:7551-7557
+```rust lib/src/protocol/mux/h2.rs:7518-7524
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.

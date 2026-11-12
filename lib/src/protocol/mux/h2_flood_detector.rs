@@ -471,12 +471,13 @@ impl H2FloodConfig {
     /// request on the listener with `ENHANCE_YOUR_CALM` — per stream for a
     /// header block that fits one HEADERS frame, and as a connection
     /// `GOAWAY` for one that spans CONTINUATION frames, where
-    /// `H2FloodDetector::record_continuation_frame` lifts `accumulated_header_size`
-    /// above the zero threshold and `h2.rs`'s `check_flood_or_return!` fires
-    /// before the explicit size test. `max_rst_stream_per_window = 0` (and
-    /// every other per-window or lifetime frame counter) is inert until a
-    /// client actually sends the frame it counts — `check_flood` compares
-    /// `count > threshold`, and `0 > 0` is false.
+    /// `H2FloodDetector::record_continuation_frame` lifts
+    /// `accumulated_header_size` above the zero threshold and
+    /// `check_flood_or_return!` (`lib/src/protocol/mux/h2.rs`) fires.
+    /// `max_rst_stream_per_window = 0` (and every other per-window or
+    /// lifetime frame counter) is inert until a client actually sends the
+    /// frame it counts — `check_flood` compares `count > threshold`, and
+    /// `0 > 0` is false.
     ///
     /// Every door that STATES a listener configuration now rejects an
     /// out-of-range knob outright — the configuration file and
