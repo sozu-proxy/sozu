@@ -10019,6 +10019,19 @@ impl<Front: SocketHandler> H2Shell<Front> {
 }
 
 #[cfg(test)]
+impl ConnectionH2 {
+    /// Test-only setter: move `stream_id`'s liveness timestamp to `at`, and
+    /// report whether the stream is tracked. The frontend-timeout tests of
+    /// `mod::tests` stage "this stream has been idle since `at`" with it, so
+    /// the reaper at the top of the frontend-timeout branch of
+    /// `Mux::timeout_inner` (`lib/src/protocol/mux/mod.rs`) weighs the idle
+    /// time a real session would have reached.
+    pub(super) fn __test_set_stream_activity(&mut self, stream_id: StreamId, at: Instant) -> bool {
+        self.stream_table.touch_activity(stream_id, at)
+    }
+}
+
+#[cfg(test)]
 pub(super) mod tests {
     use std::{cell::RefCell, collections::HashMap, rc::Rc};
 

@@ -2898,8 +2898,13 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     `Continue` — through the `should_write` writable loop, or through
     `delay_close_for_frontend_flush("timeout")` — with only the FRONTEND
     container re-armed. That is safe only because the branch calls
-    `Connection::end_stream` for every id in `context.backend_streams[&token]`,
-    unconditionally at the bottom of the loop. `ConnectionH2::end_stream` then
+    `Connection::end_stream` for every id in `context.backend_streams[&token]`
+    that does not defer to the client, ahead of the arms of the loop. It runs
+    before an arm installs its answer because `ConnectionH1::end_stream` pools
+    the connection when `Stream::back` is terminated: called after the 504, it
+    read the 504 as the backend's own whole response and pooled a connection
+    whose request the backend had not answered, so the session's next request
+    read that late answer. `ConnectionH2::end_stream` then
     begins with `Context::unlink_stream`; `ConnectionH1::end_stream` does NOT —
     it guards `self.stream != Some(stream)` and returns early first. That guard
     cannot reject a stream this loop passes it, because an H1 connection carries
@@ -2924,8 +2929,11 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     fresh-dial branch. Asserted under `debug_assertions` at the
     re-arm site and pinned by
     `a_backend_timeout_leaves_no_linked_stream_behind_on_the_close_path` and
-    `a_completed_backend_response_timeout_unlinks_through_end_stream_alone`.
-    Both tests set `h1.stream = Some(0)` by hand, so they exercise
+    `a_completed_backend_response_timeout_unlinks_through_end_stream_alone`;
+    the pooling half by
+    `a_backend_timeout_answering_504_closes_the_backend_that_still_owes_an_answer`
+    and `a_backend_timeout_after_a_whole_response_keeps_the_backend_pooled`.
+    The first two tests set `h1.stream = Some(0)` by hand, so they exercise
     `ConnectionH1::end_stream`'s matched path only; the mismatch arm is covered
     by the one-active-stream invariant above, not by a test.
 

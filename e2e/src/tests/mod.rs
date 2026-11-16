@@ -48,6 +48,7 @@ mod h2_security_sni;
 mod h2_security_tests;
 mod h2_stream_slot_tests;
 mod h2_tests;
+mod h2_timeout_backend_detach_tests;
 pub(crate) mod h2_utils;
 mod h2_window_update_tests;
 mod h2c_prior_knowledge_tests;
