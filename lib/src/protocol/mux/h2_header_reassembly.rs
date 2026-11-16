@@ -17,28 +17,27 @@
 //! [`HeaderBlockAccumulator`] gives the read side a real owned lifetime
 //! (`Vec<u8>`) instead of borrowing a window into `zero.storage`. A HEADERS
 //! frame without END_HEADERS seeds it via [`HeaderBlockAccumulator::begin`]
-//! with a copy of its own fragment (the same "copy out before the buffer
-//! changes purpose" move the CVE-2024-27316 abort path in `h2.rs` already
-//! made defensively, generalised to the happy path); every CONTINUATION
-//! frame's payload is folded in via [`HeaderBlockAccumulator::append`] as
-//! soon as it finishes being read, with `zero.storage` cleared by the caller
-//! in the same step; the block is retired via [`HeaderBlockAccumulator::finish`]
-//! — decoded on a completed block, or handed to
-//! `DiscardedFieldBlock::Continuation` unread on a CVE-2024-27316 refusal —
-//! either way returning ownership of the bytes and resetting to idle. Every
-//! early-return path in `ConnectionH2::handle_headers_frame` that could
-//! abandon an in-progress reassembly (e.g. an RFC 7540 §5.3.1 PRIORITY
-//! self-dependency reset) must retire it before returning, or the
-//! `is_in_progress()` flag leaks into the NEXT HEADERS frame processed on
-//! this connection — which may belong to an entirely different stream —
-//! and that frame's own "read from `zero.storage`" fast path is silently
-//! skipped in favour of the leaked stream's stale bytes. This is not a
-//! hypothetical: it shipped once, in this module's first changeset, and was
-//! caught only by review (`a_priority_self_dependency_reset_does_not_leak_the_reassembly_accumulator`,
+//! with a copy of its own fragment (copied out before the buffer changes
+//! purpose); every CONTINUATION frame's payload is folded in via
+//! [`HeaderBlockAccumulator::append`] as soon as it finishes being read, with
+//! `zero.storage` cleared by the caller in the same step; the block is
+//! retired via [`HeaderBlockAccumulator::finish`] — decoded on a completed
+//! block, or dropped unread by an early return of
+//! `ConnectionH2::handle_headers_frame` — either way returning ownership of
+//! the bytes and resetting to idle. Every early-return path in
+//! `ConnectionH2::handle_headers_frame` that could abandon an in-progress
+//! reassembly (e.g. an RFC 7540 §5.3.1 PRIORITY self-dependency reset) must
+//! retire it before returning, or the `is_in_progress()` flag leaks into the
+//! NEXT HEADERS frame processed on this connection — which may belong to an
+//! entirely different stream — and that frame's own "read from
+//! `zero.storage`" fast path is silently skipped in favour of the leaked
+//! stream's stale bytes. This is not a hypothetical: it shipped once, in this
+//! module's first changeset, and was caught only by review
+//! (`a_priority_self_dependency_reset_does_not_leak_the_reassembly_accumulator`,
 //! `h2.rs`) rather than by any assertion, because the accumulator's own
 //! `begin()`/`append()`/`finish()` debug_asserts only fire on a call that
-//! actually happens — a call that is *silently skipped* (the `if
-//! !self.header_reassembly.is_in_progress() { begin(...) }` gate in the
+//! actually happens — a call that is *silently skipped* (the
+//! `if !self.header_reassembly.is_in_progress() { begin(...) }` gate in the
 //! `!end_headers` branch) asserts nothing at all.
 //!
 //! No write-side code holds a field named `header_reassembly` — that is
@@ -164,7 +163,8 @@ impl HeaderBlockAccumulator {
     }
 
     /// Retire the reassembly in progress — completed (about to be decoded)
-    /// or abandoned (about to be discarded, CVE-2024-27316) — returning
+    /// or abandoned (about to be discarded, as when a PRIORITY
+    /// self-dependency resets the stream) — returning
     /// ownership of the accumulated bytes and resetting to idle. The single
     /// exit point from "in progress", matched by the single entry point
     /// [`Self::begin`].

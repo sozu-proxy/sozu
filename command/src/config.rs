@@ -583,7 +583,7 @@ pub enum ConfigError {
     ///   `record_continuation_frame` lifts `accumulated_header_size` above the
     ///   zero threshold and `check_flood_or_return!`
     ///   (`lib/src/protocol/mux/h2.rs`) escalates to
-    ///   `GOAWAY(ENHANCE_YOUR_CALM)` before the explicit size test below it.
+    ///   `GOAWAY(ENHANCE_YOUR_CALM)`.
     ///   `h2_max_header_table_size` is NOT in this class: `0` only zeroes the
     ///   HPACK encoder's dynamic table.
     /// - The per-window and lifetime frame counters only move when a client
