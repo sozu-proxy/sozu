@@ -6466,6 +6466,7 @@ mod listener_lifecycle_tests {
             manager.handle_input(
                 ManagerInput::ClientDatagram {
                     src: SocketAddr::from(([192, 0, 2, 1], port)),
+                    dst: SocketAddr::from(([192, 0, 2, 53], 53)),
                     payload: b"q",
                     backends: &mut OneBackend,
                 },

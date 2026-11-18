@@ -217,6 +217,17 @@ impl WriteQueue {
 pub struct UdpListener {
     active: SessionIsToBeClosed,
     address: SocketAddr,
+    /// The address the registered socket is actually bound to, read once from
+    /// `local_addr()` when [`activate`](Self::activate) registers it, so the
+    /// receive path does not pay a `getsockname` per datagram. It is the PPv2
+    /// destination of every datagram this listener forwards: the address the
+    /// client contacted, as `SendProxyProtocol::back_writable`
+    /// (`lib/src/protocol/proxy_protocol/send.rs`) names it for TCP. It differs
+    /// from `address` only for an ephemeral port (`:0`) or an inherited socket.
+    /// A wildcard bind (`0.0.0.0` / `::`) leaves an unspecified IP here: the
+    /// datagram's real destination is not read from the packet
+    /// (`IP_PKTINFO` / `IPV6_RECVPKTINFO`).
+    local_address: SocketAddr,
     cluster_id: Option<ClusterId>,
     config: UdpListenerConfig,
     socket: Option<UdpSocket>,
@@ -285,6 +296,7 @@ impl UdpListener {
             parked_socket: None,
             token,
             address: config.address.into(),
+            local_address: config.address.into(),
             config,
             active: false,
             tags: BTreeMap::new(),
@@ -364,6 +376,10 @@ impl UdpListener {
             return Err(error);
         }
 
+        // Read the bound address once, now, rather than per datagram. A
+        // `getsockname` failure on a socket that just registered is not
+        // expected; keep the configured address rather than fail activation.
+        self.local_address = socket.local_addr().unwrap_or(address);
         self.socket = Some(socket);
         self.active = true;
         Ok(self.token)
@@ -1392,10 +1408,12 @@ impl UdpListenerSession {
                 let Some(socket) = listener.socket.as_ref() else {
                     return;
                 };
-                socket.recv_from(&mut self.recv_buf)
+                socket
+                    .recv_from(&mut self.recv_buf)
+                    .map(|(len, src)| (len, src, listener.local_address))
             };
             match result {
-                Ok((len, src)) => {
+                Ok((len, src, dst)) => {
                     // Mark the in-flight client so `on_send_to_backend` can
                     // resolve the owning flow's upstream socket for an
                     // already-established flow (no `OpenUpstream` precedes it).
@@ -1417,6 +1435,7 @@ impl UdpListenerSession {
                     mgr.borrow_mut().handle_input(
                         ManagerInput::ClientDatagram {
                             src,
+                            dst,
                             payload,
                             backends: &mut *backends,
                         },
@@ -2437,6 +2456,7 @@ mod tests {
             manager.handle_input(
                 ManagerInput::ClientDatagram {
                     src: SocketAddr::from(([127, 0, 0, 1], 41000)),
+                    dst: SocketAddr::from(([127, 0, 0, 1], 5300)),
                     payload: b"query",
                     backends: &mut *backends,
                 },

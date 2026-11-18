@@ -140,6 +140,12 @@ pub enum ManagerInput<'a> {
     ClientDatagram {
         /// Real (pre-NAT) client source address.
         src: SocketAddr,
+        /// The local address the datagram arrived on: the address the client
+        /// contacted, which the PPv2 header names as its destination. The shell
+        /// passes the listener socket's bound address; on a wildcard bind
+        /// (`0.0.0.0` / `::`) that address carries an unspecified IP, because the
+        /// datagram's real destination is not read from the packet.
+        dst: SocketAddr,
         /// Borrowed datagram bytes.
         payload: &'a [u8],
         /// The backend set to select from, for this admission only.
@@ -161,9 +167,12 @@ pub enum ManagerInput<'a> {
 impl std::fmt::Debug for ManagerInput<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ClientDatagram { src, payload, .. } => f
+            Self::ClientDatagram {
+                src, dst, payload, ..
+            } => f
                 .debug_struct("ClientDatagram")
                 .field("src", src)
+                .field("dst", dst)
                 .field("payload_len", &payload.len())
                 .finish_non_exhaustive(),
             Self::BackendDatagram { flow, payload } => f

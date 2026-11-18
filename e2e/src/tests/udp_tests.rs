@@ -669,7 +669,8 @@ fn test_udp_oversized_datagram_dropped() {
 
 // =========================================================================
 // Test 8: PPv2-to-backend — cluster send_proxy_protocol=true makes the backend
-// see a PPv2 DGRAM header carrying the real client address.
+// see a PPv2 DGRAM header carrying the real client address as source and the
+// listener the client contacted as destination (never the backend itself).
 // =========================================================================
 
 fn try_udp_proxy_protocol_to_backend() -> State {
@@ -695,12 +696,14 @@ fn try_udp_proxy_protocol_to_backend() -> State {
     let stopped = worker.wait_for_server_stop();
 
     // The backend must have stripped a PPv2 header whose advertised client
-    // address matches the real client source, and the inner payload must be
-    // intact. The reply (inner payload echoed) must reach the client.
+    // address matches the real client source and whose destination is the
+    // listener the client sent to (not the backend), and the inner payload must
+    // be intact. The reply (inner payload echoed) must reach the client.
     let first = observed.first();
     let pp_ok = match first {
         Some(d) => {
             let addr_ok = d.proxy_protocol_client == Some(client_src);
+            let dst_ok = d.proxy_protocol_destination == Some(front);
             let payload_ok = d.payload == b"proxied";
             if !addr_ok {
                 println!(
@@ -708,7 +711,13 @@ fn try_udp_proxy_protocol_to_backend() -> State {
                     d.proxy_protocol_client
                 );
             }
-            addr_ok && payload_ok
+            if !dst_ok {
+                println!(
+                    "PPv2 destination mismatch: saw {:?}, expected the listener {front}",
+                    d.proxy_protocol_destination
+                );
+            }
+            addr_ok && dst_ok && payload_ok
         }
         None => {
             println!("backend received no datagram");
@@ -730,7 +739,7 @@ fn test_udp_proxy_protocol_to_backend() {
     assert_eq!(
         repeat_until_error_or(
             5,
-            "UDP PPv2: backend sees a v2 DGRAM header with the real client addr",
+            "UDP PPv2: backend sees a v2 DGRAM header naming the real client and the listener",
             try_udp_proxy_protocol_to_backend,
         ),
         State::Success,

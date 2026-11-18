@@ -44,6 +44,10 @@ pub struct ObservedDatagram {
     /// The real (pre-NAT) client address advertised in a PPv2 DGRAM header,
     /// when one was present; `None` for an un-proxied datagram.
     pub proxy_protocol_client: Option<SocketAddr>,
+    /// The destination advertised in the same PPv2 DGRAM header: the address
+    /// the client contacted, which is the proxy's listener and never this
+    /// backend. `None` for an un-proxied datagram.
+    pub proxy_protocol_destination: Option<SocketAddr>,
     /// The inner application payload (PPv2 header stripped when present).
     pub payload: Vec<u8>,
 }
@@ -180,7 +184,8 @@ impl UdpBackend {
                     if raw == b"__stop__" {
                         break;
                     }
-                    let (proxy_protocol_client, payload) = parse_proxy_protocol(raw);
+                    let (proxy_protocol_client, proxy_protocol_destination, payload) =
+                        parse_proxy_protocol(raw);
                     let payload = payload.to_vec();
                     thread_shared
                         .lock()
@@ -189,6 +194,7 @@ impl UdpBackend {
                         .push(ObservedDatagram {
                             peer,
                             proxy_protocol_client,
+                            proxy_protocol_destination,
                             payload: payload.clone(),
                         });
                     // Reply N times to the source we received from. UDP replies
@@ -216,44 +222,57 @@ impl UdpBackend {
 }
 
 /// Parse an optional PPv2 DGRAM header off the front of a received datagram.
-/// Returns `(advertised_client, inner_payload)`. When no valid PPv2 header is
-/// present, returns `(None, whole_datagram)`.
-fn parse_proxy_protocol(raw: &[u8]) -> (Option<SocketAddr>, &[u8]) {
+/// Returns `(advertised_client, advertised_destination, inner_payload)`. When no
+/// valid PPv2 header is present, returns `(None, None, whole_datagram)`.
+fn parse_proxy_protocol(raw: &[u8]) -> (Option<SocketAddr>, Option<SocketAddr>, &[u8]) {
     if raw.len() < 16 || raw[..12] != PP2_SIGNATURE {
-        return (None, raw);
+        return (None, None, raw);
     }
     // Byte 12: version+command (0x21 = v2 + PROXY). Byte 13: family+transport.
     let ver_cmd = raw[12];
     if ver_cmd >> 4 != 0x2 {
-        return (None, raw);
+        return (None, None, raw);
     }
     let fam = raw[13];
     let addr_len = u16::from_be_bytes([raw[14], raw[15]]) as usize;
     let body_start = 16;
     if raw.len() < body_start + addr_len {
-        return (None, raw);
+        return (None, None, raw);
     }
     let body = &raw[body_start..body_start + addr_len];
     let inner = &raw[body_start + addr_len..];
-    let client = match fam {
+    let addresses = match fam {
         // AF_INET | DGRAM: 4 + 4 + 2 + 2 = 12 bytes.
         0x12 if addr_len >= 12 => {
             let src_ip = Ipv4Addr::new(body[0], body[1], body[2], body[3]);
+            let dst_ip = Ipv4Addr::new(body[4], body[5], body[6], body[7]);
             let src_port = u16::from_be_bytes([body[8], body[9]]);
-            Some(SocketAddr::new(IpAddr::V4(src_ip), src_port))
+            let dst_port = u16::from_be_bytes([body[10], body[11]]);
+            Some((
+                SocketAddr::new(IpAddr::V4(src_ip), src_port),
+                SocketAddr::new(IpAddr::V4(dst_ip), dst_port),
+            ))
         }
         // AF_INET6 | DGRAM: 16 + 16 + 2 + 2 = 36 bytes.
         0x22 if addr_len >= 36 => {
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(&body[0..16]);
-            let src_ip = Ipv6Addr::from(octets);
+            let mut src = [0u8; 16];
+            src.copy_from_slice(&body[0..16]);
+            let mut dst = [0u8; 16];
+            dst.copy_from_slice(&body[16..32]);
             let src_port = u16::from_be_bytes([body[32], body[33]]);
-            Some(SocketAddr::new(IpAddr::V6(src_ip), src_port))
+            let dst_port = u16::from_be_bytes([body[34], body[35]]);
+            Some((
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::from(src)), src_port),
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::from(dst)), dst_port),
+            ))
         }
         // AF_UNSPEC / unknown: treat as un-proxied.
         _ => None,
     };
-    (client, inner)
+    match addresses {
+        Some((client, destination)) => (Some(client), Some(destination), inner),
+        None => (None, None, inner),
+    }
 }
 
 #[cfg(test)]
@@ -273,18 +292,23 @@ mod tests {
         dg.extend_from_slice(&1234u16.to_be_bytes());
         dg.extend_from_slice(&5678u16.to_be_bytes());
         dg.extend_from_slice(b"PING");
-        let (client, payload) = parse_proxy_protocol(&dg);
+        let (client, destination, payload) = parse_proxy_protocol(&dg);
         assert_eq!(
             client,
             Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 1234))
+        );
+        assert_eq!(
+            destination,
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)), 5678))
         );
         assert_eq!(payload, b"PING");
     }
 
     #[test]
     fn un_proxied_datagram_passes_through() {
-        let (client, payload) = parse_proxy_protocol(b"hello");
+        let (client, destination, payload) = parse_proxy_protocol(b"hello");
         assert_eq!(client, None);
+        assert_eq!(destination, None);
         assert_eq!(payload, b"hello");
     }
 }
