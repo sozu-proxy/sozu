@@ -12,6 +12,10 @@
 
 <!-- changelog-slot:backend-ownership -->
 
+<!-- changelog-slot:rustsec-2026-0543-0544 -->
+
+- Security: `libz-sys` moves from 1.1.31 to 1.1.33 for RUSTSEC-2026-0544, a heap buffer overflow in zlib's `gz_vacate()`; it reaches `sozu-lib` through `flate2`. The `sozu-e2e` Kafka test now speaks the Kafka protocol through `kafka-protocol` instead of `rskafka`, which depends on the unmaintained `chrono` (RUSTSEC-2026-0543); `chrono` leaves the lockfile and `cargo audit --deny warnings` passes again.
+
 ## 2.3.5 - 2026-11-16
 
 ### Security

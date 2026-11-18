@@ -25,7 +25,7 @@ mio = { workspace = true }
 mongodb = { workspace = true, optional = true, features = ["compat-3-0-0", "rustls-tls"] }
 mysql_async = { workspace = true, optional = true, features = ["minimal-rust"] }
 redis = { workspace = true, optional = true, features = ["tokio-comp"] }
-rskafka = { workspace = true, optional = true }
+kafka-protocol = { workspace = true, optional = true }
 rustls = { workspace = true }
 sha2 = { workspace = true }
 time = { workspace = true }
@@ -117,7 +117,7 @@ service-postgres = ["dep:tokio-postgres"]
 service-mysql = ["dep:mysql_async"]
 service-redis = ["dep:redis"]
 service-mongodb = ["dep:mongodb"]
-service-kafka = ["dep:rskafka"]
+service-kafka = ["dep:kafka-protocol"]
 service-rabbitmq = ["dep:lapin"]
 service-pulsar = ["dep:magnetar"]
 service-coredns = ["dep:hickory-proto"]
