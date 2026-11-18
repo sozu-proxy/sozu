@@ -12,14 +12,15 @@
 
 <!-- changelog-slot:backend-ownership -->
 
-<!-- changelog-slot:rustsec-2026-0543-0544 -->
+## 2.3.6 - 2026-11-18
 
-- Security: `libz-sys` moves from 1.1.31 to 1.1.33 for RUSTSEC-2026-0544, a heap buffer overflow in zlib's `gz_vacate()`; it reaches `sozu-lib` through `flate2`. The `sozu-e2e` Kafka test now speaks the Kafka protocol through `kafka-protocol` instead of `rskafka`, which depends on the unmaintained `chrono` (RUSTSEC-2026-0543); `chrono` leaves the lockfile and `cargo audit --deny warnings` passes again.
-<!-- changelog-slot:udp-proxy-protocol-destination -->
+### Security
+
+- `libz-sys` moves from 1.1.31 to 1.1.33 for RUSTSEC-2026-0544, a heap buffer overflow in zlib's `gz_vacate()`; it reaches `sozu-lib` through `flate2`. The `sozu-e2e` Kafka test now speaks the Kafka protocol through `kafka-protocol` instead of `rskafka`, which depends on the unmaintained `chrono` (RUSTSEC-2026-0543); `chrono` leaves the lockfile and `cargo audit --deny warnings` passes again (#1928).
 
 ### Fixed
 
-- The PROXY protocol v2 header Sōzu prepends to UDP datagrams (`send_proxy_protocol`, first datagram or every datagram with `proxy_protocol_every_datagram`) now names the address the client contacted as its destination, the UDP listener's address and port, as the specification defines it and as the TCP header always did. It named the backend the datagram was forwarded to: a capture against a production load balancer on 2026-11-17 showed destination `10.101.0.6` (the backend node) over UDP and the load balancer's public IP over TCP. The source, the real client address, was and stays correct. A listener bound to a wildcard address (`0.0.0.0` or `::`) advertises that wildcard IP with the listener port, because Sōzu does not read a datagram's real destination from the packet (`IP_PKTINFO`); bind the listener to the address clients reach when a backend needs the destination IP. Library API: `ManagerInput::ClientDatagram` gains a `dst` field, which breaks code that builds it.
+- The PROXY protocol v2 header Sōzu prepends to UDP datagrams (`send_proxy_protocol`, first datagram or every datagram with `proxy_protocol_every_datagram`) now names the address the client contacted as its destination, the UDP listener's address and port, as the specification defines it and as the TCP header always did. It named the backend the datagram was forwarded to: a capture against a production load balancer on 2026-11-17 showed destination `10.101.0.6` (the backend node) over UDP and the load balancer's public IP over TCP. The source, the real client address, was and stays correct. A listener bound to a wildcard address (`0.0.0.0` or `::`) advertises that wildcard IP with the listener port, because Sōzu does not read a datagram's real destination from the packet (`IP_PKTINFO`); bind the listener to the address clients reach when a backend needs the destination IP. Library API: `ManagerInput::ClientDatagram` gains a `dst` field, which breaks code that builds it (#1927).
 
 ## 2.3.5 - 2026-11-16
 
