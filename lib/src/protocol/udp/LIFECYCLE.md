@@ -60,7 +60,8 @@ exactly what the deterministic-simulation test in `sim/tests/udp_simulation.rs`
 The two halves talk over a narrow message contract in `mod.rs`:
 
 - **`ManagerInput<'a>`** (`mod.rs`) — what the shell feeds in:
-  `ClientDatagram { src, payload, backends }` (`mod.rs`; `backends` is the
+  `ClientDatagram { src, dst, payload, backends }` (`mod.rs`; `dst` is the
+  address the datagram arrived on, the PPv2 destination; `backends` is the
   `BackendSource` view the core selects from, lent for this datagram only),
   `BackendDatagram { flow, payload }` (`mod.rs`, already tagged with the owning
   flow) and `Config(ConfigEvent)` (`mod.rs`). Inputs **borrow** the recv buffer.
@@ -346,12 +347,32 @@ version+command byte (offset 12) is `0x21` and the family+transport byte
 `0x2` = DGRAM, vs `0x1` = STREAM used by the TCP serializer)
 (the module doc and the `PP2_SIGNATURE` and byte constants of `proxy_protocol.rs`).
 
-`dgram_header(client, backend)` (`proxy_protocol.rs`) builds the header with
-the **real (pre-NAT) client** as the PPv2 source and the backend as the
-destination. `prepend_dgram_header` (`proxy_protocol.rs`) splices it in front
-of the owned payload. Mixed-family (a v4/v6 mismatch the datapath never produces,
-since the connected socket matches the backend family) falls back to an
+`dgram_header(client, destination)` (`proxy_protocol.rs`) builds the header with
+the **real (pre-NAT) client** as the PPv2 source and the **address the client
+contacted** as the destination, as the spec defines it and as the TCP serializer
+does (`SendProxyProtocol::back_writable` in
+`lib/src/protocol/proxy_protocol/send.rs` uses the accepted socket's
+`local_addr()`). The backend the datagram is forwarded to never appears in the
+header. `prepend_dgram_header` (`proxy_protocol.rs`) splices it in front of the
+owned payload. Mixed-family (a v4/v6 mismatch the datapath never produces, since
+a datagram's source and the socket it arrived on share a family) falls back to an
 `AF_UNSPEC` zero-length block per the spec (the mixed-family arm of `dgram_header`).
+
+The destination reaches the core per datagram, as `ManagerInput::ClientDatagram`'s
+`dst` (`mod.rs`), and `UdpManager::forward_admission_datagram` and
+`UdpManager::forward_on_existing_flow` (`manager.rs`) pass it to
+`prepend_dgram_header`, so both modes below carry it. The shell fills it from
+`UdpListener::local_address` (`lib/src/udp.rs`), the bound address read once
+from `local_addr()` when `UdpListener::activate` registers the socket.
+
+**Wildcard binds.** A listener bound to `0.0.0.0` or `::` has no single address
+the client contacted, and Sōzu does not read the datagram's real destination
+from the packet (`IP_PKTINFO` / `IPV6_RECVPKTINFO` ancillary data on
+`recvmsg(2)`). On such a listener the PPv2 destination is the bound address as
+it is: the right port, an unspecified IP (`0.0.0.0` / `::`). Bind the listener to
+the address clients reach when the backend needs the destination IP. The
+return path has the matching limitation: `send_to` on a wildcard socket lets the
+kernel choose the reply's source address.
 
 Policy is per-cluster: `send_proxy_protocol` gates it; `proxy_protocol_every_datagram`
 chooses **first-datagram-only** (default) vs **every-datagram**. `UdpFlow::take_proxy_protocol`

@@ -90,6 +90,10 @@ const POOL_IPS: u8 = 8;
 const POOL_PORTS: u16 = 4;
 const POOL_PORT_BASE: u16 = 9000;
 
+/// The listener address every client datagram is sent to: the PPv2
+/// destination, distinct from every pooled source and backend.
+const LISTENER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 53);
+
 /// Pick one of the 32 pooled client source addresses.
 fn pooled_source(ctx: &SimContext) -> SocketAddr {
     let ip = ctx.random().random_range(0..POOL_IPS);
@@ -561,6 +565,7 @@ impl Workload for UdpSimWorkload {
                     mgr.handle_input(
                         ManagerInput::ClientDatagram {
                             src,
+                            dst: LISTENER,
                             payload: &payload,
                             backends: &mut backends,
                         },
@@ -623,6 +628,7 @@ impl Workload for UdpSimWorkload {
                         mgr.handle_input(
                             ManagerInput::ClientDatagram {
                                 src,
+                                dst: LISTENER,
                                 payload: &payload,
                                 backends: &mut backends,
                             },

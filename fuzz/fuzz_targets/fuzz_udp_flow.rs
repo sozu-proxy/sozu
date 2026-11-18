@@ -249,6 +249,9 @@ fuzz_target!(|data: &[u8]| {
                 mgr.handle_input(
                     ManagerInput::ClientDatagram {
                         src,
+                        // The listener the datagram arrived on: the PPv2
+                        // destination, fixed so the input layout is unchanged.
+                        dst: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 53),
                         payload,
                         backends: &mut backends,
                     },
@@ -360,14 +363,14 @@ fuzz_target!(|data: &[u8]| {
     // --- Part 3: PPv2 DGRAM framing on arbitrary addresses -----------------
 
     let client = r.addr();
-    let backend = r.addr();
-    let header = dgram_header(client, backend);
+    let destination = r.addr();
+    let header = dgram_header(client, destination);
     // The header is never shorter than the 16-byte fixed prefix.
     assert!(header.len() >= 16, "PPv2 header shorter than fixed prefix");
 
     let mut buf = r.bytes().to_vec();
     let original_len = buf.len();
-    let header_len = prepend_dgram_header(&mut buf, client, backend);
+    let header_len = prepend_dgram_header(&mut buf, client, destination);
     // Prefix accounting must be exact: header_len bytes prepended, payload kept.
     assert_eq!(buf.len(), header_len + original_len, "PPv2 prefix length mismatch");
     assert_eq!(header_len, header.len(), "prepend disagrees with dgram_header");

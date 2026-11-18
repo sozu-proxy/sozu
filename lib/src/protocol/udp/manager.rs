@@ -235,9 +235,10 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
         match input {
             ManagerInput::ClientDatagram {
                 src,
+                dst,
                 payload,
                 backends,
-            } => self.on_client_datagram(src, payload, backends, now),
+            } => self.on_client_datagram(src, dst, payload, backends, now),
             ManagerInput::BackendDatagram { flow, payload } => {
                 self.on_backend_datagram(flow, payload, now)
             }
@@ -305,6 +306,7 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
     fn on_client_datagram(
         &mut self,
         src: SocketAddr,
+        dst: SocketAddr,
         payload: &[u8],
         backends: &mut dyn BackendSource,
         now: Instant,
@@ -330,7 +332,7 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
 
         // Tracked flow → reuse its backend (two-tier selection).
         if let Some(&flow_id) = self.table.get(&key) {
-            self.forward_on_existing_flow(flow_id, payload, now);
+            self.forward_on_existing_flow(flow_id, dst, payload, now);
             return;
         }
 
@@ -450,7 +452,7 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
         // Forward the admission datagram immediately. It used to be buffered
         // until the shell resolved a backend; there is no such window now, so
         // it is a forward like any other and is counted as one.
-        self.forward_admission_datagram(flow_id, payload, backend_addr, now);
+        self.forward_admission_datagram(flow_id, dst, payload, backend_addr, now);
     }
 
     /// Send the datagram that caused a flow's admission, counting it as the
@@ -463,6 +465,7 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
     fn forward_admission_datagram(
         &mut self,
         flow_id: FlowId,
+        dst: SocketAddr,
         payload: &[u8],
         backend: SocketAddr,
         now: Instant,
@@ -474,7 +477,7 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
         let mut out = payload.to_vec();
         flow.on_client_datagram(now);
         if flow.take_proxy_protocol() {
-            prepend_dgram_header(&mut out, flow.client, backend);
+            prepend_dgram_header(&mut out, flow.client, dst);
         }
         let teardown = flow.teardown_reason();
         self.outputs
@@ -492,7 +495,13 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
         self.reschedule();
     }
 
-    fn forward_on_existing_flow(&mut self, flow_id: FlowId, payload: &[u8], now: Instant) {
+    fn forward_on_existing_flow(
+        &mut self,
+        flow_id: FlowId,
+        dst: SocketAddr,
+        payload: &[u8],
+        now: Instant,
+    ) {
         let Some(flow) = self.flows.get_mut(flow_id) else {
             // Table/slab desync should be impossible, but never panic on it.
             self.drop_datagram(DropReason::UnknownFlow);
@@ -507,7 +516,7 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
                     .expect("Established flow always has a backend address");
                 let mut out = payload.to_vec();
                 if flow.take_proxy_protocol() {
-                    prepend_dgram_header(&mut out, flow.client, backend);
+                    prepend_dgram_header(&mut out, flow.client, dst);
                 }
                 let teardown = flow.teardown_reason();
                 self.outputs
@@ -1021,6 +1030,13 @@ mod tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)), port)
     }
 
+    /// The listener address every test datagram is sent to: the address the
+    /// client contacted, which the PPv2 header must name as its destination.
+    /// Distinct from every `client` and every test backend on purpose.
+    fn listener() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 53)
+    }
+
     /// Drain all outputs into a Vec for assertions.
     fn drain(mgr: &mut UdpManager) -> Vec<Output> {
         let mut out = Vec::new();
@@ -1037,6 +1053,7 @@ mod tests {
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src: client(1, 1000),
+                dst: listener(),
                 payload: b"hi",
                 backends: &mut TestBackends::one(),
             },
@@ -1061,6 +1078,7 @@ mod tests {
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src: client(1, 1000),
+                dst: listener(),
                 payload: b"",
                 backends: &mut TestBackends::one(),
             },
@@ -1080,6 +1098,7 @@ mod tests {
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src: client(1, 1000),
+                dst: listener(),
                 payload: b"toolong",
                 backends: &mut TestBackends::one(),
             },
@@ -1113,6 +1132,7 @@ mod tests {
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src,
+                dst: listener(),
                 payload: b"query",
                 backends: &mut TestBackends::one(),
             },
@@ -1182,6 +1202,7 @@ mod tests {
             mgr.handle_input(
                 ManagerInput::ClientDatagram {
                     src,
+                    dst: listener(),
                     payload: b"hi",
                     backends: &mut backends,
                 },
@@ -1231,6 +1252,7 @@ mod tests {
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src,
+                dst: listener(),
                 payload: b"q1",
                 backends: &mut TestBackends::one(),
             },
@@ -1249,6 +1271,7 @@ mod tests {
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src,
+                dst: listener(),
                 payload: b"q2",
                 backends: &mut TestBackends::one(),
             },
@@ -1277,6 +1300,7 @@ mod tests {
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src,
+                dst: listener(),
                 payload: b"q",
                 backends: &mut TestBackends::one(),
             },
@@ -1321,6 +1345,7 @@ mod tests {
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src,
+                dst: listener(),
                 payload: b"1",
                 backends: &mut TestBackends::one(),
             },
@@ -1338,6 +1363,7 @@ mod tests {
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src,
+                dst: listener(),
                 payload: b"2",
                 backends: &mut TestBackends::one(),
             },
@@ -1355,6 +1381,7 @@ mod tests {
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src: client(1, 1000),
+                dst: listener(),
                 payload: b"a",
                 backends: &mut TestBackends::one(),
             },
@@ -1366,6 +1393,7 @@ mod tests {
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src: client(2, 1000),
+                dst: listener(),
                 payload: b"b",
                 backends: &mut TestBackends::one(),
             },
@@ -1388,6 +1416,7 @@ mod tests {
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src,
+                dst: listener(),
                 payload: b"q",
                 backends: &mut TestBackends::one(),
             },
@@ -1521,6 +1550,7 @@ mod tests {
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src: client(1, 1000),
+                dst: listener(),
                 payload: b"q",
                 backends: &mut TestBackends::one(),
             },
@@ -1564,6 +1594,7 @@ mod tests {
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src: client(1, 1000),
+                dst: listener(),
                 payload: b"q",
                 backends: &mut TestBackends::one(),
             },
@@ -1631,6 +1662,7 @@ mod tests {
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src: client(1, 1000),
+                dst: listener(),
                 payload: b"q",
                 backends: &mut TestBackends::one(),
             },
@@ -1682,6 +1714,7 @@ mod tests {
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src,
+                dst: listener(),
                 payload: b"q",
                 backends: &mut TestBackends::one(),
             },
@@ -1701,6 +1734,7 @@ mod tests {
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src,
+                dst: listener(),
                 payload: b"q2",
                 backends: &mut TestBackends::one(),
             },
@@ -1731,6 +1765,7 @@ mod tests {
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src,
+                dst: listener(),
                 payload: b"q",
                 backends: &mut TestBackends::one(),
             },
@@ -1742,6 +1777,7 @@ mod tests {
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src: client(2, 1000),
+                dst: listener(),
                 payload: b"q",
                 backends: &mut TestBackends::one(),
             },
@@ -1765,6 +1801,7 @@ mod tests {
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src,
+                dst: listener(),
                 payload: b"q",
                 backends: &mut TestBackends::one(),
             },
@@ -1803,6 +1840,7 @@ mod tests {
             mgr.handle_input(
                 ManagerInput::ClientDatagram {
                     src: client(n, 1000),
+                    dst: listener(),
                     payload: b"q",
                     backends: &mut TestBackends::one(),
                 },
@@ -1834,6 +1872,7 @@ mod tests {
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src,
+                dst: listener(),
                 payload: b"q1",
                 backends: &mut TestBackends::one(),
             },
@@ -1867,6 +1906,7 @@ mod tests {
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src,
+                dst: listener(),
                 payload: b"q2",
                 backends: &mut TestBackends::one(),
             },
@@ -1880,6 +1920,93 @@ mod tests {
             })
             .unwrap();
         assert_eq!(second, b"q2", "no PPv2 prefix on subsequent datagrams");
+    }
+
+    /// The PPv2 header's destination is the address the client contacted —
+    /// the listener — never the backend the datagram is forwarded to, in both
+    /// first-datagram-only and every-datagram modes. Before the fix the header
+    /// named the backend (`dst 10.101.0.6` in the 2026-11-17 production capture
+    /// against a listener on the LB's public IP), while the TCP serializer in
+    /// `SendProxyProtocol::back_writable` (`lib/src/protocol/proxy_protocol/send.rs`)
+    /// has always named the listener.
+    #[test]
+    fn proxy_protocol_destination_is_the_listener_not_the_backend() {
+        // PPv2 IPv4 DGRAM layout: 16-byte preamble, then src ip (16..20), dst
+        // ip (20..24), src port (24..26), dst port (26..28).
+        fn header_dst(payload: &[u8]) -> SocketAddr {
+            let ip = Ipv4Addr::new(payload[20], payload[21], payload[22], payload[23]);
+            let port = u16::from_be_bytes([payload[26], payload[27]]);
+            SocketAddr::new(IpAddr::V4(ip), port)
+        }
+        fn header_src(payload: &[u8]) -> SocketAddr {
+            let ip = Ipv4Addr::new(payload[16], payload[17], payload[18], payload[19]);
+            let port = u16::from_be_bytes([payload[24], payload[25]]);
+            SocketAddr::new(IpAddr::V4(ip), port)
+        }
+
+        for every_datagram in [false, true] {
+            let mut cfg = cluster("dns");
+            cfg.send_proxy_protocol = true;
+            cfg.proxy_protocol_every_datagram = every_datagram;
+            let mut mgr = UdpManager::new(cfg, 16, 65535, 7);
+            let now = Instant::now();
+            // Three pairwise-distinct addresses, IP and port both, so the
+            // assertion cannot pass by coincidence.
+            let src = client(7, 40000);
+            let backend = backend_addr(1);
+            assert_ne!(src.ip(), listener().ip());
+            assert_ne!(backend.ip(), listener().ip());
+            assert_ne!(backend.port(), listener().port());
+
+            let mut headers = Vec::new();
+            for payload in [&b"q1"[..], &b"q2"[..]] {
+                mgr.handle_input(
+                    ManagerInput::ClientDatagram {
+                        src,
+                        dst: listener(),
+                        payload,
+                        backends: &mut TestBackends::one(),
+                    },
+                    now,
+                );
+                let sent = drain(&mut mgr)
+                    .into_iter()
+                    .find_map(|o| match o {
+                        Output::SendToBackend(t) => Some(t),
+                        _ => None,
+                    })
+                    .expect("every datagram is forwarded");
+                // The transmit still goes to the backend; only the header
+                // names the listener.
+                assert_eq!(sent.dst, backend, "the datagram is sent to the backend");
+                if sent.payload.len() == 28 + payload.len() {
+                    headers.push(sent.payload);
+                } else {
+                    assert_eq!(sent.payload, payload, "no header means the bare payload");
+                }
+            }
+
+            let expected = if every_datagram { 2 } else { 1 };
+            assert_eq!(
+                headers.len(),
+                expected,
+                "every_datagram={every_datagram}: header count"
+            );
+            for header in &headers {
+                assert_eq!(&header[12..14], &[0x21, 0x12], "v2 PROXY, AF_INET DGRAM");
+                assert_eq!(header_src(header), src, "PPv2 source is the client");
+                assert_eq!(
+                    header_dst(header),
+                    listener(),
+                    "every_datagram={every_datagram}: PPv2 destination is the listener"
+                );
+                assert_ne!(
+                    header_dst(header),
+                    backend,
+                    "every_datagram={every_datagram}: PPv2 destination is never the backend"
+                );
+            }
+        }
     }
 
     /// Helper: admit a flow from `src`, resolve it to `backend()`, and return
@@ -1896,6 +2023,7 @@ mod tests {
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src,
+                dst: listener(),
                 payload: b"q",
                 backends: &mut TestBackends::one(),
             },
@@ -1927,6 +2055,7 @@ mod tests {
             mgr.handle_input(
                 ManagerInput::ClientDatagram {
                     src: client(n, 1000),
+                    dst: listener(),
                     payload: b"q",
                     backends: &mut TestBackends::one(),
                 },
@@ -2032,6 +2161,7 @@ mod tests {
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src: client(1, 1000),
+                dst: listener(),
                 payload: b"q",
                 // The cluster has nothing that can serve.
                 backends: &mut TestBackends::none(),
@@ -2066,6 +2196,7 @@ mod tests {
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src: client(1, 1000),
+                dst: listener(),
                 payload: b"q2",
                 backends: &mut TestBackends::one(),
             },
@@ -2134,6 +2265,7 @@ mod tests {
             mgr.handle_input(
                 ManagerInput::ClientDatagram {
                     src,
+                    dst: listener(),
                     payload: p,
                     backends: &mut TestBackends::one(),
                 },
@@ -2162,6 +2294,7 @@ mod tests {
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src,
+                dst: listener(),
                 payload: b"a",
                 backends: &mut TestBackends::one(),
             },
@@ -2184,6 +2317,7 @@ mod tests {
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src,
+                dst: listener(),
                 payload: b"b",
                 backends: &mut TestBackends::one(),
             },
@@ -2221,6 +2355,7 @@ mod tests {
                         mgr.handle_input(
                             ManagerInput::ClientDatagram {
                                 src,
+                                dst: listener(),
                                 payload: b"q",
                                 backends: &mut TestBackends::one(),
                             },
@@ -2277,6 +2412,7 @@ mod tests {
             mgr.handle_input(
                 ManagerInput::ClientDatagram {
                     src,
+                    dst: listener(),
                     payload: b"q",
                     backends: &mut TestBackends::one(),
                 },
@@ -2289,6 +2425,7 @@ mod tests {
             mgr.handle_input(
                 ManagerInput::ClientDatagram {
                     src,
+                    dst: listener(),
                     payload: b"q2",
                     backends: &mut TestBackends::one(),
                 },

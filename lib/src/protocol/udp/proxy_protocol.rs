@@ -6,10 +6,13 @@
 //! for UDP-over-IPv6 (the low nibble `0x2` = `DGRAM`, vs `0x1` = `STREAM` used
 //! by the TCP serializer in `protocol/proxy_protocol/header.rs`).
 //!
-//! This builds the header for a flow's first upstream datagram with the **real
-//! (pre-NAT) client address** as the PPv2 source. The destination is the
-//! backend address. The header is a cheap prefix the core prepends in place to
-//! the owned payload [`Vec<u8>`].
+//! This builds the header for an upstream datagram with the **real (pre-NAT)
+//! client address** as the PPv2 source and the **address the client contacted**
+//! (the listener's bound address) as the PPv2 destination, as the spec defines
+//! it and as the TCP serializer does with the accepted socket's local address.
+//! The backend the datagram is forwarded to never appears in the header. The
+//! header is a cheap prefix the core prepends in place to the owned payload
+//! [`Vec<u8>`].
 //!
 //! Layout (v2):
 //! ```text
@@ -37,15 +40,16 @@ const PP2_FAM_INET_DGRAM: u8 = 0x12;
 const PP2_FAM_INET6_DGRAM: u8 = 0x22;
 
 /// Build the PPv2 DGRAM header bytes for a datagram whose real client source is
-/// `client` and whose backend destination is `backend`.
+/// `client` and which the client sent to `destination`, the listener address it
+/// contacted. `destination` is never the backend.
 ///
 /// When the two addresses are mixed-family (one v4, one v6 — which the UDP
-/// datapath never produces, since the connected upstream socket matches the
-/// backend family) this falls back to an `AF_UNSPEC` / `UNSPEC` header with a
+/// datapath never produces, since a datagram's source and the socket it arrived
+/// on share a family) this falls back to an `AF_UNSPEC` / `UNSPEC` header with a
 /// zero-length address block, exactly as the TCP serializer does. The backend
 /// must then treat the connection as un-proxied, per the spec's UNSPEC rule.
-pub fn dgram_header(client: SocketAddr, backend: SocketAddr) -> Vec<u8> {
-    match (client, backend) {
+pub fn dgram_header(client: SocketAddr, destination: SocketAddr) -> Vec<u8> {
+    match (client, destination) {
         (SocketAddr::V4(src), SocketAddr::V4(dst)) => {
             let mut h = Vec::with_capacity(16 + 12);
             h.extend_from_slice(&PP2_SIGNATURE);
@@ -87,9 +91,9 @@ pub fn dgram_header(client: SocketAddr, backend: SocketAddr) -> Vec<u8> {
 pub fn prepend_dgram_header(
     payload: &mut Vec<u8>,
     client: SocketAddr,
-    backend: SocketAddr,
+    destination: SocketAddr,
 ) -> usize {
-    let header = dgram_header(client, backend);
+    let header = dgram_header(client, destination);
     let header_len = header.len();
     // Single splice: reserve, shift the payload right, copy the header in front.
     let mut prefixed = Vec::with_capacity(header_len + payload.len());
@@ -107,10 +111,10 @@ mod tests {
 
     #[test]
     fn dgram_header_ipv4_exact_bytes() {
-        // client 125.25.10.1:8080  →  backend 10.4.5.8:4200
+        // client 125.25.10.1:8080  →  listener 10.4.5.8:4200
         let client = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(125, 25, 10, 1)), 8080);
-        let backend = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 4, 5, 8)), 4200);
-        let header = dgram_header(client, backend);
+        let listener = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 4, 5, 8)), 4200);
+        let header = dgram_header(client, listener);
         let expected: [u8; 28] = [
             0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54,
             0x0A, // signature
@@ -128,10 +132,10 @@ mod tests {
 
     #[test]
     fn dgram_header_ipv6_exact_bytes() {
-        // client ::1:8080  →  backend ::1:4200
+        // client ::1:8080  →  listener ::1:4200
         let client = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), 8080);
-        let backend = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), 4200);
-        let header = dgram_header(client, backend);
+        let listener = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), 4200);
+        let header = dgram_header(client, listener);
         let expected: [u8; 52] = [
             0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54,
             0x0A, // signature
@@ -152,9 +156,9 @@ mod tests {
     #[test]
     fn prepend_shifts_payload() {
         let client = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 1234);
-        let backend = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)), 5678);
+        let listener = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)), 5678);
         let mut payload = b"DNSQUERY".to_vec();
-        let n = prepend_dgram_header(&mut payload, client, backend);
+        let n = prepend_dgram_header(&mut payload, client, listener);
         assert_eq!(n, 28);
         assert_eq!(&payload[..12], &PP2_SIGNATURE);
         assert_eq!(payload[12], PP2_VER_CMD_PROXY);
@@ -165,8 +169,8 @@ mod tests {
     #[test]
     fn mixed_family_emits_unspec() {
         let client = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 1);
-        let backend = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 2);
-        let header = dgram_header(client, backend);
+        let listener = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 2);
+        let header = dgram_header(client, listener);
         assert_eq!(header.len(), 16);
         assert_eq!(header[12], PP2_VER_CMD_PROXY);
         assert_eq!(header[13], 0x00); // AF_UNSPEC
