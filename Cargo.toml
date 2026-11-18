@@ -46,7 +46,7 @@ quickcheck = "^1.1.0"
 rand = "^0.10.3"
 regex = "^1.13.1"
 redis = { version = "^1.8.0", default-features = false }
-rskafka = { version = "^0.6.0", default-features = false }
+kafka-protocol = { version = "^0.18.0", default-features = false, features = ["client"] }
 rustls-openssl = { version = "^0.4.2", default-features = false, features = ["tls12"] }
 # The certificate parser rustls verifies with. No crypto feature: Sozu only
 # reads CRL issuers with it, rustls keeps doing every signature check.

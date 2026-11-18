@@ -117,8 +117,11 @@ Pulsar uses Magnetar with its `tokio` and `crypto-ring` features. This focused
 job validates that client/provider combination and does not claim coverage for
 the other Sōzu crypto-provider cells. Its container becomes ready only after the
 broker health endpoint returns the exact `ok` body and the standalone
-`public/default` namespace exists. Kafka uses the pure-Rust `rskafka` client;
-the standalone stream test deliberately does not exercise consumer groups.
+`public/default` namespace exists. Kafka speaks the wire protocol through
+`kafka-protocol`, which only encodes and decodes messages: the test frames
+requests itself over one connection to the single KRaft node (ApiVersions,
+CreateTopics, Produce, Fetch, DeleteTopics), so there is no metadata or leader
+discovery, and it deliberately does not exercise consumer groups.
 The DNS client uses `hickory-proto` only to encode and decode datagrams on a
 connected `UdpSocket`; there is no system resolver and no hidden TCP fallback.
 
