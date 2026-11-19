@@ -2088,9 +2088,15 @@ generates itself to a partly received request (400, 401, 413, 503, 504, or a
 408 after part of a head): each lingers, bounded by `request_timeout`. A
 request of which no byte arrived (the 408 `client_timeout` to a silent client,
 whose `stream.front` is still at `StatusLine` with empty storage) has nothing
-in flight to drain and closes at once, as before. Pending also ends the
-linked backend stream through `endpoint.end_stream`, which disconnects that
-backend. Once nothing is left to flush (the response, then any TLS
+in flight to drain and closes at once, as before. The branch ends the linked
+backend stream through `endpoint.end_stream` whether it lingers or not — the
+backend is done with the stream either way, and the call is what records the
+stream's `StreamsEnded` (invariant 14). `ConnectionH1::end_stream` then
+returns the backend connection to `BackendStatus::KeepAlive` when its response
+was whole, the request was written to it whole, and it did not ask to close,
+and disconnects it otherwise (always, for a request received in part); the
+session's close closes a kept one with the rest.
+Once nothing is left to flush (the response, then any TLS
 `close_notify`), `defer_close_for_tls_flush` calls `start_linger` instead of
 returning `CloseSession`: it shuts the write side down with `shutdown_write`,
 so the FIN follows the response, and leaves only READABLE in the interest.
@@ -2556,8 +2562,27 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     outside `Connection::end_stream` must release the charge that stream's
     creation took (`ConnectionH2::cancel_timed_out_streams`,
     `ConnectionH2::handle_rst_stream_frame` and
-    `ConnectionH2::handle_goaway_frame`; all `h2.rs`).
+    `ConnectionH2::handle_goaway_frame`; all `h2.rs`; and the
+    backend-response parse error of `ConnectionH1::readable`, `h1.rs`, which
+    ends its own stream through the inherent `ConnectionH1::end_stream`).
     Otherwise load-balancing counters drift monotonically.
+
+    The release must also be recorded **while the stream is still in the
+    reverse index**, or by the site that removes it: `Mux::close_backend_connections`
+    and the dead-backend sweep of `Mux::ready_inner` count their
+    `StreamsEnded(n)` from `Context::backend_streams`, so a stream taken out
+    of it first (`remove_backend_stream`) is counted by neither. That is why
+    the closing arm of `ConnectionH1::writable` ends the backend stream
+    through `Endpoint::end_stream` for every request it answers, as the
+    keep-alive arm does, and not only for the lingering one: a complete
+    response on a frontend that closes after it (client `Connection: close`,
+    or the backend's) would otherwise leave one charge per request on the
+    backend. Pinned by
+    `a_complete_response_on_a_closing_h1_frontend_releases_the_backend_stream_charge`,
+    `a_backend_response_that_does_not_parse_releases_the_backend_stream_charge`
+    and their `*_charge_once` companions, which charge a second stream to the
+    same backend so a double release reads as a wrong count instead of
+    saturating at zero (`mod.rs`).
 
     The core does not perform the release; it **emits** it. Question 12 of
     [#1340](https://github.com/sozu-proxy/sozu/issues/1340) took

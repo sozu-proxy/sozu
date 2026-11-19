@@ -9655,8 +9655,10 @@ mod tests {
         mux.router.backends.insert(backend_token, connection);
         mux.context.link_stream(0, backend_token);
         // A request received whole, from a client that asked to close: the
-        // response closes the frontend without a lingering drain (which
-        // would end this backend's stream at once).
+        // response closes the frontend without a lingering drain. The close
+        // ends the backend's stream (it returns to `BackendStatus::KeepAlive`,
+        // with no synthetic HUP), so it is the FIN's own edge, below, that
+        // closes the backend.
         mux.context.streams[0].front.parsing_phase = kawa::ParsingPhase::Terminated;
         mux.context.streams[0].context.keep_alive_frontend = false;
         mux.frontend.readiness_mut().event = Ready::EMPTY;
@@ -9696,6 +9698,283 @@ mod tests {
         assert!(
             !mux.router.backends.contains_key(&backend_token),
             "the backend must be closed on that round, not later"
+        );
+    }
+
+    // ── the ledger of an H1 stream that ends on a path that is not the keep-alive one ──
+
+    /// Register `connection` under `token` as the H1 backend that carries
+    /// stream 0, charged exactly as a dial or a pooled reuse charges it:
+    /// `Connection::start_stream` on a `Connected` connection records
+    /// `StreamsStarted(1)`, and the ledger is applied. Returns the backend's
+    /// handle, which is where `active_requests` can be read.
+    fn register_charged_backend_stream(
+        mux: &mut Mux<mio::net::TcpStream, test_support::TestListener>,
+        token: Token,
+        mut connection: Connection<SessionTcpStream>,
+    ) -> Rc<RefCell<Backend>> {
+        let backend = {
+            let Position::Client(_, backend_id, status) = connection.position_mut() else {
+                unreachable!("new_h1_client builds a client connection")
+            };
+            *status = BackendStatus::Connected;
+            Rc::clone(
+                mux.backend_registry
+                    .handle(backend_id)
+                    .expect("the backend must be in the registry that minted its id"),
+            )
+        };
+        assert!(
+            connection.start_stream(0, &mut mux.context),
+            "a Connected H1 client must start the stream"
+        );
+        mux.router.backends.insert(token, connection);
+        mux.context.link_stream(0, token);
+        mux.apply_backend_deltas();
+        assert_eq!(
+            backend.borrow().active_requests,
+            1,
+            "premise: the stream is charged to its backend"
+        );
+        backend
+    }
+
+    /// Hand `bytes` to the H1 backend registered under `token` the way
+    /// `epoll_wait` would: written by the peer, awaited until the kernel
+    /// shows them, then announced as a READABLE edge.
+    fn deliver_to_backend(
+        mux: &mut Mux<mio::net::TcpStream, test_support::TestListener>,
+        token: Token,
+        backend_peer: &mut std::net::TcpStream,
+        bytes: &[u8],
+    ) {
+        use std::io::Write;
+
+        backend_peer
+            .write_all(bytes)
+            .expect("the backend peer must write");
+        let Some(Connection::H1(h1)) = mux.router.backends.get_mut(&token) else {
+            unreachable!("the backend is registered as an H1 client")
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while h1.socket.stream.peek(&mut [0u8; 1]).is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "the backend's bytes must reach its socket"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        h1.readiness.event = Ready::READABLE;
+    }
+
+    /// Invariant 14 (`lib/src/protocol/mux/LIFECYCLE.md`): a complete
+    /// response on an H1 frontend that closes after it — the client sent
+    /// `Connection: close` — leaves the backend's `active_requests` where it
+    /// found it once the session is closed. The keep-alive arm of
+    /// `ConnectionH1::writable` ends the backend stream through
+    /// `Endpoint::end_stream`, which records `StreamsEnded(1)`; the close arm
+    /// does not, after `remove_backend_stream` took the stream out of the
+    /// reverse index that `Mux::close_backend_connections` and the dead-backend
+    /// sweep of `Mux::ready_inner` count their `StreamsEnded` from.
+    #[test]
+    fn a_complete_response_on_a_closing_h1_frontend_releases_the_backend_stream_charge() {
+        const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut mux, mut frontend_peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));
+        let backend_token = Token(1);
+        let (connection, mut backend_peer) =
+            test_backend_connection(&mut mux, Duration::from_secs(30));
+        let backend = register_charged_backend_stream(&mut mux, backend_token, connection);
+        // A request received whole, from a client that asked to close.
+        mux.context.streams[0].front.parsing_phase = kawa::ParsingPhase::Terminated;
+        mux.context.streams[0].context.keep_alive_frontend = false;
+        mux.frontend.readiness_mut().event = Ready::EMPTY;
+        deliver_to_backend(&mut mux, backend_token, &mut backend_peer, RESPONSE);
+
+        let session: Rc<RefCell<dyn ProxySession>> = Rc::new(RefCell::new(NoDialSession));
+        let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(RemoveOnlyProxy));
+        let mut metrics = SessionMetrics::new(None);
+        let result = mux.ready(session, proxy.clone(), &mut metrics);
+        let (forwarded, _) = drain_peer(&mut frontend_peer, b"hello");
+        assert!(
+            forwarded.ends_with(b"hello"),
+            "premise: the response must reach the client, got {:?}",
+            String::from_utf8_lossy(&forwarded)
+        );
+        assert_eq!(
+            result,
+            SessionResult::Close,
+            "premise: the response ends a frontend whose client asked to close"
+        );
+
+        mux.close(proxy, &mut metrics);
+        assert_eq!(
+            backend.borrow().active_requests,
+            0,
+            "the request's StreamsStarted charge must be paid back by a StreamsEnded \
+             once the session is closed"
+        );
+    }
+
+    /// Invariant 14, on the path of a backend response that does not parse:
+    /// `ConnectionH1::readable` ends the stream of the backend connection
+    /// through the inherent `ConnectionH1::end_stream`, not through
+    /// `Connection::end_stream`, which is the only one that records
+    /// `StreamsEnded(1)`. The inherent method takes the stream out of the
+    /// reverse index, so the dead-backend sweep and the session close count
+    /// zero streams on it.
+    #[test]
+    fn a_backend_response_that_does_not_parse_releases_the_backend_stream_charge() {
+        const MALFORMED: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\n";
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut mux, mut frontend_peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));
+        let backend_token = Token(1);
+        let (connection, mut backend_peer) =
+            test_backend_connection(&mut mux, Duration::from_secs(30));
+        let backend = register_charged_backend_stream(&mut mux, backend_token, connection);
+        // A request received whole and written to the backend: the error is
+        // answered 502 (`end_stream_decision`), not retried on another dial.
+        mux.context.streams[0].front.parsing_phase = kawa::ParsingPhase::Terminated;
+        mux.context.streams[0].front.consumed = true;
+        mux.frontend.readiness_mut().event = Ready::EMPTY;
+        deliver_to_backend(&mut mux, backend_token, &mut backend_peer, MALFORMED);
+
+        let session: Rc<RefCell<dyn ProxySession>> = Rc::new(RefCell::new(NoDialSession));
+        let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(RemoveOnlyProxy));
+        let mut metrics = SessionMetrics::new(None);
+        // The sweep that retires the backend runs on an inner iteration of
+        // the pass, or on the next pass.
+        for _ in 0..3 {
+            if mux.ready(session.clone(), proxy.clone(), &mut metrics) == SessionResult::Close
+                || !mux.router.backends.contains_key(&backend_token)
+            {
+                break;
+            }
+        }
+        // Premise: the parse error ran, so the client was answered 502.
+        let mut answer = [0u8; 12];
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut received = 0;
+        while received < answer.len() && Instant::now() < deadline {
+            match std::io::Read::read(&mut frontend_peer, &mut answer[received..]) {
+                Ok(0) => break,
+                Ok(n) => received += n,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("the client socket must be readable: {e}"),
+            }
+        }
+        assert_eq!(
+            &answer[..received],
+            b"HTTP/1.1 502",
+            "premise: a backend response that does not parse is answered 502"
+        );
+
+        mux.close(proxy, &mut metrics);
+        assert_eq!(
+            backend.borrow().active_requests,
+            0,
+            "the request's StreamsStarted charge must be paid back by a StreamsEnded \
+             once the backend is gone and the session is closed"
+        );
+    }
+
+    /// The release the two tests above demand is exactly one: `active_requests`
+    /// saturates at zero, so a stream paid back twice reads as zero there. A
+    /// second stream, another session's, is charged to the same backend here,
+    /// and it is the one that would be paid for.
+    ///
+    /// The backend answered `Connection: close`, so the frontend closes after
+    /// the response and the backend connection is disconnected at the same
+    /// time, which is the shape where both the stream end and the connection
+    /// close are counted.
+    #[test]
+    fn a_closing_h1_frontend_and_its_closing_backend_pay_the_stream_charge_once() {
+        const RESPONSE: &[u8] =
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello";
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut mux, mut frontend_peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));
+        let backend_token = Token(1);
+        let (connection, mut backend_peer) =
+            test_backend_connection(&mut mux, Duration::from_secs(30));
+        let backend = register_charged_backend_stream(&mut mux, backend_token, connection);
+        backend.borrow_mut().active_requests += 1;
+        mux.context.streams[0].front.parsing_phase = kawa::ParsingPhase::Terminated;
+        mux.frontend.readiness_mut().event = Ready::EMPTY;
+        deliver_to_backend(&mut mux, backend_token, &mut backend_peer, RESPONSE);
+
+        let session: Rc<RefCell<dyn ProxySession>> = Rc::new(RefCell::new(NoDialSession));
+        let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(RemoveOnlyProxy));
+        let mut metrics = SessionMetrics::new(None);
+        let result = mux.ready(session, proxy.clone(), &mut metrics);
+        let (forwarded, _) = drain_peer(&mut frontend_peer, b"hello");
+        assert!(
+            forwarded.ends_with(b"hello"),
+            "premise: the response must reach the client, got {:?}",
+            String::from_utf8_lossy(&forwarded)
+        );
+        assert_eq!(
+            result,
+            SessionResult::Close,
+            "premise: the backend's Connection: close ends the frontend"
+        );
+
+        mux.close(proxy, &mut metrics);
+        assert_eq!(
+            backend.borrow().active_requests,
+            1,
+            "the stream is paid back once: the other session's charge stays"
+        );
+    }
+
+    /// Same strict balance as above for a backend response that does not
+    /// parse: `ConnectionH1::readable` releases the stream, and neither the
+    /// dead-backend sweep nor the session close may release it again.
+    #[test]
+    fn a_backend_response_that_does_not_parse_pays_the_stream_charge_once() {
+        const MALFORMED: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\n";
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut mux, _frontend_peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));
+        let backend_token = Token(1);
+        let (connection, mut backend_peer) =
+            test_backend_connection(&mut mux, Duration::from_secs(30));
+        let backend = register_charged_backend_stream(&mut mux, backend_token, connection);
+        backend.borrow_mut().active_requests += 1;
+        mux.context.streams[0].front.parsing_phase = kawa::ParsingPhase::Terminated;
+        mux.context.streams[0].front.consumed = true;
+        mux.frontend.readiness_mut().event = Ready::EMPTY;
+        deliver_to_backend(&mut mux, backend_token, &mut backend_peer, MALFORMED);
+
+        let session: Rc<RefCell<dyn ProxySession>> = Rc::new(RefCell::new(NoDialSession));
+        let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(RemoveOnlyProxy));
+        let mut metrics = SessionMetrics::new(None);
+        for _ in 0..3 {
+            if mux.ready(session.clone(), proxy.clone(), &mut metrics) == SessionResult::Close
+                || !mux.router.backends.contains_key(&backend_token)
+            {
+                break;
+            }
+        }
+        // The sweep retired the backend or the pass closed the session: the
+        // stream's release has been recorded, the other session's charge is
+        // untouched.
+        mux.apply_backend_deltas();
+        assert_eq!(
+            backend.borrow().active_requests,
+            1,
+            "the stream is paid back once: the other session's charge stays"
+        );
+
+        mux.close(proxy, &mut metrics);
+        assert_eq!(
+            backend.borrow().active_requests,
+            1,
+            "the session close must not pay the stream back a second time"
         );
     }
 

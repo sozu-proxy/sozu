@@ -12,6 +12,10 @@
 
 <!-- changelog-slot:backend-ownership -->
 
+### Fixed
+
+- A backend's in-flight request count no longer drifts upward on two HTTP/1.1 paths, which skewed the `LEAST_LOADED` and `POWER_OF_TWO` load-balancing algorithms under `load_metric = "requests"` (they read it under no other metric, and the default `ROUND_ROBIN` never reads it). A complete response on a frontend that closes after it, because the client sent `Connection: close` or the backend's response carried it, never released the request's charge on its backend, so each such request left the backend one request heavier for the life of the worker. A backend response that failed to parse (a malformed `Content-Length`, for instance) left one the same way. The charge is now released on both paths, once.
+
 ## 2.3.6 - 2026-11-18
 
 ### Security

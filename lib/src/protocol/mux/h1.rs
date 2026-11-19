@@ -19,8 +19,8 @@ use crate::metrics::names;
 use crate::{
     L7ListenerHandler, ListenerHandler, Readiness,
     protocol::mux::{
-        BackendStatus, Context, DebugEvent, Endpoint, GlobalStreamId, MuxResult, Position,
-        StreamState, forcefully_terminate_answer, memoized_rtt,
+        BackendChange, BackendStatus, Context, DebugEvent, Endpoint, GlobalStreamId, MuxResult,
+        Position, StreamState, forcefully_terminate_answer, memoized_rtt,
         parser::H2Error,
         remove_backend_stream, set_default_answer,
         shared::{
@@ -767,6 +767,19 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         return MuxResult::CloseSession;
                     };
                     let global_stream_id = stream_id;
+                    // This connection ends its own stream through the
+                    // inherent `end_stream`, not through
+                    // `Connection::end_stream`, which is the one that records
+                    // the `StreamsEnded(1)` pairing the `StreamsStarted(1)` of
+                    // `Connection::start_stream`. The inherent method empties
+                    // the reverse index that the dead-backend sweep and
+                    // `Mux::close_backend_connections` count their
+                    // `StreamsEnded` from, so the release is recorded here, the
+                    // way `ConnectionH2` does where it retires a stream without
+                    // that wrapper (LIFECYCLE invariant 14).
+                    if let Position::Client(_, backend, BackendStatus::Connected) = &self.position {
+                        context.record_backend_delta(backend, BackendChange::StreamsEnded(1));
+                    }
                     self.end_stream(global_stream_id, context);
                     endpoint.end_stream(token, global_stream_id, context);
                 }
@@ -1497,13 +1510,24 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                             // The client may still be sending the request:
                             // drain it once the response is flushed, so the
                             // close does not reset the response away (RFC
-                            // 9112 §9.6). The backend is done with either way.
+                            // 9112 §9.6).
                             self.linger = Linger::Pending {
                                 deadline: now + self.linger_timeout,
                             };
-                            if let StreamState::Linked(token) = old_state {
-                                endpoint.end_stream(token, stream_id, context);
-                            }
+                        }
+                        // The backend is done with the stream either way. It
+                        // is ended here, whatever the request's state: the
+                        // `remove_backend_stream` above emptied the reverse
+                        // index that `Mux::close_backend_connections` and the
+                        // dead-backend sweep count their `StreamsEnded` from,
+                        // so with no `end_stream` the `StreamsStarted` charge
+                        // this stream took would never be released and
+                        // `Backend::active_requests` would grow by one per
+                        // request answered on a closing connection (LIFECYCLE
+                        // invariant 14). It is the keep-alive arm's call above
+                        // too, and exactly one of the two arms runs.
+                        if let StreamState::Linked(token) = old_state {
+                            endpoint.end_stream(token, stream_id, context);
                         }
                         let stream = &mut context.streams[stream_id];
                         if stream.context.keep_alive_frontend && stream.context.keep_alive_backend {
