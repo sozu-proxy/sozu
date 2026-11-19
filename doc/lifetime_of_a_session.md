@@ -693,6 +693,16 @@ would share its wheel handle but not its entry, and a reset only the session
 performs would leave that entry live as a second one, fired later at whichever
 session has inherited the token.
 
+A frontend HUP closes every state before the `Pipe`, so `TcpSession::ready_inner`
+reads the pending bytes of the two states that decide on what the client sent
+before it acts on one: `ExpectProxyProtocol`
+([#1823](https://github.com/sozu-proxy/sozu/issues/1823)) and an undecided
+`SniPreread`. A client that queues its first bytes and half-closes behind them
+is reported as one `READABLE | HUP` event, and an empty accumulator on that
+event is not an empty connection: for `SniPreread` it would be closed as a
+silent health check although its ClientHello is queued in the kernel
+(`tcp_preread/LIFECYCLE.md` §9).
+
 1. **Accept** as in §3; the listener's `TCP_NODELAY` and the accepted address
    apply unchanged.
 2. **Connect.** `TcpSession::connect_to_backend` resolves the cluster (the

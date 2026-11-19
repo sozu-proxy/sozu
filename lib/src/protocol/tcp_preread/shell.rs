@@ -291,7 +291,8 @@ impl<Front: SocketHandler> SniPreread<Front> {
     /// routing decision it mirrors `readable`'s `SocketResult::Closed`
     /// handling: silent when no bytes were ever received (the bare TCP
     /// health-check pattern), metered otherwise. Once a route has latched
-    /// (backend connect still pending) it is a plain close with no metric.
+    /// (backend connect pending or not yet started) it is a plain close with
+    /// no metric.
     pub fn on_front_closed(&mut self, cfg: &PrereadConfig<'_>) {
         let _ = self.front_gone(cfg);
     }
@@ -300,22 +301,25 @@ impl<Front: SocketHandler> SniPreread<Front> {
     /// (`Ok(0)` / socket error) and the HUP-path (`on_front_closed`).
     fn front_gone(&mut self, cfg: &PrereadConfig<'_>) -> SessionResult {
         if self.outcome.is_some() {
-            // The route already latched (the backend connect is still
-            // pending, which is the only way to be here: the read path
-            // returns early once routed). The accumulator still holds the
-            // ClientHello, so `has_received_bytes()` is true, and feeding
+            // The route already latched and the backend connect has not
+            // completed: it is pending, or it never started because the
+            // route latched in `TcpSession::ready_inner`'s pre-HUP drain on
+            // the same `READABLE | HUP` event (`lib/src/tcp.rs`). Only the
+            // HUP path gets here: the read path returns early once routed.
+            // The accumulator still holds the ClientHello, so
+            // `has_received_bytes()` is true, and feeding
             // `Input::FrontClosed` into the decided core would replay the
             // SAME latched `Output::Routed` through `handle_output`'s
             // `Routed` arm a second time: `tcp.sni_preread.routed` counted
             // twice and the route logged twice in release, the
             // `debug_assert!(self.outcome.is_none(), ...)` tripping in
             // debug. There is no preread verdict left to meter: the
-            // frontend going away mid-connect is a plain close, exactly like
-            // the route-aware front timeout in `TcpSession::timeout`
+            // frontend going away before the connect completes is a plain
+            // close, as is the route-aware front timeout in `TcpSession::timeout`
             // (`lib/src/tcp.rs`, sozu-proxy/sozu#1290).
             debug!(
-                "{} frontend closed while a routed SNI-preread session was still waiting on \
-                 its backend connect",
+                "{} frontend closed after the SNI preread routed, before the backend connect \
+                 completed",
                 log_context!(self)
             );
             return SessionResult::Close;

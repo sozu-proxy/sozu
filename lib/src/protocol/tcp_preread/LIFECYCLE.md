@@ -304,7 +304,29 @@ fully drained. The regression guard is
 `readable`'s own `SocketResult::Closed`/`Error` arm and
 `on_front_closed` (invoked from `tcp.rs`'s
 `TcpSession::front_hup`) — branch on `has_received_bytes()`
-(`frontend_buffer.available_data() > 0`):
+(`frontend_buffer.available_data() > 0`), which counts the bytes already read
+into the accumulator and not the bytes still queued in the kernel. That is why
+HUP is never honoured first while the session is undecided: a client that
+queues its ClientHello and half-closes right behind it can deliver both as ONE
+`READABLE | HUP` event (Linux coalesces `EPOLLIN | EPOLLRDHUP`), and
+`front_hup` on that event would see an empty accumulator and take the silent
+branch below for a client whose hello did arrive (or, for a hello whose last
+fragment and FIN coalesce, meter it as `rejected.front_closed` although the
+kernel holds the rest). `TcpSession::ready_inner` (`lib/src/tcp.rs`) therefore
+calls `readable` while READABLE and HUP are both set and the session is an
+undecided `SniPreread`, before its frontend-HUP check, as it already does for
+`ExpectProxyProtocol` (#1823). The read then reaches one of the cases below
+with the bytes in the accumulator: it routes (the route latch drops frontend
+READABLE interest, which ends the drain; the still-set HUP then closes the
+session through the *route already latched* case, so the route is metered once
+and the backend is not dialed), rejects (`Close`, metered with the reason the
+bytes earn), consumes a hello the FIN cut short (the core waits for more, and
+the *bytes were seen* case meters `rejected.front_closed` on the next read's
+EOF or on the HUP check), or reads zero bytes (the silent case). A routed
+`SniPreread` is not drained: it reads nothing any more. The regression guards are
+`sni_preread_hello_and_fin_in_one_event_is_routed_not_a_silent_health_check`
+and `sni_preread_last_fragment_and_fin_in_one_event_is_routed_not_rejected`
+(`lib/src/tcp.rs`).
 
 - **Bytes were seen**: feeds `Input::FrontClosed` into the core, which
   latches `Reject(FrontClosed)` and increments
@@ -315,8 +337,10 @@ fully drained. The regression guard is
   `protocol/proxy_protocol/expect.rs` — counting every health-check probe as
   a routing rejection would make the reject-reason metrics useless as a
   signal for actual client-facing failures.
-- **A route already latched** (`outcome` is set, the backend connect is still
-  pending): `front_gone` returns `Close` before looking at the accumulator,
+- **A route already latched** (`outcome` is set and the backend connect has
+  not completed: it is pending, or it never started because the route latched
+  in the pre-HUP drain above): `front_gone` returns `Close` before looking at
+  the accumulator,
   which still holds the ClientHello and would otherwise make
   `has_received_bytes()` true. Feeding `Input::FrontClosed` into the decided
   core would replay the latched `Output::Routed` (§3) through

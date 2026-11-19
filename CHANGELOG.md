@@ -26,6 +26,10 @@
 
 - A client that hangs up after its ClientHello was routed, while the TCP backend connect is still pending, no longer routes the session a second time. The frontend HUP fed `Input::FrontClosed` into the already-decided SNI preread core, which replayed the latched route through the shell's output handler: `tcp.sni_preread.routed` was counted twice and the route logged twice, and a debug build aborted the worker on `debug_assert!(self.outcome.is_none(), ...)`. A hang-up after the route latched now closes the session without a second routing verdict, as the front timeout already did (#1290). A hang-up before any route is unchanged: it still counts `tcp.sni_preread.rejected.front_closed` when bytes were received and stays silent for a bare health-check connect.
 
+<!-- changelog-slot:tcp-sni-hello-and-fin -->
+
+- A client that sends its ClientHello and half-closes right behind it is no longer counted as a silent health-check connect on an SNI-routed TCP listener. When the hello and the FIN reach the worker before it services the socket, Linux reports them as one `READABLE | HUP` event, and the session honoured the HUP first: the accumulator was still empty, so the close took the branch reserved for a connection that sent no bytes at all, which logs at `trace` only and meters nothing, although the hello was queued in the kernel. The session was closed with no `tcp.sni_preread.routed` or `tcp.sni_preread.rejected.*` count and nothing logged above `trace`. A hello whose last fragment arrived together with the FIN was counted as `rejected.front_closed` for the same reason, although the rest of it was already queued. `TcpSession::ready_inner` now reads the pending bytes of an undecided `SniPreread` session before it acts on the HUP, as it already did for `expect_proxy`: the hello is routed and counted once, a malformed or incomplete one is counted with the reason it earns, and a connect that sent nothing stays silent. The session is still closed on the HUP, and the backend is not dialed.
+
 ## 2.3.6 - 2026-11-18
 
 ### Security

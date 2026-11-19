@@ -1451,21 +1451,41 @@ impl TcpSession {
             return state_result;
         }
 
-        // A client that half-closes right behind its PROXY-v2 header and
-        // payload can deliver both as ONE `READABLE | HUP` event (Linux
-        // coalesces `EPOLLIN | EPOLLRDHUP`). `front_hup` closes every
-        // pre-`Pipe` state (`SniPreread` without an access log), so
+        // A client that half-closes right behind its first bytes can deliver
+        // both as ONE `READABLE | HUP` event (Linux coalesces `EPOLLIN |
+        // EPOLLRDHUP`): its PROXY-v2 header and payload on an expect
+        // listener, its ClientHello on an SNI-routed one. `front_hup` closes
+        // every pre-`Pipe` state (`SniPreread` without an access log), so
         // honouring HUP first would drop a complete, already-queued header
-        // (sozu-proxy/sozu#1823).
-        // Drain the expect state's readable bytes first: a parsed header
-        // returns `Upgrade` and the recursive `ready()` hands the still-set
-        // HUP to `Pipe::frontend_hup`, which keeps the session alive while
-        // request bytes remain in the kernel or the pipe's buffers. An empty
-        // or truncated header
-        // ends with READABLE cleared (`readable` removes it on every
-        // zero-byte read) or a `Close`, so a dead client still closes,
-        // through `readable`'s own zero-byte arm or the HUP check below.
-        if let TcpStateMachine::ExpectProxyProtocol(_) = self.state {
+        // (sozu-proxy/sozu#1823), and would read an `SniPreread` session whose
+        // hello is still queued in the kernel as "zero bytes ever arrived",
+        // the silent bare-TCP health check, instead of metering the route or
+        // the reject it is owed (`lib/src/protocol/tcp_preread/LIFECYCLE.md`
+        // section 9).
+        // Drain the readable bytes of those two states first. Expect: a
+        // parsed header returns `Upgrade` and the recursive `ready()` hands
+        // the still-set HUP to `Pipe::frontend_hup`, which keeps the session
+        // alive while request bytes remain in the kernel or the pipe's
+        // buffers. An empty or truncated header ends with READABLE cleared
+        // (`readable` removes it on every zero-byte read) or a `Close`, so a
+        // dead client still closes, through `readable`'s own zero-byte arm or
+        // the HUP check below. Undecided `SniPreread`: the read either routes
+        // (the route latch drops frontend READABLE interest, which ends the
+        // drain, and the HUP check below then closes the session without a
+        // second verdict), rejects (`Close`, metered with the reason the
+        // bytes earn), consumes a hello the FIN cut short (the core waits
+        // for more, and `rejected.front_closed` is metered by the next
+        // read's EOF or by the HUP check below) or reads zero bytes (silent
+        // `Close`, the genuine health check). A routed
+        // `SniPreread` is excluded: it reads nothing any more, its READABLE
+        // interest is already gone, and its bytes belong to the post-upgrade
+        // state.
+        let drains_readable_before_hup = match &self.state {
+            TcpStateMachine::ExpectProxyProtocol(_) => true,
+            TcpStateMachine::SniPreread(preread) => !preread.is_routed(),
+            _ => false,
+        };
+        if drains_readable_before_hup {
             while (self.front_readiness().interest & self.front_readiness().event).is_readable()
                 && self.front_readiness().event.is_hup()
                 && counter < MAX_LOOP_ITERATIONS
@@ -5679,20 +5699,30 @@ mod sni_routing_tests {
     /// real kernel event rather than a synthetic readiness word.
     #[cfg(target_os = "linux")]
     fn half_close_and_observe_frontend(fixture: &mut ExpectProxyFixture, wire: &[u8]) -> Ready {
-        use std::{io::Write as _, net::Shutdown, os::fd::AsRawFd, time::Duration};
+        use std::os::fd::AsRawFd;
+
+        let frontend_fd = fixture.session.borrow().state.front_socket().as_raw_fd();
+        half_close_and_observe(&mut fixture.client, frontend_fd, wire)
+    }
+
+    /// The body of `half_close_and_observe_frontend`, for any fixture: `client`
+    /// is the peer end that writes `wire` then half-closes, `frontend_fd` the
+    /// accepted socket on the other end.
+    #[cfg(target_os = "linux")]
+    fn half_close_and_observe(
+        client: &mut std::net::TcpStream,
+        frontend_fd: std::os::fd::RawFd,
+        wire: &[u8],
+    ) -> Ready {
+        use std::{io::Write as _, net::Shutdown, time::Duration};
 
         use mio::{Events, Interest, Poll, Token, unix::SourceFd};
 
-        fixture
-            .client
-            .write_all(wire)
-            .expect("write the request stream");
-        fixture
-            .client
+        client.write_all(wire).expect("write the request stream");
+        client
             .shutdown(Shutdown::Write)
             .expect("half-close the client write side");
 
-        let frontend_fd = fixture.session.borrow().state.front_socket().as_raw_fd();
         let mut source = SourceFd(&frontend_fd);
         let mut poll = Poll::new().expect("create frontend poll");
         let observed_token = Token(7);
@@ -6817,6 +6847,162 @@ mod sni_routing_tests {
             1,
             "a frontend HUP after the route latched must not double-count \
              tcp.sni_preread.routed"
+        );
+    }
+
+    /// A client that writes a complete ClientHello and half-closes right
+    /// behind it before the worker services the socket delivers both as ONE
+    /// `READABLE | HUP` event (see `half_close_and_observe_frontend`). The
+    /// hello is still queued in the kernel, so the session must read and route
+    /// it before it acts on the HUP; acting on the HUP first reads
+    /// "zero bytes accumulated" as the bare TCP health check
+    /// (`SniPreread::front_gone`: `trace!` and `Close`, no metric, no log), so a
+    /// client whose hello did arrive is counted as neither `routed` nor
+    /// `rejected.*` (`lib/src/protocol/tcp_preread/LIFECYCLE.md` section 9
+    /// keeps the silent branch for "zero bytes ever arrived").
+    ///
+    /// Whether the session then stays open is not asserted: after the route
+    /// the still-set HUP closes an `SniPreread` session either way.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sni_preread_hello_and_fin_in_one_event_is_routed_not_a_silent_health_check() {
+        use std::os::fd::AsRawFd;
+
+        let mut fixture = dial_fixture(
+            true,
+            |back_buffer, front_buffer, token, listener, proxy, socket, peer| {
+                TcpSession::new_sni_preread(
+                    back_buffer,
+                    Duration::from_secs(30),
+                    Duration::from_secs(30),
+                    front_buffer,
+                    token,
+                    listener,
+                    proxy,
+                    socket,
+                    peer,
+                    Duration::from_millis(0),
+                    Duration::from_secs(3),
+                    16384,
+                )
+            },
+        );
+
+        let frontend_fd = fixture.session.borrow().state.front_socket().as_raw_fd();
+        let ready = half_close_and_observe(
+            &mut fixture.client,
+            frontend_fd,
+            &minimal_client_hello_wire("example.com"),
+        );
+
+        let routed_before = sni_preread_routed_count();
+        fixture
+            .session
+            .borrow_mut()
+            .update_readiness(fixture.frontend_token, ready);
+        let _ = fixture
+            .session
+            .borrow_mut()
+            .ready(fixture.proxy_session.clone());
+
+        assert_eq!(
+            sni_preread_routed_count() - routed_before,
+            1,
+            "a complete ClientHello queued behind the same READABLE|HUP event as the FIN must be \
+             read and routed before the HUP is honoured, not closed as a silent zero-byte \
+             health check"
+        );
+    }
+
+    /// The fragmented variant of the test above: the first half of the hello
+    /// is read in an earlier pass, then its second half and the FIN arrive as
+    /// ONE `READABLE | HUP` event. The accumulator is non-empty, so the
+    /// session used to take the metered branch of `SniPreread::front_gone` and
+    /// count a `rejected.front_closed` for a hello the client had in fact
+    /// finished sending, which was still queued in the kernel. Reading before
+    /// the HUP completes the hello and routes it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sni_preread_last_fragment_and_fin_in_one_event_is_routed_not_rejected() {
+        use std::{io::Write as _, os::fd::AsRawFd};
+
+        use mio::{Events, Interest, Poll, unix::SourceFd};
+
+        let mut fixture = dial_fixture(
+            true,
+            |back_buffer, front_buffer, token, listener, proxy, socket, peer| {
+                TcpSession::new_sni_preread(
+                    back_buffer,
+                    Duration::from_secs(30),
+                    Duration::from_secs(30),
+                    front_buffer,
+                    token,
+                    listener,
+                    proxy,
+                    socket,
+                    peer,
+                    Duration::from_millis(0),
+                    Duration::from_secs(3),
+                    16384,
+                )
+            },
+        );
+
+        let wire = minimal_client_hello_wire("example.com");
+        let (first, rest) = wire.split_at(wire.len() / 2);
+        let frontend_fd = fixture.session.borrow().state.front_socket().as_raw_fd();
+
+        // First fragment: wait for the kernel to report it, then let the
+        // session read it. It is incomplete, so the session keeps waiting.
+        fixture
+            .client
+            .write_all(first)
+            .expect("write the first fragment");
+        let mut source = SourceFd(&frontend_fd);
+        let mut poll = Poll::new().expect("create frontend poll");
+        poll.registry()
+            .register(&mut source, Token(7), Interest::READABLE)
+            .expect("register accepted frontend socket");
+        let mut events = Events::with_capacity(4);
+        poll.poll(&mut events, Some(Duration::from_secs(2)))
+            .expect("poll accepted frontend socket");
+        assert!(
+            events.iter().any(|event| event.is_readable()),
+            "the first fragment must be reported readable"
+        );
+        let routed_before = sni_preread_routed_count();
+        fixture
+            .session
+            .borrow_mut()
+            .update_readiness(fixture.frontend_token, Ready::READABLE);
+        let first_pass = fixture
+            .session
+            .borrow_mut()
+            .ready(fixture.proxy_session.clone());
+        assert!(!first_pass, "an incomplete hello keeps the session open");
+        assert_eq!(
+            sni_preread_routed_count() - routed_before,
+            0,
+            "precondition: half a hello routes nothing"
+        );
+
+        // Second fragment and FIN together.
+        let ready = half_close_and_observe(&mut fixture.client, frontend_fd, rest);
+        fixture
+            .session
+            .borrow_mut()
+            .update_readiness(fixture.frontend_token, ready);
+        let _ = fixture
+            .session
+            .borrow_mut()
+            .ready(fixture.proxy_session.clone());
+
+        assert_eq!(
+            sni_preread_routed_count() - routed_before,
+            1,
+            "the last fragment of a ClientHello queued behind the same READABLE|HUP event as the \
+             FIN must be read and routed before the HUP is honoured, not metered as a front \
+             close of an incomplete hello"
         );
     }
 }
