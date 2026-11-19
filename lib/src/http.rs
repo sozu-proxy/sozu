@@ -3431,9 +3431,12 @@ mod tests {
     /// response buffer), so `create_stream` fails with certainty and the
     /// accept is refused with `BufferCapacityReached`.
     ///
-    /// To SEE THIS GREEN: in `HttpSession::new`, plain branch, move
-    /// `gauge_add!(names::protocol::HTTP, 1)` after the
+    /// To SEE THIS RED: in `HttpSession::new`, plain branch, move
+    /// `gauge_add!(names::protocol::HTTP, 1)` back above the
     /// `context.create_stream(..).ok_or(AcceptError::BufferCapacityReached)?`.
+    /// The last assertion then fails with "an accept refused for lack of
+    /// buffers builds no session, so it must not leave `protocol.http`
+    /// raised".
     #[test]
     fn an_accept_refused_for_buffers_leaves_the_http_gauge_untouched() {
         let address = SocketAddress::new_v4(127, 0, 0, 1, crate::testing::provide_port());
@@ -3712,10 +3715,11 @@ mod listener_sibling_tests {
     /// per-cluster page silently falls back to the listener default on it
     /// until the cluster is added again or the worker restarts.
     ///
-    /// To SEE THIS GREEN: in `HttpProxy::add_listener`, apply the overrides of
-    /// every cluster in `self.clusters` to the new listener's registry (the
-    /// legacy `answer_503` is taken out of the stored cluster by
-    /// `add_cluster`, so it has to be kept beside the cluster).
+    /// To SEE THIS RED: in `HttpProxy::add_listener`, delete the
+    /// `for cluster in self.clusters.values()` loop that calls
+    /// `replace_cluster_answers` on the new listener's registry. The last
+    /// assertion then fails with "the listener added after the cluster must
+    /// hold its answer overrides too" (`left: []`, `right: ["503"]`).
     #[test]
     fn a_listener_added_after_a_cluster_receives_its_answer_overrides() {
         let mut proxy = proxy();
@@ -3752,9 +3756,11 @@ mod listener_sibling_tests {
     /// served until `RemoveCluster`, while a worker rebuilt from the main
     /// state serves the default.
     ///
-    /// To SEE THIS GREEN: in `HttpProxy::add_cluster`, call
-    /// `remove_cluster_answers` on every listener before applying the new map,
-    /// including when the new map is empty.
+    /// To SEE THIS RED: in `HttpProxy::add_cluster`, call
+    /// `add_cluster_answers` instead of `replace_cluster_answers` on each
+    /// listener's registry. The assertion then fails with "an upsert must
+    /// replace the overrides, not merge into them", naming `dropped` (still
+    /// serving "503") and `shrunk` (still serving "404" and "503").
     #[test]
     fn an_add_cluster_upsert_replaces_the_cluster_answer_overrides() {
         let mut proxy = proxy();
@@ -3926,8 +3932,10 @@ mod listener_sibling_tests {
     /// the matched removal beside it is the control that the line is not simply
     /// always written and that a removal that worked still answers `Ok`.
     ///
-    /// To SEE THIS GREEN: in `HttpProxy::remove_listener`, make the test
-    /// `if self.listeners.len() == len`.
+    /// To SEE THIS RED: in `HttpProxy::remove_listener`, replace the test
+    /// `if self.listeners.len() == len` with `if !self.listeners.len() < len`.
+    /// The final assertion then fails with "removing an address the proxy never
+    /// held answered Ok and logged nothing".
     #[test]
     fn removing_a_listener_the_proxy_does_not_hold_is_not_answered_ok_in_silence() {
         use std::sync::{Arc, Mutex};

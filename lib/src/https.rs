@@ -4566,9 +4566,13 @@ mod tests {
     /// session cannot show the defect, because the second decrement clamps at
     /// zero and the final value equals the correct one.
     ///
-    /// To SEE THIS GREEN: in `HttpsSession::upgrade_handshake`, move
-    /// `gauge_add!(names::protocol::TLS_HANDSHAKE, -1)` to the success tail,
-    /// beside `gauge_add!(names::protocol::HTTPS, 1)`.
+    /// To SEE THIS RED: in `HttpsSession::upgrade_handshake`, move
+    /// `gauge_add!(names::protocol::TLS_HANDSHAKE, -1)` from the success tail,
+    /// beside `gauge_add!(names::protocol::HTTPS, 1)`, back above
+    /// `let frontend_events = upgraded_frontend_events(..)`, ahead of the two
+    /// fallible allocations. The assertion on the witness session then fails
+    /// with "one session is still mid-handshake: a refused upgrade followed by
+    /// its close must take `protocol.tls.handshake` down once, not twice".
     #[test]
     fn a_refused_handshake_upgrade_takes_the_handshake_gauge_down_once() {
         let proxy = proxy_with_certificate_domain("lolcatho.st".to_owned());
@@ -5472,10 +5476,11 @@ mod listener_sibling_tests {
     /// sibling, so a per-cluster page silently falls back to the listener
     /// default on it until the cluster is added again or the worker restarts.
     ///
-    /// To SEE THIS GREEN: in `HttpsProxy::add_listener`, apply the overrides
-    /// of every cluster in `self.clusters` to the new listener's registry (the
-    /// legacy `answer_503` is taken out of the stored cluster by
-    /// `add_cluster`, so it has to be kept beside the cluster).
+    /// To SEE THIS RED: in `HttpsProxy::add_listener`, delete the
+    /// `for cluster in self.clusters.values()` loop that calls
+    /// `replace_cluster_answers` on the new listener's registry. The last
+    /// assertion then fails with "the listener added after the cluster must
+    /// hold its answer overrides too" (`left: []`, `right: ["503"]`).
     #[test]
     fn a_listener_added_after_a_cluster_receives_its_answer_overrides() {
         let mut proxy = proxy();
@@ -5512,9 +5517,11 @@ mod listener_sibling_tests {
     /// served until `RemoveCluster`, while a worker rebuilt from the main
     /// state serves the default.
     ///
-    /// To SEE THIS GREEN: in `HttpsProxy::add_cluster`, call
-    /// `remove_cluster_answers` on every listener before applying the new map,
-    /// including when the new map is empty.
+    /// To SEE THIS RED: in `HttpsProxy::add_cluster`, call
+    /// `add_cluster_answers` instead of `replace_cluster_answers` on each
+    /// listener's registry. The assertion then fails with "an upsert must
+    /// replace the overrides, not merge into them", naming `dropped` (still
+    /// serving "503") and `shrunk` (still serving "404" and "503").
     #[test]
     fn an_add_cluster_upsert_replaces_the_cluster_answer_overrides() {
         let mut proxy = proxy();
@@ -5686,8 +5693,10 @@ mod listener_sibling_tests {
     /// the matched removal beside it is the control that the line is not simply
     /// always written and that a removal that worked still answers `Ok`.
     ///
-    /// To SEE THIS GREEN: in `HttpsProxy::remove_listener`, make the test
-    /// `if self.listeners.len() == len`.
+    /// To SEE THIS RED: in `HttpsProxy::remove_listener`, replace the test
+    /// `if self.listeners.len() == len` with `if !self.listeners.len() < len`.
+    /// The final assertion then fails with "removing an address the proxy never
+    /// held answered Ok and logged nothing".
     #[test]
     fn removing_a_listener_the_proxy_does_not_hold_is_not_answered_ok_in_silence() {
         use std::sync::{Arc, Mutex};
