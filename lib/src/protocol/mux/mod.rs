@@ -2683,27 +2683,36 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             }
 
             match client.position() {
-                Position::Client(cluster_id, backend, _) => {
+                Position::Client(cluster_id, backend, status) => {
                     // Session teardown iterates the backends map directly
                     // instead of routing through `Connection::close`, so it
                     // emits the same two accounting changes that path emits.
                     // Going through the ledger rather than mutating here is
                     // what lets the invariant-14 balance be read off one
                     // stream of deltas — see `Mux::apply_backend_deltas`.
-                    let count = self
-                        .context
-                        .backend_streams
-                        .get(token)
-                        .map_or(0, |ids| ids.len());
                     let (slot, backend_id, metric_incarnation) = (
                         backend.slot(),
                         backend.backend_id.clone(),
                         backend.metric_incarnation(),
                     );
-                    self.context.backend_deltas.push(BackendDelta {
-                        slot,
-                        change: BackendChange::StreamsEnded(count),
-                    });
+                    // A dial that has not completed charged nothing to
+                    // `active_requests`: its streams are charged at the
+                    // connect edge in `Mux::ready_inner`, so releasing them
+                    // here would eat into the charges other sessions took on
+                    // the same backend. The dead-backend sweep skips the
+                    // release for a `Connecting` connection for the same
+                    // reason.
+                    if !matches!(status, BackendStatus::Connecting(_)) {
+                        let count = self
+                            .context
+                            .backend_streams
+                            .get(token)
+                            .map_or(0, |ids| ids.len());
+                        self.context.backend_deltas.push(BackendDelta {
+                            slot,
+                            change: BackendChange::StreamsEnded(count),
+                        });
+                    }
                     self.context.backend_deltas.push(BackendDelta {
                         slot,
                         change: BackendChange::ConnectionClosed,
@@ -9619,6 +9628,79 @@ mod tests {
              which must take it out of the epoll set"
         );
         drop(parts.event_loop);
+    }
+
+    /// A session that closes while a stream is linked to a backend whose dial
+    /// has not completed releases nothing from that backend's
+    /// `active_requests`.
+    ///
+    /// The shared counter is raised for a `Connecting` dial only at the
+    /// connect edge, so no charge was ever taken for the stream. A release of
+    /// `backend_streams[token].len()` for it would eat into another session's
+    /// in-flight request on the same backend (one charge, taken by that
+    /// session): `Mux::close_backend_connections` skips the release for a
+    /// `Connecting` connection, as the dead-backend sweep of
+    /// `Mux::ready_inner` does.
+    ///
+    /// TO SEE THIS RED: in `Mux::close_backend_connections`, push the
+    /// `StreamsEnded(count)` delta whatever the connection's status.
+    #[test]
+    fn close_does_not_release_a_charge_for_a_stream_linked_to_a_connecting_backend() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut mux, _front_peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(30));
+        let backend_token = Token(1);
+
+        let (socket, _back_peer) = connected_socket();
+        let backend_address = "127.0.0.1:2".parse().expect("backend address must parse");
+        let backend = Rc::new(RefCell::new(Backend::new(
+            "test-backend",
+            backend_address,
+            None,
+            None,
+            None,
+        )));
+        // One request of ANOTHER session is in flight on this backend: the
+        // counter is shared by every session of the worker.
+        backend.borrow_mut().active_requests = 1;
+        let backend_id = mux.backend_registry.id_for(&backend);
+        let mut connection = Connection::new_h1_client(
+            mux.session_ulid,
+            SessionTcpStream::new(socket, mux.session_ulid, Some(backend_address)),
+            "test-cluster".into(),
+            backend_id,
+            Duration::from_secs(30),
+        );
+        let Connection::H1(h1) = &mut connection else {
+            unreachable!("new_h1_client builds an H1 connection")
+        };
+        h1.stream = Some(0);
+        assert!(
+            matches!(
+                h1.position,
+                Position::Client(_, _, BackendStatus::Connecting(_))
+            ),
+            "premise: the dial has not completed"
+        );
+        mux.router.backends.insert(backend_token, connection);
+        // What `Router::commit_dialed` does for a fresh dial: the stream is
+        // linked while the connection is `Connecting`, and no charge is taken
+        // until the connect edge.
+        mux.context.link_stream(0, backend_token);
+        assert!(
+            mux.context.backend_deltas.is_empty(),
+            "premise: nothing charged the backend for this stream, got {:?}",
+            mux.context.backend_deltas
+        );
+
+        let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(RemoveOnlyProxy));
+        mux.close(proxy, &mut SessionMetrics::new(None));
+
+        assert_eq!(
+            backend.borrow().active_requests,
+            1,
+            "closing a session must not release a charge it never took: the other \
+             session's in-flight request on this backend is still counted"
+        );
     }
 
     // ── a read that meets the EOF records HUP ──────────────────────────

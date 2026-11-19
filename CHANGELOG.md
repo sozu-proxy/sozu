@@ -107,6 +107,10 @@
 
 - A stream of an HTTP/2 frontend whose response Sōzu ends in error while the client is still sending its request now gives its slot back once the `RST_STREAM` is on the wire. The stream waited for the client's `END_STREAM`, which Sōzu discards on a stream it has reset, so the wait never ended: the slot, its two buffers from the pool, its entry against `SETTINGS_MAX_CONCURRENT_STREAMS` and its counted request stayed until the connection closed. A `back_timeout` on a response that had started, a backend `GOAWAY` while the request was still uploading, and a backend that closed in the middle of a response each left one behind, and a connection kept busy by other streams accumulated them until Sōzu refused its new streams. The request is now logged when the reset leaves, and the client's remaining frames on that stream are still ignored.
 
+<!-- changelog-slot:backend-active-requests-balance -->
+
+- A backend's in-flight request count stays accurate when an HTTP/2 backend connection provokes a stream reset, and when a session closes with a request waiting on a backend connection that is still connecting. A stream Sōzu reset because of what the backend sent (a `WINDOW_UPDATE` with a zero increment, `DATA` on a 204 or 304 response or past the announced `content-length`, a stream made to depend on itself, a header block that does not parse) never gave back the request it counted against that backend, so the backend looked busier after each one until the worker restarted. A session closed while a backend dial was still pending (a client that resets its connection before the backend connection completes, or a frontend `GOAWAY` carrying an error) gave back a request that was never counted, which lowered the count other sessions had raised on the same backend. Only `load_metric = "requests"` reads this count, so the default `connections` metric and PeakEWMA balancing were not affected.
+
 ## 2.3.6 - 2026-11-18
 
 ### Security

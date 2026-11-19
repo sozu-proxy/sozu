@@ -8362,6 +8362,18 @@ impl ConnectionH2 {
                  un-counted"
             );
         } else {
+            // A reset on a backend connection removes the stream without going
+            // through `Connection::end_stream`: the endpoint is the frontend,
+            // whose `Connection::end_stream` books nothing on a
+            // `Position::Server`, and the unlink above has already taken the
+            // stream out of the reverse index the dead-backend sweep and the
+            // session teardown count their `StreamsEnded` from. Release the
+            // `active_requests` charge here, as `Self::handle_rst_stream_frame`,
+            // `Self::cancel_timed_out_streams` and `Self::handle_goaway_frame`
+            // do for the streams they remove.
+            if let Position::Client(_, backend, BackendStatus::Connected) = &self.position {
+                context.record_backend_delta(backend, BackendChange::StreamsEnded(1));
+            }
             // Post: a backend reset never recycles the frontend's slot.
             debug_assert!(
                 old_state == StreamState::Recycle
@@ -24312,6 +24324,86 @@ pub(super) mod tests {
             reconcile(&context.backend_deltas),
             (1, 0),
             "the reset stream must release its charge, and only its own"
+        );
+        assert_eq!(
+            settle(&mut fixture, &mut context),
+            1,
+            "one of the two streams is gone, so exactly one charge remains"
+        );
+    }
+
+    /// A stream Sōzu resets on a backend connection because of something the
+    /// backend sent owes the same release as an inbound `RST_STREAM`.
+    ///
+    /// A WINDOW_UPDATE with a zero increment on an open stream (RFC 9113 §6.9)
+    /// is answered by [`ConnectionH2::reset_stream`], which unlinks the stream
+    /// from the backend reverse index and ends it on the frontend through
+    /// `EndpointServer`. The frontend's `Connection::end_stream` books nothing
+    /// on a `Position::Server`, and every later release (the dead-backend
+    /// sweep, the session close) counts that same reverse index, which the
+    /// reset has just emptied of this stream: only the reset itself can
+    /// release the `active_requests` charge `Connection::start_stream` took.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::tear_down_reset_stream`, drop the
+    /// `StreamsEnded(1)` of the `Position::Client` branch.
+    #[test]
+    fn invariant_14_a_backend_provoked_stream_reset_releases_its_charge() {
+        let pool = make_pool_for_invariant_16();
+        let mut context = test_context(&pool);
+        let mut fixture = ledger_fixture(&pool);
+
+        // What the router does before `start_stream`: the frontend stream is
+        // `Linked` to the backend token and listed in the reverse index.
+        let backend_token = mio::Token(7);
+        let gids = open_streams(&mut fixture, &mut context, 2);
+        for gid in &gids {
+            context.link_stream(*gid, backend_token);
+        }
+        assert_eq!(
+            reconcile(&context.backend_deltas),
+            (2, 0),
+            "premise: two started streams charge two"
+        );
+
+        let Connection::H2(shell) = &mut fixture.connection else {
+            unreachable!("the fixture was built as H2");
+        };
+        // The second stream: the H1 frontend below carries slot 0 and only
+        // logs `end_stream` for any other slot. Whatever the frontend does
+        // there, it books nothing on the ledger, which is the point.
+        let reset_id = shell
+            .core
+            .stream_table
+            .streams()
+            .iter()
+            .find_map(|(&wire_id, &gid)| (gid == gids[1]).then_some(wire_id))
+            .expect("the scenario opened two streams");
+
+        // The frontend a backend connection reaches through `EndpointServer`.
+        let (frontend_socket, _frontend_peer) = connected_socket();
+        let mut frontend =
+            Connection::new_h1_server(Ulid::generate(), frontend_socket, Duration::from_secs(30));
+
+        // The backend sends WINDOW_UPDATE(increment = 0) on an open stream:
+        // a stream error, answered with RST_STREAM(PROTOCOL_ERROR).
+        shell.core.handle_window_update_frame(
+            parser::WindowUpdate {
+                stream_id: reset_id,
+                increment: 0,
+            },
+            &mut context,
+            crate::protocol::mux::connection::EndpointServer(&mut frontend),
+        );
+        assert_eq!(
+            shell.core.stream_table.streams().len(),
+            1,
+            "premise: the reset retired exactly the stream it named"
+        );
+
+        assert_eq!(
+            reconcile(&context.backend_deltas),
+            (1, 0),
+            "the stream the backend provoked a reset on must release its charge, and only its own"
         );
         assert_eq!(
             settle(&mut fixture, &mut context),

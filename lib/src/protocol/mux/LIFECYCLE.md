@@ -1729,7 +1729,11 @@ Three directions:
   is `None` after one, as after a `silent_close_answer`), whatever the slot's
   state — `Idle`, `Link`, `Linked` or `Unlinked` — and recycles the slot
   (§3.2). On a backend connection the slot stays `Unlinked` for the frontend
-  stream that owns it, which answers and logs. It then queues the outgoing RST via
+  stream that owns it, which answers and logs, and the stream's
+  `active_requests` charge is released there with `StreamsEnded(1)` when the
+  connection is `BackendStatus::Connected` (§9 invariant 14): the frontend's
+  `end_stream` books nothing, and the unlink has already emptied the reverse
+  index the later sweeps count from. It then queues the outgoing RST via
   [`enqueue_rst`](#proxy-rst-emission-path), and counts against
   `record_rst_emitted` (CVE-2025-8671 MadeYouReset) unless `NoError`.
   A request rejected at its HEADERS (a malformed `:path`) is therefore
@@ -2575,9 +2579,23 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
 14. **Backend `active_requests` balance.** Every site that removes a stream
     outside `Connection::end_stream` must release the charge that stream's
     creation took (`ConnectionH2::cancel_timed_out_streams`,
-    `ConnectionH2::handle_rst_stream_frame` and
-    `ConnectionH2::handle_goaway_frame`; all `h2.rs`).
-    Otherwise load-balancing counters drift monotonically.
+    `ConnectionH2::handle_rst_stream_frame`,
+    `ConnectionH2::handle_goaway_frame` and
+    `ConnectionH2::tear_down_reset_stream`, which every
+    `ConnectionH2::reset_stream` goes through; all `h2.rs`).
+    Otherwise load-balancing counters drift monotonically. A stream Sōzu
+    resets on a backend connection because of a frame the backend sent
+    (WINDOW_UPDATE with a zero increment, DATA on a 204 or past its
+    `content-length`, a PRIORITY self-dependency, a header block that fails to
+    parse) leaves through the last of these: its unlink empties the
+    `Context::backend_streams` entry the dead-backend sweep and the session
+    teardown count their `StreamsEnded(count)` from, and the frontend's
+    `Connection::end_stream` books nothing on a `Position::Server`, so only
+    the explicit `StreamsEnded(1)` releases the charge. Like the other
+    per-stream sites, it emits only on a `BackendStatus::Connected`
+    connection, the status `Connection::start_stream` charges on. Pinned by
+    `invariant_14_a_backend_provoked_stream_reset_releases_its_charge`
+    (`h2.rs`).
 
     The core does not perform the release; it **emits** it. Question 12 of
     [#1340](https://github.com/sozu-proxy/sozu/issues/1340) took
@@ -2593,8 +2611,8 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     six scattered mutations: summing a ledger's `StreamsStarted` against its
     `StreamsEnded` is the balance itself. `h2.rs`'s
     `invariant_14_*` tests reconcile it across the nominal, refused-start,
-    `RST_STREAM`, `GOAWAY` and idle-reap paths, and then apply the ledger and
-    assert the counter returns to zero.
+    `RST_STREAM`, backend-provoked reset, `GOAWAY` and idle-reap paths, and
+    then apply the ledger and assert the counter returns to zero.
 
     Two ordering rules the emit/apply split has to keep, both load-bearing:
 
@@ -2677,8 +2695,14 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     `Connection::start_stream`'s `Connected` guard skips them. `Mux`'s
     `Connecting` -> `Connected` transition is what charges them, so it emits
     `StreamsStarted(n)` onto the same list — as do the dead-backend arm and
-    session teardown, each emitting the `StreamsEnded(count)` its
-    `Context::backend_streams` entry owes. The health and latency writes
+    session teardown (`Mux::close_backend_connections`, which `Mux::close` and
+    the error-GOAWAY linger both run), each emitting the `StreamsEnded(count)`
+    its `Context::backend_streams` entry owes. Both skip a connection still
+    `BackendStatus::Connecting`: its streams were never charged, and a release
+    for them would subtract from the `active_requests` other sessions raised on
+    the same backend. The session-teardown skip is pinned by
+    `close_does_not_release_a_charge_for_a_stream_linked_to_a_connecting_backend`
+    (`mod.rs`). The health and latency writes
     (`Backend::failures`, `retry_policy`, `set_connection_time`) are NOT part
     of this balance and stay immediate at their embedder-side call sites,
     because the load balancer reads `retry_policy`. The retry policy and the
