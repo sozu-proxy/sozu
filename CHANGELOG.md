@@ -130,6 +130,11 @@
 <!-- changelog-slot:h2-discard-writable-spin -->
 
 - An HTTP/2 connection no longer closes its whole session when the payload of a frame Sōzu discards is not readable yet. Sōzu drops the payload of a `HEADERS` frame it refuses (a stream over `SETTINGS_MAX_CONCURRENT_STREAMS`, during a graceful drain, or when the buffer pool is exhausted), of a frame on a stream it has reset, and the rest of a `DATA` frame whose stream was removed mid-frame. The `RST_STREAM` or `WINDOW_UPDATE` queued for it arms write readiness, and the write pass that sent it left that readiness armed. When the payload arrived in a later TCP segment or TLS record (a 16 KiB `DATA` frame on a reset stream spans two records), the session loop called that same write pass without end until its 10 000-iteration budget, counted `http.infinite_loop.error` and closed the session, with every stream of the connection and no `GOAWAY`, unless other output was queued. A client could also cost a worker that budget on purpose by splitting such a payload. The write pass now gives up write readiness while a payload is being discarded, except while TLS records are waiting to be flushed, and the end of the discard raises it again for anything queued in the meantime.
+<!-- changelog-slot:listener-removal -->
+
+### Fixed
+
+- The `protocol.http` and `protocol.tls.handshake` gauges no longer drift when the worker's buffer pool is exhausted. A plain HTTP connection accepted with no buffer left for its first stream is refused (`BufferCapacityReached`) and builds no session, but `protocol.http` had already been raised and nothing took it back down, so every such refusal left it one higher for good. A TLS handshake that completed but whose upgrade to the HTTP/1.1 or HTTP/2 mux found no buffer for its first stream or its H2 connection took `protocol.tls.handshake` down when the upgrade started and again when the session was closed, so the gauge under-reported the handshakes in flight by one per refusal and logged an underflow error once it reached zero. Each gauge now moves only once the step that can fail has succeeded, and a refused upgrade leaves `protocol.tls.handshake` once, when its session closes (`HttpSession::new`, `HttpsSession::upgrade_handshake`).
 
 ## 2.3.6 - 2026-11-18
 

@@ -176,7 +176,6 @@ impl HttpSession {
                 Ready::EMPTY,
             ))
         } else {
-            gauge_add!(names::protocol::HTTP, 1);
             // The address `accept(2)` returned. On an expect-proxy listener
             // the other branch ignores it: the session address comes from the
             // PROXY header at `upgrade_expect`.
@@ -200,6 +199,10 @@ impl HttpSession {
             context
                 .create_stream(request_id, 1 << 16)
                 .ok_or(AcceptError::BufferCapacityReached)?;
+            // Raised only once nothing can fail any more: a refused accept
+            // builds no `HttpSession`, so no `close` would ever take the gauge
+            // back down.
+            gauge_add!(names::protocol::HTTP, 1);
             HttpStateMachine::Mux(Mux {
                 configured_frontend_timeout,
                 frontend_token: token,
@@ -3368,6 +3371,112 @@ mod tests {
             peer,
             client.local_addr().expect("the test client has an address"),
             "the peer address handed over must be the client's"
+        );
+        drop(parts.event_loop);
+    }
+
+    /// The current process-local value of the gauge `name`, treating an
+    /// absent key as 0. `METRICS` is a `thread_local!` and libtest gives each
+    /// test its own thread, so this reads only what the test itself emitted.
+    fn local_gauge(name: &str) -> i64 {
+        use sozu_command::proto::command::filtered_metrics::Inner;
+        crate::metrics::METRICS.with(|metrics| {
+            metrics
+                .borrow_mut()
+                .dump_local_proxy_metrics()
+                .get(name)
+                .and_then(|fm| fm.inner.as_ref())
+                .and_then(|inner| match inner {
+                    Inner::Gauge(v) => Some(*v as i64),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        })
+    }
+
+    /// An accept refused because the buffer pool cannot back the first stream
+    /// builds no `HttpSession`, so nothing ever runs the `close` that would
+    /// take `protocol.http` back down. `HttpSession::new` raised the gauge
+    /// before the fallible `create_stream`, so every such refusal leaks one
+    /// unit of it permanently, and it happens exactly under buffer pressure,
+    /// when an operator reads the gauge.
+    ///
+    /// The pool holds a single buffer and a stream needs two (a request and a
+    /// response buffer), so `create_stream` fails with certainty and the
+    /// accept is refused with `BufferCapacityReached`.
+    ///
+    /// To SEE THIS GREEN: in `HttpSession::new`, plain branch, move
+    /// `gauge_add!(names::protocol::HTTP, 1)` after the
+    /// `context.create_stream(..).ok_or(AcceptError::BufferCapacityReached)?`.
+    #[test]
+    fn an_accept_refused_for_buffers_leaves_the_http_gauge_untouched() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, crate::testing::provide_port());
+        let parts = crate::testing::prebuild_server(1, 16_384, false)
+            .expect("test server parts must build");
+        let sessions = parts.sessions.clone();
+        let listener_token = {
+            let mut sessions = sessions.borrow_mut();
+            let entry = sessions.slab.vacant_entry();
+            let key = entry.key();
+            entry.insert(Rc::new(RefCell::new(crate::server::ListenSession {
+                protocol: Protocol::HTTPListen,
+            })));
+            Token(key)
+        };
+        let mut proxy = HttpProxy::new(parts.registry, parts.sessions, parts.pool, parts.backends);
+        proxy
+            .add_listener(
+                ListenerBuilder::new_http(address)
+                    .to_http(None)
+                    .expect("test listener config must build"),
+                listener_token,
+            )
+            .expect("test listener must register");
+        let proxy = Rc::new(RefCell::new(proxy));
+
+        let peer_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind the test peer listener");
+        let _client = TcpStream::connect(
+            peer_listener
+                .local_addr()
+                .expect("the test peer listener has an address"),
+        )
+        .expect("connect the test client");
+        let (accepted, peer) = peer_listener.accept().expect("accept the test client");
+        accepted
+            .set_nonblocking(true)
+            .expect("the front socket must go non-blocking");
+
+        assert_eq!(
+            local_gauge(names::protocol::HTTP),
+            0,
+            "precondition: no HTTP session has been counted on this thread"
+        );
+        let slab_len_before = sessions.borrow().slab.len();
+
+        let created = proxy.borrow_mut().create_session(
+            mio::net::TcpStream::from_std(accepted),
+            peer,
+            ListenToken(listener_token.0),
+            Duration::ZERO,
+            proxy.clone(),
+        );
+
+        assert_eq!(
+            created,
+            Err(AcceptError::BufferCapacityReached),
+            "precondition: the single-buffer pool must refuse the accept for lack of buffers"
+        );
+        assert_eq!(
+            sessions.borrow().slab.len(),
+            slab_len_before,
+            "precondition: a refused accept must leave no session in the slab"
+        );
+        assert_eq!(
+            local_gauge(names::protocol::HTTP),
+            0,
+            "an accept refused for lack of buffers builds no session, so it must not \
+             leave `protocol.http` raised"
         );
         drop(parts.event_loop);
     }

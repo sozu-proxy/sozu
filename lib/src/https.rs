@@ -590,8 +590,6 @@ impl HttpsSession {
             incr!(rustls_ciphersuite_str(cipher));
         };
 
-        gauge_add!(names::protocol::TLS_HANDSHAKE, -1);
-
         // Read before `handshake.session` moves into `FrontRustls` below.
         let frontend_events = upgraded_frontend_events(
             handshake.frontend_readiness.event,
@@ -801,6 +799,13 @@ impl HttpsSession {
             "mux context and connection must share the handshake-derived session ulid"
         );
 
+        // Leave `TLS_HANDSHAKE` and enter `HTTPS` together, once nothing can
+        // fail any more. The two fallible steps above (the first stream's
+        // buffers, the H2 connection's buffers) return `None` with the state
+        // still `FailedUpgrade(Handshake)`, and `HttpsSession::close` takes
+        // `TLS_HANDSHAKE` down for that marker: lowering it earlier counted
+        // the same session out twice.
+        gauge_add!(names::protocol::TLS_HANDSHAKE, -1);
         gauge_add!(names::protocol::HTTPS, 1);
         Some(HttpsStateMachine::Mux(Mux {
             configured_frontend_timeout: self.configured_frontend_timeout,
@@ -4502,6 +4507,140 @@ mod tests {
             "a frontend whose client is still there must keep its shutdown(SHUT_WR)"
         );
         assert!(saw_fin, "the client must observe the FIN");
+    }
+
+    /// The current process-local value of the gauge `name`, treating an
+    /// absent key as 0. `METRICS` is a `thread_local!` and libtest gives each
+    /// test its own thread, so this reads only what the test itself emitted.
+    fn local_gauge(name: &str) -> i64 {
+        use sozu_command::proto::command::filtered_metrics::Inner;
+        crate::metrics::METRICS.with(|metrics| {
+            metrics
+                .borrow_mut()
+                .dump_local_proxy_metrics()
+                .get(name)
+                .and_then(|fm| fm.inner.as_ref())
+                .and_then(|inner| match inner {
+                    Inner::Gauge(v) => Some(*v as i64),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        })
+    }
+
+    /// `upgrade_handshake` takes `protocol.tls.handshake` down before the two
+    /// allocations that can still fail on an exhausted buffer pool (the first
+    /// stream of an HTTP/1.1 session, the H2 connection's buffers). A refused
+    /// upgrade then keeps `FailedUpgrade(Handshake)`, and `close` takes the
+    /// same gauge down again by that marker: one session leaves the gauge
+    /// twice, and the gauge under-reports the handshakes in flight by one per
+    /// refusal, until it clamps at zero and logs an underflow.
+    ///
+    /// A second session stays mid-handshake as a witness: on its own, a single
+    /// session cannot show the defect, because the second decrement clamps at
+    /// zero and the final value equals the correct one.
+    ///
+    /// To SEE THIS GREEN: in `HttpsSession::upgrade_handshake`, move
+    /// `gauge_add!(names::protocol::TLS_HANDSHAKE, -1)` to the success tail,
+    /// beside `gauge_add!(names::protocol::HTTPS, 1)`.
+    #[test]
+    fn a_refused_handshake_upgrade_takes_the_handshake_gauge_down_once() {
+        let proxy = proxy_with_certificate_domain("lolcatho.st".to_owned());
+        let listener = proxy
+            .listeners
+            .values()
+            .next()
+            .expect("the test proxy has one listener")
+            .clone();
+        let pool = proxy.pool.clone();
+        let public_address = *listener.borrow().get_addr();
+        let proxy = Rc::new(RefCell::new(proxy));
+
+        let accepting = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("test listener must bind to a loopback port");
+        let address = accepting
+            .local_addr()
+            .expect("test listener must report its local address");
+        let new_session = |token: usize| {
+            let stream =
+                std::net::TcpStream::connect(address).expect("loopback connect must complete");
+            let (client, client_address) =
+                accepting.accept().expect("loopback accept must complete");
+            stream
+                .set_nonblocking(true)
+                .expect("mio requires a nonblocking stream");
+            let rustls_details = ServerConnection::new(listener.borrow().rustls_details.clone())
+                .expect("a test rustls server session must be created");
+            let session = HttpsSession::new(
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+                false,
+                listener.clone(),
+                Rc::downgrade(&pool),
+                proxy.clone(),
+                public_address,
+                rustls_details,
+                MioTcpStream::from_std(stream),
+                client_address,
+                Token(token),
+                Duration::from_secs(0),
+            );
+            (session, client)
+        };
+
+        assert_eq!(
+            local_gauge(names::protocol::TLS_HANDSHAKE),
+            0,
+            "precondition: no handshake has been counted on this thread"
+        );
+        let (mut refused, _refused_client) = new_session(100);
+        let (_witness, _witness_client) = new_session(101);
+        assert_eq!(
+            local_gauge(names::protocol::TLS_HANDSHAKE),
+            2,
+            "precondition: both sessions are counted as mid-handshake"
+        );
+
+        // Take every buffer the pool will give, so that the stream the
+        // upgrade needs cannot be built.
+        let mut held = Vec::new();
+        loop {
+            let checkout = pool.borrow_mut().checkout();
+            match checkout {
+                Some(checkout) => held.push(checkout),
+                None => break,
+            }
+        }
+        assert!(
+            !held.is_empty(),
+            "precondition: the pool handed out buffers before it ran dry"
+        );
+
+        assert!(
+            refused.upgrade(),
+            "precondition: the upgrade must be refused for lack of buffers"
+        );
+        assert!(
+            refused.state.failed() && matches!(refused.state.marker(), StateMarker::Handshake),
+            "precondition: the refused session keeps FailedUpgrade(Handshake)"
+        );
+
+        refused.close();
+
+        assert_eq!(
+            local_gauge(names::protocol::TLS_HANDSHAKE),
+            1,
+            "one session is still mid-handshake: a refused upgrade followed by its close \
+             must take `protocol.tls.handshake` down once, not twice"
+        );
+        assert_eq!(
+            local_gauge(names::protocol::HTTPS),
+            0,
+            "no mux was built, so `protocol.https` must not have moved"
+        );
+        drop(held);
     }
 }
 
