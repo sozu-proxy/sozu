@@ -221,8 +221,16 @@ impl TcpSession {
                 frontend_buffer_session = Some(frontend_buffer);
                 backend_buffer_session = Some(backend_buffer);
                 gauge_add!(names::protocol::PROXY_EXPECT, 1);
+                // `ExpectProxyProtocol` is shared with HTTP and HTTPS, which
+                // keep their frontend deadline in it, so it still takes a
+                // container: an EMPTY one here. The one frontend deadline of
+                // a TCP session is `TcpSession::container_frontend_timeout`.
+                // A clone of it would share its wheel handle but not its
+                // entry, and the session's own resets would then leave the
+                // clone's entry live under the same token as a second one
+                // (see `expect_proxy_pipe_leaves_no_orphan_frontend_timer_after_a_timeout`).
                 TcpStateMachine::ExpectProxyProtocol(ExpectProxyProtocol::new(
-                    container_frontend_timeout.clone(),
+                    TimeoutContainer::new_empty(configured_frontend_timeout),
                     socket,
                     frontend_token,
                     request_id,
@@ -5864,6 +5872,150 @@ mod sni_routing_tests {
             session.back_connected(),
             BackendConnectionStatus::NotConnected,
             "an incomplete PROXY header must never dial the backend"
+        );
+    }
+
+    /// An `expect_proxy` session has ONE frontend deadline, owned by
+    /// `TcpSession::container_frontend_timeout`. `TcpSession::new` used to also
+    /// hand `ExpectProxyProtocol` a CLONE of that container, and
+    /// `ExpectProxyProtocol::into_pipe` passed the clone on to the `Pipe`, which
+    /// reset it in `Pipe::reset_timeouts`. A clone shares the wheel handle but
+    /// not the entry that handle names: the session's own resets
+    /// (`TcpSession::readable`, `TcpSession::set_back_connected`)
+    /// move the entry out from under the clone, whose next reset then fails
+    /// (`Timeout` handles are tick-guarded), drops its handle and arms a second
+    /// entry on the following `Pipe::readable`. The session then owned two live
+    /// entries under one token.
+    ///
+    /// Whichever fires first runs `TcpSession::timeout`, which marks the
+    /// session's own container `triggered()` -- discarding its handle without
+    /// cancelling -- and closes the session. If the clone's entry fired first,
+    /// the session's entry stays in the wheel with no owner left to cancel it
+    /// and later fires under the same token, which `Server::timeout` hands to
+    /// whichever session has inherited that slab key. TCP does not re-check a
+    /// deadline on timeout, so that session is killed.
+    ///
+    /// The wall clock barely moves during a unit test (milliseconds, inside
+    /// one 100 ms wheel tick), so every real re-arm would land on the same
+    /// wheel tick and the clone's stale handle would alias the session's live
+    /// entry. The resets only the SESSION performs (the PROXY header read in a
+    /// later wheel tick, the backend connect completing later) are therefore
+    /// replayed with `set_at` at later instants; everything else --
+    /// `TcpSession::new`, `TcpSession::upgrade`, `Pipe::readable`,
+    /// `TcpSession::timeout`, `TcpSession::close` -- is production code.
+    /// The wheel is then driven second by second, as the worker does, and
+    /// nothing may fire under the frontend token once the session is closed.
+    ///
+    /// To SEE THIS RED against a fixed tree: hand `ExpectProxyProtocol` a
+    /// clone of the session's container again (`.clone()` at the
+    /// `ExpectProxyProtocol::new` call in `TcpSession::new`, with
+    /// `ExpectProxyProtocol::into_pipe` passing it to `Pipe::new`). The pipe's entry fires first and the
+    /// session's entry fires again afterwards.
+    ///
+    /// Either half alone also leaves the orphan check green here (`set_at`
+    /// has already made the clone's handle stale), so the last two
+    /// assertions pin each half: the expect stage holds no armed entry, and
+    /// the `Pipe` is built without a frontend timer.
+    #[test]
+    fn expect_proxy_pipe_leaves_no_orphan_frontend_timer_after_a_timeout() {
+        use crate::server::TIMER;
+
+        let fixture = expect_proxy_fixture();
+        let (session, frontend_token) = (fixture.session.clone(), fixture.frontend_token);
+        // Read after the fixture armed the session's deadline, so every
+        // instant below is later than that arming.
+        let base = Instant::now();
+        let at = |secs: u64| base + Duration::from_secs(secs);
+
+        // A reset only the session performs, as if it ran `secs` later.
+        let session_only_reset_at = |secs: u64| {
+            session
+                .borrow_mut()
+                .container_frontend_timeout
+                .set_at(frontend_token, at(secs));
+        };
+        // The pipe's own `readable`, which resets the timers it owns.
+        let pipe_readable = || {
+            let mut guard = session.borrow_mut();
+            let session = &mut *guard;
+            let TcpStateMachine::Pipe(pipe) = &mut session.state else {
+                panic!("the session must be a Pipe by now");
+            };
+            let _ = pipe.readable(&mut session.metrics);
+        };
+
+        // Read now, asserted last, so a regression first shows the orphan.
+        let expect_stage_holds_an_entry = {
+            let guard = session.borrow();
+            let TcpStateMachine::ExpectProxyProtocol(expect) = &guard.state else {
+                panic!("precondition: an ExpectHeader session starts in the expect state");
+            };
+            expect.container_frontend_timeout.is_armed()
+        };
+
+        // The PROXY header is read in a later wheel tick than the accept.
+        session_only_reset_at(31);
+        assert!(
+            !session.borrow_mut().upgrade(),
+            "the expect state must upgrade to a pipe"
+        );
+        assert!(
+            matches!(session.borrow().state, TcpStateMachine::Pipe(_)),
+            "precondition: the session is now a Pipe"
+        );
+        let pipe_holds_a_frontend_timer = {
+            let guard = session.borrow();
+            let TcpStateMachine::Pipe(pipe) = &guard.state else {
+                panic!("precondition: the session is now a Pipe");
+            };
+            pipe.container_frontend_timeout.is_some()
+        };
+
+        // Two reads while the dial is pending, each in a later tick.
+        session_only_reset_at(32);
+        pipe_readable();
+        session_only_reset_at(33);
+        pipe_readable();
+
+        // The backend connect completes in a later tick; both peers go quiet.
+        session_only_reset_at(34);
+
+        // Drive the wheel second by second, as the worker does; close the
+        // session on the first timeout it receives.
+        let mut fired: Vec<u64> = Vec::new();
+        for secs in 1..=120u64 {
+            while let Some(token) = TIMER.with(|timer| timer.borrow_mut().poll_at(at(secs))) {
+                if token != frontend_token {
+                    continue;
+                }
+                if fired.is_empty() {
+                    assert!(
+                        session.borrow_mut().timeout(token),
+                        "a frontend timeout must close the session"
+                    );
+                    session.borrow_mut().close();
+                }
+                fired.push(secs);
+            }
+        }
+
+        assert_eq!(
+            fired.len(),
+            1,
+            "the session has one frontend deadline, so exactly one wheel entry may fire \
+             under its token, but entries fired at +{fired:?}s: every firing after the first \
+             is an orphan left by the timeout and would close whichever session has \
+             inherited the slab key"
+        );
+        assert!(
+            !expect_stage_holds_an_entry,
+            "the expect stage of a TCP session must hold no armed frontend entry: a clone \
+             of the session's container shares its wheel handle, not its entry"
+        );
+        assert!(
+            !pipe_holds_a_frontend_timer,
+            "the Pipe of a TCP session must be built without a frontend timer: the \
+             session's container is its only frontend deadline"
         );
     }
 

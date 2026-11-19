@@ -125,6 +125,22 @@ PROXY phase and the downstream protocol.
     `ExpectProxyProtocol::into_pipe` (`expect.rs`), which prefers
     `ProxyAddr::source()` and falls back to the front socket's `peer_addr` when
     it is `AfUnspec` — including for every `LOCAL` header (§1).
+  - The pipe `into_pipe` builds carries no frontend timer (`None`). `into_pipe`
+    is only the TCP listener's upgrade, and a `TcpSession` keeps its one
+    frontend deadline in `TcpSession::container_frontend_timeout`, which it
+    resets before every `Pipe::readable` and `Pipe::backend_readable` it
+    dispatches. The `ExpectProxyProtocol` a `TcpSession` creates therefore holds
+    an empty `TimeoutContainer` (`TimeoutContainer::new_empty`), never a clone
+    of the session's. A clone shares the wheel handle and not the entry the
+    handle names: a reset only the session performs leaves the clone's entry
+    behind, the clone's next reset fails and arms a second entry under the same
+    token, and whichever of the two fires second is delivered to the session
+    that has inherited the slab key. HTTP and HTTPS are unaffected: their
+    `ExpectProxyProtocol` owns the only container and moves it on to the
+    stage it upgrades to.
+    The regression guard is
+    `expect_proxy_pipe_leaves_no_orphan_frontend_timer_after_a_timeout`
+    (`lib/src/tcp.rs`).
 - HUP is honoured only after the readable bytes are drained. A client
   that half-closes right behind its header and payload can deliver all of
   it as ONE `READABLE | HUP` event (Linux coalesces `EPOLLIN |

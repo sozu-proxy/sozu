@@ -682,6 +682,17 @@ an optional PROXY-protocol stage (expect, send or relay), then a `Pipe`
 (`lib/src/protocol/pipe.rs`) that copies bytes both ways without parsing them.
 A WebSocket upgrade on an H1 connection ends in the same `Pipe`.
 
+A TCP session has exactly one frontend deadline, a `TimeoutContainer` owned by
+`TcpSession` (`TcpSession::container_frontend_timeout`), and one wheel entry
+under the frontend token. The `Pipe` of a TCP session is built without a
+frontend timer, whichever stage it comes from, and the session resets its own
+before dispatching every `Pipe::readable` and `Pipe::backend_readable`.
+`ExpectProxyProtocol` is shared with HTTP and HTTPS, which keep their deadline
+in it, so a TCP session gives it an empty container; a clone of the session's
+would share its wheel handle but not its entry, and a reset only the session
+performs would leave that entry live as a second one, fired later at whichever
+session has inherited the token.
+
 1. **Accept** as in §3; the listener's `TCP_NODELAY` and the accepted address
    apply unchanged.
 2. **Connect.** `TcpSession::connect_to_backend` resolves the cluster (the
