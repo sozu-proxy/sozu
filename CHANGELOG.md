@@ -18,6 +18,10 @@
 
 - A TCP backend connection that is still not established when `connect_timeout` expires is now counted against its backend. The session was closed, as the documented TCP exception requires (a TCP session is not failed over), but the timeout never reached the accounting that a refused connection goes through: `failures`, the backend's retry policy, `backend.connections.error`, `backend.down` and `backend.available` stayed untouched. A blackholed TCP backend (SYN dropped, accept queue full) therefore never entered its back-off window, the load balancer kept selecting it, and every client routed to it waited the full `connect_timeout` before being closed, indefinitely. `TcpSession::timeout` now charges the backend when the timer that fired belongs to a still-`Connecting` dial; a timer firing on an established backend is still an idle timeout and charges nothing.
 
+<!-- changelog-slot:tcp-sni-front-hup -->
+
+- A client that hangs up after its ClientHello was routed, while the TCP backend connect is still pending, no longer routes the session a second time. The frontend HUP fed `Input::FrontClosed` into the already-decided SNI preread core, which replayed the latched route through the shell's output handler: `tcp.sni_preread.routed` was counted twice and the route logged twice, and a debug build aborted the worker on `debug_assert!(self.outcome.is_none(), ...)`. A hang-up after the route latched now closes the session without a second routing verdict, as the front timeout already did (#1290). A hang-up before any route is unchanged: it still counts `tcp.sni_preread.rejected.front_closed` when bytes were received and stays silent for a bare health-check connect.
+
 ## 2.3.6 - 2026-11-18
 
 ### Security

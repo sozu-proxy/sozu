@@ -315,6 +315,21 @@ fully drained. The regression guard is
   `protocol/proxy_protocol/expect.rs` — counting every health-check probe as
   a routing rejection would make the reject-reason metrics useless as a
   signal for actual client-facing failures.
+- **A route already latched** (`outcome` is set, the backend connect is still
+  pending): `front_gone` returns `Close` before looking at the accumulator,
+  which still holds the ClientHello and would otherwise make
+  `has_received_bytes()` true. Feeding `Input::FrontClosed` into the decided
+  core would replay the latched `Output::Routed` (§3) through
+  `SniPreread::handle_output` a second time, counting
+  `tcp.sni_preread.routed` and logging the route twice in release and
+  tripping `handle_output`'s `debug_assert!(self.outcome.is_none(), ...)` in
+  debug. A client that hangs up mid-connect is a plain close with no preread
+  verdict left to meter, as for the route-aware front timeout in
+  `TcpSession::timeout` (`lib/src/tcp.rs`). Only `on_front_closed` can reach
+  this arm: `readable` already returns early once routed. The regression
+  guard is
+  `frontend_hup_after_route_with_pending_dial_does_not_replay_the_route`
+  (`lib/src/tcp.rs`).
 
 ---
 

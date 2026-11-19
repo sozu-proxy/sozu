@@ -6563,6 +6563,110 @@ mod sni_routing_tests {
         );
         assert_upgraded_pipe_reports_the_dialed_address(&fixture);
     }
+
+    /// A client that hangs up after its ClientHello was routed, while the
+    /// backend dial is still pending, must not re-feed the latched
+    /// `Output::Routed` through `SniPreread::handle_output`. Same hazard as the
+    /// front-timeout one (`timeout` guards it with `is_routed()`), reached
+    /// through the HUP arm of `ready_inner` -> `front_hup` ->
+    /// `SniPreread::on_front_closed` -> `front_gone`, which replays the latched
+    /// verdict because the accumulator still holds the ClientHello bytes.
+    ///
+    /// Run in a debug build, the replay trips `debug_assert!(self.outcome
+    /// .is_none(), ...)` in `handle_output`; in a release build it counts
+    /// `tcp.sni_preread.routed` a second time. Both are asserted.
+    #[test]
+    fn frontend_hup_after_route_with_pending_dial_does_not_replay_the_route() {
+        use std::io::Write as _;
+
+        let mut fixture = dial_fixture(
+            true,
+            |back_buffer, front_buffer, token, listener, proxy, socket, peer| {
+                TcpSession::new_sni_preread(
+                    back_buffer,
+                    Duration::from_secs(30),
+                    Duration::from_secs(30),
+                    front_buffer,
+                    token,
+                    listener,
+                    proxy,
+                    socket,
+                    peer,
+                    Duration::from_millis(0),
+                    Duration::from_secs(3),
+                    16384,
+                )
+            },
+        );
+        fixture
+            .client
+            .write_all(&minimal_client_hello_wire("example.com"))
+            .expect("write ClientHello");
+        fixture.client.flush().ok();
+
+        let routed_before = sni_preread_routed_count();
+        for _ in 0..10 {
+            if fixture.session.borrow().cluster_id.is_some() {
+                break;
+            }
+            let _ = fixture.session.borrow_mut().readable();
+        }
+        assert_eq!(
+            fixture.session.borrow().cluster_id.as_deref(),
+            Some("cluster-dial"),
+            "precondition: the ClientHello routes the session"
+        );
+        // Dial the backend; no backend event is ever delivered, so the dial
+        // stays `Connecting` and the session stays in `SniPreread`.
+        let closed = fixture
+            .session
+            .borrow_mut()
+            .ready(fixture.proxy_session.clone());
+        assert!(!closed, "precondition: the dial keeps the session open");
+        {
+            let session = fixture.session.borrow();
+            assert!(
+                matches!(&session.state, TcpStateMachine::SniPreread(p) if p.is_routed()),
+                "precondition: the routed session is still in SniPreread"
+            );
+            assert!(
+                session.backend_connected.is_connecting(),
+                "precondition: the backend dial is still pending"
+            );
+        }
+        assert_eq!(
+            sni_preread_routed_count() - routed_before,
+            1,
+            "precondition: routing counted tcp.sni_preread.routed exactly once"
+        );
+
+        // The client hangs up before the backend connect completes.
+        fixture
+            .session
+            .borrow_mut()
+            .update_readiness(fixture.frontend_token, Ready::HUP);
+        let hup_pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fixture
+                .session
+                .borrow_mut()
+                .ready(fixture.proxy_session.clone())
+        }));
+        assert!(
+            hup_pass.is_ok(),
+            "a frontend HUP after the route latched must not replay Output::Routed through \
+             SniPreread::handle_output (debug_assert!(self.outcome.is_none()) tripped)"
+        );
+        assert!(
+            matches!(hup_pass, Ok(true)),
+            "a frontend HUP after the route latched must still close the session"
+        );
+        assert_eq!(
+            sni_preread_routed_count() - routed_before,
+            1,
+            "a frontend HUP after the route latched must not double-count \
+             tcp.sni_preread.routed"
+        );
+    }
 }
 
 /// Coverage for the `RelayProxyProtocol` -> `Pipe` handoff. It lives here
