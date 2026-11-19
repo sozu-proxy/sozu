@@ -2066,6 +2066,26 @@ impl ProxySession for TcpSession {
         }
         if self.backend_token == Some(token) {
             self.container_backend_timeout.triggered();
+            // The backend timer is armed for `connect_timeout` at dial time
+            // and only switches to the backend timeout once the handshake
+            // completes (`set_back_connected`). While the dial is still
+            // `Connecting`, this firing is a connect that timed out: charge
+            // it to the backend like a refused one, or a blackholed backend
+            // never reaches its retry policy and every client routed to it
+            // waits the full `connect_timeout`. `Server::timeout`
+            // (`lib/src/server.rs`) runs no `ready` pass for TCP
+            // (`ProxySession::needs_ready_pass` in `lib/src/lib.rs` is
+            // `false`), and the session closes right after (the documented
+            // TCP exception: no failover), so the accounting has to happen
+            // here. A timer that fires on a `Connected` backend is an idle
+            // timeout, not a connect failure.
+            if self.backend_connected.is_connecting() {
+                debug!(
+                    "{} backend connect timed out, charging it to the backend",
+                    log_context!(self)
+                );
+                self.fail_backend_connection();
+            }
             return true;
         }
         // invalid token, obsolete timeout triggered
@@ -5934,6 +5954,111 @@ mod sni_routing_tests {
             pipe.get_backend_address(),
             Some(backend_address),
             "the pipe must report the backend address the session dialed"
+        );
+    }
+
+    /// A backend connect that is still `Connecting` when `connect_timeout`
+    /// fires closes the client (the documented TCP exception: no failover)
+    /// and is charged to the backend like any other failed connect, so the
+    /// retry policy can back a blackholed backend off.
+    ///
+    /// `Server::timeout` (`lib/src/server.rs`) hands the backend token to
+    /// `TcpSession::timeout` and, for TCP, runs no `ready` pass afterwards
+    /// (`ProxySession::needs_ready_pass` in `lib/src/lib.rs` is `false`), so
+    /// the accounting has to happen in the `timeout` arm itself.
+    ///
+    /// To SEE THIS RED: run it unmodified. The backend arm of
+    /// `TcpSession::timeout` only calls `container_backend_timeout.triggered()`,
+    /// so `failures` stays 0 and the retry policy records no try.
+    #[test]
+    fn a_backend_connect_timeout_is_charged_to_the_backend() {
+        let fixture = expect_proxy_fixture_dialed();
+        let session = fixture.session.clone();
+
+        let (backend_token, backend) = {
+            let session = session.borrow();
+            assert!(
+                session.back_connected().is_connecting(),
+                "precondition: no backend event was delivered, the dial is still Connecting"
+            );
+            (
+                session
+                    .backend_token
+                    .expect("precondition: the dial wired a backend token"),
+                session
+                    .backend
+                    .clone()
+                    .expect("precondition: the dial holds a backend handle"),
+            )
+        };
+        {
+            let backend = backend.borrow();
+            assert_eq!(backend.failures, 0, "precondition: a fresh backend");
+            assert_eq!(
+                backend.retry_policy.current_tries(),
+                0,
+                "precondition: a fresh retry policy"
+            );
+        }
+
+        let closed = session.borrow_mut().timeout(backend_token);
+        assert!(
+            closed,
+            "a connect that timed out on connect_timeout must still close the session"
+        );
+
+        let backend = backend.borrow();
+        assert_eq!(
+            backend.failures, 1,
+            "a connect timed out on connect_timeout must be counted against its backend"
+        );
+        assert_eq!(
+            backend.retry_policy.current_tries(),
+            1,
+            "a connect timed out on connect_timeout must feed the backend's retry policy"
+        );
+    }
+
+    /// The pair of the test above: once the handshake has completed, the
+    /// backend timer is the idle `back_timeout`, and its firing closes the
+    /// session without charging the backend.
+    ///
+    /// To SEE THIS RED: drop the `is_connecting()` guard from the backend arm
+    /// of `TcpSession::timeout`, so every firing charges the backend.
+    #[test]
+    fn a_backend_idle_timeout_is_not_charged_to_the_backend() {
+        let fixture = expect_proxy_fixture_dialed();
+        let session = fixture.session.clone();
+
+        let (backend_token, backend) = {
+            let mut session = session.borrow_mut();
+            session.set_back_connected(BackendConnectionStatus::Connected);
+            (
+                session
+                    .backend_token
+                    .expect("precondition: the dial wired a backend token"),
+                session
+                    .backend
+                    .clone()
+                    .expect("precondition: the dial holds a backend handle"),
+            )
+        };
+
+        let closed = session.borrow_mut().timeout(backend_token);
+        assert!(
+            closed,
+            "a backend idle timeout must still close the session"
+        );
+
+        let backend = backend.borrow();
+        assert_eq!(
+            backend.failures, 0,
+            "an idle timeout on an established backend is not a connect failure"
+        );
+        assert_eq!(
+            backend.retry_policy.current_tries(),
+            0,
+            "an idle timeout on an established backend must not feed its retry policy"
         );
     }
 

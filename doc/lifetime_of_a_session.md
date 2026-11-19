@@ -697,7 +697,11 @@ A WebSocket upgrade on an H1 connection ends in the same `Pipe`.
    arms `Backend::retry_policy` (which keeps the backend out of selection for
    its back-off window) and counts `backend.connections.error`, then the
    connect is retried while the cluster's `max_connection_attempts` (5 by
-   default) lasts. A connect that completes
+   default) lasts. A connect still unanswered when `connect_timeout`
+   expires reaches the session through the backend timer alone, and
+   `Server::timeout` runs no `ready` pass for TCP: `TcpSession::timeout`
+   charges the backend itself with the same `TcpSession::fail_backend_connection`
+   and closes the session, without a retry. A connect that completes
    resets the retry policy (`TcpSession::set_back_connected`).
 3. **Relay.** On Linux with the `splice` feature, a `Protocol::TCP` pipe
    takes a `SplicePipe` (`lib/src/splice.rs`) when it is created: an idle pair
