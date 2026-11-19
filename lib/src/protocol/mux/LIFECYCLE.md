@@ -465,7 +465,10 @@ handshake facts and are frozen for the same reason — see §1.2.
   (`stream.rs`). This is the *fallback* tag source, reached only for a request
   that never completed routing — malformed, unknown host, SNI/authority
   mismatch — because a routed request carries the tags of the frontend rule that
-  matched it in `HttpContext::tags`. Resolving it needs the request authority,
+  matched it in `HttpContext::tags`. `HttpContext::reset` (`editor.rs`) clears
+  `tags` between the requests of an H1 connection, so a keep-alive request
+  refused before routing falls back to this lookup instead of logging the
+  previous request's tags. Resolving it needs the request authority,
   which does not exist yet at the capture point, and snapshotting the listener's
   whole authority-keyed map per request would cost more than the observability
   it buys.

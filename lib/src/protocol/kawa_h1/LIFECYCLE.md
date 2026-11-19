@@ -740,7 +740,16 @@ a wedged session, or a security regression.
    cookie ([#1822](https://github.com/sozu-proxy/sozu/issues/1822)). Pinned by
    `reset_clears_the_sticky_session_answer_of_the_previous_request`
    (`editor.rs`) and `test_keep_alive_does_not_carry_a_sticky_cookie_over`
-   (`e2e/src/tests/tests.rs`).
+   (`e2e/src/tests/tests.rs`). So are the matched frontend's access-log tags
+   (`HttpContext::tags`) and its redirect stash
+   (`HttpContext::redirect_status`, `HttpContext::frontend_redirect_template`):
+   the router writes them only once a frontend matched, so `reset` clears them
+   and a request refused before routing (an unknown host, an SNI/authority
+   mismatch) logs through the listener's tag fallback rather than with the
+   previous request's tags. Pinned by
+   `a_keep_alive_request_refused_before_routing_does_not_log_the_previous_requests_tags`
+   (`lib/src/protocol/mux/h1.rs`) and `test_reset_clears_request_response_state`
+   (`editor.rs`).
 
 5. **`impl kawa::AsBuffer for Checkout` is unique to this module.** It lives at
    `mod.rs`; the orphan rule permits no second impl **for `Checkout`**, so

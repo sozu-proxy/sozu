@@ -2327,6 +2327,19 @@ impl HttpContext {
         self.redirect_location = None;
         self.www_authenticate = None;
         self.original_authority = None;
+        // The matched frontend's access-log tags and its redirect stash are
+        // written by `Router::route_from_request`
+        // (`lib/src/protocol/mux/router.rs`) only once a frontend matched,
+        // after every early return for a request that never reaches routing
+        // (a malformed route, an unknown host, an SNI/authority mismatch).
+        // Keeping them would hand such a request the previous request's tags
+        // in its access log, in place of the listener fallback
+        // `Stream::generate_access_log` (`lib/src/protocol/mux/stream.rs`)
+        // documents, and the previous request's redirect status and template
+        // to a legacy `https_redirect` answer, which never sets them itself.
+        self.tags = None;
+        self.frontend_redirect_template = None;
+        self.redirect_status = None;
         self.headers_response.clear();
         self.trailer_fields = 0;
         self.backends_unavailable = false;
@@ -2347,6 +2360,9 @@ impl HttpContext {
                 && self.path.is_none()
                 && self.status.is_none()
                 && self.x_request_id.is_none()
+                && self.tags.is_none()
+                && self.frontend_redirect_template.is_none()
+                && self.redirect_status.is_none()
                 && self.headers_response.is_empty()
                 && self.trailer_fields == 0
                 && !self.backends_unavailable,
@@ -2596,6 +2612,11 @@ mod tests {
         ctx.redirect_location = Some("https://example.com/".to_owned());
         ctx.www_authenticate = Some("Basic realm=\"sozu\"".to_owned());
         ctx.original_authority = Some("old.example.com".to_owned());
+        ctx.tags = Some(Rc::new(CachedTags::new(std::collections::BTreeMap::from(
+            [("owner".to_owned(), "team-a".to_owned())],
+        ))));
+        ctx.frontend_redirect_template = Some("HTTP/1.1 302 Found\r\n\r\n".to_owned());
+        ctx.redirect_status = Some(302);
         ctx.headers_response.push(HeaderEditSnapshot {
             key: b"X-Cache".to_vec(),
             val: b"HIT".to_vec(),
@@ -2625,6 +2646,12 @@ mod tests {
         assert!(ctx.www_authenticate.is_none());
         assert!(ctx.original_authority.is_none());
         assert!(ctx.headers_response.is_empty());
+        // The frontend that matched one request owns its access-log tags
+        // and its redirect stash; a later request of the connection that is
+        // refused before routing must not read them back.
+        assert!(ctx.tags.is_none());
+        assert!(ctx.frontend_redirect_template.is_none());
+        assert!(ctx.redirect_status.is_none());
     }
 
     #[test]

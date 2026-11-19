@@ -3284,6 +3284,142 @@ mod tests {
         );
     }
 
+    /// The access-log tags of the frontend that matched one request of a
+    /// keep-alive connection belong to that request alone. The routing layer
+    /// stashes them in `HttpContext::tags` only once a frontend matched, so a
+    /// later request of the same connection that is refused before routing (an
+    /// unknown host, a TLS SNI/authority mismatch) has no matched frontend and
+    /// must log through the listener fallback, as `Stream::generate_access_log`
+    /// documents. `HttpContext::reset` (`lib/src/protocol/kawa_h1/editor.rs`)
+    /// clears `tags` for that reason: a `reset` that kept them would log that
+    /// request with the previous request's tags.
+    ///
+    /// Driven through the real `H1::Complete` site of
+    /// `ConnectionH1::writable`, which recycles the stream for the next request
+    /// of the connection, twice. Routing is staged: the first request carries
+    /// the tags the router would have stashed for its frontend, the second
+    /// carries none because the router never ran for it.
+    #[test]
+    fn a_keep_alive_request_refused_before_routing_does_not_log_the_previous_requests_tags() {
+        const BACKEND: mio::Token = mio::Token(1);
+        const PREVIOUS_FRONTEND_TAG: &str = "frontend-of-request-one=alpha";
+
+        let output = crate::capture_test_logs(move || {
+            let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+            let mut context = test_context(&pool);
+            context
+                .create_stream(Ulid::generate(), 1 << 16)
+                .expect("the test pool must hand out stream buffers");
+            let (front_socket, mut front_peer) = connected_socket();
+            front_peer
+                .set_nonblocking(true)
+                .expect("the frontend peer is drained without blocking");
+            let mut frontend =
+                Connection::new_h1_server(Ulid::generate(), front_socket, Duration::from_secs(60));
+            let (back_socket, mut back_peer) = connected_socket();
+            let backend_ulid = Ulid::generate();
+            let mut client = h1_of(Connection::new_h1_client(
+                backend_ulid,
+                SessionTcpStream::new(back_socket, backend_ulid, None),
+                "test-cluster".into(),
+                test_backend_id(cached_peer()),
+                Duration::from_secs(60),
+            ));
+            if let Position::Client(_, _, status) = &mut client.position {
+                *status = BackendStatus::KeepAlive;
+            }
+            let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+            router.backends.insert(BACKEND, Connection::H1(client));
+
+            let mut drained = [0u8; 4096];
+            for request in 0..2 {
+                let Some(Connection::H1(client)) = router.backends.get_mut(&BACKEND) else {
+                    unreachable!("the backend was inserted as H1")
+                };
+                assert!(
+                    client.start_stream(0, &mut context),
+                    "premise: the pooled backend must accept request {request}"
+                );
+                let stream = &mut context.streams[0];
+                stream.state = StreamState::Linked(BACKEND);
+                stream.context.keep_alive_frontend = true;
+                if request == 0 {
+                    // What `route_from_request` stashes once a frontend
+                    // matched. The second request is refused before routing,
+                    // so nothing stashes anything for it.
+                    stream.context.tags = Some(Rc::new(sozu_command::logging::CachedTags::new(
+                        std::collections::BTreeMap::from([(
+                            "frontend-of-request-one".to_owned(),
+                            "alpha".to_owned(),
+                        )]),
+                    )));
+                } else {
+                    stream.context.authority = Some("unknown.example.com".to_owned());
+                }
+                stream.front.parsing_phase = kawa::ParsingPhase::Terminated;
+                stream.metrics.service_start();
+                stream.metrics.backend_id = Some("test-backend".into());
+                stream.metrics.backend_start();
+                stream.metrics.backend_connected();
+
+                back_peer
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .expect("the loopback backend peer must accept the response");
+                for _ in 0..64 {
+                    client.readiness.event.insert(Ready::READABLE);
+                    client.readable(&mut context, EndpointServer(&mut frontend));
+                    if context.streams[0].back.is_terminated() {
+                        break;
+                    }
+                }
+                assert!(
+                    context.streams[0].back.is_terminated(),
+                    "premise: response {request} must be read whole"
+                );
+
+                for _ in 0..64 {
+                    frontend.readiness_mut().event.insert(Ready::WRITABLE);
+                    frontend.writable(&mut context, EndpointClient(&mut router));
+                    if context.streams[0].metrics.start.is_none() {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    context.streams[0].state,
+                    StreamState::Idle,
+                    "premise: request {request} must complete through the \
+                     keep-alive branch of `H1::Complete`"
+                );
+                while let Ok(read) = std::io::Read::read(&mut front_peer, &mut drained) {
+                    if read == 0 {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let lines: Vec<&str> = output
+            .lines()
+            .filter(|line| line.contains("H1::Complete"))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "every request must be logged, got: {output}"
+        );
+        assert!(
+            lines[0].contains(PREVIOUS_FRONTEND_TAG),
+            "premise: the routed request logs its frontend's tags: {}",
+            lines[0]
+        );
+        assert!(
+            !lines[1].contains(PREVIOUS_FRONTEND_TAG),
+            "a request refused before routing has no matched frontend and \
+             must not log the previous request's tags: {}",
+            lines[1]
+        );
+    }
+
     /// A backend connection that answered before the whole request was
     /// written to it still expects the rest of the body: `end_stream` must not
     /// pool it, or the next request would be read as that body
