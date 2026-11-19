@@ -611,6 +611,21 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   still be a `Dial`, so the test asserts on the state the router and the stream
   are left in rather than on the returned value.
 
+  An H2 connection is reused only while it has room for one more stream, in
+  both states the scan accepts: a `Connected` connection whose stream count has
+  reached `peer_settings.settings_max_concurrent_streams` is skipped, and so is
+  a `BackendStatus::Connecting` one, the fallback taken when no `Connected`
+  connection has room. A connecting connection's limit is the default
+  (`H2Settings::default()`), because the backend's SETTINGS have not arrived,
+  and streams attached to it count against it from the moment
+  `ConnectionH2::start_stream` registers them. Without the check on the
+  `Connecting` arm, the stream past that limit was attached anyway, refused by
+  `ConnectionH2::start_stream`, and answered 503 with `MaxSessionsMemory`;
+  with it the router answers `ConnectPlan::Dial` and the stream waits on a
+  second connection. Pinned by
+  `a_full_pooled_h2_connection_is_not_reused_connected_or_connecting`
+  (`router.rs`).
+
   The pool scan matches a connection by the cluster id in its
   `Position::Client`, and skips one whose backend has left the configuration.
   A cluster id outlives `RemoveCluster` followed by `AddCluster` of the same

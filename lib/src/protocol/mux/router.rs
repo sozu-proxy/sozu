@@ -55,7 +55,12 @@
 //! fallback has no such counter, but every candidate it ranks is a connection
 //! that cannot serve anything yet, and it concentrated every waiting stream on
 //! one of them before this change too; the total order fixes WHICH one, it
-//! does not change how many.
+//! does not change how many. What bounds how many is the capacity check the
+//! `Connected` arm has and the fallback shares: a connecting connection that
+//! already carries `peer_settings.settings_max_concurrent_streams` streams
+//! (the default until the backend's SETTINGS arrive) is skipped, so the next
+//! stream dials a second connection instead of being refused by
+//! `ConnectionH2::start_stream` and answered 503.
 //!
 //! ## Complexity — UNMEASURED beyond the default configuration
 //!
@@ -888,7 +893,7 @@ impl Router {
         H2 connecting strategy (least-loaded):
         - look at every backend connection
         - among connected backends for this cluster, pick the one with the fewest active streams
-        - fall back to a connecting backend if no connected one exists
+        - fall back to a connecting backend with room for one more stream if no connected one exists
         - if no backend is to reuse, ask the router for a socket to the "next in line" backend
 
         H1 strategy: reuse the first KeepAlive backend for this cluster.
@@ -932,10 +937,18 @@ impl Router {
                     }
                 }
                 (true, Position::Client(other_cluster_id, _, BackendStatus::Connecting(_))) => {
-                    // Only use a connecting backend if no connected one was found
+                    // Only use a connecting backend if no connected one was
+                    // found, and only while it has room for one more stream:
+                    // the same capacity check as the `Connected` arm. Streams
+                    // attached before the backend's SETTINGS arrive count
+                    // against the default limit, and `ConnectionH2::start_stream`
+                    // refuses the one past it, which would answer 503 where a
+                    // second dial can serve it.
                     if other_cluster_id == cluster_id
                         && best_h2_stream_count == usize::MAX
-                        && matches!(backend, Connection::H2(_))
+                        && let Connection::H2(h2c) = backend
+                        && h2c.core.stream_count()
+                            < h2c.core.peer_settings.settings_max_concurrent_streams as usize
                     {
                         reuse_token = Some(*token)
                     }
@@ -3192,6 +3205,105 @@ mod backend_selection_order_tests {
                 connection.idle_pooled_backend().is_some(),
                 idle,
                 "{arm}: idle_pooled_backend must answer {idle}"
+            );
+        }
+    }
+
+    /// A new stream whose `Context` is shaped for `staged`'s cluster, in the
+    /// `Link` state the router decides on.
+    fn linkable_stream(
+        context: &mut Context<HttpListener>,
+        staged: &Staged,
+    ) -> crate::protocol::mux::GlobalStreamId {
+        let stream_id = context
+            .create_stream(Ulid::generate(), 65_535)
+            .expect("the test pool must hand out a stream");
+        let stream = &mut context.streams[stream_id];
+        stream.state = StreamState::Link;
+        stream.context.authority = Some(staged.authority().to_owned());
+        stream.context.path = Some("/".to_owned());
+        stream.context.method = Some(Method::Get);
+        stream_id
+    }
+
+    /// A pooled H2 backend connection that already carries as many streams as
+    /// the peer is assumed to allow is not reused, whether the connection is
+    /// `Connected` or still `Connecting`.
+    ///
+    /// The `Connected` arm of the reuse scan skips a connection at its
+    /// `settings_max_concurrent_streams`; the `Connecting` fallback has no
+    /// such check and attaches every further stream of the cluster to the
+    /// connection until `ConnectionH2::start_stream` refuses it, which the
+    /// router turns into `MaxSessionsMemory` and the caller into a 503. The
+    /// limit of a connection still `Connecting` is the default, because the
+    /// backend's SETTINGS have not arrived (`H2Settings::default()` in the
+    /// `ConnectionH2` core constructor).
+    ///
+    /// The limit is lowered to one here so that a single attached stream fills
+    /// the connection, which is the state 100 attached streams reach with the
+    /// default.
+    ///
+    /// TO SEE THIS GREEN: give the `Connecting` arm of the scan in
+    /// `Router::decide_after_gate` the capacity check the `Connected` arm has
+    /// (skip a connection whose `stream_count()` is at or above its
+    /// `peer_settings.settings_max_concurrent_streams`).
+    #[test]
+    fn a_full_pooled_h2_connection_is_not_reused_connected_or_connecting() {
+        let fixture = routing_fixture();
+        for (staged, arm) in [
+            (Staged::ConnectedH2, "H2 Connected"),
+            (Staged::ConnectingH2, "H2 Connecting"),
+        ] {
+            let mut context = Context::new(
+                Ulid::generate(),
+                Rc::downgrade(&fixture.pool),
+                fixture.listener.clone(),
+                None,
+                "127.0.0.1:80"
+                    .parse()
+                    .expect("test public address must parse"),
+            );
+            let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+            let mut backend_registry = BackendRegistry::default();
+            let (mut connection, _peer) =
+                staged_backend(&fixture.pool, &staged, &mut backend_registry);
+            let Connection::H2(h2c) = &mut connection else {
+                unreachable!("an H2 arm stages an H2 connection")
+            };
+            h2c.core.peer_settings.settings_max_concurrent_streams = 1;
+            router.backends.insert(Token(LOWEST_TOKEN), connection);
+
+            let proxy_ref = fixture.proxy.borrow();
+            let view = RoutingView::new(proxy_ref.clusters(), proxy_ref.kind());
+
+            // Premise: with room left, the connection is reused.
+            let first = linkable_stream(&mut context, &staged);
+            let plan = router
+                .plan_connect(first, &mut context, &view)
+                .map(decided)
+                .expect("routing must resolve the staged cluster");
+            assert!(
+                matches!(plan, ConnectPlan::Attached),
+                "premise, {arm}: a connection below its stream limit is reused, got {plan:?}"
+            );
+            assert_eq!(
+                context.streams[first].state,
+                StreamState::Linked(Token(LOWEST_TOKEN))
+            );
+
+            // The connection now holds one stream, the limit it is assumed to
+            // allow: the next stream needs another connection.
+            let second = linkable_stream(&mut context, &staged);
+            let plan = router
+                .plan_connect(second, &mut context, &view)
+                .map(decided);
+            assert!(
+                matches!(
+                    &plan,
+                    Ok(ConnectPlan::Dial { cluster_id, .. }) if &**cluster_id == staged.cluster()
+                ),
+                "{arm}: a connection at its stream limit must not be reused, a second \
+                 connection must be dialed, got {plan:?}"
             );
         }
     }
