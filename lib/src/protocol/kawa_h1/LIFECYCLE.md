@@ -157,8 +157,18 @@ mutable companion to the Kawa parser. Its `kawa::h1::ParserCallbacks` impl
   code (`standard_reason`, `editor.rs`) when the backend sent exactly that
   phrase, and copied otherwise; the forwarded status line is kawa's own and
   never reads it. It also clears `keep_alive_backend` on a backend
-  `Connection: close`, and forwards that header unchanged. That flag is what
-  sends a backend EOF into
+  `Connection: close`, and forwards that header unchanged, and on a
+  close-delimited response of any version: one with neither `Content-Length`
+  nor a chunked `Transfer-Encoding` is delimited by the close (RFC 9112
+  §6.3 rule 8), whether or not it also says `Connection: close`, because
+  that option is advisory (RFC 9112 §9.6). kawa hands such a response to the
+  callback in `ParsingPhase::Body` with `BodySize::Empty`; a 1xx, a 204 and
+  a 304 arrive as `Length(0)`, a response to HEAD is `Terminated` by the
+  callback itself, and an H2 response reaches it in the initial phase, so
+  none of them is mistaken for one. An HTTP/1.1 close-delimited response is
+  forwarded as the backend sent it, with no `Connection` line added: its
+  framing already tells the client the body ends with the close. That flag
+  is what sends a backend EOF into
   `ConnectionH1::terminate_close_delimited` (`lib/src/protocol/mux/h1.rs`),
   where only a body with neither `Content-Length` nor chunked coding ends
   cleanly: a body the close cut short ends in `ParsingPhase::Error`,
@@ -178,8 +188,9 @@ mutable companion to the Kawa parser. Its `kawa::h1::ParserCallbacks` impl
   H2 converter ignores the version. HTTP/1.1 is persistent by default where
   HTTP/1.0 is not (RFC 9112 §9.3), so the same branch clears
   `keep_alive_backend` for an HTTP/1.0 response that lacks a `keep-alive`
-  connection option, has a close-delimited body, or carries
-  `Transfer-Encoding` (faulty framing in HTTP/1.0, RFC 9112 §6.1). It then
+  connection option or carries `Transfer-Encoding` (faulty framing in
+  HTTP/1.0, RFC 9112 §6.1), on top of the close-delimited body that clears
+  it for every version (above). For any of the three it then
   merges the response's `Connection` options into one line ending in
   `close` (RFC 9112 §9.6): every option that nominates a hop-by-hop field
   survives (RFC 9110 §7.6.1), and only the `keep-alive` the close
@@ -459,8 +470,10 @@ still end the stream.
   bodies (`an_h2_request_is_left_for_pkawa_to_frame`).
 - **Responses keep their framing.** `on_response_headers` never runs this
   rule, so a response without length stays close-delimited, ended by
-  `ConnectionH1::terminate_close_delimited`. Only an HTTP/1.0 response has
-  its version and `Connection` header edited (§2), never its length.
+  `ConnectionH1::terminate_close_delimited`: `on_response_headers` clears
+  `keep_alive_backend` for it, so the backend EOF ends the body instead of
+  being judged a truncation. Only an HTTP/1.0 response has its version and
+  `Connection` header edited (§2), never its length.
 - **Interactions.** `Expect: 100-continue` with no length has no body to wait
   for. A WebSocket `GET` with `Upgrade` has no body either; the 101 still
   switches to the pipe. Bytes a client sends behind the upgrade request

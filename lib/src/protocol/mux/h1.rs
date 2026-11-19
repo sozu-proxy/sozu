@@ -1354,13 +1354,15 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     // The connection outlives the response only when neither
                     // side asked to close it. `keep_alive_backend` is false
                     // once the backend's response carried `Connection: close`,
-                    // or was a non-persistent HTTP/1.0 one that sozu forwards
-                    // as HTTP/1.1 with `Connection: close` added
+                    // was a non-persistent HTTP/1.0 one that sozu forwards
+                    // as HTTP/1.1 with `Connection: close` added, or had a
+                    // close-delimited body whatever its version
                     // (`HttpContext::on_response_headers`,
-                    // `lib/src/protocol/kawa_h1/editor.rs`): sozu forwards that
-                    // header, so RFC 9112 §9.6 requires it to close after this
-                    // response and to process no further request on it. It
-                    // is also the only way a close-delimited body ends here:
+                    // `lib/src/protocol/kawa_h1/editor.rs`). Where sozu
+                    // forwards that header, RFC 9112 §9.6 requires it to close
+                    // after this response and to process no further request
+                    // on it. It is also the only way a close-delimited body
+                    // ends here:
                     // `ConnectionH1::terminate_close_delimited` runs only for
                     // such a backend, and that body ends, for the client too,
                     // only with the close (§6.3 rule 8). Keeping the
@@ -1547,7 +1549,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         }
                         if !stream.context.keep_alive_backend {
                             debug!(
-                                "{} H1 closing the frontend after a response carrying the backend's Connection: close on stream {}",
+                                "{} H1 closing the frontend after a response that ends its backend connection on stream {}",
                                 log_context!(self),
                                 stream_id
                             );
@@ -4951,6 +4953,112 @@ mod tests {
                     kawa.parsing_phase
                 );
             }
+        }
+    }
+
+    /// An HTTP/1.1 response with neither `Content-Length` nor chunked coding
+    /// is delimited by the close of the connection (RFC 9112 §6.3 rule 8),
+    /// whether or not it also carries `Connection: close`: that header is
+    /// advisory (RFC 9112 §9.6) and the framing rule does not depend on it.
+    /// The backend's EOF is therefore the end of a complete response, not a
+    /// truncation: the stream must end cleanly, not in the Error phase that
+    /// makes an H2 frontend send RST_STREAM(INTERNAL_ERROR) and an H1
+    /// frontend drop the parsed-but-unwritten tail.
+    ///
+    /// Driven through the real `ConnectionH1::readable` (which runs the
+    /// `on_response_headers` callback that decides `keep_alive_backend`)
+    /// over a loopback backend that sends the response and closes, then
+    /// through `ConnectionH1::close`, which is what the dead-backend sweep
+    /// calls on the backend's HUP. The first case is the control: with
+    /// `Connection: close` the same path already ends cleanly.
+    #[test]
+    fn an_unframed_http11_response_without_connection_close_is_not_truncated_by_the_backend_eof() {
+        const FRONTEND: mio::Token = mio::Token(0);
+        let cases: [(&[u8], &str); 2] = [
+            (
+                b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nabcd",
+                "with Connection: close",
+            ),
+            (b"HTTP/1.1 200 OK\r\n\r\nabcd", "without Connection: close"),
+        ];
+        for (response, label) in cases {
+            let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+            let mut context = test_context(&pool);
+            context
+                .create_stream(Ulid::generate(), 1 << 16)
+                .expect("the test pool must hand out stream buffers");
+            let (front_socket, _front_peer) = connected_socket();
+            let mut frontend =
+                Connection::new_h1_server(Ulid::generate(), front_socket, Duration::from_secs(60));
+            let (back_socket, mut back_peer) = connected_socket();
+            let backend_ulid = Ulid::generate();
+            let mut client = h1_of(Connection::new_h1_client(
+                backend_ulid,
+                SessionTcpStream::new(back_socket, backend_ulid, None),
+                "test-cluster".into(),
+                test_backend_id(cached_peer()),
+                Duration::from_secs(60),
+            ));
+            if let Position::Client(_, _, status) = &mut client.position {
+                *status = BackendStatus::Connected;
+            }
+            assert!(
+                client.start_stream(0, &mut context),
+                "{label}: premise: the backend connection must accept the stream"
+            );
+            context.streams[0].state = StreamState::Linked(FRONTEND);
+            context.streams[0].front.parsing_phase = kawa::ParsingPhase::Terminated;
+
+            back_peer
+                .write_all(response)
+                .expect("the loopback backend peer must accept the response");
+            back_peer
+                .shutdown(std::net::Shutdown::Both)
+                .expect("the loopback backend peer must close after its response");
+
+            // The backend read stops on a short read, so the bytes and the EOF
+            // come back from successive reads. Bounded: a read that never
+            // reports the EOF fails the premise below instead of hanging.
+            for _ in 0..64 {
+                client.readiness.event.insert(Ready::READABLE);
+                client.readable(&mut context, EndpointServer(&mut frontend));
+                if client.readiness.event.is_hup() {
+                    break;
+                }
+            }
+            assert!(
+                client.readiness.event.is_hup(),
+                "{label}: premise: the backend EOF must have been read"
+            );
+            let stream = &context.streams[0];
+            assert!(
+                !stream.back.is_error(),
+                "{label}: premise: a complete response is not an error, got {:?}",
+                stream.back.parsing_phase
+            );
+            assert_eq!(
+                stream.back.body_size,
+                kawa::BodySize::Empty,
+                "{label}: premise: the response has neither Content-Length nor chunked coding"
+            );
+            let keep_alive_backend = stream.context.keep_alive_backend;
+
+            client.close(&mut context, EndpointServer(&mut frontend));
+
+            let back = &context.streams[0].back;
+            assert!(
+                !back.is_error(),
+                "{label}: a close-delimited response complete at the backend EOF must \
+                 not be ended as truncated (keep_alive_backend={keep_alive_backend}), \
+                 got {:?}",
+                back.parsing_phase
+            );
+            assert!(
+                back.is_terminated(),
+                "{label}: a close-delimited response complete at the backend EOF must \
+                 end cleanly, got {:?}",
+                back.parsing_phase
+            );
         }
     }
 }

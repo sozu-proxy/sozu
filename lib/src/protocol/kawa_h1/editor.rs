@@ -1868,7 +1868,9 @@ impl HttpContext {
     /// - save information:
     ///   - status code
     ///   - reason
-    ///   - back keep-alive
+    ///   - back keep-alive (cleared by `Connection: close`, by a
+    ///     close-delimited body of any version, and by a non-persistent
+    ///     HTTP/1.0 response)
     fn on_response_headers(&mut self, response: &mut GenericHttpStream) {
         // Like the request path, response editing only adds or elides — pin
         // the entry count so the postcondition can assert "blocks only grow".
@@ -1962,6 +1964,30 @@ impl HttpContext {
             }
         }
 
+        // A final response with neither `Content-Length` nor a chunked
+        // `Transfer-Encoding` is delimited by the close of the backend
+        // connection (RFC 9112 §6.3 rule 8), whatever its HTTP version and
+        // whether or not it carries `Connection: close`: that option is
+        // advisory (RFC 9112 §9.6) and the framing does not depend on it.
+        // kawa maps such a response to `ParsingPhase::Body` with
+        // `BodySize::Empty` before calling back; a 1xx, a 204 and a 304
+        // arrive as `Length(0)`, a response to HEAD is `Terminated` above,
+        // and an H2 response reaches this callback in the initial phase, so
+        // none of them matches. The backend connection cannot be kept after
+        // such a response, so `keep_alive_backend` is cleared: the backend
+        // EOF then ends the body (`ConnectionH1::terminate_close_delimited`,
+        // `lib/src/protocol/mux/h1.rs`) instead of being judged a truncation
+        // that resets an H2 stream or drops the unwritten tail of an H1 one
+        // (`shared::end_stream_decision`, `ForwardUnterminated`), and an H1
+        // client connection closes after the response
+        // (`ConnectionH1::writable`).
+        let close_delimited = !is_interim
+            && response.parsing_phase == kawa::ParsingPhase::Body
+            && response.body_size == kawa::BodySize::Empty;
+        if close_delimited {
+            self.keep_alive_backend = false;
+        }
+
         // RFC 9110 §6.2: Sōzu answers in its own version, HTTP/1.1, whatever
         // the backend spoke. kawa serialises `Version::V10` as `HTTP/1.0` for
         // an H1 client (the H2 converter ignores the version), so only an
@@ -1969,7 +1995,7 @@ impl HttpContext {
         //
         // HTTP/1.0 is not persistent unless the response asks to be with a
         // `keep-alive` connection option (RFC 9112 §9.3); a close-delimited
-        // body (RFC 9112 §6.3 rule 8) ends with the close whatever it asked,
+        // body (cleared above) ends with the close whatever it asked,
         // and `Transfer-Encoding` in an HTTP/1.0 message is faulty framing
         // that closes the connection after it (RFC 9112 §6.1). Forwarded as
         // HTTP/1.1 the client would read it as persistent, so a
@@ -1978,7 +2004,10 @@ impl HttpContext {
         // (`ConnectionH1::terminate_close_delimited`,
         // `lib/src/protocol/mux/h1.rs`) and closes an H1 client connection
         // after the response (`ConnectionH1::writable`), and announces that
-        // close (RFC 9112 §9.6).
+        // close (RFC 9112 §9.6). An HTTP/1.1 close-delimited response is
+        // forwarded as the backend sent it: its framing already tells the
+        // client the body ends with the close, so no `Connection` header is
+        // added.
         //
         // A shutting-down Sōzu closes the client connection after the
         // response too (`ConnectionH1::writable` tests `closing` first), in
@@ -1992,12 +2021,8 @@ impl HttpContext {
         // An interim 1xx says nothing about the connection: its persistence
         // belongs to the final response, which runs this callback again, and
         // a 101 must keep its `Connection: Upgrade` (RFC 9110 §7.8).
-        if is_http10 && !is_interim {
-            let close_delimited = response.parsing_phase == kawa::ParsingPhase::Body
-                && response.body_size == kawa::BodySize::Empty;
-            if !asks_keep_alive || close_delimited || has_transfer_encoding {
-                self.keep_alive_backend = false;
-            }
+        if is_http10 && !is_interim && (!asks_keep_alive || has_transfer_encoding) {
+            self.keep_alive_backend = false;
         }
         if !is_interim && (self.closing || (is_http10 && !self.keep_alive_backend)) {
             merge_connection_options_into_close(response, false);
@@ -4636,6 +4661,125 @@ mod tests {
                     .iter()
                     .any(|line| line.to_ascii_lowercase().contains("close")),
                 "{label}: the close is still announced, got {wire:?}"
+            );
+        }
+    }
+
+    /// RFC 9112 §6.3 rule 8: an HTTP/1.1 final response with neither
+    /// `Content-Length` nor a chunked `Transfer-Encoding` is delimited by the
+    /// close of the backend connection, with or without a `Connection: close`
+    /// of its own, so its backend connection is not kept. Every response
+    /// that has a length, or no body by definition (a 1xx, a 204, a 304, a
+    /// response to HEAD), still keeps it, and the response is forwarded
+    /// without a `Connection` line the backend did not send.
+    ///
+    /// TO SEE THIS RED, restrict the `close_delimited` clearing of
+    /// `HttpContext::on_response_headers` to `is_http10`: the unframed
+    /// HTTP/1.1 rows keep `keep_alive_backend`. TO SEE THE OTHER SIDE, drop
+    /// its `ParsingPhase::Body` test and the HEAD row loses its persistence,
+    /// or its `BodySize::Empty` test and every framed row does.
+    #[test]
+    fn an_unframed_http11_response_is_close_delimited_and_a_framed_one_is_not() {
+        // (label, response head and body, method, keeps the backend)
+        let cases: [(&str, &[u8], Method, bool); 11] = [
+            (
+                "unframed",
+                b"HTTP/1.1 200 OK\r\n\r\nabcd",
+                Method::Get,
+                false,
+            ),
+            (
+                "unframed with a keep-alive option",
+                b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n\r\nabcd",
+                Method::Get,
+                false,
+            ),
+            (
+                "unframed with Connection: close",
+                b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nabcd",
+                Method::Get,
+                false,
+            ),
+            (
+                "non-chunked Transfer-Encoding",
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nabcd",
+                Method::Get,
+                false,
+            ),
+            (
+                "Content-Length",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabcd",
+                Method::Get,
+                true,
+            ),
+            (
+                "empty Content-Length",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+                Method::Get,
+                true,
+            ),
+            (
+                "chunked",
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n0\r\n\r\n",
+                Method::Get,
+                true,
+            ),
+            (
+                "204 without length",
+                b"HTTP/1.1 204 No Content\r\n\r\n",
+                Method::Get,
+                true,
+            ),
+            (
+                "304 without length",
+                b"HTTP/1.1 304 Not Modified\r\n\r\n",
+                Method::Get,
+                true,
+            ),
+            (
+                "1xx without length",
+                b"HTTP/1.1 103 Early Hints\r\nLink: </a.css>; rel=preload\r\n\r\n",
+                Method::Get,
+                true,
+            ),
+            (
+                "response to HEAD without length",
+                b"HTTP/1.1 200 OK\r\n\r\n",
+                Method::Head,
+                true,
+            ),
+        ];
+        for (label, bytes, method, keeps) in cases {
+            let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+            let mut ctx = make_context();
+            ctx.method = Some(method);
+            let mut kawa: GenericHttpStream = kawa::Kawa::new(
+                kawa::Kind::Response,
+                kawa::Buffer::new(
+                    pool.checkout()
+                        .expect("the test pool must hand out a buffer"),
+                ),
+            );
+            kawa.storage.space()[..bytes.len()].copy_from_slice(bytes);
+            kawa.storage.fill(bytes.len());
+            kawa::h1::parse(&mut kawa, &mut ctx);
+            assert!(
+                !kawa.is_error(),
+                "{label}: premise: the response must parse"
+            );
+            assert_eq!(ctx.keep_alive_backend, keeps, "{label}: keep_alive_backend");
+            let sent: Vec<String> = connection_lines(&String::from_utf8_lossy(bytes))
+                .iter()
+                .map(|line| line.to_ascii_lowercase())
+                .collect();
+            let wire = serialized_request(&mut kawa);
+            let forwarded: Vec<String> = connection_lines(&wire)
+                .iter()
+                .map(|line| line.to_ascii_lowercase())
+                .collect();
+            assert_eq!(
+                forwarded, sent,
+                "{label}: the Connection lines are forwarded as sent, got {wire:?}"
             );
         }
     }

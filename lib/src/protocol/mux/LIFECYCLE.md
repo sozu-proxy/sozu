@@ -1978,9 +1978,15 @@ stream that has completed on the backend. Behavior depends on `Position`:
   schedules the frontend write.
 
 **A backend close before the end of the response** (sozu-proxy/sozu#1633).
-With `Connection: close` (`keep_alive_backend == false`) the backend's EOF
-reaches `ConnectionH1::terminate_close_delimited` (`h1.rs`) from both EOF
-branches of `ConnectionH1::readable`. Only a body with neither
+With `keep_alive_backend == false` the backend's EOF reaches
+`ConnectionH1::terminate_close_delimited` (`h1.rs`) from both EOF branches of
+`ConnectionH1::readable`. `HttpContext::on_response_headers` clears the flag
+for a backend `Connection: close`, for a non-persistent HTTP/1.0 response and
+for a close-delimited response of any version, so an HTTP/1.1 response with
+neither `Content-Length` nor chunked coding is ended cleanly by the EOF
+whether or not it also says `Connection: close`; with the flag still set, the
+EOF would reach `end_stream_decision` as `ForwardUnterminated` and truncate a
+complete response. Only a body with neither
 `Content-Length` nor chunked coding (`BodySize::Empty`) is delimited by the
 close (RFC 9112 §6.3 rule 8) and ends `Terminated`. A `Content-Length` body
 still expecting bytes (rule 5) or a chunked body without its terminating zero
@@ -2004,7 +2010,10 @@ write-only shutdown) once the errored response is flushed, never keeping it
 alive: the client sees a close before `Content-Length`, the incomplete-message
 signal of RFC 9112 §6.3, and no pipelined response can follow the truncated
 body. `Mux::close` logs the stream as an error. Pinned by
-`only_a_close_delimited_body_ends_cleanly_at_the_backend_eof` (`h1.rs`),
+`only_a_close_delimited_body_ends_cleanly_at_the_backend_eof` and
+`an_unframed_http11_response_without_connection_close_is_not_truncated_by_the_backend_eof`
+(`h1.rs`), `an_unframed_http11_response_is_close_delimited_and_a_framed_one_is_not`
+(`editor.rs`),
 `an_errored_response_already_handed_to_the_client_is_not_replaced`
 (`shared.rs`), `a_content_length_response_cut_short_ends_with_a_reset`
 (`h2.rs`), and the e2e `test_h2_content_length_truncated_*`,
