@@ -2482,6 +2482,62 @@ impl Server {
         let _ = self.shut_down_sessions_by_frontend_tokens(HashSet::from([token]));
     }
 
+    /// Deals with a response whose frame exceeds the command channel's ceiling
+    /// (`max_command_buffer_size`) and can therefore never be written: the
+    /// operator is told and the response is dropped. If it was a terminal
+    /// answer, the request it answered is given a short `Failure` in its place.
+    ///
+    /// The main process counts a terminal answer per worker and finishes a
+    /// request only once every worker has given one, so dropping the answer
+    /// without a stand-in would leave that request waiting for a frame that
+    /// cannot arrive. A response that is not terminal (a `Processing` progress
+    /// report, or an event) owes the main process nothing: the real answer is
+    /// still to come, a `Failure` now would end the request early, and an event
+    /// answers no request at all.
+    ///
+    /// The stand-in is queued again only when it fits under the ceiling but not
+    /// in the room a backlog leaves, the transient case `send_queue` already
+    /// handles for any response. When even it exceeds the ceiling it is dropped,
+    /// so no stand-in is ever replaced by another.
+    fn refuse_oversized_response(
+        &mut self,
+        resp: &WorkerResponse,
+        message_len: usize,
+        max: usize,
+        queue: &mut VecDeque<WorkerResponse>,
+    ) {
+        error!(
+            "Dropping response {}: its {} bytes exceed the {} bytes the command channel can \
+             carry (max_command_buffer_size)",
+            resp.id, message_len, max
+        );
+
+        if !matches!(
+            ResponseStatus::try_from(resp.status),
+            Ok(ResponseStatus::Ok | ResponseStatus::Failure)
+        ) {
+            return;
+        }
+
+        let stand_in = WorkerResponse::error(
+            &resp.id,
+            format!(
+                "the worker response of {message_len} bytes exceeds the {max} bytes the command \
+                 channel can carry (max_command_buffer_size)"
+            ),
+        );
+        match self.channel.write_message(&stand_in) {
+            Ok(()) => {}
+            Err(ChannelError::MessageTooLarge {
+                message_len, max, ..
+            }) if message_len <= max => queue.push_front(stand_in),
+            Err(e) => error!(
+                "Could not write the failure standing in for response {} on the channel: {}",
+                resp.id, e
+            ),
+        }
+    }
+
     fn send_queue(&mut self) {
         if self.channel.readiness.is_writable() {
             QUEUE.with(|q| {
@@ -2489,9 +2545,24 @@ impl Server {
                 loop {
                     if let Some(resp) = queue.pop_front() {
                         debug!("Sending response {:?}", resp);
-                        if let Err(e) = self.channel.write_message(&resp) {
-                            error!("Could not write message {} on the channel: {}", resp, e);
-                            queue.push_front(resp);
+                        match self.channel.write_message(&resp) {
+                            Ok(()) => {}
+                            // The framed response is bigger than the channel's
+                            // ceiling (`max_command_buffer_size`). Unlike a
+                            // frame that only misses the room left in a
+                            // backlogged buffer, no drain ever admits it, so
+                            // keeping it at the head of the queue would make
+                            // this loop retry it for good, with the worker's
+                            // only thread never back in `epoll_wait`.
+                            Err(ChannelError::MessageTooLarge {
+                                message_len, max, ..
+                            }) if message_len > max => {
+                                self.refuse_oversized_response(&resp, message_len, max, &mut queue);
+                            }
+                            Err(e) => {
+                                error!("Could not write message {} on the channel: {}", resp, e);
+                                queue.push_front(resp);
+                            }
                         }
                     }
 
@@ -5787,6 +5858,16 @@ mod listener_lifecycle_tests {
     /// minus the pre-installed listener — `Server::new` builds its own UDP
     /// proxy, which is the one these tests exercise.
     pub(super) fn bare_server() -> Server {
+        bare_server_with_command_channel(1000, 10000).0
+    }
+
+    /// `bare_server`, with the channel sizes chosen by the test and the main
+    /// process's end of the worker channel handed back, so that a test can read
+    /// what the worker wrote on it. `bare_server` drops that end.
+    pub(super) fn bare_server_with_command_channel(
+        buffer_size: u64,
+        max_buffer_size: u64,
+    ) -> (Server, Channel<WorkerRequest, WorkerResponse>) {
         let ServerParts {
             event_loop,
             sessions,
@@ -5796,10 +5877,10 @@ mod listener_lifecycle_tests {
             server_config,
             ..
         } = prebuild_server(16, 16384, true).expect("could not prebuild a test server");
-        let (_command_channel, proxy_channel) =
-            Channel::generate(1000, 10000).expect("could not generate a test channel");
+        let (command_channel, proxy_channel) = Channel::generate(buffer_size, max_buffer_size)
+            .expect("could not generate a test channel");
 
-        Server::new(
+        let server = Server::new(
             event_loop,
             proxy_channel,
             server_scm_socket,
@@ -5813,7 +5894,8 @@ mod listener_lifecycle_tests {
             None,
             false,
         )
-        .expect("could not build the test server")
+        .expect("could not build the test server");
+        (server, command_channel)
     }
 
     fn add_udp_listener(server: &mut Server, address: SocketAddress) -> Token {
@@ -6636,6 +6718,246 @@ mod listener_lifecycle_tests {
         assert!(
             !admit(&manager, 1002),
             "the cluster's own limit of 2 counts the two open flows and sheds a third"
+        );
+    }
+}
+
+#[cfg(test)]
+mod send_queue_tests {
+    use std::{sync::mpsc, thread, time::Duration};
+
+    use sozu_command::channel::ChannelError;
+
+    use super::listener_lifecycle_tests::{bare_server, bare_server_with_command_channel};
+    use super::*;
+
+    /// Wall-clock budget `send_queue` gets to return. A correct `send_queue`
+    /// returns in microseconds (it writes into a buffer and, at most, one
+    /// socket); the budget is only there so that a wedged one fails the test
+    /// instead of hanging it.
+    const SEND_QUEUE_DEADLINE: Duration = Duration::from_secs(5);
+
+    /// A worker response whose encoding exceeds the worker channel's
+    /// `max_buffer_size` can never be written: `Channel::write_delimited_message`
+    /// refuses it with `MessageTooLarge` before it buffers a single byte, and
+    /// the refusal is permanent (an empty back buffer is already as large as it
+    /// may grow). `send_queue` must not keep such a response at the head of the
+    /// queue and retry it forever: the worker has one thread, and a
+    /// `send_queue` that never returns never goes back to `epoll_wait`.
+    ///
+    /// `Server` is not `Send` and `QUEUE` is thread-local, so the server is
+    /// built, fed and driven on one spawned thread; the test thread only waits
+    /// for the answer, with a deadline. On the unfixed code that thread spins
+    /// for the remaining lifetime of the test process; it is left behind on
+    /// purpose, there is no way to interrupt it.
+    ///
+    /// To SEE THIS RED: nothing to change, it is red on the unfixed
+    /// `send_queue`, which does `queue.push_front(resp)` on every write error;
+    /// the assertion fails with "send_queue did not return".
+    #[test]
+    fn a_response_larger_than_the_channel_ceiling_does_not_wedge_send_queue() {
+        let (setup_tx, setup_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        thread::Builder::new()
+            .name("send-queue-oversized-response".to_owned())
+            .spawn(move || {
+                let mut server = bare_server();
+                // `send_queue` only runs while the channel is writable, which
+                // is the steady state of a worker whose socket is not full.
+                server.channel.readiness.insert(Ready::WRITABLE);
+
+                // 50 kB against the 10 kB ceiling `bare_server` gives its
+                // channel. Prove the premise instead of assuming it: this very
+                // write is refused for its size, and refused for good.
+                let oversized = WorkerResponse::error("test-oversized", "x".repeat(50_000));
+                match server.channel.write_message(&oversized) {
+                    Err(ChannelError::MessageTooLarge { .. }) => {}
+                    other => panic!("the premise of the test is broken: {other:?}"),
+                }
+                push_queue(oversized);
+                setup_tx
+                    .send(())
+                    .expect("the test thread must still be waiting for the setup");
+
+                server.send_queue();
+
+                let still_queued = QUEUE.with(|queue| queue.borrow().len());
+                let _ = done_tx.send(still_queued);
+            })
+            .expect("could not spawn the send_queue thread");
+
+        // A closed channel here means the thread panicked while preparing the
+        // test: a harness failure, not the defect under test.
+        setup_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the send_queue thread must finish its setup");
+
+        let still_queued = done_rx
+            .recv_timeout(SEND_QUEUE_DEADLINE)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "send_queue did not return within {SEND_QUEUE_DEADLINE:?} on a response larger \
+                 than the channel's max_buffer_size ({error}): the worker's only thread is stuck \
+                 re-queueing a message the channel will never accept"
+                )
+            });
+        assert_eq!(
+            still_queued, 0,
+            "a response the channel can never carry must be dropped or replaced, not kept at \
+             the head of the queue"
+        );
+    }
+
+    /// A worker response whose encoding is far over any channel ceiling.
+    fn oversized_response(id: &str) -> WorkerResponse {
+        WorkerResponse::error(id, "x".repeat(50_000))
+    }
+
+    /// Queues `responses` on a worker whose channel has the given sizes, runs
+    /// `send_queue`, and returns how many responses are still queued and the
+    /// `answers_expected` responses the main process's end of the channel reads.
+    ///
+    /// `Server` is not `Send` and `QUEUE` is thread-local, so everything runs on
+    /// one spawned thread, and the test thread waits with a deadline: a
+    /// `send_queue` that wedges fails the test instead of hanging it.
+    fn run_send_queue(
+        buffer_size: u64,
+        max_buffer_size: u64,
+        responses: Vec<WorkerResponse>,
+        answers_expected: usize,
+    ) -> (usize, Vec<WorkerResponse>) {
+        let (setup_tx, setup_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        thread::Builder::new()
+            .name("send-queue-answers".to_owned())
+            .spawn(move || {
+                let (mut server, mut command_channel) =
+                    bare_server_with_command_channel(buffer_size, max_buffer_size);
+                server.channel.readiness.insert(Ready::WRITABLE);
+                for response in responses {
+                    push_queue(response);
+                }
+                setup_tx
+                    .send(())
+                    .expect("the test thread must still be waiting for the setup");
+
+                server.send_queue();
+
+                let still_queued = QUEUE.with(|queue| queue.borrow().len());
+                let answers = (0..answers_expected)
+                    .map(|_| {
+                        command_channel
+                            .read_message_blocking_timeout(Some(Duration::from_secs(2)))
+                            .expect("the main process's end of the channel must read the answer")
+                    })
+                    .collect();
+                let _ = done_tx.send((still_queued, answers));
+            })
+            .expect("could not spawn the send_queue thread");
+
+        // Building the server is not what is under test, and a loaded machine
+        // may take a while: it gets its own, generous, budget. A closed channel
+        // here means the thread panicked while preparing the test.
+        setup_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the send_queue thread must finish its setup");
+
+        done_rx
+            .recv_timeout(SEND_QUEUE_DEADLINE)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "send_queue did not finish within {SEND_QUEUE_DEADLINE:?}, or its thread \
+                     died ({error})"
+                )
+            })
+    }
+
+    /// The main process waits for an answer to every request it scattered, and
+    /// only a response carrying that request's id satisfies the wait. Dropping
+    /// a response the channel can never carry would strand the task that asked
+    /// for it, so the worker answers the same id with a short failure, and the
+    /// responses queued behind it still go out, in order.
+    #[test]
+    fn an_oversized_response_is_answered_with_a_failure_for_the_same_request() {
+        let (still_queued, answers) = run_send_queue(
+            1000,
+            10000,
+            vec![
+                oversized_response("test-oversized"),
+                WorkerResponse::ok("test-behind-oversized"),
+            ],
+            2,
+        );
+
+        assert_eq!(still_queued, 0, "both responses must have left the queue");
+        assert_eq!(answers[0].id, "test-oversized");
+        assert_eq!(
+            answers[0].status,
+            ResponseStatus::Failure as i32,
+            "the stand-in for a response that cannot be sent is a failure: {:?}",
+            answers[0]
+        );
+        assert!(
+            answers[0].message.contains("max_command_buffer_size"),
+            "the failure must name the setting that caused it: {:?}",
+            answers[0]
+        );
+        assert_eq!(answers[1].id, "test-behind-oversized");
+        assert_eq!(answers[1].status, ResponseStatus::Ok as i32);
+    }
+
+    /// Only a terminal answer is owed to the main process. An oversized
+    /// progress report (or an event, which answers no request at all) is
+    /// dropped with the log and nothing in its place: a `Failure` for its id
+    /// would finish a request that is still waiting for its real answer.
+    #[test]
+    fn an_oversized_progress_response_is_dropped_without_a_stand_in() {
+        let mut progress = WorkerResponse::processing("test-progress");
+        progress.message = "x".repeat(50_000);
+
+        let (still_queued, answers) = run_send_queue(
+            1000,
+            10000,
+            vec![progress, WorkerResponse::ok("test-behind-progress")],
+            1,
+        );
+
+        assert_eq!(still_queued, 0, "neither response may stay queued");
+        assert_eq!(
+            answers[0].id, "test-behind-progress",
+            "the first thing the main process reads must be the response behind the dropped \
+             progress report, not a failure for its id: {:?}",
+            answers[0]
+        );
+        assert_eq!(answers[0].status, ResponseStatus::Ok as i32);
+    }
+
+    /// The stand-in failure is itself a frame. With a ceiling too small even
+    /// for that, it is dropped and never queued again: replacing it in turn
+    /// would restart the very loop this guards against. The response queued
+    /// behind them still goes out.
+    #[test]
+    fn a_ceiling_too_small_for_the_failure_drops_it_instead_of_looping() {
+        let (still_queued, answers) = run_send_queue(
+            64,
+            64,
+            vec![
+                oversized_response("test-oversized"),
+                WorkerResponse::ok("test-behind"),
+            ],
+            1,
+        );
+
+        assert_eq!(
+            still_queued, 0,
+            "neither the response nor its stand-in may stay queued"
+        );
+        assert_eq!(
+            answers[0].id, "test-behind",
+            "the only response that fits is the one queued behind: {:?}",
+            answers[0]
         );
     }
 }

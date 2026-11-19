@@ -30,6 +30,12 @@
 
 - A worker's soft stop is no longer stalled for good by a `RemoveListener` that reaches it after the stop, or for an address it never held. The worker counted a `RemoveListener` against `base_sessions_count`, the number of slab slots that are not client sessions, before it looked for a listener slot to release. When the proxy did not hold the address, nothing was released and the count dropped under the slots still in the slab, so the soft-stop exit test (`slab.len() <= base_sessions_count`) could never hold again and the worker never answered the `SoftStop`; `sozu upgrade --worker` waits for that answer with no timeout. Two cases led there: a draining worker, whose proxies a soft stop had already emptied of listeners and which an untargeted scatter still reaches, and a worker that refused an `AddListener` (session list full) while the main process kept the listener. The count now drops only where the listener's slot is released.
 
+<!-- changelog-slot:worker-response-ceiling -->
+
+### Fixed
+
+- A worker no longer freezes for good on a response larger than `max_command_buffer_size`. The command channel refuses such a frame before buffering a byte, and the refusal is final, but `Server::send_queue` put the response back at the head of its queue and retried it with no exit, so the worker's only thread never returned to `epoll_wait`: no traffic served, no answer to the supervisor. An unfiltered `QueryMetrics` (what `sozu top` sends) on a worker with many clusters and backends, or a lowered `max_command_buffer_size`, is enough, and the query is scattered to every worker, so the whole fleet freezes together. The worker now logs the refusal and drops the response; if it was a terminal answer it answers the same request id with a short `Failure` that names `max_command_buffer_size`, which the supervisor counts as that worker's failed answer instead of waiting for one that cannot arrive. An oversized `Processing` report or event is dropped with the log alone. A frame that only misses the room a backlog leaves is unchanged: it stays queued until the socket drains.
+
 ## 2.3.6 - 2026-11-18
 
 ### Security
