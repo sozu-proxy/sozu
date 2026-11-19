@@ -5048,8 +5048,19 @@ impl ConnectionH2 {
                 }
 
                 // Don't recycle if the client hasn't sent END_STREAM yet —
-                // more DATA frames may arrive for this stream.
-                if !stream.front_received_end_of_stream {
+                // more DATA frames may arrive for this stream. Unless this
+                // connection has already sent RST_STREAM on the id: the read
+                // path then discards every DATA and HEADERS frame the client
+                // still sends on it (`ConnectionH2::handle_header_state`, RFC 9113
+                // §5.1, through `H2StreamTable::was_reset_locally`) before it can
+                // reach `mark_end_of_stream`, so nothing would ever set the
+                // flag and the stream would hold its slot, its two pool
+                // buffers and its wire-map entry until the connection closes.
+                // Retiring it moves the id into `recently_reset`, which keeps
+                // ignoring those frames.
+                if !stream.front_received_end_of_stream
+                    && !self.stream_table.was_reset_locally(stream_id)
+                {
                     trace!(
                         "{} Defer recycle stream {}: client still sending",
                         log_module_context!(),
@@ -16760,6 +16771,174 @@ pub(super) mod tests {
                 stream.metrics.start
             );
         }
+    }
+
+    /// A response Sōzu ends in error while the client is still sending its
+    /// request must give the stream slot back once the RST_STREAM is on the
+    /// wire and the client has finished its request.
+    ///
+    /// A POST announcing `content-length: 5` opens stream 1 (HEADERS without
+    /// END_STREAM). A response then starts — HEADERS and three DATA octets
+    /// leave on stream 1, no END_STREAM — and is ended in error by
+    /// `forcefully_terminate_answer`, as the backend-token branch of
+    /// `Mux::timeout_inner` does for a started response and
+    /// `ConnectionH2::end_stream` for an unterminated one. The write pass
+    /// sends the converter's RST_STREAM and flushes it. When
+    /// `ConnectionH2::try_recycle_server_stream` deferred such a stream while
+    /// `front_received_end_of_stream` was unset, the client's own END_STREAM
+    /// arrived on the wire id Sōzu reset and `ConnectionH2` discarded it
+    /// before it could reach the flag, so nothing set the flag and nothing
+    /// removed the stream: its slot, its two pool buffers, its wire-map entry
+    /// (counted against `SETTINGS_MAX_CONCURRENT_STREAMS`) and its counted
+    /// request stayed until the connection closed.
+    ///
+    /// The slot is checked after the client's END_STREAM and another
+    /// round of write passes, not right after the RST_STREAM, so that a fix
+    /// retiring the stream either when the RST leaves or when the client
+    /// ends its request satisfies it.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::try_recycle_server_stream`, drop
+    /// `&& !self.stream_table.was_reset_locally(stream_id)` from the
+    /// client-still-sending deferral. The `(None, StreamState::Recycle)`
+    /// assertion then fails with `left: (Some(0), Unlinked)`.
+    #[test]
+    fn a_response_ended_in_error_before_the_request_is_complete_recycles_its_slot() {
+        // `:method POST`, `:path /`, `:scheme https`, `:authority localhost`
+        // and `content-length: 5`, as in
+        // `content_length_reset_recycles_stream_slot`.
+        let mut block = vec![0x83, 0x84, 0x87, 0x01, 0x09];
+        block.extend_from_slice(b"localhost");
+        block.extend_from_slice(&[0x0f, 0x0d, 0x01, b'5']);
+
+        let pool = default_limits_pool();
+        let (mut connection, mut context, mut router, _peer) = slot_recycle_fixture(&pool);
+        let headers = orphan_frame(1, parser::FLAG_END_HEADERS, 1, block.len() as u32, &block);
+        assert!(
+            feed_and_drive(&mut connection, &mut context, &mut router, &headers),
+            "the driver must settle after the HEADERS"
+        );
+        let gid = connection
+            .core
+            .stream_table
+            .get(1)
+            .expect("premise: the request opened stream 1");
+        assert_eq!(
+            context.streams[gid].state,
+            StreamState::Link,
+            "premise: the request waits for a backend"
+        );
+
+        // A response that started and is not over: `:status 200`, then three
+        // body octets, parsing still in the body.
+        {
+            let kawa = &mut context.streams[gid].back;
+            kawa.detached.status_line = kawa::StatusLine::Response {
+                version: kawa::Version::V20,
+                code: 200,
+                status: kawa::Store::Static(b"200"),
+                reason: kawa::Store::Empty,
+            };
+            kawa.push_block(kawa::Block::StatusLine);
+            kawa.push_block(kawa::Block::Flags(kawa::Flags {
+                end_body: false,
+                end_chunk: false,
+                end_header: true,
+                end_stream: false,
+            }));
+            kawa.push_block(kawa::Block::Chunk(kawa::Chunk {
+                data: kawa::Store::Static(b"abc"),
+            }));
+            kawa.parsing_phase = kawa::ParsingPhase::Body;
+            context.streams[gid].state = StreamState::Unlinked;
+            connection.core.readiness.arm_writable();
+        }
+        assert!(
+            feed_and_drive(&mut connection, &mut context, &mut router, &[]),
+            "the driver must settle after the response start"
+        );
+        let started =
+            peer_frames(&connection.socket.wire).expect("the peer must read whole frames");
+        assert!(
+            started
+                .iter()
+                .any(|(kind, _, id, _)| *kind == 1 && *id == 1)
+                && started.iter().any(|(kind, flags, id, payload)| *kind == 0
+                    && *id == 1
+                    && payload == b"abc"
+                    && flags & parser::FLAG_END_STREAM == 0),
+            "premise: the response HEADERS and three DATA octets left on stream 1, got {started:?}"
+        );
+        assert!(
+            !context.streams[gid].front_received_end_of_stream
+                && context.streams[gid].back.consumed,
+            "premise: the request is still open and the response has started"
+        );
+
+        // The response is ended in error; the write pass sends and flushes
+        // the converter's RST_STREAM.
+        let wire_before_reset = connection.socket.wire.len();
+        crate::protocol::mux::answers::forcefully_terminate_answer(
+            &mut context.streams[gid],
+            &mut connection.core.readiness,
+            H2Error::InternalError,
+        );
+        assert!(
+            feed_and_drive(&mut connection, &mut context, &mut router, &[]),
+            "the driver must settle after the termination"
+        );
+        let (rst, goaway) = rst_codes_and_goaways(&connection.socket.wire[wire_before_reset..]);
+        assert_eq!(
+            (rst.get(&1).cloned(), goaway),
+            (Some(vec![H2Error::InternalError as u32]), 0),
+            "premise: stream 1 is reset with INTERNAL_ERROR, the connection stays up"
+        );
+        let after_rst = (
+            connection.core.stream_table.get(1),
+            context.streams[gid].state,
+        );
+
+        // The client finishes its request on the wire id Sōzu reset, and the
+        // connection gets a few more write passes.
+        let data = orphan_frame(0, parser::FLAG_END_STREAM, 1, 5, b"abcde");
+        assert!(
+            feed_and_drive(&mut connection, &mut context, &mut router, &data),
+            "the driver must settle after the client's END_STREAM"
+        );
+        for _ in 0..4 {
+            assert!(
+                feed_and_drive(&mut connection, &mut context, &mut router, &[]),
+                "the driver must settle on an idle connection"
+            );
+        }
+        assert!(
+            !matches!(connection.core.state, H2State::GoAway | H2State::Error),
+            "premise: the client's late END_STREAM on a reset stream does not end the connection"
+        );
+
+        let stream = &context.streams[gid];
+        eprintln!(
+            "a_response_ended_in_error_before_the_request_is_complete_recycles_its_slot: \
+             after_rst(table entry, state)={after_rst:?} final table entry={:?} state={:?} \
+             request_counted={} start={:?} front_received_end_of_stream={}",
+            connection.core.stream_table.get(1),
+            stream.state,
+            stream.request_counted,
+            stream.metrics.start.is_some(),
+            stream.front_received_end_of_stream,
+        );
+        assert_eq!(
+            (connection.core.stream_table.get(1), stream.state),
+            (None, StreamState::Recycle),
+            "a stream whose response ended in error must leave the stream table and have its \
+             slot recycled once its RST_STREAM is flushed and the client has ended its request; \
+             it is kept until the connection closes (after the RST: {after_rst:?})"
+        );
+        assert!(
+            !stream.request_counted && stream.metrics.start.is_none(),
+            "the recycled stream must have logged its request: request_counted={}, start={:?}",
+            stream.request_counted,
+            stream.metrics.start
+        );
     }
 
     // ── a frontend reset logs its request once, when it happens ─────────

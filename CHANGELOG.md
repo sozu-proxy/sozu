@@ -103,6 +103,10 @@
 
 - The `back_timeout` of an idle pooled HTTP/2 backend connection no longer closes the client session. An HTTP/2 backend connection whose last stream had ended kept the deadline that stream's last byte armed, so once `back_timeout` (30 s by default) elapsed without a byte on it, the whole session was closed even though no request was waiting on that connection. A session still serving a request on another backend lost it: a slow response, an SSE stream or an upload started after the request the HTTP/2 backend had answered was cut, and on an HTTP/2 frontend every multiplexed stream was cut. The session also lived only `back_timeout` after its last HTTP/2 backend response, whatever `front_timeout` allowed. A backend timer that fires with no stream linked to that backend is now dropped and the session is left alone; the idle connection stays pooled without a deadline, as an idle HTTP/1.1 keep-alive backend connection already does, and the next request written on it arms the deadline again. A backend timer with a stream linked to it is handled as before.
 
+<!-- changelog-slot:h2-error-reset-recycle -->
+
+- A stream of an HTTP/2 frontend whose response Sōzu ends in error while the client is still sending its request now gives its slot back once the `RST_STREAM` is on the wire. The stream waited for the client's `END_STREAM`, which Sōzu discards on a stream it has reset, so the wait never ended: the slot, its two buffers from the pool, its entry against `SETTINGS_MAX_CONCURRENT_STREAMS` and its counted request stayed until the connection closed. A `back_timeout` on a response that had started, a backend `GOAWAY` while the request was still uploading, and a backend that closed in the middle of a response each left one behind, and a connection kept busy by other streams accumulated them until Sōzu refused its new streams. The request is now logged when the reset leaves, and the client's remaining frames on that stream are still ignored.
+
 ## 2.3.6 - 2026-11-18
 
 ### Security

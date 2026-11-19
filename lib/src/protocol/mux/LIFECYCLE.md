@@ -769,7 +769,25 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   `reset_of_an_unlinked_stream_recycles_its_slot` (`h2.rs`),
   `test_h2_malformed_requests_release_their_stream_slots` and
   `test_h2_content_length_resets_release_their_stream_slots`
-  (`e2e/src/tests/h2_stream_slot_tests.rs`). A recycled `Link` slot may
+  (`e2e/src/tests/h2_stream_slot_tests.rs`). The write path recycles one
+  stream before the client has ended its request: a response Sōzu ends in
+  error (`forcefully_terminate_answer` from the backend-token branch of
+  `Mux::timeout_inner` on a started response and from a backend GOAWAY on a
+  stream whose request was consumed, `ConnectionH2::end_stream` on an
+  unterminated or truncated close-delimited response) is
+  followed by the converter's own RST_STREAM, and `try_recycle_server_stream`
+  no longer defers on `Stream::front_received_end_of_stream` once
+  `H2StreamTable::was_reset_locally` holds for the id. That deferral waits
+  for DATA the read path will never deliver, since `handle_header_state`
+  discards every DATA and HEADERS frame on a stream Sōzu reset (RFC 9113
+  §5.1) before `mark_end_of_stream` can set the flag: the stream kept its
+  slot, its two pool buffers, its wire-map entry (counted against
+  `SETTINGS_MAX_CONCURRENT_STREAMS`) and its counted request until the
+  connection closed. Retiring it moves the id from `rst_sent` into
+  `recently_reset`, which keeps ignoring the client's remaining frames.
+  Pinned by
+  `a_response_ended_in_error_before_the_request_is_complete_recycles_its_slot`
+  (`h2.rs`). A recycled `Link` slot may
   still have its id queued in `context.pending_links`. The drain in
   `Mux::ready_inner` skips every entry whose slot is not `Link`, so the
   stale entry is skipped while the slot is `Recycle` or `Idle`. When the slot
@@ -2062,8 +2080,10 @@ terminated and completed as well as the response; otherwise it disconnects,
 because that backend still expects the rest of the body and would read the
 next request pooled onto it as that body. That backend guard serves both
 frontends: an H2 frontend already defers `try_recycle_server_stream` until
-the client's END_STREAM, but a client RST_STREAM after the whole response
-reaches `end_stream` with the request still incomplete. An H2 backend takes a
+the client's END_STREAM, except on a stream Sōzu itself reset, which retires
+once its RST_STREAM is flushed. A client RST_STREAM after the whole response
+reaches `end_stream` with the request still incomplete, and so can the
+retirement of a stream Sōzu reset while it was still linked. An H2 backend takes a
 different path: a stream it carries is never reused, and when one ends the
 connection sends RST_STREAM(CANCEL) unless `back_received_end_of_stream &&
 front.is_terminated() && front.is_completed()` (`fully_completed` in
