@@ -212,6 +212,29 @@ PROXY phase and the downstream protocol.
     socketpair — see
     `back_writable_keeps_its_readiness_when_a_signal_interrupts_the_write`
     (`relay.rs`).
+- A frontend HUP waits for the upgrade once the header is parsed. A client
+  that sends its header and request and half-closes can deliver them as ONE
+  `READABLE | HUP` event, and the first `TcpSession::ready_inner` pass only
+  dials the backend, so the HUP is still pending when the connect completes.
+  Honouring it there would close the session in this state, before
+  `RelayProxyProtocol::back_writable` has forwarded anything: the client's
+  header and request are dropped and the backend sees a dialed connection
+  closed with nothing written. `ready_inner` therefore reads the pending bytes
+  first (as for `ExpectProxyProtocol`, §2.1), and `TcpSession::defers_frontend_hup`
+  holds the HUP while `RelayProxyProtocol::header_size` is set. The bit stays in
+  the readiness `event`, which `RelayProxyProtocol::into_pipe` hands to the
+  pipe through `restore_readiness_events`, and `Pipe::frontend_hup` keeps the
+  session alive while the buffered request remains. The dispatch loop masks it
+  out of the frontend interest: left there it would count as work no branch
+  performs and run to `MAX_LOOP_ITERATIONS`. A header that cannot complete (a
+  stream that ends inside it, or no byte at all) leaves `header_size` unset and
+  closes at once on the HUP, so a dead client never waits for a backend. The
+  regression guards are
+  `relay_proxy_protocol_half_close_before_backend_connect_forwards_the_request`,
+  `relay_proxy_protocol_front_hup_while_connecting_waits_for_the_backend`,
+  `relay_proxy_protocol_half_close_without_any_byte_closes_at_once` and
+  `relay_proxy_protocol_half_close_inside_the_header_closes_at_once`
+  (`lib/src/tcp.rs`).
 - `relay.rs` places **no** upper bound on header size, unlike `expect.rs`'s
   fixed 232-byte staging array: a v2 header is `16 + len` with `len: u16`,
   and this state reads into a pool `Checkout`, so a declared `len` larger
@@ -230,6 +253,26 @@ PROXY phase and the downstream protocol.
   writes until the cursor reaches `header.len()` and returns
   `SessionResult::Upgrade`; partial writes set `WouldBlock` and yield to
   the event loop.
+- A frontend HUP waits for the upgrade, always. This state's frontend interest
+  has no READABLE and it reads nothing, so it cannot tell a client that
+  connected and closed from one whose request is queued in the kernel ahead of
+  its FIN, and the first `TcpSession::ready_inner` pass only dials, so the HUP
+  is still pending when the connect completes. Honouring it would close the
+  session before the header was written and drop the request.
+  `TcpSession::defers_frontend_hup` holds it; the bit stays in the readiness
+  `event`, which `SendProxyProtocol::into_pipe` hands to the pipe, and
+  `Pipe::frontend_hup` then keeps the session while the request is in flight.
+  The dispatch loop masks it out of the frontend interest, where it would
+  otherwise count as work no branch performs. The price is that a bare
+  connect-then-FIN on a `send` cluster still opens a backend connection
+  carrying only the PROXY header, which the pipe then closes. The regression
+  guards are
+  `send_proxy_protocol_half_close_before_backend_connect_forwards_the_request`,
+  `send_proxy_protocol_front_hup_while_connecting_waits_for_the_backend` and
+  `send_proxy_protocol_bare_half_close_delivers_only_the_header_then_closes`;
+  `send_proxy_protocol_reset_while_connecting_closes_at_once` holds that only
+  the HUP waits, and a frontend ERROR still closes the session at once
+  (`lib/src/tcp.rs`).
 
 ---
 

@@ -693,15 +693,30 @@ would share its wheel handle but not its entry, and a reset only the session
 performs would leave that entry live as a second one, fired later at whichever
 session has inherited the token.
 
-A frontend HUP closes every state before the `Pipe`, so `TcpSession::ready_inner`
-reads the pending bytes of the two states that decide on what the client sent
+`TcpSession::front_hup` closes every state before the `Pipe`, so `TcpSession::ready_inner`
+reads the pending bytes of the three states that decide on what the client sent
 before it acts on one: `ExpectProxyProtocol`
-([#1823](https://github.com/sozu-proxy/sozu/issues/1823)) and an undecided
-`SniPreread`. A client that queues its first bytes and half-closes behind them
-is reported as one `READABLE | HUP` event, and an empty accumulator on that
-event is not an empty connection: for `SniPreread` it would be closed as a
-silent health check although its ClientHello is queued in the kernel
-(`tcp_preread/LIFECYCLE.md` §9).
+([#1823](https://github.com/sozu-proxy/sozu/issues/1823)), an undecided
+`SniPreread` and `RelayProxyProtocol`. A client that queues its first bytes and
+half-closes behind them is reported as one `READABLE | HUP` event, and an empty
+accumulator on that event is not an empty connection: for `SniPreread` it would
+be closed as a silent health check although its ClientHello is queued in the
+kernel (`tcp_preread/LIFECYCLE.md` §9).
+
+The two PROXY states that dial before they upgrade, `RelayProxyProtocol` and
+`SendProxyProtocol`, owe the backend a request that the HUP must not drop.
+The first readiness pass only dials, so the HUP is still pending when the
+connect completes. `TcpSession::defers_frontend_hup` holds it: for a relay
+session once its header is parsed, for a send session always, since it reads
+nothing and cannot tell a bare connect from a request queued ahead of the FIN.
+The HUP stays in the readiness `event`, out of the dispatch loop's frontend
+interest so that it does not count as work, until the header is written and the
+session upgrades; `Pipe::frontend_hup` then keeps the session alive while the
+request is in flight, and closes it otherwise. A relay client that half-closes
+inside its header never reaches that state and closes at once. A send client
+that connects and closes without a byte costs the backend one connection that
+carries only the PROXY header. The wait ends with the backend connect, its
+`connect_timeout` or the frontend timeout, and an ERROR still closes at once.
 
 1. **Accept** as in §3; the listener's `TCP_NODELAY` and the accepted address
    apply unchanged.
