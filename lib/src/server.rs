@@ -6529,11 +6529,12 @@ mod listener_lifecycle_tests {
     /// worker refused to add, or one a soft stop already dropped from the
     /// proxy's map) releases no slot, and must leave the count where it was.
     ///
-    /// To SEE THIS RED: nothing to change, it is red on the unfixed
-    /// `RemoveListener` arm of `notify_proxys`, which lowers
-    /// `base_sessions_count` before it knows whether there is a slot to
-    /// release; the assertion fails with "removing an unknown listener
-    /// released no slot".
+    /// To SEE THIS RED: in the `RemoveListener` arm of `Server::notify_proxys`,
+    /// move `self.base_sessions_count -= 1;` out of the
+    /// `if let Some(token) = listen_token` block to just before
+    /// `let address = remove.listener_key();`, as it was before the fix. The
+    /// last assertion then fails with "removing an unknown listener released
+    /// no slot, so base_sessions_count must not move".
     #[test]
     fn removing_an_unknown_listener_leaves_base_sessions_count_unchanged() {
         let mut server = bare_server();
@@ -6571,9 +6572,12 @@ mod listener_lifecycle_tests {
     /// slots that are still there: the worker would then never answer the
     /// `SoftStop` it was given.
     ///
-    /// To SEE THIS RED: nothing to change, it is red on the unfixed
-    /// `RemoveListener` arm of `notify_proxys`; the assertion fails with "a
-    /// draining worker holding no client session must finish its soft stop".
+    /// To SEE THIS RED: in the `RemoveListener` arm of `Server::notify_proxys`,
+    /// move `self.base_sessions_count -= 1;` out of the
+    /// `if let Some(token) = listen_token` block to just before
+    /// `let address = remove.listener_key();`, as it was before the fix. The
+    /// assertion then fails with "a draining worker holding no client session
+    /// must finish its soft stop".
     #[test]
     fn a_remove_listener_after_a_soft_stop_does_not_stall_the_drain() {
         let mut server = bare_server();
@@ -6994,9 +6998,11 @@ mod send_queue_tests {
     /// for the remaining lifetime of the test process; it is left behind on
     /// purpose, there is no way to interrupt it.
     ///
-    /// To SEE THIS RED: nothing to change, it is red on the unfixed
-    /// `send_queue`, which does `queue.push_front(resp)` on every write error;
-    /// the assertion fails with "send_queue did not return".
+    /// To SEE THIS RED: in `Server::send_queue`, replace
+    /// `self.refuse_oversized_response(&resp, message_len, max, &mut queue);`
+    /// in the `MessageTooLarge` arm with `queue.push_front(resp);`, as it was
+    /// before the fix. The loop then retries the response for good and the
+    /// test panics with "send_queue did not return within 5s".
     #[test]
     fn a_response_larger_than_the_channel_ceiling_does_not_wedge_send_queue() {
         let (setup_tx, setup_rx) = mpsc::channel();
