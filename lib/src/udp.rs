@@ -137,6 +137,9 @@ enum SendOutcome {
     /// `WouldBlock`: leave the datagram at the front and stop draining.
     WouldBlock,
     /// A hard error (e.g. ECONNREFUSED): drop this datagram + count it, continue.
+    /// `WriteQueue::drain` does the counting
+    /// (`udp.datagrams.dropped.send_error`), so a `send` closure returns this
+    /// and never counts the same datagram itself.
     Dropped,
 }
 
@@ -195,14 +198,21 @@ impl WriteQueue {
 
     /// Drain in FIFO order, calling `send` for each datagram. Stops on the first
     /// `WouldBlock` (leaving that datagram queued for the next writable event) or
-    /// when empty. Hard-errored datagrams are popped and counted via
-    /// `SendOutcome::Dropped`. Returns `true` if the queue is now empty (the
+    /// when empty. Hard-errored datagrams are popped and counted here, as
+    /// `udp.datagrams.dropped.send_error` -- the same counter the immediate-send
+    /// paths (`UdpListenerSession::on_send_to_backend`, `on_send_to_client`)
+    /// move for the same error -- once per datagram, so the `send` closure must
+    /// not count it as well. Returns `true` if the queue is now empty (the
     /// caller can drop WRITABLE interest back to READABLE-only).
     fn drain<F: FnMut(&SocketAddr, &[u8]) -> SendOutcome>(&mut self, mut send: F) -> bool {
         while let Some((dst, payload)) = self.queue.front() {
             match send(dst, payload) {
-                SendOutcome::Sent | SendOutcome::Dropped => {
+                SendOutcome::Sent => {
                     self.queue.pop_front();
+                }
+                SendOutcome::Dropped => {
+                    self.queue.pop_front();
+                    incr!(names::udp::DROPPED_SEND_ERROR);
                 }
                 SendOutcome::WouldBlock => break,
             }
@@ -1509,7 +1519,15 @@ impl UdpListenerSession {
                 Output::ArmTimer(deadline) => self.arm_timer(deadline, now),
                 Output::Metric(ev) => Self::record_metric(ev),
                 Output::CloseFlow(flow) => self.on_close_flow(flow),
-                Output::Drop(reason) => Self::record_drop(reason),
+                // `UdpManager::drop_datagram` announces each drop twice, as
+                // `Output::Metric(MetricEvent::DatagramDropped)` and as this
+                // output. The counters move on the metric event alone
+                // (`record_metric`); counting here too read every core-side
+                // drop double in `udp.datagrams.dropped` and its reason
+                // counter. The output stays what the core's own tests observe,
+                // and the shell logs nothing for it: it is driven by spoofable
+                // datagrams.
+                Output::Drop(_) => {}
             }
         }
     }
@@ -2598,6 +2616,232 @@ mod tests {
             sessions.borrow().slab.len(),
             slab_len,
             "a shed flow must not leave an upstream slab slot behind"
+        );
+    }
+
+    /// The current value of one proxy-level counter on this test thread,
+    /// absent counting as 0. `METRICS` is a `thread_local!` and libtest gives
+    /// each test its own thread, but callers still assert a DELTA against a
+    /// baseline, never an absolute value (same convention as `proxy_count` in
+    /// `lib/src/socket.rs`).
+    fn proxy_count(name: &str) -> i64 {
+        use sozu_command::proto::command::filtered_metrics::Inner;
+        crate::metrics::METRICS.with(|metrics| {
+            metrics
+                .borrow_mut()
+                .dump_local_proxy_metrics()
+                .get(name)
+                .and_then(|metric| match metric.inner {
+                    Some(Inner::Count(value)) => Some(value),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        })
+    }
+
+    /// A real `UdpListenerSession` over a real, activated loopback listener,
+    /// with no cluster configured. The proxy is returned so it outlives the
+    /// session, as it does in the tests above.
+    fn loopback_listener_session() -> (UdpProxy, Rc<RefCell<UdpListenerSession>>) {
+        use crate::testing::{ServerParts, prebuild_server, provide_port};
+
+        let ServerParts {
+            registry,
+            sessions,
+            pool,
+            backends,
+            ..
+        } = prebuild_server(16, 16384, false).expect("could not prebuild a test server");
+
+        let address =
+            sozu_command::proto::command::SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let config = sozu_command::config::ListenerBuilder::new_udp(address)
+            .to_udp(None)
+            .expect("could not build a UdpListenerConfig for the test");
+
+        let listener_token = {
+            let mut session_manager = sessions.borrow_mut();
+            let entry = session_manager.slab.vacant_entry();
+            let token = Token(entry.key());
+            entry.insert(Rc::new(RefCell::new(crate::server::ListenSession {
+                protocol: Protocol::UDPListen,
+            })));
+            token
+        };
+
+        let mut proxy = UdpProxy::new(registry, sessions, pool, backends, 16, 16384);
+        proxy
+            .add_listener(config, listener_token)
+            .expect("could not add the test UDP listener");
+        proxy
+            .activate_listener(&address.into(), None)
+            .expect("could not activate the test UDP listener");
+        let session = proxy
+            .build_session(listener_token)
+            .expect("could not build the test UDP listener session");
+        (proxy, session)
+    }
+
+    /// A datagram the core refuses is one drop: `udp.datagrams.dropped` and
+    /// its reason counter each move by exactly one.
+    ///
+    /// `UdpManager::drop_datagram` announces the drop twice, as
+    /// `Output::Metric(MetricEvent::DatagramDropped(reason))` and as
+    /// `Output::Drop(reason)`, and `UdpListenerSession::drain_outputs` routes
+    /// both to `record_drop`, so each counter reads double. A listener with no
+    /// cluster configured drops every client datagram as
+    /// `DropReason::NoBackend`, which reaches no flow, socket or timer: the
+    /// two counters are the only thing the drop touches.
+    #[test]
+    fn a_core_side_dropped_datagram_is_counted_once() {
+        let (_proxy, session) = loopback_listener_session();
+        let now = Instant::now();
+
+        let total_before = proxy_count(names::udp::DATAGRAMS_DROPPED);
+        let reason_before = proxy_count(names::udp::DROPPED_NO_BACKEND);
+
+        {
+            let session = session.borrow();
+            let mut manager = session.manager.borrow_mut();
+            let mut backends = session.backends.borrow_mut();
+            manager.handle_input(
+                ManagerInput::ClientDatagram {
+                    src: SocketAddr::from(([127, 0, 0, 1], 41000)),
+                    dst: SocketAddr::from(([127, 0, 0, 1], 5300)),
+                    payload: b"query",
+                    backends: &mut *backends,
+                },
+                now,
+            );
+        }
+        session.borrow_mut().drain_outputs(now);
+
+        assert_eq!(
+            session.borrow().manager.borrow().flow_count(),
+            0,
+            "precondition: a drop allocates no flow"
+        );
+        assert_eq!(
+            proxy_count(names::udp::DROPPED_NO_BACKEND) - reason_before,
+            1,
+            "one dropped datagram must move its reason counter by one"
+        );
+        assert_eq!(
+            proxy_count(names::udp::DATAGRAMS_DROPPED) - total_before,
+            1,
+            "one dropped datagram must move the aggregate counter by one"
+        );
+    }
+
+    /// Block until the socket reports a pending error, without consuming it.
+    /// `poll(2)` reports `POLLERR` whatever the requested events, and unlike
+    /// `take_error` or a `send` it leaves `sk_err` in place for the call the
+    /// test is about.
+    fn wait_for_pending_socket_error(socket: &UdpSocket) {
+        let mut fds = [libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events: 0,
+            revents: 0,
+        }];
+        // SAFETY: `fds` is a valid one-element array that lives across the call.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 1, 5_000) };
+        assert_eq!(ready, 1, "precondition: the ICMP error must become pending");
+        assert_ne!(
+            fds[0].revents & libc::POLLERR,
+            0,
+            "precondition: the pending error must be reported as POLLERR"
+        );
+    }
+
+    /// A datagram that waited in an upstream write queue and then hit a hard
+    /// send error is counted as `udp.datagrams.dropped.send_error`, as
+    /// `SendOutcome::Dropped` and `WriteQueue::drain` both say it is.
+    ///
+    /// The flow's connected socket points at a closed loopback port, so the
+    /// kernel turns the ICMP port-unreachable of one probe into a pending
+    /// `ECONNREFUSED`, and the next `send` -- the drain's -- fails with it.
+    /// The immediate-send path counts the same error
+    /// (`UdpListenerSession::on_send_to_backend`); the drain closure does not.
+    #[test]
+    fn a_hard_error_draining_the_upstream_queue_is_counted_as_send_error() {
+        use crate::testing::provide_port;
+
+        let (_proxy, session) = loopback_listener_session();
+        let backend = SocketAddr::from(([127, 0, 0, 1], provide_port()));
+
+        let mut socket = udp_connect(backend).expect("could not open the upstream socket");
+        // A closed port: the probe is accepted by the kernel and answered by an
+        // ICMP port-unreachable that sets the socket's pending error.
+        socket
+            .send(b"probe")
+            .expect("the first send to a closed loopback port must be accepted");
+        wait_for_pending_socket_error(&socket);
+
+        let token = Token(usize::MAX - 1);
+        session
+            .borrow()
+            .registry
+            .register(&mut socket, token, Interest::READABLE)
+            .expect("could not register the upstream socket");
+        let mut queue = WriteQueue::new(UPSTREAM_WRITE_QUEUE_CAP);
+        assert!(
+            queue.push(backend, b"queued".to_vec()),
+            "precondition: the queue accepts one datagram"
+        );
+        {
+            let mut session = session.borrow_mut();
+            session.upstream_sockets.insert(token, socket);
+            session.upstream_write_queues.insert(token, queue);
+        }
+
+        let before = proxy_count(names::udp::DROPPED_SEND_ERROR);
+        session.borrow_mut().drain_upstream_queue(token);
+
+        assert!(
+            !session.borrow().upstream_write_queues.contains_key(&token),
+            "precondition: the hard error popped the datagram and emptied the queue"
+        );
+        assert_eq!(
+            proxy_count(names::udp::DROPPED_SEND_ERROR) - before,
+            1,
+            "a queued datagram dropped on a hard send error must be counted"
+        );
+    }
+
+    /// Same contract on the client-return queue: a datagram that waited there
+    /// and then hit a hard `send_to` error is counted as
+    /// `udp.datagrams.dropped.send_error`
+    /// (`UdpListenerSession::drain_client_queue`; the immediate path counts it
+    /// in `UdpListenerSession::on_send_to_client`).
+    ///
+    /// The hard error is forced with a destination port of 0, which Linux
+    /// refuses with `EINVAL` before anything is sent: an unconnected socket
+    /// never reports an ICMP error on `send_to`, so the upstream test's
+    /// mechanism is not available here.
+    #[test]
+    fn a_hard_error_draining_the_client_queue_is_counted_as_send_error() {
+        let (_proxy, session) = loopback_listener_session();
+
+        let unsendable = SocketAddr::from(([127, 0, 0, 1], 0));
+        assert!(
+            session
+                .borrow_mut()
+                .client_write_queue
+                .push(unsendable, b"queued".to_vec()),
+            "precondition: the queue accepts one datagram"
+        );
+
+        let before = proxy_count(names::udp::DROPPED_SEND_ERROR);
+        session.borrow_mut().drain_client_queue();
+
+        assert!(
+            session.borrow().client_write_queue.is_empty(),
+            "precondition: the hard error popped the datagram and emptied the queue"
+        );
+        assert_eq!(
+            proxy_count(names::udp::DROPPED_SEND_ERROR) - before,
+            1,
+            "a queued datagram dropped on a hard send_to error must be counted"
         );
     }
 }

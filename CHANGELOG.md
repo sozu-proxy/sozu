@@ -42,6 +42,13 @@
 
 - `RemoveListener` now closes an activated HTTP, HTTPS or TCP listener's socket at once, even while sessions accepted on it are still open. The worker dropped only the proxy's map entry, and every session holds an `Rc` to the listener object that owns the listening socket, so the socket stayed open, listening and registered in epoll under the slab token the removal had just freed until the last of those sessions closed, which an HTTP/2, WebSocket or TCP pipe session can postpone indefinitely. The kernel kept completing handshakes into a backlog nobody accepted, and after a re-add on the same address (the documented way to change a TCP listener's `--sni-preread-*` options) the orphan stayed in the `SO_REUSEPORT` group of the new socket and could take a share of the new connections. The proxies now take the socket out of the listener and deregister it before dropping the entry, as a deactivation already does; the sessions in flight are not interrupted.
 
+<!-- changelog-slot:udp-drop-accounting -->
+
+### Fixed
+
+- A UDP datagram the core refuses (oversize, no cluster, key rejected, draining, per-source limit, flow cap, no backend selected, unknown backend flow) is now counted once in `udp.datagrams.dropped` and its reason counter (`invalid`, `truncated`, `no_backend`, `shed`, `unknown_flow`), not twice. `UdpManager::drop_datagram` announces each drop as a `MetricEvent::DatagramDropped` and as an `Output::Drop`, and the listener session recorded both, so these counters read double what was dropped. The session now counts the metric event and leaves the `Output::Drop`, which stays what the core's own tests observe, uncounted. Dashboards and alerts built on those counters see them halve on upgrade.
+- A UDP datagram that waited in a write queue and then hit a hard send error (for example `ECONNREFUSED` from a pending ICMP error) is now counted in `udp.datagrams.dropped.send_error`. `WriteQueue::drain` popped it and moved no counter, although the immediate send paths count the same error and `SendOutcome::Dropped` is documented as counted, so a backend refusing traffic under load looked healthier than it was. The count is made once, in `WriteQueue::drain`, for both the per-flow upstream queue and the listener's client-return queue.
+
 ## 2.3.6 - 2026-11-18
 
 ### Security

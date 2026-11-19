@@ -211,7 +211,11 @@ pub enum Output {
     /// decrements `udp.active_flows`.
     CloseFlow(FlowId),
     /// A datagram was dropped before allocating any flow/buffer/socket
-    /// ("silence is a virtue"). Carries the reason for metrics/logs.
+    /// ("silence is a virtue"). Carries the reason for whoever observes the
+    /// core (its own tests assert on it). The shell does **not** count it:
+    /// `UdpManager::drop_datagram` pairs it with
+    /// [`MetricEvent::DatagramDropped`], the one event that moves
+    /// `udp.datagrams.dropped` and its reason counter.
     Drop(DropReason),
 }
 
@@ -261,7 +265,9 @@ pub enum MetricEvent {
     /// A backend→client datagram was returned (`udp.datagrams.out`,
     /// `udp.bytes.out`).
     DatagramOut(usize),
-    /// A datagram was dropped, by reason (`udp.datagrams.dropped`).
+    /// A datagram was dropped, by reason (`udp.datagrams.dropped` and its
+    /// by-reason counter). The only counting path for a core-side drop: the
+    /// paired [`Output::Drop`] is not counted by the shell.
     DatagramDropped(DropReason),
 }
 

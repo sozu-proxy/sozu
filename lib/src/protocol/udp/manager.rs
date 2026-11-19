@@ -765,8 +765,10 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
                 >= cfg.max_flows_per_subnet
     }
 
-    /// Emit a drop with its by-reason metric. Allocates nothing per the
-    /// "silence is a virtue" posture.
+    /// Emit a drop: the by-reason metric event, which is what the shell counts,
+    /// then the `Output::Drop` the shell ignores and the tests observe. Always
+    /// both, so a consumer counts one of them and never both. Allocates nothing
+    /// per the "silence is a virtue" posture.
     fn drop_datagram(&mut self, reason: DropReason) {
         // "Silence is a virtue": a drop allocates no flow and frees none — the
         // slab is untouched across the reject. Snapshot + pair-assert so a future

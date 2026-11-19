@@ -71,7 +71,11 @@ The two halves talk over a narrow message contract in `mod.rs`:
   (`mod.rs`), `ArmTimer` (`mod.rs`), `Metric` (`mod.rs`), `CloseFlow`
   (`mod.rs`), `Drop` (`mod.rs`). There is no selection round trip: the
   `SelectBackend` output and the `BackendResolved` input were removed when
-  selection moved into the core (#1340, Question 6).
+  selection moved into the core (#1340, Question 6). A refused datagram is
+  announced twice, `Metric(DatagramDropped(reason))` and `Drop(reason)`
+  (`UdpManager::drop_datagram`, `manager.rs`); the shell counts the metric
+  event and ignores the `Drop` output (`drain_outputs`, `udp.rs`), so one drop
+  moves `udp.datagrams.dropped` and its reason counter once.
 
 The **single owned copy** the design permits is the admission copy: the borrowed
 recv buffer is materialised into an owned `Transmit::payload: Vec<u8>`
@@ -513,7 +517,8 @@ model.
    any flow, buffer, or socket is allocated (`UdpManager::on_client_datagram`,
    `manager.rs`). Each early return pair-asserts `flows.len()` is
    unchanged (the `flows_before_admit` snapshot in the same function). `DropReason` (`mod.rs`) carries the
-   reason into `udp.datagrams.dropped`.
+   reason into `udp.datagrams.dropped`, counted once per drop from
+   `MetricEvent::DatagramDropped`; the paired `Output::Drop` is not counted.
 2. **Bounded flow table = bounded fds.** `max_flows` (`UdpManager::max_flows`, `manager.rs`;
    `effective_max_flows` `udp.rs`) defaults to ~70 % of the soft
    `RLIMIT_NOFILE`, **clamped against shared-slab headroom** so a UDP listener
@@ -530,7 +535,11 @@ model.
 4. **Bounded egress write queue.** A stalled backend cannot balloon memory: the
    per-flow upstream write queue (`WriteQueue`, `udp.rs`) has a small cap;
    past it the datagram is dropped (`udp.datagrams.dropped.wq_full`, the
-   `WriteQueue` doc in `udp.rs`) — UDP is best-effort, the client retries. Writable re-arm
+   `WriteQueue` doc in `udp.rs`) — UDP is best-effort, the client retries. A
+   queued datagram that then hits a hard send error (`ECONNREFUSED` from a
+   pending ICMP error, say) is popped and counted as
+   `udp.datagrams.dropped.send_error` by `WriteQueue::drain`, the same counter
+   the immediate send paths move for that error. Writable re-arm
    (`arm_upstream_writable` / `drain_upstream_queue`; client side
    `arm_client_writable` / `drain_client_queue`; all `udp.rs`) is the UDP analog
    of `signal_pending_write` on the edge-triggered loop.
