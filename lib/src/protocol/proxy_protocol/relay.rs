@@ -22,7 +22,7 @@ use crate::{
     pool::Checkout,
     protocol::{
         pipe::{Pipe, WebSocketContext},
-        proxy_protocol::{header::ProxyAddr, parser::parse_v2_header},
+        proxy_protocol::{expect::V2_FIXED_HEADER_LEN, header::ProxyAddr, parser::parse_v2_header},
     },
     socket::{SocketHandler, SocketResult},
     sozu_command::ready::Ready,
@@ -181,7 +181,35 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
                     debug_assert!(consumed > 0, "a recognized v2 header is non-empty");
                     consumed
                 }
-                Err(Err::Incomplete(_)) => return SessionResult::Continue,
+                Err(Err::Incomplete(_)) => {
+                    // `parse_v2_header` slices exactly `len` address bytes
+                    // before it hands them to the family parser, so once the
+                    // 16-byte fixed part and those `len` bytes are all
+                    // buffered, no later byte can change the verdict: an
+                    // `Incomplete` here is a block too short for its family
+                    // (an AF_INET6 `len` of 16, an AF_INET `len` of 0), a
+                    // malformed header. Waiting would park the session on a
+                    // timer; reject it as `ExpectProxyProtocol::readable`
+                    // does (`lib/src/protocol/proxy_protocol/expect.rs`).
+                    // Below that, bytes are still missing: keep reading.
+                    if data_len >= V2_FIXED_HEADER_LEN {
+                        let declared_total = V2_FIXED_HEADER_LEN
+                            + usize::from(u16::from_be_bytes([
+                                self.frontend_buffer.data()[V2_FIXED_HEADER_LEN - 2],
+                                self.frontend_buffer.data()[V2_FIXED_HEADER_LEN - 1],
+                            ]));
+                        if data_len >= declared_total {
+                            error!(
+                                "{} proxy protocol header is incomplete at its declared length ({} bytes), closing the connection",
+                                log_context!(self),
+                                declared_total
+                            );
+                            incr!(names::proxy_protocol::ERRORS);
+                            return SessionResult::Close;
+                        }
+                    }
+                    return SessionResult::Continue;
+                }
                 Err(e) => {
                     error!(
                         "{} error parsing the proxy protocol header (error={:?}), closing the connection",
@@ -351,11 +379,20 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
                             break;
                         }
                         _ => {
+                            // A genuine write error (`EPIPE`, `ECONNRESET`, ...)
+                            // means the backend is gone. Close the session as
+                            // `SendProxyProtocol::back_writable`
+                            // (`lib/src/protocol/proxy_protocol/send.rs`)
+                            // does: emptying both readiness words and
+                            // returning `Continue` parked it, since a later
+                            // backend `HUP | ERROR` is OR-ed into `event` but
+                            // `TcpSession::ready_inner` (`lib/src/tcp.rs`)
+                            // reads `interest & event`, which is then empty
+                            // on both sides, leaving a client hang-up or a
+                            // timer to end it.
                             incr!(names::proxy_protocol::ERRORS);
-                            self.frontend_readiness.reset();
-                            self.backend_readiness.reset();
                             debug!("{} write error: {}", log_context!(self), e);
-                            break;
+                            return SessionResult::Close;
                         }
                     },
                 }
@@ -980,7 +1017,7 @@ mod relay_test {
     ///
     /// To SEE THIS RED: delete the `ErrorKind::WouldBlock` arm from
     /// `back_writable`'s `Err(e) => match e.kind()`, leaving the catch-all that
-    /// calls `frontend_readiness.reset()` / `backend_readiness.reset()`.
+    /// closes the session.
     #[test]
     fn back_writable_parks_the_session_on_a_backpressured_backend() {
         setup_test_logger!();
@@ -1399,6 +1436,180 @@ mod relay_test {
         assert_eq!(
             errors, 1,
             "closing on a malformed PROXY header must count proxy_protocol.errors exactly once"
+        );
+    }
+
+    /// Feeds `bytes` to `RelayProxyProtocol::readable` over a real loopback
+    /// connection and stops as soon as every one of them sits in the session
+    /// buffer, or `readable` stops asking for more. Returns the last result
+    /// together with how much `proxy_protocol.errors` grew.
+    ///
+    /// Unlike `relay_readable_error_count`, which keeps calling `readable`
+    /// until its 10s deadline while the answer is `Continue`, this one ends
+    /// the moment the whole header has been read, so a session that keeps
+    /// waiting on bytes that are already there fails fast instead of timing
+    /// out.
+    fn relay_readable_once_buffered(bytes: &[u8]) -> (SessionResult, i64) {
+        let (frontend, mut client) = connected_pair(None);
+        client
+            .write_all(bytes)
+            .expect("the client must be able to write its header");
+
+        let mut pool = Pool::with_capacity(1, 1, 64);
+        let front_buf = pool.checkout().expect("the pool must hand out a buffer");
+        let mut relay = RelayProxyProtocol::new(
+            TcpStream::from_std(frontend),
+            Token(0),
+            Ulid::generate(),
+            None,
+            front_buf,
+        );
+        // What the event loop hands `readable`.
+        relay.frontend_readiness.event.insert(Ready::READABLE);
+
+        let mut metrics = SessionMetrics::new(None);
+        let errors_before = proxy_protocol_errors_count();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut result = SessionResult::Continue;
+        while result == SessionResult::Continue
+            && relay.frontend_buffer.available_data() < bytes.len()
+            && Instant::now() < deadline
+        {
+            result = relay.readable(&mut metrics);
+        }
+        assert_eq!(
+            relay.frontend_buffer.available_data(),
+            bytes.len(),
+            "every byte the client wrote must have reached the session buffer"
+        );
+        assert!(
+            relay.header_size.is_none(),
+            "the header under test is malformed, so no header size may ever be recorded"
+        );
+        (result, proxy_protocol_errors_count() - errors_before)
+    }
+
+    /// A v2 header whose address block is completely buffered but shorter
+    /// than its family requires is malformed, and no later byte can change
+    /// that: `parse_v2_header` slices exactly `len` bytes before it hands the
+    /// block to the family parser, so the window stays `len` bytes whatever
+    /// the client sends next. The streaming `take(16)` for the IPv6
+    /// destination address nevertheless answers `Incomplete` on a 16-byte
+    /// window, and `readable` used to map every `Incomplete` to `Continue`.
+    /// `ExpectProxyProtocol::readable` closes the same bytes and counts them
+    /// (`lib/src/protocol/proxy_protocol/expect.rs`, the `Incomplete` arm
+    /// that runs once `read_target` bytes are in), and
+    /// `lib/src/protocol/proxy_protocol/LIFECYCLE.md` requires a malformed
+    /// header to become `Close` plus `proxy_protocol.errors`; the documented
+    /// stall covers only a `len` larger than the buffer, where declared bytes
+    /// are still missing.
+    ///
+    /// Signature, command `PROXY`, family AF_INET6 over STREAM and `len` 16,
+    /// then exactly 16 address bytes: 32 bytes, the whole declared header,
+    /// with an IPv6 block that needs 36.
+    ///
+    /// To SEE THIS RED: in `readable`'s `Err(Err::Incomplete(_))` arm, return
+    /// `SessionResult::Continue` without comparing the buffered bytes with
+    /// `16 + len`.
+    #[test]
+    fn readable_closes_a_fully_buffered_ipv6_header_with_a_short_address_block() {
+        setup_test_logger!();
+        let mut header = Vec::with_capacity(32);
+        header.extend_from_slice(&[
+            0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+        ]);
+        header.push(0x21); // version 2, command PROXY
+        header.push(0x21); // AF_INET6 over STREAM
+        header.extend_from_slice(&16u16.to_be_bytes());
+        header.resize(32, b'x'); // the 16 declared address bytes, all present
+        let (result, errors) = relay_readable_once_buffered(&header);
+
+        assert_eq!(
+            result,
+            SessionResult::Close,
+            "a header whose declared address block is fully buffered and too short for AF_INET6 can never complete: it must close, not wait for a timer"
+        );
+        assert_eq!(
+            errors, 1,
+            "closing on a malformed PROXY header must count proxy_protocol.errors exactly once"
+        );
+    }
+
+    /// Same reject edge, smallest input: `len` 0 with an AF_INET family. The
+    /// fixed part alone is the whole declared header, and the IPv4 family
+    /// parser's streaming `take(4)` on an empty window answers `Incomplete`
+    /// (`lib/src/protocol/proxy_protocol/parser.rs`). `ExpectProxyProtocol`
+    /// closes these 16 bytes at `read_target`.
+    #[test]
+    fn readable_closes_a_fully_buffered_ipv4_header_with_an_empty_address_block() {
+        setup_test_logger!();
+        let mut header = Vec::with_capacity(16);
+        header.extend_from_slice(&[
+            0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+        ]);
+        header.push(0x21); // version 2, command PROXY
+        header.push(0x11); // AF_INET over STREAM
+        header.extend_from_slice(&0u16.to_be_bytes());
+        let (result, errors) = relay_readable_once_buffered(&header);
+
+        assert_eq!(
+            result,
+            SessionResult::Close,
+            "a header declaring no address bytes for AF_INET can never complete: it must close, not wait for a timer"
+        );
+        assert_eq!(
+            errors, 1,
+            "closing on a malformed PROXY header must count proxy_protocol.errors exactly once"
+        );
+    }
+
+    /// `back_writable`'s catch-all arm: a write error that is neither
+    /// `WouldBlock` nor `Interrupted` is a dead backend, and
+    /// `SendProxyProtocol::back_writable` answers it with `Close`. Relay used
+    /// to zero both readiness words and return `Continue` instead, so the
+    /// next `ready_inner` turn computed an empty `interest & event` on both
+    /// sides, a later backend `HUP | ERROR` was OR-ed into `event` but never
+    /// reached `back_hup`, and the session held both sockets and both
+    /// buffers until the client hung up or a timer fired.
+    ///
+    /// To SEE THIS RED: in that arm, replace `return SessionResult::Close`
+    /// with the two `reset()` calls and a `break`.
+    ///
+    /// `shutdown(Write)` on the relay's own end makes the next `write` fail
+    /// with `BrokenPipe` deterministically, with no race on a peer reset.
+    #[test]
+    fn back_writable_closes_the_session_on_a_genuine_write_error() {
+        setup_test_logger!();
+        let (frontend, _front_peer) = connected_pair(None);
+        let (relay_side, _backend_peer) = connected_pair(None);
+        SockRef::from(&relay_side)
+            .shutdown(std::net::Shutdown::Write)
+            .expect("the relay's backend end must accept a write shutdown");
+
+        let header_size = 64;
+        let mut pool = Pool::with_capacity(1, 1, header_size);
+        let mut front_buf = pool.checkout().expect("the pool must hand out a buffer");
+        front_buf.space().fill(b'h');
+        front_buf.fill(header_size);
+
+        let mut relay = RelayProxyProtocol::new(
+            TcpStream::from_std(frontend),
+            Token(0),
+            Ulid::generate(),
+            Some(TcpStream::from_std(relay_side)),
+            front_buf,
+        );
+        relay.header_size = Some(header_size);
+        relay.backend_readiness.interest.insert(Ready::WRITABLE);
+        relay.backend_readiness.event.insert(Ready::WRITABLE);
+
+        let mut metrics = SessionMetrics::new(None);
+        assert_eq!(
+            relay.back_writable(&mut metrics),
+            SessionResult::Close,
+            "a backend that refuses the header with BrokenPipe is gone: the session must close, as SendProxyProtocol::back_writable does, not park with both readiness words empty (frontend={}, backend={})",
+            relay.frontend_readiness,
+            relay.backend_readiness
         );
     }
 }
