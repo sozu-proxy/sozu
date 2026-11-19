@@ -1869,23 +1869,27 @@ impl CommandHub {
     /// A worker channel reported `CloseSession`: kill the worker and answer
     /// every request still in flight on it with a synthetic failure.
     ///
-    /// Only the FIRST close of a given worker synthesises failures: the
-    /// session stays registered after `close_worker`, which leaves it
-    /// `Stopped`, and can report `CloseSession` again on the next poll, which
-    /// would double-count. The gate is `!= Stopped`, not `is_active`: a
-    /// `Stopping` worker (the old worker of an `upgrade --worker`, whose
-    /// `SoftStop` task has no deadline) that closes before answering must
-    /// still fail its requests, or that task never finishes and its client is
-    /// never answered.
+    /// The failures are NOT gated on the worker's run state. A worker that is
+    /// already `Stopped` when its channel closes is the usual case after a
+    /// fence (`Server::fence_worker`, which kills the process and marks the
+    /// session `Stopped` without touching the routes it still owes): the
+    /// readiness check of a `NotAnswering` worker that was also sent a
+    /// `SoftStop` fences it, and only its close, which arrives afterwards,
+    /// can fail that `Timeout::None` stop, or the `Timeout::Default` task
+    /// waiting on it would end only at its deadline. A `Stopping` worker (the
+    /// old worker of an `upgrade --worker`, whose `SoftStop` task has no
+    /// deadline) that closes before answering is the same case.
+    ///
+    /// Repeating the call is harmless: the session stays registered after
+    /// `close_worker` and can report `CloseSession` again on the next poll,
+    /// but a synthetic `Failure` is a terminal answer, so
+    /// `handle_worker_response` retires its route, and a `Stopped` worker is
+    /// never sent a request that would register another (`Server::scatter_on`,
+    /// `Server::scatter_to` and `Server::queue_initial_status` skip it). The
+    /// second call finds no route and counts nothing.
     pub(crate) fn on_worker_channel_closed(&mut self, token: &Token, worker_id: WorkerId) {
-        let first_close = self
-            .workers
-            .get(token)
-            .is_some_and(|worker| worker.run_state != RunState::Stopped);
         self.handle_worker_close(token);
-        if first_close {
-            self.fail_in_flight_requests_of_worker(worker_id);
-        }
+        self.fail_in_flight_requests_of_worker(worker_id);
     }
 
     /// How long the event loop may block in `poll` before a task deadline
@@ -6289,6 +6293,92 @@ mod tests {
             seen.get(),
             (0, 1, 1),
             "the unanswered SoftStop must be accounted as one failure"
+        );
+        assert!(hub.tasks.is_empty() && hub.server.queued_tasks.is_empty());
+    }
+
+    /// A worker launched by automatic restart is still `NotAnswering` when a
+    /// stop order arrives: it owes the stop an answer as well as its first
+    /// `Status`. It then misses its readiness deadline, which fences it
+    /// (`Stopped`, process killed), and its channel closes afterwards. The
+    /// stop task has no deadline and ends only when its workers answer or
+    /// their channels close, so the fenced worker's close must still fail the
+    /// request it owes; otherwise the stop (`sozu shutdown`, SIGTERM) is never
+    /// answered and the main stays in `WorkersStopping`.
+    ///
+    /// The worker's pid is a child this test owns, so the real `fence_worker`
+    /// `SIGKILL` reaches it and not the test's process group.
+    #[test]
+    fn a_fenced_startup_worker_closing_finishes_the_pending_stop_task() {
+        let mut hub = create_test_hub();
+        // `Config::default()` is zero: the readiness deadline must be real so
+        // the sweep below is what expires it.
+        hub.server.config.worker_timeout = 60;
+        let (_worker_side, _scm) = register_test_worker(&mut hub.server, 0, 4096, 65536);
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("could not spawn the stand-in worker process");
+        let token = {
+            let worker = hub
+                .server
+                .workers
+                .values_mut()
+                .find(|worker| worker.id == 0)
+                .expect("worker 0 is registered");
+            worker.pid = child.id() as pid_t;
+            worker.token
+        };
+        hub.server
+            .begin_worker_initialization(0, Box::new(WorkerReadinessTask::new(0)));
+        assert_eq!(worker_state(&hub.server, 0), Some(RunState::NotAnswering));
+        assert!(hub.server.startup_workers.contains(&0));
+
+        let seen = std::rc::Rc::new(std::cell::Cell::new((0, 0, 0)));
+        let soft_stop = hub.server.new_task(
+            Box::new(TallyTask {
+                gatherer: DefaultGatherer::default(),
+                seen: seen.clone(),
+            }),
+            Timeout::None,
+        );
+        hub.server.scatter_on(
+            RequestType::SoftStop(SoftStop {}).into(),
+            soft_stop,
+            0,
+            None,
+        );
+        assert_eq!(
+            hub.server.in_flight.len(),
+            2,
+            "the NotAnswering worker owes both its initial Status and the SoftStop"
+        );
+
+        // The worker stays silent past its readiness deadline: the readiness
+        // task fences it. The stop task has no deadline and keeps waiting.
+        let after_deadline = Instant::now() + Duration::from_secs(120);
+        hub.finish_ready_tasks(after_deadline);
+        assert_eq!(worker_state(&hub.server, 0), Some(RunState::Stopped));
+        let status = child.wait().expect("could not reap the stand-in worker");
+        assert!(!status.success(), "the fence must have killed the worker");
+        assert!(
+            hub.tasks.contains_key(&soft_stop),
+            "the SoftStop task has no deadline: it is still waiting on its worker"
+        );
+
+        // The killed worker's channel then closes.
+        hub.on_worker_channel_closed(&token, 0);
+        hub.finish_ready_tasks(after_deadline);
+
+        assert!(
+            hub.server.in_flight.is_empty(),
+            "the fenced worker's close must retire the route it still owes: {:?}",
+            hub.server.in_flight
+        );
+        assert_eq!(
+            seen.get(),
+            (0, 1, 1),
+            "the unanswered SoftStop must be accounted as one failure and finish"
         );
         assert!(hub.tasks.is_empty() && hub.server.queued_tasks.is_empty());
     }

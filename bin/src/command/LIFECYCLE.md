@@ -54,10 +54,14 @@ The supervisor is a single-threaded mio event loop. Each tick:
   with a deadline whose worker stays silent is reaped at its own deadline,
   not at the latest deadline of any other pending task (sozu#1826). A task
   scattered with `Timeout::None` has no deadline: it ends only when its
-  workers answer or their channels close. The first close of any worker
-  that is not yet `Stopped`, a `Stopping` one included, answers its
-  in-flight requests with synthetic failures
-  (`CommandHub::on_worker_channel_closed`). Each task turns them into the
+  workers answer or their channels close. The close of any worker, whatever
+  its run state (a `Stopping` one included, and a `Stopped` one: a fence
+  (`Server::fence_worker`) kills the process and marks the session `Stopped`
+  without failing the routes it still owes, so the close that follows is the
+  only thing that can), answers its in-flight requests with synthetic
+  failures (`CommandHub::on_worker_channel_closed`). A repeated close finds
+  no route left, because a synthetic failure is a terminal answer and a
+  `Stopped` worker is never sent another request. Each task turns them into the
   client answer it would give a real rejection: an old worker that closes
   before answering the `SoftStop` of an `upgrade --worker` fails that
   upgrade (§4).
