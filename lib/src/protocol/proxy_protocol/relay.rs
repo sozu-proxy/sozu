@@ -188,6 +188,11 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
                         log_context!(self),
                         e
                     );
+                    // Same input, same counter as `ExpectProxyProtocol::readable`
+                    // (`lib/src/protocol/proxy_protocol/expect.rs`): a header the
+                    // v2 parser rejects outright is a PROXY protocol parsing
+                    // error and must reach the alert.
+                    incr!(names::proxy_protocol::ERRORS);
                     return SessionResult::Close;
                 }
             };
@@ -1286,6 +1291,114 @@ mod relay_test {
         assert!(
             relay.backend_readiness.interest.is_writable(),
             "Interrupted must leave the WRITABLE interest set so ready_inner re-enters back_writable"
+        );
+    }
+
+    /// Read the current process-local `proxy_protocol.errors` counter,
+    /// treating an absent key as 0. `dump_local_proxy_metrics` is a
+    /// non-draining filter over the proxy `MetricsMap` and the metrics are
+    /// thread-local, so a read is side-effect free and tests do not see each
+    /// other's increments.
+    fn proxy_protocol_errors_count() -> i64 {
+        use sozu_command::proto::command::filtered_metrics::Inner;
+        crate::metrics::METRICS.with(|metrics| {
+            metrics
+                .borrow_mut()
+                .dump_local_proxy_metrics()
+                .get(names::proxy_protocol::ERRORS)
+                .and_then(|fm| fm.inner.as_ref())
+                .and_then(|inner| match inner {
+                    Inner::Count(v) => Some(*v),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        })
+    }
+
+    /// Feeds `bytes` to `RelayProxyProtocol::readable` over a real loopback
+    /// connection until the session stops asking for more, and returns the
+    /// final result together with how much `proxy_protocol.errors` grew.
+    fn relay_readable_error_count(bytes: &[u8]) -> (SessionResult, i64) {
+        let (frontend, mut client) = connected_pair(None);
+        client
+            .write_all(bytes)
+            .expect("the client must be able to write its malformed header");
+
+        let mut pool = Pool::with_capacity(1, 1, 64);
+        let front_buf = pool.checkout().expect("the pool must hand out a buffer");
+        let mut relay = RelayProxyProtocol::new(
+            TcpStream::from_std(frontend),
+            Token(0),
+            Ulid::generate(),
+            None,
+            front_buf,
+        );
+        // What the event loop hands `readable`.
+        relay.frontend_readiness.event.insert(Ready::READABLE);
+
+        let mut metrics = SessionMetrics::new(None);
+        let errors_before = proxy_protocol_errors_count();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut result = SessionResult::Continue;
+        while result == SessionResult::Continue && Instant::now() < deadline {
+            result = relay.readable(&mut metrics);
+        }
+        (result, proxy_protocol_errors_count() - errors_before)
+    }
+
+    /// The `Err(e)` arm of `readable` closes the session on a header the v2
+    /// parser rejects outright and must bump `proxy_protocol.errors` once, as
+    /// `ExpectProxyProtocol::readable`
+    /// (`lib/src/protocol/proxy_protocol/expect.rs`) does for the same input.
+    /// `lib/src/protocol/proxy_protocol/LIFECYCLE.md` (§4, rule 4) counts
+    /// every header the three PROXY states reject, and `doc/configure.md`
+    /// defines the counter as
+    /// "PROXY protocol v2 parsing and framing errors": without the bump, a
+    /// flood of garbage at a `RelayHeader` cluster was invisible to the alert
+    /// the counter exists for.
+    ///
+    /// Sixteen `0x0D` bytes carry a whole v2 fixed part that fails on the
+    /// 12-byte signature, so the parser answers `Err(Error)` rather than
+    /// `Incomplete`.
+    #[test]
+    fn readable_counts_a_header_with_a_bad_signature_as_a_proxy_protocol_error() {
+        setup_test_logger!();
+        let (result, errors) = relay_readable_error_count(&[0x0D; 16]);
+
+        assert_eq!(
+            result,
+            SessionResult::Close,
+            "a header the v2 parser rejects closes the session"
+        );
+        assert_eq!(
+            errors, 1,
+            "closing on a malformed PROXY header must count proxy_protocol.errors exactly once"
+        );
+    }
+
+    /// Same arm, reached through the other parser rejection: a correct
+    /// signature, command `PROXY`, address family nibble 3 (`AF_UNIX`, which
+    /// `parse_addr_v2` does not accept) and a zero length.
+    #[test]
+    fn readable_counts_an_unsupported_address_family_as_a_proxy_protocol_error() {
+        setup_test_logger!();
+        let mut header = Vec::with_capacity(16);
+        header.extend_from_slice(&[
+            0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+        ]);
+        header.push(0x21); // version 2, command PROXY
+        header.push(0x31); // AF_UNIX over STREAM
+        header.extend_from_slice(&0u16.to_be_bytes());
+        let (result, errors) = relay_readable_error_count(&header);
+
+        assert_eq!(
+            result,
+            SessionResult::Close,
+            "a header with an unsupported address family closes the session"
+        );
+        assert_eq!(
+            errors, 1,
+            "closing on a malformed PROXY header must count proxy_protocol.errors exactly once"
         );
     }
 }

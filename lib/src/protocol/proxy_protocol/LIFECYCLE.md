@@ -154,6 +154,9 @@ PROXY phase and the downstream protocol.
   `RelayProxyProtocol::back_writable` (`relay.rs`) drains exactly the first `header_size`
   bytes of `frontend_buffer` onto the backend socket and returns
   `SessionResult::Upgrade` once the cursor reaches them.
+- A header the v2 parser rejects outright (a bad signature, an unsupported
+  address family) closes the session and increments `proxy_protocol.errors`,
+  exactly as `ExpectProxyProtocol::readable` does for the same input.
 - Anything the client pipelined into the same read stays in
   `frontend_buffer` for the pipe phase, and `RelayProxyProtocol::into_pipe` (`relay.rs`)
   hands that same `Checkout` to `Pipe::new`. Note where the surviving
@@ -282,9 +285,18 @@ which makes it an attractive target. These rules are load-bearing.
    `MAX_LOOP_ITERATIONS` from `sozu_command::config`
    (e.g. `expect.rs:15`); any drain or read loop must respect it so a
    misbehaving peer cannot starve the single-threaded event loop.
-4. **Error counters on every reject.** Every `Close` path bumps the
-   `proxy_protocol.errors` counter via `incr!` so operators can alert on a
-   sudden spike (e.g. a backend that started rejecting the protocol).
+4. **Error counters on every reject.** In the three PROXY states of §2,
+   every `Close` path that rejects a header (a parse error, an oversized
+   header, a header incomplete at its declared length) or fails a socket read
+   or a header write bumps the `proxy_protocol.errors` counter via `incr!` so
+   operators can alert on a sudden spike (e.g. a backend that started
+   rejecting the protocol). The TCP SNI preread counts the header it rejects
+   under its own `tcp.sni_preread.rejected.proxy_header_invalid`. A close
+   for a peer that left or never spoke is not a protocol error and is not
+   counted: the zero-byte healthcheck close (rule 2), a close on a HUP or
+   ERROR readiness event, and the two `Close` returns of
+   `SendProxyProtocol::back_writable` taken when the client's `peer_addr` or
+   the accepted socket's `local_addr` is already unavailable.
 5. **No panic on adversarial input.** Per the repo `CLAUDE.md`
    security-sensitive areas list, the proxy-protocol path must convert
    parse errors / partial reads / oversized headers into
