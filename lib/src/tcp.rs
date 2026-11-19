@@ -6198,9 +6198,12 @@ mod sni_routing_tests {
     /// (`ProxySession::needs_ready_pass` in `lib/src/lib.rs` is `false`), so
     /// the accounting has to happen in the `timeout` arm itself.
     ///
-    /// To SEE THIS RED: run it unmodified. The backend arm of
-    /// `TcpSession::timeout` only calls `container_backend_timeout.triggered()`,
-    /// so `failures` stays 0 and the retry policy records no try.
+    /// To SEE THIS RED: delete the `self.fail_backend_connection();` call from
+    /// the `if self.backend_connected.is_connecting()` block in the backend
+    /// arm of `TcpSession::timeout`. The arm then only calls
+    /// `container_backend_timeout.triggered()`, and the `failures` assertion
+    /// fails with "a connect timed out on connect_timeout must be counted
+    /// against its backend" (`left: 0`, `right: 1`).
     #[test]
     fn a_backend_connect_timeout_is_charged_to_the_backend() {
         let fixture = expect_proxy_fixture_dialed();
