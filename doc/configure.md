@@ -274,6 +274,15 @@ provide status 503, the `answers["503"]` map entry overrides the legacy
 pre-dispatch check prevents new invalid state; it does not automatically repair
 a malformed cluster entry persisted by an older Sōzu version.
 
+An `AddCluster` upsert replaces the cluster's answer templates as a whole, on
+the workers as in the main process: a status the new `answers` map no longer
+carries, or an empty map, goes back to the listener's template at once, without
+a `RemoveCluster`. An HTTP or HTTPS listener added after a cluster serves that
+cluster's answer templates like the listeners that were there before it; a
+cluster whose templates do not compile (one accepted while the worker had no
+listener of that kind) is logged and served the listener's own pages, and the
+listener is still added.
+
 If a frontend has a `sticky_session`, the sticky name is defined at the listener
 level.
 

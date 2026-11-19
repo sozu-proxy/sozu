@@ -2418,6 +2418,27 @@ impl HttpsProxy {
                 .lock()
                 .map_err(|e| ProxyError::Lock(e.to_string()))? = certificates;
         }
+        // A cluster's answer overrides live in each listener's own registry,
+        // which starts empty: give this one the overrides of every cluster
+        // the proxy already holds, as if it had been there when they arrived.
+        // A cluster that arrived while the proxy had no listener was compiled
+        // nowhere, so its templates may not compile: this listener then serves
+        // its own pages for it rather than being refused.
+        for cluster in self.clusters.values() {
+            if let Err((status, error)) = https_listener
+                .answers
+                .borrow_mut()
+                .replace_cluster_answers(&cluster.cluster_id, &cluster.answers)
+            {
+                error!(
+                    "{} cluster {} keeps the listener's answers on {}: {}",
+                    log_module_context!(),
+                    cluster.cluster_id,
+                    https_listener.address,
+                    ListenerError::TemplateParse(status, error)
+                );
+            }
+        }
         match self.listeners.entry(token) {
             Entry::Vacant(entry) => {
                 entry.insert(Rc::new(RefCell::new(https_listener)));
@@ -2787,23 +2808,28 @@ impl HttpsProxy {
         &mut self,
         mut cluster: Cluster,
     ) -> Result<Option<ResponseContent>, ProxyError> {
-        let mut cluster_overrides = cluster.answers.clone();
+        // Reconcile the legacy single-status `answer_503` field with the
+        // new map. The new map wins on collision. The stored cluster keeps
+        // the result, which is what `add_listener` replays onto a listener
+        // added later.
         if let Some(answer_503) = cluster.answer_503.take() {
-            cluster_overrides
+            cluster
+                .answers
                 .entry("503".to_owned())
                 .or_insert(answer_503);
         }
-        if !cluster_overrides.is_empty() {
-            for listener in self.listeners.values() {
-                listener
-                    .borrow()
-                    .answers
-                    .borrow_mut()
-                    .add_cluster_answers(&cluster.cluster_id, &cluster_overrides)
-                    .map_err(|(status, error)| {
-                        ProxyError::AddCluster(ListenerError::TemplateParse(status, error))
-                    })?;
-            }
+        // An upsert replaces the cluster's overrides, as the main process
+        // replaces the cluster: a status the new map no longer names, or an
+        // empty map, must stop serving the old page.
+        for listener in self.listeners.values() {
+            listener
+                .borrow()
+                .answers
+                .borrow_mut()
+                .replace_cluster_answers(&cluster.cluster_id, &cluster.answers)
+                .map_err(|(status, error)| {
+                    ProxyError::AddCluster(ListenerError::TemplateParse(status, error))
+                })?;
         }
         self.clusters
             .insert(cluster.cluster_id.as_str().into(), cluster);
@@ -5402,5 +5428,249 @@ mod listener_sibling_tests {
             "a refused policy leaves the applied one in place"
         );
         assert!(Arc::ptr_eq(&listener.rustls_details, &applied_context));
+    }
+
+    /// One template per status, each compiling on its own.
+    fn answers(statuses: &[&str]) -> BTreeMap<String, String> {
+        statuses
+            .iter()
+            .map(|status| {
+                (
+                    (*status).to_owned(),
+                    format!("HTTP/1.1 {status} Test\r\nContent-Length: 0\r\n\r\n"),
+                )
+            })
+            .collect()
+    }
+
+    fn upsert(proxy: &mut HttpsProxy, cluster_id: &str, statuses: &[&str]) {
+        proxy
+            .add_cluster(Cluster {
+                cluster_id: cluster_id.to_owned(),
+                answers: answers(statuses),
+                ..Default::default()
+            })
+            .expect("the cluster must be accepted");
+    }
+
+    /// The statuses the listener holds a per-cluster override for, sorted.
+    fn override_statuses(proxy: &HttpsProxy, token: usize, cluster_id: &str) -> Vec<String> {
+        proxy.listeners[&Token(token)]
+            .borrow()
+            .answers
+            .borrow()
+            .cluster_answers
+            .get(cluster_id)
+            .map(|overrides| overrides.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// A listener added after a cluster serves that cluster's answer
+    /// overrides, like the listener that was there when the cluster arrived.
+    /// A new listener starts with an empty per-cluster registry and
+    /// `add_listener` copies only the routes, tags and certificates of a
+    /// sibling, so a per-cluster page silently falls back to the listener
+    /// default on it until the cluster is added again or the worker restarts.
+    ///
+    /// To SEE THIS GREEN: in `HttpsProxy::add_listener`, apply the overrides
+    /// of every cluster in `self.clusters` to the new listener's registry (the
+    /// legacy `answer_503` is taken out of the stored cluster by
+    /// `add_cluster`, so it has to be kept beside the cluster).
+    #[test]
+    fn a_listener_added_after_a_cluster_receives_its_answer_overrides() {
+        let mut proxy = proxy();
+        add(
+            &mut proxy,
+            SocketAddress::new_v4(0, 0, 0, 0, provide_port()),
+            None,
+            0,
+        );
+        upsert(&mut proxy, "cluster-a", &["503"]);
+        add(
+            &mut proxy,
+            SocketAddress::new_v4(0, 0, 0, 0, provide_port()),
+            None,
+            1,
+        );
+
+        assert_eq!(
+            override_statuses(&proxy, 0, "cluster-a"),
+            ["503"],
+            "precondition: the listener present when the cluster arrived holds its override"
+        );
+        assert_eq!(
+            override_statuses(&proxy, 1, "cluster-a"),
+            ["503"],
+            "the listener added after the cluster must hold its answer overrides too"
+        );
+    }
+
+    /// An `AddCluster` upsert replaces the cluster's answer overrides, as the
+    /// main process replaces the cluster. `add_cluster` skips the listener
+    /// registries when the new map is empty and otherwise extends the existing
+    /// entry, so an override the operator dropped or shrank away keeps being
+    /// served until `RemoveCluster`, while a worker rebuilt from the main
+    /// state serves the default.
+    ///
+    /// To SEE THIS GREEN: in `HttpsProxy::add_cluster`, call
+    /// `remove_cluster_answers` on every listener before applying the new map,
+    /// including when the new map is empty.
+    #[test]
+    fn an_add_cluster_upsert_replaces_the_cluster_answer_overrides() {
+        let mut proxy = proxy();
+        add(
+            &mut proxy,
+            SocketAddress::new_v4(0, 0, 0, 0, provide_port()),
+            None,
+            0,
+        );
+        upsert(&mut proxy, "dropped", &["503"]);
+        upsert(&mut proxy, "shrunk", &["404", "503"]);
+        assert_eq!(override_statuses(&proxy, 0, "dropped"), ["503"]);
+        assert_eq!(override_statuses(&proxy, 0, "shrunk"), ["404", "503"]);
+
+        upsert(&mut proxy, "dropped", &[]);
+        upsert(&mut proxy, "shrunk", &["503"]);
+
+        assert!(
+            proxy.clusters["dropped"].answers.is_empty()
+                && proxy.clusters["shrunk"].answers.len() == 1,
+            "precondition: the proxy itself recorded the replacement"
+        );
+        let mut stale = Vec::new();
+        let dropped = override_statuses(&proxy, 0, "dropped");
+        if !dropped.is_empty() {
+            stale.push(format!("`dropped` still serves {dropped:?}, expected none"));
+        }
+        let shrunk = override_statuses(&proxy, 0, "shrunk");
+        if shrunk != ["503"] {
+            stale.push(format!(
+                "`shrunk` still serves {shrunk:?}, expected [\"503\"]"
+            ));
+        }
+        assert!(
+            stale.is_empty(),
+            "an upsert must replace the overrides, not merge into them: {stale:?}"
+        );
+    }
+
+    /// The legacy `answer_503` field is folded into the cluster's overrides
+    /// and taken out of the field, so a listener added later can only get it
+    /// from what the proxy stored beside the cluster.
+    #[test]
+    fn a_listener_added_after_a_cluster_receives_its_legacy_answer_503() {
+        let mut proxy = proxy();
+        add(
+            &mut proxy,
+            SocketAddress::new_v4(0, 0, 0, 0, provide_port()),
+            None,
+            0,
+        );
+        proxy
+            .add_cluster(Cluster {
+                cluster_id: "legacy".to_owned(),
+                answer_503: Some(answers(&["503"])["503"].clone()),
+                ..Default::default()
+            })
+            .expect("the cluster must be accepted");
+        add(
+            &mut proxy,
+            SocketAddress::new_v4(0, 0, 0, 0, provide_port()),
+            None,
+            1,
+        );
+
+        assert_eq!(
+            override_statuses(&proxy, 0, "legacy"),
+            ["503"],
+            "precondition: the listener present when the cluster arrived holds the legacy 503"
+        );
+        assert_eq!(
+            override_statuses(&proxy, 1, "legacy"),
+            ["503"],
+            "the listener added after the cluster must hold the legacy 503 too"
+        );
+    }
+
+    /// An upsert whose templates do not compile is refused before any
+    /// registry changes: the overrides already serving, and the cluster the
+    /// proxy recorded, stay as they were.
+    #[test]
+    fn a_refused_upsert_keeps_the_cluster_answer_overrides() {
+        let mut proxy = proxy();
+        add(
+            &mut proxy,
+            SocketAddress::new_v4(0, 0, 0, 0, provide_port()),
+            None,
+            0,
+        );
+        upsert(&mut proxy, "kept", &["404", "503"]);
+
+        let refused = proxy.add_cluster(Cluster {
+            cluster_id: "kept".to_owned(),
+            answers: BTreeMap::from([("503".to_owned(), "not a valid http response".to_owned())]),
+            ..Default::default()
+        });
+
+        assert!(
+            matches!(
+                refused,
+                Err(ProxyError::AddCluster(ListenerError::TemplateParse(..)))
+            ),
+            "an unparseable template must be refused, got {refused:?}"
+        );
+        assert_eq!(
+            override_statuses(&proxy, 0, "kept"),
+            ["404", "503"],
+            "a refused upsert must leave the serving overrides untouched"
+        );
+        assert_eq!(
+            proxy.clusters["kept"].answers.len(),
+            2,
+            "a refused upsert must leave the recorded cluster untouched"
+        );
+    }
+
+    /// A proxy with no listener compiles no template when a cluster arrives,
+    /// so it can hold a cluster whose templates do not compile (one persisted
+    /// by an older Sōzu, or sent straight to a worker). A listener added later
+    /// must still be added: it serves its own page for that cluster, as every
+    /// listener did before the overrides were replayed, and the other
+    /// clusters' overrides still reach it.
+    #[test]
+    fn a_cluster_whose_answers_do_not_compile_does_not_refuse_a_later_listener() {
+        let mut proxy = proxy();
+        proxy
+            .add_cluster(Cluster {
+                cluster_id: "unparseable".to_owned(),
+                answers: BTreeMap::from([(
+                    "503".to_owned(),
+                    "not a valid http response".to_owned(),
+                )]),
+                ..Default::default()
+            })
+            .expect("with no listener, no template is compiled and the cluster is kept");
+        upsert(&mut proxy, "valid", &["503"]);
+
+        let added = proxy.add_listener(
+            ListenerBuilder::new_https(SocketAddress::new_v4(0, 0, 0, 0, provide_port()))
+                .to_tls(None)
+                .expect("could not build the listener config"),
+            Token(0),
+        );
+
+        assert!(
+            matches!(added, Ok(Token(0))),
+            "a cluster's unparseable template must not refuse the listener, got {added:?}"
+        );
+        assert!(
+            override_statuses(&proxy, 0, "unparseable").is_empty(),
+            "the unparseable cluster must fall back to the listener's own page"
+        );
+        assert_eq!(
+            override_statuses(&proxy, 0, "valid"),
+            ["503"],
+            "the other clusters' overrides must still reach the new listener"
+        );
     }
 }
