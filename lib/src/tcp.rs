@@ -2266,6 +2266,34 @@ impl TcpListener {
         key.matches(&self.address, self.config.interface.as_deref())
     }
 
+    /// Stop listening: close this listener's sockets and deregister them.
+    ///
+    /// Sessions accepted on this listener clone the `Rc` that owns it, so
+    /// dropping the proxy's map entry does not drop the socket while any of
+    /// them is alive: it would stay open, listening and registered in epoll
+    /// under a slab token `RemoveListener` has just freed, completing
+    /// handshakes into a backlog nobody accepts until the last session of
+    /// the listener closed (H2, WebSocket and TCP pipes keep it for as long
+    /// as they live). Taking the socket out of the listener is what closes
+    /// it, as `TcpProxy::give_back_listener` and the `SoftStop` arm of
+    /// `TcpProxy::notify` (`lib/src/tcp.rs`) do. The parked socket of a failed
+    /// `TcpListener::activate` is bound and listening too, so it goes as well.
+    fn close_sockets(&mut self, registry: &Registry) {
+        // A socket-less listener is not active, as after `give_back_listener`.
+        self.active = false;
+        self.parked_listener = None;
+        if let Some(mut socket) = self.listener.take()
+            && let Err(error) = registry.deregister(&mut socket)
+        {
+            error!(
+                "{} error deregistering TCP listen socket {:?}: {:?}",
+                log_module_context!(),
+                socket,
+                error
+            );
+        }
+    }
+
     fn new(config: TcpListenerConfig, token: Token) -> Result<TcpListener, ListenerError> {
         Ok(TcpListener {
             cluster_id: None,
@@ -2961,6 +2989,14 @@ impl TcpProxy {
     pub fn remove_listener(&mut self, address: &ListenerKey) -> SessionIsToBeClosed {
         let len = self.listeners.len();
 
+        // Close the sockets first: a session still holding the listener
+        // object would keep an open socket alive past the map entry.
+        for listener in self.listeners.values() {
+            let mut listener = listener.borrow_mut();
+            if listener.is(address) {
+                listener.close_sockets(&self.registry);
+            }
+        }
         self.listeners.retain(|_, l| !l.borrow().is(address));
         self.listeners.len() < len
     }

@@ -180,6 +180,22 @@ none is installed already (the proxy's `listener_sessions` map is the record),
 because `load_state` re-emits one `activate-listener` per active listener on
 every replay.
 
+`remove-listener` ends the socket's life at the same moment it releases the
+slot, whatever sessions are still open on the listener. Every session accepted
+on an HTTP, HTTPS or TCP listener holds an `Rc` to the listener object, and the
+listening socket is a field of that object, so dropping the proxy's map entry
+would not close it: the socket would stay listening, registered in epoll under
+the token just freed, and keep completing handshakes into a backlog nobody
+accepts until the last such session closed, which an H2, WebSocket or TCP pipe
+session can delay indefinitely. After a re-add on the same address the orphan
+would also stay in the `SO_REUSEPORT` group of the new socket and could take a
+share of its connections. Each proxy's `remove_listener` therefore takes the
+socket out of the listener and deregisters it first (`HttpListener::close_sockets`
+in `lib/src/http.rs`, and its twins `HttpsListener::close_sockets` and
+`TcpListener::close_sockets`), the same way `deactivate-listener` and the soft
+stop do. The sessions in flight keep running on their own sockets; only the
+listening socket goes. The UDP proxy already closes its flows on removal.
+
 A forwarding session occupies one slab entry per socket: the frontend token,
 plus one token per backend connection. The same session is reachable through
 several keys.

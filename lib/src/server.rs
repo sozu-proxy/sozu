@@ -5842,7 +5842,8 @@ mod listener_lifecycle_tests {
         config::ListenerBuilder,
         proto::command::{
             ActivateListener, DeactivateListener, ListenerType, LoadBalancingParams,
-            RemoveListener, RequestUdpFrontend, SocketAddress, SoftStop, filtered_metrics,
+            RemoveListener, RequestTcpFrontend, RequestUdpFrontend, SocketAddress, SoftStop,
+            filtered_metrics,
         },
     };
 
@@ -6718,6 +6719,248 @@ mod listener_lifecycle_tests {
         assert!(
             !admit(&manager, 1002),
             "the cluster's own limit of 2 counts the two open flows and sheds a third"
+        );
+    }
+
+    /// A worker holding one activated HTTP or HTTPS listener, built like
+    /// `server_with_tcp_listener`: the listen token carries a `ListenSession`
+    /// placeholder, and the listener is also known to the worker's
+    /// `ConfigState`, where a real `RemoveListener` finds it.
+    fn server_with_l7_listener(https: bool) -> (Server, Token, SocketAddress) {
+        let ServerParts {
+            event_loop,
+            registry,
+            sessions,
+            pool,
+            backends,
+            server_scm_socket,
+            server_config,
+            ..
+        } = prebuild_server(16, 16384, true).expect("could not prebuild a test server");
+        let (_command_channel, proxy_channel) =
+            Channel::generate(1000, 10000).expect("could not generate a test channel");
+
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let listen_token = {
+            let mut session_manager = sessions.borrow_mut();
+            let entry = session_manager.slab.vacant_entry();
+            let token = Token(entry.key());
+            entry.insert(Rc::new(RefCell::new(ListenSession {
+                protocol: if https {
+                    Protocol::HTTPSListen
+                } else {
+                    Protocol::HTTPListen
+                },
+            })));
+            token
+        };
+
+        let (http, https_proxy, request_type) = if https {
+            let config = ListenerBuilder::new_https(address)
+                .to_tls(None)
+                .expect("could not build an HttpsListenerConfig for the test");
+            let mut proxy =
+                https::HttpsProxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
+            proxy
+                .add_listener(config.clone(), listen_token)
+                .expect("could not add the test HTTPS listener");
+            proxy
+                .activate_listener(&address.into(), None)
+                .expect("could not activate the test HTTPS listener");
+            (None, Some(proxy), RequestType::AddHttpsListener(config))
+        } else {
+            let config = ListenerBuilder::new_http(address)
+                .to_http(None)
+                .expect("could not build an HttpListenerConfig for the test");
+            let mut proxy =
+                http::HttpProxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
+            proxy
+                .add_listener(config.clone(), listen_token)
+                .expect("could not add the test HTTP listener");
+            proxy
+                .activate_listener(&address.into(), None)
+                .expect("could not activate the test HTTP listener");
+            (Some(proxy), None, RequestType::AddHttpListener(config))
+        };
+
+        let mut server = Server::new(
+            event_loop,
+            proxy_channel,
+            server_scm_socket,
+            sessions,
+            pool,
+            backends,
+            http,
+            https_proxy,
+            None,
+            server_config,
+            None,
+            false,
+        )
+        .expect("could not build the test server");
+        server
+            .config_state
+            .dispatch(&Request {
+                request_type: Some(request_type),
+            })
+            .expect("the worker state must accept the test listener");
+        (server, listen_token, address)
+    }
+
+    /// Leave one client session alive on the activated `proxy` listener at
+    /// `address`, remove the listener the way the main process does, and
+    /// assert that it no longer listens.
+    ///
+    /// The session keeps the listener object alive through the `Rc` it
+    /// clones, so dropping the proxy's map entry alone does not drop the
+    /// socket: it stays open, listening and registered in epoll under the
+    /// slab token the `RemoveListener` arm has just freed, and keeps
+    /// completing handshakes nobody accepts until the last session of that
+    /// listener closes.
+    fn assert_removal_closes_the_socket_while_a_session_holds_the_listener(
+        server: &mut Server,
+        listen_token: Token,
+        address: SocketAddress,
+        proxy: ListenerType,
+    ) {
+        use std::{
+            net::{SocketAddr, TcpStream},
+            time::Duration,
+        };
+
+        let protocol = match proxy {
+            ListenerType::Http => Protocol::HTTPListen,
+            ListenerType::Https => Protocol::HTTPSListen,
+            ListenerType::Tcp => Protocol::TCPListen,
+            other => panic!("not a stream listener: {other:?}"),
+        };
+
+        // One live client session: accepted, then turned into a session that
+        // clones the listener `Rc`.
+        let socket_address: SocketAddr = address.into();
+        let _client = TcpStream::connect_timeout(&socket_address, Duration::from_secs(5))
+            .expect("the activated listener must accept a connection");
+        server.accept(ListenToken(listen_token.0), protocol);
+        server.create_sessions();
+        assert_eq!(
+            server.sessions.borrow().nb_connections,
+            1,
+            "the setup client must have become a live {proxy:?} session"
+        );
+
+        server.notify_proxys(WorkerRequest {
+            id: "test-remove".to_owned(),
+            content: RequestType::RemoveListener(RemoveListener {
+                interface: None,
+                address,
+                proxy: proxy as i32,
+            })
+            .into(),
+        });
+
+        let still_mapped = match proxy {
+            ListenerType::Http => server.http.borrow().listener_token(&address.into()),
+            ListenerType::Https => server.https.borrow().listener_token(&address.into()),
+            _ => server.tcp.borrow().listener_token(&address.into()),
+        };
+        assert!(
+            still_mapped.is_none(),
+            "the {proxy:?} proxy must have dropped the removed listener from its map"
+        );
+        assert_eq!(
+            server.sessions.borrow().nb_connections,
+            1,
+            "removing a listener must not have closed the client session by itself"
+        );
+        let after_removal = TcpStream::connect_timeout(&socket_address, Duration::from_secs(5));
+        assert!(
+            after_removal.is_err(),
+            "a removed {proxy:?} listener must stop listening: the socket stayed open because \
+             the live session still holds the listener, and the kernel completed this handshake \
+             into a backlog nobody will ever accept"
+        );
+    }
+
+    #[test]
+    fn removing_an_activated_tcp_listener_closes_its_socket_while_a_session_holds_it() {
+        let (mut server, listen_token, address) = server_with_tcp_listener();
+        let cluster_id = "remove-listener-live-session";
+
+        // `server_with_tcp_listener` installs the listener in the proxy only.
+        // A real worker also holds it in its `ConfigState`, where the main
+        // process's `RemoveListener` finds it.
+        server
+            .config_state
+            .dispatch(&Request {
+                request_type: Some(RequestType::AddTcpListener(
+                    ListenerBuilder::new_tcp(address)
+                        .to_tcp(None)
+                        .expect("could not build a TcpListenerConfig for the test"),
+                )),
+            })
+            .expect("the worker state must accept the test TCP listener");
+
+        // `TcpProxy::create_session` refuses a listener with no cluster.
+        for (id, request) in [
+            (
+                "test-add-cluster",
+                RequestType::AddCluster(Cluster {
+                    cluster_id: cluster_id.to_owned(),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "test-add-tcp-front",
+                RequestType::AddTcpFrontend(RequestTcpFrontend {
+                    cluster_id: cluster_id.to_owned(),
+                    address,
+                    ..Default::default()
+                }),
+            ),
+        ] {
+            server.notify_proxys(WorkerRequest {
+                id: id.to_owned(),
+                content: request.into(),
+            });
+        }
+        QUEUE.with(|queue| {
+            for response in queue.borrow_mut().drain(..) {
+                assert_eq!(
+                    response.status,
+                    ResponseStatus::Ok as i32,
+                    "the setup order {} must succeed: {response:?}",
+                    response.id
+                );
+            }
+        });
+
+        assert_removal_closes_the_socket_while_a_session_holds_the_listener(
+            &mut server,
+            listen_token,
+            address,
+            ListenerType::Tcp,
+        );
+    }
+
+    #[test]
+    fn removing_an_activated_http_listener_closes_its_socket_while_a_session_holds_it() {
+        let (mut server, listen_token, address) = server_with_l7_listener(false);
+        assert_removal_closes_the_socket_while_a_session_holds_the_listener(
+            &mut server,
+            listen_token,
+            address,
+            ListenerType::Http,
+        );
+    }
+
+    #[test]
+    fn removing_an_activated_https_listener_closes_its_socket_while_a_session_holds_it() {
+        let (mut server, listen_token, address) = server_with_l7_listener(true);
+        assert_removal_closes_the_socket_while_a_session_holds_the_listener(
+            &mut server,
+            listen_token,
+            address,
+            ListenerType::Https,
         );
     }
 }

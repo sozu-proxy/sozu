@@ -1503,6 +1503,34 @@ impl HttpsListener {
         key.matches(&self.address, self.config.interface.as_deref())
     }
 
+    /// Stop listening: close this listener's sockets and deregister them.
+    ///
+    /// Sessions accepted on this listener clone the `Rc` that owns it, so
+    /// dropping the proxy's map entry does not drop the socket while any of
+    /// them is alive: it would stay open, listening and registered in epoll
+    /// under a slab token `RemoveListener` has just freed, completing
+    /// handshakes into a backlog nobody accepts until the last session of
+    /// the listener closed (H2, WebSocket and TCP pipes keep it for as long
+    /// as they live). Taking the socket out of the listener is what closes
+    /// it, as `HttpsProxy::give_back_listener` and `HttpsProxy::soft_stop`
+    /// (`lib/src/https.rs`) do. The parked socket of a failed
+    /// `HttpsListener::activate` is bound and listening too, so it goes as well.
+    fn close_sockets(&mut self, registry: &Registry) {
+        // A socket-less listener is not active, as after `give_back_listener`.
+        self.active = false;
+        self.parked_listener = None;
+        if let Some(mut socket) = self.listener.take()
+            && let Err(error) = registry.deregister(&mut socket)
+        {
+            error!(
+                "{} error deregistering HTTPS listen socket {:?}: {:?}",
+                log_module_context!(),
+                socket,
+                error
+            );
+        }
+    }
+
     /// Whether this listener rejects clients that do not negotiate `h2`
     /// via TLS ALPN (including those that omit ALPN). Reads the
     /// `disable_http11` knob; defaults to `false` to preserve the
@@ -2437,6 +2465,14 @@ impl HttpsProxy {
         let len = self.listeners.len();
 
         let remove_address = remove.listener_key();
+        // Close the sockets first: a session still holding the listener
+        // object would keep an open socket alive past the map entry.
+        for listener in self.listeners.values() {
+            let mut listener = listener.borrow_mut();
+            if listener.is(&remove_address) {
+                listener.close_sockets(&self.registry);
+            }
+        }
         self.listeners
             .retain(|_, listener| !listener.borrow().is(&remove_address));
 

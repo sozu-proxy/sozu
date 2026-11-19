@@ -36,6 +36,12 @@
 
 - A worker no longer freezes for good on a response larger than `max_command_buffer_size`. The command channel refuses such a frame before buffering a byte, and the refusal is final, but `Server::send_queue` put the response back at the head of its queue and retried it with no exit, so the worker's only thread never returned to `epoll_wait`: no traffic served, no answer to the supervisor. An unfiltered `QueryMetrics` (what `sozu top` sends) on a worker with many clusters and backends, or a lowered `max_command_buffer_size`, is enough, and the query is scattered to every worker, so the whole fleet freezes together. The worker now logs the refusal and drops the response; if it was a terminal answer it answers the same request id with a short `Failure` that names `max_command_buffer_size`, which the supervisor counts as that worker's failed answer instead of waiting for one that cannot arrive. An oversized `Processing` report or event is dropped with the log alone. A frame that only misses the room a backlog leaves is unchanged: it stays queued until the socket drains.
 
+<!-- changelog-slot:worker-listener-socket -->
+
+### Fixed
+
+- `RemoveListener` now closes an activated HTTP, HTTPS or TCP listener's socket at once, even while sessions accepted on it are still open. The worker dropped only the proxy's map entry, and every session holds an `Rc` to the listener object that owns the listening socket, so the socket stayed open, listening and registered in epoll under the slab token the removal had just freed until the last of those sessions closed, which an HTTP/2, WebSocket or TCP pipe session can postpone indefinitely. The kernel kept completing handshakes into a backlog nobody accepted, and after a re-add on the same address (the documented way to change a TCP listener's `--sni-preread-*` options) the orphan stayed in the `SO_REUSEPORT` group of the new socket and could take a share of the new connections. The proxies now take the socket out of the listener and deregister it before dropping the entry, as a deactivation already does; the sessions in flight are not interrupted.
+
 ## 2.3.6 - 2026-11-18
 
 ### Security
