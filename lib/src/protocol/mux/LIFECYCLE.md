@@ -2892,8 +2892,27 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     behaviour is common, but no test drives an early backend delivery.
 
 22. **A timed-out backend holds no linked stream when the shared tail runs.**
-    The backend-token branch of `Mux::timeout` re-arms the backend container
-    only when `!should_close`, yet the shared tail below it can still return
+    A backend timer bounds the inactivity of the streams linked to that
+    backend, so the backend-token branch of `Mux::timeout` returns
+    `StateResult::Continue` before the loop below when
+    `context.backend_streams[&token]` is empty: no stream to answer or reap,
+    and the shared tail, which closes the session unless a stream asked to
+    keep it, would cut every stream the other backends still serve. The case
+    is a pooled H2 connection whose last stream has ended. `ConnectionH1`
+    clears its deadline when the backend's response terminates, so a pooled
+    H1 keep-alive backend never fires, but an H2 connection has no such edge
+    and keeps the deadline its last DATA, HEADERS or stream write armed. `consume_timer_entry` has
+    already cleared the elapsed deadline and `Mux::reschedule` cancels the
+    wheel entry; the connection stays pooled without a timer, exactly as an
+    idle H1 keep-alive connection does, and its first write that moves a
+    stream's bytes arms the deadline again (invariant 9). The frontend timer is
+    not re-armed on that return. Pinned by
+    `an_idle_h2_backend_deadline_does_not_close_a_session_with_a_live_stream`
+    and `an_idle_h2_backend_timeout_leaves_the_streams_of_other_backends_alone`,
+    the second also pinning the reuse leg.
+    The rest of this invariant concerns the backends that do have linked
+    streams. The backend-token branch of `Mux::timeout` re-arms the backend
+    container only when `!should_close`, yet the shared tail below it can still return
     `Continue` — through the `should_write` writable loop, or through
     `delay_close_for_frontend_flush("timeout")` — with only the FRONTEND
     container re-armed. That is safe only because the branch calls
@@ -2925,7 +2944,10 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     out on the first pass a backend actually moves bytes on, but nothing hangs
     on it — invariant 9.) That is what covers the
     pool-reuse branch of `Router::plan_connect` never arming a timeout, unlike the
-    fresh-dial branch. Asserted under `debug_assertions` at the
+    fresh-dial branch. The early return at the start of this invariant drops
+    an idle pooled H2 connection's elapsed deadline without re-arming it, so a
+    stream linked to that connection afterwards has no backend timer until the
+    first pass that moves its bytes arms one. Asserted under `debug_assertions` at the
     re-arm site and pinned by
     `a_backend_timeout_leaves_no_linked_stream_behind_on_the_close_path` and
     `a_completed_backend_response_timeout_unlinks_through_end_stream_alone`;

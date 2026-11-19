@@ -97,6 +97,11 @@
 ### Fixed
 
 - An `AddCluster` for a UDP cluster with an active `udp.health` no longer resets the health of its backends. A UDP cluster carries no `health_check`, so the worker took every `AddCluster` it received for one, such as a configuration reload that changes the cluster, for the removal of a health check and reset each backend to healthy with zeroed counters, assuming no probe would ever mark it up again. The UDP prober keeps running across the upsert and writes the same backend health, so a backend it had marked down went back into rotation without a single successful probe, new flows could hash to it and stay pinned until idle timeout, until `fall` failed probes marked it down again. The worker still forgets the cluster's HTTP/TCP health check, but leaves the health state to the prober while one is armed, so a backend marked down stays down until `rise` successful probes mark it up. The same holds for `RemoveHealthCheck` on such a cluster and for the abort of a protected health-check change. A cluster with no `udp.health` block, or with `mode = HEALTH_OFF`, has no prober and is reset as before.
+<!-- changelog-slot:idle-h2-backend-timeout -->
+
+### Fixed
+
+- The `back_timeout` of an idle pooled HTTP/2 backend connection no longer closes the client session. An HTTP/2 backend connection whose last stream had ended kept the deadline that stream's last byte armed, so once `back_timeout` (30 s by default) elapsed without a byte on it, the whole session was closed even though no request was waiting on that connection. A session still serving a request on another backend lost it: a slow response, an SSE stream or an upload started after the request the HTTP/2 backend had answered was cut, and on an HTTP/2 frontend every multiplexed stream was cut. The session also lived only `back_timeout` after its last HTTP/2 backend response, whatever `front_timeout` allowed. A backend timer that fires with no stream linked to that backend is now dropped and the session is left alone; the idle connection stays pooled without a deadline, as an idle HTTP/1.1 keep-alive backend connection already does, and the next request written on it arms the deadline again. A backend timer with a stream linked to it is handled as before.
 
 ## 2.3.6 - 2026-11-18
 
