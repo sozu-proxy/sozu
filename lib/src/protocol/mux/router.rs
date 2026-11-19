@@ -3243,10 +3243,14 @@ mod backend_selection_order_tests {
     /// the connection, which is the state 100 attached streams reach with the
     /// default.
     ///
-    /// TO SEE THIS GREEN: give the `Connecting` arm of the scan in
-    /// `Router::decide_after_gate` the capacity check the `Connected` arm has
-    /// (skip a connection whose `stream_count()` is at or above its
-    /// `peer_settings.settings_max_concurrent_streams`).
+    /// To SEE THIS RED: in the `Connecting` arm of the scan in
+    /// `Router::decide_after_gate`, replace the
+    /// `let Connection::H2(h2c) = backend` condition and the
+    /// `h2c.core.stream_count() < ...settings_max_concurrent_streams` check
+    /// that follows it with `matches!(backend, Connection::H2(_))`, as it was
+    /// before the fix. The `H2 Connecting` round then fails with "a connection
+    /// at its stream limit must not be reused, a second connection must be
+    /// dialed, got Err(MaxSessionsMemory)".
     #[test]
     fn a_full_pooled_h2_connection_is_not_reused_connected_or_connecting() {
         let fixture = routing_fixture();
