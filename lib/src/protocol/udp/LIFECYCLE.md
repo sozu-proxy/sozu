@@ -246,6 +246,21 @@ under a fresh `upstream_token` and records `upstream_token -> FlowId`
 client via the front socket — restoring the pre-NAT client address that
 `UdpFlow::client` (`flow.rs`) preserved at admission.
 
+The socket is registered edge-triggered and nothing re-drives a session that
+stopped early (`UdpListenerSession::ready` is a constant `false`), so
+`ingest_upstream` drains to `WouldBlock`, and a hard `recv` error does not end
+the drain. A backend or middlebox ICMP error (port unreachable, say) stays
+pending on a connected UDP socket until a `send` or a `recv` consumes it, and
+on Linux that `recv` returns the error AHEAD of the datagrams already queued
+and clears it; the socket then reports `POLLIN | POLLERR` together, as one
+readable edge. `ingest_upstream` therefore logs the error and reads on, so the
+queued replies are delivered by that edge instead of waiting for an unrelated
+later datagram or dying with the flow. An error that never clears would
+otherwise spin the worker, so a run of `UPSTREAM_RECV_ERROR_BUDGET` consecutive
+errors (`udp.rs`) ends the drain; a successful `recv` resets the count. The
+listener socket's `ingest_client` keeps its stop on a hard error: an unconnected
+UDP socket is never handed an ICMP error as a pending error.
+
 No shared state, no kernel conntrack entry, no source-port rewriting bookkeeping:
 one connected fd per flow does it all. The trade-off is one fd per active flow,
 which is exactly why `max_flows` exists (§9).
@@ -495,6 +510,16 @@ Worker requests reach UDP via `UdpProxy::notify` (`udp.rs`), routed from
   socket in the address's `SO_REUSEPORT` group is expected to go on taking a
   share of new datagrams for as long as it stays open. That expectation follows
   from `SO_REUSEPORT` load-balancing semantics; nothing here measures it.
+  `give_back_listeners` keeps each listener's session installed: a worker that
+  gave its sockets back and goes on running (an aborted upgrade, for instance)
+  can be sent a later `ActivateListener`, which binds a fresh socket that the
+  retained session reaches through the shared listener. It does discard the
+  session's client-return write queue: the WRITABLE interest that queue waits on belongs to
+  the socket leaving, `UdpListener::activate` registers the fresh one `READABLE`
+  only, and a datagram left in the queue would divert every later reply into it
+  with nothing to drain it. Each discarded datagram is counted once as
+  `udp.datagrams.dropped.unknown_flow`, the egress counter for a socket that is
+  gone (`UdpListenerSession::discard_client_queue`, `udp.rs`).
 - **Hot-upgrade resets flows.** Only the **listener fd** is handed off — flow
   state is **not** migrated (`UdpProxy::give_back_listener`'s `close_all_flows` on
   hand-off, `udp.rs`). In-flight flows reset on upgrade. This is a deliberate
@@ -539,7 +564,9 @@ model.
    queued datagram that then hits a hard send error (`ECONNREFUSED` from a
    pending ICMP error, say) is popped and counted as
    `udp.datagrams.dropped.send_error` by `WriteQueue::drain`, the same counter
-   the immediate send paths move for that error. Writable re-arm
+   the immediate send paths move for that error. A client-return queue whose
+   listener socket is handed off is discarded, not carried over, and counted
+   as `udp.datagrams.dropped.unknown_flow` (the SCM fd hand-off note in §11). Writable re-arm
    (`arm_upstream_writable` / `drain_upstream_queue`; client side
    `arm_client_writable` / `drain_client_queue`; all `udp.rs`) is the UDP analog
    of `signal_pending_write` on the edge-triggered loop.

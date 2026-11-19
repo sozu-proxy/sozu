@@ -786,7 +786,9 @@ the code (only the new-flow cost was traced):
   each readiness burst ends with one `recvfrom` that answers `EAGAIN`, since a
   datagram socket offers no short-read proof;
 - **per backend reply:** one `recv(2)`, one copy, one `sendto(2)` on the
-  listener socket;
+  listener socket; a pending ICMP error costs one more `recv`, which returns it
+  (`ECONNREFUSED`) ahead of the replies already queued, and the drain goes on
+  past it to `EAGAIN` (§6 of the UDP `LIFECYCLE.md`);
 - **per new flow:** `udp_connect` (`lib/src/socket.rs`) issues `socket(2)`,
   born non-blocking and close-on-exec (`SOCK_NONBLOCK | SOCK_CLOEXEC`),
   `bind(2)` and `connect(2)`; the shell then registers the socket

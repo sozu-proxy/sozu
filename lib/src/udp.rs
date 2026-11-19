@@ -127,6 +127,15 @@ const UPSTREAM_WRITE_QUEUE_CAP: usize = 64;
 /// many clients through the single listener socket). Sized larger than the
 /// per-flow cap because it is shared across every flow's return traffic.
 const CLIENT_WRITE_QUEUE_CAP: usize = 256;
+/// How many consecutive hard `recv` errors one drain of a flow's upstream
+/// socket rides through before it gives up (`UdpListenerSession::ingest_upstream`).
+/// A connected UDP socket reports a pending ICMP error (`ECONNREFUSED`, ...)
+/// from its next `recv`, and that `recv` clears it, so the datagrams queued
+/// behind it are still readable and the drain must go on. A second error in a
+/// row needs a fresh ICMP message between two `recv`s; an error that never
+/// clears (a closed descriptor, say) would otherwise spin the worker, so the
+/// run is bounded. A successful `recv` resets the count.
+const UPSTREAM_RECV_ERROR_BUDGET: u32 = 8;
 
 /// What `WriteQueue::drain` should do after a single send attempt: keep
 /// draining, stop because the socket went `WouldBlock` (rearm WRITABLE), or stop
@@ -175,6 +184,15 @@ impl WriteQueue {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.queue.len()
+    }
+
+    /// Drop every queued datagram and return how many there were, so the
+    /// caller can count them. Used when the socket the queue was waiting on is
+    /// gone (see `UdpProxy::give_back_listeners`).
+    fn discard(&mut self) -> usize {
+        let discarded = self.queue.len();
+        self.queue.clear();
+        discarded
     }
 
     /// Enqueue a datagram for later draining. Returns `true` if it was accepted,
@@ -785,16 +803,31 @@ impl UdpProxy {
         Some(session)
     }
 
+    /// Hand every listener socket over for an SCM hand-off. Each listener's
+    /// session stays installed, flows included (a later
+    /// [`activate_listener`](Self::activate_listener) binds a fresh socket that
+    /// the retained session reaches through the shared listener), but the
+    /// client-return queue does not stay with it: the WRITABLE interest that
+    /// queue waits on belongs to the socket leaving here, and the fresh one is
+    /// registered `READABLE` only. A datagram left in the queue would divert
+    /// every later reply into it and nothing would ever drain it, so the queue
+    /// is discarded (and counted) with the socket it was waiting on.
     pub fn give_back_listeners(&mut self) -> Vec<(ListenerKey, UdpSocket)> {
         self.listeners
-            .values()
-            .filter_map(|listener| {
-                let mut owned = listener.borrow_mut();
-                if let Some(socket) = owned.socket.take() {
+            .iter()
+            .filter_map(|(token, listener)| {
+                let (key, socket) = {
+                    let mut owned = listener.borrow_mut();
+                    let socket = owned.socket.take()?;
                     owned.active = false;
-                    return Some((owned.key(), socket));
+                    (owned.key(), socket)
+                };
+                // The listener borrow is released: the session reads the
+                // listener itself when it drains.
+                if let Some(session) = self.listener_sessions.get(token) {
+                    session.borrow_mut().discard_client_queue();
                 }
-                None
+                Some((key, socket))
             })
             .collect()
     }
@@ -1472,10 +1505,22 @@ impl UdpListenerSession {
 
     /// Drain datagrams waiting on one flow's connected upstream socket into the
     /// manager as `BackendDatagram`s.
+    ///
+    /// The drain runs to `WouldBlock`, because the socket is registered
+    /// edge-triggered and nothing re-drives a session that stopped early
+    /// (`UdpListenerSession::ready` is a constant `false`). A hard `recv` error
+    /// therefore does not end it: on Linux a connected UDP socket returns the
+    /// pending ICMP error (`ECONNREFUSED` after a port-unreachable, say) from
+    /// its next `recv`, AHEAD of the datagrams already queued, and that `recv`
+    /// clears it. Stopping there would leave those datagrams unread until an
+    /// unrelated later datagram raises a new edge, or lose them with the flow.
+    /// The run of consecutive errors is bounded by `UPSTREAM_RECV_ERROR_BUDGET`
+    /// so an error that never clears cannot spin the worker.
     fn ingest_upstream(&mut self, upstream_token: Token, now: Instant) {
         let Some(&flow) = self.upstream_to_flow.get(&upstream_token) else {
             return;
         };
+        let mut consecutive_errors: u32 = 0;
         loop {
             let result = {
                 let Some(socket) = self.upstream_sockets.get(&upstream_token) else {
@@ -1485,6 +1530,7 @@ impl UdpListenerSession {
             };
             match result {
                 Ok(len) => {
+                    consecutive_errors = 0;
                     let len = len.min(self.recv_buf.len());
                     let payload: &[u8] = &self.recv_buf[..len];
                     let mgr = self.manager.clone();
@@ -1500,7 +1546,10 @@ impl UdpListenerSession {
                         log_context!(self),
                         e
                     );
-                    break;
+                    consecutive_errors += 1;
+                    if consecutive_errors >= UPSTREAM_RECV_ERROR_BUDGET {
+                        break;
+                    }
                 }
             }
         }
@@ -1845,6 +1894,28 @@ impl UdpListenerSession {
                 e
             );
         }
+    }
+
+    /// Drop the client-return queue because the listener socket it was waiting
+    /// on has left (`UdpProxy::give_back_listeners`), counting each datagram.
+    ///
+    /// A queued reply is lost with its socket, as when `send_to` hits a hard
+    /// error, and the counter is the one the egress paths already use for a
+    /// socket that is gone (`udp.datagrams.dropped.unknown_flow`, see
+    /// `UdpListenerSession::on_send_to_backend`), once per datagram. Only the
+    /// reason counter moves, as for every shell-side egress drop. Nothing here
+    /// touches the registry: the socket has already been taken from the
+    /// listener and its caller deregisters it, so there is no WRITABLE
+    /// interest left to disarm.
+    fn discard_client_queue(&mut self) {
+        let discarded = self.client_write_queue.discard();
+        if discarded > 0 {
+            count!(names::udp::DROPPED_UNKNOWN_FLOW, discarded as i64);
+        }
+        debug_assert!(
+            self.client_write_queue.is_empty(),
+            "a discarded client-return queue must be empty"
+        );
     }
 
     /// Drain the client-return write queue on a listener writable event. Re-sends
@@ -2842,6 +2913,339 @@ mod tests {
             proxy_count(names::udp::DROPPED_SEND_ERROR) - before,
             1,
             "a queued datagram dropped on a hard send_to error must be counted"
+        );
+    }
+
+    /// Block until the socket holds a queued datagram AND a pending error, and
+    /// consume neither: `poll(2)` reports `POLLIN` for the first and `POLLERR`
+    /// for the second, and unlike a `recv` (even `MSG_PEEK`, which still
+    /// reads and clears `sk_err` first) it leaves both in place for the call
+    /// the test is about.
+    fn wait_for_queued_datagram_and_pending_error(socket: &UdpSocket) {
+        let wanted = libc::POLLIN | libc::POLLERR;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut fds = [libc::pollfd {
+                fd: socket.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            // SAFETY: `fds` is a valid one-element array that lives across the call.
+            let ready = unsafe { libc::poll(fds.as_mut_ptr(), 1, 0) };
+            assert!(ready >= 0, "precondition: poll(2) must not fail");
+            if fds[0].revents & wanted == wanted {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "precondition: the socket must hold a queued datagram and a pending error \
+                 (revents {:#x})",
+                fds[0].revents
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// A reply already queued on a flow's upstream socket is delivered by the
+    /// readable event that reports it, even when an ICMP error is pending on
+    /// the same socket.
+    ///
+    /// On Linux the pending `ECONNREFUSED` of a connected UDP socket is
+    /// returned by the NEXT `recv`, ahead of the datagrams already queued, and
+    /// the socket then reports `POLLIN | POLLERR` together (the precondition
+    /// helper above asserts exactly that before the readable event is
+    /// delivered). `ingest_upstream` drains an edge-triggered socket "to
+    /// `WouldBlock`", but its generic `Err` arm stops at the first hard error,
+    /// so the reply behind it waits for an unrelated later datagram on that
+    /// socket, or dies with the flow.
+    ///
+    /// The ICMP error is real: a second client datagram is forwarded to the
+    /// backend port after the backend socket has answered once and closed. The
+    /// whole pass is one `update_readiness` on the upstream token, which is
+    /// what the event loop does for the single edge the kernel reports; a
+    /// second call would hide the defect, which is the missing re-drive.
+    #[test]
+    fn a_pending_icmp_error_does_not_strand_the_replies_queued_behind_it() {
+        use crate::backends::Backend;
+
+        const CLUSTER: &str = "udp-icmp-drain";
+        const DEADLINE: Duration = Duration::from_secs(2);
+
+        let (_proxy, session) = loopback_listener_session();
+        let listener_address = session.borrow().address;
+        let listener_token = session.borrow().listener_token;
+
+        let backend =
+            std::net::UdpSocket::bind(("127.0.0.1", 0)).expect("could not bind the test backend");
+        backend
+            .set_read_timeout(Some(DEADLINE))
+            .expect("could not set the backend read timeout");
+        let backend_address = backend.local_addr().expect("the backend has an address");
+        {
+            let session = session.borrow();
+            session.backends.borrow_mut().add_backend(
+                CLUSTER,
+                Backend::new("backend-1", backend_address, None, None, None),
+            );
+            session.manager.borrow_mut().handle_input(
+                ManagerInput::Config(ConfigEvent::SetCluster(ClusterConfig {
+                    cluster: CLUSTER.into(),
+                    ..Default::default()
+                })),
+                Instant::now(),
+            );
+        }
+
+        let client =
+            std::net::UdpSocket::bind(("127.0.0.1", 0)).expect("could not bind the test client");
+        client
+            .set_read_timeout(Some(DEADLINE))
+            .expect("could not set the client read timeout");
+        let mut buffer = [0u8; 64];
+
+        // The first query admits the flow and opens its connected upstream socket.
+        client
+            .send_to(b"query-1", listener_address)
+            .expect("the client must reach the listener");
+        session
+            .borrow_mut()
+            .update_readiness(listener_token, Ready::READABLE);
+        let (length, upstream_address) = backend
+            .recv_from(&mut buffer)
+            .expect("the backend must receive the first query");
+        assert_eq!(&buffer[..length], b"query-1");
+
+        // The backend answers, then goes away: the reply is queued on the
+        // upstream socket, and the next datagram sent to the closed port
+        // comes back as an ICMP port-unreachable.
+        backend
+            .send_to(b"reply", upstream_address)
+            .expect("the backend must answer");
+        drop(backend);
+        client
+            .send_to(b"query-2", listener_address)
+            .expect("the client must reach the listener");
+        session
+            .borrow_mut()
+            .update_readiness(listener_token, Ready::READABLE);
+
+        let upstream_token = {
+            let session = session.borrow();
+            assert_eq!(
+                session.upstream_sockets.len(),
+                1,
+                "precondition: the two queries share one flow, so one upstream socket"
+            );
+            let token = *session
+                .upstream_sockets
+                .keys()
+                .next()
+                .expect("one upstream socket was just asserted");
+            wait_for_queued_datagram_and_pending_error(&session.upstream_sockets[&token]);
+            token
+        };
+
+        // The one readable event the kernel reports for both.
+        session
+            .borrow_mut()
+            .update_readiness(upstream_token, Ready::READABLE);
+
+        match client.recv_from(&mut buffer) {
+            Ok((length, _)) => assert_eq!(
+                &buffer[..length],
+                b"reply",
+                "the client must receive the backend's reply"
+            ),
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                panic!(
+                    "the reply queued behind a pending ICMP error was not delivered by the \
+                     readable event that reported it: the drain stopped at the error and \
+                     no further edge will come"
+                )
+            }
+            Err(error) => panic!("unexpected error reading the client socket: {error}"),
+        }
+    }
+
+    /// The listener's client-return queue survives the SCM hand-off with its
+    /// session, so after the listener is activated again on the same worker the
+    /// return path must work: the datagrams behind the queue reach their client.
+    ///
+    /// `give_back_listeners` takes the socket and keeps the session, queue
+    /// included; the WRITABLE interest that queue was waiting on belonged to
+    /// the socket that is gone, and `UdpListener::activate` registers the fresh
+    /// socket READABLE only. `Server` skips `build_session` for the retained
+    /// session. `on_send_to_client` appends to a non-empty queue without
+    /// arming anything, and `drain_client_queue` runs only on a WRITABLE event
+    /// for the listener token, so every reply after that waits in a queue
+    /// nothing drains until it is full and they are dropped as `wq_full`.
+    ///
+    /// The queue is filled by hand, as a listener `send_to` that returned
+    /// `WouldBlock` leaves it (with the WRITABLE interest armed). The outcome
+    /// is read through a real `mio::Poll` loop, driven like the server's run
+    /// loop for this one listener token, and asserts only that the reply
+    /// sent after the re-activation reaches the client: whether the stale
+    /// queued datagram is delivered or discarded is the fix's choice.
+    #[test]
+    fn a_client_return_queue_kept_across_a_handoff_is_drained_after_reactivation() {
+        use crate::{
+            protocol::udp::Transmit,
+            testing::{ServerParts, prebuild_server, provide_port},
+        };
+
+        const DEADLINE: Duration = Duration::from_secs(2);
+
+        let ServerParts {
+            event_loop: mut poll,
+            registry,
+            sessions,
+            pool,
+            backends,
+            ..
+        } = prebuild_server(16, 16384, false).expect("could not prebuild a test server");
+
+        let address =
+            sozu_command::proto::command::SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let config = sozu_command::config::ListenerBuilder::new_udp(address)
+            .to_udp(None)
+            .expect("could not build a UdpListenerConfig for the test");
+
+        let listener_token = {
+            let mut session_manager = sessions.borrow_mut();
+            let entry = session_manager.slab.vacant_entry();
+            let token = Token(entry.key());
+            entry.insert(Rc::new(RefCell::new(crate::server::ListenSession {
+                protocol: Protocol::UDPListen,
+            })));
+            token
+        };
+
+        let mut proxy = UdpProxy::new(registry, sessions, pool, backends, 16, 16384);
+        proxy
+            .add_listener(config, listener_token)
+            .expect("could not add the test UDP listener");
+        proxy
+            .activate_listener(&address.into(), None)
+            .expect("could not activate the test UDP listener");
+        let session = proxy
+            .build_session(listener_token)
+            .expect("could not build the test UDP listener session");
+
+        let client =
+            std::net::UdpSocket::bind(("127.0.0.1", 0)).expect("could not bind the test client");
+        client
+            .set_nonblocking(true)
+            .expect("could not make the client non-blocking");
+        let client_address = client.local_addr().expect("the client has an address");
+
+        // What a `WouldBlock` on the listener socket leaves behind.
+        assert!(
+            session
+                .borrow_mut()
+                .client_write_queue
+                .push(client_address, b"queued".to_vec()),
+            "precondition: the queue accepts one datagram"
+        );
+        session.borrow_mut().arm_client_writable();
+        assert!(
+            !session.borrow().client_write_queue.is_empty(),
+            "precondition: a datagram waits for the listener to become writable"
+        );
+
+        // The SCM hand-off: `Server::return_listen_sockets` deregisters the
+        // sockets and drops them once sent, the session stays installed.
+        let handed_over = proxy.give_back_listeners();
+        assert_eq!(
+            handed_over.len(),
+            1,
+            "precondition: the listener hands its socket over"
+        );
+        drop(handed_over);
+
+        // A later `ActivateListener` binds a fresh socket; `Server` finds the
+        // session still installed and does not build another.
+        proxy
+            .activate_listener(&address.into(), None)
+            .expect("could not re-activate the test UDP listener");
+        assert!(
+            session.borrow().listener.borrow().socket.is_some(),
+            "precondition: the re-activated listener holds a fresh socket"
+        );
+
+        session.borrow_mut().on_send_to_client(Transmit {
+            dst: client_address,
+            segment_size: None,
+            payload: b"new".to_vec(),
+        });
+
+        // The run loop for this listener: dispatch what the poll reports to the
+        // session, as `Server::ready` does, until the client has the reply.
+        let mut events = mio::Events::with_capacity(16);
+        let mut buffer = [0u8; 64];
+        let mut received: Vec<Vec<u8>> = Vec::new();
+        let deadline = Instant::now() + DEADLINE;
+        while Instant::now() < deadline && !received.iter().any(|datagram| datagram == b"new") {
+            poll.poll(&mut events, Some(Duration::from_millis(20)))
+                .expect("could not poll the test event loop");
+            for event in events.iter() {
+                if event.token() == listener_token {
+                    session
+                        .borrow_mut()
+                        .update_readiness(event.token(), Ready::from(event));
+                }
+            }
+            while let Ok((length, _)) = client.recv_from(&mut buffer) {
+                received.push(buffer[..length].to_vec());
+            }
+        }
+        assert!(
+            received.iter().any(|datagram| datagram == b"new"),
+            "a reply sent after the listener was re-activated never reached the client: \
+             it waits behind a client-return queue no event will drain (received {received:?})"
+        );
+    }
+
+    /// The datagrams a hand-off discards from the client-return queue are
+    /// counted, one per datagram, as `udp.datagrams.dropped.unknown_flow` (the
+    /// egress counter for a socket that is gone), and the queue is empty
+    /// afterwards. The aggregate `udp.datagrams.dropped` is core-side only and
+    /// does not move.
+    #[test]
+    fn a_handoff_counts_the_client_return_datagrams_it_discards() {
+        let (mut proxy, session) = loopback_listener_session();
+        let client = SocketAddr::from(([127, 0, 0, 1], 41000));
+        for _ in 0..3 {
+            assert!(
+                session
+                    .borrow_mut()
+                    .client_write_queue
+                    .push(client, b"queued".to_vec()),
+                "precondition: the queue accepts the datagram"
+            );
+        }
+
+        let reason_before = proxy_count(names::udp::DROPPED_UNKNOWN_FLOW);
+        let total_before = proxy_count(names::udp::DATAGRAMS_DROPPED);
+        let handed_over = proxy.give_back_listeners();
+
+        assert_eq!(
+            handed_over.len(),
+            1,
+            "precondition: the listener hands its socket over"
+        );
+        assert!(
+            session.borrow().client_write_queue.is_empty(),
+            "the hand-off must discard the queue that waited on the departing socket"
+        );
+        assert_eq!(
+            proxy_count(names::udp::DROPPED_UNKNOWN_FLOW) - reason_before,
+            3,
+            "each discarded datagram must be counted once"
+        );
+        assert_eq!(
+            proxy_count(names::udp::DATAGRAMS_DROPPED) - total_before,
+            0,
+            "a shell-side egress drop does not move the core-side aggregate"
         );
     }
 }
