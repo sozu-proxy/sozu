@@ -928,8 +928,23 @@ and its siblings) deregisters and drops its listener sockets — then calls
 
 When the last session is gone the worker answers the main process and leaves
 its event loop, flushing the log backends first so a `file://` access log keeps
-its buffered records ([#1554](https://github.com/sozu-proxy/sozu/pull/1554)). A
-hard stop (`sozu shutdown --hard`, or a second `SIGTERM` during a soft stop)
+its buffered records ([#1554](https://github.com/sozu-proxy/sozu/pull/1554)).
+"The last session" is a slab length test: `Server::shut_down_sessions` finishes
+once the slab holds no more entries than `Server::base_sessions_count`, the
+slots that are not client sessions: the channel, timer and metrics slots
+reserved when the worker is built, and one slot per added listener, which the
+drain never closes (`ListenSession` and `UdpListenerSession` both answer `false`
+to `shutting_down`).
+A soft stop empties each proxy's listener map but leaves those slots in the
+slab, so they stay counted until the worker exits. `RemoveListener`
+(`Server::notify_proxys`) releases a listener's slot and lowers the count in the
+same step, and only when the proxy still holds the listener at that address. A
+`RemoveListener` for an address the proxy does not hold, such as a listener this
+worker refused to add or one a soft stop already dropped from the map, releases
+nothing and leaves the count alone; lowering it anyway would put the count under
+the slots still in the slab, and the worker would never answer the `SoftStop`.
+
+A hard stop (`sozu shutdown --hard`, or a second `SIGTERM` during a soft stop)
 closes every session at once.
 
 ## 13. Hot reconfiguration and upgrades

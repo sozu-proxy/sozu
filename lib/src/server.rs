@@ -3272,21 +3272,23 @@ impl Server {
             }
             Some(RequestType::RemoveListener(ref remove)) => {
                 debug!("{} remove {:?} listener {:?}", req_id, remove.proxy, remove);
-                // We only remove a listener that was previously added, so the
-                // base count is at least 1 — the subtraction cannot underflow.
-                debug_assert!(
-                    self.base_sessions_count > 0,
-                    "removing a listener with base_sessions_count == 0 would underflow"
-                );
-                self.base_sessions_count -= 1;
                 let listener_type = ListenerType::try_from(remove.proxy);
                 // `RemoveListener` is the sole release point of the slab slot
                 // `AddListener` reserved (see `reserve_listen_token`): no
                 // proxy's `remove_listener` touches the session slab, so
                 // without this the slot leaks one slab key per add/remove
-                // cycle — and `base_sessions_count`, decremented just above,
-                // drifts below the number of reserved slots. Read the token
-                // BEFORE the proxy drops the listener that holds it.
+                // cycle. Read the token BEFORE the proxy drops the listener
+                // that holds it.
+                //
+                // `base_sessions_count` counts those reserved slots, so it is
+                // lowered only where a slot is released, below. An address the
+                // proxy does not hold has no slot to release: a listener this
+                // worker refused to add, or one a soft stop already dropped
+                // from the proxy's map, whose slot stays in the slab until the
+                // worker exits. Lowering the count for it would put the count
+                // under the slots still in the slab, and the soft-stop exit
+                // test (`slab.len() <= base_sessions_count`) could never hold
+                // again.
                 let address = remove.listener_key();
                 let listen_token = match listener_type {
                     Ok(ListenerType::Http) => self.http.borrow().listener_token(&address),
@@ -3303,7 +3305,15 @@ impl Server {
                     Err(_) => WorkerResponse::error(req_id, "Wrong variant ListenerType"),
                 };
                 if let Some(token) = listen_token {
+                    // A listener held by a proxy was counted when it was
+                    // added, so the count is at least 1 — the subtraction
+                    // cannot underflow.
+                    debug_assert!(
+                        self.base_sessions_count > 0,
+                        "releasing a listener slot with base_sessions_count == 0 would underflow"
+                    );
                     self.sessions.borrow_mut().slab.try_remove(token.0);
+                    self.base_sessions_count -= 1;
                     // Same rule as the deactivate arms: a listen token with no
                     // slab slot must not stay queued for a deferred accept.
                     self.accept_ready.remove(&ListenToken(token.0));
@@ -5761,7 +5771,7 @@ mod listener_lifecycle_tests {
         config::ListenerBuilder,
         proto::command::{
             ActivateListener, DeactivateListener, ListenerType, LoadBalancingParams,
-            RemoveListener, RequestUdpFrontend, SocketAddress, filtered_metrics,
+            RemoveListener, RequestUdpFrontend, SocketAddress, SoftStop, filtered_metrics,
         },
     };
 
@@ -6376,9 +6386,9 @@ mod listener_lifecycle_tests {
     /// only sound if something releases it: no proxy's `remove_listener`
     /// touches the session slab, so `RemoveListener` is the sole release point.
     /// Without it each add/remove cycle would strand one slab key — and
-    /// `base_sessions_count`, decremented on every `RemoveListener`, would
-    /// drift below the number of occupied slots, so a soft stop would wait for
-    /// sessions that do not exist.
+    /// `base_sessions_count`, lowered by each `RemoveListener` that releases a
+    /// slot, would drift below the number of occupied slots, so a soft stop
+    /// would wait for sessions that do not exist.
     ///
     /// Three full cycles, because a leak is only visible as growth, and every
     /// other one removes the listener while it is still ACTIVATED: that path
@@ -6428,6 +6438,89 @@ mod listener_lifecycle_tests {
                 "cycle {cycle}: base_sessions_count must track the reserved slots"
             );
         }
+    }
+
+    /// `base_sessions_count` counts the slab slots that are not client
+    /// sessions, so it may only fall when a slot is actually released. A
+    /// `RemoveListener` for an address the proxy does not know (a listener the
+    /// worker refused to add, or one a soft stop already dropped from the
+    /// proxy's map) releases no slot, and must leave the count where it was.
+    ///
+    /// To SEE THIS RED: nothing to change, it is red on the unfixed
+    /// `RemoveListener` arm of `notify_proxys`, which lowers
+    /// `base_sessions_count` before it knows whether there is a slot to
+    /// release; the assertion fails with "removing an unknown listener
+    /// released no slot".
+    #[test]
+    fn removing_an_unknown_listener_leaves_base_sessions_count_unchanged() {
+        let mut server = bare_server();
+        let slab_len = server.sessions.borrow().slab.len();
+        let base_sessions_count = server.base_sessions_count;
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+
+        server.notify_proxys(WorkerRequest {
+            id: "test-remove-unknown".to_owned(),
+            content: RequestType::RemoveListener(RemoveListener {
+                interface: None,
+                address,
+                proxy: ListenerType::Udp as i32,
+            })
+            .into(),
+        });
+
+        assert_eq!(
+            server.sessions.borrow().slab.len(),
+            slab_len,
+            "removing an unknown listener must not touch the slab"
+        );
+        assert_eq!(
+            server.base_sessions_count, base_sessions_count,
+            "removing an unknown listener released no slot, so base_sessions_count must not move"
+        );
+    }
+
+    /// The soft-stop exit test is `slab.len() <= base_sessions_count`. A soft
+    /// stop empties every proxy's listener map but leaves the listener slots in
+    /// the slab, and `ListenSession::shutting_down` never closes them, so the
+    /// worker leaves the drain only through that count. A `RemoveListener` that
+    /// reaches the draining worker after the stop (an untargeted scatter does)
+    /// finds no listener to release, and must not lower the count under the
+    /// slots that are still there: the worker would then never answer the
+    /// `SoftStop` it was given.
+    ///
+    /// To SEE THIS RED: nothing to change, it is red on the unfixed
+    /// `RemoveListener` arm of `notify_proxys`; the assertion fails with "a
+    /// draining worker holding no client session must finish its soft stop".
+    #[test]
+    fn a_remove_listener_after_a_soft_stop_does_not_stall_the_drain() {
+        let mut server = bare_server();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        add_udp_listener(&mut server, address);
+        activate(&mut server, address, ListenerType::Udp);
+
+        server.shutting_down = Some("test-soft-stop".to_owned());
+        server.last_sessions_len = server.sessions.borrow().slab.len();
+        server.notify_proxys(WorkerRequest {
+            id: "test-soft-stop".to_owned(),
+            content: RequestType::SoftStop(SoftStop {}).into(),
+        });
+        server.notify_proxys(WorkerRequest {
+            id: "test-remove-after-soft-stop".to_owned(),
+            content: RequestType::RemoveListener(RemoveListener {
+                interface: None,
+                address,
+                proxy: ListenerType::Udp as i32,
+            })
+            .into(),
+        });
+
+        assert!(
+            server.shut_down_sessions(),
+            "a draining worker holding no client session must finish its soft stop: \
+             slab.len() = {}, base_sessions_count = {}",
+            server.sessions.borrow().slab.len(),
+            server.base_sessions_count
+        );
     }
 
     /// The UDP per-source flow limit is opt-in per cluster: a global
