@@ -386,7 +386,31 @@ forwarded; service managers should signal the unit rather than a superseded PID.
 (`bin/src/command/upgrade.rs`) and re-exec of an individual worker. Its first
 phase takes the old worker's listeners and launches the new worker with them;
 its second phase (`StopOldActivateNew`) soft-stops the old worker and sends the
-activation requests to the new one. `UpgradeWorkerTask::on_finish` answers
+activation requests to the new one.
+
+Between the two phases the old worker stays `Running` but holds no listening
+socket: `ReturnListenSockets` makes it hand every descriptor over and keep
+none, and the supervisor closes its own copies once the replacement has them.
+The second phase starts only when the replacement answers its initial `Status`
+with `Ok` (`AwaitingReadiness`). Every other exit, a replacement that times
+out, is rejected, or is refused its bootstrap, a failed or malformed receive
+of the listeners, and a failed launch, ends the upgrade through
+`UpgradeWorkerTask::abort_keeping_old_worker`: a replacement that reached
+`AwaitingReadiness` is fenced first, and the old worker is sent an
+`ActivateListener` for every listener the state
+holds as active (`RestoringOldWorker`), so it binds a fresh socket with
+`SO_REUSEPORT`. A repeated activation of a listener that is already active
+answers `Ok`. The client gets `Processing` while it waits, then one `Failure`
+that says the old worker "listens again and keeps serving" only once every
+activation was answered `Ok`; a rejected or unanswered activation is named
+instead, and a worker that is already stopping or stopped is not asked. With no
+active listener the answer is immediate. While the restoration is in flight
+the task cannot be handed over to a new main process
+(`TaskSnapshotError::OldWorkerRestoreInFlight`), as for the readiness wait. An
+old worker that never answers the first `ReturnListenSockets` is not covered:
+that answer is indeterminate and the upgrade fails as before.
+
+`UpgradeWorkerTask::on_finish` of the second phase answers
 `Ok` only when every response of that second phase is `Ok`. A failure of the
 old worker's `SoftStop`, including the synthetic "closed before answering" of
 §1.2, or of any activation request of the new worker, answers `Failure` naming

@@ -364,6 +364,10 @@ pub enum TaskSnapshotError {
     ProtectedTransactionInFlight,
     #[error("a new worker has not confirmed it is ready and cannot be handed over")]
     WorkerReadinessInFlight,
+    #[error(
+        "an aborted worker upgrade is waiting for its old worker to listen again and cannot be handed over"
+    )]
+    OldWorkerRestoreInFlight,
     #[error("test-only task {0} cannot be upgraded")]
     #[cfg_attr(not(test), allow(dead_code))]
     UnsupportedTestTask(&'static str),
@@ -4359,6 +4363,332 @@ mod tests {
         );
         fixture.hub.finish_ready_tasks(Instant::now());
         fixture.assert_refused();
+    }
+
+    /// Phase one of `upgrade --worker` takes every listening socket away from
+    /// the old worker for good (`ReturnListenSockets` leaves it with none),
+    /// and the replacement that held the only copy has just been fenced. An
+    /// abort that tells the client "the old worker keeps serving" therefore
+    /// has to make the old worker listen again: it must be sent an
+    /// `ActivateListener` for every listener the state holds as active.
+    #[test]
+    fn upgrade_readiness_failure_makes_the_old_worker_listen_again() {
+        use sozu_command_lib::{
+            config::ListenerBuilder,
+            proto::command::{ActivateListener, ListenerType},
+        };
+
+        let mut fixture = upgrade_readiness_fixture();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8089);
+        let listener = ListenerBuilder::new_http(address)
+            .to_http(None)
+            .expect("default HTTP listener config");
+        for request in [
+            RequestType::AddHttpListener(listener),
+            RequestType::ActivateListener(ActivateListener {
+                address,
+                proxy: ListenerType::Http.into(),
+                from_scm: false,
+                interface: None,
+            }),
+        ] {
+            fixture
+                .hub
+                .server
+                .state
+                .dispatch(&request.into())
+                .expect("the state should hold an active listener");
+        }
+        assert_eq!(
+            fixture.hub.server.state.generate_activate_requests().len(),
+            1
+        );
+
+        let id = fixture.readiness_id.clone();
+        fixture
+            .hub
+            .handle_worker_response(8, status_answer(&id, ResponseStatus::Failure));
+        fixture.hub.finish_ready_tasks(Instant::now());
+
+        // the abort ran: the replacement was fenced and the old worker was
+        // kept. When the client gets its answer is left to the fix, which may
+        // wait for the old worker to confirm it listens again.
+        assert_eq!(
+            worker_state(&fixture.hub.server, 8),
+            Some(RunState::Stopped)
+        );
+        assert_eq!(
+            fixture.hub.server.workers[&fixture.old_token].run_state,
+            RunState::Running
+        );
+
+        let to_old = drain_worker_requests(&mut fixture.hub.server, &mut fixture.old_side);
+        let reactivated = to_old.iter().any(|request| {
+            matches!(
+                &request.content.request_type,
+                Some(RequestType::ActivateListener(activate))
+                    if activate.address == address
+                        && activate.proxy == i32::from(ListenerType::Http)
+            )
+        });
+        assert!(
+            reactivated,
+            "the old worker gave its listening sockets away and the replacement that held \
+             them is dead: it must be told to listen again, but it was sent {to_old:?}"
+        );
+    }
+
+    /// An HTTP listener the state holds as active, as the main process does
+    /// for a listener whose socket the old worker gave away in phase one.
+    fn add_active_http_listener(hub: &mut CommandHub, port: u16) -> SocketAddress {
+        use sozu_command_lib::{
+            config::ListenerBuilder,
+            proto::command::{ActivateListener, ListenerType},
+        };
+
+        let address = SocketAddress::new_v4(127, 0, 0, 1, port);
+        let listener = ListenerBuilder::new_http(address)
+            .to_http(None)
+            .expect("default HTTP listener config");
+        for request in [
+            RequestType::AddHttpListener(listener),
+            RequestType::ActivateListener(ActivateListener {
+                address,
+                proxy: ListenerType::Http.into(),
+                from_scm: false,
+                interface: None,
+            }),
+        ] {
+            hub.server
+                .state
+                .dispatch(&request.into())
+                .expect("the state should hold an active listener");
+        }
+        address
+    }
+
+    /// The `ActivateListener` requests the old worker (worker 7) was sent.
+    fn reactivation_requests(fixture: &mut UpgradeReadinessFixture) -> Vec<WorkerRequest> {
+        drain_worker_requests(&mut fixture.hub.server, &mut fixture.old_side)
+            .into_iter()
+            .filter(|request| {
+                matches!(
+                    request.content.request_type,
+                    Some(RequestType::ActivateListener(_))
+                )
+            })
+            .collect()
+    }
+
+    /// Every message the client got since the last read, oldest first.
+    fn client_messages(fixture: &mut UpgradeReadinessFixture) -> Vec<Response> {
+        flush_client_responses(
+            &mut fixture.hub,
+            fixture.client_token,
+            &mut fixture.client_peer,
+        );
+        let mut messages = Vec::new();
+        while let Ok(message) = fixture.client_peer.read_message() {
+            messages.push(message);
+        }
+        messages
+    }
+
+    #[test]
+    fn upgrade_readiness_failure_waits_for_the_old_worker_to_listen_again_before_answering() {
+        let mut fixture = upgrade_readiness_fixture();
+        add_active_http_listener(&mut fixture.hub, 8091);
+        let id = fixture.readiness_id.clone();
+        fixture
+            .hub
+            .handle_worker_response(8, status_answer(&id, ResponseStatus::Failure));
+        fixture.hub.finish_ready_tasks(Instant::now());
+
+        let requests = reactivation_requests(&mut fixture);
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        let before = client_messages(&mut fixture);
+        assert!(
+            before
+                .iter()
+                .all(|message| message.status == ResponseStatus::Processing as i32),
+            "no terminal answer before the old worker confirmed: {before:?}"
+        );
+        assert_eq!(fixture.hub.server.in_flight.len(), 1);
+
+        fixture
+            .hub
+            .handle_worker_response(7, status_answer(&requests[0].id, ResponseStatus::Ok));
+        fixture.hub.finish_ready_tasks(Instant::now());
+
+        let after = client_messages(&mut fixture);
+        assert_eq!(after.len(), 1, "exactly one terminal answer: {after:?}");
+        assert_eq!(after[0].status, ResponseStatus::Failure as i32, "{after:?}");
+        assert!(
+            after[0].message.contains("never confirmed it was ready")
+                && after[0].message.contains("listens again and keeps serving"),
+            "{after:?}"
+        );
+        assert!(fixture.hub.server.in_flight.is_empty());
+        assert!(fixture.hub.tasks.is_empty() && fixture.hub.server.queued_tasks.is_empty());
+        assert_eq!(
+            fixture.hub.server.workers[&fixture.old_token].run_state,
+            RunState::Running
+        );
+    }
+
+    #[test]
+    fn upgrade_readiness_failure_does_not_claim_the_old_worker_serves_when_it_cannot_listen() {
+        let mut fixture = upgrade_readiness_fixture();
+        add_active_http_listener(&mut fixture.hub, 8092);
+        let id = fixture.readiness_id.clone();
+        fixture
+            .hub
+            .handle_worker_response(8, status_answer(&id, ResponseStatus::Failure));
+        fixture.hub.finish_ready_tasks(Instant::now());
+        let requests = reactivation_requests(&mut fixture);
+        assert_eq!(requests.len(), 1, "{requests:?}");
+
+        let mut refusal = status_answer(&requests[0].id, ResponseStatus::Failure);
+        refusal.message = "Could not activate HTTP listener: address in use".to_owned();
+        fixture.hub.handle_worker_response(7, refusal);
+        fixture.hub.finish_ready_tasks(Instant::now());
+
+        let answers = client_messages(&mut fixture);
+        let terminal = answers.last().expect("a terminal answer");
+        assert_eq!(
+            terminal.status,
+            ResponseStatus::Failure as i32,
+            "{answers:?}"
+        );
+        assert!(
+            terminal.message.contains("could not listen again")
+                && terminal.message.contains("address in use")
+                && !terminal.message.contains("keeps serving"),
+            "{terminal:?}"
+        );
+        assert!(fixture.hub.server.in_flight.is_empty());
+        assert!(fixture.hub.tasks.is_empty() && fixture.hub.server.queued_tasks.is_empty());
+    }
+
+    #[test]
+    fn upgrade_readiness_failure_does_not_claim_the_old_worker_serves_when_it_never_answers() {
+        let mut fixture = upgrade_readiness_fixture();
+        add_active_http_listener(&mut fixture.hub, 8093);
+        let id = fixture.readiness_id.clone();
+        fixture
+            .hub
+            .handle_worker_response(8, status_answer(&id, ResponseStatus::Failure));
+        fixture.hub.finish_ready_tasks(Instant::now());
+        assert_eq!(reactivation_requests(&mut fixture).len(), 1);
+
+        fixture
+            .hub
+            .finish_ready_tasks(Instant::now() + Duration::from_secs(60));
+
+        let answers = client_messages(&mut fixture);
+        let terminal = answers.last().expect("a terminal answer");
+        assert_eq!(
+            terminal.status,
+            ResponseStatus::Failure as i32,
+            "{answers:?}"
+        );
+        assert!(
+            terminal
+                .message
+                .contains("did not confirm that it listens again")
+                && terminal.message.contains("timeout")
+                && !terminal.message.contains("keeps serving"),
+            "{terminal:?}"
+        );
+        assert!(fixture.hub.server.in_flight.is_empty());
+        assert!(fixture.hub.tasks.is_empty() && fixture.hub.server.queued_tasks.is_empty());
+    }
+
+    #[test]
+    fn upgrade_readiness_failure_does_not_reopen_listeners_on_a_stopping_old_worker() {
+        let mut fixture = upgrade_readiness_fixture();
+        add_active_http_listener(&mut fixture.hub, 8094);
+        fixture
+            .hub
+            .server
+            .workers
+            .get_mut(&fixture.old_token)
+            .expect("old worker")
+            .run_state = RunState::Stopping;
+        let id = fixture.readiness_id.clone();
+        fixture
+            .hub
+            .handle_worker_response(8, status_answer(&id, ResponseStatus::Failure));
+        fixture.hub.finish_ready_tasks(Instant::now());
+
+        assert!(
+            drain_worker_requests(&mut fixture.hub.server, &mut fixture.old_side).is_empty(),
+            "a draining worker must not be told to listen again"
+        );
+        let answers = client_messages(&mut fixture);
+        assert_eq!(answers.len(), 1, "{answers:?}");
+        assert_eq!(answers[0].status, ResponseStatus::Failure as i32);
+        assert!(
+            answers[0].message.contains("stopping or stopped")
+                && !answers[0].message.contains("keeps serving"),
+            "{answers:?}"
+        );
+    }
+
+    /// The other exits of phase one share the cause: once the old worker
+    /// answered `ReturnListenSockets` it has no listener, so a failed SCM
+    /// receive must make it listen again too. The test worker's SCM peer is
+    /// closed, so the receive fails.
+    #[test]
+    fn upgrade_failed_listener_receive_makes_the_old_worker_listen_again() {
+        use sozu_command_lib::proto::command::ReturnListenSockets;
+
+        let mut fixture = upgrade_readiness_fixture();
+        let address = add_active_http_listener(&mut fixture.hub, 8095);
+        let task_id = fixture.hub.server.new_task(
+            crate::command::upgrade::requesting_listen_sockets_task(
+                fixture.client_token,
+                fixture.old_token,
+                7,
+            ),
+            Timeout::Default,
+        );
+        fixture.hub.server.scatter_on_matching(
+            RequestType::ReturnListenSockets(ReturnListenSockets {}).into(),
+            task_id,
+            0,
+            &|worker| worker.id == 7,
+        );
+        let sent = drain_worker_requests(&mut fixture.hub.server, &mut fixture.old_side);
+        let request_id = sent
+            .iter()
+            .find(|request| {
+                matches!(
+                    request.content.request_type,
+                    Some(RequestType::ReturnListenSockets(_))
+                )
+            })
+            .map(|request| request.id.clone())
+            .expect("the old worker was asked for its listen sockets");
+
+        fixture
+            .hub
+            .handle_worker_response(7, status_answer(&request_id, ResponseStatus::Ok));
+        fixture.hub.finish_ready_tasks(Instant::now());
+
+        let requests = reactivation_requests(&mut fixture);
+        assert!(
+            requests.iter().any(|request| matches!(
+                &request.content.request_type,
+                Some(RequestType::ActivateListener(activate)) if activate.address == address
+            )),
+            "the old worker must be told to listen again, it was sent {requests:?}"
+        );
+        assert_eq!(
+            worker_state(&fixture.hub.server, 8),
+            Some(RunState::NotAnswering),
+            "no replacement was launched or fenced by this failure"
+        );
     }
 
     #[test]

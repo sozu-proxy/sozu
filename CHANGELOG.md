@@ -12,6 +12,12 @@
 
 <!-- changelog-slot:backend-ownership -->
 
+<!-- changelog-slot:upgrade-worker-abort-listeners -->
+
+### Fixed
+
+- An aborted `sozu upgrade --worker` no longer leaves the old worker with no listening socket. The first phase makes the old worker hand every listening socket over and keep none, and the main process forwards them to the replacement and closes its own copies. When the replacement then never answered its initial `Status` with `Ok` (a timeout, a rejection, a refused bootstrap), the main process fenced it, which destroyed the only remaining copy of the sockets, and told the client that the old worker "keeps serving" while it stayed `Running` with nothing to accept on: with one worker new connections were refused until an operator acted, and `sozu upgrade`, which upgrades every worker concurrently, could do that to all of them at once. The abort now sends the old worker an `ActivateListener` for every listener the state holds as active, so it binds a fresh `SO_REUSEPORT` socket again, and the client is told it listens again and keeps serving only after every activation was answered `Ok`; a refused or unanswered activation is reported with its reason instead. A failed or malformed receive of the sockets and a failed launch of the replacement take the same path. A worker that is already stopping or stopped is not asked, and with no active listener the answer is immediate as before.
+
 ## 2.3.6 - 2026-11-18
 
 ### Security
