@@ -2502,7 +2502,7 @@ impl HttpsProxy {
         self.listeners
             .retain(|_, listener| !listener.borrow().is(&remove_address));
 
-        if !self.listeners.len() < len {
+        if self.listeners.len() == len {
             info!(
                 "{} no HTTPS listener to remove at address {}",
                 log_module_context!(),
@@ -5671,6 +5671,92 @@ mod listener_sibling_tests {
             override_statuses(&proxy, 0, "valid"),
             ["503"],
             "the other clusters' overrides must still reach the new listener"
+        );
+    }
+
+    /// What an operator sees when a `RemoveListener` is answered. The branch
+    /// meant to say "no HTTPS listener to remove" tests
+    /// `!self.listeners.len() < len`, which parses as `(!after) < before`, the
+    /// bitwise complement of a small `usize` against a small `usize`, so it is
+    /// false for every reachable map size. An order naming an address the proxy
+    /// does not hold therefore answers `Ok` and logs nothing, exactly like a
+    /// removal that worked, and nobody learns that nothing was removed (the
+    /// TCP and UDP proxies answer an error for the same order). The order
+    /// must either be refused or leave the "no HTTPS listener to remove" line;
+    /// the matched removal beside it is the control that the line is not simply
+    /// always written and that a removal that worked still answers `Ok`.
+    ///
+    /// To SEE THIS GREEN: in `HttpsProxy::remove_listener`, make the test
+    /// `if self.listeners.len() == len`.
+    #[test]
+    fn removing_a_listener_the_proxy_does_not_hold_is_not_answered_ok_in_silence() {
+        use std::sync::{Arc, Mutex};
+
+        const NOTHING_REMOVED: &str = "no HTTPS listener to remove";
+        // The arm of `notify` that receives the order logs this at `debug`: it
+        // proves the capture works, so an absent "nothing removed" line means
+        // the branch stayed silent and not that the capture returned nothing.
+        const ORDER_RECEIVED: &str = "removing HTTPS listener at address";
+
+        /// Builds a proxy holding one listener, sends it a `RemoveListener`
+        /// through `notify` for the held address when `named_held`, or for an
+        /// address it never held otherwise, and returns the answer with the
+        /// log lines the order produced.
+        fn remove_through_notify(named_held: bool) -> (WorkerResponse, String) {
+            let held = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+            let unheld = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+            let answer = Arc::new(Mutex::new(None));
+            let sink = answer.clone();
+            let output = crate::capture_test_logs_at_level("debug", move || {
+                let mut proxy = proxy();
+                add(&mut proxy, held, None, 10);
+                let response = proxy.notify(WorkerRequest {
+                    id: "remove-listener-signal-test".to_owned(),
+                    content: RequestType::RemoveListener(RemoveListener {
+                        interface: None,
+                        address: if named_held { held } else { unheld },
+                        proxy: ListenerType::Https.into(),
+                    })
+                    .into(),
+                });
+                *sink.lock().expect("the answer slot must not be poisoned") = Some(response);
+            });
+            let response = answer
+                .lock()
+                .expect("the answer slot must not be poisoned")
+                .take()
+                .expect("the notify call must have produced an answer");
+            (response, output)
+        }
+
+        let ok = sozu_command::proto::command::ResponseStatus::Ok as i32;
+
+        let (matched, matched_log) = remove_through_notify(true);
+        assert_eq!(
+            matched.status, ok,
+            "control: removing a held listener must succeed: {}",
+            matched.message
+        );
+        assert!(
+            matched_log.contains(ORDER_RECEIVED),
+            "control: the log capture must see the order arrive: {matched_log:?}"
+        );
+        assert!(
+            !matched_log.contains(NOTHING_REMOVED),
+            "control: removing a held listener must not log that nothing was removed: {matched_log}"
+        );
+
+        let (unmatched, unmatched_log) = remove_through_notify(false);
+        assert!(
+            unmatched_log.contains(ORDER_RECEIVED),
+            "control: the log capture must see the order arrive: {unmatched_log:?}"
+        );
+        assert!(
+            unmatched.status != ok || unmatched_log.contains(NOTHING_REMOVED),
+            "removing an address the proxy never held answered Ok and logged nothing: \
+             status={}, message={:?}, log={unmatched_log:?}",
+            unmatched.status,
+            unmatched.message
         );
     }
 }

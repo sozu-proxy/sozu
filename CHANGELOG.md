@@ -140,6 +140,8 @@
 
 - An HTTP or HTTPS listener added after a cluster now serves that cluster's answer templates. A new listener starts with an empty per-cluster registry and only the routes, tags and certificates of a sibling were copied onto it, so a listener added at runtime (including the documented remove-then-add used to change a bind-only field) answered with the listener default instead of the cluster's page until the cluster was added again or the worker restarted. `HttpProxy::add_listener` and `HttpsProxy::add_listener` now install the answer templates of every cluster the proxy already holds, the legacy `answer_503` included; a cluster whose templates do not compile, which a proxy with no listener accepts without compiling them, is logged and left to the listener's own pages rather than refusing the listener.
 
+- A `RemoveListener` naming an address the HTTP or HTTPS worker holds no listener at now leaves the `no HTTP listener to remove` / `no HTTPS listener to remove` line in the worker log. The branch meant to write it tested `!self.listeners.len() < len`, which parses as `(!after) < before`, the bitwise complement of a small `usize` against a small `usize`, so it was false for every reachable map size and the removal of an address the worker never held, or of one a draining worker had already emptied, was indistinguishable from one that worked. The order is still answered `ok`, as before: the TCP and UDP proxies answer an error, and making these two do the same is a separate decision, since one worker's error makes the main process answer the whole order as failed (`HttpProxy::remove_listener`, `HttpsProxy::remove_listener`).
+
 ## 2.3.6 - 2026-11-18
 
 ### Security
