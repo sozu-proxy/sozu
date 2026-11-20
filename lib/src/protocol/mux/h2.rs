@@ -1886,16 +1886,29 @@ fn decode_discarded_field_block(
 }
 
 impl ConnectionH2 {
+    /// Whether the client of a draining frontend can receive nothing more.
+    ///
+    /// A hang-up is `WRITE_CLOSED` (mio's `is_write_closed`: `EPOLLHUP` or
+    /// `EPOLLERR`) or `ERROR`, as `Mux::frontend_exchange_in_flight` reads
+    /// it. `HUP` alone is not one: `Ready::from(&mio::event::Event)` raises
+    /// it for a read-closed socket too, so a TCP half-close (the client's
+    /// FIN, `EPOLLRDHUP`) is `HUP` without `WRITE_CLOSED` — a client that
+    /// stopped sending and still reads. Taking that for a hang-up would drop
+    /// the output queue (the adopted tail of a frame a short write cut
+    /// included), the park, the control queues, and the TLS records still to
+    /// flush, for a client the Mux keeps serving (#1779). `WRITE_CLOSED`, not
+    /// `ERROR` alone, is what tells a reset whose error a `read` or `write`
+    /// already consumed (`EPOLLHUP` without `EPOLLERR`) from a half-close.
     fn frontend_hung_up_while_draining(&self) -> bool {
         matches!(self.position, Position::Server)
             && self.drain.draining()
-            && (self.readiness.event.is_hup() || self.readiness.event.is_error())
+            && (self.readiness.event.is_write_closed() || self.readiness.event.is_error())
     }
 
     /// Once the final GOAWAY has been queued and all streams/control frames are
-    /// gone, a peer-side HUP/ERR means any remaining rustls backlog is no
-    /// longer deliverable. Waiting on `socket_wants_write()` in that state can
-    /// deadlock shutdown forever because GOAWAY disables further frame reads.
+    /// gone, a peer-side hang-up (WRITE_CLOSED/ERR, never a half-close's HUP
+    /// alone) means any remaining rustls backlog is no longer deliverable.
+    /// Waiting on `socket_wants_write()` then can deadlock: GOAWAY stops reads.
     fn peer_gone_after_final_goaway(&self) -> bool {
         self.frontend_hung_up_while_draining()
             && matches!(self.state, H2State::GoAway | H2State::Error)
@@ -4682,11 +4695,13 @@ impl ConnectionH2 {
     /// serialise, and whatever was already queued — an ACK, the rest of a
     /// stream frame a partial write cut — stays ahead of what this walk adds.
     pub fn flush_pending_control_frames(&mut self) -> H2ControlFlushTarget {
-        // The peer hung up while the connection drains: nothing queued for it
-        // will be read. Only OUTPUT is dropped. `zero` is input only, and a
-        // `Ready::HUP` can be a TCP half-close with frames the peer already
-        // sent still unread (review of e1c3c2fb, B2), which the shutdown
-        // drive's forced `readable()` goes on to read.
+        // The peer hung up while the connection drains (`WRITE_CLOSED` or
+        // `ERROR`, not a `HUP` alone, which a TCP half-close raises while the
+        // client still reads): nothing queued for it will be read. Only
+        // OUTPUT is dropped. `zero` is input only, and the hang-up can still
+        // follow frames the peer already sent and left unread (review of
+        // e1c3c2fb, B2), which the shutdown drive's forced `readable()` goes
+        // on to read.
         if self.frontend_hung_up_while_draining() {
             self.stream_table.set_expect_write(None);
             self.clear_output();
@@ -13326,6 +13341,61 @@ pub(super) mod tests {
                 (6, parser::FLAG_ACK, 0, b"pingpon2".to_vec()),
             ]),
             "the SETTINGS ACK then the PING ACK must follow the whole DATA frame"
+        );
+    }
+
+    /// A client that half-closes its write side while the frontend drains
+    /// still reads, and the frame a short write cut must still reach it
+    /// whole (#1779: a half-closed client is served).
+    ///
+    /// `Ready::from(&mio::event::Event)` raises `HUP` for a read-closed
+    /// socket and `WRITE_CLOSED` only for a write-closed one
+    /// (`command/src/ready.rs`), so a TCP half-close is `HUP` without
+    /// `WRITE_CLOSED`: the peer sent its FIN and keeps reading. The socket
+    /// takes 20 bytes of a 41-byte DATA frame, the connection starts to
+    /// drain (soft stop), and that `HUP` lands. The 21 bytes still owed are
+    /// the adopted tail of the cut frame in the ordered output queue
+    /// (#1604), and the stream is parked in `expect_write`. A hang-up is
+    /// `WRITE_CLOSED` or `ERROR`, as `Mux::frontend_exchange_in_flight`
+    /// (`lib/src/protocol/mux/mod.rs`) reads it;
+    /// `ConnectionH2::frontend_hung_up_while_draining` reads `is_hup()`, so
+    /// `ConnectionH2::flush_pending_control_frames` drops the tail and the
+    /// park, and the peer reads 20 bytes of a frame announcing 32 payload
+    /// bytes.
+    ///
+    /// TO SEE THIS RED: run it unmodified on a tree where
+    /// `ConnectionH2::frontend_hung_up_while_draining` still reads
+    /// `self.readiness.event.is_hup() || self.readiness.event.is_error()`.
+    /// It fails on `a half-closed client must still read the whole frame the
+    /// short write cut`, its left side being `Err("frame type 0x0 announces
+    /// 32 bytes, 11 remain")`. It goes green once that predicate reads
+    /// `self.readiness.event.is_write_closed() || self.readiness.event.is_error()`.
+    #[test]
+    fn a_half_closed_client_still_receives_the_frame_a_short_write_cut_while_draining() {
+        let (_pool, mut connection, mut context, mut router, gid) = park_half_written_frame();
+        // A stream being answered is linked, as the neighbouring tests set it.
+        context.streams[gid].state = StreamState::Linked(mio::Token(1));
+        connection.core.drain.__test_set_draining();
+
+        // The client's FIN: HUP, no WRITE_CLOSED, no ERROR.
+        connection.core.readiness.event.insert(Ready::HUP);
+        assert!(
+            !connection.core.readiness.event.is_write_closed()
+                && !connection.core.readiness.event.is_error(),
+            "premise: a half-close is HUP alone"
+        );
+
+        drive_unthrottled(&mut connection, &mut context, &mut router);
+
+        assert_eq!(
+            peer_frames(&connection.socket.wire),
+            Ok(vec![(
+                0,
+                0,
+                REGISTERED_STREAM_ID,
+                HALF_WRITTEN_PAYLOAD.to_vec()
+            )]),
+            "a half-closed client must still read the whole frame the short write cut"
         );
     }
 
@@ -22263,21 +22333,29 @@ pub(super) mod tests {
         );
 
         // Exactly #1423's trigger: the connection is draining AND the
-        // frontend readiness reports HUP, landing squarely mid-reassembly.
-        // A peer can legitimately produce this by sending TCP FIN together
-        // with (or shortly after) the last CONTINUATION frame it manages to
-        // get out, observed by edge-triggered epoll as one combined event.
+        // frontend readiness reports a hang-up (HUP and WRITE_CLOSED; a
+        // half-close's HUP alone no longer reaches this stage), landing
+        // squarely mid-reassembly. A hang-up can still leave bytes the peer
+        // sent before it, its last CONTINUATION frame, unread in the kernel.
         connection.core.drain.__test_set_draining();
-        connection.core.readiness.event.insert(Ready::HUP);
+        connection
+            .core
+            .readiness
+            .event
+            .insert(Ready::HUP | Ready::WRITE_CLOSED);
 
-        // `flush_pending_control_frames`'s first, HUP-gated stage fires
+        // `flush_pending_control_frames`'s first, hang-up-gated stage fires
         // here.
         connection.writable(&mut context, EndpointClient(&mut router));
 
         // Real epoll delivers HUP once; un-signal it so the reads below
         // reflect the peer's normal traffic rather than a second synthetic
         // HUP this test injected by hand.
-        connection.core.readiness.event.remove(Ready::HUP);
+        connection
+            .core
+            .readiness
+            .event
+            .remove(Ready::HUP | Ready::WRITE_CLOSED);
 
         // Now the CONTINUATION frame completing the block arrives — still
         // fully deliverable, exactly as it would be if the peer's FIN and
@@ -22851,13 +22929,21 @@ pub(super) mod tests {
         );
 
         // Exactly B2's trigger: the connection is draining AND the frontend
-        // readiness reports HUP, landing squarely mid-payload-read — the
-        // shape a TCP half-close produces (mio's `is_read_closed()` can be
-        // true with data the peer already sent still unread).
+        // readiness reports a hang-up (HUP and WRITE_CLOSED), landing squarely
+        // mid-payload-read. A half-close's HUP alone no longer reaches this
+        // stage, but a hang-up can still leave data the peer sent unread.
         connection.core.drain.__test_set_draining();
-        connection.core.readiness.event.insert(Ready::HUP);
+        connection
+            .core
+            .readiness
+            .event
+            .insert(Ready::HUP | Ready::WRITE_CLOSED);
         connection.writable(&mut context, EndpointClient(&mut router));
-        connection.core.readiness.event.remove(Ready::HUP);
+        connection
+            .core
+            .readiness
+            .event
+            .remove(Ready::HUP | Ready::WRITE_CLOSED);
 
         // Now the second TCP segment, completing the CONTINUATION frame's
         // payload, arrives.
@@ -23599,9 +23685,17 @@ pub(super) mod tests {
                 }
                 Interleave::HupWhileDraining => {
                     connection.core.drain.__test_set_draining();
-                    connection.core.readiness.event.insert(Ready::HUP);
+                    connection
+                        .core
+                        .readiness
+                        .event
+                        .insert(Ready::HUP | Ready::WRITE_CLOSED);
                     connection.writable(context, EndpointClient(router));
-                    connection.core.readiness.event.remove(Ready::HUP);
+                    connection
+                        .core
+                        .readiness
+                        .event
+                        .remove(Ready::HUP | Ready::WRITE_CLOSED);
                 }
                 Interleave::GracefulGoaway => {
                     if !connection.core.drain.draining() {

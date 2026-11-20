@@ -1775,7 +1775,13 @@ Two GOAWAY frames in `ConnectionH2::graceful_goaway` (`h2.rs`):
    budget below instead of the error one.
 
 `peer_gone_after_final_goaway` (`h2.rs`) guards against deadlock on a
-peer-side HUP after the final GOAWAY.
+peer-side hang-up after the final GOAWAY. A hang-up is `WRITE_CLOSED`
+(`EPOLLHUP`, or `EPOLLERR`) or `ERROR` (`ConnectionH2::frontend_hung_up_while_draining`),
+the two bits `Mux::frontend_exchange_in_flight` reads (§2.4), not the `HUP`
+alone of a client's half-close: that client still reads, so the TLS records
+still buffered are flushed, a close after the final GOAWAY lingers (the client's
+EOF is already there, so the drain ends at once), and a draining connection
+keeps its output queue, its parked stream and its control frames for it.
 
 **The close after a final GOAWAY lingers.** The client may still be
 sending frames it wrote before it read the GOAWAY (RFC 9113 §6.8 lets it), and

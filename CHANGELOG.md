@@ -138,6 +138,10 @@
 <!-- changelog-slot:h2-error-goaway-open-stream-close -->
 
 - An HTTP/2 connection that sent an error `GOAWAY` now closes without waiting for a backend byte or a timer when the stream a stalled write had parked is still open. The stream is resumed by the next write pass, which finishes the parked frame and the `GOAWAY` behind it; when the stream was still waiting on its backend, that pass withdrew write readiness, and the connection reads nothing after its `GOAWAY`, so nothing brought it back to the close. It stayed open, with its streams and its backend connections, until the backend answered or `front_timeout` or `back_timeout` elapsed, whereas an error `GOAWAY` with no parked stream closes on the next pass. The write pass now keeps write readiness in that state, the connection lingers on the error budget (at most 1 s and 256 KiB) and releases its streams and backend connections when the linger starts.
+
+<!-- changelog-slot:h2-half-close-while-draining -->
+
+- A client that half-closes its side of an HTTP/2 connection while the frontend drains (a soft stop, the client's own `GOAWAY`, or after Sōzu's final `GOAWAY`) no longer loses what Sōzu still owed it. A TCP half-close (the client's FIN, `EPOLLRDHUP`) raises the same `HUP` readiness bit as a hang-up, and the draining connection took it for one: it dropped its queued output, including the rest of a frame a short write had cut, the parked stream, the pending `WINDOW_UPDATE` and `RST_STREAM` frames, and, after the final `GOAWAY`, it closed without flushing the TLS records still buffered. The client then read a truncated frame, or no `GOAWAY`, although it kept reading until the answer arrived and the session was keeping it open to serve it. A connection now treats only a write-closed (`EPOLLHUP`) or error (`EPOLLERR`) event as a hang-up while draining, the same test the session applies when it decides whether an exchange is still in flight, so a half-closed client is served to the end.
 <!-- changelog-slot:listener-removal -->
 
 ### Fixed
