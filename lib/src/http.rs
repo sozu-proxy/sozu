@@ -176,7 +176,6 @@ impl HttpSession {
                 Ready::EMPTY,
             ))
         } else {
-            gauge_add!(names::protocol::HTTP, 1);
             // The address `accept(2)` returned. On an expect-proxy listener
             // the other branch ignores it: the session address comes from the
             // PROXY header at `upgrade_expect`.
@@ -200,6 +199,10 @@ impl HttpSession {
             context
                 .create_stream(request_id, 1 << 16)
                 .ok_or(AcceptError::BufferCapacityReached)?;
+            // Raised only once nothing can fail any more: a refused accept
+            // builds no `HttpSession`, so no `close` would ever take the gauge
+            // back down.
+            gauge_add!(names::protocol::HTTP, 1);
             HttpStateMachine::Mux(Mux {
                 configured_frontend_timeout,
                 frontend_token: token,
@@ -1248,6 +1251,27 @@ impl HttpProxy {
             http_listener.fronts = sibling.fronts.clone();
             http_listener.tags = sibling.tags.clone();
         }
+        // A cluster's answer overrides live in each listener's own registry,
+        // which starts empty: give this one the overrides of every cluster
+        // the proxy already holds, as if it had been there when they arrived.
+        // A cluster that arrived while the proxy had no listener was compiled
+        // nowhere, so its templates may not compile: this listener then serves
+        // its own pages for it rather than being refused.
+        for cluster in self.clusters.values() {
+            if let Err((name, error)) = http_listener
+                .answers
+                .borrow_mut()
+                .replace_cluster_answers(&cluster.cluster_id, &cluster.answers)
+            {
+                error!(
+                    "{} cluster {} keeps the listener's answers on {}: {}",
+                    log_module_context!(),
+                    cluster.cluster_id,
+                    http_listener.address,
+                    ListenerError::TemplateParse(name, error)
+                );
+            }
+        }
         match self.listeners.entry(token) {
             Entry::Vacant(entry) => {
                 entry.insert(Rc::new(RefCell::new(http_listener)));
@@ -1305,7 +1329,7 @@ impl HttpProxy {
         self.listeners
             .retain(|_, l| !l.borrow().is(&remove_address));
 
-        if !self.listeners.len() < len {
+        if self.listeners.len() == len {
             info!(
                 "{} no HTTP listener to remove at {}",
                 log_module_context!(),
@@ -1455,22 +1479,27 @@ impl HttpProxy {
 
     pub fn add_cluster(&mut self, mut cluster: Cluster) -> Result<(), ProxyError> {
         // Reconcile the legacy single-status `answer_503` field with the
-        // new map. The new map wins on collision.
-        let mut overrides = cluster.answers.clone();
+        // new map. The new map wins on collision. The stored cluster keeps
+        // the result, which is what `add_listener` replays onto a listener
+        // added later.
         if let Some(answer_503) = cluster.answer_503.take() {
-            overrides.entry("503".to_owned()).or_insert(answer_503);
+            cluster
+                .answers
+                .entry("503".to_owned())
+                .or_insert(answer_503);
         }
-        if !overrides.is_empty() {
-            for listener in self.listeners.values() {
-                listener
-                    .borrow()
-                    .answers
-                    .borrow_mut()
-                    .add_cluster_answers(&cluster.cluster_id, &overrides)
-                    .map_err(|(name, error)| {
-                        ProxyError::AddCluster(ListenerError::TemplateParse(name, error))
-                    })?;
-            }
+        // An upsert replaces the cluster's overrides, as the main process
+        // replaces the cluster: a status the new map no longer names, or an
+        // empty map, must stop serving the old page.
+        for listener in self.listeners.values() {
+            listener
+                .borrow()
+                .answers
+                .borrow_mut()
+                .replace_cluster_answers(&cluster.cluster_id, &cluster.answers)
+                .map_err(|(name, error)| {
+                    ProxyError::AddCluster(ListenerError::TemplateParse(name, error))
+                })?;
         }
         self.clusters
             .insert(cluster.cluster_id.as_str().into(), cluster);
@@ -3371,6 +3400,115 @@ mod tests {
         );
         drop(parts.event_loop);
     }
+
+    /// The current process-local value of the gauge `name`, treating an
+    /// absent key as 0. `METRICS` is a `thread_local!` and libtest gives each
+    /// test its own thread, so this reads only what the test itself emitted.
+    fn local_gauge(name: &str) -> i64 {
+        use sozu_command::proto::command::filtered_metrics::Inner;
+        crate::metrics::METRICS.with(|metrics| {
+            metrics
+                .borrow_mut()
+                .dump_local_proxy_metrics()
+                .get(name)
+                .and_then(|fm| fm.inner.as_ref())
+                .and_then(|inner| match inner {
+                    Inner::Gauge(v) => Some(*v as i64),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        })
+    }
+
+    /// An accept refused because the buffer pool cannot back the first stream
+    /// builds no `HttpSession`, so nothing ever runs the `close` that would
+    /// take `protocol.http` back down. `HttpSession::new` raised the gauge
+    /// before the fallible `create_stream`, so every such refusal leaks one
+    /// unit of it permanently, and it happens exactly under buffer pressure,
+    /// when an operator reads the gauge.
+    ///
+    /// The pool holds a single buffer and a stream needs two (a request and a
+    /// response buffer), so `create_stream` fails with certainty and the
+    /// accept is refused with `BufferCapacityReached`.
+    ///
+    /// To SEE THIS RED: in `HttpSession::new`, plain branch, move
+    /// `gauge_add!(names::protocol::HTTP, 1)` back above the
+    /// `context.create_stream(..).ok_or(AcceptError::BufferCapacityReached)?`.
+    /// The last assertion then fails with "an accept refused for lack of
+    /// buffers builds no session, so it must not leave `protocol.http`
+    /// raised".
+    #[test]
+    fn an_accept_refused_for_buffers_leaves_the_http_gauge_untouched() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, crate::testing::provide_port());
+        let parts = crate::testing::prebuild_server(1, 16_384, false)
+            .expect("test server parts must build");
+        let sessions = parts.sessions.clone();
+        let listener_token = {
+            let mut sessions = sessions.borrow_mut();
+            let entry = sessions.slab.vacant_entry();
+            let key = entry.key();
+            entry.insert(Rc::new(RefCell::new(crate::server::ListenSession {
+                protocol: Protocol::HTTPListen,
+            })));
+            Token(key)
+        };
+        let mut proxy = HttpProxy::new(parts.registry, parts.sessions, parts.pool, parts.backends);
+        proxy
+            .add_listener(
+                ListenerBuilder::new_http(address)
+                    .to_http(None)
+                    .expect("test listener config must build"),
+                listener_token,
+            )
+            .expect("test listener must register");
+        let proxy = Rc::new(RefCell::new(proxy));
+
+        let peer_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind the test peer listener");
+        let _client = TcpStream::connect(
+            peer_listener
+                .local_addr()
+                .expect("the test peer listener has an address"),
+        )
+        .expect("connect the test client");
+        let (accepted, peer) = peer_listener.accept().expect("accept the test client");
+        accepted
+            .set_nonblocking(true)
+            .expect("the front socket must go non-blocking");
+
+        assert_eq!(
+            local_gauge(names::protocol::HTTP),
+            0,
+            "precondition: no HTTP session has been counted on this thread"
+        );
+        let slab_len_before = sessions.borrow().slab.len();
+
+        let created = proxy.borrow_mut().create_session(
+            mio::net::TcpStream::from_std(accepted),
+            peer,
+            ListenToken(listener_token.0),
+            Duration::ZERO,
+            proxy.clone(),
+        );
+
+        assert_eq!(
+            created,
+            Err(AcceptError::BufferCapacityReached),
+            "precondition: the single-buffer pool must refuse the accept for lack of buffers"
+        );
+        assert_eq!(
+            sessions.borrow().slab.len(),
+            slab_len_before,
+            "precondition: a refused accept must leave no session in the slab"
+        );
+        assert_eq!(
+            local_gauge(names::protocol::HTTP),
+            0,
+            "an accept refused for lack of buffers builds no session, so it must not \
+             leave `protocol.http` raised"
+        );
+        drop(parts.event_loop);
+    }
 }
 
 #[cfg(test)]
@@ -3532,6 +3670,341 @@ mod listener_sibling_tests {
         assert!(
             !routes(&proxy, 1),
             "the failure on one listener must not spare its sibling's route"
+        );
+    }
+
+    /// One template per status, each compiling on its own.
+    fn answers(statuses: &[&str]) -> BTreeMap<String, String> {
+        statuses
+            .iter()
+            .map(|status| {
+                (
+                    (*status).to_owned(),
+                    format!("HTTP/1.1 {status} Test\r\nContent-Length: 0\r\n\r\n"),
+                )
+            })
+            .collect()
+    }
+
+    fn upsert(proxy: &mut HttpProxy, cluster_id: &str, statuses: &[&str]) {
+        proxy
+            .add_cluster(Cluster {
+                cluster_id: cluster_id.to_owned(),
+                answers: answers(statuses),
+                ..Default::default()
+            })
+            .expect("the cluster must be accepted");
+    }
+
+    /// The statuses the listener holds a per-cluster override for, sorted.
+    fn override_statuses(proxy: &HttpProxy, token: usize, cluster_id: &str) -> Vec<String> {
+        proxy.listeners[&Token(token)]
+            .borrow()
+            .answers
+            .borrow()
+            .cluster_answers
+            .get(cluster_id)
+            .map(|overrides| overrides.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// A listener added after a cluster serves that cluster's answer
+    /// overrides, like the listener that was there when the cluster arrived.
+    /// A new listener starts with an empty per-cluster registry and
+    /// `add_listener` copies only the routes and tags of a sibling, so a
+    /// per-cluster page silently falls back to the listener default on it
+    /// until the cluster is added again or the worker restarts.
+    ///
+    /// To SEE THIS RED: in `HttpProxy::add_listener`, delete the
+    /// `for cluster in self.clusters.values()` loop that calls
+    /// `replace_cluster_answers` on the new listener's registry. The last
+    /// assertion then fails with "the listener added after the cluster must
+    /// hold its answer overrides too" (`left: []`, `right: ["503"]`).
+    #[test]
+    fn a_listener_added_after_a_cluster_receives_its_answer_overrides() {
+        let mut proxy = proxy();
+        add(
+            &mut proxy,
+            SocketAddress::new_v4(0, 0, 0, 0, provide_port()),
+            None,
+            0,
+        );
+        upsert(&mut proxy, "cluster-a", &["503"]);
+        add(
+            &mut proxy,
+            SocketAddress::new_v4(0, 0, 0, 0, provide_port()),
+            None,
+            1,
+        );
+
+        assert_eq!(
+            override_statuses(&proxy, 0, "cluster-a"),
+            ["503"],
+            "precondition: the listener present when the cluster arrived holds its override"
+        );
+        assert_eq!(
+            override_statuses(&proxy, 1, "cluster-a"),
+            ["503"],
+            "the listener added after the cluster must hold its answer overrides too"
+        );
+    }
+
+    /// An `AddCluster` upsert replaces the cluster's answer overrides, as the
+    /// main process replaces the cluster. `add_cluster` skips the listener
+    /// registries when the new map is empty and otherwise extends the existing
+    /// entry, so an override the operator dropped or shrank away keeps being
+    /// served until `RemoveCluster`, while a worker rebuilt from the main
+    /// state serves the default.
+    ///
+    /// To SEE THIS RED: in `HttpProxy::add_cluster`, call
+    /// `add_cluster_answers` instead of `replace_cluster_answers` on each
+    /// listener's registry. The assertion then fails with "an upsert must
+    /// replace the overrides, not merge into them", naming `dropped` (still
+    /// serving "503") and `shrunk` (still serving "404" and "503").
+    #[test]
+    fn an_add_cluster_upsert_replaces_the_cluster_answer_overrides() {
+        let mut proxy = proxy();
+        add(
+            &mut proxy,
+            SocketAddress::new_v4(0, 0, 0, 0, provide_port()),
+            None,
+            0,
+        );
+        upsert(&mut proxy, "dropped", &["503"]);
+        upsert(&mut proxy, "shrunk", &["404", "503"]);
+        assert_eq!(override_statuses(&proxy, 0, "dropped"), ["503"]);
+        assert_eq!(override_statuses(&proxy, 0, "shrunk"), ["404", "503"]);
+
+        upsert(&mut proxy, "dropped", &[]);
+        upsert(&mut proxy, "shrunk", &["503"]);
+
+        assert!(
+            proxy.clusters["dropped"].answers.is_empty()
+                && proxy.clusters["shrunk"].answers.len() == 1,
+            "precondition: the proxy itself recorded the replacement"
+        );
+        let mut stale = Vec::new();
+        let dropped = override_statuses(&proxy, 0, "dropped");
+        if !dropped.is_empty() {
+            stale.push(format!("`dropped` still serves {dropped:?}, expected none"));
+        }
+        let shrunk = override_statuses(&proxy, 0, "shrunk");
+        if shrunk != ["503"] {
+            stale.push(format!(
+                "`shrunk` still serves {shrunk:?}, expected [\"503\"]"
+            ));
+        }
+        assert!(
+            stale.is_empty(),
+            "an upsert must replace the overrides, not merge into them: {stale:?}"
+        );
+    }
+
+    /// The legacy `answer_503` field is folded into the cluster's overrides
+    /// and taken out of the field, so a listener added later can only get it
+    /// from what the proxy stored beside the cluster.
+    #[test]
+    fn a_listener_added_after_a_cluster_receives_its_legacy_answer_503() {
+        let mut proxy = proxy();
+        add(
+            &mut proxy,
+            SocketAddress::new_v4(0, 0, 0, 0, provide_port()),
+            None,
+            0,
+        );
+        proxy
+            .add_cluster(Cluster {
+                cluster_id: "legacy".to_owned(),
+                answer_503: Some(answers(&["503"])["503"].clone()),
+                ..Default::default()
+            })
+            .expect("the cluster must be accepted");
+        add(
+            &mut proxy,
+            SocketAddress::new_v4(0, 0, 0, 0, provide_port()),
+            None,
+            1,
+        );
+
+        assert_eq!(
+            override_statuses(&proxy, 0, "legacy"),
+            ["503"],
+            "precondition: the listener present when the cluster arrived holds the legacy 503"
+        );
+        assert_eq!(
+            override_statuses(&proxy, 1, "legacy"),
+            ["503"],
+            "the listener added after the cluster must hold the legacy 503 too"
+        );
+    }
+
+    /// An upsert whose templates do not compile is refused before any
+    /// registry changes: the overrides already serving, and the cluster the
+    /// proxy recorded, stay as they were.
+    #[test]
+    fn a_refused_upsert_keeps_the_cluster_answer_overrides() {
+        let mut proxy = proxy();
+        add(
+            &mut proxy,
+            SocketAddress::new_v4(0, 0, 0, 0, provide_port()),
+            None,
+            0,
+        );
+        upsert(&mut proxy, "kept", &["404", "503"]);
+
+        let refused = proxy.add_cluster(Cluster {
+            cluster_id: "kept".to_owned(),
+            answers: BTreeMap::from([("503".to_owned(), "not a valid http response".to_owned())]),
+            ..Default::default()
+        });
+
+        assert!(
+            matches!(
+                refused,
+                Err(ProxyError::AddCluster(ListenerError::TemplateParse(..)))
+            ),
+            "an unparseable template must be refused, got {refused:?}"
+        );
+        assert_eq!(
+            override_statuses(&proxy, 0, "kept"),
+            ["404", "503"],
+            "a refused upsert must leave the serving overrides untouched"
+        );
+        assert_eq!(
+            proxy.clusters["kept"].answers.len(),
+            2,
+            "a refused upsert must leave the recorded cluster untouched"
+        );
+    }
+
+    /// A proxy with no listener compiles no template when a cluster arrives,
+    /// so it can hold a cluster whose templates do not compile (one persisted
+    /// by an older Sōzu, or sent straight to a worker). A listener added later
+    /// must still be added: it serves its own page for that cluster, as every
+    /// listener did before the overrides were replayed, and the other
+    /// clusters' overrides still reach it.
+    #[test]
+    fn a_cluster_whose_answers_do_not_compile_does_not_refuse_a_later_listener() {
+        let mut proxy = proxy();
+        proxy
+            .add_cluster(Cluster {
+                cluster_id: "unparseable".to_owned(),
+                answers: BTreeMap::from([(
+                    "503".to_owned(),
+                    "not a valid http response".to_owned(),
+                )]),
+                ..Default::default()
+            })
+            .expect("with no listener, no template is compiled and the cluster is kept");
+        upsert(&mut proxy, "valid", &["503"]);
+
+        let added = proxy.add_listener(
+            ListenerBuilder::new_http(SocketAddress::new_v4(0, 0, 0, 0, provide_port()))
+                .to_http(None)
+                .expect("could not build the listener config"),
+            Token(0),
+        );
+
+        assert!(
+            matches!(added, Ok(Token(0))),
+            "a cluster's unparseable template must not refuse the listener, got {added:?}"
+        );
+        assert!(
+            override_statuses(&proxy, 0, "unparseable").is_empty(),
+            "the unparseable cluster must fall back to the listener's own page"
+        );
+        assert_eq!(
+            override_statuses(&proxy, 0, "valid"),
+            ["503"],
+            "the other clusters' overrides must still reach the new listener"
+        );
+    }
+
+    /// What an operator sees when a `RemoveListener` is answered. The branch
+    /// meant to say "no HTTP listener to remove" tests
+    /// `!self.listeners.len() < len`, which parses as `(!after) < before`, the
+    /// bitwise complement of a small `usize` against a small `usize`, so it is
+    /// false for every reachable map size. An order naming an address the proxy
+    /// does not hold therefore answers `Ok` and logs nothing, exactly like a
+    /// removal that worked, and nobody learns that nothing was removed (the
+    /// TCP and UDP proxies answer an error for the same order). The order
+    /// must either be refused or leave the "no HTTP listener to remove" line;
+    /// the matched removal beside it is the control that the line is not simply
+    /// always written and that a removal that worked still answers `Ok`.
+    ///
+    /// To SEE THIS RED: in `HttpProxy::remove_listener`, replace the test
+    /// `if self.listeners.len() == len` with `if !self.listeners.len() < len`.
+    /// The final assertion then fails with "removing an address the proxy never
+    /// held answered Ok and logged nothing".
+    #[test]
+    fn removing_a_listener_the_proxy_does_not_hold_is_not_answered_ok_in_silence() {
+        use std::sync::{Arc, Mutex};
+
+        const NOTHING_REMOVED: &str = "no HTTP listener to remove";
+        // The arm of `notify` that receives the order logs this at `debug`: it
+        // proves the capture works, so an absent "nothing removed" line means
+        // the branch stayed silent and not that the capture returned nothing.
+        const ORDER_RECEIVED: &str = "removing HTTP listener at address";
+
+        /// Builds a proxy holding one listener, sends it a `RemoveListener`
+        /// through `notify` for the held address when `named_held`, or for an
+        /// address it never held otherwise, and returns the answer with the
+        /// log lines the order produced.
+        fn remove_through_notify(named_held: bool) -> (WorkerResponse, String) {
+            let held = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+            let unheld = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+            let answer = Arc::new(Mutex::new(None));
+            let sink = answer.clone();
+            let output = crate::capture_test_logs_at_level("debug", move || {
+                let mut proxy = proxy();
+                add(&mut proxy, held, None, 10);
+                let response = proxy.notify(WorkerRequest {
+                    id: "remove-listener-signal-test".to_owned(),
+                    content: RequestType::RemoveListener(RemoveListener {
+                        interface: None,
+                        address: if named_held { held } else { unheld },
+                        proxy: ListenerType::Http.into(),
+                    })
+                    .into(),
+                });
+                *sink.lock().expect("the answer slot must not be poisoned") = Some(response);
+            });
+            let response = answer
+                .lock()
+                .expect("the answer slot must not be poisoned")
+                .take()
+                .expect("the notify call must have produced an answer");
+            (response, output)
+        }
+
+        let ok = sozu_command::proto::command::ResponseStatus::Ok as i32;
+
+        let (matched, matched_log) = remove_through_notify(true);
+        assert_eq!(
+            matched.status, ok,
+            "control: removing a held listener must succeed: {}",
+            matched.message
+        );
+        assert!(
+            matched_log.contains(ORDER_RECEIVED),
+            "control: the log capture must see the order arrive: {matched_log:?}"
+        );
+        assert!(
+            !matched_log.contains(NOTHING_REMOVED),
+            "control: removing a held listener must not log that nothing was removed: {matched_log}"
+        );
+
+        let (unmatched, unmatched_log) = remove_through_notify(false);
+        assert!(
+            unmatched_log.contains(ORDER_RECEIVED),
+            "control: the log capture must see the order arrive: {unmatched_log:?}"
+        );
+        assert!(
+            unmatched.status != ok || unmatched_log.contains(NOTHING_REMOVED),
+            "removing an address the proxy never held answered Ok and logged nothing: \
+             status={}, message={:?}, log={unmatched_log:?}",
+            unmatched.status,
+            unmatched.message
         );
     }
 }

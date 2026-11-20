@@ -212,6 +212,12 @@ routes. `Server::notify_proxys` drops those entries in the same step that
 releases the slot and purges `Server::accept_ready`; their clients see the
 connection close.
 
+A `remove-listener` that matches no listener of the
+proxy (an address it never held, or one a draining worker already emptied) is
+still answered `ok`, leaves the proxy's listeners as they are, and logs
+`no HTTP listener to remove` / `no HTTPS listener to remove` at `info`; the TCP
+and UDP proxies answer an error instead.
+
 A forwarding session occupies one slab entry per socket: the frontend token,
 plus one token per backend connection. The same session is reachable through
 several keys.

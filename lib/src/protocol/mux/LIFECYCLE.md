@@ -465,12 +465,23 @@ custom pages mid-response.
 
 That publication boundary is the listener reload and nothing else.
 `HttpProxy::add_cluster` / `HttpProxy::remove_cluster` (`lib/src/http.rs`) and
-their HTTPS counterparts still reach `HttpAnswers::add_cluster_answers` /
+their HTTPS counterparts still reach `HttpAnswers::replace_cluster_answers` /
 `HttpAnswers::remove_cluster_answers` through a `borrow_mut` on whatever
 registry the listener currently holds, so a cluster-level answer added or
 removed without a listener reload is visible to requests already in flight.
 Closing that too means publishing on those paths as well; it is not what
 Question 7 asked and is left as it was.
+
+`replace_cluster_answers` is the `AddCluster` upsert: it makes the cluster's new
+map the whole set, so a status the upsert no longer names (or an empty map)
+stops being overridden, and it compiles every template before it touches the
+registry. `HttpProxy::add_listener` / `HttpsProxy::add_listener` replay the same
+call for every cluster the proxy already holds onto the new listener's own,
+empty registry; the stored cluster carries the legacy `answer_503` folded into
+its `answers` map for that purpose. A cluster accepted while the proxy had no
+listener was compiled nowhere: if its templates do not compile, the replay logs
+it and the new listener serves its own pages for that cluster instead of being
+refused.
 
 
 **Captured once per connection, not per request**, because no patch can change

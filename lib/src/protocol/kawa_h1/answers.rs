@@ -513,7 +513,8 @@ pub struct HttpAnswers {
     /// cloned — it owns a `kawa::Kawa`, which has no `Clone` — so the shared
     /// ownership has to sit here. Nothing ever mutates a template through the
     /// handle: `Template::fill` takes `&self`, and
-    /// [`HttpAnswers::add_cluster_answers`] replaces entries rather than
+    /// [`HttpAnswers::add_cluster_answers`] and
+    /// [`HttpAnswers::replace_cluster_answers`] replace entries rather than
     /// editing them.
     pub cluster_answers: HashMap<ClusterId, BTreeMap<String, Rc<Template>>>,
     pub listener_answers: BTreeMap<String, Template>,
@@ -1267,6 +1268,38 @@ impl HttpAnswers {
         Ok(())
     }
 
+    /// Make `answers` the complete set of per-cluster template overrides of
+    /// `cluster_id`: statuses the cluster used to override and `answers` no
+    /// longer names stop being served, and an empty `answers` drops them all.
+    ///
+    /// This is what an `AddCluster` upsert means, since the main process
+    /// replaces the cluster as a whole. [`HttpAnswers::add_cluster_answers`]
+    /// only extends, so applying an upsert through it alone would keep serving
+    /// what the operator removed until `RemoveCluster`, while a worker rebuilt
+    /// from the main state would serve the default.
+    ///
+    /// Every template is compiled before the registry changes: on an error the
+    /// overrides already registered for the cluster stay exactly as they were.
+    pub fn replace_cluster_answers(
+        &mut self,
+        cluster_id: &str,
+        answers: &BTreeMap<String, String>,
+    ) -> Result<(), (String, TemplateError)> {
+        let compiled = Self::templates(answers)?;
+        if compiled.is_empty() {
+            self.remove_cluster_answers(cluster_id);
+        } else {
+            self.cluster_answers.insert(
+                cluster_id.into(),
+                compiled
+                    .into_iter()
+                    .map(|(name, template)| (name, Rc::new(template)))
+                    .collect(),
+            );
+        }
+        Ok(())
+    }
+
     /// Drop every per-cluster override for `cluster_id`. Subsequent lookups
     /// fall through to the listener-level template.
     pub fn remove_cluster_answers(&mut self, cluster_id: &str) {
@@ -1801,6 +1834,59 @@ mod tests {
         assert!(
             kept,
             "WWW-Authenticate header must be kept when realm is non-empty"
+        );
+    }
+
+    /// The statuses `answers` holds a per-cluster override for.
+    fn cluster_statuses(answers: &HttpAnswers, cluster_id: &str) -> Vec<String> {
+        answers
+            .cluster_answers
+            .get(cluster_id)
+            .map(|overrides| overrides.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// `replace_cluster_answers` makes the given set the whole set: a status
+    /// it omits stops being overridden, an empty set drops the cluster, and a
+    /// set with a template that does not compile changes nothing.
+    #[test]
+    fn replace_cluster_answers_replaces_the_whole_set() {
+        let template =
+            |status: &str| format!("HTTP/1.1 {status} Test\r\nContent-Length: 0\r\n\r\n");
+        let both = BTreeMap::from([
+            ("404".to_owned(), template("404")),
+            ("503".to_owned(), template("503")),
+        ]);
+        let mut answers = HttpAnswers::new(&BTreeMap::new()).expect("default HttpAnswers");
+        answers
+            .replace_cluster_answers("c1", &both)
+            .expect("both overrides compile");
+        assert_eq!(cluster_statuses(&answers, "c1"), ["404", "503"]);
+
+        let refused = BTreeMap::from([("503".to_owned(), "not a valid http response".to_owned())]);
+        assert!(answers.replace_cluster_answers("c1", &refused).is_err());
+        assert_eq!(
+            cluster_statuses(&answers, "c1"),
+            ["404", "503"],
+            "a refused set must leave the registered overrides as they were"
+        );
+
+        let only_503 = BTreeMap::from([("503".to_owned(), template("503"))]);
+        answers
+            .replace_cluster_answers("c1", &only_503)
+            .expect("the shrunk set compiles");
+        assert_eq!(
+            cluster_statuses(&answers, "c1"),
+            ["503"],
+            "a status the new set omits must stop being overridden"
+        );
+
+        answers
+            .replace_cluster_answers("c1", &BTreeMap::new())
+            .expect("the empty set compiles");
+        assert!(
+            !answers.cluster_answers.contains_key("c1"),
+            "an empty set must drop the cluster's entry, not leave an empty map"
         );
     }
 

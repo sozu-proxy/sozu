@@ -274,6 +274,15 @@ provide status 503, the `answers["503"]` map entry overrides the legacy
 pre-dispatch check prevents new invalid state; it does not automatically repair
 a malformed cluster entry persisted by an older Sōzu version.
 
+An `AddCluster` upsert replaces the cluster's answer templates as a whole, on
+the workers as in the main process: a status the new `answers` map no longer
+carries, or an empty map, goes back to the listener's template at once, without
+a `RemoveCluster`. An HTTP or HTTPS listener added after a cluster serves that
+cluster's answer templates like the listeners that were there before it; a
+cluster whose templates do not compile (one accepted while the worker had no
+listener of that kind) is logged and served the listener's own pages, and the
+listener is still added.
+
 If a frontend has a `sticky_session`, the sticky name is defined at the listener
 level.
 
@@ -4210,6 +4219,13 @@ transitions through phases (e.g., Expect → TLS Handshake → HTTPS → WSS).
 | `protocol.ws`               | gauge | proxy | Active WebSocket sessions (over HTTP)                 |
 | `protocol.wss`              | gauge | proxy | Active WebSocket sessions (over HTTPS)                |
 | `websocket.active_requests` | gauge | proxy | Active WebSocket requests (HTTP + HTTPS)              |
+
+A session enters a phase's gauge only once the move cannot fail any more, and
+leaves it exactly once, when it moves on or closes. A connection refused for
+lack of buffers (the pool cannot back the first stream) builds no session and
+raises no gauge. A TLS handshake whose upgrade is refused for the same reason
+stays in `protocol.tls.handshake` until its session closes, and leaves it then,
+once.
 
 #### Request lifecycle
 
