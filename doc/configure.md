@@ -1905,6 +1905,12 @@ probe still in flight when its backend is removed is discarded on completion,
 even if a backend with the same id and address was added in the meantime: the
 re-added backend starts with a fresh health state.
 
+Adding a cluster that already exists, as a configuration reload that changes it
+does, keeps the prober running and does not reset the health of its backends: one
+marked down stays down until `rise` successful probes mark it up. Only a cluster
+with no `udp.health` block, or with `mode = "HEALTH_OFF"`, is reset to healthy,
+because nothing probes it any more.
+
 A complete DNS cluster, with HRW affinity, single-reply flows, PROXY v2 to the
 backend, and a TCP-probe health check:
 
