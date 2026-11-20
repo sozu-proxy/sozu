@@ -226,7 +226,8 @@ probably a bug in the event loop or the protocol implementations, so its interna
 is incremented for each zombie session that gets deleted.
 
 New connections are put into a queue, and wait until the session is created (if we have available resources),
-or until a configurable timeout has elapsed. The following metrics observe the accept queue usage:
+or until a configurable timeout has elapsed. A `remove-listener` closes the connections its listener left in the
+queue; no counter below records those. The following metrics observe the accept queue usage:
 
 * `sozu.accept_queue.connections`: number of sockets in the accept queue
 * `sozu.accept_queue.timeout`: incremented every time a socket stayed too long in the queue and is closed

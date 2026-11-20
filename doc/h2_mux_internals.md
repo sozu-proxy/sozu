@@ -743,7 +743,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:5060-5073
+```rust lib/src/protocol/mux/h2.rs:5102-5115
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -769,7 +769,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:5111-5117
+```rust lib/src/protocol/mux/h2.rs:5153-5159
 let events = stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -809,7 +809,7 @@ taken at the top of `H2WritePhase::Flush`'s post-flush tail
 (`ConnectionH2::poll_write_target`, `lib/src/protocol/mux/h2.rs`) and passes `stream.linked_token()` straight
 out of it:
 
-```rust lib/src/protocol/mux/h2.rs:3808-3809
+```rust lib/src/protocol/mux/h2.rs:3819-3820
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 ```
@@ -930,7 +930,7 @@ used to reach the socket from somewhere the shell cannot stand:
 ### Inverting `force_disconnect`
 
 `force_disconnect` read `tls_wants_write` itself, and it is called from
-seventeen sites in the core — seven of them inside `ConnectionH2::handle_read`,
+sixteen sites in the core — seven of them inside `ConnectionH2::handle_read`,
 whose `pub` signature is socket-free by construction and does not change. So
 neither moving it nor threading the answer through its callers was available:
 the first takes the socket to `handle_read`, the second takes a socket-derived
@@ -1162,7 +1162,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9551-9555
+```rust lib/src/protocol/mux/h2.rs:9744-9748
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1255,7 +1255,7 @@ borrowed view of live storage and is told the byte count afterwards.
 | `Frame(header)` | inline `handle_frame()` logic |
 | `ContinuationFrame(headers)` | inline continuation assembly |
 | `ClientPreface` / `ServerSettings` | handshake validation |
-| `Discard` | skips payload bytes: a refused stream's HEADERS payload (HPACK still decoded), or the unread rest of a DATA payload whose stream was removed mid-frame, read in pieces and credited to the connection window (`skip_orphaned_data_payload`, #1597) |
+| `Discard` | skips payload bytes: a refused stream's HEADERS payload (HPACK still decoded), or the unread rest of a DATA payload whose stream was removed mid-frame, read in pieces and credited to the connection window (`skip_orphaned_data_payload`, #1597). Its write pass withdraws WRITABLE once the control frames are flushed, since nothing else can be written meanwhile, and the end of the discard raises it again; left armed it spun the Mux loop to `MAX_LOOP_ITERATIONS` whenever the payload arrived in a later segment |
 
 ### handle_header_state()
 
@@ -1287,7 +1287,10 @@ Key decisions in this method:
   END_STREAM in the body phase (§8.1.1, PROTOCOL_ERROR) reset that one stream
   through `reset_stream_and_discard_frame`, and the payload is still minimally
   processed through `Discard` (HPACK decoded, DATA credited to the connection
-  window). Every other stream on the connection carries on
+  window). Every other stream on the connection carries on. A reset that
+  trips the glitch limit or the emitted-RST cap answers
+  GOAWAY(ENHANCE_YOUR_CALM) first, and the frame's payload is then not
+  discarded: `Discard` would overwrite the closing `GoAway` state
 - DATA and HEADERS frames on a stream this endpoint reset are ignored (§5.1)
   after the same minimal processing (`ConnectionH2::discard_frame_payload`),
   whether the stream is still tracked or retired:
@@ -1327,6 +1330,14 @@ Key decisions in this method:
   same stream may follow (§6.10), it is discarded with it, and the block is
   decoded whole for HPACK (§4.3). The first fragment counts toward
   `max_header_list_size` like an accepted block's
+- A complete HEADERS block whose PRIORITY (RFC 7540 §5.3.1) depends on its own
+  stream resets that stream, and the block is still decoded for HPACK before
+  it is dropped (§4.3), through `ConnectionH2::decode_and_drop_field_block`,
+  the helper `ConnectionH2::drop_field_block_of_removed_stream` shares. Without
+  it the entries the peer's encoder indexed from that block would be missing
+  from the connection's decoder, and later blocks would resolve dynamic indices
+  against the wrong table. A block that does not decode is a connection error
+  COMPRESSION_ERROR
 
 ### handle_continuation_header_state()
 
@@ -1340,7 +1351,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9733-9737
+```rust lib/src/protocol/mux/h2.rs:9926-9930
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1815,7 +1826,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:9052
+```rust lib/src/protocol/mux/h2.rs:9245
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -2059,7 +2070,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:7504-7506
+```rust lib/src/protocol/mux/h2.rs:7685-7687
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -2067,7 +2078,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:7518-7524
+```rust lib/src/protocol/mux/h2.rs:7699-7705
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.

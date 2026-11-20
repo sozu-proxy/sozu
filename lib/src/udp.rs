@@ -127,6 +127,15 @@ const UPSTREAM_WRITE_QUEUE_CAP: usize = 64;
 /// many clients through the single listener socket). Sized larger than the
 /// per-flow cap because it is shared across every flow's return traffic.
 const CLIENT_WRITE_QUEUE_CAP: usize = 256;
+/// How many consecutive hard `recv` errors one drain of a flow's upstream
+/// socket rides through before it gives up (`UdpListenerSession::ingest_upstream`).
+/// A connected UDP socket reports a pending ICMP error (`ECONNREFUSED`, ...)
+/// from its next `recv`, and that `recv` clears it, so the datagrams queued
+/// behind it are still readable and the drain must go on. A second error in a
+/// row needs a fresh ICMP message between two `recv`s; an error that never
+/// clears (a closed descriptor, say) would otherwise spin the worker, so the
+/// run is bounded. A successful `recv` resets the count.
+const UPSTREAM_RECV_ERROR_BUDGET: u32 = 8;
 
 /// What `WriteQueue::drain` should do after a single send attempt: keep
 /// draining, stop because the socket went `WouldBlock` (rearm WRITABLE), or stop
@@ -137,6 +146,9 @@ enum SendOutcome {
     /// `WouldBlock`: leave the datagram at the front and stop draining.
     WouldBlock,
     /// A hard error (e.g. ECONNREFUSED): drop this datagram + count it, continue.
+    /// `WriteQueue::drain` does the counting
+    /// (`udp.datagrams.dropped.send_error`), so a `send` closure returns this
+    /// and never counts the same datagram itself.
     Dropped,
 }
 
@@ -174,6 +186,15 @@ impl WriteQueue {
         self.queue.len()
     }
 
+    /// Drop every queued datagram and return how many there were, so the
+    /// caller can count them. Used when the socket the queue was waiting on is
+    /// gone (see `UdpProxy::give_back_listeners`).
+    fn discard(&mut self) -> usize {
+        let discarded = self.queue.len();
+        self.queue.clear();
+        discarded
+    }
+
     /// Enqueue a datagram for later draining. Returns `true` if it was accepted,
     /// `false` if the queue was at capacity (caller drops + counts `wq_full`).
     #[must_use]
@@ -195,14 +216,21 @@ impl WriteQueue {
 
     /// Drain in FIFO order, calling `send` for each datagram. Stops on the first
     /// `WouldBlock` (leaving that datagram queued for the next writable event) or
-    /// when empty. Hard-errored datagrams are popped and counted via
-    /// `SendOutcome::Dropped`. Returns `true` if the queue is now empty (the
+    /// when empty. Hard-errored datagrams are popped and counted here, as
+    /// `udp.datagrams.dropped.send_error` -- the same counter the immediate-send
+    /// paths (`UdpListenerSession::on_send_to_backend`, `on_send_to_client`)
+    /// move for the same error -- once per datagram, so the `send` closure must
+    /// not count it as well. Returns `true` if the queue is now empty (the
     /// caller can drop WRITABLE interest back to READABLE-only).
     fn drain<F: FnMut(&SocketAddr, &[u8]) -> SendOutcome>(&mut self, mut send: F) -> bool {
         while let Some((dst, payload)) = self.queue.front() {
             match send(dst, payload) {
-                SendOutcome::Sent | SendOutcome::Dropped => {
+                SendOutcome::Sent => {
                     self.queue.pop_front();
+                }
+                SendOutcome::Dropped => {
+                    self.queue.pop_front();
+                    incr!(names::udp::DROPPED_SEND_ERROR);
                 }
                 SendOutcome::WouldBlock => break,
             }
@@ -245,6 +273,14 @@ pub struct UdpListener {
     /// and putting it there made a failed registration answer `ENOENT` from
     /// `deregister` and fail the whole soft stop.
     parked_socket: Option<UdpSocket>,
+    /// Whether the socket this listener holds (`socket`, or `parked_socket`
+    /// after a failed registration) was handed in by the supervisor over SCM
+    /// instead of bound by [`activate`](Self::activate). Set by every
+    /// activation, and read only by [`UdpProxy::abandon_activation`]: a socket
+    /// this listener bound itself can be closed to undo the activation, while
+    /// an inherited one has already left the SCM table and closing it would
+    /// lose the descriptor and the datagrams queued on it (sozu#1342).
+    socket_inherited: bool,
     tags: BTreeMap<String, CachedTags>,
     token: Token,
 }
@@ -294,6 +330,7 @@ impl UdpListener {
             cluster_id: None,
             socket: None,
             parked_socket: None,
+            socket_inherited: false,
             token,
             address: config.address.into(),
             local_address: config.address.into(),
@@ -334,7 +371,7 @@ impl UdpListener {
         // ALSO handed one over, the parked socket is disposed of deliberately
         // below instead of being silently overwritten.
         let parked = self.parked_socket.take();
-        let mut socket = match (udp_socket, parked) {
+        let (mut socket, from_scm) = match (udp_socket, parked) {
             (Some(inherited), Some(parked)) => {
                 // Not reachable while `Listeners::get_*` removes the entry it
                 // hands over and `scm_listeners` is written once: a parked
@@ -351,12 +388,16 @@ impl UdpListener {
                     address
                 );
                 drop(parked);
-                inherited
+                (inherited, true)
             }
-            (Some(inherited), None) => inherited,
-            (None, Some(parked)) => parked,
-            (None, None) => udp_bind(address, self.config.interface.as_deref())
-                .map_err(|e| ProxyError::BindToSocket(address, e))?,
+            (Some(inherited), None) => (inherited, true),
+            // The parked socket keeps the origin it was parked with.
+            (None, Some(parked)) => (parked, self.socket_inherited),
+            (None, None) => (
+                udp_bind(address, self.config.interface.as_deref())
+                    .map_err(|e| ProxyError::BindToSocket(address, e))?,
+                false,
+            ),
         };
 
         let registration = registry
@@ -373,6 +414,7 @@ impl UdpListener {
             // It goes to `parked_socket`, never to `socket`, because every other
             // consumer of that field reads `Some` as "registered and live".
             self.parked_socket = Some(socket);
+            self.socket_inherited = from_scm;
             return Err(error);
         }
 
@@ -381,6 +423,7 @@ impl UdpListener {
         // expected; keep the configured address rather than fail activation.
         self.local_address = socket.local_addr().unwrap_or(address);
         self.socket = Some(socket);
+        self.socket_inherited = from_scm;
         self.active = true;
         Ok(self.token)
     }
@@ -753,6 +796,15 @@ impl UdpProxy {
         self.cluster_for_listener.get(&token).cloned()
     }
 
+    /// Drop the flow manager of the listener at `token`, so that
+    /// [`build_session`](Self::build_session) answers `None` for it, as it
+    /// does when `Registry::try_clone` fails, for tests of the server's answer
+    /// to a session it cannot build (`lib/src/server.rs`).
+    #[cfg(test)]
+    pub(crate) fn forget_manager(&mut self, token: Token) {
+        self.managers.remove(&token);
+    }
+
     /// Build the [`UdpListenerSession`] that drives this listener's datagrams.
     /// The server inserts the returned session into the slab **at the listener
     /// token**, replacing the `ListenSession` placeholder, so the generic
@@ -775,16 +827,31 @@ impl UdpProxy {
         Some(session)
     }
 
+    /// Hand every listener socket over for an SCM hand-off. Each listener's
+    /// session stays installed, flows included (a later
+    /// [`activate_listener`](Self::activate_listener) binds a fresh socket that
+    /// the retained session reaches through the shared listener), but the
+    /// client-return queue does not stay with it: the WRITABLE interest that
+    /// queue waits on belongs to the socket leaving here, and the fresh one is
+    /// registered `READABLE` only. A datagram left in the queue would divert
+    /// every later reply into it and nothing would ever drain it, so the queue
+    /// is discarded (and counted) with the socket it was waiting on.
     pub fn give_back_listeners(&mut self) -> Vec<(ListenerKey, UdpSocket)> {
         self.listeners
-            .values()
-            .filter_map(|listener| {
-                let mut owned = listener.borrow_mut();
-                if let Some(socket) = owned.socket.take() {
+            .iter()
+            .filter_map(|(token, listener)| {
+                let (key, socket) = {
+                    let mut owned = listener.borrow_mut();
+                    let socket = owned.socket.take()?;
                     owned.active = false;
-                    return Some((owned.key(), socket));
+                    (owned.key(), socket)
+                };
+                // The listener borrow is released: the session reads the
+                // listener itself when it drains.
+                if let Some(session) = self.listener_sessions.get(token) {
+                    session.borrow_mut().discard_client_queue();
                 }
-                None
+                Some((key, socket))
             })
             .collect()
     }
@@ -815,6 +882,60 @@ impl UdpProxy {
             session.borrow_mut().close_all_flows(Instant::now());
         }
         Ok((token, taken))
+    }
+
+    /// Take back an activation the server could not finish, leaving the
+    /// listener inactive: its socket deregistered, and either closed or kept
+    /// parked for the next activation, as follows.
+    ///
+    /// `Server::notify_activate_listener` binds and registers the socket first
+    /// and builds the listener's session second. A failure of the second step
+    /// (`Registry::try_clone` answers `EMFILE` once the worker is out of
+    /// descriptors) is reported to the control plane as a failed activation, and
+    /// whatever the first step did must not outlive that answer: a listener
+    /// left active keeps its socket registered under a token whose slab slot
+    /// holds the inert placeholder, so datagrams queue in the kernel and nothing
+    /// reads them, and the activation that would heal it is never asked for.
+    ///
+    /// The session is torn down with the socket, exactly as a deactivation does
+    /// ([`give_back_listener`](Self::give_back_listener)), so the listener also
+    /// drops a session that was built but never reached the slab.
+    ///
+    /// A socket this listener bound itself is closed, which is the state before
+    /// the activation: the address is no longer bound by this worker, so it
+    /// takes no share of the datagrams sent to it, and a retried activation
+    /// binds again. An inherited socket is parked instead, the way a failed
+    /// registration parks it in [`UdpListener::activate`]: it has already left
+    /// the SCM table, so closing it would lose the descriptor and the datagrams
+    /// queued on it (sozu#1342). A parked socket is still bound, so datagrams
+    /// keep queueing on it, and taking its share of the address under
+    /// `SO_REUSEPORT`, until a retried activation takes it back or
+    /// `RemoveListener` drops it; a `DeactivateListener` answers
+    /// `UnactivatedListener`, as for a parked socket after a failed
+    /// registration.
+    pub fn abandon_activation(&mut self, address: &ListenerKey) -> Result<(), ProxyError> {
+        let (token, mut socket) = self.give_back_listener(address)?;
+        if let Err(error) = self.registry.deregister(&mut socket) {
+            error!(
+                "{} could not deregister the UDP socket of {} while abandoning its activation: {}",
+                log_module_context!(),
+                address,
+                error
+            );
+        }
+        if let Some(listener) = self.listeners.get(&token) {
+            let mut listener = listener.borrow_mut();
+            if listener.socket_inherited {
+                debug_assert!(
+                    listener.parked_socket.is_none(),
+                    "an activation consumes the parked socket, so none is parked over it"
+                );
+                listener.parked_socket = Some(socket);
+            }
+            // Otherwise `socket` drops at the end of this function, which
+            // closes the descriptor this listener bound.
+        }
+        Ok(())
     }
 
     pub fn update_listener(&mut self, patch: UpdateUdpListenerConfig) -> Result<(), ProxyError> {
@@ -1010,22 +1131,11 @@ impl UdpProxy {
 
         // 1b. Health settings from the cluster's `udp.health` block, if any.
         // Mode HEALTH_OFF / no health block disables probing for this cluster.
-        let health_settings = cluster.udp.as_ref().and_then(|udp| {
-            udp.health.as_ref().and_then(|h| {
-                let mode = h
-                    .mode
-                    .and_then(|m| sozu_command::proto::command::UdpHealthMode::try_from(m).ok());
-                match mode {
-                    Some(sozu_command::proto::command::UdpHealthMode::HealthOff) => None,
-                    // TCP_PROBE (default when a health block is present) and
-                    // UDP_PROBE both schedule the TCP-probe state machine; the
-                    // app UDP-probe payload rides along for the secondary check.
-                    _ => Some(health::UdpHealthSettings::from_proto(h)),
-                }
-            })
-        });
-        self.health
-            .set_cluster(&cluster.cluster_id, health_settings, &self.registry);
+        self.health.set_cluster(
+            &cluster.cluster_id,
+            udp_health_settings(cluster),
+            &self.registry,
+        );
 
         // 1c. Cache the UDP knobs so a frontend added in EITHER order picks them
         // up via `cluster_config_for`. An `AddCluster` without a `udp` block
@@ -1207,6 +1317,32 @@ fn apply_udp_knobs(cfg: &mut ClusterConfig, udp: &sozu_command::proto::command::
     cfg.requests = udp.requests.unwrap_or(0);
     cfg.send_proxy_protocol = udp.send_proxy_protocol.unwrap_or(false);
     cfg.proxy_protocol_every_datagram = udp.proxy_protocol_every_datagram.unwrap_or(false);
+}
+
+/// The settings of the UDP prober a cluster asks for, `None` when it asks for
+/// none: no `udp.health` block, or a block whose mode is `HEALTH_OFF`.
+///
+/// The one definition of "this cluster has an armed UDP prober":
+/// `UdpProxy::apply_cluster` arms the prober from it, and `Server::add_cluster`
+/// (`lib/src/server.rs`) records the same answer in the `BackendMap`
+/// (`BackendMap::set_udp_health_prober`, `lib/src/backends.rs`), so the reset
+/// of a cluster's backends that follows the loss of its HTTP/TCP health check
+/// leaves alone the `Backend.health` this prober writes.
+pub(crate) fn udp_health_settings(cluster: &Cluster) -> Option<health::UdpHealthSettings> {
+    cluster.udp.as_ref().and_then(|udp| {
+        udp.health.as_ref().and_then(|h| {
+            let mode = h
+                .mode
+                .and_then(|m| sozu_command::proto::command::UdpHealthMode::try_from(m).ok());
+            match mode {
+                Some(sozu_command::proto::command::UdpHealthMode::HealthOff) => None,
+                // TCP_PROBE (default when a health block is present) and
+                // UDP_PROBE both schedule the TCP-probe state machine; the
+                // app UDP-probe payload rides along for the secondary check.
+                _ => Some(health::UdpHealthSettings::from_proto(h)),
+            }
+        })
+    })
 }
 
 /// Fallback auto `max_flows` when `RLIMIT_NOFILE` can't be read.
@@ -1462,10 +1598,22 @@ impl UdpListenerSession {
 
     /// Drain datagrams waiting on one flow's connected upstream socket into the
     /// manager as `BackendDatagram`s.
+    ///
+    /// The drain runs to `WouldBlock`, because the socket is registered
+    /// edge-triggered and nothing re-drives a session that stopped early
+    /// (`UdpListenerSession::ready` is a constant `false`). A hard `recv` error
+    /// therefore does not end it: on Linux a connected UDP socket returns the
+    /// pending ICMP error (`ECONNREFUSED` after a port-unreachable, say) from
+    /// its next `recv`, AHEAD of the datagrams already queued, and that `recv`
+    /// clears it. Stopping there would leave those datagrams unread until an
+    /// unrelated later datagram raises a new edge, or lose them with the flow.
+    /// The run of consecutive errors is bounded by `UPSTREAM_RECV_ERROR_BUDGET`
+    /// so an error that never clears cannot spin the worker.
     fn ingest_upstream(&mut self, upstream_token: Token, now: Instant) {
         let Some(&flow) = self.upstream_to_flow.get(&upstream_token) else {
             return;
         };
+        let mut consecutive_errors: u32 = 0;
         loop {
             let result = {
                 let Some(socket) = self.upstream_sockets.get(&upstream_token) else {
@@ -1475,6 +1623,7 @@ impl UdpListenerSession {
             };
             match result {
                 Ok(len) => {
+                    consecutive_errors = 0;
                     let len = len.min(self.recv_buf.len());
                     let payload: &[u8] = &self.recv_buf[..len];
                     let mgr = self.manager.clone();
@@ -1490,7 +1639,10 @@ impl UdpListenerSession {
                         log_context!(self),
                         e
                     );
-                    break;
+                    consecutive_errors += 1;
+                    if consecutive_errors >= UPSTREAM_RECV_ERROR_BUDGET {
+                        break;
+                    }
                 }
             }
         }
@@ -1509,7 +1661,15 @@ impl UdpListenerSession {
                 Output::ArmTimer(deadline) => self.arm_timer(deadline, now),
                 Output::Metric(ev) => Self::record_metric(ev),
                 Output::CloseFlow(flow) => self.on_close_flow(flow),
-                Output::Drop(reason) => Self::record_drop(reason),
+                // `UdpManager::drop_datagram` announces each drop twice, as
+                // `Output::Metric(MetricEvent::DatagramDropped)` and as this
+                // output. The counters move on the metric event alone
+                // (`record_metric`); counting here too read every core-side
+                // drop double in `udp.datagrams.dropped` and its reason
+                // counter. The output stays what the core's own tests observe,
+                // and the shell logs nothing for it: it is driven by spoofable
+                // datagrams.
+                Output::Drop(_) => {}
             }
         }
     }
@@ -1827,6 +1987,28 @@ impl UdpListenerSession {
                 e
             );
         }
+    }
+
+    /// Drop the client-return queue because the listener socket it was waiting
+    /// on has left (`UdpProxy::give_back_listeners`), counting each datagram.
+    ///
+    /// A queued reply is lost with its socket, as when `send_to` hits a hard
+    /// error, and the counter is the one the egress paths already use for a
+    /// socket that is gone (`udp.datagrams.dropped.unknown_flow`, see
+    /// `UdpListenerSession::on_send_to_backend`), once per datagram. Only the
+    /// reason counter moves, as for every shell-side egress drop. Nothing here
+    /// touches the registry: the socket has already been taken from the
+    /// listener and its caller deregisters it, so there is no WRITABLE
+    /// interest left to disarm.
+    fn discard_client_queue(&mut self) {
+        let discarded = self.client_write_queue.discard();
+        if discarded > 0 {
+            count!(names::udp::DROPPED_UNKNOWN_FLOW, discarded as i64);
+        }
+        debug_assert!(
+            self.client_write_queue.is_empty(),
+            "a discarded client-return queue must be empty"
+        );
     }
 
     /// Drain the client-return write queue on a listener writable event. Re-sends
@@ -2600,6 +2782,565 @@ mod tests {
             "a shed flow must not leave an upstream slab slot behind"
         );
     }
+
+    /// The current value of one proxy-level counter on this test thread,
+    /// absent counting as 0. `METRICS` is a `thread_local!` and libtest gives
+    /// each test its own thread, but callers still assert a DELTA against a
+    /// baseline, never an absolute value (same convention as `proxy_count` in
+    /// `lib/src/socket.rs`).
+    fn proxy_count(name: &str) -> i64 {
+        use sozu_command::proto::command::filtered_metrics::Inner;
+        crate::metrics::METRICS.with(|metrics| {
+            metrics
+                .borrow_mut()
+                .dump_local_proxy_metrics()
+                .get(name)
+                .and_then(|metric| match metric.inner {
+                    Some(Inner::Count(value)) => Some(value),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        })
+    }
+
+    /// A real `UdpListenerSession` over a real, activated loopback listener,
+    /// with no cluster configured. The proxy is returned so it outlives the
+    /// session, as it does in the tests above.
+    fn loopback_listener_session() -> (UdpProxy, Rc<RefCell<UdpListenerSession>>) {
+        use crate::testing::{ServerParts, prebuild_server, provide_port};
+
+        let ServerParts {
+            registry,
+            sessions,
+            pool,
+            backends,
+            ..
+        } = prebuild_server(16, 16384, false).expect("could not prebuild a test server");
+
+        let address =
+            sozu_command::proto::command::SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let config = sozu_command::config::ListenerBuilder::new_udp(address)
+            .to_udp(None)
+            .expect("could not build a UdpListenerConfig for the test");
+
+        let listener_token = {
+            let mut session_manager = sessions.borrow_mut();
+            let entry = session_manager.slab.vacant_entry();
+            let token = Token(entry.key());
+            entry.insert(Rc::new(RefCell::new(crate::server::ListenSession {
+                protocol: Protocol::UDPListen,
+            })));
+            token
+        };
+
+        let mut proxy = UdpProxy::new(registry, sessions, pool, backends, 16, 16384);
+        proxy
+            .add_listener(config, listener_token)
+            .expect("could not add the test UDP listener");
+        proxy
+            .activate_listener(&address.into(), None)
+            .expect("could not activate the test UDP listener");
+        let session = proxy
+            .build_session(listener_token)
+            .expect("could not build the test UDP listener session");
+        (proxy, session)
+    }
+
+    /// A datagram the core refuses is one drop: `udp.datagrams.dropped` and
+    /// its reason counter each move by exactly one.
+    ///
+    /// `UdpManager::drop_datagram` announces the drop twice, as
+    /// `Output::Metric(MetricEvent::DatagramDropped(reason))` and as
+    /// `Output::Drop(reason)`, and `UdpListenerSession::drain_outputs` routes
+    /// both to `record_drop`, so each counter reads double. A listener with no
+    /// cluster configured drops every client datagram as
+    /// `DropReason::NoBackend`, which reaches no flow, socket or timer: the
+    /// two counters are the only thing the drop touches.
+    #[test]
+    fn a_core_side_dropped_datagram_is_counted_once() {
+        let (_proxy, session) = loopback_listener_session();
+        let now = Instant::now();
+
+        let total_before = proxy_count(names::udp::DATAGRAMS_DROPPED);
+        let reason_before = proxy_count(names::udp::DROPPED_NO_BACKEND);
+
+        {
+            let session = session.borrow();
+            let mut manager = session.manager.borrow_mut();
+            let mut backends = session.backends.borrow_mut();
+            manager.handle_input(
+                ManagerInput::ClientDatagram {
+                    src: SocketAddr::from(([127, 0, 0, 1], 41000)),
+                    dst: SocketAddr::from(([127, 0, 0, 1], 5300)),
+                    payload: b"query",
+                    backends: &mut *backends,
+                },
+                now,
+            );
+        }
+        session.borrow_mut().drain_outputs(now);
+
+        assert_eq!(
+            session.borrow().manager.borrow().flow_count(),
+            0,
+            "precondition: a drop allocates no flow"
+        );
+        assert_eq!(
+            proxy_count(names::udp::DROPPED_NO_BACKEND) - reason_before,
+            1,
+            "one dropped datagram must move its reason counter by one"
+        );
+        assert_eq!(
+            proxy_count(names::udp::DATAGRAMS_DROPPED) - total_before,
+            1,
+            "one dropped datagram must move the aggregate counter by one"
+        );
+    }
+
+    /// Block until the socket reports a pending error, without consuming it.
+    /// `poll(2)` reports `POLLERR` whatever the requested events, and unlike
+    /// `take_error` or a `send` it leaves `sk_err` in place for the call the
+    /// test is about.
+    fn wait_for_pending_socket_error(socket: &UdpSocket) {
+        let mut fds = [libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events: 0,
+            revents: 0,
+        }];
+        // SAFETY: `fds` is a valid one-element array that lives across the call.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 1, 5_000) };
+        assert_eq!(ready, 1, "precondition: the ICMP error must become pending");
+        assert_ne!(
+            fds[0].revents & libc::POLLERR,
+            0,
+            "precondition: the pending error must be reported as POLLERR"
+        );
+    }
+
+    /// A datagram that waited in an upstream write queue and then hit a hard
+    /// send error is counted as `udp.datagrams.dropped.send_error`, as
+    /// `SendOutcome::Dropped` and `WriteQueue::drain` both say it is.
+    ///
+    /// The flow's connected socket points at a closed loopback port, so the
+    /// kernel turns the ICMP port-unreachable of one probe into a pending
+    /// `ECONNREFUSED`, and the next `send` -- the drain's -- fails with it.
+    /// The immediate-send path counts the same error
+    /// (`UdpListenerSession::on_send_to_backend`); the drain closure does not.
+    #[test]
+    fn a_hard_error_draining_the_upstream_queue_is_counted_as_send_error() {
+        use crate::testing::provide_port;
+
+        let (_proxy, session) = loopback_listener_session();
+        let backend = SocketAddr::from(([127, 0, 0, 1], provide_port()));
+
+        let mut socket = udp_connect(backend).expect("could not open the upstream socket");
+        // A closed port: the probe is accepted by the kernel and answered by an
+        // ICMP port-unreachable that sets the socket's pending error.
+        socket
+            .send(b"probe")
+            .expect("the first send to a closed loopback port must be accepted");
+        wait_for_pending_socket_error(&socket);
+
+        let token = Token(usize::MAX - 1);
+        session
+            .borrow()
+            .registry
+            .register(&mut socket, token, Interest::READABLE)
+            .expect("could not register the upstream socket");
+        let mut queue = WriteQueue::new(UPSTREAM_WRITE_QUEUE_CAP);
+        assert!(
+            queue.push(backend, b"queued".to_vec()),
+            "precondition: the queue accepts one datagram"
+        );
+        {
+            let mut session = session.borrow_mut();
+            session.upstream_sockets.insert(token, socket);
+            session.upstream_write_queues.insert(token, queue);
+        }
+
+        let before = proxy_count(names::udp::DROPPED_SEND_ERROR);
+        session.borrow_mut().drain_upstream_queue(token);
+
+        assert!(
+            !session.borrow().upstream_write_queues.contains_key(&token),
+            "precondition: the hard error popped the datagram and emptied the queue"
+        );
+        assert_eq!(
+            proxy_count(names::udp::DROPPED_SEND_ERROR) - before,
+            1,
+            "a queued datagram dropped on a hard send error must be counted"
+        );
+    }
+
+    /// Same contract on the client-return queue: a datagram that waited there
+    /// and then hit a hard `send_to` error is counted as
+    /// `udp.datagrams.dropped.send_error`
+    /// (`UdpListenerSession::drain_client_queue`; the immediate path counts it
+    /// in `UdpListenerSession::on_send_to_client`).
+    ///
+    /// The hard error is forced with a destination port of 0, which Linux
+    /// refuses with `EINVAL` before anything is sent: an unconnected socket
+    /// never reports an ICMP error on `send_to`, so the upstream test's
+    /// mechanism is not available here.
+    #[test]
+    fn a_hard_error_draining_the_client_queue_is_counted_as_send_error() {
+        let (_proxy, session) = loopback_listener_session();
+
+        let unsendable = SocketAddr::from(([127, 0, 0, 1], 0));
+        assert!(
+            session
+                .borrow_mut()
+                .client_write_queue
+                .push(unsendable, b"queued".to_vec()),
+            "precondition: the queue accepts one datagram"
+        );
+
+        let before = proxy_count(names::udp::DROPPED_SEND_ERROR);
+        session.borrow_mut().drain_client_queue();
+
+        assert!(
+            session.borrow().client_write_queue.is_empty(),
+            "precondition: the hard error popped the datagram and emptied the queue"
+        );
+        assert_eq!(
+            proxy_count(names::udp::DROPPED_SEND_ERROR) - before,
+            1,
+            "a queued datagram dropped on a hard send_to error must be counted"
+        );
+    }
+
+    /// Block until the socket holds a queued datagram AND a pending error, and
+    /// consume neither: `poll(2)` reports `POLLIN` for the first and `POLLERR`
+    /// for the second, and unlike a `recv` (even `MSG_PEEK`, which still
+    /// reads and clears `sk_err` first) it leaves both in place for the call
+    /// the test is about.
+    fn wait_for_queued_datagram_and_pending_error(socket: &UdpSocket) {
+        let wanted = libc::POLLIN | libc::POLLERR;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut fds = [libc::pollfd {
+                fd: socket.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            // SAFETY: `fds` is a valid one-element array that lives across the call.
+            let ready = unsafe { libc::poll(fds.as_mut_ptr(), 1, 0) };
+            assert!(ready >= 0, "precondition: poll(2) must not fail");
+            if fds[0].revents & wanted == wanted {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "precondition: the socket must hold a queued datagram and a pending error \
+                 (revents {:#x})",
+                fds[0].revents
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// A reply already queued on a flow's upstream socket is delivered by the
+    /// readable event that reports it, even when an ICMP error is pending on
+    /// the same socket.
+    ///
+    /// On Linux the pending `ECONNREFUSED` of a connected UDP socket is
+    /// returned by the NEXT `recv`, ahead of the datagrams already queued, and
+    /// the socket then reports `POLLIN | POLLERR` together (the precondition
+    /// helper above asserts exactly that before the readable event is
+    /// delivered). `ingest_upstream` drains an edge-triggered socket "to
+    /// `WouldBlock`", but its generic `Err` arm stops at the first hard error,
+    /// so the reply behind it waits for an unrelated later datagram on that
+    /// socket, or dies with the flow.
+    ///
+    /// The ICMP error is real: a second client datagram is forwarded to the
+    /// backend port after the backend socket has answered once and closed. The
+    /// whole pass is one `update_readiness` on the upstream token, which is
+    /// what the event loop does for the single edge the kernel reports; a
+    /// second call would hide the defect, which is the missing re-drive.
+    #[test]
+    fn a_pending_icmp_error_does_not_strand_the_replies_queued_behind_it() {
+        use crate::backends::Backend;
+
+        const CLUSTER: &str = "udp-icmp-drain";
+        const DEADLINE: Duration = Duration::from_secs(2);
+
+        let (_proxy, session) = loopback_listener_session();
+        let listener_address = session.borrow().address;
+        let listener_token = session.borrow().listener_token;
+
+        let backend =
+            std::net::UdpSocket::bind(("127.0.0.1", 0)).expect("could not bind the test backend");
+        backend
+            .set_read_timeout(Some(DEADLINE))
+            .expect("could not set the backend read timeout");
+        let backend_address = backend.local_addr().expect("the backend has an address");
+        {
+            let session = session.borrow();
+            session.backends.borrow_mut().add_backend(
+                CLUSTER,
+                Backend::new("backend-1", backend_address, None, None, None),
+            );
+            session.manager.borrow_mut().handle_input(
+                ManagerInput::Config(ConfigEvent::SetCluster(ClusterConfig {
+                    cluster: CLUSTER.into(),
+                    ..Default::default()
+                })),
+                Instant::now(),
+            );
+        }
+
+        let client =
+            std::net::UdpSocket::bind(("127.0.0.1", 0)).expect("could not bind the test client");
+        client
+            .set_read_timeout(Some(DEADLINE))
+            .expect("could not set the client read timeout");
+        let mut buffer = [0u8; 64];
+
+        // The first query admits the flow and opens its connected upstream socket.
+        client
+            .send_to(b"query-1", listener_address)
+            .expect("the client must reach the listener");
+        session
+            .borrow_mut()
+            .update_readiness(listener_token, Ready::READABLE);
+        let (length, upstream_address) = backend
+            .recv_from(&mut buffer)
+            .expect("the backend must receive the first query");
+        assert_eq!(&buffer[..length], b"query-1");
+
+        // The backend answers, then goes away: the reply is queued on the
+        // upstream socket, and the next datagram sent to the closed port
+        // comes back as an ICMP port-unreachable.
+        backend
+            .send_to(b"reply", upstream_address)
+            .expect("the backend must answer");
+        drop(backend);
+        client
+            .send_to(b"query-2", listener_address)
+            .expect("the client must reach the listener");
+        session
+            .borrow_mut()
+            .update_readiness(listener_token, Ready::READABLE);
+
+        let upstream_token = {
+            let session = session.borrow();
+            assert_eq!(
+                session.upstream_sockets.len(),
+                1,
+                "precondition: the two queries share one flow, so one upstream socket"
+            );
+            let token = *session
+                .upstream_sockets
+                .keys()
+                .next()
+                .expect("one upstream socket was just asserted");
+            wait_for_queued_datagram_and_pending_error(&session.upstream_sockets[&token]);
+            token
+        };
+
+        // The one readable event the kernel reports for both.
+        session
+            .borrow_mut()
+            .update_readiness(upstream_token, Ready::READABLE);
+
+        match client.recv_from(&mut buffer) {
+            Ok((length, _)) => assert_eq!(
+                &buffer[..length],
+                b"reply",
+                "the client must receive the backend's reply"
+            ),
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                panic!(
+                    "the reply queued behind a pending ICMP error was not delivered by the \
+                     readable event that reported it: the drain stopped at the error and \
+                     no further edge will come"
+                )
+            }
+            Err(error) => panic!("unexpected error reading the client socket: {error}"),
+        }
+    }
+
+    /// The listener's client-return queue survives the SCM hand-off with its
+    /// session, so after the listener is activated again on the same worker the
+    /// return path must work: the datagrams behind the queue reach their client.
+    ///
+    /// `give_back_listeners` takes the socket and keeps the session, queue
+    /// included; the WRITABLE interest that queue was waiting on belonged to
+    /// the socket that is gone, and `UdpListener::activate` registers the fresh
+    /// socket READABLE only. `Server` skips `build_session` for the retained
+    /// session. `on_send_to_client` appends to a non-empty queue without
+    /// arming anything, and `drain_client_queue` runs only on a WRITABLE event
+    /// for the listener token, so every reply after that waits in a queue
+    /// nothing drains until it is full and they are dropped as `wq_full`.
+    ///
+    /// The queue is filled by hand, as a listener `send_to` that returned
+    /// `WouldBlock` leaves it (with the WRITABLE interest armed). The outcome
+    /// is read through a real `mio::Poll` loop, driven like the server's run
+    /// loop for this one listener token, and asserts only that the reply
+    /// sent after the re-activation reaches the client: whether the stale
+    /// queued datagram is delivered or discarded is the fix's choice.
+    #[test]
+    fn a_client_return_queue_kept_across_a_handoff_is_drained_after_reactivation() {
+        use crate::{
+            protocol::udp::Transmit,
+            testing::{ServerParts, prebuild_server, provide_port},
+        };
+
+        const DEADLINE: Duration = Duration::from_secs(2);
+
+        let ServerParts {
+            event_loop: mut poll,
+            registry,
+            sessions,
+            pool,
+            backends,
+            ..
+        } = prebuild_server(16, 16384, false).expect("could not prebuild a test server");
+
+        let address =
+            sozu_command::proto::command::SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let config = sozu_command::config::ListenerBuilder::new_udp(address)
+            .to_udp(None)
+            .expect("could not build a UdpListenerConfig for the test");
+
+        let listener_token = {
+            let mut session_manager = sessions.borrow_mut();
+            let entry = session_manager.slab.vacant_entry();
+            let token = Token(entry.key());
+            entry.insert(Rc::new(RefCell::new(crate::server::ListenSession {
+                protocol: Protocol::UDPListen,
+            })));
+            token
+        };
+
+        let mut proxy = UdpProxy::new(registry, sessions, pool, backends, 16, 16384);
+        proxy
+            .add_listener(config, listener_token)
+            .expect("could not add the test UDP listener");
+        proxy
+            .activate_listener(&address.into(), None)
+            .expect("could not activate the test UDP listener");
+        let session = proxy
+            .build_session(listener_token)
+            .expect("could not build the test UDP listener session");
+
+        let client =
+            std::net::UdpSocket::bind(("127.0.0.1", 0)).expect("could not bind the test client");
+        client
+            .set_nonblocking(true)
+            .expect("could not make the client non-blocking");
+        let client_address = client.local_addr().expect("the client has an address");
+
+        // What a `WouldBlock` on the listener socket leaves behind.
+        assert!(
+            session
+                .borrow_mut()
+                .client_write_queue
+                .push(client_address, b"queued".to_vec()),
+            "precondition: the queue accepts one datagram"
+        );
+        session.borrow_mut().arm_client_writable();
+        assert!(
+            !session.borrow().client_write_queue.is_empty(),
+            "precondition: a datagram waits for the listener to become writable"
+        );
+
+        // The SCM hand-off: `Server::return_listen_sockets` deregisters the
+        // sockets and drops them once sent, the session stays installed.
+        let handed_over = proxy.give_back_listeners();
+        assert_eq!(
+            handed_over.len(),
+            1,
+            "precondition: the listener hands its socket over"
+        );
+        drop(handed_over);
+
+        // A later `ActivateListener` binds a fresh socket; `Server` finds the
+        // session still installed and does not build another.
+        proxy
+            .activate_listener(&address.into(), None)
+            .expect("could not re-activate the test UDP listener");
+        assert!(
+            session.borrow().listener.borrow().socket.is_some(),
+            "precondition: the re-activated listener holds a fresh socket"
+        );
+
+        session.borrow_mut().on_send_to_client(Transmit {
+            dst: client_address,
+            segment_size: None,
+            payload: b"new".to_vec(),
+        });
+
+        // The run loop for this listener: dispatch what the poll reports to the
+        // session, as `Server::ready` does, until the client has the reply.
+        let mut events = mio::Events::with_capacity(16);
+        let mut buffer = [0u8; 64];
+        let mut received: Vec<Vec<u8>> = Vec::new();
+        let deadline = Instant::now() + DEADLINE;
+        while Instant::now() < deadline && !received.iter().any(|datagram| datagram == b"new") {
+            poll.poll(&mut events, Some(Duration::from_millis(20)))
+                .expect("could not poll the test event loop");
+            for event in events.iter() {
+                if event.token() == listener_token {
+                    session
+                        .borrow_mut()
+                        .update_readiness(event.token(), Ready::from(event));
+                }
+            }
+            while let Ok((length, _)) = client.recv_from(&mut buffer) {
+                received.push(buffer[..length].to_vec());
+            }
+        }
+        assert!(
+            received.iter().any(|datagram| datagram == b"new"),
+            "a reply sent after the listener was re-activated never reached the client: \
+             it waits behind a client-return queue no event will drain (received {received:?})"
+        );
+    }
+
+    /// The datagrams a hand-off discards from the client-return queue are
+    /// counted, one per datagram, as `udp.datagrams.dropped.unknown_flow` (the
+    /// egress counter for a socket that is gone), and the queue is empty
+    /// afterwards. The aggregate `udp.datagrams.dropped` is core-side only and
+    /// does not move.
+    #[test]
+    fn a_handoff_counts_the_client_return_datagrams_it_discards() {
+        let (mut proxy, session) = loopback_listener_session();
+        let client = SocketAddr::from(([127, 0, 0, 1], 41000));
+        for _ in 0..3 {
+            assert!(
+                session
+                    .borrow_mut()
+                    .client_write_queue
+                    .push(client, b"queued".to_vec()),
+                "precondition: the queue accepts the datagram"
+            );
+        }
+
+        let reason_before = proxy_count(names::udp::DROPPED_UNKNOWN_FLOW);
+        let total_before = proxy_count(names::udp::DATAGRAMS_DROPPED);
+        let handed_over = proxy.give_back_listeners();
+
+        assert_eq!(
+            handed_over.len(),
+            1,
+            "precondition: the listener hands its socket over"
+        );
+        assert!(
+            session.borrow().client_write_queue.is_empty(),
+            "the hand-off must discard the queue that waited on the departing socket"
+        );
+        assert_eq!(
+            proxy_count(names::udp::DROPPED_UNKNOWN_FLOW) - reason_before,
+            3,
+            "each discarded datagram must be counted once"
+        );
+        assert_eq!(
+            proxy_count(names::udp::DATAGRAMS_DROPPED) - total_before,
+            0,
+            "a shell-side egress drop does not move the core-side aggregate"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2657,5 +3398,138 @@ mod listener_sibling_tests {
             Some("cluster-a"),
             "the flow manager side must know the cluster too"
         );
+    }
+}
+
+#[cfg(test)]
+mod activation_abandon_tests {
+    use std::net::UdpSocket as StdUdpSocket;
+
+    use sozu_command::{config::ListenerBuilder, proto::command::SocketAddress};
+
+    use super::*;
+    use crate::{
+        InheritedSocketFate,
+        testing::{ServerParts, prebuild_server, provide_port},
+    };
+
+    const QUEUED: &[u8] = b"queued before the failed activation";
+
+    fn proxy_with_a_listener() -> (UdpProxy, SocketAddress, ListenerKey) {
+        let ServerParts {
+            registry,
+            sessions,
+            pool,
+            backends,
+            ..
+        } = prebuild_server(16, 16384, false).expect("could not prebuild a test server");
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let mut proxy = UdpProxy::new(registry, sessions, pool, backends, 16, 16384);
+        proxy
+            .add_listener(
+                ListenerBuilder::new_udp(address)
+                    .to_udp(None)
+                    .expect("could not build the listener config"),
+                Token(0),
+            )
+            .expect("could not add the listener");
+        (proxy, address, address.into())
+    }
+
+    /// `Server::notify_activate_listener` abandons an activation whose session
+    /// it cannot build. The socket the listener bound for that activation is
+    /// closed: the address is released, so the worker takes no share of the
+    /// datagrams sent to it and a retried activation binds again.
+    ///
+    /// A socket that sets no `SO_REUSEPORT` can bind an address only once every
+    /// socket bound there is closed, which makes the plain bind below the
+    /// observation of the close.
+    ///
+    /// To SEE THIS RED: in `UdpProxy::abandon_activation`, park the socket
+    /// whatever `socket_inherited` says: the `parked_socket` assertion fails,
+    /// and without it the bind below fails with "address in use".
+    #[test]
+    fn abandoning_an_activation_closes_the_socket_the_listener_bound() {
+        let (mut proxy, address, key) = proxy_with_a_listener();
+        proxy
+            .activate_listener(&key, None)
+            .expect("could not activate the listener");
+        assert_eq!(
+            proxy.inherited_socket_fate(&key),
+            InheritedSocketFate::Refused
+        );
+
+        proxy
+            .abandon_activation(&key)
+            .expect("an active listener can be taken back");
+
+        assert_eq!(
+            proxy.inherited_socket_fate(&key),
+            InheritedSocketFate::Adopted,
+            "an abandoned activation leaves the listener inactive"
+        );
+        assert!(
+            proxy.listeners[&Token(0)].borrow().parked_socket.is_none(),
+            "a socket the listener bound itself is not worth parking"
+        );
+        StdUdpSocket::bind(SocketAddr::from(address))
+            .expect("the abandoned activation must have closed the socket it bound");
+
+        proxy
+            .activate_listener(&key, None)
+            .expect("a retried activation binds the address again");
+        assert_eq!(
+            proxy.inherited_socket_fate(&key),
+            InheritedSocketFate::Refused
+        );
+    }
+
+    /// An inherited socket has already left the SCM table, so an abandoned
+    /// activation keeps it, with the datagrams queued on it, for the retry
+    /// (sozu#1342): closing it would lose both.
+    ///
+    /// To SEE THIS RED: in `UdpProxy::abandon_activation`, drop the socket
+    /// whatever `socket_inherited` says: `parked_socket` is then `None`, and the
+    /// retry binds a fresh socket that holds no datagram.
+    #[test]
+    fn abandoning_an_activation_keeps_the_inherited_socket_and_what_it_queued() {
+        let (mut proxy, address, key) = proxy_with_a_listener();
+        let inherited =
+            udp_bind(address.into(), None).expect("could not bind the inherited socket");
+        let sender = StdUdpSocket::bind("127.0.0.1:0").expect("could not bind the test sender");
+        sender
+            .send_to(QUEUED, SocketAddr::from(address))
+            .expect("could not queue a datagram on the inherited socket");
+        proxy
+            .activate_listener(&key, Some(inherited))
+            .expect("could not activate the listener on the inherited socket");
+
+        proxy
+            .abandon_activation(&key)
+            .expect("an active listener can be taken back");
+
+        assert_eq!(
+            proxy.inherited_socket_fate(&key),
+            InheritedSocketFate::Adopted,
+            "an abandoned activation leaves the listener inactive"
+        );
+        assert!(
+            proxy.listeners[&Token(0)].borrow().parked_socket.is_some(),
+            "the inherited socket must stay parked on the listener"
+        );
+
+        proxy
+            .activate_listener(&key, None)
+            .expect("a retried activation takes the parked socket back");
+        let listener = proxy.listeners[&Token(0)].borrow();
+        let socket = listener
+            .socket
+            .as_ref()
+            .expect("the retried activation holds a socket");
+        let mut buffer = [0u8; 64];
+        let (length, _) = socket
+            .recv_from(&mut buffer)
+            .expect("the datagram queued before the failed activation must still be there");
+        assert_eq!(&buffer[..length], QUEUED);
     }
 }
