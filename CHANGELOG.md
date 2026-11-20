@@ -149,6 +149,10 @@
 
 - A WebSocket client (`ws://` or `wss://`) that sends its last frame and half-closes no longer loses that frame, and the session now reaches the access log and the end-of-session metrics. `Pipe::ready` closed on the first frontend HUP without reading the bytes the kernel still held behind the FIN and without writing an access log line, so such a session was missing from `access_logs.count` and the request and service times; the HUP now goes through the drain-then-log handler the TCP pipe uses. A WebSocket session that ended on a frontend socket error or on the loop limit was skipped the same way and is now logged once.
 
+<!-- changelog-slot:pipe-backend-hup-spin -->
+
+- Fixed: a TCP, WebSocket or secure WebSocket session whose backend closes while response bytes are still queued for a client that has stopped reading is no longer cut with the tail undelivered. The backend hang-up handler turned the frontend's WRITABLE event back on after every failed write, so the pass never parked to wait for the client and retried the failing `send` until it reached the 100000-iteration bound. It then closed the session, counted `tcp.infinite_loop.error` or `http.infinite_loop.error`, dropped the rest of the response, and stalled the single-threaded worker for that whole pass. The handler now adds the WRITABLE interest only; the session waits for the client's next writable event and delivers the tail once the client reads.
+
 ## 2.3.6 - 2026-11-18
 
 ### Security

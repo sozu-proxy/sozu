@@ -3,9 +3,11 @@
 //! Forwards bytes between front and back through fixed-size buffers without
 //! payload inspection. When bytes enter a sozu-owned buffer, the opposite
 //! endpoint is armed via `Readiness::arm_writable()` so edge-triggered epoll
-//! cannot park buffered data behind a missing writable edge. Used as the
-//! post-handshake state for raw TCP listeners and after a successful WebSocket
-//! upgrade on the H1 path.
+//! cannot park buffered data behind a missing writable edge. A backend hang-up
+//! only adds the frontend's WRITABLE interest: the event stays whatever the
+//! last write left it, so a client that stopped reading parks the pass instead
+//! of spinning it. Used as the post-handshake state for raw TCP listeners and
+//! after a successful WebSocket upgrade on the H1 path.
 
 use std::{cell::RefCell, net::SocketAddr, rc::Rc};
 
@@ -699,7 +701,20 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 "{} Pipe::backend_hup: backend connection closed, keeping alive due to inflight data in buffers.",
                 log_context!(self)
             );
-            self.frontend_readiness.arm_writable();
+            // Interest only, never the event. Every path that queues response
+            // bytes (`backend_readable`, `splice_backend_readable`,
+            // `arm_inherited_buffer_writes`) has already armed the frontend
+            // WRITABLE event, so `writable` has had its chance to run on them.
+            // This site runs after `writable` in the same iteration: if that
+            // write met EAGAIN it just cleared the event, and setting it again
+            // here would defeat the "backend HUP, frontend interested in
+            // WRITABLE but no WRITABLE event" break guard in `ready` (and in
+            // `TcpSession::ready_inner`, `lib/src/tcp.rs`). The pass would then
+            // retry the failing write every iteration until
+            // `MAX_LOOP_ITERATIONS` and close the session with the response
+            // tail undelivered. Parking instead waits for the client's next
+            // EPOLLOUT edge, which sets the event.
+            self.frontend_readiness.interest.insert(Ready::WRITABLE);
             if self.backend_readiness.event.is_readable() {
                 self.backend_readiness.interest.insert(Ready::READABLE);
             }
@@ -4204,6 +4219,118 @@ mod tests {
             1,
             "a WebSocket session that ends on a frontend socket error must reach the access log \
              and the end-of-session metrics once"
+        );
+    }
+
+    /// Write to `stream` until its kernel send buffer refuses more, so the
+    /// next write the code under test makes meets `EAGAIN`. The peer never
+    /// reads, so the window stays closed and nothing drains the buffer. Both
+    /// ends are pinned small first: an explicit `SO_SNDBUF`/`SO_RCVBUF` turns
+    /// off the kernel's buffer autotuning, which would otherwise grow the
+    /// send buffer again after the first `EAGAIN`.
+    fn fill_send_buffer(stream: &mut StdTcpStream, peer: &StdTcpStream) {
+        socket2::SockRef::from(peer)
+            .set_recv_buffer_size(16 * 1024)
+            .expect("the peer receive buffer must be settable");
+        socket2::SockRef::from(&*stream)
+            .set_send_buffer_size(4096)
+            .expect("the send buffer must be settable");
+        for chunk_len in [65_536usize, 4_096, 256, 1] {
+            let chunk = vec![0u8; chunk_len];
+            loop {
+                match stream.write(&chunk) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("filling the send buffer failed: {error}"),
+                }
+            }
+        }
+    }
+
+    /// The backend has hung up with a response tail still in `backend_buffer`
+    /// and the client's receive window is closed. One pass must write once,
+    /// meet `EAGAIN`, and then park on the "backend HUP, frontend interested
+    /// in WRITABLE but no WRITABLE event" break guard until the client's
+    /// EPOLLOUT edge comes back; it must not spin until `MAX_LOOP_ITERATIONS`
+    /// and close the session with the tail undelivered.
+    ///
+    /// `Pipe::backend_hup` re-arms the frontend WRITABLE *event* (not only
+    /// the interest) on its "bytes still buffered" branch, which cancels the
+    /// `EAGAIN` that `writable` had just recorded, so the guard never holds
+    /// and every iteration makes one more failing `send(2)`.
+    ///
+    /// To SEE THIS RED: in the buffered-data branch of `Pipe::backend_hup`,
+    /// replace `self.frontend_readiness.interest.insert(Ready::WRITABLE)` with
+    /// `self.frontend_readiness.arm_writable()`, the call it had before. The
+    /// pass then runs to `MAX_LOOP_ITERATIONS` and the first assertion fails
+    /// with `left: 1` against `right: 0`.
+    #[test]
+    fn backend_hup_with_a_blocked_frontend_parks_instead_of_spinning_to_the_loop_cap() {
+        use crate::socket::tests::proxy_count;
+
+        let (frontend_peer, mut frontend_server) = connected_pair();
+        fill_send_buffer(&mut frontend_server, &frontend_peer);
+        let (_backend_peer, backend_socket) = connected_pair();
+
+        let tail = [b'x'; 2048];
+        let mut pool = Pool::with_capacity(2, 2, 4096);
+        let mut backend_buffer = pool.checkout().expect("backend buffer");
+        let frontend_buffer = pool.checkout().expect("frontend buffer");
+        backend_buffer
+            .write_all(&tail)
+            .expect("queue the response tail");
+        let address = "127.0.0.1:0".parse().expect("test address");
+        let listener = Rc::new(RefCell::new(TestListener { address }));
+
+        let mut pipe = Pipe::new(
+            backend_buffer,
+            None,
+            Some(TcpStream::from_std(backend_socket)),
+            None,
+            None,
+            None,
+            None,
+            frontend_buffer,
+            Token(0),
+            TcpStream::from_std(frontend_server),
+            listener,
+            Protocol::HTTP,
+            Ulid::generate(),
+            Ulid::generate(),
+            None,
+            WebSocketContext::Tcp,
+        );
+        pipe.set_back_token(Token(1));
+        // The client's EPOLLOUT edge just arrived, and so did the backend's
+        // hang-up: the state a slow reader leaves behind after one burst.
+        pipe.frontend_readiness.event = Ready::WRITABLE;
+        pipe.backend_readiness.event = Ready::HUP;
+
+        let session: Rc<RefCell<dyn crate::ProxySession>> =
+            Rc::new(RefCell::new(crate::server::ListenSession {
+                protocol: Protocol::HTTPListen,
+            }));
+        let proxy: Rc<RefCell<dyn crate::L7Proxy>> = Rc::new(RefCell::new(UnusedProxy));
+        let mut metrics = SessionMetrics::new(Some(Duration::ZERO));
+
+        let capped_before = proxy_count(names::http::INFINITE_LOOP_ERROR);
+        let result = pipe.ready(session, proxy, &mut metrics);
+        let capped = proxy_count(names::http::INFINITE_LOOP_ERROR) - capped_before;
+
+        assert_eq!(
+            capped, 0,
+            "a blocked client must not drive the pass to MAX_LOOP_ITERATIONS \
+             ({MAX_LOOP_ITERATIONS} failing writes in one ready())"
+        );
+        assert_eq!(
+            result,
+            SessionResult::Continue,
+            "the session must stay open until the client drains the response tail"
+        );
+        assert_eq!(
+            pipe.backend_buffer.available_data(),
+            tail.len(),
+            "the undelivered tail must still be queued for the client"
         );
     }
 }

@@ -782,7 +782,14 @@ A WebSocket upgrade on an H1 connection ends in the same `Pipe`.
    (`tcp_preread/LIFECYCLE.md` §8). Without splice, or on a WebSocket pipe, the
    `Pipe` copies through its two pooled buffers with `recv`/`send`.
 4. **Close.** A HUP on either side drains what is in flight
-   (`Pipe::frontend_hup`, `Pipe::backend_hup`). The `Pipe` logs the session
+   (`Pipe::frontend_hup`, `Pipe::backend_hup`). A backend HUP that finds
+   response bytes still queued adds the frontend's WRITABLE interest and never
+   its WRITABLE event: the write that just met `EAGAIN` cleared that event, and
+   setting it again would defeat the pass's break guard (backend HUP, frontend
+   interested in WRITABLE, no WRITABLE event), which parks the session until the
+   client's next `EPOLLOUT` edge. Re-arming it made every iteration retry the
+   failing write until `MAX_LOOP_ITERATIONS` and close the session with the
+   tail undelivered. The `Pipe` logs the session
    once, from whichever of its handlers ends it (`Pipe::log_request_success`
    or `Pipe::log_request_error`, both through `Pipe::log_request`:
    `getsockopt(TCP_INFO)` on each side). The backend address it logs is the
