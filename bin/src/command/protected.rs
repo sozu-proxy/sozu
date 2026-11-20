@@ -517,7 +517,23 @@ impl Gatherer for ProtectedHealthCheckTask {
         message: WorkerResponse,
     ) {
         let status = ResponseStatus::try_from(message.status);
-        if matches!(status, Ok(ResponseStatus::Processing)) || self.answered.contains(&worker_id) {
+        // Once the step reached a decision (`Gatherer::has_finished`), the
+        // answers that still arrive belong to the order that decision
+        // replaces: every answer of a poll batch is routed before
+        // `CommandHub::finish_ready_tasks` (`bin/src/command/server.rs`)
+        // hands the decision out. They must not reach the transaction. A
+        // refusal that started the abort already moved it to `Aborting`,
+        // where `Transaction::failed`
+        // (`command/src/protected_transaction.rs`) means "this worker's abort
+        // failed": a second worker that merely refused the same order, and
+        // has not been sent an abort yet, would be booked unrecoverable and
+        // fenced. A worker that closed meanwhile loses nothing by being
+        // ignored here: `advance` books every unreachable target of the next
+        // order as failed itself.
+        if self.step.is_some()
+            || matches!(status, Ok(ResponseStatus::Processing))
+            || self.answered.contains(&worker_id)
+        {
             return;
         }
         let version = self.txn.version();
@@ -2325,6 +2341,64 @@ mod tests {
         assert_eq!(
             rig.hub.server.protected.held_values(CLUSTER),
             Some(vec![b"SYNTHETIC-OTHER-3f".to_vec()])
+        );
+    }
+
+    /// Every worker refuses the same order: the first refusal starts the
+    /// abort, and the refusals that follow inside the same poll batch (the
+    /// answers are all routed before `finish_ready_tasks` hands the abort out)
+    /// say nothing about the abort, which no worker has been sent yet. Each
+    /// worker is then asked to roll back, acknowledges, and the change ends as
+    /// a clean `FAILED`. A refusal booked as a failed abort would leave the
+    /// worker `unrecoverable`: the outcome would be `INCOHERENT` and the main
+    /// would `SIGKILL` a healthy worker, with its live connections.
+    ///
+    /// TO SEE THIS RED: delete the `self.step.is_some()` condition from the
+    /// early return at the top of `ProtectedHealthCheckTask::on_message`, so
+    /// that the second refusal reaches `Transaction::failed` while the
+    /// transaction is already `Aborting`: the worker it books unrecoverable
+    /// is fenced, and "refused the order and acknowledged its rollback, yet
+    /// the main fenced it" fails with `left: Stopped` for both phases.
+    fn two_refusals_of_one_order_roll_back_without_fencing_a_healthy_worker(
+        phase: ProtectedHealthCheckPhase,
+    ) {
+        let mut rig = rig(2);
+        rig.workers[0].refuses = Some(phase);
+        rig.workers[1].refuses = Some(phase);
+
+        rig.begin(order(&[("Authorization", SECRET)]));
+        rig.pump();
+        rig.pump();
+
+        assert_eq!(rig.final_status(), Some(ResponseStatus::Failure));
+        for worker in rig.hub.server.workers.values() {
+            assert_ne!(
+                worker.run_state,
+                RunState::Stopped,
+                "{phase:?}: worker {} refused the order and acknowledged its rollback, \
+                 yet the main fenced it",
+                worker.id
+            );
+        }
+        assert_eq!(
+            final_message(&mut rig).as_deref(),
+            Some(FAILED),
+            "{phase:?}: a clean rollback of every worker is reported as such"
+        );
+        assert_nothing_applied(&mut rig);
+    }
+
+    #[test]
+    fn two_prepare_refusals_roll_back_without_fencing_a_healthy_worker() {
+        two_refusals_of_one_order_roll_back_without_fencing_a_healthy_worker(
+            ProtectedHealthCheckPhase::ProtectedHealthCheckPrepare,
+        );
+    }
+
+    #[test]
+    fn two_commit_refusals_roll_back_without_fencing_a_healthy_worker() {
+        two_refusals_of_one_order_roll_back_without_fencing_a_healthy_worker(
+            ProtectedHealthCheckPhase::ProtectedHealthCheckCommit,
         );
     }
 
