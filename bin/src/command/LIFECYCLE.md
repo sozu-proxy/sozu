@@ -86,6 +86,19 @@ The supervisor is a single-threaded mio event loop. Each tick:
   client answer it would give a real rejection: an old worker that closes
   before answering the `SoftStop` of an `upgrade --worker` fails that
   upgrade (§4).
+- serves the audit-event subscribers (`sozu events subscribe`). Audit events
+  are queued on `Server::pending_audit_events` and reach the subscribers only
+  through `CommandHub::flush_pending_audit_events`, which the loop calls right
+  after the task sweep (`CommandHub::finish_ready_tasks`) at the top of every
+  iteration and after each handled client request. The sweep call is what
+  delivers the completion line of a task (`WorkerTask`, `LoadStateTask`, and
+  `STATE_LOADED`, which a successful `load_state` raises at no other time):
+  `GatheringTask::on_finish` runs only from that sweep, outside any request
+  handler, so on a control plane where no client sends anything the
+  subscribers get the event in the iteration that finished the task, not at
+  the next request. A worker's own `Event` answer is not queued there: it is
+  forwarded to the subscribers as soon as `CommandHub::handle_worker_response`
+  routes it;
 - forgets the sessions of dead workers
   (`CommandHub::collect_unreferenced_restored_stopped_workers`, at the top of
   every iteration, after the task sweep). A `Stopped` session is removed, its
@@ -136,6 +149,17 @@ while `WorkersStopping`, nothing once `Stopping`. Workers ignore `SIGTERM`
 control group, as systemd does for a unit without `ExecStop=`, leaves the
 workers to the main process's soft stop. A worker whose main process dies
 still leaves: its channel closes and its event loop returns.
+
+Once `StopTask` has moved the main to `Stopping` the loop closes every client
+whose response buffer is empty and keeps only those holding unflushed bytes,
+returning when none is left. That wait has a deadline: one `worker_timeout`
+(at least one second), dated when the loop first sees `Stopping`. A client
+that stopped reading with a full socket buffer raises no event and asks for no
+retry, and the workers are already gone, so without the deadline nothing but
+the service manager's `SIGKILL` ended the stop. When the deadline passes the
+loop logs a warning, closes the remaining clients and returns; the poll
+timeout is capped at the time left, since no readiness announces the deadline.
+
 Hot upgrades are dispatched from `upgrade::upgrade_main`
 (`bin/src/upgrade.rs::fork_main_into_new_main`) and
 re-enter the new master via the same `begin_main_process` path with

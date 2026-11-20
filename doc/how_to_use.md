@@ -262,6 +262,9 @@ This will make systemd take notice of it, and now you can start the service with
 `sozu shutdown`: the workers stop accepting, finish their sessions, flush their logs and exit, then the
 main process exits. A second `SIGTERM` while the workers still drain turns it into a hard stop, the
 same as `sozu shutdown --hard`. A soft stop waits for sessions to end, and systemd bounds that wait:
-once `TimeoutStopSec` (90 s by default) expires, it sends `SIGKILL` to the whole unit.
+once `TimeoutStopSec` (90 s by default) expires, it sends `SIGKILL` to the whole unit. Once the workers
+are gone, the main process still sends each command client the responses it was owed, but waits for
+them at most one `worker_timeout` (10 s by default): a client that holds unread bytes after that is
+closed with a warning and the main process exits.
 
 [unit-file]: ../os-build/systemd/sozu.service

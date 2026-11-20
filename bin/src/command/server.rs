@@ -1159,7 +1159,9 @@ impl CommandHub {
     /// the first `SIGTERM` is a soft stop, a second one while the workers still
     /// drain is a hard stop. Each worker then leaves its event loop and flushes
     /// its log buffers. Bounding the drain is left to the supervisor: systemd
-    /// sends `SIGKILL` once `TimeoutStopSec` expires.
+    /// sends `SIGKILL` once `TimeoutStopSec` expires. The flush of the command
+    /// clients that follows the drain is bounded by [`Self::run`] itself, at
+    /// one `worker_timeout`.
     ///
     /// The handler writes to a socket pair whose read end joins the event loop
     /// under `SIGTERM_TOKEN`; the loop does the actual work
@@ -1287,9 +1289,11 @@ impl CommandHub {
         );
     }
 
-    /// Drain audit events queued by the [Server] during a client request and
-    /// fan them out to every subscribed client (same path as worker-emitted
-    /// backend events). Called from the event loop after handling a request.
+    /// Drain audit events queued by the [Server] and fan them out to every
+    /// subscribed client (same path as worker-emitted backend events). Called
+    /// from the event loop after handling a request, and at the top of every
+    /// iteration right after [`Self::finish_ready_tasks`]: the events a task
+    /// raises when it completes come from no request handler.
     fn flush_pending_audit_events(&mut self) {
         let events: Vec<Event> = self.server.pending_audit_events.drain(..).collect();
         if events.is_empty() {
@@ -1838,6 +1842,10 @@ impl CommandHub {
     pub fn run(&mut self) -> bool {
         let mut events = Events::with_capacity(100);
         debug!("running the command hub: {:?}", self);
+        // The instant clients that still hold unflushed bytes stop being
+        // waited for once the main is `Stopping`; set when the loop first sees
+        // that state.
+        let mut stopping_flush_deadline: Option<Instant> = None;
 
         loop {
             self.retry_pending_upgrade_completion();
@@ -1845,6 +1853,11 @@ impl CommandHub {
             let now = Instant::now();
 
             self.finish_ready_tasks(now);
+            // The completion of a task raises its audit event here, outside
+            // any request handler (`GatheringTask::on_finish` runs only from
+            // this sweep): serve the subscribers now, since no later client
+            // request is owed.
+            self.flush_pending_audit_events();
             self.announce_cold_ready();
 
             // A Stopped worker can still hold an SCM socket needed by
@@ -1866,13 +1879,42 @@ impl CommandHub {
             }
 
             if self.run_state == ServerState::Stopping {
-                // when closing, close all ClientSession which are not transfering data
+                // The flush of a client that holds unflushed bytes ends at a
+                // deadline dated when this loop first sees `Stopping`: a peer
+                // that stopped reading with a full socket buffer raises no
+                // event and no retry, and the workers are gone, so nothing
+                // else would end the wait before the service manager does.
+                let flush_deadline = *stopping_flush_deadline.get_or_insert_with(|| {
+                    now + Duration::from_secs(u64::from(self.server.config.worker_timeout.max(1)))
+                });
+                let flush_expired = now >= flush_deadline;
+                if flush_expired {
+                    let stuck = self
+                        .clients
+                        .values()
+                        .filter(|s| s.channel.back_buf.available_data() > 0)
+                        .count();
+                    if stuck > 0 {
+                        warn!(
+                            "stopping: closing {} client(s) still holding unflushed bytes \
+                             after the flush deadline",
+                            stuck
+                        );
+                    }
+                }
+                // when closing, close all ClientSession which are not transfering data,
+                // and every one once the flush deadline has passed
                 self.clients
-                    .retain(|_, s| s.channel.back_buf.available_data() > 0);
+                    .retain(|_, s| !flush_expired && s.channel.back_buf.available_data() > 0);
                 // when all ClientSession are closed, the CommandServer stops
                 if self.clients.is_empty() {
                     return self.server.upgrading;
                 }
+                // Nothing wakes the loop for a stuck client: wake it when the
+                // flush deadline passes.
+                let remaining = flush_deadline.saturating_duration_since(now);
+                poll_timeout =
+                    Some(poll_timeout.map_or(remaining, |timeout| timeout.min(remaining)));
             }
 
             let mut tick_tokens = std::mem::take(&mut self.restored_session_ticks);
@@ -2246,8 +2288,9 @@ pub struct Server {
     next_task_id: TaskId,
     next_worker_id: WorkerId,
     /// audit events emitted by the main process for control-plane mutations,
-    /// drained by the [CommandHub] after each request and fanned out to the
-    /// subscribed clients (same channel as worker-emitted backend events).
+    /// drained by the [CommandHub] after each request and after each task
+    /// sweep, and fanned out to the subscribed clients (same channel as
+    /// worker-emitted backend events).
     pub pending_audit_events: VecDeque<Event>,
     /// Dedicated file handle for the control-plane audit log, opened once
     /// at boot if `Config::audit_logs_target` is set. Every audit line is
@@ -2802,7 +2845,8 @@ impl Server {
     }
 
     /// Queue an audit event for fan-out to subscribed clients. Drained by
-    /// `CommandHub::flush_pending_audit_events` after every request handler.
+    /// `CommandHub::flush_pending_audit_events` after every request handler
+    /// and after every task sweep of the event loop.
     pub fn push_audit_event(&mut self, event: Event) {
         self.pending_audit_events.push_back(event);
     }
@@ -6544,6 +6588,257 @@ mod tests {
         assert_eq!(
             paired_routes, 1,
             "A's route must be retired while B's route remains owned by B"
+        );
+    }
+
+    /// Task whose completion raises an audit event, as `WorkerTask::on_finish`
+    /// and `LoadStateTask::on_finish` do through `audit_emit`, which only
+    /// queues it with [`Server::push_audit_event`]. The task with
+    /// `stop_server` raises nothing: it ends the loop at its own deadline.
+    #[derive(Debug)]
+    struct AuditOnFinishTask {
+        gatherer: DefaultGatherer,
+        stop_server: bool,
+    }
+
+    impl GatheringTask for AuditOnFinishTask {
+        fn client_token(&self) -> Option<Token> {
+            None
+        }
+
+        fn get_gatherer(&mut self) -> &mut dyn Gatherer {
+            &mut self.gatherer
+        }
+
+        fn snapshot(&self, _timing: TaskSnapshotTiming) -> Result<TaskSnapshot, TaskSnapshotError> {
+            Err(TaskSnapshotError::UnsupportedTestTask("AuditOnFinishTask"))
+        }
+
+        fn on_finish(
+            self: Box<Self>,
+            server: &mut Server,
+            _client: &mut OptionalClient,
+            _timed_out: bool,
+        ) {
+            if self.stop_server {
+                server.run_state = ServerState::Stopping;
+            } else {
+                server.push_audit_event(Event {
+                    kind: EventKind::StateLoaded as i32,
+                    ..Event::default()
+                });
+            }
+        }
+    }
+
+    /// Regression (s15-A6): an audit event raised when a task completes must
+    /// reach the subscribers when the task ends, not at the next client
+    /// request.
+    ///
+    /// `audit_emit` only queues the event on `Server::pending_audit_events`;
+    /// the subscribers are served by `CommandHub::flush_pending_audit_events`,
+    /// which the event loop called only after a handled client request. The
+    /// completion line of `WorkerTask` and `LoadStateTask` (and
+    /// `STATE_LOADED`, which a successful `load_state` raises at no other
+    /// time) is raised by `finish_ready_tasks`, outside any request handler,
+    /// so on a quiet control plane the subscriber never got it. The loop now
+    /// also serves the queue right after that sweep.
+    ///
+    /// The real event loop runs two tasks against one worker that never
+    /// answers: A (early deadline) raises the event, B (late deadline) stops
+    /// the loop. No client sends a request, so the only way the subscriber can
+    /// get the event is for the loop to serve the queue itself.
+    ///
+    /// TO SEE THIS RED: delete the call to `flush_pending_audit_events` right
+    /// after `self.finish_ready_tasks(now)` in `CommandHub::run`: the
+    /// assertion "subscriber never received ..." fires.
+    #[test]
+    fn task_completion_audit_event_reaches_subscribers_without_a_later_request() {
+        let mut hub = create_test_hub();
+        let (_silent_worker, _scm) = register_ready_test_worker(&mut hub.server, 0, 4096, 65536);
+        let (subscriber, mut peer) = register_observable_client(&mut hub);
+        hub.server.event_subscribers.insert(subscriber);
+
+        for (index, (timeout, stop_server)) in [
+            (Duration::from_millis(50), false),
+            (Duration::from_millis(600), true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let task_id = hub.server.new_task(
+                Box::new(AuditOnFinishTask {
+                    gatherer: DefaultGatherer::default(),
+                    stop_server,
+                }),
+                Timeout::Custom(timeout),
+            );
+            hub.server.scatter_on(
+                RequestType::Status(Status {}).into(),
+                task_id,
+                index + 1,
+                None,
+            );
+        }
+        assert_eq!(
+            hub.server.queued_tasks.len(),
+            2,
+            "both tasks must be admitted before the event loop starts"
+        );
+
+        assert!(
+            !hub.run(),
+            "the probe stops normally; it is not a main-upgrade handoff"
+        );
+
+        // The loop is over and the subscriber session with it: whatever the
+        // main wrote to the socket is still there to read.
+        peer.handle_events(Ready::READABLE);
+        let _ = peer.run();
+        let mut events = Vec::new();
+        while let Ok(response) = peer.read_message() {
+            if let Some(ResponseContent {
+                content_type: Some(ContentType::Event(event)),
+            }) = response.content
+            {
+                events.push(event);
+            }
+        }
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == EventKind::StateLoaded as i32),
+            "subscriber never received the audit event raised when task A completed, \
+             and no client request came to carry it; received {events:?}, \
+             still queued: {:?}",
+            hub.server.pending_audit_events
+        );
+        assert!(
+            hub.server.pending_audit_events.is_empty(),
+            "the completion event is delivered, not left queued: {:?}",
+            hub.server.pending_audit_events
+        );
+    }
+
+    /// Regression (s15-A5): a main that is `Stopping` must not wait without
+    /// bound for a client that holds unflushed bytes and never reads.
+    ///
+    /// `CommandHub::run` kept, while `Stopping`, every client whose
+    /// `back_buf` held data, and returned only once no client was left. A
+    /// write that hits `WouldBlock` leaves the bytes in `back_buf` and drops
+    /// the writable readiness, nothing retries, and the peer is neither in
+    /// error nor hung up: a subscriber that stopped reading with a full socket
+    /// buffer kept the main alive after its workers were gone, until the
+    /// service manager killed it. The wait now ends one `worker_timeout`
+    /// after the loop first sees `Stopping`, and not before: an owed response
+    /// is given that long to leave.
+    ///
+    /// The client is registered through `register_client`, its kernel socket
+    /// buffer is filled so the response queued next cannot be written, and the
+    /// main is stopped as `SIGTERM` stops it, with no worker: the loop starts
+    /// `Stopping` with no worker and no task. The peer socket is
+    /// held by a helper thread that closes it after `HELPER_RELEASES_PEER`: a
+    /// hang-up is the one thing that frees a stuck client today, so the helper
+    /// bounds the test and, by being the one to set `released`, tells a main
+    /// that gave up from one that was let go. `worker_timeout` is one second,
+    /// the deadline the audit proposes for the flush.
+    ///
+    /// TO SEE THIS RED: make the `Stopping` branch of `CommandHub::run`
+    /// retain every client with `back_buf` data again regardless of its
+    /// deadline: "the main was still waiting ..." fires after 5 seconds. For
+    /// the lower bound, make that `retain` closure return `false` for every
+    /// client, so the main drops it the moment it sees `Stopping`: "the main
+    /// gave up ..." fires.
+    #[test]
+    fn stopping_main_does_not_wait_forever_for_a_client_that_never_reads() {
+        const HELPER_RELEASES_PEER: Duration = Duration::from_secs(5);
+
+        let dir = tempfile::tempdir().expect("could not create temp dir");
+        let listener =
+            UnixListener::bind(dir.path().join("stuck-client.sock")).expect("could not bind");
+        let config = Config {
+            worker_timeout: 1,
+            command_buffer_size: DEFAULT_COMMAND_BUFFER_SIZE,
+            max_command_buffer_size: DEFAULT_MAX_COMMAND_BUFFER_SIZE,
+            ..Config::default()
+        };
+        let flush_deadline = Duration::from_secs(u64::from(config.worker_timeout));
+        let mut hub =
+            CommandHub::new(listener, config, "sozu".to_owned()).expect("could not create Hub");
+
+        let (peer, accepted) =
+            std::os::unix::net::UnixStream::pair().expect("could not create client pair");
+        accepted
+            .set_nonblocking(true)
+            .expect("could not make client nonblocking");
+        hub.register_client(UnixStream::from_std(accepted));
+        let token = *hub.clients.keys().next().expect("registered client token");
+
+        // Fill the kernel buffer the way a client that stopped reading does,
+        // then queue one more response: it cannot leave `back_buf`.
+        {
+            let client = hub.clients.get_mut(&token).expect("registered client");
+            let chunk = [0_u8; 4096];
+            loop {
+                match std::io::Write::write(&mut client.channel.sock, &chunk) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("could not fill the client socket: {error}"),
+                }
+            }
+            client.return_processing("response the client never reads");
+            client.update_readiness(Ready::WRITABLE);
+            assert!(matches!(client.ready(), ClientResult::NothingToDo));
+            assert!(
+                client.channel.back_buf.available_data() > 0,
+                "the response must be stuck in the back buffer"
+            );
+            assert!(
+                !wants_to_tick(&client.channel),
+                "a stuck client must not ask for a retry: nothing wakes the loop for it"
+            );
+        }
+
+        let (loop_over, helper_wakes) = std::sync::mpsc::channel::<()>();
+        let helper = std::thread::spawn(move || {
+            let released = matches!(
+                helper_wakes.recv_timeout(HELPER_RELEASES_PEER),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            );
+            drop(peer);
+            released
+        });
+
+        // Enter `Stopping` the way `SIGTERM` does, through `begin_stop` and
+        // `StopTask::on_finish`: with no worker the stop task is finished at
+        // once, so a fix that dates the stop where the state changes sees it.
+        begin_stop(&mut hub.server, None, false);
+        hub.finish_ready_tasks(Instant::now());
+        assert_eq!(
+            hub.run_state,
+            ServerState::Stopping,
+            "with no worker to wait for, the stop task must end at once"
+        );
+        let stuck_bytes = hub.clients[&token].channel.back_buf.available_data();
+        let started_at = Instant::now();
+        let upgrading = hub.run();
+        let elapsed = started_at.elapsed();
+        let _ = loop_over.send(());
+        let released = helper.join().expect("helper thread");
+
+        assert!(!upgrading, "the loop stops normally");
+        assert!(
+            !released,
+            "the main was still waiting {elapsed:?} after it began stopping, for a client \
+             that holds {stuck_bytes} unflushed bytes and never reads: it returned only \
+             because the peer hung up"
+        );
+        // The deadline is dated inside `run`, after `started_at`: exact, not
+        // load-sensitive.
+        assert!(
+            elapsed >= flush_deadline,
+            "the main gave up after {elapsed:?} on a client that holds {stuck_bytes} \
+             unflushed bytes, before its {flush_deadline:?} flush deadline"
         );
     }
 
