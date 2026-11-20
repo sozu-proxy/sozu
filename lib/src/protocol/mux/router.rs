@@ -4763,7 +4763,11 @@ mod backend_selection_order_tests {
     /// which is the state `EndStreamAction::Reconnect` puts it back in after a
     /// failed dial, so calling `plan_connect` twice on it is the retry.
     ///
-    /// To SEE THIS RED: nothing to change, it fails on the unmodified tree.
+    /// To SEE THIS RED: in `Router::plan_connect`, replace
+    /// `if !replaying && !retried {` with `if !replaying {`, so that a retried
+    /// dial routes the request again, as before the fix. The second attempt
+    /// then fails with "attempt 2: the operator's `X-Trace` request header
+    /// must reach the backend once", two copies of the value being found.
     #[test]
     fn a_retried_dial_inserts_an_operator_request_header_once() {
         const CLUSTER: &str = "cluster-retry-header";
