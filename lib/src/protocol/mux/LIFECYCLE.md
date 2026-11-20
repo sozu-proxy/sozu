@@ -502,7 +502,10 @@ handshake facts and are frozen for the same reason — see §1.2.
   (`stream.rs`). This is the *fallback* tag source, reached only for a request
   that never completed routing — malformed, unknown host, SNI/authority
   mismatch — because a routed request carries the tags of the frontend rule that
-  matched it in `HttpContext::tags`. Resolving it needs the request authority,
+  matched it in `HttpContext::tags`. `HttpContext::reset` (`editor.rs`) clears
+  `tags` between the requests of an H1 connection, so a keep-alive request
+  refused before routing falls back to this lookup instead of logging the
+  previous request's tags. Resolving it needs the request authority,
   which does not exist yet at the capture point, and snapshotting the listener's
   whole authority-keyed map per request would cost more than the observability
   it buys.
@@ -645,6 +648,21 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   still be a `Dial`, so the test asserts on the state the router and the stream
   are left in rather than on the returned value.
 
+  An H2 connection is reused only while it has room for one more stream, in
+  both states the scan accepts: a `Connected` connection whose stream count has
+  reached `peer_settings.settings_max_concurrent_streams` is skipped, and so is
+  a `BackendStatus::Connecting` one, the fallback taken when no `Connected`
+  connection has room. A connecting connection's limit is the default
+  (`H2Settings::default()`), because the backend's SETTINGS have not arrived,
+  and streams attached to it count against it from the moment
+  `ConnectionH2::start_stream` registers them. Without the check on the
+  `Connecting` arm, the stream past that limit was attached anyway, refused by
+  `ConnectionH2::start_stream`, and answered 503 with `MaxSessionsMemory`;
+  with it the router answers `ConnectPlan::Dial` and the stream waits on a
+  second connection. Pinned by
+  `a_full_pooled_h2_connection_is_not_reused_connected_or_connecting`
+  (`router.rs`).
+
   The pool scan matches a connection by the cluster id in its
   `Position::Client`, and skips one whose backend has left the configuration.
   A cluster id outlives `RemoveCluster` followed by `AddCluster` of the same
@@ -679,8 +697,12 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   ends. The check runs on every pass of the session, so a connection idle
   before the removal is closed on the session's next event. The
   `RemovedBackendHasNoConnections` event is still tied to the session: it is
-  emitted when the last `Rc` of the backend drops, and the session's
-  `BackendRegistry` holds one until the session closes.
+  emitted when the last `Rc` of a retired backend drops, and the session's
+  `BackendRegistry` holds one until the session closes. Only a retired backend
+  (`BackendStatus::Closing` or `Closed`, which `BackendList::remove_backend` and
+  `BackendMap::remove_cluster` set before they release it) announces itself: the
+  temporary `Backend` an `AddBackend` upsert is given and drops, once its fields
+  are copied onto the configured backend, is `Normal` and emits nothing.
 
   A reload that changes a backend's weight, `sticky_id` or `backup` reaches the
   workers as `RemoveBackend` then `AddBackend` (`ConfigState::diff`,
@@ -772,9 +794,9 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   `Router::plan_connect` derives it (`affinity_key`, `router.rs`) right after
   `route_from_request`, where both the routed cluster and the request's header
   blocks are in hand, and stores it in `HttpContext::affinity_key` beside
-  `cluster_id`. The storage is for the same reason as the cluster's: a replay
-  skips routing against a drained front kawa, so it reuses the key the first
-  attempt derived rather than recomputing it from blocks that are gone. The key
+  `cluster_id`. The storage is for the same reason as the cluster's: a retry or
+  a replay does not route again, so it reuses the key the first attempt derived
+  rather than recomputing it from blocks that were edited or are gone. The key
   is `None` under every other policy, and a sticky cookie naming a live backend
   still wins over it. Connection reuse runs before any dial and does not read
   the key: an H1 keep-alive or H2 connection the session already holds serves
@@ -2141,9 +2163,15 @@ stream that has completed on the backend. Behavior depends on `Position`:
   schedules the frontend write.
 
 **A backend close before the end of the response** (sozu-proxy/sozu#1633).
-With `Connection: close` (`keep_alive_backend == false`) the backend's EOF
-reaches `ConnectionH1::terminate_close_delimited` (`h1.rs`) from both EOF
-branches of `ConnectionH1::readable`. Only a body with neither
+With `keep_alive_backend == false` the backend's EOF reaches
+`ConnectionH1::terminate_close_delimited` (`h1.rs`) from both EOF branches of
+`ConnectionH1::readable`. `HttpContext::on_response_headers` clears the flag
+for a backend `Connection: close`, for a non-persistent HTTP/1.0 response and
+for a close-delimited response of any version, so an HTTP/1.1 response with
+neither `Content-Length` nor chunked coding is ended cleanly by the EOF
+whether or not it also says `Connection: close`; with the flag still set, the
+EOF would reach `end_stream_decision` as `ForwardUnterminated` and truncate a
+complete response. Only a body with neither
 `Content-Length` nor chunked coding (`BodySize::Empty`) is delimited by the
 close (RFC 9112 §6.3 rule 8) and ends `Terminated`. A `Content-Length` body
 still expecting bytes (rule 5) or a chunked body without its terminating zero
@@ -2152,7 +2180,17 @@ chunk (§7.1) is truncated: `warn!`,
 the backend goes away without that read path ending the body (a socket error,
 a backend timeout), the `CloseDelimited` arm of `ConnectionH2::end_stream`
 applies the same `body_size != BodySize::Empty` test, with the same `warn!`
-and metric, and ends the stream in `Error`.
+and metric, and ends the stream in `Error`. The `CloseDelimited` arm of
+`ConnectionH1::end_stream` ends the response the same way, by calling
+`ConnectionH1::terminate_close_delimited` itself (a socket error such as
+`ETIMEDOUT` is read as `SocketResult::Error`, which `ConnectionH1::readable`
+deliberately does not turn into an end of message, and the sweep of the dead
+backend then reaches the arm). It used to unlink the stream and arm the write
+and nothing else, which left the response neither terminated nor errored:
+`ConnectionH1::writable` has no exit for such a response, so the client waited
+for the frontend timeout before the connection closed: a delayed end for a
+close-delimited body, and for a length-framed one a truncation that left no
+`warn!` and no `h1.backend_eof_before_message_complete` count.
 
 A response in `Error` then ends in error on both frontends, never with a
 substitute answer once part of it left: `end_stream_decision` answers
@@ -2167,10 +2205,14 @@ write-only shutdown) once the errored response is flushed, never keeping it
 alive: the client sees a close before `Content-Length`, the incomplete-message
 signal of RFC 9112 §6.3, and no pipelined response can follow the truncated
 body. `Mux::close` logs the stream as an error. Pinned by
-`only_a_close_delimited_body_ends_cleanly_at_the_backend_eof` (`h1.rs`),
+`only_a_close_delimited_body_ends_cleanly_at_the_backend_eof` and
+`an_unframed_http11_response_without_connection_close_is_not_truncated_by_the_backend_eof`
+(`h1.rs`), `an_unframed_http11_response_is_close_delimited_and_a_framed_one_is_not`
+(`editor.rs`),
 `an_errored_response_already_handed_to_the_client_is_not_replaced`
 (`shared.rs`), `a_content_length_response_cut_short_ends_with_a_reset`
-(`h2.rs`), and the e2e `test_h2_content_length_truncated_*`,
+(`h2.rs`), `an_h1_frontend_ends_a_response_whose_close_delimited_backend_is_gone`
+(`h1.rs`), and the e2e `test_h2_content_length_truncated_*`,
 `test_h1_content_length_truncated_*` and `*_chunked_truncated_*` tests.
 
 **The H1 client connection closes after that response even when it ended
@@ -2205,6 +2247,31 @@ Pinned by the e2e `test_h1_close_delimited_body_closes_client`,
 `test_h1_content_length_complete_then_backend_close_closes_client`,
 `test_h1_framed_keep_alive_responses_keep_the_client` and
 `test_h2_*_keeps_the_h2_connection`.
+
+**An interim response whose backend is gone ends the session.** A backend that
+sends `100 Continue` (or another 1xx) and closes before the frontend has
+flushed it is ended by the sweep of the dead backend as if the 1xx were the
+final response: `end_stream_decision` answers `ForwardTerminated` for the
+terminated interim head and the stream becomes `Unlinked`. The `100` arm of
+`ConnectionH1::writable` clears the response and re-arms the backend read to
+wait for the final response, which only a linked backend can send, so that arm
+applies while the stream is still `Linked`. An unlinked `100` takes the arm of
+the other interim responses: it logs the request as `H1::Interim`, resets the
+stream's metrics so that `Mux::close`, which logs every open stream whose
+metrics still carry a start, does not log it a second time, marks the stream
+closing, as the close of a completed response does, so that the second
+`writable` pass a TLS close deferred behind its `close_notify` brings takes the
+`closing-context` exit instead of logging the request again, and closes the
+frontend through `defer_close_for_tls_flush("interim")`. Before this, the
+client waited for the frontend timeout (re-armed by every read of a request
+still uploading) and then saw a silent close, where it now sees the close once
+the `100` is flushed; and the other interim responses logged their request
+again on that close, at `Mux::close` and, on a TLS frontend, on the deferred
+pass as well, counting its status bucket each time. Pinned by
+`a_backend_close_after_100_continue_does_not_leave_the_request_unanswered`,
+`an_interim_response_whose_backend_is_gone_is_logged_once` and
+`a_deferred_tls_close_after_an_interim_response_logs_the_request_once`
+(`h1.rs`).
 
 **Neither connection outlives a response that completed before its request**
 (sozu-proxy/sozu#1721). A backend may answer early — a 413 or a 401 on an
@@ -2256,9 +2323,15 @@ generates itself to a partly received request (400, 401, 413, 503, 504, or a
 408 after part of a head): each lingers, bounded by `request_timeout`. A
 request of which no byte arrived (the 408 `client_timeout` to a silent client,
 whose `stream.front` is still at `StatusLine` with empty storage) has nothing
-in flight to drain and closes at once, as before. Pending also ends the
-linked backend stream through `endpoint.end_stream`, which disconnects that
-backend. Once nothing is left to flush (the response, then any TLS
+in flight to drain and closes at once, as before. The branch ends the linked
+backend stream through `endpoint.end_stream` whether it lingers or not — the
+backend is done with the stream either way, and the call is what records the
+stream's `StreamsEnded` (invariant 14). `ConnectionH1::end_stream` then
+returns the backend connection to `BackendStatus::KeepAlive` when its response
+was whole, the request was written to it whole, and it did not ask to close,
+and disconnects it otherwise (always, for a request received in part); the
+session's close closes a kept one with the rest.
+Once nothing is left to flush (the response, then any TLS
 `close_notify`), `defer_close_for_tls_flush` calls `start_linger` instead of
 returning `CloseSession`: it shuts the write side down with `shutdown_write`,
 so the FIN follows the response, and leaves only READABLE in the interest.
@@ -2441,7 +2514,7 @@ was it encoded for an H2 upstream?
 
 | Request state | Upstream answered | Action |
 |---|---|---|
-| untouched (`!front.consumed`, `!front_bound_to_backend`) | no | `Reconnect` — re-link and route from the intact front kawa |
+| untouched (`!front.consumed`, `!front_bound_to_backend`) | no | `Reconnect` — re-link and dial another backend with the front kawa as the first routing left it (not routed again) |
 | encoded for an H2 backend, unsent (`!front.consumed`, `front_bound_to_backend`) | no | `SendDefault(502)` — its frames belong to that connection |
 | written, replayable | no | `ReplayOnFreshBackend` — re-link and re-serialize the captured bytes |
 | written, not replayable | no | `SendDefault(502)` |
@@ -2573,6 +2646,24 @@ second partial copy of the request. A replay whose `cluster_id` did not
 survive, and one whose cluster switched to `http2` between attempts, are both
 refused through `BackendConnectionError::ReplayRefused` and answered 502 —
 what the stream would have received before the replay existed.
+
+It skips it on a `Reconnect` too, and for a reason that does not need a drained
+kawa: the front kawa of an untouched request is intact, but it is the one
+routing already edited in place, and routing is not idempotent on it. An
+operator request header edit with a value is inserted before the end-of-headers
+flag with no record of having run, so a second pass would send the header once
+per attempt; an edit that deleted a header has already run, so the Basic-auth
+check and the header predicates of the frontend lookup, which read
+`front.blocks`, would no longer see it. The discriminator is `Stream::attempts`
+read before `plan_connect` counts the attempt: it is zero when a request starts
+(`Context::create_stream`, the H1 keep-alive reset) and a stream only returns to
+`Link` after an attempt that routed it — every routing error ends in a default
+answer — so every re-link of the same request, whichever path queued it (the
+H1 and H2 `Reconnect`, the failed `connect(2)` re-queue, the re-link after a
+backend GOAWAY), reuses the cluster, the affinity key, the access-log tags and
+the response edits the first routing left on the stream's `HttpContext`. Backend
+selection and the per-(cluster, source-IP) gate still run on every attempt.
+`a_retried_dial_inserts_an_operator_request_header_once` (`router.rs`) pins it.
 
 The captured bytes are PREPENDED to `front.out`, because `out` need not be
 empty: a partial `socket_write_vectored` leaves the refused remainder queued
@@ -2726,7 +2817,9 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     `ConnectionH2::handle_rst_stream_frame`,
     `ConnectionH2::handle_goaway_frame` and
     `ConnectionH2::tear_down_reset_stream`, which every
-    `ConnectionH2::reset_stream` goes through; all `h2.rs`).
+    `ConnectionH2::reset_stream` goes through; all `h2.rs`; and the
+    backend-response parse error of `ConnectionH1::readable`, `h1.rs`, which
+    ends its own stream through the inherent `ConnectionH1::end_stream`).
     Otherwise load-balancing counters drift monotonically. A stream Sōzu
     resets on a backend connection because of a frame the backend sent
     (WINDOW_UPDATE with a zero increment, DATA on a 204 or past its
@@ -2740,6 +2833,23 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     connection, the status `Connection::start_stream` charges on. Pinned by
     `invariant_14_a_backend_provoked_stream_reset_releases_its_charge`
     (`h2.rs`).
+
+    The release must also be recorded **while the stream is still in the
+    reverse index**, or by the site that removes it: `Mux::close_backend_connections`
+    and the dead-backend sweep of `Mux::ready_inner` count their
+    `StreamsEnded(n)` from `Context::backend_streams`, so a stream taken out
+    of it first (`remove_backend_stream`) is counted by neither. That is why
+    the closing arm of `ConnectionH1::writable` ends the backend stream
+    through `Endpoint::end_stream` for every request it answers, as the
+    keep-alive arm does, and not only for the lingering one: a complete
+    response on a frontend that closes after it (client `Connection: close`,
+    or the backend's) would otherwise leave one charge per request on the
+    backend. Pinned by
+    `a_complete_response_on_a_closing_h1_frontend_releases_the_backend_stream_charge`,
+    `a_backend_response_that_does_not_parse_releases_the_backend_stream_charge`
+    and their `*_charge_once` companions, which charge a second stream to the
+    same backend so a double release reads as a wrong count instead of
+    saturating at zero (`mod.rs`).
 
     The core does not perform the release; it **emits** it. Question 12 of
     [#1340](https://github.com/sozu-proxy/sozu/issues/1340) took

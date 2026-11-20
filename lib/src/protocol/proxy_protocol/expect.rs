@@ -31,7 +31,7 @@ use crate::{
     timer::TimeoutContainer,
 };
 
-const V2_FIXED_HEADER_LEN: usize = 16;
+pub(super) const V2_FIXED_HEADER_LEN: usize = 16;
 const MAX_HEADER_LEN: usize = 232;
 
 /// Module-level prefix used on every log line emitted from this module when

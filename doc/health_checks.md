@@ -111,7 +111,9 @@ is accepted:
 The status judged is the final one: interim `1xx` responses (`100 Continue`,
 `103 Early Hints`, RFC 9110 §15.2) are skipped, on HTTP/1.1 and h2c alike, so
 accepting `1xx` or `any` never lets an interim response stand in for a final
-500. `101 Switching Protocols` is final. The probe buffers at most 4096 bytes
+500. `101 Switching Protocols` is final. The probe reads everything the backend
+has already sent on each readiness event (the socket is edge-triggered, so
+bytes left unread would raise no further event) and buffers at most 4096 bytes
 of response before reaching its verdict, interim responses included: a backend
 that sends, say, a `103 Early Hints` with more than about 4 KB of headers
 before its final status fails the probe.
@@ -362,7 +364,9 @@ sozu cluster health-check remove --id my-cluster
 Stops health checking for the given cluster. All backends in the cluster are
 reset to healthy and resume receiving traffic immediately, including those a
 probe had marked DOWN; probes still in flight are dropped, so none can mark a
-backend DOWN after the reset. Adding the cluster again without a health check
+backend DOWN after the reset. The `backend.available` gauge of such a backend
+returns to `1` with it, unless its retry policy still holds it down. Adding the
+cluster again without a health check
 (`sozu cluster add` on the existing id) has the same effect. The protected
 header values held for the cluster are dropped with the health check.
 

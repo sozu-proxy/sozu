@@ -188,6 +188,17 @@ PROXY phase and the downstream protocol.
   `RelayProxyProtocol::back_writable` (`relay.rs`) drains exactly the first `header_size`
   bytes of `frontend_buffer` onto the backend socket and returns
   `SessionResult::Upgrade` once the cursor reaches them.
+- A header the v2 parser rejects outright (a bad signature, an unsupported
+  address family) closes the session and increments `proxy_protocol.errors`,
+  exactly as `ExpectProxyProtocol::readable` does for the same input.
+- A parser `Incomplete` means "keep reading" only while declared bytes are
+  still missing. `parse_v2_header` hands the family parser exactly `len`
+  address bytes, so once the 16-byte fixed part and those `len` bytes are all
+  buffered, no later byte can change the verdict: an `Incomplete` at that point
+  (an `AF_INET6` header declaring 16 address bytes, an `AF_INET` header
+  declaring none) is a malformed header. `RelayProxyProtocol::readable` closes
+  it and increments `proxy_protocol.errors`, as `ExpectProxyProtocol::readable`
+  does at its `read_target`; it does not wait for a timer.
 - Anything the client pipelined into the same read stays in
   `frontend_buffer` for the pipe phase, and `RelayProxyProtocol::into_pipe` (`relay.rs`)
   hands that same `Checkout` to `Pipe::new`. Note where the surviving
@@ -218,8 +229,13 @@ PROXY phase and the downstream protocol.
     `WouldBlock` clears only the stale WRITABLE **event** and keeps the
     interest (as `send.rs::back_writable` does); `Interrupted` touches
     neither word so `ready_inner` retries under its own bound. Only a
-    genuine error resets both words. Clearing `interest` on backpressure
-    would mean no later epoll edge is ever acted on, stranding a
+    genuine error (`EPIPE`, `ECONNRESET`, ...) ends the session: it increments
+    `proxy_protocol.errors` and returns `SessionResult::Close`, as
+    `SendProxyProtocol::back_writable` does. Emptying both readiness words and
+    returning `Continue` would park the session, because a later backend
+    `HUP | ERROR` is OR-ed into `event` but `tcp.rs::ready_inner` acts on
+    `interest & event`, which is empty on both sides. Clearing `interest` on
+    backpressure would mean no later epoll edge is ever acted on, stranding a
     half-written header on the backend until the frontend timeout, and
     clearing the `event` on EINTR would strand it the same way — a signal
     is not a socket state change, so edge-triggered epoll owes no new edge
@@ -359,9 +375,18 @@ which makes it an attractive target. These rules are load-bearing.
    `MAX_LOOP_ITERATIONS` from `sozu_command::config`
    (e.g. `expect.rs:15`); any drain or read loop must respect it so a
    misbehaving peer cannot starve the single-threaded event loop.
-4. **Error counters on every reject.** Every `Close` path bumps the
-   `proxy_protocol.errors` counter via `incr!` so operators can alert on a
-   sudden spike (e.g. a backend that started rejecting the protocol).
+4. **Error counters on every reject.** In the three PROXY states of §2,
+   every `Close` path that rejects a header (a parse error, an oversized
+   header, a header incomplete at its declared length) or fails a socket read
+   or a header write bumps the `proxy_protocol.errors` counter via `incr!` so
+   operators can alert on a sudden spike (e.g. a backend that started
+   rejecting the protocol). The TCP SNI preread counts the header it rejects
+   under its own `tcp.sni_preread.rejected.proxy_header_invalid`. A close
+   for a peer that left or never spoke is not a protocol error and is not
+   counted: the zero-byte healthcheck close (rule 2), a close on a HUP or
+   ERROR readiness event, and the two `Close` returns of
+   `SendProxyProtocol::back_writable` taken when the client's `peer_addr` or
+   the accepted socket's `local_addr` is already unavailable.
 5. **No panic on adversarial input.** Per the repo `CLAUDE.md`
    security-sensitive areas list, the proxy-protocol path must convert
    parse errors / partial reads / oversized headers into

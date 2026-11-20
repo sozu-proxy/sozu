@@ -55,7 +55,12 @@
 //! fallback has no such counter, but every candidate it ranks is a connection
 //! that cannot serve anything yet, and it concentrated every waiting stream on
 //! one of them before this change too; the total order fixes WHICH one, it
-//! does not change how many.
+//! does not change how many. What bounds how many is the capacity check the
+//! `Connected` arm has and the fallback shares: a connecting connection that
+//! already carries `peer_settings.settings_max_concurrent_streams` streams
+//! (the default until the backend's SETTINGS arrive) is skipped, so the next
+//! stream dials a second connection instead of being refused by
+//! `ConnectionH2::start_stream` and answered 503.
 //!
 //! ## Complexity — UNMEASURED beyond the default configuration
 //!
@@ -657,6 +662,14 @@ impl Router {
                 stream.context.cluster_id.clone(),
             ));
         }
+        // Whether an earlier attempt of THIS request already ran, read before
+        // the increment below. `attempts` is zero when a request starts
+        // (`Context::create_stream` for a new or recycled slot, the keep-alive
+        // reset in `ConnectionH1::writable`), and a stream only comes back to
+        // `Link` after an attempt that routed it: every routing error ends in
+        // a default answer (`Mux::ready_inner`), and a failed `connect(2)`
+        // fails after routing.
+        let retried = stream.attempts > 0;
         stream.attempts += 1;
 
         // Borrow front mutably (so route_from_request can rewrite the request
@@ -666,33 +679,43 @@ impl Router {
         // headers_response). We split-borrow manually to keep the rest of
         // `connect` working with `stream_context` aliasing `stream.context`.
         //
-        // A REPLAY skips routing entirely. `front.consumed` is the exact
-        // discriminator: it is false on every first connect and on the
-        // untouched-request `EndStreamAction::Reconnect`, and true only once
-        // request bytes have left the front kawa — which is precisely the
-        // `EndStreamAction::ReplayOnFreshBackend` case. Routing already ran
-        // on the first attempt and every decision it made (cluster, legacy
-        // HTTPS redirect, SNI/authority binding, authentication, request-side
-        // header edits) is baked into the captured bytes.
+        // A RETRY or a REPLAY skips routing entirely: routing runs once per
+        // request, on its first attempt. Every decision it made (cluster,
+        // legacy HTTPS redirect, SNI/authority binding, authentication,
+        // request-side header edits) is baked into the front kawa, and the
+        // stream's `HttpContext` keeps the rest (cluster, affinity key,
+        // access-log tags, response edits).
         //
-        // Re-running it against a front kawa whose blocks are drained cannot
-        // reproduce them: the request line and headers it rewrites are no
-        // longer in `front.blocks`, and `end_of_headers_index` has no anchor
-        // to place injected headers at. Whatever the next `prepare` did emit
-        // would land BEHIND the replayed bytes, because `Kawa::prepare`
-        // appends to `out` while `Stream::queue_upstream_replay` prepends —
-        // a second, partial copy of the request trailing the first on the
-        // same connection.
+        // A retry re-links an untouched request after a dial that was refused,
+        // timed out or failed (`EndStreamAction::Reconnect`, the failed
+        // `connect(2)` re-queue, the re-link after a backend GOAWAY). Its
+        // front kawa is intact, but it is the EDITED one, and routing is not
+        // idempotent on it: an operator request header edit with a value is
+        // inserted once more per attempt, and an edit that deleted a header
+        // has run, so the Basic-auth check and the header predicates of the
+        // frontend lookup no longer see it and could answer 401 or pick
+        // another frontend.
         //
-        // So a replay whose routing decision did not survive is refused
-        // outright rather than re-routed against that drained kawa: 502 is
-        // what the stream would have received before the replay existed.
+        // A replay is told apart by `front.consumed`, which is true only once
+        // request bytes have left the front kawa: precisely the
+        // `EndStreamAction::ReplayOnFreshBackend` case. Re-running routing
+        // against a front kawa whose blocks are drained cannot reproduce its
+        // decisions: the request line and headers it rewrites are no longer in
+        // `front.blocks`, and `end_of_headers_index` has no anchor to place
+        // injected headers at. Whatever the next `prepare` did emit would land
+        // BEHIND the replayed bytes, because `Kawa::prepare` appends to `out`
+        // while `Stream::queue_upstream_replay` prepends — a second, partial
+        // copy of the request trailing the first on the same connection.
+        //
+        // So a retry or a replay whose routing decision did not survive is
+        // refused outright rather than re-routed: 502 is what the stream
+        // would have received before the replay existed.
         //
         // The routed id, a handle on the route table's `ClusterId` and not a
         // copy, moves into `HttpContext::cluster_id`; everything after this
         // borrows or re-counts it, the embedder's gate included (#1583).
         let replaying = stream.front.consumed;
-        if !replaying {
+        if !replaying && !retried {
             let (front_ref, stream_context_ref) = {
                 let stream_split = &mut *stream;
                 (&mut stream_split.front, &mut stream_split.context)
@@ -702,8 +725,8 @@ impl Router {
                 .map_err(BackendConnectionError::RetrieveClusterError)?;
             // Derived here, where the routed cluster and the request's header
             // blocks are both in hand, and stored beside the cluster id: a
-            // replay finds the blocks drained and reuses this key, as it
-            // reuses the cluster.
+            // retry or a replay does not route again and reuses this key, as
+            // it reuses the cluster.
             let context = &stream.context;
             let key = view.cluster(&routed).and_then(|cluster| {
                 affinity_key(
@@ -723,7 +746,8 @@ impl Router {
             stream.context.cluster_id = Some(routed);
         }
         let stream_context = &stream.context;
-        // Only a replay can find it unset: routing has just stored it otherwise.
+        // Only a retry or a replay can find it unset: routing has just stored
+        // it otherwise.
         let Some(cluster_id) = stream_context.cluster_id.as_deref() else {
             return Err(BackendConnectionError::ReplayRefused(
                 "no cluster_id survived the first attempt",
@@ -888,7 +912,7 @@ impl Router {
         H2 connecting strategy (least-loaded):
         - look at every backend connection
         - among connected backends for this cluster, pick the one with the fewest active streams
-        - fall back to a connecting backend if no connected one exists
+        - fall back to a connecting backend with room for one more stream if no connected one exists
         - if no backend is to reuse, ask the router for a socket to the "next in line" backend
 
         H1 strategy: reuse the first KeepAlive backend for this cluster.
@@ -932,10 +956,18 @@ impl Router {
                     }
                 }
                 (true, Position::Client(other_cluster_id, _, BackendStatus::Connecting(_))) => {
-                    // Only use a connecting backend if no connected one was found
+                    // Only use a connecting backend if no connected one was
+                    // found, and only while it has room for one more stream:
+                    // the same capacity check as the `Connected` arm. Streams
+                    // attached before the backend's SETTINGS arrive count
+                    // against the default limit, and `ConnectionH2::start_stream`
+                    // refuses the one past it, which would answer 503 where a
+                    // second dial can serve it.
                     if other_cluster_id == cluster_id
                         && best_h2_stream_count == usize::MAX
-                        && matches!(backend, Connection::H2(_))
+                        && let Connection::H2(h2c) = backend
+                        && h2c.core.stream_count()
+                            < h2c.core.peer_settings.settings_max_concurrent_streams as usize
                     {
                         reuse_token = Some(*token)
                     }
@@ -3196,6 +3228,109 @@ mod backend_selection_order_tests {
         }
     }
 
+    /// A new stream whose `Context` is shaped for `staged`'s cluster, in the
+    /// `Link` state the router decides on.
+    fn linkable_stream(
+        context: &mut Context<HttpListener>,
+        staged: &Staged,
+    ) -> crate::protocol::mux::GlobalStreamId {
+        let stream_id = context
+            .create_stream(Ulid::generate(), 65_535)
+            .expect("the test pool must hand out a stream");
+        let stream = &mut context.streams[stream_id];
+        stream.state = StreamState::Link;
+        stream.context.authority = Some(staged.authority().to_owned());
+        stream.context.path = Some("/".to_owned());
+        stream.context.method = Some(Method::Get);
+        stream_id
+    }
+
+    /// A pooled H2 backend connection that already carries as many streams as
+    /// the peer is assumed to allow is not reused, whether the connection is
+    /// `Connected` or still `Connecting`.
+    ///
+    /// The `Connected` arm of the reuse scan skips a connection at its
+    /// `settings_max_concurrent_streams`; the `Connecting` fallback has no
+    /// such check and attaches every further stream of the cluster to the
+    /// connection until `ConnectionH2::start_stream` refuses it, which the
+    /// router turns into `MaxSessionsMemory` and the caller into a 503. The
+    /// limit of a connection still `Connecting` is the default, because the
+    /// backend's SETTINGS have not arrived (`H2Settings::default()` in the
+    /// `ConnectionH2` core constructor).
+    ///
+    /// The limit is lowered to one here so that a single attached stream fills
+    /// the connection, which is the state 100 attached streams reach with the
+    /// default.
+    ///
+    /// To SEE THIS RED: in the `Connecting` arm of the scan in
+    /// `Router::decide_after_gate`, replace the
+    /// `let Connection::H2(h2c) = backend` condition and the
+    /// `h2c.core.stream_count() < ...settings_max_concurrent_streams` check
+    /// that follows it with `matches!(backend, Connection::H2(_))`, as it was
+    /// before the fix. The `H2 Connecting` round then fails with "a connection
+    /// at its stream limit must not be reused, a second connection must be
+    /// dialed, got Err(MaxSessionsMemory)".
+    #[test]
+    fn a_full_pooled_h2_connection_is_not_reused_connected_or_connecting() {
+        let fixture = routing_fixture();
+        for (staged, arm) in [
+            (Staged::ConnectedH2, "H2 Connected"),
+            (Staged::ConnectingH2, "H2 Connecting"),
+        ] {
+            let mut context = Context::new(
+                Ulid::generate(),
+                Rc::downgrade(&fixture.pool),
+                fixture.listener.clone(),
+                None,
+                "127.0.0.1:80"
+                    .parse()
+                    .expect("test public address must parse"),
+            );
+            let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+            let mut backend_registry = BackendRegistry::default();
+            let (mut connection, _peer) =
+                staged_backend(&fixture.pool, &staged, &mut backend_registry);
+            let Connection::H2(h2c) = &mut connection else {
+                unreachable!("an H2 arm stages an H2 connection")
+            };
+            h2c.core.peer_settings.settings_max_concurrent_streams = 1;
+            router.backends.insert(Token(LOWEST_TOKEN), connection);
+
+            let proxy_ref = fixture.proxy.borrow();
+            let view = RoutingView::new(proxy_ref.clusters(), proxy_ref.kind());
+
+            // Premise: with room left, the connection is reused.
+            let first = linkable_stream(&mut context, &staged);
+            let plan = router
+                .plan_connect(first, &mut context, &view)
+                .map(decided)
+                .expect("routing must resolve the staged cluster");
+            assert!(
+                matches!(plan, ConnectPlan::Attached),
+                "premise, {arm}: a connection below its stream limit is reused, got {plan:?}"
+            );
+            assert_eq!(
+                context.streams[first].state,
+                StreamState::Linked(Token(LOWEST_TOKEN))
+            );
+
+            // The connection now holds one stream, the limit it is assumed to
+            // allow: the next stream needs another connection.
+            let second = linkable_stream(&mut context, &staged);
+            let plan = router
+                .plan_connect(second, &mut context, &view)
+                .map(decided);
+            assert!(
+                matches!(
+                    &plan,
+                    Ok(ConnectPlan::Dial { cluster_id, .. }) if &**cluster_id == staged.cluster()
+                ),
+                "{arm}: a connection at its stream limit must not be reused, a second \
+                 connection must be dialed, got {plan:?}"
+            );
+        }
+    }
+
     /// An admitted stream must have been **counted** before the decision
     /// resumes — the ordering the gate-as-a-step split has to preserve.
     ///
@@ -4614,6 +4749,140 @@ mod backend_selection_order_tests {
         assert!(router.backends.remove(&Token(LOWEST_TOKEN + 5)).is_some());
         assert!(router.backends.remove(&Token(LOWEST_TOKEN + 2)).is_some());
         assert!(router.backends.is_empty());
+    }
+
+    /// A request whose first backend dial failed before any byte was written
+    /// is planned again on the very front kawa the first attempt already
+    /// edited: `front.consumed` is false, so `Router::plan_connect` does not
+    /// take the replay shortcut and routes the request a second time. An
+    /// operator `Request` header edit with a value is an insertion, and the
+    /// insertion keeps no record of having run, so the retried request would
+    /// carry the header once per attempt.
+    ///
+    /// The stream stays in `StreamState::Link` after a `ConnectPlan::Dial`,
+    /// which is the state `EndStreamAction::Reconnect` puts it back in after a
+    /// failed dial, so calling `plan_connect` twice on it is the retry.
+    ///
+    /// To SEE THIS RED: in `Router::plan_connect`, replace
+    /// `if !replaying && !retried {` with `if !replaying {`, so that a retried
+    /// dial routes the request again, as before the fix. The second attempt
+    /// then fails with "attempt 2: the operator's `X-Trace` request header
+    /// must reach the backend once", two copies of the value being found.
+    #[test]
+    fn a_retried_dial_inserts_an_operator_request_header_once() {
+        const CLUSTER: &str = "cluster-retry-header";
+        const AUTHORITY: &str = "retry-header.example.com";
+        const KEY: &str = "X-Trace";
+        const VALUE: &str = "operator-edit";
+
+        let port = crate::testing::provide_port();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, port);
+        let config = ListenerBuilder::new_http(address)
+            .to_http(None)
+            .expect("test http listener config must build");
+        let parts =
+            crate::testing::prebuild_server(32, 65_536, false).expect("test server must build");
+        let pool = parts.pool.clone();
+        let mut proxy = HttpProxy::new(parts.registry, parts.sessions, parts.pool, parts.backends);
+        let listener_token = Token(0);
+        proxy
+            .add_listener(config, listener_token)
+            .expect("test listener must register");
+        proxy
+            .add_cluster(Cluster {
+                cluster_id: CLUSTER.to_owned(),
+                ..Default::default()
+            })
+            .expect("the test cluster must register");
+        proxy
+            .add_http_frontend(RequestHttpFrontend {
+                cluster_id: Some(CLUSTER.to_owned()),
+                address,
+                hostname: AUTHORITY.to_owned(),
+                path: PathRule::prefix("/".to_owned()),
+                position: RulePosition::Tree.into(),
+                headers: vec![sozu_command::proto::command::Header {
+                    position: sozu_command::proto::command::HeaderPosition::Request as i32,
+                    key: KEY.to_owned(),
+                    val: VALUE.to_owned(),
+                }],
+                ..Default::default()
+            })
+            .expect("the header-editing frontend must register");
+        let listener = proxy
+            .get_listener(&listener_token)
+            .expect("the registered listener must be reachable");
+        let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(proxy));
+
+        let mut context = Context::new(
+            Ulid::generate(),
+            Rc::downgrade(&pool),
+            listener,
+            None,
+            "127.0.0.1:80"
+                .parse()
+                .expect("test public address must parse"),
+        );
+        let stream_id = context
+            .create_stream(Ulid::generate(), 65_535)
+            .expect("the test pool must hand out a stream");
+        {
+            let stream = &mut context.streams[stream_id];
+            stream.state = StreamState::Link;
+            stream.context.authority = Some(AUTHORITY.to_owned());
+            stream.context.path = Some("/".to_owned());
+            stream.context.method = Some(Method::Get);
+            stream.front.push_block(kawa::Block::Flags(kawa::Flags {
+                end_body: false,
+                end_chunk: false,
+                end_header: true,
+                end_stream: true,
+            }));
+        }
+
+        let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+        let proxy_ref = proxy.borrow();
+        let view = RoutingView::new(proxy_ref.clusters(), proxy_ref.kind());
+
+        for attempt in 1..=2 {
+            let plan = router
+                .plan_connect(stream_id, &mut context, &view)
+                .map(decided)
+                .expect("routing must resolve the header-editing cluster");
+            assert!(
+                matches!(plan, ConnectPlan::Dial { .. }),
+                "attempt {attempt}: no backend connection is pooled, so the plan is a dial: got {plan:?}"
+            );
+            let stream = &context.streams[stream_id];
+            assert!(
+                !stream.front.consumed,
+                "attempt {attempt}: no request byte has been written, so a retry is not a replay"
+            );
+            assert!(
+                matches!(stream.state, StreamState::Link),
+                "attempt {attempt}: a dial plan leaves the stream in Link, where a failed dial puts it back"
+            );
+            let buffer = stream.front.storage.buffer();
+            let inserted: Vec<Vec<u8>> = stream
+                .front
+                .blocks
+                .iter()
+                .filter_map(|block| match block {
+                    kawa::Block::Header(pair)
+                        if !pair.is_elided()
+                            && pair.key.data(buffer).eq_ignore_ascii_case(KEY.as_bytes()) =>
+                    {
+                        Some(pair.val.data(buffer).to_vec())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                inserted,
+                vec![VALUE.as_bytes().to_vec()],
+                "attempt {attempt}: the operator's `{KEY}` request header must reach the backend once"
+            );
+        }
     }
 }
 
