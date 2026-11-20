@@ -2339,7 +2339,7 @@ impl HttpsListener {
                 "{} cannot accept connections, no listening socket available",
                 log_module_context!()
             );
-            Err(AcceptError::IoError)
+            Err(AcceptError::NoListenSocket)
         }
     }
 }
@@ -2995,7 +2995,7 @@ impl ProxyConfiguration for HttpsProxy {
     fn accept(&mut self, token: ListenToken) -> Result<(MioTcpStream, StdSocketAddr), AcceptError> {
         match self.listeners.get(&Token(token.0)) {
             Some(listener) => listener.borrow_mut().accept(),
-            None => Err(AcceptError::IoError),
+            None => Err(AcceptError::NoListenSocket),
         }
     }
 

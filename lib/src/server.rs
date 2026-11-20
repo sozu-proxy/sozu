@@ -114,6 +114,16 @@ fn per_source_bucket(peer: &SocketAddr) -> &'static str {
 /// — the binary `accept_queue.backpressure` gauge collapses that duration.
 const ACCEPT_SATURATION_TICK: Duration = Duration::from_secs(1);
 
+/// Pause between two deferred accept passes after an `accept(2)` failed on a
+/// live listener (descriptor exhaustion, a connection aborted before it was
+/// accepted). `Server::accept` keeps such a listener armed in `accept_ready`
+/// and `Server::handle_remaining_readiness` retries it on a later turn, since
+/// the listener is edge-triggered and the connections the kernel already
+/// completed raise no further event. The pause bounds the retry, and the two
+/// `error!` lines each failure writes, to a few per second however fast the
+/// loop turns.
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(250);
+
 pub type ProxyChannel = Channel<WorkerResponse, WorkerRequest>;
 
 thread_local! {
@@ -1103,6 +1113,81 @@ impl SessionManager {
         gauge!(names::client::CONNECTIONS, self.nb_connections);
     }
 
+    /// The number of live sessions under which a closed accept gate reopens:
+    /// 90 % of `max_connections`, and never less than one.
+    ///
+    /// The integer division alone gives `0` for a cap of one, and a count can
+    /// not be below `0`: the gate that `check_limits` closed with the one
+    /// session alive would stay closed after that session closed, with nothing
+    /// left that could ever reopen it. With the floor, an empty worker always
+    /// reopens its gate.
+    fn accept_reopen_threshold(&self) -> usize {
+        let threshold = (self.max_connections * 90 / 100).max(1);
+        // Pair: never zero, or an empty worker would not be under it, and never
+        // above the cap, or a worker at the cap would be.
+        debug_assert!(
+            threshold >= 1,
+            "an empty worker must be under the reopening threshold"
+        );
+        debug_assert!(
+            threshold <= self.max_connections.max(1),
+            "the reopening threshold {} must not exceed max_connections {}",
+            threshold,
+            self.max_connections
+        );
+        threshold
+    }
+
+    /// Reopens the accept gate and clears the backpressure gauge. Where a gate
+    /// that `check_limits` (or the TCP proxy) closed is reopened: `decr` and
+    /// `reopen_stranded_accept_gate` both come through here.
+    fn open_accept_gate(&mut self) {
+        debug_assert!(
+            !self.can_accept,
+            "only a closed gate is reopened, or the backpressure gauge is cleared twice"
+        );
+        gauge!(names::accept_queue::BACKPRESSURE, 0);
+        self.can_accept = true;
+    }
+
+    /// Reopens a gate that no session close can reopen any more.
+    ///
+    /// [`Self::decr`] reopens the gate when a counted session closes, so a gate
+    /// closed while no counted session is alive is never reopened by anything
+    /// else. That is the state when the slab test of [`Self::check_limits`]
+    /// closes the gate on entries that are not counted sessions (UDP flows
+    /// take a slab slot without consulting `at_capacity`), and when the buffer
+    /// pool runs dry with no session left to hand buffers back. The run loop
+    /// calls this every turn, before it re-drives the listeners that were
+    /// parked behind the gate.
+    ///
+    /// It reopens only when `check_limits` would admit a connection (room under
+    /// the cap and under the slab gate): with a counted session alive its
+    /// `decr` is still to come, and reopening on the strength of the count
+    /// alone would defeat the backpressure a dry buffer pool applies while
+    /// sessions hold the buffers.
+    pub fn reopen_stranded_accept_gate(&mut self) {
+        if !self.can_accept
+            && self.nb_connections == 0
+            && self.max_connections > 0
+            && !self.at_capacity()
+        {
+            debug!(
+                "no counted session left and room under both gates, starting to accept again \
+                 (slab: {}, accept gate at {})",
+                self.slab.len(),
+                self.accept_slab_threshold()
+            );
+            // The gate reopens only where `check_limits` would admit.
+            debug_assert!(
+                self.nb_connections < self.max_connections && !self.at_capacity(),
+                "reopened a gate that check_limits would close again at once"
+            );
+            self.open_accept_gate();
+            debug_assert!(self.can_accept, "reopening must leave the gate open");
+        }
+    }
+
     /// Decrements the number of sessions, start accepting new connections
     /// if the capacity limit of 90% has not been reached.
     pub fn decr(&mut self) {
@@ -1118,13 +1203,12 @@ impl SessionManager {
         gauge!(names::client::CONNECTIONS, self.nb_connections);
 
         // do not be ready to accept right away, wait until we get back to 10% capacity
-        if !self.can_accept && self.nb_connections < self.max_connections * 90 / 100 {
+        if !self.can_accept && self.nb_connections < self.accept_reopen_threshold() {
             debug!(
                 "nb_connections = {}, max_connections = {}, starting to accept again",
                 self.nb_connections, self.max_connections
             );
-            gauge!(names::accept_queue::BACKPRESSURE, 0);
-            self.can_accept = true;
+            self.open_accept_gate();
         }
     }
 
@@ -1356,6 +1440,10 @@ pub struct Server {
     /// `command::config::DEFAULT_EVICT_ON_QUEUE_FULL` for the rationale.
     evict_on_queue_full: bool,
     accept_ready: HashSet<ListenToken>,
+    /// Earliest instant at which `handle_remaining_readiness` may drive
+    /// `accept_ready` again after an `accept(2)` failed on a live listener
+    /// (see [`ACCEPT_RETRY_DELAY`]). `None` while no such failure is pending.
+    accept_retry_at: Option<Instant>,
     backends: Rc<RefCell<BackendMap>>,
     base_sessions_count: usize,
     channel: ProxyChannel,
@@ -1629,6 +1717,7 @@ impl Server {
             accept_queue: VecDeque::new(),
             evict_on_queue_full: server_config.evict_on_queue_full.unwrap_or(false),
             accept_ready: HashSet::new(),
+            accept_retry_at: None,
             backends,
             base_sessions_count,
             channel,
@@ -4577,7 +4666,41 @@ impl Server {
                     self.accept_ready.remove(&token);
                     break;
                 }
+                Err(io_error @ AcceptError::IoError) => {
+                    error!(
+                        "error accepting {:?} sockets: {:?}",
+                        accepted_protocol, io_error
+                    );
+                    // `accept(2)` failed on a live socket (descriptor
+                    // exhaustion, a connection aborted before it was
+                    // accepted). The listener is edge-triggered: the
+                    // connections the kernel already completed raise no
+                    // further event, so removing the token here would strand
+                    // them until a NEW connection produced an edge, for ever
+                    // on a quiet listener. Keep it armed instead, for the
+                    // deferred pass of a later turn, paused for
+                    // `ACCEPT_RETRY_DELAY` so a failure that persists cannot
+                    // spin the loop or flood the log. The token is armed here
+                    // and not only by `ready()` because the activation arms
+                    // reach this point without it.
+                    self.accept_ready.insert(token);
+                    // `get_or_insert`: a failure that lands while a pause is
+                    // pending must not push its end back, or arrivals failing
+                    // faster than the pause would keep the deferred pass from
+                    // ever running for a listener whose clients are all
+                    // queued in the backlog.
+                    self.accept_retry_at
+                        .get_or_insert(Instant::now() + ACCEPT_RETRY_DELAY);
+                    debug_assert!(
+                        self.accept_ready.contains(&token) && self.accept_retry_at.is_some(),
+                        "a failed accept(2) must leave the listener armed and the retry paused"
+                    );
+                    break;
+                }
                 Err(other) => {
+                    // No socket to accept on (`AcceptError::NoListenSocket`):
+                    // a retry changes nothing, so the token leaves the
+                    // deferred pass for good.
                     error!(
                         "error accepting {:?} sockets: {:?}",
                         accepted_protocol, other
@@ -4865,15 +4988,35 @@ impl Server {
     }
 
     pub fn handle_remaining_readiness(&mut self) {
+        // The gate that `check_limits` closed while no counted session is
+        // alive has no `decr` left to reopen it; look at it before the guard
+        // below, which would otherwise keep the listeners parked behind it
+        // for ever.
+        self.sessions.borrow_mut().reopen_stranded_accept_gate();
+
+        // After an `accept(2)` that failed on a live listener, the listener
+        // stays armed in `accept_ready` and is retried here, once the pause
+        // `Server::accept` set has elapsed. The pause holds the whole deferred
+        // pass, so a healthy listener parked behind the gate waits it out too,
+        // and then the next turn, up to a `poll_timeout` later since the pause
+        // arms no timer; a readiness event reaching `ready()` is not delayed
+        // by it.
+        if let Some(retry_at) = self.accept_retry_at {
+            if Instant::now() < retry_at {
+                return;
+            }
+            self.accept_retry_at = None;
+        }
+
         // try to accept again after handling all session events,
         // since we might have released a few session slots
         if self.sessions.borrow().can_accept && !self.accept_ready.is_empty() {
-            while let Some(token) = self
-                .accept_ready
-                .iter()
-                .next()
-                .map(|token| ListenToken(token.0))
-            {
+            // One pass visits each parked listener once. `accept()` keeps a
+            // token armed when `accept(2)` failed, so walking `accept_ready`
+            // until it is empty would hand back that same token for ever; a
+            // token it re-arms is next tried by a later pass.
+            let parked: Vec<ListenToken> = self.accept_ready.iter().copied().collect();
+            for token in parked {
                 // A listen token queued here while `can_accept` was false can
                 // outlive its slab entry. `notify_deactivate_listener` no
                 // longer frees that entry — it RESERVES the slot, re-arming it
@@ -4886,10 +5029,8 @@ impl Server {
                 // token reaching this loop with no slab entry means those
                 // purges were bypassed. Indexing the slab with it panicked the
                 // worker, hence the fallible `get`. Purging it HERE as well as
-                // at those sites is what keeps the loop finite: `accept()`
-                // below only removes the token on `WouldBlock`/error, so a
-                // `continue` without the removal would hand `iter().next()` the
-                // same stale token forever.
+                // at those sites keeps a stale token from being parked for
+                // ever: nothing else would ever take it out of `accept_ready`.
                 let protocol = self
                     .sessions
                     .borrow()
@@ -4905,7 +5046,7 @@ impl Server {
                     continue;
                 };
                 self.accept(token, protocol);
-                if !self.sessions.borrow().can_accept || self.accept_ready.is_empty() {
+                if !self.sessions.borrow().can_accept {
                     break;
                 }
             }
@@ -5363,9 +5504,9 @@ mod accept_ready_tests {
     /// Structural safety for the deferred-accept pass itself: whatever else
     /// ever drops a listen token's slab entry, indexing the slab with a token
     /// that is no longer there must not take the worker down. Dropping the
-    /// stale token is also what keeps THIS branch finite: `accept()` only
-    /// removes a token on `WouldBlock`/error, so re-entering the loop without
-    /// the removal would spin on the same vacant slot forever.
+    /// stale token is also what stops every later pass from visiting, and
+    /// logging, the same vacant slot: no `accept()` ever runs for it, so
+    /// nothing else would take it out of `accept_ready`.
     ///
     /// To SEE THIS RED: restore `self.sessions.borrow().slab[token.0]` in
     /// `handle_remaining_readiness` — this test then panics with
@@ -5382,6 +5523,350 @@ mod accept_ready_tests {
         assert!(
             server.accept_ready.is_empty(),
             "a listen token with no session must be dropped from accept_ready"
+        );
+    }
+
+    /// The descriptor, in this process, of the LISTENING socket bound to
+    /// `port`. `provide_port` keeps a second, non-listening socket bound to
+    /// the same port for the whole test (`reserve_port`), so the port alone
+    /// does not identify the listener: `SO_ACCEPTCONN` does.
+    #[cfg(target_os = "linux")]
+    fn listening_fd_on_port(port: u16) -> std::os::fd::RawFd {
+        let descriptors: Vec<std::os::fd::RawFd> = std::fs::read_dir("/proc/self/fd")
+            .expect("could not list the descriptors of this process")
+            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+            .collect();
+        descriptors
+            .into_iter()
+            .find(|&fd| {
+                let mut accepting: libc::c_int = 0;
+                let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+                // SAFETY: `getsockopt` writes at most `length` bytes into
+                // `accepting` and updates `length`; both outlive the call. A
+                // non-socket descriptor answers -1 and is skipped.
+                let result = unsafe {
+                    libc::getsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_ACCEPTCONN,
+                        (&raw mut accepting).cast(),
+                        &raw mut length,
+                    )
+                };
+                if result != 0 || accepting == 0 {
+                    return false;
+                }
+                // SAFETY: a zeroed `sockaddr_storage` is a valid value.
+                let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+                let mut length = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+                // SAFETY: `getsockname` writes at most `length` bytes into
+                // `storage` and updates `length`; both outlive the call.
+                let result = unsafe {
+                    libc::getsockname(
+                        fd,
+                        (&raw mut storage).cast::<libc::sockaddr>(),
+                        &raw mut length,
+                    )
+                };
+                if result != 0 || storage.ss_family != libc::AF_INET as libc::sa_family_t {
+                    return false;
+                }
+                // SAFETY: the family check above proves the kernel filled a
+                // `sockaddr_in`, which `sockaddr_storage` is aligned and sized
+                // for.
+                let inet = unsafe { &*(&raw const storage).cast::<libc::sockaddr_in>() };
+                u16::from_be(inet.sin_port) == port
+            })
+            .expect("the test listener must hold a listening descriptor")
+    }
+
+    /// An `accept(2)` that fails with anything but `WouldBlock` must not
+    /// strand the connections the kernel already completed behind it.
+    ///
+    /// The listener is edge-triggered: the connections queued in its backlog
+    /// raise no further event, so once the `Err(other)` arm of
+    /// `Server::accept` has removed the token from `accept_ready` nothing
+    /// ever drives that listener again, until a NEW connection produces a
+    /// new edge. On a quiet listener that is for ever, and the clients wait
+    /// in the kernel until their own timeout.
+    ///
+    /// The failure is injected on the listener's descriptor only, with no
+    /// process-wide state touched: the descriptor number is pointed at
+    /// `/dev/null` for the duration of one `ready()` (so `accept4` answers
+    /// `ENOTSOCK`, an error that is not `WouldBlock`), then pointed back at
+    /// the very same socket, whose backlog the swap never touched because
+    /// the open file description stayed alive through a `dup`. The error
+    /// is thus transient, as `EMFILE` is, and the listener is healthy
+    /// again when the later turns run.
+    ///
+    /// A "later turn" is driven the way `Server::run` drives it, minus the
+    /// `epoll_wait` that has nothing to report: expired timers, then
+    /// `handle_remaining_readiness`, repeated until a deadline. The test
+    /// asserts the outcome (the three queued clients are accepted), never
+    /// that the token is still in `accept_ready`: keeping the token would
+    /// make `handle_remaining_readiness` spin on a persistent error.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_accept_does_not_strand_the_connections_queued_behind_it() {
+        use std::{
+            fs::File,
+            net::{SocketAddr, TcpStream},
+            os::fd::AsRawFd,
+            time::{Duration, Instant},
+        };
+
+        let (mut server, listen_token, address) = server_with_tcp_listener();
+        let socket_address: SocketAddr = address.into();
+        let _clients: Vec<TcpStream> = (0..3)
+            .map(|_| {
+                TcpStream::connect_timeout(&socket_address, Duration::from_secs(5))
+                    .expect("the activated listener must complete a handshake")
+            })
+            .collect();
+
+        let listen_fd = listening_fd_on_port(address.port as u16);
+        // SAFETY: `dup` only reads the descriptor number it is given; the
+        // result is checked below.
+        let saved_fd = unsafe { libc::dup(listen_fd) };
+        assert!(
+            saved_fd >= 0,
+            "could not duplicate the listening descriptor"
+        );
+        let null = File::open("/dev/null").expect("could not open /dev/null");
+        // SAFETY: both descriptors are open and owned by this test; `dup2`
+        // atomically closes `listen_fd`'s old target, whose open file
+        // description survives through `saved_fd`.
+        let swapped = unsafe { libc::dup2(null.as_raw_fd(), listen_fd) };
+        assert_eq!(
+            swapped, listen_fd,
+            "could not swap the listening descriptor"
+        );
+
+        // The readiness event of the listener: `accept4` fails here.
+        server.ready(listen_token, Ready::READABLE);
+
+        // SAFETY: as above; this puts the listening socket back under its
+        // descriptor number and releases the spare copy.
+        let restored = unsafe { libc::dup2(saved_fd, listen_fd) };
+        assert_eq!(
+            restored, listen_fd,
+            "could not restore the listening descriptor"
+        );
+        // SAFETY: `saved_fd` is owned by this test and not used again.
+        unsafe { libc::close(saved_fd) };
+        drop(null);
+
+        assert!(
+            server.accept_queue.is_empty(),
+            "premise: the accept that ran under the swapped descriptor must have failed"
+        );
+
+        // Later turns of the event loop, with no new connection and no new
+        // readiness event for the listener.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while server.accept_queue.len() < 3 && Instant::now() < deadline {
+            while let Some(token) = TIMER.with(|timer| timer.borrow_mut().poll()) {
+                server.timeout(token);
+            }
+            server.handle_remaining_readiness();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let accepted_by_later_turns = server.accept_queue.len();
+
+        // Harness proof: the restored listener still holds the three
+        // connections, so an explicit accept reaches all of them.
+        server.accept(ListenToken(listen_token.0), Protocol::TCPListen);
+        assert_eq!(
+            server.accept_queue.len(),
+            3,
+            "the swap must not have cost the listener its backlog"
+        );
+
+        assert_eq!(
+            accepted_by_later_turns, 3,
+            "connections the kernel completed before a failed accept must be accepted by a \
+             later turn: the listener is edge-triggered, so no event will ever announce them"
+        );
+    }
+
+    /// The accept gate closed by the SLAB test (`check_limits` reaching
+    /// `at_capacity`) while no counted session exists must reopen once the
+    /// slab has shrunk. `SessionManager::decr`, the only writer of
+    /// `can_accept = true`, runs only when a counted session closes, and
+    /// with `nb_connections == 0` none ever will: uncounted slab entries
+    /// (UDP flows, which take a slot without consulting `at_capacity`) fill
+    /// the slab, a connection arrives and closes the gate, the flows idle
+    /// out, and every HTTP/HTTPS/TCP listener stays deaf for ever.
+    ///
+    /// A "turn" is `handle_remaining_readiness`, the per-turn hook of
+    /// `Server::run` that re-drives parked listeners, repeated until a
+    /// deadline. The outcome is read from `accept_queue`: the test listener has
+    /// no cluster, so `create_sessions` could not turn the socket into a
+    /// session whatever the gate does.
+    #[test]
+    fn a_gate_closed_by_the_slab_reopens_once_the_slab_shrinks_with_no_session_left() {
+        use std::{
+            net::{SocketAddr, TcpStream},
+            time::{Duration, Instant},
+        };
+
+        let (mut server, listen_token, address) = server_with_tcp_listener();
+
+        // Uncounted entries fill the slab to the accept gate.
+        let fillers: Vec<usize> = {
+            let mut sessions = server.sessions.borrow_mut();
+            let mut keys = Vec::new();
+            while !sessions.at_capacity() {
+                let entry = sessions.slab.vacant_entry();
+                keys.push(entry.key());
+                entry.insert(Rc::new(RefCell::new(ListenSession {
+                    protocol: Protocol::Channel,
+                })));
+            }
+            keys
+        };
+
+        // The production writer closes the gate.
+        assert!(
+            !server.sessions.borrow_mut().check_limits(),
+            "premise: a full slab must refuse"
+        );
+        assert_eq!(
+            server.sessions.borrow().nb_connections,
+            0,
+            "premise: no counted session exists"
+        );
+        assert!(
+            !server.sessions.borrow().can_accept,
+            "premise: the refusal must have closed the gate"
+        );
+
+        // A client arrives while the slab is still full; the gate is closed,
+        // so the token only parks.
+        let socket_address: SocketAddr = address.into();
+        let _client = TcpStream::connect_timeout(&socket_address, Duration::from_secs(5))
+            .expect("the activated listener must complete a handshake");
+        server.ready(listen_token, Ready::READABLE);
+        assert!(
+            server.accept_ready.contains(&ListenToken(listen_token.0)),
+            "premise: the readable listener must be parked while the gate is closed"
+        );
+
+        // The uncounted entries go away: the slab is below its gate again,
+        // and no event will announce it.
+        for key in fillers {
+            server.sessions.borrow_mut().slab.remove(key);
+        }
+        assert!(
+            !server.sessions.borrow().at_capacity(),
+            "premise: the slab must be below the accept gate again"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while server.accept_queue.is_empty() && Instant::now() < deadline {
+            server.handle_remaining_readiness();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            server.accept_queue.len(),
+            1,
+            "the gate was closed by the slab test, not by a connection count, and the slab \
+             has shrunk since: the parked connection must be accepted instead of waiting for \
+             a counted session to close"
+        );
+    }
+
+    /// The pause `Server::accept` sets after a failed `accept(2)` holds the
+    /// deferred pass, and the pass resumes once it has elapsed. Without the
+    /// pause a failure that persists is retried on every turn of the loop,
+    /// with two `error!` lines each.
+    ///
+    /// To SEE THIS RED: make the `Instant::now() < retry_at` test in
+    /// `handle_remaining_readiness` never hold (`&& false`) — the first
+    /// assertion fails with "a pass inside the retry pause must not accept".
+    #[test]
+    fn the_retry_pause_holds_the_deferred_accept_pass_until_it_elapses() {
+        use std::{
+            net::{SocketAddr, TcpStream},
+            time::{Duration, Instant},
+        };
+
+        let (mut server, listen_token, address) = server_with_tcp_listener();
+        let socket_address: SocketAddr = address.into();
+        let _client = TcpStream::connect_timeout(&socket_address, Duration::from_secs(5))
+            .expect("the activated listener must complete a handshake");
+
+        server.accept_ready.insert(ListenToken(listen_token.0));
+        let paused_until = Instant::now() + Duration::from_secs(3600);
+        server.accept_retry_at = Some(paused_until);
+
+        server.handle_remaining_readiness();
+
+        assert!(
+            server.accept_queue.is_empty(),
+            "a pass inside the retry pause must not accept"
+        );
+        assert_eq!(
+            server.accept_retry_at,
+            Some(paused_until),
+            "a pass inside the retry pause must leave the pause as it was"
+        );
+        assert!(
+            server.accept_ready.contains(&ListenToken(listen_token.0)),
+            "the listener must stay armed through the pause"
+        );
+
+        server.accept_retry_at = Some(Instant::now());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while server.accept_queue.is_empty() && Instant::now() < deadline {
+            server.handle_remaining_readiness();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            server.accept_queue.len(),
+            1,
+            "the pass must resume once the pause has elapsed"
+        );
+        assert_eq!(
+            server.accept_retry_at, None,
+            "an elapsed pause must be cleared"
+        );
+    }
+
+    /// A listener that holds no socket any more (here handed back, as an
+    /// upgrade does) answers `accept` with `AcceptError::NoListenSocket`, not
+    /// `AcceptError::IoError`: no retry can change that, so the token must
+    /// leave `accept_ready` and no pause may be set. Re-arming it as a failed
+    /// `accept(2)` would retry it, and log it, for as long as the worker lives.
+    ///
+    /// To SEE THIS RED: make `TcpProxy::accept` (`lib/src/tcp.rs`) answer
+    /// `AcceptError::IoError` instead of `AcceptError::NoListenSocket` for a
+    /// listener whose socket is `None` — the token is then re-armed and the
+    /// first assertion fails with "a listener with no socket must be dropped
+    /// from the deferred accept pass".
+    #[test]
+    fn a_listener_with_no_socket_is_not_retried_after_a_failed_accept() {
+        let (mut server, listen_token, _address) = server_with_tcp_listener();
+
+        let handed_back = server.tcp.borrow_mut().give_back_listeners();
+        assert_eq!(
+            handed_back.len(),
+            1,
+            "premise: the listener held one activated socket"
+        );
+        server.accept_ready.insert(ListenToken(listen_token.0));
+
+        server.handle_remaining_readiness();
+
+        assert!(
+            server.accept_ready.is_empty(),
+            "a listener with no socket must be dropped from the deferred accept pass"
+        );
+        assert_eq!(
+            server.accept_retry_at, None,
+            "a listener with no socket must not set the retry pause"
         );
     }
 }
@@ -9420,6 +9905,77 @@ mod tests {
     use mio::Token;
     use slab::Slab;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    /// With `max_connections = 1`, the accept gate that `check_limits` closes
+    /// at the cap must open again when the one session closes.
+    /// `SessionManager::decr` reopens it only below `max_connections * 90 /
+    /// 100`, which is `0` for a cap of one: `nb_connections < 0` never holds,
+    /// no session is left to close, and the listeners never accept again.
+    #[test]
+    fn the_accept_gate_reopens_when_the_only_session_of_a_one_connection_cap_closes() {
+        let manager = SessionManager::new(Slab::new(), 1, 0, 0, 0, 32, 128);
+
+        manager.borrow_mut().incr();
+        assert!(
+            !manager.borrow_mut().check_limits(),
+            "premise: one session at a cap of one must refuse the next"
+        );
+        assert!(
+            !manager.borrow().can_accept,
+            "premise: the refusal must have closed the gate"
+        );
+
+        manager.borrow_mut().decr();
+
+        assert_eq!(
+            manager.borrow().nb_connections,
+            0,
+            "premise: the only session is gone"
+        );
+        assert!(
+            manager.borrow().can_accept,
+            "no session is left to close and the slab is empty, yet the gate stays closed: the \
+             listeners will never accept again"
+        );
+    }
+
+    /// `SessionManager::reopen_stranded_accept_gate`, run on every turn of the
+    /// event loop, reopens a closed gate only when no counted session is left to
+    /// reopen it through `decr`. While one is alive the gate stays as it is:
+    /// the TCP proxy closes it on buffer-pool exhaustion (`can_accept = false`),
+    /// and reopening it on the next turn, with the buffers still held by that
+    /// session, would accept the backlog only to refuse each connection.
+    ///
+    /// To SEE THIS RED: replace the `self.nb_connections == 0` and
+    /// `self.max_connections > 0` conditions of `reopen_stranded_accept_gate`
+    /// with `self.nb_connections < self.max_connections` — the first assertion
+    /// fails with "a gate closed while a counted session is alive is that
+    /// session's `decr` to reopen".
+    #[test]
+    fn a_stranded_gate_reopens_but_one_a_counted_session_can_still_reopen_does_not() {
+        let manager = SessionManager::new(Slab::new(), 16, 0, 0, 0, 32, 128);
+
+        manager.borrow_mut().incr();
+        manager.borrow_mut().can_accept = false;
+        manager.borrow_mut().reopen_stranded_accept_gate();
+        assert!(
+            !manager.borrow().can_accept,
+            "a gate closed while a counted session is alive is that session's `decr` to reopen"
+        );
+
+        manager.borrow_mut().decr();
+        assert!(
+            manager.borrow().can_accept,
+            "`decr` must reopen the gate once the count is below the threshold"
+        );
+
+        manager.borrow_mut().can_accept = false;
+        manager.borrow_mut().reopen_stranded_accept_gate();
+        assert!(
+            manager.borrow().can_accept,
+            "a gate closed with no counted session left must reopen"
+        );
+    }
 
     /// A cluster override can drop to `Some(0)` AFTER a session was
     /// tracked under a positive limit: `AddCluster` is an upsert and

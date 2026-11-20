@@ -2019,7 +2019,7 @@ impl HttpListener {
                 "{} cannot accept connections, no listening socket available",
                 log_module_context!()
             );
-            Err(AcceptError::IoError)
+            Err(AcceptError::NoListenSocket)
         }
     }
 }
@@ -2152,7 +2152,7 @@ impl ProxyConfiguration for HttpProxy {
         if let Some(listener) = self.listeners.get(&Token(token.0)) {
             listener.borrow_mut().accept()
         } else {
-            Err(AcceptError::IoError)
+            Err(AcceptError::NoListenSocket)
         }
     }
 

@@ -253,6 +253,25 @@ its frontend socket (`epoll_ctl(EPOLL_CTL_ADD)`) and allocates the session
 object once: `Rc<RefCell<HttpSession>>` carries the mux inline, including the
 first backend connection slot and the frontend's timer handle (§8.1).
 
+The batch ends on `EAGAIN`, and a listener is edge-triggered: a connection the
+kernel completed but the batch did not reach raises no further event. An
+`accept4(2)` that fails with anything else (`EMFILE` or `ENFILE` when the
+descriptors run out, `ECONNABORTED`) ends the batch the same way, so
+`Server::accept` leaves the listener in `Server::accept_ready` instead of
+dropping it. `Server::handle_remaining_readiness` visits each token of
+`accept_ready` once per turn and tries it again, no sooner than
+`ACCEPT_RETRY_DELAY` (250 ms) after the failure, so a failure that lasts costs
+a few `accept4(2)` calls and error lines per second and does not spin the loop.
+The pause is shared by the whole deferred pass and a failure during it does not
+extend it, so a healthy listener parked behind the gate waits out the rest of
+that pause too; a readiness event reaching `Server::ready` is never delayed by
+it. The pause arms no timer: the retry runs on the first turn after it has
+elapsed, and the loop wakes at least once per `poll_timeout` (1 s), so a worker
+with no traffic retries, and drives that parked listener, within about 1.25 s
+of the failure. A listener that has no socket to
+accept on any more (`AcceptError::NoListenSocket`: deactivated, stopped, or
+handed back for an upgrade) is not retried: its token leaves `accept_ready`.
+
 ### 3.3 Backpressure and `max_connections`
 
 If the slab is at capacity (`SessionManager::can_accept` is `false`) the proxy
@@ -261,8 +280,23 @@ surplus. The `accept_queue.backpressure` gauge flips to 1 in that state
 (`SessionManager::check_limits`); a 1 Hz ticker also bumps
 `accept_queue.saturated_seconds` so dashboards can plot how long the worker
 spent backpressured (the `ACCEPT_SATURATION_TICK` block of `Server::run`). The
-gate reopens only below 90 % of `max_connections`, to avoid flapping (the
-`can_accept` branch of `SessionManager::decr`).
+gate reopens only below 90 % of `max_connections`, to avoid flapping, when a
+counted session closes (the `can_accept` branch of `SessionManager::decr`). The
+threshold is never less than one session, so a worker with `max_connections = 1`
+reopens its gate when its one session closes: `1 * 90 / 100` is `0`, which a
+count cannot be below.
+
+That reopening has a blind spot, because nothing else reopens the gate: a gate
+closed while no counted session is alive has no session left to close. The slab
+test of `check_limits` (`10 + 2 * max_connections` entries) counts every slab
+entry, UDP flows included, which take a slot without consulting it, and the TCP
+proxy closes the gate when the buffer pool runs dry. Every turn,
+`Server::handle_remaining_readiness` therefore asks
+`SessionManager::reopen_stranded_accept_gate` to reopen a closed gate when no
+session is counted and `check_limits` would admit a connection (room under
+`max_connections` and under the slab gate). It leaves the gate alone while a
+counted session is alive, whose `decr` is still to come, so the backpressure a
+dry buffer pool applies while sessions hold the buffers is unchanged.
 
 ### 3.4 Zombie detection
 

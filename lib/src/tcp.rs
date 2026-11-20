@@ -3324,7 +3324,7 @@ impl ProxyConfiguration for TcpProxy {
             let mut listener = listener.borrow_mut();
             let accepted = match &listener.listener {
                 Some(tcp_listener) => tcp_listener.accept(),
-                None => return Err(AcceptError::IoError),
+                None => return Err(AcceptError::NoListenSocket),
             };
             match accepted {
                 Ok((frontend_sock, peer)) => {
@@ -3351,7 +3351,7 @@ impl ProxyConfiguration for TcpProxy {
                 }
             }
         } else {
-            Err(AcceptError::IoError)
+            Err(AcceptError::NoListenSocket)
         }
     }
 
