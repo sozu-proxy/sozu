@@ -178,7 +178,45 @@ is the one protocol that replaces the placeholder with a real session
 (`UdpListenerSession`), and its activation arm installs that session only when
 none is installed already (the proxy's `listener_sessions` map is the record),
 because `load_state` re-emits one `activate-listener` per active listener on
-every replay.
+every replay. That activation is all or nothing: the socket is bound and
+registered before the session is built, and when the build fails
+(`Registry::try_clone` answers `EMFILE` once the worker is out of descriptors)
+the arm answers a failure and takes the activation back
+(`UdpProxy::abandon_activation`, `lib/src/udp.rs`), so no registered socket is
+left with no session to read it. The socket the listener bound is closed; an
+inherited one is deregistered and parked on the listener for a retry, and stays
+bound, queueing datagrams, until then or until `remove-listener`.
+
+`remove-listener` ends the socket's life at the same moment it releases the
+slot, whatever sessions are still open on the listener. Every session accepted
+on an HTTP, HTTPS or TCP listener holds an `Rc` to the listener object, and the
+listening socket is a field of that object, so dropping the proxy's map entry
+would not close it: the socket would stay listening, registered in epoll under
+the token just freed, and keep completing handshakes into a backlog nobody
+accepts until the last such session closed, which an H2, WebSocket or TCP pipe
+session can delay indefinitely. After a re-add on the same address the orphan
+would also stay in the `SO_REUSEPORT` group of the new socket and could take a
+share of its connections. Each proxy's `remove_listener` therefore takes the
+socket out of the listener and deregisters it first (`HttpListener::close_sockets`
+in `lib/src/http.rs`, and its twins `HttpsListener::close_sockets` and
+`TcpListener::close_sockets`), the same way `deactivate-listener` and the soft
+stop do. The sessions in flight keep running on their own sockets; only the
+listening socket goes. The UDP proxy already closes its flows on removal.
+
+`remove-listener` also closes the connections the listener accepted that have
+not yet become sessions. `Server::accept_queue` (§3.2) identifies the listener
+of each parked socket by its token alone, and the slab hands the token just
+freed to the next `add-listener`, so a socket left in the queue would be
+resolved against that new listener and served with its configuration and
+routes. `Server::notify_proxys` drops those entries in the same step that
+releases the slot and purges `Server::accept_ready`; their clients see the
+connection close.
+
+A `remove-listener` that matches no listener of the
+proxy (an address it never held, or one a draining worker already emptied) is
+still answered `ok`, leaves the proxy's listeners as they are, and logs
+`no HTTP listener to remove` / `no HTTPS listener to remove` at `info`; the TCP
+and UDP proxies answer an error instead.
 
 A forwarding session occupies one slab entry per socket: the frontend token,
 plus one token per backend connection. The same session is reachable through
@@ -232,10 +270,31 @@ client address comes from the PROXY header when the session upgrades.
 
 Sessions are *not* created inside the accept loop. `Server::create_sessions`
 drains the queue later in the same turn, newest first, and drops connections
-that waited longer than `accept_queue_timeout`. Creating a session registers
+that waited longer than `accept_queue_timeout`. An entry names the listener
+that accepted it by its token only, so `remove-listener` drops the entries of
+the token it releases (§2.4). Creating a session registers
 its frontend socket (`epoll_ctl(EPOLL_CTL_ADD)`) and allocates the session
 object once: `Rc<RefCell<HttpSession>>` carries the mux inline, including the
 first backend connection slot and the frontend's timer handle (§8.1).
+
+The batch ends on `EAGAIN`, and a listener is edge-triggered: a connection the
+kernel completed but the batch did not reach raises no further event. An
+`accept4(2)` that fails with anything else (`EMFILE` or `ENFILE` when the
+descriptors run out, `ECONNABORTED`) ends the batch the same way, so
+`Server::accept` leaves the listener in `Server::accept_ready` instead of
+dropping it. `Server::handle_remaining_readiness` visits each token of
+`accept_ready` once per turn and tries it again, no sooner than
+`ACCEPT_RETRY_DELAY` (250 ms) after the failure, so a failure that lasts costs
+a few `accept4(2)` calls and error lines per second and does not spin the loop.
+The pause is shared by the whole deferred pass and a failure during it does not
+extend it, so a healthy listener parked behind the gate waits out the rest of
+that pause too; a readiness event reaching `Server::ready` is never delayed by
+it. The pause arms no timer: the retry runs on the first turn after it has
+elapsed, and the loop wakes at least once per `poll_timeout` (1 s), so a worker
+with no traffic retries, and drives that parked listener, within about 1.25 s
+of the failure. A listener that has no socket to
+accept on any more (`AcceptError::NoListenSocket`: deactivated, stopped, or
+handed back for an upgrade) is not retried: its token leaves `accept_ready`.
 
 ### 3.3 Backpressure and `max_connections`
 
@@ -245,8 +304,23 @@ surplus. The `accept_queue.backpressure` gauge flips to 1 in that state
 (`SessionManager::check_limits`); a 1 Hz ticker also bumps
 `accept_queue.saturated_seconds` so dashboards can plot how long the worker
 spent backpressured (the `ACCEPT_SATURATION_TICK` block of `Server::run`). The
-gate reopens only below 90 % of `max_connections`, to avoid flapping (the
-`can_accept` branch of `SessionManager::decr`).
+gate reopens only below 90 % of `max_connections`, to avoid flapping, when a
+counted session closes (the `can_accept` branch of `SessionManager::decr`). The
+threshold is never less than one session, so a worker with `max_connections = 1`
+reopens its gate when its one session closes: `1 * 90 / 100` is `0`, which a
+count cannot be below.
+
+That reopening has a blind spot, because nothing else reopens the gate: a gate
+closed while no counted session is alive has no session left to close. The slab
+test of `check_limits` (`10 + 2 * max_connections` entries) counts every slab
+entry, UDP flows included, which take a slot without consulting it, and the TCP
+proxy closes the gate when the buffer pool runs dry. Every turn,
+`Server::handle_remaining_readiness` therefore asks
+`SessionManager::reopen_stranded_accept_gate` to reopen a closed gate when no
+session is counted and `check_limits` would admit a connection (room under
+`max_connections` and under the slab gate). It leaves the gate alone while a
+counted session is alive, whose `decr` is still to come, so the backpressure a
+dry buffer pool applies while sessions hold the buffers is unchanged.
 
 ### 3.4 Zombie detection
 
@@ -711,7 +785,14 @@ A WebSocket upgrade on an H1 connection ends in the same `Pipe`.
    (`tcp_preread/LIFECYCLE.md` §8). Without splice, or on a WebSocket pipe, the
    `Pipe` copies through its two pooled buffers with `recv`/`send`.
 4. **Close.** A HUP on either side drains what is in flight
-   (`Pipe::frontend_hup`, `Pipe::backend_hup`). The `Pipe` logs the session
+   (`Pipe::frontend_hup`, `Pipe::backend_hup`). A backend HUP that finds
+   response bytes still queued adds the frontend's WRITABLE interest and never
+   its WRITABLE event: the write that just met `EAGAIN` cleared that event, and
+   setting it again would defeat the pass's break guard (backend HUP, frontend
+   interested in WRITABLE, no WRITABLE event), which parks the session until the
+   client's next `EPOLLOUT` edge. Re-arming it made every iteration retry the
+   failing write until `MAX_LOOP_ITERATIONS` and close the session with the
+   tail undelivered. The `Pipe` logs the session
    once, from whichever of its handlers ends it (`Pipe::log_request_success`
    or `Pipe::log_request_error`, both through `Pipe::log_request`:
    `getsockopt(TCP_INFO)` on each side). The backend address it logs is the
@@ -731,6 +812,26 @@ A WebSocket upgrade on an H1 connection ends in the same `Pipe`.
    then one `ioctl(FIONREAD)` per pipe must confirm it, so a pair still holding
    a byte of this session never serves another one. A pair holding bytes, or
    one beyond the pool's 32 idle pairs, closes its four descriptors.
+
+A WebSocket `Pipe` (`ws://` and `wss://`) is closed by its HTTP or HTTPS
+session, not by `TcpSession`, and ends in three further ways. `Pipe::ready`
+hands a frontend HUP to `Pipe::frontend_hup`, as `TcpSession` does, so a
+client's last frame that reaches the kernel with its FIN is read and forwarded
+before the session closes; every exit of `Pipe::ready` that returns `Close`,
+the frontend `ERROR` and the loop limit included, writes the access log line and
+the end-of-session metrics once. On `wss://`, `FrontRustls::socket_write`
+reports plaintext written as soon as rustls has absorbed it, and what the kernel
+refused (at most 64 KiB) stays inside rustls: `Pipe::check_connections` counts
+`SocketHandler::socket_wants_write` as response in flight, `Pipe::writable`
+flushes rustls on a WRITABLE edge that finds `backend_buffer` empty
+(`Pipe::flush_frontend_records`, then the same `check_connections` gate as any
+other drain), and `Pipe::backend_hup` keeps the session for the next WRITABLE
+edge instead of closing over those records. `Pipe::close` then queues the TLS
+`close_notify` and flushes it, and whatever rustls still held, with
+`drain_tls_close_notify` (`lib/src/protocol/mux/shared.rs`, bounded to 16 empty
+writes), before `HttpsSession::close` shuts the write side down: a client sees
+`Ok(0)` and not an `UnexpectedEof`. A plaintext frontend has neither a
+`close_notify` nor records to flush, so `ws://` and TCP are unchanged.
 
 Measured on the same rig as §6.7, `curl` through a TCP listener to the same
 backend, one connection per request. The `c086b456` column is the closing
@@ -773,7 +874,9 @@ the code (only the new-flow cost was traced):
   each readiness burst ends with one `recvfrom` that answers `EAGAIN`, since a
   datagram socket offers no short-read proof;
 - **per backend reply:** one `recv(2)`, one copy, one `sendto(2)` on the
-  listener socket;
+  listener socket; a pending ICMP error costs one more `recv`, which returns it
+  (`ECONNREFUSED`) ahead of the replies already queued, and the drain goes on
+  past it to `EAGAIN` (§6 of the UDP `LIFECYCLE.md`);
 - **per new flow:** `udp_connect` (`lib/src/socket.rs`) issues `socket(2)`,
   born non-blocking and close-on-exec (`SOCK_NONBLOCK | SOCK_CLOEXEC`),
   `bind(2)` and `connect(2)`; the shell then registers the socket
@@ -931,8 +1034,41 @@ and its siblings) deregisters and drops its listener sockets — then calls
 
 When the last session is gone the worker answers the main process and leaves
 its event loop, flushing the log backends first so a `file://` access log keeps
-its buffered records ([#1554](https://github.com/sozu-proxy/sozu/pull/1554)). A
-hard stop (`sozu shutdown --hard`, or a second `SIGTERM` during a soft stop)
+its buffered records ([#1554](https://github.com/sozu-proxy/sozu/pull/1554)).
+"The last session" is a slab length test: `Server::shut_down_sessions` finishes
+once the slab holds no more entries than `Server::base_sessions_count`, the
+slots that are not client sessions: the channel, timer and metrics slots
+reserved when the worker is built, and one slot per added listener, which the
+drain never closes (`ListenSession` and `UdpListenerSession` both answer `false`
+to `shutting_down`).
+A soft stop empties each proxy's listener map but leaves those slots in the
+slab, so they stay counted until the worker exits. `RemoveListener`
+(`Server::notify_proxys`) releases a listener's slot and lowers the count in the
+same step, and only when the proxy still holds the listener at that address. A
+`RemoveListener` for an address the proxy does not hold, such as a listener this
+worker refused to add or one a soft stop already dropped from the map, releases
+nothing and leaves the count alone; lowering it anyway would put the count under
+the slots still in the slab, and the worker would never answer the `SoftStop`.
+
+A soft stop is terminal, so a draining worker takes no listener back. The main
+process scatters listener orders to a `Stopping` worker as it does to the others,
+and the emptied listener maps accept an `AddListener` for a new address. Its
+`ActivateListener` is refused (`Server::notify_activate_listener`, whatever the
+protocol, before any socket is bound or taken from the SCM table) with a failure
+naming the address: activating it would bind a fresh `SO_REUSEPORT` socket, the
+kernel would hand the worker a share of the address's new connections, and the
+same turn's `Server::shut_down_sessions` would close each one before a byte is
+read. The refusal rolls the worker's own `ConfigState` back, so the listener stays
+inactive there, and the listener the worker added holds the slab slot
+`base_sessions_count` already counts, so the drain still ends. The main process
+counts the refusal as a failed worker of the order (`WorkerTask::on_finish`,
+`bin/src/command/requests.rs`), as it counted the `NoListenerFound` a draining
+worker used to answer to the activation of a listener that existed before the
+stop, which this refusal replaces: the order answers a failure that lists each
+worker's answer, the draining one's included, and the address stays served by the
+workers that are not draining.
+
+A hard stop (`sozu shutdown --hard`, or a second `SIGTERM` during a soft stop)
 closes every session at once.
 
 ## 13. Hot reconfiguration and upgrades
@@ -992,8 +1128,11 @@ minimum set to read a session's life from a dashboard:
   `Mux::attach_dialed`; `-1` in `Mux::close` for the backends still open at
   session teardown, in `Connection::pre_close_client_bookkeeping` for a backend
   closed through `Connection::close` — the dead-backend sweep of
-  `Mux::ready_inner` included — and in `Mux::attach_dialed`'s rollback when the
-  mio registration of a new backend socket fails).
+  `Mux::ready_inner` included — in `Mux::attach_dialed`'s rollback when the
+  mio registration of a new backend socket fails, in `Pipe::close` for the one
+  connection a WebSocket upgrade moves into its pipe, and in
+  `Mux::release_backend_connections_except` for the other connections the
+  session still pools when it upgrades).
 - `requests`, `bytes_in`, `bytes_out`, `backend_response_time`,
   `backend_header_time` — per-cluster and per-backend counters and timings
   (`names::backend`, `lib/src/metrics/names.rs`).

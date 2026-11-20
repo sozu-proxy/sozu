@@ -659,7 +659,9 @@ pub mod udp {
     pub const DROPPED_NO_BACKEND: &str = "udp.datagrams.dropped.no_backend";
     /// Dropped: flow-table cap reached (shed).
     pub const DROPPED_SHED: &str = "udp.datagrams.dropped.shed";
-    /// Dropped: referenced an unknown / already-closed flow.
+    /// Dropped: referenced an unknown / already-closed flow, or an egress
+    /// datagram whose socket is gone, including the client-return replies
+    /// discarded when the listener socket is handed off (SCM hand-off).
     pub const DROPPED_UNKNOWN_FLOW: &str = "udp.datagrams.dropped.unknown_flow";
     /// Dropped: the bounded per-flow / client-return write queue was at
     /// capacity (genuine egress-queue overflow under sustained `WouldBlock`).

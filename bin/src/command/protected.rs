@@ -574,6 +574,12 @@ impl GatheringTask for ProtectedHealthCheckTask {
         Err(TaskSnapshotError::ProtectedTransactionInFlight)
     }
 
+    /// A transaction that ends incoherent stops every worker it named
+    /// (`fence_all`), and proves it from the session of that worker.
+    fn retained_worker_ids(&self) -> Vec<WorkerId> {
+        self.txn.workers()
+    }
+
     fn on_finish(
         mut self: Box<Self>,
         server: &mut Server,
@@ -1595,6 +1601,12 @@ impl GatheringTask for WorkerBootstrapTask {
         self.finalizer.retained_worker_token()
     }
 
+    /// The finalizer fences the worker when its bootstrap fails, including
+    /// when the worker died between two stages and no route is left.
+    fn retained_worker_ids(&self) -> Vec<WorkerId> {
+        self.finalizer.retained_worker_ids()
+    }
+
     fn on_finish(
         mut self: Box<Self>,
         server: &mut Server,
@@ -2562,6 +2574,49 @@ mod tests {
         let _ = bystander.wait();
     }
 
+    /// A worker the main killed itself stays proven stopped for as long as a
+    /// change names it. The sweep that forgets dead worker sessions waits for
+    /// the change (`GatheringTask::retained_worker_ids`): a session it had
+    /// removed would leave `fence_worker` with no worker to prove, and the
+    /// client would be told that a worker the main killed could not be
+    /// stopped, with its cluster blocked until a restart.
+    #[test]
+    fn a_worker_that_died_during_a_change_is_still_fenced_as_stopped_when_it_ends() {
+        let mut rig = rig(2);
+        rig.workers[0].refuses = Some(ProtectedHealthCheckPhase::ProtectedHealthCheckCommit);
+        rig.workers[1].holds = Some(ProtectedHealthCheckPhase::ProtectedHealthCheckAbort);
+        rig.begin(order(&[("Authorization", SECRET)]));
+        rig.pump();
+        assert_eq!(rig.final_status(), None, "the abort of worker 1 is awaited");
+        let token = rig
+            .hub
+            .server
+            .workers
+            .values()
+            .find(|worker| worker.id == 1)
+            .map(|worker| worker.token)
+            .expect("worker 1");
+
+        // Worker 1 dies: its channel closes and the main kills what is left.
+        rig.hub.on_worker_channel_closed(&token, 1);
+        rig.hub.collect_unreferenced_restored_stopped_workers();
+        assert!(
+            rig.hub.server.workers.contains_key(&token),
+            "the session is kept while a change in flight names its worker"
+        );
+
+        rig.pump();
+        assert_eq!(rig.final_status(), Some(ResponseStatus::Failure));
+        assert_eq!(final_message(&mut rig).as_deref(), Some(INCOHERENT));
+        assert!(!rig.hub.server.protected.is_active(CLUSTER));
+
+        rig.hub.collect_unreferenced_restored_stopped_workers();
+        assert!(
+            !rig.hub.server.workers.contains_key(&token),
+            "no change names the worker any more: its session is collected"
+        );
+    }
+
     /// The client is told the worker was stopped only when that is proven: a
     /// worker the main process no longer knows cannot be.
     #[test]
@@ -3470,6 +3525,25 @@ mod tests {
         let fake = register_fake(&mut rig.hub, &mut rig.children, id, state);
         rig.workers.push(fake);
         rig.hub.server.begin_worker_initialization(id, job);
+    }
+
+    /// The finalizer of a bootstrap fences the worker when the bootstrap
+    /// fails, also when the worker died between two stages and no route of the
+    /// task names it any more: the bootstrap keeps the session of that worker
+    /// for as long as the finalizer would.
+    #[test]
+    fn a_bootstrap_retains_the_worker_its_finalizer_fences() {
+        let task = WorkerBootstrapTask {
+            worker_id: 4,
+            clusters: Vec::new(),
+            version: ProtectedHeaderVersion::from_wire(0),
+            stage: BootstrapStage::Capability,
+            expected: 0,
+            verdict: None,
+            finalizer: Box::new(crate::command::server::WorkerReadinessTask::new(4)),
+        };
+
+        assert_eq!(task.retained_worker_ids(), vec![4]);
     }
 
     #[test]

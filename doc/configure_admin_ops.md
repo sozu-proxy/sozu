@@ -339,6 +339,27 @@ pairs, that silence is the case to rule out — and unlike the size ceiling abov
 there is no configuration to reconcile, because no conforming writer produces
 either shape.
 
+The same ceiling bounds what a worker writes back, and a worker does not take
+the bound down with it. A response whose frame is larger than
+`max_command_buffer_size` can never be written, however much of the channel is
+drained: `Channel::write_delimited_message` refuses it with `MessageTooLarge`
+before buffering a byte, and the refusal is final. An unfiltered
+`QueryMetrics` on a worker with many clusters and backends is the realistic
+way to produce one. `Server::send_queue` (`lib/src/server.rs`) logs the
+refusal and drops that response. If it was a terminal answer (`Ok` or
+`Failure`), the worker answers the same request id with a short `Failure`
+whose message gives the size of the frame and names `max_command_buffer_size`;
+the supervisor's gatherer counts it as that worker's failed answer, so the
+request finishes instead of waiting for a frame that cannot arrive, and the
+worker's event loop goes on to its next turn. A `Processing` report or an event
+that is too large is dropped with the log alone, since the real answer is still
+to come. A frame that fits under the ceiling but not in the room a backlog
+leaves is not this case: it stays queued and goes out once the socket has
+drained. If the ceiling is so low that not even the `Failure` fits, it is
+dropped as well with an error log, and the supervisor gets no answer to that
+request from this worker. Either way the fix is the one above: raise
+`max_command_buffer_size` on both ends, or narrow the query.
+
 ### 5.3 Drop-on-register-fail for the unix command socket
 
 Commit: `b8c8fc61`. Reference:

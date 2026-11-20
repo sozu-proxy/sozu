@@ -1,6 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     rc::{Rc, Weak},
     time::{Duration, Instant},
@@ -541,6 +541,13 @@ pub struct BackendMap {
     /// h2c-only backend is not probed with an HTTP/1.1 preface that
     /// would always fail.
     pub cluster_http2: HashMap<ClusterId, bool>,
+    /// The clusters whose backends a UDP prober keeps marking (an active
+    /// `udp.health`, see `udp_health_settings` in `lib/src/udp.rs`). That
+    /// prober writes the same `Backend.health` as the HTTP/TCP one and runs
+    /// whether or not the cluster has a `health_check`, so losing the latter
+    /// leaves a prober that can still mark a backend UP:
+    /// [`Self::reset_cluster_health`] keeps the state of these clusters.
+    udp_probed_clusters: HashSet<ClusterId>,
     /// The one source of randomness selection and backoff draw from: it seeds
     /// every cluster's load-balancing policy and supplies the jitter of every
     /// backoff window a failed connection arms.
@@ -582,6 +589,7 @@ impl BackendMap {
             health_check_configs: HashMap::new(),
             protected_health_check_headers: HashMap::new(),
             cluster_http2: HashMap::new(),
+            udp_probed_clusters: HashSet::new(),
             rng,
         }
     }
@@ -714,10 +722,12 @@ impl BackendMap {
         self.health_check_configs.remove(cluster_id);
         self.protected_health_check_headers.remove(cluster_id);
         self.cluster_http2.remove(cluster_id);
+        self.udp_probed_clusters.remove(cluster_id);
         debug_assert!(
             !self.backends.contains_key(cluster_id)
                 && !self.health_check_configs.contains_key(cluster_id)
-                && !self.cluster_http2.contains_key(cluster_id),
+                && !self.cluster_http2.contains_key(cluster_id)
+                && !self.udp_probed_clusters.contains(cluster_id),
             "remove_cluster must leave nothing keyed by the cluster"
         );
     }
@@ -731,6 +741,22 @@ impl BackendMap {
             self.cluster_http2.insert(cluster_id.into(), true);
         } else {
             self.cluster_http2.remove(cluster_id);
+        }
+    }
+
+    /// Record whether a UDP prober is armed for `cluster_id` (its `udp.health`
+    /// block is present and its mode is not `HEALTH_OFF`, see
+    /// `udp_health_settings` in `lib/src/udp.rs`). While one is, dropping the
+    /// cluster's HTTP/TCP health check does not reset the health of its
+    /// backends: the UDP prober keeps running and owns their rise/fall
+    /// hysteresis. Call it
+    /// before the health check is set or cleared, so that the reset sees the
+    /// cluster as it is after the upsert.
+    pub fn set_udp_health_prober(&mut self, cluster_id: &str, armed: bool) {
+        if armed {
+            self.udp_probed_clusters.insert(cluster_id.into());
+        } else {
+            self.udp_probed_clusters.remove(cluster_id);
         }
     }
 
@@ -751,6 +777,13 @@ impl BackendMap {
     /// Put back exactly what a protected health check replaced: the
     /// configuration and the values behind its headers, each present or absent
     /// as it was.
+    ///
+    /// Restoring *no* configuration is a removal of the health check, so it
+    /// resets the backends the aborted configuration's probes marked DOWN just
+    /// as [`set_health_check_config`](Self::set_health_check_config) does for a
+    /// `RemoveHealthCheck`: the cluster is back to having no prober, and none
+    /// would ever mark them UP again. The caller drops the probes still in
+    /// flight (`Server::handle_protected_health_check`), which only it can.
     pub fn restore_health_check(
         &mut self,
         cluster_id: &str,
@@ -763,6 +796,7 @@ impl BackendMap {
             }
             None => {
                 self.health_check_configs.remove(cluster_id);
+                self.reset_cluster_health(cluster_id);
             }
         }
         match headers {
@@ -799,40 +833,54 @@ impl BackendMap {
             }
             None => {
                 self.health_check_configs.remove(cluster_id);
-                // When the operator drops the health check, any
-                // previously-recorded `HealthState::Unhealthy` would
-                // otherwise stick — `next_available_backend` keeps
-                // skipping the backend even though we have stopped
-                // probing it. Reset every backend in the cluster to a
-                // pristine healthy state so the load balancer can
-                // route again.
-                if let Some(backend_list) = self.backends.get(cluster_id) {
-                    for backend in &backend_list.backends {
-                        let mut backend = backend.borrow_mut();
-                        let was_healthy = backend.health.is_healthy();
-                        backend.health = HealthState::default();
-                        // The DOWN transition in `health_check.rs` latched
-                        // `backend.available = 0` and no probe will ever flip
-                        // it back: a backend the reset made routable again
-                        // must say so. One that is still unavailable (retry
-                        // policy down, retired) keeps its 0, and one that was
-                        // never marked DOWN holds no stale value.
-                        if !was_healthy && backend.is_available() {
-                            gauge!(
-                                names::backend::AVAILABLE,
-                                1,
-                                Some(cluster_id),
-                                Some(backend.backend_id.as_str())
-                            );
-                        }
-                    }
-                }
-                // Re-emit the rollup gauges so dashboards reflect the
-                // post-reset availability instead of holding the last
-                // health-check value indefinitely.
-                self.record_cluster_availability(cluster_id);
+                self.reset_cluster_health(cluster_id);
             }
         }
+    }
+
+    /// A cluster that has no health check has no prober, so nothing will ever
+    /// mark a backend UP again. When the health check goes away — dropped by
+    /// the operator, or restored to none by an aborted protected change — any
+    /// previously-recorded `HealthState::Unhealthy` would otherwise stick:
+    /// `next_available_backend` keeps skipping the backend even though we have
+    /// stopped probing it. Reset every backend in the cluster to a pristine
+    /// healthy state so the load balancer can route again.
+    ///
+    /// Unless a UDP prober is armed for the cluster
+    /// ([`Self::set_udp_health_prober`]): that prober outlives the health
+    /// check, keeps writing the same `Backend.health` and marks a backend UP
+    /// again after its `rise` successes, so the premise above is false and the
+    /// reset would only erase its rise/fall hysteresis, putting back in
+    /// rotation a backend it marked DOWN.
+    fn reset_cluster_health(&mut self, cluster_id: &str) {
+        if self.udp_probed_clusters.contains(cluster_id) {
+            return;
+        }
+        if let Some(backend_list) = self.backends.get(cluster_id) {
+            for backend in &backend_list.backends {
+                let mut backend = backend.borrow_mut();
+                let was_healthy = backend.health.is_healthy();
+                backend.health = HealthState::default();
+                // The DOWN transition in `health_check.rs` latched
+                // `backend.available = 0` and no probe will ever flip
+                // it back: a backend the reset made routable again
+                // must say so. One that is still unavailable (retry
+                // policy down, retired) keeps its 0, and one that was
+                // never marked DOWN holds no stale value.
+                if !was_healthy && backend.is_available() {
+                    gauge!(
+                        names::backend::AVAILABLE,
+                        1,
+                        Some(cluster_id),
+                        Some(backend.backend_id.as_str())
+                    );
+                }
+            }
+        }
+        // Re-emit the rollup gauges so dashboards reflect the
+        // post-reset availability instead of holding the last
+        // health-check value indefinitely.
+        self.record_cluster_availability(cluster_id);
     }
 
     pub fn import_configuration_state(
@@ -3140,6 +3188,58 @@ mod backends_test {
             None,
             backend_available_gauge(cluster_id, "never-down"),
             "a backend never marked DOWN holds no gauge for the reset to refresh"
+        );
+    }
+
+    /// A cluster whose UDP prober is armed keeps the health that prober wrote
+    /// when its HTTP/TCP health check goes away, whichever way it goes (an
+    /// upsert or `RemoveHealthCheck` through `set_health_check_config`, the
+    /// restore of an aborted protected change through `restore_health_check`):
+    /// the prober keeps running and owns the rise/fall hysteresis. Once it is
+    /// disarmed, or the cluster is removed, nothing probes the cluster and the
+    /// reset applies again.
+    ///
+    /// To SEE THIS RED: make `reset_cluster_health` ignore
+    /// `udp_probed_clusters`; the first assertion fails.
+    #[test]
+    fn a_udp_prober_keeps_its_verdict_when_the_health_check_goes_away() {
+        let backend_is_healthy = |map: &BackendMap, cluster_id: &str| {
+            map.backends[cluster_id].backends[0]
+                .borrow()
+                .health
+                .is_healthy()
+        };
+        let mut map = BackendMap::new();
+        let cluster_id = "c-udp-prober";
+        map.add_backend(cluster_id, unhealthy_backend("b1", 9802));
+        map.set_udp_health_prober(cluster_id, true);
+
+        map.set_health_check_config(cluster_id, None);
+        assert!(
+            !backend_is_healthy(&map, cluster_id),
+            "an upsert without a health check must not reset a backend the UDP prober marked DOWN"
+        );
+        map.restore_health_check(cluster_id, None, None);
+        assert!(
+            !backend_is_healthy(&map, cluster_id),
+            "an aborted protected change must not reset a backend the UDP prober marked DOWN"
+        );
+
+        map.set_udp_health_prober(cluster_id, false);
+        map.set_health_check_config(cluster_id, None);
+        assert!(
+            backend_is_healthy(&map, cluster_id),
+            "no prober is left: the reset applies"
+        );
+
+        map.add_backend(cluster_id, unhealthy_backend("b2", 9803));
+        map.set_udp_health_prober(cluster_id, true);
+        map.remove_cluster(cluster_id);
+        map.add_backend(cluster_id, unhealthy_backend("b3", 9804));
+        map.set_health_check_config(cluster_id, None);
+        assert!(
+            backend_is_healthy(&map, cluster_id),
+            "removing the cluster forgets its prober: the recreated cluster is reset"
         );
     }
 

@@ -31,7 +31,28 @@ Entry point: `begin_main_process` (`bin/src/command/mod.rs`), called from `main`
    path, then `chmod` to `command_socket_mode`, `0o600` by default).
 4. Forks the configured number of workers via `fork_main_into_worker`
    (`bin/src/worker.rs`). Each worker inherits a `Channel` pair plus an
-   `ScmSocket` for FD passing.
+   `ScmSocket` for FD passing. The forked child is a copy of the whole
+   supervisor, so it never returns into the caller: it `exec`s the worker
+   binary or, when that fails, logs the error and ends with `_exit(1)`. The
+   supervisor sees that worker's channel close, answers its in-flight requests
+   with synthetic failures (§1.2), and, with `worker_automatic_restart` (the
+   default), forks a replacement (`Server::workers_to_spawn`).
+
+   A launch can also fail in the supervisor, before or after the fork: the
+   state file, the socket pairs, `fork` itself, the configuration sent to the
+   new worker, or the registration of its channel. It leaves no descriptor
+   open in the supervisor. `ScmSocket` and `Listeners` carry raw descriptors
+   and have no `Drop`, so `fork_main_into_worker` owns both through guards
+   that close them on every error return (the listeners on success too, once
+   the worker has its own copies), and `Server::register_worker` closes the
+   SCM socket when the registration fails before a session exists. After a
+   failed automatic launch the round ends and the next one waits
+   `SPAWN_RETRY_INTERVAL` (one second, `Server::paced_workers_to_spawn`):
+   the failure is resource exhaustion, so retrying at once only repeats it
+   with a state file written and synced per attempt. During that delay the
+   count of workers to spawn is zero, so `poll` is not given a zero timeout,
+   and it blocks for at most the time left. A launch that succeeds ends the
+   delay.
 5. Enters the master event loop via `CommandHub::run`
    (`bin/src/command/server.rs`).
 
@@ -54,13 +75,45 @@ The supervisor is a single-threaded mio event loop. Each tick:
   with a deadline whose worker stays silent is reaped at its own deadline,
   not at the latest deadline of any other pending task (sozu#1826). A task
   scattered with `Timeout::None` has no deadline: it ends only when its
-  workers answer or their channels close. The first close of any worker
-  that is not yet `Stopped`, a `Stopping` one included, answers its
-  in-flight requests with synthetic failures
-  (`CommandHub::on_worker_channel_closed`). Each task turns them into the
+  workers answer or their channels close. The close of any worker, whatever
+  its run state (a `Stopping` one included, and a `Stopped` one: a fence
+  (`Server::fence_worker`) kills the process and marks the session `Stopped`
+  without failing the routes it still owes, so the close that follows is the
+  only thing that can), answers its in-flight requests with synthetic
+  failures (`CommandHub::on_worker_channel_closed`). A repeated close finds
+  no route left, because a synthetic failure is a terminal answer and a
+  `Stopped` worker is never sent another request. Each task turns them into the
   client answer it would give a real rejection: an old worker that closes
   before answering the `SoftStop` of an `upgrade --worker` fails that
   upgrade (§4).
+- forgets the sessions of dead workers
+  (`CommandHub::collect_unreferenced_restored_stopped_workers`, at the top of
+  every iteration, after the task sweep). A `Stopped` session is removed, its
+  command channel deregistered and both of its descriptors closed (the SCM
+  socket is closed explicitly, since `ScmSocket` has no `Drop`), once no task
+  retains its token and no live route names its worker, so a worker that died
+  with answers still owed keeps its session until its close has failed them.
+  A session this main forked is removed only after its own `SIGKILL` (or an
+  `ESRCH`) proved the process unable to act (`WorkerSession::process_stop_proven`):
+  one whose kill failed keeps its session, its descriptors and its bootstrap
+  slot, since the process may still act. A task that may still stop a worker
+  by id (`GatheringTask::retained_worker_ids`: the readiness task of a new
+  worker, its protected-value bootstrap, the readiness phase of an
+  `upgrade --worker`, and a protected health check change for every worker it
+  names) keeps that worker's session while it lives, even with no route left,
+  because `Server::fence_worker` proves a worker stopped from its session and
+  would report one it killed itself as unprovable once the session is gone.
+  The process of a removed session is waited for with a non-blocking
+  `waitpid` (`Server::unreaped_workers`, `Server::reap_removed_workers`) on
+  every sweep, and `poll` blocks at most 100 ms (`REAP_POLL_INTERVAL`) while
+  one is still to be waited for, because the `SIGKILL` lands after the close
+  and no event announces the zombie; without that wait every worker death
+  left one zombie child of the main until it exited. A restored session
+  (§4) is removed on the same terms except that its historical PID is never
+  waited for, being no child of this main. `ListWorkers` therefore no longer
+  reports a dead worker once its session is gone, and a crash loop under
+  `worker_automatic_restart` no longer adds two descriptors, two command
+  buffers and a zombie per restart.
 
 `CommandHub` (`server.rs`) owns the per-client and per-worker session
 maps; it derefs to `Server` (`Deref` / `DerefMut for CommandHub`,
@@ -386,7 +439,36 @@ forwarded; service managers should signal the unit rather than a superseded PID.
 (`bin/src/command/upgrade.rs`) and re-exec of an individual worker. Its first
 phase takes the old worker's listeners and launches the new worker with them;
 its second phase (`StopOldActivateNew`) soft-stops the old worker and sends the
-activation requests to the new one. `UpgradeWorkerTask::on_finish` answers
+activation requests to the new one.
+
+Between the two phases the old worker stays `Running` but holds no listening
+socket: `ReturnListenSockets` makes it hand every descriptor over and keep
+none, and the supervisor closes its own copies once the replacement has them,
+or once the launch has failed (`fork_main_into_worker` closes them on every
+error return): a copy left open would keep the supervisor listening on sockets
+it never accepts on, so with one worker new connections would complete the
+handshake and hang, and with several `SO_REUSEPORT` would still hash a share of
+them there until the supervisor exited.
+The second phase starts only when the replacement answers its initial `Status`
+with `Ok` (`AwaitingReadiness`). Every other exit, a replacement that times
+out, is rejected, or is refused its bootstrap, a failed or malformed receive
+of the listeners, and a failed launch, ends the upgrade through
+`UpgradeWorkerTask::abort_keeping_old_worker`: a replacement that reached
+`AwaitingReadiness` is fenced first, and the old worker is sent an
+`ActivateListener` for every listener the state
+holds as active (`RestoringOldWorker`), so it binds a fresh socket with
+`SO_REUSEPORT`. A repeated activation of a listener that is already active
+answers `Ok`. The client gets `Processing` while it waits, then one `Failure`
+that says the old worker "listens again and keeps serving" only once every
+activation was answered `Ok`; a rejected or unanswered activation is named
+instead, and a worker that is already stopping or stopped is not asked. With no
+active listener the answer is immediate. While the restoration is in flight
+the task cannot be handed over to a new main process
+(`TaskSnapshotError::OldWorkerRestoreInFlight`), as for the readiness wait. An
+old worker that never answers the first `ReturnListenSockets` is not covered:
+that answer is indeterminate and the upgrade fails as before.
+
+`UpgradeWorkerTask::on_finish` of the second phase answers
 `Ok` only when every response of that second phase is `Ok`. A failure of the
 old worker's `SoftStop`, including the synthetic "closed before answering" of
 §1.2, or of any activation request of the new worker, answers `Failure` naming

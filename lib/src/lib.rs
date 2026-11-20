@@ -876,7 +876,18 @@ impl fmt::Debug for RetrieveClusterError {
 /// Used in sessions
 #[derive(Debug, PartialEq, Eq)]
 pub enum AcceptError {
+    /// As answered by `ProxyConfiguration::accept`: `accept(2)` itself failed on
+    /// a live listening socket, with anything but `WouldBlock` (descriptor
+    /// exhaustion, a connection aborted before it was accepted). The
+    /// connections the kernel already completed are still in the backlog, so
+    /// `Server::accept` (`lib/src/server.rs`) keeps the listener armed for a
+    /// retry.
     IoError,
+    /// There is no socket to accept on: the token names no listener, or the
+    /// listener holds no socket any more (deactivated, stopped, or handed back
+    /// for an upgrade). Nothing a retry could change, so the listener is dropped
+    /// from the deferred accept pass.
+    NoListenSocket,
     TooManySessions,
     WouldBlock,
     RegisterError,

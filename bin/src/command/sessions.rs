@@ -797,15 +797,17 @@ fn is_transient_overflow(error: &ChannelError) -> bool {
 }
 
 impl WorkerSession {
-    /// Close both descriptors when a restored terminal session has no
-    /// remaining task or response correlation. `ScmSocket` deliberately
-    /// borrows its raw descriptor, so dropping the session alone closes only
-    /// the command channel.
-    pub(crate) fn close_restored_descriptors(self) -> io::Result<()> {
+    /// Close both descriptors when a terminal session has no remaining task or
+    /// response correlation. `ScmSocket` deliberately borrows its raw
+    /// descriptor, so dropping the session alone closes only the command
+    /// channel.
+    pub(crate) fn close_descriptors(self) -> io::Result<()> {
         let scm_fd = self.scm_socket.raw_fd();
         drop(self);
-        // SAFETY: the restored Hub owns this descriptor after COMMIT and
-        // removes the sole WorkerSession that names it before this call.
+        // SAFETY: the Hub owns this descriptor and removes the sole
+        // WorkerSession that names it before this call. A worker this main
+        // forked got it from `fork_main_into_worker`, which released it with
+        // `into_raw_fd`; a restored one owns it after COMMIT.
         if unsafe { libc::close(scm_fd) } == 0 {
             Ok(())
         } else {

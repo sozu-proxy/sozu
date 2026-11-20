@@ -49,7 +49,7 @@ by the main process and workers (like the log level):
 | `ctl_command_timeout`         | maximum time the command line will wait for a command to complete, `0` disables it; a soft `shutdown` ignores it and waits for the drain                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |                                           |
 | `pid_file_path`               | stores the pid in a specific file location                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |                                           |
 | `front_timeout`               | maximum time of inactivity for a front socket (seconds). Defaults to `60`. On an HTTP/1.1 frontend it also bounds a request's whole backend connection failover; see "Backend connection failover". While a response is in progress and the client has taken every byte so far, the client is waiting on the backend: this timeout then leaves the response to `back_timeout` instead of cutting it (#1906)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |                                           |
-| `back_timeout`                | maximum time of inactivity for a backend socket (seconds). Defaults to `30`. Can be overridden per listener. While Sōzu still holds response bytes the client has not taken, it stops reading the backend itself: this timeout then leaves the response to `front_timeout` instead of cutting it, so a slow client is never charged to the backend (#1906).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | seconds                                   |
+| `back_timeout`                | maximum time of inactivity for a backend socket (seconds). Defaults to `30`. Can be overridden per listener. While Sōzu still holds response bytes the client has not taken, it stops reading the backend itself: this timeout then leaves the response to `front_timeout` instead of cutting it, so a slow client is never charged to the backend (#1906). A pooled backend connection with no request in flight (an HTTP/2 connection whose last stream has ended, an HTTP/1.1 keep-alive connection) is not bounded by this timeout: the timeout neither closes that connection nor ends the client session, which keeps serving its other requests.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | seconds                                   |
 | `connect_timeout`             | maximum time to establish a backend connection (seconds). Defaults to `3`; on expiry an HTTP request fails over to another backend while `max_connection_attempts` lasts, a TCP session is closed |                                           |
 | `max_connection_attempts`     | how many backend connections a request may try, the first included, before it is answered `503` (HTTP) or closed (TCP). A failed connection — refused, timed out on `connect_timeout`, or reporting a socket error — is counted against its backend and the request goes to another backend while attempts remain. Defaults to `5` (the hard-coded `CONN_RETRIES` of earlier versions allowed `3`). Must lie in `1`-`255`; a value outside it is rejected at config-load time. Each cluster may override it, and `sozu connection-attempts set` changes it on running workers. See "Backend connection failover". | integer (1-255, default 5)                |
 | `accept_queue_timeout`        | maximum time (in seconds) a TCP connection stays in sozu's accept queue before being dropped. Defaults to `60`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | seconds                                   |
@@ -273,6 +273,15 @@ provide status 503, the `answers["503"]` map entry overrides the legacy
 `answer_503` field, matching the HTTP and HTTPS worker registries. This
 pre-dispatch check prevents new invalid state; it does not automatically repair
 a malformed cluster entry persisted by an older Sōzu version.
+
+An `AddCluster` upsert replaces the cluster's answer templates as a whole, on
+the workers as in the main process: a status the new `answers` map no longer
+carries, or an empty map, goes back to the listener's template at once, without
+a `RemoveCluster`. An HTTP or HTTPS listener added after a cluster serves that
+cluster's answer templates like the listeners that were there before it; a
+cluster whose templates do not compile (one accepted while the worker had no
+listener of that kind) is logged and served the listener's own pages, and the
+listener is still added.
 
 If a frontend has a `sticky_session`, the sticky name is defined at the listener
 level.
@@ -1904,6 +1913,12 @@ its backend id and address, never to another backend at the same address. A
 probe still in flight when its backend is removed is discarded on completion,
 even if a backend with the same id and address was added in the meantime: the
 re-added backend starts with a fresh health state.
+
+Adding a cluster that already exists, as a configuration reload that changes it
+does, keeps the prober running and does not reset the health of its backends: one
+marked down stays down until `rise` successful probes mark it up. Only a cluster
+with no `udp.health` block, or with `mode = "HEALTH_OFF"`, is reset to healthy,
+because nothing probes it any more.
 
 A complete DNS cluster, with HRW affinity, single-reply flows, PROXY v2 to the
 backend, and a TCP-probe health check:
@@ -4205,6 +4220,13 @@ transitions through phases (e.g., Expect → TLS Handshake → HTTPS → WSS).
 | `protocol.wss`              | gauge | proxy | Active WebSocket sessions (over HTTPS)                |
 | `websocket.active_requests` | gauge | proxy | Active WebSocket requests (HTTP + HTTPS)              |
 
+A session enters a phase's gauge only once the move cannot fail any more, and
+leaves it exactly once, when it moves on or closes. A connection refused for
+lack of buffers (the pool cannot back the first stream) builds no session and
+raises no gauge. A TLS handshake whose upgrade is refused for the same reason
+stays in `protocol.tls.handshake` until its session closes, and leaves it then,
+once.
+
 #### Request lifecycle
 
 | Metric                 | Type    | Scope                   | Description                                                                                                                                                                                                                    |
@@ -4487,7 +4509,7 @@ while this chooses among sockets this session already holds.
 | ----------------------------- | ------- | ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `backend.pool.hit`            | counter | proxy | Request attached to an existing backend connection (H2 multiplex slot or H1 keep-alive).                                                                                                                                                                                                                                          |
 | `backend.pool.miss`           | counter | proxy | No reusable connection found; a fresh dial starts. Incremented before `backend_from_request`, so failed selections still count. Dial may still fail — in that case `backend.pool.size` is not bumped.                                                                                                                             |
-| `backend.pool.size`           | gauge   | proxy | Live mux router entries. `+1` at `router.rs::connect` new-dial commit; `-1` at `connection.rs::pre_close_client_bookkeeping` and `mod.rs::close_backend`. Mirrors the `backend.connections` site set in mux exactly, so gauge symmetry follows from `backend.connections` correctness. Non-mux H1/TCP paths are NOT counted here. |
+| `backend.pool.size`           | gauge   | proxy | Live mux router entries. `+1` at `router.rs::connect` new-dial commit; `-1` at `connection.rs::pre_close_client_bookkeeping`, `mod.rs::close_backend` and, for the connection a WebSocket upgrade hands to its pipe, `Pipe::close`. Mirrors the `backend.connections` site set in mux exactly, so gauge symmetry follows from `backend.connections` correctness. Non-mux H1/TCP paths are NOT counted here. |
 | `backend.flow_control.paused` | counter | proxy | Direction-scoped counterpart of `h2.flow_control_stall`: emitted only when the converter stalls while writing toward an upstream backend (`Position::Client`) because the backend's HTTP/2 receive window is empty.                                                                                                               |
 
 Intentionally **not** emitted in this slice (no corresponding lifecycle exists):
@@ -4633,7 +4655,7 @@ force-disconnected. In the first case no dropped frame would have been
 serialised anyway; in the second the peer already holds a GOAWAY, so the
 dropped resets do not change what it can still believe about a stream
 | | `h2.headers_no_stream.error` | counter | proxy
-| HEADERS frame received with no matching stream (protocol error) | |
+| header block completed after its stream was removed (the client cancelled the request, or the stream was reaped, while the block was being read): the block is decoded for HPACK and dropped and the connection stays up | |
 `h2.frames.tx.headers` | counter | proxy | HEADERS frames emitted by the H2
 block converter (one per response, plus the first frame of any header block
 split into HEADERS+CONTINUATION when the encoded headers exceed the negotiated

@@ -261,6 +261,32 @@ Declared in `h2.rs` (`pub enum H2State`):
   rather than on where it sits (sozu-proxy/sozu#1447). Do not convert it back.
 - `Continuation*` states handle multi-frame HEADERS per RFC 9113 §4.3 — enter in
   `ConnectionH2::handle_headers_frame` (`h2.rs`).
+- **Discard does not spin on WRITABLE.** The RST_STREAM of a refusal
+  (`enqueue_rst`) and the connection WINDOW_UPDATE of
+  `skip_orphaned_data_payload` arm WRITABLE, and the payload to discard may
+  not be readable yet: it follows in a later TCP segment or TLS record. The
+  `writable()` pass that serialises that frame has nothing else to do in
+  `Discard`, because stream frames wait for `Header`, so a WRITABLE interest
+  left armed has `Mux::ready_inner` call the same pass on every inner
+  iteration until `MAX_LOOP_ITERATIONS`: `http.infinite_loop.error`, then a
+  closed session with every stream of the connection unless other output is
+  queued. The `H2State::Discard` arm of `ConnectionH2::dispatch_writable_state`
+  therefore withdraws the WRITABLE interest, as the `ServerSettings` arm of a
+  backend does, except while rustls still holds records (`tls_wants_write`):
+  only a write pass flushes them, so the interest stays and
+  `ensure_tls_flushed` keeps the retry alive. What the withdrawn interest
+  swallowed while the payload was read — a response a backend queued on
+  another stream, a parked write — armed an edge that does not come back
+  (invariants 15 and 16), so the `H2State::Discard` arm of
+  `ConnectionH2::handle_read` raises WRITABLE (`Readiness::arm_writable`) when
+  the discard ends with the interest down, on a frontend and on a backend
+  connection alike. The write pass it earns settles through
+  `FinalizeAction::Quiesce` when nothing is queued. A discard that ends in
+  `ConnectionH2::goaway` arms WRITABLE itself. Pinned by
+  `a_discarded_field_block_still_in_flight_does_not_spin_the_loop_to_its_limit`,
+  `a_discard_with_nothing_to_flush_withdraws_the_write_interest`,
+  `a_discard_with_tls_records_pending_keeps_the_write_interest` and
+  `the_end_of_a_discard_raises_the_write_interest_its_pass_withdrew`.
 - **Discard does not skip HPACK.** HPACK field-compression state is scoped to
   the *connection* (RFC 9113 §4.3), not the stream, so the bytes `Discard`
   drops on a refused stream are still a field block the peer's encoder has
@@ -439,12 +465,23 @@ custom pages mid-response.
 
 That publication boundary is the listener reload and nothing else.
 `HttpProxy::add_cluster` / `HttpProxy::remove_cluster` (`lib/src/http.rs`) and
-their HTTPS counterparts still reach `HttpAnswers::add_cluster_answers` /
+their HTTPS counterparts still reach `HttpAnswers::replace_cluster_answers` /
 `HttpAnswers::remove_cluster_answers` through a `borrow_mut` on whatever
 registry the listener currently holds, so a cluster-level answer added or
 removed without a listener reload is visible to requests already in flight.
 Closing that too means publishing on those paths as well; it is not what
 Question 7 asked and is left as it was.
+
+`replace_cluster_answers` is the `AddCluster` upsert: it makes the cluster's new
+map the whole set, so a status the upsert no longer names (or an empty map)
+stops being overridden, and it compiles every template before it touches the
+registry. `HttpProxy::add_listener` / `HttpsProxy::add_listener` replay the same
+call for every cluster the proxy already holds onto the new listener's own,
+empty registry; the stored cluster carries the legacy `answer_503` folded into
+its `answers` map for that purpose. A cluster accepted while the proxy had no
+listener was compiled nowhere: if its templates do not compile, the replay logs
+it and the new listener serves its own pages for that cluster instead of being
+refused.
 
 
 **Captured once per connection, not per request**, because no patch can change
@@ -791,7 +828,48 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   `reset_of_an_unlinked_stream_recycles_its_slot` (`h2.rs`),
   `test_h2_malformed_requests_release_their_stream_slots` and
   `test_h2_content_length_resets_release_their_stream_slots`
-  (`e2e/src/tests/h2_stream_slot_tests.rs`). A recycled `Link` slot may
+  (`e2e/src/tests/h2_stream_slot_tests.rs`). The write path recycles one
+  stream before the client has ended its request: a response Sōzu ends in
+  error (`forcefully_terminate_answer` from the backend-token branch of
+  `Mux::timeout_inner` on a started response and from a backend GOAWAY on a
+  stream whose request was consumed, `ConnectionH2::end_stream` on an
+  unterminated or truncated close-delimited response) is
+  followed by the converter's own RST_STREAM, and `try_recycle_server_stream`
+  no longer defers on `Stream::front_received_end_of_stream` once
+  `H2StreamTable::was_reset_locally` holds for the id. That deferral waits
+  for DATA the read path will never deliver, since `handle_header_state`
+  discards every DATA and HEADERS frame on a stream Sōzu reset (RFC 9113
+  §5.1) before `mark_end_of_stream` can set the flag: the stream kept its
+  slot, its two pool buffers, its wire-map entry (counted against
+  `SETTINGS_MAX_CONCURRENT_STREAMS`) and its counted request until the
+  connection closed. Retiring it moves the id from `rst_sent` into
+  `recently_reset`, which keeps ignoring the client's remaining frames.
+  Pinned by
+  `a_response_ended_in_error_before_the_request_is_complete_recycles_its_slot`
+  (`h2.rs`). The deferral on a client that is still sending has its own
+  wake-up. The write pass that found the response whole and deferred the
+  recycle leaves a quiescent connection with no WRITABLE interest, and the
+  client's last frame is the only thing that lets the stream go, yet it queues
+  no flow-control credit of its own: a DATA frame with END_STREAM earns no
+  stream WINDOW_UPDATE and sends the connection-level one only when it happens
+  to cross the threshold (an empty one never does), and a trailer block
+  carries no DATA to credit. `ConnectionH2::mark_end_of_stream` therefore arms
+  WRITABLE (`Readiness::arm_writable`) when it sets
+  `Stream::front_received_end_of_stream` on a server connection whose
+  response is already terminated and completed, the condition the write pass
+  tests before it recycles. Its three callers share it — the `Unlinked` and
+  the `Linked` DATA branches of `ConnectionH2::handle_data_frame` and the
+  trailer branch of `ConnectionH2::handle_headers_frame` — and a request that
+  ends before its response is whole arms nothing. The drain pass of
+  `Mux::shutting_down_inner` already arms next to the flag.
+  Without it the stream kept its slot, its two pool buffers, its entry against
+  `SETTINGS_MAX_CONCURRENT_STREAMS` and its access log until an unrelated
+  write pass ran or `ConnectionH2::cancel_timed_out_streams` reaped it, which
+  logged the finished exchange as `H2::IdleTimeout` with an error and sent
+  RST_STREAM(CANCEL) on a stream both sides had closed. Pinned by
+  `a_client_end_of_stream_after_a_complete_answer_recycles_the_stream` and
+  `a_client_trailer_after_a_complete_answer_recycles_the_stream` (`h2.rs`); the
+  `Linked` DATA branch has no test of its own. A recycled `Link` slot may
   still have its id queued in `context.pending_links`. The drain in
   `Mux::ready_inner` skips every entry whose slot is not `Link`, so the
   stale entry is skipped while the slot is `Recycle` or `Idle`. When the slot
@@ -1055,6 +1133,47 @@ and hands the unread remainder `n` to
 - restores READABLE interest, since a stream parked on buffer pressure is
   resumed only by `try_resume_reading`, which needs the stream to exist. It
   does so even while output is queued: `zero` is input only (invariant 28).
+
+A HEADERS or CONTINUATION payload is the opposite case: it is read through
+`H2StreamId::Zero`, which belongs to no stream, so `remove_dead_stream` has
+nothing to repair and the `Frame` state and the `(Zero, n)` debt survive the
+removal. The block is read to its end and reaches `ConnectionH2::handle_headers_frame`
+with its stream gone, which can only mean the stream was removed while the
+block was being read: `ConnectionH2::handle_header_state` lets a HEADERS frame
+through only for a stream the table holds or just created, and
+`ConnectionH2::handle_continuation_header_state` checks the stream id the
+CONTINUATION names against the HEADERS frame's, not that the stream still
+exists. `ConnectionH2::drop_field_block_of_removed_stream` decodes the block
+(through `ConnectionH2::decode_and_drop_field_block`, which also retires the
+reassembly accumulator and `zero.storage`) into the connection's HPACK decoder
+and drops it: the peer's encoder already
+indexed its fields, so skipping them would desynchronise every later block of
+the connection (RFC 9113 §4.3), and the connection is shared with every other
+stream of the session, so one client's cancel must not close it. The result is
+`MuxResult::Continue`, `zero.storage` and the reassembly accumulator are
+retired, and the bytes are attributed to overhead; the
+`h2.headers_no_stream.error` counter counts the dropped block. A block that
+does not decode is a connection error of type COMPRESSION_ERROR, as on a live
+stream. The backend-side `ConnectionH2::end_stream` that cancels a request
+between two reads of its response HEADERS, or between its HEADERS and its
+CONTINUATION frames, is the case reproduced. Pinned by
+`a_response_headers_block_of_a_cancelled_stream_keeps_the_backend_connection`,
+`a_response_continuation_of_a_cancelled_stream_keeps_the_backend_connection`,
+`the_block_of_a_cancelled_stream_still_reaches_the_hpack_decoder` and
+`an_undecodable_block_of_a_cancelled_stream_is_a_compression_error` (`h2.rs`).
+
+A completed HEADERS block that carries an RFC 7540 PRIORITY depending on its
+own stream is the other block `ConnectionH2::handle_headers_frame` ends without
+handing it to `pkawa::handle_header`: the stream is reset and removed
+(RFC 7540 §5.3.1 forbids the dependency), and the block is decoded first
+through the same `ConnectionH2::decode_and_drop_field_block`, because the
+block reached the peer's HPACK encoder all the same and the reset is a stream
+error, not a reason to let the connection's decoder fall behind. A block that
+does not decode is `GOAWAY(COMPRESSION_ERROR)` in place of the stream reset.
+Pinned by `a_priority_self_dependency_reset_keeps_the_hpack_decoder_in_sync`,
+`an_undecodable_block_of_a_self_dependent_stream_is_a_compression_error` and
+`a_priority_self_dependency_reset_does_not_leak_the_reassembly_accumulator`
+(`h2.rs`).
 
 The backend-side `ConnectionH2::end_stream` RST_STREAM(CANCEL) once went
 into `zero` with neither `expect_write` nor READABLE touched. A backend
@@ -1617,6 +1736,29 @@ and backend handles out of `Mux.timeouts` and hands them to `Pipe`, which is why
 `sync_timeout` keeps each handle's `duration()` current through
 `TimeoutContainer::retune` — `Pipe` re-arms from it.
 
+The upgrade also consumes the `Mux` without ever running `Mux::close`, so it owes
+the backend accounting `Mux::close` would have settled. The connection it hands
+to the `Pipe` is released by `Pipe::close` (`lib/src/protocol/pipe.rs`): the
+`active_connections` reservation selection took and the `backend.connections`,
+`backend.pool.size` and `connections_per_backend` gauges `attach_dialed` raised.
+Every other connection the session still pools for another cluster is released
+by `Mux::release_backend_connections_except` (`lib/src/protocol/mux/mod.rs`),
+called first thing in `upgrade_mux` with the upgrading stream's backend token as
+the one it skips: it runs `Mux::close_backend_connections` and drains the ledger,
+because the mux does not outlive the upgrade to drain it later. The skip is what
+keeps the pipe's connection from being released twice. The skip has one cost:
+a `return None` of `upgrade_mux` after the release (an H2 frontend or backend,
+a backend no longer `Connected`, an unknown registry slot) drops the kept
+connection unreleased, since no `Pipe` takes it; none of these exits has a
+known trigger. Pinned by
+`closing_a_websocket_pipe_releases_its_backend_connection`,
+`closing_a_websocket_pipe_twice_releases_its_connection_once`
+(`lib/src/protocol/pipe.rs`),
+`a_websocket_upgrade_releases_the_pooled_connections_but_not_the_kept_one`
+(`lib/src/protocol/mux/mod.rs`), `websocket_sessions_each_release_their_own_backend_connection`
+and `websocket_upgrade_releases_the_other_pooled_backend_connections`
+(`e2e/src/tests/metrics_lifecycle_tests.rs`).
+
 One deliberate semantic shift comes with the split, and it is not literally "no
 change": the old `TimeoutContainer::reset()` computed its deadline from a fresh
 `Instant::now()` at the call site, whereas `arm_timeout(now)` computes it from
@@ -1733,7 +1875,11 @@ Three directions:
   is `None` after one, as after a `silent_close_answer`), whatever the slot's
   state — `Idle`, `Link`, `Linked` or `Unlinked` — and recycles the slot
   (§3.2). On a backend connection the slot stays `Unlinked` for the frontend
-  stream that owns it, which answers and logs. It then queues the outgoing RST via
+  stream that owns it, which answers and logs, and the stream's
+  `active_requests` charge is released there with `StreamsEnded(1)` when the
+  connection is `BackendStatus::Connected` (§9 invariant 14): the frontend's
+  `end_stream` books nothing, and the unlink has already emptied the reverse
+  index the later sweeps count from. It then queues the outgoing RST via
   [`enqueue_rst`](#proxy-rst-emission-path), and counts against
   `record_rst_emitted` (CVE-2025-8671 MadeYouReset) unless `NoError`.
   A request rejected at its HEADERS (a malformed `:path`) is therefore
@@ -1741,6 +1887,26 @@ Three directions:
   `session close` when its connection closed. Pinned by
   `a_backend_stream_reset_leaves_the_frontend_slot_to_the_frontend` and
   the tests §3.2 lists.
+- **A provoked reset that trips a flood limit ends the connection, not just
+  the stream.** `ConnectionH2::reset_stream_and_discard_frame` answers DATA or
+  HEADERS on a half-closed (remote) stream, and a trailer block without
+  END_STREAM, with RST_STREAM and then discards the frame's payload
+  (`ConnectionH2::discard_frame_payload`). Every provoked reset records a
+  glitch and one emitted RST, and checks the flood limits at once, so the
+  reset that crosses the glitch limit or the emitted-RST cap queues
+  GOAWAY(ENHANCE_YOUR_CALM) from inside `reset_stream` (`ConnectionH2::enqueue_rst`
+  through `ConnectionH2::handle_flood_violation`). `ConnectionH2::goaway`
+  answers `MuxResult::Continue`, so the result cannot tell that case from a
+  reset that only queued its frame: the connection state does. A connection
+  left in `H2State::GoAway` or `H2State::Error` keeps it and the payload is
+  not discarded, because `H2State::Discard` would overwrite the final
+  GOAWAY's state: after a HEADERS frame the connection kept no READABLE
+  interest and never took the `GoAway` close decision, after a DATA frame it
+  restored READABLE interest and read the peer's frames after its final
+  GOAWAY. `ConnectionH2::refuse_stream_and_discard` returns the flood verdict
+  of its own `enqueue_rst` before discarding, which is the same rule. Pinned
+  by `a_flood_goaway_raised_by_a_headers_reset_survives_the_discard` and
+  `a_flood_goaway_raised_by_a_data_reset_survives_the_discard` (`h2.rs`).
 - **Never for a backend stream still idle** — on `Position::Client` a stream id
   is allocated by `ConnectionH2::start_stream` when the router links the
   request, but its HEADERS leave with a later write pass, possibly never (the
@@ -2129,8 +2295,10 @@ terminated and completed as well as the response; otherwise it disconnects,
 because that backend still expects the rest of the body and would read the
 next request pooled onto it as that body. That backend guard serves both
 frontends: an H2 frontend already defers `try_recycle_server_stream` until
-the client's END_STREAM, but a client RST_STREAM after the whole response
-reaches `end_stream` with the request still incomplete. An H2 backend takes a
+the client's END_STREAM, except on a stream Sōzu itself reset, which retires
+once its RST_STREAM is flushed. A client RST_STREAM after the whole response
+reaches `end_stream` with the request still incomplete, and so can the
+retirement of a stream Sōzu reset while it was still linked. An H2 backend takes a
 different path: a stream it carries is never reused, and when one ends the
 connection sends RST_STREAM(CANCEL) unless `back_received_end_of_stream &&
 front.is_terminated() && front.is_completed()` (`fully_completed` in
@@ -2646,11 +2814,25 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
 14. **Backend `active_requests` balance.** Every site that removes a stream
     outside `Connection::end_stream` must release the charge that stream's
     creation took (`ConnectionH2::cancel_timed_out_streams`,
-    `ConnectionH2::handle_rst_stream_frame` and
-    `ConnectionH2::handle_goaway_frame`; all `h2.rs`; and the
+    `ConnectionH2::handle_rst_stream_frame`,
+    `ConnectionH2::handle_goaway_frame` and
+    `ConnectionH2::tear_down_reset_stream`, which every
+    `ConnectionH2::reset_stream` goes through; all `h2.rs`; and the
     backend-response parse error of `ConnectionH1::readable`, `h1.rs`, which
     ends its own stream through the inherent `ConnectionH1::end_stream`).
-    Otherwise load-balancing counters drift monotonically.
+    Otherwise load-balancing counters drift monotonically. A stream Sōzu
+    resets on a backend connection because of a frame the backend sent
+    (WINDOW_UPDATE with a zero increment, DATA on a 204 or past its
+    `content-length`, a PRIORITY self-dependency, a header block that fails to
+    parse) leaves through the last of these: its unlink empties the
+    `Context::backend_streams` entry the dead-backend sweep and the session
+    teardown count their `StreamsEnded(count)` from, and the frontend's
+    `Connection::end_stream` books nothing on a `Position::Server`, so only
+    the explicit `StreamsEnded(1)` releases the charge. Like the other
+    per-stream sites, it emits only on a `BackendStatus::Connected`
+    connection, the status `Connection::start_stream` charges on. Pinned by
+    `invariant_14_a_backend_provoked_stream_reset_releases_its_charge`
+    (`h2.rs`).
 
     The release must also be recorded **while the stream is still in the
     reverse index**, or by the site that removes it: `Mux::close_backend_connections`
@@ -2683,8 +2865,8 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     six scattered mutations: summing a ledger's `StreamsStarted` against its
     `StreamsEnded` is the balance itself. `h2.rs`'s
     `invariant_14_*` tests reconcile it across the nominal, refused-start,
-    `RST_STREAM`, `GOAWAY` and idle-reap paths, and then apply the ledger and
-    assert the counter returns to zero.
+    `RST_STREAM`, backend-provoked reset, `GOAWAY` and idle-reap paths, and
+    then apply the ledger and assert the counter returns to zero.
 
     Two ordering rules the emit/apply split has to keep, both load-bearing:
 
@@ -2715,7 +2897,11 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
       selection applies it, so that selection sees the backend exactly where
       a failed `Backend::try_connect` left it. A dial that connects keeps the
       reservation as its connection's count, and the connection's
-      `ConnectionClosed` releases it.
+      `ConnectionClosed` releases it. The one connection that never gets a
+      `ConnectionClosed` is the one a WebSocket upgrade moves into a `Pipe`: it
+      leaves `router.backends` with its `Backend` handle, and `Pipe::close`
+      calls `Backend::dec_connections` itself. That is the single embedder-side
+      write to `active_connections` outside the ledger.
 
       A dial that connects but is then abandoned releases it too
       ([#1713](https://github.com/sozu-proxy/sozu/issues/1713)). Every exit
@@ -2767,8 +2953,14 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     `Connection::start_stream`'s `Connected` guard skips them. `Mux`'s
     `Connecting` -> `Connected` transition is what charges them, so it emits
     `StreamsStarted(n)` onto the same list — as do the dead-backend arm and
-    session teardown, each emitting the `StreamsEnded(count)` its
-    `Context::backend_streams` entry owes. The health and latency writes
+    session teardown (`Mux::close_backend_connections`, which `Mux::close` and
+    the error-GOAWAY linger both run), each emitting the `StreamsEnded(count)`
+    its `Context::backend_streams` entry owes. Both skip a connection still
+    `BackendStatus::Connecting`: its streams were never charged, and a release
+    for them would subtract from the `active_requests` other sessions raised on
+    the same backend. The session-teardown skip is pinned by
+    `close_does_not_release_a_charge_for_a_stream_linked_to_a_connecting_backend`
+    (`mod.rs`). The health and latency writes
     (`Backend::failures`, `retry_policy`, `set_connection_time`) are NOT part
     of this balance and stay immediate at their embedder-side call sites,
     because the load balancer reads `retry_policy`. The retry policy and the
@@ -3002,8 +3194,27 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     behaviour is common, but no test drives an early backend delivery.
 
 22. **A timed-out backend holds no linked stream when the shared tail runs.**
-    The backend-token branch of `Mux::timeout` re-arms the backend container
-    only when `!should_close`, yet the shared tail below it can still return
+    A backend timer bounds the inactivity of the streams linked to that
+    backend, so the backend-token branch of `Mux::timeout` returns
+    `StateResult::Continue` before the loop below when
+    `context.backend_streams[&token]` is empty: no stream to answer or reap,
+    and the shared tail, which closes the session unless a stream asked to
+    keep it, would cut every stream the other backends still serve. The case
+    is a pooled H2 connection whose last stream has ended. `ConnectionH1`
+    clears its deadline when the backend's response terminates, so a pooled
+    H1 keep-alive backend never fires, but an H2 connection has no such edge
+    and keeps the deadline its last DATA, HEADERS or stream write armed. `consume_timer_entry` has
+    already cleared the elapsed deadline and `Mux::reschedule` cancels the
+    wheel entry; the connection stays pooled without a timer, exactly as an
+    idle H1 keep-alive connection does, and its first write that moves a
+    stream's bytes arms the deadline again (invariant 9). The frontend timer is
+    not re-armed on that return. Pinned by
+    `an_idle_h2_backend_deadline_does_not_close_a_session_with_a_live_stream`
+    and `an_idle_h2_backend_timeout_leaves_the_streams_of_other_backends_alone`,
+    the second also pinning the reuse leg.
+    The rest of this invariant concerns the backends that do have linked
+    streams. The backend-token branch of `Mux::timeout` re-arms the backend
+    container only when `!should_close`, yet the shared tail below it can still return
     `Continue` — through the `should_write` writable loop, or through
     `delay_close_for_frontend_flush("timeout")` — with only the FRONTEND
     container re-armed. That is safe only because the branch calls
@@ -3035,7 +3246,10 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     out on the first pass a backend actually moves bytes on, but nothing hangs
     on it — invariant 9.) That is what covers the
     pool-reuse branch of `Router::plan_connect` never arming a timeout, unlike the
-    fresh-dial branch. Asserted under `debug_assertions` at the
+    fresh-dial branch. The early return at the start of this invariant drops
+    an idle pooled H2 connection's elapsed deadline without re-arming it, so a
+    stream linked to that connection afterwards has no backend timer until the
+    first pass that moves its bytes arms one. Asserted under `debug_assertions` at the
     re-arm site and pinned by
     `a_backend_timeout_leaves_no_linked_stream_behind_on_the_close_path` and
     `a_completed_backend_response_timeout_unlinks_through_end_stream_alone`;
@@ -3123,10 +3337,15 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
       (the match arm in `ConnectionH2::handle_read`) — before `handle_frame`
       is even re-entered.
     - The block is retired via `HeaderBlockAccumulator::finish`, either
-      decoded (`handle_headers_frame`'s `END_HEADERS` branch) or dropped
-      unread by an early return of `handle_headers_frame` (the PRIORITY
-      self-dependency reset) — the single exit point
-      matching the single entry point `begin`. **Every early-return path in
+      decoded into a kept message (`handle_headers_frame`'s `END_HEADERS`
+      branch) or decoded and dropped by an early return of
+      `handle_headers_frame` (the PRIORITY self-dependency reset, and the
+      block of a removed stream, both through
+      `ConnectionH2::decode_and_drop_field_block`) — the single exit point
+      matching the single entry point `begin`. A dropped block is still
+      decoded: the peer's encoder has indexed its fields, and an undecoded
+      block leaves every later block of the connection resolving dynamic
+      indices against a table missing them (RFC 9113 §4.3). **Every early-return path in
       `handle_headers_frame` between the `!end_headers` check and the
       normal `finish()` call must retire an in-progress accumulator before
       returning, or `is_in_progress()` leaks `true` into the NEXT HEADERS
@@ -3737,7 +3956,8 @@ If you are fixing a bug in this module:
   this path goes through `BackendRegistry::apply`, driven by
   `Mux::apply_backend_deltas`, so the drift is either a missing
   `Context::record_backend_delta` at a stream-removal site or a drain that
-  ran after something read the counter.
+  ran after something read the counter. After a WebSocket upgrade the one
+  connection the `Pipe` kept is the exception: `Pipe::close` releases it.
 - **Truncated response / TLS decode error** — check `has_pending_write`
   (`h2.rs`), `delay_close_for_frontend_flush` (`mod.rs`), and the TLS
   drain logic in the `Position::Server` arm of `H2Shell::close`

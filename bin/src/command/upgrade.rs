@@ -48,12 +48,21 @@ enum UpgradeWorkerProgress {
         old_worker_token: Token,
         old_worker_id: WorkerId,
     },
-    /// 3. wait for the new worker to answer its initial `Status`; the old
-    ///    worker keeps serving, untouched, until that answer is `Ok`
+    /// 3. wait for the new worker to answer its initial `Status`. Phase one
+    ///    left the old worker with no listening socket, so it only keeps
+    ///    serving what it already accepted until that answer is `Ok`; if it
+    ///    never is, step 3b gives the listeners back
     AwaitingReadiness {
         old_worker_token: Token,
         old_worker_id: WorkerId,
         new_worker_id: WorkerId,
+    },
+    /// 3b. the upgrade was abandoned after phase one: wait for the old worker
+    ///     to bind and activate its listeners again. `abort` is the head of
+    ///     the answer, why the upgrade was abandoned
+    RestoringOldWorker {
+        old_worker_id: WorkerId,
+        abort: String,
     },
     /// 4. soft stop the old worker
     /// 5. activate the listeners of the new worker
@@ -182,6 +191,7 @@ impl UpgradeWorkerTask {
         old_worker_token: Token,
         old_worker_id: WorkerId,
     ) {
+        let client_token = self.client_token;
         let old_worker = match server.workers.get_mut(&old_worker_token) {
             Some(old_worker) => old_worker,
             None => {
@@ -191,10 +201,19 @@ impl UpgradeWorkerTask {
         };
         let old_worker_id = old_worker.id;
 
+        // From here on the old worker has answered `ReturnListenSockets`: it
+        // no longer holds any listening socket, so every way out that does not
+        // reach a ready replacement must make it listen again.
         match old_worker.scm_socket.set_blocking(true) {
             Ok(_) => {}
             Err(error) => {
-                client.finish_failure(format!("Could not set SCM sockets to blocking: {error:?}"));
+                Self::abort_keeping_old_worker(
+                    client_token,
+                    server,
+                    client,
+                    old_worker_id,
+                    format!("Could not set SCM sockets to blocking: {error:?}"),
+                );
                 return;
             }
         }
@@ -202,16 +221,20 @@ impl UpgradeWorkerTask {
         let listeners = match old_worker.scm_socket.receive_listeners() {
             Ok(listeners) => listeners,
             Err(_) => {
-                client.finish_failure(
-                    "Could not upgrade worker: did not get back listeners from the old worker",
+                Self::abort_keeping_old_worker(
+                    client_token,
+                    server,
+                    client,
+                    old_worker_id,
+                    "Could not upgrade worker: did not get back listeners from the old worker"
+                        .to_owned(),
                 );
                 return;
             }
         };
 
-        // The old worker stays `Running` and keeps serving until the new one
-        // has proven it is ready (`AwaitingReadiness`).
-        let client_token = self.client_token;
+        // The old worker stays `Running` until the new one has proven it is
+        // ready (`AwaitingReadiness`); it holds no listening socket meanwhile.
         let (new_worker_id, _) =
             match server.launch_worker_awaiting_status(Some(listeners), |new_worker_id| {
                 Box::new(UpgradeWorkerTask {
@@ -229,11 +252,78 @@ impl UpgradeWorkerTask {
             }) {
                 Ok(launched) => launched,
                 Err(worker_err) => {
-                    return client
-                        .finish_failure(format!("could not launch new worker: {worker_err}"));
+                    return Self::abort_keeping_old_worker(
+                        client_token,
+                        server,
+                        client,
+                        old_worker_id,
+                        format!("could not launch new worker: {worker_err}"),
+                    );
                 }
             };
         client.return_processing(format!("Launched a new worker with id {new_worker_id}"));
+    }
+
+    /// End an upgrade that cannot reach a ready replacement, after phase one.
+    ///
+    /// `ReturnListenSockets` took every listening socket away from the old
+    /// worker for good: it handed the descriptors over, kept none, and reset
+    /// the `active` flag of its listeners. The only other copy went to the
+    /// replacement (main closes its own as soon as it forwards them), so a
+    /// replacement that is fenced, or never launched, leaves the old worker
+    /// `Running` with nothing to accept on. The old worker is therefore asked to
+    /// bind and activate again every listener the state holds as active, the
+    /// requests `stop_old_activate_new` sends to a replacement; the worker
+    /// binds a fresh socket with `SO_REUSEPORT`, and answers `Ok` to a repeat
+    /// for a listener that is already active.
+    ///
+    /// `abort` is the head of the answer. The client is told the old worker
+    /// keeps serving only when it is asked nothing or confirms every
+    /// activation.
+    fn abort_keeping_old_worker(
+        client_token: Token,
+        server: &mut Server,
+        client: &mut OptionalClient,
+        old_worker_id: WorkerId,
+        abort: String,
+    ) {
+        if server.get_active_worker_by_id(old_worker_id).is_none() {
+            // Stopping or stopped: a listener must not be reopened on a worker
+            // that drains, and a stopped one is restarted from the main state
+            // when automatic restart is on.
+            client.finish_failure(format!(
+                "{abort}; worker {old_worker_id} is stopping or stopped, its listeners were not restored"
+            ));
+            return;
+        }
+
+        let requests = server.state.generate_activate_requests();
+        if requests.is_empty() {
+            client.finish_failure(format!("{abort}; worker {old_worker_id} keeps serving"));
+            return;
+        }
+
+        client.return_processing(format!(
+            "Upgrade of worker {old_worker_id} aborted, asking it to listen again on {} listener(s)",
+            requests.len()
+        ));
+        let task = server.new_task(
+            Box::new(UpgradeWorkerTask {
+                client_token,
+                progress: UpgradeWorkerProgress::RestoringOldWorker {
+                    old_worker_id,
+                    abort,
+                },
+                ok: 0,
+                errors: 0,
+                responses: Vec::new(),
+                expected_responses: 0,
+            }),
+            Timeout::Default,
+        );
+        for (count, request) in requests.into_iter().enumerate() {
+            server.scatter_on(request, task, count, Some(old_worker_id));
+        }
     }
 
     /// The new worker answered its initial `Status` with `Ok`: only now does
@@ -287,6 +377,27 @@ impl UpgradeWorkerTask {
     }
 }
 
+/// The first stage of `upgrade --worker`, which waits for the old worker to
+/// hand its listening sockets over, for the fixtures of `command::server`.
+#[cfg(test)]
+pub(crate) fn requesting_listen_sockets_task(
+    client_token: Token,
+    old_worker_token: Token,
+    old_worker_id: WorkerId,
+) -> Box<dyn GatheringTask> {
+    Box::new(UpgradeWorkerTask {
+        client_token,
+        progress: UpgradeWorkerProgress::RequestingListenSockets {
+            old_worker_token,
+            old_worker_id,
+        },
+        ok: 0,
+        errors: 0,
+        responses: Vec::new(),
+        expected_responses: 0,
+    })
+}
+
 /// The readiness stage of `upgrade --worker`, for the fixtures of
 /// `command::server` whose `UpgradeWorkerTask` cannot be named.
 #[cfg(test)]
@@ -324,6 +435,9 @@ impl GatheringTask for UpgradeWorkerTask {
             UpgradeWorkerProgress::AwaitingReadiness { .. } => {
                 return Err(TaskSnapshotError::WorkerReadinessInFlight);
             }
+            UpgradeWorkerProgress::RestoringOldWorker { .. } => {
+                return Err(TaskSnapshotError::OldWorkerRestoreInFlight);
+            }
             UpgradeWorkerProgress::RequestingListenSockets {
                 old_worker_token,
                 old_worker_id,
@@ -357,7 +471,19 @@ impl GatheringTask for UpgradeWorkerTask {
             | UpgradeWorkerProgress::AwaitingReadiness {
                 old_worker_token, ..
             } => Some(old_worker_token),
-            UpgradeWorkerProgress::StopOldActivateNew { .. } => None,
+            UpgradeWorkerProgress::RestoringOldWorker { .. }
+            | UpgradeWorkerProgress::StopOldActivateNew { .. } => None,
+        }
+    }
+
+    /// The replacement is fenced when it never answers its initial `Status`
+    /// with `Ok`, and the abort says whether it was proven stopped.
+    fn retained_worker_ids(&self) -> Vec<WorkerId> {
+        match self.progress {
+            UpgradeWorkerProgress::AwaitingReadiness { new_worker_id, .. } => vec![new_worker_id],
+            UpgradeWorkerProgress::RequestingListenSockets { .. }
+            | UpgradeWorkerProgress::RestoringOldWorker { .. }
+            | UpgradeWorkerProgress::StopOldActivateNew { .. } => Vec::new(),
         }
     }
 
@@ -397,18 +523,56 @@ impl GatheringTask for UpgradeWorkerTask {
                     );
                     return;
                 }
-                // Never `Running`: fence the child so it cannot serve, and
-                // leave the old worker untouched.
+                // Never `Running`: fence the child so it cannot serve, then
+                // give the old worker back the listeners phase one took from
+                // it, since the child held the only other copy.
                 let fenced = server.fence_worker(new_worker_id);
-                client.finish_failure(format!(
-                    "Upgrade of worker {old_worker_id} aborted: new worker {new_worker_id} never confirmed it was ready ({}), {}; worker {old_worker_id} keeps serving",
-                    if timed_out { "timeout" } else { "rejected" },
-                    if fenced {
-                        "it was stopped"
-                    } else {
-                        "it could not be proven stopped"
-                    },
-                ));
+                Self::abort_keeping_old_worker(
+                    self.client_token,
+                    server,
+                    client,
+                    old_worker_id,
+                    format!(
+                        "Upgrade of worker {old_worker_id} aborted: new worker {new_worker_id} never confirmed it was ready ({}), {}",
+                        if timed_out { "timeout" } else { "rejected" },
+                        if fenced {
+                            "it was stopped"
+                        } else {
+                            "it could not be proven stopped"
+                        },
+                    ),
+                );
+            }
+            UpgradeWorkerProgress::RestoringOldWorker {
+                old_worker_id,
+                ref abort,
+            } => {
+                let mut reasons: Vec<&str> = Vec::new();
+                for (worker_id, response) in &self.responses {
+                    if *worker_id == old_worker_id
+                        && ResponseStatus::try_from(response.status) == Ok(ResponseStatus::Failure)
+                        && !reasons.contains(&response.message.as_str())
+                    {
+                        reasons.push(response.message.as_str());
+                    }
+                }
+                // `ok > 0` guards the vacuous case of an old worker that left
+                // the fan-out before it was asked anything.
+                if !timed_out && self.errors == 0 && self.ok > 0 {
+                    client.finish_failure(format!(
+                        "{abort}; worker {old_worker_id} listens again and keeps serving"
+                    ));
+                } else if reasons.is_empty() {
+                    client.finish_failure(format!(
+                        "{abort}; worker {old_worker_id} did not confirm that it listens again ({})",
+                        if timed_out { "timeout" } else { "no answer" }
+                    ));
+                } else {
+                    client.finish_failure(format!(
+                        "{abort}; worker {old_worker_id} could not listen again: {}",
+                        reasons.join("; ")
+                    ));
+                }
             }
             UpgradeWorkerProgress::StopOldActivateNew {
                 old_worker_id,
@@ -517,7 +681,8 @@ impl Gatherer for UpgradeWorkerTask {
                 self.ok += 1;
                 match self.progress {
                     UpgradeWorkerProgress::RequestingListenSockets { .. }
-                    | UpgradeWorkerProgress::AwaitingReadiness { .. } => {}
+                    | UpgradeWorkerProgress::AwaitingReadiness { .. }
+                    | UpgradeWorkerProgress::RestoringOldWorker { .. } => {}
                     UpgradeWorkerProgress::StopOldActivateNew { .. } => {
                         client.return_processing(format!(
                             "Worker {worker_id} answered OK to {}. {}",
@@ -1483,5 +1648,49 @@ pub(crate) mod tests {
             response.message,
             "Upgrade successful:\n- finished soft stop of worker 11\n- finished activation of new worker 12"
         );
+    }
+
+    /// The replacement is fenced when it never answers its initial `Status`,
+    /// and the abort says whether it was proven stopped from its session:
+    /// only that phase keeps the session of the replacement.
+    #[test]
+    fn only_the_readiness_phase_retains_the_replacement_worker_by_id() {
+        let task = |progress| UpgradeWorkerTask {
+            client_token: Token(1),
+            progress,
+            ok: 0,
+            errors: 0,
+            responses: Vec::new(),
+            expected_responses: 0,
+        };
+
+        assert_eq!(
+            task(UpgradeWorkerProgress::AwaitingReadiness {
+                old_worker_token: Token(2),
+                old_worker_id: 11,
+                new_worker_id: 12,
+            })
+            .retained_worker_ids(),
+            vec![12]
+        );
+        for progress in [
+            UpgradeWorkerProgress::RequestingListenSockets {
+                old_worker_token: Token(2),
+                old_worker_id: 11,
+            },
+            UpgradeWorkerProgress::RestoringOldWorker {
+                old_worker_id: 11,
+                abort: String::new(),
+            },
+            UpgradeWorkerProgress::StopOldActivateNew {
+                old_worker_id: 11,
+                new_worker_id: 12,
+            },
+        ] {
+            assert!(
+                task(progress).retained_worker_ids().is_empty(),
+                "no other phase fences the replacement"
+            );
+        }
     }
 }
