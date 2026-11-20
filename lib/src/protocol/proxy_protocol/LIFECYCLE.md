@@ -162,6 +162,24 @@ PROXY phase and the downstream protocol.
 - Used when Sōzu sits between two PROXY-aware peers: read the inbound
   header, then write those exact bytes (and only those bytes) to the
   backend before any user-payload byte.
+- The backend is dialed once the header is parsed, never before. The dial
+  charges the per-(cluster, source-IP/subnet) slot
+  (`max_connections_per_ip`, `max_connections_per_subnet`) and derives the
+  affinity key of `HRW`, `MAGLEV` and shuffle sharding from
+  `TcpSession::effective_session_address`, whose relay arm reads
+  `RelayProxyProtocol::addresses` and otherwise falls back to the accepted
+  peer, which is the upstream load balancer. A dial that ran before the first
+  header byte would therefore admit and pin every client behind one load
+  balancer as that load balancer, and nothing re-keys the slot afterwards.
+  `TcpSession::attempt_backend_connect_if_needed` skips a relay session whose
+  `header_size` is still `None`; the attempt that follows the `readable()` call
+  dials in the pass that parses the header (the dispatch loop's, or the pre-HUP
+  drain's in `TcpSession::ready_inner` when the header arrives together with the
+  client's FIN). A header that never completes costs no backend connection. A
+  `LOCAL` header names no source (`ProxyAddr::AfUnspec`), so that session is
+  charged to the peer address, as for `expect`. The regression guard is
+  `a_relay_proxy_protocol_session_is_charged_to_the_header_source_not_the_lb_peer`
+  (`lib/src/tcp.rs`).
 - Entry points: `RelayProxyProtocol::readable` (`relay.rs`) feeds the parser; on a complete
   parse it flips `frontend_readiness.interest` to drop READABLE and arms
   the backend WRITABLE bit (`relay.rs:163-164`). It then records
@@ -214,8 +232,8 @@ PROXY phase and the downstream protocol.
     (`relay.rs`).
 - A frontend HUP waits for the upgrade once the header is parsed. A client
   that sends its header and request and half-closes can deliver them as ONE
-  `READABLE | HUP` event, and the first `TcpSession::ready_inner` pass only
-  dials the backend, so the HUP is still pending when the connect completes.
+  `READABLE | HUP` event, and the pass that parses the header also dials the
+  backend and returns, so the HUP is still pending when the connect completes.
   Honouring it there would close the session in this state, before
   `RelayProxyProtocol::back_writable` has forwarded anything: the client's
   header and request are dropped and the backend sees a dialed connection

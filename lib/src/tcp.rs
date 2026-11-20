@@ -1338,9 +1338,22 @@ impl TcpSession {
     /// A no-op whenever `back_connected() != NotConnected` (already
     /// attempted, or backend already up), the state is a NOT-YET-ROUTED
     /// `SniPreread` (the cluster -- and therefore the backend to dial -- is
-    /// unknown until `SniPrereadCore` decides), or the state is still
-    /// `ExpectProxyProtocol` (see below), so this changes nothing for any
-    /// other pre-existing state/path.
+    /// unknown until `SniPrereadCore` decides), the state is still
+    /// `ExpectProxyProtocol` (see below), or the state is a
+    /// `RelayProxyProtocol` that has not parsed its header yet (see below),
+    /// so this changes nothing for any other pre-existing state/path.
+    ///
+    /// `RelayProxyProtocol` dials once `RelayProxyProtocol::readable` has
+    /// parsed the inbound header (`header_size` is set), not on the first
+    /// readiness event. The dial charges the per-(cluster, source-IP/subnet)
+    /// slot and derives the affinity key of `HRW`, `MAGLEV` and shuffle
+    /// sharding from `effective_session_address`, whose relay arm reads the
+    /// header's source and otherwise falls back to the accepted peer: the
+    /// upstream load balancer, which relays every client behind it. Nothing
+    /// re-keys the slot after the dial, so dialing first would admit and pin
+    /// all of them as one client. The attempt that follows the `readable()`
+    /// call (the dispatch loop's, or the pre-HUP drain's in `ready_inner`)
+    /// dials in the same pass that parses the header.
     ///
     /// `ExpectProxyProtocol` has NO backend side at all: `back_readiness`
     /// returns `None` for it and `set_back_socket` panics outright ("We
@@ -1364,6 +1377,20 @@ impl TcpSession {
             return None;
         }
         if matches!(&self.state, TcpStateMachine::ExpectProxyProtocol(_)) {
+            return None;
+        }
+        // A relay session dials only once its inbound PROXY header is parsed
+        // (`RelayProxyProtocol::header_size`). The dial charges the
+        // per-(cluster, source-IP/subnet) slot and derives the affinity key
+        // from `effective_session_address`, whose relay arm reads the parsed
+        // `addresses` and otherwise falls back to the accepted peer, which is
+        // the upstream load balancer. Dialed before the header, every client
+        // relayed by one load balancer would share one counter and one
+        // affinity bucket, and nothing re-keys the slot afterwards.
+        if matches!(
+            &self.state,
+            TcpStateMachine::RelayProxyProtocol(relay) if relay.header_size.is_none()
+        ) {
             return None;
         }
 
@@ -1533,6 +1560,19 @@ impl TcpSession {
                 }
                 counter += 1;
             }
+            // A relay session dials once its header is parsed
+            // (`attempt_backend_connect_if_needed`). The drain may have just
+            // parsed it, which drops frontend READABLE interest: the dispatch
+            // loop below, whose own attempt follows a `readable()` of its
+            // iteration, would then find no interest, and the session would
+            // wait for a wake-up the client's FIN never sends. Only a relay
+            // session dials here: an `SniPreread` session routed by the
+            // drain is closed by the HUP check below without a dial.
+            if matches!(&self.state, TcpStateMachine::RelayProxyProtocol(_))
+                && let Some(state_result) = self.attempt_backend_connect_if_needed(&session)
+            {
+                return state_result;
+            }
         }
 
         // The request of a `Relay` or `Send` session is owed to a backend whose
@@ -1598,12 +1638,14 @@ impl TcpSession {
                 if session_result != SessionResult::Continue {
                     return session_result;
                 }
-                // A `SniPreread` route decision can complete INSIDE this
-                // very `readable()` call; without a second attempt here the
-                // session would stall until an unrelated readiness event
-                // re-entered `ready_inner` to reach the top-of-function
-                // connect gate. A no-op for every other state/backend
-                // status (see `attempt_backend_connect_if_needed`'s guard).
+                // A `SniPreread` route decision, or a `RelayProxyProtocol`
+                // header parse, can complete INSIDE this very `readable()`
+                // call; without a second attempt here the session would
+                // stall until an unrelated readiness event re-entered
+                // `ready_inner` to reach the top-of-function connect gate.
+                // This is where a relay session dials. A no-op for every
+                // other state/backend status (see
+                // `attempt_backend_connect_if_needed`'s guard).
                 if let Some(state_result) = self.attempt_backend_connect_if_needed(&session) {
                     return state_result;
                 }
@@ -6500,11 +6542,10 @@ mod sni_routing_tests {
         }
     }
 
-    /// A legacy (non-SNI) session whose cluster uses `proxy_protocol`; its
-    /// first `ready()` dials the backend while it is still in its
-    /// PROXY-protocol state.
-    fn proxy_protocol_session_dialed(proxy_protocol: ProxyProtocolConfig) -> DialFixture {
-        let fixture = dial_fixture(
+    /// A legacy (non-SNI) session whose cluster uses `proxy_protocol`, before
+    /// its first readiness event: nothing read, nothing dialed.
+    fn proxy_protocol_session(proxy_protocol: ProxyProtocolConfig) -> DialFixture {
+        dial_fixture(
             false,
             |back_buffer, front_buffer, token, listener, proxy, socket, peer| {
                 TcpSession::new(
@@ -6524,16 +6565,56 @@ mod sni_routing_tests {
                     Duration::from_millis(0),
                 )
             },
-        );
-        fixture
-            .session
-            .borrow_mut()
-            .update_readiness(fixture.frontend_token, Ready::WRITABLE);
-        let closed = fixture
-            .session
-            .borrow_mut()
-            .ready(fixture.proxy_session.clone());
-        assert!(!closed, "precondition: the dial keeps the session open");
+        )
+    }
+
+    /// A legacy (non-SNI) session whose cluster uses `proxy_protocol`, driven
+    /// until it has dialed its backend while it is still in its
+    /// PROXY-protocol state.
+    ///
+    /// A `Send` session dials on its first `ready()`. A `Relay` session dials
+    /// once it has parsed its inbound PROXY header, so the client writes one
+    /// first: dialing before it would charge the per-IP slot to the load
+    /// balancer's peer address
+    /// (`a_relay_proxy_protocol_session_is_charged_to_the_header_source_not_the_lb_peer`).
+    fn proxy_protocol_session_dialed(proxy_protocol: ProxyProtocolConfig) -> DialFixture {
+        use std::{io::Write as _, time::Instant};
+
+        let relay = matches!(proxy_protocol, ProxyProtocolConfig::RelayHeader);
+        let mut fixture = proxy_protocol_session(proxy_protocol);
+        if relay {
+            fixture
+                .client
+                .write_all(&proxy_protocol_v2_ipv4_header())
+                .expect("write the relayed PROXY header");
+            fixture.client.flush().expect("flush the relayed header");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while fixture.session.borrow().backend_token.is_none() {
+                fixture
+                    .session
+                    .borrow_mut()
+                    .update_readiness(fixture.frontend_token, Ready::READABLE | Ready::WRITABLE);
+                let closed = fixture
+                    .session
+                    .borrow_mut()
+                    .ready(fixture.proxy_session.clone());
+                assert!(!closed, "precondition: the dial keeps the session open");
+                assert!(
+                    Instant::now() < deadline,
+                    "the relay session did not dial within 2 s of its PROXY header"
+                );
+            }
+        } else {
+            fixture
+                .session
+                .borrow_mut()
+                .update_readiness(fixture.frontend_token, Ready::WRITABLE);
+            let closed = fixture
+                .session
+                .borrow_mut()
+                .ready(fixture.proxy_session.clone());
+            assert!(!closed, "precondition: the dial keeps the session open");
+        }
         fixture
     }
 
@@ -6735,6 +6816,159 @@ mod sni_routing_tests {
             "precondition: a RelayHeader cluster starts in the relay state"
         );
         assert_upgraded_pipe_reports_the_dialed_address(&fixture);
+    }
+
+    /// Whether `ip` holds a per-(cluster, source-IP) slot on `cluster-dial`,
+    /// asked as a foreign connection would: the `max=1` gate that admits a
+    /// token only while no other token holds the slot.
+    fn cluster_dial_slot_is_held(session: &TcpSession, ip: &str) -> bool {
+        let ip: std::net::IpAddr = ip.parse().expect("test IP literal");
+        let proxy = session.proxy.borrow();
+        let sessions = proxy.sessions.borrow();
+        sessions.cluster_ip_at_limit(Token(usize::MAX - 1), "cluster-dial", &ip, Some(1))
+    }
+
+    /// A `RelayHeader` session is admitted and load-balanced on the address
+    /// the upstream load balancer's PROXY header names, not on the load
+    /// balancer's own `peer_addr`.
+    ///
+    /// The test client connects from 127.0.0.1, which stands for the load
+    /// balancer, and relays a header whose source is 192.0.2.7. The slot must
+    /// never be charged to 127.0.0.1 (every client relayed by one load
+    /// balancer would share one per-IP counter and one affinity bucket), and
+    /// must end up charged to 192.0.2.7.
+    ///
+    /// To SEE THIS RED: keep the top-of-`ready_inner` dial for a
+    /// `RelayProxyProtocol` whose `header_size` is still `None`
+    /// (`attempt_backend_connect_if_needed` excludes only
+    /// `ExpectProxyProtocol` and an unrouted `SniPreread`): the dial runs
+    /// before `readable` parses the header, so `effective_session_address`
+    /// falls back to `frontend_address`.
+    #[test]
+    fn a_relay_proxy_protocol_session_is_charged_to_the_header_source_not_the_lb_peer() {
+        use std::{io::Write as _, time::Instant};
+
+        const LB_PEER: &str = "127.0.0.1";
+        const HEADER_SOURCE: &str = "192.0.2.7";
+
+        // Built here rather than through `proxy_protocol_session_dialed`: that
+        // fixture's contract is "dialed", which a fix must reach by writing a
+        // header first, and this test needs the session before any header byte.
+        let mut fixture = dial_fixture(
+            false,
+            |back_buffer, front_buffer, token, listener, proxy, socket, peer| {
+                TcpSession::new(
+                    back_buffer,
+                    None,
+                    Some("cluster-dial".into()),
+                    Duration::from_secs(30),
+                    Duration::from_secs(30),
+                    Duration::from_secs(30),
+                    front_buffer,
+                    token,
+                    listener,
+                    Some(ProxyProtocolConfig::RelayHeader),
+                    proxy,
+                    socket,
+                    peer,
+                    Duration::from_millis(0),
+                )
+            },
+        );
+        // The first readiness of a freshly accepted socket: WRITABLE, before
+        // the load balancer has sent a byte.
+        fixture
+            .session
+            .borrow_mut()
+            .update_readiness(fixture.frontend_token, Ready::WRITABLE);
+        let closed = fixture
+            .session
+            .borrow_mut()
+            .ready(fixture.proxy_session.clone());
+        assert!(
+            !closed,
+            "precondition: the first readiness keeps the session open"
+        );
+        assert!(
+            matches!(
+                fixture.session.borrow().state,
+                TcpStateMachine::RelayProxyProtocol(_)
+            ),
+            "precondition: a RelayHeader cluster starts in the relay state"
+        );
+        assert!(
+            fixture.session.borrow().frontend_address.map(|a| a.ip())
+                == Some(LB_PEER.parse().expect("test IP literal")),
+            "precondition: the accepted peer is the load balancer, 127.0.0.1"
+        );
+        assert!(
+            fixture
+                .session
+                .borrow()
+                .effective_session_address()
+                .is_none_or(|a| a.ip().to_string() != HEADER_SOURCE),
+            "precondition: no header byte was read, the header source is unknown"
+        );
+
+        // Before a single header byte is read, the gate does not know the
+        // client: the load balancer's address must hold no slot.
+        assert!(
+            !cluster_dial_slot_is_held(&fixture.session.borrow(), LB_PEER),
+            "the per-IP slot must not be charged to the load balancer's peer address \
+             before its PROXY header is read"
+        );
+
+        // The load balancer now relays its header; drive the session until it
+        // is parsed.
+        let mut header = proxy_protocol_v2_ipv4_header();
+        header[16..20].copy_from_slice(&[192, 0, 2, 7]);
+        fixture
+            .client
+            .write_all(&header)
+            .expect("write the relayed PROXY header");
+        fixture.client.flush().expect("flush the relayed header");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            fixture
+                .session
+                .borrow_mut()
+                .update_readiness(fixture.frontend_token, Ready::READABLE | Ready::WRITABLE);
+            let closed = fixture
+                .session
+                .borrow_mut()
+                .ready(fixture.proxy_session.clone());
+            assert!(
+                !closed,
+                "a well-formed relayed header keeps the session open"
+            );
+            let parsed = match &fixture.session.borrow().state {
+                TcpStateMachine::RelayProxyProtocol(relay) => relay.addresses.is_some(),
+                TcpStateMachine::Pipe(_) => true,
+                _ => false,
+            };
+            if parsed {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the relayed PROXY header was not parsed within 2 s"
+            );
+        }
+
+        let session = fixture.session.borrow();
+        assert!(
+            session.cluster_ip_tracked,
+            "precondition: the session holds a per-IP slot once it has dialed"
+        );
+        assert!(
+            cluster_dial_slot_is_held(&session, HEADER_SOURCE),
+            "the per-IP slot must be charged to the PROXY header's source {HEADER_SOURCE}"
+        );
+        assert!(
+            !cluster_dial_slot_is_held(&session, LB_PEER),
+            "the load balancer's peer address {LB_PEER} must hold no slot once the header is parsed"
+        );
     }
 
     /// An SNI-routed session dials from `SniPreread`: `upgrade_sni_preread`
@@ -7061,8 +7295,9 @@ mod sni_routing_tests {
     /// Drive a `Relay` or `Send` session whose client wrote its request and
     /// half-closed BEFORE the worker serviced the socket: the frontend event
     /// is the coalesced `READABLE | HUP` of `half_close_and_observe`,
-    /// delivered at the very first pass, which only dials. The backend
-    /// connect completes on the next pass.
+    /// delivered at the very first pass, which dials (a relay session once
+    /// the pre-HUP drain has parsed its header) and forwards nothing. The
+    /// backend connect completes on the next pass.
     ///
     /// The HUP is still pending while the session is `RelayProxyProtocol` or
     /// `SendProxyProtocol`, and the request behind it is complete and queued
@@ -7106,7 +7341,8 @@ mod sni_routing_tests {
         let ready = half_close_and_observe(&mut fixture.client, frontend_fd, wire);
 
         // First pass: the request and the FIN are already queued. The session
-        // dials the backend and returns before it reads anything.
+        // dials the backend and returns before it forwards anything; a relay
+        // session reads and parses its header first, then dials.
         fixture
             .session
             .borrow_mut()
@@ -7338,12 +7574,13 @@ mod sni_routing_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn relay_proxy_protocol_front_hup_while_connecting_waits_for_the_backend() {
+        // `proxy_protocol_session_dialed` already wrote and parsed the PROXY
+        // header (a relay session dials only then): the client sends its
+        // request behind it, not a second header.
         let payload = b"request-after-proxy-header";
-        let mut wire = proxy_protocol_v2_ipv4_header().to_vec();
-        wire.extend_from_slice(payload);
         assert_front_hup_while_connecting_waits_for_the_backend(
             ProxyProtocolConfig::RelayHeader,
-            &wire,
+            payload,
             payload,
         );
     }
@@ -7365,7 +7602,8 @@ mod sni_routing_tests {
     /// header is a dead client: the header can no longer complete, there is
     /// nothing to forward, and the session closes in the same pass instead of
     /// waiting for a backend connect that could only deliver a truncated
-    /// header. The pre-HUP drain reads the stream to its EOF, which clears
+    /// header. It never dialed one: a relay session dials once its header is
+    /// parsed. The pre-HUP drain reads the stream to its EOF, which clears
     /// READABLE, and `RelayProxyProtocol::header_size` is still `None`, so
     /// `TcpSession::defers_frontend_hup` does not hold the HUP.
     ///
@@ -7375,7 +7613,9 @@ mod sni_routing_tests {
     fn assert_relay_half_close_without_a_complete_header_closes_at_once(wire: &[u8]) {
         use std::os::fd::AsRawFd;
 
-        let mut fixture = proxy_protocol_session_dialed(ProxyProtocolConfig::RelayHeader);
+        // Undialed: a relay session dials once its header is parsed, and this
+        // client never completes one.
+        let mut fixture = proxy_protocol_session(ProxyProtocolConfig::RelayHeader);
         let frontend_fd = fixture.session.borrow().state.front_socket().as_raw_fd();
         let ready = half_close_and_observe(&mut fixture.client, frontend_fd, wire);
         fixture

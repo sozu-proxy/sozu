@@ -704,19 +704,21 @@ be closed as a silent health check although its ClientHello is queued in the
 kernel (`tcp_preread/LIFECYCLE.md` §9).
 
 The two PROXY states that dial before they upgrade, `RelayProxyProtocol` and
-`SendProxyProtocol`, owe the backend a request that the HUP must not drop.
-The first readiness pass only dials, so the HUP is still pending when the
-connect completes. `TcpSession::defers_frontend_hup` holds it: for a relay
-session once its header is parsed, for a send session always, since it reads
-nothing and cannot tell a bare connect from a request queued ahead of the FIN.
-The HUP stays in the readiness `event`, out of the dispatch loop's frontend
-interest so that it does not count as work, until the header is written and the
-session upgrades; `Pipe::frontend_hup` then keeps the session alive while the
-request is in flight, and closes it otherwise. A relay client that half-closes
-inside its header never reaches that state and closes at once. A send client
-that connects and closes without a byte costs the backend one connection that
-carries only the PROXY header. The wait ends with the backend connect, its
-`connect_timeout` or the frontend timeout, and an ERROR still closes at once.
+`SendProxyProtocol`, owe the backend a request that the HUP must not drop. The
+pass that dials returns before the connect completes (for a send session the
+first readiness pass, for a relay session the one that parses its header), so
+the HUP is still pending when it does. `TcpSession::defers_frontend_hup` holds
+it: for a relay session once its header is parsed, for a send session always,
+since it reads nothing and cannot tell a bare connect from a request queued
+ahead of the FIN. The HUP stays in the readiness `event`, out of the dispatch
+loop's frontend interest so that it does not count as work, until the header is
+written and the session upgrades; `Pipe::frontend_hup` then keeps the session
+alive while the request is in flight, and closes it otherwise. A relay client
+that half-closes inside its header never reaches that state and closes at once,
+without having dialed. A send client that connects and closes without a byte
+costs the backend one connection that carries only the PROXY header. The wait
+ends with the backend connect, its `connect_timeout` or the frontend timeout,
+and an ERROR still closes at once.
 
 1. **Accept** as in §3; the listener's `TCP_NODELAY` and the accepted address
    apply unchanged.
@@ -738,7 +740,13 @@ carries only the PROXY header. The wait ends with the backend connect, its
    `Server::timeout` runs no `ready` pass for TCP: `TcpSession::timeout`
    charges the backend itself with the same `TcpSession::fail_backend_connection`
    and closes the session, without a retry. A connect that completes
-   resets the retry policy (`TcpSession::set_back_connected`).
+   resets the retry policy (`TcpSession::set_back_connected`). The gate and
+   the affinity key both read the PROXY-v2 source of the session's own header,
+   so a session that relays one (`RelayProxyProtocol`) is dialed only once it
+   has parsed that header, in the pass that reads it, and a session that
+   expects one (`ExpectProxyProtocol`) is dialed from the `Pipe` it upgrades
+   to: neither is ever charged to the address of the load balancer that sent
+   the header (`lib/src/protocol/proxy_protocol/LIFECYCLE.md` §2.2).
 3. **Relay.** On Linux with the `splice` feature, a `Protocol::TCP` pipe
    takes a `SplicePipe` (`lib/src/splice.rs`) when it is created: an idle pair
    from the worker's pool when there is one, at no system call, otherwise a new
