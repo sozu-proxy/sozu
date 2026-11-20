@@ -3477,6 +3477,18 @@ impl Server {
                     // Same rule as the deactivate arms: a listen token with no
                     // slab slot must not stay queued for a deferred accept.
                     self.accept_ready.remove(&ListenToken(token.0));
+                    // `accept_queue` entries carry only the listen token of
+                    // the listener that accepted them, and `create_sessions`
+                    // resolves it in the protocol's current listener map. The
+                    // slab hands the key just freed to the next `AddListener`,
+                    // so an entry left here would be served by that unrelated
+                    // listener, with its configuration, instead of failing the
+                    // lookup. Drop the sockets accepted on the removed
+                    // listener with it: their clients see the connection
+                    // close, which is also what an entry that failed the
+                    // lookup would have got.
+                    self.accept_queue
+                        .retain(|(_, queued_token, ..)| *queued_token != ListenToken(token.0));
                     info!("released listen token {:?}", token);
                 }
                 self.finish_proxy_order(&mut rollback, response);
@@ -7450,6 +7462,143 @@ mod listener_lifecycle_tests {
             listen_token,
             address,
             ListenerType::Https,
+        );
+    }
+
+    /// A socket accepted on a listener that `RemoveListener` then deletes must
+    /// not be served by the next listener of the same protocol.
+    ///
+    /// `accept_queue` carries only the listen token of the listener that
+    /// accepted each socket, and `create_sessions` resolves that token in the
+    /// protocol's current listener map when it pops the entry. `RemoveListener`
+    /// frees the token's slab slot and the slab hands the freed key to the next
+    /// `AddListener`, so an entry left in the queue by the removal (the
+    /// listener's readiness event ran before the command in the same
+    /// `epoll_wait` result, or `create_sessions` stopped early) is resolved
+    /// against a listener the client never connected to: its socket becomes a
+    /// session configured by, and routed through, the new listener.
+    ///
+    /// The test drives that sequence on the worker's own surface: accept one
+    /// real loopback connection on listener A, remove A before the queue
+    /// drains, add listener B on another address (it must reuse A's token, the
+    /// premise), then run `create_sessions`. The socket was accepted on a
+    /// listener that no longer exists, so no session may be created for it.
+    /// A socket queued at the same time by listener C, which stays, must still
+    /// become a session: the removal purges by token, not the whole queue.
+    ///
+    /// To SEE THIS RED: nothing to change, it is red on the unfixed
+    /// `RemoveListener` arm of `notify_proxys`, which purges `accept_ready` but
+    /// not `accept_queue`; the assertion fails with "a socket accepted on a
+    /// removed listener must not be served by the listener that reuses its
+    /// token". Replacing the fix's `retain` with `clear()` turns the second
+    /// assertion red instead.
+    #[test]
+    fn a_socket_queued_for_a_removed_listener_is_not_served_by_the_listener_that_reuses_its_token()
+    {
+        use std::{net::TcpStream as StdTcpStream, time::Duration};
+
+        let mut server = bare_server();
+
+        let address_a = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let config_a = ListenerBuilder::new_http(address_a)
+            .to_http(None)
+            .expect("could not build the HTTP listener A configuration");
+        server.notify_proxys(WorkerRequest {
+            id: "test-add-a".to_owned(),
+            content: RequestType::AddHttpListener(config_a).into(),
+        });
+        let token_a = server
+            .http
+            .borrow()
+            .listener_token(&address_a.into())
+            .expect("listener A must own a token");
+        activate(&mut server, address_a, ListenerType::Http);
+
+        // One real connection, accepted by listener A and parked in the queue:
+        // the state a turn leaves behind when `create_sessions` has not run
+        // yet, or stopped early.
+        let _client = StdTcpStream::connect_timeout(&address_a.into(), Duration::from_secs(5))
+            .expect("the activated HTTP listener A must complete a handshake");
+        server.accept(ListenToken(token_a.0), Protocol::HTTPListen);
+        assert_eq!(
+            server.accept_queue.len(),
+            1,
+            "premise: listener A must have accepted the connection into the queue"
+        );
+
+        // Listener C stays for the whole test: its queued socket must survive
+        // the removal of A.
+        let address_c = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let config_c = ListenerBuilder::new_http(address_c)
+            .to_http(None)
+            .expect("could not build the HTTP listener C configuration");
+        server.notify_proxys(WorkerRequest {
+            id: "test-add-c".to_owned(),
+            content: RequestType::AddHttpListener(config_c).into(),
+        });
+        let token_c = server
+            .http
+            .borrow()
+            .listener_token(&address_c.into())
+            .expect("listener C must own a token");
+        activate(&mut server, address_c, ListenerType::Http);
+        let _client_c = StdTcpStream::connect_timeout(&address_c.into(), Duration::from_secs(5))
+            .expect("the activated HTTP listener C must complete a handshake");
+        server.accept(ListenToken(token_c.0), Protocol::HTTPListen);
+        assert_eq!(
+            server.accept_queue.len(),
+            2,
+            "premise: listener C must have accepted its connection into the queue"
+        );
+
+        server.notify_proxys(WorkerRequest {
+            id: "test-remove-a".to_owned(),
+            content: RequestType::RemoveListener(RemoveListener {
+                interface: None,
+                address: address_a,
+                proxy: ListenerType::Http as i32,
+            })
+            .into(),
+        });
+        assert!(
+            server
+                .http
+                .borrow()
+                .listener_token(&address_a.into())
+                .is_none(),
+            "premise: listener A must be gone from the HTTP proxy"
+        );
+
+        let address_b = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let config_b = ListenerBuilder::new_http(address_b)
+            .to_http(None)
+            .expect("could not build the HTTP listener B configuration");
+        server.notify_proxys(WorkerRequest {
+            id: "test-add-b".to_owned(),
+            content: RequestType::AddHttpListener(config_b).into(),
+        });
+        let token_b = server
+            .http
+            .borrow()
+            .listener_token(&address_b.into())
+            .expect("listener B must own a token");
+        assert_eq!(
+            token_b, token_a,
+            "premise: the slab must hand the token freed by the removal to the next listener"
+        );
+
+        let connections_before = server.sessions.borrow().nb_connections;
+        server.create_sessions();
+
+        assert!(
+            server.sessions.borrow().nb_connections <= connections_before + 1,
+            "a socket accepted on a removed listener must not be served by the listener that \
+             reuses its token"
+        );
+        assert_eq!(
+            server.sessions.borrow().nb_connections,
+            connections_before + 1,
+            "the socket queued by listener C, which was not removed, must become a session"
         );
     }
 }

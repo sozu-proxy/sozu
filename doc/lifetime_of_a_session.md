@@ -196,6 +196,15 @@ in `lib/src/http.rs`, and its twins `HttpsListener::close_sockets` and
 stop do. The sessions in flight keep running on their own sockets; only the
 listening socket goes. The UDP proxy already closes its flows on removal.
 
+`remove-listener` also closes the connections the listener accepted that have
+not yet become sessions. `Server::accept_queue` (§3.2) identifies the listener
+of each parked socket by its token alone, and the slab hands the token just
+freed to the next `add-listener`, so a socket left in the queue would be
+resolved against that new listener and served with its configuration and
+routes. `Server::notify_proxys` drops those entries in the same step that
+releases the slot and purges `Server::accept_ready`; their clients see the
+connection close.
+
 A forwarding session occupies one slab entry per socket: the frontend token,
 plus one token per backend connection. The same session is reachable through
 several keys.
@@ -248,7 +257,9 @@ client address comes from the PROXY header when the session upgrades.
 
 Sessions are *not* created inside the accept loop. `Server::create_sessions`
 drains the queue later in the same turn, newest first, and drops connections
-that waited longer than `accept_queue_timeout`. Creating a session registers
+that waited longer than `accept_queue_timeout`. An entry names the listener
+that accepted it by its token only, so `remove-listener` drops the entries of
+the token it releases (§2.4). Creating a session registers
 its frontend socket (`epoll_ctl(EPOLL_CTL_ADD)`) and allocates the session
 object once: `Rc<RefCell<HttpSession>>` carries the mux inline, including the
 first backend connection slot and the frontend's timer handle (§8.1).

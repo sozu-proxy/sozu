@@ -68,6 +68,12 @@
 
 - A listener whose `accept(2)` failed with an error other than `EAGAIN` (`EMFILE` or `ENFILE` when the descriptors run out, `ECONNABORTED`) no longer strands the connections the kernel had already completed. The listener is edge-triggered, and the worker dropped it from its deferred accept set on that error, so the backlog got no further event and its clients waited, on a quiet listener for good, until their own timeout. The listener now stays armed and is retried by a later turn of the event loop, no sooner than 250 ms after the failure, so a failure that lasts costs a few `accept4(2)` calls and error lines per second and never spins the loop. A listener with no socket left to accept on (deactivated, stopped, handed back for an upgrade) is still dropped, through the new `AcceptError::NoListenSocket` variant that the HTTP, HTTPS and TCP proxies return instead of `AcceptError::IoError`. Library API: code that matches `AcceptError` exhaustively gains a variant to handle.
 
+<!-- changelog-slot:accept-queue-purge -->
+
+### Fixed
+
+- A connection accepted on a listener that `RemoveListener` then deletes is no longer served by the next listener of the same protocol. The accept queue records only the listen token of the listener that accepted each socket, and the worker resolves that token in the protocol's current listener map when it creates the session. `RemoveListener` freed the token's slab slot and purged the listener from the deferred accept set, but left its sockets in the queue, and the slab hands the freed key to the next `AddListener`. A socket still queued when the removal ran (its readiness event came before the command in one `epoll_wait` result, or `create_sessions` stopped early and left it waiting up to `accept_queue_timeout`) therefore became a session configured by, and routed through, a listener the client never connected to. `RemoveListener` now closes the sockets still queued for the listener it releases, so their clients see the connection close.
+
 ## 2.3.6 - 2026-11-18
 
 ### Security
