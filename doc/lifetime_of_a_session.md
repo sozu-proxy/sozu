@@ -178,7 +178,14 @@ is the one protocol that replaces the placeholder with a real session
 (`UdpListenerSession`), and its activation arm installs that session only when
 none is installed already (the proxy's `listener_sessions` map is the record),
 because `load_state` re-emits one `activate-listener` per active listener on
-every replay.
+every replay. That activation is all or nothing: the socket is bound and
+registered before the session is built, and when the build fails
+(`Registry::try_clone` answers `EMFILE` once the worker is out of descriptors)
+the arm answers a failure and takes the activation back
+(`UdpProxy::abandon_activation`, `lib/src/udp.rs`), so no registered socket is
+left with no session to read it. The socket the listener bound is closed; an
+inherited one is deregistered and parked on the listener for a retry, and stays
+bound, queueing datagrams, until then or until `remove-listener`.
 
 `remove-listener` ends the socket's life at the same moment it releases the
 slot, whatever sessions are still open on the listener. Every session accepted

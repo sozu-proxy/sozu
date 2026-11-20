@@ -273,6 +273,14 @@ pub struct UdpListener {
     /// and putting it there made a failed registration answer `ENOENT` from
     /// `deregister` and fail the whole soft stop.
     parked_socket: Option<UdpSocket>,
+    /// Whether the socket this listener holds (`socket`, or `parked_socket`
+    /// after a failed registration) was handed in by the supervisor over SCM
+    /// instead of bound by [`activate`](Self::activate). Set by every
+    /// activation, and read only by [`UdpProxy::abandon_activation`]: a socket
+    /// this listener bound itself can be closed to undo the activation, while
+    /// an inherited one has already left the SCM table and closing it would
+    /// lose the descriptor and the datagrams queued on it (sozu#1342).
+    socket_inherited: bool,
     tags: BTreeMap<String, CachedTags>,
     token: Token,
 }
@@ -322,6 +330,7 @@ impl UdpListener {
             cluster_id: None,
             socket: None,
             parked_socket: None,
+            socket_inherited: false,
             token,
             address: config.address.into(),
             local_address: config.address.into(),
@@ -362,7 +371,7 @@ impl UdpListener {
         // ALSO handed one over, the parked socket is disposed of deliberately
         // below instead of being silently overwritten.
         let parked = self.parked_socket.take();
-        let mut socket = match (udp_socket, parked) {
+        let (mut socket, from_scm) = match (udp_socket, parked) {
             (Some(inherited), Some(parked)) => {
                 // Not reachable while `Listeners::get_*` removes the entry it
                 // hands over and `scm_listeners` is written once: a parked
@@ -379,12 +388,16 @@ impl UdpListener {
                     address
                 );
                 drop(parked);
-                inherited
+                (inherited, true)
             }
-            (Some(inherited), None) => inherited,
-            (None, Some(parked)) => parked,
-            (None, None) => udp_bind(address, self.config.interface.as_deref())
-                .map_err(|e| ProxyError::BindToSocket(address, e))?,
+            (Some(inherited), None) => (inherited, true),
+            // The parked socket keeps the origin it was parked with.
+            (None, Some(parked)) => (parked, self.socket_inherited),
+            (None, None) => (
+                udp_bind(address, self.config.interface.as_deref())
+                    .map_err(|e| ProxyError::BindToSocket(address, e))?,
+                false,
+            ),
         };
 
         let registration = registry
@@ -401,6 +414,7 @@ impl UdpListener {
             // It goes to `parked_socket`, never to `socket`, because every other
             // consumer of that field reads `Some` as "registered and live".
             self.parked_socket = Some(socket);
+            self.socket_inherited = from_scm;
             return Err(error);
         }
 
@@ -409,6 +423,7 @@ impl UdpListener {
         // expected; keep the configured address rather than fail activation.
         self.local_address = socket.local_addr().unwrap_or(address);
         self.socket = Some(socket);
+        self.socket_inherited = from_scm;
         self.active = true;
         Ok(self.token)
     }
@@ -781,6 +796,15 @@ impl UdpProxy {
         self.cluster_for_listener.get(&token).cloned()
     }
 
+    /// Drop the flow manager of the listener at `token`, so that
+    /// [`build_session`](Self::build_session) answers `None` for it, as it
+    /// does when `Registry::try_clone` fails, for tests of the server's answer
+    /// to a session it cannot build (`lib/src/server.rs`).
+    #[cfg(test)]
+    pub(crate) fn forget_manager(&mut self, token: Token) {
+        self.managers.remove(&token);
+    }
+
     /// Build the [`UdpListenerSession`] that drives this listener's datagrams.
     /// The server inserts the returned session into the slab **at the listener
     /// token**, replacing the `ListenSession` placeholder, so the generic
@@ -858,6 +882,60 @@ impl UdpProxy {
             session.borrow_mut().close_all_flows(Instant::now());
         }
         Ok((token, taken))
+    }
+
+    /// Take back an activation the server could not finish, leaving the
+    /// listener inactive: its socket deregistered, and either closed or kept
+    /// parked for the next activation, as follows.
+    ///
+    /// `Server::notify_activate_listener` binds and registers the socket first
+    /// and builds the listener's session second. A failure of the second step
+    /// (`Registry::try_clone` answers `EMFILE` once the worker is out of
+    /// descriptors) is reported to the control plane as a failed activation, and
+    /// whatever the first step did must not outlive that answer: a listener
+    /// left active keeps its socket registered under a token whose slab slot
+    /// holds the inert placeholder, so datagrams queue in the kernel and nothing
+    /// reads them, and the activation that would heal it is never asked for.
+    ///
+    /// The session is torn down with the socket, exactly as a deactivation does
+    /// ([`give_back_listener`](Self::give_back_listener)), so the listener also
+    /// drops a session that was built but never reached the slab.
+    ///
+    /// A socket this listener bound itself is closed, which is the state before
+    /// the activation: the address is no longer bound by this worker, so it
+    /// takes no share of the datagrams sent to it, and a retried activation
+    /// binds again. An inherited socket is parked instead, the way a failed
+    /// registration parks it in [`UdpListener::activate`]: it has already left
+    /// the SCM table, so closing it would lose the descriptor and the datagrams
+    /// queued on it (sozu#1342). A parked socket is still bound, so datagrams
+    /// keep queueing on it, and taking its share of the address under
+    /// `SO_REUSEPORT`, until a retried activation takes it back or
+    /// `RemoveListener` drops it; a `DeactivateListener` answers
+    /// `UnactivatedListener`, as for a parked socket after a failed
+    /// registration.
+    pub fn abandon_activation(&mut self, address: &ListenerKey) -> Result<(), ProxyError> {
+        let (token, mut socket) = self.give_back_listener(address)?;
+        if let Err(error) = self.registry.deregister(&mut socket) {
+            error!(
+                "{} could not deregister the UDP socket of {} while abandoning its activation: {}",
+                log_module_context!(),
+                address,
+                error
+            );
+        }
+        if let Some(listener) = self.listeners.get(&token) {
+            let mut listener = listener.borrow_mut();
+            if listener.socket_inherited {
+                debug_assert!(
+                    listener.parked_socket.is_none(),
+                    "an activation consumes the parked socket, so none is parked over it"
+                );
+                listener.parked_socket = Some(socket);
+            }
+            // Otherwise `socket` drops at the end of this function, which
+            // closes the descriptor this listener bound.
+        }
+        Ok(())
     }
 
     pub fn update_listener(&mut self, patch: UpdateUdpListenerConfig) -> Result<(), ProxyError> {
@@ -3305,5 +3383,138 @@ mod listener_sibling_tests {
             Some("cluster-a"),
             "the flow manager side must know the cluster too"
         );
+    }
+}
+
+#[cfg(test)]
+mod activation_abandon_tests {
+    use std::net::UdpSocket as StdUdpSocket;
+
+    use sozu_command::{config::ListenerBuilder, proto::command::SocketAddress};
+
+    use super::*;
+    use crate::{
+        InheritedSocketFate,
+        testing::{ServerParts, prebuild_server, provide_port},
+    };
+
+    const QUEUED: &[u8] = b"queued before the failed activation";
+
+    fn proxy_with_a_listener() -> (UdpProxy, SocketAddress, ListenerKey) {
+        let ServerParts {
+            registry,
+            sessions,
+            pool,
+            backends,
+            ..
+        } = prebuild_server(16, 16384, false).expect("could not prebuild a test server");
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let mut proxy = UdpProxy::new(registry, sessions, pool, backends, 16, 16384);
+        proxy
+            .add_listener(
+                ListenerBuilder::new_udp(address)
+                    .to_udp(None)
+                    .expect("could not build the listener config"),
+                Token(0),
+            )
+            .expect("could not add the listener");
+        (proxy, address, address.into())
+    }
+
+    /// `Server::notify_activate_listener` abandons an activation whose session
+    /// it cannot build. The socket the listener bound for that activation is
+    /// closed: the address is released, so the worker takes no share of the
+    /// datagrams sent to it and a retried activation binds again.
+    ///
+    /// A socket that sets no `SO_REUSEPORT` can bind an address only once every
+    /// socket bound there is closed, which makes the plain bind below the
+    /// observation of the close.
+    ///
+    /// To SEE THIS RED: in `UdpProxy::abandon_activation`, park the socket
+    /// whatever `socket_inherited` says: the `parked_socket` assertion fails,
+    /// and without it the bind below fails with "address in use".
+    #[test]
+    fn abandoning_an_activation_closes_the_socket_the_listener_bound() {
+        let (mut proxy, address, key) = proxy_with_a_listener();
+        proxy
+            .activate_listener(&key, None)
+            .expect("could not activate the listener");
+        assert_eq!(
+            proxy.inherited_socket_fate(&key),
+            InheritedSocketFate::Refused
+        );
+
+        proxy
+            .abandon_activation(&key)
+            .expect("an active listener can be taken back");
+
+        assert_eq!(
+            proxy.inherited_socket_fate(&key),
+            InheritedSocketFate::Adopted,
+            "an abandoned activation leaves the listener inactive"
+        );
+        assert!(
+            proxy.listeners[&Token(0)].borrow().parked_socket.is_none(),
+            "a socket the listener bound itself is not worth parking"
+        );
+        StdUdpSocket::bind(SocketAddr::from(address))
+            .expect("the abandoned activation must have closed the socket it bound");
+
+        proxy
+            .activate_listener(&key, None)
+            .expect("a retried activation binds the address again");
+        assert_eq!(
+            proxy.inherited_socket_fate(&key),
+            InheritedSocketFate::Refused
+        );
+    }
+
+    /// An inherited socket has already left the SCM table, so an abandoned
+    /// activation keeps it, with the datagrams queued on it, for the retry
+    /// (sozu#1342): closing it would lose both.
+    ///
+    /// To SEE THIS RED: in `UdpProxy::abandon_activation`, drop the socket
+    /// whatever `socket_inherited` says: `parked_socket` is then `None`, and the
+    /// retry binds a fresh socket that holds no datagram.
+    #[test]
+    fn abandoning_an_activation_keeps_the_inherited_socket_and_what_it_queued() {
+        let (mut proxy, address, key) = proxy_with_a_listener();
+        let inherited =
+            udp_bind(address.into(), None).expect("could not bind the inherited socket");
+        let sender = StdUdpSocket::bind("127.0.0.1:0").expect("could not bind the test sender");
+        sender
+            .send_to(QUEUED, SocketAddr::from(address))
+            .expect("could not queue a datagram on the inherited socket");
+        proxy
+            .activate_listener(&key, Some(inherited))
+            .expect("could not activate the listener on the inherited socket");
+
+        proxy
+            .abandon_activation(&key)
+            .expect("an active listener can be taken back");
+
+        assert_eq!(
+            proxy.inherited_socket_fate(&key),
+            InheritedSocketFate::Adopted,
+            "an abandoned activation leaves the listener inactive"
+        );
+        assert!(
+            proxy.listeners[&Token(0)].borrow().parked_socket.is_some(),
+            "the inherited socket must stay parked on the listener"
+        );
+
+        proxy
+            .activate_listener(&key, None)
+            .expect("a retried activation takes the parked socket back");
+        let listener = proxy.listeners[&Token(0)].borrow();
+        let socket = listener
+            .socket
+            .as_ref()
+            .expect("the retried activation holds a socket");
+        let mut buffer = [0u8; 64];
+        let (length, _) = socket
+            .recv_from(&mut buffer)
+            .expect("the datagram queued before the failed activation must still be there");
+        assert_eq!(&buffer[..length], QUEUED);
     }
 }

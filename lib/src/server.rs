@@ -1863,12 +1863,7 @@ impl Server {
                 self.answer_initial(worker_response_error(id, REFUSED_INITIAL_REQUEST))?;
                 continue;
             };
-            let response = self.protected_health_check.handle(
-                &id,
-                request_type,
-                &mut self.config_state,
-                &mut self.backends.borrow_mut(),
-            );
+            let response = self.handle_protected_health_check(&id, request_type);
             match response {
                 Some(response) if step.is_answered_by(&response) => {
                     stage = step.next;
@@ -3175,12 +3170,7 @@ impl Server {
             return;
         }
         if let Some(request_type) = request.content.request_type.as_mut()
-            && let Some(response) = self.protected_health_check.handle(
-                &request.id,
-                request_type,
-                &mut self.config_state,
-                &mut self.backends.borrow_mut(),
-            )
+            && let Some(response) = self.handle_protected_health_check(&request.id, request_type)
         {
             push_queue(response);
             return;
@@ -3635,6 +3625,57 @@ impl Server {
             !self.backends.borrow().backends.contains_key(cluster_id),
             "a removed cluster must leave no backend list behind"
         );
+    }
+
+    /// Answer a protected health-check request through [`ProtectedWorker`],
+    /// then finish what an abort leaves to the server.
+    ///
+    /// The handler restores the `ConfigState` and the `BackendMap`, and resets
+    /// the backends the aborted configuration marked DOWN when it restores no
+    /// configuration at all, but the probes belong to the `HealthChecker`,
+    /// which it cannot reach. An abort that leaves a cluster without a health
+    /// check leaves it without a prober too, and the probes the aborted
+    /// configuration launched (the poll that ends the loop turn of the commit
+    /// launches the first at once) are still in flight: their verdicts would be
+    /// recorded by `record_check_result`, which never consults the
+    /// configurations, and nothing could ever mark such a backend UP again. They
+    /// are dropped here, as [`remove_health_check_state`](Self::remove_health_check_state)
+    /// does for every other removal of a health check. A cluster that still has
+    /// a configuration after the abort keeps its prober, and the probes of the
+    /// version it replaced drain as for any change of policy.
+    ///
+    /// Both entry points of a protected order go through here: the blocking
+    /// handshake of `await_initial_status`, where no probe can exist yet, and
+    /// `notify_proxys`.
+    fn handle_protected_health_check(
+        &mut self,
+        request_id: &str,
+        request_type: &mut RequestType,
+    ) -> Option<WorkerResponse> {
+        let aborted = match request_type {
+            RequestType::ProtectedHealthCheckOrder(order)
+                if order.phase == ProtectedHealthCheckPhase::ProtectedHealthCheckAbort as i32 =>
+            {
+                Some(order.cluster_id.to_owned())
+            }
+            _ => None,
+        };
+        let response = self.protected_health_check.handle(
+            request_id,
+            request_type,
+            &mut self.config_state,
+            &mut self.backends.borrow_mut(),
+        );
+        if let Some(cluster_id) = aborted
+            && !self
+                .backends
+                .borrow()
+                .health_check_configs
+                .contains_key(cluster_id.as_str())
+        {
+            self.health_checker.remove_cluster(&cluster_id);
+        }
+        response
     }
 
     /// Stop health checking `cluster_id`: drop its in-flight probes, then
@@ -4268,33 +4309,58 @@ impl Server {
                             && self.sessions.borrow().slab.contains(token.0);
                         if !session_installed {
                             // The slot is reserved for the listener's whole
-                            // lifetime (`reserve_listen_token`), so both failures
-                            // below are invariant breaks; report them instead of
-                            // returning `ok` for a listener whose socket is
-                            // registered under a token `Server::ready` would
-                            // ignore.
-                            let session = match self.udp.borrow_mut().build_session(token) {
+                            // lifetime (`reserve_listen_token`), so the second
+                            // failure below is an invariant break; report both
+                            // instead of returning `ok` for a listener whose
+                            // socket is registered under a token `Server::ready`
+                            // would ignore.
+                            //
+                            // Reporting is not enough: `activate_listener` has
+                            // already bound and registered the socket, and the
+                            // answer tells the control plane the activation
+                            // FAILED, so the worker's own state is rolled back to
+                            // inactive (`finish_proxy_order`) and nothing would
+                            // ever deactivate the proxy's listener. Left active it
+                            // would keep a registered socket that no session
+                            // reads, queuing datagrams in the kernel until a
+                            // retried activation, which nothing forces, rebuilt
+                            // the session. The first failure is real:
+                            // `build_session` clones the epoll descriptor
+                            // (`Registry::try_clone`), which answers `EMFILE`
+                            // once the worker is out of descriptors.
+                            // `abandon_activation` takes the socket back out of
+                            // service: closed when this activation bound it,
+                            // which is the state before the request, and parked
+                            // when the supervisor handed it over, which is not
+                            // this worker's to lose (sozu#1342).
+                            let built = self.udp.borrow_mut().build_session(token);
+                            let session = match built {
                                 Some(session) => session,
                                 None => {
-                                    return worker_response_error(
+                                    return self.abandon_udp_activation(
                                         req_id,
+                                        &address,
                                         format!(
                                             "Could not build the UDP listener session for {address}"
                                         ),
                                     );
                                 }
                             };
-                            let mut sessions = self.sessions.borrow_mut();
-                            match sessions.slab.get_mut(token.0) {
-                                Some(slot) => *slot = session,
-                                None => {
-                                    return worker_response_error(
-                                        req_id,
-                                        format!(
-                                            "UDP listener {address} has no session slot at {token:?}"
-                                        ),
-                                    );
+                            let installed = match self.sessions.borrow_mut().slab.get_mut(token.0) {
+                                Some(slot) => {
+                                    *slot = session;
+                                    true
                                 }
+                                None => false,
+                            };
+                            if !installed {
+                                return self.abandon_udp_activation(
+                                    req_id,
+                                    &address,
+                                    format!(
+                                        "UDP listener {address} has no session slot at {token:?}"
+                                    ),
+                                );
                             }
                         }
                         WorkerResponse::ok(req_id)
@@ -4307,6 +4373,25 @@ impl Server {
             }
             Err(_) => worker_response_error(req_id, "Wrong variant for ListenerType on request"),
         }
+    }
+
+    /// Answer a UDP `ActivateListener` that bound and registered its socket
+    /// but could not install the listener's session, after taking the
+    /// activation back (`UdpProxy::abandon_activation`): a failed activation
+    /// leaves the listener inactive, whichever step failed.
+    fn abandon_udp_activation(
+        &mut self,
+        req_id: &str,
+        address: &ListenerKey,
+        reason: String,
+    ) -> WorkerResponse {
+        if let Err(error) = self.udp.borrow_mut().abandon_activation(address) {
+            error!(
+                "{} could not take back the activation of the UDP listener {}: {}",
+                req_id, address, error
+            );
+        }
+        worker_response_error(req_id, reason)
     }
 
     fn notify_deactivate_listener(
@@ -6759,6 +6844,142 @@ mod listener_lifecycle_tests {
         assert!(
             Rc::ptr_eq(&installed, &slab_session(&server, listen_token)),
             "a repeated ActivateListener must not replace the live UDP listener session"
+        );
+    }
+
+    /// `ActivateListener` binds and registers the socket first and builds the
+    /// listener's session second. When the second step fails — the epoll
+    /// descriptor cannot be duplicated (`Registry::try_clone`) once the
+    /// process is out of descriptors — the control plane is told the
+    /// activation failed, so the worker must be left as it was: a listener
+    /// that is not active. A listener left active keeps its socket bound and
+    /// registered under a token whose slab slot holds the inert placeholder,
+    /// so datagrams queue in the kernel and nothing ever reads them.
+    ///
+    /// `UdpProxy::build_session` (`lib/src/udp.rs`) is made to answer `None`
+    /// by dropping the listener's flow manager, the same exit a failed
+    /// `Registry::try_clone` takes. The real `EMFILE` needs a process-wide
+    /// descriptor limit, which no test can lower while its siblings run, and
+    /// re-executing the test binary for it forks while they hold sockets: the
+    /// child's copies kept their ports bound and their listeners open.
+    #[test]
+    fn a_udp_activation_whose_session_cannot_be_built_leaves_no_active_listener() {
+        let mut server = bare_server();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let token = add_udp_listener(&mut server, address);
+        let key: ListenerKey = address.into();
+        assert_eq!(
+            server.udp.borrow().inherited_socket_fate(&key),
+            crate::InheritedSocketFate::Adopted,
+            "test setup: an added listener is not active"
+        );
+
+        server.udp.borrow_mut().forget_manager(token);
+        let response = server.notify_activate_listener(
+            "test-activate",
+            &ActivateListener {
+                interface: None,
+                address,
+                proxy: ListenerType::Udp as i32,
+                from_scm: false,
+            },
+        );
+
+        assert_eq!(
+            response.status,
+            ResponseStatus::Failure as i32,
+            "test setup: the session cannot be built, so the activation fails: {response:?}"
+        );
+        assert!(
+            response
+                .message
+                .contains("Could not build the UDP listener session"),
+            "test setup: the activation failed at the session, not at the bind: {response:?}"
+        );
+        assert_ne!(
+            server.udp.borrow().inherited_socket_fate(&key),
+            crate::InheritedSocketFate::Refused,
+            "an activation that failed must not leave the listener active: its socket \
+             stays bound and registered while no session reads it"
+        );
+    }
+
+    /// The other exit of the same step: the session is built, and the listener's
+    /// reserved slab slot is gone, so it cannot be installed. The slot is
+    /// reserved for the listener's whole lifetime, so this is an invariant break
+    /// and no real request reaches it; the test frees the slot by hand.
+    ///
+    /// The activation is taken back whole, the built session included, and a
+    /// retried activation heals the listener: it binds the address again and
+    /// installs a session, which it would not if the session of the failed
+    /// attempt were still recorded as installed
+    /// (`UdpProxy::has_listener_session`).
+    ///
+    /// To SEE THIS RED: in that arm, answer `worker_response_error` instead of
+    /// calling `abandon_udp_activation`: the first assertion on the listener's
+    /// fate fails with "an activation that failed must not leave the listener
+    /// active".
+    #[test]
+    fn a_udp_activation_without_a_session_slot_is_taken_back_and_can_be_retried() {
+        let mut server = bare_server();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let token = add_udp_listener(&mut server, address);
+        let key: ListenerKey = address.into();
+        let request = ActivateListener {
+            interface: None,
+            address,
+            proxy: ListenerType::Udp as i32,
+            from_scm: false,
+        };
+
+        server.sessions.borrow_mut().slab.remove(token.0);
+        let response = server.notify_activate_listener("test-activate", &request);
+
+        assert_eq!(
+            response.status,
+            ResponseStatus::Failure as i32,
+            "test setup: with no slot the session cannot be installed: {response:?}"
+        );
+        assert!(
+            response.message.contains("has no session slot"),
+            "test setup: the activation failed at the slot: {response:?}"
+        );
+        assert_ne!(
+            server.udp.borrow().inherited_socket_fate(&key),
+            crate::InheritedSocketFate::Refused,
+            "an activation that failed must not leave the listener active"
+        );
+        assert!(
+            !server.udp.borrow().has_listener_session(token),
+            "a session that never reached the slab must not stay recorded as installed"
+        );
+
+        // The slab hands the freed key back to the next entry: put the
+        // placeholder there again, as `AddListener` reserved it.
+        {
+            let mut sessions = server.sessions.borrow_mut();
+            let entry = sessions.slab.vacant_entry();
+            assert_eq!(entry.key(), token.0, "test setup: the freed key is reused");
+            entry.insert(Rc::new(RefCell::new(ListenSession {
+                protocol: Protocol::UDPListen,
+            })));
+        }
+        let response = server.notify_activate_listener("test-activate-again", &request);
+
+        assert_eq!(
+            response.status,
+            ResponseStatus::Ok as i32,
+            "a retried activation must succeed: {response:?}"
+        );
+        assert_eq!(
+            slot_state(&server, token),
+            Some((Protocol::UDPListen, false)),
+            "the retried activation must install the real UdpListenerSession"
+        );
+        assert_eq!(
+            server.udp.borrow().inherited_socket_fate(&key),
+            crate::InheritedSocketFate::Refused,
+            "the retried activation leaves the listener active"
         );
     }
 
@@ -10293,8 +10514,9 @@ mod initial_protected_bootstrap_tests {
         channel::Channel,
         proto::command::{
             CountRequests, HealthCheckConfig, HealthCheckHeader, HealthCheckHeaderValue,
-            InitialState, ProtectedHealthCheckOrder, ProtectedHealthCheckPhase,
-            QueryProtectedHealthCheckSupport, SetProtectedHealthCheck, Status,
+            InitialState, LoadBalancingParams, ProtectedHealthCheckOrder,
+            ProtectedHealthCheckPhase, QueryProtectedHealthCheckSupport, SetProtectedHealthCheck,
+            Status,
         },
         secret::{FingerprintKey, ProtectedHeader, SecretValue, Zeroizing},
     };
@@ -10711,6 +10933,138 @@ mod initial_protected_bootstrap_tests {
         assert_reply(&answers[3], Phase::ProtectedHealthCheckAbort, CLUSTER, 1);
         assert_holds_nothing(&backends);
         assert_no_secret(&answers);
+    }
+
+    /// Apply one protected order to a running worker through its request
+    /// surface and return its only answer.
+    fn run(server: &mut Server, message: WorkerRequest) -> WorkerResponse {
+        server.notify_proxys(message);
+        let mut answers: Vec<WorkerResponse> = QUEUE.with(|queue| {
+            queue
+                .borrow_mut()
+                .drain(..)
+                .filter(|response| response.id != "EVENT")
+                .collect()
+        });
+        assert_eq!(answers.len(), 1, "one answer expected: {answers:?}");
+        answers.remove(0)
+    }
+
+    /// A worker whose `CLUSTER` has no health check and one backend at
+    /// `address`, then the first protected health check of that cluster
+    /// prepared and committed: the probes read the new configuration from
+    /// here on.
+    fn running_worker_with_a_committed_first_check(address: SocketAddr) -> Server {
+        let (mut server, _backends, _answers) = bootstrap(vec![capability("cap"), status("st")]);
+        assert_holds_nothing(&server.backends);
+        let answer = run(
+            &mut server,
+            request(
+                "add-backend",
+                RequestType::AddBackend(AddBackend {
+                    cluster_id: CLUSTER.to_owned(),
+                    backend_id: format!("{CLUSTER}-0"),
+                    address: address.into(),
+                    load_balancing_parameters: Some(LoadBalancingParams::default()),
+                    sticky_id: None,
+                    backup: None,
+                    unix_path: None,
+                }),
+            ),
+        );
+        assert_eq!(answer.status, ResponseStatus::Ok as i32, "{answer:?}");
+        for (message, phase) in [
+            (prepare("prep", 1), Phase::ProtectedHealthCheckPrepare),
+            (commit("com", 1), Phase::ProtectedHealthCheckCommit),
+        ] {
+            assert_reply(&run(&mut server, message), phase, CLUSTER, 1);
+        }
+        assert_eq!(
+            server
+                .backends
+                .borrow()
+                .health_check_configs
+                .get(CLUSTER)
+                .map(|config| config.headers.len()),
+            Some(1),
+            "test setup: the commit installed the protected health check"
+        );
+        server
+    }
+
+    /// A commit installed a health check on a cluster that had none, a probe
+    /// of that configuration marked the backend DOWN, and the change is then
+    /// aborted: the cluster is back to having no health check, so nothing
+    /// will ever probe the backend again. Removing a health check by any other
+    /// path resets the backends it marked DOWN (`RemoveHealthCheck`, an
+    /// `AddCluster` without one), and the abort must restore the state that
+    /// preceded the commit: every backend healthy.
+    ///
+    /// The mark is written the way `HealthChecker::record_check_result` writes
+    /// it, once the probe's own threshold is reached.
+    #[test]
+    fn aborting_the_first_protected_health_check_resets_a_backend_its_probes_marked_down() {
+        let mut server =
+            running_worker_with_a_committed_first_check(SocketAddr::from(([127, 0, 0, 1], 23_100)));
+        let backend = server.backends.borrow().backends[CLUSTER].backends[0].to_owned();
+        backend.borrow_mut().health.record_failure(1);
+        assert!(
+            !backend.borrow().health.is_healthy(),
+            "test setup: a probe of the committed configuration marked the backend DOWN"
+        );
+
+        assert_reply(
+            &run(&mut server, abort("abort", 1)),
+            Phase::ProtectedHealthCheckAbort,
+            CLUSTER,
+            1,
+        );
+
+        assert_holds_nothing(&server.backends);
+        assert!(
+            backend.borrow().health.is_healthy(),
+            "an aborted first protected health check leaves its cluster without a prober: \
+             the backend its probes marked DOWN must be healthy again"
+        );
+    }
+
+    /// The same abort, for the probe still in flight when it arrives. The
+    /// commit and the poll that follows it in the same loop turn launch a probe
+    /// carrying the aborted configuration; once the abort has removed that
+    /// configuration, the probe's verdict would still be recorded by
+    /// `record_check_result`, which never consults the configurations, and
+    /// nothing remains to heal a DOWN mark it writes.
+    #[test]
+    fn aborting_the_first_protected_health_check_drops_its_probes_in_flight() {
+        // accepts the probe's connection in the kernel and never answers
+        let silent =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("could not bind the silent backend");
+        let mut server = running_worker_with_a_committed_first_check(
+            silent.local_addr().expect("the silent backend's address"),
+        );
+        server
+            .health_checker
+            .poll(&server.backends, server.poll.registry());
+        assert_eq!(
+            server.health_checker.in_flight_len(),
+            1,
+            "test setup: the loop turn of the commit launched a probe"
+        );
+
+        assert_reply(
+            &run(&mut server, abort("abort", 1)),
+            Phase::ProtectedHealthCheckAbort,
+            CLUSTER,
+            1,
+        );
+
+        assert_holds_nothing(&server.backends);
+        assert_eq!(
+            server.health_checker.in_flight_len(),
+            0,
+            "an aborted first protected health check leaves no prober for the cluster: \
+             its probes in flight must be dropped"
+        );
     }
 
     #[test]

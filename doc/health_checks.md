@@ -484,7 +484,13 @@ Prepare, Commit, Abort or Release exchange; a worker's acknowledgement gates
 each step. When a worker refuses, fails or goes silent before every Commit is
 acknowledged, the protected change is aborted, every worker is rolled back, and
 the previous health check, with the configuration and state it came from, is
-retained or restored. Once every Commit is acknowledged, Release only makes the
+retained or restored. When the cluster had no health check before the change,
+the abort removes the one it installed as
+[Remove a health check](#remove-a-health-check) does: every backend its probes
+marked DOWN is reset to healthy and its probes still in flight are dropped, since
+no prober would ever mark them UP again. When the previous health check is
+restored, probes of the aborted one still in flight drain as for any change of
+policy. Once every Commit is acknowledged, Release only makes the
 workers forget the state the commit replaced: a Release that is refused or
 times out is a retention or cleanup failure, reported as such, and it cannot roll
 back a before-image that the workers already destroyed. A worker that is

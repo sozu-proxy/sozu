@@ -74,6 +74,18 @@
 
 - A connection accepted on a listener that `RemoveListener` then deletes is no longer served by the next listener of the same protocol. The accept queue records only the listen token of the listener that accepted each socket, and the worker resolves that token in the protocol's current listener map when it creates the session. `RemoveListener` freed the token's slab slot and purged the listener from the deferred accept set, but left its sockets in the queue, and the slab hands the freed key to the next `AddListener`. A socket still queued when the removal ran (its readiness event came before the command in one `epoll_wait` result, or `create_sessions` stopped early and left it waiting up to `accept_queue_timeout`) therefore became a session configured by, and routed through, a listener the client never connected to. `RemoveListener` now closes the sockets still queued for the listener it releases, so their clients see the connection close.
 
+<!-- changelog-slot:protected-abort-health-reset -->
+
+### Fixed
+
+- Aborting the first protected health check of a cluster no longer leaves its backends marked DOWN with nothing left to mark them UP. A protected change that installs a health check on a cluster that had none starts probing at once, and when it is then aborted (a worker refuses, fails or goes silent before every commit is acknowledged) the worker removed the configuration and the protected header values but kept every DOWN mark the aborted configuration's probes had recorded, and kept those probes in flight, whose verdicts are still recorded after the abort. The cluster then had no prober, so a backend marked DOWN stayed out of rotation until an operator acted, although the documented abort restores the state that preceded the change. The abort now resets the cluster's backends to healthy and drops its probes in flight, as `sozu cluster health-check remove` does. When the previous health check is restored instead, nothing changes: its own probes carry on and the aborted configuration's probes drain as for any change of policy.
+
+<!-- changelog-slot:udp-activate-session-failure -->
+
+### Fixed
+
+- A UDP `ActivateListener` that fails because the worker cannot build the listener's session no longer leaves the listener active. The worker binds and registers the socket first and builds the session second, and when the second step failed (cloning the epoll descriptor answers `EMFILE` once the worker is out of descriptors, which a flood of flows can bring about) it answered a failure and undid nothing: the socket stayed bound and registered with no session to read it, datagrams queued in the kernel and, with `SO_REUSEPORT`, took a share of the address's traffic, while the control plane believed the listener inactive and had no reason to retry. The activation is now taken back as a whole, whichever of its two steps failed: the listener is inactive again and its socket deregistered. A socket the worker bound for that activation is closed, so nothing stays bound and a retried `ActivateListener` binds again and installs the session. A socket inherited from the supervisor at an upgrade is kept parked instead, as a failed registration already keeps it, because it is not the worker's to lose: it stays bound and queues datagrams until the retry takes it back or `RemoveListener` drops it, and a `DeactivateListener` for that listener answers that it is not activated meanwhile.
+
 ## 2.3.6 - 2026-11-18
 
 ### Security

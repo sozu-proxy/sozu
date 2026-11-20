@@ -11,7 +11,10 @@
 //!   `BackendMap`, where the probes read them. The state before the commit is
 //!   kept until the order to release it;
 //! - *abort* drops a staged version, or restores exactly the state that
-//!   preceded an applied one;
+//!   preceded an applied one. Restoring *no* health check is a removal: the
+//!   backends the aborted configuration's probes marked DOWN are reset
+//!   ([`BackendMap::restore_health_check`]) and its probes in flight are dropped
+//!   (`Server::handle_protected_health_check`), as for `RemoveHealthCheck`;
 //! - *release* forgets that state once every worker applied the version.
 //!
 //! The `BackendMap` stays the single source the probes read. An ordinary change

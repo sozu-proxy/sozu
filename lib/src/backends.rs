@@ -740,6 +740,13 @@ impl BackendMap {
     /// Put back exactly what a protected health check replaced: the
     /// configuration and the values behind its headers, each present or absent
     /// as it was.
+    ///
+    /// Restoring *no* configuration is a removal of the health check, so it
+    /// resets the backends the aborted configuration's probes marked DOWN just
+    /// as [`set_health_check_config`](Self::set_health_check_config) does for a
+    /// `RemoveHealthCheck`: the cluster is back to having no prober, and none
+    /// would ever mark them UP again. The caller drops the probes still in
+    /// flight (`Server::handle_protected_health_check`), which only it can.
     pub fn restore_health_check(
         &mut self,
         cluster_id: &str,
@@ -752,6 +759,7 @@ impl BackendMap {
             }
             None => {
                 self.health_check_configs.remove(cluster_id);
+                self.reset_cluster_health(cluster_id);
             }
         }
         match headers {
@@ -788,24 +796,28 @@ impl BackendMap {
             }
             None => {
                 self.health_check_configs.remove(cluster_id);
-                // When the operator drops the health check, any
-                // previously-recorded `HealthState::Unhealthy` would
-                // otherwise stick — `next_available_backend` keeps
-                // skipping the backend even though we have stopped
-                // probing it. Reset every backend in the cluster to a
-                // pristine healthy state so the load balancer can
-                // route again.
-                if let Some(backend_list) = self.backends.get(cluster_id) {
-                    for backend in &backend_list.backends {
-                        backend.borrow_mut().health = HealthState::default();
-                    }
-                }
-                // Re-emit the rollup gauges so dashboards reflect the
-                // post-reset availability instead of holding the last
-                // health-check value indefinitely.
-                self.record_cluster_availability(cluster_id);
+                self.reset_cluster_health(cluster_id);
             }
         }
+    }
+
+    /// A cluster that has no health check has no prober, so nothing will ever
+    /// mark a backend UP again. When the health check goes away — dropped by
+    /// the operator, or restored to none by an aborted protected change — any
+    /// previously-recorded `HealthState::Unhealthy` would otherwise stick:
+    /// `next_available_backend` keeps skipping the backend even though we have
+    /// stopped probing it. Reset every backend in the cluster to a pristine
+    /// healthy state so the load balancer can route again.
+    fn reset_cluster_health(&mut self, cluster_id: &str) {
+        if let Some(backend_list) = self.backends.get(cluster_id) {
+            for backend in &backend_list.backends {
+                backend.borrow_mut().health = HealthState::default();
+            }
+        }
+        // Re-emit the rollup gauges so dashboards reflect the
+        // post-reset availability instead of holding the last
+        // health-check value indefinitely.
+        self.record_cluster_availability(cluster_id);
     }
 
     pub fn import_configuration_state(

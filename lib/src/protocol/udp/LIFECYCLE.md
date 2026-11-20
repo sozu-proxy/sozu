@@ -476,6 +476,29 @@ Worker requests reach UDP via `UdpProxy::notify` (`udp.rs`), routed from
   installed. Rebuilding on a repeat would displace the live session while the
   proxy kept the shared `UdpManager` and its flow table, leaving every in-flight
   flow unforwardable and its upstream slab slot unreleasable.
+  The activation is all or nothing. `activate_listener` has bound (or adopted)
+  and registered the socket by the time `build_session` runs, and the answer to
+  the control plane is a failure when the session cannot be built
+  (`Registry::try_clone` answers `EMFILE` once the worker is out of descriptors)
+  or installed (the listener's reserved slab slot is missing, an invariant
+  break). The worker's own state is rolled back to inactive on that answer, so
+  the arm also takes the activation back through `UdpProxy::abandon_activation`
+  (`udp.rs`): the same teardown as a deactivation (`give_back_listener`, so a
+  session that was built and never reached the slab goes too) and the socket
+  deregistered. A socket the listener bound for this activation is then
+  **closed**, which is the state before the request: nothing stays bound, so
+  the worker takes no share of the address's datagrams, and a retried
+  activation binds again. An inherited socket is **parked** instead
+  (`UdpListener::parked_socket`, told apart by `UdpListener::socket_inherited`),
+  as a failed registration parks it, because it has already left the SCM table
+  and closing it would lose the descriptor and the datagrams queued on it
+  (sozu#1342). A parked socket is still bound: datagrams keep queueing on it,
+  and under `SO_REUSEPORT` it keeps its share of the address, until a retried
+  activation takes it back or `RemoveListener` drops it, and
+  `DeactivateListener` answers `UnactivatedListener` meanwhile. A listener left
+  active would instead keep a registered socket that no session reads, with
+  the worker and the control plane disagreeing about it, until a retried
+  activation that nothing forces.
 - **Front add/remove**: `UdpProxy::add_udp_front` (`udp.rs`) / `UdpProxy::remove_udp_front`
   (`udp.rs`).
 - **Cluster knobs**: `UdpProxy::apply_cluster` (`udp.rs`) → `apply_udp_knobs`
