@@ -4489,6 +4489,22 @@ impl ConnectionH2 {
         // RFC 9113 §6.8: if draining and all streams have completed,
         // send the final GOAWAY with the actual last_stream_id
         if self.drain.draining() && self.stream_table.streams().is_empty() {
+            // A connection already in `H2State::GoAway` or `H2State::Error`
+            // has sent (or failed to send) its final GOAWAY and gets no second
+            // one, as in `ConnectionH2::goaway_before_forced_close`. The resume
+            // of a stream parked by a stalled write reaches this branch when it
+            // retires the last stream: `graceful_goaway` would queue another
+            // GOAWAY(NO_ERROR) and set `ConnectionH2::graceful_goaway`, which
+            // relabels an error GOAWAY as graceful for
+            // `ConnectionH2::linger_budget` and
+            // `Connection::lingers_after_error_goaway`
+            // (`lib/src/protocol/mux/connection.rs`). That second `goaway` also
+            // armed WRITABLE for the close decision of the `H2State::GoAway`
+            // arm, which the next pass must still reach.
+            if matches!(self.state, H2State::GoAway | H2State::Error) {
+                self.readiness.arm_writable();
+                return H2FinalizeTarget::Done(MuxResult::Continue);
+            }
             return H2FinalizeTarget::Done(self.graceful_goaway(self.now));
         }
 
@@ -13355,6 +13371,116 @@ pub(super) mod tests {
                 (7, 0, 0)
             ]),
             "the whole DATA frame, the PING ACK, then the GOAWAY"
+        );
+    }
+
+    /// An error GOAWAY stays the one final GOAWAY when the resume of the
+    /// parked stream retires the last stream. A connection already in
+    /// `H2State::GoAway` has sent its final GOAWAY, so the drain-complete
+    /// branch of `ConnectionH2::finalize_write` must not ask
+    /// `graceful_goaway` for another: that would put a second
+    /// GOAWAY(NO_ERROR) on the wire and turn `graceful_goaway` true, which
+    /// hands the close the graceful linger budget and takes it out of the
+    /// error-linger release.
+    ///
+    /// TO SEE THIS RED: in the drain-complete branch of
+    /// `ConnectionH2::finalize_write` (the `if self.drain.draining() &&
+    /// self.stream_table.streams().is_empty()` one), remove whatever keeps
+    /// `H2State::GoAway` and `H2State::Error` out of the
+    /// `self.graceful_goaway(..)` call, so that a connection in either state
+    /// reaches it. The test then fails with `the peer must read the DATA
+    /// frame and one GOAWAY(ENHANCE_YOUR_CALM), and the connection must not
+    /// be marked as gracefully draining`, its left side carrying a second
+    /// `(7, 0, 0, [0, 0, 0, 0, 0, 0, 0, 0])` frame and `true`. Verified
+    /// 2026-11-20.
+    #[test]
+    fn an_error_goaway_gets_no_second_graceful_goaway_when_the_parked_stream_retires() {
+        let (_pool, mut connection, mut context, mut router, gid) = park_half_written_frame();
+        // The response is fully buffered and terminated, and the request
+        // ended: finishing the parked frame retires the stream, which is the
+        // last one. `Unlinked` is open, so the closing connection does not
+        // prune it before its frame resumes.
+        context.streams[gid].state = StreamState::Unlinked;
+        context.streams[gid].back.parsing_phase = kawa::ParsingPhase::Terminated;
+        context.streams[gid].front_received_end_of_stream = true;
+        let _ = connection.core.goaway(H2Error::EnhanceYourCalm);
+
+        drive_unthrottled(&mut connection, &mut context, &mut router);
+
+        // The fixture registers stream 1 without reading its HEADERS, so the
+        // highest peer stream id the GOAWAY reports is 0.
+        let enhance_your_calm = u32::from(H2Error::EnhanceYourCalm as u8);
+        let mut goaway_payload = 0u32.to_be_bytes().to_vec();
+        goaway_payload.extend_from_slice(&enhance_your_calm.to_be_bytes());
+        assert_eq!(
+            (
+                peer_frames(&connection.socket.wire),
+                connection.core.graceful_goaway
+            ),
+            (
+                Ok(vec![
+                    (0, 0, REGISTERED_STREAM_ID, HALF_WRITTEN_PAYLOAD.to_vec()),
+                    (7, 0, 0, goaway_payload),
+                ]),
+                false
+            ),
+            "the peer must read the DATA frame and one GOAWAY(ENHANCE_YOUR_CALM), \
+             and the connection must not be marked as gracefully draining"
+        );
+    }
+
+    /// The pass that retires the last stream of a connection in
+    /// `H2State::GoAway` keeps WRITABLE armed, so the next pass reaches the
+    /// close decision of the `H2State::GoAway` arm and lingers on the error
+    /// GOAWAY's budget. The second GOAWAY that
+    /// `an_error_goaway_gets_no_second_graceful_goaway_when_the_parked_stream_retires`
+    /// forbids used to arm that pass as a side effect; withdrawing WRITABLE
+    /// instead would leave the closing connection waiting for a timer.
+    ///
+    /// TO SEE THIS RED: in the `H2State::GoAway | H2State::Error` branch of
+    /// `ConnectionH2::finalize_write`, delete the `self.readiness.arm_writable()`
+    /// call. The test then fails with `the retiring pass must leave WRITABLE
+    /// armed for the close decision`. Verified 2026-11-20.
+    #[test]
+    fn an_error_goaway_whose_parked_stream_retires_still_reaches_the_error_linger() {
+        let (_pool, mut connection, mut context, mut router, gid) = park_half_written_frame();
+        context.streams[gid].state = StreamState::Unlinked;
+        context.streams[gid].back.parsing_phase = kawa::ParsingPhase::Terminated;
+        context.streams[gid].front_received_end_of_stream = true;
+        let _ = connection.core.goaway(H2Error::EnhanceYourCalm);
+        connection.socket.budget = usize::MAX;
+
+        // The resume pass: it finishes the parked frame and retires the
+        // stream, which is the last one. It starts with WRITABLE neither
+        // wanted nor signalled, as after a pass that quiesced: only the
+        // retiring pass itself can make the close decision due.
+        connection.core.readiness.interest.remove(Ready::WRITABLE);
+        connection.core.readiness.event.remove(Ready::WRITABLE);
+        let resume = connection.writable(&mut context, EndpointClient(&mut router));
+        assert!(
+            matches!(resume, MuxResult::Continue),
+            "the resume pass hands the close to the next one, got {resume:?}"
+        );
+        assert!(
+            connection.core.stream_table.streams().is_empty(),
+            "the resume pass must have retired the last stream"
+        );
+        assert!(
+            connection.core.readiness.filter_interest().is_writable(),
+            "the retiring pass must leave WRITABLE armed for the close decision"
+        );
+
+        let close = connection.writable(&mut context, EndpointClient(&mut router));
+        assert!(
+            matches!(close, MuxResult::Continue),
+            "the close decision stages the linger, got {close:?}"
+        );
+        assert!(
+            matches!(
+                connection.core.linger,
+                Linger::Draining { remaining, .. } if remaining == ERROR_GOAWAY_LINGER_MAX_BYTES
+            ),
+            "an error GOAWAY lingers on the error budget, not the graceful one"
         );
     }
 

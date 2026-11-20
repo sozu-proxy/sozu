@@ -1764,7 +1764,15 @@ Two GOAWAY frames in `ConnectionH2::graceful_goaway` (`h2.rs`):
    forced-close budget elapses first (§8.3), `Mux::shutting_down_inner` sends
    it through `ConnectionH2::goaway_before_forced_close` instead, which
    reports a stream whose opening block never completed as unprocessed
-   (invariant 31).
+   (invariant 31). A connection already in `H2State::GoAway` or
+   `H2State::Error` has sent (or failed to send) its final GOAWAY and gets no
+   second one: when the resume of a stream parked by a stalled write retires
+   the last stream of such a connection, `ConnectionH2::finalize_write` only
+   re-arms WRITABLE for the close decision of the `H2State::GoAway` arm
+   and does not call `graceful_goaway`. A second `goaway(NoError)` there
+   would put another GOAWAY(NO_ERROR) on the wire after an error GOAWAY and
+   mark the connection graceful, which hands its close the graceful linger
+   budget below instead of the error one.
 
 `peer_gone_after_final_goaway` (`h2.rs`) guards against deadlock on a
 peer-side HUP after the final GOAWAY.
@@ -1822,7 +1830,11 @@ socket for at most 1 s and 256 KiB of reads. Pinned by
 `an_error_goaway_lingers_under_the_short_budget_and_a_graceful_one_keeps_its_own`,
 `an_error_goaway_linger_releases_its_streams_and_backends_when_it_starts`
 and `an_error_goaway_linger_pending_on_close_notify_releases_before_pending_links`
-(`mod.rs`). `ConnectionH2::arm_timeout` and `set_timeout_duration` leave the
+(`mod.rs`), and, for the parked stream whose resume retires the last stream
+of an error GOAWAY (no second GOAWAY, still the error budget), by
+`an_error_goaway_gets_no_second_graceful_goaway_when_the_parked_stream_retires`
+and `an_error_goaway_whose_parked_stream_retires_still_reaches_the_error_linger`
+(`h2.rs`). `ConnectionH2::arm_timeout` and `set_timeout_duration` leave the
 deadline in place, so bytes the client sends never extend it. The lingering `readable`
 and `writable` passes adopt the pass's clock (`ConnectionH2::adopt_now`)
 before they return, so the bounds are: the linger deadline,

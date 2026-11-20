@@ -743,7 +743,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:5102-5115
+```rust lib/src/protocol/mux/h2.rs:5118-5131
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -769,7 +769,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:5153-5159
+```rust lib/src/protocol/mux/h2.rs:5169-5175
 let events = stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -1162,7 +1162,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9744-9748
+```rust lib/src/protocol/mux/h2.rs:9760-9764
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1351,7 +1351,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9926-9930
+```rust lib/src/protocol/mux/h2.rs:9942-9946
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1707,7 +1707,14 @@ live.
 `write_streams` ends by asking `finalize_write` what the pass owes the next
 tick, handing it the `tls_wants_write` answer it read itself. After the RFC 9113
 §6.8 graceful-GOAWAY check (draining with every stream gone), the rest is one
-decision taken in `h2_close::finalize_action`; the four readiness answers are
+decision taken in `h2_close::finalize_action`. That check sends the final
+GOAWAY only once: a connection already in `H2State::GoAway` or `H2State::Error`
+has sent (or failed to send) it, so a pass that retires the last stream of
+such a connection, the resume of a stream a stalled write had parked, queues no
+second GOAWAY and re-arms WRITABLE with `Readiness::arm_writable` for the close
+decision of the `H2State::GoAway` arm instead. The second GOAWAY would have
+set `graceful_goaway` on an error GOAWAY and given its close the graceful
+linger budget; the four readiness answers are
 performed here and the two TLS answers are handed back to `write_streams` as an
 `H2FinalizeTarget`, whose second call is `finalize_write_after_flush`:
 
@@ -1826,7 +1833,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:9245
+```rust lib/src/protocol/mux/h2.rs:9261
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -2070,7 +2077,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:7685-7687
+```rust lib/src/protocol/mux/h2.rs:7701-7703
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -2078,7 +2085,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:7699-7705
+```rust lib/src/protocol/mux/h2.rs:7715-7721
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.
