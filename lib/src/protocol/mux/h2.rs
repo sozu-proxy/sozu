@@ -1886,16 +1886,29 @@ fn decode_discarded_field_block(
 }
 
 impl ConnectionH2 {
+    /// Whether the client of a draining frontend can receive nothing more.
+    ///
+    /// A hang-up is `WRITE_CLOSED` (mio's `is_write_closed`: `EPOLLHUP` or
+    /// `EPOLLERR`) or `ERROR`, as `Mux::frontend_exchange_in_flight` reads
+    /// it. `HUP` alone is not one: `Ready::from(&mio::event::Event)` raises
+    /// it for a read-closed socket too, so a TCP half-close (the client's
+    /// FIN, `EPOLLRDHUP`) is `HUP` without `WRITE_CLOSED` — a client that
+    /// stopped sending and still reads. Taking that for a hang-up would drop
+    /// the output queue (the adopted tail of a frame a short write cut
+    /// included), the park, the control queues, and the TLS records still to
+    /// flush, for a client the Mux keeps serving (#1779). `WRITE_CLOSED`, not
+    /// `ERROR` alone, is what tells a reset whose error a `read` or `write`
+    /// already consumed (`EPOLLHUP` without `EPOLLERR`) from a half-close.
     fn frontend_hung_up_while_draining(&self) -> bool {
         matches!(self.position, Position::Server)
             && self.drain.draining()
-            && (self.readiness.event.is_hup() || self.readiness.event.is_error())
+            && (self.readiness.event.is_write_closed() || self.readiness.event.is_error())
     }
 
     /// Once the final GOAWAY has been queued and all streams/control frames are
-    /// gone, a peer-side HUP/ERR means any remaining rustls backlog is no
-    /// longer deliverable. Waiting on `socket_wants_write()` in that state can
-    /// deadlock shutdown forever because GOAWAY disables further frame reads.
+    /// gone, a peer-side hang-up (WRITE_CLOSED/ERR, never a half-close's HUP
+    /// alone) means any remaining rustls backlog is no longer deliverable.
+    /// Waiting on `socket_wants_write()` then can deadlock: GOAWAY stops reads.
     fn peer_gone_after_final_goaway(&self) -> bool {
         self.frontend_hung_up_while_draining()
             && matches!(self.state, H2State::GoAway | H2State::Error)
@@ -4489,6 +4502,22 @@ impl ConnectionH2 {
         // RFC 9113 §6.8: if draining and all streams have completed,
         // send the final GOAWAY with the actual last_stream_id
         if self.drain.draining() && self.stream_table.streams().is_empty() {
+            // A connection already in `H2State::GoAway` or `H2State::Error`
+            // has sent (or failed to send) its final GOAWAY and gets no second
+            // one, as in `ConnectionH2::goaway_before_forced_close`. The resume
+            // of a stream parked by a stalled write reaches this branch when it
+            // retires the last stream: `graceful_goaway` would queue another
+            // GOAWAY(NO_ERROR) and set `ConnectionH2::graceful_goaway`, which
+            // relabels an error GOAWAY as graceful for
+            // `ConnectionH2::linger_budget` and
+            // `Connection::lingers_after_error_goaway`
+            // (`lib/src/protocol/mux/connection.rs`). That second `goaway` also
+            // armed WRITABLE for the close decision of the `H2State::GoAway`
+            // arm, which the next pass must still reach.
+            if matches!(self.state, H2State::GoAway | H2State::Error) {
+                self.readiness.arm_writable();
+                return H2FinalizeTarget::Done(MuxResult::Continue);
+            }
             return H2FinalizeTarget::Done(self.graceful_goaway(self.now));
         }
 
@@ -4555,7 +4584,26 @@ impl ConnectionH2 {
                     "Wrote everything: {:?}",
                     self.stream_table.streams()
                 )));
-                self.readiness.interest.remove(Ready::WRITABLE);
+                if matches!(self.state, H2State::GoAway | H2State::Error) {
+                    // Withdrawing WRITABLE is the live-connection policy: the
+                    // next wake-up is a WINDOW_UPDATE, a new request or a
+                    // backend byte. A connection that has sent its final
+                    // GOAWAY reads none of the first two, so only WRITABLE
+                    // can bring it back to the close decision of the
+                    // `H2State::GoAway` arm of `Self::dispatch_writable_state`.
+                    // The resume of a parked stream that stays open (it waits
+                    // on its backend, so the table is not empty) writes bytes
+                    // that are not progress and lands here: withdrawing would
+                    // leave the closing connection, its streams and its
+                    // backend connections waiting for a backend byte or a
+                    // timer. The next pass, with nothing parked, takes the
+                    // close decision; a stream parked again is owned by that
+                    // park (`FinalizeAction::Parked`), so this re-arm cannot
+                    // spin.
+                    self.readiness.arm_writable();
+                } else {
+                    self.readiness.interest.remove(Ready::WRITABLE);
+                }
                 H2FinalizeTarget::Done(MuxResult::Continue)
             }
             // The two TLS answers differ only in the step the CALLER performs,
@@ -4647,11 +4695,13 @@ impl ConnectionH2 {
     /// serialise, and whatever was already queued — an ACK, the rest of a
     /// stream frame a partial write cut — stays ahead of what this walk adds.
     pub fn flush_pending_control_frames(&mut self) -> H2ControlFlushTarget {
-        // The peer hung up while the connection drains: nothing queued for it
-        // will be read. Only OUTPUT is dropped. `zero` is input only, and a
-        // `Ready::HUP` can be a TCP half-close with frames the peer already
-        // sent still unread (review of e1c3c2fb, B2), which the shutdown
-        // drive's forced `readable()` goes on to read.
+        // The peer hung up while the connection drains (`WRITE_CLOSED` or
+        // `ERROR`, not a `HUP` alone, which a TCP half-close raises while the
+        // client still reads): nothing queued for it will be read. Only
+        // OUTPUT is dropped. `zero` is input only, and the hang-up can still
+        // follow frames the peer already sent and left unread (review of
+        // e1c3c2fb, B2), which the shutdown drive's forced `readable()` goes
+        // on to read.
         if self.frontend_hung_up_while_draining() {
             self.stream_table.set_expect_write(None);
             self.clear_output();
@@ -13294,6 +13344,61 @@ pub(super) mod tests {
         );
     }
 
+    /// A client that half-closes its write side while the frontend drains
+    /// still reads, and the frame a short write cut must still reach it
+    /// whole (#1779: a half-closed client is served).
+    ///
+    /// `Ready::from(&mio::event::Event)` raises `HUP` for a read-closed
+    /// socket and `WRITE_CLOSED` only for a write-closed one
+    /// (`command/src/ready.rs`), so a TCP half-close is `HUP` without
+    /// `WRITE_CLOSED`: the peer sent its FIN and keeps reading. The socket
+    /// takes 20 bytes of a 41-byte DATA frame, the connection starts to
+    /// drain (soft stop), and that `HUP` lands. The 21 bytes still owed are
+    /// the adopted tail of the cut frame in the ordered output queue
+    /// (#1604), and the stream is parked in `expect_write`. A hang-up is
+    /// `WRITE_CLOSED` or `ERROR`, as `Mux::frontend_exchange_in_flight`
+    /// (`lib/src/protocol/mux/mod.rs`) reads it;
+    /// `ConnectionH2::frontend_hung_up_while_draining` reads `is_hup()`, so
+    /// `ConnectionH2::flush_pending_control_frames` drops the tail and the
+    /// park, and the peer reads 20 bytes of a frame announcing 32 payload
+    /// bytes.
+    ///
+    /// TO SEE THIS RED: run it unmodified on a tree where
+    /// `ConnectionH2::frontend_hung_up_while_draining` still reads
+    /// `self.readiness.event.is_hup() || self.readiness.event.is_error()`.
+    /// It fails on `a half-closed client must still read the whole frame the
+    /// short write cut`, its left side being `Err("frame type 0x0 announces
+    /// 32 bytes, 11 remain")`. It goes green once that predicate reads
+    /// `self.readiness.event.is_write_closed() || self.readiness.event.is_error()`.
+    #[test]
+    fn a_half_closed_client_still_receives_the_frame_a_short_write_cut_while_draining() {
+        let (_pool, mut connection, mut context, mut router, gid) = park_half_written_frame();
+        // A stream being answered is linked, as the neighbouring tests set it.
+        context.streams[gid].state = StreamState::Linked(mio::Token(1));
+        connection.core.drain.__test_set_draining();
+
+        // The client's FIN: HUP, no WRITE_CLOSED, no ERROR.
+        connection.core.readiness.event.insert(Ready::HUP);
+        assert!(
+            !connection.core.readiness.event.is_write_closed()
+                && !connection.core.readiness.event.is_error(),
+            "premise: a half-close is HUP alone"
+        );
+
+        drive_unthrottled(&mut connection, &mut context, &mut router);
+
+        assert_eq!(
+            peer_frames(&connection.socket.wire),
+            Ok(vec![(
+                0,
+                0,
+                REGISTERED_STREAM_ID,
+                HALF_WRITTEN_PAYLOAD.to_vec()
+            )]),
+            "a half-closed client must still read the whole frame the short write cut"
+        );
+    }
+
     /// The shutdown drive (`Mux::shutting_down`) calls `flush_output_buffer`,
     /// then forces READABLE and calls `readable()`. That read must not eat
     /// the queued ACK. Since #1604 it cannot by construction: the read lands
@@ -13355,6 +13460,207 @@ pub(super) mod tests {
                 (7, 0, 0)
             ]),
             "the whole DATA frame, the PING ACK, then the GOAWAY"
+        );
+    }
+
+    /// An error GOAWAY stays the one final GOAWAY when the resume of the
+    /// parked stream retires the last stream. A connection already in
+    /// `H2State::GoAway` has sent its final GOAWAY, so the drain-complete
+    /// branch of `ConnectionH2::finalize_write` must not ask
+    /// `graceful_goaway` for another: that would put a second
+    /// GOAWAY(NO_ERROR) on the wire and turn `graceful_goaway` true, which
+    /// hands the close the graceful linger budget and takes it out of the
+    /// error-linger release.
+    ///
+    /// TO SEE THIS RED: in the drain-complete branch of
+    /// `ConnectionH2::finalize_write` (the `if self.drain.draining() &&
+    /// self.stream_table.streams().is_empty()` one), remove whatever keeps
+    /// `H2State::GoAway` and `H2State::Error` out of the
+    /// `self.graceful_goaway(..)` call, so that a connection in either state
+    /// reaches it. The test then fails with `the peer must read the DATA
+    /// frame and one GOAWAY(ENHANCE_YOUR_CALM), and the connection must not
+    /// be marked as gracefully draining`, its left side carrying a second
+    /// `(7, 0, 0, [0, 0, 0, 0, 0, 0, 0, 0])` frame and `true`. Verified
+    /// 2026-11-20.
+    #[test]
+    fn an_error_goaway_gets_no_second_graceful_goaway_when_the_parked_stream_retires() {
+        let (_pool, mut connection, mut context, mut router, gid) = park_half_written_frame();
+        // The response is fully buffered and terminated, and the request
+        // ended: finishing the parked frame retires the stream, which is the
+        // last one. `Unlinked` is open, so the closing connection does not
+        // prune it before its frame resumes.
+        context.streams[gid].state = StreamState::Unlinked;
+        context.streams[gid].back.parsing_phase = kawa::ParsingPhase::Terminated;
+        context.streams[gid].front_received_end_of_stream = true;
+        let _ = connection.core.goaway(H2Error::EnhanceYourCalm);
+
+        drive_unthrottled(&mut connection, &mut context, &mut router);
+
+        // The fixture registers stream 1 without reading its HEADERS, so the
+        // highest peer stream id the GOAWAY reports is 0.
+        let enhance_your_calm = u32::from(H2Error::EnhanceYourCalm as u8);
+        let mut goaway_payload = 0u32.to_be_bytes().to_vec();
+        goaway_payload.extend_from_slice(&enhance_your_calm.to_be_bytes());
+        assert_eq!(
+            (
+                peer_frames(&connection.socket.wire),
+                connection.core.graceful_goaway
+            ),
+            (
+                Ok(vec![
+                    (0, 0, REGISTERED_STREAM_ID, HALF_WRITTEN_PAYLOAD.to_vec()),
+                    (7, 0, 0, goaway_payload),
+                ]),
+                false
+            ),
+            "the peer must read the DATA frame and one GOAWAY(ENHANCE_YOUR_CALM), \
+             and the connection must not be marked as gracefully draining"
+        );
+    }
+
+    /// The pass that retires the last stream of a connection in
+    /// `H2State::GoAway` keeps WRITABLE armed, so the next pass reaches the
+    /// close decision of the `H2State::GoAway` arm and lingers on the error
+    /// GOAWAY's budget. The second GOAWAY that
+    /// `an_error_goaway_gets_no_second_graceful_goaway_when_the_parked_stream_retires`
+    /// forbids used to arm that pass as a side effect; withdrawing WRITABLE
+    /// instead would leave the closing connection waiting for a timer.
+    ///
+    /// TO SEE THIS RED: in the `H2State::GoAway | H2State::Error` branch of
+    /// `ConnectionH2::finalize_write`, delete the `self.readiness.arm_writable()`
+    /// call. The test then fails with `the retiring pass must leave WRITABLE
+    /// armed for the close decision`. Verified 2026-11-20.
+    #[test]
+    fn an_error_goaway_whose_parked_stream_retires_still_reaches_the_error_linger() {
+        let (_pool, mut connection, mut context, mut router, gid) = park_half_written_frame();
+        context.streams[gid].state = StreamState::Unlinked;
+        context.streams[gid].back.parsing_phase = kawa::ParsingPhase::Terminated;
+        context.streams[gid].front_received_end_of_stream = true;
+        let _ = connection.core.goaway(H2Error::EnhanceYourCalm);
+        connection.socket.budget = usize::MAX;
+
+        // The resume pass: it finishes the parked frame and retires the
+        // stream, which is the last one. It starts with WRITABLE neither
+        // wanted nor signalled, as after a pass that quiesced: only the
+        // retiring pass itself can make the close decision due.
+        connection.core.readiness.interest.remove(Ready::WRITABLE);
+        connection.core.readiness.event.remove(Ready::WRITABLE);
+        let resume = connection.writable(&mut context, EndpointClient(&mut router));
+        assert!(
+            matches!(resume, MuxResult::Continue),
+            "the resume pass hands the close to the next one, got {resume:?}"
+        );
+        assert!(
+            connection.core.stream_table.streams().is_empty(),
+            "the resume pass must have retired the last stream"
+        );
+        assert!(
+            connection.core.readiness.filter_interest().is_writable(),
+            "the retiring pass must leave WRITABLE armed for the close decision"
+        );
+
+        let close = connection.writable(&mut context, EndpointClient(&mut router));
+        assert!(
+            matches!(close, MuxResult::Continue),
+            "the close decision stages the linger, got {close:?}"
+        );
+        assert!(
+            matches!(
+                connection.core.linger,
+                Linger::Draining { remaining, .. } if remaining == ERROR_GOAWAY_LINGER_MAX_BYTES
+            ),
+            "an error GOAWAY lingers on the error budget, not the graceful one"
+        );
+    }
+
+    /// An error GOAWAY whose parked stream drains but stays open (it waits on
+    /// its backend, so the table is not empty) must still reach the close
+    /// decision of the `H2State::GoAway` arm. READABLE is gone since the
+    /// GOAWAY, so WRITABLE is the only readiness that can bring the session
+    /// back to that arm: a resume pass that withdraws it leaves the closing
+    /// connection waiting for a backend byte or a timer, whereas the same
+    /// GOAWAY without a parked stream closes on the very next pass.
+    ///
+    /// The session is driven the way `Mux` drives it (`drive_unthrottled`
+    /// calls `writable()` only while the filtered readiness allows it), so
+    /// the test reads the outcome (the linger the close decision stages) and
+    /// not one particular readiness bit: closing within the resume pass
+    /// would satisfy it as well as keeping WRITABLE armed.
+    ///
+    /// Without the fix the resume pass finishes the parked frame and the
+    /// GOAWAY, `finalize_write` finds the stream table non-empty and
+    /// `finalize_action` answers `Quiesce` (the resume bytes are not
+    /// progress), which removes WRITABLE; nothing re-arms it. The last
+    /// assertion then fails with `the close decision of the GoAway arm was
+    /// never reached`, carrying `state GoAway, linger Off` and the readiness
+    /// `interest: --EH-` (no WRITABLE).
+    ///
+    /// TO SEE THIS RED: without the fix, run it unchanged. With the fix in,
+    /// undo it: make the `FinalizeAction::Quiesce` arm of
+    /// `ConnectionH2::finalize_write` withdraw WRITABLE without re-arming it
+    /// when `self.state` is `H2State::GoAway` or `H2State::Error`, and the
+    /// same assertion fails with the same message. The fix itself is, in that
+    /// arm, `self.readiness.arm_writable()` for those two states: with it
+    /// this test passes, and so does
+    /// `an_error_goaway_whose_parked_stream_retires_still_reaches_the_error_linger`.
+    #[test]
+    fn an_error_goaway_whose_parked_stream_stays_open_still_reaches_the_error_linger() {
+        let (_pool, mut connection, mut context, mut router, gid) = park_half_written_frame();
+        // The stream is open and has no response to finish: it waits on its
+        // backend. `Linked` keeps the closing connection from pruning it.
+        context.streams[gid].state = StreamState::Linked(mio::Token(1));
+        let _ = connection.core.goaway(H2Error::EnhanceYourCalm);
+        connection.socket.budget = usize::MAX;
+        assert!(
+            connection.core.stream_table.expect_write().is_some()
+                && connection.core.readiness.interest.is_writable()
+                && !connection.core.readiness.interest.is_readable(),
+            "premise: the GOAWAY left a parked stream, WRITABLE wanted and no reads, got {:?}",
+            connection.core.readiness
+        );
+
+        // The resume pass: it finishes the parked frame and the GOAWAY behind
+        // it, and leaves the stream open.
+        let resume = connection.writable(&mut context, EndpointClient(&mut router));
+        assert!(
+            matches!(resume, MuxResult::Continue),
+            "the resume pass hands the close to a later one, got {resume:?}"
+        );
+        let enhance_your_calm = u32::from(H2Error::EnhanceYourCalm as u8);
+        let mut goaway_payload = 0u32.to_be_bytes().to_vec();
+        goaway_payload.extend_from_slice(&enhance_your_calm.to_be_bytes());
+        assert_eq!(
+            peer_frames(&connection.socket.wire),
+            Ok(vec![
+                (0, 0, REGISTERED_STREAM_ID, HALF_WRITTEN_PAYLOAD.to_vec()),
+                (7, 0, 0, goaway_payload),
+            ]),
+            "premise: the resume pass wrote the rest of the DATA frame and the GOAWAY"
+        );
+        assert!(
+            connection.core.stream_table.expect_write().is_none()
+                && connection
+                    .core
+                    .stream_table
+                    .streams()
+                    .contains_key(&REGISTERED_STREAM_ID),
+            "premise: the park is drained and the stream is still open"
+        );
+
+        drive_unthrottled(&mut connection, &mut context, &mut router);
+
+        assert!(
+            matches!(
+                connection.core.linger,
+                Linger::Draining { remaining, .. } if remaining == ERROR_GOAWAY_LINGER_MAX_BYTES
+            ),
+            "the close decision of the GoAway arm was never reached: the resume \
+             pass withdrew WRITABLE with the stream still open and nothing \
+             wakes the session before a backend byte or a timer, state {:?}, \
+             linger {:?}, readiness {:?}",
+            connection.core.state,
+            connection.core.linger,
+            connection.core.readiness
         );
     }
 
@@ -22027,21 +22333,29 @@ pub(super) mod tests {
         );
 
         // Exactly #1423's trigger: the connection is draining AND the
-        // frontend readiness reports HUP, landing squarely mid-reassembly.
-        // A peer can legitimately produce this by sending TCP FIN together
-        // with (or shortly after) the last CONTINUATION frame it manages to
-        // get out, observed by edge-triggered epoll as one combined event.
+        // frontend readiness reports a hang-up (HUP and WRITE_CLOSED; a
+        // half-close's HUP alone no longer reaches this stage), landing
+        // squarely mid-reassembly. A hang-up can still leave bytes the peer
+        // sent before it, its last CONTINUATION frame, unread in the kernel.
         connection.core.drain.__test_set_draining();
-        connection.core.readiness.event.insert(Ready::HUP);
+        connection
+            .core
+            .readiness
+            .event
+            .insert(Ready::HUP | Ready::WRITE_CLOSED);
 
-        // `flush_pending_control_frames`'s first, HUP-gated stage fires
+        // `flush_pending_control_frames`'s first, hang-up-gated stage fires
         // here.
         connection.writable(&mut context, EndpointClient(&mut router));
 
         // Real epoll delivers HUP once; un-signal it so the reads below
         // reflect the peer's normal traffic rather than a second synthetic
         // HUP this test injected by hand.
-        connection.core.readiness.event.remove(Ready::HUP);
+        connection
+            .core
+            .readiness
+            .event
+            .remove(Ready::HUP | Ready::WRITE_CLOSED);
 
         // Now the CONTINUATION frame completing the block arrives — still
         // fully deliverable, exactly as it would be if the peer's FIN and
@@ -22615,13 +22929,21 @@ pub(super) mod tests {
         );
 
         // Exactly B2's trigger: the connection is draining AND the frontend
-        // readiness reports HUP, landing squarely mid-payload-read — the
-        // shape a TCP half-close produces (mio's `is_read_closed()` can be
-        // true with data the peer already sent still unread).
+        // readiness reports a hang-up (HUP and WRITE_CLOSED), landing squarely
+        // mid-payload-read. A half-close's HUP alone no longer reaches this
+        // stage, but a hang-up can still leave data the peer sent unread.
         connection.core.drain.__test_set_draining();
-        connection.core.readiness.event.insert(Ready::HUP);
+        connection
+            .core
+            .readiness
+            .event
+            .insert(Ready::HUP | Ready::WRITE_CLOSED);
         connection.writable(&mut context, EndpointClient(&mut router));
-        connection.core.readiness.event.remove(Ready::HUP);
+        connection
+            .core
+            .readiness
+            .event
+            .remove(Ready::HUP | Ready::WRITE_CLOSED);
 
         // Now the second TCP segment, completing the CONTINUATION frame's
         // payload, arrives.
@@ -23363,9 +23685,17 @@ pub(super) mod tests {
                 }
                 Interleave::HupWhileDraining => {
                     connection.core.drain.__test_set_draining();
-                    connection.core.readiness.event.insert(Ready::HUP);
+                    connection
+                        .core
+                        .readiness
+                        .event
+                        .insert(Ready::HUP | Ready::WRITE_CLOSED);
                     connection.writable(context, EndpointClient(router));
-                    connection.core.readiness.event.remove(Ready::HUP);
+                    connection
+                        .core
+                        .readiness
+                        .event
+                        .remove(Ready::HUP | Ready::WRITE_CLOSED);
                 }
                 Interleave::GracefulGoaway => {
                     if !connection.core.drain.draining() {

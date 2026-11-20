@@ -743,7 +743,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:5102-5115
+```rust lib/src/protocol/mux/h2.rs:5152-5165
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -769,7 +769,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:5153-5159
+```rust lib/src/protocol/mux/h2.rs:5203-5209
 let events = stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -809,7 +809,7 @@ taken at the top of `H2WritePhase::Flush`'s post-flush tail
 (`ConnectionH2::poll_write_target`, `lib/src/protocol/mux/h2.rs`) and passes `stream.linked_token()` straight
 out of it:
 
-```rust lib/src/protocol/mux/h2.rs:3819-3820
+```rust lib/src/protocol/mux/h2.rs:3832-3833
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 ```
@@ -1162,7 +1162,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9744-9748
+```rust lib/src/protocol/mux/h2.rs:9794-9798
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1351,7 +1351,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9926-9930
+```rust lib/src/protocol/mux/h2.rs:9976-9980
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1422,13 +1422,20 @@ application frames, in order:
 
 1. **Frontend-hung-up-while-draining cleanup**: if
    `frontend_hung_up_while_draining()` (`Position::Server`, draining, AND a
-   HUP/ERROR readiness event — all three), clears `expect_write`, the output
-   queue, the pending WINDOW_UPDATE queue and `pending_rst_streams` — the peer
-   is gone, so nothing queued for it will ever reach it. It clears output
-   only: `zero` is input, and `Ready::HUP` is `is_read_closed() ||
-   is_write_closed()` (`command/src/ready.rs`), which mio documents as true on
-   a TCP half-close too, where data the peer already sent can still be sitting
-   unread in the kernel receive queue. `drive_frontend_shutdown_io` (`mod.rs`)
+   WRITE_CLOSED/ERROR readiness event — all three), clears `expect_write`, the
+   output queue, the pending WINDOW_UPDATE queue and `pending_rst_streams` —
+   the peer is gone, so nothing queued for it will ever reach it. `Ready::HUP`
+   alone is not a hang-up: it is `is_read_closed() || is_write_closed()`
+   (`command/src/ready.rs`), so a TCP half-close (the client's FIN) raises it
+   while `WRITE_CLOSED` (`EPOLLHUP` or `EPOLLERR`, which a half-close never
+   raises) stays clear, and that client still reads. Taking the half-close
+   for a hang-up dropped the tail of a frame a short write had cut, the park,
+   the control queues and the TLS records still to flush, for a client
+   `Mux::frontend_exchange_in_flight` (`mod.rs`) keeps serving
+   ([#1779](https://github.com/sozu-proxy/sozu/issues/1779)); the stage reads
+   the same two bits that function reads. It clears output
+   only: `zero` is input, and a hang-up can still follow data the peer
+   already sent, sitting unread in the kernel receive queue. `drive_frontend_shutdown_io` (`mod.rs`)
    force-calls `readable()` for H2 on every `shutting_down()` poll, so a
    CONTINUATION frame split across TCP segments landing a HUP event alongside
    its first segment is the ordinary soft-stop path. Review of this stage's
@@ -1707,7 +1714,21 @@ live.
 `write_streams` ends by asking `finalize_write` what the pass owes the next
 tick, handing it the `tls_wants_write` answer it read itself. After the RFC 9113
 §6.8 graceful-GOAWAY check (draining with every stream gone), the rest is one
-decision taken in `h2_close::finalize_action`; the four readiness answers are
+decision taken in `h2_close::finalize_action`. That check sends the final
+GOAWAY only once: a connection already in `H2State::GoAway` or `H2State::Error`
+has sent (or failed to send) it, so a pass that retires the last stream of
+such a connection, the resume of a stream a stalled write had parked, queues no
+second GOAWAY and re-arms WRITABLE with `Readiness::arm_writable` for the close
+decision of the `H2State::GoAway` arm instead. The second GOAWAY would have
+set `graceful_goaway` on an error GOAWAY and given its close the graceful
+linger budget. The same close decision is why the `Quiesce` answer is not
+taken as written in those two states: a connection that has sent its final
+GOAWAY reads neither a `WINDOW_UPDATE` nor a new request, so the resume of a
+parked stream that stays open (it waits on its backend, so the table is not
+empty) would withdraw the only readiness that reaches the `H2State::GoAway`
+arm, and the session, its streams and its backend connections would wait for a
+backend byte or a timer. `finalize_write` re-arms WRITABLE there instead. The
+four readiness answers are
 performed here and the two TLS answers are handed back to `write_streams` as an
 `H2FinalizeTarget`, whose second call is `finalize_write_after_flush`:
 
@@ -1718,7 +1739,7 @@ performed here and the two TLS answers are handed back to `write_streams` as an
 | `Parked` | a partial write set `expect_write`: it owns the next tick, no bit moves |
 | `RetainPendingBack` | LIFECYCLE §9 invariant 16: progress plus queued response bytes, so `Ready::WRITABLE` survives (the absence of the withdrawal below) |
 | `ArmControlQueue` | a deferred RST_STREAM / WINDOW_UPDATE is still queued: `Readiness::arm_writable` |
-| `Quiesce` | nothing owed anywhere: withdraw `Ready::WRITABLE` interest |
+| `Quiesce` | nothing owed anywhere: withdraw `Ready::WRITABLE` interest; in `H2State::GoAway` and `H2State::Error`, which read nothing that could wake the connection, `Readiness::arm_writable` instead so the next pass takes the close decision |
 | `ReArm` | post-flush: records survived, re-arm the edge-triggered WRITABLE event |
 | `Settled` | post-flush: the kernel took everything |
 
@@ -1826,7 +1847,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:9245
+```rust lib/src/protocol/mux/h2.rs:9295
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -1884,8 +1905,10 @@ H2 stream state, GOAWAY sequencing, and rustls buffering interact:
   no longer correspond to useful work.
 - `peer_gone_after_final_goaway()` is the terminal shutdown condition for the
   frontend H2 connection. Once the final GOAWAY has been queued, all stream
-  mappings are gone, and the peer has already hung up, the remaining rustls
-  backlog is no longer deliverable and the session may close immediately.
+  mappings are gone, and the peer has already hung up (`WRITE_CLOSED` or
+  `ERROR`, not the `HUP` alone of a client's half-close, which still reads),
+  the remaining rustls backlog is no longer deliverable and the session may
+  close immediately.
 - While the peer is still there, a close after a final GOAWAY lingers
   instead (`H2Shell::linger_instead_of_closing`): `close_notify` is flushed,
   the write side is shut down, and what the client still sends is read and
@@ -2070,7 +2093,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:7685-7687
+```rust lib/src/protocol/mux/h2.rs:7735-7737
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -2078,7 +2101,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:7699-7705
+```rust lib/src/protocol/mux/h2.rs:7749-7755
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.

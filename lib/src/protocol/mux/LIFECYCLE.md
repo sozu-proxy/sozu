@@ -1786,10 +1786,24 @@ Two GOAWAY frames in `ConnectionH2::graceful_goaway` (`h2.rs`):
    forced-close budget elapses first (§8.3), `Mux::shutting_down_inner` sends
    it through `ConnectionH2::goaway_before_forced_close` instead, which
    reports a stream whose opening block never completed as unprocessed
-   (invariant 31).
+   (invariant 31). A connection already in `H2State::GoAway` or
+   `H2State::Error` has sent (or failed to send) its final GOAWAY and gets no
+   second one: when the resume of a stream parked by a stalled write retires
+   the last stream of such a connection, `ConnectionH2::finalize_write` only
+   re-arms WRITABLE for the close decision of the `H2State::GoAway` arm
+   and does not call `graceful_goaway`. A second `goaway(NoError)` there
+   would put another GOAWAY(NO_ERROR) on the wire after an error GOAWAY and
+   mark the connection graceful, which hands its close the graceful linger
+   budget below instead of the error one.
 
 `peer_gone_after_final_goaway` (`h2.rs`) guards against deadlock on a
-peer-side HUP after the final GOAWAY.
+peer-side hang-up after the final GOAWAY. A hang-up is `WRITE_CLOSED`
+(`EPOLLHUP`, or `EPOLLERR`) or `ERROR` (`ConnectionH2::frontend_hung_up_while_draining`),
+the two bits `Mux::frontend_exchange_in_flight` reads (§2.4), not the `HUP`
+alone of a client's half-close: that client still reads, so the TLS records
+still buffered are flushed, a close after the final GOAWAY lingers (the client's
+EOF is already there, so the drain ends at once), and a draining connection
+keeps its output queue, its parked stream and its control frames for it.
 
 **The close after a final GOAWAY lingers.** The client may still be
 sending frames it wrote before it read the GOAWAY (RFC 9113 §6.8 lets it), and
@@ -1844,7 +1858,14 @@ socket for at most 1 s and 256 KiB of reads. Pinned by
 `an_error_goaway_lingers_under_the_short_budget_and_a_graceful_one_keeps_its_own`,
 `an_error_goaway_linger_releases_its_streams_and_backends_when_it_starts`
 and `an_error_goaway_linger_pending_on_close_notify_releases_before_pending_links`
-(`mod.rs`). `ConnectionH2::arm_timeout` and `set_timeout_duration` leave the
+(`mod.rs`), and, for the parked stream whose resume retires the last stream
+of an error GOAWAY (no second GOAWAY, still the error budget), by
+`an_error_goaway_gets_no_second_graceful_goaway_when_the_parked_stream_retires`
+and `an_error_goaway_whose_parked_stream_retires_still_reaches_the_error_linger`
+(`h2.rs`), and, for the parked stream that drains but stays open (it waits on
+its backend, so the resume pass quiesces), by
+`an_error_goaway_whose_parked_stream_stays_open_still_reaches_the_error_linger`
+(`h2.rs`). `ConnectionH2::arm_timeout` and `set_timeout_duration` leave the
 deadline in place, so bytes the client sends never extend it. The lingering `readable`
 and `writable` passes adopt the pass's clock (`ConnectionH2::adopt_now`)
 before they return, so the bounds are: the linger deadline,
@@ -3017,7 +3038,12 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     zero-progress pass (e.g. all streams flow-control-starved) must relinquish
     `Ready::WRITABLE` so the session dispatcher does not busy-spin — the next
     wake-up arrives from `WINDOW_UPDATE`, backend readable, or a new request.
-    Enforced at runtime via the file-private helper
+    The exception is a connection in `H2State::GoAway` or `H2State::Error`: it
+    reads none of those but the backend's, so `finalize_write` re-arms the bit
+    on a `Quiesce` there (`Readiness::arm_writable`) and the next pass takes
+    the close decision of the `H2State::GoAway` arm of
+    `ConnectionH2::dispatch_writable_state`, instead of waiting for a backend
+    byte or a timer. Enforced at runtime via the file-private helper
     `any_stream_has_pending_back` (`h2.rs`), which `finalize_write` hands to
     `h2_close::finalize_action` as a closure rather than a `bool` so the walk
     stays behind the same short-circuit it had inline. The decision is that

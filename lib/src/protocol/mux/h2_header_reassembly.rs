@@ -93,6 +93,13 @@
 //! now shares the same guard its three siblings already had, closing
 //! #1423 for real.
 //!
+//! The stage no longer fires on a half-close at all:
+//! `ConnectionH2::frontend_hung_up_while_draining`
+//! (`lib/src/protocol/mux/h2.rs`) reads `WRITE_CLOSED` or `ERROR`, not
+//! `HUP` alone, since a half-closed client still reads what it is owed. A
+//! hang-up can still leave bytes the peer sent unread, so the stage keeps
+//! leaving input alone.
+//!
 //! No dependency was added: this is a plain `Vec<u8>`, exactly what
 //! `CONTRIBUTING.md`'s dependency policy and this step's task both require.
 
