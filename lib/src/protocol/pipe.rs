@@ -22,7 +22,7 @@ use crate::{
     L7Proxy, ListenerHandler, Protocol, Readiness, SessionMetrics, SessionResult, StateResult,
     backends::Backend,
     pool::Checkout,
-    protocol::{SessionState, http::parser::Method},
+    protocol::{SessionState, http::parser::Method, mux::drain_tls_close_notify},
     socket::{SocketHandler, SocketResult, TransportProtocol, stats::socket_rtt},
     sozu_command::ready::Ready,
     timer::TimeoutContainer,
@@ -106,6 +106,10 @@ pub struct Pipe<Front: SocketHandler, L: ListenerHandler> {
     pub container_backend_timeout: Option<TimeoutContainer>,
     pub container_frontend_timeout: Option<TimeoutContainer>,
     frontend_buffer: Checkout,
+    /// Set once `SessionState::close` has queued the frontend's TLS
+    /// `close_notify`: a second alert would corrupt the TLS stream
+    /// (`drain_tls_close_notify`, `lib/src/protocol/mux/shared.rs`).
+    close_notify_sent: bool,
     pub frontend_readiness: Readiness,
     frontend_status: ConnectionStatus,
     frontend_token: Token,
@@ -195,6 +199,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             container_backend_timeout,
             container_frontend_timeout,
             frontend_buffer,
+            close_notify_sent: false,
             frontend_readiness: Readiness {
                 interest: Ready::READABLE | Ready::WRITABLE | Ready::HUP | Ready::ERROR,
                 event: Ready::EMPTY,
@@ -535,9 +540,16 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         let request_is_inflight = self.frontend_buffer.available_data() > 0
             || self.frontend_readiness.event.is_readable()
             || self.splice_in_pending() > 0;
+        // Plaintext a TLS frontend absorbed is not delivered: `socket_write`
+        // reports it consumed while its records still sit inside rustls
+        // (at most 64 KiB) until the kernel takes them, so the response is in
+        // flight for as long as the frontend wants to write. A plaintext
+        // frontend never does (`SocketHandler::socket_wants_write`,
+        // `lib/src/socket.rs`).
         let response_is_inflight = self.backend_buffer.available_data() > 0
             || self.backend_readiness.event.is_readable()
-            || self.splice_out_pending() > 0;
+            || self.splice_out_pending() > 0
+            || self.frontend.socket_wants_write();
         match (self.frontend_status, self.backend_status) {
             (ConnectionStatus::Normal, ConnectionStatus::Normal) => true,
             (ConnectionStatus::Normal, ConnectionStatus::ReadOpen) => true,
@@ -654,8 +666,33 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 );
                 SessionResult::Continue
             } else {
-                self.log_request_success(metrics);
-                SessionResult::Close
+                match self.flush_frontend_records() {
+                    SocketResult::WouldBlock => {
+                        // The frontend still owes the client records rustls
+                        // absorbed and the socket refused: closing now drops
+                        // them. The refusal just consumed the WRITABLE edge,
+                        // so only the interest is armed; forcing the event
+                        // would make `ready` write, meet the same refusal and
+                        // come back here until `MAX_LOOP_ITERATIONS`. The next
+                        // real edge runs `writable`, which flushes and then
+                        // closes through `check_connections`.
+                        self.frontend_readiness.interest.insert(Ready::WRITABLE);
+                        self.frontend_readiness.event.remove(Ready::WRITABLE);
+                        debug!(
+                            "{} Pipe::backend_hup: backend connection closed, keeping alive due to TLS records the frontend socket refused.",
+                            log_context!(self)
+                        );
+                        SessionResult::Continue
+                    }
+                    SocketResult::Error => {
+                        self.log_request_error(metrics, "front socket write error");
+                        SessionResult::Close
+                    }
+                    SocketResult::Continue | SocketResult::Closed => {
+                        self.log_request_success(metrics);
+                        SessionResult::Close
+                    }
+                }
             }
         } else {
             debug!(
@@ -667,6 +704,25 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 self.backend_readiness.interest.insert(Ready::READABLE);
             }
             SessionResult::Continue
+        }
+    }
+
+    /// Hand the records a TLS frontend holds inside rustls to its socket.
+    ///
+    /// `SocketHandler::socket_write` (`lib/src/socket.rs`) reports plaintext
+    /// as written once rustls has absorbed it, and `consume` drops it from
+    /// `backend_buffer` at once, so a write that met `WouldBlock` leaves up
+    /// to 64 KiB of ciphertext that nothing but another `socket_write` (an
+    /// empty one flushes) can send. Returns `Continue` when nothing is left
+    /// to send, whatever the handler (a plaintext frontend never wants to
+    /// write), and otherwise the result of the flush: `WouldBlock` when the
+    /// kernel refused the rest and a later WRITABLE edge must resume,
+    /// `Closed` or `Error` when the channel is dead.
+    fn flush_frontend_records(&mut self) -> SocketResult {
+        if self.frontend.socket_wants_write() {
+            self.frontend.socket_write(&[]).1
+        } else {
+            SocketResult::Continue
         }
     }
 
@@ -830,8 +886,41 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
         trace!("{} Pipe writable", log_context!(self));
         if self.backend_buffer.available_data() == 0 {
+            // Nothing is buffered, but a TLS frontend may still hold records
+            // rustls absorbed from an earlier write that met `WouldBlock`.
+            // This WRITABLE edge is the one that can send them, and
+            // `flush_frontend_records` is the only thing that does:
+            // dropping the interest first would strand them until the
+            // backend happens to send again.
+            let records_pending = self.frontend.socket_wants_write();
+            match self.flush_frontend_records() {
+                SocketResult::WouldBlock => {
+                    // The interest stays, so the next edge resumes the flush.
+                    self.frontend_readiness.event.remove(Ready::WRITABLE);
+                    return SessionResult::Continue;
+                }
+                SocketResult::Error => {
+                    self.reset_readiness_for_close();
+                    self.log_request_error(metrics, "front socket write error");
+                    return SessionResult::Close;
+                }
+                SocketResult::Closed => {
+                    self.reset_readiness_for_close();
+                    self.log_request_success(metrics);
+                    return SessionResult::Close;
+                }
+                SocketResult::Continue => {}
+            }
             self.backend_readiness.interest.insert(Ready::READABLE);
             self.frontend_readiness.interest.remove(Ready::WRITABLE);
+            // The records were the last response in flight
+            // (`check_connections`), and no later event is guaranteed to end
+            // a half-closed session: run the gate every drain runs.
+            if records_pending && !self.check_connections() {
+                self.reset_readiness_for_close();
+                self.log_request_success(metrics);
+                return SessionResult::Close;
+            }
             return SessionResult::Continue;
         }
 
@@ -1681,8 +1770,23 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
     ) -> SessionResult {
         let mut counter = 0;
 
+        // A client that sends its last frame and half-closes can deliver both
+        // as ONE `READABLE | HUP` event (Linux coalesces `EPOLLIN |
+        // EPOLLRDHUP`). Closing on the bare HUP dropped that frame, and the
+        // session never reached the access log: `frontend_hup` drains what is
+        // in flight, or logs and closes when nothing is, exactly as
+        // `TcpSession::ready_inner` (`lib/src/tcp.rs`) does for a TCP pipe.
         if self.frontend_readiness.event.is_hup() {
-            return SessionResult::Close;
+            let session_result = self.frontend_hup(metrics);
+            if session_result != SessionResult::Continue {
+                return session_result;
+            }
+            // `frontend_hup` kept the session alive to drain the request
+            // bytes. The client already sent its FIN, so edge-triggered epoll
+            // offers no further frontend event: clear the consumed HUP bit
+            // and let the loop below read the kernel tail and flush
+            // `frontend_buffer` in this same pass.
+            self.frontend_readiness.event.remove(Ready::HUP);
         }
 
         while counter < MAX_LOOP_ITERATIONS {
@@ -1739,6 +1843,10 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
                 self.frontend_readiness.interest = Ready::EMPTY;
                 self.backend_readiness.interest = Ready::EMPTY;
 
+                // Every other exit of this loop ends the session through a
+                // handler that logs it: this one must too, or the session
+                // never reaches the access log or the end-of-session metrics.
+                self.log_request(metrics, true, Some("frontend socket error"));
                 return SessionResult::Close;
             }
 
@@ -1762,6 +1870,7 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
 
             incr!(names::http::INFINITE_LOOP_ERROR);
             self.print_state(self.protocol_string());
+            self.log_request(metrics, true, Some("session loop limit reached"));
 
             return SessionResult::Close;
         }
@@ -1812,6 +1921,26 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
             let mut backend = backend.borrow_mut();
             backend.active_requests = backend.active_requests.saturating_sub(1);
         }
+
+        // The TLS teardown the session's own `close` expects from its state
+        // (`HttpsSession::close` in `lib/src/https.rs` shuts the TCP write
+        // side right after): RFC 8446 section 6.1 wants a `close_notify`
+        // before it, and the alert and the records still inside rustls only
+        // leave through a flush, as the mux does on close. Bounded, because
+        // this runs inside the single-threaded event loop; whatever the
+        // kernel still refuses is reported. A plaintext frontend (TCP,
+        // `ws://`) has neither a close nor a record to flush, so this is a
+        // flag write for it.
+        let (records_pending, drain_rounds) =
+            drain_tls_close_notify(&mut self.frontend, &mut self.close_notify_sent);
+        if records_pending {
+            warn!(
+                "{} Pipe TLS records NOT fully flushed on close: drain_rounds={}, frontend_readiness={:?}",
+                log_context!(self),
+                drain_rounds,
+                self.frontend_readiness
+            );
+        }
     }
 
     fn print_state(&self, context: &str) {
@@ -1849,7 +1978,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::pool::Pool;
+    use crate::{pool::Pool, socket::FrontRustls};
 
     struct TestListener {
         address: SocketAddr,
@@ -3386,6 +3515,695 @@ mod tests {
             pipe.get_backend_address(),
             Some(retried),
             "a later dial must replace the reported backend address"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // WebSocket pipe teardown: frontend hang-up and unflushed TLS records
+    // ------------------------------------------------------------------
+
+    /// `SessionState::ready` ignores the session and proxy handles it is
+    /// given (the same stand-ins as the expect stage's tests), so neither
+    /// answers anything.
+    struct UnusedSession;
+
+    impl crate::ProxySession for UnusedSession {
+        fn protocol(&self) -> Protocol {
+            unreachable!("Pipe::ready never asks the session")
+        }
+        fn ready(
+            &mut self,
+            _session: Rc<RefCell<dyn crate::ProxySession>>,
+        ) -> crate::SessionIsToBeClosed {
+            unreachable!("Pipe::ready never asks the session")
+        }
+        fn update_readiness(&mut self, _token: Token, _events: Ready) {
+            unreachable!("Pipe::ready never asks the session")
+        }
+        fn close(&mut self) {
+            unreachable!("Pipe::ready never asks the session")
+        }
+        fn timeout(&mut self, _t: Token) -> crate::SessionIsToBeClosed {
+            unreachable!("Pipe::ready never asks the session")
+        }
+        fn last_event(&self) -> std::time::Instant {
+            unreachable!("Pipe::ready never asks the session")
+        }
+        fn print_session(&self) {
+            unreachable!("Pipe::ready never asks the session")
+        }
+        fn frontend_token(&self) -> Token {
+            unreachable!("Pipe::ready never asks the session")
+        }
+        fn shutting_down(&mut self) -> crate::SessionIsToBeClosed {
+            unreachable!("Pipe::ready never asks the session")
+        }
+    }
+
+    struct UnusedProxy;
+
+    impl crate::L7Proxy for UnusedProxy {
+        fn kind(&self) -> sozu_command::proto::command::ListenerType {
+            unreachable!("Pipe::ready never asks the proxy")
+        }
+        fn register_socket(
+            &self,
+            _socket: &mut TcpStream,
+            _token: Token,
+            _interest: mio::Interest,
+        ) -> Result<(), std::io::Error> {
+            unreachable!("Pipe::ready never asks the proxy")
+        }
+        fn add_session(&self, _session: Rc<RefCell<dyn crate::ProxySession>>) -> Token {
+            unreachable!("Pipe::ready never asks the proxy")
+        }
+        fn remove_session(&self, _token: Token) -> bool {
+            unreachable!("Pipe::ready never asks the proxy")
+        }
+        fn clusters(
+            &self,
+        ) -> &std::collections::HashMap<ClusterId, sozu_command::proto::command::Cluster> {
+            unreachable!("Pipe::ready never asks the proxy")
+        }
+        fn sessions(&self) -> Rc<RefCell<crate::server::SessionManager>> {
+            unreachable!("Pipe::ready never asks the proxy")
+        }
+    }
+
+    type UnusedHandles = (
+        Rc<RefCell<dyn crate::ProxySession>>,
+        Rc<RefCell<dyn crate::L7Proxy>>,
+    );
+
+    fn unused_handles() -> UnusedHandles {
+        (
+            Rc::new(RefCell::new(UnusedSession)),
+            Rc::new(RefCell::new(UnusedProxy)),
+        )
+    }
+
+    /// The endpoint a WebSocket pipe carries after an HTTP upgrade, as
+    /// `HttpsSession::upgrade_mux` and its plaintext twin build it.
+    fn websocket_endpoint() -> WebSocketContext {
+        WebSocketContext::Http {
+            method: None,
+            authority: None,
+            path: None,
+            status: None,
+            reason: None,
+        }
+    }
+
+    /// The `revents` `poll(2)` reports for `fd` once any of `events` is set,
+    /// or after `timeout`.
+    fn poll_revents(fd: std::os::fd::RawFd, events: libc::c_short, timeout: Duration) -> i16 {
+        let mut pollfd = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        // SAFETY: one valid `pollfd` borrowed for the duration of the call.
+        let ready = unsafe { libc::poll(&mut pollfd, 1, timeout.as_millis() as libc::c_int) };
+        assert!(
+            ready >= 0,
+            "poll(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+        pollfd.revents
+    }
+
+    /// A plaintext WebSocket pipe (`Protocol::HTTP`, as an `ws://` upgrade
+    /// creates it) over a connected frontend and backend.
+    fn plain_websocket_pipe(
+        pool: &mut Pool,
+        frontend_socket: StdTcpStream,
+        backend_socket: StdTcpStream,
+    ) -> Pipe<TcpStream, TestListener> {
+        let address = "127.0.0.1:0".parse().expect("test address");
+        let listener = Rc::new(RefCell::new(TestListener { address }));
+        let mut pipe = Pipe::new(
+            pool.checkout().expect("backend buffer"),
+            None,
+            Some(TcpStream::from_std(backend_socket)),
+            None,
+            None,
+            None,
+            None,
+            pool.checkout().expect("frontend buffer"),
+            Token(0),
+            TcpStream::from_std(frontend_socket),
+            listener,
+            Protocol::HTTP,
+            Ulid::generate(),
+            Ulid::generate(),
+            None,
+            websocket_endpoint(),
+        );
+        pipe.set_back_token(Token(1));
+        pipe
+    }
+
+    /// The client's last WebSocket frame is on the wire together with its FIN
+    /// (`EPOLLIN | EPOLLRDHUP`, one coalesced event): the pipe must hand the
+    /// frame to the backend before it closes, as `Pipe::frontend_hup` does for
+    /// a TCP session.
+    ///
+    /// `Pipe::ready` returns `Close` as soon as the frontend event carries
+    /// HUP, before it reads the kernel tail, so the frame is dropped.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn websocket_frontend_hup_delivers_the_clients_last_frame_before_closing() {
+        use std::{io::Read, net::Shutdown, os::fd::AsRawFd};
+
+        const LAST_FRAME: &[u8] = b"last websocket frame, sent right before the FIN";
+
+        let (mut frontend_peer, frontend_socket) = connected_pair();
+        let (mut backend_peer, backend_socket) = connected_pair();
+
+        frontend_peer
+            .write_all(LAST_FRAME)
+            .expect("the client writes its last frame");
+        frontend_peer
+            .shutdown(Shutdown::Write)
+            .expect("the client half-closes");
+        // Premise: the kernel really holds both the frame and the FIN.
+        let wanted = libc::POLLIN | libc::POLLRDHUP;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut revents = 0;
+        while revents & wanted != wanted && std::time::Instant::now() < deadline {
+            revents = poll_revents(
+                frontend_socket.as_raw_fd(),
+                wanted,
+                Duration::from_millis(50),
+            );
+        }
+        assert_eq!(
+            revents & wanted,
+            wanted,
+            "premise: the frame and the FIN must both be queued on the frontend socket"
+        );
+
+        let mut pool = Pool::with_capacity(2, 2, 4096);
+        let mut pipe = plain_websocket_pipe(&mut pool, frontend_socket, backend_socket);
+        // The event epoll reports for a frame followed by a FIN.
+        pipe.update_readiness(Token(0), Ready::READABLE | Ready::HUP);
+
+        let (session, proxy) = unused_handles();
+        let mut metrics = SessionMetrics::new(Some(Duration::ZERO));
+        let result = pipe.ready(session, proxy, &mut metrics);
+
+        let mut received = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while received.len() < LAST_FRAME.len() && std::time::Instant::now() < deadline {
+            let mut buf = [0u8; 128];
+            match backend_peer.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => received.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::yield_now(),
+                Err(e) => panic!("backend read failed: {e}"),
+            }
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&received),
+            String::from_utf8_lossy(LAST_FRAME),
+            "the client's last frame never reached the backend: Pipe::ready returned {result:?} \
+             on the frontend HUP without draining the kernel tail"
+        );
+    }
+
+    /// A WebSocket client that closes (FIN, nothing in flight) ends its
+    /// session: the pipe must write the access log and the end-of-session
+    /// metrics once, as `Pipe::frontend_hup` does.
+    ///
+    /// `Pipe::ready` returns `Close` on the HUP without any `log_request*`
+    /// call, so `access_logs.count` never moves.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn websocket_frontend_hup_is_access_logged_once() {
+        use std::{net::Shutdown, os::fd::AsRawFd};
+
+        fn idle_pipe_after_fin(
+            pool: &mut Pool,
+        ) -> (Pipe<TcpStream, TestListener>, [StdTcpStream; 2]) {
+            let (frontend_peer, frontend_socket) = connected_pair();
+            let (backend_peer, backend_socket) = connected_pair();
+            frontend_peer
+                .shutdown(Shutdown::Write)
+                .expect("the client half-closes");
+            let revents = poll_revents(
+                frontend_socket.as_raw_fd(),
+                libc::POLLRDHUP,
+                Duration::from_secs(5),
+            );
+            assert_ne!(
+                revents & libc::POLLRDHUP,
+                0,
+                "premise: the FIN must be queued on the frontend socket"
+            );
+            (
+                plain_websocket_pipe(pool, frontend_socket, backend_socket),
+                [frontend_peer, backend_peer],
+            )
+        }
+
+        let mut pool = Pool::with_capacity(4, 4, 4096);
+        let mut metrics = SessionMetrics::new(Some(Duration::ZERO));
+        let access_logs = || crate::socket::tests::proxy_count(names::access_logs::COUNT);
+
+        // Premise: the oracle sees a close that logs. `frontend_hup` is the
+        // drain-then-log entry the TCP session uses.
+        let before = access_logs();
+        let (mut tcp_style, _peers) = idle_pipe_after_fin(&mut pool);
+        assert_eq!(tcp_style.frontend_hup(&mut metrics), SessionResult::Close);
+        assert_eq!(
+            access_logs() - before,
+            1,
+            "premise: Pipe::frontend_hup must move access_logs.count by one"
+        );
+
+        // The WebSocket entry: the same event through `SessionState::ready`.
+        let before = access_logs();
+        let (mut websocket, _peers) = idle_pipe_after_fin(&mut pool);
+        websocket.update_readiness(Token(0), Ready::HUP);
+        let (session, proxy) = unused_handles();
+        let result = websocket.ready(session, proxy, &mut metrics);
+        assert_eq!(result, SessionResult::Close);
+        assert_eq!(
+            access_logs() - before,
+            1,
+            "a WebSocket session that ends on the client's FIN must reach the access log \
+             and the end-of-session metrics once"
+        );
+    }
+
+    /// Lets `Pipe<FrontRustls, _>` run over a real socket pair whose peer is
+    /// an in-memory rustls client.
+    struct WssFixture {
+        pipe: Pipe<FrontRustls, TestListener>,
+        client: rustls::ClientConnection,
+        client_socket: StdTcpStream,
+        metrics: SessionMetrics,
+        /// Plaintext bytes handed to the pipe through `backend_buffer`.
+        loaded: usize,
+        /// Plaintext bytes the client has decrypted so far.
+        received: usize,
+        _backend_peer: StdTcpStream,
+        _pool: Pool,
+    }
+
+    /// Move every pending TLS byte from `from` to `to`, in memory.
+    fn pump_tls<A, B>(
+        from: &mut rustls::ConnectionCommon<A>,
+        to: &mut rustls::ConnectionCommon<B>,
+    ) {
+        let mut wire = Vec::new();
+        while from.wants_write() {
+            from.write_tls(&mut wire)
+                .expect("a TLS flight must serialize into memory");
+        }
+        let mut cursor = std::io::Cursor::new(wire.as_slice());
+        while (cursor.position() as usize) < wire.len() {
+            to.read_tls(&mut cursor)
+                .expect("a TLS flight must be readable from memory");
+            to.process_new_packets()
+                .expect("a TLS flight must process cleanly");
+        }
+    }
+
+    impl WssFixture {
+        fn new() -> Self {
+            use socket2::{Domain, SockRef, Socket, Type};
+
+            // Small kernel buffers on both ends, so a few KiB of ciphertext
+            // fill the connection while the client does not read.
+            let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind the WSS listener");
+            let client_socket =
+                Socket::new(Domain::IPV4, Type::STREAM, None).expect("a client socket");
+            client_socket
+                .set_recv_buffer_size(4096)
+                .expect("SO_RCVBUF on the client");
+            client_socket
+                .connect(&listener.local_addr().expect("listener address").into())
+                .expect("the client connects");
+            let client_socket = StdTcpStream::from(client_socket);
+            let (frontend_socket, _) = listener.accept().expect("accept the client");
+            SockRef::from(&frontend_socket)
+                .set_send_buffer_size(4096)
+                .expect("SO_SNDBUF on the frontend");
+            client_socket
+                .set_nonblocking(true)
+                .expect("client nonblocking");
+            frontend_socket
+                .set_nonblocking(true)
+                .expect("frontend nonblocking");
+
+            // Settle a TLS 1.3 handshake in memory, so the real socket only
+            // ever carries application records.
+            let (mut session, mut client) =
+                crate::socket::rustls_read_tests::fresh_pair(Vec::new());
+            for _ in 0..16 {
+                if !client.is_handshaking() && !session.is_handshaking() && !client.wants_write() {
+                    break;
+                }
+                pump_tls(&mut client, &mut session);
+                pump_tls(&mut session, &mut client);
+            }
+            pump_tls(&mut session, &mut client);
+            assert!(
+                !session.is_handshaking() && !client.is_handshaking(),
+                "premise: the in-memory handshake must complete"
+            );
+            assert!(
+                !session.wants_write() && !client.wants_write(),
+                "premise: no TLS record may be pending after the handshake"
+            );
+
+            let (_backend_peer, backend_socket) = connected_pair();
+            // A buffer holds the largest burst the tests hand to the pipe.
+            let mut pool = Pool::with_capacity(2, 2, 65536);
+            let address = "127.0.0.1:0".parse().expect("test address");
+            let listener = Rc::new(RefCell::new(TestListener { address }));
+            let mut pipe = Pipe::new(
+                pool.checkout().expect("backend buffer"),
+                None,
+                Some(TcpStream::from_std(backend_socket)),
+                None,
+                None,
+                None,
+                None,
+                pool.checkout().expect("frontend buffer"),
+                Token(0),
+                FrontRustls {
+                    stream: TcpStream::from_std(frontend_socket),
+                    session,
+                    peer_disconnected: false,
+                    peer_reset: false,
+                    tls_fatal: false,
+                    session_ulid: Ulid::generate(),
+                    configured_peer: None,
+                    recv_memory: crate::socket::RecvMemory::default(),
+                },
+                listener,
+                Protocol::HTTPS,
+                Ulid::generate(),
+                Ulid::generate(),
+                None,
+                websocket_endpoint(),
+            );
+            pipe.set_back_token(Token(1));
+
+            Self {
+                pipe,
+                client,
+                client_socket,
+                metrics: SessionMetrics::new(Some(Duration::ZERO)),
+                loaded: 0,
+                received: 0,
+                _backend_peer,
+                _pool: pool,
+            }
+        }
+
+        /// What the backend sent: `backend_readable` queues `bytes` in
+        /// `backend_buffer` and arms the frontend WRITABLE interest and event;
+        /// the WRITABLE event then runs the response direction.
+        fn push(&mut self, bytes: &[u8]) -> SessionResult {
+            self.pipe
+                .backend_buffer
+                .write_all(bytes)
+                .expect("the backend buffer holds the burst");
+            self.loaded += bytes.len();
+            self.pipe.frontend_readiness.arm_writable();
+            self.pipe.writable(&mut self.metrics)
+        }
+
+        /// The client reads its socket dry and decrypts what arrived.
+        fn drain_client(&mut self) {
+            use std::io::Read;
+
+            loop {
+                match self.client.read_tls(&mut self.client_socket) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        self.client
+                            .process_new_packets()
+                            .expect("the client must accept the server's records");
+                        let mut buf = [0u8; 4096];
+                        loop {
+                            match self.client.reader().read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => self.received += n,
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                Err(e) => panic!("client plaintext read failed: {e}"),
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("client socket read failed: {e}"),
+                }
+            }
+        }
+
+        /// Premise: a small burst round-trips, so a shortfall later is the
+        /// pipe's and not the fixture's.
+        fn prove_the_round_trip(&mut self) {
+            use std::os::fd::AsRawFd;
+
+            assert_eq!(self.push(b"premise"), SessionResult::Continue);
+            let revents = poll_revents(
+                self.client_socket.as_raw_fd(),
+                libc::POLLIN,
+                Duration::from_secs(5),
+            );
+            assert_ne!(revents & libc::POLLIN, 0, "premise: the record must arrive");
+            self.drain_client();
+            assert_eq!(
+                (self.received, self.pipe.frontend.socket_wants_write()),
+                (self.loaded, false),
+                "premise: a small burst must be decrypted by the client and leave rustls empty"
+            );
+        }
+
+        /// Hand the pipe a burst while the connection is full: rustls absorbs
+        /// all of it (its send buffer holds 64 KiB), the kernel takes only a
+        /// few KiB, and `backend_buffer` is empty again, so the pipe believes
+        /// the whole burst delivered.
+        fn strand_a_burst_in_rustls(&mut self) {
+            let burst = vec![0x5a; 40 * 1024];
+            assert_eq!(self.push(&burst), SessionResult::Continue);
+            assert_eq!(
+                self.pipe.backend_buffer.available_data(),
+                0,
+                "premise: rustls must absorb the whole burst"
+            );
+            assert!(
+                self.pipe.frontend.socket_wants_write(),
+                "premise: rustls must still hold ciphertext the full connection refused"
+            );
+            assert!(
+                !self.pipe.frontend_readiness.event.is_writable(),
+                "premise: the WouldBlock write must have consumed the WRITABLE event"
+            );
+        }
+
+        /// The kernel's WRITABLE edge for the frontend socket, once the
+        /// client has read enough for the connection to accept bytes again.
+        fn deliver_the_writable_edge(&mut self) -> bool {
+            use std::os::fd::AsRawFd;
+
+            let writable = poll_revents(
+                self.pipe.front_socket().as_raw_fd(),
+                libc::POLLOUT,
+                Duration::from_millis(20),
+            ) & libc::POLLOUT
+                != 0;
+            if writable {
+                self.pipe.update_readiness(Token(0), Ready::WRITABLE);
+            }
+            writable
+        }
+    }
+
+    /// Plaintext that rustls absorbed is not delivered: it is 40 KiB of
+    /// records the connection refused. While the backend stays open and says
+    /// nothing more, the only thing that can send them is the next WRITABLE
+    /// edge, and `Pipe::writable` answers that edge with an empty
+    /// `backend_buffer` by dropping the WRITABLE interest, without the
+    /// flushing `socket_write(&[])` that would hand them to the socket.
+    #[test]
+    fn wss_pipe_tls_records_are_flushed_when_the_buffer_is_empty() {
+        let mut fixture = WssFixture::new();
+        fixture.prove_the_round_trip();
+        fixture.strand_a_burst_in_rustls();
+
+        // The client catches up, round after round, as a slow reader does.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while fixture.received < fixture.loaded && std::time::Instant::now() < deadline {
+            fixture.drain_client();
+            if fixture.deliver_the_writable_edge()
+                && fixture
+                    .pipe
+                    .frontend_readiness
+                    .filter_interest()
+                    .is_writable()
+            {
+                assert_eq!(
+                    fixture.pipe.writable(&mut fixture.metrics),
+                    SessionResult::Continue
+                );
+            }
+        }
+        fixture.drain_client();
+
+        assert_eq!(
+            fixture.received,
+            fixture.loaded,
+            "{} of {} plaintext bytes never reached the WSS client: rustls still holds {} \
+             (wants_write={}) and Pipe::writable left them unflushed on every WRITABLE edge",
+            fixture.loaded - fixture.received,
+            fixture.loaded,
+            if fixture.pipe.frontend.socket_wants_write() {
+                "their ciphertext"
+            } else {
+                "nothing"
+            },
+            fixture.pipe.frontend.socket_wants_write(),
+        );
+    }
+
+    /// The backend closes while the same burst sits in rustls. The pipe
+    /// counts only `backend_buffer`, not what rustls holds, as the response
+    /// in flight, so `backend_hup` closes the session and the records are
+    /// lost: nothing after `Close` flushes rustls.
+    #[test]
+    fn wss_pipe_tls_records_survive_the_backend_hup() {
+        let mut fixture = WssFixture::new();
+        fixture.prove_the_round_trip();
+        fixture.strand_a_burst_in_rustls();
+
+        let (session, proxy) = unused_handles();
+
+        // The backend closes: HUP on its token, nothing buffered.
+        fixture.pipe.update_readiness(Token(1), Ready::HUP);
+        let first = fixture
+            .pipe
+            .ready(session.clone(), proxy.clone(), &mut fixture.metrics);
+        assert_ne!(
+            first,
+            SessionResult::Close,
+            "the first ready pass closed before the client read anything"
+        );
+
+        // The client reads some, the connection accepts bytes again.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        fixture.drain_client();
+        let mut edge = fixture.deliver_the_writable_edge();
+        while !edge && std::time::Instant::now() < deadline {
+            fixture.drain_client();
+            edge = fixture.deliver_the_writable_edge();
+        }
+        // Without the edge the second pass would stop at the loop head and
+        // prove nothing.
+        assert!(
+            edge,
+            "premise: the frontend WRITABLE edge must arrive before the second pass"
+        );
+        let second = fixture.pipe.ready(session, proxy, &mut fixture.metrics);
+
+        let pending = fixture.pipe.frontend.socket_wants_write();
+        fixture.drain_client();
+        assert!(
+            second != SessionResult::Close || !pending,
+            "ready returned Close on the backend HUP while rustls still held ciphertext \
+             ({} of {} plaintext bytes had not reached the WSS client)",
+            fixture.loaded - fixture.received,
+            fixture.loaded
+        );
+    }
+
+    /// The backend's last burst and its EOF arrive together while the
+    /// client's connection is full: `backend_readable` has met the EOF
+    /// (`WriteOpen`) and `writable` hands the burst to rustls, which absorbs
+    /// it all and leaves the ciphertext behind a `WouldBlock`. The
+    /// `check_connections` inside `writable` must count what rustls holds as
+    /// the response in flight, or it closes the half-closed session with the
+    /// records unsent; the flush that finally empties rustls must then end
+    /// the session, because no later event is owed to it.
+    #[test]
+    fn wss_pipe_outlives_the_backend_eof_until_rustls_is_flushed() {
+        let mut fixture = WssFixture::new();
+        fixture.prove_the_round_trip();
+        fixture.pipe.backend_status = ConnectionStatus::WriteOpen;
+
+        let burst = vec![0x5a; 40 * 1024];
+        let first = fixture.push(&burst);
+        assert!(
+            fixture.pipe.frontend.socket_wants_write(),
+            "premise: rustls must hold ciphertext the full connection refused"
+        );
+        assert_eq!(
+            first,
+            SessionResult::Continue,
+            "writable closed a session whose rustls still held {} of {} plaintext bytes",
+            fixture.loaded - fixture.received,
+            fixture.loaded
+        );
+
+        // The client catches up; the session must end on the flush that
+        // empties rustls, and not before.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut last = SessionResult::Continue;
+        while last == SessionResult::Continue && std::time::Instant::now() < deadline {
+            fixture.drain_client();
+            if fixture.deliver_the_writable_edge()
+                && fixture
+                    .pipe
+                    .frontend_readiness
+                    .filter_interest()
+                    .is_writable()
+            {
+                last = fixture.pipe.writable(&mut fixture.metrics);
+                assert!(
+                    last == SessionResult::Continue || !fixture.pipe.frontend.socket_wants_write(),
+                    "writable closed the session with ciphertext still inside rustls"
+                );
+            }
+        }
+        fixture.drain_client();
+
+        assert_eq!(
+            last,
+            SessionResult::Close,
+            "the flush that emptied rustls must end the half-closed session"
+        );
+        assert_eq!(
+            fixture.received, fixture.loaded,
+            "every plaintext byte must reach the WSS client before the session closes"
+        );
+    }
+
+    /// A frontend socket error ends a WebSocket session too, and that exit
+    /// of `Pipe::ready` must reach the access log and the end-of-session
+    /// metrics once, as every handler that returns `Close` does.
+    #[test]
+    fn websocket_frontend_error_is_access_logged_once() {
+        let (_frontend_peer, frontend_socket) = connected_pair();
+        let (_backend_peer, backend_socket) = connected_pair();
+        let mut pool = Pool::with_capacity(2, 2, 4096);
+        let mut pipe = plain_websocket_pipe(&mut pool, frontend_socket, backend_socket);
+        let mut metrics = SessionMetrics::new(Some(Duration::ZERO));
+        let access_logs = || crate::socket::tests::proxy_count(names::access_logs::COUNT);
+
+        let before = access_logs();
+        pipe.update_readiness(Token(0), Ready::ERROR);
+        let (session, proxy) = unused_handles();
+        let result = pipe.ready(session, proxy, &mut metrics);
+        assert_eq!(result, SessionResult::Close);
+        assert_eq!(
+            access_logs() - before,
+            1,
+            "a WebSocket session that ends on a frontend socket error must reach the access log \
+             and the end-of-session metrics once"
         );
     }
 }

@@ -247,7 +247,7 @@ pub(super) fn end_stream_decision(stream: &Stream) -> EndStreamAction {
 ///
 /// Returns `(tls_still_pending, drain_rounds)` so the caller can log or
 /// react to an incomplete drain.
-pub(super) fn drain_tls_close_notify<S: SocketHandler>(
+pub(crate) fn drain_tls_close_notify<S: SocketHandler>(
     socket: &mut S,
     close_notify_sent: &mut bool,
 ) -> (bool, u32) {

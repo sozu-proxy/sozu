@@ -184,6 +184,7 @@ pub(crate) use crate::protocol::mux::answers::{
     forcefully_terminate_answer, set_default_answer, set_default_answer_with_retry_after,
 };
 use crate::protocol::mux::connection::{EndpointClient, EndpointServer};
+pub(crate) use crate::protocol::mux::shared::drain_tls_close_notify;
 pub use crate::protocol::mux::{
     answers::terminate_default_answer,
     buffer_source::{BufferSource, PoolBufferSource},

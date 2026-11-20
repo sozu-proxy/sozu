@@ -2644,6 +2644,173 @@ fn test_wss_client_frame_after_upgrade_receives_pusher_pong() {
     );
 }
 
+/// How a WSS client sees the end of its stream once the backend has closed.
+#[derive(Debug)]
+enum WssClose {
+    /// `read` answered `Ok(0)`: rustls reports that only for a stream the
+    /// server closed with a TLS `close_notify`.
+    CloseNotify,
+    /// `read` failed: a bare TCP FIN surfaces as `UnexpectedEof`.
+    Failed(ErrorKind, String),
+    /// Nothing ended the stream before the deadline.
+    StillOpen,
+}
+
+/// A WSS session that Sōzu ends because its backend closed must send the
+/// client a TLS `close_notify` before the TCP FIN (RFC 8446 section 6.1), as
+/// the mux path does. The WebSocket pipe tears the session down without one,
+/// so the client's read fails with `UnexpectedEof`.
+///
+/// Setup problems panic with their own message, so the only way to reach the
+/// closing assertion is with the read result in hand.
+fn try_wss_backend_close_sends_tls_close_notify() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let back_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned("WSS-CLOSE-NOTIFY", config, listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        ListenerBuilder::new_https(front_address.clone())
+            .to_tls(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: "localhost".to_owned(),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: CertificateAndKey {
+            certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+            key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+            certificate_chain: vec![],
+            versions: vec![],
+            names: vec![],
+        },
+        expired_at: None,
+    }));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let mut backend = SyncBackend::new(
+        "BACKEND_0",
+        back_address,
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+    );
+    backend.connect();
+
+    let tls_config = {
+        let mut config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(Verifier))
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        config
+    };
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let conn = rustls::ClientConnection::new(Arc::new(tls_config), server_name.to_owned()).unwrap();
+    let addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_millis(500))).ok();
+    tcp.set_write_timeout(Some(Duration::from_millis(500))).ok();
+    let mut tls_stream = rustls::StreamOwned::new(conn, tcp);
+
+    let request = "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    tls_stream
+        .write_all(request.as_bytes())
+        .expect("setup: the client could not send the upgrade request");
+    tls_stream.flush().ok();
+
+    assert!(
+        backend.accept(0),
+        "setup: the backend accepted no connection"
+    );
+    assert!(
+        backend.receive(0).is_some(),
+        "setup: the backend received no upgrade request"
+    );
+    assert!(
+        backend.send(0).is_some(),
+        "setup: the backend could not send the 101"
+    );
+    assert!(
+        read_tls_until_contains_all(&mut tls_stream, &[b"101 Switching Protocols"]).is_some(),
+        "setup: the client did not receive the 101"
+    );
+
+    // The pipe is live: a frame crosses it and the client consumes it, so
+    // the only thing left on the stream is whatever ends the session.
+    let frame = websocket_text_frame(PUSHER_CONNECTION_ESTABLISHED);
+    assert!(
+        backend_send_bytes(&mut backend, 0, &frame),
+        "setup: the backend could not send a frame"
+    );
+    assert!(
+        read_tls_until_contains_all(&mut tls_stream, &[PUSHER_CONNECTION_ESTABLISHED.as_bytes()])
+            .is_some(),
+        "setup: the client did not receive the frame through the pipe"
+    );
+
+    assert!(backend.close(0), "setup: the backend could not close");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut buf = [0u8; 1024];
+    let mut outcome = WssClose::StillOpen;
+    while Instant::now() < deadline {
+        match tls_stream.read(&mut buf) {
+            Ok(0) => {
+                outcome = WssClose::CloseNotify;
+                break;
+            }
+            Ok(_) => {}
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(error) => {
+                outcome = WssClose::Failed(error.kind(), error.to_string());
+                break;
+            }
+        }
+    }
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    assert!(stopped, "the worker did not stop");
+
+    assert!(
+        matches!(outcome, WssClose::CloseNotify),
+        "after the backend closed, the WSS client read {outcome:?}; a session Sōzu ends must \
+         reach the client as Ok(0), the read of a stream closed with a TLS close_notify"
+    );
+    State::Success
+}
+
+#[test]
+fn test_wss_backend_close_sends_tls_close_notify() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "WSS backend close reaches the client as a TLS close_notify",
+            try_wss_backend_close_sends_tls_close_notify,
+        ),
+        State::Success,
+    );
+}
+
 // ============================================================================
 // Test 7: ALPN absent on H2-only listener — RFC 9113 §3.2 gate
 // ============================================================================
