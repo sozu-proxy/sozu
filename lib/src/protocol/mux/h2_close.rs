@@ -270,7 +270,10 @@ pub(super) enum FinalizeAction {
     ArmControlQueue,
     /// Nothing is owed on any stream and nothing is queued: withdraw
     /// `Ready::WRITABLE` interest and wait for an external wake-up
-    /// (`WINDOW_UPDATE`, backend readable, a new request).
+    /// (`WINDOW_UPDATE`, backend readable, a new request). The decision has no
+    /// state input; `ConnectionH2::finalize_write` (`lib/src/protocol/mux/h2.rs`)
+    /// does not withdraw in `H2State::GoAway` or `H2State::Error`, which read
+    /// no `WINDOW_UPDATE` and no new request and must reach the close decision.
     Quiesce,
     /// Records survived the flush: re-arm the edge-triggered WRITABLE event,
     /// through `ConnectionH2::ensure_tls_flushed`, which leaves a flush the

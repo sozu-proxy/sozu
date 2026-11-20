@@ -4571,7 +4571,26 @@ impl ConnectionH2 {
                     "Wrote everything: {:?}",
                     self.stream_table.streams()
                 )));
-                self.readiness.interest.remove(Ready::WRITABLE);
+                if matches!(self.state, H2State::GoAway | H2State::Error) {
+                    // Withdrawing WRITABLE is the live-connection policy: the
+                    // next wake-up is a WINDOW_UPDATE, a new request or a
+                    // backend byte. A connection that has sent its final
+                    // GOAWAY reads none of the first two, so only WRITABLE
+                    // can bring it back to the close decision of the
+                    // `H2State::GoAway` arm of `Self::dispatch_writable_state`.
+                    // The resume of a parked stream that stays open (it waits
+                    // on its backend, so the table is not empty) writes bytes
+                    // that are not progress and lands here: withdrawing would
+                    // leave the closing connection, its streams and its
+                    // backend connections waiting for a backend byte or a
+                    // timer. The next pass, with nothing parked, takes the
+                    // close decision; a stream parked again is owned by that
+                    // park (`FinalizeAction::Parked`), so this re-arm cannot
+                    // spin.
+                    self.readiness.arm_writable();
+                } else {
+                    self.readiness.interest.remove(Ready::WRITABLE);
+                }
                 H2FinalizeTarget::Done(MuxResult::Continue)
             }
             // The two TLS answers differ only in the step the CALLER performs,
@@ -13481,6 +13500,97 @@ pub(super) mod tests {
                 Linger::Draining { remaining, .. } if remaining == ERROR_GOAWAY_LINGER_MAX_BYTES
             ),
             "an error GOAWAY lingers on the error budget, not the graceful one"
+        );
+    }
+
+    /// An error GOAWAY whose parked stream drains but stays open (it waits on
+    /// its backend, so the table is not empty) must still reach the close
+    /// decision of the `H2State::GoAway` arm. READABLE is gone since the
+    /// GOAWAY, so WRITABLE is the only readiness that can bring the session
+    /// back to that arm: a resume pass that withdraws it leaves the closing
+    /// connection waiting for a backend byte or a timer, whereas the same
+    /// GOAWAY without a parked stream closes on the very next pass.
+    ///
+    /// The session is driven the way `Mux` drives it (`drive_unthrottled`
+    /// calls `writable()` only while the filtered readiness allows it), so
+    /// the test reads the outcome (the linger the close decision stages) and
+    /// not one particular readiness bit: closing within the resume pass
+    /// would satisfy it as well as keeping WRITABLE armed.
+    ///
+    /// Without the fix the resume pass finishes the parked frame and the
+    /// GOAWAY, `finalize_write` finds the stream table non-empty and
+    /// `finalize_action` answers `Quiesce` (the resume bytes are not
+    /// progress), which removes WRITABLE; nothing re-arms it. The last
+    /// assertion then fails with `the close decision of the GoAway arm was
+    /// never reached`, carrying `state GoAway, linger Off` and the readiness
+    /// `interest: --EH-` (no WRITABLE).
+    ///
+    /// TO SEE THIS RED: without the fix, run it unchanged. With the fix in,
+    /// undo it: make the `FinalizeAction::Quiesce` arm of
+    /// `ConnectionH2::finalize_write` withdraw WRITABLE without re-arming it
+    /// when `self.state` is `H2State::GoAway` or `H2State::Error`, and the
+    /// same assertion fails with the same message. The fix itself is, in that
+    /// arm, `self.readiness.arm_writable()` for those two states: with it
+    /// this test passes, and so does
+    /// `an_error_goaway_whose_parked_stream_retires_still_reaches_the_error_linger`.
+    #[test]
+    fn an_error_goaway_whose_parked_stream_stays_open_still_reaches_the_error_linger() {
+        let (_pool, mut connection, mut context, mut router, gid) = park_half_written_frame();
+        // The stream is open and has no response to finish: it waits on its
+        // backend. `Linked` keeps the closing connection from pruning it.
+        context.streams[gid].state = StreamState::Linked(mio::Token(1));
+        let _ = connection.core.goaway(H2Error::EnhanceYourCalm);
+        connection.socket.budget = usize::MAX;
+        assert!(
+            connection.core.stream_table.expect_write().is_some()
+                && connection.core.readiness.interest.is_writable()
+                && !connection.core.readiness.interest.is_readable(),
+            "premise: the GOAWAY left a parked stream, WRITABLE wanted and no reads, got {:?}",
+            connection.core.readiness
+        );
+
+        // The resume pass: it finishes the parked frame and the GOAWAY behind
+        // it, and leaves the stream open.
+        let resume = connection.writable(&mut context, EndpointClient(&mut router));
+        assert!(
+            matches!(resume, MuxResult::Continue),
+            "the resume pass hands the close to a later one, got {resume:?}"
+        );
+        let enhance_your_calm = u32::from(H2Error::EnhanceYourCalm as u8);
+        let mut goaway_payload = 0u32.to_be_bytes().to_vec();
+        goaway_payload.extend_from_slice(&enhance_your_calm.to_be_bytes());
+        assert_eq!(
+            peer_frames(&connection.socket.wire),
+            Ok(vec![
+                (0, 0, REGISTERED_STREAM_ID, HALF_WRITTEN_PAYLOAD.to_vec()),
+                (7, 0, 0, goaway_payload),
+            ]),
+            "premise: the resume pass wrote the rest of the DATA frame and the GOAWAY"
+        );
+        assert!(
+            connection.core.stream_table.expect_write().is_none()
+                && connection
+                    .core
+                    .stream_table
+                    .streams()
+                    .contains_key(&REGISTERED_STREAM_ID),
+            "premise: the park is drained and the stream is still open"
+        );
+
+        drive_unthrottled(&mut connection, &mut context, &mut router);
+
+        assert!(
+            matches!(
+                connection.core.linger,
+                Linger::Draining { remaining, .. } if remaining == ERROR_GOAWAY_LINGER_MAX_BYTES
+            ),
+            "the close decision of the GoAway arm was never reached: the resume \
+             pass withdrew WRITABLE with the stream still open and nothing \
+             wakes the session before a backend byte or a timer, state {:?}, \
+             linger {:?}, readiness {:?}",
+            connection.core.state,
+            connection.core.linger,
+            connection.core.readiness
         );
     }
 

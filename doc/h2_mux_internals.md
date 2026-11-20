@@ -743,7 +743,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:5118-5131
+```rust lib/src/protocol/mux/h2.rs:5137-5150
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -769,7 +769,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:5169-5175
+```rust lib/src/protocol/mux/h2.rs:5188-5194
 let events = stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -1162,7 +1162,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9760-9764
+```rust lib/src/protocol/mux/h2.rs:9779-9783
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1351,7 +1351,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9942-9946
+```rust lib/src/protocol/mux/h2.rs:9961-9965
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1714,7 +1714,14 @@ such a connection, the resume of a stream a stalled write had parked, queues no
 second GOAWAY and re-arms WRITABLE with `Readiness::arm_writable` for the close
 decision of the `H2State::GoAway` arm instead. The second GOAWAY would have
 set `graceful_goaway` on an error GOAWAY and given its close the graceful
-linger budget; the four readiness answers are
+linger budget. The same close decision is why the `Quiesce` answer is not
+taken as written in those two states: a connection that has sent its final
+GOAWAY reads neither a `WINDOW_UPDATE` nor a new request, so the resume of a
+parked stream that stays open (it waits on its backend, so the table is not
+empty) would withdraw the only readiness that reaches the `H2State::GoAway`
+arm, and the session, its streams and its backend connections would wait for a
+backend byte or a timer. `finalize_write` re-arms WRITABLE there instead. The
+four readiness answers are
 performed here and the two TLS answers are handed back to `write_streams` as an
 `H2FinalizeTarget`, whose second call is `finalize_write_after_flush`:
 
@@ -1725,7 +1732,7 @@ performed here and the two TLS answers are handed back to `write_streams` as an
 | `Parked` | a partial write set `expect_write`: it owns the next tick, no bit moves |
 | `RetainPendingBack` | LIFECYCLE §9 invariant 16: progress plus queued response bytes, so `Ready::WRITABLE` survives (the absence of the withdrawal below) |
 | `ArmControlQueue` | a deferred RST_STREAM / WINDOW_UPDATE is still queued: `Readiness::arm_writable` |
-| `Quiesce` | nothing owed anywhere: withdraw `Ready::WRITABLE` interest |
+| `Quiesce` | nothing owed anywhere: withdraw `Ready::WRITABLE` interest; in `H2State::GoAway` and `H2State::Error`, which read nothing that could wake the connection, `Readiness::arm_writable` instead so the next pass takes the close decision |
 | `ReArm` | post-flush: records survived, re-arm the edge-triggered WRITABLE event |
 | `Settled` | post-flush: the kernel took everything |
 
@@ -1833,7 +1840,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:9261
+```rust lib/src/protocol/mux/h2.rs:9280
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -2077,7 +2084,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:7701-7703
+```rust lib/src/protocol/mux/h2.rs:7720-7722
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -2085,7 +2092,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:7715-7721
+```rust lib/src/protocol/mux/h2.rs:7734-7740
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.

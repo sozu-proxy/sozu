@@ -134,6 +134,10 @@
 <!-- changelog-slot:h2-error-goaway-single-final -->
 
 - An HTTP/2 connection that sent an error `GOAWAY` no longer sends a second, `GOAWAY(NO_ERROR)`, when it finishes the last stream it was still writing. A stalled write parks a stream half-way through a frame; a protocol error or a flood then queues `GOAWAY(ENHANCE_YOUR_CALM)` (or another error code) behind the rest of that frame, and the stream is resumed by the next write pass. When that resume retired the last stream, the connection treated the drain as finished and queued the final `GOAWAY` again, this time `NO_ERROR`, which the client read after the error one. It also marked the connection as gracefully closed, so the lingering close that follows an error `GOAWAY` took the graceful budget (`request_timeout` and 4 MiB of discarded reads) instead of the error one (at most 1 s and 256 KiB), and streams and backend connections were not released when that linger started. The connection now sends one final `GOAWAY`, keeps its error code, and goes on to the error linger.
+
+<!-- changelog-slot:h2-error-goaway-open-stream-close -->
+
+- An HTTP/2 connection that sent an error `GOAWAY` now closes without waiting for a backend byte or a timer when the stream a stalled write had parked is still open. The stream is resumed by the next write pass, which finishes the parked frame and the `GOAWAY` behind it; when the stream was still waiting on its backend, that pass withdrew write readiness, and the connection reads nothing after its `GOAWAY`, so nothing brought it back to the close. It stayed open, with its streams and its backend connections, until the backend answered or `front_timeout` or `back_timeout` elapsed, whereas an error `GOAWAY` with no parked stream closes on the next pass. The write pass now keeps write readiness in that state, the connection lingers on the error budget (at most 1 s and 256 KiB) and releases its streams and backend connections when the linger starts.
 <!-- changelog-slot:listener-removal -->
 
 ### Fixed

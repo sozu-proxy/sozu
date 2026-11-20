@@ -1834,6 +1834,9 @@ and `an_error_goaway_linger_pending_on_close_notify_releases_before_pending_link
 of an error GOAWAY (no second GOAWAY, still the error budget), by
 `an_error_goaway_gets_no_second_graceful_goaway_when_the_parked_stream_retires`
 and `an_error_goaway_whose_parked_stream_retires_still_reaches_the_error_linger`
+(`h2.rs`), and, for the parked stream that drains but stays open (it waits on
+its backend, so the resume pass quiesces), by
+`an_error_goaway_whose_parked_stream_stays_open_still_reaches_the_error_linger`
 (`h2.rs`). `ConnectionH2::arm_timeout` and `set_timeout_duration` leave the
 deadline in place, so bytes the client sends never extend it. The lingering `readable`
 and `writable` passes adopt the pass's clock (`ConnectionH2::adopt_now`)
@@ -2919,7 +2922,12 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     zero-progress pass (e.g. all streams flow-control-starved) must relinquish
     `Ready::WRITABLE` so the session dispatcher does not busy-spin — the next
     wake-up arrives from `WINDOW_UPDATE`, backend readable, or a new request.
-    Enforced at runtime via the file-private helper
+    The exception is a connection in `H2State::GoAway` or `H2State::Error`: it
+    reads none of those but the backend's, so `finalize_write` re-arms the bit
+    on a `Quiesce` there (`Readiness::arm_writable`) and the next pass takes
+    the close decision of the `H2State::GoAway` arm of
+    `ConnectionH2::dispatch_writable_state`, instead of waiting for a backend
+    byte or a timer. Enforced at runtime via the file-private helper
     `any_stream_has_pending_back` (`h2.rs`), which `finalize_write` hands to
     `h2_close::finalize_action` as a closure rather than a `bool` so the walk
     stays behind the same short-circuit it had inline. The decision is that
