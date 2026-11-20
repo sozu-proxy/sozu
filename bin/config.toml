@@ -254,7 +254,8 @@ buffer_size = 16393
 # it is answered 503 (HTTP) or closed (TCP). A connection that is refused,
 # times out on connect_timeout or reports a socket error counts against its
 # backend, and the request goes to another backend while attempts remain
-# (a TCP session whose connect times out is closed instead).
+# (a TCP session whose connect times out is closed instead, and the timeout
+# still counts against its backend).
 # 1 to 255, defaults to 5 (earlier versions hard-coded 3). Each cluster may
 # override it; `sozu connection-attempts set` changes it at runtime.
 # max_connection_attempts = 5

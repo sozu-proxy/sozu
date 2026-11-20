@@ -328,7 +328,15 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
             backend_socket,
             None,
             None,
-            Some(self.container_frontend_timeout),
+            // The pipe gets no frontend timer. `into_pipe` is the TCP
+            // listener's upgrade (HTTP and HTTPS never call it), and a TCP
+            // session owns its one frontend deadline in
+            // `TcpSession::container_frontend_timeout`, which it resets
+            // before every pipe read it dispatches. A container here, the
+            // session's clone or a live one, would put a second wheel entry
+            // under the same token, and whichever fired second would be
+            // delivered to the session that inherits the slab key.
+            None,
             None,
             front_buf,
             self.frontend_token,

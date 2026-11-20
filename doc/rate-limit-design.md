@@ -341,7 +341,12 @@ against the socket peer:
   `.or(self.frontend_address)` (`frontend_address = Some(peer)`, the address
   `accept(2)` returned, set in `TcpSession::new` and
   `TcpSession::new_sni_preread`), and is called from the per-(cluster,
-  source-IP) gate in `TcpSession::connect_to_backend`.
+  source-IP) gate in `TcpSession::connect_to_backend`. A `RelayHeader`
+  session reaches that gate only after its header is parsed
+  (`TcpSession::attempt_backend_connect_if_needed` skips it until
+  `RelayProxyProtocol::header_size` is set): the fall-back to the accepted
+  peer is for a `LOCAL` header, never for a header not read yet, or every
+  client relayed by one load balancer would share that load balancer's slot.
 - `ExpectProxyProtocol::into_pipe`
   (`lib/src/protocol/proxy_protocol/expect.rs`) and
   `RelayProxyProtocol::into_pipe`
