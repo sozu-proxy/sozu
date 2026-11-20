@@ -7381,9 +7381,11 @@ mod listener_lifecycle_tests {
     /// connect proves the socket was bound and listening; the port
     /// reservation of `provide_port` never listens.
     ///
-    /// To SEE THIS RED: nothing to change, it is red on the unfixed worker;
-    /// the assertion fails with "a draining worker must not accept
-    /// connections on a listener ordered after its soft stop".
+    /// To SEE THIS RED: in `Server::notify_activate_listener`, delete the
+    /// `if self.shutting_down.is_some() { … }` guard that answers "Could not
+    /// activate listener …: the worker is shutting down". The activation is
+    /// then answered ok and the assertion fails with "a draining worker must
+    /// not accept connections on a listener ordered after its soft stop".
     #[test]
     fn a_listener_ordered_after_a_soft_stop_is_not_brought_back() {
         let mut server = bare_server();
@@ -7888,12 +7890,14 @@ mod listener_lifecycle_tests {
     /// A socket queued at the same time by listener C, which stays, must still
     /// become a session: the removal purges by token, not the whole queue.
     ///
-    /// To SEE THIS RED: nothing to change, it is red on the unfixed
-    /// `RemoveListener` arm of `notify_proxys`, which purges `accept_ready` but
-    /// not `accept_queue`; the assertion fails with "a socket accepted on a
-    /// removed listener must not be served by the listener that reuses its
-    /// token". Replacing the fix's `retain` with `clear()` turns the second
-    /// assertion red instead.
+    /// To SEE THIS RED: in the `RemoveListener` arm of `Server::notify_proxys`,
+    /// delete the `self.accept_queue.retain(…)` statement, so that the arm
+    /// purges `accept_ready` but not `accept_queue`; the assertion fails with
+    /// "a socket accepted on a removed listener must not be served by the
+    /// listener that reuses its token". Replacing that `retain` with
+    /// `self.accept_queue.clear()` turns the second assertion red instead:
+    /// "the socket queued by listener C, which was not removed, must become a
+    /// session".
     #[test]
     fn a_socket_queued_for_a_removed_listener_is_not_served_by_the_listener_that_reuses_its_token()
     {
@@ -8654,9 +8658,11 @@ mod remove_health_check_tests {
     /// DOWN turns healthy again, with zeroed counters, without a single
     /// successful probe.
     ///
-    /// To SEE THIS RED: nothing to change, it is red on the unfixed
-    /// `Server::add_cluster`; the assertion fails with "re-sending an
-    /// AddCluster must not reset a backend the UDP prober marked DOWN".
+    /// To SEE THIS RED: in `Server::add_cluster`, pass `false` instead of
+    /// `crate::udp::udp_health_settings(cluster).is_some()` to
+    /// `set_udp_health_prober`, so that the reset of the upsert applies; the
+    /// assertion fails with "re-sending an AddCluster must not reset a backend
+    /// the UDP prober marked DOWN", the backend read back `Healthy`.
     #[test]
     fn add_cluster_of_a_udp_cluster_with_udp_health_keeps_a_backend_marked_down() {
         use sozu_command::proto::command::{UdpClusterConfig, UdpHealthConfig, UdpHealthMode};
