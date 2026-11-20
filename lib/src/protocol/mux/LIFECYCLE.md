@@ -1075,6 +1075,32 @@ and hands the unread remainder `n` to
   resumed only by `try_resume_reading`, which needs the stream to exist. It
   does so even while output is queued: `zero` is input only (invariant 28).
 
+A HEADERS or CONTINUATION payload is the opposite case: it is read through
+`H2StreamId::Zero`, which belongs to no stream, so `remove_dead_stream` has
+nothing to repair and the `Frame` state and the `(Zero, n)` debt survive the
+removal. The block is read to its end and reaches `ConnectionH2::handle_headers_frame`
+with its stream gone, which can only mean the stream was removed while the
+block was being read: `ConnectionH2::handle_header_state` lets a HEADERS frame
+through only for a stream the table holds or just created, and
+`ConnectionH2::handle_continuation_header_state` checks the stream id the
+CONTINUATION names against the HEADERS frame's, not that the stream still
+exists. `ConnectionH2::drop_field_block_of_removed_stream` decodes the block
+into the connection's HPACK decoder and drops it: the peer's encoder already
+indexed its fields, so skipping them would desynchronise every later block of
+the connection (RFC 9113 §4.3), and the connection is shared with every other
+stream of the session, so one client's cancel must not close it. The result is
+`MuxResult::Continue`, `zero.storage` and the reassembly accumulator are
+retired, and the bytes are attributed to overhead; the
+`h2.headers_no_stream.error` counter counts the dropped block. A block that
+does not decode is a connection error of type COMPRESSION_ERROR, as on a live
+stream. The backend-side `ConnectionH2::end_stream` that cancels a request
+between two reads of its response HEADERS, or between its HEADERS and its
+CONTINUATION frames, is the case reproduced. Pinned by
+`a_response_headers_block_of_a_cancelled_stream_keeps_the_backend_connection`,
+`a_response_continuation_of_a_cancelled_stream_keeps_the_backend_connection`,
+`the_block_of_a_cancelled_stream_still_reaches_the_hpack_decoder` and
+`an_undecodable_block_of_a_cancelled_stream_is_a_compression_error` (`h2.rs`).
+
 The backend-side `ConnectionH2::end_stream` RST_STREAM(CANCEL) once went
 into `zero` with neither `expect_write` nor READABLE touched. A backend
 connection that skipped an orphaned DATA remainder then read the next frame
@@ -1764,6 +1790,26 @@ Three directions:
   `session close` when its connection closed. Pinned by
   `a_backend_stream_reset_leaves_the_frontend_slot_to_the_frontend` and
   the tests §3.2 lists.
+- **A provoked reset that trips a flood limit ends the connection, not just
+  the stream.** `ConnectionH2::reset_stream_and_discard_frame` answers DATA or
+  HEADERS on a half-closed (remote) stream, and a trailer block without
+  END_STREAM, with RST_STREAM and then discards the frame's payload
+  (`ConnectionH2::discard_frame_payload`). Every provoked reset records a
+  glitch and one emitted RST, and checks the flood limits at once, so the
+  reset that crosses the glitch limit or the emitted-RST cap queues
+  GOAWAY(ENHANCE_YOUR_CALM) from inside `reset_stream` (`ConnectionH2::enqueue_rst`
+  through `ConnectionH2::handle_flood_violation`). `ConnectionH2::goaway`
+  answers `MuxResult::Continue`, so the result cannot tell that case from a
+  reset that only queued its frame: the connection state does. A connection
+  left in `H2State::GoAway` or `H2State::Error` keeps it and the payload is
+  not discarded, because `H2State::Discard` would overwrite the final
+  GOAWAY's state: after a HEADERS frame the connection kept no READABLE
+  interest and never took the `GoAway` close decision, after a DATA frame it
+  restored READABLE interest and read the peer's frames after its final
+  GOAWAY. `ConnectionH2::refuse_stream_and_discard` returns the flood verdict
+  of its own `enqueue_rst` before discarding, which is the same rule. Pinned
+  by `a_flood_goaway_raised_by_a_headers_reset_survives_the_discard` and
+  `a_flood_goaway_raised_by_a_data_reset_survives_the_discard` (`h2.rs`).
 - **Never for a backend stream still idle** — on `Position::Client` a stream id
   is allocated by `ConnectionH2::start_stream` when the router links the
   request, but its HEADERS leave with a later write pass, possibly never (the

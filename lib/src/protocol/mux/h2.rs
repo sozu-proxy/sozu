@@ -1202,7 +1202,7 @@ pub(super) enum MetricEvent {
     StreamReapedStallBudget,
     /// A stream was reaped for exceeding the per-stream idle cap.
     StreamReapedIdleTimeout,
-    /// HEADERS arrived that no stream could be allocated for.
+    /// A header block ended after its stream was removed: decoded and dropped.
     HeadersWithoutStream,
     /// A header block failed to parse on a backend (client-position)
     /// connection.
@@ -1701,7 +1701,7 @@ pub enum H2WritableStateTarget {
 /// The fourth member of the poll/handle family, and the only one that cannot
 /// be *returned* by the function that raises it. [`H2FinalizeTarget`],
 /// [`H2ControlFlushTarget`] and [`H2WritableStateTarget`] are answers a core
-/// step hands straight back to its caller; this one is raised at seventeen
+/// step hands straight back to its caller; this one is raised at sixteen
 /// sites, seven of them inside [`ConnectionH2::handle_read`], whose `pub`
 /// signature returns [`MuxResult`] and does not change. A target that cannot
 /// ride the return value has to be parked on the connection instead, which is
@@ -5724,6 +5724,20 @@ impl ConnectionH2 {
     /// frame's payload ([`Self::discard_frame_payload`]). Every other stream
     /// on the connection carries on. The RST_STREAM goes through
     /// [`Self::reset_stream`], so it feeds the emitted-RST flood accounting.
+    ///
+    /// That accounting can end the connection instead: a provoked reset that
+    /// crosses the emitted-RST cap or the glitch limit answers
+    /// GOAWAY(ENHANCE_YOUR_CALM) from inside [`Self::reset_stream`]
+    /// ([`Self::enqueue_rst`] through [`Self::handle_flood_violation`]). That
+    /// GOAWAY is the connection's final word, and [`Self::goaway`] answers
+    /// `MuxResult::Continue`, so the result cannot tell it from a reset that
+    /// only queued its frame: the state does. A connection left in
+    /// `H2State::GoAway` or `H2State::Error` keeps it, and the frame's payload
+    /// is not discarded — [`Self::discard_frame_payload`] would write
+    /// `H2State::Discard` over the terminal state, and the connection would
+    /// either wait for a READABLE event it no longer asks for (HEADERS) or go
+    /// on reading after its final GOAWAY (DATA). `Self::refuse_stream_and_discard`
+    /// answers the same verdict the same way, through [`Self::enqueue_rst`].
     fn reset_stream_and_discard_frame<E, L>(
         &mut self,
         header: &FrameHeader,
@@ -5739,7 +5753,9 @@ impl ConnectionH2 {
         let result =
             self.reset_stream(header.stream_id, global_stream_id, context, endpoint, error);
         self.remove_dead_stream(header.stream_id, global_stream_id);
-        if !matches!(result, MuxResult::Continue) {
+        if !matches!(result, MuxResult::Continue)
+            || matches!(self.state, H2State::GoAway | H2State::Error)
+        {
             return result;
         }
         self.discard_frame_payload(header)
@@ -6955,6 +6971,83 @@ impl ConnectionH2 {
         MuxResult::Continue
     }
 
+    /// A header block whose stream was removed after its first frame was
+    /// accepted is decoded for HPACK and dropped, and the connection carries
+    /// on.
+    ///
+    /// [`Self::handle_header_state`] only lets a HEADERS frame through for a
+    /// stream the table holds (or one it just created), and
+    /// [`Self::handle_continuation_header_state`] only checks that the
+    /// CONTINUATION frames name the HEADERS frame's stream, so the stream can
+    /// only be missing here because it was removed while the block was being
+    /// read, between two reads of the same frame or between its HEADERS and
+    /// its CONTINUATION frames: the client cancelled the request
+    /// (`ConnectionH2::end_stream` on a backend connection) or the stream was
+    /// reaped. The frame's payload is read through `H2StreamId::Zero`, which
+    /// belongs to no stream, so [`Self::remove_dead_stream`] has nothing to
+    /// repair, as it does for the DATA payload it skips
+    /// ([`Self::skip_orphaned_data_payload`]). That connection is shared with
+    /// every other stream of the session, so it is not closed for one
+    /// stream's cancel, and the block still reached the peer's HPACK encoder:
+    /// decoding it keeps the dynamic table in sync (RFC 9113 §4.3), as the
+    /// `H2State::Discard` arm of [`Self::handle_read`] does for a refused
+    /// stream's block. A block that does not decode is a connection error of
+    /// type COMPRESSION_ERROR.
+    fn drop_field_block_of_removed_stream(&mut self, headers: &Headers) -> MuxResult {
+        debug_assert!(
+            headers.end_headers,
+            "only a complete header block is dropped for a removed stream"
+        );
+        debug!(
+            "{} HEADERS block for stream {} whose stream was removed, decoding and dropping it",
+            log_context!(self),
+            headers.stream_id
+        );
+        self.metric_events.push(MetricEvent::HeadersWithoutStream);
+        // Where the block lives depends on how it was read: in the owned
+        // accumulator when CONTINUATION frames fed it, else still in
+        // `zero.storage` (see `Self::handle_headers_frame`). Disjoint fields,
+        // so the decoder can be borrowed beside the block.
+        let block = if self.header_reassembly.is_in_progress() {
+            Some(self.header_reassembly.data())
+        } else {
+            headers
+                .header_block_fragment
+                .data_opt(self.zero.storage.buffer())
+        };
+        let decoded = match block {
+            Some(block) => self
+                .hpack
+                .decoder_mut()
+                .decode_with_cb(block, |_, _| {})
+                .map_err(|_| H2Error::CompressionError),
+            None => Err(H2Error::InternalError),
+        };
+        // Retired on every outcome, as on the accepted path: a flag left
+        // `is_in_progress()` would leak into the next HEADERS frame.
+        if self.header_reassembly.is_in_progress() {
+            self.header_reassembly.finish();
+        }
+        self.zero.storage.clear();
+        self.attribute_bytes_to_overhead();
+        debug_assert!(
+            !self.header_reassembly.is_in_progress(),
+            "the dropped block's accumulator must not leak into the next HEADERS frame"
+        );
+        match decoded {
+            Ok(()) => MuxResult::Continue,
+            Err(error) => {
+                error!(
+                    "{} HPACK field block of removed stream {} failed to decode: {:?}",
+                    log_context!(self),
+                    headers.stream_id,
+                    error
+                );
+                self.goaway(error)
+            }
+        }
+    }
+
     fn handle_headers_frame<E, L>(
         &mut self,
         headers: Headers,
@@ -7013,17 +7106,9 @@ impl ConnectionH2 {
         }
         // Header block is complete — reset CONTINUATION counters
         self.flood_detector.reset_continuation();
-        // can this fail?
         let stream_id = headers.stream_id;
         let Some(global_stream_id) = self.stream_table.get(stream_id) else {
-            error!(
-                "{} Handling Headers frame with no attached stream {:#?}",
-                log_context!(self),
-                self
-            );
-            self.metric_events.push(MetricEvent::HeadersWithoutStream);
-            self.attribute_bytes_to_overhead();
-            return self.force_disconnect();
+            return self.drop_field_block_of_removed_stream(&headers);
         };
 
         // Refresh per-stream idle timer on HEADERS (response headers or trailers
@@ -8092,7 +8177,7 @@ impl ConnectionH2 {
     /// long is recoverable and a session closed with records still buffered is
     /// the truncation `h2_close::force_disconnect_action` exists to prevent.
     ///
-    /// Seventeen sites reach this function and every one returns its answer
+    /// Sixteen sites reach this function and every one returns its answer
     /// immediately, so on the ordinary paths no core code runs between the
     /// raise and the return of the entry point the shell called.
     /// [`Self::goaway`] and `Self::send_initial_goaway` are the exception on
@@ -9396,7 +9481,7 @@ impl<Front: SocketHandler> H2Shell<Front> {
     /// on the way.
     ///
     /// The one place the socket answers a force-disconnect, and the reason
-    /// `ConnectionH2::force_disconnect` can be raised from seventeen sites
+    /// `ConnectionH2::force_disconnect` can be raised from sixteen sites
     /// that hold no socket. Every `MuxResult` a core step hands this impl
     /// block leaves through here, which is what makes the discipline
     /// greppable rather than asserted: a core call in this block whose type is
@@ -18732,6 +18817,561 @@ pub(super) mod tests {
              PING ACK; state={:?} expect_read={:?}",
             connection.core.state,
             connection.core.stream_table.expect_read()
+        );
+    }
+
+    /// What a backend connection is left in: whether it waits on a frame
+    /// header, whether it is still `Connected`, and what `expect_read` names.
+    type BackendEndState = (bool, bool, Option<(H2StreamId, usize)>);
+
+    /// Read a backend response HEADERS block for stream 1 in two reads and
+    /// return what the backend connection is left in: whether it waits on a
+    /// frame header (`H2State::Header`), whether it is still `Connected`, and
+    /// what `expect_read` names. With `cancel_between`, the client cancels the
+    /// request (`end_stream`) between the two reads. The block is cut inside
+    /// the payload of one HEADERS frame (`H2State::Frame`), or, with
+    /// `continuation`, between a HEADERS frame without END_HEADERS and the
+    /// CONTINUATION frame that completes it (`H2State::ContinuationHeader`).
+    ///
+    /// The `Err` side is the message of a panic raised while the rest of the
+    /// frame is read: in a debug build a force-disconnect reached from
+    /// `ConnectionH2::handle_frame` fails `ConnectionH2::check_invariants`
+    /// (`GoAway/Error state must imply the connection is draining`) before
+    /// the caller can look at the state.
+    fn read_a_response_headers_block_in_two_reads(
+        cancel_between: bool,
+        continuation: bool,
+    ) -> Result<BackendEndState, String> {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+        let mut connection = paced_backend(&pool, usize::MAX);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        let gid = context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("test context must create a stream");
+        context.streams[gid].state = StreamState::Linked(mio::Token(1));
+        // The backend is answering, so the request's HEADERS reached it.
+        context.streams[gid].front.consumed = true;
+        connection
+            .core
+            .stream_table
+            .register(1, gid, connection.core.now);
+
+        // `:status 200` (indexed), then `x-probe: one` (literal with
+        // incremental indexing, new name): fourteen octets in all.
+        let mut block = vec![0x88, 0x40, 7];
+        block.extend_from_slice(b"x-probe");
+        block.push(3);
+        block.extend_from_slice(b"one");
+        assert_eq!(block.len(), 14, "premise: the block is fourteen octets");
+        // The first three octets of the block arrive with their frame header;
+        // the other eleven follow in the rest of that frame, or in the
+        // CONTINUATION frame that completes it.
+        let (first, rest, waiting_for, waiting_on_the_payload) = if continuation {
+            (
+                orphan_frame(1, 0, 1, 3, &block[..3]),
+                orphan_frame(9, parser::FLAG_END_HEADERS, 1, 11, &block[3..]),
+                Some((H2StreamId::Zero, 9)),
+                false,
+            )
+        } else {
+            let frame = orphan_frame(1, parser::FLAG_END_HEADERS, 1, block.len() as u32, &block);
+            let (first, rest) = frame.split_at(9 + 3);
+            (
+                first.to_vec(),
+                rest.to_vec(),
+                Some((H2StreamId::Zero, 11)),
+                true,
+            )
+        };
+        let waiting = |state: &H2State| {
+            if waiting_on_the_payload {
+                matches!(state, H2State::Frame(_))
+            } else {
+                matches!(state, H2State::ContinuationHeader(_))
+            }
+        };
+        connection.socket.inbound.extend(&first);
+        for _ in 0..16 {
+            connection.core.readiness.event.insert(Ready::READABLE);
+            if !connection.core.readiness.filter_interest().is_readable() {
+                break;
+            }
+            connection.readable(&mut context, EndpointClient(&mut router));
+            if waiting(&connection.core.state)
+                && connection.core.stream_table.expect_read() == waiting_for
+            {
+                break;
+            }
+        }
+        assert!(
+            waiting(&connection.core.state)
+                && connection.core.stream_table.expect_read() == waiting_for,
+            "premise: the connection waits for the rest of the block ({waiting_for:?}), got \
+             state {:?} and expect_read {:?}",
+            connection.core.state,
+            connection.core.stream_table.expect_read()
+        );
+
+        if cancel_between {
+            // The client gives up on the request between two reads.
+            connection.end_stream(gid, &mut context);
+            assert!(
+                !connection.core.stream_table.streams().contains_key(&1),
+                "premise: end_stream removed the backend stream from the table"
+            );
+        }
+
+        // The backend, not yet aware of the cancel, finishes the frame.
+        connection.socket.inbound.extend(&rest);
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for _ in 0..16 {
+                connection
+                    .core
+                    .readiness
+                    .event
+                    .insert(Ready::READABLE | Ready::WRITABLE);
+                if connection.core.readiness.filter_interest().is_writable() {
+                    connection.writable(&mut context, EndpointClient(&mut router));
+                }
+                if connection.core.readiness.filter_interest().is_readable() {
+                    connection.readable(&mut context, EndpointClient(&mut router));
+                }
+                if matches!(connection.core.state, H2State::GoAway | H2State::Error)
+                    || (connection.socket.inbound.is_empty()
+                        && matches!(connection.core.state, H2State::Header)
+                        && connection.core.stream_table.expect_read()
+                            == Some((H2StreamId::Zero, 9)))
+                {
+                    break;
+                }
+            }
+        }))
+        .map_err(|payload| {
+            payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(ToString::to_string))
+                .unwrap_or_else(|| "a panic with no message".to_owned())
+        })?;
+        let connected = matches!(
+            &connection.core.position,
+            Position::Client(_, _, BackendStatus::Connected)
+        );
+        Ok((
+            matches!(connection.core.state, H2State::Header),
+            connected,
+            connection.core.stream_table.expect_read(),
+        ))
+    }
+
+    /// Control of the two cancelled-stream tests below: the same two reads
+    /// without the cancel leave the backend connection waiting on the next
+    /// frame header, so the end state they assert is the one a healthy
+    /// connection reaches.
+    #[test]
+    fn a_response_headers_block_read_in_two_parts_is_read_whole() {
+        for continuation in [false, true] {
+            assert_eq!(
+                read_a_response_headers_block_in_two_reads(false, continuation),
+                Ok((true, true, Some((H2StreamId::Zero, 9)))),
+                "a HEADERS block split across two reads on a live stream must be read whole \
+                 (continuation: {continuation})"
+            );
+        }
+    }
+
+    /// A backend response HEADERS whose payload is cut by a read, and whose
+    /// stream the client cancels (`end_stream`) before the rest arrives, is
+    /// decoded for HPACK and dropped: RFC 9113 §4.3 asks for the field block
+    /// to reach the decoder whatever became of its stream, and the other
+    /// streams of the backend connection belong to other requests of the same
+    /// session. The DATA twin is
+    /// `end_stream_on_a_backend_mid_data_payload_sends_its_rst_before_reading_on`.
+    ///
+    /// `ConnectionH2::remove_dead_stream` repairs only the DATA payload read
+    /// through `H2StreamId::Other`; the HEADERS payload is read through
+    /// `H2StreamId::Zero`, so the `(Zero, n)` debt and the `Frame` state
+    /// survive the removal and `ConnectionH2::handle_headers_frame` then finds
+    /// no stream for the block and force-disconnects the backend.
+    #[test]
+    fn a_response_headers_block_of_a_cancelled_stream_keeps_the_backend_connection() {
+        let outcome = read_a_response_headers_block_in_two_reads(true, false);
+        eprintln!("outcome={outcome:?}");
+        assert_eq!(
+            outcome,
+            Ok((true, true, Some((H2StreamId::Zero, 9)))),
+            "a HEADERS block whose stream was cancelled mid-frame must be decoded and dropped, \
+             not take down the backend connection every other stream shares (state, connected, \
+             expect_read; or the panic the force-disconnect raised)"
+        );
+    }
+
+    /// The CONTINUATION twin: the client cancels the request after a HEADERS
+    /// frame without END_HEADERS was read whole and before the CONTINUATION
+    /// that completes the block. `ConnectionH2::handle_continuation_header_state`
+    /// checks the stream id the CONTINUATION names against the HEADERS, not
+    /// that the stream still exists, so the completed block reaches
+    /// `ConnectionH2::handle_headers_frame` all the same.
+    #[test]
+    fn a_response_continuation_of_a_cancelled_stream_keeps_the_backend_connection() {
+        let outcome = read_a_response_headers_block_in_two_reads(true, true);
+        eprintln!("outcome={outcome:?}");
+        assert_eq!(
+            outcome,
+            Ok((true, true, Some((H2StreamId::Zero, 9)))),
+            "a header block whose stream was cancelled between its HEADERS and its CONTINUATION \
+             must be decoded and dropped, not take down the backend connection every other \
+             stream shares (state, connected, expect_read; or the panic the force-disconnect \
+             raised)"
+        );
+    }
+
+    /// A backend connection that read the first three octets of the HEADERS
+    /// block `block` of stream 1 (alone in its frame, or ahead of a
+    /// CONTINUATION frame carrying the rest), whose client then cancelled the
+    /// request (`end_stream`), and that was then handed the rest of the
+    /// block. The reads run through `readable` and `writable`, honoring the
+    /// interest the connection asks for.
+    fn read_a_response_block_whose_stream_is_cancelled_midway(
+        pool: &Rc<RefCell<Pool>>,
+        block: &[u8],
+        continuation: bool,
+    ) -> H2Shell<PacedSocket> {
+        let mut connection = paced_backend(pool, usize::MAX);
+        let mut context = test_context(pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        let gid = context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("test context must create a stream");
+        context.streams[gid].state = StreamState::Linked(mio::Token(1));
+        context.streams[gid].front.consumed = true;
+        connection
+            .core
+            .stream_table
+            .register(1, gid, connection.core.now);
+        let (first, rest) = if continuation {
+            (
+                orphan_frame(1, 0, 1, 3, &block[..3]),
+                orphan_frame(
+                    9,
+                    parser::FLAG_END_HEADERS,
+                    1,
+                    (block.len() - 3) as u32,
+                    &block[3..],
+                ),
+            )
+        } else {
+            let frame = orphan_frame(1, parser::FLAG_END_HEADERS, 1, block.len() as u32, block);
+            let (first, rest) = frame.split_at(9 + 3);
+            (first.to_vec(), rest.to_vec())
+        };
+        let mut drive = |connection: &mut H2Shell<PacedSocket>,
+                         context: &mut Context<TestListener>| {
+            for _ in 0..16 {
+                connection
+                    .core
+                    .readiness
+                    .event
+                    .insert(Ready::READABLE | Ready::WRITABLE);
+                if connection.core.readiness.filter_interest().is_writable() {
+                    connection.writable(context, EndpointClient(&mut router));
+                }
+                if connection.core.readiness.filter_interest().is_readable() {
+                    connection.readable(context, EndpointClient(&mut router));
+                }
+                // The session closes a disconnecting backend: nothing more
+                // is driven on it.
+                if matches!(
+                    connection.core.position,
+                    Position::Client(_, _, BackendStatus::Disconnecting)
+                ) {
+                    break;
+                }
+            }
+        };
+        connection.socket.inbound.extend(&first);
+        drive(&mut connection, &mut context);
+        connection.end_stream(gid, &mut context);
+        connection.socket.inbound.extend(&rest);
+        drive(&mut connection, &mut context);
+        connection
+    }
+
+    /// The block of a cancelled stream is dropped, not skipped: the peer's
+    /// encoder indexed `x-probe: one` while encoding it, so the connection's
+    /// decoder has to hold the same entry (RFC 9113 §4.3) or every later
+    /// block that refers to it fails to decode. The first dynamic table entry
+    /// is index 62 (`0xbe`).
+    #[test]
+    fn the_block_of_a_cancelled_stream_still_reaches_the_hpack_decoder() {
+        let mut block = vec![0x88, 0x40, 7];
+        block.extend_from_slice(b"x-probe");
+        block.push(3);
+        block.extend_from_slice(b"one");
+        for continuation in [false, true] {
+            let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+            let mut connection =
+                read_a_response_block_whose_stream_is_cancelled_midway(&pool, &block, continuation);
+            assert!(
+                matches!(connection.core.state, H2State::Header),
+                "continuation: {continuation}: the connection waits on the next frame, got {:?}",
+                connection.core.state
+            );
+            let mut fields = Vec::new();
+            let decoded = connection
+                .core
+                .hpack
+                .decoder_mut()
+                .decode_with_cb(&[0xbe], |name, value| {
+                    fields.push((name.into_owned(), value.into_owned()))
+                });
+            assert!(
+                decoded.is_ok(),
+                "continuation: {continuation}: the dropped block's literal field must be indexed \
+                 in the decoder, got {decoded:?}"
+            );
+            assert_eq!(
+                fields,
+                vec![(b"x-probe".to_vec(), b"one".to_vec())],
+                "continuation: {continuation}"
+            );
+        }
+    }
+
+    /// A block of a cancelled stream that does not decode is what it is on
+    /// any stream: a connection error of type COMPRESSION_ERROR (RFC 9113
+    /// §4.3), whose GOAWAY goes out. Index 0 of an indexed field is invalid
+    /// (RFC 7541 §6.1).
+    #[test]
+    fn an_undecodable_block_of_a_cancelled_stream_is_a_compression_error() {
+        let mut block = vec![0x88, 0x80];
+        block.extend_from_slice(&[0x88; 12]);
+        for continuation in [false, true] {
+            let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+            let connection =
+                read_a_response_block_whose_stream_is_cancelled_midway(&pool, &block, continuation);
+            assert!(
+                matches!(connection.core.state, H2State::GoAway | H2State::Error),
+                "continuation: {continuation}: got {:?}",
+                connection.core.state
+            );
+            let frames =
+                peer_frames(&connection.socket.wire).expect("the peer must read whole frames");
+            let goaways: Vec<u32> = frames
+                .iter()
+                .filter(|(kind, _, _, _)| *kind == 7)
+                .map(|(_, _, _, payload)| {
+                    u32::from_be_bytes(payload[4..8].try_into().expect("a GOAWAY carries an error"))
+                })
+                .collect();
+            assert_eq!(
+                goaways,
+                vec![H2Error::CompressionError as u32],
+                "continuation: {continuation}: frames {frames:?}"
+            );
+        }
+    }
+
+    /// A frontend connection past its preface whose glitch limit is one, with
+    /// streams 1 and 3 opened by a request that ended with its HEADERS
+    /// (`END_STREAM`) and now wait for a backend (`Link`, half-closed
+    /// remote). A frame the client sends on such a stream is a stream error
+    /// of type STREAM_CLOSED (RFC 9113 §5.1): the connection answers
+    /// `RST_STREAM`, and every provoked reset is also one glitch.
+    fn half_closed_streams_under_a_glitch_limit_of_one(
+        pool: &Rc<RefCell<Pool>>,
+    ) -> (
+        H2Shell<PacedSocket>,
+        Context<TestListener>,
+        Router,
+        std::net::TcpStream,
+    ) {
+        let (mut connection, mut context, mut router, peer) = slot_recycle_fixture(pool);
+        connection.core.flood_detector = h2_flood_detector::H2FloodDetector::new(
+            H2FloodConfig::from_optional(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(1),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            connection.core.now,
+        );
+        // `:method GET`, `:path /`, `:scheme https`, `:authority localhost`.
+        let mut block = vec![0x82, 0x84, 0x87, 0x01, 0x09];
+        block.extend_from_slice(b"localhost");
+        for stream_id in [1, 3] {
+            let request = orphan_frame(
+                1,
+                parser::FLAG_END_HEADERS | parser::FLAG_END_STREAM,
+                stream_id,
+                block.len() as u32,
+                &block,
+            );
+            assert!(
+                feed_and_drive(&mut connection, &mut context, &mut router, &request),
+                "premise: the driver must settle after the HEADERS of stream {stream_id}"
+            );
+            let gid = connection
+                .core
+                .stream_table
+                .get(stream_id)
+                .expect("premise: the request opened its stream");
+            assert_eq!(
+                (
+                    context.streams[gid].state,
+                    context.streams[gid].front_received_end_of_stream,
+                ),
+                (StreamState::Link, true),
+                "premise: stream {stream_id} is half-closed (remote) and waits for a backend"
+            );
+        }
+        (connection, context, router, peer)
+    }
+
+    /// Drive `readable()` on the frame bytes `frame` — honoring the filtered
+    /// readiness as `Mux` does — until the connection leaves the states that
+    /// wait on a frame header or its payload, and return the state it left
+    /// them for. One pass is enough for a frame whose header the connection
+    /// answers at once; the budget only keeps a stuck connection from hanging
+    /// the test.
+    fn read_until_the_frame_is_answered(
+        connection: &mut H2Shell<PacedSocket>,
+        context: &mut Context<TestListener>,
+        router: &mut Router,
+        frame: &[u8],
+    ) -> String {
+        connection.socket.inbound.extend(frame);
+        for _ in 0..16 {
+            connection.core.readiness.event.insert(Ready::READABLE);
+            if !connection.core.readiness.filter_interest().is_readable() {
+                break;
+            }
+            connection.readable(context, EndpointClient(router));
+            if !matches!(connection.core.state, H2State::Header | H2State::Frame(_)) {
+                break;
+            }
+        }
+        format!("{:?}", connection.core.state)
+    }
+
+    /// Open the second provoked reset of the connection from
+    /// [`half_closed_streams_under_a_glitch_limit_of_one`] with `second`, the
+    /// frame the client sends on half-closed stream 3 after a first DATA on
+    /// stream 1 used up the glitch budget, and check what the connection is
+    /// left in.
+    ///
+    /// RFC 9113 §5.4.1 and §6.8: a connection that answered a flood with its
+    /// final GOAWAY stays in `GoAway` — it reads nothing more and closes once
+    /// the GOAWAY is flushed. The provoked `RST_STREAM(STREAM_CLOSED)` for
+    /// `second` carries the second glitch past a limit of one, so
+    /// `ConnectionH2::account_emitted_rst` answers GOAWAY(ENHANCE_YOUR_CALM),
+    /// yet `ConnectionH2::reset_stream_and_discard_frame` goes on to discard
+    /// the frame's payload, which writes `H2State::Discard` over `GoAway`.
+    fn assert_flood_goaway_survives_the_discard_of(second: &[u8], what: &str) {
+        let pool = default_limits_pool();
+        let (mut connection, mut context, mut router, _peer) =
+            half_closed_streams_under_a_glitch_limit_of_one(&pool);
+        // The first provoked reset is the first glitch: under the limit.
+        assert!(
+            feed_and_drive(
+                &mut connection,
+                &mut context,
+                &mut router,
+                &orphan_frame(0, 0, 1, 3, b"abc"),
+            ),
+            "{what}: premise: the first DATA on a half-closed stream is reset and discarded"
+        );
+        assert!(
+            matches!(connection.core.state, H2State::Header),
+            "{what}: premise: one glitch does not trip a limit of one, got {:?}",
+            connection.core.state
+        );
+
+        let left_in =
+            read_until_the_frame_is_answered(&mut connection, &mut context, &mut router, second);
+        let (final_state, interest, expect_read) = (
+            matches!(connection.core.state, H2State::GoAway | H2State::Error),
+            connection.core.readiness.interest,
+            connection.core.stream_table.expect_read(),
+        );
+        eprintln!("{what}: state={left_in} interest={interest:?} expect_read={expect_read:?}");
+
+        // The GOAWAY did go out: the flood verdict was reached and answered,
+        // so a state other than `GoAway` is the discard's doing.
+        connection.socket.wire.clear();
+        connection.core.readiness.event.insert(Ready::WRITABLE);
+        if connection.core.readiness.filter_interest().is_writable() {
+            connection.writable(&mut context, EndpointClient(&mut router));
+        }
+        let frames = peer_frames(&connection.socket.wire).expect("the peer must read whole frames");
+        let goaways: Vec<u32> = frames
+            .iter()
+            .filter(|(kind, _, _, _)| *kind == 7)
+            .map(|(_, _, _, payload)| {
+                u32::from_be_bytes(payload[4..8].try_into().expect("a GOAWAY carries an error"))
+            })
+            .collect();
+        assert_eq!(
+            goaways,
+            vec![H2Error::EnhanceYourCalm as u32],
+            "{what}: premise: the flood cap answered exactly one GOAWAY(ENHANCE_YOUR_CALM), \
+             got frames {frames:?}"
+        );
+
+        assert!(
+            final_state,
+            "{what}: the GOAWAY the flood cap queued is the connection's final word; the \
+             discard of the frame's payload must not replace the state, got {left_in}"
+        );
+        assert!(
+            !interest.is_readable(),
+            "{what}: after the final GOAWAY the connection must not wait for the peer's \
+             frames, got interest {interest:?} with expect_read {expect_read:?}"
+        );
+    }
+
+    /// A trailer-like HEADERS on stream 3, already half-closed (remote), is
+    /// the provoked reset that trips the glitch limit: its discard must not
+    /// undo the GOAWAY. Today it leaves `Discard` with no READABLE interest,
+    /// so nothing reads the payload and nothing takes the `GoAway` close
+    /// decision.
+    #[test]
+    fn a_flood_goaway_raised_by_a_headers_reset_survives_the_discard() {
+        let mut trailer = vec![0x00, 9];
+        trailer.extend_from_slice(b"x-trailer");
+        trailer.extend_from_slice(&[3]);
+        trailer.extend_from_slice(b"one");
+        assert_flood_goaway_survives_the_discard_of(
+            &orphan_frame(
+                1,
+                parser::FLAG_END_HEADERS | parser::FLAG_END_STREAM,
+                3,
+                trailer.len() as u32,
+                &trailer,
+            ),
+            "HEADERS on a half-closed stream",
+        );
+    }
+
+    /// The DATA twin: the discard of an orphaned DATA payload re-inserts
+    /// READABLE interest, so the connection reads the peer's frames again
+    /// after its final GOAWAY.
+    #[test]
+    fn a_flood_goaway_raised_by_a_data_reset_survives_the_discard() {
+        assert_flood_goaway_survives_the_discard_of(
+            &orphan_frame(0, 0, 3, 3, b"abc"),
+            "DATA on a half-closed stream",
         );
     }
 

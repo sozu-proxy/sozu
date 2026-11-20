@@ -930,7 +930,7 @@ used to reach the socket from somewhere the shell cannot stand:
 ### Inverting `force_disconnect`
 
 `force_disconnect` read `tls_wants_write` itself, and it is called from
-seventeen sites in the core — seven of them inside `ConnectionH2::handle_read`,
+sixteen sites in the core — seven of them inside `ConnectionH2::handle_read`,
 whose `pub` signature is socket-free by construction and does not change. So
 neither moving it nor threading the answer through its callers was available:
 the first takes the socket to `handle_read`, the second takes a socket-derived
@@ -1162,7 +1162,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9588-9592
+```rust lib/src/protocol/mux/h2.rs:9673-9677
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1287,7 +1287,10 @@ Key decisions in this method:
   END_STREAM in the body phase (§8.1.1, PROTOCOL_ERROR) reset that one stream
   through `reset_stream_and_discard_frame`, and the payload is still minimally
   processed through `Discard` (HPACK decoded, DATA credited to the connection
-  window). Every other stream on the connection carries on
+  window). Every other stream on the connection carries on. A reset that
+  trips the glitch limit or the emitted-RST cap answers
+  GOAWAY(ENHANCE_YOUR_CALM) first, and the frame's payload is then not
+  discarded: `Discard` would overwrite the closing `GoAway` state
 - DATA and HEADERS frames on a stream this endpoint reset are ignored (§5.1)
   after the same minimal processing (`ConnectionH2::discard_frame_payload`),
   whether the stream is still tracked or retired:
@@ -1340,7 +1343,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9770-9774
+```rust lib/src/protocol/mux/h2.rs:9855-9859
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1815,7 +1818,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:9089
+```rust lib/src/protocol/mux/h2.rs:9174
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -2059,7 +2062,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:7529-7531
+```rust lib/src/protocol/mux/h2.rs:7614-7616
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -2067,7 +2070,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:7543-7549
+```rust lib/src/protocol/mux/h2.rs:7628-7634
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.

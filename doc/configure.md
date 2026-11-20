@@ -4638,7 +4638,7 @@ force-disconnected. In the first case no dropped frame would have been
 serialised anyway; in the second the peer already holds a GOAWAY, so the
 dropped resets do not change what it can still believe about a stream
 | | `h2.headers_no_stream.error` | counter | proxy
-| HEADERS frame received with no matching stream (protocol error) | |
+| header block completed after its stream was removed (the client cancelled the request, or the stream was reaped, while the block was being read): the block is decoded for HPACK and dropped and the connection stays up | |
 `h2.frames.tx.headers` | counter | proxy | HEADERS frames emitted by the H2
 block converter (one per response, plus the first frame of any header block
 split into HEADERS+CONTINUATION when the encoded headers exceed the negotiated
