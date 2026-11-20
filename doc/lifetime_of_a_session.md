@@ -1125,8 +1125,11 @@ minimum set to read a session's life from a dashboard:
   `Mux::attach_dialed`; `-1` in `Mux::close` for the backends still open at
   session teardown, in `Connection::pre_close_client_bookkeeping` for a backend
   closed through `Connection::close` — the dead-backend sweep of
-  `Mux::ready_inner` included — and in `Mux::attach_dialed`'s rollback when the
-  mio registration of a new backend socket fails).
+  `Mux::ready_inner` included — in `Mux::attach_dialed`'s rollback when the
+  mio registration of a new backend socket fails, in `Pipe::close` for the one
+  connection a WebSocket upgrade moves into its pipe, and in
+  `Mux::release_backend_connections_except` for the other connections the
+  session still pools when it upgrades).
 - `requests`, `bytes_in`, `bytes_out`, `backend_response_time`,
   `backend_header_time` — per-cluster and per-backend counters and timings
   (`names::backend`, `lib/src/metrics/names.rs`).

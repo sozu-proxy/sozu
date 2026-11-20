@@ -1932,9 +1932,30 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
     }
 
     fn close(&mut self, _proxy: Rc<RefCell<dyn L7Proxy>>, _metrics: &mut SessionMetrics) {
-        if let Some(backend) = self.backend.as_mut() {
-            let mut backend = backend.borrow_mut();
-            backend.active_requests = backend.active_requests.saturating_sub(1);
+        // Only a WebSocket pipe holds a `Backend` (`HttpSession::upgrade_mux`
+        // in `lib/src/http.rs`, `HttpsSession::upgrade_mux` in
+        // `lib/src/https.rs`); the TCP proxy passes `None` and releases its
+        // own connection. The upgrade moved the backend connection out of the
+        // mux's `router.backends`, where `Mux::close` would have released it,
+        // so this is the only place left to give back what the mux took for
+        // it: the `active_connections` reservation selection made, and the
+        // three gauges `Mux::attach_dialed` raised at dial. `take` lets a
+        // second close release nothing.
+        if let Some(backend) = self.backend.take() {
+            {
+                let mut backend = backend.borrow_mut();
+                backend.active_requests = backend.active_requests.saturating_sub(1);
+                backend.dec_connections();
+            }
+            gauge_add!(names::backend::CONNECTIONS, -1);
+            gauge_add!(names::backend::POOL_SIZE, -1);
+            gauge_add!(
+                names::backend::CONNECTIONS_PER_BACKEND,
+                -1,
+                self.cluster_id.as_deref(),
+                self.backend_id.as_deref(),
+                self.cluster_metrics_incarnation
+            );
         }
 
         // The TLS teardown the session's own `close` expects from its state
@@ -4331,6 +4352,203 @@ mod tests {
             pipe.backend_buffer.available_data(),
             tail.len(),
             "the undelivered tail must still be queued for the client"
+        );
+    }
+
+    /// Read a process-local proxy gauge (the thread-local `METRICS` the
+    /// `gauge_add!` calls feed), treating an absent key as 0. The read does
+    /// not drain, and every `#[test]` runs on its own thread, so the value is
+    /// private to the test that reads it.
+    fn proxy_gauge(name: &str) -> i64 {
+        use sozu_command::proto::command::filtered_metrics::Inner;
+        crate::metrics::METRICS.with(|metrics| {
+            metrics
+                .borrow_mut()
+                .dump_local_proxy_metrics()
+                .get(name)
+                .and_then(|filtered| filtered.inner.as_ref())
+                .and_then(|inner| match inner {
+                    Inner::Gauge(value) => Some(*value as i64),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        })
+    }
+
+    /// A WebSocket pipe inherits the mux's backend connection (`upgrade_mux`
+    /// moves the socket and the `Backend` handle into `Pipe::new`), and with it
+    /// the connection's accounting: the `active_connections` reservation the
+    /// mux took when it selected the backend, and the `backend.connections`
+    /// and `backend.pool.size` gauges it raised when the dial completed.
+    /// Nothing else releases them once the connection has left the mux's
+    /// backend map, so closing the pipe must.
+    ///
+    /// The "before" values are not asserted to be zero: they are the state the
+    /// mux leaves behind, one reservation and one unit of each gauge for this
+    /// connection, and a close must bring the three back by exactly that unit.
+    ///
+    /// To SEE THIS RED: delete the `backend.dec_connections()` call from
+    /// `Pipe::close`. The tuple then reads `(1, 0, 0)` where `(0, 0, 0)` is
+    /// expected: the reservation the mux took for the connection is never
+    /// given back.
+    #[test]
+    fn closing_a_websocket_pipe_releases_its_backend_connection() {
+        let (_frontend_peer, frontend_socket) = connected_pair();
+        let (_backend_peer, backend_socket) = connected_pair();
+
+        let mut pool = Pool::with_capacity(2, 2, 4096);
+        let backend_buffer = pool.checkout().expect("backend buffer");
+        let frontend_buffer = pool.checkout().expect("frontend buffer");
+        let address = "127.0.0.1:0".parse().expect("test address");
+        let listener = Rc::new(RefCell::new(TestListener { address }));
+        let backend = Rc::new(RefCell::new(Backend::new(
+            "backend-ws",
+            "127.0.0.1:1".parse().expect("backend address"),
+            None,
+            None,
+            None,
+        )));
+
+        // What the mux did before it handed the connection to the pipe:
+        // `reserve_connection` -> `inc_connections`, then, at dial,
+        // `attach_dialed`'s two unlabelled gauge increments.
+        assert_eq!(
+            backend.borrow_mut().inc_connections(),
+            Some(1),
+            "precondition: the mux reserved one connection on the backend"
+        );
+        let connections_before = proxy_gauge(names::backend::CONNECTIONS);
+        let pool_size_before = proxy_gauge(names::backend::POOL_SIZE);
+        gauge_add!(names::backend::CONNECTIONS, 1);
+        gauge_add!(names::backend::POOL_SIZE, 1);
+        assert_eq!(
+            proxy_gauge(names::backend::CONNECTIONS),
+            connections_before + 1,
+            "precondition: the dial raised backend.connections"
+        );
+        assert_eq!(
+            proxy_gauge(names::backend::POOL_SIZE),
+            pool_size_before + 1,
+            "precondition: the dial raised backend.pool.size"
+        );
+
+        let mut pipe = Pipe::new(
+            backend_buffer,
+            Some("backend-ws".to_owned()),
+            Some(TcpStream::from_std(backend_socket)),
+            Some(backend.clone()),
+            None,
+            None,
+            Some("cluster-ws".into()),
+            frontend_buffer,
+            Token(0),
+            TcpStream::from_std(frontend_socket),
+            listener,
+            Protocol::HTTP,
+            Ulid::generate(),
+            Ulid::generate(),
+            None,
+            WebSocketContext::Tcp,
+        );
+
+        // `Pipe::close` ignores its proxy argument; any `L7Proxy` will do.
+        let parts = crate::testing::prebuild_server(4, 16_384, false)
+            .expect("test server parts must build");
+        let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(crate::http::HttpProxy::new(
+            parts.registry,
+            parts.sessions,
+            parts.pool,
+            parts.backends,
+        )));
+        let mut metrics = SessionMetrics::new(Some(Duration::ZERO));
+        SessionState::close(&mut pipe, proxy, &mut metrics);
+
+        // One assertion for the three, so a failure reports every counter the
+        // close left behind and not only the first.
+        assert_eq!(
+            (
+                backend.borrow().active_connections,
+                proxy_gauge(names::backend::CONNECTIONS) - connections_before,
+                proxy_gauge(names::backend::POOL_SIZE) - pool_size_before,
+            ),
+            (0, 0, 0),
+            "closing the pipe must release what the mux took for the connection it \
+             handed over: (backend.active_connections, backend.connections delta, \
+             backend.pool.size delta)"
+        );
+    }
+
+    /// `Pipe::close` gives back one connection, the pipe's own. A backend that
+    /// carries another connection keeps that one's reservation and gauges,
+    /// and a repeated close of the same pipe releases nothing more.
+    #[test]
+    fn closing_a_websocket_pipe_twice_releases_its_connection_once() {
+        let (_frontend_peer, frontend_socket) = connected_pair();
+        let (_backend_peer, backend_socket) = connected_pair();
+
+        let mut pool = Pool::with_capacity(2, 2, 4096);
+        let backend_buffer = pool.checkout().expect("backend buffer");
+        let frontend_buffer = pool.checkout().expect("frontend buffer");
+        let address = "127.0.0.1:0".parse().expect("test address");
+        let listener = Rc::new(RefCell::new(TestListener { address }));
+        let backend = Rc::new(RefCell::new(Backend::new(
+            "backend-ws-twice",
+            "127.0.0.1:1".parse().expect("backend address"),
+            None,
+            None,
+            None,
+        )));
+
+        // Two connections on the backend: the pipe's, and one that stays.
+        assert_eq!(backend.borrow_mut().inc_connections(), Some(1));
+        assert_eq!(backend.borrow_mut().inc_connections(), Some(2));
+        let connections_before = proxy_gauge(names::backend::CONNECTIONS);
+        let pool_size_before = proxy_gauge(names::backend::POOL_SIZE);
+        gauge_add!(names::backend::CONNECTIONS, 2);
+        gauge_add!(names::backend::POOL_SIZE, 2);
+
+        let mut pipe = Pipe::new(
+            backend_buffer,
+            Some("backend-ws-twice".to_owned()),
+            Some(TcpStream::from_std(backend_socket)),
+            Some(backend.clone()),
+            None,
+            None,
+            Some("cluster-ws".into()),
+            frontend_buffer,
+            Token(0),
+            TcpStream::from_std(frontend_socket),
+            listener,
+            Protocol::HTTP,
+            Ulid::generate(),
+            Ulid::generate(),
+            None,
+            WebSocketContext::Tcp,
+        );
+
+        let parts = crate::testing::prebuild_server(4, 16_384, false)
+            .expect("test server parts must build");
+        let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(crate::http::HttpProxy::new(
+            parts.registry,
+            parts.sessions,
+            parts.pool,
+            parts.backends,
+        )));
+        let mut metrics = SessionMetrics::new(Some(Duration::ZERO));
+        SessionState::close(&mut pipe, proxy.clone(), &mut metrics);
+        SessionState::close(&mut pipe, proxy, &mut metrics);
+
+        assert_eq!(
+            (
+                backend.borrow().active_connections,
+                proxy_gauge(names::backend::CONNECTIONS) - connections_before,
+                proxy_gauge(names::backend::POOL_SIZE) - pool_size_before,
+            ),
+            (1, 1, 1),
+            "two closes of one pipe must release its connection once and leave the \
+             other connection's reservation and gauges held: \
+             (backend.active_connections, backend.connections delta, \
+             backend.pool.size delta)"
         );
     }
 }

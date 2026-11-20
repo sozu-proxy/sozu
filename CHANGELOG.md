@@ -153,6 +153,10 @@
 
 - Fixed: a TCP, WebSocket or secure WebSocket session whose backend closes while response bytes are still queued for a client that has stopped reading is no longer cut with the tail undelivered. The backend hang-up handler turned the frontend's WRITABLE event back on after every failed write, so the pass never parked to wait for the client and retried the failing `send` until it reached the 100000-iteration bound. It then closed the session, counted `tcp.infinite_loop.error` or `http.infinite_loop.error`, dropped the rest of the response, and stalled the single-threaded worker for that whole pass. The handler now adds the WRITABLE interest only; the session waits for the client's next writable event and delivers the tail once the client reads.
 
+<!-- changelog-slot:websocket-backend-accounting -->
+
+- A WebSocket session (`ws` and `wss`) now gives its backend connection back when it ends. The upgrade moves the backend connection out of the mux into a `Pipe`, and nothing released it afterwards: every WebSocket session left its backend's `active_connections` one higher for as long as that backend lived, and the `backend.connections`, `backend.pool.size` and `connections_per_backend` gauges one higher for the life of the worker. The drift grew with each session, skewed the `CONNECTIONS` and `CONNECTION_TIME` load metrics that `LEAST_LOADED` and `POWER_OF_TWO` read against the backends serving WebSockets, and kept a removed backend `Closing` forever, since it only becomes `Closed` when its count reaches zero. The upgrade also dropped, without releasing them, the other keep-alive connections the client's HTTP/1.1 session still pooled for other clusters (a request to cluster A, then an upgrade to cluster B on the same client connection); each leaked the same four counters. `Pipe::close` now releases the connection the pipe kept, and the upgrade releases the pooled ones through the same path `Mux::close` takes for them, which also shuts their sockets down and frees their session slots instead of leaving both to the session's close.
+
 ## 2.3.6 - 2026-11-18
 
 ### Security
