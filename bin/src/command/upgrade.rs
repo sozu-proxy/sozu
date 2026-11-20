@@ -162,6 +162,15 @@ pub fn upgrade_worker(server: &mut Server, client: &mut ClientSession, old_worke
         }
     };
 
+    // One upgrade at a time per worker, up to the moment it stops: until then
+    // the worker is still `Running`, so the check above admits a second one.
+    if server.worker_upgrade_in_flight(old_worker_id) {
+        client.finish_failure(format!(
+            "Worker {old_worker_id} is already being upgraded, wait for that upgrade to finish"
+        ));
+        return;
+    }
+
     client.return_processing(format!(
         "Requesting listen sockets from worker {old_worker_id}"
     ));
@@ -473,6 +482,20 @@ impl GatheringTask for UpgradeWorkerTask {
             } => Some(old_worker_token),
             UpgradeWorkerProgress::RestoringOldWorker { .. }
             | UpgradeWorkerProgress::StopOldActivateNew { .. } => None,
+        }
+    }
+
+    /// Every stage of the upgrade names its old worker, and the upgrade is in
+    /// flight until the last one ends: a stage that ends without chaining the
+    /// next (an abort, a failure, the final answer) is what frees the worker.
+    fn upgrading_worker_id(&self) -> Option<WorkerId> {
+        match self.progress {
+            UpgradeWorkerProgress::RequestingListenSockets { old_worker_id, .. }
+            | UpgradeWorkerProgress::AwaitingReadiness { old_worker_id, .. }
+            | UpgradeWorkerProgress::RestoringOldWorker { old_worker_id, .. }
+            | UpgradeWorkerProgress::StopOldActivateNew { old_worker_id, .. } => {
+                Some(old_worker_id)
+            }
         }
     }
 

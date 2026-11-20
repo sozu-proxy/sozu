@@ -309,6 +309,13 @@ pub(crate) trait GatheringTask: Debug {
         Vec::new()
     }
 
+    /// The worker whose `upgrade --worker` this task is a stage of, whichever
+    /// stage it is: while any live task names a worker here, no second upgrade
+    /// of that worker is admitted ([`Server::worker_upgrade_in_flight`]).
+    fn upgrading_worker_id(&self) -> Option<WorkerId> {
+        None
+    }
+
     /// This is called once every worker has answered
     /// It allows to operate both on the server (launch workers...) and the client (send an answer...)
     fn on_finish(
@@ -1050,6 +1057,15 @@ impl CommandHub {
                 }
                 Some((task_id, task))
             })
+            .collect();
+        // The one place the tasks that stay alive are all in sight, the ones
+        // that just chained included: a worker is upgrading exactly while one
+        // of them names it, so a task that ended however it ended frees it.
+        self.server.upgrading_workers = self
+            .tasks
+            .values()
+            .chain(self.server.queued_tasks.values())
+            .filter_map(|task| task.job.upgrading_worker_id())
             .collect();
     }
 
@@ -2268,6 +2284,17 @@ pub struct Server {
     /// cold start included. Empty once every readiness task has concluded;
     /// never part of a snapshot, since a pending readiness task refuses one.
     startup_workers: HashSet<WorkerId>,
+    /// Workers an `upgrade --worker` is in flight for, as the last task sweep
+    /// ([`CommandHub::finish_ready_tasks`]) found them: the tasks of an
+    /// upgrade live in `CommandHub::tasks` after that sweep, out of reach of
+    /// `upgrade_worker`, which only holds the server. Derived, never
+    /// maintained: each sweep replaces it with what the live tasks name
+    /// ([`GatheringTask::upgrading_worker_id`]), so no way for a task to end
+    /// can leave a worker marked, and a main process that took over a handoff
+    /// has it after its first sweep. Read through
+    /// [`Self::worker_upgrade_in_flight`], which adds the tasks queued since.
+    /// Never part of a snapshot.
+    upgrading_workers: HashSet<WorkerId>,
     /// Workers being given the confirmed protected health check values
     /// (`protected::begin_worker_bootstrap`), and those whose fence did not
     /// prove their process gone. A worker listed here accepts the exact
@@ -2495,6 +2522,7 @@ impl Server {
             workers: HashMap::new(),
             protected: Default::default(),
             startup_workers: HashSet::new(),
+            upgrading_workers: HashSet::new(),
             bootstrapping_workers: HashSet::new(),
             unreaped_workers: Vec::new(),
             spawn_retry_at: None,
@@ -2824,6 +2852,23 @@ impl Server {
         self.workers
             .values()
             .find(|worker| worker.id == id && worker.is_active())
+    }
+
+    /// Whether an `upgrade --worker` of worker `id` is in flight: the worker
+    /// owns one pending shutdown id (`lib/src/server.rs`, `shutting_down`), so a
+    /// second upgrade would take its listen sockets again (it has none left to
+    /// give), launch a second replacement for the same slot, and overwrite the
+    /// id of the first `SoftStop`, which then never gets its answer.
+    ///
+    /// Two sources, because a task changes hands: one created in this
+    /// event-loop iteration is still in `queued_tasks`, and one that went
+    /// through a sweep is only in [`Self::upgrading_workers`].
+    pub(crate) fn worker_upgrade_in_flight(&self, id: WorkerId) -> bool {
+        self.upgrading_workers.contains(&id)
+            || self
+                .queued_tasks
+                .values()
+                .any(|task| task.job.upgrading_worker_id() == Some(id))
     }
 
     /// register a worker session in the server, return the mutable worker session
@@ -4928,6 +4973,294 @@ mod tests {
         );
         fixture.hub.finish_ready_tasks(Instant::now());
         fixture.assert_refused();
+    }
+
+    /// A worker owns one pending shutdown id, so only one `upgrade --worker`
+    /// may be in flight for it: the second one is refused before it asks the
+    /// worker for anything. Admitted, it takes the listen sockets again (the
+    /// worker has none left to give), launches a second replacement for the
+    /// same slot and later soft stops the worker a second time, which
+    /// overwrites the id of the first `SoftStop` and leaves the first client
+    /// with a synthetic failure.
+    ///
+    /// A repeat is refused both in the event-loop iteration of the first
+    /// upgrade, while its task still sits in `Server::queued_tasks`, and in a
+    /// later one, once `CommandHub::finish_ready_tasks` has moved it into
+    /// `CommandHub::tasks`, which `upgrade_worker` cannot see: that is where
+    /// an operator retry finds it.
+    ///
+    /// TO SEE THIS RED: delete the `if server.worker_upgrade_in_flight(..)`
+    /// block of `upgrade_worker` (`bin/src/command/upgrade.rs`): both repeats
+    /// are admitted and "worker 7 is asked for its listen sockets once, by
+    /// the first upgrade only" fails with `left: 3`, `right: 1`. Narrower,
+    /// each source of `Server::worker_upgrade_in_flight` alone: keep only
+    /// `self.upgrading_workers.contains(&id)` there (the repeat in the same
+    /// iteration is admitted), or drop the recomputation of
+    /// `self.server.upgrading_workers` at the end of
+    /// `CommandHub::finish_ready_tasks` (the later repeat is admitted); the
+    /// same assertion then fails with `left: 2`.
+    #[test]
+    fn a_second_upgrade_of_a_worker_already_being_upgraded_is_refused() {
+        let mut hub = create_test_hub();
+        // The first upgrade must still be waiting when the later iteration
+        // sweeps the tasks, not timed out by a zero `worker_timeout`.
+        hub.server.config.worker_timeout = 60;
+        let (first_token, mut first_peer) = register_observable_client(&mut hub);
+        let (second_token, mut second_peer) = register_observable_client(&mut hub);
+        let (later_token, mut later_peer) = register_observable_client(&mut hub);
+        let (mut worker_side, _scm) = register_ready_test_worker(&mut hub.server, 7, 4096, 65536);
+
+        for client_token in [first_token, second_token, later_token] {
+            if client_token == later_token {
+                hub.finish_ready_tasks(Instant::now());
+            }
+            let (server, client) = hub.get_client_mut(&client_token).expect("the client");
+            server.handle_client_request(client, RequestType::UpgradeWorker(7).into());
+        }
+
+        let listen_socket_requests = drain_worker_requests(&mut hub.server, &mut worker_side)
+            .into_iter()
+            .filter(|request| {
+                matches!(
+                    request.content.request_type,
+                    Some(RequestType::ReturnListenSockets(_))
+                )
+            })
+            .count();
+        assert_eq!(
+            listen_socket_requests, 1,
+            "worker 7 is asked for its listen sockets once, by the first upgrade only"
+        );
+        assert_eq!(
+            hub.live_task_count(),
+            1,
+            "only the first upgrade of worker 7 is in flight"
+        );
+
+        for (token, peer, when) in [
+            (second_token, &mut second_peer, "same"),
+            (later_token, &mut later_peer, "later"),
+        ] {
+            flush_client_responses(&mut hub, token, peer);
+            let mut answers = Vec::new();
+            while let Ok(message) = peer.read_message() {
+                answers.push(message);
+            }
+            assert_eq!(
+                answers
+                    .last()
+                    .map(|answer| ResponseStatus::try_from(answer.status)),
+                Some(Ok(ResponseStatus::Failure)),
+                "a repeat in the {when} iteration must be refused at once, it got {answers:?}"
+            );
+        }
+
+        flush_client_responses(&mut hub, first_token, &mut first_peer);
+        let mut first_answers = Vec::new();
+        while let Ok(message) = first_peer.read_message() {
+            first_answers.push(message);
+        }
+        assert!(
+            first_answers
+                .iter()
+                .all(|answer| answer.status != ResponseStatus::Failure as i32),
+            "the first upgrade is unaffected by the refusal, it got {first_answers:?}"
+        );
+    }
+
+    /// Send `upgrade --worker 7` for the client `token`, and return the last
+    /// answer it got.
+    fn upgrade_worker_7_answer(
+        hub: &mut CommandHub,
+        token: Token,
+        peer: &mut Channel<Request, Response>,
+    ) -> Option<Response> {
+        let (server, client) = hub.get_client_mut(&token).expect("the client");
+        server.handle_client_request(client, RequestType::UpgradeWorker(7).into());
+        flush_client_responses(hub, token, peer);
+        let mut last = None;
+        while let Ok(message) = peer.read_message() {
+            last = Some(message);
+        }
+        last
+    }
+
+    fn is_already_upgrading_refusal(answer: &Option<Response>) -> bool {
+        answer.as_ref().is_some_and(|answer| {
+            answer.status == ResponseStatus::Failure as i32
+                && answer.message.contains("already being upgraded")
+        })
+    }
+
+    /// The wait for the replacement is the long stage of an upgrade, and the
+    /// old worker is `Running` and listening on nothing all through it, so a
+    /// second upgrade must be refused there too, with no request sent to the
+    /// worker. The worker is free again as soon as the upgrade has ended, here
+    /// aborted by the deadline of the replacement: the mark is derived from the
+    /// live tasks, so no way for the upgrade to end can leave it behind.
+    ///
+    /// TO SEE THIS RED: drop the recomputation of
+    /// `self.server.upgrading_workers` at the end of
+    /// `CommandHub::finish_ready_tasks`: the swept readiness task is out of
+    /// the guard's sight, the second upgrade is admitted, and the first
+    /// refusal assertion fails with `Some(Response { status: Processing,
+    /// message: "Requesting listen sockets from worker 7", .. })`. For the
+    /// second half, make that recomputation only add to the set
+    /// (`self.server.upgrading_workers.extend(..)` with the same workers): the
+    /// ended upgrade keeps worker 7 marked and "an ended upgrade must not keep
+    /// the worker out of a new one" fails with the refusal "Worker 7 is
+    /// already being upgraded, wait for that upgrade to finish".
+    #[test]
+    fn a_worker_is_refused_a_second_upgrade_while_its_replacement_boots_and_is_free_once_it_ended()
+    {
+        let mut fixture = upgrade_readiness_fixture();
+        let (second_token, mut second_peer) = register_observable_client(&mut fixture.hub);
+        let (third_token, mut third_peer) = register_observable_client(&mut fixture.hub);
+
+        fixture.hub.finish_ready_tasks(Instant::now());
+        assert_eq!(fixture.hub.tasks.len(), 1, "the readiness task is swept");
+        let answer = upgrade_worker_7_answer(&mut fixture.hub, second_token, &mut second_peer);
+        assert!(is_already_upgrading_refusal(&answer), "{answer:?}");
+        assert!(
+            drain_worker_requests(&mut fixture.hub.server, &mut fixture.old_side).is_empty(),
+            "a refused upgrade asks the worker for nothing"
+        );
+
+        fixture
+            .hub
+            .finish_ready_tasks(Instant::now() + Duration::from_secs(60));
+        fixture.assert_refused();
+
+        let answer = upgrade_worker_7_answer(&mut fixture.hub, third_token, &mut third_peer);
+        assert!(
+            !answer
+                .as_ref()
+                .is_some_and(|answer| answer.message.contains("already being upgraded")),
+            "an ended upgrade must not keep the worker out of a new one: {answer:?}"
+        );
+        let requests = drain_worker_requests(&mut fixture.hub.server, &mut fixture.old_side);
+        assert!(
+            requests.iter().any(|request| matches!(
+                request.content.request_type,
+                Some(RequestType::ReturnListenSockets(_))
+            )),
+            "the new upgrade asks worker 7 for its listen sockets, it was sent {requests:?}"
+        );
+    }
+
+    /// A phase-one task a main process took over in a handoff is in
+    /// `CommandHub::tasks` from the first sweep and was never created by
+    /// `upgrade_worker` in this process: the worker it upgrades is refused a
+    /// second upgrade all the same.
+    ///
+    /// TO SEE THIS RED: drop the recomputation of
+    /// `self.server.upgrading_workers` at the end of
+    /// `CommandHub::finish_ready_tasks`, the only place the restored task is
+    /// seen: worker 7 is no longer marked, the upgrade is admitted, and the
+    /// last assertion fails with `Some(Response { status: Processing,
+    /// message: "Requesting listen sockets from worker 7", .. })`.
+    #[test]
+    fn a_worker_whose_upgrade_was_handed_over_is_refused_a_second_upgrade() {
+        let mut hub = create_test_hub();
+        hub.server.config.worker_timeout = 60;
+        let (client_token, mut client_peer) = register_observable_client(&mut hub);
+        let (_worker_side, _scm) = register_ready_test_worker(&mut hub.server, 7, 4096, 65536);
+        let old_token = *hub.server.workers.keys().next().expect("worker 7 session");
+
+        let snapshot: TaskSnapshot = serde_json::from_value(serde_json::json!({
+            "UpgradeWorker": {
+                "client_token": client_token.0,
+                "progress": {
+                    "RequestingListenSockets": {
+                        "old_worker_token": old_token.0,
+                        "old_worker_id": 7
+                    }
+                },
+                "ok": 0,
+                "errors": 0,
+                "responses": [],
+                "expected_responses": 1
+            }
+        }))
+        .expect("phase-one task snapshot should deserialize");
+        let restored = snapshot
+            .restore(TaskRestoreTiming {
+                now: Instant::now(),
+                handoff_elapsed: Duration::ZERO,
+            })
+            .expect("phase-one task should restore");
+        hub.tasks.insert(
+            11,
+            TaskContainer {
+                job: restored,
+                timeout: Some(Instant::now() + Duration::from_secs(60)),
+            },
+        );
+        hub.server.next_task_id = 12;
+
+        hub.finish_ready_tasks(Instant::now());
+        assert_eq!(
+            hub.live_task_count(),
+            1,
+            "the restored task is still waiting"
+        );
+        let answer = upgrade_worker_7_answer(&mut hub, client_token, &mut client_peer);
+        assert!(is_already_upgrading_refusal(&answer), "{answer:?}");
+    }
+
+    /// An upgrade whose replacement fails its readiness is not over when the
+    /// replacement is fenced: it then asks the old worker to listen again
+    /// (`UpgradeWorkerProgress::RestoringOldWorker`), and the old worker is
+    /// still being upgraded until it answered. A second upgrade is refused
+    /// there too, also once the restore stage went through a sweep, with no
+    /// request sent to the worker, and the worker is free again as soon as the
+    /// restore ended.
+    ///
+    /// TO SEE THIS RED: in `UpgradeWorkerTask::upgrading_worker_id`
+    /// (`bin/src/command/upgrade.rs`), make the
+    /// `UpgradeWorkerProgress::RestoringOldWorker` arm return `None`: the
+    /// restore stage no longer marks worker 7, the second upgrade is admitted,
+    /// and the refusal assertion fails with `Some(Response { status:
+    /// Processing, message: "Requesting listen sockets from worker 7", .. })`.
+    #[test]
+    fn a_worker_is_refused_a_second_upgrade_while_its_aborted_upgrade_restores_it_and_is_free_once_restored()
+     {
+        let mut fixture = upgrade_readiness_fixture();
+        add_active_http_listener(&mut fixture.hub, 8093);
+        let (second_token, mut second_peer) = register_observable_client(&mut fixture.hub);
+        let (third_token, mut third_peer) = register_observable_client(&mut fixture.hub);
+        let id = fixture.readiness_id.clone();
+        fixture
+            .hub
+            .handle_worker_response(8, status_answer(&id, ResponseStatus::Failure));
+        fixture.hub.finish_ready_tasks(Instant::now());
+        let requests = reactivation_requests(&mut fixture);
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        fixture.hub.finish_ready_tasks(Instant::now());
+        assert_eq!(fixture.hub.tasks.len(), 1, "the restore stage is swept");
+
+        let answer = upgrade_worker_7_answer(&mut fixture.hub, second_token, &mut second_peer);
+        assert!(is_already_upgrading_refusal(&answer), "{answer:?}");
+        assert!(
+            drain_worker_requests(&mut fixture.hub.server, &mut fixture.old_side).is_empty(),
+            "a refused upgrade asks the worker for nothing"
+        );
+
+        fixture
+            .hub
+            .handle_worker_response(7, status_answer(&requests[0].id, ResponseStatus::Ok));
+        fixture.hub.finish_ready_tasks(Instant::now());
+        assert!(
+            fixture.hub.tasks.is_empty() && fixture.hub.server.queued_tasks.is_empty(),
+            "the restore ended"
+        );
+        let answer = upgrade_worker_7_answer(&mut fixture.hub, third_token, &mut third_peer);
+        assert!(
+            !answer
+                .as_ref()
+                .is_some_and(|answer| answer.message.contains("already being upgraded")),
+            "an ended restore must free the worker: {answer:?}"
+        );
     }
 
     #[test]

@@ -468,6 +468,35 @@ the task cannot be handed over to a new main process
 old worker that never answers the first `ReturnListenSockets` is not covered:
 that answer is indeterminate and the upgrade fails as before.
 
+Only one `upgrade --worker` runs per worker at a time. A worker keeps a single
+pending shutdown id, and the old worker stays `Running` until the replacement
+is ready, so `get_active_worker_by_id` alone would admit a second upgrade of
+it: the worker has no listening socket left to give back, the second upgrade
+launches a second replacement for the same slot, and its `SoftStop` overwrites
+the id of the first, whose client then gets only the synthetic "closed before
+answering" failure. `upgrade_worker` therefore refuses a worker that a live task
+is upgrading (`Server::worker_upgrade_in_flight`) with "Worker N is already
+being upgraded", before it asks the worker for anything. Every stage of the
+upgrade names its old worker (`GatheringTask::upgrading_worker_id`), the
+readiness stage included while the protected bootstrap of the replacement
+(`WorkerBootstrapTask`) holds it, which forwards the name as it forwards the
+retained workers; a refused bootstrap marks no worker as bootstrapping, so this
+is the only guard there. The answer is read from two places because a task
+changes hands: one created in the current event-loop iteration is still in
+`Server::queued_tasks`, and one that went through a sweep is only in
+`CommandHub::tasks`, out of the server's reach.
+The sweep (`CommandHub::finish_ready_tasks`) therefore rewrites
+`Server::upgrading_workers` from the tasks that stay alive, the ones just
+chained included. Nothing ever clears it by hand: an upgrade that ended however
+it ended (an abort, a failure, the final answer, a worker that died) frees its
+worker at that sweep, and a main process that took a phase-one task over in a
+handoff has the set after its first sweep, so the set is in no snapshot. The
+second upgrade of a worker that is already `Stopping` keeps the answer it had,
+"does not exist, or is stopping / stopped". The per-worker upgrades of
+`sozu upgrade` target distinct workers and do not refuse each other, but one
+of them is refused like any other when an `upgrade --worker` of the same
+worker is already in flight.
+
 `UpgradeWorkerTask::on_finish` of the second phase answers
 `Ok` only when every response of that second phase is `Ok`. A failure of the
 old worker's `SoftStop`, including the synthetic "closed before answering" of

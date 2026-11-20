@@ -1607,6 +1607,13 @@ impl GatheringTask for WorkerBootstrapTask {
         self.finalizer.retained_worker_ids()
     }
 
+    /// The readiness task of an `upgrade --worker` waits inside this one
+    /// while its replacement is given the confirmed values: its old worker is
+    /// still being upgraded.
+    fn upgrading_worker_id(&self) -> Option<WorkerId> {
+        self.finalizer.upgrading_worker_id()
+    }
+
     fn on_finish(
         mut self: Box<Self>,
         server: &mut Server,
@@ -3544,6 +3551,41 @@ mod tests {
         };
 
         assert_eq!(task.retained_worker_ids(), vec![4]);
+    }
+
+    /// A replacement whose bootstrap main refuses (the confirmed set is not
+    /// one the state names) holds the readiness task of its `upgrade --worker`
+    /// until the next sweep, and nothing marks it as bootstrapping: its old
+    /// worker is still being upgraded, and a second upgrade of it is refused.
+    ///
+    /// TO SEE THIS RED: delete `WorkerBootstrapTask::upgrading_worker_id`, so
+    /// that the trait's default `None` hides the readiness task the bootstrap
+    /// holds: the upgrade of worker 0 is admitted and the assertion fails with
+    /// `Some(Response { status: Processing, message: "Requesting listen
+    /// sockets from worker 0", .. })`. Keeping only
+    /// `self.upgrading_workers.contains(&id)` in
+    /// `Server::worker_upgrade_in_flight` fails it the same way, since the
+    /// bootstrap is still queued when the upgrade arrives.
+    #[test]
+    fn a_refused_bootstrap_still_holds_the_upgrade_of_the_old_worker() {
+        let mut rig = rig_with_confirmed_values();
+        assert!(rig.hub.server.mark_worker_ready(0));
+        let cluster = rig.hub.server.state.clusters.get_mut(CLUSTER);
+        cluster.expect("the cluster").health_check = None;
+        let old = token_of(&rig, 0);
+        let job = crate::command::upgrade::awaiting_readiness_task(rig.client, old, 0, 1);
+        start_worker_with(&mut rig, 1, job);
+        assert!(!rig.hub.server.worker_bootstrap_in_flight());
+
+        send(&mut rig, RequestType::UpgradeWorker(0));
+        let answer = rig.responses().pop();
+        assert!(
+            answer
+                .as_ref()
+                .is_some_and(|answer| answer.status == ResponseStatus::Failure as i32
+                    && answer.message.contains("already being upgraded")),
+            "{answer:?}"
+        );
     }
 
     #[test]
