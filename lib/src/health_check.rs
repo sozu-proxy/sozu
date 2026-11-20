@@ -602,42 +602,57 @@ impl HealthChecker {
                 }
             }
 
+            // The probe socket is registered edge-triggered, so the kernel
+            // raises one readiness event per arrival and none for bytes that
+            // stay queued after a read: a single 256-byte read would leave the
+            // rest of a burst unread with nothing to wake the probe again
+            // before its timeout. Read until the queue is empty (`WouldBlock`),
+            // the peer closes, a verdict is reached or the response exceeds
+            // `MAX_HEALTH_RESPONSE_SIZE`. Every iteration that does not leave
+            // the loop appends at least one byte to a buffer capped at that
+            // size, so the loop is bounded.
             let mut buf = [0u8; 256];
-            match check.stream.read(&mut buf) {
-                Ok(0) => {
-                    let success =
-                        parse_probe_response(&check.response_buf, &check.config, check.h2c)
-                            .unwrap_or(false);
-                    completed.push((idx, success));
-                }
-                Ok(n) => {
-                    // A successful read never reports more bytes than the
-                    // fixed-size stack buffer can hold.
-                    debug_assert!(
-                        n <= buf.len(),
-                        "read reported {n} bytes into a {}-byte buffer",
-                        buf.len()
-                    );
-                    if check.response_buf.len() + n > MAX_HEALTH_RESPONSE_SIZE {
-                        completed.push((idx, false));
-                        continue;
-                    }
-                    check.response_buf.extend_from_slice(&buf[..n]);
-                    // The accumulator stays within the documented ceiling once
-                    // the over-limit guard above has run.
-                    debug_assert!(
-                        check.response_buf.len() <= MAX_HEALTH_RESPONSE_SIZE,
-                        "response buffer must stay within the max health response size"
-                    );
-                    if let Some(success) =
-                        parse_probe_response(&check.response_buf, &check.config, check.h2c)
-                    {
+            loop {
+                match check.stream.read(&mut buf) {
+                    Ok(0) => {
+                        let success =
+                            parse_probe_response(&check.response_buf, &check.config, check.h2c)
+                                .unwrap_or(false);
                         completed.push((idx, success));
+                        break;
                     }
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(_e) => {
-                    completed.push((idx, false));
+                    Ok(n) => {
+                        // A successful read never reports more bytes than the
+                        // fixed-size stack buffer can hold.
+                        debug_assert!(
+                            n <= buf.len(),
+                            "read reported {n} bytes into a {}-byte buffer",
+                            buf.len()
+                        );
+                        if check.response_buf.len() + n > MAX_HEALTH_RESPONSE_SIZE {
+                            completed.push((idx, false));
+                            break;
+                        }
+                        check.response_buf.extend_from_slice(&buf[..n]);
+                        // The accumulator stays within the documented ceiling
+                        // once the over-limit guard above has run.
+                        debug_assert!(
+                            check.response_buf.len() <= MAX_HEALTH_RESPONSE_SIZE,
+                            "response buffer must stay within the max health response size"
+                        );
+                        if let Some(success) =
+                            parse_probe_response(&check.response_buf, &check.config, check.h2c)
+                        {
+                            completed.push((idx, success));
+                            break;
+                        }
+                    }
+                    // The queue is drained: wait for the next readiness edge.
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_e) => {
+                        completed.push((idx, false));
+                        break;
+                    }
                 }
             }
         }
@@ -1817,6 +1832,196 @@ mod tests {
         assert!(
             matches!(data.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
             "the data port must not be dialed"
+        );
+    }
+
+    /// Run `checker` the way the server loop does until `done` holds or
+    /// `deadline` passes: wait on a real `mio::Poll`, hand every event of a
+    /// probe socket to `HealthChecker::ready`, then progress the checks.
+    /// Nothing else wakes a probe, so a pass that leaves bytes unread gets no
+    /// second chance unless the kernel raises a new edge.
+    fn pump_probes(
+        checker: &mut HealthChecker,
+        backends: &Rc<RefCell<BackendMap>>,
+        poll: &mut mio::Poll,
+        events: &mut mio::Events,
+        deadline: Instant,
+        done: impl Fn(&HealthChecker) -> bool,
+    ) -> bool {
+        while !done(checker) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            poll.poll(events, Some(Duration::from_millis(50))).unwrap();
+            for event in events.iter() {
+                if checker.owns_token(event.token()) {
+                    checker.ready(event.token());
+                }
+            }
+            checker.progress_checks(backends, poll.registry());
+        }
+        true
+    }
+
+    /// Probe one backend whose listener, once the probe has sent its whole
+    /// request, answers with `burst` in a single write and then keeps the
+    /// connection open (a close would raise one more edge and one more read).
+    /// The probe timeout is 30 s, so only a verdict can end the probe inside
+    /// the 2 s window. Returns the probes still in flight afterwards and the
+    /// backend's `(consecutive_successes, consecutive_failures)`.
+    fn probe_answered_by_one_burst(h2c: bool, burst: &[u8]) -> (usize, (u32, u32)) {
+        const CLUSTER: &str = "one-burst-cluster";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut poll = mio::Poll::new().unwrap();
+        let mut events = mio::Events::with_capacity(16);
+        let mut backend_map = BackendMap::new();
+        backend_map.add_backend(CLUSTER, Backend::new("b", address, None, None, None));
+        backend_map.health_check_configs.insert(
+            CLUSTER.into(),
+            HealthCheckConfig {
+                timeout: 30,
+                ..h2c_config(0)
+            },
+        );
+        if h2c {
+            backend_map.cluster_http2.insert(CLUSTER.into(), true);
+        }
+        let backends = Rc::new(RefCell::new(backend_map));
+        let mut checker = HealthChecker::new();
+
+        checker.initiate_checks(&backends, poll.registry());
+        assert_eq!(checker.in_flight.len(), 1, "one probe is launched");
+
+        // The probe writes its request, then reads: nothing has been
+        // answered yet, so that first read finds an empty queue.
+        let request_sent = pump_probes(
+            &mut checker,
+            &backends,
+            &mut poll,
+            &mut events,
+            Instant::now() + Duration::from_secs(5),
+            |checker| {
+                checker
+                    .in_flight
+                    .first()
+                    .is_none_or(|check| check.request_bytes.is_none())
+            },
+        );
+        assert!(request_sent, "the probe must send its request");
+        assert_eq!(
+            checker.in_flight_len(),
+            1,
+            "nothing has been answered yet, so the probe is still waiting"
+        );
+
+        let (mut accepted, _) = listener.accept().expect("the probe dialed the listener");
+        accepted.write_all(burst).unwrap();
+
+        pump_probes(
+            &mut checker,
+            &backends,
+            &mut poll,
+            &mut events,
+            Instant::now() + Duration::from_secs(2),
+            |checker| checker.in_flight_len() == 0,
+        );
+        let health = backends.borrow().backends[CLUSTER].backends[0]
+            .borrow()
+            .health
+            .clone();
+        drop(accepted);
+        (
+            checker.in_flight_len(),
+            (health.consecutive_successes, health.consecutive_failures),
+        )
+    }
+
+    /// Control for the two tests below: a response that fits in the probe's
+    /// first read is judged, through the same harness, from one burst.
+    #[test]
+    fn probe_judges_a_response_that_fits_one_read() {
+        let block = encode_response_headers(&[(b":status", b"200")]);
+        let h2c_burst = frame_with_header(0x01, FLAG_END_HEADERS, 1, &block);
+        assert!(h2c_burst.len() < 256);
+        assert_eq!(probe_answered_by_one_burst(true, &h2c_burst), (0, (1, 0)));
+
+        let h1_burst = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(probe_answered_by_one_burst(false, h1_burst), (0, (1, 0)));
+    }
+
+    /// The probe reads at most 256 bytes per readiness edge, and a socket
+    /// registered edge-triggered raises no second edge for bytes already
+    /// queued. An h2c response whose stream-1 HEADERS frame ends past that
+    /// first read, delivered in one burst by a backend that keeps the
+    /// connection open, must still be judged; today it waits out the probe
+    /// timeout. `doc/health_checks.md` promises 4096 bytes.
+    #[test]
+    fn h2c_probe_judges_a_headers_frame_larger_than_one_read() {
+        let pad = "0123456789abcdef".repeat(75);
+        let block = encode_response_headers(&[(b":status", b"200"), (b"x-pad", pad.as_bytes())]);
+        let burst = frame_with_header(0x01, FLAG_END_HEADERS, 1, &block);
+        assert!(
+            burst.len() > 2 * 256,
+            "the burst outlasts two 256-byte reads"
+        );
+        assert!(
+            burst.len() < 4096,
+            "the burst is within the documented limit"
+        );
+        assert_eq!(
+            try_parse_h2c_status(&burst, &h2c_config(0)),
+            Some(true),
+            "the burst is one complete, healthy response"
+        );
+
+        let (in_flight, (successes, failures)) = probe_answered_by_one_burst(true, &burst);
+
+        assert_eq!(
+            in_flight, 0,
+            "the probe must judge a complete response delivered in one burst"
+        );
+        assert_eq!(
+            (successes, failures),
+            (1, 0),
+            "a healthy response counts as one success"
+        );
+    }
+
+    /// Same defect over HTTP/1.1: an interim `103` whose header section and
+    /// the final status line that follows it end past the first 256 bytes.
+    #[test]
+    fn h1_probe_judges_an_interim_response_larger_than_one_read() {
+        let pad = "0123456789abcdef".repeat(40);
+        let burst = format!(
+            "HTTP/1.1 103 Early Hints\r\nLink: </a.css>; rel=preload\r\nX-Pad: {pad}\r\n\r\n\
+             HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+        );
+        assert!(
+            burst.len() > 2 * 256,
+            "the burst outlasts two 256-byte reads"
+        );
+        assert!(
+            burst.len() < 4096,
+            "the burst is within the documented limit"
+        );
+        assert_eq!(
+            try_parse_status_line(burst.as_bytes(), &h2c_config(0)),
+            Some(true),
+            "the burst is one complete, healthy response"
+        );
+
+        let (in_flight, (successes, failures)) =
+            probe_answered_by_one_burst(false, burst.as_bytes());
+
+        assert_eq!(
+            in_flight, 0,
+            "the probe must judge a complete response delivered in one burst"
+        );
+        assert_eq!(
+            (successes, failures),
+            (1, 0),
+            "a healthy response counts as one success"
         );
     }
 
