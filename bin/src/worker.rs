@@ -266,6 +266,66 @@ pub fn begin_worker_process(
     Ok(())
 }
 
+/// The listening sockets a worker upgrade hands to the main process, owned by
+/// [`fork_main_into_worker`] for the length of one launch.
+///
+/// [`Listeners`] holds raw descriptors and has no `Drop`. The new worker gets
+/// its own copies over the SCM socket, so the main process keeps none of them
+/// on any outcome: closing them on drop covers the success path and every
+/// error return alike. An error return that left them open would keep the main
+/// process listening on sockets it never accepts on, close-on-exec so that no
+/// worker inherits them either, until it exits.
+struct OwnedListeners(Listeners);
+
+impl Drop for OwnedListeners {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+/// The main end of a new worker's SCM socket, owned by
+/// [`fork_main_into_worker`] until its launch has succeeded.
+///
+/// [`ScmSocket`] borrows its raw descriptor and has no `Drop`, so an error
+/// return between creating the socket and handing it to the caller would leave
+/// the descriptor open in the main process for good. The failure repeats on
+/// every automatic restart until `EMFILE`, after which the main process can
+/// neither accept a client nor spawn a worker.
+struct OwnedScmSocket(ScmSocket);
+
+impl OwnedScmSocket {
+    /// Hand the socket, and the duty to close it, to the caller.
+    fn release(self) -> ScmSocket {
+        // `ManuallyDrop` keeps `Drop::drop` from closing the descriptor the
+        // returned copy now stands for.
+        let released = std::mem::ManuallyDrop::new(self);
+        released.0.clone()
+    }
+}
+
+impl std::ops::Deref for OwnedScmSocket {
+    type Target = ScmSocket;
+
+    fn deref(&self) -> &ScmSocket {
+        &self.0
+    }
+}
+
+impl Drop for OwnedScmSocket {
+    fn drop(&mut self) {
+        // SAFETY: `fork_main_into_worker` is the sole owner of this
+        // descriptor until `release`, which `drop` never follows. It created
+        // the socket from an owned stream's raw descriptor and handed it
+        // nowhere else, so nothing else closes it.
+        if unsafe { libc::close(self.0.raw_fd()) } != 0 {
+            error!(
+                "could not close the SCM socket of a worker that failed to launch: {}",
+                IoError::last_os_error()
+            );
+        }
+    }
+}
+
 /// unix-forks the main process
 ///
 /// - Parent: sends config, state and listeners to the new worker
@@ -274,6 +334,11 @@ pub fn begin_worker_process(
 ///   instead of returning: it is a copy of the whole main process, and
 ///   returning would resume that copy inside the caller's event loop. The
 ///   parent then sees the worker's channel close.
+///
+/// Takes ownership of the descriptors in `listeners`: the main process closes
+/// them when this function returns, whether the launch succeeded or not. An
+/// error also leaves no descriptor of this launch open in the main process,
+/// the SCM socket included.
 ///
 /// returns the child process pid, and channels to talk to it.
 pub fn fork_main_into_worker(
@@ -286,6 +351,10 @@ pub fn fork_main_into_worker(
     // SAFETY: `libc::getpid` takes no input pointers, never fails, and
     // returns a value type. No invariant beyond "FFI signature matches libc".
     trace!("parent({})", unsafe { libc::getpid() });
+
+    // From here on every `?` returns through this binding, which closes the
+    // listening sockets: they have no `Drop` of their own.
+    let listeners = listeners.map(OwnedListeners);
 
     let mut state_file = tempfile().map_err(WorkerError::CreateStateFile)?;
     util::disable_close_on_exec(state_file.as_raw_fd()).map_err(|util_err| {
@@ -306,13 +375,16 @@ pub fn fork_main_into_worker(
     let (main_to_worker_scm, worker_to_main_scm) =
         UnixStream::pair().map_err(WorkerError::CreateUnixStream)?;
 
-    let main_to_worker_scm =
+    // `ScmSocket::new` closes the descriptor itself when it fails; once it
+    // succeeded, the guard closes it on every later error return.
+    let main_to_worker_scm = OwnedScmSocket(
         ScmSocket::new(main_to_worker_scm.into_raw_fd()).map_err(|scm_err| {
             WorkerError::CreateScmSocket {
                 kind: "main-to-worker".to_string(),
                 scm_err,
             }
-        })?;
+        })?,
+    );
 
     util::disable_close_on_exec(worker_to_main.as_raw_fd()).map_err(|util_err| {
         WorkerError::DisableCloexec {
@@ -384,11 +456,13 @@ pub fn fork_main_into_worker(
                     channel_err,
                 })?;
 
-            if let Some(listeners) = listeners {
+            // The new worker holds its own copies once they are sent; the
+            // main process closes its own when `listeners` drops, whatever the
+            // outcome of the send.
+            if let Some(OwnedListeners(listeners)) = &listeners {
                 info!("sending listeners to new worker: {:?}", listeners);
-                let result = main_to_worker_scm.send_listeners(&listeners);
+                let result = main_to_worker_scm.send_listeners(listeners);
                 info!("sent listeners from main: {:?}", result);
-                listeners.close();
             };
 
             // `main_to_worker_scm` stays close-on-exec: every worker forked
@@ -400,7 +474,7 @@ pub fn fork_main_into_worker(
             Ok((
                 worker_pid.into(),
                 main_to_worker_channel.into(),
-                main_to_worker_scm,
+                main_to_worker_scm.release(),
             ))
         }
         ForkResult::Child => {
@@ -550,5 +624,237 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Exit status a forked scenario reports when `fork_main_into_worker`
+    /// returned `Ok`: the scenario did not break the launch, so the test would
+    /// prove nothing.
+    const LAUNCH_SUCCEEDED: libc::c_int = 100;
+    /// Exit status a forked scenario reports when its body panicked.
+    const SCENARIO_PANICKED: libc::c_int = 101;
+    /// Exit status of a scenario whose listener descriptor was still open.
+    const LISTENER_LEFT_OPEN: libc::c_int = 102;
+    /// Exit status of a scenario whose launch failed on another edge than the
+    /// one it sets up.
+    const WRONG_EDGE: libc::c_int = 103;
+
+    /// Run `scenario` in a forked copy of this test process and return its exit
+    /// code, or `None` when it did not end within the deadline.
+    ///
+    /// The scenarios change process-global state (`RLIMIT_NOFILE`) and read the
+    /// descriptor table, so none of them may run beside the other tests of this
+    /// process. The child is a single-threaded copy: it reaches `_exit` without
+    /// unwinding into the harness it no longer owns. It also inherits every
+    /// lock another test thread held at the fork, with no owner left to release
+    /// it, so a scenario never writes the environment: `set_var` waits there
+    /// for good on a reader of the environment lock.
+    fn in_forked_child(scenario: impl FnOnce() -> libc::c_int) -> Option<libc::c_int> {
+        // SAFETY: `fork` is called with no lock of ours held. The child only
+        // runs the scenario, which is the code under test, then `_exit`.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "could not fork the scenario process");
+        if pid == 0 {
+            // SAFETY: `setpgid` takes no pointer. The group gathers the workers
+            // the scenario forks, before it forks any.
+            unsafe { libc::setpgid(0, 0) };
+            let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(scenario))
+                .unwrap_or(SCENARIO_PANICKED);
+            // SAFETY: `_exit` takes no pointer and never returns.
+            unsafe { libc::_exit(code) }
+        }
+        let status = wait_for_exit(pid, Duration::from_secs(30));
+        // A worker the scenario forked is waited for by nobody, and can stay
+        // stuck for good in its error log on the stdout lock another thread
+        // held at the fork: end the whole group. While a member lives, its id
+        // cannot be given to another process; with none left this fails.
+        // SAFETY: `kill` takes no pointer.
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+        let status = status?;
+        assert!(
+            libc::WIFEXITED(status),
+            "the scenario process must exit by itself, wait status {status:#x}"
+        );
+        Some(libc::WEXITSTATUS(status))
+    }
+
+    /// Every descriptor number below 1024 that is open in this process. It only
+    /// calls `fcntl`, so taking a snapshot opens nothing itself.
+    fn open_descriptors() -> std::collections::BTreeSet<libc::c_int> {
+        (0..1024)
+            // SAFETY: `F_GETFD` on an arbitrary number reads a flag or fails
+            // with `EBADF`; it takes no pointer and touches no descriptor.
+            .filter(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } != -1)
+            .collect()
+    }
+
+    /// A `Config` whose command channel cannot carry its own `ServerConfig`:
+    /// `fork_main_into_worker` forks, then fails to send the configuration with
+    /// `MessageTooLarge`.
+    fn config_that_cannot_be_sent() -> Config {
+        Config {
+            command_buffer_size: 1,
+            max_command_buffer_size: 1,
+            ..Default::default()
+        }
+    }
+
+    /// An HTTP listening socket on an ephemeral port, as the old worker hands
+    /// it to the main process in the first phase of a worker upgrade.
+    fn received_listeners() -> (Listeners, libc::c_int) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("could not bind an ephemeral listening socket");
+        let address = listener.local_addr().expect("listener has an address");
+        let fd = listener.into_raw_fd();
+        let listeners = Listeners {
+            http: vec![(
+                sozu_command_lib::listener_key::ListenerKey::from(address),
+                fd,
+            )],
+            ..Default::default()
+        };
+        (listeners, fd)
+    }
+
+    /// Hand `listeners` to a launch that `break_launch` makes fail, and report
+    /// whether the listening socket is still open once it returned.
+    ///
+    /// A NUL in the worker id keeps the forked child from ever reaching
+    /// `execve`, as in the test above.
+    fn failed_launch_listener_status(
+        config: Config,
+        break_launch: impl FnOnce(),
+        expected_edge: fn(&WorkerError) -> bool,
+    ) -> libc::c_int {
+        let (listeners, fd) = received_listeners();
+        break_launch();
+        let state = ConfigState::new();
+        let launched = fork_main_into_worker(
+            "worker\0id",
+            &config,
+            "/nonexistent/sozu".to_string(),
+            &state,
+            Some(listeners),
+        );
+        // Nothing may open a descriptor between the failure and this probe: a
+        // new descriptor would reuse the listener's number once it is closed.
+        // SAFETY: `F_GETFD` reads a flag or fails with `EBADF`.
+        let still_open = unsafe { libc::fcntl(fd, libc::F_GETFD) } != -1;
+        match launched {
+            Ok(_) => LAUNCH_SUCCEEDED,
+            Err(error) if !expected_edge(&error) => WRONG_EDGE,
+            Err(_) if still_open => LISTENER_LEFT_OPEN,
+            Err(_) => 0,
+        }
+    }
+
+    /// Lower `RLIMIT_NOFILE` so that this process can open at most `room` more
+    /// descriptors. The limit binds a privileged process as well, unlike
+    /// `RLIMIT_NPROC`.
+    fn leave_room_for_descriptors(room: libc::rlim_t) {
+        // SAFETY: `dup` and `close` act on descriptors of this single-threaded
+        // scenario process; `limit` is a valid slot.
+        unsafe {
+            let lowest_free = libc::dup(0);
+            assert!(lowest_free >= 0, "could not find the lowest free fd");
+            libc::close(lowest_free);
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+            limit.rlim_cur = lowest_free as libc::rlim_t + room;
+            assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0);
+        }
+    }
+
+    fn assert_listeners_closed(edge: &str, status: Option<libc::c_int>) {
+        assert_eq!(
+            status,
+            Some(0),
+            "a launch that failed {edge} must close the listening sockets it was handed, or \
+             main keeps them listening without ever accepting (scenario status: \
+             {LISTENER_LEFT_OPEN} = still open, {LAUNCH_SUCCEEDED} = the launch did not fail, \
+             {WRONG_EDGE} = it failed elsewhere, {SCENARIO_PANICKED} = panicked)"
+        );
+    }
+
+    /// The listening sockets a worker upgrade hands to the main process are
+    /// raw descriptors with no `Drop`. A launch that fails before the fork must
+    /// close them, not leave the main process listening on sockets it never
+    /// accepts on: with one worker new connections complete the handshake and
+    /// hang, with several `SO_REUSEPORT` still hashes a share of them there.
+    /// The descriptor limit leaves no room for the state file.
+    #[test]
+    fn a_launch_failing_to_create_the_state_file_closes_the_listeners() {
+        let status = in_forked_child(|| {
+            failed_launch_listener_status(
+                Config::default(),
+                || leave_room_for_descriptors(0),
+                |error| matches!(error, WorkerError::CreateStateFile(_)),
+            )
+        });
+        assert_listeners_closed("to create its state file", status);
+    }
+
+    /// Same defect on the edge `UnixStream::pair` reports: the descriptor limit
+    /// leaves room for the state file and no more; the pair needs two.
+    #[test]
+    fn a_launch_failing_to_create_the_socket_pairs_closes_the_listeners() {
+        let status = in_forked_child(|| {
+            failed_launch_listener_status(
+                Config::default(),
+                || leave_room_for_descriptors(1),
+                |error| matches!(error, WorkerError::CreateUnixStream(_)),
+            )
+        });
+        assert_listeners_closed("to create its socket pairs", status);
+    }
+
+    /// Same defect after the fork: the configuration cannot be sent to the new
+    /// worker, so the launch fails with the child already running.
+    #[test]
+    fn a_launch_failing_to_send_the_configuration_closes_the_listeners() {
+        let status = in_forked_child(|| {
+            failed_launch_listener_status(
+                config_that_cannot_be_sent(),
+                || {},
+                |error| matches!(error, WorkerError::SendConfig(_)),
+            )
+        });
+        assert_listeners_closed("to send the configuration to the new worker", status);
+    }
+
+    /// `fork_main_into_worker` turns the main end of the worker's SCM socket
+    /// into an `ScmSocket`, which has no `Drop`. Every error return after that
+    /// point must close it: an automatic restart retries a failing launch at
+    /// once, and each retry used to leave one more descriptor open in the main
+    /// process until `EMFILE` stopped it from accepting a client or spawning
+    /// a worker again.
+    #[test]
+    fn a_launch_failing_after_the_scm_socket_exists_leaves_no_descriptor_open() {
+        let status = in_forked_child(|| {
+            let state = ConfigState::new();
+            let before = open_descriptors();
+            let launched = fork_main_into_worker(
+                "worker\0id",
+                &config_that_cannot_be_sent(),
+                "/nonexistent/sozu".to_string(),
+                &state,
+                None,
+            );
+            let after = open_descriptors();
+            match launched {
+                Ok(_) => LAUNCH_SUCCEEDED,
+                Err(WorkerError::SendConfig(_)) => after.difference(&before).count() as libc::c_int,
+                Err(_) => WRONG_EDGE,
+            }
+        });
+        assert_eq!(
+            status,
+            Some(0),
+            "a launch that failed after creating the SCM socket left that many descriptors \
+             open in the main process ({LAUNCH_SUCCEEDED} = the launch did not fail, \
+             {WRONG_EDGE} = it failed elsewhere, {SCENARIO_PANICKED} = panicked)"
+        );
     }
 }

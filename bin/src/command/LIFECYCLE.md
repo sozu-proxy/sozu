@@ -37,6 +37,22 @@ Entry point: `begin_main_process` (`bin/src/command/mod.rs`), called from `main`
    supervisor sees that worker's channel close, answers its in-flight requests
    with synthetic failures (§1.2), and, with `worker_automatic_restart` (the
    default), forks a replacement (`Server::workers_to_spawn`).
+
+   A launch can also fail in the supervisor, before or after the fork: the
+   state file, the socket pairs, `fork` itself, the configuration sent to the
+   new worker, or the registration of its channel. It leaves no descriptor
+   open in the supervisor. `ScmSocket` and `Listeners` carry raw descriptors
+   and have no `Drop`, so `fork_main_into_worker` owns both through guards
+   that close them on every error return (the listeners on success too, once
+   the worker has its own copies), and `Server::register_worker` closes the
+   SCM socket when the registration fails before a session exists. After a
+   failed automatic launch the round ends and the next one waits
+   `SPAWN_RETRY_INTERVAL` (one second, `Server::paced_workers_to_spawn`):
+   the failure is resource exhaustion, so retrying at once only repeats it
+   with a state file written and synced per attempt. During that delay the
+   count of workers to spawn is zero, so `poll` is not given a zero timeout,
+   and it blocks for at most the time left. A launch that succeeds ends the
+   delay.
 5. Enters the master event loop via `CommandHub::run`
    (`bin/src/command/server.rs`).
 
@@ -427,7 +443,12 @@ activation requests to the new one.
 
 Between the two phases the old worker stays `Running` but holds no listening
 socket: `ReturnListenSockets` makes it hand every descriptor over and keep
-none, and the supervisor closes its own copies once the replacement has them.
+none, and the supervisor closes its own copies once the replacement has them,
+or once the launch has failed (`fork_main_into_worker` closes them on every
+error return): a copy left open would keep the supervisor listening on sockets
+it never accepts on, so with one worker new connections would complete the
+handshake and hang, and with several `SO_REUSEPORT` would still hash a share of
+them there until the supervisor exited.
 The second phase starts only when the replacement answers its initial `Status`
 with `Ok` (`AwaitingReadiness`). Every other exit, a replacement that times
 out, is rejected, or is refused its bootstrap, a failed or malformed receive

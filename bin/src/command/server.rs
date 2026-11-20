@@ -78,6 +78,13 @@ const SIGTERM_TOKEN: Token = Token(usize::MAX);
 /// takes the process down a moment later and nothing wakes the loop then.
 const REAP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// How long automatic worker restart waits after a launch failed before it
+/// tries again ([`Server::paced_workers_to_spawn`]). A launch fails on resource
+/// exhaustion (`fork`, descriptors, the disk behind the state file), which
+/// retrying at once only repeats: each attempt writes and syncs a state file,
+/// and the event loop would not block in `poll` meanwhile.
+const SPAWN_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Write end of the `SIGTERM` self-pipe, `-1` until
 /// [`CommandHub::handle_sigterm`] installs the handler. The descriptor is never
 /// closed, so the handler can never write into a recycled one.
@@ -1849,7 +1856,13 @@ impl CommandHub {
                 .map(|token| (token, Ready::EMPTY, None))
                 .collect::<Vec<_>>();
 
-            let workers_to_spawn = self.workers_to_spawn();
+            let (workers_to_spawn, spawn_retry_wait) = self.paced_workers_to_spawn(now);
+            // The delay after a failed launch holds the spawn back, and with it
+            // the zero timeout below: wake up when it ends, since no event
+            // announces that.
+            if let Some(wait) = spawn_retry_wait {
+                poll_timeout = Some(poll_timeout.map_or(wait, |timeout| timeout.min(wait)));
+            }
 
             // if we have sessions to tick or workers to spawn, we don't want to block on poll
             if !sessions_to_tick.is_empty()
@@ -2275,6 +2288,11 @@ pub struct Server {
     /// Never holds a restored worker, which is no child of this main. Never
     /// part of a snapshot: the zombies belong to this process alone.
     unreaped_workers: Vec<pid_t>,
+    /// When automatic restart may launch a worker again after a launch failed
+    /// ([`Self::automatic_worker_spawn_with`]); cleared by the next launch that
+    /// succeeds. Past its instant it holds nothing back. Never part of a
+    /// snapshot: a new main process starts without a delay.
+    spawn_retry_at: Option<Instant>,
 }
 
 /// What the answer to the initial `Status` of a new worker proves.
@@ -2479,6 +2497,7 @@ impl Server {
             startup_workers: HashSet::new(),
             bootstrapping_workers: HashSet::new(),
             unreaped_workers: Vec::new(),
+            spawn_retry_at: None,
         })
     }
 
@@ -2808,6 +2827,11 @@ impl Server {
     }
 
     /// register a worker session in the server, return the mutable worker session
+    ///
+    /// Takes over the duty to close the descriptor of `scm_socket`, which
+    /// `ScmSocket` does not close on drop: the session closes it with the
+    /// worker (`WorkerSession::close_descriptors`), and so does this function
+    /// when it fails before a session exists.
     pub fn register_worker(
         &mut self,
         worker_id: WorkerId,
@@ -2824,7 +2848,20 @@ impl Server {
             "register_worker must use a fresh, unoccupied session token"
         );
         let workers_before = self.workers.len();
-        self.register(token, &mut channel.sock)?;
+        if let Err(error) = self.register(token, &mut channel.sock) {
+            // SAFETY: the session that would own this descriptor was never
+            // made, and `scm_socket` is dropped right after without closing
+            // it: this is the sole close. A worker forked by this main got it
+            // from `fork_main_into_worker`, which handed it over open.
+            if unsafe { libc::close(scm_socket.raw_fd()) } != 0 {
+                error!(
+                    "could not close the SCM socket of worker {}: {}",
+                    worker_id,
+                    IoError::last_os_error()
+                );
+            }
+            return Err(error);
+        }
         self.workers.insert(
             token,
             WorkerSession::new(channel, worker_id, pid, token, scm_socket),
@@ -3155,23 +3192,62 @@ impl Server {
         }
     }
 
+    /// [`Self::workers_to_spawn`] as the event loop acts on it at `now`, and
+    /// how long `poll` may block when that is not at once.
+    ///
+    /// While the delay that follows a failed launch runs
+    /// ([`SPAWN_RETRY_INTERVAL`]) the count is `0`, so the loop neither spawns
+    /// nor polls with a zero timeout, and the second value is the time left:
+    /// the longest `poll` may block, since nothing else wakes the loop when the
+    /// delay ends. It is `None` whenever no delay holds a spawn back.
+    fn paced_workers_to_spawn(&self, now: Instant) -> (u16, Option<Duration>) {
+        let count = self.workers_to_spawn();
+        match self.spawn_retry_at {
+            Some(retry_at) if count > 0 && now < retry_at => (0, Some(retry_at - now)),
+            _ => (count, None),
+        }
+    }
+
     /// spawn brand new workers
     pub fn automatic_worker_spawn(&mut self, count: u16) {
+        self.automatic_worker_spawn_with(count, |server| {
+            // A restarted worker is `NotAnswering`, hence counted by
+            // `alive_workers`, until its `Status` is answered. Its
+            // initialization admits it to the orders queued after that
+            // `Status`, or gives it the confirmed protected values first.
+            server
+                .launch_worker_awaiting_status(None, |id| Box::new(WorkerReadinessTask::new(id)))
+                .map(|_| ())
+        });
+    }
+
+    /// [`Self::automatic_worker_spawn`] with the launch given, so a test can
+    /// fail it without forking.
+    ///
+    /// The first launch that fails ends the round and starts the delay of
+    /// [`SPAWN_RETRY_INTERVAL`]: the cause is shared by the launches still to
+    /// come, and [`Self::paced_workers_to_spawn`] holds the next round back
+    /// until it has run. A launch that succeeds ends the delay.
+    fn automatic_worker_spawn_with(
+        &mut self,
+        count: u16,
+        mut launch: impl FnMut(&mut Self) -> Result<(), ServerError>,
+    ) {
         if count == 0 {
             return;
         }
 
         info!("Automatically restarting {} workers", count);
         for _ in 0..count {
-            // A restarted worker is `NotAnswering`, hence counted by
-            // `alive_workers`, until its `Status` is answered. Its
-            // initialization admits it to the orders queued after that
-            // `Status`, or gives it the confirmed protected values first.
-            if let Err(err) = self
-                .launch_worker_awaiting_status(None, |id| Box::new(WorkerReadinessTask::new(id)))
-            {
-                error!("could not launch new worker: {}", err);
+            if let Err(err) = launch(self) {
+                error!(
+                    "could not launch new worker: {}; retrying in {:?}",
+                    err, SPAWN_RETRY_INTERVAL
+                );
+                self.spawn_retry_at = Some(Instant::now() + SPAWN_RETRY_INTERVAL);
+                return;
             }
+            self.spawn_retry_at = None;
         }
     }
 
@@ -5133,6 +5209,110 @@ mod tests {
             worker.run_state = RunState::Stopped;
         }
         assert_eq!(server.workers_to_spawn(), 1, "a fenced worker is refilled");
+    }
+
+    /// A launch that fails (resource exhaustion in `fork`, the descriptor
+    /// table, the state file) used to be retried by the very next event-loop
+    /// iteration, with a zero `poll` timeout, for as long as the failure
+    /// lasted. It now ends the round and holds the next one back for
+    /// `SPAWN_RETRY_INTERVAL`.
+    #[test]
+    fn a_failed_automatic_launch_holds_the_next_round_back() {
+        let mut server = create_test_server();
+        server.config.worker_automatic_restart = true;
+        server.config.worker_count = 3;
+        assert_eq!(
+            server.paced_workers_to_spawn(Instant::now()),
+            (3, None),
+            "no failed launch, no delay"
+        );
+
+        let mut attempts = 0;
+        server.automatic_worker_spawn_with(3, |_| {
+            attempts += 1;
+            Err(ServerError::WorkerNotFound)
+        });
+        assert_eq!(
+            attempts, 1,
+            "the first failure ends the round: the others share its cause"
+        );
+
+        let (count, wait) = server.paced_workers_to_spawn(Instant::now());
+        assert_eq!(count, 0, "the delay holds every spawn back");
+        let wait = wait.expect("the event loop must learn when to wake up");
+        assert!(
+            wait > Duration::ZERO && wait <= SPAWN_RETRY_INTERVAL,
+            "the time left lies inside the delay: {wait:?}"
+        );
+
+        assert_eq!(
+            server.paced_workers_to_spawn(Instant::now() + SPAWN_RETRY_INTERVAL),
+            (3, None),
+            "the delay over, the missing workers are launched again"
+        );
+    }
+
+    /// The delay bounds how long `poll` blocks only when a spawn is waiting
+    /// for it, and a launch that succeeds ends it.
+    #[test]
+    fn the_spawn_delay_only_matters_while_a_worker_is_missing_and_ends_with_a_launch() {
+        let mut server = create_test_server();
+        server.config.worker_automatic_restart = true;
+        server.config.worker_count = 1;
+        server.automatic_worker_spawn_with(1, |_| Err(ServerError::WorkerNotFound));
+        assert!(server.paced_workers_to_spawn(Instant::now()).1.is_some());
+
+        server.config.worker_automatic_restart = false;
+        assert_eq!(
+            server.paced_workers_to_spawn(Instant::now()),
+            (0, None),
+            "with nothing to spawn the delay must not wake the loop"
+        );
+
+        server.config.worker_automatic_restart = true;
+        server.automatic_worker_spawn_with(1, |_| Ok(()));
+        assert_eq!(
+            server.paced_workers_to_spawn(Instant::now()),
+            (1, None),
+            "a launch that succeeded ended the delay"
+        );
+    }
+
+    /// `register_worker` takes over the duty to close the SCM socket, which
+    /// `ScmSocket` does not close on drop. When it fails before the session
+    /// exists, nobody else will: the descriptor used to stay open in the main
+    /// process for good.
+    ///
+    /// The command channel's stream is registered beforehand, so registering
+    /// it again fails with `EEXIST`.
+    #[test]
+    fn a_failed_worker_registration_closes_the_scm_socket() {
+        let mut server = create_test_server();
+        let (mut main_sock, _worker_sock) =
+            UnixStream::pair().expect("could not create a socket pair");
+        server
+            .poll
+            .registry()
+            .register(&mut main_sock, Token(usize::MAX - 1), Interest::READABLE)
+            .expect("could not register the stream beforehand");
+        let channel: Channel<WorkerRequest, WorkerResponse> = Channel::new(main_sock, 4096, 65536);
+        let (scm_main, mut scm_peer) =
+            std::os::unix::net::UnixStream::pair().expect("could not create an scm pair");
+        scm_peer
+            .set_nonblocking(true)
+            .expect("could not make the SCM peer non-blocking");
+        let scm_socket =
+            ScmSocket::new(scm_main.into_raw_fd()).expect("could not create scm socket");
+
+        let registered = server.register_worker(1, 0, channel, scm_socket);
+        assert!(
+            matches!(registered, Err(ServerError::RegisterChannel(_))),
+            "registering a stream twice must fail"
+        );
+        assert!(server.workers.is_empty(), "no session was made");
+
+        let scm_eof = wait_for_eof(&mut scm_peer, "the SCM socket of the failed registration");
+        assert!(scm_eof.is_ok(), "{scm_eof:?}");
     }
 
     /// Regression (sozu#1430): the command-socket client channel is sized at
