@@ -50,6 +50,7 @@ use sozu_lib::{
 };
 
 use crate::command::{
+    rollback::{RollbackTicket, Unwind},
     server::{
         DefaultGatherer, ElapsedSnapshot, Gatherer, GatheringTask, MessageClient, Server,
         ServerState, TaskRestoreTiming, TaskSnapshot, TaskSnapshotError, TaskSnapshotTiming,
@@ -310,6 +311,9 @@ impl RequestTaskSnapshot {
                     metric_detail_audit,
                     clear_master_metrics_on_finish,
                     rollback,
+                    // The ledger of the main process that took the snapshot
+                    // did not cross the handover.
+                    rollback_ticket: None,
                 })
             }
             Self::SetMetricDetail {
@@ -2178,7 +2182,7 @@ pub fn load_static_config(
             debug!("config generated {:?}", request);
         }
 
-        server.scatter_on(request, task_id, request_index, None);
+        scatter_accepted_entry(server, request, task_id, request_index);
     }
 
     if let Some(client_ref) = client.as_deref() {
@@ -3359,6 +3363,11 @@ struct WorkerTask {
     /// `ConfigState` to revert the committed change. `None` for requests
     /// without a defined inverse (they keep today's best-effort behavior).
     rollback: Option<Request>,
+    /// This order's claim on [`Server::rollbacks`], which holds its revert back
+    /// until every newer order on the same object has ended. `None` for an
+    /// order without an inverse, and for a task restored by a main process
+    /// upgrade, whose revert then runs on its own.
+    rollback_ticket: Option<RollbackTicket>,
 }
 
 /// Carry the per-verb metadata needed to emit a completion-time audit
@@ -3749,7 +3758,9 @@ fn compute_rollback(request: &RequestType) -> Option<Request> {
 ///   panicking during a rolling upgrade commits a malformed frontend for good
 ///   (sozu#1314). The client is already told `Failure` on this same path, so
 ///   reverting keeps the authoritative state consistent with the reported
-///   outcome.
+///   outcome. That holds order by order only when the reverts of orders on
+///   one object run newest first: [`settle_rollback`] holds an older revert
+///   back until every newer order on its object has ended.
 ///
 /// `expected == 0` (a local-only fan-out) is never a verdict about anything and
 /// never reverts; it is unreachable through the timeout path anyway, since
@@ -3764,6 +3775,50 @@ fn compute_rollback(request: &RequestType) -> Option<Request> {
 /// entry no worker confirmed, which is strictly worse for this incident class.
 fn should_rollback_fanout(timed_out: bool, expected: usize, ok: usize, errors: usize) -> bool {
     expected > 0 && ok == 0 && (errors > 0 || timed_out)
+}
+
+/// Give back the claim an ended order holds on [`Server::rollbacks`], with the
+/// verdict of [`should_rollback_fanout`] as `revert`, and return the inverses
+/// that may be dispatched to the main process state now, newest first.
+///
+/// An order revert is only the exact undo of that order while no newer order on
+/// the same object has changed the state since: the ledger holds the revert of
+/// an older order back until every newer order on its object has ended, and
+/// then releases the whole stack from the newest end. Two unacknowledged
+/// orders on one frontend, an add and the removal after it, used to be
+/// reverted in the order their deadlines expired: the add's removal found
+/// nothing to remove, and the removal's inverse then put back a frontend
+/// neither client was told exists.
+///
+/// An order with no claim (no inverse, or restored by a main process upgrade)
+/// reverts on its own, as it did before the ledger.
+fn settle_rollback(
+    server: &mut Server,
+    ticket: Option<RollbackTicket>,
+    inverse: Option<&Request>,
+    revert: bool,
+) -> Vec<Unwind> {
+    match ticket {
+        Some(ticket) => server.rollbacks.settle(ticket, revert),
+        None => inverse
+            .filter(|_| revert)
+            .map(|inverse| {
+                vec![Unwind {
+                    inverse: inverse.clone(),
+                    deferred: false,
+                }]
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// What a log line says about an inverse that waited for a newer order.
+fn deferral_note(unwound: &Unwind) -> &'static str {
+    if unwound.deferred {
+        " [released behind a newer order on the same object]"
+    } else {
+        ""
+    }
 }
 
 /// Extra deadline granted per scattered entry by [`bulk_replay_timeout`].
@@ -3842,11 +3897,20 @@ struct ScatteredEntry {
     /// inverse of the scattered request; `None` when it has no unambiguous one
     /// (see [`compute_rollback`])
     rollback: Option<Request>,
+    /// the claim of this entry on [`Server::rollbacks`], when the main process
+    /// that scattered it holds one. Never part of a snapshot, so an entry
+    /// restored by a main process upgrade reverts on its own.
+    #[serde(skip)]
+    ticket: Option<RollbackTicket>,
 }
 
 impl PerEntryGatherer {
-    /// Revert every entry NO worker acknowledged, and return how many were
-    /// reverted from the main-process `ConfigState`.
+    /// Revert every entry NO worker acknowledged, and return how many of THIS
+    /// task's entries were reverted from the main-process `ConfigState` by this
+    /// call. An entry whose revert waits behind a newer order on its object is
+    /// reverted when that order ends, and is not counted: the revert this call
+    /// releases on behalf of an older order is logged but belongs to that
+    /// order's count, which is already closed.
     ///
     /// Same safety bound as the live fan-out: an entry at least one worker
     /// applied is never reverted, and an entry whose verb has no unambiguous
@@ -3854,24 +3918,26 @@ impl PerEntryGatherer {
     fn revert_unacknowledged(&self, server: &mut Server, timed_out: bool) -> usize {
         let mut reverted = 0usize;
         for entry in self.entries.values() {
-            if !should_rollback_fanout(timed_out, entry.expected, entry.ok, entry.errors) {
-                continue;
-            }
-            let Some(rollback) = entry.rollback.as_ref() else {
-                continue;
-            };
-            // Counts only, never request content: a `RequestHttpFrontend`
-            // rendering carries the operator-supplied hostname.
-            match server.state.dispatch(rollback) {
-                Ok(()) => {
-                    reverted += 1;
-                    align_protected_journal(server, rollback);
+            let revert = should_rollback_fanout(timed_out, entry.expected, entry.ok, entry.errors);
+            // Every entry settles its claim, reverted or kept: a newer order on
+            // the same object may be waiting for it, and this entry's own
+            // revert may have to wait for one.
+            for unwound in settle_rollback(server, entry.ticket, entry.rollback.as_ref(), revert) {
+                let rollback = &unwound.inverse;
+                let note = deferral_note(&unwound);
+                // Counts only, never request content: a `RequestHttpFrontend`
+                // rendering carries the operator-supplied hostname.
+                match server.state.dispatch(rollback) {
+                    Ok(()) => {
+                        reverted += usize::from(!unwound.deferred);
+                        align_protected_journal(server, rollback);
+                    }
+                    Err(revert_error) => error!(
+                        "sozu#1313 rollback: could not revert an unacknowledged replay entry \
+                         (ok=0, errors={}, expected={}, timed_out={}){}: {}",
+                        entry.errors, entry.expected, timed_out, note, revert_error
+                    ),
                 }
-                Err(revert_error) => error!(
-                    "sozu#1313 rollback: could not revert an unacknowledged replay entry \
-                     (ok=0, errors={}, expected={}, timed_out={}): {}",
-                    entry.errors, entry.expected, timed_out, revert_error
-                ),
             }
         }
         if reverted > 0 {
@@ -3890,6 +3956,23 @@ impl PerEntryGatherer {
 impl Gatherer for PerEntryGatherer {
     fn inc_expected_responses(&mut self, count: usize) {
         self.inner.inc_expected_responses(count);
+    }
+
+    fn adopt_rollback_ticket(&mut self, request_id: usize, ticket: RollbackTicket) -> bool {
+        let entry = self.entries.entry(request_id).or_default();
+        // One claim per entry: an entry scattered again keeps the first.
+        if entry.ticket.is_some() {
+            return false;
+        }
+        entry.ticket = Some(ticket);
+        true
+    }
+
+    fn take_rollback_tickets(&mut self) -> Vec<RollbackTicket> {
+        self.entries
+            .values_mut()
+            .filter_map(|entry| entry.ticket.take())
+            .collect()
     }
 
     fn has_finished(&self) -> bool {
@@ -4328,6 +4411,11 @@ pub fn worker_request(
 
     client.return_processing("Processing worker request...");
 
+    // The state accepted the order: from here its revert is owed in the order
+    // the orders were applied, and not in the order their deadlines expire.
+    let rollback_ticket = rollback
+        .as_ref()
+        .and_then(|inverse| server.rollbacks.owe(inverse.clone()));
     server.scatter(
         request,
         Box::new(WorkerTask {
@@ -4339,6 +4427,7 @@ pub fn worker_request(
             metric_detail_audit: metric_detail_audit_completion,
             clear_master_metrics_on_finish,
             rollback,
+            rollback_ticket,
         }),
         Timeout::Default,
         None,
@@ -4537,22 +4626,26 @@ impl GatheringTask for WorkerTask {
         // precomputed inverse. A mixed result (`ok > 0`) is deliberately left
         // as-is to avoid diverging the main process from the workers that did
         // accept. See [`should_rollback_fanout`] for both triggers and for the
-        // accepted late-`Ok` residual on the timeout path.
-        if should_rollback_fanout(timed_out, expected, ok, errors)
-            && let Some(rollback) = self.rollback.as_ref()
+        // accepted late-`Ok` residual on the timeout path. The order always
+        // settles its claim on the ledger, kept or reverted: a newer order on
+        // the same object may still be in flight, and then this revert waits
+        // for it and runs after its own, newest first.
+        let revert = should_rollback_fanout(timed_out, expected, ok, errors);
+        for unwound in settle_rollback(server, self.rollback_ticket, self.rollback.as_ref(), revert)
         {
-            match server.state.dispatch(rollback) {
+            let note = deferral_note(&unwound);
+            match server.state.dispatch(&unwound.inverse) {
                 // Counts only, never request content: a `RequestHttpFrontend`
                 // rendering carries the operator-supplied hostname.
                 Ok(()) => warn!(
                     "sozu#1301/sozu#1314 rollback: reverted a change from main-process state \
-                     (ok=0, errors={}, expected={}, timed_out={})",
-                    errors, expected, timed_out
+                     (ok=0, errors={}, expected={}, timed_out={}){}",
+                    errors, expected, timed_out, note
                 ),
                 Err(revert_error) => error!(
                     "sozu#1301/sozu#1314 rollback: could not revert main-process state after an \
-                     unacknowledged fan-out (ok=0, errors={}, expected={}, timed_out={}): {}",
-                    errors, expected, timed_out, revert_error
+                     unacknowledged fan-out (ok=0, errors={}, expected={}, timed_out={}){}: {}",
+                    errors, expected, timed_out, note, revert_error
                 ),
             }
         }
@@ -5455,7 +5548,28 @@ fn apply_saved_entry(
             counter_before + 1,
             "load_state must advance the scatter request_id by exactly one per dispatch"
         );
-        server.scatter_on(request, task_id, *scatter_request_counter, None);
+        scatter_accepted_entry(server, request, task_id, *scatter_request_counter);
+    }
+}
+
+/// Scatter one entry of a bulk apply path that the main process state has just
+/// accepted, and register its revert on [`Server::rollbacks`] first: the entry
+/// is a change to the state like any order, and a newer order on the same
+/// object must not be undone before it, nor this entry before that order.
+fn scatter_accepted_entry(
+    server: &mut Server,
+    request: Request,
+    task_id: usize,
+    request_id: usize,
+) {
+    let ticket = request
+        .request_type
+        .as_ref()
+        .and_then(compute_rollback)
+        .and_then(|inverse| server.rollbacks.owe(inverse));
+    server.scatter_on(request, task_id, request_id, None);
+    if let Some(ticket) = ticket {
+        server.adopt_rollback_ticket(task_id, request_id, ticket);
     }
 }
 
@@ -8800,6 +8914,7 @@ mod upgrade_task_snapshot_tests {
                     metric_detail_audit: None,
                     clear_master_metrics_on_finish: false,
                     rollback: Some(Request::default()),
+                    rollback_ticket: None,
                 }),
             ),
             (

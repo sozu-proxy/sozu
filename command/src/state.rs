@@ -106,6 +106,65 @@ pub fn rollback_request(request: &RequestType) -> Option<Request> {
     Some(inverse.into())
 }
 
+/// The object an inverse of [`rollback_request`] or [`ConfigState::rollback_for`]
+/// acts on, spelled the way [`ConfigState::dispatch`] identifies it.
+///
+/// Two inverses with the same key can undo each other's work when they run in
+/// an order other than newest first, so the main process runs them as a stack
+/// per key. Two inverses with different keys never touch the same entry of
+/// the state and may run in any order. The key of an order's inverse is the
+/// key of the order itself, since an add and the removal of what it added
+/// name one object:
+///
+/// - an HTTP or HTTPS frontend is its route key, which names no cluster (a
+///   key freed by one cluster's removal can be taken by another);
+/// - a TCP frontend is its `(address, sni, alpn)` identity in canonical form,
+///   again across clusters, as `tcp_frontend_matches` and the listener-wide
+///   scan of `add_tcp_frontend` compare it;
+/// - a UDP frontend is its address alone, since a UDP listener address is the
+///   whole routing key and one frontend holds it across every cluster;
+/// - a listener, and its activation flag, is its type and `address%interface`.
+///
+/// `None` for a request that is not such an inverse.
+pub fn rollback_key(inverse: &Request) -> Option<String> {
+    let key = match inverse.request_type.as_ref()? {
+        RequestType::AddHttpFrontend(front)
+        | RequestType::AddHttpFrontendWithSilentClose(front)
+        | RequestType::AddHttpFrontendWithHeaderPredicates(front)
+        | RequestType::RemoveHttpFrontend(front)
+        | RequestType::RemoveHttpFrontendWithHeaderPredicates(front) => {
+            format!("http-frontend:{front}")
+        }
+        RequestType::AddHttpsFrontend(front)
+        | RequestType::AddHttpsFrontendWithSilentClose(front)
+        | RequestType::AddHttpsFrontendWithHeaderPredicates(front)
+        | RequestType::RemoveHttpsFrontend(front)
+        | RequestType::RemoveHttpsFrontendWithHeaderPredicates(front) => {
+            format!("https-frontend:{front}")
+        }
+        RequestType::AddTcpFrontend(front) | RequestType::RemoveTcpFrontend(front) => {
+            let address: SocketAddr = front.address.into();
+            let sni = front.sni.as_deref().map(str::to_ascii_lowercase);
+            let alpn = canonical_tcp_alpn(&front.alpn);
+            format!("tcp-frontend:{address}|{sni:?}|{alpn:?}")
+        }
+        RequestType::AddUdpFrontend(front) | RequestType::RemoveUdpFrontend(front) => {
+            let address: SocketAddr = front.address.into();
+            format!("udp-frontend:{address}")
+        }
+        RequestType::RemoveListener(remove) => {
+            let proxy = ListenerType::try_from(remove.proxy).ok()?;
+            format!("listener:{proxy:?}:{}", remove.listener_key())
+        }
+        RequestType::DeactivateListener(deactivate) => {
+            let proxy = ListenerType::try_from(deactivate.proxy).ok()?;
+            format!("listener:{proxy:?}:{}", deactivate.listener_key())
+        }
+        _ => return None,
+    };
+    Some(key)
+}
+
 /// Why a UDP cluster and a backend with a `unix_path` never meet in the state.
 const UDP_UNIX_BACKEND_REFUSED: &str = "a UDP cluster cannot use unix_path backends";
 
@@ -12104,6 +12163,146 @@ mod tests {
             vec![Some("stable")],
             "removing the canary must leave its base"
         );
+    }
+
+    /// An order and the inverse that undoes it name one object, however the
+    /// two spell it, so the main process can stack the reverts of orders on
+    /// that object and run them newest first (`bin/src/command/rollback.rs`).
+    /// Orders on two objects the state tells apart never share a key, or one
+    /// would hold the other's revert back for nothing.
+    ///
+    /// TO SEE THIS RED: stop lowercasing the SNI, or stop sorting the ALPN, in
+    /// `rollback_key`: the respelled TCP removal stops sharing its add's key.
+    #[test]
+    fn rollback_keys_name_the_object_an_order_and_its_inverse_share() {
+        let key = |request_type: RequestType| rollback_key(&request_type.into());
+        let http = |hostname: &str| RequestHttpFrontend {
+            cluster_id: Some("cluster_1".to_owned()),
+            hostname: hostname.to_owned(),
+            path: PathRule::prefix("/".to_owned()),
+            address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+            ..Default::default()
+        };
+        let tcp = |sni: Option<&str>, alpn: &[&str], cluster: &str| RequestTcpFrontend {
+            cluster_id: cluster.to_owned(),
+            address: SocketAddress::new_v4(0, 0, 0, 0, 9000),
+            sni: sni.map(str::to_owned),
+            alpn: alpn.iter().map(|protocol| (*protocol).to_owned()).collect(),
+            ..Default::default()
+        };
+
+        // An HTTP frontend: the add, its removal, and the removal with
+        // predicates are one route; another hostname is another.
+        let add = rollback_request(&RequestType::AddHttpFrontend(http("a.example.com")))
+            .expect("an add has an inverse");
+        assert_eq!(
+            rollback_key(&add),
+            key(RequestType::add_http_frontend(http("a.example.com"))),
+            "the removal and the add name one route"
+        );
+        assert_ne!(
+            rollback_key(&add),
+            key(RequestType::add_http_frontend(http("b.example.com")))
+        );
+        assert_ne!(
+            key(RequestType::add_http_frontend(http("a.example.com"))),
+            key(RequestType::add_https_frontend(http("a.example.com"))),
+            "the HTTP and the HTTPS route of one hostname are two objects"
+        );
+
+        // A TCP frontend is its canonical (address, sni, alpn), whichever
+        // cluster holds it and however the request spells it.
+        assert_eq!(
+            key(RequestType::AddTcpFrontend(tcp(
+                Some("Example.COM"),
+                &["h2", "http/1.1"],
+                "cluster_1"
+            ))),
+            key(RequestType::RemoveTcpFrontend(tcp(
+                Some("example.com"),
+                &["http/1.1", "h2", "h2"],
+                "cluster_2"
+            )))
+        );
+        assert_ne!(
+            key(RequestType::AddTcpFrontend(tcp(
+                Some("a.example.com"),
+                &[],
+                "c"
+            ))),
+            key(RequestType::AddTcpFrontend(tcp(
+                Some("b.example.com"),
+                &[],
+                "c"
+            )))
+        );
+        assert_ne!(
+            key(RequestType::AddTcpFrontend(tcp(None, &[], "c"))),
+            key(RequestType::AddTcpFrontend(tcp(
+                Some("a.example.com"),
+                &[],
+                "c"
+            )))
+        );
+
+        // A UDP listener address is the whole routing key.
+        let udp = |cluster: &str, port: u16| RequestUdpFrontend {
+            cluster_id: cluster.to_owned(),
+            address: SocketAddress::new_v4(0, 0, 0, 0, port),
+            ..Default::default()
+        };
+        assert_eq!(
+            key(RequestType::AddUdpFrontend(udp("cluster_1", 5000))),
+            key(RequestType::RemoveUdpFrontend(udp("cluster_2", 5000)))
+        );
+        assert_ne!(
+            key(RequestType::AddUdpFrontend(udp("cluster_1", 5000))),
+            key(RequestType::AddUdpFrontend(udp("cluster_1", 5001)))
+        );
+
+        // A listener and its activation flag are one object, per type and
+        // interface.
+        let address = SocketAddress::new_v4(0, 0, 0, 0, 8080);
+        let removal = |proxy: ListenerType, interface: Option<&str>| {
+            key(RequestType::RemoveListener(RemoveListener {
+                address,
+                proxy: proxy.into(),
+                interface: interface.map(str::to_owned),
+            }))
+        };
+        assert_eq!(
+            removal(ListenerType::Http, None),
+            key(RequestType::DeactivateListener(DeactivateListener {
+                address,
+                proxy: ListenerType::Http.into(),
+                to_scm: false,
+                interface: None,
+            }))
+        );
+        assert_ne!(
+            removal(ListenerType::Http, None),
+            removal(ListenerType::Https, None)
+        );
+        assert_ne!(
+            removal(ListenerType::Http, None),
+            removal(ListenerType::Http, Some("wg0"))
+        );
+
+        // The inverse a removal captures from the state is keyed like the
+        // removal itself.
+        let mut state: ConfigState = Default::default();
+        state
+            .dispatch(&RequestType::AddHttpFrontend(http("a.example.com")).into())
+            .expect("the frontend is added");
+        let removal = RequestType::RemoveHttpFrontend(http("a.example.com"));
+        let inverse = state
+            .rollback_for(&removal)
+            .expect("a stored frontend has an inverse");
+        assert_eq!(rollback_key(&inverse), key(removal));
+
+        // Anything else is not an inverse the main process stacks.
+        assert_eq!(key(RequestType::Logging("info".to_owned())), None);
+        assert_eq!(rollback_key(&Request::default()), None);
     }
 
     /// `CloseSessions` acts on live sessions only: the state accepts it,

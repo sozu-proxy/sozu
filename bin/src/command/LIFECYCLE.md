@@ -319,6 +319,38 @@ carries the tags the identity needs.
 Upsert verbs (`AddCluster`, `AddBackend`) and non-add verbs stay deliberately
 uncovered: they keep the best-effort behaviour rather than risk a wrong revert.
 
+An inverse is the exact undo of its order only while that order is the newest
+change to its object: it is captured against the state as it stood when the
+order arrived, which already holds the effect of every order still in flight
+before it. Two orders on one object that both end unacknowledged — an add and
+the removal that follows it, or the reverse — used to be reverted in the order
+their deadlines expired, oldest first, and undid each other's work: the add's
+removal found nothing to remove (`StateError::NotFound`, only logged), and the
+removal's inverse then put back a frontend that neither client was told exists
+(or, in the other direction, dropped the frontend that existed before both
+orders). `RollbackLedger` (`bin/src/command/rollback.rs`) now holds one stack
+per object, oldest order first, keyed by `rollback_key`
+(`command/src/state.rs`): an HTTP or HTTPS frontend by its route key, a TCP
+frontend by its canonical `(address, sni, alpn)`, a UDP frontend by its address,
+a listener and its activation flag by type and `address%interface` — each
+spelled the way `ConfigState::dispatch` identifies the object, an order and
+the inverse that undoes it sharing one key. Every order registers with
+`RollbackLedger::owe` when the state accepts it (`worker_request`,
+`apply_saved_entry`, `load_static_config`) and settles with
+`RollbackLedger::settle` when its fan-out ends, reverted or kept
+(`WorkerTask::on_finish`, `PerEntryGatherer::revert_unacknowledged`). `settle`
+walks the stack from the newest order: a revert waits while a newer order on
+its object is still in flight, then runs newest first behind it; an order that
+a worker acknowledged supersedes every older revert on its object, which is
+dropped; orders on different objects never wait for each other. A replay that
+`load_state` cancels gives its claims back with `Server::cancel_task`. The
+ledger is not part of an upgrade snapshot: a task restored by a main upgrade
+holds no claim and reverts on its own when it ends, exactly as before, so an
+unacknowledged order that straddles a main upgrade can still be reverted out of
+order, and a revert already parked in the ledger behind a newer order is lost
+with the old process, its task having ended. `cargo test -p sozu --lib stacked_unacknowledged_orders` and the
+tests of `rollback.rs` lock the ordering.
+
 A listener patch (`Update*Listener`) has no inverse either, so it relies on two
 properties instead (sozu#1703). First, it is all-or-nothing on both sides:
 `ConfigState::update_http_listener` and `ConfigState::update_https_listener`

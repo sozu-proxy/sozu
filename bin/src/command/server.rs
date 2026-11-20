@@ -58,6 +58,7 @@ use crate::{
     command::{
         protected::ProtectedRuntime,
         requests::{AuditExtras, AuditResult, ClientRequestOutcome, audit_emit_inline, begin_stop},
+        rollback::{RollbackLedger, RollbackTicket},
         sessions::{
             ClientResult, ClientSession, OptionalClient, PausedClientSession, PausedWorkerSession,
             SessionSnapshotError, UpgradeResponseQueue, WorkerResult, WorkerSession, wants_to_tick,
@@ -262,6 +263,23 @@ pub trait Gatherer {
     fn on_scatter(&mut self, request_id: usize, worker_count: usize, request: &Request) {
         let _ = (request_id, request);
         self.inc_expected_responses(worker_count);
+    }
+
+    /// Take over the claim `ticket` that `Server::rollbacks` holds for the
+    /// entry `request_id` of this gatherer, which the main process state
+    /// already accepted. Returns whether the gatherer owns it now: it must
+    /// then settle it when the task ends, or hand it to
+    /// [`Self::take_rollback_tickets`] when the task is dropped. The default
+    /// refuses, and the caller releases the claim.
+    fn adopt_rollback_ticket(&mut self, request_id: usize, ticket: RollbackTicket) -> bool {
+        let _ = (request_id, ticket);
+        false
+    }
+
+    /// The claims this gatherer still owns, given up because its task is
+    /// dropped without ending ([`Server::cancel_task`]).
+    fn take_rollback_tickets(&mut self) -> Vec<RollbackTicket> {
+        Vec::new()
     }
 
     /// Return true if enough responses has been gathered
@@ -2284,6 +2302,12 @@ pub struct Server {
     /// cold start included. Empty once every readiness task has concluded;
     /// never part of a snapshot, since a pending readiness task refuses one.
     startup_workers: HashSet<WorkerId>,
+    /// The changes committed to `state` that no worker has answered yet, per
+    /// object, so a revert of an unacknowledged order never runs ahead of a
+    /// newer order on the same object (`bin/src/command/rollback.rs`). Not part
+    /// of a snapshot: a task restored by a main process upgrade holds no claim
+    /// and reverts on its own.
+    pub(crate) rollbacks: RollbackLedger,
     /// Workers an `upgrade --worker` is in flight for, as the last task sweep
     /// ([`CommandHub::finish_ready_tasks`]) found them: the tasks of an
     /// upgrade live in `CommandHub::tasks` after that sweep, out of reach of
@@ -2521,6 +2545,7 @@ impl Server {
             unix_listener,
             workers: HashMap::new(),
             protected: Default::default(),
+            rollbacks: RollbackLedger::default(),
             startup_workers: HashSet::new(),
             upgrading_workers: HashSet::new(),
             bootstrapping_workers: HashSet::new(),
@@ -3187,9 +3212,35 @@ impl Server {
     /// and returned before any cleanup, so every failed replay leaked its
     /// routes for the life of the main process. Routes of other tasks are kept.
     pub fn cancel_task(&mut self, task_id: TaskId) {
-        self.queued_tasks.remove(&task_id);
+        if let Some(mut task) = self.queued_tasks.remove(&task_id) {
+            // The entries it already put in the state stay there, as they
+            // always did, but they no longer hold back the revert of an older
+            // order on the same object.
+            for ticket in task.job.get_gatherer().take_rollback_tickets() {
+                self.rollbacks.settle(ticket, false);
+            }
+        }
         self.in_flight
             .retain(|_, in_flight_task_id| *in_flight_task_id != task_id);
+    }
+
+    /// Hand the claim `ticket` of [`Self::rollbacks`] to the gatherer of the
+    /// queued task `task_id`, for the entry `request_id` it just scattered. A
+    /// claim nobody owns is released at once, as kept.
+    pub(crate) fn adopt_rollback_ticket(
+        &mut self,
+        task_id: TaskId,
+        request_id: usize,
+        ticket: RollbackTicket,
+    ) {
+        let adopted = self.queued_tasks.get_mut(&task_id).is_some_and(|task| {
+            task.job
+                .get_gatherer()
+                .adopt_rollback_ticket(request_id, ticket)
+        });
+        if !adopted {
+            self.rollbacks.settle(ticket, false);
+        }
     }
 
     /// Called when the main cannot communicate anymore with a worker (it's channel closed)
@@ -7595,6 +7646,380 @@ mod tests {
                 (8444, "AddHttpsListener"),
             ],
             "the fan-out must carry each HTTPS listener on the verb its client auth calls for"
+        );
+    }
+
+    /// Two orders on one frontend key are both left unacknowledged: the first
+    /// adds the frontend, the second removes it while the first is still in
+    /// flight. Both clients are told `Failure`, and no worker ever applied
+    /// either order, so the main process state must end exactly as it was
+    /// before the first one.
+    ///
+    /// Each order captures its inverse against the state as it was when the
+    /// order arrived. Applied as each task ends, in deadline order, the older
+    /// inverse would run first: the removal that reverts the add finds
+    /// nothing to remove (the second order already took the frontend out), and
+    /// the inverse of the second order, an add of the frontend it removed,
+    /// then restores an entry neither client was told exists.
+    /// `RollbackLedger::settle` (`bin/src/command/rollback.rs`) holds the older
+    /// revert back until the newer order has ended, then runs both newest
+    /// first.
+    ///
+    /// The two tasks end in two separate sweeps, the older one first: within
+    /// one sweep `CommandHub::finish_ready_tasks` drains `HashMap`s, so the
+    /// order of two tasks that end together is arbitrary. The second order is
+    /// issued with the longer `worker_timeout`, which only fixes which deadline
+    /// comes first without sleeping: with equal timeouts the first order's
+    /// deadline is the earlier one anyway.
+    ///
+    /// TO SEE THIS RED: in `WorkerTask::on_finish`
+    /// (`bin/src/command/requests.rs`) pass `None` instead of
+    /// `self.rollback_ticket` to `settle_rollback`, so that every task
+    /// dispatches its own inverse as soon as it ends unacknowledged, as before
+    /// the ledger: the final assertion finds
+    /// `0.0.0.0:8080;stacked.example.com;P/` in `ConfigState::http_fronts`.
+    #[test]
+    fn stacked_unacknowledged_orders_on_one_key_leave_the_state_as_it_was_before_either() {
+        let mut hub = create_test_hub();
+        // A `Running` worker that never answers: without one, the fan-out
+        // expects nobody, finishes at once, and nothing is ever reverted.
+        let (_silent_worker, _scm) = register_ready_test_worker(&mut hub.server, 0, 4096, 65536);
+        let (token_a, mut peer_a) = register_observable_client(&mut hub);
+        let (token_b, mut peer_b) = register_observable_client(&mut hub);
+        let frontend = RequestHttpFrontend {
+            cluster_id: Some(String::from("cluster_1")),
+            hostname: String::from("stacked.example.com"),
+            path: PathRule::prefix(String::from("/")),
+            address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+            position: RulePosition::Tree.into(),
+            ..Default::default()
+        };
+        assert!(
+            hub.server.state.http_fronts.is_empty(),
+            "the fixture starts without a frontend"
+        );
+
+        // Order A adds the frontend; order B removes it while A is in flight.
+        hub.server.config.worker_timeout = 10;
+        crate::command::requests::worker_request(
+            &mut hub.server,
+            hub.clients.get_mut(&token_a).expect("client A is live"),
+            RequestType::AddHttpFrontend(frontend.clone()),
+        );
+        assert_eq!(
+            hub.server.state.http_fronts.len(),
+            1,
+            "order A is committed to the main process state"
+        );
+        let task_a = *hub
+            .server
+            .queued_tasks
+            .keys()
+            .next()
+            .expect("order A is in flight");
+        let deadline_a = hub.server.queued_tasks[&task_a]
+            .timeout
+            .expect("order A has a deadline");
+
+        hub.server.config.worker_timeout = 20;
+        crate::command::requests::worker_request(
+            &mut hub.server,
+            hub.clients.get_mut(&token_b).expect("client B is live"),
+            RequestType::RemoveHttpFrontend(frontend.clone()),
+        );
+        assert!(
+            hub.server.state.http_fronts.is_empty(),
+            "order B is committed to the main process state"
+        );
+        assert_eq!(
+            hub.server.queued_tasks.len(),
+            2,
+            "both orders are in flight and nobody answered"
+        );
+        let deadline_b = hub
+            .server
+            .queued_tasks
+            .iter()
+            .find_map(|(task_id, task)| (*task_id != task_a).then_some(task.timeout))
+            .flatten()
+            .expect("order B has a deadline");
+        assert!(deadline_a < deadline_b, "A must be the older deadline");
+
+        // Sweep 1: only A has run out of time. Its inverse removes a frontend
+        // that is already gone.
+        hub.finish_ready_tasks(deadline_a + (deadline_b - deadline_a) / 2);
+        assert_eq!(
+            hub.tasks.len() + hub.server.queued_tasks.len(),
+            1,
+            "only order B is still in flight after the first sweep"
+        );
+        assert!(
+            hub.server.state.http_fronts.is_empty(),
+            "reverting A cannot bring the frontend back: B removed it"
+        );
+
+        // Sweep 2: B runs out of time as well. Both orders are over.
+        hub.finish_ready_tasks(deadline_b + Duration::from_secs(1));
+        assert!(
+            hub.tasks.is_empty() && hub.server.queued_tasks.is_empty(),
+            "both orders are over"
+        );
+        for (token, peer) in [(token_a, &mut peer_a), (token_b, &mut peer_b)] {
+            flush_client_responses(&mut hub, token, peer);
+            let mut answers = vec![];
+            while let Ok(answer) = peer.read_message() {
+                answers.push(answer);
+            }
+            assert_eq!(
+                answers.last().map(|answer| answer.status),
+                Some(ResponseStatus::Failure as i32),
+                "the client was told its order failed: {answers:?}"
+            );
+        }
+
+        assert!(
+            hub.server.state.http_fronts.is_empty(),
+            "no worker applied either order and both clients were told `Failure`, \
+             yet the main process state holds {:?}, a frontend neither of them was \
+             told exists",
+            hub.server.state.http_fronts.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// The frontend the stacked-order tests below fight over.
+    fn contested_frontend() -> RequestHttpFrontend {
+        RequestHttpFrontend {
+            cluster_id: Some(String::from("cluster_1")),
+            hostname: String::from("stacked.example.com"),
+            path: PathRule::prefix(String::from("/")),
+            address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+            position: RulePosition::Tree.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Two orders on one frontend in the opposite direction of
+    /// `stacked_unacknowledged_orders_on_one_key_leave_the_state_as_it_was_before_either`:
+    /// the frontend exists, the first order removes it and the second adds it
+    /// back while the first is in flight. No worker answers either. The main
+    /// process state must end with the frontend it started with.
+    ///
+    /// Oldest first, the removal's inverse (an add of the frontend) is refused
+    /// because the second order already put it back, and the add's inverse
+    /// then removes it: the frontend neither client touched successfully is
+    /// gone.
+    ///
+    /// TO SEE THIS RED: in `RollbackLedger::settle` (`bin/src/command/rollback.rs`)
+    /// delete the `Verdict::Revert if blocked => {}` arm, so that an older
+    /// revert is released while a newer order on its object is in flight.
+    #[test]
+    fn stacked_unacknowledged_orders_in_the_mirror_direction_keep_the_frontend() {
+        let mut hub = create_test_hub();
+        let (_silent_worker, _scm) = register_ready_test_worker(&mut hub.server, 0, 4096, 65536);
+        let (token_a, _peer_a) = register_observable_client(&mut hub);
+        let (token_b, _peer_b) = register_observable_client(&mut hub);
+        let frontend = contested_frontend();
+        hub.server
+            .state
+            .dispatch(&RequestType::AddHttpFrontend(frontend.clone()).into())
+            .expect("the frontend exists before either order");
+        let before_either = hub.server.state.http_fronts.clone();
+
+        hub.server.config.worker_timeout = 10;
+        crate::command::requests::worker_request(
+            &mut hub.server,
+            hub.clients.get_mut(&token_a).expect("client A is live"),
+            RequestType::RemoveHttpFrontend(frontend.clone()),
+        );
+        assert!(
+            hub.server.state.http_fronts.is_empty(),
+            "order A removed it"
+        );
+        let task_a = *hub
+            .server
+            .queued_tasks
+            .keys()
+            .next()
+            .expect("order A is in flight");
+        let deadline_a = hub.server.queued_tasks[&task_a]
+            .timeout
+            .expect("order A has a deadline");
+
+        hub.server.config.worker_timeout = 20;
+        crate::command::requests::worker_request(
+            &mut hub.server,
+            hub.clients.get_mut(&token_b).expect("client B is live"),
+            RequestType::AddHttpFrontend(frontend.clone()),
+        );
+        assert_eq!(hub.server.state.http_fronts.len(), 1, "order B put it back");
+        let deadline_b = hub
+            .server
+            .queued_tasks
+            .iter()
+            .find_map(|(task_id, task)| (*task_id != task_a).then_some(task.timeout))
+            .flatten()
+            .expect("order B has a deadline");
+        assert!(deadline_a < deadline_b, "A must be the older deadline");
+
+        hub.finish_ready_tasks(deadline_a + (deadline_b - deadline_a) / 2);
+        assert_eq!(
+            hub.tasks.len() + hub.server.queued_tasks.len(),
+            1,
+            "only order B is still in flight after the first sweep"
+        );
+        assert_eq!(
+            hub.server.state.http_fronts.len(),
+            1,
+            "reverting A must wait for B: B's frontend is in the state"
+        );
+
+        hub.finish_ready_tasks(deadline_b + Duration::from_secs(1));
+        assert!(
+            hub.tasks.is_empty() && hub.server.queued_tasks.is_empty(),
+            "both orders are over"
+        );
+        assert_eq!(
+            hub.server.state.http_fronts, before_either,
+            "no worker applied either order, so the frontends must be exactly the ones that \
+             existed before them"
+        );
+        assert_eq!(
+            hub.server.rollbacks.live_tickets(),
+            0,
+            "an ended order holds no claim"
+        );
+    }
+
+    /// The bulk twin: an entry of a saved state that `load_state` put in the
+    /// main process state, and a live removal of the same frontend while the
+    /// replay is in flight. Neither is acknowledged. `PerEntryGatherer`
+    /// reverts its entries with the same inverses as `WorkerTask` and must
+    /// not run ahead of the newer order either.
+    ///
+    /// TO SEE THIS RED: in `scatter_accepted_entry` (`bin/src/command/requests.rs`)
+    /// skip the `server.rollbacks.owe` call (`let ticket = None;`): the replay
+    /// entry reverts on its own when its deadline expires, finds the frontend
+    /// already removed, and the removal's inverse puts the frontend back.
+    #[test]
+    fn a_replayed_entry_and_a_newer_live_order_unwind_newest_first() {
+        let mut hub = create_test_hub();
+        let (_silent_worker, _scm) = register_ready_test_worker(&mut hub.server, 0, 4096, 65536);
+        let (token_b, _peer_b) = register_observable_client(&mut hub);
+        let frontend = contested_frontend();
+
+        let dir = tempfile::tempdir().expect("could not create temp dir");
+        let state_path = dir.path().join("replay.state");
+        {
+            let message = WorkerRequest::new(
+                String::from("SAVE-0"),
+                RequestType::AddHttpFrontend(frontend.clone()).into(),
+            );
+            let mut record = serde_json::to_vec(&message).expect("a serializable request");
+            record.extend_from_slice(b"\n\0");
+            std::fs::write(&state_path, record).expect("writing the state file");
+        }
+
+        hub.server.config.worker_timeout = 10;
+        crate::command::requests::load_state(
+            &mut hub.server,
+            None,
+            state_path.to_str().expect("a UTF-8 temp path"),
+        );
+        assert_eq!(
+            hub.server.state.http_fronts.len(),
+            1,
+            "the replay committed the entry to the main process state"
+        );
+        let replay = *hub
+            .server
+            .queued_tasks
+            .keys()
+            .next()
+            .expect("the replay is in flight");
+        let deadline_replay = hub.server.queued_tasks[&replay]
+            .timeout
+            .expect("the replay has a deadline");
+
+        hub.server.config.worker_timeout = 20;
+        crate::command::requests::worker_request(
+            &mut hub.server,
+            hub.clients.get_mut(&token_b).expect("client B is live"),
+            RequestType::RemoveHttpFrontend(frontend.clone()),
+        );
+        assert!(
+            hub.server.state.http_fronts.is_empty(),
+            "the live order removed the entry"
+        );
+        let deadline_b = hub
+            .server
+            .queued_tasks
+            .iter()
+            .find_map(|(task_id, task)| (*task_id != replay).then_some(task.timeout))
+            .flatten()
+            .expect("the live order has a deadline");
+        assert!(deadline_replay < deadline_b, "the replay ends first");
+
+        hub.finish_ready_tasks(deadline_replay + (deadline_b - deadline_replay) / 2);
+        assert!(
+            hub.server.state.http_fronts.is_empty(),
+            "reverting the replayed entry cannot bring the frontend back: the live order removed it"
+        );
+        hub.finish_ready_tasks(deadline_b + Duration::from_secs(1));
+        assert!(
+            hub.tasks.is_empty() && hub.server.queued_tasks.is_empty(),
+            "both are over"
+        );
+        assert!(
+            hub.server.state.http_fronts.is_empty(),
+            "no worker applied the entry or the removal, yet the main process state holds {:?}",
+            hub.server.state.http_fronts.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(hub.server.rollbacks.live_tickets(), 0);
+    }
+
+    /// A replay that fails to parse after it put an entry in the state is
+    /// cancelled without ever ending. The claim of that entry must go with the
+    /// task, or every older order on the same frontend would wait for an
+    /// answer that cannot come.
+    ///
+    /// TO SEE THIS RED: drop the `take_rollback_tickets` loop from
+    /// `Server::cancel_task`: the cancelled replay's claim stays in
+    /// `Server::rollbacks`.
+    #[test]
+    fn cancelling_a_replay_releases_the_claims_of_its_entries() {
+        let mut hub = create_test_hub();
+        let dir = tempfile::tempdir().expect("could not create temp dir");
+        let state_path = dir.path().join("broken.state");
+        {
+            let message = WorkerRequest::new(
+                String::from("SAVE-0"),
+                RequestType::AddHttpFrontend(contested_frontend()).into(),
+            );
+            let mut record = serde_json::to_vec(&message).expect("a serializable request");
+            record.extend_from_slice(b"\n\0");
+            record.extend_from_slice(b"not a record");
+            std::fs::write(&state_path, record).expect("writing the state file");
+        }
+
+        crate::command::requests::load_state(
+            &mut hub.server,
+            None,
+            state_path.to_str().expect("a UTF-8 temp path"),
+        );
+
+        assert!(
+            hub.server.queued_tasks.is_empty(),
+            "the unreadable replay was cancelled"
+        );
+        assert_eq!(
+            hub.server.state.http_fronts.len(),
+            1,
+            "the entry read before the failure stays in the state, as it always did"
+        );
+        assert_eq!(
+            hub.server.rollbacks.live_tickets(),
+            0,
+            "the cancelled replay holds no claim"
         );
     }
 }
