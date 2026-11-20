@@ -2010,7 +2010,17 @@ chunk (§7.1) is truncated: `warn!`,
 the backend goes away without that read path ending the body (a socket error,
 a backend timeout), the `CloseDelimited` arm of `ConnectionH2::end_stream`
 applies the same `body_size != BodySize::Empty` test, with the same `warn!`
-and metric, and ends the stream in `Error`.
+and metric, and ends the stream in `Error`. The `CloseDelimited` arm of
+`ConnectionH1::end_stream` ends the response the same way, by calling
+`ConnectionH1::terminate_close_delimited` itself (a socket error such as
+`ETIMEDOUT` is read as `SocketResult::Error`, which `ConnectionH1::readable`
+deliberately does not turn into an end of message, and the sweep of the dead
+backend then reaches the arm). It used to unlink the stream and arm the write
+and nothing else, which left the response neither terminated nor errored:
+`ConnectionH1::writable` has no exit for such a response, so the client waited
+for the frontend timeout before the connection closed: a delayed end for a
+close-delimited body, and for a length-framed one a truncation that left no
+`warn!` and no `h1.backend_eof_before_message_complete` count.
 
 A response in `Error` then ends in error on both frontends, never with a
 substitute answer once part of it left: `end_stream_decision` answers
@@ -2031,7 +2041,8 @@ body. `Mux::close` logs the stream as an error. Pinned by
 (`editor.rs`),
 `an_errored_response_already_handed_to_the_client_is_not_replaced`
 (`shared.rs`), `a_content_length_response_cut_short_ends_with_a_reset`
-(`h2.rs`), and the e2e `test_h2_content_length_truncated_*`,
+(`h2.rs`), `an_h1_frontend_ends_a_response_whose_close_delimited_backend_is_gone`
+(`h1.rs`), and the e2e `test_h2_content_length_truncated_*`,
 `test_h1_content_length_truncated_*` and `*_chunked_truncated_*` tests.
 
 **The H1 client connection closes after that response even when it ended
@@ -2066,6 +2077,31 @@ Pinned by the e2e `test_h1_close_delimited_body_closes_client`,
 `test_h1_content_length_complete_then_backend_close_closes_client`,
 `test_h1_framed_keep_alive_responses_keep_the_client` and
 `test_h2_*_keeps_the_h2_connection`.
+
+**An interim response whose backend is gone ends the session.** A backend that
+sends `100 Continue` (or another 1xx) and closes before the frontend has
+flushed it is ended by the sweep of the dead backend as if the 1xx were the
+final response: `end_stream_decision` answers `ForwardTerminated` for the
+terminated interim head and the stream becomes `Unlinked`. The `100` arm of
+`ConnectionH1::writable` clears the response and re-arms the backend read to
+wait for the final response, which only a linked backend can send, so that arm
+applies while the stream is still `Linked`. An unlinked `100` takes the arm of
+the other interim responses: it logs the request as `H1::Interim`, resets the
+stream's metrics so that `Mux::close`, which logs every open stream whose
+metrics still carry a start, does not log it a second time, marks the stream
+closing, as the close of a completed response does, so that the second
+`writable` pass a TLS close deferred behind its `close_notify` brings takes the
+`closing-context` exit instead of logging the request again, and closes the
+frontend through `defer_close_for_tls_flush("interim")`. Before this, the
+client waited for the frontend timeout (re-armed by every read of a request
+still uploading) and then saw a silent close, where it now sees the close once
+the `100` is flushed; and the other interim responses logged their request
+again on that close, at `Mux::close` and, on a TLS frontend, on the deferred
+pass as well, counting its status bucket each time. Pinned by
+`a_backend_close_after_100_continue_does_not_leave_the_request_unanswered`,
+`an_interim_response_whose_backend_is_gone_is_logged_once` and
+`a_deferred_tls_close_after_an_interim_response_logs_the_request_once`
+(`h1.rs`).
 
 **Neither connection outlives a response that completed before its request**
 (sozu-proxy/sozu#1721). A backend may answer early — a 413 or a 401 on an

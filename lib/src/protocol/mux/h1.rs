@@ -526,7 +526,10 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         dropped_trailers
     }
 
-    /// End a response body at the backend's EOF.
+    /// End a response body at the backend's EOF, or when the backend is lost
+    /// without one (the `CloseDelimited` arm of `ConnectionH1::end_stream`,
+    /// reached by a socket error the read path does not turn into an end of
+    /// message).
     ///
     /// Only a body with neither `Content-Length` nor chunked coding
     /// (`BodySize::Empty`) is delimited by the close (RFC 9112 §6.3 rule 8):
@@ -559,7 +562,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 "a Content-Length body still in its body phase must be missing bytes"
             );
             warn!(
-                "{} H1 backend EOF before the end of a {:?} response on stream {}: emitting RST_STREAM",
+                "{} H1 backend closed before the end of a {:?} response on stream {}: emitting RST_STREAM",
                 log_module_context!(),
                 kawa.body_size,
                 stream_id
@@ -720,9 +723,12 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             // For a close-delimited backend response (no Content-Length, no
             // chunked), a graceful EOF IS the end-of-body signal. Terminate
             // the kawa so the H2 converter emits DATA with END_STREAM.
-            // SocketResult::Error (ECONNRESET etc.) is NOT treated as a valid
-            // close-delimiter — transport errors should produce 502, not a
-            // truncated response.
+            // SocketResult::Error (a timeout, an unreachable host; a reset
+            // reads as Closed) does not end the body here: the sweep of the
+            // dead backend ends the stream, and the `CloseDelimited` arm of
+            // `ConnectionH1::end_stream` (`lib/src/protocol/mux/h1.rs`) or
+            // `ConnectionH2::end_stream` (`lib/src/protocol/mux/h2.rs`)
+            // applies the same framed-versus-unframed test.
             if status == SocketResult::Closed
                 && self.position.is_client()
                 && kawa.is_main_phase()
@@ -1259,7 +1265,16 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                             }
                             return MuxResult::Upgrade;
                         }
-                        kawa::StatusLine::Response { code: 100, .. } => {
+                        // A 100 whose stream is no longer linked (the backend
+                        // closed while the 100 was still queued, and the
+                        // sweep ended the stream as a terminated response)
+                        // is not handled here: no backend is left to send the
+                        // final response this arm re-arms a read for, so it
+                        // falls through to the interim arm below, which
+                        // closes.
+                        kawa::StatusLine::Response { code: 100, .. }
+                            if matches!(stream.state, StreamState::Linked(_)) =>
+                        {
                             debug!("{} ============== HANDLE CONTINUE!", log_context!(self));
                             // After a 100 Continue, we expect the client to continue
                             // with its request body. Do NOT call generate_access_log
@@ -1285,8 +1300,11 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         // §15.2 has a client accept any number of them before
                         // the final response, so the stream stays linked and
                         // the backend stays out of the keep-alive pool until
-                        // that final response has been written.
-                        kawa::StatusLine::Response { code, .. } if (102..200).contains(&code) => {
+                        // that final response has been written. A 100 reaches
+                        // this arm only when its stream is unlinked (101 was
+                        // taken above): like any interim response whose
+                        // backend is gone, it ends the session below.
+                        kawa::StatusLine::Response { code, .. } if (100..200).contains(&code) => {
                             debug!(
                                 "{} ============== HANDLE INTERIM {}!",
                                 log_context!(self),
@@ -1324,6 +1342,20 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                                 {
                                     crate::protocol::mux::h2::record_metric(event);
                                 }
+                                // The request is logged: leave `Mux::close`
+                                // nothing to log again for this open stream
+                                // (it logs every open stream whose metrics
+                                // still carry a start), as `H1::Complete` does
+                                // below.
+                                stream.metrics.reset();
+                                // A TLS close is deferred until `close_notify`
+                                // is flushed, and `writable` runs again: mark
+                                // the stream closing so that pass takes the
+                                // `closing-context` exit above instead of
+                                // logging this interim response a second
+                                // time, as the close of a completed response
+                                // does below.
+                                stream.context.closing = true;
                                 return self.defer_close_for_tls_flush("interim");
                             }
                         }
@@ -1836,6 +1868,19 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 }
                 EndStreamAction::CloseDelimited => {
                     debug!("{} CLOSE DELIMITED", log_context!(self));
+                    // The backend is gone without the EOF read path having
+                    // ended the body (a socket error, which `readable` does
+                    // not turn into an end of message), so the response is
+                    // neither terminated nor errored and `writable` has no
+                    // exit for it. End it as that read path does, and as the
+                    // `CloseDelimited` arm of `ConnectionH2::end_stream`
+                    // (`lib/src/protocol/mux/h2.rs`) does: a body with
+                    // neither `Content-Length` nor chunked coding is
+                    // terminated, any other is truncated and goes to Error.
+                    // `end_stream_decision` picks this action only for a
+                    // response in its body phase that is not terminated,
+                    // which is what `terminate_close_delimited` requires.
+                    Self::terminate_close_delimited(&mut stream.back, stream_id);
                     stream.state = StreamState::Unlinked;
                     self.readiness.arm_writable();
                 }
@@ -2680,6 +2725,360 @@ mod tests {
             "the first response-header byte arrives before the last response \
              byte: header_time {header_time:?} must not exceed response_time \
              {response_time:?}"
+        );
+    }
+
+    // ── A backend that closes while its interim 1xx is still queued ─────────
+    //
+    // DO NOT READ THESE TESTS AS COVERING H2. They drive a `Position::Server`
+    // `ConnectionH1` writing a backend's interim response. The H2 frontend
+    // forwards an interim through its own converter.
+
+    /// Stage a linked H1 backend that sent `interim` and closed before the
+    /// frontend flushed it: the backend read parses the interim, the backend
+    /// close ends the stream through `ConnectionH1::close`, and the frontend
+    /// then runs one `writable` pass. Returns the pass's result, the stream
+    /// state and whether the back buffer holds anything but an empty status
+    /// line afterwards (a queued answer).
+    fn frontend_write_after_an_interim_and_a_backend_close(
+        interim: &[u8],
+    ) -> (MuxResult, StreamState, bool) {
+        let mut fixture = linked_backend_connection();
+        let BackendReadFixture {
+            context,
+            frontend,
+            client,
+            backend_peer,
+            ..
+        } = &mut fixture;
+        if let Connection::H1(server) = frontend {
+            server.stream = Some(0);
+        }
+
+        feed_backend(
+            backend_peer,
+            client,
+            context,
+            frontend,
+            interim,
+            |context| context.streams[0].back.is_terminated(),
+        );
+        assert!(
+            matches!(context.streams[0].state, StreamState::Linked(_)),
+            "premise: the stream is still linked while the interim sits in the back buffer"
+        );
+
+        // The sweep of a dead backend: it ends the frontend's stream, and the
+        // interim, parsed as terminated, is taken for a final response.
+        client.close(context, EndpointServer(frontend));
+        assert_eq!(
+            context.streams[0].state,
+            StreamState::Unlinked,
+            "premise: the backend close ends the stream as a terminated response"
+        );
+        assert!(
+            context.streams[0].back.is_terminated() && !context.streams[0].back.is_completed(),
+            "premise: the interim has not been flushed to the client yet"
+        );
+
+        let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+        let result = frontend.writable(context, EndpointClient(&mut router));
+        (
+            result,
+            context.streams[0].state,
+            !context.streams[0].back.is_initial(),
+        )
+    }
+
+    /// A backend that sends `100 Continue` and closes before the frontend
+    /// flushed it must not leave the request with no answer. A `100` arm of
+    /// `ConnectionH1::writable` that only clears the response, once the 100
+    /// is written, waits for a final response from a stream that is
+    /// `Unlinked`: nothing ever answers and the client waits for the frontend
+    /// timeout. The 102-199 arm right below it closes the session in the same
+    /// state; the 100 arm must not leave the stream silent either: it closes,
+    /// or it queues an answer.
+    ///
+    /// The 102 case is the control: it takes the arm that has the
+    /// `Unlinked` branch, so it shows the harness reaches the interim
+    /// handling and sees the close.
+    #[test]
+    fn a_backend_close_after_100_continue_does_not_leave_the_request_unanswered() {
+        let (result, _, _) =
+            frontend_write_after_an_interim_and_a_backend_close(b"HTTP/1.1 102 Processing\r\n\r\n");
+        assert!(
+            matches!(result, MuxResult::CloseSession),
+            "control: an unlinked 102 closes the session, got {result:?}"
+        );
+
+        let (result, state, answer_queued) =
+            frontend_write_after_an_interim_and_a_backend_close(b"HTTP/1.1 100 Continue\r\n\r\n");
+        assert!(
+            matches!(result, MuxResult::CloseSession) || answer_queued,
+            "an unlinked stream whose backend is gone after the 100 must close the session \
+             or queue an answer; got {result:?} with the stream {state:?} and nothing queued"
+        );
+    }
+
+    /// The interim response of a backend that is gone ends the session after
+    /// logging the request, and leaves nothing for `Mux::close` to log again:
+    /// that teardown logs every open stream whose metrics still carry a start,
+    /// and `Unlinked` is open, so a request logged here and not reset would be
+    /// logged a second time as `session close`, counting its status bucket
+    /// twice. Covers the 100, which shares the arm with the other interim
+    /// responses once its stream is no longer linked.
+    #[test]
+    fn an_interim_response_whose_backend_is_gone_is_logged_once() {
+        for interim in [
+            &b"HTTP/1.1 100 Continue\r\n\r\n"[..],
+            &b"HTTP/1.1 102 Processing\r\n\r\n"[..],
+        ] {
+            let mut fixture = linked_backend_connection();
+            let BackendReadFixture {
+                context,
+                frontend,
+                client,
+                backend_peer,
+                ..
+            } = &mut fixture;
+            if let Connection::H1(server) = frontend {
+                server.stream = Some(0);
+            }
+            context.streams[0].metrics.service_start();
+            feed_backend(
+                backend_peer,
+                client,
+                context,
+                frontend,
+                interim,
+                |context| context.streams[0].back.is_terminated(),
+            );
+            client.close(context, EndpointServer(frontend));
+            assert!(
+                context.streams[0].metrics.start.is_some(),
+                "premise: the request has not been logged yet"
+            );
+
+            let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+            let result = frontend.writable(context, EndpointClient(&mut router));
+            let label = String::from_utf8_lossy(interim);
+            assert!(
+                matches!(result, MuxResult::CloseSession),
+                "{label:?}: premise: the session ends, got {result:?}"
+            );
+            assert!(
+                context.streams[0].state.is_open(),
+                "{label:?}: premise: the stream is still open for `Mux::close` to visit"
+            );
+            assert!(
+                context.streams[0].metrics.start.is_none(),
+                "{label:?}: the request was logged by the interim arm; `Mux::close` must not \
+                 find it still carrying a start and log it again"
+            );
+        }
+    }
+
+    /// A TLS frontend defers the close of the session behind its pending
+    /// `close_notify`, and `writable` runs again on the same connection once
+    /// that flush went through. The interim arm that closes for a backend that
+    /// is gone must take the `closing-context` exit on that second pass, as the
+    /// close of a completed response does
+    /// (`a_deferred_tls_close_completes_the_response_once`): left to run again
+    /// it would log the request a second time as `H1::Interim` and count its
+    /// status bucket twice.
+    #[test]
+    fn a_deferred_tls_close_after_an_interim_response_logs_the_request_once() {
+        const BACKEND: mio::Token = mio::Token(1);
+        for interim in [
+            &b"HTTP/1.1 100 Continue\r\n\r\n"[..],
+            &b"HTTP/1.1 102 Processing\r\n\r\n"[..],
+        ] {
+            let (results_sender, results_receiver) = std::sync::mpsc::channel();
+            let output = crate::capture_test_logs(move || {
+                let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+                let mut context = test_context(&pool);
+                context
+                    .create_stream(Ulid::generate(), 1 << 16)
+                    .expect("the test pool must hand out stream buffers");
+                let (front_socket, _front_peer) = connected_socket();
+                let mut frontend = Connection::new_h1_server(
+                    Ulid::generate(),
+                    PendingCloseNotifySocket {
+                        stream: front_socket,
+                        closing: false,
+                    },
+                    Duration::from_secs(60),
+                );
+                if let Connection::H1(server) = &mut frontend {
+                    server.stream = Some(0);
+                }
+                let (back_socket, mut back_peer) = connected_socket();
+                let backend_ulid = Ulid::generate();
+                let mut client = h1_of(Connection::new_h1_client(
+                    backend_ulid,
+                    SessionTcpStream::new(back_socket, backend_ulid, None),
+                    "test-cluster".into(),
+                    test_backend_id(cached_peer()),
+                    Duration::from_secs(60),
+                ));
+                if let Position::Client(_, _, status) = &mut client.position {
+                    *status = BackendStatus::KeepAlive;
+                }
+                assert!(
+                    client.start_stream(0, &mut context),
+                    "premise: the backend must accept the request"
+                );
+                let stream = &mut context.streams[0];
+                stream.state = StreamState::Linked(BACKEND);
+                stream.front.parsing_phase = kawa::ParsingPhase::Terminated;
+                stream.metrics.service_start();
+                stream.metrics.backend_id = Some("test-backend".into());
+                stream.metrics.backend_start();
+                stream.metrics.backend_connected();
+
+                back_peer
+                    .write_all(interim)
+                    .expect("the loopback backend peer must accept the interim response");
+                for _ in 0..64 {
+                    client.readiness.event.insert(Ready::READABLE);
+                    client.readable(&mut context, EndpointServer(&mut frontend));
+                    if context.streams[0].back.is_terminated() {
+                        break;
+                    }
+                }
+                assert!(
+                    context.streams[0].back.is_terminated(),
+                    "premise: the interim response must be read whole"
+                );
+                // The sweep of the dead backend ends the stream as a
+                // terminated response before the interim was flushed.
+                client.close(&mut context, EndpointServer(&mut frontend));
+                assert_eq!(
+                    context.streams[0].state,
+                    StreamState::Unlinked,
+                    "premise: the backend close ends the stream"
+                );
+
+                let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+                let mut results = Vec::new();
+                for _ in 0..2 {
+                    frontend.readiness_mut().event.insert(Ready::WRITABLE);
+                    results.push(frontend.writable(&mut context, EndpointClient(&mut router)));
+                }
+                results_sender
+                    .send(results)
+                    .expect("the test thread must report its results");
+            });
+
+            let label = String::from_utf8_lossy(interim);
+            let results = results_receiver
+                .recv()
+                .expect("the test thread must report its results");
+            assert!(
+                matches!(results[0], MuxResult::Continue),
+                "{label:?}: the first pass defers the close behind the pending close_notify, got {:?}",
+                results[0]
+            );
+            assert!(
+                matches!(results[1], MuxResult::CloseSession),
+                "{label:?}: once close_notify is flushed the session closes, got {:?}",
+                results[1]
+            );
+            let logged = output
+                .lines()
+                .filter(|line| line.contains("H1::Interim"))
+                .count();
+            assert_eq!(
+                logged, 1,
+                "{label:?}: the request must be logged once, got: {output}"
+            );
+        }
+    }
+
+    // ── A backend that goes away mid-response without an EOF ────────────────
+    //
+    // DO NOT READ THESE TESTS AS COVERING H2. They drive the `Position::Server`
+    // `ConnectionH1::end_stream`. The H2 frontend takes the same decision in
+    // `ConnectionH2::end_stream`, which already errors or terminates the stream.
+
+    /// A backend that announced `Connection: close` and is lost mid-response
+    /// without a clean EOF (a socket error such as `ETIMEDOUT` is read as
+    /// `SocketResult::Error`, which `ConnectionH1::readable` does not turn
+    /// into an end of body) is swept by `Mux::ready_inner`, which ends the
+    /// frontend's stream with `end_stream_decision` answering `CloseDelimited`.
+    /// The H1 frontend must then end the response, as `ConnectionH2::end_stream`
+    /// does: a body short of its `Content-Length` is cut (Error phase), a
+    /// close-delimited body is terminated. An H1 arm that only unlinks the
+    /// stream leaves the response in its body phase, neither ended nor
+    /// failed, and `writable` has no exit for it until the frontend timeout.
+    #[test]
+    fn an_h1_frontend_ends_a_response_whose_close_delimited_backend_is_gone() {
+        // (response bytes, the response must be cut, not cleanly terminated)
+        let cases: [(&[u8], bool); 2] = [
+            (
+                b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 10\r\n\r\nabcd",
+                true,
+            ),
+            (b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nabcd", false),
+        ];
+        let mut failures = Vec::new();
+        for (response, truncated) in cases {
+            let mut fixture = linked_backend_connection();
+            let BackendReadFixture {
+                context,
+                frontend,
+                client,
+                backend_peer,
+                ..
+            } = &mut fixture;
+            if let Connection::H1(server) = frontend {
+                server.stream = Some(0);
+            }
+            context.streams[0].context.keep_alive_backend = false;
+
+            feed_backend(
+                backend_peer,
+                client,
+                context,
+                frontend,
+                response,
+                |context| {
+                    context.streams[0].back.is_main_phase()
+                        && context.streams[0].back.storage.unparsed_data().is_empty()
+                },
+            );
+            assert!(
+                !context.streams[0].back.is_terminated() && !context.streams[0].back.is_error(),
+                "premise: the response is cut in its body phase, got {:?}",
+                context.streams[0].back.parsing_phase
+            );
+
+            // The sweep of a dead backend, as in the 1xx test above.
+            client.close(context, EndpointServer(frontend));
+            assert_eq!(
+                context.streams[0].state,
+                StreamState::Unlinked,
+                "premise: the backend close reached the frontend's end_stream"
+            );
+
+            let back = &context.streams[0].back;
+            let ended = if truncated {
+                back.is_error()
+            } else {
+                back.is_terminated()
+            };
+            if !ended {
+                failures.push(format!(
+                    "{}: left in {:?}, expected {}",
+                    String::from_utf8_lossy(response).escape_debug(),
+                    back.parsing_phase,
+                    if truncated { "Error" } else { "Terminated" }
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "the H1 frontend must end a response whose close-delimited backend is gone: {failures:#?}"
         );
     }
 
