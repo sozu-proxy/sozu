@@ -753,9 +753,9 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   `Router::plan_connect` derives it (`affinity_key`, `router.rs`) right after
   `route_from_request`, where both the routed cluster and the request's header
   blocks are in hand, and stores it in `HttpContext::affinity_key` beside
-  `cluster_id`. The storage is for the same reason as the cluster's: a replay
-  skips routing against a drained front kawa, so it reuses the key the first
-  attempt derived rather than recomputing it from blocks that are gone. The key
+  `cluster_id`. The storage is for the same reason as the cluster's: a retry or
+  a replay does not route again, so it reuses the key the first attempt derived
+  rather than recomputing it from blocks that were edited or are gone. The key
   is `None` under every other policy, and a sticky cookie naming a live backend
   still wins over it. Connection reuse runs before any dial and does not read
   the key: an H1 keep-alive or H2 connection the session already holds serves
@@ -2342,7 +2342,7 @@ was it encoded for an H2 upstream?
 
 | Request state | Upstream answered | Action |
 |---|---|---|
-| untouched (`!front.consumed`, `!front_bound_to_backend`) | no | `Reconnect` — re-link and route from the intact front kawa |
+| untouched (`!front.consumed`, `!front_bound_to_backend`) | no | `Reconnect` — re-link and dial another backend with the front kawa as the first routing left it (not routed again) |
 | encoded for an H2 backend, unsent (`!front.consumed`, `front_bound_to_backend`) | no | `SendDefault(502)` — its frames belong to that connection |
 | written, replayable | no | `ReplayOnFreshBackend` — re-link and re-serialize the captured bytes |
 | written, not replayable | no | `SendDefault(502)` |
@@ -2474,6 +2474,24 @@ second partial copy of the request. A replay whose `cluster_id` did not
 survive, and one whose cluster switched to `http2` between attempts, are both
 refused through `BackendConnectionError::ReplayRefused` and answered 502 —
 what the stream would have received before the replay existed.
+
+It skips it on a `Reconnect` too, and for a reason that does not need a drained
+kawa: the front kawa of an untouched request is intact, but it is the one
+routing already edited in place, and routing is not idempotent on it. An
+operator request header edit with a value is inserted before the end-of-headers
+flag with no record of having run, so a second pass would send the header once
+per attempt; an edit that deleted a header has already run, so the Basic-auth
+check and the header predicates of the frontend lookup, which read
+`front.blocks`, would no longer see it. The discriminator is `Stream::attempts`
+read before `plan_connect` counts the attempt: it is zero when a request starts
+(`Context::create_stream`, the H1 keep-alive reset) and a stream only returns to
+`Link` after an attempt that routed it — every routing error ends in a default
+answer — so every re-link of the same request, whichever path queued it (the
+H1 and H2 `Reconnect`, the failed `connect(2)` re-queue, the re-link after a
+backend GOAWAY), reuses the cluster, the affinity key, the access-log tags and
+the response edits the first routing left on the stream's `HttpContext`. Backend
+selection and the per-(cluster, source-IP) gate still run on every attempt.
+`a_retried_dial_inserts_an_operator_request_header_once` (`router.rs`) pins it.
 
 The captured bytes are PREPENDED to `front.out`, because `out` need not be
 empty: a partial `socket_write_vectored` leaves the refused remainder queued

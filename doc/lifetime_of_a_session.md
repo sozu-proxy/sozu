@@ -450,7 +450,10 @@ closed, and the request, of which no byte was sent, is linked again through
 `EndStreamAction::Reconnect`. The next selection skips the backends that
 already failed for that request (`Stream::tried_backends`), and the cluster's
 `max_connection_attempts` (5 by default) bounds the attempts before a `503`
-([#1800](https://github.com/sozu-proxy/sozu/issues/1800)). A connect timeout
+([#1800](https://github.com/sozu-proxy/sozu/issues/1800)). Routing runs once, on
+the first attempt: a retry reuses its decisions and does not edit the request a
+second time, so an operator request header reaches the backend that finally
+serves it once. A connect timeout
 reaches the session through the timer alone, so `Server::timeout` runs the
 `ready` pass that does this (`ProxySession::needs_ready_pass`).
 
