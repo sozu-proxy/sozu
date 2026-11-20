@@ -5274,9 +5274,23 @@ impl ConnectionH2 {
     ///
     /// Server reads from the front (client), so sets `front_received_end_of_stream`.
     /// Client reads from the back (backend), so sets `back_received_end_of_stream`.
-    fn mark_end_of_stream(&self, stream: &mut crate::protocol::mux::Stream) {
+    ///
+    /// On a server, the flag is what lets [`Self::try_recycle_server_stream`]
+    /// retire a stream: the write pass that found the response whole deferred
+    /// it ("client still sending") and, being quiescent, removed its WRITABLE
+    /// interest. Only a write pass can retire the stream, and a read that
+    /// carries the client's last frame queues no WINDOW_UPDATE for that frame
+    /// (none for an END_STREAM, and an empty one never crosses the connection
+    /// threshold), so nothing would run it before another frame or the idle
+    /// reaper. When the response is already terminated and flushed, the flag
+    /// arms WRITABLE as the pass's own recycle condition would find it.
+    fn mark_end_of_stream(&mut self, stream: &mut crate::protocol::mux::Stream) {
         if self.position.is_server() {
             stream.front_received_end_of_stream = true;
+            let response = &stream.back;
+            if (response.is_terminated() || response.is_error()) && response.is_completed() {
+                self.readiness.arm_writable();
+            }
         } else {
             stream.back_received_end_of_stream = true;
         }
@@ -16783,6 +16797,191 @@ pub(super) mod tests {
                 stream.metrics.start
             );
         }
+    }
+
+    /// Open stream 1 with `request_block` (HEADERS without END_STREAM), answer
+    /// it whole with a default 404 (slot `Unlinked`), let the write pass flush
+    /// the answer and defer the recycle because the client is still sending,
+    /// deliver `body` (the request's DATA without END_STREAM) in its own read,
+    /// then deliver `final_frame` — the frame that ends the client's request —
+    /// as a read event and nothing else. The stream must leave the stream
+    /// table and its slot must be `Recycle` without any unrelated write pass.
+    fn assert_end_of_request_recycles_a_deferred_answer(
+        request_block: &[u8],
+        body: &[u8],
+        final_frame: &[u8],
+        what: &str,
+    ) {
+        let pool = default_limits_pool();
+        let (mut connection, mut context, mut router, _peer) = slot_recycle_fixture(&pool);
+        let headers = orphan_frame(
+            1,
+            parser::FLAG_END_HEADERS,
+            1,
+            request_block.len() as u32,
+            request_block,
+        );
+        assert!(
+            feed_and_drive(&mut connection, &mut context, &mut router, &headers),
+            "{what}: the driver must settle after the HEADERS"
+        );
+        let gid = connection
+            .core
+            .stream_table
+            .get(1)
+            .expect("premise: the request opened stream 1");
+        assert_eq!(
+            context.streams[gid].state,
+            StreamState::Link,
+            "{what}: premise: the request waits for a backend"
+        );
+        let answers = context.streams[gid].answers.clone();
+        crate::protocol::mux::answers::set_default_answer(
+            &mut context.streams[gid],
+            &mut connection.core.readiness,
+            404,
+            &answers.borrow(),
+        );
+        let wire_before_answer = connection.socket.wire.len();
+        assert!(
+            feed_and_drive(&mut connection, &mut context, &mut router, &[]),
+            "{what}: the driver must settle after the answer"
+        );
+        let answered = peer_frames(&connection.socket.wire[wire_before_answer..])
+            .expect("the peer must read whole frames");
+        assert!(
+            answered
+                .iter()
+                .any(|(kind, flags, id, _)| *kind == 1 && *id == 1 && flags & 0x4 != 0),
+            "{what}: premise: the 404 HEADERS left on stream 1, got {answered:?}"
+        );
+        // The client goes on sending its body after the answer, in a read of
+        // its own: the stream WINDOW_UPDATE it earns arms WRITABLE, and that
+        // write pass must still find the request open and defer the recycle.
+        // `feed_and_drive` returns before the write pass that WINDOW_UPDATE
+        // asks for, its exit test not reading the flow-control queue; the Mux
+        // runs that pass at once, so the second drive runs it here.
+        assert!(
+            feed_and_drive(&mut connection, &mut context, &mut router, body)
+                && feed_and_drive(&mut connection, &mut context, &mut router, &[]),
+            "{what}: the driver must settle after the body"
+        );
+        assert_eq!(
+            (
+                connection.core.stream_table.get(1),
+                context.streams[gid].state,
+                context.streams[gid].front_received_end_of_stream,
+            ),
+            (Some(gid), StreamState::Unlinked, false),
+            "{what}: premise: the answered stream stays in the table, Unlinked, while the \
+             client is still sending"
+        );
+        assert!(
+            !connection.core.readiness.interest.is_writable(),
+            "{what}: premise: the answered, quiescent connection waits for no WRITABLE"
+        );
+
+        // The client ends its request: one read event, no other frame, no
+        // timer. A second drive with no bytes gives any WRITABLE interest the
+        // read raised its write pass; it does nothing when none was raised.
+        assert!(
+            feed_and_drive(&mut connection, &mut context, &mut router, final_frame),
+            "{what}: the driver must settle after the client's END_STREAM"
+        );
+        let writable_after_read = connection.core.readiness.interest.is_writable();
+        assert!(
+            feed_and_drive(&mut connection, &mut context, &mut router, &[]),
+            "{what}: the driver must settle on the idle connection"
+        );
+        assert!(
+            !matches!(connection.core.state, H2State::GoAway | H2State::Error),
+            "{what}: premise: the client's END_STREAM does not end the connection"
+        );
+
+        let stream = &context.streams[gid];
+        eprintln!(
+            "{what}: table entry={:?} state={:?} front_received_end_of_stream={} \
+             writable_interest_after_read={writable_after_read} request_counted={}",
+            connection.core.stream_table.get(1),
+            stream.state,
+            stream.front_received_end_of_stream,
+            stream.request_counted,
+        );
+        assert_eq!(
+            (connection.core.stream_table.get(1), stream.state),
+            (None, StreamState::Recycle),
+            "{what}: an answered stream whose request the client has just ended must leave the \
+             stream table and be recycled without an unrelated write pass; the read armed no \
+             WRITABLE (writable interest after the read: {writable_after_read}), so the stream \
+             waits for another pass or the idle reaper"
+        );
+    }
+
+    /// A client that ends its request after Sōzu answered it whole must see
+    /// the stream retired by the read that carries the END_STREAM.
+    ///
+    /// A POST opens stream 1 (HEADERS without END_STREAM) and is answered at
+    /// once with a default 404, which sets the slot `Unlinked`.
+    /// `ConnectionH2::try_recycle_server_stream` defers the recycle because
+    /// the client is still sending, and the write pass that deferred it
+    /// leaves no WRITABLE interest. The client's last frame, an empty DATA
+    /// with END_STREAM, reaches the `Unlinked` branch of
+    /// `ConnectionH2::handle_data_frame`, which sets
+    /// `front_received_end_of_stream` and arms nothing: the stream-level
+    /// WINDOW_UPDATE is skipped for END_STREAM and an empty frame never
+    /// crosses the connection-level threshold. No write pass revisits the
+    /// stream; it keeps its slot, two pool buffers and
+    /// `SETTINGS_MAX_CONCURRENT_STREAMS` entry until another pass runs or
+    /// `cancel_timed_out_streams` reaps it as `H2::IdleTimeout` with an
+    /// RST_STREAM(CANCEL).
+    #[test]
+    fn a_client_end_of_stream_after_a_complete_answer_recycles_the_stream() {
+        // `:method POST`, `:path /`, `:scheme https`, `:authority localhost`
+        // and `content-length: 5`, as in
+        // `reset_of_an_unlinked_stream_recycles_its_slot`.
+        let mut block = vec![0x83, 0x84, 0x87, 0x01, 0x09];
+        block.extend_from_slice(b"localhost");
+        block.extend_from_slice(&[0x0f, 0x0d, 0x01, b'5']);
+        // The five announced octets arrive in a DATA frame of their own after
+        // the answer and are discarded; the final DATA is empty, so the
+        // request matches its content-length and the frame queues no credit.
+        assert_end_of_request_recycles_a_deferred_answer(
+            &block,
+            &orphan_frame(0, 0, 1, 5, b"hello"),
+            &orphan_frame(0, parser::FLAG_END_STREAM, 1, 0, &[]),
+            "empty DATA with END_STREAM",
+        );
+    }
+
+    /// The trailer twin of
+    /// `a_client_end_of_stream_after_a_complete_answer_recycles_the_stream`:
+    /// the client ends its request with a trailer section (HEADERS with
+    /// END_STREAM) on the answered, deferred stream, and
+    /// `ConnectionH2::handle_headers_frame` marks the end of the stream
+    /// without arming the connection's own WRITABLE.
+    #[test]
+    fn a_client_trailer_after_a_complete_answer_recycles_the_stream() {
+        // `:method POST`, `:path /`, `:scheme https`, `:authority localhost`,
+        // no content-length, so the trailers are not a length mismatch.
+        let mut block = vec![0x83, 0x84, 0x87, 0x01, 0x09];
+        block.extend_from_slice(b"localhost");
+        // The trailer block `x-trailer: one` (literal without indexing).
+        let mut trailer = vec![0x00, 9];
+        trailer.extend_from_slice(b"x-trailer");
+        trailer.extend_from_slice(&[3]);
+        trailer.extend_from_slice(b"one");
+        assert_end_of_request_recycles_a_deferred_answer(
+            &block,
+            &[],
+            &orphan_frame(
+                1,
+                parser::FLAG_END_HEADERS | parser::FLAG_END_STREAM,
+                1,
+                trailer.len() as u32,
+                &trailer,
+            ),
+            "trailers with END_STREAM",
+        );
     }
 
     /// A response Sōzu ends in error while the client is still sending its

@@ -787,7 +787,30 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   `recently_reset`, which keeps ignoring the client's remaining frames.
   Pinned by
   `a_response_ended_in_error_before_the_request_is_complete_recycles_its_slot`
-  (`h2.rs`). A recycled `Link` slot may
+  (`h2.rs`). The deferral on a client that is still sending has its own
+  wake-up. The write pass that found the response whole and deferred the
+  recycle leaves a quiescent connection with no WRITABLE interest, and the
+  client's last frame is the only thing that lets the stream go, yet it queues
+  no flow-control credit of its own: a DATA frame with END_STREAM earns no
+  stream WINDOW_UPDATE and sends the connection-level one only when it happens
+  to cross the threshold (an empty one never does), and a trailer block
+  carries no DATA to credit. `ConnectionH2::mark_end_of_stream` therefore arms
+  WRITABLE (`Readiness::arm_writable`) when it sets
+  `Stream::front_received_end_of_stream` on a server connection whose
+  response is already terminated and completed, the condition the write pass
+  tests before it recycles. Its three callers share it — the `Unlinked` and
+  the `Linked` DATA branches of `ConnectionH2::handle_data_frame` and the
+  trailer branch of `ConnectionH2::handle_headers_frame` — and a request that
+  ends before its response is whole arms nothing. The drain pass of
+  `Mux::shutting_down_inner` already arms next to the flag.
+  Without it the stream kept its slot, its two pool buffers, its entry against
+  `SETTINGS_MAX_CONCURRENT_STREAMS` and its access log until an unrelated
+  write pass ran or `ConnectionH2::cancel_timed_out_streams` reaped it, which
+  logged the finished exchange as `H2::IdleTimeout` with an error and sent
+  RST_STREAM(CANCEL) on a stream both sides had closed. Pinned by
+  `a_client_end_of_stream_after_a_complete_answer_recycles_the_stream` and
+  `a_client_trailer_after_a_complete_answer_recycles_the_stream` (`h2.rs`); the
+  `Linked` DATA branch has no test of its own. A recycled `Link` slot may
   still have its id queued in `context.pending_links`. The drain in
   `Mux::ready_inner` skips every entry whose slot is not `Link`, so the
   stale entry is skipped while the slot is `Recycle` or `Idle`. When the slot
