@@ -22297,10 +22297,13 @@ pub(super) mod tests {
     /// cannot see this: every field it encodes has a static-table name, so
     /// the peer's encoder indexes nothing.
     ///
-    /// To SEE THIS RED: no mutation needed, it fails on the tree it was
-    /// written against. The final assertion reports
-    /// `Err(InvalidIndex)` instead of `Ok(())`, because the connection's
-    /// dynamic table is empty.
+    /// To SEE THIS RED: in the self-dependency branch of
+    /// `ConnectionH2::handle_headers_frame`, delete the
+    /// `if let Err(error) = self.decode_and_drop_field_block(&headers)`
+    /// statement and its block. The final assertion then fails with "the
+    /// connection decoder must still resolve the peer's dynamic table after a
+    /// self-dependent stream was reset, got Err(InvalidIndex)", because the
+    /// entry the reset block indexed never reached the connection's decoder.
     #[test]
     fn a_priority_self_dependency_reset_keeps_the_hpack_decoder_in_sync() {
         use std::io::Write;
