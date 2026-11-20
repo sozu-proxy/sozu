@@ -366,6 +366,15 @@ backend DOWN after the reset. Adding the cluster again without a health check
 (`sozu cluster add` on the existing id) has the same effect. The protected
 header values held for the cluster are dropped with the health check.
 
+A UDP cluster with an active `[clusters.<id>.udp.health]` block is the
+exception to the reset: its health lives in `udp.health`, so it carries no
+`health_check` of its own, and its prober keeps running when the HTTP/TCP check
+is removed or the cluster is added again, such as by a configuration reload that
+changes it. The worker leaves the state of its backends to that prober: a backend
+it marked DOWN stays DOWN until `rise` successful probes mark it UP again. A
+`udp.health` block whose `mode` is `HEALTH_OFF`, or no block at all, leaves no
+prober, and the reset applies.
+
 ## Custom request headers
 
 An `HTTP` health check can send extra request headers on every probe, typically

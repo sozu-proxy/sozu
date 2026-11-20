@@ -3537,6 +3537,19 @@ impl Server {
                 cluster.shard_mode,
             ),
         );
+        // A UDP cluster carries no `health_check`: its health lives in
+        // `udp.health`, so every `AddCluster` it receives clears the HTTP/TCP
+        // health check, and clearing it resets the backends its probes marked
+        // DOWN, since no probe would ever mark them UP again (#1811). That
+        // premise fails for a cluster whose UDP prober is armed: the prober
+        // keeps running across the upsert (`UdpProxy::apply_cluster` in
+        // `lib/src/udp.rs`) and writes the same `Backend.health`. Record it
+        // first, so that the reset leaves that state, and its rise/fall
+        // hysteresis, to the prober.
+        backends.set_udp_health_prober(
+            &cluster.cluster_id,
+            crate::udp::udp_health_settings(cluster).is_some(),
+        );
         backends.set_health_check_config(&cluster.cluster_id, cluster.health_check.to_owned());
         backends.set_cluster_http2(&cluster.cluster_id, cluster.http2.unwrap_or(false));
     }
@@ -4105,6 +4118,27 @@ impl Server {
         );
 
         let address = activate.listener_key();
+
+        // A soft stop is terminal: the worker leaves once its last session is
+        // gone. The main process scatters listener orders to a `Stopping`
+        // worker like to the others, and the soft stop emptied every proxy's
+        // listener map, so an `AddListener` for a new address is accepted here.
+        // Activating it would bind a fresh `SO_REUSEPORT` socket: the kernel
+        // would hand this worker a share of the address's new connections and
+        // the same turn's `shut_down_sessions` would close each one before a
+        // byte is read. Refuse before anything is bound or taken from the SCM
+        // table; the address stays served by the workers that are not draining.
+        // The listener the worker added stays inactive in its slab slot, which
+        // `base_sessions_count` already counts, so the drain still ends.
+        if self.shutting_down.is_some() {
+            return worker_response_error(
+                req_id,
+                format!(
+                    "Could not activate listener {address}: the worker is shutting down and \
+                     takes no new listener"
+                ),
+            );
+        }
 
         match ListenerType::try_from(activate.proxy) {
             Ok(ListenerType::Http) => {
@@ -7328,6 +7362,153 @@ mod listener_lifecycle_tests {
         );
     }
 
+    /// A soft stop is terminal: the worker stops accepting and leaves once the
+    /// last session is gone (`doc/lifetime_of_a_session.md`, soft stop). The
+    /// main process scatters `AddListener` / `ActivateListener` to `Stopping`
+    /// workers too, and the soft stop emptied the proxy's listener map, so a
+    /// listener added for a NEW address during the drain is accepted and
+    /// activated: it binds a fresh `SO_REUSEPORT` socket and registers it, the
+    /// kernel hands the draining worker a share of the new connections, and
+    /// the same turn's `shut_down_sessions` closes each one before a byte is
+    /// read. A draining worker must refuse to bring a listener back, so the
+    /// address must not be reachable afterwards.
+    ///
+    /// Both orders go through `Server::notify_proxys`, the worker's entry
+    /// point, so a refusal anywhere on the worker side passes, and so does
+    /// either answer to the orders (a refusal, or an ok that binds nothing):
+    /// the defect is the bound socket, not the answer. The kernel completes a
+    /// TCP handshake into the backlog of any listening socket, so a successful
+    /// connect proves the socket was bound and listening; the port
+    /// reservation of `provide_port` never listens.
+    ///
+    /// To SEE THIS RED: nothing to change, it is red on the unfixed worker;
+    /// the assertion fails with "a draining worker must not accept
+    /// connections on a listener ordered after its soft stop".
+    #[test]
+    fn a_listener_ordered_after_a_soft_stop_is_not_brought_back() {
+        let mut server = bare_server();
+        server.shutting_down = Some("test-soft-stop".to_owned());
+        server.last_sessions_len = server.sessions.borrow().slab.len();
+        server.notify_proxys(WorkerRequest {
+            id: "test-soft-stop".to_owned(),
+            content: RequestType::SoftStop(SoftStop {}).into(),
+        });
+
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let listener_config = ListenerBuilder::new_tcp(address)
+            .to_tcp(None)
+            .expect("could not build a TcpListenerConfig for the test");
+        for (id, order) in [
+            (
+                "test-add-after-soft-stop",
+                RequestType::AddTcpListener(listener_config),
+            ),
+            (
+                "test-activate-after-soft-stop",
+                RequestType::ActivateListener(ActivateListener {
+                    interface: None,
+                    address,
+                    proxy: ListenerType::Tcp as i32,
+                    from_scm: false,
+                }),
+            ),
+        ] {
+            server.notify_proxys(WorkerRequest {
+                id: id.to_owned(),
+                content: order.into(),
+            });
+        }
+        let answers: Vec<(String, i32)> = QUEUE.with(|queue| {
+            queue
+                .borrow()
+                .iter()
+                .filter(|answer| answer.id.ends_with("-after-soft-stop"))
+                .map(|answer| (answer.id.to_owned(), answer.status))
+                .collect()
+        });
+
+        let socket_address: SocketAddr = address.into();
+        assert!(
+            std::net::TcpStream::connect_timeout(&socket_address, Duration::from_secs(1)).is_err(),
+            "a draining worker must not accept connections on a listener ordered after its soft \
+             stop (answers: {answers:?})"
+        );
+    }
+
+    /// The refusal of an activation after a soft stop answers a failure that
+    /// names the address, leaves the listener the worker added inactive in the
+    /// worker's own state (`finish_proxy_order` rolls the activation back), and
+    /// does not stall the drain: the added listener holds a slab slot that
+    /// `base_sessions_count` counts, so `shut_down_sessions` still finishes.
+    ///
+    /// To SEE THIS RED: remove the `shutting_down` guard of
+    /// `Server::notify_activate_listener`; the first assertion fails, the
+    /// activation having answered ok.
+    #[test]
+    fn a_refused_activation_after_a_soft_stop_names_the_address_and_keeps_the_drain_finishable() {
+        let mut server = bare_server();
+        server.shutting_down = Some("test-soft-stop".to_owned());
+        server.last_sessions_len = server.sessions.borrow().slab.len();
+        server.notify_proxys(WorkerRequest {
+            id: "test-soft-stop".to_owned(),
+            content: RequestType::SoftStop(SoftStop {}).into(),
+        });
+
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let activate = ActivateListener {
+            interface: None,
+            address,
+            proxy: ListenerType::Tcp as i32,
+            from_scm: false,
+        };
+        let listener_config = ListenerBuilder::new_tcp(address)
+            .to_tcp(None)
+            .expect("could not build a TcpListenerConfig for the test");
+        server.notify_proxys(WorkerRequest {
+            id: "test-refused-add".to_owned(),
+            content: RequestType::AddTcpListener(listener_config).into(),
+        });
+        server.notify_proxys(WorkerRequest {
+            id: "test-refused-activate".to_owned(),
+            content: RequestType::ActivateListener(activate.to_owned()).into(),
+        });
+        let activation = QUEUE
+            .with(|queue| {
+                queue
+                    .borrow()
+                    .iter()
+                    .find(|answer| answer.id == "test-refused-activate")
+                    .cloned()
+            })
+            .expect("the worker must answer the activation");
+
+        assert_eq!(
+            activation.status,
+            ResponseStatus::Failure as i32,
+            "a draining worker must refuse to activate a listener: {activation:?}"
+        );
+        let socket_address: SocketAddr = address.into();
+        assert!(
+            activation.message.contains(&socket_address.to_string()),
+            "the refusal must name the address: {activation:?}"
+        );
+        assert!(
+            server
+                .config_state
+                .tcp_listeners
+                .get(&activate.listener_key())
+                .is_some_and(|listener| !listener.active),
+            "the worker's own state must keep the refused listener inactive"
+        );
+        assert!(
+            server.shut_down_sessions(),
+            "a refused activation must not stall the drain: slab.len() = {}, \
+             base_sessions_count = {}",
+            server.sessions.borrow().slab.len(),
+            server.base_sessions_count
+        );
+    }
+
     /// The UDP per-source flow limit is opt-in per cluster: a global
     /// `max_connections_per_ip` / `max_connections_per_subnet` — here set at
     /// runtime, as an operator would for HTTP/TCP — never reaches a UDP
@@ -8459,6 +8640,188 @@ mod remove_health_check_tests {
             server.backends.borrow().health_check_configs[CLUSTER],
             ported,
             "the health check configuration stays"
+        );
+    }
+
+    /// A UDP cluster carries no `health_check`: its health lives in
+    /// `udp.health` and is owned by the UDP prober, which keeps probing across
+    /// an `AddCluster` and writes the verdict into the same shared
+    /// `Backend.health`. The reset an `AddCluster` without a `health_check`
+    /// performs (`add_cluster_without_health_check_resets_a_backend_marked_down`)
+    /// assumes nobody probes the cluster any more; for a UDP cluster with an
+    /// active `udp.health` that assumption is false, and the reset would
+    /// erase the prober's rise/fall hysteresis: the backend the prober marked
+    /// DOWN turns healthy again, with zeroed counters, without a single
+    /// successful probe.
+    ///
+    /// To SEE THIS RED: nothing to change, it is red on the unfixed
+    /// `Server::add_cluster`; the assertion fails with "re-sending an
+    /// AddCluster must not reset a backend the UDP prober marked DOWN".
+    #[test]
+    fn add_cluster_of_a_udp_cluster_with_udp_health_keeps_a_backend_marked_down() {
+        use sozu_command::proto::command::{UdpClusterConfig, UdpHealthConfig, UdpHealthMode};
+
+        let udp_cluster = || WorkerRequest {
+            id: "test-add-udp-cluster".to_owned(),
+            content: RequestType::AddCluster(Cluster {
+                cluster_id: CLUSTER.to_owned(),
+                health_check: None,
+                udp: Some(UdpClusterConfig {
+                    health: Some(UdpHealthConfig {
+                        mode: Some(UdpHealthMode::TcpProbe as i32),
+                        fall: Some(3),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .into(),
+        };
+
+        let mut server = bare_server();
+        server.notify_proxys(udp_cluster());
+        server.notify_proxys(WorkerRequest {
+            id: "test-add-backend".to_owned(),
+            content: RequestType::AddBackend(AddBackend {
+                cluster_id: CLUSTER.to_owned(),
+                backend_id: format!("{CLUSTER}-0"),
+                address: SocketAddr::from(([127, 0, 0, 1], 23_100)).into(),
+                load_balancing_parameters: Some(LoadBalancingParams::default()),
+                sticky_id: None,
+                backup: None,
+                unix_path: None,
+            })
+            .into(),
+        });
+        {
+            // what the UDP prober does after `fall` consecutive failed probes
+            let backends = server.backends.borrow();
+            let mut backend = backends.backends[CLUSTER].backends[0].borrow_mut();
+            for _ in 0..3 {
+                backend.health.record_failure(3);
+            }
+        }
+        let before = server.backends.borrow().backends[CLUSTER].backends[0]
+            .borrow()
+            .health
+            .clone();
+        assert!(!before.is_healthy(), "test setup: backend DOWN");
+        assert_eq!(before.consecutive_failures, 3, "test setup: counters");
+
+        // the same AddCluster again, as a reload whose diff marks the cluster
+        // Added or Changed sends it
+        server.notify_proxys(udp_cluster());
+
+        let after = server.backends.borrow().backends[CLUSTER].backends[0]
+            .borrow()
+            .health
+            .clone();
+        assert_eq!(
+            after, before,
+            "re-sending an AddCluster must not reset a backend the UDP prober marked DOWN"
+        );
+    }
+
+    /// A UDP cluster with a `udp.health` block and the given `mode`, and a
+    /// backend its prober (or an earlier HTTP/TCP probe) marked DOWN.
+    fn udp_cluster_with_down_backend(mode: sozu_command::proto::command::UdpHealthMode) -> Server {
+        use sozu_command::proto::command::{UdpClusterConfig, UdpHealthConfig};
+
+        let mut server = bare_server();
+        server.notify_proxys(WorkerRequest {
+            id: "test-add-udp-cluster".to_owned(),
+            content: RequestType::AddCluster(Cluster {
+                cluster_id: CLUSTER.to_owned(),
+                health_check: None,
+                udp: Some(UdpClusterConfig {
+                    health: Some(UdpHealthConfig {
+                        mode: Some(mode as i32),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .into(),
+        });
+        server.notify_proxys(WorkerRequest {
+            id: "test-add-backend".to_owned(),
+            content: RequestType::AddBackend(AddBackend {
+                cluster_id: CLUSTER.to_owned(),
+                backend_id: format!("{CLUSTER}-0"),
+                address: SocketAddr::from(([127, 0, 0, 1], 23_100)).into(),
+                load_balancing_parameters: Some(LoadBalancingParams::default()),
+                sticky_id: None,
+                backup: None,
+                unix_path: None,
+            })
+            .into(),
+        });
+        server.backends.borrow().backends[CLUSTER].backends[0]
+            .borrow_mut()
+            .health
+            .record_failure(1);
+        assert!(!backend_is_healthy(&server), "test setup: backend DOWN");
+        server
+    }
+
+    /// `RemoveHealthCheck` reaches the same reset as an `AddCluster` without a
+    /// `health_check`, and a UDP cluster has none to remove: the prober that
+    /// marked its backend DOWN keeps running, so the order must leave the
+    /// backend to it, as the upsert does.
+    ///
+    /// To SEE THIS RED: make `BackendMap::reset_cluster_health` ignore
+    /// `udp_probed_clusters`; the backend turns healthy.
+    #[test]
+    fn remove_health_check_of_a_udp_cluster_with_udp_health_keeps_a_backend_marked_down() {
+        use sozu_command::proto::command::UdpHealthMode;
+
+        let mut server = udp_cluster_with_down_backend(UdpHealthMode::TcpProbe);
+        server.notify_proxys(WorkerRequest {
+            id: "test-remove-health-check".to_owned(),
+            content: RequestType::RemoveHealthCheck(CLUSTER.to_owned()).into(),
+        });
+        assert!(
+            !backend_is_healthy(&server),
+            "RemoveHealthCheck must not reset a backend the UDP prober marked DOWN"
+        );
+    }
+
+    /// The guard follows the armed prober, not the presence of a `udp` block:
+    /// `HEALTH_OFF` arms no UDP prober (`udp_health_settings` in
+    /// `lib/src/udp.rs`), nothing is left to mark the backend UP again, and
+    /// the reset of an upsert without a
+    /// `health_check` applies as it does for any other cluster.
+    ///
+    /// To SEE THIS RED: in `Server::add_cluster`, pass
+    /// `cluster.udp.as_ref().is_some_and(|udp| udp.health.is_some())` instead
+    /// of `udp_health_settings(cluster).is_some()` to `set_udp_health_prober`;
+    /// the backend stays DOWN.
+    #[test]
+    fn add_cluster_of_a_udp_cluster_with_health_off_resets_a_backend_marked_down() {
+        use sozu_command::proto::command::{UdpClusterConfig, UdpHealthConfig, UdpHealthMode};
+
+        let mut server = udp_cluster_with_down_backend(UdpHealthMode::TcpProbe);
+        server.notify_proxys(WorkerRequest {
+            id: "test-add-udp-cluster-health-off".to_owned(),
+            content: RequestType::AddCluster(Cluster {
+                cluster_id: CLUSTER.to_owned(),
+                health_check: None,
+                udp: Some(UdpClusterConfig {
+                    health: Some(UdpHealthConfig {
+                        mode: Some(UdpHealthMode::HealthOff as i32),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .into(),
+        });
+        assert!(
+            backend_is_healthy(&server),
+            "the prober is switched off: nothing would mark the backend UP again, the reset must apply"
         );
     }
 }

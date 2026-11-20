@@ -456,6 +456,22 @@ and allocates no descriptor: cloning it there cost an `fcntl(F_DUPFD_CLOEXEC)`
 and a `close` on every event-loop turn, and skipped probing outright when the
 worker was out of descriptors (`EMFILE`).
 
+The prober outlives an `AddCluster`. `UdpProxy::apply_cluster` (`lib/src/udp.rs`)
+re-arms it from `udp_health_settings` (`lib/src/udp.rs`) and only replaces its
+settings, and the verdict it wrote into the shared `Backend::health` stays. A UDP
+cluster carries no `health_check`, so `Server::add_cluster` (`lib/src/server.rs`)
+clears the cluster's HTTP/TCP health check on every `AddCluster`, and clearing it
+resets the backends' health, since no probe would mark a backend UP again. That
+premise is false while a prober is armed: `Server::add_cluster` records the answer
+of `udp_health_settings` with `BackendMap::set_udp_health_prober`
+(`lib/src/backends.rs`) first, and `BackendMap::reset_cluster_health` leaves the
+state of such a cluster alone. A backend the prober marked DOWN, such as by a
+reload that re-sends the cluster, stays DOWN until `rise` successful probes mark
+it UP, whichever way the HTTP/TCP health check goes away (an `AddCluster`, a
+`RemoveHealthCheck`, the abort of a protected change). A cluster with no
+`udp.health` block, or with `mode = HEALTH_OFF`, has no prober and is reset as
+before.
+
 ---
 
 ## 11. Control Plane: Config, Hot-Reconfig, SCM, Upgrade

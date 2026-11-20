@@ -1131,22 +1131,11 @@ impl UdpProxy {
 
         // 1b. Health settings from the cluster's `udp.health` block, if any.
         // Mode HEALTH_OFF / no health block disables probing for this cluster.
-        let health_settings = cluster.udp.as_ref().and_then(|udp| {
-            udp.health.as_ref().and_then(|h| {
-                let mode = h
-                    .mode
-                    .and_then(|m| sozu_command::proto::command::UdpHealthMode::try_from(m).ok());
-                match mode {
-                    Some(sozu_command::proto::command::UdpHealthMode::HealthOff) => None,
-                    // TCP_PROBE (default when a health block is present) and
-                    // UDP_PROBE both schedule the TCP-probe state machine; the
-                    // app UDP-probe payload rides along for the secondary check.
-                    _ => Some(health::UdpHealthSettings::from_proto(h)),
-                }
-            })
-        });
-        self.health
-            .set_cluster(&cluster.cluster_id, health_settings, &self.registry);
+        self.health.set_cluster(
+            &cluster.cluster_id,
+            udp_health_settings(cluster),
+            &self.registry,
+        );
 
         // 1c. Cache the UDP knobs so a frontend added in EITHER order picks them
         // up via `cluster_config_for`. An `AddCluster` without a `udp` block
@@ -1328,6 +1317,32 @@ fn apply_udp_knobs(cfg: &mut ClusterConfig, udp: &sozu_command::proto::command::
     cfg.requests = udp.requests.unwrap_or(0);
     cfg.send_proxy_protocol = udp.send_proxy_protocol.unwrap_or(false);
     cfg.proxy_protocol_every_datagram = udp.proxy_protocol_every_datagram.unwrap_or(false);
+}
+
+/// The settings of the UDP prober a cluster asks for, `None` when it asks for
+/// none: no `udp.health` block, or a block whose mode is `HEALTH_OFF`.
+///
+/// The one definition of "this cluster has an armed UDP prober":
+/// `UdpProxy::apply_cluster` arms the prober from it, and `Server::add_cluster`
+/// (`lib/src/server.rs`) records the same answer in the `BackendMap`
+/// (`BackendMap::set_udp_health_prober`, `lib/src/backends.rs`), so the reset
+/// of a cluster's backends that follows the loss of its HTTP/TCP health check
+/// leaves alone the `Backend.health` this prober writes.
+pub(crate) fn udp_health_settings(cluster: &Cluster) -> Option<health::UdpHealthSettings> {
+    cluster.udp.as_ref().and_then(|udp| {
+        udp.health.as_ref().and_then(|h| {
+            let mode = h
+                .mode
+                .and_then(|m| sozu_command::proto::command::UdpHealthMode::try_from(m).ok());
+            match mode {
+                Some(sozu_command::proto::command::UdpHealthMode::HealthOff) => None,
+                // TCP_PROBE (default when a health block is present) and
+                // UDP_PROBE both schedule the TCP-probe state machine; the
+                // app UDP-probe payload rides along for the secondary check.
+                _ => Some(health::UdpHealthSettings::from_proto(h)),
+            }
+        })
+    })
 }
 
 /// Fallback auto `max_flows` when `RLIMIT_NOFILE` can't be read.

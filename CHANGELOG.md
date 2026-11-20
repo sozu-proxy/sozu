@@ -86,6 +86,18 @@
 
 - A UDP `ActivateListener` that fails because the worker cannot build the listener's session no longer leaves the listener active. The worker binds and registers the socket first and builds the session second, and when the second step failed (cloning the epoll descriptor answers `EMFILE` once the worker is out of descriptors, which a flood of flows can bring about) it answered a failure and undid nothing: the socket stayed bound and registered with no session to read it, datagrams queued in the kernel and, with `SO_REUSEPORT`, took a share of the address's traffic, while the control plane believed the listener inactive and had no reason to retry. The activation is now taken back as a whole, whichever of its two steps failed: the listener is inactive again and its socket deregistered. A socket the worker bound for that activation is closed, so nothing stays bound and a retried `ActivateListener` binds again and installs the session. A socket inherited from the supervisor at an upgrade is kept parked instead, as a failed registration already keeps it, because it is not the worker's to lose: it stays bound and queues datagrams until the retry takes it back or `RemoveListener` drops it, and a `DeactivateListener` for that listener answers that it is not activated meanwhile.
 
+<!-- changelog-slot:soft-stop-listener-activation -->
+
+### Fixed
+
+- A worker that is draining after a soft stop no longer activates a listener it is ordered to. The main process scatters listener orders to a `Stopping` worker like to the others, and the soft stop had emptied each proxy's listener map, so an `AddListener` for a new address followed by `ActivateListener` bound a fresh `SO_REUSEPORT` socket there: the kernel handed the draining worker a share of the new connections, and the same turn's `shut_down_sessions` closed each one before a byte was read, so a fraction of the clients of that address were refused. `ActivateListener` is now refused while the worker shuts down, for HTTP, HTTPS, TCP and UDP listeners, with a failure naming the address, before anything is bound, and the address stays served by the workers that are not draining. The refusal rolls the worker's own state back, the listener the worker added stays inactive and its slab slot is still counted, so the drain ends as before. The order the operator sent lists the draining worker among its failures, as it did for the activation of a listener that existed before the stop, which the same refusal now answers.
+
+<!-- changelog-slot:udp-health-add-cluster -->
+
+### Fixed
+
+- An `AddCluster` for a UDP cluster with an active `udp.health` no longer resets the health of its backends. A UDP cluster carries no `health_check`, so the worker took every `AddCluster` it received for one, such as a configuration reload that changes the cluster, for the removal of a health check and reset each backend to healthy with zeroed counters, assuming no probe would ever mark it up again. The UDP prober keeps running across the upsert and writes the same backend health, so a backend it had marked down went back into rotation without a single successful probe, new flows could hash to it and stay pinned until idle timeout, until `fall` failed probes marked it down again. The worker still forgets the cluster's HTTP/TCP health check, but leaves the health state to the prober while one is armed, so a backend marked down stays down until `rise` successful probes mark it up. The same holds for `RemoveHealthCheck` on such a cluster and for the abort of a protected health-check change. A cluster with no `udp.health` block, or with `mode = HEALTH_OFF`, has no prober and is reset as before.
+
 ## 2.3.6 - 2026-11-18
 
 ### Security

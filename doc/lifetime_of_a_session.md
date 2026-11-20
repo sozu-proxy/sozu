@@ -1014,6 +1014,24 @@ worker refused to add or one a soft stop already dropped from the map, releases
 nothing and leaves the count alone; lowering it anyway would put the count under
 the slots still in the slab, and the worker would never answer the `SoftStop`.
 
+A soft stop is terminal, so a draining worker takes no listener back. The main
+process scatters listener orders to a `Stopping` worker as it does to the others,
+and the emptied listener maps accept an `AddListener` for a new address. Its
+`ActivateListener` is refused (`Server::notify_activate_listener`, whatever the
+protocol, before any socket is bound or taken from the SCM table) with a failure
+naming the address: activating it would bind a fresh `SO_REUSEPORT` socket, the
+kernel would hand the worker a share of the address's new connections, and the
+same turn's `Server::shut_down_sessions` would close each one before a byte is
+read. The refusal rolls the worker's own `ConfigState` back, so the listener stays
+inactive there, and the listener the worker added holds the slab slot
+`base_sessions_count` already counts, so the drain still ends. The main process
+counts the refusal as a failed worker of the order (`WorkerTask::on_finish`,
+`bin/src/command/requests.rs`), as it counted the `NoListenerFound` a draining
+worker used to answer to the activation of a listener that existed before the
+stop, which this refusal replaces: the order answers a failure that lists each
+worker's answer, the draining one's included, and the address stays served by the
+workers that are not draining.
+
 A hard stop (`sozu shutdown --hard`, or a second `SIGTERM` during a soft stop)
 closes every session at once.
 
