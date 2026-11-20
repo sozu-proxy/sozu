@@ -58,6 +58,7 @@ use crate::{
     command::{
         protected::ProtectedRuntime,
         requests::{AuditExtras, AuditResult, ClientRequestOutcome, audit_emit_inline, begin_stop},
+        rollback::{RollbackLedger, RollbackTicket},
         sessions::{
             ClientResult, ClientSession, OptionalClient, PausedClientSession, PausedWorkerSession,
             SessionSnapshotError, UpgradeResponseQueue, WorkerResult, WorkerSession, wants_to_tick,
@@ -264,6 +265,23 @@ pub trait Gatherer {
         self.inc_expected_responses(worker_count);
     }
 
+    /// Take over the claim `ticket` that `Server::rollbacks` holds for the
+    /// entry `request_id` of this gatherer, which the main process state
+    /// already accepted. Returns whether the gatherer owns it now: it must
+    /// then settle it when the task ends, or hand it to
+    /// [`Self::take_rollback_tickets`] when the task is dropped. The default
+    /// refuses, and the caller releases the claim.
+    fn adopt_rollback_ticket(&mut self, request_id: usize, ticket: RollbackTicket) -> bool {
+        let _ = (request_id, ticket);
+        false
+    }
+
+    /// The claims this gatherer still owns, given up because its task is
+    /// dropped without ending ([`Server::cancel_task`]).
+    fn take_rollback_tickets(&mut self) -> Vec<RollbackTicket> {
+        Vec::new()
+    }
+
     /// Return true if enough responses has been gathered
     fn has_finished(&self) -> bool;
 
@@ -307,6 +325,13 @@ pub(crate) trait GatheringTask: Debug {
     /// two steps takes no further order).
     fn retained_worker_ids(&self) -> Vec<WorkerId> {
         Vec::new()
+    }
+
+    /// The worker whose `upgrade --worker` this task is a stage of, whichever
+    /// stage it is: while any live task names a worker here, no second upgrade
+    /// of that worker is admitted ([`Server::worker_upgrade_in_flight`]).
+    fn upgrading_worker_id(&self) -> Option<WorkerId> {
+        None
     }
 
     /// This is called once every worker has answered
@@ -1051,6 +1076,15 @@ impl CommandHub {
                 Some((task_id, task))
             })
             .collect();
+        // The one place the tasks that stay alive are all in sight, the ones
+        // that just chained included: a worker is upgrading exactly while one
+        // of them names it, so a task that ended however it ended frees it.
+        self.server.upgrading_workers = self
+            .tasks
+            .values()
+            .chain(self.server.queued_tasks.values())
+            .filter_map(|task| task.job.upgrading_worker_id())
+            .collect();
     }
 
     /// Owe systemd the cold-start `READY=1`, to be announced by
@@ -1125,7 +1159,9 @@ impl CommandHub {
     /// the first `SIGTERM` is a soft stop, a second one while the workers still
     /// drain is a hard stop. Each worker then leaves its event loop and flushes
     /// its log buffers. Bounding the drain is left to the supervisor: systemd
-    /// sends `SIGKILL` once `TimeoutStopSec` expires.
+    /// sends `SIGKILL` once `TimeoutStopSec` expires. The flush of the command
+    /// clients that follows the drain is bounded by [`Self::run`] itself, at
+    /// one `worker_timeout`.
     ///
     /// The handler writes to a socket pair whose read end joins the event loop
     /// under `SIGTERM_TOKEN`; the loop does the actual work
@@ -1253,9 +1289,11 @@ impl CommandHub {
         );
     }
 
-    /// Drain audit events queued by the [Server] during a client request and
-    /// fan them out to every subscribed client (same path as worker-emitted
-    /// backend events). Called from the event loop after handling a request.
+    /// Drain audit events queued by the [Server] and fan them out to every
+    /// subscribed client (same path as worker-emitted backend events). Called
+    /// from the event loop after handling a request, and at the top of every
+    /// iteration right after [`Self::finish_ready_tasks`]: the events a task
+    /// raises when it completes come from no request handler.
     fn flush_pending_audit_events(&mut self) {
         let events: Vec<Event> = self.server.pending_audit_events.drain(..).collect();
         if events.is_empty() {
@@ -1804,6 +1842,10 @@ impl CommandHub {
     pub fn run(&mut self) -> bool {
         let mut events = Events::with_capacity(100);
         debug!("running the command hub: {:?}", self);
+        // The instant clients that still hold unflushed bytes stop being
+        // waited for once the main is `Stopping`; set when the loop first sees
+        // that state.
+        let mut stopping_flush_deadline: Option<Instant> = None;
 
         loop {
             self.retry_pending_upgrade_completion();
@@ -1811,6 +1853,11 @@ impl CommandHub {
             let now = Instant::now();
 
             self.finish_ready_tasks(now);
+            // The completion of a task raises its audit event here, outside
+            // any request handler (`GatheringTask::on_finish` runs only from
+            // this sweep): serve the subscribers now, since no later client
+            // request is owed.
+            self.flush_pending_audit_events();
             self.announce_cold_ready();
 
             // A Stopped worker can still hold an SCM socket needed by
@@ -1832,13 +1879,42 @@ impl CommandHub {
             }
 
             if self.run_state == ServerState::Stopping {
-                // when closing, close all ClientSession which are not transfering data
+                // The flush of a client that holds unflushed bytes ends at a
+                // deadline dated when this loop first sees `Stopping`: a peer
+                // that stopped reading with a full socket buffer raises no
+                // event and no retry, and the workers are gone, so nothing
+                // else would end the wait before the service manager does.
+                let flush_deadline = *stopping_flush_deadline.get_or_insert_with(|| {
+                    now + Duration::from_secs(u64::from(self.server.config.worker_timeout.max(1)))
+                });
+                let flush_expired = now >= flush_deadline;
+                if flush_expired {
+                    let stuck = self
+                        .clients
+                        .values()
+                        .filter(|s| s.channel.back_buf.available_data() > 0)
+                        .count();
+                    if stuck > 0 {
+                        warn!(
+                            "stopping: closing {} client(s) still holding unflushed bytes \
+                             after the flush deadline",
+                            stuck
+                        );
+                    }
+                }
+                // when closing, close all ClientSession which are not transfering data,
+                // and every one once the flush deadline has passed
                 self.clients
-                    .retain(|_, s| s.channel.back_buf.available_data() > 0);
+                    .retain(|_, s| !flush_expired && s.channel.back_buf.available_data() > 0);
                 // when all ClientSession are closed, the CommandServer stops
                 if self.clients.is_empty() {
                     return self.server.upgrading;
                 }
+                // Nothing wakes the loop for a stuck client: wake it when the
+                // flush deadline passes.
+                let remaining = flush_deadline.saturating_duration_since(now);
+                poll_timeout =
+                    Some(poll_timeout.map_or(remaining, |timeout| timeout.min(remaining)));
             }
 
             let mut tick_tokens = std::mem::take(&mut self.restored_session_ticks);
@@ -2212,8 +2288,9 @@ pub struct Server {
     next_task_id: TaskId,
     next_worker_id: WorkerId,
     /// audit events emitted by the main process for control-plane mutations,
-    /// drained by the [CommandHub] after each request and fanned out to the
-    /// subscribed clients (same channel as worker-emitted backend events).
+    /// drained by the [CommandHub] after each request and after each task
+    /// sweep, and fanned out to the subscribed clients (same channel as
+    /// worker-emitted backend events).
     pub pending_audit_events: VecDeque<Event>,
     /// Dedicated file handle for the control-plane audit log, opened once
     /// at boot if `Config::audit_logs_target` is set. Every audit line is
@@ -2268,6 +2345,23 @@ pub struct Server {
     /// cold start included. Empty once every readiness task has concluded;
     /// never part of a snapshot, since a pending readiness task refuses one.
     startup_workers: HashSet<WorkerId>,
+    /// The changes committed to `state` that no worker has answered yet, per
+    /// object, so a revert of an unacknowledged order never runs ahead of a
+    /// newer order on the same object (`bin/src/command/rollback.rs`). Not part
+    /// of a snapshot: a task restored by a main process upgrade holds no claim
+    /// and reverts on its own.
+    pub(crate) rollbacks: RollbackLedger,
+    /// Workers an `upgrade --worker` is in flight for, as the last task sweep
+    /// ([`CommandHub::finish_ready_tasks`]) found them: the tasks of an
+    /// upgrade live in `CommandHub::tasks` after that sweep, out of reach of
+    /// `upgrade_worker`, which only holds the server. Derived, never
+    /// maintained: each sweep replaces it with what the live tasks name
+    /// ([`GatheringTask::upgrading_worker_id`]), so no way for a task to end
+    /// can leave a worker marked, and a main process that took over a handoff
+    /// has it after its first sweep. Read through
+    /// [`Self::worker_upgrade_in_flight`], which adds the tasks queued since.
+    /// Never part of a snapshot.
+    upgrading_workers: HashSet<WorkerId>,
     /// Workers being given the confirmed protected health check values
     /// (`protected::begin_worker_bootstrap`), and those whose fence did not
     /// prove their process gone. A worker listed here accepts the exact
@@ -2494,7 +2588,9 @@ impl Server {
             unix_listener,
             workers: HashMap::new(),
             protected: Default::default(),
+            rollbacks: RollbackLedger::default(),
             startup_workers: HashSet::new(),
+            upgrading_workers: HashSet::new(),
             bootstrapping_workers: HashSet::new(),
             unreaped_workers: Vec::new(),
             spawn_retry_at: None,
@@ -2749,7 +2845,8 @@ impl Server {
     }
 
     /// Queue an audit event for fan-out to subscribed clients. Drained by
-    /// `CommandHub::flush_pending_audit_events` after every request handler.
+    /// `CommandHub::flush_pending_audit_events` after every request handler
+    /// and after every task sweep of the event loop.
     pub fn push_audit_event(&mut self, event: Event) {
         self.pending_audit_events.push_back(event);
     }
@@ -2824,6 +2921,23 @@ impl Server {
         self.workers
             .values()
             .find(|worker| worker.id == id && worker.is_active())
+    }
+
+    /// Whether an `upgrade --worker` of worker `id` is in flight: the worker
+    /// owns one pending shutdown id (`lib/src/server.rs`, `shutting_down`), so a
+    /// second upgrade would take its listen sockets again (it has none left to
+    /// give), launch a second replacement for the same slot, and overwrite the
+    /// id of the first `SoftStop`, which then never gets its answer.
+    ///
+    /// Two sources, because a task changes hands: one created in this
+    /// event-loop iteration is still in `queued_tasks`, and one that went
+    /// through a sweep is only in [`Self::upgrading_workers`].
+    pub(crate) fn worker_upgrade_in_flight(&self, id: WorkerId) -> bool {
+        self.upgrading_workers.contains(&id)
+            || self
+                .queued_tasks
+                .values()
+                .any(|task| task.job.upgrading_worker_id() == Some(id))
     }
 
     /// register a worker session in the server, return the mutable worker session
@@ -3142,9 +3256,35 @@ impl Server {
     /// and returned before any cleanup, so every failed replay leaked its
     /// routes for the life of the main process. Routes of other tasks are kept.
     pub fn cancel_task(&mut self, task_id: TaskId) {
-        self.queued_tasks.remove(&task_id);
+        if let Some(mut task) = self.queued_tasks.remove(&task_id) {
+            // The entries it already put in the state stay there, as they
+            // always did, but they no longer hold back the revert of an older
+            // order on the same object.
+            for ticket in task.job.get_gatherer().take_rollback_tickets() {
+                self.rollbacks.settle(ticket, false);
+            }
+        }
         self.in_flight
             .retain(|_, in_flight_task_id| *in_flight_task_id != task_id);
+    }
+
+    /// Hand the claim `ticket` of [`Self::rollbacks`] to the gatherer of the
+    /// queued task `task_id`, for the entry `request_id` it just scattered. A
+    /// claim nobody owns is released at once, as kept.
+    pub(crate) fn adopt_rollback_ticket(
+        &mut self,
+        task_id: TaskId,
+        request_id: usize,
+        ticket: RollbackTicket,
+    ) {
+        let adopted = self.queued_tasks.get_mut(&task_id).is_some_and(|task| {
+            task.job
+                .get_gatherer()
+                .adopt_rollback_ticket(request_id, ticket)
+        });
+        if !adopted {
+            self.rollbacks.settle(ticket, false);
+        }
     }
 
     /// Called when the main cannot communicate anymore with a worker (it's channel closed)
@@ -4930,6 +5070,294 @@ mod tests {
         fixture.assert_refused();
     }
 
+    /// A worker owns one pending shutdown id, so only one `upgrade --worker`
+    /// may be in flight for it: the second one is refused before it asks the
+    /// worker for anything. Admitted, it takes the listen sockets again (the
+    /// worker has none left to give), launches a second replacement for the
+    /// same slot and later soft stops the worker a second time, which
+    /// overwrites the id of the first `SoftStop` and leaves the first client
+    /// with a synthetic failure.
+    ///
+    /// A repeat is refused both in the event-loop iteration of the first
+    /// upgrade, while its task still sits in `Server::queued_tasks`, and in a
+    /// later one, once `CommandHub::finish_ready_tasks` has moved it into
+    /// `CommandHub::tasks`, which `upgrade_worker` cannot see: that is where
+    /// an operator retry finds it.
+    ///
+    /// TO SEE THIS RED: delete the `if server.worker_upgrade_in_flight(..)`
+    /// block of `upgrade_worker` (`bin/src/command/upgrade.rs`): both repeats
+    /// are admitted and "worker 7 is asked for its listen sockets once, by
+    /// the first upgrade only" fails with `left: 3`, `right: 1`. Narrower,
+    /// each source of `Server::worker_upgrade_in_flight` alone: keep only
+    /// `self.upgrading_workers.contains(&id)` there (the repeat in the same
+    /// iteration is admitted), or drop the recomputation of
+    /// `self.server.upgrading_workers` at the end of
+    /// `CommandHub::finish_ready_tasks` (the later repeat is admitted); the
+    /// same assertion then fails with `left: 2`.
+    #[test]
+    fn a_second_upgrade_of_a_worker_already_being_upgraded_is_refused() {
+        let mut hub = create_test_hub();
+        // The first upgrade must still be waiting when the later iteration
+        // sweeps the tasks, not timed out by a zero `worker_timeout`.
+        hub.server.config.worker_timeout = 60;
+        let (first_token, mut first_peer) = register_observable_client(&mut hub);
+        let (second_token, mut second_peer) = register_observable_client(&mut hub);
+        let (later_token, mut later_peer) = register_observable_client(&mut hub);
+        let (mut worker_side, _scm) = register_ready_test_worker(&mut hub.server, 7, 4096, 65536);
+
+        for client_token in [first_token, second_token, later_token] {
+            if client_token == later_token {
+                hub.finish_ready_tasks(Instant::now());
+            }
+            let (server, client) = hub.get_client_mut(&client_token).expect("the client");
+            server.handle_client_request(client, RequestType::UpgradeWorker(7).into());
+        }
+
+        let listen_socket_requests = drain_worker_requests(&mut hub.server, &mut worker_side)
+            .into_iter()
+            .filter(|request| {
+                matches!(
+                    request.content.request_type,
+                    Some(RequestType::ReturnListenSockets(_))
+                )
+            })
+            .count();
+        assert_eq!(
+            listen_socket_requests, 1,
+            "worker 7 is asked for its listen sockets once, by the first upgrade only"
+        );
+        assert_eq!(
+            hub.live_task_count(),
+            1,
+            "only the first upgrade of worker 7 is in flight"
+        );
+
+        for (token, peer, when) in [
+            (second_token, &mut second_peer, "same"),
+            (later_token, &mut later_peer, "later"),
+        ] {
+            flush_client_responses(&mut hub, token, peer);
+            let mut answers = Vec::new();
+            while let Ok(message) = peer.read_message() {
+                answers.push(message);
+            }
+            assert_eq!(
+                answers
+                    .last()
+                    .map(|answer| ResponseStatus::try_from(answer.status)),
+                Some(Ok(ResponseStatus::Failure)),
+                "a repeat in the {when} iteration must be refused at once, it got {answers:?}"
+            );
+        }
+
+        flush_client_responses(&mut hub, first_token, &mut first_peer);
+        let mut first_answers = Vec::new();
+        while let Ok(message) = first_peer.read_message() {
+            first_answers.push(message);
+        }
+        assert!(
+            first_answers
+                .iter()
+                .all(|answer| answer.status != ResponseStatus::Failure as i32),
+            "the first upgrade is unaffected by the refusal, it got {first_answers:?}"
+        );
+    }
+
+    /// Send `upgrade --worker 7` for the client `token`, and return the last
+    /// answer it got.
+    fn upgrade_worker_7_answer(
+        hub: &mut CommandHub,
+        token: Token,
+        peer: &mut Channel<Request, Response>,
+    ) -> Option<Response> {
+        let (server, client) = hub.get_client_mut(&token).expect("the client");
+        server.handle_client_request(client, RequestType::UpgradeWorker(7).into());
+        flush_client_responses(hub, token, peer);
+        let mut last = None;
+        while let Ok(message) = peer.read_message() {
+            last = Some(message);
+        }
+        last
+    }
+
+    fn is_already_upgrading_refusal(answer: &Option<Response>) -> bool {
+        answer.as_ref().is_some_and(|answer| {
+            answer.status == ResponseStatus::Failure as i32
+                && answer.message.contains("already being upgraded")
+        })
+    }
+
+    /// The wait for the replacement is the long stage of an upgrade, and the
+    /// old worker is `Running` and listening on nothing all through it, so a
+    /// second upgrade must be refused there too, with no request sent to the
+    /// worker. The worker is free again as soon as the upgrade has ended, here
+    /// aborted by the deadline of the replacement: the mark is derived from the
+    /// live tasks, so no way for the upgrade to end can leave it behind.
+    ///
+    /// TO SEE THIS RED: drop the recomputation of
+    /// `self.server.upgrading_workers` at the end of
+    /// `CommandHub::finish_ready_tasks`: the swept readiness task is out of
+    /// the guard's sight, the second upgrade is admitted, and the first
+    /// refusal assertion fails with `Some(Response { status: Processing,
+    /// message: "Requesting listen sockets from worker 7", .. })`. For the
+    /// second half, make that recomputation only add to the set
+    /// (`self.server.upgrading_workers.extend(..)` with the same workers): the
+    /// ended upgrade keeps worker 7 marked and "an ended upgrade must not keep
+    /// the worker out of a new one" fails with the refusal "Worker 7 is
+    /// already being upgraded, wait for that upgrade to finish".
+    #[test]
+    fn a_worker_is_refused_a_second_upgrade_while_its_replacement_boots_and_is_free_once_it_ended()
+    {
+        let mut fixture = upgrade_readiness_fixture();
+        let (second_token, mut second_peer) = register_observable_client(&mut fixture.hub);
+        let (third_token, mut third_peer) = register_observable_client(&mut fixture.hub);
+
+        fixture.hub.finish_ready_tasks(Instant::now());
+        assert_eq!(fixture.hub.tasks.len(), 1, "the readiness task is swept");
+        let answer = upgrade_worker_7_answer(&mut fixture.hub, second_token, &mut second_peer);
+        assert!(is_already_upgrading_refusal(&answer), "{answer:?}");
+        assert!(
+            drain_worker_requests(&mut fixture.hub.server, &mut fixture.old_side).is_empty(),
+            "a refused upgrade asks the worker for nothing"
+        );
+
+        fixture
+            .hub
+            .finish_ready_tasks(Instant::now() + Duration::from_secs(60));
+        fixture.assert_refused();
+
+        let answer = upgrade_worker_7_answer(&mut fixture.hub, third_token, &mut third_peer);
+        assert!(
+            !answer
+                .as_ref()
+                .is_some_and(|answer| answer.message.contains("already being upgraded")),
+            "an ended upgrade must not keep the worker out of a new one: {answer:?}"
+        );
+        let requests = drain_worker_requests(&mut fixture.hub.server, &mut fixture.old_side);
+        assert!(
+            requests.iter().any(|request| matches!(
+                request.content.request_type,
+                Some(RequestType::ReturnListenSockets(_))
+            )),
+            "the new upgrade asks worker 7 for its listen sockets, it was sent {requests:?}"
+        );
+    }
+
+    /// A phase-one task a main process took over in a handoff is in
+    /// `CommandHub::tasks` from the first sweep and was never created by
+    /// `upgrade_worker` in this process: the worker it upgrades is refused a
+    /// second upgrade all the same.
+    ///
+    /// TO SEE THIS RED: drop the recomputation of
+    /// `self.server.upgrading_workers` at the end of
+    /// `CommandHub::finish_ready_tasks`, the only place the restored task is
+    /// seen: worker 7 is no longer marked, the upgrade is admitted, and the
+    /// last assertion fails with `Some(Response { status: Processing,
+    /// message: "Requesting listen sockets from worker 7", .. })`.
+    #[test]
+    fn a_worker_whose_upgrade_was_handed_over_is_refused_a_second_upgrade() {
+        let mut hub = create_test_hub();
+        hub.server.config.worker_timeout = 60;
+        let (client_token, mut client_peer) = register_observable_client(&mut hub);
+        let (_worker_side, _scm) = register_ready_test_worker(&mut hub.server, 7, 4096, 65536);
+        let old_token = *hub.server.workers.keys().next().expect("worker 7 session");
+
+        let snapshot: TaskSnapshot = serde_json::from_value(serde_json::json!({
+            "UpgradeWorker": {
+                "client_token": client_token.0,
+                "progress": {
+                    "RequestingListenSockets": {
+                        "old_worker_token": old_token.0,
+                        "old_worker_id": 7
+                    }
+                },
+                "ok": 0,
+                "errors": 0,
+                "responses": [],
+                "expected_responses": 1
+            }
+        }))
+        .expect("phase-one task snapshot should deserialize");
+        let restored = snapshot
+            .restore(TaskRestoreTiming {
+                now: Instant::now(),
+                handoff_elapsed: Duration::ZERO,
+            })
+            .expect("phase-one task should restore");
+        hub.tasks.insert(
+            11,
+            TaskContainer {
+                job: restored,
+                timeout: Some(Instant::now() + Duration::from_secs(60)),
+            },
+        );
+        hub.server.next_task_id = 12;
+
+        hub.finish_ready_tasks(Instant::now());
+        assert_eq!(
+            hub.live_task_count(),
+            1,
+            "the restored task is still waiting"
+        );
+        let answer = upgrade_worker_7_answer(&mut hub, client_token, &mut client_peer);
+        assert!(is_already_upgrading_refusal(&answer), "{answer:?}");
+    }
+
+    /// An upgrade whose replacement fails its readiness is not over when the
+    /// replacement is fenced: it then asks the old worker to listen again
+    /// (`UpgradeWorkerProgress::RestoringOldWorker`), and the old worker is
+    /// still being upgraded until it answered. A second upgrade is refused
+    /// there too, also once the restore stage went through a sweep, with no
+    /// request sent to the worker, and the worker is free again as soon as the
+    /// restore ended.
+    ///
+    /// TO SEE THIS RED: in `UpgradeWorkerTask::upgrading_worker_id`
+    /// (`bin/src/command/upgrade.rs`), make the
+    /// `UpgradeWorkerProgress::RestoringOldWorker` arm return `None`: the
+    /// restore stage no longer marks worker 7, the second upgrade is admitted,
+    /// and the refusal assertion fails with `Some(Response { status:
+    /// Processing, message: "Requesting listen sockets from worker 7", .. })`.
+    #[test]
+    fn a_worker_is_refused_a_second_upgrade_while_its_aborted_upgrade_restores_it_and_is_free_once_restored()
+     {
+        let mut fixture = upgrade_readiness_fixture();
+        add_active_http_listener(&mut fixture.hub, 8093);
+        let (second_token, mut second_peer) = register_observable_client(&mut fixture.hub);
+        let (third_token, mut third_peer) = register_observable_client(&mut fixture.hub);
+        let id = fixture.readiness_id.clone();
+        fixture
+            .hub
+            .handle_worker_response(8, status_answer(&id, ResponseStatus::Failure));
+        fixture.hub.finish_ready_tasks(Instant::now());
+        let requests = reactivation_requests(&mut fixture);
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        fixture.hub.finish_ready_tasks(Instant::now());
+        assert_eq!(fixture.hub.tasks.len(), 1, "the restore stage is swept");
+
+        let answer = upgrade_worker_7_answer(&mut fixture.hub, second_token, &mut second_peer);
+        assert!(is_already_upgrading_refusal(&answer), "{answer:?}");
+        assert!(
+            drain_worker_requests(&mut fixture.hub.server, &mut fixture.old_side).is_empty(),
+            "a refused upgrade asks the worker for nothing"
+        );
+
+        fixture
+            .hub
+            .handle_worker_response(7, status_answer(&requests[0].id, ResponseStatus::Ok));
+        fixture.hub.finish_ready_tasks(Instant::now());
+        assert!(
+            fixture.hub.tasks.is_empty() && fixture.hub.server.queued_tasks.is_empty(),
+            "the restore ended"
+        );
+        let answer = upgrade_worker_7_answer(&mut fixture.hub, third_token, &mut third_peer);
+        assert!(
+            !answer
+                .as_ref()
+                .is_some_and(|answer| answer.message.contains("already being upgraded")),
+            "an ended restore must free the worker: {answer:?}"
+        );
+    }
+
     #[test]
     fn upgrade_readiness_ignores_answers_that_are_not_the_exact_initial_status_ok() {
         let mut fixture = upgrade_readiness_fixture();
@@ -6163,6 +6591,257 @@ mod tests {
         );
     }
 
+    /// Task whose completion raises an audit event, as `WorkerTask::on_finish`
+    /// and `LoadStateTask::on_finish` do through `audit_emit`, which only
+    /// queues it with [`Server::push_audit_event`]. The task with
+    /// `stop_server` raises nothing: it ends the loop at its own deadline.
+    #[derive(Debug)]
+    struct AuditOnFinishTask {
+        gatherer: DefaultGatherer,
+        stop_server: bool,
+    }
+
+    impl GatheringTask for AuditOnFinishTask {
+        fn client_token(&self) -> Option<Token> {
+            None
+        }
+
+        fn get_gatherer(&mut self) -> &mut dyn Gatherer {
+            &mut self.gatherer
+        }
+
+        fn snapshot(&self, _timing: TaskSnapshotTiming) -> Result<TaskSnapshot, TaskSnapshotError> {
+            Err(TaskSnapshotError::UnsupportedTestTask("AuditOnFinishTask"))
+        }
+
+        fn on_finish(
+            self: Box<Self>,
+            server: &mut Server,
+            _client: &mut OptionalClient,
+            _timed_out: bool,
+        ) {
+            if self.stop_server {
+                server.run_state = ServerState::Stopping;
+            } else {
+                server.push_audit_event(Event {
+                    kind: EventKind::StateLoaded as i32,
+                    ..Event::default()
+                });
+            }
+        }
+    }
+
+    /// Regression (s15-A6): an audit event raised when a task completes must
+    /// reach the subscribers when the task ends, not at the next client
+    /// request.
+    ///
+    /// `audit_emit` only queues the event on `Server::pending_audit_events`;
+    /// the subscribers are served by `CommandHub::flush_pending_audit_events`,
+    /// which the event loop called only after a handled client request. The
+    /// completion line of `WorkerTask` and `LoadStateTask` (and
+    /// `STATE_LOADED`, which a successful `load_state` raises at no other
+    /// time) is raised by `finish_ready_tasks`, outside any request handler,
+    /// so on a quiet control plane the subscriber never got it. The loop now
+    /// also serves the queue right after that sweep.
+    ///
+    /// The real event loop runs two tasks against one worker that never
+    /// answers: A (early deadline) raises the event, B (late deadline) stops
+    /// the loop. No client sends a request, so the only way the subscriber can
+    /// get the event is for the loop to serve the queue itself.
+    ///
+    /// TO SEE THIS RED: delete the call to `flush_pending_audit_events` right
+    /// after `self.finish_ready_tasks(now)` in `CommandHub::run`: the
+    /// assertion "subscriber never received ..." fires.
+    #[test]
+    fn task_completion_audit_event_reaches_subscribers_without_a_later_request() {
+        let mut hub = create_test_hub();
+        let (_silent_worker, _scm) = register_ready_test_worker(&mut hub.server, 0, 4096, 65536);
+        let (subscriber, mut peer) = register_observable_client(&mut hub);
+        hub.server.event_subscribers.insert(subscriber);
+
+        for (index, (timeout, stop_server)) in [
+            (Duration::from_millis(50), false),
+            (Duration::from_millis(600), true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let task_id = hub.server.new_task(
+                Box::new(AuditOnFinishTask {
+                    gatherer: DefaultGatherer::default(),
+                    stop_server,
+                }),
+                Timeout::Custom(timeout),
+            );
+            hub.server.scatter_on(
+                RequestType::Status(Status {}).into(),
+                task_id,
+                index + 1,
+                None,
+            );
+        }
+        assert_eq!(
+            hub.server.queued_tasks.len(),
+            2,
+            "both tasks must be admitted before the event loop starts"
+        );
+
+        assert!(
+            !hub.run(),
+            "the probe stops normally; it is not a main-upgrade handoff"
+        );
+
+        // The loop is over and the subscriber session with it: whatever the
+        // main wrote to the socket is still there to read.
+        peer.handle_events(Ready::READABLE);
+        let _ = peer.run();
+        let mut events = Vec::new();
+        while let Ok(response) = peer.read_message() {
+            if let Some(ResponseContent {
+                content_type: Some(ContentType::Event(event)),
+            }) = response.content
+            {
+                events.push(event);
+            }
+        }
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == EventKind::StateLoaded as i32),
+            "subscriber never received the audit event raised when task A completed, \
+             and no client request came to carry it; received {events:?}, \
+             still queued: {:?}",
+            hub.server.pending_audit_events
+        );
+        assert!(
+            hub.server.pending_audit_events.is_empty(),
+            "the completion event is delivered, not left queued: {:?}",
+            hub.server.pending_audit_events
+        );
+    }
+
+    /// Regression (s15-A5): a main that is `Stopping` must not wait without
+    /// bound for a client that holds unflushed bytes and never reads.
+    ///
+    /// `CommandHub::run` kept, while `Stopping`, every client whose
+    /// `back_buf` held data, and returned only once no client was left. A
+    /// write that hits `WouldBlock` leaves the bytes in `back_buf` and drops
+    /// the writable readiness, nothing retries, and the peer is neither in
+    /// error nor hung up: a subscriber that stopped reading with a full socket
+    /// buffer kept the main alive after its workers were gone, until the
+    /// service manager killed it. The wait now ends one `worker_timeout`
+    /// after the loop first sees `Stopping`, and not before: an owed response
+    /// is given that long to leave.
+    ///
+    /// The client is registered through `register_client`, its kernel socket
+    /// buffer is filled so the response queued next cannot be written, and the
+    /// main is stopped as `SIGTERM` stops it, with no worker: the loop starts
+    /// `Stopping` with no worker and no task. The peer socket is
+    /// held by a helper thread that closes it after `HELPER_RELEASES_PEER`: a
+    /// hang-up is the one thing that frees a stuck client today, so the helper
+    /// bounds the test and, by being the one to set `released`, tells a main
+    /// that gave up from one that was let go. `worker_timeout` is one second,
+    /// the deadline the audit proposes for the flush.
+    ///
+    /// TO SEE THIS RED: make the `Stopping` branch of `CommandHub::run`
+    /// retain every client with `back_buf` data again regardless of its
+    /// deadline: "the main was still waiting ..." fires after 5 seconds. For
+    /// the lower bound, make that `retain` closure return `false` for every
+    /// client, so the main drops it the moment it sees `Stopping`: "the main
+    /// gave up ..." fires.
+    #[test]
+    fn stopping_main_does_not_wait_forever_for_a_client_that_never_reads() {
+        const HELPER_RELEASES_PEER: Duration = Duration::from_secs(5);
+
+        let dir = tempfile::tempdir().expect("could not create temp dir");
+        let listener =
+            UnixListener::bind(dir.path().join("stuck-client.sock")).expect("could not bind");
+        let config = Config {
+            worker_timeout: 1,
+            command_buffer_size: DEFAULT_COMMAND_BUFFER_SIZE,
+            max_command_buffer_size: DEFAULT_MAX_COMMAND_BUFFER_SIZE,
+            ..Config::default()
+        };
+        let flush_deadline = Duration::from_secs(u64::from(config.worker_timeout));
+        let mut hub =
+            CommandHub::new(listener, config, "sozu".to_owned()).expect("could not create Hub");
+
+        let (peer, accepted) =
+            std::os::unix::net::UnixStream::pair().expect("could not create client pair");
+        accepted
+            .set_nonblocking(true)
+            .expect("could not make client nonblocking");
+        hub.register_client(UnixStream::from_std(accepted));
+        let token = *hub.clients.keys().next().expect("registered client token");
+
+        // Fill the kernel buffer the way a client that stopped reading does,
+        // then queue one more response: it cannot leave `back_buf`.
+        {
+            let client = hub.clients.get_mut(&token).expect("registered client");
+            let chunk = [0_u8; 4096];
+            loop {
+                match std::io::Write::write(&mut client.channel.sock, &chunk) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("could not fill the client socket: {error}"),
+                }
+            }
+            client.return_processing("response the client never reads");
+            client.update_readiness(Ready::WRITABLE);
+            assert!(matches!(client.ready(), ClientResult::NothingToDo));
+            assert!(
+                client.channel.back_buf.available_data() > 0,
+                "the response must be stuck in the back buffer"
+            );
+            assert!(
+                !wants_to_tick(&client.channel),
+                "a stuck client must not ask for a retry: nothing wakes the loop for it"
+            );
+        }
+
+        let (loop_over, helper_wakes) = std::sync::mpsc::channel::<()>();
+        let helper = std::thread::spawn(move || {
+            let released = matches!(
+                helper_wakes.recv_timeout(HELPER_RELEASES_PEER),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            );
+            drop(peer);
+            released
+        });
+
+        // Enter `Stopping` the way `SIGTERM` does, through `begin_stop` and
+        // `StopTask::on_finish`: with no worker the stop task is finished at
+        // once, so a fix that dates the stop where the state changes sees it.
+        begin_stop(&mut hub.server, None, false);
+        hub.finish_ready_tasks(Instant::now());
+        assert_eq!(
+            hub.run_state,
+            ServerState::Stopping,
+            "with no worker to wait for, the stop task must end at once"
+        );
+        let stuck_bytes = hub.clients[&token].channel.back_buf.available_data();
+        let started_at = Instant::now();
+        let upgrading = hub.run();
+        let elapsed = started_at.elapsed();
+        let _ = loop_over.send(());
+        let released = helper.join().expect("helper thread");
+
+        assert!(!upgrading, "the loop stops normally");
+        assert!(
+            !released,
+            "the main was still waiting {elapsed:?} after it began stopping, for a client \
+             that holds {stuck_bytes} unflushed bytes and never reads: it returned only \
+             because the peer hung up"
+        );
+        // The deadline is dated inside `run`, after `started_at`: exact, not
+        // load-sensitive.
+        assert!(
+            elapsed >= flush_deadline,
+            "the main gave up after {elapsed:?} on a client that holds {stuck_bytes} \
+             unflushed bytes, before its {flush_deadline:?} flush deadline"
+        );
+    }
+
     /// Regression (sozu#1313): a request that can NEVER be delivered on a
     /// worker channel must be accounted as a `Failure` for the owning task.
     ///
@@ -7262,6 +7941,380 @@ mod tests {
                 (8444, "AddHttpsListener"),
             ],
             "the fan-out must carry each HTTPS listener on the verb its client auth calls for"
+        );
+    }
+
+    /// Two orders on one frontend key are both left unacknowledged: the first
+    /// adds the frontend, the second removes it while the first is still in
+    /// flight. Both clients are told `Failure`, and no worker ever applied
+    /// either order, so the main process state must end exactly as it was
+    /// before the first one.
+    ///
+    /// Each order captures its inverse against the state as it was when the
+    /// order arrived. Applied as each task ends, in deadline order, the older
+    /// inverse would run first: the removal that reverts the add finds
+    /// nothing to remove (the second order already took the frontend out), and
+    /// the inverse of the second order, an add of the frontend it removed,
+    /// then restores an entry neither client was told exists.
+    /// `RollbackLedger::settle` (`bin/src/command/rollback.rs`) holds the older
+    /// revert back until the newer order has ended, then runs both newest
+    /// first.
+    ///
+    /// The two tasks end in two separate sweeps, the older one first: within
+    /// one sweep `CommandHub::finish_ready_tasks` drains `HashMap`s, so the
+    /// order of two tasks that end together is arbitrary. The second order is
+    /// issued with the longer `worker_timeout`, which only fixes which deadline
+    /// comes first without sleeping: with equal timeouts the first order's
+    /// deadline is the earlier one anyway.
+    ///
+    /// TO SEE THIS RED: in `WorkerTask::on_finish`
+    /// (`bin/src/command/requests.rs`) pass `None` instead of
+    /// `self.rollback_ticket` to `settle_rollback`, so that every task
+    /// dispatches its own inverse as soon as it ends unacknowledged, as before
+    /// the ledger: the final assertion finds
+    /// `0.0.0.0:8080;stacked.example.com;P/` in `ConfigState::http_fronts`.
+    #[test]
+    fn stacked_unacknowledged_orders_on_one_key_leave_the_state_as_it_was_before_either() {
+        let mut hub = create_test_hub();
+        // A `Running` worker that never answers: without one, the fan-out
+        // expects nobody, finishes at once, and nothing is ever reverted.
+        let (_silent_worker, _scm) = register_ready_test_worker(&mut hub.server, 0, 4096, 65536);
+        let (token_a, mut peer_a) = register_observable_client(&mut hub);
+        let (token_b, mut peer_b) = register_observable_client(&mut hub);
+        let frontend = RequestHttpFrontend {
+            cluster_id: Some(String::from("cluster_1")),
+            hostname: String::from("stacked.example.com"),
+            path: PathRule::prefix(String::from("/")),
+            address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+            position: RulePosition::Tree.into(),
+            ..Default::default()
+        };
+        assert!(
+            hub.server.state.http_fronts.is_empty(),
+            "the fixture starts without a frontend"
+        );
+
+        // Order A adds the frontend; order B removes it while A is in flight.
+        hub.server.config.worker_timeout = 10;
+        crate::command::requests::worker_request(
+            &mut hub.server,
+            hub.clients.get_mut(&token_a).expect("client A is live"),
+            RequestType::AddHttpFrontend(frontend.clone()),
+        );
+        assert_eq!(
+            hub.server.state.http_fronts.len(),
+            1,
+            "order A is committed to the main process state"
+        );
+        let task_a = *hub
+            .server
+            .queued_tasks
+            .keys()
+            .next()
+            .expect("order A is in flight");
+        let deadline_a = hub.server.queued_tasks[&task_a]
+            .timeout
+            .expect("order A has a deadline");
+
+        hub.server.config.worker_timeout = 20;
+        crate::command::requests::worker_request(
+            &mut hub.server,
+            hub.clients.get_mut(&token_b).expect("client B is live"),
+            RequestType::RemoveHttpFrontend(frontend.clone()),
+        );
+        assert!(
+            hub.server.state.http_fronts.is_empty(),
+            "order B is committed to the main process state"
+        );
+        assert_eq!(
+            hub.server.queued_tasks.len(),
+            2,
+            "both orders are in flight and nobody answered"
+        );
+        let deadline_b = hub
+            .server
+            .queued_tasks
+            .iter()
+            .find_map(|(task_id, task)| (*task_id != task_a).then_some(task.timeout))
+            .flatten()
+            .expect("order B has a deadline");
+        assert!(deadline_a < deadline_b, "A must be the older deadline");
+
+        // Sweep 1: only A has run out of time. Its inverse removes a frontend
+        // that is already gone.
+        hub.finish_ready_tasks(deadline_a + (deadline_b - deadline_a) / 2);
+        assert_eq!(
+            hub.tasks.len() + hub.server.queued_tasks.len(),
+            1,
+            "only order B is still in flight after the first sweep"
+        );
+        assert!(
+            hub.server.state.http_fronts.is_empty(),
+            "reverting A cannot bring the frontend back: B removed it"
+        );
+
+        // Sweep 2: B runs out of time as well. Both orders are over.
+        hub.finish_ready_tasks(deadline_b + Duration::from_secs(1));
+        assert!(
+            hub.tasks.is_empty() && hub.server.queued_tasks.is_empty(),
+            "both orders are over"
+        );
+        for (token, peer) in [(token_a, &mut peer_a), (token_b, &mut peer_b)] {
+            flush_client_responses(&mut hub, token, peer);
+            let mut answers = vec![];
+            while let Ok(answer) = peer.read_message() {
+                answers.push(answer);
+            }
+            assert_eq!(
+                answers.last().map(|answer| answer.status),
+                Some(ResponseStatus::Failure as i32),
+                "the client was told its order failed: {answers:?}"
+            );
+        }
+
+        assert!(
+            hub.server.state.http_fronts.is_empty(),
+            "no worker applied either order and both clients were told `Failure`, \
+             yet the main process state holds {:?}, a frontend neither of them was \
+             told exists",
+            hub.server.state.http_fronts.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// The frontend the stacked-order tests below fight over.
+    fn contested_frontend() -> RequestHttpFrontend {
+        RequestHttpFrontend {
+            cluster_id: Some(String::from("cluster_1")),
+            hostname: String::from("stacked.example.com"),
+            path: PathRule::prefix(String::from("/")),
+            address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+            position: RulePosition::Tree.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Two orders on one frontend in the opposite direction of
+    /// `stacked_unacknowledged_orders_on_one_key_leave_the_state_as_it_was_before_either`:
+    /// the frontend exists, the first order removes it and the second adds it
+    /// back while the first is in flight. No worker answers either. The main
+    /// process state must end with the frontend it started with.
+    ///
+    /// Oldest first, the removal's inverse (an add of the frontend) is refused
+    /// because the second order already put it back, and the add's inverse
+    /// then removes it: the frontend neither client touched successfully is
+    /// gone.
+    ///
+    /// TO SEE THIS RED: in `RollbackLedger::settle` (`bin/src/command/rollback.rs`)
+    /// delete the `Verdict::Revert if blocked => {}` arm, so that an older
+    /// revert is released while a newer order on its object is in flight.
+    #[test]
+    fn stacked_unacknowledged_orders_in_the_mirror_direction_keep_the_frontend() {
+        let mut hub = create_test_hub();
+        let (_silent_worker, _scm) = register_ready_test_worker(&mut hub.server, 0, 4096, 65536);
+        let (token_a, _peer_a) = register_observable_client(&mut hub);
+        let (token_b, _peer_b) = register_observable_client(&mut hub);
+        let frontend = contested_frontend();
+        hub.server
+            .state
+            .dispatch(&RequestType::AddHttpFrontend(frontend.clone()).into())
+            .expect("the frontend exists before either order");
+        let before_either = hub.server.state.http_fronts.clone();
+
+        hub.server.config.worker_timeout = 10;
+        crate::command::requests::worker_request(
+            &mut hub.server,
+            hub.clients.get_mut(&token_a).expect("client A is live"),
+            RequestType::RemoveHttpFrontend(frontend.clone()),
+        );
+        assert!(
+            hub.server.state.http_fronts.is_empty(),
+            "order A removed it"
+        );
+        let task_a = *hub
+            .server
+            .queued_tasks
+            .keys()
+            .next()
+            .expect("order A is in flight");
+        let deadline_a = hub.server.queued_tasks[&task_a]
+            .timeout
+            .expect("order A has a deadline");
+
+        hub.server.config.worker_timeout = 20;
+        crate::command::requests::worker_request(
+            &mut hub.server,
+            hub.clients.get_mut(&token_b).expect("client B is live"),
+            RequestType::AddHttpFrontend(frontend.clone()),
+        );
+        assert_eq!(hub.server.state.http_fronts.len(), 1, "order B put it back");
+        let deadline_b = hub
+            .server
+            .queued_tasks
+            .iter()
+            .find_map(|(task_id, task)| (*task_id != task_a).then_some(task.timeout))
+            .flatten()
+            .expect("order B has a deadline");
+        assert!(deadline_a < deadline_b, "A must be the older deadline");
+
+        hub.finish_ready_tasks(deadline_a + (deadline_b - deadline_a) / 2);
+        assert_eq!(
+            hub.tasks.len() + hub.server.queued_tasks.len(),
+            1,
+            "only order B is still in flight after the first sweep"
+        );
+        assert_eq!(
+            hub.server.state.http_fronts.len(),
+            1,
+            "reverting A must wait for B: B's frontend is in the state"
+        );
+
+        hub.finish_ready_tasks(deadline_b + Duration::from_secs(1));
+        assert!(
+            hub.tasks.is_empty() && hub.server.queued_tasks.is_empty(),
+            "both orders are over"
+        );
+        assert_eq!(
+            hub.server.state.http_fronts, before_either,
+            "no worker applied either order, so the frontends must be exactly the ones that \
+             existed before them"
+        );
+        assert_eq!(
+            hub.server.rollbacks.live_tickets(),
+            0,
+            "an ended order holds no claim"
+        );
+    }
+
+    /// The bulk twin: an entry of a saved state that `load_state` put in the
+    /// main process state, and a live removal of the same frontend while the
+    /// replay is in flight. Neither is acknowledged. `PerEntryGatherer`
+    /// reverts its entries with the same inverses as `WorkerTask` and must
+    /// not run ahead of the newer order either.
+    ///
+    /// TO SEE THIS RED: in `scatter_accepted_entry` (`bin/src/command/requests.rs`)
+    /// skip the `server.rollbacks.owe` call (`let ticket = None;`): the replay
+    /// entry reverts on its own when its deadline expires, finds the frontend
+    /// already removed, and the removal's inverse puts the frontend back.
+    #[test]
+    fn a_replayed_entry_and_a_newer_live_order_unwind_newest_first() {
+        let mut hub = create_test_hub();
+        let (_silent_worker, _scm) = register_ready_test_worker(&mut hub.server, 0, 4096, 65536);
+        let (token_b, _peer_b) = register_observable_client(&mut hub);
+        let frontend = contested_frontend();
+
+        let dir = tempfile::tempdir().expect("could not create temp dir");
+        let state_path = dir.path().join("replay.state");
+        {
+            let message = WorkerRequest::new(
+                String::from("SAVE-0"),
+                RequestType::AddHttpFrontend(frontend.clone()).into(),
+            );
+            let mut record = serde_json::to_vec(&message).expect("a serializable request");
+            record.extend_from_slice(b"\n\0");
+            std::fs::write(&state_path, record).expect("writing the state file");
+        }
+
+        hub.server.config.worker_timeout = 10;
+        crate::command::requests::load_state(
+            &mut hub.server,
+            None,
+            state_path.to_str().expect("a UTF-8 temp path"),
+        );
+        assert_eq!(
+            hub.server.state.http_fronts.len(),
+            1,
+            "the replay committed the entry to the main process state"
+        );
+        let replay = *hub
+            .server
+            .queued_tasks
+            .keys()
+            .next()
+            .expect("the replay is in flight");
+        let deadline_replay = hub.server.queued_tasks[&replay]
+            .timeout
+            .expect("the replay has a deadline");
+
+        hub.server.config.worker_timeout = 20;
+        crate::command::requests::worker_request(
+            &mut hub.server,
+            hub.clients.get_mut(&token_b).expect("client B is live"),
+            RequestType::RemoveHttpFrontend(frontend.clone()),
+        );
+        assert!(
+            hub.server.state.http_fronts.is_empty(),
+            "the live order removed the entry"
+        );
+        let deadline_b = hub
+            .server
+            .queued_tasks
+            .iter()
+            .find_map(|(task_id, task)| (*task_id != replay).then_some(task.timeout))
+            .flatten()
+            .expect("the live order has a deadline");
+        assert!(deadline_replay < deadline_b, "the replay ends first");
+
+        hub.finish_ready_tasks(deadline_replay + (deadline_b - deadline_replay) / 2);
+        assert!(
+            hub.server.state.http_fronts.is_empty(),
+            "reverting the replayed entry cannot bring the frontend back: the live order removed it"
+        );
+        hub.finish_ready_tasks(deadline_b + Duration::from_secs(1));
+        assert!(
+            hub.tasks.is_empty() && hub.server.queued_tasks.is_empty(),
+            "both are over"
+        );
+        assert!(
+            hub.server.state.http_fronts.is_empty(),
+            "no worker applied the entry or the removal, yet the main process state holds {:?}",
+            hub.server.state.http_fronts.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(hub.server.rollbacks.live_tickets(), 0);
+    }
+
+    /// A replay that fails to parse after it put an entry in the state is
+    /// cancelled without ever ending. The claim of that entry must go with the
+    /// task, or every older order on the same frontend would wait for an
+    /// answer that cannot come.
+    ///
+    /// TO SEE THIS RED: drop the `take_rollback_tickets` loop from
+    /// `Server::cancel_task`: the cancelled replay's claim stays in
+    /// `Server::rollbacks`.
+    #[test]
+    fn cancelling_a_replay_releases_the_claims_of_its_entries() {
+        let mut hub = create_test_hub();
+        let dir = tempfile::tempdir().expect("could not create temp dir");
+        let state_path = dir.path().join("broken.state");
+        {
+            let message = WorkerRequest::new(
+                String::from("SAVE-0"),
+                RequestType::AddHttpFrontend(contested_frontend()).into(),
+            );
+            let mut record = serde_json::to_vec(&message).expect("a serializable request");
+            record.extend_from_slice(b"\n\0");
+            record.extend_from_slice(b"not a record");
+            std::fs::write(&state_path, record).expect("writing the state file");
+        }
+
+        crate::command::requests::load_state(
+            &mut hub.server,
+            None,
+            state_path.to_str().expect("a UTF-8 temp path"),
+        );
+
+        assert!(
+            hub.server.queued_tasks.is_empty(),
+            "the unreadable replay was cancelled"
+        );
+        assert_eq!(
+            hub.server.state.http_fronts.len(),
+            1,
+            "the entry read before the failure stays in the state, as it always did"
+        );
+        assert_eq!(
+            hub.server.rollbacks.live_tickets(),
+            0,
+            "the cancelled replay holds no claim"
         );
     }
 }

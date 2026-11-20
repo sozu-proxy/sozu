@@ -86,6 +86,19 @@ The supervisor is a single-threaded mio event loop. Each tick:
   client answer it would give a real rejection: an old worker that closes
   before answering the `SoftStop` of an `upgrade --worker` fails that
   upgrade (§4).
+- serves the audit-event subscribers (`sozu events subscribe`). Audit events
+  are queued on `Server::pending_audit_events` and reach the subscribers only
+  through `CommandHub::flush_pending_audit_events`, which the loop calls right
+  after the task sweep (`CommandHub::finish_ready_tasks`) at the top of every
+  iteration and after each handled client request. The sweep call is what
+  delivers the completion line of a task (`WorkerTask`, `LoadStateTask`, and
+  `STATE_LOADED`, which a successful `load_state` raises at no other time):
+  `GatheringTask::on_finish` runs only from that sweep, outside any request
+  handler, so on a control plane where no client sends anything the
+  subscribers get the event in the iteration that finished the task, not at
+  the next request. A worker's own `Event` answer is not queued there: it is
+  forwarded to the subscribers as soon as `CommandHub::handle_worker_response`
+  routes it;
 - forgets the sessions of dead workers
   (`CommandHub::collect_unreferenced_restored_stopped_workers`, at the top of
   every iteration, after the task sweep). A `Stopped` session is removed, its
@@ -136,6 +149,17 @@ while `WorkersStopping`, nothing once `Stopping`. Workers ignore `SIGTERM`
 control group, as systemd does for a unit without `ExecStop=`, leaves the
 workers to the main process's soft stop. A worker whose main process dies
 still leaves: its channel closes and its event loop returns.
+
+Once `StopTask` has moved the main to `Stopping` the loop closes every client
+whose response buffer is empty and keeps only those holding unflushed bytes,
+returning when none is left. That wait has a deadline: one `worker_timeout`
+(at least one second), dated when the loop first sees `Stopping`. A client
+that stopped reading with a full socket buffer raises no event and asks for no
+retry, and the workers are already gone, so without the deadline nothing but
+the service manager's `SIGKILL` ended the stop. When the deadline passes the
+loop logs a warning, closes the remaining clients and returns; the poll
+timeout is capped at the time left, since no readiness announces the deadline.
+
 Hot upgrades are dispatched from `upgrade::upgrade_main`
 (`bin/src/upgrade.rs::fork_main_into_new_main`) and
 re-enter the new master via the same `begin_main_process` path with
@@ -319,6 +343,38 @@ carries the tags the identity needs.
 Upsert verbs (`AddCluster`, `AddBackend`) and non-add verbs stay deliberately
 uncovered: they keep the best-effort behaviour rather than risk a wrong revert.
 
+An inverse is the exact undo of its order only while that order is the newest
+change to its object: it is captured against the state as it stood when the
+order arrived, which already holds the effect of every order still in flight
+before it. Two orders on one object that both end unacknowledged — an add and
+the removal that follows it, or the reverse — used to be reverted in the order
+their deadlines expired, oldest first, and undid each other's work: the add's
+removal found nothing to remove (`StateError::NotFound`, only logged), and the
+removal's inverse then put back a frontend that neither client was told exists
+(or, in the other direction, dropped the frontend that existed before both
+orders). `RollbackLedger` (`bin/src/command/rollback.rs`) now holds one stack
+per object, oldest order first, keyed by `rollback_key`
+(`command/src/state.rs`): an HTTP or HTTPS frontend by its route key, a TCP
+frontend by its canonical `(address, sni, alpn)`, a UDP frontend by its address,
+a listener and its activation flag by type and `address%interface` — each
+spelled the way `ConfigState::dispatch` identifies the object, an order and
+the inverse that undoes it sharing one key. Every order registers with
+`RollbackLedger::owe` when the state accepts it (`worker_request`,
+`apply_saved_entry`, `load_static_config`) and settles with
+`RollbackLedger::settle` when its fan-out ends, reverted or kept
+(`WorkerTask::on_finish`, `PerEntryGatherer::revert_unacknowledged`). `settle`
+walks the stack from the newest order: a revert waits while a newer order on
+its object is still in flight, then runs newest first behind it; an order that
+a worker acknowledged supersedes every older revert on its object, which is
+dropped; orders on different objects never wait for each other. A replay that
+`load_state` cancels gives its claims back with `Server::cancel_task`. The
+ledger is not part of an upgrade snapshot: a task restored by a main upgrade
+holds no claim and reverts on its own when it ends, exactly as before, so an
+unacknowledged order that straddles a main upgrade can still be reverted out of
+order, and a revert already parked in the ledger behind a newer order is lost
+with the old process, its task having ended. `cargo test -p sozu --lib stacked_unacknowledged_orders` and the
+tests of `rollback.rs` lock the ordering.
+
 A listener patch (`Update*Listener`) has no inverse either, so it relies on two
 properties instead (sozu#1703). First, it is all-or-nothing on both sides:
 `ConfigState::update_http_listener` and `ConfigState::update_https_listener`
@@ -467,6 +523,35 @@ the task cannot be handed over to a new main process
 (`TaskSnapshotError::OldWorkerRestoreInFlight`), as for the readiness wait. An
 old worker that never answers the first `ReturnListenSockets` is not covered:
 that answer is indeterminate and the upgrade fails as before.
+
+Only one `upgrade --worker` runs per worker at a time. A worker keeps a single
+pending shutdown id, and the old worker stays `Running` until the replacement
+is ready, so `get_active_worker_by_id` alone would admit a second upgrade of
+it: the worker has no listening socket left to give back, the second upgrade
+launches a second replacement for the same slot, and its `SoftStop` overwrites
+the id of the first, whose client then gets only the synthetic "closed before
+answering" failure. `upgrade_worker` therefore refuses a worker that a live task
+is upgrading (`Server::worker_upgrade_in_flight`) with "Worker N is already
+being upgraded", before it asks the worker for anything. Every stage of the
+upgrade names its old worker (`GatheringTask::upgrading_worker_id`), the
+readiness stage included while the protected bootstrap of the replacement
+(`WorkerBootstrapTask`) holds it, which forwards the name as it forwards the
+retained workers; a refused bootstrap marks no worker as bootstrapping, so this
+is the only guard there. The answer is read from two places because a task
+changes hands: one created in the current event-loop iteration is still in
+`Server::queued_tasks`, and one that went through a sweep is only in
+`CommandHub::tasks`, out of the server's reach.
+The sweep (`CommandHub::finish_ready_tasks`) therefore rewrites
+`Server::upgrading_workers` from the tasks that stay alive, the ones just
+chained included. Nothing ever clears it by hand: an upgrade that ended however
+it ended (an abort, a failure, the final answer, a worker that died) frees its
+worker at that sweep, and a main process that took a phase-one task over in a
+handoff has the set after its first sweep, so the set is in no snapshot. The
+second upgrade of a worker that is already `Stopping` keeps the answer it had,
+"does not exist, or is stopping / stopped". The per-worker upgrades of
+`sozu upgrade` target distinct workers and do not refuse each other, but one
+of them is refused like any other when an `upgrade --worker` of the same
+worker is already in flight.
 
 `UpgradeWorkerTask::on_finish` of the second phase answers
 `Ok` only when every response of that second phase is `Ok`. A failure of the

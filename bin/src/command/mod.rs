@@ -9,6 +9,7 @@
 
 mod protected;
 mod requests;
+mod rollback;
 pub mod server;
 pub mod sessions;
 pub mod upgrade;

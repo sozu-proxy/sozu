@@ -517,7 +517,23 @@ impl Gatherer for ProtectedHealthCheckTask {
         message: WorkerResponse,
     ) {
         let status = ResponseStatus::try_from(message.status);
-        if matches!(status, Ok(ResponseStatus::Processing)) || self.answered.contains(&worker_id) {
+        // Once the step reached a decision (`Gatherer::has_finished`), the
+        // answers that still arrive belong to the order that decision
+        // replaces: every answer of a poll batch is routed before
+        // `CommandHub::finish_ready_tasks` (`bin/src/command/server.rs`)
+        // hands the decision out. They must not reach the transaction. A
+        // refusal that started the abort already moved it to `Aborting`,
+        // where `Transaction::failed`
+        // (`command/src/protected_transaction.rs`) means "this worker's abort
+        // failed": a second worker that merely refused the same order, and
+        // has not been sent an abort yet, would be booked unrecoverable and
+        // fenced. A worker that closed meanwhile loses nothing by being
+        // ignored here: `advance` books every unreachable target of the next
+        // order as failed itself.
+        if self.step.is_some()
+            || matches!(status, Ok(ResponseStatus::Processing))
+            || self.answered.contains(&worker_id)
+        {
             return;
         }
         let version = self.txn.version();
@@ -1607,6 +1623,13 @@ impl GatheringTask for WorkerBootstrapTask {
         self.finalizer.retained_worker_ids()
     }
 
+    /// The readiness task of an `upgrade --worker` waits inside this one
+    /// while its replacement is given the confirmed values: its old worker is
+    /// still being upgraded.
+    fn upgrading_worker_id(&self) -> Option<WorkerId> {
+        self.finalizer.upgrading_worker_id()
+    }
+
     fn on_finish(
         mut self: Box<Self>,
         server: &mut Server,
@@ -2318,6 +2341,64 @@ mod tests {
         assert_eq!(
             rig.hub.server.protected.held_values(CLUSTER),
             Some(vec![b"SYNTHETIC-OTHER-3f".to_vec()])
+        );
+    }
+
+    /// Every worker refuses the same order: the first refusal starts the
+    /// abort, and the refusals that follow inside the same poll batch (the
+    /// answers are all routed before `finish_ready_tasks` hands the abort out)
+    /// say nothing about the abort, which no worker has been sent yet. Each
+    /// worker is then asked to roll back, acknowledges, and the change ends as
+    /// a clean `FAILED`. A refusal booked as a failed abort would leave the
+    /// worker `unrecoverable`: the outcome would be `INCOHERENT` and the main
+    /// would `SIGKILL` a healthy worker, with its live connections.
+    ///
+    /// TO SEE THIS RED: delete the `self.step.is_some()` condition from the
+    /// early return at the top of `ProtectedHealthCheckTask::on_message`, so
+    /// that the second refusal reaches `Transaction::failed` while the
+    /// transaction is already `Aborting`: the worker it books unrecoverable
+    /// is fenced, and "refused the order and acknowledged its rollback, yet
+    /// the main fenced it" fails with `left: Stopped` for both phases.
+    fn two_refusals_of_one_order_roll_back_without_fencing_a_healthy_worker(
+        phase: ProtectedHealthCheckPhase,
+    ) {
+        let mut rig = rig(2);
+        rig.workers[0].refuses = Some(phase);
+        rig.workers[1].refuses = Some(phase);
+
+        rig.begin(order(&[("Authorization", SECRET)]));
+        rig.pump();
+        rig.pump();
+
+        assert_eq!(rig.final_status(), Some(ResponseStatus::Failure));
+        for worker in rig.hub.server.workers.values() {
+            assert_ne!(
+                worker.run_state,
+                RunState::Stopped,
+                "{phase:?}: worker {} refused the order and acknowledged its rollback, \
+                 yet the main fenced it",
+                worker.id
+            );
+        }
+        assert_eq!(
+            final_message(&mut rig).as_deref(),
+            Some(FAILED),
+            "{phase:?}: a clean rollback of every worker is reported as such"
+        );
+        assert_nothing_applied(&mut rig);
+    }
+
+    #[test]
+    fn two_prepare_refusals_roll_back_without_fencing_a_healthy_worker() {
+        two_refusals_of_one_order_roll_back_without_fencing_a_healthy_worker(
+            ProtectedHealthCheckPhase::ProtectedHealthCheckPrepare,
+        );
+    }
+
+    #[test]
+    fn two_commit_refusals_roll_back_without_fencing_a_healthy_worker() {
+        two_refusals_of_one_order_roll_back_without_fencing_a_healthy_worker(
+            ProtectedHealthCheckPhase::ProtectedHealthCheckCommit,
         );
     }
 
@@ -3544,6 +3625,41 @@ mod tests {
         };
 
         assert_eq!(task.retained_worker_ids(), vec![4]);
+    }
+
+    /// A replacement whose bootstrap main refuses (the confirmed set is not
+    /// one the state names) holds the readiness task of its `upgrade --worker`
+    /// until the next sweep, and nothing marks it as bootstrapping: its old
+    /// worker is still being upgraded, and a second upgrade of it is refused.
+    ///
+    /// TO SEE THIS RED: delete `WorkerBootstrapTask::upgrading_worker_id`, so
+    /// that the trait's default `None` hides the readiness task the bootstrap
+    /// holds: the upgrade of worker 0 is admitted and the assertion fails with
+    /// `Some(Response { status: Processing, message: "Requesting listen
+    /// sockets from worker 0", .. })`. Keeping only
+    /// `self.upgrading_workers.contains(&id)` in
+    /// `Server::worker_upgrade_in_flight` fails it the same way, since the
+    /// bootstrap is still queued when the upgrade arrives.
+    #[test]
+    fn a_refused_bootstrap_still_holds_the_upgrade_of_the_old_worker() {
+        let mut rig = rig_with_confirmed_values();
+        assert!(rig.hub.server.mark_worker_ready(0));
+        let cluster = rig.hub.server.state.clusters.get_mut(CLUSTER);
+        cluster.expect("the cluster").health_check = None;
+        let old = token_of(&rig, 0);
+        let job = crate::command::upgrade::awaiting_readiness_task(rig.client, old, 0, 1);
+        start_worker_with(&mut rig, 1, job);
+        assert!(!rig.hub.server.worker_bootstrap_in_flight());
+
+        send(&mut rig, RequestType::UpgradeWorker(0));
+        let answer = rig.responses().pop();
+        assert!(
+            answer
+                .as_ref()
+                .is_some_and(|answer| answer.status == ResponseStatus::Failure as i32
+                    && answer.message.contains("already being upgraded")),
+            "{answer:?}"
+        );
     }
 
     #[test]
