@@ -756,6 +756,44 @@ an optional PROXY-protocol stage (expect, send or relay), then a `Pipe`
 (`lib/src/protocol/pipe.rs`) that copies bytes both ways without parsing them.
 A WebSocket upgrade on an H1 connection ends in the same `Pipe`.
 
+A TCP session has exactly one frontend deadline, a `TimeoutContainer` owned by
+`TcpSession` (`TcpSession::container_frontend_timeout`), and one wheel entry
+under the frontend token. The `Pipe` of a TCP session is built without a
+frontend timer, whichever stage it comes from, and the session resets its own
+before dispatching every `Pipe::readable` and `Pipe::backend_readable`.
+`ExpectProxyProtocol` is shared with HTTP and HTTPS, which keep their deadline
+in it, so a TCP session gives it an empty container; a clone of the session's
+would share its wheel handle but not its entry, and a reset only the session
+performs would leave that entry live as a second one, fired later at whichever
+session has inherited the token.
+
+`TcpSession::front_hup` closes every state before the `Pipe`, so `TcpSession::ready_inner`
+reads the pending bytes of the three states that decide on what the client sent
+before it acts on one: `ExpectProxyProtocol`
+([#1823](https://github.com/sozu-proxy/sozu/issues/1823)), an undecided
+`SniPreread` and `RelayProxyProtocol`. A client that queues its first bytes and
+half-closes behind them is reported as one `READABLE | HUP` event, and an empty
+accumulator on that event is not an empty connection: for `SniPreread` it would
+be closed as a silent health check although its ClientHello is queued in the
+kernel (`tcp_preread/LIFECYCLE.md` §9).
+
+The two PROXY states that dial before they upgrade, `RelayProxyProtocol` and
+`SendProxyProtocol`, owe the backend a request that the HUP must not drop. The
+pass that dials returns before the connect completes (for a send session the
+first readiness pass, for a relay session the one that parses its header), so
+the HUP is still pending when it does. `TcpSession::defers_frontend_hup` holds
+it: for a relay session once its header is parsed, for a send session always,
+since it reads nothing and cannot tell a bare connect from a request queued
+ahead of the FIN. The HUP stays in the readiness `event`, out of the dispatch
+loop's frontend interest so that it does not count as work, until the header is
+written and the session upgrades; `Pipe::frontend_hup` then keeps the session
+alive while the request is in flight, and closes it otherwise. A relay client
+that half-closes inside its header never reaches that state and closes at once,
+without having dialed. A send client that connects and closes without a byte
+costs the backend one connection that carries only the PROXY header. The wait
+ends with the backend connect, its `connect_timeout` or the frontend timeout,
+and an ERROR still closes at once.
+
 1. **Accept** as in §3; the listener's `TCP_NODELAY` and the accepted address
    apply unchanged.
 2. **Connect.** `TcpSession::connect_to_backend` resolves the cluster (the
@@ -771,8 +809,18 @@ A WebSocket upgrade on an H1 connection ends in the same `Pipe`.
    arms `Backend::retry_policy` (which keeps the backend out of selection for
    its back-off window) and counts `backend.connections.error`, then the
    connect is retried while the cluster's `max_connection_attempts` (5 by
-   default) lasts. A connect that completes
-   resets the retry policy (`TcpSession::set_back_connected`).
+   default) lasts. A connect still unanswered when `connect_timeout`
+   expires reaches the session through the backend timer alone, and
+   `Server::timeout` runs no `ready` pass for TCP: `TcpSession::timeout`
+   charges the backend itself with the same `TcpSession::fail_backend_connection`
+   and closes the session, without a retry. A connect that completes
+   resets the retry policy (`TcpSession::set_back_connected`). The gate and
+   the affinity key both read the PROXY-v2 source of the session's own header,
+   so a session that relays one (`RelayProxyProtocol`) is dialed only once it
+   has parsed that header, in the pass that reads it, and a session that
+   expects one (`ExpectProxyProtocol`) is dialed from the `Pipe` it upgrades
+   to: neither is ever charged to the address of the load balancer that sent
+   the header (`lib/src/protocol/proxy_protocol/LIFECYCLE.md` §2.2).
 3. **Relay.** On Linux with the `splice` feature, a `Protocol::TCP` pipe
    takes a `SplicePipe` (`lib/src/splice.rs`) when it is created: an idle pair
    from the worker's pool when there is one, at no system call, otherwise a new

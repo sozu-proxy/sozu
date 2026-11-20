@@ -125,6 +125,22 @@ PROXY phase and the downstream protocol.
     `ExpectProxyProtocol::into_pipe` (`expect.rs`), which prefers
     `ProxyAddr::source()` and falls back to the front socket's `peer_addr` when
     it is `AfUnspec` — including for every `LOCAL` header (§1).
+  - The pipe `into_pipe` builds carries no frontend timer (`None`). `into_pipe`
+    is only the TCP listener's upgrade, and a `TcpSession` keeps its one
+    frontend deadline in `TcpSession::container_frontend_timeout`, which it
+    resets before every `Pipe::readable` and `Pipe::backend_readable` it
+    dispatches. The `ExpectProxyProtocol` a `TcpSession` creates therefore holds
+    an empty `TimeoutContainer` (`TimeoutContainer::new_empty`), never a clone
+    of the session's. A clone shares the wheel handle and not the entry the
+    handle names: a reset only the session performs leaves the clone's entry
+    behind, the clone's next reset fails and arms a second entry under the same
+    token, and whichever of the two fires second is delivered to the session
+    that has inherited the slab key. HTTP and HTTPS are unaffected: their
+    `ExpectProxyProtocol` owns the only container and moves it on to the
+    stage it upgrades to.
+    The regression guard is
+    `expect_proxy_pipe_leaves_no_orphan_frontend_timer_after_a_timeout`
+    (`lib/src/tcp.rs`).
 - HUP is honoured only after the readable bytes are drained. A client
   that half-closes right behind its header and payload can deliver all of
   it as ONE `READABLE | HUP` event (Linux coalesces `EPOLLIN |
@@ -146,6 +162,24 @@ PROXY phase and the downstream protocol.
 - Used when Sōzu sits between two PROXY-aware peers: read the inbound
   header, then write those exact bytes (and only those bytes) to the
   backend before any user-payload byte.
+- The backend is dialed once the header is parsed, never before. The dial
+  charges the per-(cluster, source-IP/subnet) slot
+  (`max_connections_per_ip`, `max_connections_per_subnet`) and derives the
+  affinity key of `HRW`, `MAGLEV` and shuffle sharding from
+  `TcpSession::effective_session_address`, whose relay arm reads
+  `RelayProxyProtocol::addresses` and otherwise falls back to the accepted
+  peer, which is the upstream load balancer. A dial that ran before the first
+  header byte would therefore admit and pin every client behind one load
+  balancer as that load balancer, and nothing re-keys the slot afterwards.
+  `TcpSession::attempt_backend_connect_if_needed` skips a relay session whose
+  `header_size` is still `None`; the attempt that follows the `readable()` call
+  dials in the pass that parses the header (the dispatch loop's, or the pre-HUP
+  drain's in `TcpSession::ready_inner` when the header arrives together with the
+  client's FIN). A header that never completes costs no backend connection. A
+  `LOCAL` header names no source (`ProxyAddr::AfUnspec`), so that session is
+  charged to the peer address, as for `expect`. The regression guard is
+  `a_relay_proxy_protocol_session_is_charged_to_the_header_source_not_the_lb_peer`
+  (`lib/src/tcp.rs`).
 - Entry points: `RelayProxyProtocol::readable` (`relay.rs`) feeds the parser; on a complete
   parse it flips `frontend_readiness.interest` to drop READABLE and arms
   the backend WRITABLE bit (`relay.rs:163-164`). It then records
@@ -196,6 +230,29 @@ PROXY phase and the downstream protocol.
     socketpair — see
     `back_writable_keeps_its_readiness_when_a_signal_interrupts_the_write`
     (`relay.rs`).
+- A frontend HUP waits for the upgrade once the header is parsed. A client
+  that sends its header and request and half-closes can deliver them as ONE
+  `READABLE | HUP` event, and the pass that parses the header also dials the
+  backend and returns, so the HUP is still pending when the connect completes.
+  Honouring it there would close the session in this state, before
+  `RelayProxyProtocol::back_writable` has forwarded anything: the client's
+  header and request are dropped and the backend sees a dialed connection
+  closed with nothing written. `ready_inner` therefore reads the pending bytes
+  first (as for `ExpectProxyProtocol`, §2.1), and `TcpSession::defers_frontend_hup`
+  holds the HUP while `RelayProxyProtocol::header_size` is set. The bit stays in
+  the readiness `event`, which `RelayProxyProtocol::into_pipe` hands to the
+  pipe through `restore_readiness_events`, and `Pipe::frontend_hup` keeps the
+  session alive while the buffered request remains. The dispatch loop masks it
+  out of the frontend interest: left there it would count as work no branch
+  performs and run to `MAX_LOOP_ITERATIONS`. A header that cannot complete (a
+  stream that ends inside it, or no byte at all) leaves `header_size` unset and
+  closes at once on the HUP, so a dead client never waits for a backend. The
+  regression guards are
+  `relay_proxy_protocol_half_close_before_backend_connect_forwards_the_request`,
+  `relay_proxy_protocol_front_hup_while_connecting_waits_for_the_backend`,
+  `relay_proxy_protocol_half_close_without_any_byte_closes_at_once` and
+  `relay_proxy_protocol_half_close_inside_the_header_closes_at_once`
+  (`lib/src/tcp.rs`).
 - `relay.rs` places **no** upper bound on header size, unlike `expect.rs`'s
   fixed 232-byte staging array: a v2 header is `16 + len` with `len: u16`,
   and this state reads into a pool `Checkout`, so a declared `len` larger
@@ -214,6 +271,26 @@ PROXY phase and the downstream protocol.
   writes until the cursor reaches `header.len()` and returns
   `SessionResult::Upgrade`; partial writes set `WouldBlock` and yield to
   the event loop.
+- A frontend HUP waits for the upgrade, always. This state's frontend interest
+  has no READABLE and it reads nothing, so it cannot tell a client that
+  connected and closed from one whose request is queued in the kernel ahead of
+  its FIN, and the first `TcpSession::ready_inner` pass only dials, so the HUP
+  is still pending when the connect completes. Honouring it would close the
+  session before the header was written and drop the request.
+  `TcpSession::defers_frontend_hup` holds it; the bit stays in the readiness
+  `event`, which `SendProxyProtocol::into_pipe` hands to the pipe, and
+  `Pipe::frontend_hup` then keeps the session while the request is in flight.
+  The dispatch loop masks it out of the frontend interest, where it would
+  otherwise count as work no branch performs. The price is that a bare
+  connect-then-FIN on a `send` cluster still opens a backend connection
+  carrying only the PROXY header, which the pipe then closes. The regression
+  guards are
+  `send_proxy_protocol_half_close_before_backend_connect_forwards_the_request`,
+  `send_proxy_protocol_front_hup_while_connecting_waits_for_the_backend` and
+  `send_proxy_protocol_bare_half_close_delivers_only_the_header_then_closes`;
+  `send_proxy_protocol_reset_while_connecting_closes_at_once` holds that only
+  the HUP waits, and a frontend ERROR still closes the session at once
+  (`lib/src/tcp.rs`).
 
 ---
 
