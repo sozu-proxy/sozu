@@ -123,6 +123,10 @@
 
 - A client that cancels an HTTP/2 request while the backend's response headers are still being read no longer takes down the other requests of its session on the same HTTP/2 backend connection. When a response header block was cut by a read (a large `HEADERS` frame crossing two reads, or a `HEADERS` frame followed by its `CONTINUATION` frames) and the client sent `RST_STREAM` for that request in between, the completed block found no stream and Sōzu closed the whole backend connection, so every other request multiplexed on it was cut. The block is now decoded to keep the HPACK dynamic table in step with the backend (RFC 9113 §4.3) and dropped, and the connection carries on; a block that does not decode still ends the connection with `GOAWAY(COMPRESSION_ERROR)`. The `h2.headers_no_stream.error` counter now counts these dropped blocks.
 
+<!-- changelog-slot:h2-priority-self-dependency-hpack -->
+
+- An HTTP/2 connection no longer loses track of its peer's HPACK dynamic table when the peer sends a `HEADERS` frame whose `PRIORITY` depends on its own stream. Sōzu resets that stream with `RST_STREAM(PROTOCOL_ERROR)` (RFC 7540 §5.3.1) but returned before decoding the header block, so the entries the peer's encoder had indexed from it never reached Sōzu's decoder. The peer's later header blocks on the same connection then resolved their dynamic-table references against a table missing those entries: the block failed to decode and the connection was closed with `GOAWAY(COMPRESSION_ERROR)`, or, when the table held older entries, silently carried another header's name and value. Only the connection of the peer that sent the self-dependent frame was affected, and no conforming peer sends one. The block is now decoded and dropped before the stream is reset (RFC 9113 §4.3), as every other dropped header block already was; a block that does not decode ends the connection with `GOAWAY(COMPRESSION_ERROR)` in place of the stream reset.
+
 ## 2.3.6 - 2026-11-18
 
 ### Security

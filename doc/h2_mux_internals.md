@@ -1162,7 +1162,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9673-9677
+```rust lib/src/protocol/mux/h2.rs:9713-9717
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1330,6 +1330,14 @@ Key decisions in this method:
   same stream may follow (§6.10), it is discarded with it, and the block is
   decoded whole for HPACK (§4.3). The first fragment counts toward
   `max_header_list_size` like an accepted block's
+- A complete HEADERS block whose PRIORITY (RFC 7540 §5.3.1) depends on its own
+  stream resets that stream, and the block is still decoded for HPACK before
+  it is dropped (§4.3), through `ConnectionH2::decode_and_drop_field_block`,
+  the helper `ConnectionH2::drop_field_block_of_removed_stream` shares. Without
+  it the entries the peer's encoder indexed from that block would be missing
+  from the connection's decoder, and later blocks would resolve dynamic indices
+  against the wrong table. A block that does not decode is a connection error
+  COMPRESSION_ERROR
 
 ### handle_continuation_header_state()
 
@@ -1343,7 +1351,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9855-9859
+```rust lib/src/protocol/mux/h2.rs:9895-9899
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1818,7 +1826,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:9174
+```rust lib/src/protocol/mux/h2.rs:9214
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -2062,7 +2070,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:7614-7616
+```rust lib/src/protocol/mux/h2.rs:7654-7656
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -2070,7 +2078,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:7628-7634
+```rust lib/src/protocol/mux/h2.rs:7668-7674
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.

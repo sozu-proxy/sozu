@@ -7004,10 +7004,48 @@ impl ConnectionH2 {
             headers.stream_id
         );
         self.metric_events.push(MetricEvent::HeadersWithoutStream);
-        // Where the block lives depends on how it was read: in the owned
-        // accumulator when CONTINUATION frames fed it, else still in
-        // `zero.storage` (see `Self::handle_headers_frame`). Disjoint fields,
-        // so the decoder can be borrowed beside the block.
+        let decoded = self.decode_and_drop_field_block(headers);
+        self.attribute_bytes_to_overhead();
+        match decoded {
+            Ok(()) => MuxResult::Continue,
+            Err(error) => {
+                error!(
+                    "{} HPACK field block of removed stream {} failed to decode: {:?}",
+                    log_context!(self),
+                    headers.stream_id,
+                    error
+                );
+                self.goaway(error)
+            }
+        }
+    }
+
+    /// Decode a complete HEADERS block whose stream is not going to take it,
+    /// so the connection's HPACK decoder stays in step with the peer's
+    /// encoder (RFC 9113 §4.3: a header block is decoded whether or not the
+    /// message it belongs to is kept, because the peer's encoder has already
+    /// inserted its incremental-indexing entries into the shared dynamic
+    /// table). No header pair is kept.
+    ///
+    /// The block is read from where [`Self::handle_headers_frame`] holds it:
+    /// the owned reassembly accumulator when CONTINUATION frames fed it, else
+    /// `zero.storage`. Both are retired on every outcome, as on the accepted
+    /// path: a flag left `is_in_progress()` would leak into the next HEADERS
+    /// frame of the connection, which may belong to another stream. An
+    /// `Err` is the connection error the caller answers with
+    /// [`Self::goaway`]: `COMPRESSION_ERROR` for a block that does not
+    /// decode.
+    ///
+    /// Shared by [`Self::drop_field_block_of_removed_stream`] and by the
+    /// PRIORITY self-dependency reset of [`Self::handle_headers_frame`], the
+    /// two places that end a completed block without handing it to
+    /// `pkawa::handle_header`.
+    fn decode_and_drop_field_block(&mut self, headers: &Headers) -> Result<(), H2Error> {
+        debug_assert!(
+            headers.end_headers,
+            "only a complete header block is decoded and dropped"
+        );
+        // Disjoint fields, so the decoder can be borrowed beside the block.
         let block = if self.header_reassembly.is_in_progress() {
             Some(self.header_reassembly.data())
         } else {
@@ -7023,29 +7061,15 @@ impl ConnectionH2 {
                 .map_err(|_| H2Error::CompressionError),
             None => Err(H2Error::InternalError),
         };
-        // Retired on every outcome, as on the accepted path: a flag left
-        // `is_in_progress()` would leak into the next HEADERS frame.
         if self.header_reassembly.is_in_progress() {
             self.header_reassembly.finish();
         }
         self.zero.storage.clear();
-        self.attribute_bytes_to_overhead();
         debug_assert!(
             !self.header_reassembly.is_in_progress(),
             "the dropped block's accumulator must not leak into the next HEADERS frame"
         );
-        match decoded {
-            Ok(()) => MuxResult::Continue,
-            Err(error) => {
-                error!(
-                    "{} HPACK field block of removed stream {} failed to decode: {:?}",
-                    log_context!(self),
-                    headers.stream_id,
-                    error
-                );
-                self.goaway(error)
-            }
-        }
+        decoded
     }
 
     fn handle_headers_frame<E, L>(
@@ -7121,18 +7145,34 @@ impl ConnectionH2 {
         {
             // This HEADERS frame's own block just completed (single-frame,
             // or the final CONTINUATION of a multi-frame sequence) — but
-            // we're aborting before ever reaching the `finish()` call below.
-            // If a CONTINUATION sequence fed it, `header_reassembly` is
-            // still `is_in_progress() == true`; retire it here or it leaks
-            // that flag into the NEXT HEADERS frame processed on this
-            // connection, which may belong to a completely different
-            // stream — that frame's own "read from zero.storage" fast path
-            // would then be skipped in favour of these stale, already-
-            // discarded bytes (sozu-proxy/sozu review of e1c3c2fb, B1).
-            // Regression:
-            // `a_priority_self_dependency_reset_does_not_leak_the_reassembly_accumulator`.
-            if self.header_reassembly.is_in_progress() {
-                self.header_reassembly.finish();
+            // we're aborting before ever reaching `pkawa::handle_header`
+            // below. The block still reached the peer's HPACK encoder, whose
+            // incremental-indexing entries are now in the table shared with
+            // our decoder, so it is decoded before it is dropped (RFC 9113
+            // §4.3): skipping the decode leaves every later block of the
+            // connection resolving dynamic indices against a table missing
+            // those entries. The same call retires the reassembly
+            // accumulator: if a CONTINUATION sequence fed the block,
+            // `header_reassembly` is still `is_in_progress() == true`, and
+            // left so it leaks that flag into the NEXT HEADERS frame
+            // processed on this connection, which may belong to a completely
+            // different stream — that frame's own "read from zero.storage"
+            // fast path would then be skipped in favour of these stale,
+            // already-discarded bytes (sozu-proxy/sozu review of e1c3c2fb,
+            // B1).
+            // Regressions:
+            // `a_priority_self_dependency_reset_does_not_leak_the_reassembly_accumulator`,
+            // `a_priority_self_dependency_reset_keeps_the_hpack_decoder_in_sync`.
+            if let Err(error) = self.decode_and_drop_field_block(&headers) {
+                // A block that does not decode is a connection error
+                // (RFC 9113 §4.3): the stream reset is moot.
+                error!(
+                    "{} HPACK field block of self-dependent stream {} failed to decode: {:?}",
+                    log_context!(self),
+                    stream_id,
+                    error
+                );
+                return self.goaway(error);
             }
             self.reset_stream(
                 stream_id,
@@ -22028,6 +22068,215 @@ pub(super) mod tests {
             Some("/stream-3-legitimate"),
             "stream 3 must decode its OWN bytes, not stream 1's stale, \
              aborted reassembly fragment"
+        );
+    }
+
+    /// A HEADERS block reset for an RFC 7540 PRIORITY self-dependency is
+    /// still a block the peer's encoder produced against its own dynamic
+    /// table: every incremental-indexing entry it inserted must reach the
+    /// connection's HPACK decoder (RFC 9113 §4.3), exactly like the blocks
+    /// of a refused stream (`refuse_stream_and_discard`) or of a removed
+    /// stream (`drop_field_block_of_removed_stream`), which
+    /// [`decode_discarded_field_block`] decodes "so our decoder does not
+    /// fall behind the peer's encoder". `handle_headers_frame` resets the
+    /// self-dependent stream and returns before `pkawa::handle_header`, the
+    /// only place that would feed the block to the decoder, so the entry
+    /// `x-sozu-probe: alpha` the block inserted never exists on our side and
+    /// the next block the peer sends, which references it as dynamic index
+    /// 62, fails to decode.
+    ///
+    /// The existing regression test
+    /// `a_priority_self_dependency_reset_does_not_leak_the_reassembly_accumulator`
+    /// cannot see this: every field it encodes has a static-table name, so
+    /// the peer's encoder indexes nothing.
+    ///
+    /// To SEE THIS RED: no mutation needed, it fails on the tree it was
+    /// written against. The final assertion reports
+    /// `Err(InvalidIndex)` instead of `Ok(())`, because the connection's
+    /// dynamic table is empty.
+    #[test]
+    fn a_priority_self_dependency_reset_keeps_the_hpack_decoder_in_sync() {
+        use std::io::Write;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+        let (mut connection, mut peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        connection.core.state = H2State::Header;
+        connection
+            .core
+            .stream_table
+            .set_expect_read(Some((H2StreamId::Zero, 9)));
+
+        // The probe field's name is in neither table, so encoding it makes
+        // the peer's encoder append `x-sozu-probe: alpha` to its dynamic
+        // table at index 62.
+        let mut peer_encoder = crate::protocol::mux::hpack::Encoder::new();
+        let field_block = peer_encoder.encode([
+            (&b":method"[..], &b"GET"[..]),
+            (&b":scheme"[..], &b"https"[..]),
+            (&b":authority"[..], &b"example.com"[..]),
+            (&b":path"[..], &b"/self-dependent"[..]),
+            (&b"x-sozu-probe"[..], &b"alpha"[..]),
+        ]);
+
+        // HEADERS, END_STREAM | END_HEADERS | PRIORITY, stream 1, whose
+        // stream dependency is stream 1 itself (RFC 7540 §5.3.1).
+        let mut payload = Vec::with_capacity(5 + field_block.len());
+        payload.extend_from_slice(&1u32.to_be_bytes()); // Stream Dependency = 1 (self)
+        payload.push(15); // Weight
+        payload.extend_from_slice(&field_block);
+        let mut frame = Vec::with_capacity(9 + payload.len());
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes()[1..]);
+        frame.push(1); // HEADERS
+        frame.push(parser::FLAG_END_STREAM | parser::FLAG_END_HEADERS | parser::FLAG_PRIORITY);
+        frame.extend_from_slice(&1u32.to_be_bytes());
+        frame.extend_from_slice(&payload);
+        peer.write_all(&frame)
+            .expect("loopback write must complete");
+        peer.flush().expect("loopback flush must complete");
+
+        // Wait for the connection to be back on the next frame's 9-byte
+        // header with stream 1 torn down: a bounded number of passes, never
+        // a sleep. `highest_peer_stream_id` is the positive signal that the
+        // HEADERS frame was read at all: every other condition already holds
+        // before the first pass.
+        for _ in 0..64 {
+            connection.readable(&mut context, EndpointClient(&mut router));
+            if matches!(connection.core.state, H2State::Header)
+                && matches!(
+                    connection.core.stream_table.expect_read(),
+                    Some((H2StreamId::Zero, 9))
+                )
+                && connection.core.stream_table.highest_peer_stream_id() == 1
+                && connection.core.stream_table.get(1).is_none()
+            {
+                break;
+            }
+            std::thread::yield_now();
+        }
+
+        // Premise: stream 1's HEADERS frame was read and the stream reset for
+        // its self-dependency, and the connection itself is still usable.
+        assert_eq!(
+            connection.core.stream_table.highest_peer_stream_id(),
+            1,
+            "stream 1's HEADERS frame must have been read"
+        );
+        assert!(
+            connection.core.stream_table.get(1).is_none(),
+            "the self-dependent stream must have been torn down"
+        );
+        assert!(
+            !matches!(connection.core.state, H2State::Error | H2State::GoAway),
+            "resetting a self-dependent stream must leave the connection \
+             usable: {:?}",
+            connection.core.state
+        );
+
+        // The peer now references the entry its encoder indexed: one
+        // indexed-field byte, no literal.
+        let next_block = peer_encoder.encode([(&b"x-sozu-probe"[..], &b"alpha"[..])]);
+        assert_eq!(
+            next_block.len(),
+            1,
+            "the peer must now reference its dynamic entry, not re-send a literal"
+        );
+
+        let mut decoded = Vec::new();
+        let status = connection
+            .core
+            .hpack
+            .decoder_mut()
+            .decode_with_cb(&next_block, |k, v| {
+                decoded.push((k.into_owned(), v.into_owned()));
+            });
+
+        assert!(
+            status.is_ok(),
+            "the connection decoder must still resolve the peer's dynamic table \
+             after a self-dependent stream was reset, got {status:?}"
+        );
+        assert_eq!(
+            decoded,
+            vec![(b"x-sozu-probe".to_vec(), b"alpha".to_vec())],
+            "the self-dependent stream's field block must have been decoded \
+             into the connection's HPACK context before the stream was reset"
+        );
+    }
+
+    /// A block that depends on its own stream and does not decode is not a
+    /// stream error: the peer's encoder and our decoder can no longer be
+    /// trusted to agree, so it is a connection error of type
+    /// COMPRESSION_ERROR (RFC 9113 §4.3), as for any other block, and the
+    /// stream reset for the self-dependency (RFC 7540 §5.3.1) is moot. Index 0
+    /// of an indexed field is invalid (RFC 7541 §6.1).
+    ///
+    /// Companion of `a_priority_self_dependency_reset_keeps_the_hpack_decoder_in_sync`.
+    #[test]
+    fn an_undecodable_block_of_a_self_dependent_stream_is_a_compression_error() {
+        use std::io::{Read, Write};
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+        let (mut connection, mut peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        connection.core.state = H2State::Header;
+        connection
+            .core
+            .stream_table
+            .set_expect_read(Some((H2StreamId::Zero, 9)));
+
+        // HEADERS, END_STREAM | END_HEADERS | PRIORITY, stream 1, whose
+        // stream dependency is stream 1 itself, carrying the invalid block.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_be_bytes()); // Stream Dependency = 1 (self)
+        payload.push(15); // Weight
+        payload.push(0x80); // indexed field, index 0
+        let mut frame = Vec::with_capacity(9 + payload.len());
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes()[1..]);
+        frame.push(1); // HEADERS
+        frame.push(parser::FLAG_END_STREAM | parser::FLAG_END_HEADERS | parser::FLAG_PRIORITY);
+        frame.extend_from_slice(&1u32.to_be_bytes());
+        frame.extend_from_slice(&payload);
+        peer.write_all(&frame)
+            .expect("loopback write must complete");
+        peer.flush().expect("loopback flush must complete");
+
+        // A bounded number of passes, never a sleep: the connection is done
+        // once it has decided to go away.
+        for _ in 0..64 {
+            connection.readable(&mut context, EndpointClient(&mut router));
+            if matches!(connection.core.state, H2State::GoAway | H2State::Error) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            matches!(connection.core.state, H2State::GoAway | H2State::Error),
+            "an undecodable block must end the connection, not reset one stream: {:?}",
+            connection.core.state
+        );
+
+        // The final GOAWAY, queued behind nothing, leaves in this flush and
+        // names COMPRESSION_ERROR.
+        connection.flush_output_buffer();
+        let mut received = [0u8; 17];
+        peer.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("setting a read timeout must succeed");
+        peer.read_exact(&mut received)
+            .expect("the peer must receive the GOAWAY");
+        assert_eq!(received[3], 7, "the frame must be a GOAWAY: {received:?}");
+        assert_eq!(
+            u32::from_be_bytes(
+                received[13..17]
+                    .try_into()
+                    .expect("a GOAWAY carries an error")
+            ),
+            H2Error::CompressionError as u32,
+            "the GOAWAY must carry COMPRESSION_ERROR: {received:?}"
         );
     }
 

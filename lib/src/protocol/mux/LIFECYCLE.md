@@ -1085,7 +1085,9 @@ through only for a stream the table holds or just created, and
 `ConnectionH2::handle_continuation_header_state` checks the stream id the
 CONTINUATION names against the HEADERS frame's, not that the stream still
 exists. `ConnectionH2::drop_field_block_of_removed_stream` decodes the block
-into the connection's HPACK decoder and drops it: the peer's encoder already
+(through `ConnectionH2::decode_and_drop_field_block`, which also retires the
+reassembly accumulator and `zero.storage`) into the connection's HPACK decoder
+and drops it: the peer's encoder already
 indexed its fields, so skipping them would desynchronise every later block of
 the connection (RFC 9113 §4.3), and the connection is shared with every other
 stream of the session, so one client's cancel must not close it. The result is
@@ -1100,6 +1102,19 @@ CONTINUATION frames, is the case reproduced. Pinned by
 `a_response_continuation_of_a_cancelled_stream_keeps_the_backend_connection`,
 `the_block_of_a_cancelled_stream_still_reaches_the_hpack_decoder` and
 `an_undecodable_block_of_a_cancelled_stream_is_a_compression_error` (`h2.rs`).
+
+A completed HEADERS block that carries an RFC 7540 PRIORITY depending on its
+own stream is the other block `ConnectionH2::handle_headers_frame` ends without
+handing it to `pkawa::handle_header`: the stream is reset and removed
+(RFC 7540 §5.3.1 forbids the dependency), and the block is decoded first
+through the same `ConnectionH2::decode_and_drop_field_block`, because the
+block reached the peer's HPACK encoder all the same and the reset is a stream
+error, not a reason to let the connection's decoder fall behind. A block that
+does not decode is `GOAWAY(COMPRESSION_ERROR)` in place of the stream reset.
+Pinned by `a_priority_self_dependency_reset_keeps_the_hpack_decoder_in_sync`,
+`an_undecodable_block_of_a_self_dependent_stream_is_a_compression_error` and
+`a_priority_self_dependency_reset_does_not_leak_the_reassembly_accumulator`
+(`h2.rs`).
 
 The backend-side `ConnectionH2::end_stream` RST_STREAM(CANCEL) once went
 into `zero` with neither `expect_write` nor READABLE touched. A backend
@@ -3148,10 +3163,15 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
       (the match arm in `ConnectionH2::handle_read`) — before `handle_frame`
       is even re-entered.
     - The block is retired via `HeaderBlockAccumulator::finish`, either
-      decoded (`handle_headers_frame`'s `END_HEADERS` branch) or dropped
-      unread by an early return of `handle_headers_frame` (the PRIORITY
-      self-dependency reset) — the single exit point
-      matching the single entry point `begin`. **Every early-return path in
+      decoded into a kept message (`handle_headers_frame`'s `END_HEADERS`
+      branch) or decoded and dropped by an early return of
+      `handle_headers_frame` (the PRIORITY self-dependency reset, and the
+      block of a removed stream, both through
+      `ConnectionH2::decode_and_drop_field_block`) — the single exit point
+      matching the single entry point `begin`. A dropped block is still
+      decoded: the peer's encoder has indexed its fields, and an undecoded
+      block leaves every later block of the connection resolving dynamic
+      indices against a table missing them (RFC 9113 §4.3). **Every early-return path in
       `handle_headers_frame` between the `!end_headers` check and the
       normal `finish()` call must retire an in-progress accumulator before
       returning, or `is_in_progress()` leaks `true` into the NEXT HEADERS
