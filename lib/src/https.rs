@@ -828,6 +828,21 @@ impl HttpsSession {
 
     fn upgrade_mux(&self, mut mux: MuxTls) -> Option<HttpsStateMachine> {
         debug!("{} mux switching to wss", log_context!(self));
+        // `HttpsSession::upgrade_mux` consumes the mux instead of closing it, so
+        // `Mux::close` never releases the backend connections it holds: each
+        // would drop with its `active_connections` reservation and its three
+        // backend gauges held. Release them now, while the mux is whole and
+        // before any `return None` below, each of which ends the session.
+        // The upgrading stream's own connection is the one exception: it
+        // moves into the `Pipe`, whose `close` releases it. A `return None`
+        // below drops it unreleased, as no `Pipe` takes it.
+        let kept = match mux.context.streams.last().map(|stream| &stream.state) {
+            Some(mux::StreamState::Linked(back_token)) => Some(*back_token),
+            _ => None,
+        };
+        let proxy: Rc<RefCell<dyn L7Proxy>> = self.proxy.clone();
+        mux.release_backend_connections_except(kept, &proxy);
+
         let Some(stream) = mux.context.streams.pop() else {
             error!(
                 "{} upgrade_mux: no stream attached to the TLS mux session, closing",

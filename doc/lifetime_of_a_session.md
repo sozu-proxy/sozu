@@ -782,7 +782,14 @@ A WebSocket upgrade on an H1 connection ends in the same `Pipe`.
    (`tcp_preread/LIFECYCLE.md` §8). Without splice, or on a WebSocket pipe, the
    `Pipe` copies through its two pooled buffers with `recv`/`send`.
 4. **Close.** A HUP on either side drains what is in flight
-   (`Pipe::frontend_hup`, `Pipe::backend_hup`). The `Pipe` logs the session
+   (`Pipe::frontend_hup`, `Pipe::backend_hup`). A backend HUP that finds
+   response bytes still queued adds the frontend's WRITABLE interest and never
+   its WRITABLE event: the write that just met `EAGAIN` cleared that event, and
+   setting it again would defeat the pass's break guard (backend HUP, frontend
+   interested in WRITABLE, no WRITABLE event), which parks the session until the
+   client's next `EPOLLOUT` edge. Re-arming it made every iteration retry the
+   failing write until `MAX_LOOP_ITERATIONS` and close the session with the
+   tail undelivered. The `Pipe` logs the session
    once, from whichever of its handlers ends it (`Pipe::log_request_success`
    or `Pipe::log_request_error`, both through `Pipe::log_request`:
    `getsockopt(TCP_INFO)` on each side). The backend address it logs is the
@@ -802,6 +809,26 @@ A WebSocket upgrade on an H1 connection ends in the same `Pipe`.
    then one `ioctl(FIONREAD)` per pipe must confirm it, so a pair still holding
    a byte of this session never serves another one. A pair holding bytes, or
    one beyond the pool's 32 idle pairs, closes its four descriptors.
+
+A WebSocket `Pipe` (`ws://` and `wss://`) is closed by its HTTP or HTTPS
+session, not by `TcpSession`, and ends in three further ways. `Pipe::ready`
+hands a frontend HUP to `Pipe::frontend_hup`, as `TcpSession` does, so a
+client's last frame that reaches the kernel with its FIN is read and forwarded
+before the session closes; every exit of `Pipe::ready` that returns `Close`,
+the frontend `ERROR` and the loop limit included, writes the access log line and
+the end-of-session metrics once. On `wss://`, `FrontRustls::socket_write`
+reports plaintext written as soon as rustls has absorbed it, and what the kernel
+refused (at most 64 KiB) stays inside rustls: `Pipe::check_connections` counts
+`SocketHandler::socket_wants_write` as response in flight, `Pipe::writable`
+flushes rustls on a WRITABLE edge that finds `backend_buffer` empty
+(`Pipe::flush_frontend_records`, then the same `check_connections` gate as any
+other drain), and `Pipe::backend_hup` keeps the session for the next WRITABLE
+edge instead of closing over those records. `Pipe::close` then queues the TLS
+`close_notify` and flushes it, and whatever rustls still held, with
+`drain_tls_close_notify` (`lib/src/protocol/mux/shared.rs`, bounded to 16 empty
+writes), before `HttpsSession::close` shuts the write side down: a client sees
+`Ok(0)` and not an `UnexpectedEof`. A plaintext frontend has neither a
+`close_notify` nor records to flush, so `ws://` and TCP are unchanged.
 
 Measured on the same rig as §6.7, `curl` through a TCP listener to the same
 backend, one connection per request. The `c086b456` column is the closing
@@ -1098,8 +1125,11 @@ minimum set to read a session's life from a dashboard:
   `Mux::attach_dialed`; `-1` in `Mux::close` for the backends still open at
   session teardown, in `Connection::pre_close_client_bookkeeping` for a backend
   closed through `Connection::close` — the dead-backend sweep of
-  `Mux::ready_inner` included — and in `Mux::attach_dialed`'s rollback when the
-  mio registration of a new backend socket fails).
+  `Mux::ready_inner` included — in `Mux::attach_dialed`'s rollback when the
+  mio registration of a new backend socket fails, in `Pipe::close` for the one
+  connection a WebSocket upgrade moves into its pipe, and in
+  `Mux::release_backend_connections_except` for the other connections the
+  session still pools when it upgrades).
 - `requests`, `bytes_in`, `bytes_out`, `backend_response_time`,
   `backend_header_time` — per-cluster and per-backend counters and timings
   (`names::backend`, `lib/src/metrics/names.rs`).

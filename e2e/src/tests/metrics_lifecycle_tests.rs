@@ -1744,6 +1744,321 @@ fn old_websocket_metrics_do_not_contaminate_same_identity_replacement() {
     assert!(worker_stopped);
 }
 
+fn wait_for_backend_connection_gauge(
+    worker: &mut Worker,
+    cluster_id: &str,
+    backend_id: &str,
+    expected: u64,
+) -> Option<u64> {
+    let deadline = Instant::now() + SESSION_BARRIER_BUDGET;
+    while Instant::now() < deadline {
+        let actual = backend_connection_gauge(worker, cluster_id, backend_id);
+        if actual == Some(expected) {
+            return actual;
+        }
+        thread::yield_now();
+    }
+    None
+}
+
+/// The backend observes the end of its connection `client_id`: a clean EOF or
+/// a reset. A connection the proxy dropped reads as gone here whatever the
+/// proxy's accounting says about it.
+fn wait_for_backend_connection_gone(backend: &mut SyncBackend, client_id: usize) -> bool {
+    let Some(stream) = backend.clients.get_mut(&client_id) else {
+        return false;
+    };
+    let deadline = Instant::now() + SESSION_BARRIER_BUDGET;
+    let mut buf = [0_u8; 1024];
+    while Instant::now() < deadline {
+        match stream.read(&mut buf) {
+            Ok(0) => return true,
+            Ok(_) => {}
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
+/// A client reuses one HTTP/1.1 connection for a plain request to cluster A,
+/// whose backend connection the mux then pools as keep-alive, and for a
+/// WebSocket upgrade to cluster B. The upgrade hands cluster B's backend
+/// connection to a `Pipe` and throws the rest of the mux away, cluster A's
+/// pooled connection included: the proxy closes that socket, so the
+/// connection is gone and the accounting for it must go with it.
+///
+/// The oracle is cluster A's own `connections_per_backend` gauge. The
+/// WebSocket connection to cluster B has its accounting on cluster B's
+/// backend row, so this assertion isolates the pooled connection from it.
+#[test]
+fn websocket_upgrade_releases_the_other_pooled_backend_connections() {
+    const UPGRADE_RESPONSE: &str =
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+    const PLAIN_REQUEST: &str = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const UPGRADE_REQUEST: &str = "GET /ws HTTP/1.1\r\nHost: websocket.localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+
+    let front_address = create_local_address();
+    let pooled_back_address = create_local_address();
+    let ws_back_address = create_local_address();
+    let pooled_cluster = "lifecycle_upgrade_pooled_cluster";
+    let pooled_backend_id = "lifecycle_upgrade_pooled_backend";
+    let ws_cluster = "lifecycle_upgrade_ws_cluster";
+    let ws_backend_id = "lifecycle_upgrade_ws_backend";
+
+    let mut worker = setup_worker_with_cluster(
+        "METRICS-LIFECYCLE-UPGRADE-POOLED",
+        pooled_cluster,
+        pooled_backend_id,
+        front_address,
+        pooled_back_address,
+    );
+    let metric_detail_ack = lease_backend_metric_detail(&mut worker);
+    let ws_cluster_ack = request_acknowledged(
+        &mut worker,
+        RequestType::AddCluster(Worker::default_cluster(ws_cluster)),
+    );
+    let ws_frontend_ack = request_acknowledged(
+        &mut worker,
+        RequestType::AddHttpFrontend(RequestHttpFrontend {
+            hostname: String::from("websocket.localhost"),
+            ..Worker::default_http_frontend(ws_cluster, front_address)
+        }),
+    );
+    let ws_backend_ack = request_acknowledged(
+        &mut worker,
+        RequestType::AddBackend(Worker::default_backend(
+            ws_cluster,
+            ws_backend_id,
+            ws_back_address,
+            None,
+        )),
+    );
+
+    let mut pooled_backend = SyncBackend::new(
+        "METRICS-LIFECYCLE-UPGRADE-POOLED-BACKEND",
+        pooled_back_address,
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\npong",
+    );
+    pooled_backend.connect();
+    let mut ws_backend = SyncBackend::new(
+        "METRICS-LIFECYCLE-UPGRADE-WS-BACKEND",
+        ws_back_address,
+        UPGRADE_RESPONSE,
+    );
+    ws_backend.connect();
+
+    let mut client = Client::new(
+        "METRICS-LIFECYCLE-UPGRADE-CLIENT",
+        front_address,
+        PLAIN_REQUEST,
+    );
+    client.connect();
+    client.send();
+
+    let pooled_answered = metric_detail_ack
+        && ws_cluster_ack
+        && ws_frontend_ack
+        && ws_backend_ack
+        && wait_for_backend_request(&mut pooled_backend, 0)
+        && pooled_backend.send(0).is_some()
+        && client
+            .receive_response(SESSION_BARRIER_BUDGET)
+            .is_some_and(|response| response.ends_with("\r\n\r\npong"));
+    let pooled_gauge_while_pooled = if pooled_answered {
+        wait_for_backend_connection_gauge(&mut worker, pooled_cluster, pooled_backend_id, 1)
+    } else {
+        None
+    };
+
+    let mut upgraded = false;
+    let mut pooled_connection_gone = false;
+    let mut pooled_gauge_after_upgrade = None;
+    let mut session_ended = false;
+    if pooled_gauge_while_pooled == Some(1) {
+        client.set_request(UPGRADE_REQUEST);
+        client.send();
+        upgraded = wait_for_backend_request(&mut ws_backend, 0)
+            && ws_backend.send(0).is_some()
+            && wait_for_client_payload(&mut client, "101 Switching Protocols");
+        pooled_connection_gone =
+            upgraded && wait_for_backend_connection_gone(&mut pooled_backend, 0);
+        if pooled_connection_gone {
+            pooled_gauge_after_upgrade = wait_for_backend_connection_gauge(
+                &mut worker,
+                pooled_cluster,
+                pooled_backend_id,
+                0,
+            );
+        }
+        // End the WebSocket session too, so the last read below shows whether
+        // the unit is still held once nothing of the session is left.
+        let _ = ws_backend.close(0);
+        session_ended = upgraded
+            && wait_for_client_termination(&mut client)
+            && wait_for_proxy_gauge(&mut worker, "protocol.ws", 0) == Some(0);
+    }
+    let pooled_gauge_last_read =
+        backend_connection_gauge(&mut worker, pooled_cluster, pooled_backend_id);
+
+    client.disconnect();
+    pooled_backend.disconnect();
+    ws_backend.disconnect();
+    let worker_stopped = stop_worker_within(worker);
+
+    println!(
+        "websocket upgrade pooled connection: detail_ack={metric_detail_ack} \
+         ws_cluster_ack={ws_cluster_ack} ws_frontend_ack={ws_frontend_ack} \
+         ws_backend_ack={ws_backend_ack} pooled_answered={pooled_answered} \
+         gauge_while_pooled={pooled_gauge_while_pooled:?} upgraded={upgraded} \
+         pooled_connection_gone={pooled_connection_gone} \
+         gauge_after_upgrade={pooled_gauge_after_upgrade:?} session_ended={session_ended} \
+         gauge_after_session_end={pooled_gauge_last_read:?} worker_stopped={worker_stopped}"
+    );
+
+    assert!(metric_detail_ack);
+    assert!(ws_cluster_ack && ws_frontend_ack && ws_backend_ack);
+    assert!(pooled_answered);
+    assert_eq!(pooled_gauge_while_pooled, Some(1));
+    assert!(upgraded);
+    assert!(
+        pooled_connection_gone,
+        "the proxy must have dropped the pooled connection to cluster A"
+    );
+    assert_eq!(
+        pooled_gauge_after_upgrade,
+        Some(0),
+        "the pooled connection to cluster A is closed, so its \
+         connections_per_backend unit must be released"
+    );
+    assert!(worker_stopped);
+}
+
+/// A WebSocket session keeps the backend connection the mux dialled for it,
+/// and `Pipe` is the only owner left to release it: its reservation on the
+/// backend and the proxy-level and per-backend connection gauges.
+///
+/// Two sessions share one backend. A gauge saturates at zero, so a lone
+/// session cannot tell one release from two: both read 0 afterwards. With a
+/// second session still open, the first one's close must take both gauges
+/// from 2 to exactly 1, and only the second one's from 1 to 0. A connection
+/// the pipe never released leaves 2 and then 1; one it released twice leaves
+/// 0 while the second session is still open.
+#[test]
+fn websocket_sessions_each_release_their_own_backend_connection() {
+    const UPGRADE_RESPONSE: &str =
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+    const UPGRADE_REQUEST: &str = "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+
+    let front_address = create_local_address();
+    let back_address = create_local_address();
+    let cluster_id = "lifecycle_websocket_release_cluster";
+    let backend_id = "lifecycle_websocket_release_backend";
+    let mut worker = setup_worker_with_cluster(
+        "METRICS-LIFECYCLE-WEBSOCKET-RELEASE",
+        cluster_id,
+        backend_id,
+        front_address,
+        back_address,
+    );
+    let metric_detail_ack = lease_backend_metric_detail(&mut worker);
+    let mut backend = SyncBackend::new(
+        "METRICS-LIFECYCLE-WEBSOCKET-RELEASE-BACKEND",
+        back_address,
+        UPGRADE_RESPONSE,
+    );
+    backend.connect();
+
+    let mut first = Client::new(
+        "METRICS-LIFECYCLE-WEBSOCKET-RELEASE-FIRST",
+        front_address,
+        UPGRADE_REQUEST,
+    );
+    first.connect();
+    first.send();
+    let first_upgraded = metric_detail_ack
+        && wait_for_backend_request(&mut backend, 0)
+        && backend.send(0).is_some()
+        && wait_for_client_payload(&mut first, "101 Switching Protocols");
+
+    let mut second = Client::new(
+        "METRICS-LIFECYCLE-WEBSOCKET-RELEASE-SECOND",
+        front_address,
+        UPGRADE_REQUEST,
+    );
+    second.connect();
+    second.send();
+    let second_upgraded = first_upgraded
+        && wait_for_backend_request(&mut backend, 1)
+        && backend.send(1).is_some()
+        && wait_for_client_payload(&mut second, "101 Switching Protocols");
+
+    let mut proxy_gauge_two_open = None;
+    let mut backend_gauge_two_open = None;
+    let mut proxy_gauge_one_open = None;
+    let mut backend_gauge_one_open = None;
+    let mut proxy_gauge_none_open = None;
+    let mut backend_gauge_none_open = None;
+    if second_upgraded {
+        proxy_gauge_two_open = wait_for_proxy_backend_connections(&mut worker, 2);
+        backend_gauge_two_open =
+            wait_for_backend_connection_gauge(&mut worker, cluster_id, backend_id, 2);
+    }
+    if proxy_gauge_two_open == Some(2) && backend_gauge_two_open == Some(2) {
+        let _ = backend.close(0);
+        if wait_for_client_termination(&mut first)
+            && wait_for_proxy_gauge(&mut worker, "protocol.ws", 1) == Some(1)
+        {
+            proxy_gauge_one_open = wait_for_proxy_backend_connections(&mut worker, 1);
+            backend_gauge_one_open =
+                wait_for_backend_connection_gauge(&mut worker, cluster_id, backend_id, 1);
+        }
+    }
+    if proxy_gauge_one_open == Some(1) && backend_gauge_one_open == Some(1) {
+        let _ = backend.close(1);
+        if wait_for_client_termination(&mut second)
+            && wait_for_proxy_gauge(&mut worker, "protocol.ws", 0) == Some(0)
+        {
+            proxy_gauge_none_open = wait_for_proxy_backend_connections(&mut worker, 0);
+            backend_gauge_none_open =
+                wait_for_backend_connection_gauge(&mut worker, cluster_id, backend_id, 0);
+        }
+    }
+
+    first.disconnect();
+    second.disconnect();
+    backend.disconnect();
+    let worker_stopped = stop_worker_within(worker);
+
+    println!(
+        "websocket sessions release: detail_ack={metric_detail_ack} \
+         first_upgraded={first_upgraded} second_upgraded={second_upgraded} \
+         two_open=(proxy {proxy_gauge_two_open:?}, backend {backend_gauge_two_open:?}) \
+         one_open=(proxy {proxy_gauge_one_open:?}, backend {backend_gauge_one_open:?}) \
+         none_open=(proxy {proxy_gauge_none_open:?}, backend {backend_gauge_none_open:?}) \
+         worker_stopped={worker_stopped}"
+    );
+
+    assert!(metric_detail_ack);
+    assert!(first_upgraded && second_upgraded);
+    assert_eq!(
+        (proxy_gauge_two_open, backend_gauge_two_open),
+        (Some(2), Some(2)),
+        "two open WebSocket sessions hold two connections on the backend"
+    );
+    assert_eq!(
+        (proxy_gauge_one_open, backend_gauge_one_open),
+        (Some(1), Some(1)),
+        "the first session's close must release exactly its own connection"
+    );
+    assert_eq!(
+        (proxy_gauge_none_open, backend_gauge_none_open),
+        (Some(0), Some(0)),
+        "the second session's close must release the last connection"
+    );
+    assert!(worker_stopped);
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // Test 4: RemoveBackend drops the backend row but keeps the cluster row
 // ══════════════════════════════════════════════════════════════════════

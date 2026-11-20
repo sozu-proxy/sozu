@@ -1714,6 +1714,29 @@ and backend handles out of `Mux.timeouts` and hands them to `Pipe`, which is why
 `sync_timeout` keeps each handle's `duration()` current through
 `TimeoutContainer::retune` — `Pipe` re-arms from it.
 
+The upgrade also consumes the `Mux` without ever running `Mux::close`, so it owes
+the backend accounting `Mux::close` would have settled. The connection it hands
+to the `Pipe` is released by `Pipe::close` (`lib/src/protocol/pipe.rs`): the
+`active_connections` reservation selection took and the `backend.connections`,
+`backend.pool.size` and `connections_per_backend` gauges `attach_dialed` raised.
+Every other connection the session still pools for another cluster is released
+by `Mux::release_backend_connections_except` (`lib/src/protocol/mux/mod.rs`),
+called first thing in `upgrade_mux` with the upgrading stream's backend token as
+the one it skips: it runs `Mux::close_backend_connections` and drains the ledger,
+because the mux does not outlive the upgrade to drain it later. The skip is what
+keeps the pipe's connection from being released twice. The skip has one cost:
+a `return None` of `upgrade_mux` after the release (an H2 frontend or backend,
+a backend no longer `Connected`, an unknown registry slot) drops the kept
+connection unreleased, since no `Pipe` takes it; none of these exits has a
+known trigger. Pinned by
+`closing_a_websocket_pipe_releases_its_backend_connection`,
+`closing_a_websocket_pipe_twice_releases_its_connection_once`
+(`lib/src/protocol/pipe.rs`),
+`a_websocket_upgrade_releases_the_pooled_connections_but_not_the_kept_one`
+(`lib/src/protocol/mux/mod.rs`), `websocket_sessions_each_release_their_own_backend_connection`
+and `websocket_upgrade_releases_the_other_pooled_backend_connections`
+(`e2e/src/tests/metrics_lifecycle_tests.rs`).
+
 One deliberate semantic shift comes with the split, and it is not literally "no
 change": the old `TimeoutContainer::reset()` computed its deadline from a fresh
 `Instant::now()` at the call site, whereas `arm_timeout(now)` computes it from
@@ -2764,7 +2787,11 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
       selection applies it, so that selection sees the backend exactly where
       a failed `Backend::try_connect` left it. A dial that connects keeps the
       reservation as its connection's count, and the connection's
-      `ConnectionClosed` releases it.
+      `ConnectionClosed` releases it. The one connection that never gets a
+      `ConnectionClosed` is the one a WebSocket upgrade moves into a `Pipe`: it
+      leaves `router.backends` with its `Backend` handle, and `Pipe::close`
+      calls `Backend::dec_connections` itself. That is the single embedder-side
+      write to `active_connections` outside the ledger.
 
       A dial that connects but is then abandoned releases it too
       ([#1713](https://github.com/sozu-proxy/sozu/issues/1713)). Every exit
@@ -3819,7 +3846,8 @@ If you are fixing a bug in this module:
   this path goes through `BackendRegistry::apply`, driven by
   `Mux::apply_backend_deltas`, so the drift is either a missing
   `Context::record_backend_delta` at a stream-removal site or a drain that
-  ran after something read the counter.
+  ran after something read the counter. After a WebSocket upgrade the one
+  connection the `Pipe` kept is the exception: `Pipe::close` releases it.
 - **Truncated response / TLS decode error** — check `has_pending_write`
   (`h2.rs`), `delay_close_for_frontend_flush` (`mod.rs`), and the TLS
   drain logic in the `Position::Server` arm of `H2Shell::close`

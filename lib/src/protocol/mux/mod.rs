@@ -184,6 +184,7 @@ pub(crate) use crate::protocol::mux::answers::{
     forcefully_terminate_answer, set_default_answer, set_default_answer_with_retry_after,
 };
 use crate::protocol::mux::connection::{EndpointClient, EndpointServer};
+pub(crate) use crate::protocol::mux::shared::drain_tls_close_notify;
 pub use crate::protocol::mux::{
     answers::terminate_default_answer,
     buffer_source::{BufferSource, PoolBufferSource},
@@ -2516,7 +2517,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         self.timeouts.frontend = TimeoutContainer::new_empty(self.timeouts.frontend.duration());
         self.timeouts.backends.clear();
 
-        self.close_backend_connections(&proxy);
+        self.close_backend_connections(&proxy, None);
 
         // The session is going away, so this is the last chance to settle the
         // ledger against the worker's registry. Everything the frontend close
@@ -2649,8 +2650,19 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     /// backend connection (`StreamsEnded`, `ConnectionClosed`, the backend
     /// gauges), then clear the backend-stream reverse index. The connections
     /// stay in `router.backends`: at teardown they drop with the `Mux`.
-    fn close_backend_connections(&mut self, proxy: &Rc<RefCell<dyn L7Proxy>>) {
+    ///
+    /// `except` names the one connection to leave alone: the one a WebSocket
+    /// upgrade moves into its `Pipe`, which releases it itself
+    /// (`Pipe::close`). Every other caller passes `None`.
+    fn close_backend_connections(
+        &mut self,
+        proxy: &Rc<RefCell<dyn L7Proxy>>,
+        except: Option<Token>,
+    ) {
         for (token, client) in &mut self.router.backends {
+            if except == Some(*token) {
+                continue;
+            }
             let proxy_borrow = proxy.borrow();
             let peer_closed = client.peer_closed();
             let socket = client.socket_mut();
@@ -2754,6 +2766,29 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         self.context.backend_streams.clear();
     }
 
+    /// Release every backend connection of a mux that a WebSocket upgrade is
+    /// about to take apart, except `kept`, the one the upgrading stream is
+    /// linked to.
+    ///
+    /// `HttpSession::upgrade_mux` (`lib/src/http.rs`) and
+    /// `HttpsSession::upgrade_mux` (`lib/src/https.rs`) consume the `Mux`
+    /// without ever running `Mux::close`, so the connections the session
+    /// still pools for other clusters would drop with their reservation and
+    /// their backend gauges held. The kept connection moves
+    /// into the `Pipe` along with its `Backend` handle, and `Pipe::close`
+    /// releases it, so releasing it here too would count it twice.
+    ///
+    /// The ledger is applied before returning, because the mux does not
+    /// outlive the upgrade to apply it later.
+    pub(crate) fn release_backend_connections_except(
+        &mut self,
+        kept: Option<Token>,
+        proxy: &Rc<RefCell<dyn L7Proxy>>,
+    ) {
+        self.close_backend_connections(proxy, kept);
+        self.apply_backend_deltas();
+    }
+
     /// Release the streams and backends of an H2 frontend that lingers after
     /// a final GOAWAY carrying an error code, in the pass that decides the
     /// linger rather than at its end, the order
@@ -2808,7 +2843,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             self.router.backends.len()
         );
         self.log_and_recycle_open_streams();
-        self.close_backend_connections(proxy);
+        self.close_backend_connections(proxy, None);
         let tokens: Vec<Token> = (&self.router.backends)
             .into_iter()
             .map(|(token, _)| *token)
@@ -3068,9 +3103,11 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         gauge_add!(names::backend::CONNECTIONS, 1);
         // `backend.pool.size` mirrors `backend.connections` exactly: one entry
         // per `Router::backends` token. The `-1` partners live in
-        // `connection.rs::pre_close_client_bookkeeping` (graceful close) and
-        // in `Mux::close` (session teardown). Symmetric pairing with both
-        // decrement sites is the only defence against the gauge underflow
+        // `connection.rs::pre_close_client_bookkeeping` (graceful close), in
+        // `Mux::close` (session teardown) and, for the one connection a
+        // WebSocket upgrade moves out of the map, in `Pipe::close`
+        // (`lib/src/protocol/pipe.rs`). Symmetric pairing with every
+        // decrement site is the only defence against the gauge underflow
         // class of bug fixed by ff401b54 / aadb3fa4.
         gauge_add!(names::backend::POOL_SIZE, 1);
         // The cluster id moved into the connection; the stream's own copy,
@@ -5556,6 +5593,60 @@ mod tests {
             "a graceful linger keeps its backend, as before"
         );
         assert_eq!(mux.context.streams[0].state, StreamState::Linked(Token(1)));
+    }
+
+    /// A WebSocket upgrade consumes the `Mux` without running `Mux::close`,
+    /// so `Mux::release_backend_connections_except` is what gives back the
+    /// connections the session still pools for other clusters: the
+    /// `active_connections` reservation each one's selection took, through
+    /// the ledger, drained before the mux is dropped. The connection the
+    /// upgrade keeps moves into the `Pipe`, whose close releases it
+    /// (`Pipe::close` in `lib/src/protocol/pipe.rs`), so it is left alone.
+    ///
+    /// TO SEE THIS RED: drop the `Mux::apply_backend_deltas` call from
+    /// `Mux::release_backend_connections_except` (the pooled reservation is
+    /// never given back), or have it pass `None` to
+    /// `Mux::close_backend_connections` (the kept one is released as well).
+    #[test]
+    fn a_websocket_upgrade_releases_the_pooled_connections_but_not_the_kept_one() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut mux, _peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));
+        let mut handles = Vec::new();
+        let mut backend_peers = Vec::new();
+        for token in [Token(1), Token(2)] {
+            let (connection, backend_peer) =
+                test_backend_connection(&mut mux, Duration::from_secs(30));
+            let Position::Client(_, backend_id, _) = connection.position() else {
+                unreachable!("new_h1_client builds a client connection")
+            };
+            let handle = mux
+                .backend_registry
+                .handle(backend_id)
+                .cloned()
+                .expect("test_backend_connection mints its id through the registry");
+            // What selection did before the dial: one reservation each.
+            assert_eq!(handle.borrow_mut().inc_connections(), Some(1));
+            handles.push(handle);
+            backend_peers.push(backend_peer);
+            mux.router.backends.insert(token, connection);
+        }
+
+        let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(RemoveOnlyProxy));
+        mux.release_backend_connections_except(Some(Token(1)), &proxy);
+
+        assert_eq!(
+            (
+                handles[0].borrow().active_connections,
+                handles[1].borrow().active_connections,
+            ),
+            (1, 0),
+            "the pooled connection's reservation is given back and the kept one's \
+             is left for `Pipe::close`: (kept, pooled)"
+        );
+        assert!(
+            mux.context.backend_deltas.is_empty(),
+            "the ledger is drained before the mux is dropped"
+        );
     }
 
     /// A TLS frontend whose final GOAWAY carries an error code and leaves a
