@@ -14,17 +14,20 @@
 
 use std::{
     io::{ErrorKind, Read, Write},
-    net::SocketAddr,
+    net::{SocketAddr, TcpStream},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
 
+use rustls::{ClientConfig, ClientConnection, StreamOwned, pki_types::ServerName};
 use sozu_command_lib::{
     config::{FileConfig, ListenerBuilder},
     proto::command::{
-        ActivateListener, ListenerType, MetricDetail, QueryMetricsOptions, RemoveBackend, Request,
-        RequestHttpFrontend, ResponseStatus, ServerConfig, SetMetricDetail, WorkerMetrics,
-        filtered_metrics, request::RequestType, response_content::ContentType,
+        ActivateListener, AddCertificate, CertificateAndKey, ListenerType, MetricDetail, PathRule,
+        QueryMetricsOptions, RemoveBackend, Request, RequestHttpFrontend, ResponseStatus,
+        ServerConfig, SetMetricDetail, WorkerMetrics, filtered_metrics, request::RequestType,
+        response_content::ContentType,
     },
     scm_socket::Listeners,
     state::ConfigState,
@@ -32,8 +35,8 @@ use sozu_command_lib::{
 
 use crate::{
     http_utils::{http_ok_response, http_request},
-    mock::{client::Client, sync_backend::Backend as SyncBackend},
-    port_registry::attach_reserved_http_listener,
+    mock::{client::Client, https_client::Verifier, sync_backend::Backend as SyncBackend},
+    port_registry::{attach_reserved_http_listener, attach_reserved_https_listener},
     sozu::worker::Worker,
     tests::{State, h2_utils::*, repeat_until_error_or},
 };
@@ -2055,6 +2058,549 @@ fn websocket_sessions_each_release_their_own_backend_connection() {
         (proxy_gauge_none_open, backend_gauge_none_open),
         (Some(0), Some(0)),
         "the second session's close must release the last connection"
+    );
+    assert!(worker_stopped);
+}
+
+// ── TLS twins of the two WebSocket accounting tests above ───────────────────
+//
+// The plain-HTTP tests reach `HttpSession::upgrade_mux` (`lib/src/http.rs`).
+// An HTTPS listener has its own copy of that hand-off, `HttpsSession::upgrade_mux`
+// (`lib/src/https.rs`), and its own pipe protocol (`protocol.wss`): the tests
+// below reach that one, through a TLS client that negotiates ALPN `http/1.1`.
+
+/// [`setup_worker_with_cluster`] for an HTTPS listener: the same cluster,
+/// frontend and backend, plus the `localhost` certificate the listener needs
+/// to complete a handshake.
+fn setup_https_worker_with_cluster(
+    name: &str,
+    cluster_id: &str,
+    backend_id: &str,
+    front_address: SocketAddr,
+    back_address: SocketAddr,
+) -> Worker {
+    let config = default_config();
+    let mut listeners = Listeners::default();
+    attach_reserved_https_listener(&mut listeners, front_address);
+    let state = ConfigState::new();
+
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        ListenerBuilder::new_https(front_address.into())
+            .to_tls(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        interface: None,
+        address: front_address.into(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(cluster_id)));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(
+        Worker::default_http_frontend(cluster_id, front_address),
+    ));
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address.into(),
+        certificate: CertificateAndKey {
+            certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+            key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+            certificate_chain: vec![],
+            versions: vec![],
+            names: vec![],
+        },
+        expired_at: None,
+    }));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        cluster_id,
+        backend_id,
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+    worker
+}
+
+/// A TLS client for the HTTPS listener. It offers ALPN `http/1.1` only, so the
+/// session stays on the HTTP/1 mux (only an HTTP/1 frontend can upgrade to
+/// WebSocket), and it accepts the self-signed test certificate.
+struct TlsClient {
+    stream: Option<StreamOwned<ClientConnection, TcpStream>>,
+    /// The handshake settled on `http/1.1`, which the tests assert: a session
+    /// that negotiated `h2` could never reach the hand-off under test.
+    alpn_http11: bool,
+}
+
+impl TlsClient {
+    /// Connect and finish the handshake here, so that a later read timeout is
+    /// a data timeout and never a handshake still in flight.
+    fn connect(address: SocketAddr) -> Option<Self> {
+        let mut config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(Verifier))
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let server_name = ServerName::try_from("localhost").ok()?;
+        let mut connection = ClientConnection::new(Arc::new(config), server_name).ok()?;
+        let mut tcp = TcpStream::connect_timeout(&address, SESSION_BARRIER_BUDGET).ok()?;
+        tcp.set_read_timeout(Some(SESSION_BARRIER_BUDGET)).ok()?;
+        tcp.set_write_timeout(Some(SESSION_BARRIER_BUDGET)).ok()?;
+        while connection.is_handshaking() {
+            connection.complete_io(&mut tcp).ok()?;
+        }
+        let alpn_http11 = connection.alpn_protocol() == Some(b"http/1.1".as_slice());
+        tcp.set_read_timeout(Some(Duration::from_millis(50))).ok()?;
+        Some(Self {
+            stream: Some(StreamOwned::new(connection, tcp)),
+            alpn_http11,
+        })
+    }
+
+    fn send(&mut self, request: &str) -> bool {
+        let Some(stream) = self.stream.as_mut() else {
+            return false;
+        };
+        stream
+            .write_all(request.as_bytes())
+            .and_then(|()| stream.flush())
+            .is_ok()
+    }
+
+    fn disconnect(&mut self) {
+        self.stream = None;
+    }
+}
+
+/// [`wait_for_client_payload`] for a [`TlsClient`].
+fn wait_for_tls_payload(client: &mut TlsClient, expected: &str) -> bool {
+    let Some(stream) = client.stream.as_mut() else {
+        return false;
+    };
+    let deadline = Instant::now() + SESSION_BARRIER_BUDGET;
+    let mut received = Vec::new();
+    let mut buf = [0_u8; 1024];
+    while Instant::now() < deadline {
+        match stream.read(&mut buf) {
+            Ok(0) => return false,
+            Ok(read) => {
+                received.extend_from_slice(&buf[..read]);
+                if received
+                    .windows(expected.len())
+                    .any(|window| window == expected.as_bytes())
+                {
+                    return true;
+                }
+            }
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// [`wait_for_client_termination`] for a [`TlsClient`]: a `close_notify`, a
+/// bare TCP close and a reset all end the session from the client's side.
+fn wait_for_tls_termination(client: &mut TlsClient) -> bool {
+    let Some(stream) = client.stream.as_mut() else {
+        return true;
+    };
+    let deadline = Instant::now() + SESSION_BARRIER_BUDGET;
+    let mut buf = [0_u8; 1024];
+    while Instant::now() < deadline {
+        match stream.read(&mut buf) {
+            Ok(0) => return true,
+            Ok(_) => {}
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
+/// TLS twin of `websocket_upgrade_releases_the_other_pooled_backend_connections`:
+/// one TLS connection sends a plain request to cluster A, whose backend
+/// connection the mux pools as keep-alive, then a WebSocket upgrade to cluster
+/// B. `HttpsSession::upgrade_mux` consumes the mux and moves cluster B's
+/// backend connection into a `Pipe`; cluster A's pooled connection is dropped
+/// with the mux, so its accounting must be released first.
+///
+/// The two clusters share one host and one certificate, and are told apart by
+/// path (`/` and `/ws`): an HTTP/1 request whose `Host` differs from the SNI of
+/// its connection is refused with a 421, so the hostname cannot switch
+/// clusters on a TLS connection the way it does in the plain-HTTP twin.
+///
+/// The oracle is cluster A's own `connections_per_backend` gauge, as in the
+/// plain-HTTP twin, and that is all this test reads of A's connection: not
+/// `Backend::active_connections`, the reservation selection took, and not the
+/// proxy-level `backend.connections` and `backend.pool.size`. Deleting
+/// `self.apply_backend_deltas();` from `Mux::release_backend_connections_except`
+/// (`lib/src/protocol/mux/mod.rs`), which is what gives the reservation back,
+/// leaves this test green.
+/// `a_websocket_upgrade_releases_the_pooled_connections_but_not_the_kept_one`
+/// (same file) is the test that pins the reservation.
+///
+/// The barriers are recorded one by one, and the gauge is read once more at the
+/// end whatever the barriers did, so a failure says whether the proxy never
+/// reached the hand-off or reached it and kept the unit.
+///
+/// TO SEE THIS RED: in `HttpsSession::upgrade_mux` (`lib/src/https.rs`), delete
+/// the `mux.release_backend_connections_except(kept, &proxy);` statement. The
+/// connection to cluster A is still dropped (`pooled_connection_gone=true`),
+/// but its gauge never leaves 1: `gauge_after_upgrade` is `None` and
+/// `gauge_last_read` is `Some(1)`, and the assertion that fails is "the pooled
+/// connection to cluster A is closed, so its connections_per_backend unit must
+/// be released". The same deletion in `HttpSession::upgrade_mux`
+/// (`lib/src/http.rs`) leaves this test green: only the plain-HTTP twin sees it.
+#[test]
+fn websocket_upgrade_over_tls_releases_the_other_pooled_backend_connections() {
+    const UPGRADE_RESPONSE: &str =
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+    const PLAIN_REQUEST: &str = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const UPGRADE_REQUEST: &str = "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+
+    let front_address = create_local_address();
+    let pooled_back_address = create_local_address();
+    let ws_back_address = create_local_address();
+    let pooled_cluster = "lifecycle_tls_upgrade_pooled_cluster";
+    let pooled_backend_id = "lifecycle_tls_upgrade_pooled_backend";
+    let ws_cluster = "lifecycle_tls_upgrade_ws_cluster";
+    let ws_backend_id = "lifecycle_tls_upgrade_ws_backend";
+
+    let mut worker = setup_https_worker_with_cluster(
+        "METRICS-LIFECYCLE-TLS-UPGRADE-POOLED",
+        pooled_cluster,
+        pooled_backend_id,
+        front_address,
+        pooled_back_address,
+    );
+    let metric_detail_ack = lease_backend_metric_detail(&mut worker);
+    let ws_cluster_ack = request_acknowledged(
+        &mut worker,
+        RequestType::AddCluster(Worker::default_cluster(ws_cluster)),
+    );
+    let ws_frontend_ack = request_acknowledged(
+        &mut worker,
+        RequestType::AddHttpsFrontend(RequestHttpFrontend {
+            path: PathRule::prefix(String::from("/ws")),
+            ..Worker::default_http_frontend(ws_cluster, front_address)
+        }),
+    );
+    let ws_backend_ack = request_acknowledged(
+        &mut worker,
+        RequestType::AddBackend(Worker::default_backend(
+            ws_cluster,
+            ws_backend_id,
+            ws_back_address,
+            None,
+        )),
+    );
+
+    let mut pooled_backend = SyncBackend::new(
+        "METRICS-LIFECYCLE-TLS-UPGRADE-POOLED-BACKEND",
+        pooled_back_address,
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\npong",
+    );
+    pooled_backend.connect();
+    let mut ws_backend = SyncBackend::new(
+        "METRICS-LIFECYCLE-TLS-UPGRADE-WS-BACKEND",
+        ws_back_address,
+        UPGRADE_RESPONSE,
+    );
+    ws_backend.connect();
+
+    let mut client = TlsClient::connect(front_address);
+    let connected = client.is_some();
+    let alpn_http11 = client.as_ref().is_some_and(|client| client.alpn_http11);
+
+    let mut pooled_answered = false;
+    if let Some(client) = client.as_mut().filter(|_| alpn_http11) {
+        pooled_answered = metric_detail_ack
+            && ws_cluster_ack
+            && ws_frontend_ack
+            && ws_backend_ack
+            && client.send(PLAIN_REQUEST)
+            && wait_for_backend_request(&mut pooled_backend, 0)
+            && pooled_backend.send(0).is_some()
+            && wait_for_tls_payload(client, "\r\n\r\npong");
+    }
+    let pooled_gauge_while_pooled = if pooled_answered {
+        wait_for_backend_connection_gauge(&mut worker, pooled_cluster, pooled_backend_id, 1)
+    } else {
+        None
+    };
+
+    let mut upgrade_sent = false;
+    let mut upgraded = false;
+    let mut wss_gauge_after_upgrade = None;
+    let mut pooled_connection_gone = false;
+    let mut pooled_gauge_after_upgrade = None;
+    let mut session_ended = false;
+    let mut wss_gauge_after_session_end = None;
+    if let (Some(client), Some(1)) = (client.as_mut(), pooled_gauge_while_pooled) {
+        upgrade_sent = client.send(UPGRADE_REQUEST);
+        upgraded = upgrade_sent
+            && wait_for_backend_request(&mut ws_backend, 0)
+            && ws_backend.send(0).is_some()
+            && wait_for_tls_payload(client, "101 Switching Protocols");
+        if upgraded {
+            wss_gauge_after_upgrade = wait_for_proxy_gauge(&mut worker, "protocol.wss", 1);
+        }
+        pooled_connection_gone =
+            upgraded && wait_for_backend_connection_gone(&mut pooled_backend, 0);
+        if pooled_connection_gone {
+            pooled_gauge_after_upgrade = wait_for_backend_connection_gauge(
+                &mut worker,
+                pooled_cluster,
+                pooled_backend_id,
+                0,
+            );
+        }
+        // End the WebSocket session too, so the last read below shows whether
+        // the unit is still held once nothing of the session is left.
+        let _ = ws_backend.close(0);
+        session_ended = upgraded && wait_for_tls_termination(client);
+        if session_ended {
+            wss_gauge_after_session_end = wait_for_proxy_gauge(&mut worker, "protocol.wss", 0);
+        }
+    }
+    let pooled_gauge_last_read =
+        backend_connection_gauge(&mut worker, pooled_cluster, pooled_backend_id);
+
+    if let Some(client) = client.as_mut() {
+        client.disconnect();
+    }
+    pooled_backend.disconnect();
+    ws_backend.disconnect();
+    let worker_stopped = stop_worker_within(worker);
+
+    println!(
+        "websocket upgrade over tls, pooled connection: detail_ack={metric_detail_ack} \
+         ws_cluster_ack={ws_cluster_ack} ws_frontend_ack={ws_frontend_ack} \
+         ws_backend_ack={ws_backend_ack} connected={connected} alpn_http11={alpn_http11} \
+         pooled_answered={pooled_answered} gauge_while_pooled={pooled_gauge_while_pooled:?} \
+         upgrade_sent={upgrade_sent} upgraded={upgraded} \
+         wss_after_upgrade={wss_gauge_after_upgrade:?} \
+         pooled_connection_gone={pooled_connection_gone} \
+         gauge_after_upgrade={pooled_gauge_after_upgrade:?} session_ended={session_ended} \
+         wss_after_session_end={wss_gauge_after_session_end:?} \
+         gauge_last_read={pooled_gauge_last_read:?} worker_stopped={worker_stopped}"
+    );
+
+    assert!(metric_detail_ack);
+    assert!(ws_cluster_ack && ws_frontend_ack && ws_backend_ack);
+    assert!(connected, "the TLS handshake must complete");
+    assert!(alpn_http11, "the session must negotiate ALPN http/1.1");
+    assert!(pooled_answered);
+    assert_eq!(pooled_gauge_while_pooled, Some(1));
+    assert!(upgraded);
+    assert_eq!(
+        wss_gauge_after_upgrade,
+        Some(1),
+        "the upgrade must have handed the session to the HTTPS WebSocket pipe"
+    );
+    assert!(
+        pooled_connection_gone,
+        "the proxy must have dropped the pooled connection to cluster A"
+    );
+    assert_eq!(
+        pooled_gauge_after_upgrade,
+        Some(0),
+        "the pooled connection to cluster A is closed, so its \
+         connections_per_backend unit must be released \
+         (last read: {pooled_gauge_last_read:?})"
+    );
+    assert!(session_ended);
+    assert_eq!(
+        wss_gauge_after_session_end,
+        Some(0),
+        "the WebSocket session must be gone from protocol.wss"
+    );
+    assert_eq!(pooled_gauge_last_read, Some(0));
+    assert!(worker_stopped);
+}
+
+/// TLS twin of `websocket_sessions_each_release_their_own_backend_connection`:
+/// two TLS connections each upgrade to WebSocket through the same backend, and
+/// `Pipe::close` is the only owner left of the connection each one took from
+/// the mux. Two sessions share the backend for the reason the plain-HTTP twin
+/// gives: a gauge saturates at zero, so only a second session still open can
+/// tell one release from none and from two.
+///
+/// The test reads `backend.connections` and `connections_per_backend`. It does
+/// not read `Backend::active_connections`, the reservation selection took, nor
+/// `backend.pool.size`: deleting `backend.dec_connections();` from
+/// `Pipe::close` alone leaves it green.
+/// `closing_a_websocket_pipe_releases_its_backend_connection`
+/// (`lib/src/protocol/pipe.rs`) is the test that pins the reservation and the
+/// pool size.
+///
+/// Each stage is a separate barrier, including the `protocol.wss` gauge that
+/// tells a session gone from a session still counted, and the gauges are read
+/// once more at the end whatever the barriers did, so a failure names the first
+/// stage that did not settle and shows the counts the proxy was left holding.
+///
+/// TO SEE THIS RED: in `Pipe::close` (`lib/src/protocol/pipe.rs`), delete the
+/// `backend.dec_connections();` call and the three `gauge_add!(.., -1, ..)`
+/// statements that follow it, so the body is back to the single
+/// `active_requests` decrement. Both sessions upgrade (`first_upgraded=true
+/// second_upgraded=true`), the first one's close terminates its client
+/// (`first_terminated=true`) and leaves `protocol.wss` at 1
+/// (`wss_one_open=Some(1)`), and neither backend gauge leaves 2:
+/// `one_open=(proxy None, backend None)` and `gauge_last_read=(proxy Some(2),
+/// backend Some(2))`. The assertion that fails is "the first session's close
+/// must release exactly its own connection". The same body is shared with the
+/// plain-HTTP twin, which goes red under the same edit.
+#[test]
+fn websocket_sessions_over_tls_each_release_their_own_backend_connection() {
+    const UPGRADE_RESPONSE: &str =
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+    const UPGRADE_REQUEST: &str = "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+
+    let front_address = create_local_address();
+    let back_address = create_local_address();
+    let cluster_id = "lifecycle_tls_websocket_release_cluster";
+    let backend_id = "lifecycle_tls_websocket_release_backend";
+    let mut worker = setup_https_worker_with_cluster(
+        "METRICS-LIFECYCLE-TLS-WEBSOCKET-RELEASE",
+        cluster_id,
+        backend_id,
+        front_address,
+        back_address,
+    );
+    let metric_detail_ack = lease_backend_metric_detail(&mut worker);
+    let mut backend = SyncBackend::new(
+        "METRICS-LIFECYCLE-TLS-WEBSOCKET-RELEASE-BACKEND",
+        back_address,
+        UPGRADE_RESPONSE,
+    );
+    backend.connect();
+
+    let mut first = TlsClient::connect(front_address);
+    let mut second = TlsClient::connect(front_address);
+    let connected = first.is_some() && second.is_some();
+    let alpn_http11 = [&first, &second]
+        .into_iter()
+        .all(|client| client.as_ref().is_some_and(|client| client.alpn_http11));
+
+    let mut first_upgraded = false;
+    let mut second_upgraded = false;
+    if let (Some(first), Some(second), true) = (first.as_mut(), second.as_mut(), alpn_http11) {
+        first_upgraded = metric_detail_ack
+            && first.send(UPGRADE_REQUEST)
+            && wait_for_backend_request(&mut backend, 0)
+            && backend.send(0).is_some()
+            && wait_for_tls_payload(first, "101 Switching Protocols");
+        second_upgraded = first_upgraded
+            && second.send(UPGRADE_REQUEST)
+            && wait_for_backend_request(&mut backend, 1)
+            && backend.send(1).is_some()
+            && wait_for_tls_payload(second, "101 Switching Protocols");
+    }
+
+    let mut proxy_gauge_two_open = None;
+    let mut backend_gauge_two_open = None;
+    let mut first_terminated = false;
+    let mut wss_gauge_one_open = None;
+    let mut proxy_gauge_one_open = None;
+    let mut backend_gauge_one_open = None;
+    let mut second_terminated = false;
+    let mut wss_gauge_none_open = None;
+    let mut proxy_gauge_none_open = None;
+    let mut backend_gauge_none_open = None;
+    if second_upgraded {
+        proxy_gauge_two_open = wait_for_proxy_backend_connections(&mut worker, 2);
+        backend_gauge_two_open =
+            wait_for_backend_connection_gauge(&mut worker, cluster_id, backend_id, 2);
+    }
+    if let (Some(first), Some(2), Some(2)) =
+        (first.as_mut(), proxy_gauge_two_open, backend_gauge_two_open)
+    {
+        let _ = backend.close(0);
+        first_terminated = wait_for_tls_termination(first);
+        if first_terminated {
+            wss_gauge_one_open = wait_for_proxy_gauge(&mut worker, "protocol.wss", 1);
+        }
+        if wss_gauge_one_open == Some(1) {
+            proxy_gauge_one_open = wait_for_proxy_backend_connections(&mut worker, 1);
+            backend_gauge_one_open =
+                wait_for_backend_connection_gauge(&mut worker, cluster_id, backend_id, 1);
+        }
+    }
+    if let (Some(second), Some(1), Some(1)) = (
+        second.as_mut(),
+        proxy_gauge_one_open,
+        backend_gauge_one_open,
+    ) {
+        let _ = backend.close(1);
+        second_terminated = wait_for_tls_termination(second);
+        if second_terminated {
+            wss_gauge_none_open = wait_for_proxy_gauge(&mut worker, "protocol.wss", 0);
+        }
+        if wss_gauge_none_open == Some(0) {
+            proxy_gauge_none_open = wait_for_proxy_backend_connections(&mut worker, 0);
+            backend_gauge_none_open =
+                wait_for_backend_connection_gauge(&mut worker, cluster_id, backend_id, 0);
+        }
+    }
+    let proxy_gauge_last_read = proxy_backend_connection_gauge(&mut worker);
+    let backend_gauge_last_read = backend_connection_gauge(&mut worker, cluster_id, backend_id);
+
+    for client in [first.as_mut(), second.as_mut()].into_iter().flatten() {
+        client.disconnect();
+    }
+    backend.disconnect();
+    let worker_stopped = stop_worker_within(worker);
+
+    println!(
+        "websocket sessions over tls release: detail_ack={metric_detail_ack} \
+         connected={connected} alpn_http11={alpn_http11} \
+         first_upgraded={first_upgraded} second_upgraded={second_upgraded} \
+         two_open=(proxy {proxy_gauge_two_open:?}, backend {backend_gauge_two_open:?}) \
+         first_terminated={first_terminated} wss_one_open={wss_gauge_one_open:?} \
+         one_open=(proxy {proxy_gauge_one_open:?}, backend {backend_gauge_one_open:?}) \
+         second_terminated={second_terminated} wss_none_open={wss_gauge_none_open:?} \
+         none_open=(proxy {proxy_gauge_none_open:?}, backend {backend_gauge_none_open:?}) \
+         gauge_last_read=(proxy {proxy_gauge_last_read:?}, backend {backend_gauge_last_read:?}) \
+         worker_stopped={worker_stopped}"
+    );
+
+    assert!(metric_detail_ack);
+    assert!(connected, "both TLS handshakes must complete");
+    assert!(alpn_http11, "both sessions must negotiate ALPN http/1.1");
+    assert!(first_upgraded && second_upgraded);
+    assert_eq!(
+        (proxy_gauge_two_open, backend_gauge_two_open),
+        (Some(2), Some(2)),
+        "two open WebSocket sessions hold two connections on the backend"
+    );
+    assert!(first_terminated);
+    assert_eq!(
+        wss_gauge_one_open,
+        Some(1),
+        "the first session must be gone from protocol.wss, the second still counted"
+    );
+    assert_eq!(
+        (proxy_gauge_one_open, backend_gauge_one_open),
+        (Some(1), Some(1)),
+        "the first session's close must release exactly its own connection \
+         (last read: proxy {proxy_gauge_last_read:?}, backend {backend_gauge_last_read:?})"
+    );
+    assert!(second_terminated);
+    assert_eq!(
+        wss_gauge_none_open,
+        Some(0),
+        "the second session must be gone from protocol.wss"
+    );
+    assert_eq!(
+        (proxy_gauge_none_open, backend_gauge_none_open),
+        (Some(0), Some(0)),
+        "the second session's close must release the last connection"
+    );
+    assert_eq!(
+        (proxy_gauge_last_read, backend_gauge_last_read),
+        (Some(0), Some(0)),
+        "no connection may be left on the backend once both sessions are closed"
     );
     assert!(worker_stopped);
 }

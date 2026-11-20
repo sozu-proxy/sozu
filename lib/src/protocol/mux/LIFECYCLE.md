@@ -1757,7 +1757,11 @@ known trigger. Pinned by
 `a_websocket_upgrade_releases_the_pooled_connections_but_not_the_kept_one`
 (`lib/src/protocol/mux/mod.rs`), `websocket_sessions_each_release_their_own_backend_connection`
 and `websocket_upgrade_releases_the_other_pooled_backend_connections`
-(`e2e/src/tests/metrics_lifecycle_tests.rs`).
+(`e2e/src/tests/metrics_lifecycle_tests.rs`), plus their TLS twins
+`websocket_sessions_over_tls_each_release_their_own_backend_connection` and
+`websocket_upgrade_over_tls_releases_the_other_pooled_backend_connections`
+(same file), which reach `HttpsSession::upgrade_mux` through a TLS client
+instead of `HttpSession::upgrade_mux`.
 
 One deliberate semantic shift comes with the split, and it is not literally "no
 change": the old `TimeoutContainer::reset()` computed its deadline from a fresh
