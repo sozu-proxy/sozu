@@ -2965,6 +2965,17 @@ impl ConnectionH2 {
                 }
                 self.attribute_bytes_to_overhead();
                 self.expect_header();
+                // The writable arm of `Discard` withdraws WRITABLE (see
+                // `Self::dispatch_writable_state`), and it also swallows what
+                // armed it while the payload was being read: a response a
+                // backend queued on another stream, a parked write, a frame
+                // queued behind the RST_STREAM. Those wake-ups are edges
+                // that do not come back, so raise one for the write pass
+                // `Header` runs. It settles in that pass: `finalize_write`
+                // withdraws the interest again once nothing is left.
+                if !self.readiness.interest.is_writable() {
+                    self.readiness.arm_writable();
+                }
             }
             (H2State::ClientPreface, Position::Server) => {
                 let i = kawa.storage.data();
@@ -4742,8 +4753,10 @@ impl ConnectionH2 {
     /// reads nothing else, while the `H2State::GoAway` arm asks for a second
     /// flush through [`H2WritableStateTarget::Flush`]. ONE read serves
     /// whichever of the two runs — only one of them can — and nothing mutates
-    /// the socket between the caller's read and this call. The arms that never
-    /// consult it discard it, exactly as `H2Shell::write_streams` discards the
+    /// the socket between the caller's read and this call. The
+    /// `H2State::Discard` arm consults it too, to keep its WRITABLE interest
+    /// while rustls holds records. The arms that never consult it discard it,
+    /// exactly as `H2Shell::write_streams` discards the
     /// answer it reads before [`Self::finalize_write`]'s graceful-GOAWAY
     /// check; `H2Shell::tls_wants_write` is free of side effects, which is what
     /// makes both unobservable.
@@ -4815,8 +4828,26 @@ impl ConnectionH2 {
             }
             // Discard state: pending data (e.g. RST_STREAM) was already
             // written in the caller's control-frame preamble; let the readable
-            // path consume the remaining frame payload.
-            (H2State::Discard, _) => H2WritableStateTarget::Done(MuxResult::Continue),
+            // path consume the remaining frame payload. Stream frames wait
+            // for `Header`, so nothing is left for this pass to write, and a
+            // WRITABLE interest kept armed makes `Mux::ready_inner` call it
+            // again on every inner iteration, until `MAX_LOOP_ITERATIONS` and
+            // a closed session, whenever the payload is not readable yet
+            // (the refusal's RST_STREAM arms WRITABLE, and the block follows
+            // in a later segment or TLS record). The interest is withdrawn,
+            // as the `(ServerSettings, Client)` arm does, and the
+            // `H2State::Discard` arm of `Self::handle_read` raises it again
+            // when the discard ends, for what was queued meanwhile. Records
+            // rustls still holds keep the interest: only a write pass can
+            // flush them, and the kernel's next WRITABLE edge calls it.
+            (H2State::Discard, _) => {
+                if tls_wants_write {
+                    self.ensure_tls_flushed(tls_wants_write);
+                } else {
+                    self.readiness.interest.remove(Ready::WRITABLE);
+                }
+                H2WritableStateTarget::Done(MuxResult::Continue)
+            }
             // A stream parked by a stalled write still has whole frames
             // queued. The rest of the frame the stall cut, if any, already
             // went with the GOAWAY from the ordered output (#1604); finish
@@ -18382,6 +18413,182 @@ pub(super) mod tests {
             vec![(b"x-sozu-probe".to_vec(), b"alpha".to_vec())],
             "the refused stream's field block must have been decoded into the \
              connection's HPACK context"
+        );
+    }
+
+    // ── `Discard` and the WRITABLE interest ───────────────────────────────
+    //
+    // A refusal's RST_STREAM arms WRITABLE, and the discarded payload may
+    // follow in a later segment. Nothing in `Discard` writes stream frames,
+    // so a WRITABLE interest left armed has `Mux::ready_inner` call
+    // `writable()` again on every inner iteration. The `Discard` arm of
+    // `dispatch_writable_state` withdraws it, and the arm of `handle_read`
+    // that ends the discard raises it again, for whatever the withdrawn
+    // interest swallowed meanwhile.
+
+    /// A `writable()` pass in `Discard` with nothing left to flush withdraws
+    /// the WRITABLE interest, so `Mux::ready_inner` stops calling it.
+    ///
+    /// TO SEE THIS RED: in the `(H2State::Discard, _)` arm of
+    /// [`ConnectionH2::dispatch_writable_state`], delete the
+    /// `self.readiness.interest.remove(Ready::WRITABLE);` call. The
+    /// interest assertion then fails with `a discard with nothing to flush
+    /// must stop asking to write`.
+    #[test]
+    fn a_discard_with_nothing_to_flush_withdraws_the_write_interest() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut connection, _peer) = connection_with_backpressure(&pool, 0, 0, H2State::Discard);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        connection
+            .core
+            .stream_table
+            .set_expect_read(Some((H2StreamId::Zero, 64)));
+        // What the RST_STREAM of a refusal does.
+        connection.core.readiness.arm_writable();
+        assert!(
+            connection.core.readiness.filter_interest().is_writable(),
+            "premise: the pass is entered with WRITABLE armed, got {:?}",
+            connection.core.readiness
+        );
+        assert!(
+            !connection.socket.socket_wants_write(),
+            "premise: no TLS record is waiting for the kernel"
+        );
+
+        let result = connection.writable(&mut context, EndpointClient(&mut router));
+
+        assert!(
+            matches!(result, MuxResult::Continue),
+            "a pass in Discard must keep the session, got {result:?}"
+        );
+        assert!(
+            matches!(connection.core.state, H2State::Discard),
+            "the pass must leave the payload to the read path, got {:?}",
+            connection.core.state
+        );
+        assert!(
+            !connection.core.readiness.filter_interest().is_writable(),
+            "a discard with nothing to flush must stop asking to write, got {:?}",
+            connection.core.readiness
+        );
+    }
+
+    /// Records rustls still holds keep the WRITABLE interest through a
+    /// `Discard` pass: only a write pass flushes them.
+    ///
+    /// TO SEE THIS RED: in the `(H2State::Discard, _)` arm of
+    /// [`ConnectionH2::dispatch_writable_state`], remove the
+    /// `if tls_wants_write` branch and withdraw the interest
+    /// unconditionally. The interest assertion then fails with `records
+    /// still buffered must keep the write interest`.
+    #[test]
+    fn a_discard_with_tls_records_pending_keeps_the_write_interest() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        // A kernel that accepts nothing: every flush leaves the records.
+        let (mut connection, _peer) = connection_with_backpressure(&pool, 2, 0, H2State::Discard);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        connection
+            .core
+            .stream_table
+            .set_expect_read(Some((H2StreamId::Zero, 64)));
+        assert!(
+            connection.socket.socket_wants_write(),
+            "premise: this harness must report buffered TLS records"
+        );
+
+        let result = connection.writable(&mut context, EndpointClient(&mut router));
+
+        assert!(
+            matches!(result, MuxResult::Continue),
+            "records still buffered: the session must stay open, got {result:?}"
+        );
+        assert!(
+            connection.core.readiness.interest.is_writable(),
+            "records still buffered must keep the write interest, got {:?}",
+            connection.core.readiness
+        );
+        assert!(
+            connection.core.readiness.event.is_writable(),
+            "the WRITABLE event must be re-signalled so the event loop retries \
+             the flush, got {:?}",
+            connection.core.readiness
+        );
+    }
+
+    /// The end of a discard raises the WRITABLE interest the `Discard` pass
+    /// withdrew, and the write pass it earns withdraws it again.
+    ///
+    /// While the payload was being read, a backend may have queued a response
+    /// on another stream: it armed WRITABLE, the `Discard` pass swallowed
+    /// that, and edge-triggered epoll does not report it twice. Without the
+    /// raise, the response waits for an unrelated event.
+    ///
+    /// TO SEE THIS RED: in the `H2State::Discard` arm of
+    /// [`ConnectionH2::handle_read`], delete the `if
+    /// !self.readiness.interest.is_writable()` block that follows
+    /// `self.expect_header();`. The interest assertion then fails with `the
+    /// end of a discard must raise the write interest the discard pass
+    /// withdrew`.
+    #[test]
+    fn the_end_of_a_discard_raises_the_write_interest_its_pass_withdrew() {
+        use std::io::Write;
+
+        const PAYLOAD_LEN: usize = 8;
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16_384)));
+        let (mut connection, mut peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        // The remainder of an orphaned DATA payload, not yet sent.
+        connection.core.state = H2State::Discard;
+        connection
+            .core
+            .stream_table
+            .set_expect_read(Some((H2StreamId::Zero, PAYLOAD_LEN)));
+        connection.core.readiness.arm_writable();
+        connection.writable(&mut context, EndpointClient(&mut router));
+        assert!(
+            !connection.core.readiness.interest.is_writable(),
+            "premise: the Discard pass withdrew the write interest, got {:?}",
+            connection.core.readiness
+        );
+
+        peer.write_all(&[0u8; PAYLOAD_LEN])
+            .expect("loopback write must complete");
+        peer.flush().expect("loopback flush must complete");
+        // Loopback delivery is not synchronous with `write_all`: read until
+        // the payload has landed, against a deadline rather than a count.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            connection.core.readiness.event.insert(Ready::READABLE);
+            connection.readable(&mut context, EndpointClient(&mut router));
+            if matches!(connection.core.state, H2State::Header) || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            matches!(connection.core.state, H2State::Header),
+            "premise: the payload was read and the discard ended, got {:?}",
+            connection.core.state
+        );
+
+        assert!(
+            connection.core.readiness.filter_interest().is_writable(),
+            "the end of a discard must raise the write interest the discard \
+             pass withdrew, got {:?}",
+            connection.core.readiness
+        );
+
+        // The pass it earns finds nothing to write and settles.
+        connection.writable(&mut context, EndpointClient(&mut router));
+        assert!(
+            !connection.core.readiness.filter_interest().is_writable(),
+            "the write pass after a discard with nothing queued must withdraw \
+             the interest again, got {:?}",
+            connection.core.readiness
         );
     }
 

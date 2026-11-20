@@ -261,6 +261,32 @@ Declared in `h2.rs` (`pub enum H2State`):
   rather than on where it sits (sozu-proxy/sozu#1447). Do not convert it back.
 - `Continuation*` states handle multi-frame HEADERS per RFC 9113 §4.3 — enter in
   `ConnectionH2::handle_headers_frame` (`h2.rs`).
+- **Discard does not spin on WRITABLE.** The RST_STREAM of a refusal
+  (`enqueue_rst`) and the connection WINDOW_UPDATE of
+  `skip_orphaned_data_payload` arm WRITABLE, and the payload to discard may
+  not be readable yet: it follows in a later TCP segment or TLS record. The
+  `writable()` pass that serialises that frame has nothing else to do in
+  `Discard`, because stream frames wait for `Header`, so a WRITABLE interest
+  left armed has `Mux::ready_inner` call the same pass on every inner
+  iteration until `MAX_LOOP_ITERATIONS`: `http.infinite_loop.error`, then a
+  closed session with every stream of the connection unless other output is
+  queued. The `H2State::Discard` arm of `ConnectionH2::dispatch_writable_state`
+  therefore withdraws the WRITABLE interest, as the `ServerSettings` arm of a
+  backend does, except while rustls still holds records (`tls_wants_write`):
+  only a write pass flushes them, so the interest stays and
+  `ensure_tls_flushed` keeps the retry alive. What the withdrawn interest
+  swallowed while the payload was read — a response a backend queued on
+  another stream, a parked write — armed an edge that does not come back
+  (invariants 15 and 16), so the `H2State::Discard` arm of
+  `ConnectionH2::handle_read` raises WRITABLE (`Readiness::arm_writable`) when
+  the discard ends with the interest down, on a frontend and on a backend
+  connection alike. The write pass it earns settles through
+  `FinalizeAction::Quiesce` when nothing is queued. A discard that ends in
+  `ConnectionH2::goaway` arms WRITABLE itself. Pinned by
+  `a_discarded_field_block_still_in_flight_does_not_spin_the_loop_to_its_limit`,
+  `a_discard_with_nothing_to_flush_withdraws_the_write_interest`,
+  `a_discard_with_tls_records_pending_keeps_the_write_interest` and
+  `the_end_of_a_discard_raises_the_write_interest_its_pass_withdrew`.
 - **Discard does not skip HPACK.** HPACK field-compression state is scoped to
   the *connection* (RFC 9113 §4.3), not the stream, so the bytes `Discard`
   drops on a refused stream are still a field block the peer's encoder has

@@ -743,7 +743,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:5071-5084
+```rust lib/src/protocol/mux/h2.rs:5102-5115
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -769,7 +769,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:5122-5128
+```rust lib/src/protocol/mux/h2.rs:5153-5159
 let events = stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -809,7 +809,7 @@ taken at the top of `H2WritePhase::Flush`'s post-flush tail
 (`ConnectionH2::poll_write_target`, `lib/src/protocol/mux/h2.rs`) and passes `stream.linked_token()` straight
 out of it:
 
-```rust lib/src/protocol/mux/h2.rs:3808-3809
+```rust lib/src/protocol/mux/h2.rs:3819-3820
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 ```
@@ -1162,7 +1162,7 @@ frontend reads go away.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9713-9717
+```rust lib/src/protocol/mux/h2.rs:9744-9748
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1255,7 +1255,7 @@ borrowed view of live storage and is told the byte count afterwards.
 | `Frame(header)` | inline `handle_frame()` logic |
 | `ContinuationFrame(headers)` | inline continuation assembly |
 | `ClientPreface` / `ServerSettings` | handshake validation |
-| `Discard` | skips payload bytes: a refused stream's HEADERS payload (HPACK still decoded), or the unread rest of a DATA payload whose stream was removed mid-frame, read in pieces and credited to the connection window (`skip_orphaned_data_payload`, #1597) |
+| `Discard` | skips payload bytes: a refused stream's HEADERS payload (HPACK still decoded), or the unread rest of a DATA payload whose stream was removed mid-frame, read in pieces and credited to the connection window (`skip_orphaned_data_payload`, #1597). Its write pass withdraws WRITABLE once the control frames are flushed, since nothing else can be written meanwhile, and the end of the discard raises it again; left armed it spun the Mux loop to `MAX_LOOP_ITERATIONS` whenever the payload arrived in a later segment |
 
 ### handle_header_state()
 
@@ -1351,7 +1351,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:9895-9899
+```rust lib/src/protocol/mux/h2.rs:9926-9930
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1826,7 +1826,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:9214
+```rust lib/src/protocol/mux/h2.rs:9245
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -2070,7 +2070,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:7654-7656
+```rust lib/src/protocol/mux/h2.rs:7685-7687
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -2078,7 +2078,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:7668-7674
+```rust lib/src/protocol/mux/h2.rs:7699-7705
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.

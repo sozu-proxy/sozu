@@ -5826,6 +5826,119 @@ mod tests {
         );
     }
 
+    /// A refused stream's field block that is still in flight must leave
+    /// `Mux::ready` idle, not spinning to `MAX_LOOP_ITERATIONS`.
+    ///
+    /// The client's HEADERS frame opens a stream past the concurrency limit:
+    /// Sōzu queues RST_STREAM(REFUSED_STREAM), which arms WRITABLE, and
+    /// drops the field block through `H2State::Discard`. Only the 9-byte
+    /// frame header has arrived; the block follows in a later segment. The
+    /// pass flushes the RST_STREAM and finds nothing more to read, so it must
+    /// stop and wait for the next readable event. The `(H2State::Discard, _)`
+    /// arm of `ConnectionH2::dispatch_writable_state` leaves the WRITABLE
+    /// interest and event armed, so every inner iteration calls the same
+    /// no-op `writable()` until the loop limit, and the session is then
+    /// closed, with every other stream on the connection and without a
+    /// GOAWAY.
+    ///
+    /// The payload is withheld on purpose: `feed_and_drive` in the `h2`
+    /// tests re-raises the WRITABLE event on every iteration, which hides
+    /// this, and a block that arrives with its header is read before the
+    /// loop can spin.
+    #[test]
+    fn a_discarded_field_block_still_in_flight_does_not_spin_the_loop_to_its_limit() {
+        use std::io::Write;
+
+        const BLOCK_LEN: u32 = 64;
+        const REFUSED_STREAM: u32 = 7;
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut mux, mut peer) = h2_mux_past_preface(&pool);
+        {
+            let Connection::H2(h2) = &mut mux.frontend else {
+                unreachable!("the fixture builds an H2 frontend")
+            };
+            // No stream may open: the first HEADERS is refused.
+            h2.core.local_settings.settings_max_concurrent_streams = 0;
+        }
+        // A quiet connection asks the poller for reads only.
+        mux.frontend
+            .readiness_mut()
+            .interest
+            .remove(Ready::WRITABLE);
+
+        // HEADERS, END_HEADERS | END_STREAM, stream 1, a 64-byte field block
+        // that has not arrived.
+        let mut frame_header = Vec::new();
+        frame_header.extend_from_slice(&BLOCK_LEN.to_be_bytes()[1..]);
+        frame_header.push(1);
+        frame_header.push(parser::FLAG_END_HEADERS | parser::FLAG_END_STREAM);
+        frame_header.extend_from_slice(&1u32.to_be_bytes());
+        peer.write_all(&frame_header)
+            .expect("the client must be able to send a frame header");
+        // Loopback delivery is not synchronous with `write_all`: wait until
+        // the whole header is readable, or the pass below would find nothing
+        // and the test could not tell that from a fixed pass.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut probe = [0u8; 9];
+        while !matches!(mux.frontend.socket().peek(&mut probe), Ok(9)) {
+            assert!(
+                Instant::now() < deadline,
+                "premise: the frame header must reach the frontend socket"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        mux.update_readiness(Token(0), Ready::READABLE);
+
+        let session: Rc<RefCell<dyn ProxySession>> = Rc::new(RefCell::new(NoDialSession));
+        let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(RemoveOnlyProxy));
+        let mut metrics = SessionMetrics::new(None);
+        LOOP_LIMIT_HITS.with(|hits| hits.set(0));
+        let result = mux.ready(session, proxy, &mut metrics);
+        let hits = LOOP_LIMIT_HITS.with(|hits| hits.get());
+
+        // Premise: the pass did refuse the stream, so the RST_STREAM is what
+        // armed WRITABLE, and it reached the client.
+        let mut received = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            drain_into(&mut peer, &mut received);
+            if h2_frames(&received)
+                .iter()
+                .any(|&(kind, _, id, _)| kind == 3 && id == 1)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "premise: RST_STREAM(REFUSED_STREAM) for stream 1 must reach the client, got {:?}",
+                h2_frames(&received)
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let reset: Vec<&[u8]> = h2_frames(&received)
+            .into_iter()
+            .filter(|&(kind, _, id, _)| kind == 3 && id == 1)
+            .map(|(_, _, _, payload)| payload)
+            .collect();
+        assert_eq!(
+            reset,
+            vec![&REFUSED_STREAM.to_be_bytes()[..]],
+            "premise: stream 1 is refused with REFUSED_STREAM"
+        );
+
+        assert_eq!(
+            hits, 0,
+            "a pass with nothing left to read or write must stop, not run to \
+             MAX_LOOP_ITERATIONS ({MAX_LOOP_ITERATIONS})"
+        );
+        assert_ne!(
+            result,
+            SessionResult::Close,
+            "a client whose refused stream's field block is still in flight must \
+             keep its connection"
+        );
+    }
+
     #[test]
     fn shutting_down_refreshes_the_snapshot_so_the_drain_budget_expires() {
         let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
