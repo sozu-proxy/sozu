@@ -2683,27 +2683,36 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             }
 
             match client.position() {
-                Position::Client(cluster_id, backend, _) => {
+                Position::Client(cluster_id, backend, status) => {
                     // Session teardown iterates the backends map directly
                     // instead of routing through `Connection::close`, so it
                     // emits the same two accounting changes that path emits.
                     // Going through the ledger rather than mutating here is
                     // what lets the invariant-14 balance be read off one
                     // stream of deltas — see `Mux::apply_backend_deltas`.
-                    let count = self
-                        .context
-                        .backend_streams
-                        .get(token)
-                        .map_or(0, |ids| ids.len());
                     let (slot, backend_id, metric_incarnation) = (
                         backend.slot(),
                         backend.backend_id.clone(),
                         backend.metric_incarnation(),
                     );
-                    self.context.backend_deltas.push(BackendDelta {
-                        slot,
-                        change: BackendChange::StreamsEnded(count),
-                    });
+                    // A dial that has not completed charged nothing to
+                    // `active_requests`: its streams are charged at the
+                    // connect edge in `Mux::ready_inner`, so releasing them
+                    // here would eat into the charges other sessions took on
+                    // the same backend. The dead-backend sweep skips the
+                    // release for a `Connecting` connection for the same
+                    // reason.
+                    if !matches!(status, BackendStatus::Connecting(_)) {
+                        let count = self
+                            .context
+                            .backend_streams
+                            .get(token)
+                            .map_or(0, |ids| ids.len());
+                        self.context.backend_deltas.push(BackendDelta {
+                            slot,
+                            change: BackendChange::StreamsEnded(count),
+                        });
+                    }
                     self.context.backend_deltas.push(BackendDelta {
                         slot,
                         change: BackendChange::ConnectionClosed,
@@ -4425,6 +4434,40 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 backend.readiness_mut().event.insert(Ready::ERROR);
                 return StateResult::Continue;
             }
+            // A backend's timer bounds the inactivity of the streams linked to
+            // it, and the loop below is its whole handling: it answers or
+            // reaps each of them. A pooled H2 connection whose last stream has
+            // ended keeps the deadline that stream's last byte armed
+            // (`ConnectionH1` clears its own when the response terminates;
+            // an H2 connection carries many streams and has no such edge), so
+            // the deadline elapses with nothing linked. There is then nothing
+            // to answer or reap, and the shared tail below, which closes the
+            // session unless a stream asked to keep it, must not run: it would
+            // close the session and cut every stream the other backends still
+            // serve.
+            //
+            // `consume_timer_entry` has already cleared the elapsed deadline,
+            // and `Mux::reschedule` cancels its wheel entry on the way out.
+            // The idle connection stays pooled without a timer, as an H1
+            // keep-alive connection does, and the first write that moves a
+            // stream's bytes on it arms the deadline again
+            // (`ConnectionH2::handle_write` in `lib/src/protocol/mux/h2.rs`).
+            // The frontend timer is left alone, as for a deferral to the
+            // client below: re-armed on every backend timeout, it would keep
+            // an idle client from ever timing out.
+            if self
+                .context
+                .backend_streams
+                .get(&token)
+                .is_none_or(|ids| ids.is_empty())
+            {
+                debug!(
+                    "{} idle backend connection timeout on {:?}, no stream linked: session kept",
+                    log_context_lite!(self),
+                    token
+                );
+                return StateResult::Continue;
+            }
             // Stream-specific on an H1 frontend only; see
             // `response_waits_on_client`.
             let front_pending_write = !front_is_h2 && self.frontend.has_pending_write();
@@ -4577,7 +4620,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             // on every pass, LIFECYCLE §9 invariant 9 — but nothing hangs on
             // it.) That is what covers the pool-reuse branch of
             // `Router::plan_connect` never arming a timeout, unlike the fresh-dial
-            // branch.
+            // branch. The early return above drops an idle pooled H2
+            // connection's elapsed deadline without re-arming it, so a stream
+            // linked to that connection afterwards has no backend timer until
+            // the first pass that moves its bytes arms one.
             //
             // The assertion below is the cheap tripwire for link 3: if the
             // impossible becomes possible (a new arm that skips `end_stream`,
@@ -5777,6 +5823,119 @@ mod tests {
         assert!(
             !mux.frontend.has_pending_write(),
             "the pass must leave nothing queued behind"
+        );
+    }
+
+    /// A refused stream's field block that is still in flight must leave
+    /// `Mux::ready` idle, not spinning to `MAX_LOOP_ITERATIONS`.
+    ///
+    /// The client's HEADERS frame opens a stream past the concurrency limit:
+    /// Sōzu queues RST_STREAM(REFUSED_STREAM), which arms WRITABLE, and
+    /// drops the field block through `H2State::Discard`. Only the 9-byte
+    /// frame header has arrived; the block follows in a later segment. The
+    /// pass flushes the RST_STREAM and finds nothing more to read, so it must
+    /// stop and wait for the next readable event. The `(H2State::Discard, _)`
+    /// arm of `ConnectionH2::dispatch_writable_state` leaves the WRITABLE
+    /// interest and event armed, so every inner iteration calls the same
+    /// no-op `writable()` until the loop limit, and the session is then
+    /// closed, with every other stream on the connection and without a
+    /// GOAWAY.
+    ///
+    /// The payload is withheld on purpose: `feed_and_drive` in the `h2`
+    /// tests re-raises the WRITABLE event on every iteration, which hides
+    /// this, and a block that arrives with its header is read before the
+    /// loop can spin.
+    #[test]
+    fn a_discarded_field_block_still_in_flight_does_not_spin_the_loop_to_its_limit() {
+        use std::io::Write;
+
+        const BLOCK_LEN: u32 = 64;
+        const REFUSED_STREAM: u32 = 7;
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut mux, mut peer) = h2_mux_past_preface(&pool);
+        {
+            let Connection::H2(h2) = &mut mux.frontend else {
+                unreachable!("the fixture builds an H2 frontend")
+            };
+            // No stream may open: the first HEADERS is refused.
+            h2.core.local_settings.settings_max_concurrent_streams = 0;
+        }
+        // A quiet connection asks the poller for reads only.
+        mux.frontend
+            .readiness_mut()
+            .interest
+            .remove(Ready::WRITABLE);
+
+        // HEADERS, END_HEADERS | END_STREAM, stream 1, a 64-byte field block
+        // that has not arrived.
+        let mut frame_header = Vec::new();
+        frame_header.extend_from_slice(&BLOCK_LEN.to_be_bytes()[1..]);
+        frame_header.push(1);
+        frame_header.push(parser::FLAG_END_HEADERS | parser::FLAG_END_STREAM);
+        frame_header.extend_from_slice(&1u32.to_be_bytes());
+        peer.write_all(&frame_header)
+            .expect("the client must be able to send a frame header");
+        // Loopback delivery is not synchronous with `write_all`: wait until
+        // the whole header is readable, or the pass below would find nothing
+        // and the test could not tell that from a fixed pass.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut probe = [0u8; 9];
+        while !matches!(mux.frontend.socket().peek(&mut probe), Ok(9)) {
+            assert!(
+                Instant::now() < deadline,
+                "premise: the frame header must reach the frontend socket"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        mux.update_readiness(Token(0), Ready::READABLE);
+
+        let session: Rc<RefCell<dyn ProxySession>> = Rc::new(RefCell::new(NoDialSession));
+        let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(RemoveOnlyProxy));
+        let mut metrics = SessionMetrics::new(None);
+        LOOP_LIMIT_HITS.with(|hits| hits.set(0));
+        let result = mux.ready(session, proxy, &mut metrics);
+        let hits = LOOP_LIMIT_HITS.with(|hits| hits.get());
+
+        // Premise: the pass did refuse the stream, so the RST_STREAM is what
+        // armed WRITABLE, and it reached the client.
+        let mut received = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            drain_into(&mut peer, &mut received);
+            if h2_frames(&received)
+                .iter()
+                .any(|&(kind, _, id, _)| kind == 3 && id == 1)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "premise: RST_STREAM(REFUSED_STREAM) for stream 1 must reach the client, got {:?}",
+                h2_frames(&received)
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let reset: Vec<&[u8]> = h2_frames(&received)
+            .into_iter()
+            .filter(|&(kind, _, id, _)| kind == 3 && id == 1)
+            .map(|(_, _, _, payload)| payload)
+            .collect();
+        assert_eq!(
+            reset,
+            vec![&REFUSED_STREAM.to_be_bytes()[..]],
+            "premise: stream 1 is refused with REFUSED_STREAM"
+        );
+
+        assert_eq!(
+            hits, 0,
+            "a pass with nothing left to read or write must stop, not run to \
+             MAX_LOOP_ITERATIONS ({MAX_LOOP_ITERATIONS})"
+        );
+        assert_ne!(
+            result,
+            SessionResult::Close,
+            "a client whose refused stream's field block is still in flight must \
+             keep its connection"
         );
     }
 
@@ -8912,6 +9071,340 @@ mod tests {
         );
     }
 
+    /// The timer of an H2 backend connection that carries no stream is the
+    /// connection's own inactivity bound, not the session's. A request whose
+    /// response was read whole leaves its H2 backend `Connected`, empty and
+    /// pooled; when that backend's deadline elapses while another request of
+    /// the session is still being served by a different backend, only the
+    /// idle connection may go. The session, and the stream on the other
+    /// backend, must survive.
+    ///
+    /// The second request is served by an H1 backend that has not answered
+    /// yet and whose own deadline is still ahead, and the frontend has
+    /// nothing queued, so `delay_close_for_frontend_flush` cannot be what
+    /// keeps the session alive.
+    #[test]
+    fn an_idle_h2_backend_timeout_leaves_the_streams_of_other_backends_alone() {
+        use std::io::Write;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 16, 16384)));
+        let (mut mux, mut front_peer) = h2_mux_past_preface(&pool);
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
+        let mut requests = h2_get_frame(&mut encoder, 1, b"/fast");
+        requests.extend(h2_get_frame(&mut encoder, 3, b"/slow"));
+        let slots = read_h2_requests(&mut mux, &mut front_peer, &requests, 2);
+        let (fast, slow) = (slots[0], slots[1]);
+        let h2_token = Token(1);
+        let h1_token = Token(2);
+        let mut h2_peer = link_to_new_h2_backend(&mut mux, &pool, fast, h2_token);
+        let mut h1_peer = link_to_new_h1_backend(&mut mux, slow, h1_token);
+        backend_reads_request(&mut mux, &mut h1_peer, "/slow");
+
+        // The H2 backend receives its request on wire stream 1.
+        let mut sent = Vec::new();
+        for _ in 0..2000 {
+            ready_pass(&mut mux);
+            drain_into(&mut h2_peer, &mut sent);
+            if h2_frames(&sent)
+                .iter()
+                .any(|&(kind, _, id, _)| kind == 1 && id == 1)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            h2_frames(&sent)
+                .iter()
+                .any(|&(kind, _, id, _)| kind == 1 && id == 1),
+            "premise: the H2 backend received the request on its wire stream 1"
+        );
+
+        // The H2 backend answers whole: HEADERS with `:status 200` (HPACK
+        // static index 8), then DATA with END_STREAM. The client reads it on
+        // its wire stream 1.
+        let mut answer = vec![0, 0, 1, 1, parser::FLAG_END_HEADERS, 0, 0, 0, 1, 0x88];
+        answer.extend_from_slice(&[0, 0, 4, 0, parser::FLAG_END_STREAM, 0, 0, 0, 1]);
+        answer.extend_from_slice(b"fast");
+        h2_peer
+            .write_all(&answer)
+            .expect("the H2 backend connection is open");
+        let mut received = Vec::new();
+        for _ in 0..2000 {
+            if let Some(backend) = mux.router.backends.get_mut(&h2_token) {
+                backend.readiness_mut().event.insert(Ready::READABLE);
+            }
+            ready_pass(&mut mux);
+            drain_into(&mut front_peer, &mut received);
+            if h2_stream_ended(&received, 1) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&h2_stream_data(&received, 1)),
+            "fast",
+            "premise: the client read the whole answer of its first request"
+        );
+        // Let the frontend flush whatever the answer left queued.
+        for _ in 0..20 {
+            ready_pass(&mut mux);
+            drain_into(&mut front_peer, &mut received);
+        }
+        assert!(
+            mux.context
+                .backend_streams
+                .get(&h2_token)
+                .is_none_or(|ids| ids.is_empty()),
+            "premise: the H2 backend carries no stream any more"
+        );
+        assert!(
+            matches!(
+                mux.router.backends.get(&h2_token).map(|b| b.position()),
+                Some(Position::Client(_, _, BackendStatus::Connected))
+            ),
+            "premise: the H2 backend is still attached and connected, idle"
+        );
+        assert_eq!(
+            mux.context.streams[slow].state,
+            StreamState::Linked(h1_token),
+            "premise: the second request is still waiting on its own backend"
+        );
+        assert!(
+            !mux.frontend.has_pending_write(),
+            "premise: the frontend has nothing queued, so nothing delays a close"
+        );
+
+        // `back_timeout` passes without a byte on the idle H2 backend: the
+        // deadline its last activity left elapses, and every other deadline
+        // is still ahead. An idle backend that holds no deadline at all has
+        // no timer to fire, which keeps the session just as well.
+        let Some(idle_deadline) = mux
+            .router
+            .backends
+            .get(&h2_token)
+            .and_then(|backend| backend.poll_timeout())
+        else {
+            return;
+        };
+        let now = Instant::now();
+        assert!(
+            idle_deadline > now,
+            "premise: the idle backend's deadline has not elapsed yet"
+        );
+        let ahead = Some(now + Duration::from_secs(30));
+        let Connection::H2(front) = &mut mux.frontend else {
+            unreachable!("the fixture builds an H2 frontend")
+        };
+        front.core.timeout_deadline = ahead;
+        match mux
+            .router
+            .backends
+            .get_mut(&h1_token)
+            .expect("premise: the H1 backend is attached to the session")
+        {
+            Connection::H1(h1) => h1.timeout_deadline = ahead,
+            Connection::H2(_) => unreachable!("the fixture links an H1 backend"),
+        }
+        match mux
+            .router
+            .backends
+            .get_mut(&h2_token)
+            .expect("premise: the H2 backend is attached to the session")
+        {
+            Connection::H2(h2) => h2.core.timeout_deadline = Some(now - Duration::from_secs(1)),
+            Connection::H1(_) => unreachable!("the fixture links an H2 backend"),
+        }
+        mux.reschedule();
+
+        let mut metrics = SessionMetrics::new(None);
+        let result = mux.timeout(h2_token, &mut metrics);
+
+        assert_eq!(
+            result,
+            StateResult::Continue,
+            "the timeout of an idle H2 backend closed the whole session"
+        );
+        assert_eq!(
+            mux.context.streams[slow].state,
+            StreamState::Linked(h1_token),
+            "the request still being served by another backend was cut"
+        );
+        assert_eq!(
+            mux.router
+                .backends
+                .get(&h2_token)
+                .and_then(|b| b.poll_timeout()),
+            None,
+            "the idle connection's elapsed deadline stays cleared, or the wheel re-delivers it"
+        );
+
+        // The idle connection is reused: the request linked to it must arm
+        // its deadline again, or nothing on the backend side bounds it.
+        let again = read_h2_requests(
+            &mut mux,
+            &mut front_peer,
+            &h2_get_frame(&mut encoder, 5, b"/again"),
+            1,
+        )[0];
+        let reused = mux
+            .router
+            .backends
+            .get_mut(&h2_token)
+            .expect("premise: the idle H2 backend is still attached");
+        assert!(
+            reused.start_stream(again, &mut mux.context),
+            "premise: the idle H2 backend takes the next stream"
+        );
+        reused.readiness_mut().event.insert(Ready::WRITABLE);
+        mux.context.link_stream(again, h2_token);
+        let before_reuse = Instant::now();
+        sent.clear();
+        for _ in 0..2000 {
+            ready_pass(&mut mux);
+            drain_into(&mut h2_peer, &mut sent);
+            if h2_frames(&sent)
+                .iter()
+                .any(|&(kind, _, id, _)| kind == 1 && id == 3)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            h2_frames(&sent)
+                .iter()
+                .any(|&(kind, _, id, _)| kind == 1 && id == 3),
+            "premise: the reused H2 backend received the next request on its wire stream 3"
+        );
+        assert!(
+            mux.router
+                .backends
+                .get(&h2_token)
+                .and_then(|b| b.poll_timeout())
+                .is_some_and(|deadline| deadline >= before_reuse + STAGED_BACK_TIMEOUT),
+            "the request written on the reused connection left it with no backend deadline"
+        );
+    }
+
+    /// The same defect as above in its smallest form, and neutral about how a
+    /// fix removes it: the deadline of an H2 backend connection that carries
+    /// no stream is not a reason to close the session while another backend
+    /// is still serving one of its streams. A fix may clear that deadline
+    /// when the connection's last stream ends, drop it when it fires, or
+    /// disconnect that one connection; each leaves the session and the live
+    /// stream alone, which is all this test requires.
+    ///
+    /// The H2 backend's only stream is ended through `end_stream`, as the
+    /// backend-side end of a finished request does; the backend stays
+    /// `Connected` and pooled with an empty stream table. The second stream
+    /// waits on an H1 backend whose own deadline is still ahead, and nothing
+    /// is queued on the frontend, so the close-delay for a pending flush
+    /// cannot be what decides the outcome.
+    #[test]
+    fn an_idle_h2_backend_deadline_does_not_close_a_session_with_a_live_stream() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 16, 16384)));
+        let (mut mux, mut front_peer) = h2_mux_past_preface(&pool);
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
+        let mut requests = h2_get_frame(&mut encoder, 1, b"/done");
+        requests.extend(h2_get_frame(&mut encoder, 3, b"/live"));
+        let slots = read_h2_requests(&mut mux, &mut front_peer, &requests, 2);
+        let (done, live) = (slots[0], slots[1]);
+        let h2_token = Token(1);
+        let h1_token = Token(2);
+        let _h2_peer = link_to_new_h2_backend(&mut mux, &pool, done, h2_token);
+        let _h1_peer = link_to_new_h1_backend(&mut mux, live, h1_token);
+
+        // The connection is armed when it connects and when its stream moves
+        // bytes (`Mux::attach_dialed`, `ConnectionH2::arm_timeout`); ending
+        // the stream does not take that deadline back.
+        let now = Instant::now();
+        let h2_backend = mux
+            .router
+            .backends
+            .get_mut(&h2_token)
+            .expect("premise: the H2 backend is attached to the session");
+        h2_backend.arm_timeout(now);
+        h2_backend.end_stream(done, &mut mux.context);
+        assert!(
+            mux.context
+                .backend_streams
+                .get(&h2_token)
+                .is_none_or(|ids| ids.is_empty()),
+            "premise: the H2 backend carries no stream any more"
+        );
+        assert!(
+            matches!(
+                mux.router.backends.get(&h2_token).map(|b| b.position()),
+                Some(Position::Client(_, _, BackendStatus::Connected))
+            ),
+            "premise: the H2 backend is still attached and connected, idle"
+        );
+        assert_eq!(
+            mux.context.streams[live].state,
+            StreamState::Linked(h1_token),
+            "premise: the second request waits on its own backend"
+        );
+        assert!(
+            !mux.frontend
+                .has_pending_write_including_streams(&mux.context),
+            "premise: the frontend has nothing queued, so nothing delays a close"
+        );
+
+        // An idle backend that holds no deadline has no timer to fire, which
+        // keeps the session just as well.
+        if mux
+            .router
+            .backends
+            .get(&h2_token)
+            .and_then(|backend| backend.poll_timeout())
+            .is_none()
+        {
+            return;
+        }
+
+        // `back_timeout` passes without a byte on the idle H2 backend: its
+        // deadline has elapsed and every other deadline is still ahead.
+        let ahead = Some(now + Duration::from_secs(30));
+        let Connection::H2(front) = &mut mux.frontend else {
+            unreachable!("the fixture builds an H2 frontend")
+        };
+        front.core.timeout_deadline = ahead;
+        match mux
+            .router
+            .backends
+            .get_mut(&h1_token)
+            .expect("premise: the H1 backend is attached to the session")
+        {
+            Connection::H1(h1) => h1.timeout_deadline = ahead,
+            Connection::H2(_) => unreachable!("the fixture links an H1 backend"),
+        }
+        match mux
+            .router
+            .backends
+            .get_mut(&h2_token)
+            .expect("premise: the H2 backend is attached to the session")
+        {
+            Connection::H2(h2) => h2.core.timeout_deadline = Some(now - Duration::from_secs(1)),
+            Connection::H1(_) => unreachable!("the fixture links an H2 backend"),
+        }
+        mux.reschedule();
+
+        let mut metrics = SessionMetrics::new(None);
+        let result = mux.timeout(h2_token, &mut metrics);
+
+        assert_eq!(
+            result,
+            StateResult::Continue,
+            "the deadline of an idle H2 backend closed the whole session"
+        );
+        assert_eq!(
+            mux.context.streams[live].state,
+            StreamState::Linked(h1_token),
+            "the request still being served by another backend was cut"
+        );
+    }
+
     /// Q7 of sozu-proxy/sozu#1340: a stream runs on the listener
     /// configuration that was in force when its request arrived, and the next
     /// request on the same connection picks up a reload that landed in
@@ -9248,6 +9741,79 @@ mod tests {
              which must take it out of the epoll set"
         );
         drop(parts.event_loop);
+    }
+
+    /// A session that closes while a stream is linked to a backend whose dial
+    /// has not completed releases nothing from that backend's
+    /// `active_requests`.
+    ///
+    /// The shared counter is raised for a `Connecting` dial only at the
+    /// connect edge, so no charge was ever taken for the stream. A release of
+    /// `backend_streams[token].len()` for it would eat into another session's
+    /// in-flight request on the same backend (one charge, taken by that
+    /// session): `Mux::close_backend_connections` skips the release for a
+    /// `Connecting` connection, as the dead-backend sweep of
+    /// `Mux::ready_inner` does.
+    ///
+    /// TO SEE THIS RED: in `Mux::close_backend_connections`, push the
+    /// `StreamsEnded(count)` delta whatever the connection's status.
+    #[test]
+    fn close_does_not_release_a_charge_for_a_stream_linked_to_a_connecting_backend() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut mux, _front_peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(30));
+        let backend_token = Token(1);
+
+        let (socket, _back_peer) = connected_socket();
+        let backend_address = "127.0.0.1:2".parse().expect("backend address must parse");
+        let backend = Rc::new(RefCell::new(Backend::new(
+            "test-backend",
+            backend_address,
+            None,
+            None,
+            None,
+        )));
+        // One request of ANOTHER session is in flight on this backend: the
+        // counter is shared by every session of the worker.
+        backend.borrow_mut().active_requests = 1;
+        let backend_id = mux.backend_registry.id_for(&backend);
+        let mut connection = Connection::new_h1_client(
+            mux.session_ulid,
+            SessionTcpStream::new(socket, mux.session_ulid, Some(backend_address)),
+            "test-cluster".into(),
+            backend_id,
+            Duration::from_secs(30),
+        );
+        let Connection::H1(h1) = &mut connection else {
+            unreachable!("new_h1_client builds an H1 connection")
+        };
+        h1.stream = Some(0);
+        assert!(
+            matches!(
+                h1.position,
+                Position::Client(_, _, BackendStatus::Connecting(_))
+            ),
+            "premise: the dial has not completed"
+        );
+        mux.router.backends.insert(backend_token, connection);
+        // What `Router::commit_dialed` does for a fresh dial: the stream is
+        // linked while the connection is `Connecting`, and no charge is taken
+        // until the connect edge.
+        mux.context.link_stream(0, backend_token);
+        assert!(
+            mux.context.backend_deltas.is_empty(),
+            "premise: nothing charged the backend for this stream, got {:?}",
+            mux.context.backend_deltas
+        );
+
+        let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(RemoveOnlyProxy));
+        mux.close(proxy, &mut SessionMetrics::new(None));
+
+        assert_eq!(
+            backend.borrow().active_requests,
+            1,
+            "closing a session must not release a charge it never took: the other \
+             session's in-flight request on this backend is still counted"
+        );
     }
 
     // ── a read that meets the EOF records HUP ──────────────────────────
