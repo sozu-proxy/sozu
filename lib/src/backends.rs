@@ -502,8 +502,19 @@ impl Backend {
 // when a backend has been removed from configuration and the last connection to
 // it has stopped, it will be dropped, so we can notify that the backend server
 // can be safely stopped
+//
+// Only a backend that was removed announces it: `BackendList::remove_backend`
+// and `BackendMap::remove_cluster` retire the backend (`set_closing`) before
+// they release it, and nothing sets a status back to `Normal`. A `Normal`
+// backend that drops was never removed: the temporary `Backend` an `AddBackend`
+// upsert is given, once its fields are copied onto the configured one, is
+// dropped as `Normal`, and announcing it would tell a subscriber that a backend
+// still configured and serving can be stopped.
 impl std::ops::Drop for Backend {
     fn drop(&mut self) {
+        if self.status == BackendStatus::Normal {
+            return;
+        }
         server::push_event(Event {
             kind: EventKind::RemovedBackendHasNoConnections as i32,
             backend_id: Some(self.backend_id.to_owned()),
@@ -797,7 +808,23 @@ impl BackendMap {
                 // route again.
                 if let Some(backend_list) = self.backends.get(cluster_id) {
                     for backend in &backend_list.backends {
-                        backend.borrow_mut().health = HealthState::default();
+                        let mut backend = backend.borrow_mut();
+                        let was_healthy = backend.health.is_healthy();
+                        backend.health = HealthState::default();
+                        // The DOWN transition in `health_check.rs` latched
+                        // `backend.available = 0` and no probe will ever flip
+                        // it back: a backend the reset made routable again
+                        // must say so. One that is still unavailable (retry
+                        // policy down, retired) keeps its 0, and one that was
+                        // never marked DOWN holds no stale value.
+                        if !was_healthy && backend.is_available() {
+                            gauge!(
+                                names::backend::AVAILABLE,
+                                1,
+                                Some(cluster_id),
+                                Some(backend.backend_id.as_str())
+                            );
+                        }
                     }
                 }
                 // Re-emit the rollup gauges so dashboards reflect the
@@ -2510,6 +2537,119 @@ mod backends_test {
         assert_eq!(1, backends_list.backends.len());
     }
 
+    /// Count the `RemovedBackendHasNoConnections` events queued for
+    /// `backend_id` on this thread's worker queue.
+    fn removed_backend_events(backend_id: &str) -> usize {
+        use sozu_command::proto::command::response_content::ContentType;
+        crate::server::QUEUE.with(|queue| {
+            queue
+                .borrow()
+                .iter()
+                .filter(|response| {
+                    matches!(
+                        response.content.as_ref().and_then(|c| c.content_type.as_ref()),
+                        Some(ContentType::Event(event))
+                            if event.kind == EventKind::RemovedBackendHasNoConnections as i32
+                                && event.backend_id.as_deref() == Some(backend_id)
+                    )
+                })
+                .count()
+        })
+    }
+
+    /// `AddBackend` is an upsert: re-sending a configured backend updates it
+    /// in place and drops the temporary `Backend` it was given. That drop must
+    /// not announce `RemovedBackendHasNoConnections` for a backend that is
+    /// still configured and serving (s11-A2).
+    #[test]
+    fn upserting_a_live_backend_does_not_announce_it_removed() {
+        let backend_id = "upserted-live-backend";
+        let address: SocketAddr = "127.0.0.1:80".parse().unwrap();
+        let mut backends_list = BackendList::new();
+        backends_list.add_backend(Backend::new(backend_id, address, None, None, None));
+
+        // Discard everything queued so far: only the upsert is under test.
+        crate::server::QUEUE.with(|queue| queue.borrow_mut().clear());
+
+        // The operator re-sends the same (id, address) to change `sticky_id`.
+        backends_list.add_backend(Backend::new(
+            backend_id,
+            address,
+            Some("sticky".to_owned()),
+            None,
+            None,
+        ));
+
+        // Sanity: the backend is still configured, and updated in place.
+        assert_eq!(1, backends_list.backends.len());
+        assert_eq!(
+            Some("sticky"),
+            backends_list.backends[0].borrow().sticky_id.as_deref(),
+            "the upsert must update the live backend in place"
+        );
+        assert_eq!(
+            0,
+            removed_backend_events(backend_id),
+            "an upsert of a live backend must not emit RemovedBackendHasNoConnections"
+        );
+    }
+
+    /// The counterpart of the upsert test: removing a backend retires it, and
+    /// the event is still announced once the last holder of it lets go, not
+    /// before. A session holds one `Rc` here, as a live session does.
+    #[test]
+    fn removing_a_backend_announces_it_once_its_last_holder_drops_it() {
+        let backend_id = "removed-backend";
+        let address: SocketAddr = "127.0.0.1:81".parse().unwrap();
+        let mut backends_list = BackendList::new();
+        backends_list.add_backend(Backend::new(backend_id, address, None, None, None));
+        let held_by_a_session = backends_list.backends[0].clone();
+        crate::server::QUEUE.with(|queue| queue.borrow_mut().clear());
+
+        assert!(backends_list.remove_backend(backend_id, &address));
+        assert_eq!(
+            0,
+            removed_backend_events(backend_id),
+            "a session still holds the removed backend"
+        );
+
+        drop(held_by_a_session);
+        assert_eq!(
+            1,
+            removed_backend_events(backend_id),
+            "the last holder of a removed backend releases it: one announcement"
+        );
+    }
+
+    /// Same for a removed cluster: every backend it held is retired, and each
+    /// is announced once its last holder lets go.
+    #[test]
+    fn removing_a_cluster_announces_its_backends_once_their_last_holder_drops_them() {
+        let backend_id = "removed-cluster-backend";
+        let address: SocketAddr = "127.0.0.1:82".parse().unwrap();
+        let mut map = BackendMap::new();
+        map.add_backend(
+            "c-removed",
+            Backend::new(backend_id, address, None, None, None),
+        );
+        let held_by_a_session = map.backends["c-removed"].backends[0].clone();
+        crate::server::QUEUE.with(|queue| queue.borrow_mut().clear());
+
+        map.remove_cluster("c-removed");
+        assert_eq!(
+            0,
+            removed_backend_events(backend_id),
+            "a session still holds a backend of the removed cluster"
+        );
+
+        drop(held_by_a_session);
+        assert_eq!(
+            1,
+            removed_backend_events(backend_id),
+            "the last holder of a removed cluster's backend releases it: one announcement"
+        );
+    }
+
     /// Build a backend addressed at 127.0.0.1:port and force it Unhealthy
     /// without going through the health-check loop.
     fn unhealthy_backend(id: &str, port: u16) -> Backend {
@@ -2859,6 +2999,147 @@ mod backends_test {
             map.backends.get(cluster_id).unwrap().availability.get(),
             "set_health_check_config(None) must re-emit the rollup after \
              resetting backend health, otherwise dashboards stay stuck at AllDown"
+        );
+    }
+
+    /// The `backend.available` gauge currently held for `(cluster_id,
+    /// backend_id)` in this thread's metrics aggregator, if any.
+    fn backend_available_gauge(cluster_id: &str, backend_id: &str) -> Option<u64> {
+        use crate::metrics::METRICS;
+        use sozu_command_lib::proto::command::{
+            QueryMetricsOptions, filtered_metrics::Inner, response_content::ContentType,
+        };
+        let response = METRICS
+            .with(|m| {
+                m.borrow_mut().query(&QueryMetricsOptions {
+                    metric_names: vec![names::backend::AVAILABLE.to_owned()],
+                    cluster_ids: vec![cluster_id.to_owned()],
+                    backend_ids: vec![],
+                    list: false,
+                    no_clusters: false,
+                    workers: false,
+                })
+            })
+            .expect("metrics query succeeds");
+        let Some(ContentType::WorkerMetrics(worker_metrics)) = response.content_type else {
+            panic!("expected WorkerMetrics in the query response");
+        };
+        let cluster_metrics = worker_metrics.clusters.get(cluster_id)?;
+        let backend_metrics = cluster_metrics
+            .backends
+            .iter()
+            .find(|b| b.backend_id == backend_id)?;
+        match backend_metrics
+            .metrics
+            .get(names::backend::AVAILABLE)
+            .and_then(|m| m.inner.as_ref())
+        {
+            Some(Inner::Gauge(value)) => Some(*value),
+            other => panic!("backend.available must be a gauge, got {other:?}"),
+        }
+    }
+
+    /// A backend a probe marked DOWN holds the per-backend gauge
+    /// `backend.available = 0`. Removing the health check resets it to
+    /// healthy and routable again, so the gauge must follow: `doc/configure.md`
+    /// defines it as `1` when the backend passes `is_available()` (s12-A3).
+    #[test]
+    fn set_health_check_config_none_re_emits_backend_available_after_reset() {
+        // The default detail level (`Cluster`) drops the `backend_id` label, so
+        // a per-backend gauge only exists at `Backend` detail. METRICS is a
+        // thread-local: this does not leak into sibling tests.
+        crate::metrics::METRICS.with(|m| {
+            m.borrow_mut()
+                .set_up_detail(sozu_command::config::MetricDetailLevel::Backend);
+        });
+        let mut map = BackendMap::new();
+        let cluster_id = "c-hc-reset-backend-gauge";
+        let backend_id = "b1";
+        map.add_backend(cluster_id, unhealthy_backend(backend_id, 9802));
+        // What `health_check.rs` emits on the UP -> DOWN transition.
+        gauge!(
+            names::backend::AVAILABLE,
+            0,
+            Some(cluster_id),
+            Some(backend_id)
+        );
+        assert_eq!(
+            Some(0),
+            backend_available_gauge(cluster_id, backend_id),
+            "test setup: the DOWN transition must have latched backend.available = 0"
+        );
+
+        map.set_health_check_config(cluster_id, None);
+
+        // Sanity: the reset made the backend routable again, and the cluster
+        // rollup already follows it.
+        let list = map.backends.get(cluster_id).unwrap();
+        assert!(
+            list.backends[0].borrow().is_available(),
+            "test setup: the reset backend must be available again"
+        );
+        assert_eq!(
+            ClusterAvailability::Available,
+            list.availability.get(),
+            "test setup: the cluster rollup follows the reset"
+        );
+        assert_eq!(
+            Some(1),
+            backend_available_gauge(cluster_id, backend_id),
+            "a reset that makes the backend routable again must re-emit \
+             backend.available = 1, not leave the last probe value 0"
+        );
+    }
+
+    /// The reset re-emits `backend.available = 1` only where the backend is
+    /// routable again. One a probe marked DOWN whose retry policy is also down
+    /// stays unavailable and keeps its `0`, and one that was never marked DOWN
+    /// is not given a gauge it did not hold.
+    #[test]
+    fn set_health_check_config_none_leaves_other_backend_gauges_alone() {
+        crate::metrics::METRICS.with(|m| {
+            m.borrow_mut()
+                .set_up_detail(sozu_command::config::MetricDetailLevel::Backend);
+        });
+        let mut map = BackendMap::new();
+        let cluster_id = "c-hc-reset-other-gauges";
+        map.add_backend(cluster_id, unhealthy_backend("still-down", 9803));
+        map.add_backend(
+            cluster_id,
+            Backend::new(
+                "never-down",
+                "127.0.0.1:9804".parse().unwrap(),
+                None,
+                None,
+                None,
+            ),
+        );
+        let list = map.backends.get(cluster_id).unwrap();
+        list.backends[0].borrow_mut().retry_policy.force_down();
+        gauge!(
+            names::backend::AVAILABLE,
+            0,
+            Some(cluster_id),
+            Some("still-down")
+        );
+
+        map.set_health_check_config(cluster_id, None);
+
+        let list = map.backends.get(cluster_id).unwrap();
+        assert!(
+            list.backends[0].borrow().health.is_healthy()
+                && !list.backends[0].borrow().is_available(),
+            "test setup: the reset backend is healthy again but its retry policy is still down"
+        );
+        assert_eq!(
+            Some(0),
+            backend_available_gauge(cluster_id, "still-down"),
+            "a backend the reset leaves unavailable keeps backend.available = 0"
+        );
+        assert_eq!(
+            None,
+            backend_available_gauge(cluster_id, "never-down"),
+            "a backend never marked DOWN holds no gauge for the reset to refresh"
         );
     }
 

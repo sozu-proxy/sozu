@@ -660,8 +660,12 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   ends. The check runs on every pass of the session, so a connection idle
   before the removal is closed on the session's next event. The
   `RemovedBackendHasNoConnections` event is still tied to the session: it is
-  emitted when the last `Rc` of the backend drops, and the session's
-  `BackendRegistry` holds one until the session closes.
+  emitted when the last `Rc` of a retired backend drops, and the session's
+  `BackendRegistry` holds one until the session closes. Only a retired backend
+  (`BackendStatus::Closing` or `Closed`, which `BackendList::remove_backend` and
+  `BackendMap::remove_cluster` set before they release it) announces itself: the
+  temporary `Backend` an `AddBackend` upsert is given and drops, once its fields
+  are copied onto the configured backend, is `Normal` and emits nothing.
 
   A reload that changes a backend's weight, `sticky_id` or `backup` reaches the
   workers as `RemoveBackend` then `AddBackend` (`ConfigState::diff`,
