@@ -70,6 +70,34 @@ The supervisor is a single-threaded mio event loop. Each tick:
   client answer it would give a real rejection: an old worker that closes
   before answering the `SoftStop` of an `upgrade --worker` fails that
   upgrade (§4).
+- forgets the sessions of dead workers
+  (`CommandHub::collect_unreferenced_restored_stopped_workers`, at the top of
+  every iteration, after the task sweep). A `Stopped` session is removed, its
+  command channel deregistered and both of its descriptors closed (the SCM
+  socket is closed explicitly, since `ScmSocket` has no `Drop`), once no task
+  retains its token and no live route names its worker, so a worker that died
+  with answers still owed keeps its session until its close has failed them.
+  A session this main forked is removed only after its own `SIGKILL` (or an
+  `ESRCH`) proved the process unable to act (`WorkerSession::process_stop_proven`):
+  one whose kill failed keeps its session, its descriptors and its bootstrap
+  slot, since the process may still act. A task that may still stop a worker
+  by id (`GatheringTask::retained_worker_ids`: the readiness task of a new
+  worker, its protected-value bootstrap, the readiness phase of an
+  `upgrade --worker`, and a protected health check change for every worker it
+  names) keeps that worker's session while it lives, even with no route left,
+  because `Server::fence_worker` proves a worker stopped from its session and
+  would report one it killed itself as unprovable once the session is gone.
+  The process of a removed session is waited for with a non-blocking
+  `waitpid` (`Server::unreaped_workers`, `Server::reap_removed_workers`) on
+  every sweep, and `poll` blocks at most 100 ms (`REAP_POLL_INTERVAL`) while
+  one is still to be waited for, because the `SIGKILL` lands after the close
+  and no event announces the zombie; without that wait every worker death
+  left one zombie child of the main until it exited. A restored session
+  (§4) is removed on the same terms except that its historical PID is never
+  waited for, being no child of this main. `ListWorkers` therefore no longer
+  reports a dead worker once its session is gone, and a crash loop under
+  `worker_automatic_restart` no longer adds two descriptors, two command
+  buffers and a zombie per restart.
 
 `CommandHub` (`server.rs`) owns the per-client and per-worker session
 maps; it derefs to `Server` (`Deref` / `DerefMut for CommandHub`,

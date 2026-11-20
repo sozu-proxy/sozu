@@ -29,7 +29,10 @@ use mio::{
 };
 use nix::{
     errno::Errno,
-    sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, kill, sigaction},
+    sys::{
+        signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, kill, sigaction},
+        wait::{WaitPidFlag, WaitStatus, waitpid},
+    },
     unistd::Pid,
 };
 use serde::{Deserialize, Serialize};
@@ -69,6 +72,11 @@ use crate::{
 /// command socket and sessions count up from 1 (`next_session_token`), so the
 /// top of the range never collides with a session.
 const SIGTERM_TOKEN: Token = Token(usize::MAX);
+
+/// Longest the event loop blocks in `poll` while a removed worker's process
+/// is still to be waited for ([`Server::reap_removed_workers`]): a `SIGKILL`
+/// takes the process down a moment later and nothing wakes the loop then.
+const REAP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Write end of the `SIGTERM` self-pipe, `-1` until
 /// [`CommandHub::handle_sigterm`] installs the handler. The descriptor is never
@@ -283,6 +291,15 @@ pub(crate) trait GatheringTask: Debug {
     /// Only the first phase of a worker upgrade owns such a dependency.
     fn retained_worker_token(&self) -> Option<Token> {
         None
+    }
+
+    /// Workers this task may still have to stop by id
+    /// (`Server::fence_worker`), which proves a worker stopped from its
+    /// session: none of their sessions is removed while the task lives, even
+    /// when no route of it names them any more (a worker that died between
+    /// two steps takes no further order).
+    fn retained_worker_ids(&self) -> Vec<WorkerId> {
+        Vec::new()
     }
 
     /// This is called once every worker has answered
@@ -885,8 +902,39 @@ impl CommandHub {
         }
     }
 
-    fn collect_unreferenced_restored_stopped_workers(&mut self) {
-        if self.restored_worker_tokens.is_empty() {
+    /// Remove every `Stopped` worker session that nothing refers to any more,
+    /// close its two descriptors, and wait for the process of a worker this
+    /// main forked. The method keeps the name it had when it served restored
+    /// sessions only.
+    ///
+    /// A session is collected once no task retains its token or its worker
+    /// (`GatheringTask::retained_worker_token`, `retained_worker_ids`: a task
+    /// that may still stop the worker by id proves it from the session, see
+    /// [`Server::fence_worker`]) and no live route names its worker:
+    /// - a restored one (`restored_worker_tokens`, inherited across a main
+    ///   upgrade) at once, and its historical PID is never signalled or
+    ///   waited for, since the process is no child of this main;
+    /// - one this main forked only once its own `SIGKILL` (or an `ESRCH`)
+    ///   proved the process unable to act (`WorkerSession::process_stop_proven`).
+    ///   A session whose kill failed is never collected: its process may
+    ///   still act and holds its bootstrap slot.
+    ///
+    /// Without this a worker death (a crash, an `upgrade --worker`, a fence)
+    /// kept two descriptors, two command buffers, its parked queue and a
+    /// zombie child for the life of the main process, and a crash loop under
+    /// `worker_automatic_restart` added one more of each per restart.
+    pub(crate) fn collect_unreferenced_restored_stopped_workers(&mut self) {
+        self.collect_stopped_worker_sessions();
+        self.server.reap_removed_workers();
+    }
+
+    fn collect_stopped_worker_sessions(&mut self) {
+        let any_stopped = self
+            .server
+            .workers
+            .values()
+            .any(|worker| worker.run_state == RunState::Stopped);
+        if !any_stopped && self.restored_worker_tokens.is_empty() {
             return;
         }
 
@@ -913,35 +961,58 @@ impl CommandHub {
                     .flatten()
             })
             .collect::<HashSet<_>>();
+        let retained_worker_ids = self
+            .tasks
+            .values()
+            .chain(self.server.queued_tasks.values())
+            .flat_map(|task| task.job.retained_worker_ids())
+            .collect::<HashSet<_>>();
         let collect = self
             .restored_worker_tokens
             .iter()
             .copied()
+            .chain(
+                self.server
+                    .workers
+                    .iter()
+                    .filter(|(_, worker)| worker.run_state == RunState::Stopped)
+                    .map(|(token, _)| *token),
+            )
+            .collect::<HashSet<_>>()
+            .into_iter()
             .filter(|token| {
                 self.server.workers.get(token).is_none_or(|worker| {
                     worker.run_state == RunState::Stopped
                         && !retained_worker_tokens.contains(token)
                         && !workers_with_live_routes.contains(&worker.id)
+                        && !retained_worker_ids.contains(&worker.id)
+                        && (self.restored_worker_tokens.contains(token)
+                            || worker.process_stop_proven)
                 })
             })
             .collect::<Vec<_>>();
 
         for token in collect {
-            self.restored_worker_tokens.remove(&token);
+            let restored = self.restored_worker_tokens.remove(&token);
             self.restored_session_ticks.remove(&token);
             let Some(mut worker) = self.server.workers.remove(&token) else {
                 continue;
             };
             if let Err(error) = self.server.poll.registry().deregister(&mut worker.channel) {
                 warn!(
-                    "could not deregister restored stopped worker {}: {}",
+                    "could not deregister stopped worker {}: {}",
                     worker.id, error
                 );
             }
             let worker_id = worker.id;
-            if let Err(error) = worker.close_restored_descriptors() {
+            if !restored {
+                // The `SIGKILL` is asynchronous: the process may not be a
+                // zombie yet, so it is waited for until it is.
+                self.server.unreaped_workers.push(worker.pid);
+            }
+            if let Err(error) = worker.close_descriptors() {
                 warn!(
-                    "could not close restored stopped worker {} SCM descriptor: {}",
+                    "could not close stopped worker {} SCM descriptor: {}",
                     worker_id, error
                 );
             }
@@ -1735,14 +1806,23 @@ impl CommandHub {
             self.finish_ready_tasks(now);
             self.announce_cold_ready();
 
-            // A restored Stopped worker can still hold an SCM socket needed
-            // by UpgradeWorker phase one, or a buffered response with a live
+            // A Stopped worker can still hold an SCM socket needed by
+            // UpgradeWorker phase one, or a buffered response with a live
             // route. Once both correlations disappear, it has no owner left:
-            // remove it without signalling its historical PID and close both
-            // inherited descriptors before another main upgrade.
+            // remove it, close both of its descriptors and wait for its
+            // process. A restored one is never signalled or waited for, its
+            // historical PID being no child of this main.
             self.collect_unreferenced_restored_stopped_workers();
 
             let mut poll_timeout = self.next_poll_timeout(now);
+            // A killed worker is a zombie only once the kernel has torn its
+            // process down, which no event of this loop announces: look again
+            // soon rather than at the next unrelated event.
+            if !self.unreaped_workers.is_empty() {
+                poll_timeout = Some(poll_timeout.map_or(REAP_POLL_INTERVAL, |timeout| {
+                    timeout.min(REAP_POLL_INTERVAL)
+                }));
+            }
 
             if self.run_state == ServerState::Stopping {
                 // when closing, close all ClientSession which are not transfering data
@@ -1881,8 +1961,10 @@ impl CommandHub {
     /// deadline) that closes before answering is the same case.
     ///
     /// Repeating the call is harmless: the session stays registered after
-    /// `close_worker` and can report `CloseSession` again on the next poll,
-    /// but a synthetic `Failure` is a terminal answer, so
+    /// `close_worker` until `Self::collect_unreferenced_restored_stopped_workers`
+    /// removes it, and while a task or a route keeps it, it can report
+    /// `CloseSession` again on the next poll, but a synthetic `Failure` is a
+    /// terminal answer, so
     /// `handle_worker_response` retires its route, and a `Stopped` worker is
     /// never sent a request that would register another (`Server::scatter_on`,
     /// `Server::scatter_to` and `Server::queue_initial_status` skip it). The
@@ -2184,6 +2266,15 @@ pub struct Server {
     /// kill or the end of the bootstrap task leave it held, and a main upgrade
     /// is refused while it is not empty. Never part of a snapshot.
     pub(crate) bootstrapping_workers: HashSet<WorkerId>,
+    /// Processes of worker sessions removed after their `SIGKILL`
+    /// ([`CommandHub::collect_unreferenced_restored_stopped_workers`]) that
+    /// this main, their parent, has not waited for yet: the kernel keeps each
+    /// one as a zombie until it does. Drained by
+    /// [`Self::reap_removed_workers`] on every sweep, and the event loop does
+    /// not block longer than [`REAP_POLL_INTERVAL`] while it is not empty.
+    /// Never holds a restored worker, which is no child of this main. Never
+    /// part of a snapshot: the zombies belong to this process alone.
+    unreaped_workers: Vec<pid_t>,
 }
 
 /// What the answer to the initial `Status` of a new worker proves.
@@ -2284,6 +2375,12 @@ impl GatheringTask for WorkerReadinessTask {
         None
     }
 
+    /// A worker that never confirmed it was ready is fenced when the task
+    /// ends.
+    fn retained_worker_ids(&self) -> Vec<WorkerId> {
+        vec![self.worker_id]
+    }
+
     fn get_gatherer(&mut self) -> &mut dyn Gatherer {
         self
     }
@@ -2381,6 +2478,7 @@ impl Server {
             protected: Default::default(),
             startup_workers: HashSet::new(),
             bootstrapping_workers: HashSet::new(),
+            unreaped_workers: Vec::new(),
         })
     }
 
@@ -2875,7 +2973,11 @@ impl Server {
     ///
     /// `true` only when the process of every session of `worker_id` is proven
     /// unable to act ([`WorkerTermination::is_proven`]); a worker that is not
-    /// registered, or whose `SIGKILL` failed, is not fenced.
+    /// registered, or whose `SIGKILL` failed, is not fenced. The sessions of
+    /// dead workers are removed by
+    /// [`CommandHub::collect_unreferenced_restored_stopped_workers`], never
+    /// while a task that may call this keeps its worker
+    /// (`GatheringTask::retained_worker_ids`).
     #[must_use]
     pub(crate) fn fence_worker(&mut self, worker_id: WorkerId) -> bool {
         let tokens: Vec<Token> = self
@@ -3071,6 +3173,36 @@ impl Server {
                 error!("could not launch new worker: {}", err);
             }
         }
+    }
+
+    /// Wait, without blocking, for the processes of the worker sessions the
+    /// main removed ([`Self::unreaped_workers`]). A process that has not
+    /// ended yet stays listed for the next sweep; one that is gone is
+    /// forgotten, whether it was reaped now or `ECHILD` says nobody is left to
+    /// wait for (a `SIGCHLD` that is ignored reaps on its own).
+    fn reap_removed_workers(&mut self) {
+        self.unreaped_workers.retain(|pid| {
+            // `waitpid(0)` and `waitpid(-1)` wait for any child, so a pid
+            // that is not strictly positive is never waited for.
+            if *pid <= 0 {
+                return false;
+            }
+            match waitpid(Pid::from_raw(*pid), Some(WaitPidFlag::WNOHANG)) {
+                Ok(WaitStatus::StillAlive) | Err(Errno::EINTR) => true,
+                Ok(status) => {
+                    debug!("worker process {} was reaped: {:?}", pid, status);
+                    false
+                }
+                Err(Errno::ECHILD) => {
+                    debug!("worker process {} has no waitable status left", pid);
+                    false
+                }
+                Err(errno) => {
+                    warn!("could not wait for worker process {}: {}", pid, errno);
+                    false
+                }
+            }
+        });
     }
 
     fn alive_workers(&self) -> usize {
@@ -4188,7 +4320,7 @@ mod tests {
             .remove(&new_token)
             .expect("replacement worker should still be registered");
         worker
-            .close_restored_descriptors()
+            .close_descriptors()
             .expect("replacement worker descriptors should close");
     }
 
@@ -6295,6 +6427,266 @@ mod tests {
             "the unanswered SoftStop must be accounted as one failure"
         );
         assert!(hub.tasks.is_empty() && hub.server.queued_tasks.is_empty());
+    }
+
+    /// A worker the test fully owns the far end of: its command channel, its
+    /// SCM socket and its process. The SCM descriptor is handed to the Hub
+    /// (`ScmSocket` borrows it and has no `Drop`), so the peer reaching EOF
+    /// proves the Hub closed it; the process is a real child, so the real
+    /// `close_worker` `SIGKILL` reaches it and not the test's process group.
+    struct DyingWorker {
+        token: Token,
+        pid: u32,
+        child: OwnedChild,
+        channel_peer: Channel<WorkerResponse, WorkerRequest>,
+        scm_peer: std::os::unix::net::UnixStream,
+    }
+
+    /// Register worker 0 on `hub`, answered and `Running`, with a stand-in
+    /// process that stays alive until the worker is closed.
+    fn register_dying_worker(hub: &mut CommandHub) -> DyingWorker {
+        let (main_sock, worker_sock) = UnixStream::pair().expect("could not create channel pair");
+        let main_side: Channel<WorkerRequest, WorkerResponse> =
+            Channel::new(main_sock, 4096, 65536);
+        let channel_peer: Channel<WorkerResponse, WorkerRequest> =
+            Channel::new(worker_sock, 4096, 65536);
+        let (scm_owner, scm_peer) =
+            std::os::unix::net::UnixStream::pair().expect("could not create scm pair");
+        scm_peer
+            .set_nonblocking(true)
+            .expect("could not make the scm peer nonblocking");
+        let scm_socket =
+            ScmSocket::new(scm_owner.as_raw_fd()).expect("could not create scm socket");
+        let child = OwnedChild(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("could not spawn the stand-in worker process"),
+        );
+        let pid = child.0.id();
+        hub.server
+            .register_worker(0, pid as pid_t, main_side, scm_socket)
+            .expect("test worker should register");
+        let token = hub
+            .server
+            .workers
+            .values_mut()
+            .find(|worker| worker.id == 0)
+            .map(|worker| {
+                worker.run_state = RunState::Running;
+                worker.token
+            })
+            .expect("worker 0 is registered");
+        // ScmSocket borrows this descriptor; transfer ownership to the Hub so
+        // the test observes its peer closing without a competing owner.
+        let _scm_fd = scm_owner.into_raw_fd();
+        DyingWorker {
+            token,
+            pid,
+            child,
+            channel_peer,
+            scm_peer,
+        }
+    }
+
+    /// Linux process state letter of `pid` (`Z` is a zombie), `None` once the
+    /// process no longer exists, that is once its parent reaped it.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn process_state(pid: u32) -> Option<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // The command name is parenthesised and may hold spaces or
+        // parentheses: the state is the first field after the last `) `.
+        stat.rsplit_once(") ")?.1.chars().next()
+    }
+
+    /// The session of a worker that died is never removed, so
+    /// every crash or `upgrade --worker` adds one more command channel and one
+    /// more SCM socket to the main process for as long as it lives. After the
+    /// worker's channel closed and the Hub swept, no session is left for it and
+    /// both of its descriptors are closed.
+    ///
+    /// To SEE THIS RED: keep the production code as it is. The only
+    /// `workers.remove` runs for sessions restored by a main upgrade
+    /// (`restored_worker_tokens`), never for one `register_worker` created.
+    #[test]
+    fn a_dead_worker_session_is_removed_and_both_its_descriptors_are_closed() {
+        let mut hub = create_test_hub();
+        let mut worker = register_dying_worker(&mut hub);
+        assert!(
+            hub.server.workers.contains_key(&worker.token),
+            "the worker is registered before its channel closes"
+        );
+
+        // The worker dies: its command channel reports HUP.
+        hub.on_worker_channel_closed(&worker.token, 0);
+        // The Hub's per-iteration sweep of sessions nothing refers to.
+        hub.collect_unreferenced_restored_stopped_workers();
+
+        // A concurrent fork may retain CLOEXEC descriptors until its exec.
+        // Observe both endpoint identities before asserting either result.
+        let removed = !hub.server.workers.contains_key(&worker.token);
+        let channel_eof = wait_for_eof(&mut worker.channel_peer.sock, "dead worker channel");
+        let scm_eof = wait_for_eof(&mut worker.scm_peer, "dead worker SCM socket");
+        assert!(
+            removed && channel_eof.is_ok() && scm_eof.is_ok(),
+            "session removed: {removed}; channel: {channel_eof:?}; SCM: {scm_eof:?}"
+        );
+    }
+
+    /// No production code waits for a worker process, so every
+    /// worker the main killed stays a zombie of the main until the main exits;
+    /// a crash-looping worker under `worker_automatic_restart` adds one per
+    /// restart and the zombies count against the process limit.
+    ///
+    /// The stand-in is observed through `/proc` and never waited on by the
+    /// test before the assertion, which is what the fixtures' own
+    /// `child.wait()` hides. The kill is asynchronous, so after the sweep the
+    /// event loop runs right after the close, the test waits for the process
+    /// to end, then gives the Hub's later sweeps a bounded time to reap it.
+    ///
+    /// To SEE THIS RED: keep the production code as it is, the child stays
+    /// in state `Z` for the whole bound.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_killed_worker_process_is_reaped_by_the_main() {
+        let mut hub = create_test_hub();
+        let worker = register_dying_worker(&mut hub);
+        let before = process_state(worker.pid).expect("/proc must expose the stand-in worker");
+        assert_ne!(
+            before, 'Z',
+            "the stand-in worker runs before its channel closes"
+        );
+
+        hub.on_worker_channel_closed(&worker.token, 0);
+        // `CommandHub::run` sweeps at the top of the iteration that follows
+        // the close, usually before the `SIGKILL` has landed: a reaper that
+        // looks only once, at that sweep, leaves the zombie behind.
+        hub.collect_unreferenced_restored_stopped_workers();
+
+        let ended_by = Instant::now() + Duration::from_secs(5);
+        while process_state(worker.pid).is_some_and(|state| state != 'Z') {
+            assert!(
+                Instant::now() < ended_by,
+                "close_worker's SIGKILL did not end the stand-in worker"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let reaped_by = Instant::now() + Duration::from_secs(2);
+        loop {
+            hub.collect_unreferenced_restored_stopped_workers();
+            if process_state(worker.pid).is_none() || Instant::now() >= reaped_by {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            process_state(worker.pid),
+            None,
+            "the killed worker (pid {}) must be reaped by the main, not left a zombie",
+            worker.pid
+        );
+        drop(worker.child);
+    }
+
+    /// A session whose `SIGKILL` could not be delivered is `Stopped` without a
+    /// proof that its process is gone: the process may still act and its
+    /// bootstrap slot is not refilled, so the sweep keeps the session, never
+    /// waits for the pid and closes neither descriptor.
+    #[test]
+    fn a_worker_whose_kill_failed_keeps_its_session_and_its_process_is_not_waited_for() {
+        let mut hub = create_test_hub();
+        let mut worker = register_dying_worker(&mut hub);
+
+        let termination = hub
+            .server
+            .close_worker_with(&worker.token, |_| Err(Errno::EPERM));
+        assert_eq!(termination, WorkerTermination::Unconfirmed(Errno::EPERM));
+        hub.collect_unreferenced_restored_stopped_workers();
+
+        assert!(
+            hub.server.workers.contains_key(&worker.token),
+            "an unproven stopped worker keeps its session"
+        );
+        assert!(
+            hub.server.unreaped_workers.is_empty(),
+            "a process that may still run is never waited for"
+        );
+        let mut byte = [0_u8; 1];
+        assert!(
+            matches!(
+                worker.scm_peer.read(&mut byte),
+                Err(ref error) if error.kind() == ErrorKind::WouldBlock
+            ),
+            "the SCM socket of a kept session stays open"
+        );
+    }
+
+    /// A stopped worker with a response route still owed keeps its session: the
+    /// channel close that fails the route has to reach it. Once the close
+    /// answered the route, the next sweep removes the session.
+    #[test]
+    fn a_stopped_worker_with_a_live_route_keeps_its_session_until_the_route_is_failed() {
+        let mut hub = create_test_hub();
+        let worker = register_dying_worker(&mut hub);
+        let seen = std::rc::Rc::new(std::cell::Cell::new((0, 0, 0)));
+        let task = hub.server.new_task(
+            Box::new(TallyTask {
+                gatherer: DefaultGatherer::default(),
+                seen: seen.clone(),
+            }),
+            Timeout::None,
+        );
+        hub.server
+            .scatter_on(RequestType::SoftStop(SoftStop {}).into(), task, 0, None);
+        assert_eq!(hub.server.in_flight.len(), 1, "the worker owes one answer");
+
+        // A fence kills the process and stops the session; its channel has
+        // not reported the close yet.
+        assert!(hub.server.fence_worker(0));
+        hub.collect_unreferenced_restored_stopped_workers();
+        assert!(
+            hub.server.workers.contains_key(&worker.token),
+            "the route the worker still owes keeps its session"
+        );
+
+        hub.on_worker_channel_closed(&worker.token, 0);
+        assert!(hub.server.in_flight.is_empty(), "the close fails the route");
+        hub.collect_unreferenced_restored_stopped_workers();
+        assert!(
+            !hub.server.workers.contains_key(&worker.token),
+            "nothing refers to the session any more"
+        );
+    }
+
+    /// A readiness task fences its worker when it ends, and proves it stopped
+    /// from the session of that worker. A worker that died with no route left
+    /// (it answered the last stage of its bootstrap, then its channel closed,
+    /// and no further order reaches a stopped worker) keeps its session until
+    /// that task has ended; the next sweep then collects it.
+    #[test]
+    fn a_stopped_worker_keeps_its_session_until_the_task_that_fences_it_ends() {
+        let mut hub = create_test_hub();
+        hub.server.config.worker_timeout = 60;
+        let worker = register_dying_worker(&mut hub);
+        hub.server
+            .new_task(Box::new(WorkerReadinessTask::new(0)), Timeout::Default);
+
+        hub.on_worker_channel_closed(&worker.token, 0);
+        assert!(hub.server.in_flight.is_empty(), "no route names the worker");
+        hub.collect_unreferenced_restored_stopped_workers();
+        assert!(
+            hub.server.workers.contains_key(&worker.token),
+            "the readiness task still has to fence the worker"
+        );
+
+        hub.finish_ready_tasks(Instant::now() + Duration::from_secs(120));
+        assert!(hub.tasks.is_empty() && hub.server.queued_tasks.is_empty());
+        hub.collect_unreferenced_restored_stopped_workers();
+        assert!(
+            !hub.server.workers.contains_key(&worker.token),
+            "nothing names the worker any more"
+        );
     }
 
     /// A worker launched by automatic restart is still `NotAnswering` when a

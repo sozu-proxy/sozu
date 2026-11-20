@@ -476,6 +476,17 @@ impl GatheringTask for UpgradeWorkerTask {
         }
     }
 
+    /// The replacement is fenced when it never answers its initial `Status`
+    /// with `Ok`, and the abort says whether it was proven stopped.
+    fn retained_worker_ids(&self) -> Vec<WorkerId> {
+        match self.progress {
+            UpgradeWorkerProgress::AwaitingReadiness { new_worker_id, .. } => vec![new_worker_id],
+            UpgradeWorkerProgress::RequestingListenSockets { .. }
+            | UpgradeWorkerProgress::RestoringOldWorker { .. }
+            | UpgradeWorkerProgress::StopOldActivateNew { .. } => Vec::new(),
+        }
+    }
+
     fn on_finish(
         self: Box<Self>,
         server: &mut Server,
@@ -1637,5 +1648,49 @@ pub(crate) mod tests {
             response.message,
             "Upgrade successful:\n- finished soft stop of worker 11\n- finished activation of new worker 12"
         );
+    }
+
+    /// The replacement is fenced when it never answers its initial `Status`,
+    /// and the abort says whether it was proven stopped from its session:
+    /// only that phase keeps the session of the replacement.
+    #[test]
+    fn only_the_readiness_phase_retains_the_replacement_worker_by_id() {
+        let task = |progress| UpgradeWorkerTask {
+            client_token: Token(1),
+            progress,
+            ok: 0,
+            errors: 0,
+            responses: Vec::new(),
+            expected_responses: 0,
+        };
+
+        assert_eq!(
+            task(UpgradeWorkerProgress::AwaitingReadiness {
+                old_worker_token: Token(2),
+                old_worker_id: 11,
+                new_worker_id: 12,
+            })
+            .retained_worker_ids(),
+            vec![12]
+        );
+        for progress in [
+            UpgradeWorkerProgress::RequestingListenSockets {
+                old_worker_token: Token(2),
+                old_worker_id: 11,
+            },
+            UpgradeWorkerProgress::RestoringOldWorker {
+                old_worker_id: 11,
+                abort: String::new(),
+            },
+            UpgradeWorkerProgress::StopOldActivateNew {
+                old_worker_id: 11,
+                new_worker_id: 12,
+            },
+        ] {
+            assert!(
+                task(progress).retained_worker_ids().is_empty(),
+                "no other phase fences the replacement"
+            );
+        }
     }
 }
