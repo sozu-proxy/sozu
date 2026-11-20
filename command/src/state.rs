@@ -981,13 +981,15 @@ impl ConfigState {
         self.count_objects_where(|owner| owner != cluster_id)
     }
 
-    /// Increments the count for this request type
+    /// Increments the count for this request type. A verb seen for the first
+    /// time starts from 0, so that its first dispatch is recorded as 1 and n
+    /// dispatches as n.
     fn increment_request_count(&mut self, request: &Request) {
         if let Some(request_type) = &request.request_type {
             let count = self
                 .request_counts
                 .entry(format_request_type(request_type).to_owned())
-                .or_insert(1);
+                .or_insert(0);
             *count += 1;
         }
     }
@@ -12153,5 +12155,48 @@ mod tests {
                 .any(|request| matches!(request.request_type, Some(RequestType::CloseSessions(_))))
         );
         assert_eq!(state.hash_state(), hashes_before);
+    }
+
+    /// The request census counts dispatches: one `AddCluster` is one entry of
+    /// 1, and three `AddCluster` dispatches are 3. `increment_request_count`
+    /// seeds a new entry with 1 and then adds 1 on top, so the first dispatch
+    /// of a verb is recorded as 2 and n dispatches as n + 1, which is what
+    /// `CountRequests` reports to the operator.
+    #[test]
+    fn request_census_counts_each_dispatch_exactly_once() {
+        let mut state = ConfigState::default();
+        assert!(
+            state.get_request_counts().map.is_empty(),
+            "a fresh state has dispatched nothing"
+        );
+
+        let add_cluster = |id: &str| -> Request {
+            RequestType::AddCluster(Cluster {
+                cluster_id: id.to_owned(),
+                ..Default::default()
+            })
+            .into()
+        };
+
+        state
+            .dispatch(&add_cluster("census_a"))
+            .expect("AddCluster must be accepted");
+        assert_eq!(
+            state.get_request_counts().map.get("AddCluster").copied(),
+            Some(1),
+            "one AddCluster dispatch must be counted once"
+        );
+
+        state
+            .dispatch(&add_cluster("census_b"))
+            .expect("AddCluster must be accepted");
+        state
+            .dispatch(&add_cluster("census_c"))
+            .expect("AddCluster must be accepted");
+        assert_eq!(
+            state.get_request_counts().map.get("AddCluster").copied(),
+            Some(3),
+            "three AddCluster dispatches must be counted three times"
+        );
     }
 }
