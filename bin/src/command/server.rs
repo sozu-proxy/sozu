@@ -6685,9 +6685,13 @@ mod tests {
     /// worker's channel closed and the Hub swept, no session is left for it and
     /// both of its descriptors are closed.
     ///
-    /// To SEE THIS RED: keep the production code as it is. The only
-    /// `workers.remove` runs for sessions restored by a main upgrade
-    /// (`restored_worker_tokens`), never for one `register_worker` created.
+    /// To SEE THIS RED: in `CommandHub::collect_stopped_worker_sessions`,
+    /// replace `&& (self.restored_worker_tokens.contains(token)
+    /// || worker.process_stop_proven)` with
+    /// `&& self.restored_worker_tokens.contains(token)`, so that only a
+    /// session restored by a main upgrade is collected, as before the fix.
+    /// The assertion then fails with "session removed: false", and neither
+    /// descriptor reaches EOF.
     #[test]
     fn a_dead_worker_session_is_removed_and_both_its_descriptors_are_closed() {
         let mut hub = create_test_hub();
@@ -6724,8 +6728,12 @@ mod tests {
     /// event loop runs right after the close, the test waits for the process
     /// to end, then gives the Hub's later sweeps a bounded time to reap it.
     ///
-    /// To SEE THIS RED: keep the production code as it is, the child stays
-    /// in state `Z` for the whole bound.
+    /// To SEE THIS RED: in `CommandHub::collect_stopped_worker_sessions`,
+    /// delete the `if !restored { … }` block that pushes the pid onto
+    /// `self.server.unreaped_workers`, so that no worker is ever waited for,
+    /// as before the fix. The child stays in state `Z` for the whole bound
+    /// and the last assertion fails with "the killed worker (pid …) must be
+    /// reaped by the main, not left a zombie", `left: Some('Z')`.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn a_killed_worker_process_is_reaped_by_the_main() {
