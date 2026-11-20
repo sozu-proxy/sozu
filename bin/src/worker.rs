@@ -77,6 +77,9 @@ pub enum WorkerError {
     },
     #[error("could not setup the logger: {0}")]
     SetupLogging(LogError),
+    /// `exec` of the worker failed in the forked child. The child logs this
+    /// error as its last line and ends; it never returns it, because that
+    /// process is a copy of the main process (see [`fork_main_into_worker`]).
     #[error("could not spawn child process: {0}")]
     SpawnChild(std::io::Error),
 }
@@ -266,7 +269,11 @@ pub fn begin_worker_process(
 /// unix-forks the main process
 ///
 /// - Parent: sends config, state and listeners to the new worker
-/// - Child: calls the sozu executable path like so: `sozu worker --id <worker_id> [...]`
+/// - Child: calls the sozu executable path like so: `sozu worker --id <worker_id> [...]`.
+///   If that `exec` fails, the child logs the error and ends with `_exit(1)`
+///   instead of returning: it is a copy of the whole main process, and
+///   returning would resume that copy inside the caller's event loop. The
+///   parent then sees the worker's channel close.
 ///
 /// returns the child process pid, and channels to talk to it.
 pub fn fork_main_into_worker(
@@ -352,7 +359,8 @@ pub fn fork_main_into_worker(
     // SAFETY: `fork` is unsafe because the child must avoid touching
     // shared mutable state inherited from the parent. The child branch
     // below restricts itself to `Command::exec`, which replaces the process
-    // image entirely — no inherited state matters after that point.
+    // image entirely — no inherited state matters after that point — and,
+    // when `exec` fails, to one log line, a log flush and `_exit`.
     match unsafe { fork().map_err(WorkerError::Fork)? } {
         ForkResult::Parent { child: worker_pid } => {
             // A successful `fork()` returns the child's pid in the parent
@@ -436,8 +444,111 @@ pub fn fork_main_into_worker(
                 .arg(config.max_command_buffer_size.to_string())
                 .exec();
 
-            error!("Failed to spawn child process: {}", err);
-            Err(WorkerError::SpawnChild(err))
+            // `exec` only returns on failure, and this process is a full copy
+            // of the main process: its event loop, its client and worker
+            // channels and its poll instance. Returning the error would hand
+            // that copy back to the command hub that called us, where it would
+            // go on serving the same descriptors beside the real main and,
+            // with a worker still missing from its own stale registry, fork
+            // another copy of itself. The parent branch reports the missing
+            // worker through the closing channel, so this process ends here.
+            error!("worker {}: {}", worker_id, WorkerError::SpawnChild(err));
+
+            // Drain the log buffers first: `_exit` skips the thread-local
+            // `LOGGER` drop, and a `file://` target would lose this line, the
+            // only record of why the spawn failed. The buffer is a copy of the
+            // main process's, so on that failure path the records it still
+            // held when we forked can appear twice.
+            LOGGER.with(|logger| logger.borrow_mut().flush());
+
+            // SAFETY: `_exit` takes no pointer and never returns. Unlike
+            // `std::process::exit` it runs none of the `atexit` handlers or
+            // destructors of the main process this child is a copy of.
+            unsafe { libc::_exit(1) }
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    /// Exit status the test gives a process that came back out of
+    /// `fork_main_into_worker` with a `SpawnChild` error, which only the
+    /// forked child can do. No other path of the function uses it.
+    const CLONE_RETURNED_INTO_CALLER: libc::c_int = 97;
+
+    /// Reap `pid` with a bounded wait; kill it and report `None` on timeout.
+    fn wait_for_exit(pid: libc::pid_t, deadline: Duration) -> Option<libc::c_int> {
+        let give_up = Instant::now() + deadline;
+        let mut status = 0;
+        loop {
+            // SAFETY: `pid` is a child of this test process and `status` is a
+            // valid output slot.
+            let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if waited == pid {
+                return Some(status);
+            }
+            if Instant::now() >= give_up {
+                // SAFETY: `pid` is a live, unreaped child of this process.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                    libc::waitpid(pid, &mut status, 0);
+                }
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// When `exec` fails in the forked worker child, that child is a copy of
+    /// the whole main process. It must end there, not return the error into
+    /// the caller: the caller is the command hub's event loop, and a returned
+    /// copy would go on serving the same descriptors beside the real main.
+    ///
+    /// A NUL byte in the worker id makes `Command::exec` fail with
+    /// `InvalidInput` before any `execve`, whatever the host allows.
+    #[test]
+    fn failed_exec_ends_the_forked_child_instead_of_returning_into_the_caller() {
+        let config = Config {
+            command_buffer_size: 16384,
+            max_command_buffer_size: 163_840,
+            ..Default::default()
+        };
+        let state = ConfigState::new();
+
+        match fork_main_into_worker(
+            "worker\0id",
+            &config,
+            "/nonexistent/sozu".to_string(),
+            &state,
+            None,
+        ) {
+            // Only the forked child's `exec` arm yields `SpawnChild`. This
+            // process is the clone: report that it survived and leave without
+            // running the rest of the harness.
+            Err(WorkerError::SpawnChild(_)) => {
+                // SAFETY: `_exit` takes no pointer and never returns; the clone
+                // must not unwind into the test harness it no longer owns.
+                unsafe { libc::_exit(CLONE_RETURNED_INTO_CALLER) }
+            }
+            Err(other) => panic!("the parent could not set up the spawn: {other}"),
+            Ok((pid, _channel, _scm)) => {
+                let status = wait_for_exit(pid, Duration::from_secs(10))
+                    .expect("the forked child neither exited nor returned within 10 s");
+                assert!(
+                    libc::WIFEXITED(status),
+                    "the forked child must exit by itself, wait status {status:#x}"
+                );
+                assert_ne!(
+                    libc::WEXITSTATUS(status),
+                    CLONE_RETURNED_INTO_CALLER,
+                    "the forked child returned `Err(SpawnChild)` into its caller and kept \
+                     running as a second copy of the main process instead of ending"
+                );
+            }
         }
     }
 }

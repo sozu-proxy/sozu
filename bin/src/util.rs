@@ -347,8 +347,8 @@ pub unsafe fn get_executable_path() -> Result<String, UtilError> {
 /// path-based `Command::new(executable_path)` is correct.
 ///
 /// On successful exec the kernel closes the fd via `O_CLOEXEC`. On failed
-/// exec the forked child returns `Err(WorkerError::SpawnChild(...))` and
-/// the worker spawn aborts, so the fd cannot accumulate across spawn
+/// exec the forked child logs the error and leaves through `_exit(1)`
+/// (`fork_main_into_worker`), so the fd cannot accumulate across spawn
 /// attempts — the helper is called inside the child immediately before
 /// `execve(2)`, never in the long-running master.
 ///
@@ -376,8 +376,8 @@ pub fn get_executable_exec_path() -> Result<String, UtilError> {
     // Convert OwnedFd → RawFd. The fd is intentionally not dropped: it
     // must remain open until exec(2) consumes it. O_CLOEXEC closes it
     // automatically on successful exec; on failed exec the forked child
-    // returns Err and aborts the spawn, so no leak persists on the
-    // long-running master.
+    // leaves through `_exit(1)`, so no leak persists on the long-running
+    // master.
     let raw_fd = owned_fd.into_raw_fd();
     Ok(format!("/proc/self/fd/{raw_fd}"))
 }

@@ -31,7 +31,12 @@ Entry point: `begin_main_process` (`bin/src/command/mod.rs`), called from `main`
    path, then `chmod` to `command_socket_mode`, `0o600` by default).
 4. Forks the configured number of workers via `fork_main_into_worker`
    (`bin/src/worker.rs`). Each worker inherits a `Channel` pair plus an
-   `ScmSocket` for FD passing.
+   `ScmSocket` for FD passing. The forked child is a copy of the whole
+   supervisor, so it never returns into the caller: it `exec`s the worker
+   binary or, when that fails, logs the error and ends with `_exit(1)`. The
+   supervisor sees that worker's channel close, answers its in-flight requests
+   with synthetic failures (§1.2), and, with `worker_automatic_restart` (the
+   default), forks a replacement (`Server::workers_to_spawn`).
 5. Enters the master event loop via `CommandHub::run`
    (`bin/src/command/server.rs`).
 
