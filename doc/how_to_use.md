@@ -191,7 +191,7 @@ epoch in the fingerprints must be the new one. See
 ## Run it with Docker
 
 The repository provides a multi-stage [Dockerfile][df]. The builder stage is the official
-`rust:1.93.1-alpine3.23` image, pinned by digest to the toolchain named in `rust-toolchain`,
+`rust:1.95.0-alpine3.23` image, pinned by digest to the toolchain named in `rust-toolchain`,
 and produces a statically linked musl binary; the runtime stage is a stable Alpine release
 (`alpine:3.24` by default).
 

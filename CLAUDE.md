@@ -1,4 +1,4 @@
-Sōzu — a hot-reconfigurable HTTP/1.x + HTTP/2 reverse proxy (AGPL-3.0). Rust 2024 (MSRV 1.93.1, matching the `1.93.1` toolchain pinned in `rust-toolchain`; bumped from 1.88.0 for the `sim/` crate's moonpool-sim dependency). Upstream: `github.com/sozu-proxy/sozu`. The H2 multiplexer rewrite landed on `main` via PR #1209 (merged commit `98c56a4c`); subsequent hardening (parser, command IPC, metrics, audit fixes) builds on it.
+Sōzu — a hot-reconfigurable HTTP/1.x + HTTP/2 reverse proxy (AGPL-3.0). Rust 2024 (MSRV 1.95.0, matching the `1.95.0` toolchain pinned in `rust-toolchain`; required by the Magnetar 2.1 Pulsar test client). Upstream: `github.com/sozu-proxy/sozu`. The H2 multiplexer rewrite landed on `main` via PR #1209 (merged commit `98c56a4c`); subsequent hardening (parser, command IPC, metrics, audit fixes) builds on it.
 
 This file is the primary agent instruction for the repo. It is symlinked to `AGENTS.md` so OpenAI Codex picks up the same content. Anthropic's global `~/.claude/CLAUDE.md` conventions (worktree-first, GPG sign-off, commitizen style) still apply and are not duplicated here.
 
@@ -53,7 +53,7 @@ Crypto-provider features live in `bin/Cargo.toml` + `lib/Cargo.toml`; CI exercis
 
 # Code style
 
-- **Edition 2024**, MSRV 1.93.1. Use 2024-only idioms freely.
+- **Edition 2024**, MSRV 1.95.0. Use 2024-only idioms freely.
 - **Errors**: `thiserror` for library error enums, `anyhow` at binary boundaries. Follow the nearest existing `thiserror::Error` enum; don't introduce new error crates.
 - **No panic on network-facing input.** In parser, socket, mux, TLS, command-channel, and config paths, convert invalid traffic into `SessionResult` / H2 `GOAWAY` / `RST_STREAM` / default HTTP answer + metric + contextual log. `unwrap`/`expect`/`panic!`/`unreachable!` are acceptable in tests and in hard internal invariants with useful messages.
 - **Ownership**: prefer `ToOwned::to_owned()` over `Clone::clone()` when going `&str → String` or `&[u8] → Vec<u8>` (clearer intent). Stick with `.clone()` when the type is already `Clone + !ToOwned`.
@@ -148,7 +148,7 @@ Crypto-provider features (`crypto-ring`, `crypto-aws-lc-rs`, `crypto-openssl`, `
 # Gotchas
 
 - **`protoc` missing** = `command/build.rs` fails before any Rust compiles. CI installs `protobuf-compiler` explicitly.
-- **`rust-toolchain` pins `1.93.1`** — local builds must match (bumped from 1.88.0; `Duration::from_hours`/`from_mins` used transitively via moonpool-sim are const-stable only since 1.91). CI still exercises stable/beta/nightly.
+- **`rust-toolchain` pins `1.95.0`** — local builds must match the minimum required by the Pulsar test client. CI still exercises stable/beta/nightly.
 - **Release strips `DEBUG`/`TRACE` logs** unless built with `--features logs-debug,logs-trace`.
 - **Repro for event-loop / zombie bugs**: `worker_count = 1`, `worker_automatic_restart = false`, `RUST_BACKTRACE=1`.
 - **`CHANGELOG.md` follows Keep-a-Changelog.** Update it when a change ships user-visible behavior (config keys, metrics, CLI flags).
@@ -161,4 +161,4 @@ cargo build -p sozu --release --locked
 target/release/sozu start -c /path/to/config.toml
 ```
 
-Container: `docker build -t sozu:local .` (builder is the digest-pinned official `rust:1.93.1-alpine3.23` image — bump it with `rust-toolchain`; it installs `build-base`, `cmake`, `pkgconf`, `protobuf`, `protobuf-dev`, plus static OpenSSL for `CRYPTO_PROVIDER=crypto-openssl` or Go and Perl for `fips`, and uses `cargo build --release --frozen`; runtime is `alpine:${ALPINE_VERSION}`, default `3.24`, never edge). Release images push as `clevercloud/sozu:${GITHUB_SHA}`. OS packaging in `os-build/` (systemd, RPM, Arch). Upgrade + release guidance: `RELEASE.md` + `doc/upgrade_e2e_tests.md`.
+Container: `docker build -t sozu:local .` (builder is the digest-pinned official `rust:1.95.0-alpine3.23` image — bump it with `rust-toolchain`; it installs `build-base`, `cmake`, `pkgconf`, `protobuf`, `protobuf-dev`, plus static OpenSSL for `CRYPTO_PROVIDER=crypto-openssl` or Go and Perl for `fips`, and uses `cargo build --release --frozen`; runtime is `alpine:${ALPINE_VERSION}`, default `3.24`, never edge). Release images push as `clevercloud/sozu:${GITHUB_SHA}`. OS packaging in `os-build/` (systemd, RPM, Arch). Upgrade + release guidance: `RELEASE.md` + `doc/upgrade_e2e_tests.md`.

@@ -3,12 +3,12 @@ members = ["lib", "command", "bin", "e2e", "sim"]
 resolver = "2" # consistent with rust edition 2024, see https://doc.rust-lang.org/cargo/reference/resolver.html#features
 
 [workspace.dependencies]
-anyhow = "^1.0.104"
+anyhow = "^1.0.105"
 async-trait = "^0.1.92"
 base64 = "^0.23.1"
-clap = "^4.6.7"
+clap = "^4.6.9"
 cookie-factory = "^0.3.3"
-flate2 = "^1.1.10"
+flate2 = "^1.1.11"
 futures = "^0.3.34"
 getrandom = "^0.4.3"
 hdrhistogram = "^7.6.0"
@@ -16,47 +16,47 @@ hex = "^0.4.3"
 hickory-proto = "^0.26.3"
 hmac = { version = "^0.13.0", features = ["zeroize"] }
 http-body-util = "^0.1.5"
-hyper = "^1.12.0"
+hyper = "^1.13.0"
 hyper-rustls = { version = "^0.27.10", default-features = false }
 hyper-util = "^0.1.21"
 idna = "^1.1.0"
-itoa = "^1.0.18"
+itoa = "^1.0.19"
 jemallocator = "^0.5.4"
 kawa = { version = "^0.7.2", default-features = false }
-lapin = { version = "^4.12.3", default-features = false }
+lapin = { version = "^4.13.0", default-features = false }
 libc = "^0.2.191"
-log = "^0.4.34"
-magnetar = { package = "magnetar-driver", version = "^1.7.4", default-features = false }
+log = "^0.4.35"
+magnetar = { package = "magnetar-driver", version = "^2.1.0", default-features = false }
 memchr = "^2.8.3"
-mio = "^1.2.4"
-mongodb = { version = "^3.9.1", default-features = false }
+mio = "^1.2.5"
+mongodb = { version = "^3.10.2", default-features = false }
 moonpool-sim = "^0.8.0"
 mysql_async = { version = "^0.37.1", default-features = false }
-nix = "^0.31.3"
+nix = "^0.32.0"
 nom = "^8.0.0"
 num_cpus = "^1.17.0"
 paw = "^1.0.0"
 pool = "^0.1.4"
 poule = "^0.3.2"
 prettytable-rs = { version = "^0.10.0", default-features = false }
-prost = "^0.14.4"
-prost-build = "^0.14.4"
+prost = "^0.14.6"
+prost-build = "^0.14.6"
 criterion = { version = "^0.8.2", features = ["html_reports"] }
 quickcheck = "^1.1.0"
-rand = "^0.10.3"
-regex = "^1.13.1"
-redis = { version = "^1.8.0", default-features = false }
+rand = "^0.10.4"
+regex = "^1.13.2"
+redis = { version = "^1.8.3", default-features = false }
 kafka-protocol = { version = "^0.18.0", default-features = false, features = ["client"] }
 rustls-openssl = { version = "^0.4.2", default-features = false, features = ["tls12"] }
 # The certificate parser rustls verifies with. No crypto feature: Sozu only
 # reads CRL issuers with it, rustls keeps doing every signature check.
-rustls-webpki = { version = "^0.103.16", default-features = false, features = ["alloc"] }
+rustls-webpki = { version = "^0.103.17", default-features = false, features = ["alloc"] }
 rustls = { version = "^0.23.46", default-features = false, features = [
   "logging",
   "std",
   "tls12",
 ] }
-rusty_ulid = "^2.0.1"
+rusty_ulid = "^2.0.2"
 serde = "^1.0.229"
 serde_json = "^1.0.154"
 serial_test = "^4.0.1"
@@ -73,12 +73,12 @@ time = "^0.3.55"
 tiny_http = "^0.12.0"
 tokio = "^1.54.1"
 tokio-postgres = { version = "^0.7.18", default-features = false }
-toml = { version = "^1.1.8", features = ["preserve_order"] }
-tonic = { version = "^0.14.8", default-features = false }
-tonic-prost = "^0.14.8"
-tonic-prost-build = "^0.14.8"
+toml = { version = "^1.2.2", features = ["preserve_order"] }
+tonic = { version = "^0.14.9", default-features = false }
+tonic-prost = "^0.14.9"
+tonic-prost-build = "^0.14.9"
 x509-parser = "^0.18.1"
-zeroize = "^1.9.1"
+zeroize = "^1.9.2"
 
 # Dependencies for the `sozu top` TUI subcommand. All gated behind the
 # opt-in `tui` Cargo feature on `bin/`; default `sozu` builds do not pull
@@ -87,7 +87,7 @@ zeroize = "^1.9.1"
 color-eyre           = "^0.6.5"
 crossbeam-channel    = "^0.5.17"
 crossterm            = { version = "^0.29.0", default-features = false }
-ctrlc                = "^3.5.2"
+ctrlc                = "^3.5.3"
 ratatui              = { version = "^0.30.2", default-features = false }
 throbber-widgets-tui = "^0.11.1"
 tui-big-text         = "^0.8.10"
