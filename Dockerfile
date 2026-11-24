@@ -13,7 +13,7 @@ ARG ALPINE_VERSION=3.24
 # does. Raise it together with `rust-toolchain`, every `rust-version` and the
 # workflow pins; take the new digest from
 # `docker buildx imagetools inspect rust:<version>-alpine<release>`.
-FROM rust:1.93.1-alpine3.23@sha256:4fec02de605563c297c78a31064c8335bc004fa2b0bf406b1b99441da64e2d2d AS builder
+FROM rust:1.95.0-alpine3.23@sha256:606fd313a0f49743ee2a7bd49a0914bab7deedb12791f3a846a34a4711db7ed2 AS builder
 
 # The image's toolchain must be the one `rust-toolchain` names: fail instead
 # of letting rustup download another one behind the build's back.

@@ -58,7 +58,7 @@ concurrency:
 jobs:
   # ┌──────────────────────────────────────────────────────────────┐
   # │ Group B — per-cell pipeline                                   │
-  # │   build → fmt(msrv) → doc(msrv) → lint(1.93.1) → test → bench │
+  # │   build → fmt(msrv) → doc(msrv) → lint(1.95.0) → test → bench │
   # └──────────────────────────────────────────────────────────────┘
   pipeline:
     name: ${{ matrix.cell }}
@@ -74,7 +74,7 @@ jobs:
           # workspace-wide fmt + doc steps; no bench. `msrv-bare` below
           # is the bare-default baseline for feature-off breakage.
           - cell: msrv-full
-            toolchain: '1.93.1'
+            toolchain: '1.95.0'
             flags: '--features opentelemetry,splice,simd'
             bench: false
             experimental: false
@@ -85,7 +85,7 @@ jobs:
           # *off* and only the default-features path is built. Mirrors
           # `cargo install sozu` for a fresh user install.
           - cell: msrv-bare
-            toolchain: '1.93.1'
+            toolchain: '1.95.0'
             flags: ''
             bench: false
             experimental: false
@@ -98,31 +98,31 @@ jobs:
           # `jemallocator` (the binary feature) because the lib-only
           # test runs do not link the bin crate.
           - cell: crypto-ring
-            toolchain: '1.93.1'
+            toolchain: '1.95.0'
             flags: '--no-default-features --features crypto-ring,opentelemetry,splice,simd'
             bench: true
             experimental: false
             runner: sozu-bench
           - cell: crypto-aws-lc-rs
-            toolchain: '1.93.1'
+            toolchain: '1.95.0'
             flags: '--no-default-features --features crypto-aws-lc-rs,opentelemetry,splice,simd'
             bench: true
             experimental: false
             runner: sozu-bench
           - cell: crypto-openssl
-            toolchain: '1.93.1'
+            toolchain: '1.95.0'
             flags: '--no-default-features --features crypto-openssl,opentelemetry,splice,simd'
             bench: true
             experimental: false
             runner: sozu-bench
           - cell: fips
-            toolchain: '1.93.1'
+            toolchain: '1.95.0'
             flags: '--no-default-features --features fips,opentelemetry,splice,simd'
             bench: true
             experimental: false
             runner: sozu-bench
           # Toolchain-drift cells: same politics as msrv (default
-          # features, no bench). Lint is gated to the 1.93.1 MSRV cell
+          # features, no bench). Lint is gated to the 1.95.0 MSRV cell
           # because newer toolchains (1.95+) fire additional untriaged
           # lints across the workspace.
           # Full-matrix migration to the self-hosted CKE runners (see ci/runners/) completed
@@ -267,13 +267,13 @@ jobs:
           test ! -e target
           df -B1 .
 
-      # Lint runs on the 1.93.1 MSRV cell so feature-specific lints
+      # Lint runs on the 1.95.0 MSRV cell so feature-specific lints
       # (e.g. only firing under `--features fips`) get caught.
       # Excluded on stable/beta/nightly because 1.95+ fires
       # `mismatched_lifetime_syntaxes` and a handful of other new
       # lints that have not been triaged across the workspace.
       - name: Lint (clippy)
-        if: matrix.toolchain == '1.93.1'
+        if: matrix.toolchain == '1.95.0'
         run: cargo clippy --all-targets --locked ${{ matrix.flags }} -- -D warnings
 
       # The step above lints the dev profile only, where `debug_assertions` is
@@ -684,8 +684,8 @@ jobs:
           workspaces: . -> target/
 
       # `+nightly` is REQUIRED here: the repo's `rust-toolchain` file pins
-      # 1.93.1, and that directory override beats the nightly default installed
-      # above. Without the explicit toolchain, `cargo install` runs under 1.93.1
+      # 1.95.0, and that directory override beats the nightly default installed
+      # above. Without the explicit toolchain, `cargo install` runs under 1.95.0
       # and cargo-fuzz's locked dep tree (cargo-platform 0.3.3, rust-version
       # 1.91) fails the MSRV gate. The fuzz steps below use `cargo +nightly`.
       - name: Install cargo-fuzz
@@ -739,8 +739,8 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - name: Install rust 1.93.1
-        uses: dtolnay/rust-toolchain@1.93.1
+      - name: Install rust 1.95.0
+        uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Cache cargo target
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
@@ -912,8 +912,8 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - name: Install rust 1.93.1
-        uses: dtolnay/rust-toolchain@1.93.1
+      - name: Install rust 1.95.0
+        uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Cache cargo target
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
@@ -975,8 +975,8 @@ jobs:
     name: Build lagging_server
     runs-on: sozu-general
     steps:
-      - name: Install rust 1.93.1
-        uses: dtolnay/rust-toolchain@1.93.1
+      - name: Install rust 1.95.0
+        uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Clone lagging_server
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -1002,8 +1002,8 @@ jobs:
     name: Build bench_logger
     runs-on: sozu-general
     steps:
-      - name: Install rust 1.93.1
-        uses: dtolnay/rust-toolchain@1.93.1
+      - name: Install rust 1.95.0
+        uses: dtolnay/rust-toolchain@1.95.0
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -1061,8 +1061,8 @@ jobs:
           - crypto-openssl
           - fips
     steps:
-      - name: Install rust 1.93.1
-        uses: dtolnay/rust-toolchain@1.93.1
+      - name: Install rust 1.95.0
+        uses: dtolnay/rust-toolchain@1.95.0
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 

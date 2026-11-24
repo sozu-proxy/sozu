@@ -17,7 +17,7 @@ updates:
       # download nonexistent rust version 1.120.0-x86_64-unknown-linux-gnu`.
       # A version that DID exist would have failed far more quietly. The action
       # runs `rustup default <ref>` and exports no `RUSTUP_TOOLCHAIN`, so the
-      # `rust-toolchain` file still pins cargo to 1.93.1 for work inside this
+      # `rust-toolchain` file still pins cargo to 1.95.0 for work inside this
       # checkout; but the steps that build outside it — `Build lagging_server`,
       # `Build bench_logger`, `cargo install cargo-audit` — would have silently
       # moved to the new toolchain, and the release build, whose own comment

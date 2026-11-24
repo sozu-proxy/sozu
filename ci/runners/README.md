@@ -4,7 +4,7 @@
 (`ghcr.io/actions/actions-runner:latest`, runner UID `1001`, home `/home/runner`) with the
 system packages and Rust toolchains that `.github/workflows/ci.yml`'s pipeline job currently
 installs on every run: `protobuf-compiler`, `cmake`, h2spec `2.6.0`, and the four toolchains
-`1.93.1` (default, matches `rust-toolchain`), `stable`, `beta`, and `nightly` (with `clippy` on
+`1.95.0` (default, matches `rust-toolchain`), `stable`, `beta`, and `nightly` (with `clippy` on
 all four and `rustfmt` on `nightly`). Baking these in removes that per-run install cost from
 every CI job that runs on the CKE-hosted runners.
 
@@ -89,11 +89,11 @@ Smoke-test the toolchains after a rebuild:
 
 ```bash
 docker run --rm sozu-ci-runner:local bash -lc \
-  'set -e; for tc in 1.93.1 stable beta nightly; do rustup run $tc rustc --version; done; \
+  'set -e; for tc in 1.95.0 stable beta nightly; do rustup run $tc rustc --version; done; \
    cargo clippy --version; cargo +nightly fmt --version; h2spec --version; protoc --version; cmake --version'
 ```
 
-Expected: four `rustc X.Y.Z` lines (one per toolchain, `1.93.1` exact for the default), plus
+Expected: four `rustc X.Y.Z` lines (one per toolchain, `1.95.0` exact for the default), plus
 clippy/fmt/h2spec/protoc/cmake version output, with no error.
 
 ## Pushing to GHCR

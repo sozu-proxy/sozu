@@ -30,8 +30,8 @@ ENV RUSTUP_HOME=/home/runner/.rustup \
     PATH=/home/runner/.cargo/bin:$PATH
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-      | sh -s -- -y --profile minimal --default-toolchain 1.93.1 --component clippy \
+      | sh -s -- -y --profile minimal --default-toolchain 1.95.0 --component clippy \
     && rustup toolchain install stable beta nightly --profile minimal --component clippy \
     && rustup component add rustfmt --toolchain nightly \
-    && rustup default 1.93.1 \
+    && rustup default 1.95.0 \
     && rustc --version && cargo --version

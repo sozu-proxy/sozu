@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+Sōzu now requires Rust 1.95.0 to build. The Pulsar integration test uses Magnetar 2.1.0.
+
 <!-- changelog-slot:header-routing -->
 
 <!-- changelog-slot:unix-backends -->
