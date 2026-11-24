@@ -352,7 +352,7 @@ cargo test -p sozu --test main_upgrade_transfer_rejection_e2e --locked \
 cargo test -p sozu --test upgrade_pid_file_failure_e2e --locked \
   -- --ignored --nocapture --test-threads=1
 
-SOZU_MATRIX_PREVIOUS=/path/to/verified-sozu-2.3.5 \
+SOZU_MATRIX_PREVIOUS=/path/to/verified-sozu-2.3.6 \
 SOZU_MATRIX_LEGACY=/path/to/legacy-sozu \
 SOZU_MATRIX_OPTION3=/path/to/replacement-sozu \
 cargo test -p sozu --test main_upgrade_compatibility_matrix_e2e --locked \
@@ -382,9 +382,9 @@ refusal policy, not a successful systemd supervision transfer.
 candidate that exits before acknowledging; the CLI must fail while the old
 PID and its HTTP route remain available.
 
-`published_2_3_5_upgrades_to_current_and_drains_all_workers` is the stable
+`published_2_3_6_upgrades_to_current_and_drains_all_workers` is the stable
 release gate. It reuses the positive bridge scenario with **two** workers and
-requires the official 2.3.5 executable (`768fad4`). Before and after the full
+requires the official 2.3.6 executable (`c609809`). Before and after the full
 upgrade, each HTTP/TCP/UDP cluster query must contain exactly `main` and both
 running worker IDs, with identical state on every process. Both old workers
 must exit, both replacements must execute the candidate, saved routing state
@@ -393,16 +393,16 @@ work before, during and after the held request drains. A completed CLI alone
 does not satisfy this gate.
 
 ```bash
-SOZU_MATRIX_PREVIOUS=/path/to/verified-sozu-2.3.5 \
+SOZU_MATRIX_PREVIOUS=/path/to/verified-sozu-2.3.6 \
 cargo test -p sozu --test main_upgrade_compatibility_matrix_e2e --locked \
-  published_2_3_5_upgrades_to_current_and_drains_all_workers \
+  published_2_3_6_upgrades_to_current_and_drains_all_workers \
   -- --ignored --exact --nocapture --test-threads=1
 ```
 
 The candidate is Cargo's exact `sozu` binary from this checkout. The crypto-ring
-`proc-observer-e2e` CI cell downloads the official 2.3.5 archive and checks its
-SHA-256 (`63332cdb8840b0d0d0998c84a549a02f14d35cb88e974237d44d4443c6af116f`),
-the extracted executable (`aa63f2ce143d940fcbdc85ef7266ff6eacc0cf4b6291736f8a1b2fa2fb279c7b`)
+`proc-observer-e2e` CI cell downloads the official 2.3.6 archive and checks its
+SHA-256 (`9c06a2a1d3768d71455c99db60ea4eca45fdb0990b4eaa458e4f9cc87efee667`),
+the extracted executable (`9d8e51e3ada28d6b23210cf5e4e4a396a60e308d5bec3b5571cc06cc621398d9`)
 and the embedded revision before running the exact case. The existing 2.2.1
 bridge and 2.3.1 metadata/refusal cases retain their assertions and scope.
 
