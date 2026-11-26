@@ -3643,15 +3643,9 @@ pub mod testing {
             server_config,
         } = prebuild_server(max_buffers, buffer_size, true)?;
 
-        let token = {
-            let mut sessions = sessions.borrow_mut();
-            let entry = sessions.slab.vacant_entry();
-            let key = entry.key();
-            let _ = entry.insert(Rc::new(RefCell::new(ListenSession {
-                protocol: Protocol::TCPListen,
-            })));
-            Token(key)
-        };
+        let token = sessions
+            .borrow_mut()
+            .insert_listener_slot(Protocol::TCPListen);
 
         let mut proxy = TcpProxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
         proxy

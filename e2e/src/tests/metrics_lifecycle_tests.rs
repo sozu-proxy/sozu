@@ -183,7 +183,7 @@ const SESSION_BARRIER_BUDGET: Duration = Duration::from_secs(3);
 
 /// Send one lifecycle request and consume intervening worker events until its
 /// own acknowledgement arrives.
-fn request_acknowledged(worker: &mut Worker, request: RequestType) -> bool {
+pub(super) fn request_acknowledged(worker: &mut Worker, request: RequestType) -> bool {
     worker.send_proxy_request_type(request);
     let expected_id = worker.command_id.last.clone();
     loop {

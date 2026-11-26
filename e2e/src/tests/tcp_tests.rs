@@ -33,7 +33,10 @@ use crate::{
     tests::{State, repeat_until_error_or},
 };
 
-use super::tests::{create_local_address, create_unbound_local_address};
+use super::{
+    metrics_lifecycle_tests::request_acknowledged,
+    tests::{create_local_address, create_unbound_local_address},
+};
 
 const BUFFER_SIZE: usize = 4096;
 
@@ -1911,6 +1914,123 @@ fn test_tcp_expect_proxy_zero_bytes_keeps_the_worker_alive() {
             3,
             "TCP expect-header: a client that sends zero bytes does not kill the worker",
             try_tcp_expect_proxy_zero_bytes_keeps_the_worker_alive,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Listener slab slots and the accept budget
+//
+// A load balancer that routes every add-on as its own TCP listener holds more
+// listener slab slots than the whole accept budget of the worker
+// (`10 + 2 * max_connections`, `SessionManager::accept_slab_threshold` in
+// `lib/src/server.rs`). Listener slots are not connections: every listener
+// must still be added, and a client must still be served.
+// =========================================================================
+
+fn try_tcp_listeners_beyond_the_accept_budget() -> State {
+    const MAX_CONNECTIONS: usize = 2;
+    // One more listener than the accept gate's whole budget.
+    const LISTENERS: usize = 10 + 2 * MAX_CONNECTIONS + 1;
+
+    let front_address = create_local_address();
+    let back_address = create_local_address();
+    let (mut config, listeners, state) = Worker::empty_tcp_config(front_address);
+    config.max_connections = MAX_CONNECTIONS as u64;
+    let mut worker =
+        Worker::start_new_worker_owned("TCP-LISTENER-BUDGET", config, listeners, state);
+
+    // The serving listener comes first, so a refusal can only hit the fillers
+    // and the accept gate, never the route the client takes.
+    let mut setup_ok = request_acknowledged(
+        &mut worker,
+        RequestType::AddTcpListener(
+            ListenerBuilder::new_tcp(front_address.into())
+                .to_tcp(None)
+                .unwrap(),
+        ),
+    );
+    setup_ok &= request_acknowledged(
+        &mut worker,
+        RequestType::ActivateListener(ActivateListener {
+            interface: None,
+            address: front_address.into(),
+            proxy: ListenerType::Tcp.into(),
+            from_scm: false,
+        }),
+    );
+    setup_ok &= request_acknowledged(
+        &mut worker,
+        RequestType::AddCluster(Worker::default_cluster("cluster_0")),
+    );
+    setup_ok &= request_acknowledged(
+        &mut worker,
+        RequestType::AddTcpFrontend(Worker::default_tcp_frontend("cluster_0", front_address)),
+    );
+    setup_ok &= request_acknowledged(
+        &mut worker,
+        RequestType::AddBackend(Worker::default_backend(
+            "cluster_0",
+            "cluster_0-0",
+            back_address,
+            None,
+        )),
+    );
+
+    // The fillers take their slab slot at `AddTcpListener`; they are never
+    // activated, so their addresses need not be bound.
+    let mut refused_listeners = 0;
+    for _ in 1..LISTENERS {
+        let address = create_unbound_local_address();
+        let added = request_acknowledged(
+            &mut worker,
+            RequestType::AddTcpListener(
+                ListenerBuilder::new_tcp(address.into())
+                    .to_tcp(None)
+                    .unwrap(),
+            ),
+        );
+        if !added {
+            refused_listeners += 1;
+        }
+    }
+
+    let mut backend = SyncBackend::new("BACKEND_0", back_address, "pong");
+    backend.connect();
+    let mut client = Client::new("CLIENT", front_address, "ping");
+    client.connect();
+    client.send();
+    backend.accept(0);
+    let backend_received = backend.receive(0);
+    backend.send(0);
+    let client_received = client.receive();
+    let served =
+        backend_received.as_deref() == Some("ping") && client_received.as_deref() == Some("pong");
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    println!(
+        "TCP listener budget: setup_ok={setup_ok} listeners={LISTENERS} \
+         refused_listeners={refused_listeners} backend_received={backend_received:?} \
+         client_received={client_received:?} stopped={stopped}"
+    );
+    if setup_ok && refused_listeners == 0 && served && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_tcp_listeners_beyond_the_accept_budget_still_accept() {
+    // The slab accounting is deterministic: one clean run proves it.
+    assert_eq!(
+        repeat_until_error_or(
+            1,
+            "TCP listener budget: listener slots do not consume the accept budget",
+            try_tcp_listeners_beyond_the_accept_budget,
         ),
         State::Success,
     );

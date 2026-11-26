@@ -10,6 +10,12 @@
 
 <!-- changelog-slot:close-sessions -->
 
+<!-- changelog-slot:listener-slab-budget -->
+
+### Fixed
+
+- A listener's slab slot was charged to its worker's accept budget (`10 + 2 * max_connections` slab entries), which only connections use. Past `7 + 2 * max_connections` listeners (the budget less the channel, timer and metrics slots), a worker refused every further `AddListener` with `session list is full, cannot add a listener`, and from that point it also refused every client connection, flushing its accept queue with `not enough memory to accept another session` while serving none. A load balancer that routes every add-on as its own TCP listener reaches that count. Listener slots are now counted apart, in the new `slab.listener_entries` gauge, and charged neither to the accept gate nor to the slab capacity sized for connections: the worker reserves one more slot of capacity per listener, so `slab.capacity` grows with the listeners. No listener add is refused because the worker is busy any more, on any of the four listener protocols. `slab.usage_percent` and `slab.accept_threshold_percent` leave listener slots out, so a worker holding many listeners and no connection reads close to 0 on both. Reproduced by `listener_slots_do_not_consume_the_accept_budget` and `test_tcp_listeners_beyond_the_accept_budget_still_accept`.
+
 ## 2.3.7 - 2026-11-24
 
 Sōzu 2.3.7 fixes worker upgrades and shutdown, HTTP/1 and HTTP/2 connection handling, WebSocket teardown, and TCP and UDP listener accounting. Building from source now requires Rust 1.95.0.

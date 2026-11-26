@@ -217,6 +217,9 @@ one for the connection to the main process, one for the metrics socket, then one
 one per backend connection. So the number of connections should always be close to (but lower than) the slab count.
 A listener holds its slot for its whole lifetime — from `add-listener` to `remove-listener`, whether it is currently
 activated or not — so a deactivated listener still counts for one, and `remove-listener` is what gives the slot back.
+`sozu.slab.listener_entries` counts those listener slots. They are not charged to the accept gate nor to the room
+sized for connections, so subtract them from `sozu.slab.entries` before comparing it with the connections: a worker
+holding thousands of listeners and no connection is idle, not full.
 * `sozu.buffer.in_use` (renamed from `sozu.buffer.number`): number of buffers used in the buffer pool. Inactive sessions and requests for which we send
 a default answer (400, 404, 413, 503 HTTP errors) do not use buffers. Active HTTP sessions use one buffer (except
 in pipelining mode), WebSocket sessions use two buffers. So the number of buffers should always be lower than the

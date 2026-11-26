@@ -397,6 +397,24 @@ pub struct SessionManager {
     pub nb_connections: usize,
     pub can_accept: bool,
     pub slab: Slab<Rc<RefCell<dyn ProxySession>>>,
+    /// Slab slots held by listeners (HTTP, HTTPS, TCP and UDP), each from its
+    /// `AddListener` to its `RemoveListener`: taken by
+    /// [`Self::add_listener_slot`] / [`Self::insert_listener_slot`], released
+    /// by [`Self::remove_listener_slot`]. A listener accepts connections and
+    /// is not one, so these slots are charged neither to the accept gate
+    /// ([`Self::at_capacity`]) nor to the capacity sized for connections
+    /// ([`Self::session_capacity`]): they are reserved on top of it. A load
+    /// balancer that routes every add-on as its own TCP listener holds more of
+    /// them than the whole accept budget of a worker.
+    ///
+    /// UDP flow slots alias their listener's session but are not listener
+    /// slots: they are inserted directly and count as session slots.
+    listener_slots: usize,
+    /// The slab capacity sized for connections, the slab's capacity when the
+    /// manager was built (`ServerConfig::slab_capacity`,
+    /// `10 + slab_entries_per_connection * max_connections`). Listener slots
+    /// are reserved on top of it.
+    session_capacity: usize,
     /// Default per-(cluster, source-IP) connection limit. `0` disables
     /// the feature; cluster-level overrides take precedence at check
     /// time.
@@ -492,11 +510,14 @@ impl SessionManager {
         subnet_ipv4_prefix: u32,
         subnet_ipv6_prefix: u32,
     ) -> Rc<RefCell<Self>> {
+        let session_capacity = slab.capacity();
         Rc::new(RefCell::new(SessionManager {
             max_connections,
             nb_connections: 0,
             can_accept: true,
             slab,
+            listener_slots: 0,
+            session_capacity,
             max_connections_per_ip,
             retry_after,
             connections_per_cluster_ip: HashMap::new(),
@@ -1018,32 +1039,167 @@ impl SessionManager {
         self.check_invariants();
     }
 
-    /// The slab is considered at capacity if it contains more sessions than twice max_connections
+    /// The slab is at capacity once its session slots, listener slots left
+    /// out, reach the accept gate ([`Self::accept_slab_threshold`]).
     pub fn at_capacity(&self) -> bool {
-        self.slab.len() >= self.accept_slab_threshold()
+        self.session_slots() >= self.accept_slab_threshold()
     }
 
-    /// The slab fill level at which `at_capacity` flips to true and the
-    /// accept queue is flushed. Reported as `slab.accept_threshold` so the
-    /// per-iteration `slab.accept_threshold_percent` gauge in the run loop
-    /// can chart proximity to this gate, distinct from raw slab usage.
+    /// The slab slots charged to the accept gate: every slot but the listener
+    /// slots, so the sessions and the channel, timer and metrics slots the
+    /// gate's `10` leaves room for.
+    pub fn session_slots(&self) -> usize {
+        // Every listener slot is a slab entry, so the subtraction cannot
+        // underflow; saturate anyway rather than wrap to a full gate.
+        debug_assert!(
+            self.listener_slots <= self.slab.len(),
+            "{} listener slots cannot exceed the {} slab entries",
+            self.listener_slots,
+            self.slab.len()
+        );
+        self.slab.len().saturating_sub(self.listener_slots)
+    }
+
+    /// The slab slots held by listeners, reported as `slab.listener_entries`.
+    pub fn listener_slots(&self) -> usize {
+        self.listener_slots
+    }
+
+    /// The slab capacity sized for connections, listener slots left out:
+    /// the denominator of `slab.usage_percent`.
+    pub fn session_capacity(&self) -> usize {
+        self.session_capacity
+    }
+
+    /// The number of session slots at which `at_capacity` flips to true and
+    /// the accept queue is flushed. The run loop's
+    /// `slab.accept_threshold_percent` gauge charts [`Self::session_slots`]
+    /// against it, distinct from `slab.usage_percent`.
     ///
     /// The constant `10 + 2 * max_connections` is the historical pre-knob
-    /// budget; configured slab capacity is
+    /// budget; the capacity sized for connections is
     /// `10 + slab_entries_per_connection * max_connections` (see
     /// `command/src/config.rs`) and can be larger, so `slab.usage_percent`
-    /// (against `slab.capacity()`) and `slab.accept_threshold_percent`
-    /// (against this gate) are emitted as independent gauges.
+    /// (against [`Self::session_capacity`]) and
+    /// `slab.accept_threshold_percent` (against this gate) are emitted as
+    /// independent gauges. Listener slots are charged to neither.
     pub fn accept_slab_threshold(&self) -> usize {
         let threshold = 10 + 2 * self.max_connections;
-        // The gate must leave headroom above the connection cap so listener /
-        // system slots (Channel, Metrics, Timer, listeners) are never starved
-        // by frontend connections alone.
+        // The gate must leave headroom above the connection cap so the system
+        // slots (Channel, Metrics, Timer) are never starved by frontend
+        // connections alone. Listener slots are outside the gate.
         debug_assert!(
             threshold > self.max_connections,
             "accept gate must sit strictly above max_connections to reserve system slots"
         );
         threshold
+    }
+
+    /// Give a listener its slab slot, for its whole `AddListener` ->
+    /// `RemoveListener` lifetime (`Server::reserve_listen_token`).
+    ///
+    /// `add` registers the listener with its proxy under the slab's next
+    /// vacant key; the slot is taken only when `add` succeeds, so a refused
+    /// listener leaves the slab as it found it. The four
+    /// `Server::notify_add_*_listener` share this path, so a listener slot is
+    /// taken, counted and sized the same way on every protocol. It is not
+    /// refused on connection load: a listener slot is not charged to the
+    /// accept gate, so a worker at its connection cap still takes a listener.
+    pub fn add_listener_slot<E>(
+        &mut self,
+        protocol: Protocol,
+        add: impl FnOnce(Token) -> Result<Token, E>,
+    ) -> Result<Token, E> {
+        let token = Token(self.slab.vacant_key());
+        debug_assert!(
+            !self.slab.contains(token.0),
+            "the next vacant slab key must be free before insertion"
+        );
+        let added = add(token)?;
+        debug_assert_eq!(
+            added, token,
+            "the proxy must register the listener under the token it was given"
+        );
+        let inserted = self.insert_listener_slot(protocol);
+        debug_assert_eq!(
+            inserted, token,
+            "the listener must occupy the vacant key its proxy registered it under"
+        );
+        Ok(token)
+    }
+
+    /// Insert a listener slot and count it, keeping room for it on top of the
+    /// capacity sized for connections. [`Self::add_listener_slot`] is the path
+    /// a worker takes; this is the half that a caller registering its
+    /// listener only afterwards (the `start_*_worker` helpers) calls directly.
+    pub fn insert_listener_slot(&mut self, protocol: Protocol) -> Token {
+        debug_assert!(
+            matches!(
+                protocol,
+                Protocol::HTTPListen
+                    | Protocol::HTTPSListen
+                    | Protocol::TCPListen
+                    | Protocol::UDPListen
+            ),
+            "only a listener takes a listener slot, not {protocol:?}"
+        );
+        let len_before = self.slab.len();
+        let listener_slots_before = self.listener_slots;
+        // Listener slots must not eat the room sized for connections, or the
+        // slab would reallocate under connection load. `Slab::reserve` grows
+        // the slab by doubling, so a worker adding thousands of listeners
+        // reallocates a logarithmic number of times, not once per listener.
+        let wanted = self.session_capacity + self.listener_slots + 1;
+        self.slab.reserve(wanted.saturating_sub(self.slab.len()));
+
+        let key = self
+            .slab
+            .insert(Rc::new(RefCell::new(ListenSession { protocol })));
+        self.listener_slots += 1;
+
+        debug_assert_eq!(
+            self.slab.len(),
+            len_before + 1,
+            "adding a listener must occupy exactly one slab slot"
+        );
+        debug_assert_eq!(
+            self.listener_slots,
+            listener_slots_before + 1,
+            "adding a listener must count exactly one listener slot"
+        );
+        debug_assert!(
+            self.slab.capacity() >= self.session_capacity + self.listener_slots,
+            "listener slots must be reserved on top of the capacity sized for connections"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+        Token(key)
+    }
+
+    /// Release the slab slot of a removed listener (`RemoveListener` in
+    /// `Server::notify_proxys`, the sole release point). Returns whether the
+    /// slot was there to release. The count saturates at zero: a test fixture
+    /// that inserts its listener slot directly into the slab, bypassing
+    /// [`Self::insert_listener_slot`], never had it counted.
+    pub fn remove_listener_slot(&mut self, token: Token) -> bool {
+        let listener_slots_before = self.listener_slots;
+        let removed = self.slab.try_remove(token.0).is_some();
+        if removed {
+            self.listener_slots = self.listener_slots.saturating_sub(1);
+        }
+        // Pair: a release uncounts at most one slot, and none when nothing was
+        // there to free.
+        debug_assert!(
+            listener_slots_before - self.listener_slots <= usize::from(removed),
+            "releasing a listener slot must uncount at most the slot it freed"
+        );
+        debug_assert!(
+            !self.slab.contains(token.0),
+            "a released listener slot must be absent from the slab"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+        removed
     }
 
     /// Check the number of connections against max_connections, and the slab capacity.
@@ -1070,8 +1226,12 @@ impl SessionManager {
         if self.at_capacity() {
             error!("not enough memory to accept another session, flushing the accept queue");
             error!(
-                "nb_connections: {}, max_connections: {}",
-                self.nb_connections, self.max_connections
+                "nb_connections: {}, max_connections: {}, session slots: {} of {} (listener slots, not charged: {})",
+                self.nb_connections,
+                self.max_connections,
+                self.session_slots(),
+                self.accept_slab_threshold(),
+                self.listener_slots
             );
             gauge!(names::accept_queue::BACKPRESSURE, 1);
             self.can_accept = false;
@@ -1174,8 +1334,8 @@ impl SessionManager {
         {
             debug!(
                 "no counted session left and room under both gates, starting to accept again \
-                 (slab: {}, accept gate at {})",
-                self.slab.len(),
+                 (session slots: {}, accept gate at {})",
+                self.session_slots(),
                 self.accept_slab_threshold()
             );
             // The gate reopens only where `check_limits` would admit.
@@ -1282,6 +1442,14 @@ impl SessionManager {
                 !by_cluster.is_empty() && by_cluster.values().all(|subnets| !subnets.is_empty())
             }),
             "cluster_subnet_tracks retains an empty per-token or per-cluster entry"
+        );
+        // 8. Every counted listener slot is a slab entry, so the session slots
+        //    the accept gate is charged with are never negative.
+        debug_assert!(
+            self.listener_slots <= self.slab.len(),
+            "{} listener slots exceed the {} slab entries",
+            self.listener_slots,
+            self.slab.len()
         );
     }
 }
@@ -2030,19 +2198,27 @@ impl Server {
             // follow the once-per-iteration batching contract this run loop
             // uses for `process.uptime_seconds` / `server.live`.
             //
-            // `slab.usage_percent` charts pure slab utilisation against
-            // `slab.capacity()`. `slab.accept_threshold_percent` charts how
-            // close the slab is to the `at_capacity()` accept gate
-            // (`10 + 2 * max_connections`, see
-            // `SessionManager::accept_slab_threshold`). Configured slab
-            // capacity can be larger than that gate (`slab_entries_per_connection`
-            // > 2), so the two gauges are kept independent on purpose.
+            // Both percentages chart the session slots, listener slots left
+            // out (`SessionManager::session_slots`): a listener is not a
+            // connection, so a worker holding thousands of listeners and no
+            // connection reads close to 0. `slab.usage_percent` charts them
+            // against the capacity sized for connections
+            // (`SessionManager::session_capacity`);
+            // `slab.accept_threshold_percent` against the `at_capacity()`
+            // accept gate (`10 + 2 * max_connections`, see
+            // `SessionManager::accept_slab_threshold`). The capacity sized for
+            // connections can be larger than that gate
+            // (`slab_entries_per_connection` > 2), so the two gauges are kept
+            // independent on purpose.
             {
                 let sessions = self.sessions.borrow();
                 let nb_connections = sessions.nb_connections;
                 let max_connections = sessions.max_connections;
                 let slab_len = sessions.slab.len();
                 let slab_capacity = sessions.slab.capacity();
+                let listener_slots = sessions.listener_slots();
+                let session_slots = sessions.session_slots();
+                let session_capacity = sessions.session_capacity();
                 let accept_threshold = sessions.accept_slab_threshold();
 
                 gauge!(names::client::CONNECTIONS, nb_connections);
@@ -2052,11 +2228,12 @@ impl Server {
                 }
 
                 gauge!(names::slab::ENTRIES, slab_len);
+                gauge!(names::slab::LISTENER_ENTRIES, listener_slots);
                 gauge!(names::slab::CAPACITY, slab_capacity);
-                if let Some(percent) = (slab_len * 100).checked_div(slab_capacity) {
+                if let Some(percent) = (session_slots * 100).checked_div(session_capacity) {
                     gauge!(names::slab::USAGE_PERCENT, percent);
                 }
-                if let Some(percent) = (slab_len * 100).checked_div(accept_threshold) {
+                if let Some(percent) = (session_slots * 100).checked_div(accept_threshold) {
                     gauge!(names::slab::ACCEPT_THRESHOLD_PERCENT, percent);
                 }
             }
@@ -3462,7 +3639,7 @@ impl Server {
                         self.base_sessions_count > 0,
                         "releasing a listener slot with base_sessions_count == 0 would underflow"
                     );
-                    self.sessions.borrow_mut().slab.try_remove(token.0);
+                    self.sessions.borrow_mut().remove_listener_slot(token);
                     self.base_sessions_count -= 1;
                     // Same rule as the deactivate arms: a listen token with no
                     // slab slot must not stay queued for a deferred accept.
@@ -3742,42 +3919,20 @@ impl Server {
             .map(Into::into)
             .collect();
 
-        if self.sessions.borrow().at_capacity() {
-            return worker_response_error(req_id, "session list is full, cannot add a listener");
-        }
-
-        let mut session_manager = self.sessions.borrow_mut();
-        // The vacant entry's key is free now and becomes the listener's token.
-        let slab_before = session_manager.slab.len();
-        debug_assert!(
-            !session_manager
-                .slab
-                .contains(session_manager.slab.vacant_key()),
-            "the next vacant slab key must be free before insertion"
-        );
-        let entry = session_manager.slab.vacant_entry();
-        let token = Token(entry.key());
-
-        match self.http.borrow_mut().add_listener_with_retained_frontends(
-            listener,
-            token,
-            retained_frontends,
-        ) {
+        // A listener slot is not charged to the accept gate, so connection load
+        // never refuses a listener (`SessionManager::add_listener_slot`).
+        let added = self
+            .sessions
+            .borrow_mut()
+            .add_listener_slot(Protocol::HTTPListen, |token| {
+                self.http.borrow_mut().add_listener_with_retained_frontends(
+                    listener,
+                    token,
+                    retained_frontends,
+                )
+            });
+        match added {
             Ok(_token) => {
-                entry.insert(Rc::new(RefCell::new(ListenSession {
-                    protocol: Protocol::HTTPListen,
-                })));
-                // The listener session occupies exactly the token's slab key,
-                // and the slab grew by exactly one slot.
-                debug_assert!(
-                    session_manager.slab.contains(token.0),
-                    "listener insert must occupy the token's slab key"
-                );
-                debug_assert_eq!(
-                    session_manager.slab.len(),
-                    slab_before + 1,
-                    "adding a listener must occupy exactly one slab slot"
-                );
                 self.base_sessions_count += 1;
                 WorkerResponse::ok(req_id)
             }
@@ -3806,40 +3961,21 @@ impl Server {
             .config_state
             .certificate_add_requests_for_address(address);
 
-        if self.sessions.borrow().at_capacity() {
-            return worker_response_error(req_id, "session list is full, cannot add a listener");
-        }
-
-        let mut session_manager = self.sessions.borrow_mut();
-        let slab_before = session_manager.slab.len();
-        debug_assert!(
-            !session_manager
-                .slab
-                .contains(session_manager.slab.vacant_key()),
-            "the next vacant slab key must be free before insertion"
-        );
-        let entry = session_manager.slab.vacant_entry();
-        let token = Token(entry.key());
-
-        match self.https.borrow_mut().add_listener_with_retained_state(
-            listener.clone(),
-            token,
-            retained_frontends,
-            retained_certificates,
-        ) {
+        // A listener slot is not charged to the accept gate, so connection load
+        // never refuses a listener (`SessionManager::add_listener_slot`).
+        let added = self
+            .sessions
+            .borrow_mut()
+            .add_listener_slot(Protocol::HTTPSListen, |token| {
+                self.https.borrow_mut().add_listener_with_retained_state(
+                    listener,
+                    token,
+                    retained_frontends,
+                    retained_certificates,
+                )
+            });
+        match added {
             Ok(_token) => {
-                entry.insert(Rc::new(RefCell::new(ListenSession {
-                    protocol: Protocol::HTTPSListen,
-                })));
-                debug_assert!(
-                    session_manager.slab.contains(token.0),
-                    "listener insert must occupy the token's slab key"
-                );
-                debug_assert_eq!(
-                    session_manager.slab.len(),
-                    slab_before + 1,
-                    "adding a listener must occupy exactly one slab slot"
-                );
                 self.base_sessions_count += 1;
                 WorkerResponse::ok(req_id)
             }
@@ -3865,39 +4001,20 @@ impl Server {
             .map(Into::into)
             .collect();
 
-        if self.sessions.borrow().at_capacity() {
-            return worker_response_error(req_id, "session list is full, cannot add a listener");
-        }
-
-        let mut session_manager = self.sessions.borrow_mut();
-        let slab_before = session_manager.slab.len();
-        debug_assert!(
-            !session_manager
-                .slab
-                .contains(session_manager.slab.vacant_key()),
-            "the next vacant slab key must be free before insertion"
-        );
-        let entry = session_manager.slab.vacant_entry();
-        let token = Token(entry.key());
-
-        match self.tcp.borrow_mut().add_listener_with_retained_frontends(
-            listener,
-            token,
-            retained_frontends,
-        ) {
+        // A listener slot is not charged to the accept gate, so connection load
+        // never refuses a listener (`SessionManager::add_listener_slot`).
+        let added = self
+            .sessions
+            .borrow_mut()
+            .add_listener_slot(Protocol::TCPListen, |token| {
+                self.tcp.borrow_mut().add_listener_with_retained_frontends(
+                    listener,
+                    token,
+                    retained_frontends,
+                )
+            });
+        match added {
             Ok(_token) => {
-                entry.insert(Rc::new(RefCell::new(ListenSession {
-                    protocol: Protocol::TCPListen,
-                })));
-                debug_assert!(
-                    session_manager.slab.contains(token.0),
-                    "listener insert must occupy the token's slab key"
-                );
-                debug_assert_eq!(
-                    session_manager.slab.len(),
-                    slab_before + 1,
-                    "adding a listener must occupy exactly one slab slot"
-                );
                 self.base_sessions_count += 1;
                 WorkerResponse::ok(req_id)
             }
@@ -3923,23 +4040,20 @@ impl Server {
             .map(Into::into)
             .collect();
 
-        if self.sessions.borrow().at_capacity() {
-            return worker_response_error(req_id, "session list is full, cannot add a listener");
-        }
-
-        let mut session_manager = self.sessions.borrow_mut();
-        let entry = session_manager.slab.vacant_entry();
-        let token = Token(entry.key());
-
-        match self.udp.borrow_mut().add_listener_with_retained_frontends(
-            listener,
-            token,
-            retained_frontends,
-        ) {
+        // A listener slot is not charged to the accept gate, so connection load
+        // never refuses a listener (`SessionManager::add_listener_slot`).
+        let added = self
+            .sessions
+            .borrow_mut()
+            .add_listener_slot(Protocol::UDPListen, |token| {
+                self.udp.borrow_mut().add_listener_with_retained_frontends(
+                    listener,
+                    token,
+                    retained_frontends,
+                )
+            });
+        match added {
             Ok(_token) => {
-                entry.insert(Rc::new(RefCell::new(ListenSession {
-                    protocol: Protocol::UDPListen,
-                })));
                 self.base_sessions_count += 1;
                 WorkerResponse::ok(req_id)
             }
@@ -8007,6 +8121,201 @@ mod listener_lifecycle_tests {
             "the socket queued by listener C, which was not removed, must become a session"
         );
     }
+
+    /// A listener slab slot is not a connection. A worker holding more
+    /// listeners than its whole accept budget (`10 + 2 * max_connections`,
+    /// `SessionManager::accept_slab_threshold`) adds every one of them, on each
+    /// of the four protocols, and still admits a connection.
+    ///
+    /// To SEE THIS RED: on the tree before the fix, the tenth listener is
+    /// refused ("listener 9 of 13 must be added whatever the accept budget").
+    /// With the fix but `SessionManager::at_capacity` comparing
+    /// `self.slab.len()` with the gate again, every listener is added and the
+    /// test fails with "a worker serving no connection must admit one,
+    /// whatever its listener count".
+    #[test]
+    fn listener_slots_do_not_consume_the_accept_budget() {
+        let mut server = bare_server();
+        let max_connections = 1;
+        server.sessions.borrow_mut().max_connections = max_connections;
+        let budget = 10 + 2 * max_connections;
+
+        for index in 0..=budget {
+            let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+            let response = match index % 4 {
+                0 => server.notify_add_http_listener(
+                    "test-add-http",
+                    ListenerBuilder::new_http(address)
+                        .to_http(None)
+                        .expect("could not build an HttpListenerConfig for the test"),
+                ),
+                1 => server.notify_add_https_listener(
+                    "test-add-https",
+                    ListenerBuilder::new_https(address)
+                        .to_tls(None)
+                        .expect("could not build an HttpsListenerConfig for the test"),
+                ),
+                2 => server.notify_add_tcp_listener(
+                    "test-add-tcp",
+                    ListenerBuilder::new_tcp(address)
+                        .to_tcp(None)
+                        .expect("could not build a TcpListenerConfig for the test"),
+                ),
+                _ => server.notify_add_udp_listener(
+                    "test-add-udp",
+                    ListenerBuilder::new_udp(address)
+                        .to_udp(None)
+                        .expect("could not build a UdpListenerConfig for the test"),
+                ),
+            };
+            assert_eq!(
+                response.status,
+                ResponseStatus::Ok as i32,
+                "listener {index} of {} must be added whatever the accept budget: {response:?}",
+                budget + 1
+            );
+        }
+
+        assert!(
+            server.sessions.borrow().slab.len() > budget,
+            "premise: the listener slots alone must outnumber the accept budget"
+        );
+        assert!(
+            server.sessions.borrow_mut().check_limits(),
+            "a worker serving no connection must admit one, whatever its listener count"
+        );
+    }
+
+    /// The listener slot count follows the slots themselves: an added listener
+    /// counts one and reserves a slot of capacity on top of the capacity sized
+    /// for connections, a refused one counts none, and `RemoveListener` takes
+    /// its one back. The session slots charged to the accept gate never move.
+    ///
+    /// To SEE THIS RED: drop the `self.slab.reserve(..)` call from
+    /// `SessionManager::insert_listener_slot` — the first add then fails on
+    /// "listener slots must be reserved on top of the capacity sized for
+    /// connections" — or drop the decrement from
+    /// `SessionManager::remove_listener_slot`, and the test fails with
+    /// "RemoveListener must uncount the slot it releases".
+    #[test]
+    fn listener_slots_are_counted_from_add_to_remove() {
+        let mut server = bare_server();
+        let session_slots = server.sessions.borrow().session_slots();
+        let session_capacity = server.sessions.borrow().session_capacity();
+        assert_eq!(server.sessions.borrow().listener_slots(), 0);
+
+        let mut addresses = Vec::new();
+        for added in 1..=3 {
+            let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+            let response = server.notify_add_tcp_listener(
+                "test-add-tcp",
+                ListenerBuilder::new_tcp(address)
+                    .to_tcp(None)
+                    .expect("could not build a TcpListenerConfig for the test"),
+            );
+            assert_eq!(response.status, ResponseStatus::Ok as i32, "{response:?}");
+            addresses.push(address);
+            let sessions = server.sessions.borrow();
+            assert_eq!(sessions.listener_slots(), added);
+            assert_eq!(
+                sessions.session_slots(),
+                session_slots,
+                "a listener slot must not be charged to the accept gate"
+            );
+            assert!(
+                sessions.slab.capacity() >= session_capacity + added,
+                "each listener must reserve its slot on top of the capacity sized for connections"
+            );
+        }
+
+        // A listener its proxy refuses takes no slot and counts none.
+        let mut refused =
+            ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, provide_port()))
+                .to_http(None)
+                .expect("could not build an HttpListenerConfig for the test");
+        refused
+            .answers
+            .insert("404".to_owned(), "not a valid http response".to_owned());
+        let slab_len = server.sessions.borrow().slab.len();
+        let response = server.notify_add_http_listener("test-add-refused", refused);
+        assert_eq!(
+            response.status,
+            ResponseStatus::Failure as i32,
+            "{response:?}"
+        );
+        assert_eq!(server.sessions.borrow().slab.len(), slab_len);
+        assert_eq!(server.sessions.borrow().listener_slots(), 3);
+
+        server.notify_proxys(WorkerRequest {
+            id: "test-remove".to_owned(),
+            content: RequestType::RemoveListener(RemoveListener {
+                interface: None,
+                address: addresses[0],
+                proxy: ListenerType::Tcp as i32,
+            })
+            .into(),
+        });
+        let sessions = server.sessions.borrow();
+        assert_eq!(
+            sessions.listener_slots(),
+            2,
+            "RemoveListener must uncount the slot it releases"
+        );
+        assert_eq!(sessions.slab.len(), slab_len - 1);
+        assert_eq!(sessions.session_slots(), session_slots);
+    }
+
+    /// A listener is not refused because the worker is busy: with its session
+    /// slots at the accept gate, a worker still takes a listener, and the
+    /// listener leaves the gate where it was.
+    ///
+    /// To SEE THIS RED: put the former refusal back at the top of
+    /// `Server::notify_add_tcp_listener`
+    /// (`if self.sessions.borrow().at_capacity() { return worker_response_error(req_id, "session list is full, cannot add a listener"); }`).
+    /// The test then fails with "a worker at its accept gate must still take a
+    /// listener".
+    #[test]
+    fn a_worker_at_its_accept_gate_still_takes_a_listener() {
+        let mut server = bare_server();
+        let threshold = server.sessions.borrow().accept_slab_threshold();
+        // Stand-in sessions, inserted directly, fill the session slots up to
+        // the gate.
+        while server.sessions.borrow().session_slots() < threshold {
+            server
+                .sessions
+                .borrow_mut()
+                .slab
+                .insert(Rc::new(RefCell::new(ListenSession {
+                    protocol: Protocol::TCP,
+                })));
+        }
+        assert!(
+            server.sessions.borrow().at_capacity(),
+            "premise: the session slots must sit at the accept gate"
+        );
+        let listener_slots = server.sessions.borrow().listener_slots();
+
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let response = server.notify_add_tcp_listener(
+            "test-add-tcp",
+            ListenerBuilder::new_tcp(address)
+                .to_tcp(None)
+                .expect("could not build a TcpListenerConfig for the test"),
+        );
+
+        assert_eq!(
+            response.status,
+            ResponseStatus::Ok as i32,
+            "a worker at its accept gate must still take a listener: {response:?}"
+        );
+        let sessions = server.sessions.borrow();
+        assert_eq!(sessions.listener_slots(), listener_slots + 1);
+        assert_eq!(
+            sessions.session_slots(),
+            threshold,
+            "the listener must leave the session slots, and so the gate, where they were"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -9142,29 +9451,21 @@ mod remove_cluster_cascade_tests {
     #[test]
     fn a_refused_duplicate_listener_add_preserves_the_preexisting_listener() {
         let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
-        let listener = ListenerBuilder::new_http(address)
+        let mut listener = ListenerBuilder::new_http(address)
             .to_http(None)
             .expect("the test HTTP listener configuration must build");
+        // An answer template the runtime cannot parse makes it refuse the
+        // duplicate too (`HttpListener::new`); `ConfigState` does not parse
+        // templates, so the setup listener still enters the worker state.
+        listener
+            .answers
+            .insert("404".to_owned(), "not a valid http response".to_owned());
         let mut server = bare_server();
         server
             .config_state
             .dispatch(&RequestType::AddHttpListener(listener.clone()).into())
             .expect("the setup listener must enter worker state");
         let before = server.config_state.http_listeners.clone();
-
-        // Fill the reserved slab headroom so the worker takes the explicit
-        // refusal path before attempting to install a runtime listener.
-        let threshold = server.sessions.borrow().accept_slab_threshold();
-        while server.sessions.borrow().slab.len() < threshold {
-            server
-                .sessions
-                .borrow_mut()
-                .slab
-                .insert(Rc::new(RefCell::new(ListenSession {
-                    protocol: Protocol::HTTPListen,
-                })));
-        }
-        assert!(server.sessions.borrow().at_capacity());
 
         let responses = send(
             &mut server,
@@ -9177,7 +9478,7 @@ mod remove_cluster_cascade_tests {
                 .map(|response| response.status)
                 .collect::<Vec<_>>(),
             vec![ResponseStatus::Failure as i32],
-            "the full session slab must refuse the duplicate listener: {responses:?}"
+            "the runtime must refuse the duplicate listener: {responses:?}"
         );
         assert_eq!(
             server.config_state.http_listeners, before,
