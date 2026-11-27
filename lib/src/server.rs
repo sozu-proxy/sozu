@@ -25,7 +25,7 @@ use sozu_command::{
     proto::command::{
         ActivateListener, AddBackend, CertificatesWithFingerprints, ClosedSessions, Cluster,
         ClusterHashes, ClusterInformations, DeactivateListener, Event, EventKind,
-        HttpListenerConfig, HttpsListenerConfig, InitialState, ListenerType,
+        HttpListenerConfig, HttpsListenerConfig, InitialState, ListenerHandoff, ListenerType,
         LoadBalancingAlgorithms, LoadMetric, MetricDetail, MetricsConfiguration,
         ProtectedHealthCheckPhase, RemoveBackend, Request, ResponseContent, ResponseStatus,
         ServerConfig, TcpListenerConfig as CommandTcpListener,
@@ -397,6 +397,29 @@ pub struct SessionManager {
     pub nb_connections: usize,
     pub can_accept: bool,
     pub slab: Slab<Rc<RefCell<dyn ProxySession>>>,
+    /// Slab slots held by listeners (HTTP, HTTPS, TCP and UDP), each from its
+    /// `AddListener` to its `RemoveListener`: taken by
+    /// [`Self::add_listener_slot`] / [`Self::insert_listener_slot`], released
+    /// by [`Self::remove_listener_slot`]. A listener accepts connections and
+    /// is not one, so these slots are charged neither to the accept gate
+    /// ([`Self::at_capacity`]) nor to the capacity sized for connections
+    /// ([`Self::session_capacity`]): they are reserved on top of it. A load
+    /// balancer that routes every add-on as its own TCP listener holds more of
+    /// them than the whole accept budget of a worker.
+    ///
+    /// UDP flow slots alias their listener's session but are not listener
+    /// slots: they are inserted directly and count as session slots.
+    listener_slots: usize,
+    /// Physical slab headroom reserved for listeners. It grows in powers of
+    /// two and never shrinks, so add/remove churn reuses the same allocation.
+    /// Keeping it separate also lets [`Self::insert_listener_slot`] preserve
+    /// any larger capacity the slab acquired under session load.
+    listener_capacity: usize,
+    /// The slab capacity sized for connections, the slab's capacity when the
+    /// manager was built (`ServerConfig::slab_capacity`,
+    /// `10 + slab_entries_per_connection * max_connections`). Listener slots
+    /// are reserved on top of it.
+    session_capacity: usize,
     /// Default per-(cluster, source-IP) connection limit. `0` disables
     /// the feature; cluster-level overrides take precedence at check
     /// time.
@@ -492,11 +515,15 @@ impl SessionManager {
         subnet_ipv4_prefix: u32,
         subnet_ipv6_prefix: u32,
     ) -> Rc<RefCell<Self>> {
+        let session_capacity = slab.capacity();
         Rc::new(RefCell::new(SessionManager {
             max_connections,
             nb_connections: 0,
             can_accept: true,
             slab,
+            listener_slots: 0,
+            listener_capacity: 0,
+            session_capacity,
             max_connections_per_ip,
             retry_after,
             connections_per_cluster_ip: HashMap::new(),
@@ -1018,32 +1045,181 @@ impl SessionManager {
         self.check_invariants();
     }
 
-    /// The slab is considered at capacity if it contains more sessions than twice max_connections
+    /// The slab is at capacity once its session slots, listener slots left
+    /// out, reach the accept gate ([`Self::accept_slab_threshold`]).
     pub fn at_capacity(&self) -> bool {
-        self.slab.len() >= self.accept_slab_threshold()
+        self.session_slots() >= self.accept_slab_threshold()
     }
 
-    /// The slab fill level at which `at_capacity` flips to true and the
-    /// accept queue is flushed. Reported as `slab.accept_threshold` so the
-    /// per-iteration `slab.accept_threshold_percent` gauge in the run loop
-    /// can chart proximity to this gate, distinct from raw slab usage.
+    /// The slab slots charged to the accept gate: every slot but the listener
+    /// slots, so the sessions and the channel, timer and metrics slots the
+    /// gate's `10` leaves room for.
+    pub fn session_slots(&self) -> usize {
+        // Every listener slot is a slab entry, so the subtraction cannot
+        // underflow; saturate anyway rather than wrap to a full gate.
+        debug_assert!(
+            self.listener_slots <= self.slab.len(),
+            "{} listener slots cannot exceed the {} slab entries",
+            self.listener_slots,
+            self.slab.len()
+        );
+        self.slab.len().saturating_sub(self.listener_slots)
+    }
+
+    /// The slab slots held by listeners, reported as `slab.listener_entries`.
+    pub fn listener_slots(&self) -> usize {
+        self.listener_slots
+    }
+
+    /// The slab capacity sized for connections, listener slots left out:
+    /// the denominator of `slab.usage_percent`.
+    pub fn session_capacity(&self) -> usize {
+        self.session_capacity
+    }
+
+    /// The number of session slots at which `at_capacity` flips to true and
+    /// the accept queue is flushed. The run loop's
+    /// `slab.accept_threshold_percent` gauge charts [`Self::session_slots`]
+    /// against it, distinct from `slab.usage_percent`.
     ///
     /// The constant `10 + 2 * max_connections` is the historical pre-knob
-    /// budget; configured slab capacity is
+    /// budget; the capacity sized for connections is
     /// `10 + slab_entries_per_connection * max_connections` (see
     /// `command/src/config.rs`) and can be larger, so `slab.usage_percent`
-    /// (against `slab.capacity()`) and `slab.accept_threshold_percent`
-    /// (against this gate) are emitted as independent gauges.
+    /// (against [`Self::session_capacity`]) and
+    /// `slab.accept_threshold_percent` (against this gate) are emitted as
+    /// independent gauges. Listener slots are charged to neither.
     pub fn accept_slab_threshold(&self) -> usize {
         let threshold = 10 + 2 * self.max_connections;
-        // The gate must leave headroom above the connection cap so listener /
-        // system slots (Channel, Metrics, Timer, listeners) are never starved
-        // by frontend connections alone.
+        // The gate must leave headroom above the connection cap so the system
+        // slots (Channel, Metrics, Timer) are never starved by frontend
+        // connections alone. Listener slots are outside the gate.
         debug_assert!(
             threshold > self.max_connections,
             "accept gate must sit strictly above max_connections to reserve system slots"
         );
         threshold
+    }
+
+    /// Give a listener its slab slot, for its whole `AddListener` ->
+    /// `RemoveListener` lifetime (`Server::reserve_listen_token`).
+    ///
+    /// `add` registers the listener with its proxy under the slab's next
+    /// vacant key; the slot is taken only when `add` succeeds, so a refused
+    /// listener leaves the slab as it found it. The four
+    /// `Server::notify_add_*_listener` share this path, so a listener slot is
+    /// taken, counted and sized the same way on every protocol. It is not
+    /// refused on connection load: a listener slot is not charged to the
+    /// accept gate, so a worker at its connection cap still takes a listener.
+    pub fn add_listener_slot<E>(
+        &mut self,
+        protocol: Protocol,
+        add: impl FnOnce(Token) -> Result<Token, E>,
+    ) -> Result<Token, E> {
+        let token = Token(self.slab.vacant_key());
+        debug_assert!(
+            !self.slab.contains(token.0),
+            "the next vacant slab key must be free before insertion"
+        );
+        let added = add(token)?;
+        debug_assert_eq!(
+            added, token,
+            "the proxy must register the listener under the token it was given"
+        );
+        let inserted = self.insert_listener_slot(protocol);
+        debug_assert_eq!(
+            inserted, token,
+            "the listener must occupy the vacant key its proxy registered it under"
+        );
+        Ok(token)
+    }
+
+    /// Insert a listener slot and count it, keeping room for it on top of the
+    /// capacity sized for connections. [`Self::add_listener_slot`] is the path
+    /// a worker takes; this is the half that a caller registering its
+    /// listener only afterwards (the `start_*_worker` helpers) calls directly.
+    pub fn insert_listener_slot(&mut self, protocol: Protocol) -> Token {
+        debug_assert!(
+            matches!(
+                protocol,
+                Protocol::HTTPListen
+                    | Protocol::HTTPSListen
+                    | Protocol::TCPListen
+                    | Protocol::UDPListen
+            ),
+            "only a listener takes a listener slot, not {protocol:?}"
+        );
+        let len_before = self.slab.len();
+        let listener_slots_before = self.listener_slots;
+        // Listener slots must not eat the room sized for connections, or the
+        // slab would reallocate under connection load. Grow their own headroom
+        // geometrically, and use `reserve_exact` so the first listener does
+        // not double the whole session-sized allocation. Capacity above the
+        // previous listener headroom was acquired under session load (or from
+        // allocator rounding), so preserve that physical high-water mark too.
+        let next_listener_slots = self.listener_slots.saturating_add(1);
+        let next_listener_capacity = next_listener_slots
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX)
+            .max(self.listener_capacity);
+        let physical_session_capacity = self
+            .slab
+            .capacity()
+            .saturating_sub(self.listener_capacity)
+            .max(self.session_capacity);
+        let wanted = physical_session_capacity.saturating_add(next_listener_capacity);
+        self.slab
+            .reserve_exact(wanted.saturating_sub(self.slab.len()));
+
+        let key = self
+            .slab
+            .insert(Rc::new(RefCell::new(ListenSession { protocol })));
+        self.listener_slots += 1;
+        self.listener_capacity = next_listener_capacity;
+
+        debug_assert_eq!(
+            self.slab.len(),
+            len_before + 1,
+            "adding a listener must occupy exactly one slab slot"
+        );
+        debug_assert_eq!(
+            self.listener_slots,
+            listener_slots_before + 1,
+            "adding a listener must count exactly one listener slot"
+        );
+        debug_assert!(
+            self.slab.capacity() >= self.session_capacity + self.listener_slots,
+            "listener slots must be reserved on top of the capacity sized for connections"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+        Token(key)
+    }
+
+    /// Release the slab slot of a removed listener (`RemoveListener` in
+    /// `Server::notify_proxys`, the sole release point). Returns whether the
+    /// slot was there to release. The count saturates at zero: a test fixture
+    /// that inserts its listener slot directly into the slab, bypassing
+    /// [`Self::insert_listener_slot`], never had it counted.
+    pub fn remove_listener_slot(&mut self, token: Token) -> bool {
+        let listener_slots_before = self.listener_slots;
+        let removed = self.slab.try_remove(token.0).is_some();
+        if removed {
+            self.listener_slots = self.listener_slots.saturating_sub(1);
+        }
+        // Pair: a release uncounts at most one slot, and none when nothing was
+        // there to free.
+        debug_assert!(
+            listener_slots_before - self.listener_slots <= usize::from(removed),
+            "releasing a listener slot must uncount at most the slot it freed"
+        );
+        debug_assert!(
+            !self.slab.contains(token.0),
+            "a released listener slot must be absent from the slab"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+        removed
     }
 
     /// Check the number of connections against max_connections, and the slab capacity.
@@ -1070,8 +1246,12 @@ impl SessionManager {
         if self.at_capacity() {
             error!("not enough memory to accept another session, flushing the accept queue");
             error!(
-                "nb_connections: {}, max_connections: {}",
-                self.nb_connections, self.max_connections
+                "nb_connections: {}, max_connections: {}, session slots: {} of {} (listener slots, not charged: {})",
+                self.nb_connections,
+                self.max_connections,
+                self.session_slots(),
+                self.accept_slab_threshold(),
+                self.listener_slots
             );
             gauge!(names::accept_queue::BACKPRESSURE, 1);
             self.can_accept = false;
@@ -1174,8 +1354,8 @@ impl SessionManager {
         {
             debug!(
                 "no counted session left and room under both gates, starting to accept again \
-                 (slab: {}, accept gate at {})",
-                self.slab.len(),
+                 (session slots: {}, accept gate at {})",
+                self.session_slots(),
                 self.accept_slab_threshold()
             );
             // The gate reopens only where `check_limits` would admit.
@@ -1282,6 +1462,14 @@ impl SessionManager {
                 !by_cluster.is_empty() && by_cluster.values().all(|subnets| !subnets.is_empty())
             }),
             "cluster_subnet_tracks retains an empty per-token or per-cluster entry"
+        );
+        // 8. Every counted listener slot is a slab entry, so the session slots
+        //    the accept gate is charged with are never negative.
+        debug_assert!(
+            self.listener_slots <= self.slab.len(),
+            "{} listener slots exceed the {} slab entries",
+            self.listener_slots,
+            self.slab.len()
         );
     }
 }
@@ -1476,6 +1664,11 @@ pub struct Server {
     /// Protected health-check headers staged, applied or kept for an abort.
     protected_health_check: ProtectedWorker,
     poll_timeout: Option<Duration>, // TODO: make this configurable? this defaults to 1000 milliseconds for now
+    /// Immutable listener snapshot and the next SCM frame expected by a
+    /// correlated, multi-frame hot-upgrade handoff. The snapshot borrows no
+    /// descriptors: until commit, every original listener stays registered
+    /// in its proxy and continues serving.
+    listener_handoff: Option<ListenerHandoffTransfer>,
     scm_listeners: Option<Listeners>,
     scm: ScmSocket,
     sessions: Rc<RefCell<SessionManager>>,
@@ -1498,6 +1691,17 @@ pub struct Server {
     tcp: Rc<RefCell<tcp::TcpProxy>>,
     udp: Rc<RefCell<udp::UdpProxy>>,
     zombie_check_interval: Duration,
+}
+
+struct ListenerHandoffTransfer {
+    transfer_id: String,
+    /// Canonically ordered `(ListenerKey, RawFd)` tables. Including the raw
+    /// descriptor detects a same-key socket replacement; invalidating the
+    /// transfer on every listener order closes the descriptor-reuse ABA gap.
+    snapshot: Listeners,
+    batches: Vec<Listeners>,
+    next_batch: usize,
+    sentinel_sent: bool,
 }
 
 impl Server {
@@ -1736,6 +1940,7 @@ impl Server {
             pool,
             poll_timeout: Some(Duration::from_millis(1000)), // TODO: make it configurable?
             poll,
+            listener_handoff: None,
             scm_listeners: None,
             scm,
             sessions,
@@ -1779,14 +1984,15 @@ impl Server {
                 msg: "Could not set the scm socket to blocking".to_string(),
                 scm_err,
             })?;
-        let listeners =
-            server
-                .scm
-                .receive_listeners()
-                .map_err(|scm_err| ServerError::ScmSocket {
-                    msg: "could not receive listeners from the scm socket".to_string(),
-                    scm_err,
-                })?;
+        let received = if server_config.listener_scm_batches() {
+            server.scm.receive_listener_batches()
+        } else {
+            server.scm.receive_listeners()
+        };
+        let listeners = received.map_err(|scm_err| ServerError::ScmSocket {
+            msg: "could not receive listeners from the scm socket".to_string(),
+            scm_err,
+        })?;
         server
             .scm
             .set_blocking(false)
@@ -2030,19 +2236,27 @@ impl Server {
             // follow the once-per-iteration batching contract this run loop
             // uses for `process.uptime_seconds` / `server.live`.
             //
-            // `slab.usage_percent` charts pure slab utilisation against
-            // `slab.capacity()`. `slab.accept_threshold_percent` charts how
-            // close the slab is to the `at_capacity()` accept gate
-            // (`10 + 2 * max_connections`, see
-            // `SessionManager::accept_slab_threshold`). Configured slab
-            // capacity can be larger than that gate (`slab_entries_per_connection`
-            // > 2), so the two gauges are kept independent on purpose.
+            // Both percentages chart the session slots, listener slots left
+            // out (`SessionManager::session_slots`): a listener is not a
+            // connection, so a worker holding thousands of listeners and no
+            // connection reads close to 0. `slab.usage_percent` charts them
+            // against the capacity sized for connections
+            // (`SessionManager::session_capacity`);
+            // `slab.accept_threshold_percent` against the `at_capacity()`
+            // accept gate (`10 + 2 * max_connections`, see
+            // `SessionManager::accept_slab_threshold`). The capacity sized for
+            // connections can be larger than that gate
+            // (`slab_entries_per_connection` > 2), so the two gauges are kept
+            // independent on purpose.
             {
                 let sessions = self.sessions.borrow();
                 let nb_connections = sessions.nb_connections;
                 let max_connections = sessions.max_connections;
                 let slab_len = sessions.slab.len();
                 let slab_capacity = sessions.slab.capacity();
+                let listener_slots = sessions.listener_slots();
+                let session_slots = sessions.session_slots();
+                let session_capacity = sessions.session_capacity();
                 let accept_threshold = sessions.accept_slab_threshold();
 
                 gauge!(names::client::CONNECTIONS, nb_connections);
@@ -2052,11 +2266,12 @@ impl Server {
                 }
 
                 gauge!(names::slab::ENTRIES, slab_len);
+                gauge!(names::slab::LISTENER_ENTRIES, listener_slots);
                 gauge!(names::slab::CAPACITY, slab_capacity);
-                if let Some(percent) = (slab_len * 100).checked_div(slab_capacity) {
+                if let Some(percent) = (session_slots * 100).checked_div(session_capacity) {
                     gauge!(names::slab::USAGE_PERCENT, percent);
                 }
-                if let Some(percent) = (slab_len * 100).checked_div(accept_threshold) {
+                if let Some(percent) = (session_slots * 100).checked_div(accept_threshold) {
                     gauge!(names::slab::ACCEPT_THRESHOLD_PERCENT, percent);
                 }
             }
@@ -2207,9 +2422,14 @@ impl Server {
                         return true;
                     }
                     Some(RequestType::SoftStop(_)) => {
+                        self.cancel_listener_handoff("SoftStop order");
                         self.shutting_down = Some(request.id.clone());
                         self.last_sessions_len = self.sessions.borrow().slab.len();
                         self.notify(request);
+                    }
+                    Some(RequestType::ListenerHandoff(ref handoff)) => {
+                        let response = self.handle_listener_handoff(&request.id, handoff);
+                        push_queue(response);
                     }
                     Some(RequestType::ReturnListenSockets(_)) => {
                         info!("received ReturnListenSockets order");
@@ -3156,6 +3376,27 @@ impl Server {
     }
 
     pub fn notify_proxys(&mut self, mut request: WorkerRequest) {
+        if matches!(
+            request.content.request_type.as_ref(),
+            Some(
+                RequestType::AddHttpListener(_)
+                    | RequestType::AddHttpsListener(_)
+                    | RequestType::AddHttpsListenerWithClientAuth(_)
+                    | RequestType::AddTcpListener(_)
+                    | RequestType::AddUdpListener(_)
+                    | RequestType::RemoveListener(_)
+                    | RequestType::ActivateListener(_)
+                    | RequestType::DeactivateListener(_)
+                    | RequestType::SoftStop(_)
+            )
+        ) {
+            // An order is enough to make an already split snapshot stale: a
+            // refused or idempotent order is cheap to recover from with a new
+            // prepare, while retaining a transfer across a descriptor reuse
+            // would create an undetectable same-key/same-fd ABA at commit.
+            self.cancel_listener_handoff("listener mutation order");
+        }
+
         // The public protected verb carries the clear values to the main
         // process only. A worker never applies it as one step: the main
         // process drives the prepare, commit, abort and release orders below.
@@ -3462,7 +3703,7 @@ impl Server {
                         self.base_sessions_count > 0,
                         "releasing a listener slot with base_sessions_count == 0 would underflow"
                     );
-                    self.sessions.borrow_mut().slab.try_remove(token.0);
+                    self.sessions.borrow_mut().remove_listener_slot(token);
                     self.base_sessions_count -= 1;
                     // Same rule as the deactivate arms: a listen token with no
                     // slab slot must not stay queued for a deferred accept.
@@ -3742,42 +3983,20 @@ impl Server {
             .map(Into::into)
             .collect();
 
-        if self.sessions.borrow().at_capacity() {
-            return worker_response_error(req_id, "session list is full, cannot add a listener");
-        }
-
-        let mut session_manager = self.sessions.borrow_mut();
-        // The vacant entry's key is free now and becomes the listener's token.
-        let slab_before = session_manager.slab.len();
-        debug_assert!(
-            !session_manager
-                .slab
-                .contains(session_manager.slab.vacant_key()),
-            "the next vacant slab key must be free before insertion"
-        );
-        let entry = session_manager.slab.vacant_entry();
-        let token = Token(entry.key());
-
-        match self.http.borrow_mut().add_listener_with_retained_frontends(
-            listener,
-            token,
-            retained_frontends,
-        ) {
+        // A listener slot is not charged to the accept gate, so connection load
+        // never refuses a listener (`SessionManager::add_listener_slot`).
+        let added = self
+            .sessions
+            .borrow_mut()
+            .add_listener_slot(Protocol::HTTPListen, |token| {
+                self.http.borrow_mut().add_listener_with_retained_frontends(
+                    listener,
+                    token,
+                    retained_frontends,
+                )
+            });
+        match added {
             Ok(_token) => {
-                entry.insert(Rc::new(RefCell::new(ListenSession {
-                    protocol: Protocol::HTTPListen,
-                })));
-                // The listener session occupies exactly the token's slab key,
-                // and the slab grew by exactly one slot.
-                debug_assert!(
-                    session_manager.slab.contains(token.0),
-                    "listener insert must occupy the token's slab key"
-                );
-                debug_assert_eq!(
-                    session_manager.slab.len(),
-                    slab_before + 1,
-                    "adding a listener must occupy exactly one slab slot"
-                );
                 self.base_sessions_count += 1;
                 WorkerResponse::ok(req_id)
             }
@@ -3806,40 +4025,21 @@ impl Server {
             .config_state
             .certificate_add_requests_for_address(address);
 
-        if self.sessions.borrow().at_capacity() {
-            return worker_response_error(req_id, "session list is full, cannot add a listener");
-        }
-
-        let mut session_manager = self.sessions.borrow_mut();
-        let slab_before = session_manager.slab.len();
-        debug_assert!(
-            !session_manager
-                .slab
-                .contains(session_manager.slab.vacant_key()),
-            "the next vacant slab key must be free before insertion"
-        );
-        let entry = session_manager.slab.vacant_entry();
-        let token = Token(entry.key());
-
-        match self.https.borrow_mut().add_listener_with_retained_state(
-            listener.clone(),
-            token,
-            retained_frontends,
-            retained_certificates,
-        ) {
+        // A listener slot is not charged to the accept gate, so connection load
+        // never refuses a listener (`SessionManager::add_listener_slot`).
+        let added = self
+            .sessions
+            .borrow_mut()
+            .add_listener_slot(Protocol::HTTPSListen, |token| {
+                self.https.borrow_mut().add_listener_with_retained_state(
+                    listener,
+                    token,
+                    retained_frontends,
+                    retained_certificates,
+                )
+            });
+        match added {
             Ok(_token) => {
-                entry.insert(Rc::new(RefCell::new(ListenSession {
-                    protocol: Protocol::HTTPSListen,
-                })));
-                debug_assert!(
-                    session_manager.slab.contains(token.0),
-                    "listener insert must occupy the token's slab key"
-                );
-                debug_assert_eq!(
-                    session_manager.slab.len(),
-                    slab_before + 1,
-                    "adding a listener must occupy exactly one slab slot"
-                );
                 self.base_sessions_count += 1;
                 WorkerResponse::ok(req_id)
             }
@@ -3865,39 +4065,20 @@ impl Server {
             .map(Into::into)
             .collect();
 
-        if self.sessions.borrow().at_capacity() {
-            return worker_response_error(req_id, "session list is full, cannot add a listener");
-        }
-
-        let mut session_manager = self.sessions.borrow_mut();
-        let slab_before = session_manager.slab.len();
-        debug_assert!(
-            !session_manager
-                .slab
-                .contains(session_manager.slab.vacant_key()),
-            "the next vacant slab key must be free before insertion"
-        );
-        let entry = session_manager.slab.vacant_entry();
-        let token = Token(entry.key());
-
-        match self.tcp.borrow_mut().add_listener_with_retained_frontends(
-            listener,
-            token,
-            retained_frontends,
-        ) {
+        // A listener slot is not charged to the accept gate, so connection load
+        // never refuses a listener (`SessionManager::add_listener_slot`).
+        let added = self
+            .sessions
+            .borrow_mut()
+            .add_listener_slot(Protocol::TCPListen, |token| {
+                self.tcp.borrow_mut().add_listener_with_retained_frontends(
+                    listener,
+                    token,
+                    retained_frontends,
+                )
+            });
+        match added {
             Ok(_token) => {
-                entry.insert(Rc::new(RefCell::new(ListenSession {
-                    protocol: Protocol::TCPListen,
-                })));
-                debug_assert!(
-                    session_manager.slab.contains(token.0),
-                    "listener insert must occupy the token's slab key"
-                );
-                debug_assert_eq!(
-                    session_manager.slab.len(),
-                    slab_before + 1,
-                    "adding a listener must occupy exactly one slab slot"
-                );
                 self.base_sessions_count += 1;
                 WorkerResponse::ok(req_id)
             }
@@ -3923,23 +4104,20 @@ impl Server {
             .map(Into::into)
             .collect();
 
-        if self.sessions.borrow().at_capacity() {
-            return worker_response_error(req_id, "session list is full, cannot add a listener");
-        }
-
-        let mut session_manager = self.sessions.borrow_mut();
-        let entry = session_manager.slab.vacant_entry();
-        let token = Token(entry.key());
-
-        match self.udp.borrow_mut().add_listener_with_retained_frontends(
-            listener,
-            token,
-            retained_frontends,
-        ) {
+        // A listener slot is not charged to the accept gate, so connection load
+        // never refuses a listener (`SessionManager::add_listener_slot`).
+        let added = self
+            .sessions
+            .borrow_mut()
+            .add_listener_slot(Protocol::UDPListen, |token| {
+                self.udp.borrow_mut().add_listener_with_retained_frontends(
+                    listener,
+                    token,
+                    retained_frontends,
+                )
+            });
+        match added {
             Ok(_token) => {
-                entry.insert(Rc::new(RefCell::new(ListenSession {
-                    protocol: Protocol::UDPListen,
-                })));
                 self.base_sessions_count += 1;
                 WorkerResponse::ok(req_id)
             }
@@ -4617,9 +4795,184 @@ impl Server {
         }
     }
 
-    /// Send all socket addresses and file descriptors of all proxies, via the scm socket
-    pub fn return_listen_sockets(&mut self) -> Result<(), ScmSocketError> {
-        self.unblock_scm_socket();
+    fn active_listener_fds(&self) -> Listeners {
+        Listeners {
+            http: self.http.borrow().listener_fds(),
+            tls: self.https.borrow().listener_fds(),
+            tcp: self.tcp.borrow().listener_fds(),
+            udp: self.udp.borrow().listener_fds(),
+        }
+    }
+
+    fn canonical_listener_fds(mut listeners: Listeners) -> Listeners {
+        listeners.http.sort_unstable();
+        listeners.tls.sort_unstable();
+        listeners.tcp.sort_unstable();
+        listeners.udp.sort_unstable();
+        listeners
+    }
+
+    fn cancel_listener_handoff(&mut self, reason: &str) {
+        if let Some(transfer) = self.listener_handoff.take() {
+            info!(
+                "cancelled listener handoff {}: {}",
+                transfer.transfer_id, reason
+            );
+        }
+    }
+
+    fn handle_listener_handoff(
+        &mut self,
+        request_id: &str,
+        handoff: &ListenerHandoff,
+    ) -> WorkerResponse {
+        let result = match (handoff.prepare, handoff.batch) {
+            (Some(true), None) => self.prepare_listener_handoff(&handoff.transfer_id),
+            (None, Some(batch)) => {
+                self.send_listener_handoff_batch(&handoff.transfer_id, batch as usize)
+            }
+            (None, None) => self.commit_listener_handoff(&handoff.transfer_id),
+            _ => Err(
+                "listener handoff must carry exactly one operation: prepare=true, a batch, or commit"
+                    .to_owned(),
+            ),
+        };
+
+        match result {
+            Ok(()) => WorkerResponse::ok(request_id),
+            Err(error) => worker_response_error(request_id, error),
+        }
+    }
+
+    fn prepare_listener_handoff(&mut self, transfer_id: &str) -> Result<(), String> {
+        let listeners = self.active_listener_fds();
+        let snapshot = Self::canonical_listener_fds(listeners.clone());
+        let batches = listeners
+            .into_batches()
+            .map_err(|error| format!("Could not split listeners into SCM batches: {error:?}"))?;
+
+        self.listener_handoff = Some(ListenerHandoffTransfer {
+            transfer_id: transfer_id.to_owned(),
+            snapshot,
+            batches,
+            next_batch: 0,
+            sentinel_sent: false,
+        });
+        Ok(())
+    }
+
+    fn send_listener_handoff_batch(
+        &mut self,
+        transfer_id: &str,
+        batch_index: usize,
+    ) -> Result<(), String> {
+        let (batch, sentinel) = {
+            let transfer = self.listener_handoff.as_ref().ok_or_else(|| {
+                "listener handoff batch received before a successful prepare".to_owned()
+            })?;
+            if transfer.transfer_id != transfer_id {
+                return Err(format!(
+                    "listener handoff transfer id mismatch: prepared {}, received {}",
+                    transfer.transfer_id, transfer_id
+                ));
+            }
+            if transfer.sentinel_sent {
+                return Err("listener handoff already sent its terminal empty batch".to_owned());
+            }
+            if batch_index != transfer.next_batch {
+                return Err(format!(
+                    "listener handoff expected batch {}, received {}",
+                    transfer.next_batch, batch_index
+                ));
+            }
+            if batch_index < transfer.batches.len() {
+                (transfer.batches[batch_index].clone(), false)
+            } else if batch_index == transfer.batches.len() {
+                (Listeners::default(), true)
+            } else {
+                return Err(format!(
+                    "listener handoff batch {} is past terminal batch {}",
+                    batch_index,
+                    transfer.batches.len()
+                ));
+            }
+        };
+
+        let current = Self::canonical_listener_fds(self.active_listener_fds());
+        if self
+            .listener_handoff
+            .as_ref()
+            .is_some_and(|transfer| transfer.snapshot != current)
+        {
+            self.cancel_listener_handoff("active listeners changed after prepare");
+            return Err("active listeners changed after listener handoff prepare".to_owned());
+        }
+
+        let sent = self
+            .scm
+            .set_blocking(false)
+            .and_then(|()| self.scm.send_listeners(&batch));
+        if let Err(error) = sent {
+            // A send error can race the supervisor's timeout. Force a new
+            // prepare so the peer first discards at most one stale SCM frame,
+            // instead of retrying a batch that may already be queued.
+            self.cancel_listener_handoff("SCM batch send failed");
+            return Err(format!(
+                "Could not send listener handoff batch on SCM socket: {error:?}"
+            ));
+        }
+
+        let transfer = self
+            .listener_handoff
+            .as_mut()
+            .expect("a successful send retains its prepared listener handoff");
+        debug_assert_eq!(transfer.transfer_id, transfer_id);
+        debug_assert_eq!(transfer.next_batch, batch_index);
+        if sentinel {
+            transfer.sentinel_sent = true;
+        } else {
+            transfer.next_batch += 1;
+        }
+        Ok(())
+    }
+
+    fn commit_listener_handoff(&mut self, transfer_id: &str) -> Result<(), String> {
+        let transfer = self.listener_handoff.as_ref().ok_or_else(|| {
+            "listener handoff commit received before a successful prepare".to_owned()
+        })?;
+        if transfer.transfer_id != transfer_id {
+            return Err(format!(
+                "listener handoff transfer id mismatch: prepared {}, received {}",
+                transfer.transfer_id, transfer_id
+            ));
+        }
+        if transfer.next_batch != transfer.batches.len() || !transfer.sentinel_sent {
+            return Err(format!(
+                "listener handoff is incomplete: sent {} of {} data batches, terminal batch sent={}",
+                transfer.next_batch,
+                transfer.batches.len(),
+                transfer.sentinel_sent
+            ));
+        }
+        let expected = transfer.snapshot.clone();
+        let current = Self::canonical_listener_fds(self.active_listener_fds());
+        if current != expected {
+            return Err("active listeners changed after listener handoff prepare".to_owned());
+        }
+
+        // Every validation above is read-only. Only a fully correlated,
+        // complete and still-current transfer reaches the detach point.
+        self.detach_listener_sockets(&expected);
+        self.listener_handoff = None;
+        Ok(())
+    }
+
+    fn detach_listener_sockets(&mut self, expected: &Listeners) {
+        debug_assert_eq!(
+            Self::canonical_listener_fds(self.active_listener_fds()),
+            *expected,
+            "the validated listener snapshot must still be current at detach"
+        );
 
         let mut http_listeners = self.http.borrow_mut().give_back_listeners();
         for &mut (_, ref mut sock) in http_listeners.iter_mut() {
@@ -4655,50 +5008,43 @@ impl Server {
             }
         }
 
-        // use as_raw_fd because the listeners should be dropped after sending them
-        let listeners = Listeners {
-            http: http_listeners
-                .iter()
-                .map(|(key, listener)| (key.clone(), listener.as_raw_fd()))
-                .collect(),
-            tls: https_listeners
-                .iter()
-                .map(|(key, listener)| (key.clone(), listener.as_raw_fd()))
-                .collect(),
-            tcp: tcp_listeners
-                .iter()
-                .map(|(key, listener)| (key.clone(), listener.as_raw_fd()))
-                .collect(),
-            udp: udp_listeners
-                .iter()
-                .map(|(key, listener)| (key.clone(), listener.as_raw_fd()))
-                .collect(),
-        };
-        // Each handed-back listener is collected exactly once: the assembled
-        // fd lists mirror the give_back lists one-to-one (the maps above are
-        // straight `.iter().map().collect()` with no filtering or dedup).
         debug_assert_eq!(
-            listeners.http.len(),
+            expected.http.len(),
             http_listeners.len(),
             "every HTTP listener must be collected exactly once"
         );
         debug_assert_eq!(
-            listeners.tls.len(),
+            expected.tls.len(),
             https_listeners.len(),
             "every HTTPS listener must be collected exactly once"
         );
         debug_assert_eq!(
-            listeners.tcp.len(),
+            expected.tcp.len(),
             tcp_listeners.len(),
             "every TCP listener must be collected exactly once"
         );
-        info!("sending default listeners: {:?}", listeners);
-        let res = self.scm.send_listeners(&listeners);
+        debug_assert_eq!(
+            expected.udp.len(),
+            udp_listeners.len(),
+            "every UDP listener must be collected exactly once"
+        );
+        info!("returned listeners: {:?}", expected);
+    }
 
+    /// Send all socket addresses and file descriptors of all proxies, via the scm socket
+    pub fn return_listen_sockets(&mut self) -> Result<(), ScmSocketError> {
+        self.cancel_listener_handoff("legacy ReturnListenSockets order");
+        // SCM_RIGHTS duplicates the descriptors. Keep the originals registered
+        // until the transfer succeeds so a refusal leaves this worker serving.
+        let listeners = self.active_listener_fds();
+        self.scm.set_blocking(false)?;
+        let sent = self.scm.send_listeners(&listeners);
         self.block_scm_socket();
+        sent?;
 
-        info!("sent default listeners: {:?}", res);
-        res
+        let expected = Self::canonical_listener_fds(listeners);
+        self.detach_listener_sockets(&expected);
+        Ok(())
     }
 
     fn block_scm_socket(&mut self) {
@@ -5510,9 +5856,13 @@ mod eviction_tests {
 
 #[cfg(test)]
 mod accept_ready_tests {
+    use std::os::unix::net::UnixStream;
+
     use sozu_command::{
         config::ListenerBuilder,
-        proto::command::{DeactivateListener, ListenerType, SocketAddress},
+        proto::command::{
+            ActivateListener, DeactivateListener, ListenerHandoff, ListenerType, SocketAddress,
+        },
     };
 
     use super::*;
@@ -5583,6 +5933,198 @@ mod accept_ready_tests {
         // `_command_channel` is dropped here on purpose: nothing in these
         // tests reads the worker's side of the channel.
         (server, listen_token, address)
+    }
+
+    #[test]
+    fn a_failed_listener_handoff_leaves_the_original_socket_listening() {
+        let (mut server, listen_token, address) = server_with_tcp_listener();
+        let (sender, receiver) = UnixStream::pair().expect("could not create a test SCM pair");
+        drop(receiver);
+        let original_scm = std::mem::replace(
+            &mut server.scm,
+            ScmSocket {
+                fd: sender.as_raw_fd(),
+                blocking: true,
+            },
+        );
+        let handoff = server.return_listen_sockets();
+        server.scm = original_scm;
+
+        assert!(
+            handoff.is_err(),
+            "a closed SCM peer must refuse the listener handoff"
+        );
+        let _client = std::net::TcpStream::connect(SocketAddr::from(address))
+            .expect("the old socket must still listen after an unsuccessful handoff");
+        assert!(
+            server
+                .tcp
+                .borrow_mut()
+                .accept(ListenToken(listen_token.0))
+                .is_ok(),
+            "the old worker must still own and accept on the original socket"
+        );
+    }
+
+    fn handoff_request(
+        server: &mut Server,
+        id: &str,
+        transfer_id: &str,
+        batch: Option<u32>,
+        prepare: Option<bool>,
+    ) -> WorkerResponse {
+        server.handle_listener_handoff(
+            id,
+            &ListenerHandoff {
+                transfer_id: transfer_id.to_owned(),
+                batch,
+                prepare,
+            },
+        )
+    }
+
+    #[test]
+    fn batched_listener_handoff_copies_before_commit_then_detaches() {
+        let (mut server, listen_token, address) = server_with_tcp_listener();
+        for index in 0..200 {
+            let extra_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+            let listener = ListenerBuilder::new_tcp(extra_address)
+                .to_tcp(None)
+                .expect("could not build an extra TCP listener");
+            let added = server.notify_add_tcp_listener(&format!("add-{index}"), listener);
+            assert_eq!(added.status, ResponseStatus::Ok as i32, "{added:?}");
+            let activated = server.notify_activate_listener(
+                &format!("activate-{index}"),
+                &ActivateListener {
+                    interface: None,
+                    address: extra_address,
+                    proxy: ListenerType::Tcp as i32,
+                    from_scm: false,
+                },
+            );
+            assert_eq!(activated.status, ResponseStatus::Ok as i32, "{activated:?}");
+        }
+        assert_eq!(server.tcp.borrow().listener_fds().len(), 201);
+
+        let (sender, receiver) = UnixStream::pair().expect("could not create a test SCM pair");
+        server.scm = ScmSocket::new(sender.as_raw_fd()).expect("could not create sender SCM");
+        let receiver = ScmSocket::new(receiver.as_raw_fd()).expect("could not create receiver SCM");
+
+        let prepared = handoff_request(&mut server, "prepare", "transfer-1", None, Some(true));
+        assert_eq!(prepared.status, ResponseStatus::Ok as i32, "{prepared:?}");
+        assert_eq!(
+            server.tcp.borrow().listener_fds().len(),
+            201,
+            "prepare must leave the original listener registered"
+        );
+
+        let batch_count = server
+            .listener_handoff
+            .as_ref()
+            .expect("the transfer must be prepared")
+            .batches
+            .len();
+        assert!(
+            batch_count > 1,
+            "201 real listeners must require several SCM frames"
+        );
+        let mut copied_count = 0;
+        for batch in 0..batch_count {
+            let response = handoff_request(
+                &mut server,
+                &format!("batch-{batch}"),
+                "transfer-1",
+                Some(batch as u32),
+                None,
+            );
+            assert_eq!(response.status, ResponseStatus::Ok as i32, "{response:?}");
+            let copied = receiver
+                .receive_listeners()
+                .expect("each listener batch must be readable after its ACK");
+            copied_count += copied.tcp.len();
+            copied.close();
+        }
+        assert_eq!(
+            copied_count, 201,
+            "every active listener must be copied once"
+        );
+
+        let terminal = handoff_request(
+            &mut server,
+            "terminal",
+            "transfer-1",
+            Some(batch_count as u32),
+            None,
+        );
+        assert_eq!(terminal.status, ResponseStatus::Ok as i32, "{terminal:?}");
+        let sentinel = receiver
+            .receive_listeners()
+            .expect("the terminal empty listener batch must be readable after its ACK");
+        assert!(sentinel.is_empty(), "the terminal SCM batch must be empty");
+
+        let _client = std::net::TcpStream::connect(SocketAddr::from(address))
+            .expect("the original listener must remain live until commit");
+        assert!(
+            server
+                .tcp
+                .borrow_mut()
+                .accept(ListenToken(listen_token.0))
+                .is_ok(),
+            "the old worker must still accept after every batch and before commit"
+        );
+
+        let committed = handoff_request(&mut server, "commit", "transfer-1", None, None);
+        assert_eq!(committed.status, ResponseStatus::Ok as i32, "{committed:?}");
+        assert!(
+            server.tcp.borrow().listener_fds().is_empty(),
+            "commit must detach every original listener"
+        );
+    }
+
+    #[test]
+    fn replacing_an_incomplete_listener_handoff_keeps_originals_live() {
+        let (mut server, listen_token, address) = server_with_tcp_listener();
+        let (sender, receiver) = UnixStream::pair().expect("could not create a test SCM pair");
+        server.scm = ScmSocket::new(sender.as_raw_fd()).expect("could not create sender SCM");
+        let receiver = ScmSocket::new(receiver.as_raw_fd()).expect("could not create receiver SCM");
+
+        assert_eq!(
+            handoff_request(&mut server, "prepare-old", "old", None, Some(true)).status,
+            ResponseStatus::Ok as i32
+        );
+        assert_eq!(
+            handoff_request(&mut server, "old-batch", "old", Some(0), None).status,
+            ResponseStatus::Ok as i32
+        );
+        receiver
+            .receive_listeners()
+            .expect("the old transfer's first batch must arrive")
+            .close();
+
+        assert_eq!(
+            handoff_request(&mut server, "prepare-new", "new", None, Some(true)).status,
+            ResponseStatus::Ok as i32,
+            "a new prepare may replace an incomplete transfer because neither owns descriptors"
+        );
+        assert!(
+            handoff_request(&mut server, "stale-commit", "old", None, None).is_failure(),
+            "the replaced transfer must never be able to commit"
+        );
+        assert!(
+            handoff_request(&mut server, "skip", "new", Some(1), None).is_failure(),
+            "a skipped batch must be refused"
+        );
+
+        let _client = std::net::TcpStream::connect(SocketAddr::from(address))
+            .expect("aborting an incomplete transfer must leave the original socket listening");
+        assert!(
+            server
+                .tcp
+                .borrow_mut()
+                .accept(ListenToken(listen_token.0))
+                .is_ok(),
+            "the original listener must still accept after replacement and stale requests"
+        );
     }
 
     /// `ready()` queues a listen token in `accept_ready` whenever its listener
@@ -8007,6 +8549,261 @@ mod listener_lifecycle_tests {
             "the socket queued by listener C, which was not removed, must become a session"
         );
     }
+
+    /// A listener slab slot is not a connection. A worker holding more
+    /// listeners than its whole accept budget (`10 + 2 * max_connections`,
+    /// `SessionManager::accept_slab_threshold`) adds every one of them, on each
+    /// of the four protocols, and still admits a connection.
+    ///
+    /// To SEE THIS RED: on the tree before the fix, the tenth listener is
+    /// refused ("listener 9 of 13 must be added whatever the accept budget").
+    /// With the fix but `SessionManager::at_capacity` comparing
+    /// `self.slab.len()` with the gate again, every listener is added and the
+    /// test fails with "a worker serving no connection must admit one,
+    /// whatever its listener count".
+    #[test]
+    fn listener_slots_do_not_consume_the_accept_budget() {
+        let mut server = bare_server();
+        let max_connections = 1;
+        server.sessions.borrow_mut().max_connections = max_connections;
+        let budget = 10 + 2 * max_connections;
+
+        for index in 0..=budget {
+            let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+            let response = match index % 4 {
+                0 => server.notify_add_http_listener(
+                    "test-add-http",
+                    ListenerBuilder::new_http(address)
+                        .to_http(None)
+                        .expect("could not build an HttpListenerConfig for the test"),
+                ),
+                1 => server.notify_add_https_listener(
+                    "test-add-https",
+                    ListenerBuilder::new_https(address)
+                        .to_tls(None)
+                        .expect("could not build an HttpsListenerConfig for the test"),
+                ),
+                2 => server.notify_add_tcp_listener(
+                    "test-add-tcp",
+                    ListenerBuilder::new_tcp(address)
+                        .to_tcp(None)
+                        .expect("could not build a TcpListenerConfig for the test"),
+                ),
+                _ => server.notify_add_udp_listener(
+                    "test-add-udp",
+                    ListenerBuilder::new_udp(address)
+                        .to_udp(None)
+                        .expect("could not build a UdpListenerConfig for the test"),
+                ),
+            };
+            assert_eq!(
+                response.status,
+                ResponseStatus::Ok as i32,
+                "listener {index} of {} must be added whatever the accept budget: {response:?}",
+                budget + 1
+            );
+        }
+
+        assert!(
+            server.sessions.borrow().slab.len() > budget,
+            "premise: the listener slots alone must outnumber the accept budget"
+        );
+        assert!(
+            server.sessions.borrow_mut().check_limits(),
+            "a worker serving no connection must admit one, whatever its listener count"
+        );
+    }
+
+    /// The listener slot count follows the slots themselves: an added listener
+    /// counts one and reserves a slot of capacity on top of the capacity sized
+    /// for connections, a refused one counts none, and `RemoveListener` takes
+    /// its one back. The session slots charged to the accept gate never move.
+    ///
+    /// To SEE THIS RED: drop the `self.slab.reserve(..)` call from
+    /// `SessionManager::insert_listener_slot` — the first add then fails on
+    /// "listener slots must be reserved on top of the capacity sized for
+    /// connections" — or drop the decrement from
+    /// `SessionManager::remove_listener_slot`, and the test fails with
+    /// "RemoveListener must uncount the slot it releases".
+    #[test]
+    fn listener_slots_are_counted_from_add_to_remove() {
+        let mut server = bare_server();
+        let session_slots = server.sessions.borrow().session_slots();
+        let session_capacity = server.sessions.borrow().session_capacity();
+        assert_eq!(server.sessions.borrow().listener_slots(), 0);
+
+        let mut addresses = Vec::new();
+        for added in 1..=3 {
+            let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+            let response = server.notify_add_tcp_listener(
+                "test-add-tcp",
+                ListenerBuilder::new_tcp(address)
+                    .to_tcp(None)
+                    .expect("could not build a TcpListenerConfig for the test"),
+            );
+            assert_eq!(response.status, ResponseStatus::Ok as i32, "{response:?}");
+            addresses.push(address);
+            let sessions = server.sessions.borrow();
+            assert_eq!(sessions.listener_slots(), added);
+            assert_eq!(
+                sessions.session_slots(),
+                session_slots,
+                "a listener slot must not be charged to the accept gate"
+            );
+            assert!(
+                sessions.slab.capacity() >= session_capacity + added,
+                "each listener must reserve its slot on top of the capacity sized for connections"
+            );
+        }
+
+        // A listener its proxy refuses takes no slot and counts none.
+        let mut refused =
+            ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, provide_port()))
+                .to_http(None)
+                .expect("could not build an HttpListenerConfig for the test");
+        refused
+            .answers
+            .insert("404".to_owned(), "not a valid http response".to_owned());
+        let slab_len = server.sessions.borrow().slab.len();
+        let response = server.notify_add_http_listener("test-add-refused", refused);
+        assert_eq!(
+            response.status,
+            ResponseStatus::Failure as i32,
+            "{response:?}"
+        );
+        assert_eq!(server.sessions.borrow().slab.len(), slab_len);
+        assert_eq!(server.sessions.borrow().listener_slots(), 3);
+
+        server.notify_proxys(WorkerRequest {
+            id: "test-remove".to_owned(),
+            content: RequestType::RemoveListener(RemoveListener {
+                interface: None,
+                address: addresses[0],
+                proxy: ListenerType::Tcp as i32,
+            })
+            .into(),
+        });
+        let sessions = server.sessions.borrow();
+        assert_eq!(
+            sessions.listener_slots(),
+            2,
+            "RemoveListener must uncount the slot it releases"
+        );
+        assert_eq!(sessions.slab.len(), slab_len - 1);
+        assert_eq!(sessions.session_slots(), session_slots);
+    }
+
+    /// Listener headroom grows independently from the room already reserved
+    /// for sessions. The first listener therefore adds only listener headroom,
+    /// and a later listener preserves a larger physical capacity that live
+    /// sessions made the slab acquire.
+    ///
+    /// To SEE THIS RED: replace `Slab::reserve_exact` with `Slab::reserve` in
+    /// `SessionManager::insert_listener_slot`. The first listener then doubles
+    /// the whole session-sized allocation. Computing the target from
+    /// `session_capacity` alone also leaves the second assertion red, because
+    /// it spends capacity previously acquired under session load.
+    #[test]
+    fn listener_headroom_does_not_double_or_consume_session_capacity() {
+        let sessions = SessionManager::new(Slab::with_capacity(64), 16, 0, 0, 0, 32, 128);
+        let initial_capacity = sessions.borrow().slab.capacity();
+        let first_listener = sessions
+            .borrow_mut()
+            .insert_listener_slot(Protocol::TCPListen);
+        let first_listener_capacity = sessions.borrow().slab.capacity();
+        assert!(
+            first_listener_capacity > initial_capacity,
+            "the first listener must add headroom beyond the session capacity"
+        );
+        assert!(
+            first_listener_capacity < initial_capacity * 2,
+            "the first listener must not double the whole session-sized allocation"
+        );
+
+        // Ordinary sessions fill the physical capacity and force the slab to
+        // acquire a new high-water allocation. The next listener must preserve
+        // all of that session room and add its own headroom above it.
+        while sessions.borrow().slab.capacity() == first_listener_capacity {
+            sessions
+                .borrow_mut()
+                .slab
+                .insert(Rc::new(RefCell::new(ListenSession {
+                    protocol: Protocol::TCP,
+                })));
+        }
+        let expanded_session_capacity = sessions.borrow().slab.capacity();
+        let second_listener = sessions
+            .borrow_mut()
+            .insert_listener_slot(Protocol::TCPListen);
+        let second_listener_capacity = sessions.borrow().slab.capacity();
+        assert!(
+            second_listener_capacity > expanded_session_capacity,
+            "listener headroom must preserve the slab capacity acquired under session load"
+        );
+
+        sessions.borrow_mut().remove_listener_slot(first_listener);
+        sessions.borrow_mut().remove_listener_slot(second_listener);
+        sessions
+            .borrow_mut()
+            .insert_listener_slot(Protocol::TCPListen);
+        assert_eq!(
+            sessions.borrow().slab.capacity(),
+            second_listener_capacity,
+            "add/remove churn must reuse the listener headroom already allocated"
+        );
+    }
+
+    /// A listener is not refused because the worker is busy: with its session
+    /// slots at the accept gate, a worker still takes a listener, and the
+    /// listener leaves the gate where it was.
+    ///
+    /// To SEE THIS RED: put the former refusal back at the top of
+    /// `Server::notify_add_tcp_listener`
+    /// (`if self.sessions.borrow().at_capacity() { return worker_response_error(req_id, "session list is full, cannot add a listener"); }`).
+    /// The test then fails with "a worker at its accept gate must still take a
+    /// listener".
+    #[test]
+    fn a_worker_at_its_accept_gate_still_takes_a_listener() {
+        let mut server = bare_server();
+        let threshold = server.sessions.borrow().accept_slab_threshold();
+        // Stand-in sessions, inserted directly, fill the session slots up to
+        // the gate.
+        while server.sessions.borrow().session_slots() < threshold {
+            server
+                .sessions
+                .borrow_mut()
+                .slab
+                .insert(Rc::new(RefCell::new(ListenSession {
+                    protocol: Protocol::TCP,
+                })));
+        }
+        assert!(
+            server.sessions.borrow().at_capacity(),
+            "premise: the session slots must sit at the accept gate"
+        );
+        let listener_slots = server.sessions.borrow().listener_slots();
+
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let response = server.notify_add_tcp_listener(
+            "test-add-tcp",
+            ListenerBuilder::new_tcp(address)
+                .to_tcp(None)
+                .expect("could not build a TcpListenerConfig for the test"),
+        );
+
+        assert_eq!(
+            response.status,
+            ResponseStatus::Ok as i32,
+            "a worker at its accept gate must still take a listener: {response:?}"
+        );
+        let sessions = server.sessions.borrow();
+        assert_eq!(sessions.listener_slots(), listener_slots + 1);
+        assert_eq!(
+            sessions.session_slots(),
+            threshold,
+            "the listener must leave the session slots, and so the gate, where they were"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -9142,29 +9939,21 @@ mod remove_cluster_cascade_tests {
     #[test]
     fn a_refused_duplicate_listener_add_preserves_the_preexisting_listener() {
         let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
-        let listener = ListenerBuilder::new_http(address)
+        let mut listener = ListenerBuilder::new_http(address)
             .to_http(None)
             .expect("the test HTTP listener configuration must build");
+        // An answer template the runtime cannot parse makes it refuse the
+        // duplicate too (`HttpListener::new`); `ConfigState` does not parse
+        // templates, so the setup listener still enters the worker state.
+        listener
+            .answers
+            .insert("404".to_owned(), "not a valid http response".to_owned());
         let mut server = bare_server();
         server
             .config_state
             .dispatch(&RequestType::AddHttpListener(listener.clone()).into())
             .expect("the setup listener must enter worker state");
         let before = server.config_state.http_listeners.clone();
-
-        // Fill the reserved slab headroom so the worker takes the explicit
-        // refusal path before attempting to install a runtime listener.
-        let threshold = server.sessions.borrow().accept_slab_threshold();
-        while server.sessions.borrow().slab.len() < threshold {
-            server
-                .sessions
-                .borrow_mut()
-                .slab
-                .insert(Rc::new(RefCell::new(ListenSession {
-                    protocol: Protocol::HTTPListen,
-                })));
-        }
-        assert!(server.sessions.borrow().at_capacity());
 
         let responses = send(
             &mut server,
@@ -9177,7 +9966,7 @@ mod remove_cluster_cascade_tests {
                 .map(|response| response.status)
                 .collect::<Vec<_>>(),
             vec![ResponseStatus::Failure as i32],
-            "the full session slab must refuse the duplicate listener: {responses:?}"
+            "the runtime must refuse the duplicate listener: {responses:?}"
         );
         assert_eq!(
             server.config_state.http_listeners, before,

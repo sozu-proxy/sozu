@@ -535,6 +535,7 @@ pub mod slab {
     pub const ACCEPT_THRESHOLD_PERCENT: &str = "slab.accept_threshold_percent";
     pub const CAPACITY: &str = "slab.capacity";
     pub const ENTRIES: &str = "slab.entries";
+    pub const LISTENER_ENTRIES: &str = "slab.listener_entries";
     pub const USAGE_PERCENT: &str = "slab.usage_percent";
 }
 

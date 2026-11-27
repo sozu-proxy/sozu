@@ -34,7 +34,7 @@ use std::{
     collections::{BTreeMap, HashMap, VecDeque, hash_map::Entry},
     io::ErrorKind,
     net::SocketAddr,
-    os::unix::io::AsRawFd,
+    os::unix::io::{AsRawFd, RawFd},
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -825,6 +825,17 @@ impl UdpProxy {
         // Keep a clone so soft/hard stop can drive per-flow teardown.
         self.listener_sessions.insert(token, session.clone());
         Some(session)
+    }
+
+    pub(crate) fn listener_fds(&self) -> Vec<(ListenerKey, RawFd)> {
+        self.listeners
+            .values()
+            .filter_map(|listener| {
+                let listener = listener.borrow();
+                let socket = listener.socket.as_ref()?;
+                Some((listener.key(), socket.as_raw_fd()))
+            })
+            .collect()
     }
 
     /// Hand every listener socket over for an SCM hand-off. Each listener's

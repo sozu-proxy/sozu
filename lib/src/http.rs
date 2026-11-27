@@ -3,6 +3,7 @@ use std::{
     collections::{BTreeMap, HashMap, hash_map::Entry},
     io::ErrorKind,
     net::SocketAddr,
+    os::unix::io::{AsRawFd, RawFd},
     rc::{Rc, Weak},
     str::from_utf8_unchecked,
     time::{Duration, Instant},
@@ -1409,6 +1410,17 @@ impl HttpProxy {
             .map(|(token, _)| *token)
     }
 
+    pub(crate) fn listener_fds(&self) -> Vec<(ListenerKey, RawFd)> {
+        self.listeners
+            .values()
+            .filter_map(|listener| {
+                let listener = listener.borrow();
+                let socket = listener.listener.as_ref()?;
+                Some((listener.key(), socket.as_raw_fd()))
+            })
+            .collect()
+    }
+
     pub fn give_back_listeners(&mut self) -> Vec<(ListenerKey, MioTcpListener)> {
         self.listeners
             .values()
@@ -2390,15 +2402,9 @@ pub mod testing {
             server_config,
         } = prebuild_server(max_buffers, buffer_size, true)?;
 
-        let token = {
-            let mut sessions = sessions.borrow_mut();
-            let entry = sessions.slab.vacant_entry();
-            let key = entry.key();
-            let _ = entry.insert(Rc::new(RefCell::new(ListenSession {
-                protocol: Protocol::HTTPListen,
-            })));
-            Token(key)
-        };
+        let token = sessions
+            .borrow_mut()
+            .insert_listener_slot(Protocol::HTTPListen);
 
         let mut proxy = HttpProxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
         proxy

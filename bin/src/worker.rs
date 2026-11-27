@@ -68,6 +68,8 @@ pub enum WorkerError {
     CreateUnixStream(IoError),
     #[error("could not send config to the new worker: {0}")]
     SendConfig(ChannelError),
+    #[error("could not send listeners to the new worker: {0}")]
+    SendListeners(ScmSocketError),
     #[error("unix fork failed: {0}")]
     Fork(Errno),
     #[error("Could not set the worker-to-main channel to {state}: {channel_err}")]
@@ -94,6 +96,7 @@ pub fn begin_worker_process(
     id: i32,
     command_buffer_size: u64,
     max_command_buffer_size: u64,
+    batched_listeners: bool,
 ) -> Result<(), WorkerError> {
     // The three descriptors were handed to us by the master via
     // `fork_main_into_worker`, each derived from a live `as_raw_fd()`, so
@@ -156,9 +159,10 @@ pub fn begin_worker_process(
     // `File`, whose `Drop` closes the descriptor.
     let mut configuration_state_file = unsafe { File::from_raw_fd(configuration_state_fd) };
 
-    let worker_config = worker_to_main_channel
+    let mut worker_config = worker_to_main_channel
         .read_message()
         .map_err(WorkerError::ReadChannel)?;
+    worker_config.listener_scm_batches = batched_listeners.then_some(true);
 
     let worker_id = format!("{}-{:02}", "WRK", id);
 
@@ -326,6 +330,30 @@ impl Drop for OwnedScmSocket {
     }
 }
 
+/// A forked worker that has not reached `CommandServer::register_worker`.
+///
+/// No event-loop session owns this PID yet. Every error between `fork` and the
+/// successful return must therefore kill and reap it here; dropping the
+/// channels alone makes the child exit but leaves a zombie with no registered
+/// PID for the regular reaper to find.
+struct UnregisteredWorker(Option<pid_t>);
+
+impl UnregisteredWorker {
+    fn release(mut self) -> pid_t {
+        self.0
+            .take()
+            .expect("an unregistered worker is released at most once")
+    }
+}
+
+impl Drop for UnregisteredWorker {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0.take() {
+            util::kill_and_reap_child(pid, "replacement worker");
+        }
+    }
+}
+
 /// unix-forks the main process
 ///
 /// - Parent: sends config, state and listeners to the new worker
@@ -347,6 +375,7 @@ pub fn fork_main_into_worker(
     executable_path: String,
     state: &ConfigState,
     listeners: Option<Listeners>,
+    batched_listeners: bool,
 ) -> Result<(pid_t, Channel<WorkerRequest, WorkerResponse>, ScmSocket), WorkerError> {
     // SAFETY: `libc::getpid` takes no input pointers, never fails, and
     // returns a value type. No invariant beyond "FFI signature matches libc".
@@ -444,6 +473,7 @@ pub fn fork_main_into_worker(
                 worker_pid.as_raw() > 0,
                 "fork parent branch must observe a strictly positive child pid"
             );
+            let worker_process = UnregisteredWorker(Some(worker_pid.as_raw()));
             info!("launching worker {} with pid {}", worker_id, worker_pid);
             main_to_worker_channel
                 .write_message(&worker_config)
@@ -461,8 +491,13 @@ pub fn fork_main_into_worker(
             // outcome of the send.
             if let Some(OwnedListeners(listeners)) = &listeners {
                 info!("sending listeners to new worker: {:?}", listeners);
-                let result = main_to_worker_scm.send_listeners(listeners);
-                info!("sent listeners from main: {:?}", result);
+                let sent = if batched_listeners {
+                    main_to_worker_scm.send_listener_batches(listeners)
+                } else {
+                    main_to_worker_scm.send_listeners(listeners)
+                };
+                sent.map_err(WorkerError::SendListeners)?;
+                info!("sent listeners from main");
             };
 
             // `main_to_worker_scm` stays close-on-exec: every worker forked
@@ -472,7 +507,7 @@ pub fn fork_main_into_worker(
             // (`bin/src/command/server.rs`) clears the flag for that hand-off
             // alone.
             Ok((
-                worker_pid.into(),
+                worker_process.release(),
                 main_to_worker_channel.into(),
                 main_to_worker_scm.release(),
             ))
@@ -502,7 +537,8 @@ pub fn fork_main_into_worker(
                     executable_path.to_owned()
                 }
             };
-            let err = Command::new(&exec_path)
+            let mut command = Command::new(&exec_path);
+            command
                 .arg("worker")
                 .arg("--id")
                 .arg(worker_id)
@@ -515,8 +551,13 @@ pub fn fork_main_into_worker(
                 .arg("--command-buffer-size")
                 .arg(config.command_buffer_size.to_string())
                 .arg("--max-command-buffer-size")
-                .arg(config.max_command_buffer_size.to_string())
-                .exec();
+                .arg(config.max_command_buffer_size.to_string());
+            // A legacy executable rejects the internal flag instead of
+            // acknowledging startup after reading only the first batch.
+            if batched_listeners {
+                command.arg("--listener-scm-batches");
+            }
+            let err = command.exec();
 
             // `exec` only returns on failure, and this process is a full copy
             // of the main process: its event loop, its client and worker
@@ -586,11 +627,7 @@ mod tests {
     /// `InvalidInput` before any `execve`, whatever the host allows.
     #[test]
     fn failed_exec_ends_the_forked_child_instead_of_returning_into_the_caller() {
-        let config = Config {
-            command_buffer_size: 16384,
-            max_command_buffer_size: 163_840,
-            ..Default::default()
-        };
+        let config = sendable_config();
         let state = ConfigState::new();
 
         match fork_main_into_worker(
@@ -599,6 +636,7 @@ mod tests {
             "/nonexistent/sozu".to_string(),
             &state,
             None,
+            false,
         ) {
             // Only the forked child's `exec` arm yields `SpawnChild`. This
             // process is the clone: report that it survived and leave without
@@ -637,6 +675,9 @@ mod tests {
     /// Exit status of a scenario whose launch failed on another edge than the
     /// one it sets up.
     const WRONG_EDGE: libc::c_int = 103;
+    /// Exit status of a scenario whose failed launch left a live child or a
+    /// zombie for the event loop, which never registered its PID, to miss.
+    const CHILD_LEFT_UNREAPED: libc::c_int = 104;
 
     /// Run `scenario` in a forked copy of this test process and return its exit
     /// code, or `None` when it did not end within the deadline.
@@ -698,6 +739,14 @@ mod tests {
         }
     }
 
+    fn sendable_config() -> Config {
+        Config {
+            command_buffer_size: 16384,
+            max_command_buffer_size: 163_840,
+            ..Default::default()
+        }
+    }
+
     /// An HTTP listening socket on an ephemeral port, as the old worker hands
     /// it to the main process in the first phase of a worker upgrade.
     fn received_listeners() -> (Listeners, libc::c_int) {
@@ -715,17 +764,35 @@ mod tests {
         (listeners, fd)
     }
 
+    fn oversized_received_listeners() -> (Listeners, libc::c_int) {
+        let mut listeners = Listeners::default();
+        let mut first_fd = None;
+        for _ in 0..201 {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("could not bind an ephemeral listening socket");
+            let address = listener.local_addr().expect("listener has an address");
+            let fd = listener.into_raw_fd();
+            first_fd.get_or_insert(fd);
+            listeners.http.push((address.into(), fd));
+        }
+        (
+            listeners,
+            first_fd.expect("the oversized listener set is non-empty"),
+        )
+    }
+
     /// Hand `listeners` to a launch that `break_launch` makes fail, and report
     /// whether the listening socket is still open once it returned.
     ///
     /// A NUL in the worker id keeps the forked child from ever reaching
     /// `execve`, as in the test above.
     fn failed_launch_listener_status(
+        make_listeners: impl FnOnce() -> (Listeners, libc::c_int),
         config: Config,
         break_launch: impl FnOnce(),
         expected_edge: fn(&WorkerError) -> bool,
     ) -> libc::c_int {
-        let (listeners, fd) = received_listeners();
+        let (listeners, fd) = make_listeners();
         break_launch();
         let state = ConfigState::new();
         let launched = fork_main_into_worker(
@@ -734,15 +801,22 @@ mod tests {
             "/nonexistent/sozu".to_string(),
             &state,
             Some(listeners),
+            false,
         );
         // Nothing may open a descriptor between the failure and this probe: a
         // new descriptor would reuse the listener's number once it is closed.
         // SAFETY: `F_GETFD` reads a flag or fails with `EBADF`.
         let still_open = unsafe { libc::fcntl(fd, libc::F_GETFD) } != -1;
+        let mut child_status = 0;
+        // SAFETY: this isolated scenario had no child before the launch. A
+        // non-negative result means the failed launch left either a live child
+        // (`0`) or one zombie that this probe just reaped (`> 0`).
+        let child_left = unsafe { libc::waitpid(-1, &mut child_status, libc::WNOHANG) } >= 0;
         match launched {
             Ok(_) => LAUNCH_SUCCEEDED,
             Err(error) if !expected_edge(&error) => WRONG_EDGE,
             Err(_) if still_open => LISTENER_LEFT_OPEN,
+            Err(_) if child_left => CHILD_LEFT_UNREAPED,
             Err(_) => 0,
         }
     }
@@ -774,7 +848,8 @@ mod tests {
             "a launch that failed {edge} must close the listening sockets it was handed, or \
              main keeps them listening without ever accepting (scenario status: \
              {LISTENER_LEFT_OPEN} = still open, {LAUNCH_SUCCEEDED} = the launch did not fail, \
-             {WRONG_EDGE} = it failed elsewhere, {SCENARIO_PANICKED} = panicked)"
+             {WRONG_EDGE} = it failed elsewhere, {CHILD_LEFT_UNREAPED} = child was not reaped, \
+             {SCENARIO_PANICKED} = panicked)"
         );
     }
 
@@ -788,6 +863,7 @@ mod tests {
     fn a_launch_failing_to_create_the_state_file_closes_the_listeners() {
         let status = in_forked_child(|| {
             failed_launch_listener_status(
+                received_listeners,
                 Config::default(),
                 || leave_room_for_descriptors(0),
                 |error| matches!(error, WorkerError::CreateStateFile(_)),
@@ -802,6 +878,7 @@ mod tests {
     fn a_launch_failing_to_create_the_socket_pairs_closes_the_listeners() {
         let status = in_forked_child(|| {
             failed_launch_listener_status(
+                received_listeners,
                 Config::default(),
                 || leave_room_for_descriptors(1),
                 |error| matches!(error, WorkerError::CreateUnixStream(_)),
@@ -816,12 +893,29 @@ mod tests {
     fn a_launch_failing_to_send_the_configuration_closes_the_listeners() {
         let status = in_forked_child(|| {
             failed_launch_listener_status(
+                received_listeners,
                 config_that_cannot_be_sent(),
                 || {},
                 |error| matches!(error, WorkerError::SendConfig(_)),
             )
         });
         assert_listeners_closed("to send the configuration to the new worker", status);
+    }
+
+    /// A listener set outside the one-frame SCM contract must make the launch
+    /// fail. The child has already forked and received its configuration, so
+    /// the parent must also terminate and reap it before returning the error.
+    #[test]
+    fn a_launch_failing_to_forward_listeners_closes_them_and_reaps_the_child() {
+        let status = in_forked_child(|| {
+            failed_launch_listener_status(
+                oversized_received_listeners,
+                sendable_config(),
+                || {},
+                |error| matches!(error, WorkerError::SendListeners(_)),
+            )
+        });
+        assert_listeners_closed("to forward its listener set", status);
     }
 
     /// `fork_main_into_worker` turns the main end of the worker's SCM socket
@@ -841,6 +935,7 @@ mod tests {
                 "/nonexistent/sozu".to_string(),
                 &state,
                 None,
+                false,
             );
             let after = open_descriptors();
             match launched {

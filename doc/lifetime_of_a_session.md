@@ -161,13 +161,20 @@ the registration. This slab is also the unit of bookkeeping that enforces
 `max_connections` (`SessionManager::check_limits` /
 `SessionManager::at_capacity`) and feeds `client.connections`,
 `client.connections_max`, `client.connections_percent`,
-`slab.{entries,capacity,usage_percent,accept_threshold_percent}` and
+`slab.{entries,listener_entries,capacity,usage_percent,accept_threshold_percent}` and
 `buffer.{in_use,capacity,usage_percent}`, all sampled once per loop turn in
 `Server::run`.
 
 Listeners live in the same slab, on a different clock. A listener is given
 one slab slot by `add-listener` and keeps that exact slot — and therefore that
-exact token — until `remove-listener`. `deactivate-listener` does *not* give the
+exact token — until `remove-listener`. A listener accepts connections and is
+not one, so its slot is counted apart (`SessionManager::add_listener_slot` and
+`SessionManager::remove_listener_slot`, `lib/src/server.rs`, reported as
+`slab.listener_entries`): it is charged neither to the accept gate of
+`check_limits` nor to the capacity sized for connections, which the slab
+extends by one slot per listener. A load balancer that routes every add-on as
+its own TCP listener holds more listener slots than the whole accept budget of
+a worker, and still accepts. `deactivate-listener` does *not* give the
 slot back: it puts the inert `ListenSession` placeholder back in it, because
 the proxies keep the token inside the listener and hand the very same one back
 out of a later `activate-listener`. A slot released on deactivation would leave
@@ -313,7 +320,8 @@ count cannot be below.
 That reopening has a blind spot, because nothing else reopens the gate: a gate
 closed while no counted session is alive has no session left to close. The slab
 test of `check_limits` (`10 + 2 * max_connections` entries) counts every slab
-entry, UDP flows included, which take a slot without consulting it, and the TCP
+entry but the listener slots, UDP flows included, which take a slot without
+consulting it, and the TCP
 proxy closes the gate when the buffer pool runs dry. Every turn,
 `Server::handle_remaining_readiness` therefore asks
 `SessionManager::reopen_stranded_accept_gate` to reopen a closed gate when no

@@ -135,6 +135,7 @@ pub fn format_request_type(request_type: &RequestType) -> &str {
         RequestType::ConfigureMetrics(_) => "ConfigureMetrics",
         RequestType::Logging(_) => "Logging",
         RequestType::ReturnListenSockets(_) => "ReturnListenSockets",
+        RequestType::ListenerHandoff(_) => "ListenerHandoff",
         RequestType::QueryCertificatesFromTheState(_) => "QueryCertificatesFromTheState",
         RequestType::QueryCertificatesFromWorkers(_) => "QueryCertificatesFromWorkers",
         RequestType::UpdateHttpListener(_) => "UpdateHttpListener",

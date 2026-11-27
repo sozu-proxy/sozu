@@ -281,6 +281,9 @@ message Request {
     // Tags 65-73 are taken by other verbs: 74 and 75 are these verbs'.
     QueryProtectedHealthCheckSupport query_protected_health_check_support = 74;
     ProtectedHealthCheckOrder protected_health_check_order = 75;
+    // Internal worker upgrade transaction. A legacy worker sees no request
+    // and keeps listening. The legacy ReturnListenSockets verb remains separate.
+    ListenerHandoff listener_handoff = 76;
   }
 }
 
@@ -361,6 +364,14 @@ message QueryClustersHashes {}
 message SoftStop {}
 message HardStop {}
 message ReturnListenSockets {}
+message ListenerHandoff {
+    required string transfer_id = 1;
+    // A batch index sends one SCM frame. After the last batch, the next
+    // index sends an empty frame. Omitting both action fields commits.
+    optional uint32 batch = 2;
+    // Prepare snapshots live sockets without sending a frame or detaching.
+    optional bool prepare = 3;
+}
 message CountRequests {}
 message QueryMaxConnectionsPerIp {}
 message QueryMaxConnectionsPerSubnet {}
@@ -2538,6 +2549,9 @@ message ServerConfig {
     // and `Request.set_max_connection_attempts` changes it at runtime.
     // Replaces the library constant `CONN_RETRIES = 3`.
     optional uint32 max_connection_attempts = 29 [default = 5];
+    // Internal bootstrap mode, selected by the worker's CLI at exec.
+    // A batched receiver waits for the terminal empty frame before replay.
+    optional bool listener_scm_batches = 30 [default = false];
 }
 
 enum ProtobufAccessLogFormat {

@@ -5783,7 +5783,7 @@ impl Config {
     /// yields requests intended to recreate a proxy that match the config
     pub fn generate_config_messages(&self) -> Result<Vec<WorkerRequest>, ConfigError> {
         let mut v = Vec::new();
-        let mut count = 0u8;
+        let mut count = 0usize;
 
         for listener in &self.http_listeners {
             v.push(WorkerRequest {
@@ -6183,6 +6183,7 @@ impl From<&Config> for ServerConfig {
             retry_after: Some(config.retry_after),
             splice_pipe_capacity_bytes: config.splice_pipe_capacity_bytes,
             max_connection_attempts: Some(config.max_connection_attempts),
+            listener_scm_batches: None,
         };
 
         // POST: the worker-facing config preserves the buffer-pool invariant

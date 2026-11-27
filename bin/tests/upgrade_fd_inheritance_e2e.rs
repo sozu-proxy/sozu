@@ -42,8 +42,8 @@
 #![cfg(target_os = "linux")]
 
 use std::{
-    collections::BTreeMap,
-    net::TcpListener,
+    collections::{BTreeMap, BTreeSet},
+    net::{TcpListener, TcpStream},
     os::unix::process::CommandExt,
     path::Path,
     process::{Child, Command, Stdio},
@@ -320,6 +320,125 @@ address = "127.0.0.1:{http_port}"
         "descriptors leaked between sozu processes:\n{}",
         problems.join("\n")
     );
+}
+
+#[test]
+#[ignore = "process-level: reads hardened workers' socket inodes under a root user namespace (see module docs)"]
+fn worker_upgrade_preserves_sockets_across_listener_batches() {
+    use std::fmt::Write as _;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let socket_path = temp.path().join("sozu.sock");
+    let config_path = temp.path().join("config.toml");
+    let pid_file = temp.path().join("sozu.pid");
+    let reservations = (0..205)
+        .map(|_| TcpListener::bind("127.0.0.1:0").expect("reserve a distinct listener port"))
+        .collect::<Vec<_>>();
+    let addresses = reservations
+        .iter()
+        .map(|listener| listener.local_addr().expect("reserved listener address"))
+        .collect::<Vec<_>>();
+    let mut config = format!(
+        r#"
+command_socket = "{socket}"
+pid_file_path = "{pid_file}"
+command_buffer_size = 16384
+max_command_buffer_size = 163840
+worker_count = 2
+worker_automatic_restart = false
+handle_process_affinity = false
+log_level = "warn"
+log_target = "stdout"
+max_connections = 16
+activate_listeners = true
+"#,
+        socket = socket_path.display(),
+        pid_file = pid_file.display(),
+    );
+    for address in &addresses {
+        writeln!(
+            config,
+            "\n[[listeners]]\nprotocol = \"tcp\"\naddress = \"{address}\""
+        )
+        .expect("append listener configuration");
+    }
+    std::fs::write(&config_path, config).expect("write config");
+    drop(reservations);
+    let guard = ProcessGuard::new(
+        Command::new(env!("CARGO_BIN_EXE_sozu"))
+            .args([
+                "start",
+                "-c",
+                config_path.to_str().expect("UTF-8 config path"),
+            ])
+            .process_group(0)
+            .spawn()
+            .expect("spawn sozu start"),
+    );
+    let before = wait_for_workers(&config_path, &[]);
+    let socket_inodes = |pid| {
+        descriptors("observe worker sockets", &[("worker".to_owned(), pid)])
+            .into_iter()
+            .map(|(_, _, target)| target)
+            .filter(|target| target.starts_with("socket:["))
+            .collect::<BTreeSet<_>>()
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let original_sockets = loop {
+        let observed = before
+            .iter()
+            .map(|&pid| (pid, socket_inodes(pid)))
+            .collect::<BTreeMap<_, _>>();
+        // The command and SCM channels are the only other sockets in this
+        // configuration. Wait for the static listener requests to take effect.
+        if observed
+            .values()
+            .all(|sockets| sockets.len() >= addresses.len() + 2)
+        {
+            break observed;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "listeners never finished starting"
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    let output = sozu(&config_path, &["upgrade", "--worker", "0"]);
+    assert!(
+        output.status.success(),
+        "the worker must upgrade across listener batches: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let after = wait_for_workers(&config_path, &before);
+    let retired = before
+        .iter()
+        .find(|pid| !after.contains(pid))
+        .expect("one retired worker");
+    let replacement = *after
+        .iter()
+        .find(|pid| !before.contains(pid))
+        .expect("one replacement worker");
+    let replacement_sockets = socket_inodes(replacement);
+    assert_eq!(
+        original_sockets[retired]
+            .intersection(&replacement_sockets)
+            .count(),
+        addresses.len(),
+        "the replacement must inherit every listening socket, preserving its kernel queues"
+    );
+    for address in addresses {
+        TcpStream::connect_timeout(&address, Duration::from_secs(1))
+            .unwrap_or_else(|error| panic!("listener {address} after upgrade: {error}"));
+    }
+    let leaks = violations(
+        "after batched worker upgrade",
+        &processes(&pid_file, &after),
+    );
+    assert!(leaks.is_empty(), "descriptor leaks: {}", leaks.join("\n"));
+
+    stop(&config_path, &pid_file);
+    drop(guard);
 }
 
 #[test]

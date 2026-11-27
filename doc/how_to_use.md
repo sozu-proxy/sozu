@@ -62,6 +62,20 @@ two processes executing or delivering the same command; recover with the
 service manager. Signal the service unit during an upgrade instead of sending a
 signal to a PID captured before the upgrade.
 
+### Worker upgrades with many listeners
+
+A hot worker upgrade transfers active HTTP, HTTPS, TCP and UDP listening
+sockets with their kernel queues intact. Each SCM message is limited to 200
+descriptors and a 4096-byte encoded manifest. With a new main and worker,
+larger sets are transferred in batches while the old worker keeps listening.
+The old worker releases its sockets after the main has received and validated
+all batches.
+
+The single-message path remains compatible with older workers. An older
+worker with a larger listener set keeps serving when a new main cannot
+prepare a batched handoff. Use a controlled instance replacement or restart
+to install the new worker on that first transition.
+
 ### First hot upgrade from 2.2.1
 
 The replacement accepts the flat snapshot sent by release `2.2.1`

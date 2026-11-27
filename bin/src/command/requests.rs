@@ -834,6 +834,9 @@ impl Server {
 
             RequestType::LaunchWorker(_) => {} // not yet implemented, nor used, anywhere
             RequestType::ReturnListenSockets(_) => {} // This is only implemented by workers,
+            RequestType::ListenerHandoff(_) => {
+                client.finish_failure("ListenerHandoff is an internal worker upgrade request");
+            }
             // Per-(cluster, source-IP) connection-limit runtime hooks. Both
             // the setter and the query are pure worker-side operations
             // (the live counter lives in `SessionManager`, not in the
