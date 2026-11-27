@@ -101,6 +101,7 @@ fn main(args: Args) -> Result<(), MainError> {
             fd: worker_to_main_channel_fd,
             scm: worker_to_main_scm_fd,
             configuration_state_fd,
+            listener_scm_batches,
             id,
             command_buffer_size,
             max_command_buffer_size,
@@ -114,6 +115,7 @@ fn main(args: Args) -> Result<(), MainError> {
                 id,
                 command_buffer_size,
                 max_command_buffer_size,
+                listener_scm_batches,
             )
             .map_err(MainError::BeginWorker)
         }

@@ -633,7 +633,9 @@ jobs:
         run: sudo --preserve-env=SOZU_MATRIX_PREVIOUS setpriv --reuid "$SOZU_PROC_OBSERVER_OWNER_UID" --regid "$SOZU_PROC_OBSERVER_OWNER_GID" --clear-groups --inh-caps +sys_admin --ambient-caps +sys_admin unshare --user --map-root-user -- "$MAIN_UPGRADE_COMPATIBILITY_MATRIX_E2E_EXE" published_2_3_6_upgrades_to_current_and_drains_all_workers --ignored --exact --nocapture --test-threads=1
 
       - name: Test sozu (descriptor inheritance across upgrades)
-        run: sudo setpriv --reuid "$SOZU_PROC_OBSERVER_OWNER_UID" --regid "$SOZU_PROC_OBSERVER_OWNER_GID" --clear-groups --inh-caps +sys_admin --ambient-caps +sys_admin unshare --user --map-root-user -- "$UPGRADE_FD_INHERITANCE_E2E_EXE" --ignored --exact upgrades_leave_no_descriptor_shared_between_sozu_processes --nocapture --test-threads=1
+        run: |
+          sudo setpriv --reuid "$SOZU_PROC_OBSERVER_OWNER_UID" --regid "$SOZU_PROC_OBSERVER_OWNER_GID" --clear-groups --inh-caps +sys_admin --ambient-caps +sys_admin unshare --user --map-root-user -- "$UPGRADE_FD_INHERITANCE_E2E_EXE" --ignored --exact upgrades_leave_no_descriptor_shared_between_sozu_processes --nocapture --test-threads=1
+          sudo setpriv --reuid "$SOZU_PROC_OBSERVER_OWNER_UID" --regid "$SOZU_PROC_OBSERVER_OWNER_GID" --clear-groups --inh-caps +sys_admin --ambient-caps +sys_admin unshare --user --map-root-user -- "$UPGRADE_FD_INHERITANCE_E2E_EXE" --ignored --exact worker_upgrade_preserves_sockets_across_listener_batches --nocapture --test-threads=1
 
       - name: Test sozu (mutable commands, process-level)
         run: sudo setpriv --reuid "$SOZU_PROC_OBSERVER_OWNER_UID" --regid "$SOZU_PROC_OBSERVER_OWNER_GID" --clear-groups --inh-caps +sys_admin --ambient-caps +sys_admin unshare --user --map-root-user -- "$MUTABLE_COMMANDS_RUNTIME_E2E_EXE" --ignored --nocapture --test-threads=1 --skip published_2_3_1_certificate_metadata_loss_is_bounded_to_the_first_upgrade

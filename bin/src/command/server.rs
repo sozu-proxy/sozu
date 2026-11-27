@@ -417,6 +417,10 @@ pub enum TaskSnapshotError {
         "an aborted worker upgrade is waiting for its old worker to listen again and cannot be handed over"
     )]
     OldWorkerRestoreInFlight,
+    #[error(
+        "a batched worker listener handoff owns a live snapshot or received descriptors and cannot be handed over"
+    )]
+    ListenerHandoffInFlight,
     #[error("test-only task {0} cannot be upgraded")]
     #[cfg_attr(not(test), allow(dead_code))]
     UnsupportedTestTask(&'static str),
@@ -2704,7 +2708,7 @@ impl Server {
         &mut self,
         listeners: Option<Listeners>,
     ) -> Result<&mut WorkerSession, ServerError> {
-        let (_, token) = self.launch_worker_awaiting_status(listeners, |id| {
+        let (_, token) = self.launch_worker_awaiting_status(listeners, false, |id| {
             Box::new(WorkerReadinessTask::new(id))
         })?;
         self.workers
@@ -2721,6 +2725,7 @@ impl Server {
     pub(crate) fn launch_worker_awaiting_status(
         &mut self,
         listeners: Option<Listeners>,
+        batched_listeners: bool,
         make_task: impl FnOnce(WorkerId) -> Box<dyn GatheringTask>,
     ) -> Result<(WorkerId, Token), ServerError> {
         let worker_id = self.next_worker_id();
@@ -2730,6 +2735,7 @@ impl Server {
             self.executable_path.clone(),
             &self.state,
             Some(listeners.unwrap_or_default()),
+            batched_listeners,
         )
         .map_err(ServerError::ForkMain)?;
 
@@ -2882,7 +2888,6 @@ impl Server {
     }
 
     /// The id the next task will receive.
-    #[cfg(test)]
     pub(crate) fn peek_next_task_id(&self) -> TaskId {
         self.next_task_id
     }
@@ -3356,7 +3361,9 @@ impl Server {
             // initialization admits it to the orders queued after that
             // `Status`, or gives it the confirmed protected values first.
             server
-                .launch_worker_awaiting_status(None, |id| Box::new(WorkerReadinessTask::new(id)))
+                .launch_worker_awaiting_status(None, false, |id| {
+                    Box::new(WorkerReadinessTask::new(id))
+                })
                 .map(|_| ())
         });
     }
@@ -5160,6 +5167,82 @@ mod tests {
                 .iter()
                 .all(|answer| answer.status != ResponseStatus::Failure as i32),
             "the first upgrade is unaffected by the refusal, it got {first_answers:?}"
+        );
+    }
+
+    /// Configurations that exceed the legacy SCM envelope must enter the
+    /// prepare/ACK/batch protocol without first asking the worker to detach.
+    /// The prepare ACK is also the barrier before batch zero, and either live
+    /// stage blocks a main-process snapshot because the worker-side snapshot
+    /// cannot move to another supervisor.
+    ///
+    /// TO SEE THIS RED: make `upgrade_worker` always send
+    /// `ReturnListenSockets`; the first request assertion observes the legacy
+    /// destructive handoff instead of `ListenerHandoff { prepare: true }`.
+    #[test]
+    fn oversized_worker_upgrade_prepares_then_requests_one_listener_batch() {
+        let mut hub = create_test_hub();
+        hub.server.config.worker_timeout = 60;
+        let (client_token, _client_peer) = register_observable_client(&mut hub);
+        let (mut worker_side, _scm) = register_ready_test_worker(&mut hub.server, 7, 4096, 65536);
+        for port in 10_000..10_201 {
+            add_active_http_listener(&mut hub, port);
+        }
+
+        let (server, client) = hub.get_client_mut(&client_token).expect("the client");
+        server.handle_client_request(client, RequestType::UpgradeWorker(7).into());
+        let prepared = drain_worker_requests(&mut hub.server, &mut worker_side);
+        let (prepare_id, transfer_id) = prepared
+            .iter()
+            .find_map(|request| match &request.content.request_type {
+                Some(RequestType::ListenerHandoff(handoff))
+                    if handoff.prepare == Some(true) && handoff.batch.is_none() =>
+                {
+                    Some((request.id.clone(), handoff.transfer_id.clone()))
+                }
+                _ => None,
+            })
+            .expect("oversized handoff starts with a prepare-only command");
+        assert!(
+            prepared.iter().all(|request| !matches!(
+                request.content.request_type,
+                Some(RequestType::ReturnListenSockets(_))
+            )),
+            "the oversized path must not detach through the legacy command: {prepared:?}"
+        );
+        let error = hub
+            .generate_upgrade_data(client_token)
+            .expect_err("the prepare transaction cannot cross a main upgrade");
+        assert!(
+            matches!(
+                error,
+                HubError::RestoreTask(TaskSnapshotError::ListenerHandoffInFlight)
+            ),
+            "unexpected snapshot refusal: {error}"
+        );
+
+        hub.handle_worker_response(7, status_answer(&prepare_id, ResponseStatus::Ok));
+        hub.finish_ready_tasks(Instant::now());
+        let batches = drain_worker_requests(&mut hub.server, &mut worker_side);
+        assert!(
+            batches.iter().any(|request| matches!(
+                &request.content.request_type,
+                Some(RequestType::ListenerHandoff(handoff))
+                    if handoff.transfer_id == transfer_id
+                        && handoff.prepare.is_none()
+                        && handoff.batch == Some(0)
+            )),
+            "prepare ACK must request exactly batch zero next: {batches:?}"
+        );
+        let error = hub
+            .generate_upgrade_data(client_token)
+            .expect_err("received listener descriptors cannot cross a main upgrade");
+        assert!(
+            matches!(
+                error,
+                HubError::RestoreTask(TaskSnapshotError::ListenerHandoffInFlight)
+            ),
+            "unexpected snapshot refusal: {error}"
         );
     }
 

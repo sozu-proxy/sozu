@@ -127,7 +127,8 @@ impl Request {
             | RequestType::RemoveListener(_)
             | RequestType::ActivateListener(_)
             | RequestType::DeactivateListener(_)
-            | RequestType::ReturnListenSockets(_) => {}
+            | RequestType::ReturnListenSockets(_)
+            | RequestType::ListenerHandoff(_) => {}
 
             // These won't ever reach a worker anyway
             RequestType::SaveState(_)

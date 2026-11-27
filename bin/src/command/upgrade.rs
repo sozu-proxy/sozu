@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use sozu_command_lib::{
     config::Config,
     proto::command::{
-        Event, ResponseStatus, ReturnListenSockets, RunState, SoftStop, WorkerResponse,
-        request::RequestType,
+        Event, ListenerHandoff, ResponseStatus, ReturnListenSockets, RunState, SoftStop,
+        WorkerResponse, request::RequestType,
     },
     scm_socket::{Listeners, ScmSocketError, validate_listener_batch},
     sd_notify,
@@ -42,6 +42,32 @@ enum UpgradeWorkerProgress {
     RequestingListenSockets {
         old_worker_token: Token,
         old_worker_id: WorkerId,
+    },
+    /// Ask a batching-aware worker to take an immutable snapshot of its live
+    /// listeners. This command deliberately carries no SCM frame: its ACK is
+    /// the barrier after which a stale frame from an earlier timed-out attempt
+    /// can be drained without racing the new snapshot.
+    PreparingListenerHandoff {
+        old_worker_token: Token,
+        old_worker_id: WorkerId,
+        transfer_id: String,
+    },
+    /// Receive exactly one bounded SCM frame after each correlated ACK. The
+    /// old worker continues accepting throughout this stage.
+    RequestingListenerBatch {
+        old_worker_token: Token,
+        old_worker_id: WorkerId,
+        transfer_id: String,
+        batch: u32,
+        listeners: StagedListeners,
+    },
+    /// The end marker and exact manifest have been observed. Only this command
+    /// allows the old worker to detach its listeners.
+    CommittingListenerHandoff {
+        old_worker_token: Token,
+        old_worker_id: WorkerId,
+        transfer_id: String,
+        listeners: StagedListeners,
     },
     /// 3. wait for the new worker to answer its initial `Status`. Phase one
     ///    left the old worker with no listening socket, so it only keeps
@@ -130,16 +156,54 @@ struct UpgradeWorkerTask {
     expected_responses: usize,
 }
 
+/// Listener descriptors accumulated by the supervisor during a batched
+/// handoff. [`Listeners`] stores raw descriptors and has no `Drop`, so every
+/// unsuccessful transaction must close these copies explicitly.
+#[derive(Debug)]
+struct StagedListeners(Option<Listeners>);
+
+impl Default for StagedListeners {
+    fn default() -> Self {
+        Self(Some(Listeners::default()))
+    }
+}
+
+impl StagedListeners {
+    fn append(&mut self, listeners: Listeners) {
+        self.0
+            .get_or_insert_with(Listeners::default)
+            .append(listeners);
+    }
+
+    fn as_listeners(&self) -> &Listeners {
+        self.0
+            .as_ref()
+            .expect("staged listeners are present until ownership is transferred")
+    }
+
+    fn into_listeners(mut self) -> Listeners {
+        self.0.take().unwrap_or_default()
+    }
+}
+
+impl Drop for StagedListeners {
+    fn drop(&mut self) {
+        if let Some(listeners) = self.0.take() {
+            listeners.close();
+        }
+    }
+}
+
 /// Build the address-only shape of the worker's listener hand-off.
 ///
 /// The descriptors are validation-only sentinels: [`validate_listener_batch`]
 /// reads their count but never dereferences or sends them. The supervisor must
 /// enforce the legacy one-frame envelope before asking an older worker to
 /// relinquish its sockets, because that worker cannot negotiate batching.
-fn validate_worker_listener_handoff(state: &ConfigState) -> Result<(), ScmSocketError> {
+fn active_listener_manifest(state: &ConfigState) -> Listeners {
     const VALIDATION_ONLY_FD: i32 = -1;
 
-    let listeners = Listeners {
+    Listeners {
         http: state
             .http_listeners
             .iter()
@@ -164,9 +228,81 @@ fn validate_worker_listener_handoff(state: &ConfigState) -> Result<(), ScmSocket
             .filter(|(_, listener)| listener.active)
             .map(|(key, _)| (key.clone(), VALIDATION_ONLY_FD))
             .collect(),
+    }
+}
+
+fn validate_worker_listener_handoff(state: &ConfigState) -> Result<(), ScmSocketError> {
+    validate_listener_batch(&active_listener_manifest(state))
+}
+
+fn validate_batched_listener_manifest(
+    state: &ConfigState,
+    listeners: &Listeners,
+) -> Result<(), String> {
+    let expected = active_listener_manifest(state);
+    let sorted_keys = |entries: &[(sozu_command_lib::listener_key::ListenerKey, i32)]| {
+        let mut keys = entries
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys
     };
 
-    validate_listener_batch(&listeners)
+    let expected_manifest = [
+        sorted_keys(&expected.http),
+        sorted_keys(&expected.tls),
+        sorted_keys(&expected.tcp),
+        sorted_keys(&expected.udp),
+    ];
+    let received_manifest = [
+        sorted_keys(&listeners.http),
+        sorted_keys(&listeners.tls),
+        sorted_keys(&listeners.tcp),
+        sorted_keys(&listeners.udp),
+    ];
+    if expected_manifest == received_manifest {
+        return Ok(());
+    }
+
+    Err(format!(
+        "listener manifest changed or did not match the worker snapshot (expected http/tls/tcp/udp={}/{}/{}/{}, received={}/{}/{}/{})",
+        expected_manifest[0].len(),
+        expected_manifest[1].len(),
+        expected_manifest[2].len(),
+        expected_manifest[3].len(),
+        received_manifest[0].len(),
+        received_manifest[1].len(),
+        received_manifest[2].len(),
+        received_manifest[3].len(),
+    ))
+}
+
+fn listener_count(listeners: &Listeners) -> usize {
+    listeners.http.len() + listeners.tls.len() + listeners.tcp.len() + listeners.udp.len()
+}
+
+fn active_listener_count(state: &ConfigState) -> usize {
+    state
+        .http_listeners
+        .values()
+        .filter(|listener| listener.active)
+        .count()
+        + state
+            .https_listeners
+            .values()
+            .filter(|listener| listener.active)
+            .count()
+        + state
+            .tcp_listeners
+            .values()
+            .filter(|listener| listener.active)
+            .count()
+        + state
+            .udp_listeners
+            .values()
+            .filter(|listener| listener.active)
+            .count()
 }
 
 pub fn upgrade_worker(server: &mut Server, client: &mut ClientSession, old_worker_id: WorkerId) {
@@ -205,10 +341,33 @@ pub fn upgrade_worker(server: &mut Server, client: &mut ClientSession, old_worke
         return;
     }
 
-    if let Err(error) = validate_worker_listener_handoff(&server.state) {
-        client.finish_failure(format!(
-            "Could not upgrade worker {old_worker_id}: its active listeners exceed the legacy single-message SCM hand-off envelope: {error}"
+    if validate_worker_listener_handoff(&server.state).is_err() {
+        let transfer_id = format!("worker-{old_worker_id}-task-{}", server.peek_next_task_id());
+        client.return_processing(format!(
+            "Preparing a batched listener handoff from worker {old_worker_id}"
         ));
+        server.scatter(
+            RequestType::ListenerHandoff(ListenerHandoff {
+                transfer_id: transfer_id.clone(),
+                batch: None,
+                prepare: Some(true),
+            })
+            .into(),
+            Box::new(UpgradeWorkerTask {
+                client_token: client.token,
+                progress: UpgradeWorkerProgress::PreparingListenerHandoff {
+                    old_worker_token,
+                    old_worker_id,
+                    transfer_id,
+                },
+                ok: 0,
+                errors: 0,
+                responses: Vec::new(),
+                expected_responses: 0,
+            }),
+            Timeout::Default,
+            Some(old_worker_id),
+        );
         return;
     }
 
@@ -234,6 +393,225 @@ pub fn upgrade_worker(server: &mut Server, client: &mut ClientSession, old_worke
 }
 
 impl UpgradeWorkerTask {
+    fn request_listener_batch(
+        client_token: Token,
+        server: &mut Server,
+        client: &mut OptionalClient,
+        old_worker: (Token, WorkerId),
+        transfer_id: String,
+        batch: u32,
+        listeners: StagedListeners,
+    ) {
+        let (old_worker_token, old_worker_id) = old_worker;
+        client.return_processing(format!(
+            "Requesting listener batch {batch} from worker {old_worker_id}"
+        ));
+        server.scatter(
+            RequestType::ListenerHandoff(ListenerHandoff {
+                transfer_id: transfer_id.clone(),
+                batch: Some(batch),
+                prepare: None,
+            })
+            .into(),
+            Box::new(UpgradeWorkerTask {
+                client_token,
+                progress: UpgradeWorkerProgress::RequestingListenerBatch {
+                    old_worker_token,
+                    old_worker_id,
+                    transfer_id,
+                    batch,
+                    listeners,
+                },
+                ok: 0,
+                errors: 0,
+                responses: Vec::new(),
+                expected_responses: 0,
+            }),
+            Timeout::Default,
+            Some(old_worker_id),
+        );
+    }
+
+    fn commit_listener_handoff(
+        client_token: Token,
+        server: &mut Server,
+        client: &mut OptionalClient,
+        old_worker_token: Token,
+        old_worker_id: WorkerId,
+        transfer_id: String,
+        listeners: StagedListeners,
+    ) {
+        client.return_processing(format!(
+            "Committing the listener handoff from worker {old_worker_id}"
+        ));
+        server.scatter(
+            RequestType::ListenerHandoff(ListenerHandoff {
+                transfer_id: transfer_id.clone(),
+                batch: None,
+                prepare: None,
+            })
+            .into(),
+            Box::new(UpgradeWorkerTask {
+                client_token,
+                progress: UpgradeWorkerProgress::CommittingListenerHandoff {
+                    old_worker_token,
+                    old_worker_id,
+                    transfer_id,
+                    listeners,
+                },
+                ok: 0,
+                errors: 0,
+                responses: Vec::new(),
+                expected_responses: 0,
+            }),
+            Timeout::Default,
+            Some(old_worker_id),
+        );
+    }
+
+    fn receive_listener_batch(
+        client_token: Token,
+        server: &mut Server,
+        client: &mut OptionalClient,
+        old_worker: (Token, WorkerId),
+        transfer_id: String,
+        batch: u32,
+        mut listeners: StagedListeners,
+    ) {
+        let (old_worker_token, old_worker_id) = old_worker;
+        let received = {
+            let old_worker = match server.workers.get_mut(&old_worker_token) {
+                Some(old_worker) => old_worker,
+                None => {
+                    client.finish_failure(format!(
+                        "Worker {old_worker_id} died while staging its listeners; its original listeners were not committed"
+                    ));
+                    return;
+                }
+            };
+            if let Err(error) = old_worker.scm_socket.set_blocking(false) {
+                client.finish_failure(format!(
+                    "Could not make listener batch {batch} receive nonblocking for worker {old_worker_id}: {error}"
+                ));
+                return;
+            }
+            old_worker.scm_socket.receive_listener_batch()
+        };
+
+        let received = match received {
+            Ok(received) => received,
+            Err(error) => {
+                client.finish_failure(format!(
+                    "Could not receive listener batch {batch} from worker {old_worker_id}: {error}; the old worker keeps serving"
+                ));
+                return;
+            }
+        };
+
+        if received.is_empty() {
+            if let Err(error) =
+                validate_batched_listener_manifest(&server.state, listeners.as_listeners())
+            {
+                client.finish_failure(format!(
+                    "Could not commit listener handoff from worker {old_worker_id}: {error}; the old worker keeps serving"
+                ));
+                return;
+            }
+            Self::commit_listener_handoff(
+                client_token,
+                server,
+                client,
+                old_worker_token,
+                old_worker_id,
+                transfer_id,
+                listeners,
+            );
+            return;
+        }
+
+        let expected_count = active_listener_count(&server.state);
+        let staged_count = listener_count(listeners.as_listeners());
+        let received_count = listener_count(&received);
+        if staged_count
+            .checked_add(received_count)
+            .is_none_or(|count| count > expected_count)
+        {
+            received.close();
+            client.finish_failure(format!(
+                "Could not stage listener batch {batch} from worker {old_worker_id}: the handoff exceeded the current {expected_count}-listener manifest; the old worker keeps serving"
+            ));
+            return;
+        }
+        listeners.append(received);
+        let Some(next_batch) = batch.checked_add(1) else {
+            client.finish_failure(format!(
+                "Could not stage listeners from worker {old_worker_id}: listener batch index overflow; the old worker keeps serving"
+            ));
+            return;
+        };
+        Self::request_listener_batch(
+            client_token,
+            server,
+            client,
+            old_worker,
+            transfer_id,
+            next_batch,
+            listeners,
+        );
+    }
+
+    fn launch_batched_replacement(
+        client_token: Token,
+        server: &mut Server,
+        client: &mut OptionalClient,
+        old_worker_token: Token,
+        old_worker_id: WorkerId,
+        listeners: StagedListeners,
+    ) {
+        if let Err(error) =
+            validate_batched_listener_manifest(&server.state, listeners.as_listeners())
+        {
+            return Self::abort_keeping_old_worker(
+                client_token,
+                server,
+                client,
+                old_worker_id,
+                format!(
+                    "Could not launch the replacement after committing worker {old_worker_id}'s listener handoff: {error}"
+                ),
+            );
+        }
+
+        let listeners = listeners.into_listeners();
+        let (new_worker_id, _) =
+            match server.launch_worker_awaiting_status(Some(listeners), true, |new_worker_id| {
+                Box::new(UpgradeWorkerTask {
+                    client_token,
+                    progress: UpgradeWorkerProgress::AwaitingReadiness {
+                        old_worker_token,
+                        old_worker_id,
+                        new_worker_id,
+                    },
+                    ok: 0,
+                    errors: 0,
+                    responses: Vec::new(),
+                    expected_responses: 0,
+                })
+            }) {
+                Ok(launched) => launched,
+                Err(worker_err) => {
+                    return Self::abort_keeping_old_worker(
+                        client_token,
+                        server,
+                        client,
+                        old_worker_id,
+                        format!("could not launch new worker: {worker_err}"),
+                    );
+                }
+            };
+        client.return_processing(format!("Launched a new worker with id {new_worker_id}"));
+    }
+
     fn receive_listen_sockets(
         self,
         server: &mut Server,
@@ -286,7 +664,7 @@ impl UpgradeWorkerTask {
         // The old worker stays `Running` until the new one has proven it is
         // ready (`AwaitingReadiness`); it holds no listening socket meanwhile.
         let (new_worker_id, _) =
-            match server.launch_worker_awaiting_status(Some(listeners), |new_worker_id| {
+            match server.launch_worker_awaiting_status(Some(listeners), false, |new_worker_id| {
                 Box::new(UpgradeWorkerTask {
                     client_token,
                     progress: UpgradeWorkerProgress::AwaitingReadiness {
@@ -488,6 +866,11 @@ impl GatheringTask for UpgradeWorkerTask {
             UpgradeWorkerProgress::RestoringOldWorker { .. } => {
                 return Err(TaskSnapshotError::OldWorkerRestoreInFlight);
             }
+            UpgradeWorkerProgress::PreparingListenerHandoff { .. }
+            | UpgradeWorkerProgress::RequestingListenerBatch { .. }
+            | UpgradeWorkerProgress::CommittingListenerHandoff { .. } => {
+                return Err(TaskSnapshotError::ListenerHandoffInFlight);
+            }
             UpgradeWorkerProgress::RequestingListenSockets {
                 old_worker_token,
                 old_worker_id,
@@ -518,6 +901,15 @@ impl GatheringTask for UpgradeWorkerTask {
             UpgradeWorkerProgress::RequestingListenSockets {
                 old_worker_token, ..
             }
+            | UpgradeWorkerProgress::PreparingListenerHandoff {
+                old_worker_token, ..
+            }
+            | UpgradeWorkerProgress::RequestingListenerBatch {
+                old_worker_token, ..
+            }
+            | UpgradeWorkerProgress::CommittingListenerHandoff {
+                old_worker_token, ..
+            }
             | UpgradeWorkerProgress::AwaitingReadiness {
                 old_worker_token, ..
             } => Some(old_worker_token),
@@ -532,6 +924,9 @@ impl GatheringTask for UpgradeWorkerTask {
     fn upgrading_worker_id(&self) -> Option<WorkerId> {
         match self.progress {
             UpgradeWorkerProgress::RequestingListenSockets { old_worker_id, .. }
+            | UpgradeWorkerProgress::PreparingListenerHandoff { old_worker_id, .. }
+            | UpgradeWorkerProgress::RequestingListenerBatch { old_worker_id, .. }
+            | UpgradeWorkerProgress::CommittingListenerHandoff { old_worker_id, .. }
             | UpgradeWorkerProgress::AwaitingReadiness { old_worker_id, .. }
             | UpgradeWorkerProgress::RestoringOldWorker { old_worker_id, .. }
             | UpgradeWorkerProgress::StopOldActivateNew { old_worker_id, .. } => {
@@ -546,6 +941,9 @@ impl GatheringTask for UpgradeWorkerTask {
         match self.progress {
             UpgradeWorkerProgress::AwaitingReadiness { new_worker_id, .. } => vec![new_worker_id],
             UpgradeWorkerProgress::RequestingListenSockets { .. }
+            | UpgradeWorkerProgress::PreparingListenerHandoff { .. }
+            | UpgradeWorkerProgress::RequestingListenerBatch { .. }
+            | UpgradeWorkerProgress::CommittingListenerHandoff { .. }
             | UpgradeWorkerProgress::RestoringOldWorker { .. }
             | UpgradeWorkerProgress::StopOldActivateNew { .. } => Vec::new(),
         }
@@ -592,6 +990,105 @@ impl GatheringTask for UpgradeWorkerTask {
                         );
                     }
                 }
+            }
+            UpgradeWorkerProgress::PreparingListenerHandoff {
+                old_worker_token,
+                old_worker_id,
+                transfer_id,
+            } => {
+                if self.ok != 1 {
+                    client.finish_failure(format!(
+                        "Could not prepare batched listener handoff {transfer_id} from worker {old_worker_id}: {}{:?}; the old worker keeps serving",
+                        if timed_out { "timeout waiting for a response; " } else { "" },
+                        self.responses,
+                    ));
+                    return;
+                }
+
+                let Some(worker) = server.workers.get(&old_worker_token) else {
+                    client.finish_failure(format!(
+                        "Worker {old_worker_id} died after preparing listener handoff {transfer_id}"
+                    ));
+                    return;
+                };
+                // The prepare ACK is a command-channel barrier: a frame now
+                // pending can only belong to a timed-out earlier attempt.
+                worker.scm_socket.discard_pending_listener_transfer();
+                Self::request_listener_batch(
+                    self.client_token,
+                    server,
+                    client,
+                    (old_worker_token, old_worker_id),
+                    transfer_id,
+                    0,
+                    StagedListeners::default(),
+                );
+            }
+            UpgradeWorkerProgress::RequestingListenerBatch {
+                old_worker_token,
+                old_worker_id,
+                transfer_id,
+                batch,
+                listeners,
+            } => {
+                if self.ok == 1 {
+                    Self::receive_listener_batch(
+                        self.client_token,
+                        server,
+                        client,
+                        (old_worker_token, old_worker_id),
+                        transfer_id,
+                        batch,
+                        listeners,
+                    );
+                    return;
+                }
+
+                if !timed_out
+                    && !self.responses.is_empty()
+                    && let Some(worker) = server.workers.get(&old_worker_token)
+                {
+                    worker.scm_socket.discard_pending_listener_transfer();
+                }
+                client.finish_failure(format!(
+                    "Could not receive listener batch {batch} for handoff {transfer_id} from worker {old_worker_id}: {}{:?}; the old worker keeps serving",
+                    if timed_out { "timeout waiting for a response; " } else { "" },
+                    self.responses,
+                ));
+            }
+            UpgradeWorkerProgress::CommittingListenerHandoff {
+                old_worker_token,
+                old_worker_id,
+                transfer_id,
+                listeners,
+            } => {
+                if self.ok == 1 {
+                    Self::launch_batched_replacement(
+                        self.client_token,
+                        server,
+                        client,
+                        old_worker_token,
+                        old_worker_id,
+                        listeners,
+                    );
+                    return;
+                }
+
+                // A timed-out commit is indeterminate: the old worker may
+                // already have detached. Activation is idempotent and follows
+                // the commit on the same command channel, so it is safe for an
+                // explicit NACK as well and restores service in both cases.
+                Self::abort_keeping_old_worker(
+                    self.client_token,
+                    server,
+                    client,
+                    old_worker_id,
+                    format!(
+                        "Could not commit listener handoff {transfer_id} from worker {old_worker_id}: {:?}{}",
+                        self.responses,
+                        if timed_out { " (timeout)" } else { "" }
+                    ),
+                );
             }
             UpgradeWorkerProgress::AwaitingReadiness {
                 old_worker_token,
@@ -767,6 +1264,9 @@ impl Gatherer for UpgradeWorkerTask {
                 self.ok += 1;
                 match self.progress {
                     UpgradeWorkerProgress::RequestingListenSockets { .. }
+                    | UpgradeWorkerProgress::PreparingListenerHandoff { .. }
+                    | UpgradeWorkerProgress::RequestingListenerBatch { .. }
+                    | UpgradeWorkerProgress::CommittingListenerHandoff { .. }
                     | UpgradeWorkerProgress::AwaitingReadiness { .. }
                     | UpgradeWorkerProgress::RestoringOldWorker { .. } => {}
                     UpgradeWorkerProgress::StopOldActivateNew { .. } => {
@@ -1295,6 +1795,7 @@ pub(crate) mod tests {
     use std::{
         collections::{HashMap, VecDeque},
         net::SocketAddr,
+        os::fd::IntoRawFd,
         sync::mpsc,
         thread,
         time::Instant,
@@ -1307,10 +1808,10 @@ pub(crate) mod tests {
     use serde_json::Value;
 
     use super::{
-        LegacyUpgradeData, UPGRADE_PROTOCOL_V2, UpgradeCounts, UpgradeData, UpgradeHandshake,
-        UpgradeServerState, UpgradeSnapshot, UpgradeStage, UpgradeWorkerProgress,
-        UpgradeWorkerTask, commit_and_wait_for_activation, validate_prepared,
-        validate_worker_listener_handoff,
+        LegacyUpgradeData, StagedListeners, UPGRADE_PROTOCOL_V2, UpgradeCounts, UpgradeData,
+        UpgradeHandshake, UpgradeServerState, UpgradeSnapshot, UpgradeStage, UpgradeWorkerProgress,
+        UpgradeWorkerTask, active_listener_manifest, commit_and_wait_for_activation,
+        validate_batched_listener_manifest, validate_prepared, validate_worker_listener_handoff,
     };
     use crate::command::{
         server::{
@@ -1320,7 +1821,7 @@ pub(crate) mod tests {
         sessions::ClientSession,
     };
     use sozu_command_lib::channel::Channel;
-    use sozu_command_lib::{config::Config, state::ConfigState};
+    use sozu_command_lib::{config::Config, scm_socket::Listeners, state::ConfigState};
     use sozu_command_lib::{
         proto::command::{
             HttpListenerConfig, Request, Response, ResponseStatus, RunState, WorkerResponse,
@@ -1461,6 +1962,54 @@ pub(crate) mod tests {
         assert!(
             validate_worker_listener_handoff(&state).is_err(),
             "201 active listeners must be refused before a legacy worker is asked to hand them off"
+        );
+    }
+
+    #[test]
+    fn batched_worker_handoff_manifest_is_exact_per_listener_protocol() {
+        let mut state = ConfigState::new();
+        let address = SocketAddr::from(([127, 0, 0, 1], 10_000));
+        let listener = HttpListenerConfig {
+            address: address.into(),
+            active: true,
+            ..Default::default()
+        };
+        state
+            .http_listeners
+            .insert(listener.listener_key(), listener);
+
+        let mut received = active_listener_manifest(&state);
+        validate_batched_listener_manifest(&state, &received)
+            .expect("the exact active listener manifest must be accepted");
+        let entry = received.http.pop().expect("one HTTP listener");
+        received.tcp.push(entry);
+        assert!(
+            validate_batched_listener_manifest(&state, &received).is_err(),
+            "moving the same key and FD count to another protocol must be rejected"
+        );
+    }
+
+    #[test]
+    fn dropping_staged_listener_batches_closes_every_received_descriptor() {
+        use std::io::{ErrorKind, Write as _};
+
+        let (owned, mut peer) = std::os::unix::net::UnixStream::pair().expect("create descriptor");
+        let fd = owned.into_raw_fd();
+        let key = "127.0.0.1:10000".parse().expect("parse listener key");
+        {
+            let _staged = StagedListeners(Some(Listeners {
+                http: vec![(key, fd)],
+                ..Listeners::default()
+            }));
+        }
+
+        // Observe the original socket through its peer. Another test may
+        // already have reused the closed descriptor number.
+        assert_eq!(
+            peer.write(&[1])
+                .expect_err("the staged socket must be closed")
+                .kind(),
+            ErrorKind::BrokenPipe,
         );
     }
 

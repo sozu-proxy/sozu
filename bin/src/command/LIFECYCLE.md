@@ -500,25 +500,36 @@ phase takes the old worker's listeners and launches the new worker with them;
 its second phase (`StopOldActivateNew`) soft-stops the old worker and sends the
 activation requests to the new one.
 
-Before phase one, the supervisor serializes the active listener keys without
-descriptors and refuses the upgrade when they exceed the legacy single-message
-SCM envelope. This check is mandatory even when the current worker can reject
-the batch safely: a worker from an older executable has no capability exchange
-and may relinquish its listeners before its oversized send fails. The refusal
-leaves that worker untouched; batching requires a future wire protocol.
+Before phase one, the supervisor sizes the active listener manifest against
+the legacy single-message SCM envelope. If it fits, it sends the historical
+`ReturnListenSockets` request. Otherwise, it sends the internal
+`ListenerHandoff` prepare request. A legacy worker cannot decode that verb
+and keeps its listening sockets. The new worker preparation snapshots its
+listening sockets without deregistering them.
+
+After prepare is acknowledged, each correlated request sends one ordered
+batch of up to 200 descriptors and 4096 encoded bytes. An empty batch marks
+the end. The supervisor owns the received duplicates, validates them against
+its active listener set, then asks the old worker to commit. The old worker
+validates its snapshot before it detaches the originals. A batch failure
+before commit drops the received copies while the old worker keeps listening.
+The first acknowledged prepare also provides a boundary for discarding a
+single pending batch from an earlier attempt. The supervisor retains
+ownership of the collected descriptors until launch, so a main upgrade is
+refused while this transaction is in flight. The child worker receives bounded frames
+through the empty terminator before it replays its initial state.
 
 Between the two phases the old worker stays `Running` but holds no listening
-socket: `ReturnListenSockets` makes it hand every descriptor over and keep
-none, and the supervisor closes its own copies once the replacement has them,
+socket after the legacy return or the batched commit. The supervisor closes
+its own copies once the replacement has them,
 or once the launch has failed (`fork_main_into_worker` closes them on every
 error return): a copy left open would keep the supervisor listening on sockets
 it never accepts on, so with one worker new connections would complete the
 handshake and hang, and with several `SO_REUSEPORT` would still hash a share of
 them there until the supervisor exited.
 The second phase starts only when the replacement answers its initial `Status`
-with `Ok` (`AwaitingReadiness`). Every other exit, a replacement that times
-out, is rejected, or is refused its bootstrap, a failed or malformed receive
-of the listeners, and a failed launch, ends the upgrade through
+with `Ok` (`AwaitingReadiness`). A failed legacy receive, a failed launch,
+or a replacement that times out or fails bootstrap ends the upgrade through
 `UpgradeWorkerTask::abort_keeping_old_worker`: a replacement that reached
 `AwaitingReadiness` is fenced first, and the old worker is sent an
 `ActivateListener` for every listener the state

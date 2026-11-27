@@ -29,6 +29,15 @@ use crate::{
 pub const MAX_FDS_OUT: usize = 200;
 pub const MAX_BYTES_OUT: usize = 4096;
 
+// Field tags from `ListenersCount` in command.proto. They are needed to count
+// the exact protobuf contribution of one listener without re-encoding the
+// whole batch for every candidate entry.
+const LISTENERS_COUNT_HTTP_TAG: u32 = 1;
+const LISTENERS_COUNT_TLS_TAG: u32 = 2;
+const LISTENERS_COUNT_TCP_TAG: u32 = 3;
+const LISTENERS_COUNT_UDP_TAG: u32 = 4;
+const DISCARD_READ_SIZE: usize = 512;
+
 // Linux accepts at most 253 descriptors in one SCM_RIGHTS message. Receiving
 // that full kernel limit lets us take ownership before rejecting a frame that
 // exceeds Sōzu's stricter MAX_FDS_OUT contract.
@@ -218,15 +227,51 @@ impl ScmSocket {
         self.send_msg_and_fds(&batch.message, &batch.file_descriptors)
     }
 
+    /// Send a listener table as bounded SCM frames followed by an empty frame.
+    pub fn send_listener_batches(&self, listeners: &Listeners) -> Result<(), ScmSocketError> {
+        for batch in listeners.clone().into_batches()? {
+            self.send_listeners(&batch)?;
+        }
+        self.send_listeners(&Listeners::default())
+    }
+
     /// Receive and parse listeners (socket addresses and file descriptors) via an scm socket
     pub fn receive_listeners(&self) -> Result<Listeners, ScmSocketError> {
         let mut buf = vec![0; MAX_BYTES_OUT];
         let (size, received_fds) = self.receive_msg_and_fds(&mut buf)?;
+        debug!("{} received :{:?}", self.fd, (size, received_fds.len()));
+        self.decode_listener_frame(&buf[..size], received_fds)
+    }
+
+    /// Receive exactly one length-delimited listener frame from the stream.
+    ///
+    /// Unlike `receive_listeners`, this method never reads bytes belonging to
+    /// the following frame. An empty frame is returned as an empty listener
+    /// table so callers can use it as the batched-transfer end marker.
+    pub fn receive_listener_batch(&self) -> Result<Listeners, ScmSocketError> {
+        let (message, received_fds) = self.receive_listener_frame()?;
+        self.decode_listener_frame(&message, received_fds)
+    }
+
+    /// Receive bounded listener frames until their empty terminal frame.
+    pub fn receive_listener_batches(&self) -> Result<Listeners, ScmSocketError> {
+        let mut received = ReceivedListenerBatches::default();
+        loop {
+            let batch = self.receive_listener_batch()?;
+            if batch.is_empty() {
+                return Ok(received.finish());
+            }
+            received.listeners.append(batch);
+        }
+    }
+
+    fn decode_listener_frame(
+        &self,
+        message: &[u8],
+        received_fds: Vec<OwnedFd>,
+    ) -> Result<Listeners, ScmSocketError> {
         let file_descriptor_length = received_fds.len();
-
-        debug!("{} received :{:?}", self.fd, (size, file_descriptor_length));
-
-        let listeners_count = ListenersCount::decode_length_delimited(&buf[..size])
+        let listeners_count = ListenersCount::decode_length_delimited(message)
             .map_err(ScmSocketError::DecodeError)?;
 
         // Validate the manifest before indexing into the owned FD vector.
@@ -409,15 +454,106 @@ impl ScmSocket {
         })
     }
 
-    /// Best-effort removal of one terminal listener transfer from the stream.
+    fn receive_listener_frame(&self) -> Result<(Vec<u8>, Vec<OwnedFd>), ScmSocketError> {
+        const MAX_LENGTH_DELIMITER_BYTES: usize = 10;
+
+        let mut prefix = [0u8; MAX_LENGTH_DELIMITER_BYTES];
+        let mut prefix_len = 0;
+        let mut received_fds = Vec::new();
+
+        loop {
+            let (received, mut fds) =
+                self.receive_msg_and_fds(&mut prefix[prefix_len..prefix_len + 1])?;
+            if received == 0 {
+                return Err(ScmSocketError::Receive(
+                    "SCM socket reached EOF while receiving a listener frame".to_owned(),
+                ));
+            }
+            debug_assert_eq!(received, 1, "the prefix receive is exactly one byte");
+            received_fds.append(&mut fds);
+            prefix_len += 1;
+
+            if received_fds.len() > MAX_FDS_OUT {
+                return Err(ScmSocketError::ListenerBatchTooLarge {
+                    fds: received_fds.len(),
+                    max_fds: MAX_FDS_OUT,
+                    bytes: prefix_len,
+                    max_bytes: MAX_BYTES_OUT,
+                });
+            }
+
+            if prefix[prefix_len - 1] & 0x80 == 0 || prefix_len == prefix.len() {
+                break;
+            }
+        }
+
+        let payload_len = prost::decode_length_delimiter(&prefix[..prefix_len])
+            .map_err(ScmSocketError::DecodeError)?;
+        let frame_len =
+            prefix_len
+                .checked_add(payload_len)
+                .ok_or(ScmSocketError::ListenerBatchTooLarge {
+                    fds: received_fds.len(),
+                    max_fds: MAX_FDS_OUT,
+                    bytes: usize::MAX,
+                    max_bytes: MAX_BYTES_OUT,
+                })?;
+        if frame_len > MAX_BYTES_OUT {
+            return Err(ScmSocketError::ListenerBatchTooLarge {
+                fds: received_fds.len(),
+                max_fds: MAX_FDS_OUT,
+                bytes: frame_len,
+                max_bytes: MAX_BYTES_OUT,
+            });
+        }
+
+        let mut message = vec![0; frame_len];
+        message[..prefix_len].copy_from_slice(&prefix[..prefix_len]);
+        let mut offset = prefix_len;
+        while offset < frame_len {
+            let (received, mut fds) = self.receive_msg_and_fds(&mut message[offset..])?;
+            if received == 0 {
+                return Err(ScmSocketError::Receive(
+                    "SCM socket reached EOF while receiving a listener frame".to_owned(),
+                ));
+            }
+            offset += received;
+            received_fds.append(&mut fds);
+            if received_fds.len() > MAX_FDS_OUT {
+                return Err(ScmSocketError::ListenerBatchTooLarge {
+                    fds: received_fds.len(),
+                    max_fds: MAX_FDS_OUT,
+                    bytes: frame_len,
+                    max_bytes: MAX_BYTES_OUT,
+                });
+            }
+        }
+
+        Ok((message, received_fds))
+    }
+
+    /// Best-effort removal of every listener-transfer byte currently pending.
+    ///
+    /// Callers use this only after a command-channel barrier proves that no
+    /// current transfer can still write to the SCM stream. A Unix stream does
+    /// not preserve `sendmsg` record boundaries, so one nonblocking receive
+    /// could leave the tail of a stale frame to corrupt the next transfer.
     /// Every delivered descriptor is immediately closed by `OwnedFd` drop.
     pub fn discard_pending_listener_transfer(&self) {
-        let mut message = [0; MAX_BYTES_OUT];
-        let mut control = AlignedControlBuffer {
-            _alignment: [],
-            bytes: [0; CONTROL_MESSAGE_BUFFER_SIZE],
-        };
-        let _ = self.receive_msg_and_fds_with_control(&mut message, &mut control.bytes, true);
+        loop {
+            let mut message = [0; DISCARD_READ_SIZE];
+            let mut control = AlignedControlBuffer {
+                _alignment: [],
+                bytes: [0; CONTROL_MESSAGE_BUFFER_SIZE],
+            };
+            match self.receive_msg_and_fds_with_control(&mut message, &mut control.bytes, true) {
+                // The owning receive dropped the delivered descriptors, but
+                // bytes from the same send can still be waiting in the stream.
+                Err(ScmSocketError::ReceiveTruncated { .. }) => {}
+                Ok((0, _)) | Err(_) => return,
+                Ok((_received, _received_fds)) => {}
+            }
+        }
     }
 
     /// Sends message and file descriptors separately. The file descriptors are summed up
@@ -512,15 +648,20 @@ impl ScmSocket {
         let control_len = u16::try_from(control.len()).expect("the ancillary buffer fits in u16");
         header.msg_controllen = control_len.into();
 
-        // SAFETY: header points to the live message and aligned control buffers
-        // above for their full lengths. recvmsg initializes only those buffers
-        // and the scalar result fields in header.
-        let received = unsafe { libc::recvmsg(self.fd, &mut header, flags.bits()) };
-        if received < 0 {
-            return Err(ScmSocketError::Receive(
-                std::io::Error::last_os_error().to_string(),
-            ));
-        }
+        let received = loop {
+            // SAFETY: header points to the live message and aligned control
+            // buffers above for their full lengths. EINTR installs neither
+            // data nor descriptors, so retrying the same header is safe.
+            let received = unsafe { libc::recvmsg(self.fd, &mut header, flags.bits()) };
+            if received >= 0 {
+                break received;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(ScmSocketError::Receive(error.to_string()));
+        };
 
         let received_fds = own_scm_rights(&header)?;
         let data_truncated = header.msg_flags & libc::MSG_TRUNC != 0;
@@ -536,6 +677,27 @@ impl ScmSocket {
 
         debug_assert!((received as usize) <= message.len());
         Ok((received as usize, received_fds))
+    }
+}
+
+#[derive(Default)]
+struct ReceivedListenerBatches {
+    listeners: Listeners,
+    finished: bool,
+}
+
+impl ReceivedListenerBatches {
+    fn finish(mut self) -> Listeners {
+        self.finished = true;
+        mem::take(&mut self.listeners)
+    }
+}
+
+impl Drop for ReceivedListenerBatches {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.listeners.close();
+        }
     }
 }
 
@@ -649,6 +811,70 @@ pub struct Listeners {
 }
 
 impl Listeners {
+    /// Split this table into independently valid SCM transport frames.
+    pub fn into_batches(self) -> Result<Vec<Listeners>, ScmSocketError> {
+        let Listeners {
+            http,
+            tls,
+            tcp,
+            udp,
+        } = self;
+        let mut batches = Vec::new();
+        let mut current = Listeners::default();
+        let mut current_payload_len = 0;
+
+        append_entries_to_batches(
+            http,
+            LISTENERS_COUNT_HTTP_TAG,
+            |listeners| &mut listeners.http,
+            &mut current,
+            &mut current_payload_len,
+            &mut batches,
+        )?;
+        append_entries_to_batches(
+            tls,
+            LISTENERS_COUNT_TLS_TAG,
+            |listeners| &mut listeners.tls,
+            &mut current,
+            &mut current_payload_len,
+            &mut batches,
+        )?;
+        append_entries_to_batches(
+            tcp,
+            LISTENERS_COUNT_TCP_TAG,
+            |listeners| &mut listeners.tcp,
+            &mut current,
+            &mut current_payload_len,
+            &mut batches,
+        )?;
+        append_entries_to_batches(
+            udp,
+            LISTENERS_COUNT_UDP_TAG,
+            |listeners| &mut listeners.udp,
+            &mut current,
+            &mut current_payload_len,
+            &mut batches,
+        )?;
+
+        if !current.is_empty() {
+            validate_listener_batch(&current)?;
+            batches.push(current);
+        }
+        Ok(batches)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.http.is_empty() && self.tls.is_empty() && self.tcp.is_empty() && self.udp.is_empty()
+    }
+
+    /// Move all listener entries from `batch` into this table.
+    pub fn append(&mut self, mut batch: Listeners) {
+        self.http.append(&mut batch.http);
+        self.tls.append(&mut batch.tls);
+        self.tcp.append(&mut batch.tcp);
+        self.udp.append(&mut batch.udp);
+    }
+
     pub fn get_http(&mut self, addr: &ListenerKey) -> Option<RawFd> {
         let before = self.http.len();
         let pos = self.http.iter().position(|(front, _)| front == addr);
@@ -755,6 +981,66 @@ impl Listeners {
             }
         }
     }
+}
+
+fn append_entries_to_batches(
+    entries: Vec<(ListenerKey, RawFd)>,
+    protobuf_tag: u32,
+    select: fn(&mut Listeners) -> &mut Vec<(ListenerKey, RawFd)>,
+    current: &mut Listeners,
+    current_payload_len: &mut usize,
+    batches: &mut Vec<Listeners>,
+) -> Result<(), ScmSocketError> {
+    for entry in entries {
+        let encoded_key = entry.0.to_string();
+        let entry_len = prost::encoding::string::encoded_len(protobuf_tag, &encoded_key);
+        let candidate_payload_len = current_payload_len.checked_add(entry_len).ok_or(
+            ScmSocketError::ListenerBatchTooLarge {
+                fds: listener_count(current).saturating_add(1),
+                max_fds: MAX_FDS_OUT,
+                bytes: usize::MAX,
+                max_bytes: MAX_BYTES_OUT,
+            },
+        )?;
+        let candidate_fds = listener_count(current).saturating_add(1);
+        let candidate_bytes = candidate_payload_len
+            .saturating_add(prost::length_delimiter_len(candidate_payload_len));
+
+        if candidate_fds > MAX_FDS_OUT || candidate_bytes > MAX_BYTES_OUT {
+            if current.is_empty() {
+                return Err(ScmSocketError::ListenerBatchTooLarge {
+                    fds: candidate_fds,
+                    max_fds: MAX_FDS_OUT,
+                    bytes: candidate_bytes,
+                    max_bytes: MAX_BYTES_OUT,
+                });
+            }
+
+            validate_listener_batch(current)?;
+            batches.push(mem::take(current));
+            *current_payload_len = 0;
+
+            let entry_bytes = entry_len.saturating_add(prost::length_delimiter_len(entry_len));
+            if entry_bytes > MAX_BYTES_OUT {
+                return Err(ScmSocketError::ListenerBatchTooLarge {
+                    fds: 1,
+                    max_fds: MAX_FDS_OUT,
+                    bytes: entry_bytes,
+                    max_bytes: MAX_BYTES_OUT,
+                });
+            }
+        }
+
+        select(current).push(entry);
+        *current_payload_len = current_payload_len
+            .checked_add(entry_len)
+            .expect("a single listener entry was already checked for overflow");
+    }
+    Ok(())
+}
+
+fn listener_count(listeners: &Listeners) -> usize {
+    listeners.http.len() + listeners.tls.len() + listeners.tcp.len() + listeners.udp.len()
 }
 
 /// Parse the manifest's listener keys: the socket address, followed by
@@ -1226,6 +1512,178 @@ mod tests {
                 writer
                     .write(&[1])
                     .expect_err("all received duplicates must be closed")
+                    .kind(),
+                std::io::ErrorKind::BrokenPipe
+            );
+        }
+    }
+
+    #[test]
+    fn discards_every_pending_stream_fragment_and_descriptor() {
+        let (stream_1, stream_2) =
+            MioUnixStream::pair().expect("Could not create a pair of mio unix streams");
+        let sender = ScmSocket::new(stream_1.into_raw_fd()).expect("Could not create scm socket");
+        let receiver = ScmSocket::new(stream_2.into_raw_fd()).expect("Could not create scm socket");
+        let (first_reader, mut first_writer) =
+            UnixStream::pair().expect("Could not create first payload unix streams");
+        let (second_reader, mut second_writer) =
+            UnixStream::pair().expect("Could not create second payload unix streams");
+
+        sender
+            .send_msg_and_fds(&[1; MAX_BYTES_OUT], &[first_reader.as_raw_fd()])
+            .expect("the first stale fragment is sent");
+        sender
+            .send_msg_and_fds(&[2; MAX_BYTES_OUT], &[second_reader.as_raw_fd()])
+            .expect("the second stale fragment is sent");
+        drop(first_reader);
+        drop(second_reader);
+
+        receiver.discard_pending_listener_transfer();
+
+        for writer in [&mut first_writer, &mut second_writer] {
+            assert_eq!(
+                writer
+                    .write(&[1])
+                    .expect_err("every descriptor in the stale stream must be closed")
+                    .kind(),
+                std::io::ErrorKind::BrokenPipe
+            );
+        }
+        let mut byte = [0];
+        assert!(
+            receiver
+                .receive_msg_and_fds_with_control(&mut byte, &mut [], true)
+                .is_err(),
+            "the stale stream must be drained through EAGAIN"
+        );
+    }
+
+    #[test]
+    fn listener_batches_split_at_the_descriptor_limit() {
+        let payload = UnixStream::pair().expect("Could not create payload unix streams");
+        let address = socket_addr_from_str("127.0.0.1:8080");
+        let batches = Listeners {
+            tcp: (0..=MAX_FDS_OUT)
+                .map(|_| (address.into(), payload.0.as_raw_fd()))
+                .collect(),
+            ..Default::default()
+        }
+        .into_batches()
+        .expect("the listener table can be split into bounded frames");
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].tcp.len(), MAX_FDS_OUT);
+        assert_eq!(batches[1].tcp.len(), 1);
+        for batch in &batches {
+            validate_listener_batch(batch).expect("every split batch fits one SCM frame");
+        }
+    }
+
+    #[test]
+    fn listener_batches_split_at_the_encoded_byte_limit() {
+        let payload = UnixStream::pair().expect("Could not create payload unix streams");
+        let address = socket_addr_from_str("127.0.0.1:8080");
+        let interface = "x".repeat(100);
+        let listener_count = 100;
+        let batches = Listeners {
+            tcp: (0..listener_count)
+                .map(|index| {
+                    (
+                        ListenerKey::new(address, Some(&format!("{interface}{index}"))),
+                        payload.0.as_raw_fd(),
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        }
+        .into_batches()
+        .expect("the listener table can be split into bounded frames");
+
+        assert!(
+            batches.len() > 1,
+            "the encoded-byte limit must split the table"
+        );
+        assert_eq!(
+            batches.iter().map(|batch| batch.tcp.len()).sum::<usize>(),
+            listener_count
+        );
+        for batch in &batches {
+            validate_listener_batch(batch).expect("every split batch fits one SCM frame");
+        }
+    }
+
+    #[test]
+    fn sends_and_receives_multiple_listener_batches_without_stream_overread() {
+        let (stream_1, stream_2) =
+            MioUnixStream::pair().expect("Could not create a pair of mio unix streams");
+        let sender = ScmSocket::new(stream_1.into_raw_fd()).expect("Could not create scm socket");
+        let receiver = ScmSocket::new(stream_2.into_raw_fd()).expect("Could not create scm socket");
+        let payload = UnixStream::pair().expect("Could not create payload unix streams");
+        let address = socket_addr_from_str("127.0.0.1:8080");
+        let listeners = Listeners {
+            tcp: (0..=MAX_FDS_OUT)
+                .map(|_| (address.into(), payload.0.as_raw_fd()))
+                .collect(),
+            ..Default::default()
+        };
+
+        sender
+            .send_listener_batches(&listeners)
+            .expect("all listener batches and the terminal marker are sent");
+        let received = receiver
+            .receive_listener_batches()
+            .expect("all listener batches are received");
+
+        assert_eq!(received.tcp.len(), listeners.tcp.len());
+        assert!(received.http.is_empty());
+        assert!(received.tls.is_empty());
+        assert!(received.udp.is_empty());
+        received.close();
+    }
+
+    #[test]
+    fn closes_all_received_batches_when_a_later_batch_is_invalid() {
+        let (stream_1, stream_2) =
+            MioUnixStream::pair().expect("Could not create a pair of mio unix streams");
+        let sender = ScmSocket::new(stream_1.into_raw_fd()).expect("Could not create scm socket");
+        let receiver = ScmSocket::new(stream_2.into_raw_fd()).expect("Could not create scm socket");
+        let (first_reader, mut first_writer) =
+            UnixStream::pair().expect("Could not create first payload unix streams");
+        let (second_reader, mut second_writer) =
+            UnixStream::pair().expect("Could not create second payload unix streams");
+        let first = Listeners {
+            tcp: vec![(
+                socket_addr_from_str("127.0.0.1:8080").into(),
+                first_reader.as_raw_fd(),
+            )],
+            ..Default::default()
+        };
+        let invalid = ListenersCount {
+            http: vec![],
+            tls: vec![],
+            tcp: vec!["not-a-listener-key".to_owned()],
+            udp: vec![],
+        }
+        .encode_length_delimited_to_vec();
+
+        sender
+            .send_listeners(&first)
+            .expect("the first batch is valid");
+        sender
+            .send_msg_and_fds(&invalid, &[second_reader.as_raw_fd()])
+            .expect("the kernel accepts the syntactically opaque second manifest");
+        drop(first_reader);
+        drop(second_reader);
+
+        assert!(matches!(
+            receiver.receive_listener_batches(),
+            Err(ScmSocketError::WrongSocketAddress { .. })
+        ));
+        for writer in [&mut first_writer, &mut second_writer] {
+            assert_eq!(
+                writer
+                    .write(&[1])
+                    .expect_err("every descriptor received before the error must be closed")
                     .kind(),
                 std::io::ErrorKind::BrokenPipe
             );

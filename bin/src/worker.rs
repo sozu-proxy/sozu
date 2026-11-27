@@ -96,6 +96,7 @@ pub fn begin_worker_process(
     id: i32,
     command_buffer_size: u64,
     max_command_buffer_size: u64,
+    batched_listeners: bool,
 ) -> Result<(), WorkerError> {
     // The three descriptors were handed to us by the master via
     // `fork_main_into_worker`, each derived from a live `as_raw_fd()`, so
@@ -158,9 +159,10 @@ pub fn begin_worker_process(
     // `File`, whose `Drop` closes the descriptor.
     let mut configuration_state_file = unsafe { File::from_raw_fd(configuration_state_fd) };
 
-    let worker_config = worker_to_main_channel
+    let mut worker_config = worker_to_main_channel
         .read_message()
         .map_err(WorkerError::ReadChannel)?;
+    worker_config.listener_scm_batches = batched_listeners.then_some(true);
 
     let worker_id = format!("{}-{:02}", "WRK", id);
 
@@ -373,6 +375,7 @@ pub fn fork_main_into_worker(
     executable_path: String,
     state: &ConfigState,
     listeners: Option<Listeners>,
+    batched_listeners: bool,
 ) -> Result<(pid_t, Channel<WorkerRequest, WorkerResponse>, ScmSocket), WorkerError> {
     // SAFETY: `libc::getpid` takes no input pointers, never fails, and
     // returns a value type. No invariant beyond "FFI signature matches libc".
@@ -488,9 +491,12 @@ pub fn fork_main_into_worker(
             // outcome of the send.
             if let Some(OwnedListeners(listeners)) = &listeners {
                 info!("sending listeners to new worker: {:?}", listeners);
-                main_to_worker_scm
-                    .send_listeners(listeners)
-                    .map_err(WorkerError::SendListeners)?;
+                let sent = if batched_listeners {
+                    main_to_worker_scm.send_listener_batches(listeners)
+                } else {
+                    main_to_worker_scm.send_listeners(listeners)
+                };
+                sent.map_err(WorkerError::SendListeners)?;
                 info!("sent listeners from main");
             };
 
@@ -531,7 +537,8 @@ pub fn fork_main_into_worker(
                     executable_path.to_owned()
                 }
             };
-            let err = Command::new(&exec_path)
+            let mut command = Command::new(&exec_path);
+            command
                 .arg("worker")
                 .arg("--id")
                 .arg(worker_id)
@@ -544,8 +551,13 @@ pub fn fork_main_into_worker(
                 .arg("--command-buffer-size")
                 .arg(config.command_buffer_size.to_string())
                 .arg("--max-command-buffer-size")
-                .arg(config.max_command_buffer_size.to_string())
-                .exec();
+                .arg(config.max_command_buffer_size.to_string());
+            // A legacy executable rejects the internal flag instead of
+            // acknowledging startup after reading only the first batch.
+            if batched_listeners {
+                command.arg("--listener-scm-batches");
+            }
+            let err = command.exec();
 
             // `exec` only returns on failure, and this process is a full copy
             // of the main process: its event loop, its client and worker
@@ -624,6 +636,7 @@ mod tests {
             "/nonexistent/sozu".to_string(),
             &state,
             None,
+            false,
         ) {
             // Only the forked child's `exec` arm yields `SpawnChild`. This
             // process is the clone: report that it survived and leave without
@@ -788,6 +801,7 @@ mod tests {
             "/nonexistent/sozu".to_string(),
             &state,
             Some(listeners),
+            false,
         );
         // Nothing may open a descriptor between the failure and this probe: a
         // new descriptor would reuse the listener's number once it is closed.
@@ -921,6 +935,7 @@ mod tests {
                 "/nonexistent/sozu".to_string(),
                 &state,
                 None,
+                false,
             );
             let after = open_descriptors();
             match launched {

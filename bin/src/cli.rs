@@ -114,6 +114,8 @@ pub enum SubCmd {
             help = "configuration data file descriptor"
         )]
         configuration_state_fd: i32,
+        #[clap(long, hide = true)]
+        listener_scm_batches: bool,
         #[clap(
             long = "command-buffer-size",
             help = "Worker's channel buffer size",

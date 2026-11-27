@@ -25,7 +25,7 @@ use sozu_command::{
     proto::command::{
         ActivateListener, AddBackend, CertificatesWithFingerprints, ClosedSessions, Cluster,
         ClusterHashes, ClusterInformations, DeactivateListener, Event, EventKind,
-        HttpListenerConfig, HttpsListenerConfig, InitialState, ListenerType,
+        HttpListenerConfig, HttpsListenerConfig, InitialState, ListenerHandoff, ListenerType,
         LoadBalancingAlgorithms, LoadMetric, MetricDetail, MetricsConfiguration,
         ProtectedHealthCheckPhase, RemoveBackend, Request, ResponseContent, ResponseStatus,
         ServerConfig, TcpListenerConfig as CommandTcpListener,
@@ -1664,6 +1664,11 @@ pub struct Server {
     /// Protected health-check headers staged, applied or kept for an abort.
     protected_health_check: ProtectedWorker,
     poll_timeout: Option<Duration>, // TODO: make this configurable? this defaults to 1000 milliseconds for now
+    /// Immutable listener snapshot and the next SCM frame expected by a
+    /// correlated, multi-frame hot-upgrade handoff. The snapshot borrows no
+    /// descriptors: until commit, every original listener stays registered
+    /// in its proxy and continues serving.
+    listener_handoff: Option<ListenerHandoffTransfer>,
     scm_listeners: Option<Listeners>,
     scm: ScmSocket,
     sessions: Rc<RefCell<SessionManager>>,
@@ -1686,6 +1691,17 @@ pub struct Server {
     tcp: Rc<RefCell<tcp::TcpProxy>>,
     udp: Rc<RefCell<udp::UdpProxy>>,
     zombie_check_interval: Duration,
+}
+
+struct ListenerHandoffTransfer {
+    transfer_id: String,
+    /// Canonically ordered `(ListenerKey, RawFd)` tables. Including the raw
+    /// descriptor detects a same-key socket replacement; invalidating the
+    /// transfer on every listener order closes the descriptor-reuse ABA gap.
+    snapshot: Listeners,
+    batches: Vec<Listeners>,
+    next_batch: usize,
+    sentinel_sent: bool,
 }
 
 impl Server {
@@ -1924,6 +1940,7 @@ impl Server {
             pool,
             poll_timeout: Some(Duration::from_millis(1000)), // TODO: make it configurable?
             poll,
+            listener_handoff: None,
             scm_listeners: None,
             scm,
             sessions,
@@ -1967,14 +1984,15 @@ impl Server {
                 msg: "Could not set the scm socket to blocking".to_string(),
                 scm_err,
             })?;
-        let listeners =
-            server
-                .scm
-                .receive_listeners()
-                .map_err(|scm_err| ServerError::ScmSocket {
-                    msg: "could not receive listeners from the scm socket".to_string(),
-                    scm_err,
-                })?;
+        let received = if server_config.listener_scm_batches() {
+            server.scm.receive_listener_batches()
+        } else {
+            server.scm.receive_listeners()
+        };
+        let listeners = received.map_err(|scm_err| ServerError::ScmSocket {
+            msg: "could not receive listeners from the scm socket".to_string(),
+            scm_err,
+        })?;
         server
             .scm
             .set_blocking(false)
@@ -2404,9 +2422,14 @@ impl Server {
                         return true;
                     }
                     Some(RequestType::SoftStop(_)) => {
+                        self.cancel_listener_handoff("SoftStop order");
                         self.shutting_down = Some(request.id.clone());
                         self.last_sessions_len = self.sessions.borrow().slab.len();
                         self.notify(request);
+                    }
+                    Some(RequestType::ListenerHandoff(ref handoff)) => {
+                        let response = self.handle_listener_handoff(&request.id, handoff);
+                        push_queue(response);
                     }
                     Some(RequestType::ReturnListenSockets(_)) => {
                         info!("received ReturnListenSockets order");
@@ -3353,6 +3376,27 @@ impl Server {
     }
 
     pub fn notify_proxys(&mut self, mut request: WorkerRequest) {
+        if matches!(
+            request.content.request_type.as_ref(),
+            Some(
+                RequestType::AddHttpListener(_)
+                    | RequestType::AddHttpsListener(_)
+                    | RequestType::AddHttpsListenerWithClientAuth(_)
+                    | RequestType::AddTcpListener(_)
+                    | RequestType::AddUdpListener(_)
+                    | RequestType::RemoveListener(_)
+                    | RequestType::ActivateListener(_)
+                    | RequestType::DeactivateListener(_)
+                    | RequestType::SoftStop(_)
+            )
+        ) {
+            // An order is enough to make an already split snapshot stale: a
+            // refused or idempotent order is cheap to recover from with a new
+            // prepare, while retaining a transfer across a descriptor reuse
+            // would create an undetectable same-key/same-fd ABA at commit.
+            self.cancel_listener_handoff("listener mutation order");
+        }
+
         // The public protected verb carries the clear values to the main
         // process only. A worker never applies it as one step: the main
         // process drives the prepare, commit, abort and release orders below.
@@ -4751,20 +4795,184 @@ impl Server {
         }
     }
 
-    /// Send all socket addresses and file descriptors of all proxies, via the scm socket
-    pub fn return_listen_sockets(&mut self) -> Result<(), ScmSocketError> {
-        // SCM_RIGHTS duplicates the descriptors. Keep the originals registered
-        // until the transfer succeeds so a refusal leaves this worker serving.
-        let listeners = Listeners {
+    fn active_listener_fds(&self) -> Listeners {
+        Listeners {
             http: self.http.borrow().listener_fds(),
             tls: self.https.borrow().listener_fds(),
             tcp: self.tcp.borrow().listener_fds(),
             udp: self.udp.borrow().listener_fds(),
+        }
+    }
+
+    fn canonical_listener_fds(mut listeners: Listeners) -> Listeners {
+        listeners.http.sort_unstable();
+        listeners.tls.sort_unstable();
+        listeners.tcp.sort_unstable();
+        listeners.udp.sort_unstable();
+        listeners
+    }
+
+    fn cancel_listener_handoff(&mut self, reason: &str) {
+        if let Some(transfer) = self.listener_handoff.take() {
+            info!(
+                "cancelled listener handoff {}: {}",
+                transfer.transfer_id, reason
+            );
+        }
+    }
+
+    fn handle_listener_handoff(
+        &mut self,
+        request_id: &str,
+        handoff: &ListenerHandoff,
+    ) -> WorkerResponse {
+        let result = match (handoff.prepare, handoff.batch) {
+            (Some(true), None) => self.prepare_listener_handoff(&handoff.transfer_id),
+            (None, Some(batch)) => {
+                self.send_listener_handoff_batch(&handoff.transfer_id, batch as usize)
+            }
+            (None, None) => self.commit_listener_handoff(&handoff.transfer_id),
+            _ => Err(
+                "listener handoff must carry exactly one operation: prepare=true, a batch, or commit"
+                    .to_owned(),
+            ),
         };
-        self.scm.set_blocking(false)?;
-        let sent = self.scm.send_listeners(&listeners);
-        self.block_scm_socket();
-        sent?;
+
+        match result {
+            Ok(()) => WorkerResponse::ok(request_id),
+            Err(error) => worker_response_error(request_id, error),
+        }
+    }
+
+    fn prepare_listener_handoff(&mut self, transfer_id: &str) -> Result<(), String> {
+        let listeners = self.active_listener_fds();
+        let snapshot = Self::canonical_listener_fds(listeners.clone());
+        let batches = listeners
+            .into_batches()
+            .map_err(|error| format!("Could not split listeners into SCM batches: {error:?}"))?;
+
+        self.listener_handoff = Some(ListenerHandoffTransfer {
+            transfer_id: transfer_id.to_owned(),
+            snapshot,
+            batches,
+            next_batch: 0,
+            sentinel_sent: false,
+        });
+        Ok(())
+    }
+
+    fn send_listener_handoff_batch(
+        &mut self,
+        transfer_id: &str,
+        batch_index: usize,
+    ) -> Result<(), String> {
+        let (batch, sentinel) = {
+            let transfer = self.listener_handoff.as_ref().ok_or_else(|| {
+                "listener handoff batch received before a successful prepare".to_owned()
+            })?;
+            if transfer.transfer_id != transfer_id {
+                return Err(format!(
+                    "listener handoff transfer id mismatch: prepared {}, received {}",
+                    transfer.transfer_id, transfer_id
+                ));
+            }
+            if transfer.sentinel_sent {
+                return Err("listener handoff already sent its terminal empty batch".to_owned());
+            }
+            if batch_index != transfer.next_batch {
+                return Err(format!(
+                    "listener handoff expected batch {}, received {}",
+                    transfer.next_batch, batch_index
+                ));
+            }
+            if batch_index < transfer.batches.len() {
+                (transfer.batches[batch_index].clone(), false)
+            } else if batch_index == transfer.batches.len() {
+                (Listeners::default(), true)
+            } else {
+                return Err(format!(
+                    "listener handoff batch {} is past terminal batch {}",
+                    batch_index,
+                    transfer.batches.len()
+                ));
+            }
+        };
+
+        let current = Self::canonical_listener_fds(self.active_listener_fds());
+        if self
+            .listener_handoff
+            .as_ref()
+            .is_some_and(|transfer| transfer.snapshot != current)
+        {
+            self.cancel_listener_handoff("active listeners changed after prepare");
+            return Err("active listeners changed after listener handoff prepare".to_owned());
+        }
+
+        let sent = self
+            .scm
+            .set_blocking(false)
+            .and_then(|()| self.scm.send_listeners(&batch));
+        if let Err(error) = sent {
+            // A send error can race the supervisor's timeout. Force a new
+            // prepare so the peer first discards at most one stale SCM frame,
+            // instead of retrying a batch that may already be queued.
+            self.cancel_listener_handoff("SCM batch send failed");
+            return Err(format!(
+                "Could not send listener handoff batch on SCM socket: {error:?}"
+            ));
+        }
+
+        let transfer = self
+            .listener_handoff
+            .as_mut()
+            .expect("a successful send retains its prepared listener handoff");
+        debug_assert_eq!(transfer.transfer_id, transfer_id);
+        debug_assert_eq!(transfer.next_batch, batch_index);
+        if sentinel {
+            transfer.sentinel_sent = true;
+        } else {
+            transfer.next_batch += 1;
+        }
+        Ok(())
+    }
+
+    fn commit_listener_handoff(&mut self, transfer_id: &str) -> Result<(), String> {
+        let transfer = self.listener_handoff.as_ref().ok_or_else(|| {
+            "listener handoff commit received before a successful prepare".to_owned()
+        })?;
+        if transfer.transfer_id != transfer_id {
+            return Err(format!(
+                "listener handoff transfer id mismatch: prepared {}, received {}",
+                transfer.transfer_id, transfer_id
+            ));
+        }
+        if transfer.next_batch != transfer.batches.len() || !transfer.sentinel_sent {
+            return Err(format!(
+                "listener handoff is incomplete: sent {} of {} data batches, terminal batch sent={}",
+                transfer.next_batch,
+                transfer.batches.len(),
+                transfer.sentinel_sent
+            ));
+        }
+        let expected = transfer.snapshot.clone();
+        let current = Self::canonical_listener_fds(self.active_listener_fds());
+        if current != expected {
+            return Err("active listeners changed after listener handoff prepare".to_owned());
+        }
+
+        // Every validation above is read-only. Only a fully correlated,
+        // complete and still-current transfer reaches the detach point.
+        self.detach_listener_sockets(&expected);
+        self.listener_handoff = None;
+        Ok(())
+    }
+
+    fn detach_listener_sockets(&mut self, expected: &Listeners) {
+        debug_assert_eq!(
+            Self::canonical_listener_fds(self.active_listener_fds()),
+            *expected,
+            "the validated listener snapshot must still be current at detach"
+        );
 
         let mut http_listeners = self.http.borrow_mut().give_back_listeners();
         for &mut (_, ref mut sock) in http_listeners.iter_mut() {
@@ -4800,29 +5008,42 @@ impl Server {
             }
         }
 
-        // The event loop cannot change the listener tables between the send
-        // and the detach. The local sockets close when their owners drop here.
         debug_assert_eq!(
-            listeners.http.len(),
+            expected.http.len(),
             http_listeners.len(),
             "every HTTP listener must be collected exactly once"
         );
         debug_assert_eq!(
-            listeners.tls.len(),
+            expected.tls.len(),
             https_listeners.len(),
             "every HTTPS listener must be collected exactly once"
         );
         debug_assert_eq!(
-            listeners.tcp.len(),
+            expected.tcp.len(),
             tcp_listeners.len(),
             "every TCP listener must be collected exactly once"
         );
         debug_assert_eq!(
-            listeners.udp.len(),
+            expected.udp.len(),
             udp_listeners.len(),
             "every UDP listener must be collected exactly once"
         );
-        info!("returned listeners: {:?}", listeners);
+        info!("returned listeners: {:?}", expected);
+    }
+
+    /// Send all socket addresses and file descriptors of all proxies, via the scm socket
+    pub fn return_listen_sockets(&mut self) -> Result<(), ScmSocketError> {
+        self.cancel_listener_handoff("legacy ReturnListenSockets order");
+        // SCM_RIGHTS duplicates the descriptors. Keep the originals registered
+        // until the transfer succeeds so a refusal leaves this worker serving.
+        let listeners = self.active_listener_fds();
+        self.scm.set_blocking(false)?;
+        let sent = self.scm.send_listeners(&listeners);
+        self.block_scm_socket();
+        sent?;
+
+        let expected = Self::canonical_listener_fds(listeners);
+        self.detach_listener_sockets(&expected);
         Ok(())
     }
 
@@ -5635,9 +5856,13 @@ mod eviction_tests {
 
 #[cfg(test)]
 mod accept_ready_tests {
+    use std::os::unix::net::UnixStream;
+
     use sozu_command::{
         config::ListenerBuilder,
-        proto::command::{DeactivateListener, ListenerType, SocketAddress},
+        proto::command::{
+            ActivateListener, DeactivateListener, ListenerHandoff, ListenerType, SocketAddress,
+        },
     };
 
     use super::*;
@@ -5712,8 +5937,6 @@ mod accept_ready_tests {
 
     #[test]
     fn a_failed_listener_handoff_leaves_the_original_socket_listening() {
-        use std::os::unix::net::UnixStream;
-
         let (mut server, listen_token, address) = server_with_tcp_listener();
         let (sender, receiver) = UnixStream::pair().expect("could not create a test SCM pair");
         drop(receiver);
@@ -5740,6 +5963,167 @@ mod accept_ready_tests {
                 .accept(ListenToken(listen_token.0))
                 .is_ok(),
             "the old worker must still own and accept on the original socket"
+        );
+    }
+
+    fn handoff_request(
+        server: &mut Server,
+        id: &str,
+        transfer_id: &str,
+        batch: Option<u32>,
+        prepare: Option<bool>,
+    ) -> WorkerResponse {
+        server.handle_listener_handoff(
+            id,
+            &ListenerHandoff {
+                transfer_id: transfer_id.to_owned(),
+                batch,
+                prepare,
+            },
+        )
+    }
+
+    #[test]
+    fn batched_listener_handoff_copies_before_commit_then_detaches() {
+        let (mut server, listen_token, address) = server_with_tcp_listener();
+        for index in 0..200 {
+            let extra_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+            let listener = ListenerBuilder::new_tcp(extra_address)
+                .to_tcp(None)
+                .expect("could not build an extra TCP listener");
+            let added = server.notify_add_tcp_listener(&format!("add-{index}"), listener);
+            assert_eq!(added.status, ResponseStatus::Ok as i32, "{added:?}");
+            let activated = server.notify_activate_listener(
+                &format!("activate-{index}"),
+                &ActivateListener {
+                    interface: None,
+                    address: extra_address,
+                    proxy: ListenerType::Tcp as i32,
+                    from_scm: false,
+                },
+            );
+            assert_eq!(activated.status, ResponseStatus::Ok as i32, "{activated:?}");
+        }
+        assert_eq!(server.tcp.borrow().listener_fds().len(), 201);
+
+        let (sender, receiver) = UnixStream::pair().expect("could not create a test SCM pair");
+        server.scm = ScmSocket::new(sender.as_raw_fd()).expect("could not create sender SCM");
+        let receiver = ScmSocket::new(receiver.as_raw_fd()).expect("could not create receiver SCM");
+
+        let prepared = handoff_request(&mut server, "prepare", "transfer-1", None, Some(true));
+        assert_eq!(prepared.status, ResponseStatus::Ok as i32, "{prepared:?}");
+        assert_eq!(
+            server.tcp.borrow().listener_fds().len(),
+            201,
+            "prepare must leave the original listener registered"
+        );
+
+        let batch_count = server
+            .listener_handoff
+            .as_ref()
+            .expect("the transfer must be prepared")
+            .batches
+            .len();
+        assert!(
+            batch_count > 1,
+            "201 real listeners must require several SCM frames"
+        );
+        let mut copied_count = 0;
+        for batch in 0..batch_count {
+            let response = handoff_request(
+                &mut server,
+                &format!("batch-{batch}"),
+                "transfer-1",
+                Some(batch as u32),
+                None,
+            );
+            assert_eq!(response.status, ResponseStatus::Ok as i32, "{response:?}");
+            let copied = receiver
+                .receive_listeners()
+                .expect("each listener batch must be readable after its ACK");
+            copied_count += copied.tcp.len();
+            copied.close();
+        }
+        assert_eq!(
+            copied_count, 201,
+            "every active listener must be copied once"
+        );
+
+        let terminal = handoff_request(
+            &mut server,
+            "terminal",
+            "transfer-1",
+            Some(batch_count as u32),
+            None,
+        );
+        assert_eq!(terminal.status, ResponseStatus::Ok as i32, "{terminal:?}");
+        let sentinel = receiver
+            .receive_listeners()
+            .expect("the terminal empty listener batch must be readable after its ACK");
+        assert!(sentinel.is_empty(), "the terminal SCM batch must be empty");
+
+        let _client = std::net::TcpStream::connect(SocketAddr::from(address))
+            .expect("the original listener must remain live until commit");
+        assert!(
+            server
+                .tcp
+                .borrow_mut()
+                .accept(ListenToken(listen_token.0))
+                .is_ok(),
+            "the old worker must still accept after every batch and before commit"
+        );
+
+        let committed = handoff_request(&mut server, "commit", "transfer-1", None, None);
+        assert_eq!(committed.status, ResponseStatus::Ok as i32, "{committed:?}");
+        assert!(
+            server.tcp.borrow().listener_fds().is_empty(),
+            "commit must detach every original listener"
+        );
+    }
+
+    #[test]
+    fn replacing_an_incomplete_listener_handoff_keeps_originals_live() {
+        let (mut server, listen_token, address) = server_with_tcp_listener();
+        let (sender, receiver) = UnixStream::pair().expect("could not create a test SCM pair");
+        server.scm = ScmSocket::new(sender.as_raw_fd()).expect("could not create sender SCM");
+        let receiver = ScmSocket::new(receiver.as_raw_fd()).expect("could not create receiver SCM");
+
+        assert_eq!(
+            handoff_request(&mut server, "prepare-old", "old", None, Some(true)).status,
+            ResponseStatus::Ok as i32
+        );
+        assert_eq!(
+            handoff_request(&mut server, "old-batch", "old", Some(0), None).status,
+            ResponseStatus::Ok as i32
+        );
+        receiver
+            .receive_listeners()
+            .expect("the old transfer's first batch must arrive")
+            .close();
+
+        assert_eq!(
+            handoff_request(&mut server, "prepare-new", "new", None, Some(true)).status,
+            ResponseStatus::Ok as i32,
+            "a new prepare may replace an incomplete transfer because neither owns descriptors"
+        );
+        assert!(
+            handoff_request(&mut server, "stale-commit", "old", None, None).is_failure(),
+            "the replaced transfer must never be able to commit"
+        );
+        assert!(
+            handoff_request(&mut server, "skip", "new", Some(1), None).is_failure(),
+            "a skipped batch must be refused"
+        );
+
+        let _client = std::net::TcpStream::connect(SocketAddr::from(address))
+            .expect("aborting an incomplete transfer must leave the original socket listening");
+        assert!(
+            server
+                .tcp
+                .borrow_mut()
+                .accept(ListenToken(listen_token.0))
+                .is_ok(),
+            "the original listener must still accept after replacement and stale requests"
         );
     }
 
