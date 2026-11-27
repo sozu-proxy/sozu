@@ -1,6 +1,6 @@
 //! SCM_RIGHTS socket for FD passing between master and workers.
 //!
-//! Wraps a `SeqPacket` unix socket and uses the `nix` SCM_RIGHTS helpers
+//! Wraps a Unix stream and uses SCM_RIGHTS
 //! to ship listener/accept FDs across the master ↔ worker boundary at
 //! startup and across hot upgrades. The borrowed-FD wrappers
 //! (`set_blocking`) hold an FD without taking ownership; the listener
@@ -8,15 +8,17 @@
 //! `TcpListener::from_raw_fd` so the FD is closed by drop.
 
 use std::{
-    io::{IoSlice, IoSliceMut},
+    io::IoSlice,
+    mem::{self, MaybeUninit},
     os::unix::{
-        io::{FromRawFd, IntoRawFd, RawFd},
+        io::{FromRawFd, IntoRawFd, OwnedFd, RawFd},
         net::UnixStream as StdUnixStream,
     },
+    ptr,
 };
 
 use mio::net::{TcpListener, UdpSocket};
-use nix::{cmsg_space, sys::socket};
+use nix::sys::socket;
 use prost::{DecodeError, Message};
 
 use crate::{
@@ -26,6 +28,19 @@ use crate::{
 
 pub const MAX_FDS_OUT: usize = 200;
 pub const MAX_BYTES_OUT: usize = 4096;
+
+// Linux accepts at most 253 descriptors in one SCM_RIGHTS message. Receiving
+// that full kernel limit lets us take ownership before rejecting a frame that
+// exceeds Sōzu's stricter MAX_FDS_OUT contract.
+const MAX_FDS_IN_CONTROL_MESSAGE: usize = 253;
+const CONTROL_MESSAGE_BUFFER_SIZE: usize =
+    socket::cmsg_space::<[RawFd; MAX_FDS_IN_CONTROL_MESSAGE]>();
+
+#[repr(C)]
+struct AlignedControlBuffer {
+    _alignment: [MaybeUninit<libc::cmsghdr>; 0],
+    bytes: [u8; CONTROL_MESSAGE_BUFFER_SIZE],
+}
 
 #[derive(thiserror::Error, Debug)]
 pub enum ScmSocketError {
@@ -61,6 +76,73 @@ pub enum ScmSocketError {
         fds_received: usize,
         max_fds: usize,
     },
+    #[error(
+        "listener batch does not fit one SCM frame: {fds} file descriptors (max {max_fds}), \
+         {bytes} encoded bytes (max {max_bytes})"
+    )]
+    ListenerBatchTooLarge {
+        fds: usize,
+        max_fds: usize,
+        bytes: usize,
+        max_bytes: usize,
+    },
+    #[error("SCM socket sent only {sent} of {expected} message bytes")]
+    SendIncomplete { sent: usize, expected: usize },
+    #[error("received a truncated SCM frame (data={data}, control={control})")]
+    ReceiveTruncated { data: bool, control: bool },
+}
+
+struct ListenerBatch {
+    message: Vec<u8>,
+    file_descriptors: Vec<RawFd>,
+}
+
+fn build_listener_batch(listeners: &Listeners) -> Result<ListenerBatch, ScmSocketError> {
+    let listeners_count = ListenersCount {
+        http: listeners.http.iter().map(|t| t.0.to_string()).collect(),
+        tls: listeners.tls.iter().map(|t| t.0.to_string()).collect(),
+        tcp: listeners.tcp.iter().map(|t| t.0.to_string()).collect(),
+        udp: listeners.udp.iter().map(|t| t.0.to_string()).collect(),
+    };
+
+    debug_assert_eq!(listeners_count.http.len(), listeners.http.len());
+    debug_assert_eq!(listeners_count.tls.len(), listeners.tls.len());
+    debug_assert_eq!(listeners_count.tcp.len(), listeners.tcp.len());
+    debug_assert_eq!(listeners_count.udp.len(), listeners.udp.len());
+
+    let message = listeners_count.encode_length_delimited_to_vec();
+    let file_descriptors = listeners
+        .http
+        .iter()
+        .chain(&listeners.tls)
+        .chain(&listeners.tcp)
+        .chain(&listeners.udp)
+        .map(|listener| listener.1)
+        .collect::<Vec<_>>();
+
+    let address_total =
+        listeners.http.len() + listeners.tls.len() + listeners.tcp.len() + listeners.udp.len();
+    debug_assert_eq!(file_descriptors.len(), address_total);
+
+    if file_descriptors.len() > MAX_FDS_OUT || message.len() > MAX_BYTES_OUT {
+        return Err(ScmSocketError::ListenerBatchTooLarge {
+            fds: file_descriptors.len(),
+            max_fds: MAX_FDS_OUT,
+            bytes: message.len(),
+            max_bytes: MAX_BYTES_OUT,
+        });
+    }
+
+    Ok(ListenerBatch {
+        message,
+        file_descriptors,
+    })
+}
+
+/// Validate that listeners fit the exact descriptor and encoded-byte limits
+/// of one SCM transport frame.
+pub fn validate_listener_batch(listeners: &Listeners) -> Result<(), ScmSocketError> {
+    build_listener_batch(listeners).map(|_| ())
 }
 
 /// A unix socket specialized for file descriptor passing
@@ -113,10 +195,9 @@ impl ScmSocket {
         // by `Drop`. `ScmSocket` retains the original ownership.
         unsafe {
             let stream = StdUnixStream::from_raw_fd(self.fd);
-            stream
-                .set_nonblocking(!blocking)
-                .map_err(|error| ScmSocketError::SetBlocking { blocking, error })?;
+            let result = stream.set_nonblocking(!blocking);
             let _dropped_fd = stream.into_raw_fd();
+            result.map_err(|error| ScmSocketError::SetBlocking { blocking, error })?;
         }
         self.blocking = blocking;
         // The flag landed on the requested value and genuinely toggled.
@@ -133,72 +214,22 @@ impl ScmSocket {
 
     /// Send listeners (socket addresses and file descriptors) via an scm socket
     pub fn send_listeners(&self, listeners: &Listeners) -> Result<(), ScmSocketError> {
-        let listeners_count = ListenersCount {
-            http: listeners.http.iter().map(|t| t.0.to_string()).collect(),
-            tls: listeners.tls.iter().map(|t| t.0.to_string()).collect(),
-            tcp: listeners.tcp.iter().map(|t| t.0.to_string()).collect(),
-            udp: listeners.udp.iter().map(|t| t.0.to_string()).collect(),
-        };
-
-        // The manifest is built 1:1 from the listener tables; each address slot
-        // ships exactly one FD, so the per-protocol counts must agree on both
-        // sides of the wire. The receiver reconstructs (address, fd) pairs by
-        // zipping these counts against the FD array — drift here is the exact
-        // bug class `command_channel_security_tests` guards.
-        debug_assert_eq!(
-            listeners_count.http.len(),
-            listeners.http.len(),
-            "http manifest count must match the http listener table"
-        );
-        debug_assert_eq!(
-            listeners_count.tls.len(),
-            listeners.tls.len(),
-            "tls manifest count must match the tls listener table"
-        );
-        debug_assert_eq!(
-            listeners_count.tcp.len(),
-            listeners.tcp.len(),
-            "tcp manifest count must match the tcp listener table"
-        );
-
-        let message = listeners_count.encode_length_delimited_to_vec();
-
-        let mut file_descriptors: Vec<RawFd> = Vec::new();
-
-        file_descriptors.extend(listeners.http.iter().map(|t| t.1));
-        file_descriptors.extend(listeners.tls.iter().map(|t| t.1));
-        file_descriptors.extend(listeners.tcp.iter().map(|t| t.1));
-        file_descriptors.extend(listeners.udp.iter().map(|t| t.1));
-
-        // The FD vector must reconcile with the address totals: one descriptor
-        // per listener, folded http+tls+tcp+udp. If these disagree the receiver
-        // would zip mismatched (address, fd) pairs.
-        let address_total =
-            listeners.http.len() + listeners.tls.len() + listeners.tcp.len() + listeners.udp.len();
-        debug_assert_eq!(
-            file_descriptors.len(),
-            address_total,
-            "the FD count sent must equal the total listener-address count (one FD per address)"
-        );
-
-        self.send_msg_and_fds(&message, &file_descriptors)
+        let batch = build_listener_batch(listeners)?;
+        self.send_msg_and_fds(&batch.message, &batch.file_descriptors)
     }
 
     /// Receive and parse listeners (socket addresses and file descriptors) via an scm socket
     pub fn receive_listeners(&self) -> Result<Listeners, ScmSocketError> {
         let mut buf = vec![0; MAX_BYTES_OUT];
-
-        let mut received_fds: [RawFd; MAX_FDS_OUT] = [0; MAX_FDS_OUT];
-
-        let (size, file_descriptor_length) =
-            self.receive_msg_and_fds(&mut buf, &mut received_fds)?;
+        let (size, received_fds) = self.receive_msg_and_fds(&mut buf)?;
+        let file_descriptor_length = received_fds.len();
 
         debug!("{} received :{:?}", self.fd, (size, file_descriptor_length));
 
         let listeners_count = ListenersCount::decode_length_delimited(&buf[..size])
             .map_err(ScmSocketError::DecodeError)?;
 
-        // Validate the manifest before indexing into the fixed-size FD array.
+        // Validate the manifest before indexing into the owned FD vector.
         // The peer-controlled `listeners_count.{http,tls,tcp,udp}` lists are
         // matched 1:1 with `received_fds` slots; without these bounds checks
         // a peer that declared more entries than MAX_FDS_OUT or more entries
@@ -222,7 +253,7 @@ impl ScmSocket {
                 fds_received: file_descriptor_length,
                 max_fds: MAX_FDS_OUT,
             })?;
-        if total > MAX_FDS_OUT || total > file_descriptor_length {
+        if total > MAX_FDS_OUT || total != file_descriptor_length {
             return Err(ScmSocketError::ListenersCountInconsistent {
                 http: http_len,
                 tls: tls_len,
@@ -234,7 +265,7 @@ impl ScmSocket {
         }
 
         // Past the consistency guard, the folded total reconciles with both the
-        // fixed FD-array bound and the number of FDs that actually arrived.
+        // transport bound and the number of FDs that actually arrived.
         // These are the invariants that keep every `received_fds[index..index+len]`
         // slice below in bounds — a malformed manifest already returned an error
         // and never reaches here.
@@ -245,11 +276,11 @@ impl ScmSocket {
         );
         debug_assert!(
             total <= MAX_FDS_OUT,
-            "total FD slots must fit the fixed-size received_fds array before indexing"
+            "total FD slots must fit the transport limit before indexing"
         );
-        debug_assert!(
-            total <= file_descriptor_length,
-            "manifest total must not exceed the FDs actually received"
+        debug_assert_eq!(
+            total, file_descriptor_length,
+            "manifest total must equal the FDs actually received"
         );
         debug_assert!(
             total <= received_fds.len(),
@@ -260,6 +291,13 @@ impl ScmSocket {
         let mut tls_addresses = parse_addresses(&listeners_count.tls)?;
         let mut tcp_addresses = parse_addresses(&listeners_count.tcp)?;
         let mut udp_addresses = parse_addresses(&listeners_count.udp)?;
+
+        // All fallible decode, consistency, and address validation is complete.
+        // Only now relinquish RAII ownership to the successful Listeners table.
+        let received_fds = received_fds
+            .into_iter()
+            .map(IntoRawFd::into_raw_fd)
+            .collect::<Vec<_>>();
 
         // Each parsed address list maps 1:1 onto a contiguous FD slice; the
         // counts must survive `parse_addresses` unchanged.
@@ -281,8 +319,8 @@ impl ScmSocket {
 
         let mut index = 0;
         let len = http_len;
-        // Each FD slice end must stay within the validated total (and thus the
-        // array); pair-assert the slice window before every zip.
+        // Each FD slice end must stay within the validated total; pair-assert
+        // the slice window before every zip.
         debug_assert!(
             index + len <= total,
             "http FD slice must lie within the reconciled total"
@@ -371,6 +409,17 @@ impl ScmSocket {
         })
     }
 
+    /// Best-effort removal of one terminal listener transfer from the stream.
+    /// Every delivered descriptor is immediately closed by `OwnedFd` drop.
+    pub fn discard_pending_listener_transfer(&self) {
+        let mut message = [0; MAX_BYTES_OUT];
+        let mut control = AlignedControlBuffer {
+            _alignment: [],
+            bytes: [0; CONTROL_MESSAGE_BUFFER_SIZE],
+        };
+        let _ = self.receive_msg_and_fds_with_control(&mut message, &mut control.bytes, true);
+    }
+
     /// Sends message and file descriptors separately. The file descriptors are summed up
     /// in a ControlMessage.
     fn send_msg_and_fds(&self, message: &[u8], fds: &[RawFd]) -> Result<(), ScmSocketError> {
@@ -383,15 +432,27 @@ impl ScmSocket {
 
         if fds.is_empty() {
             debug!("{} send empty", self.fd);
-            socket::sendmsg::<()>(self.fd, &iov, &[], flags, None)
+            let sent = socket::sendmsg::<()>(self.fd, &iov, &[], flags, None)
                 .map_err(|error| ScmSocketError::Send(error.to_string()))?;
+            if sent != message.len() {
+                return Err(ScmSocketError::SendIncomplete {
+                    sent,
+                    expected: message.len(),
+                });
+            }
             return Ok(());
         };
 
         let control_message = [socket::ControlMessage::ScmRights(fds)];
         debug!("{} send with data", self.fd);
-        socket::sendmsg::<()>(self.fd, &iov, &control_message, flags, None)
+        let sent = socket::sendmsg::<()>(self.fd, &iov, &control_message, flags, None)
             .map_err(|error| ScmSocketError::Send(error.to_string()))?;
+        if sent != message.len() {
+            return Err(ScmSocketError::SendIncomplete {
+                sent,
+                expected: message.len(),
+            });
+        }
         Ok(())
     }
 
@@ -399,15 +460,21 @@ impl ScmSocket {
     fn receive_msg_and_fds(
         &self,
         message: &mut [u8],
-        fds: &mut [RawFd],
-    ) -> Result<(usize, usize), ScmSocketError> {
-        // Snapshot the buffer length before `message` is borrowed mutably by
-        // `iov`; the received byte count is asserted against it below.
-        let message_capacity = message.len();
-        let mut cmsg = cmsg_space!([RawFd; MAX_FDS_OUT]);
-        let mut iov = [IoSliceMut::new(message)];
+    ) -> Result<(usize, Vec<OwnedFd>), ScmSocketError> {
+        let mut control = AlignedControlBuffer {
+            _alignment: [],
+            bytes: [0; CONTROL_MESSAGE_BUFFER_SIZE],
+        };
+        self.receive_msg_and_fds_with_control(message, &mut control.bytes, false)
+    }
 
-        let flags = if self.blocking {
+    fn receive_msg_and_fds_with_control(
+        &self,
+        message: &mut [u8],
+        control: &mut [u8],
+        force_nonblocking: bool,
+    ) -> Result<(usize, Vec<OwnedFd>), ScmSocketError> {
+        let flags = if self.blocking && !force_nonblocking {
             socket::MsgFlags::empty()
         } else {
             socket::MsgFlags::MSG_DONTWAIT
@@ -433,64 +500,139 @@ impl ScmSocket {
         ))]
         let flags = flags | socket::MsgFlags::MSG_CMSG_CLOEXEC;
 
-        let msg = socket::recvmsg::<()>(self.fd, &mut iov[..], Some(&mut cmsg), flags)
-            .map_err(|error| ScmSocketError::Receive(error.to_string()))?;
+        let mut iov = libc::iovec {
+            iov_base: message.as_mut_ptr().cast(),
+            iov_len: message.len(),
+        };
+        let mut header: libc::msghdr = unsafe { mem::zeroed() };
+        header.msg_iov = &mut iov;
+        header.msg_iovlen = 1;
+        header.msg_control = control.as_mut_ptr().cast();
+        // msg_controllen is usize on Linux and socklen_t on BSD-family targets.
+        let control_len = u16::try_from(control.len()).expect("the ancillary buffer fits in u16");
+        header.msg_controllen = control_len.into();
 
-        // The destination slice is the receiver's fixed `[RawFd; MAX_FDS_OUT]`
-        // array; the zip below cannot write past it.
-        let fds_capacity = fds.len();
-        debug_assert!(
-            fds_capacity <= MAX_FDS_OUT,
-            "destination FD slice must not exceed the MAX_FDS_OUT cmsg space"
-        );
-        let mut fd_count = 0;
-        let received_fds = msg
-            .cmsgs()
-            .map_err(|error| ScmSocketError::Receive(error.to_string()))?
-            .filter_map(|cmsg| {
-                if let socket::ControlMessageOwned::ScmRights(s) = cmsg {
-                    Some(s)
-                } else {
-                    None
-                }
-            })
-            .flatten();
-        for (fd, place) in received_fds.zip(fds.iter_mut()) {
-            fd_count += 1;
-            *place = fd;
-            #[cfg(not(any(
-                target_os = "linux",
-                target_os = "android",
-                target_os = "freebsd",
-                target_os = "dragonfly",
-                target_os = "netbsd",
-                target_os = "openbsd"
-            )))]
-            // SAFETY: `fd` was just installed in this process by `recvmsg`
-            // and is owned by the caller's table; `F_SETFD` only changes its
-            // descriptor flags.
-            unsafe {
-                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-            }
-            // The zip is bounded by `fds.iter_mut()`, so each wrap stays within
-            // the destination array — never write past `fds_capacity`.
-            debug_assert!(
-                fd_count <= fds_capacity,
-                "received FD count must never exceed the destination array capacity"
-            );
+        // SAFETY: header points to the live message and aligned control buffers
+        // above for their full lengths. recvmsg initializes only those buffers
+        // and the scalar result fields in header.
+        let received = unsafe { libc::recvmsg(self.fd, &mut header, flags.bits()) };
+        if received < 0 {
+            return Err(ScmSocketError::Receive(
+                std::io::Error::last_os_error().to_string(),
+            ));
         }
-        // Post-condition: the reported count reconciles with the destination
-        // bound and the byte count is within the message buffer we handed in.
-        debug_assert!(
-            fd_count <= fds_capacity,
-            "final received FD count must fit the destination array"
-        );
-        debug_assert!(
-            msg.bytes <= message_capacity,
-            "received byte count must not exceed the message buffer it was read into"
-        );
-        Ok((msg.bytes, fd_count))
+
+        let received_fds = own_scm_rights(&header)?;
+        let data_truncated = header.msg_flags & libc::MSG_TRUNC != 0;
+        let control_truncated = header.msg_flags & libc::MSG_CTRUNC != 0;
+        if data_truncated || control_truncated {
+            // received_fds owns every descriptor described by the delivered
+            // control prefix, including when descriptor limits caused CTRUNC.
+            return Err(ScmSocketError::ReceiveTruncated {
+                data: data_truncated,
+                control: control_truncated,
+            });
+        }
+
+        debug_assert!((received as usize) <= message.len());
+        Ok((received as usize, received_fds))
     }
+}
+
+fn own_scm_rights(header: &libc::msghdr) -> Result<Vec<OwnedFd>, ScmSocketError> {
+    let control_start = header.msg_control as usize;
+    // recvmsg cannot report more control bytes than the buffer supplied.
+    let control_len = u16::try_from(header.msg_controllen)
+        .map(usize::from)
+        .map_err(|_| ScmSocketError::Receive("invalid ancillary data length".to_owned()))?;
+    let control_end = control_start
+        .checked_add(control_len)
+        .ok_or_else(|| ScmSocketError::Receive("invalid ancillary data length".to_owned()))?;
+    let minimum_header_len = unsafe { libc::CMSG_LEN(0) as usize };
+    let mut owned_fds = Vec::new();
+
+    // nix 0.32 refuses RecvMsg::cmsgs() when MSG_CTRUNC is set. Walking the
+    // kernel-produced prefix directly is necessary to own and close the FDs
+    // installed before descriptor limits truncated the message.
+    // SAFETY: header comes directly from a successful recvmsg call. Every
+    // dereference and payload read below is first bounded by msg_controllen.
+    let mut current = unsafe { libc::CMSG_FIRSTHDR(header) };
+    while !current.is_null() {
+        let current_address = current as usize;
+        let remaining = control_end.checked_sub(current_address).ok_or_else(|| {
+            ScmSocketError::Receive("ancillary header lies outside its buffer".to_owned())
+        })?;
+        if current_address < control_start || remaining < mem::size_of::<libc::cmsghdr>() {
+            return Err(ScmSocketError::Receive(
+                "truncated ancillary header".to_owned(),
+            ));
+        }
+
+        // SAFETY: current is aligned by CMSG_FIRSTHDR/CMSG_NXTHDR and the full
+        // cmsghdr was checked to lie inside the control buffer.
+        let cmsg = unsafe { ptr::read(current) };
+        let cmsg_len = cmsg.cmsg_len as usize;
+        if cmsg_len < minimum_header_len || cmsg_len > remaining {
+            return Err(ScmSocketError::Receive(
+                "invalid ancillary message length".to_owned(),
+            ));
+        }
+
+        // SAFETY: current points to a complete cmsghdr validated above.
+        let data = unsafe { libc::CMSG_DATA(current) };
+        let data_offset = (data as usize)
+            .checked_sub(current_address)
+            .ok_or_else(|| {
+                ScmSocketError::Receive("invalid ancillary payload pointer".to_owned())
+            })?;
+        if data_offset > cmsg_len {
+            return Err(ScmSocketError::Receive(
+                "ancillary payload lies outside its message".to_owned(),
+            ));
+        }
+
+        if cmsg.cmsg_level == libc::SOL_SOCKET && cmsg.cmsg_type == libc::SCM_RIGHTS {
+            let payload_len = cmsg_len - data_offset;
+            if !payload_len.is_multiple_of(mem::size_of::<RawFd>()) {
+                return Err(ScmSocketError::Receive(
+                    "invalid SCM_RIGHTS payload length".to_owned(),
+                ));
+            }
+
+            for index in 0..payload_len / mem::size_of::<RawFd>() {
+                // SAFETY: the payload bounds and RawFd-sized divisibility were
+                // checked above. read_unaligned handles CMSG_DATA alignment.
+                let fd = unsafe { ptr::read_unaligned(data.cast::<RawFd>().add(index)) };
+                if fd < 0 {
+                    return Err(ScmSocketError::Receive(
+                        "received an invalid file descriptor".to_owned(),
+                    ));
+                }
+                // SAFETY: recvmsg installed this descriptor in the process and
+                // SCM_RIGHTS transfers ownership to the receiver exactly once.
+                let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+                #[cfg(not(any(
+                    target_os = "linux",
+                    target_os = "android",
+                    target_os = "freebsd",
+                    target_os = "dragonfly",
+                    target_os = "netbsd",
+                    target_os = "openbsd"
+                )))]
+                // SAFETY: owned_fd is live and F_SETFD changes only its flags.
+                unsafe {
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                }
+                owned_fds.push(owned_fd);
+            }
+        }
+
+        // SAFETY: current is a validated header from this msghdr. libc applies
+        // the platform's CMSG alignment and returns null at msg_controllen.
+        current = unsafe { libc::CMSG_NXTHDR(header, current) };
+    }
+
+    Ok(owned_fds)
 }
 
 /// Listener keys (socket address, plus interface when bound) and file
@@ -635,7 +777,12 @@ fn parse_addresses(addresses: &[String]) -> Result<Vec<ListenerKey>, ScmSocketEr
 #[cfg(test)]
 mod tests {
 
-    use std::{net::SocketAddr, os::unix::prelude::AsRawFd, str::FromStr};
+    use std::{
+        io::Write,
+        net::SocketAddr,
+        os::unix::{net::UnixStream, prelude::AsRawFd},
+        str::FromStr,
+    };
 
     use mio::net::UnixStream as MioUnixStream;
 
@@ -942,6 +1089,146 @@ mod tests {
                 "expected ListenersCountInconsistent, got {other:?}\n\
                  NOTE: a panic / OOM here means the SCM bounds check was reverted",
             ),
+        }
+    }
+
+    /// A listener transfer is one logical receive on the Unix stream. Its
+    /// sender must reject a descriptor table the matching receiver cannot hold.
+    #[test]
+    fn rejects_listener_batch_above_the_fd_frame_limit_before_sending() {
+        let (stream_1, _stream_2) =
+            MioUnixStream::pair().expect("Could not create a pair of mio unix streams");
+        let sender = ScmSocket::new(stream_1.into_raw_fd()).expect("Could not create scm socket");
+        let payload = UnixStream::pair().expect("Could not create payload unix streams");
+        let address = socket_addr_from_str("127.0.0.1:8080");
+        let listeners = Listeners {
+            tcp: (0..=MAX_FDS_OUT)
+                .map(|_| (address.into(), payload.0.as_raw_fd()))
+                .collect(),
+            ..Default::default()
+        };
+
+        assert!(
+            sender.send_listeners(&listeners).is_err(),
+            "a batch with more than MAX_FDS_OUT descriptors must be refused before sendmsg"
+        );
+    }
+
+    /// The receiver's data buffer is part of the same frame contract as its
+    /// ancillary descriptor table.
+    #[test]
+    fn rejects_listener_batch_above_the_message_frame_limit_before_sending() {
+        let (stream_1, _stream_2) =
+            MioUnixStream::pair().expect("Could not create a pair of mio unix streams");
+        let sender = ScmSocket::new(stream_1.into_raw_fd()).expect("Could not create scm socket");
+        let payload = UnixStream::pair().expect("Could not create payload unix streams");
+        let interface = "x".repeat(MAX_BYTES_OUT);
+        let listeners = Listeners {
+            tcp: vec![(
+                ListenerKey::new(socket_addr_from_str("127.0.0.1:8080"), Some(&interface)),
+                payload.0.as_raw_fd(),
+            )],
+            ..Default::default()
+        };
+
+        assert!(
+            sender.send_listeners(&listeners).is_err(),
+            "a manifest larger than MAX_BYTES_OUT must be refused before sendmsg"
+        );
+    }
+
+    /// Descriptors installed by `recvmsg` belong to the receiver even when a
+    /// later manifest parse fails. The error path must close them.
+    #[test]
+    fn closes_received_descriptors_when_listener_manifest_parsing_fails() {
+        let (stream_1, stream_2) =
+            MioUnixStream::pair().expect("Could not create a pair of mio unix streams");
+        let sender = ScmSocket::new(stream_1.into_raw_fd()).expect("Could not create scm socket");
+        let receiver = ScmSocket::new(stream_2.into_raw_fd()).expect("Could not create scm socket");
+        let (payload_reader, mut payload_writer) =
+            UnixStream::pair().expect("Could not create payload unix streams");
+        let manifest = ListenersCount {
+            http: vec!["not-a-listener-key".to_owned()],
+            tls: vec![],
+            tcp: vec![],
+            udp: vec![],
+        }
+        .encode_length_delimited_to_vec();
+
+        sender
+            .send_msg_and_fds(&manifest, &[payload_reader.as_raw_fd()])
+            .expect("the kernel accepts the syntactically opaque manifest");
+        drop(payload_reader);
+        assert!(
+            matches!(
+                receiver.receive_listeners(),
+                Err(ScmSocketError::WrongSocketAddress { .. })
+            ),
+            "the malformed listener key must be rejected"
+        );
+        assert_eq!(
+            payload_writer.write(&[1]).expect_err(
+                "the received duplicate must be closed, leaving the payload writer without a peer"
+            ).kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+    }
+
+    /// Even when the control buffer truncates SCM_RIGHTS, every descriptor the
+    /// kernel did deliver must be owned and closed before returning the error.
+    #[test]
+    fn closes_received_descriptors_when_control_data_is_truncated() {
+        let (stream_1, stream_2) =
+            MioUnixStream::pair().expect("Could not create a pair of mio unix streams");
+        let sender = ScmSocket::new(stream_1.into_raw_fd()).expect("Could not create scm socket");
+        let receiver = ScmSocket::new(stream_2.into_raw_fd()).expect("Could not create scm socket");
+        let payloads = [
+            UnixStream::pair().expect("Could not create payload unix streams"),
+            UnixStream::pair().expect("Could not create payload unix streams"),
+            UnixStream::pair().expect("Could not create payload unix streams"),
+        ];
+        let fds = payloads
+            .iter()
+            .map(|(reader, _)| reader.as_raw_fd())
+            .collect::<Vec<_>>();
+
+        sender
+            .send_msg_and_fds(&[0], &fds)
+            .expect("the kernel accepts the descriptor message");
+        let mut writers = payloads
+            .into_iter()
+            .map(|(reader, writer)| {
+                drop(reader);
+                writer
+            })
+            .collect::<Vec<_>>();
+
+        let mut message = [0; MAX_BYTES_OUT];
+        let mut control = AlignedControlBuffer {
+            _alignment: [],
+            bytes: [0; CONTROL_MESSAGE_BUFFER_SIZE],
+        };
+        let one_fd_control_size = socket::cmsg_space::<RawFd>();
+        assert!(matches!(
+            receiver.receive_msg_and_fds_with_control(
+                &mut message,
+                &mut control.bytes[..one_fd_control_size],
+                false,
+            ),
+            Err(ScmSocketError::ReceiveTruncated {
+                data: false,
+                control: true
+            })
+        ));
+
+        for writer in &mut writers {
+            assert_eq!(
+                writer
+                    .write(&[1])
+                    .expect_err("all received duplicates must be closed")
+                    .kind(),
+                std::io::ErrorKind::BrokenPipe
+            );
         }
     }
 }

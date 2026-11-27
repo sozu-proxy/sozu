@@ -3,6 +3,7 @@ use std::{
     collections::{BTreeMap, HashMap, hash_map::Entry},
     io::ErrorKind,
     net::{Shutdown, SocketAddr},
+    os::unix::io::{AsRawFd, RawFd},
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -3195,6 +3196,17 @@ impl TcpProxy {
     pub(crate) fn listener_cluster(&self, address: &ListenerKey) -> Option<ClusterId> {
         let token = self.listener_token(address)?;
         self.listeners[&token].borrow().cluster_id.clone()
+    }
+
+    pub(crate) fn listener_fds(&self) -> Vec<(ListenerKey, RawFd)> {
+        self.listeners
+            .values()
+            .filter_map(|listener| {
+                let listener = listener.borrow();
+                let socket = listener.listener.as_ref()?;
+                Some((listener.key(), socket.as_raw_fd()))
+            })
+            .collect()
     }
 
     pub fn give_back_listeners(&mut self) -> Vec<(ListenerKey, MioTcpListener)> {

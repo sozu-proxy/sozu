@@ -11,7 +11,11 @@ use libc::{cpu_set_t, pid_t};
 use nix::{
     errno::Errno,
     fcntl::{FcntlArg, FdFlag, fcntl},
-    unistd::{AccessFlags, access},
+    sys::{
+        signal::{Signal, kill},
+        wait::waitpid,
+    },
+    unistd::{AccessFlags, Pid, access},
 };
 use sozu_command_lib::config::Config;
 use sozu_lib::metrics::{self, MetricError};
@@ -49,6 +53,26 @@ pub enum UtilError {
     or use the SOZU_CONFIG environment variable when building sozu."
     )]
     GetConfigFilePath,
+}
+
+/// Kill and synchronously reap a child that cannot be handed to the event loop.
+///
+/// Once a forked replacement fails before registration, no `WorkerSession`
+/// exists to own its PID. Closing its channels makes it exit, but only an
+/// explicit `waitpid` prevents the exited process from remaining a zombie.
+pub fn kill_and_reap_child(pid: i32, description: &str) {
+    let pid = Pid::from_raw(pid);
+    let _ = kill(pid, Signal::SIGKILL);
+    loop {
+        match waitpid(pid, None) {
+            Ok(_) | Err(Errno::ECHILD) => return,
+            Err(Errno::EINTR) => continue,
+            Err(error) => {
+                warn!("could not reap failed {} {}: {}", description, pid, error);
+                return;
+            }
+        }
+    }
 }
 
 /// FD_CLOEXEC is set by default on every fd in Rust standard lib,

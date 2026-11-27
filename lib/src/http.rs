@@ -3,6 +3,7 @@ use std::{
     collections::{BTreeMap, HashMap, hash_map::Entry},
     io::ErrorKind,
     net::SocketAddr,
+    os::unix::io::{AsRawFd, RawFd},
     rc::{Rc, Weak},
     str::from_utf8_unchecked,
     time::{Duration, Instant},
@@ -1407,6 +1408,17 @@ impl HttpProxy {
             .iter()
             .find(|(_, listener)| listener.borrow().is(address))
             .map(|(token, _)| *token)
+    }
+
+    pub(crate) fn listener_fds(&self) -> Vec<(ListenerKey, RawFd)> {
+        self.listeners
+            .values()
+            .filter_map(|listener| {
+                let listener = listener.borrow();
+                let socket = listener.listener.as_ref()?;
+                Some((listener.key(), socket.as_raw_fd()))
+            })
+            .collect()
     }
 
     pub fn give_back_listeners(&mut self) -> Vec<(ListenerKey, MioTcpListener)> {

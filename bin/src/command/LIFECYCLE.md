@@ -45,7 +45,10 @@ Entry point: `begin_main_process` (`bin/src/command/mod.rs`), called from `main`
    and have no `Drop`, so `fork_main_into_worker` owns both through guards
    that close them on every error return (the listeners on success too, once
    the worker has its own copies), and `Server::register_worker` closes the
-   SCM socket when the registration fails before a session exists. After a
+   SCM socket when the registration fails before a session exists. A failure
+   after `fork` but before registration also kills and synchronously reaps the
+   unregistered child; closing its channels alone would make it exit but leave
+   a zombie whose PID the event loop never received. After a
    failed automatic launch the round ends and the next one waits
    `SPAWN_RETRY_INTERVAL` (one second, `Server::paced_workers_to_spawn`):
    the failure is resource exhaustion, so retrying at once only repeats it
@@ -497,6 +500,13 @@ phase takes the old worker's listeners and launches the new worker with them;
 its second phase (`StopOldActivateNew`) soft-stops the old worker and sends the
 activation requests to the new one.
 
+Before phase one, the supervisor serializes the active listener keys without
+descriptors and refuses the upgrade when they exceed the legacy single-message
+SCM envelope. This check is mandatory even when the current worker can reject
+the batch safely: a worker from an older executable has no capability exchange
+and may relinquish its listeners before its oversized send fails. The refusal
+leaves that worker untouched; batching requires a future wire protocol.
+
 Between the two phases the old worker stays `Running` but holds no listening
 socket: `ReturnListenSockets` makes it hand every descriptor over and keep
 none, and the supervisor closes its own copies once the replacement has them,
@@ -522,7 +532,10 @@ active listener the answer is immediate. While the restoration is in flight
 the task cannot be handed over to a new main process
 (`TaskSnapshotError::OldWorkerRestoreInFlight`), as for the readiness wait. An
 old worker that never answers the first `ReturnListenSockets` is not covered:
-that answer is indeterminate and the upgrade fails as before.
+that answer is indeterminate and the upgrade fails as before. A worker that
+explicitly rejects the request is instead sent every idempotent activation and
+must confirm them before the failure says it keeps serving; this both confirms
+a current worker retained its sockets and repairs a legacy destructive failure.
 
 Only one `upgrade --worker` runs per worker at a time. A worker keeps a single
 pending shutdown id, and the old worker stays `Running` until the replacement

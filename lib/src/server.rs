@@ -410,6 +410,11 @@ pub struct SessionManager {
     /// UDP flow slots alias their listener's session but are not listener
     /// slots: they are inserted directly and count as session slots.
     listener_slots: usize,
+    /// Physical slab headroom reserved for listeners. It grows in powers of
+    /// two and never shrinks, so add/remove churn reuses the same allocation.
+    /// Keeping it separate also lets [`Self::insert_listener_slot`] preserve
+    /// any larger capacity the slab acquired under session load.
+    listener_capacity: usize,
     /// The slab capacity sized for connections, the slab's capacity when the
     /// manager was built (`ServerConfig::slab_capacity`,
     /// `10 + slab_entries_per_connection * max_connections`). Listener slots
@@ -517,6 +522,7 @@ impl SessionManager {
             can_accept: true,
             slab,
             listener_slots: 0,
+            listener_capacity: 0,
             session_capacity,
             max_connections_per_ip,
             retry_after,
@@ -1146,16 +1152,30 @@ impl SessionManager {
         let len_before = self.slab.len();
         let listener_slots_before = self.listener_slots;
         // Listener slots must not eat the room sized for connections, or the
-        // slab would reallocate under connection load. `Slab::reserve` grows
-        // the slab by doubling, so a worker adding thousands of listeners
-        // reallocates a logarithmic number of times, not once per listener.
-        let wanted = self.session_capacity + self.listener_slots + 1;
-        self.slab.reserve(wanted.saturating_sub(self.slab.len()));
+        // slab would reallocate under connection load. Grow their own headroom
+        // geometrically, and use `reserve_exact` so the first listener does
+        // not double the whole session-sized allocation. Capacity above the
+        // previous listener headroom was acquired under session load (or from
+        // allocator rounding), so preserve that physical high-water mark too.
+        let next_listener_slots = self.listener_slots.saturating_add(1);
+        let next_listener_capacity = next_listener_slots
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX)
+            .max(self.listener_capacity);
+        let physical_session_capacity = self
+            .slab
+            .capacity()
+            .saturating_sub(self.listener_capacity)
+            .max(self.session_capacity);
+        let wanted = physical_session_capacity.saturating_add(next_listener_capacity);
+        self.slab
+            .reserve_exact(wanted.saturating_sub(self.slab.len()));
 
         let key = self
             .slab
             .insert(Rc::new(RefCell::new(ListenSession { protocol })));
         self.listener_slots += 1;
+        self.listener_capacity = next_listener_capacity;
 
         debug_assert_eq!(
             self.slab.len(),
@@ -4733,7 +4753,18 @@ impl Server {
 
     /// Send all socket addresses and file descriptors of all proxies, via the scm socket
     pub fn return_listen_sockets(&mut self) -> Result<(), ScmSocketError> {
-        self.unblock_scm_socket();
+        // SCM_RIGHTS duplicates the descriptors. Keep the originals registered
+        // until the transfer succeeds so a refusal leaves this worker serving.
+        let listeners = Listeners {
+            http: self.http.borrow().listener_fds(),
+            tls: self.https.borrow().listener_fds(),
+            tcp: self.tcp.borrow().listener_fds(),
+            udp: self.udp.borrow().listener_fds(),
+        };
+        self.scm.set_blocking(false)?;
+        let sent = self.scm.send_listeners(&listeners);
+        self.block_scm_socket();
+        sent?;
 
         let mut http_listeners = self.http.borrow_mut().give_back_listeners();
         for &mut (_, ref mut sock) in http_listeners.iter_mut() {
@@ -4769,28 +4800,8 @@ impl Server {
             }
         }
 
-        // use as_raw_fd because the listeners should be dropped after sending them
-        let listeners = Listeners {
-            http: http_listeners
-                .iter()
-                .map(|(key, listener)| (key.clone(), listener.as_raw_fd()))
-                .collect(),
-            tls: https_listeners
-                .iter()
-                .map(|(key, listener)| (key.clone(), listener.as_raw_fd()))
-                .collect(),
-            tcp: tcp_listeners
-                .iter()
-                .map(|(key, listener)| (key.clone(), listener.as_raw_fd()))
-                .collect(),
-            udp: udp_listeners
-                .iter()
-                .map(|(key, listener)| (key.clone(), listener.as_raw_fd()))
-                .collect(),
-        };
-        // Each handed-back listener is collected exactly once: the assembled
-        // fd lists mirror the give_back lists one-to-one (the maps above are
-        // straight `.iter().map().collect()` with no filtering or dedup).
+        // The event loop cannot change the listener tables between the send
+        // and the detach. The local sockets close when their owners drop here.
         debug_assert_eq!(
             listeners.http.len(),
             http_listeners.len(),
@@ -4806,13 +4817,13 @@ impl Server {
             tcp_listeners.len(),
             "every TCP listener must be collected exactly once"
         );
-        info!("sending default listeners: {:?}", listeners);
-        let res = self.scm.send_listeners(&listeners);
-
-        self.block_scm_socket();
-
-        info!("sent default listeners: {:?}", res);
-        res
+        debug_assert_eq!(
+            listeners.udp.len(),
+            udp_listeners.len(),
+            "every UDP listener must be collected exactly once"
+        );
+        info!("returned listeners: {:?}", listeners);
+        Ok(())
     }
 
     fn block_scm_socket(&mut self) {
@@ -5697,6 +5708,39 @@ mod accept_ready_tests {
         // `_command_channel` is dropped here on purpose: nothing in these
         // tests reads the worker's side of the channel.
         (server, listen_token, address)
+    }
+
+    #[test]
+    fn a_failed_listener_handoff_leaves_the_original_socket_listening() {
+        use std::os::unix::net::UnixStream;
+
+        let (mut server, listen_token, address) = server_with_tcp_listener();
+        let (sender, receiver) = UnixStream::pair().expect("could not create a test SCM pair");
+        drop(receiver);
+        let original_scm = std::mem::replace(
+            &mut server.scm,
+            ScmSocket {
+                fd: sender.as_raw_fd(),
+                blocking: true,
+            },
+        );
+        let handoff = server.return_listen_sockets();
+        server.scm = original_scm;
+
+        assert!(
+            handoff.is_err(),
+            "a closed SCM peer must refuse the listener handoff"
+        );
+        let _client = std::net::TcpStream::connect(SocketAddr::from(address))
+            .expect("the old socket must still listen after an unsuccessful handoff");
+        assert!(
+            server
+                .tcp
+                .borrow_mut()
+                .accept(ListenToken(listen_token.0))
+                .is_ok(),
+            "the old worker must still own and accept on the original socket"
+        );
     }
 
     /// `ready()` queues a listen token in `accept_ready` whenever its listener
@@ -8263,6 +8307,66 @@ mod listener_lifecycle_tests {
         );
         assert_eq!(sessions.slab.len(), slab_len - 1);
         assert_eq!(sessions.session_slots(), session_slots);
+    }
+
+    /// Listener headroom grows independently from the room already reserved
+    /// for sessions. The first listener therefore adds only listener headroom,
+    /// and a later listener preserves a larger physical capacity that live
+    /// sessions made the slab acquire.
+    ///
+    /// To SEE THIS RED: replace `Slab::reserve_exact` with `Slab::reserve` in
+    /// `SessionManager::insert_listener_slot`. The first listener then doubles
+    /// the whole session-sized allocation. Computing the target from
+    /// `session_capacity` alone also leaves the second assertion red, because
+    /// it spends capacity previously acquired under session load.
+    #[test]
+    fn listener_headroom_does_not_double_or_consume_session_capacity() {
+        let sessions = SessionManager::new(Slab::with_capacity(64), 16, 0, 0, 0, 32, 128);
+        let initial_capacity = sessions.borrow().slab.capacity();
+        let first_listener = sessions
+            .borrow_mut()
+            .insert_listener_slot(Protocol::TCPListen);
+        let first_listener_capacity = sessions.borrow().slab.capacity();
+        assert!(
+            first_listener_capacity > initial_capacity,
+            "the first listener must add headroom beyond the session capacity"
+        );
+        assert!(
+            first_listener_capacity < initial_capacity * 2,
+            "the first listener must not double the whole session-sized allocation"
+        );
+
+        // Ordinary sessions fill the physical capacity and force the slab to
+        // acquire a new high-water allocation. The next listener must preserve
+        // all of that session room and add its own headroom above it.
+        while sessions.borrow().slab.capacity() == first_listener_capacity {
+            sessions
+                .borrow_mut()
+                .slab
+                .insert(Rc::new(RefCell::new(ListenSession {
+                    protocol: Protocol::TCP,
+                })));
+        }
+        let expanded_session_capacity = sessions.borrow().slab.capacity();
+        let second_listener = sessions
+            .borrow_mut()
+            .insert_listener_slot(Protocol::TCPListen);
+        let second_listener_capacity = sessions.borrow().slab.capacity();
+        assert!(
+            second_listener_capacity > expanded_session_capacity,
+            "listener headroom must preserve the slab capacity acquired under session load"
+        );
+
+        sessions.borrow_mut().remove_listener_slot(first_listener);
+        sessions.borrow_mut().remove_listener_slot(second_listener);
+        sessions
+            .borrow_mut()
+            .insert_listener_slot(Protocol::TCPListen);
+        assert_eq!(
+            sessions.borrow().slab.capacity(),
+            second_listener_capacity,
+            "add/remove churn must reuse the listener headroom already allocated"
+        );
     }
 
     /// A listener is not refused because the worker is busy: with its session

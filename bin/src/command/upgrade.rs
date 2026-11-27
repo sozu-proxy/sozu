@@ -5,13 +5,6 @@ use std::{
 
 use libc::pid_t;
 use mio::Token;
-use nix::{
-    sys::{
-        signal::{Signal, kill},
-        wait::waitpid,
-    },
-    unistd::Pid,
-};
 use serde::{Deserialize, Serialize};
 use sozu_command_lib::{
     config::Config,
@@ -19,6 +12,7 @@ use sozu_command_lib::{
         Event, ResponseStatus, ReturnListenSockets, RunState, SoftStop, WorkerResponse,
         request::RequestType,
     },
+    scm_socket::{Listeners, ScmSocketError, validate_listener_batch},
     sd_notify,
     state::ConfigState,
 };
@@ -37,6 +31,7 @@ use crate::{
         UpgradePayload, fork_main_into_new_main, probe_main_upgrade_candidate,
         send_upgrade_transfer,
     },
+    util,
 };
 use sozu_command_lib::proto::command::EventKind;
 
@@ -135,6 +130,45 @@ struct UpgradeWorkerTask {
     expected_responses: usize,
 }
 
+/// Build the address-only shape of the worker's listener hand-off.
+///
+/// The descriptors are validation-only sentinels: [`validate_listener_batch`]
+/// reads their count but never dereferences or sends them. The supervisor must
+/// enforce the legacy one-frame envelope before asking an older worker to
+/// relinquish its sockets, because that worker cannot negotiate batching.
+fn validate_worker_listener_handoff(state: &ConfigState) -> Result<(), ScmSocketError> {
+    const VALIDATION_ONLY_FD: i32 = -1;
+
+    let listeners = Listeners {
+        http: state
+            .http_listeners
+            .iter()
+            .filter(|(_, listener)| listener.active)
+            .map(|(key, _)| (key.clone(), VALIDATION_ONLY_FD))
+            .collect(),
+        tls: state
+            .https_listeners
+            .iter()
+            .filter(|(_, listener)| listener.active)
+            .map(|(key, _)| (key.clone(), VALIDATION_ONLY_FD))
+            .collect(),
+        tcp: state
+            .tcp_listeners
+            .iter()
+            .filter(|(_, listener)| listener.active)
+            .map(|(key, _)| (key.clone(), VALIDATION_ONLY_FD))
+            .collect(),
+        udp: state
+            .udp_listeners
+            .iter()
+            .filter(|(_, listener)| listener.active)
+            .map(|(key, _)| (key.clone(), VALIDATION_ONLY_FD))
+            .collect(),
+    };
+
+    validate_listener_batch(&listeners)
+}
+
 pub fn upgrade_worker(server: &mut Server, client: &mut ClientSession, old_worker_id: WorkerId) {
     info!(
         "client[{:?}] msg wants to upgrade worker {}",
@@ -167,6 +201,13 @@ pub fn upgrade_worker(server: &mut Server, client: &mut ClientSession, old_worke
     if server.worker_upgrade_in_flight(old_worker_id) {
         client.finish_failure(format!(
             "Worker {old_worker_id} is already being upgraded, wait for that upgrade to finish"
+        ));
+        return;
+    }
+
+    if let Err(error) = validate_worker_listener_handoff(&server.state) {
+        client.finish_failure(format!(
+            "Could not upgrade worker {old_worker_id}: its active listeners exceed the legacy single-message SCM hand-off envelope: {error}"
         ));
         return;
     }
@@ -524,10 +565,32 @@ impl GatheringTask for UpgradeWorkerTask {
                 if self.ok == 1 {
                     self.receive_listen_sockets(server, client, old_worker_token, old_worker_id);
                 } else {
-                    client.finish_failure(format!(
+                    let abort = format!(
                         "Could not get listen sockets from old worker:{:?}",
                         self.responses
-                    ));
+                    );
+                    if timed_out || self.responses.is_empty() {
+                        // No reply is indeterminate: the worker may still be
+                        // inside the hand-off, so sending activation requests
+                        // concurrently could race that transition.
+                        client.finish_failure(abort);
+                    } else {
+                        if let Some(worker) = server.workers.get(&old_worker_token) {
+                            worker.scm_socket.discard_pending_listener_transfer();
+                        }
+                        // A negative reply is terminal. New workers retain
+                        // their sockets on every failure; legacy workers could
+                        // answer only after a destructive send failure. The
+                        // idempotent activations both confirm the former and
+                        // restore the latter before the client is answered.
+                        Self::abort_keeping_old_worker(
+                            self.client_token,
+                            server,
+                            client,
+                            old_worker_id,
+                            abort,
+                        );
+                    }
                 }
             }
             UpgradeWorkerProgress::AwaitingReadiness {
@@ -996,14 +1059,6 @@ fn close_reload_window_after_failed_upgrade() {
     }
 }
 
-fn reap_failed_child(pid: i32) {
-    let pid = Pid::from_raw(pid);
-    let _ = kill(pid, Signal::SIGKILL);
-    if let Err(error) = waitpid(pid, None) {
-        warn!("could not reap failed replacement main {}: {}", pid, error);
-    }
-}
-
 fn validate_prepared(
     message: &UpgradeHandshake,
     expected_counts: UpgradeCounts,
@@ -1057,7 +1112,7 @@ fn abort_before_commit(
     message: String,
 ) {
     drop(confirmation);
-    reap_failed_child(new_main_pid);
+    util::kill_and_reap_child(new_main_pid, "replacement main");
     restore_cloexec_after_failed_upgrade(hub);
     close_reload_window_after_failed_upgrade();
     hub.fail_upgrade(client_token, message);
@@ -1239,6 +1294,7 @@ pub fn upgrade_main(hub: &mut CommandHub, client_token: Token) {
 pub(crate) mod tests {
     use std::{
         collections::{HashMap, VecDeque},
+        net::SocketAddr,
         sync::mpsc,
         thread,
         time::Instant,
@@ -1254,6 +1310,7 @@ pub(crate) mod tests {
         LegacyUpgradeData, UPGRADE_PROTOCOL_V2, UpgradeCounts, UpgradeData, UpgradeHandshake,
         UpgradeServerState, UpgradeSnapshot, UpgradeStage, UpgradeWorkerProgress,
         UpgradeWorkerTask, commit_and_wait_for_activation, validate_prepared,
+        validate_worker_listener_handoff,
     };
     use crate::command::{
         server::{
@@ -1265,7 +1322,9 @@ pub(crate) mod tests {
     use sozu_command_lib::channel::Channel;
     use sozu_command_lib::{config::Config, state::ConfigState};
     use sozu_command_lib::{
-        proto::command::{Request, Response, ResponseStatus, RunState, WorkerResponse},
+        proto::command::{
+            HttpListenerConfig, Request, Response, ResponseStatus, RunState, WorkerResponse,
+        },
         ready::Ready,
     };
 
@@ -1373,6 +1432,36 @@ pub(crate) mod tests {
         let listener =
             UnixListener::bind(directory.path().join("sozu.sock")).expect("bind command listener");
         CommandHub::new(listener, Config::default(), "sozu".to_owned()).expect("create command Hub")
+    }
+
+    #[test]
+    fn legacy_worker_handoff_preflight_counts_only_active_listeners() {
+        let mut state = ConfigState::new();
+        for index in 0_u16..201 {
+            let address = SocketAddr::from(([127, 0, 0, 1], 10_000 + index));
+            let listener = HttpListenerConfig {
+                address: address.into(),
+                active: index < 200,
+                ..Default::default()
+            };
+            state
+                .http_listeners
+                .insert(listener.listener_key(), listener);
+        }
+
+        validate_worker_listener_handoff(&state)
+            .expect("200 active listeners fit the legacy descriptor envelope");
+
+        state
+            .http_listeners
+            .values_mut()
+            .find(|listener| !listener.active)
+            .expect("one listener starts inactive")
+            .active = true;
+        assert!(
+            validate_worker_listener_handoff(&state).is_err(),
+            "201 active listeners must be refused before a legacy worker is asked to hand them off"
+        );
     }
 
     #[test]
